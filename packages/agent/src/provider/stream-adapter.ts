@@ -246,7 +246,7 @@ export function makeMlxStreamSimple(
       // another inference. A later /new or /resume must not relabel an older
       // request that was already submitted under the previous root.
       rootCacheOwnerId = resolveRootCacheOwner?.();
-      emitter = new TurnEmitter(stream, model, onPerformance);
+      emitter = new TurnEmitter(stream, model, onPerformance, options?.reasoning !== undefined);
     } catch (err) {
       terminalize('error', err);
       return stream;

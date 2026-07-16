@@ -1569,6 +1569,7 @@ impl GRPOTrainingEngine {
                         tool_call_id: m.tool_call_id.clone(),
                         is_error: m.is_error,
                         reasoning_content: m.reasoning_content.clone(),
+                        thinking_enabled: m.thinking_enabled,
                         images: None, // Images not used in training
                         audio: None,  // Audio not used in training
                     })

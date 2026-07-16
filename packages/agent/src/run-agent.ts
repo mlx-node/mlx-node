@@ -64,6 +64,11 @@ export interface RunAgentOptions {
   pagedConfigOverrides?: AgentPagedConfigOverrides;
 }
 
+/** @internal Exact opt-in parser kept separate so non-`1` values stay disabled. */
+export function agentGemmaDraftEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.MLX_AGENT_ENABLE_GEMMA_DRAFT === '1';
+}
+
 /**
  * Seed the pi/mlx environment (never clobbering user-set values) and run
  * pi's `main()` with the mlx inline extensions. May not return: pi
@@ -83,10 +88,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 
   // Force every paged-capable agent family through an isolated config clone.
   // This includes quantized LFM2 (whose standalone default is deliberately
-  // flat) and Qwen3.5 dense/MoE (whose text-only defaults are flat). The model
-  // host verifies the native adapter after load, so unsupported quantization
-  // or hardware fails clearly instead of silently violating this contract.
-  const pagedConfigOverrides = opts.pagedConfigOverrides ?? new PagedConfigOverrideManager();
+  // flat) and Qwen3.5 dense/MoE (whose text-only defaults are flat). Gemma4's
+  // paged overlay intentionally hides an embedded draft/ directory: the
+  // current speculative executor is flat-cache-only and can regress quantized
+  // agent workloads. Users may explicitly opt back into that native behavior.
+  const preserveEmbeddedGemmaDraft = agentGemmaDraftEnabled();
+  const pagedConfigOverrides =
+    opts.pagedConfigOverrides ?? new PagedConfigOverrideManager({ preserveEmbeddedGemmaDraft });
   const modelHost = new MlxModelHost(
     opts.models.map((model) => model.discovered),
     {

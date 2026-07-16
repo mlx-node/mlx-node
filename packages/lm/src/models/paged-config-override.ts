@@ -4,12 +4,15 @@
  * Native model loaders accept a directory path and read paging policy from
  * `config.json`. This manager creates an isolated temporary clone containing a
  * patched config plus symlinks to the source files, so callers can opt models
- * into paging without mutating downloaded checkpoints.
+ * into paging without mutating downloaded checkpoints. Loader-known Qwen3.5
+ * MTP sidecars are preserved explicitly; unrelated directories (including a
+ * Gemma4 `draft/`) remain hidden unless a caller explicitly preserves the
+ * Gemma draft for flat speculative decoding.
  */
 
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 /** Every chat-capable family currently discovered by `@mlx-node/agent`. */
 export const AGENT_PAGED_MODEL_TYPES = ['qwen3', 'qwen3_5', 'qwen3_5_moe', 'gemma4', 'lfm2', 'lfm2_moe'] as const;
@@ -19,12 +22,20 @@ export const QWEN35_PAGED_MODEL_TYPES = ['qwen3_5', 'qwen3_5_moe'] as const;
 
 const QWEN35_CACHE_FLOOR_MODEL_TYPES = new Set<string>(QWEN35_PAGED_MODEL_TYPES);
 const DEFAULT_QWEN35_PAGED_CACHE_MB = 16_384;
+const QWEN35_MTP_DRAFTER_DIR = 'mtp-drafter';
+const QWEN35_DENSE_NESTED_MTP_SIDECAR = 'mtp/weights.safetensors';
 
 export interface PagedConfigOverrideManagerOptions {
   /** Model types to force onto the paged path. Defaults to all agent chat families. */
   modelTypes?: readonly string[];
   /** Temporary-directory prefix. Primarily useful for diagnostics/tests. */
   tempDirPrefix?: string;
+  /**
+   * Pass Gemma4 checkpoints with an embedded `draft/` through unchanged.
+   * This keeps native draft auto-discovery, which currently requires flat KV
+   * caches. Defaults to false so a paged override remains a paged contract.
+   */
+  preserveEmbeddedGemmaDraft?: boolean;
 }
 
 /**
@@ -38,6 +49,7 @@ export interface PagedConfigOverrideManagerOptions {
 export class PagedConfigOverrideManager {
   private readonly modelTypes: ReadonlySet<string>;
   private readonly tempDirPrefix: string;
+  private readonly preserveEmbeddedGemmaDraft: boolean;
   private readonly overrides = new Map<string, Promise<string>>();
   private rootPromise: Promise<string> | undefined;
   private disposed = false;
@@ -45,6 +57,7 @@ export class PagedConfigOverrideManager {
   constructor(options: PagedConfigOverrideManagerOptions = {}) {
     this.modelTypes = new Set(options.modelTypes ?? AGENT_PAGED_MODEL_TYPES);
     this.tempDirPrefix = options.tempDirPrefix ?? 'mlx-paged-overrides-';
+    this.preserveEmbeddedGemmaDraft = options.preserveEmbeddedGemmaDraft ?? false;
   }
 
   /**
@@ -72,18 +85,30 @@ export class PagedConfigOverrideManager {
       return modelPath;
     }
 
+    // Gemma4's DSpark / assistant speculative executor currently owns flat KV
+    // caches. Preserve native draft discovery only for explicit callers; the
+    // default paged clone intentionally omits subdirectories, hiding `draft/`
+    // while keeping the downloaded checkpoint unchanged.
+    const hasEmbeddedGemmaDraft = modelType === 'gemma4' && (await isDirectory(join(sourcePath, 'draft')));
+    if (this.preserveEmbeddedGemmaDraft && hasEmbeddedGemmaDraft) {
+      return modelPath;
+    }
+
     const cacheFloorMb = QWEN35_CACHE_FLOOR_MODEL_TYPES.has(modelType) ? resolveQwen35CacheFloorMb() : undefined;
     const pagedEnabled = config.use_block_paged_cache === true;
     const configuredMemoryMb = positiveNumber(config.paged_cache_memory_mb);
     const memorySatisfied = cacheFloorMb === undefined || (configuredMemoryMb ?? 0) >= cacheFloorMb;
-    if (pagedEnabled && memorySatisfied) {
+    // Even an already-paged Gemma config must be cloned when `draft/` exists:
+    // returning the source would expose the draft to native auto-discovery and
+    // trigger the flat-speculation/paged-cache conflict.
+    if (pagedEnabled && memorySatisfied && !hasEmbeddedGemmaDraft) {
       return modelPath;
     }
 
     const existing = this.overrides.get(sourcePath);
     if (existing !== undefined) return existing;
 
-    const pending = this.createOverride(sourcePath, config, cacheFloorMb);
+    const pending = this.createOverride(sourcePath, config, cacheFloorMb, modelType);
     this.overrides.set(sourcePath, pending);
     try {
       return await pending;
@@ -112,6 +137,7 @@ export class PagedConfigOverrideManager {
     sourcePath: string,
     sourceConfig: Record<string, unknown>,
     cacheFloorMb: number | undefined,
+    modelType: string,
   ): Promise<string> {
     const root = await this.getRoot();
     const overrideDir = join(root, hashPath(sourcePath));
@@ -147,12 +173,102 @@ export class PagedConfigOverrideManager {
       }
     }
 
+    if (QWEN35_CACHE_FLOOR_MODEL_TYPES.has(modelType)) {
+      await preserveQwen35MtpSidecars(sourcePath, overrideDir, sourceConfig, modelType);
+    }
+
     return overrideDir;
   }
 
   private getRoot(): Promise<string> {
     this.rootPromise ??= mkdtemp(join(tmpdir(), this.tempDirPrefix));
     return this.rootPromise;
+  }
+}
+
+/**
+ * Keep only the nested paths that the native Qwen3.5 loaders inspect.
+ *
+ * Both dense and MoE loaders accept an mlx-vlm `mtp-drafter/` directory.
+ * Dense additionally accepts a config-declared relative sidecar and the
+ * conventional `mtp/weights.safetensors` fallback. Top-level sidecar files
+ * are already handled by the normal source-file loop above.
+ */
+async function preserveQwen35MtpSidecars(
+  sourcePath: string,
+  overrideDir: string,
+  sourceConfig: Record<string, unknown>,
+  modelType: string,
+): Promise<void> {
+  await symlinkDirectoryIfPresent(join(sourcePath, QWEN35_MTP_DRAFTER_DIR), join(overrideDir, QWEN35_MTP_DRAFTER_DIR));
+
+  // The MoE loader supports the split drafter directory, but deliberately has
+  // no `mtp.safetensors`-style sidecar discovery path.
+  if (modelType !== 'qwen3_5') return;
+
+  const relativeSidecars = new Set<string>([QWEN35_DENSE_NESTED_MTP_SIDECAR]);
+  const configuredSidecar = configuredQwen35MtpFile(sourceConfig);
+  if (configuredSidecar !== undefined && !isAbsolute(configuredSidecar)) {
+    relativeSidecars.add(configuredSidecar);
+  }
+
+  for (const sidecar of relativeSidecars) {
+    await symlinkContainedFileIfPresent(sourcePath, overrideDir, sidecar);
+  }
+}
+
+function configuredQwen35MtpFile(config: Record<string, unknown>): string | undefined {
+  const extra = config.mlx_lm_extra_tensors;
+  if (extra === null || typeof extra !== 'object' || Array.isArray(extra)) return undefined;
+  const mtpFile = (extra as Record<string, unknown>).mtp_file;
+  return typeof mtpFile === 'string' && mtpFile.trim() !== '' ? mtpFile : undefined;
+}
+
+async function symlinkContainedFileIfPresent(
+  sourceRoot: string,
+  destinationRoot: string,
+  relativePath: string,
+): Promise<void> {
+  const source = resolve(sourceRoot, relativePath);
+  const normalizedRelative = relative(sourceRoot, source);
+  if (
+    normalizedRelative === '' ||
+    normalizedRelative === '..' ||
+    normalizedRelative.startsWith(`..${sep}`) ||
+    isAbsolute(normalizedRelative)
+  ) {
+    return;
+  }
+
+  try {
+    if (!(await stat(source)).isFile()) return;
+  } catch {
+    return;
+  }
+
+  const destination = join(destinationRoot, normalizedRelative);
+  await mkdir(dirname(destination), { recursive: true });
+  await symlinkIfMissing(source, destination);
+}
+
+async function symlinkDirectoryIfPresent(source: string, destination: string): Promise<void> {
+  if (!(await isDirectory(source))) return;
+  await symlinkIfMissing(source, destination);
+}
+
+async function symlinkIfMissing(source: string, destination: string): Promise<void> {
+  try {
+    await symlink(source, destination);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+}
+
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
   }
 }
 

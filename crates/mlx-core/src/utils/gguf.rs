@@ -1,7 +1,9 @@
 /// GGUF Binary Format Parser and Converter
 ///
 /// Reads GGUF model files and converts tensors to MLX SafeTensors format.
-/// Supports BF16/F16/F32 unquantized tensors and Q4_0/Q4_1/Q8_0 quantized tensors.
+/// Supports BF16/F16/F32 unquantized tensors, Q4_0/Q4_1/Q8_0 tensors repacked
+/// into MLX affine quantization, and the Gemma4 token embedding's Q6_K fallback
+/// (dequantized to BF16).
 ///
 /// Reference: https://github.com/ggml-org/ggml/blob/master/docs/gguf.md
 use std::collections::HashMap;
@@ -32,6 +34,7 @@ pub enum GgufTensorType {
     Q4_0 = 2,
     Q4_1 = 3,
     Q8_0 = 8,
+    Q6K = 14,
     BF16 = 30,
 }
 
@@ -43,6 +46,7 @@ impl GgufTensorType {
             2 => Some(Self::Q4_0),
             3 => Some(Self::Q4_1),
             8 => Some(Self::Q8_0),
+            14 => Some(Self::Q6K),
             30 => Some(Self::BF16),
             _ => None,
         }
@@ -56,6 +60,9 @@ impl GgufTensorType {
             Self::Q4_0 => 18, // block size: 2 byte scale + 16 bytes (32 x 4-bit)
             Self::Q4_1 => 20, // 2 byte scale + 2 byte bias + 16 bytes
             Self::Q8_0 => 34, // 2 byte scale + 32 bytes
+            // 128 low-nibble bytes + 64 high-two-bit bytes + 16 signed
+            // sub-scales + one f16 super-scale for 256 values.
+            Self::Q6K => 210,
         }
     }
 
@@ -63,11 +70,16 @@ impl GgufTensorType {
     fn block_size(&self) -> usize {
         match self {
             Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => 32,
+            Self::Q6K => 256,
             _ => 1,
         }
     }
 
     fn is_quantized(&self) -> bool {
+        matches!(self, Self::Q4_0 | Self::Q4_1 | Self::Q8_0 | Self::Q6K)
+    }
+
+    fn is_mlx_affine_quantized(&self) -> bool {
         matches!(self, Self::Q4_0 | Self::Q4_1 | Self::Q8_0)
     }
 
@@ -78,6 +90,7 @@ impl GgufTensorType {
             Self::Q4_0 => "Q4_0",
             Self::Q4_1 => "Q4_1",
             Self::Q8_0 => "Q8_0",
+            Self::Q6K => "Q6_K",
             Self::BF16 => "BF16",
         }
     }
@@ -466,8 +479,8 @@ pub fn parse_gguf<P: AsRef<Path>>(path: P) -> Result<GgufFile> {
             Some(t) => t,
             None => {
                 return Err(Error::from_reason(format!(
-                    "Tensor '{}' has unsupported GGUF type {} — only F32(0), F16(1), Q4_0(2), Q4_1(3), Q8_0(8), BF16(30) are supported. \
-                     K-quant formats (Q4_K, Q5_K, Q6_K, etc.) require dequantization before conversion.",
+                    "Tensor '{}' has unsupported GGUF type {} — only F32(0), F16(1), Q4_0(2), Q4_1(3), Q8_0(8), Q6_K(14), BF16(30) are supported. \
+                     Q6_K is supported only for the Gemma4 token embedding; other K-quant formats require dequantization before conversion.",
                     name, type_u32
                 )));
             }
@@ -555,6 +568,96 @@ fn load_unquantized_tensor(
             tensor.tensor_type.name()
         ))),
     }
+}
+
+/// Dequantize a GGUF Q6_K tensor to dense BF16.
+///
+/// Q6_K stores 256 values in 210 bytes: 128 bytes of low nibbles, 64 bytes of
+/// high two-bit planes, 16 signed i8 sub-scales (one per 16 values), and one
+/// f16 super-scale. This is intentionally a quality-preserving fallback for the
+/// Gemma4 token embedding until mlx-node has native Q6_K gather/tied-head
+/// kernels. Streaming one block at a time avoids retaining the additional
+/// ~788 MiB packed source alongside the ~1.88 GiB BF16 destination.
+fn load_q6k_tensor_bf16(
+    reader: &mut (impl Read + Seek),
+    gguf: &GgufFile,
+    tensor: &GgufTensorInfo,
+) -> Result<MxArray> {
+    const QK_K: usize = 256;
+    const BLOCK_BYTES: usize = 210;
+    const QL_BYTES: usize = 128;
+    const QH_OFFSET: usize = 128;
+    const SCALES_OFFSET: usize = 192;
+    const D_OFFSET: usize = 208;
+
+    let shape = tensor.mlx_shape();
+    let last_dim = shape.last().copied().unwrap_or(0);
+    if last_dim <= 0 || last_dim as usize % QK_K != 0 {
+        return Err(Error::from_reason(format!(
+            "Q6_K tensor '{}' has last dimension {last_dim}; expected a positive multiple of {QK_K}",
+            tensor.name
+        )));
+    }
+    let num_elements = tensor.num_elements() as usize;
+    if num_elements % QK_K != 0 {
+        return Err(Error::from_reason(format!(
+            "Q6_K tensor '{}' has {num_elements} elements; expected a multiple of {QK_K}",
+            tensor.name
+        )));
+    }
+
+    let abs_offset = gguf.data_offset + tensor.offset;
+    reader.seek(SeekFrom::Start(abs_offset)).map_err(|e| {
+        Error::from_reason(format!(
+            "Failed to seek to Q6_K tensor '{}': {e}",
+            tensor.name
+        ))
+    })?;
+
+    let mut values = Vec::<u16>::new();
+    values.try_reserve_exact(num_elements).map_err(|e| {
+        Error::from_reason(format!(
+            "Failed to allocate BF16 destination for Q6_K tensor '{}': {e}",
+            tensor.name
+        ))
+    })?;
+    let mut block = [0u8; BLOCK_BYTES];
+    for block_idx in 0..(num_elements / QK_K) {
+        reader.read_exact(&mut block).map_err(|e| {
+            Error::from_reason(format!(
+                "Failed to read Q6_K block {block_idx} from tensor '{}': {e}",
+                tensor.name
+            ))
+        })?;
+
+        let d = half::f16::from_bits(u16::from_le_bytes([block[D_OFFSET], block[D_OFFSET + 1]]))
+            .to_f32();
+
+        for value_idx in 0..QK_K {
+            // The low nibbles are arranged as two 64-byte planes. Within each
+            // plane the low/high nibble halves are themselves split into two
+            // 32-value groups. The high two bits use four bit-planes per
+            // 128-value half. This matches ggml/gguf's canonical Q6_K layout.
+            let group32 = value_idx / 32;
+            let lane = value_idx % 32;
+            let group_in_half = group32 % 4;
+            let ql_index = (group32 / 4) * 64 + (group_in_half % 2) * 32 + lane;
+            debug_assert!(ql_index < QL_BYTES);
+            let ql_shift = (group_in_half / 2) * 4;
+            let low = (block[ql_index] >> ql_shift) & 0x0f;
+
+            let qh_index = QH_OFFSET + (group32 / 4) * 32 + lane;
+            let qh_shift = group_in_half * 2;
+            let high = (block[qh_index] >> qh_shift) & 0x03;
+
+            let q = i32::from(low | (high << 4)) - 32;
+            let sub_scale = f32::from(block[SCALES_OFFSET + value_idx / 16] as i8);
+            let value = d * sub_scale * q as f32;
+            values.push(half::bf16::from_f32(value).to_bits());
+        }
+    }
+
+    MxArray::from_bfloat16(&values, &shape)
 }
 
 /// Load a quantized tensor (Q4_0, Q4_1, Q8_0) and produce (weight, scales, biases) triplet
@@ -722,7 +825,21 @@ pub fn load_gguf_tensors<P: AsRef<Path>>(
             );
         }
 
-        if tensor.tensor_type.is_quantized() {
+        if tensor.tensor_type == GgufTensorType::Q6K {
+            let is_gemma4 = gguf
+                .metadata
+                .get("general.architecture")
+                .and_then(GgufMetaValue::as_str)
+                == Some("gemma4");
+            if !is_gemma4 || tensor.name != "token_embd.weight" {
+                return Err(Error::from_reason(format!(
+                    "Q6_K tensor '{}' is unsupported in this position. mlx-node currently supports Q6_K only for Gemma4 token_embd.weight, dequantized to BF16.",
+                    tensor.name
+                )));
+            }
+            let arr = load_q6k_tensor_bf16(&mut reader, gguf, tensor)?;
+            weights.insert(tensor.name.clone(), arr);
+        } else if tensor.tensor_type.is_mlx_affine_quantized() {
             let triplet = load_quantized_tensor(&mut reader, gguf, tensor)?;
             for (name, arr) in triplet {
                 weights.insert(name, arr);
@@ -737,6 +854,100 @@ pub fn load_gguf_tensors<P: AsRef<Path>>(
 }
 
 // ── Key Remapping ───────────────────────────────────────────────────────────
+
+fn is_gemma4_main_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+    metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        == Some("gemma4")
+}
+
+fn is_gemma4_mmproj_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+    metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        == Some("clip")
+        && (metadata
+            .get("clip.vision.projector_type")
+            .and_then(GgufMetaValue::as_str)
+            == Some("gemma4uv")
+            || metadata
+                .get("clip.audio.projector_type")
+                .and_then(GgufMetaValue::as_str)
+                == Some("gemma4ua"))
+}
+
+/// Gemma4's GGUF naming has four distinct residual norms. The generic mapper
+/// predates that architecture and maps `ffn_norm` and `post_attention_norm` to
+/// the same destination, silently losing one tensor when collected into a
+/// HashMap. Keep the architecture-specific mapping explicit and complete.
+fn gemma4_name_to_hf(name: &str) -> Option<String> {
+    if name == "rope_freqs.weight" {
+        // RoPE frequencies are derived from config at runtime.
+        return None;
+    }
+
+    let mut result = name.to_string();
+    if result.starts_with("blk.") {
+        result = result.replacen("blk.", "model.layers.", 1);
+    }
+
+    result = result.replace(".attn_q.", ".self_attn.q_proj.");
+    result = result.replace(".attn_k.", ".self_attn.k_proj.");
+    result = result.replace(".attn_v.", ".self_attn.v_proj.");
+    result = result.replace(".attn_output.", ".self_attn.o_proj.");
+    result = result.replace(".attn_q_norm.", ".self_attn.q_norm.");
+    result = result.replace(".attn_k_norm.", ".self_attn.k_norm.");
+    result = result.replace(".ffn_gate.", ".mlp.gate_proj.");
+    result = result.replace(".ffn_down.", ".mlp.down_proj.");
+    result = result.replace(".ffn_up.", ".mlp.up_proj.");
+
+    result = result.replace(".attn_norm.", ".input_layernorm.");
+    result = result.replace(".post_attention_norm.", ".post_attention_layernorm.");
+    result = result.replace(".ffn_norm.", ".pre_feedforward_layernorm.");
+    result = result.replace(".post_ffw_norm.", ".post_feedforward_layernorm.");
+    result = result.replace(".layer_output_scale.weight", ".layer_scalar");
+
+    if result == "token_embd.weight" {
+        result = "model.embed_tokens.weight".to_string();
+    } else if result == "output_norm.weight" {
+        result = "model.norm.weight".to_string();
+    } else if result == "output.weight" {
+        result = "lm_head.weight".to_string();
+    }
+    Some(result)
+}
+
+fn gemma4_mmproj_name_to_hf(name: &str) -> Option<String> {
+    let mapped = match name {
+        "mm.a.input_projection.weight" => "model.embed_audio.embedding_projection.weight",
+        "mm.input_projection.weight" => "model.embed_vision.embedding_projection.weight",
+        "v.patch_embd.weight" => "model.vision_embedder.patch_dense.weight",
+        "v.patch_embd.bias" => "model.vision_embedder.patch_dense.bias",
+        "v.patch_norm.1.weight" => "model.vision_embedder.patch_ln1.weight",
+        "v.patch_norm.1.bias" => "model.vision_embedder.patch_ln1.bias",
+        "v.patch_norm.2.weight" => "model.vision_embedder.patch_ln2.weight",
+        "v.patch_norm.2.bias" => "model.vision_embedder.patch_ln2.bias",
+        "v.position_embd.weight" => "model.vision_embedder.pos_embedding",
+        "v.patch_norm.3.weight" => "model.vision_embedder.pos_norm.weight",
+        "v.patch_norm.3.bias" => "model.vision_embedder.pos_norm.bias",
+        _ => return Some(gguf_name_to_hf(name)),
+    };
+    Some(mapped.to_string())
+}
+
+fn gguf_name_to_hf_for_metadata(
+    name: &str,
+    metadata: &HashMap<String, GgufMetaValue>,
+) -> Option<String> {
+    if is_gemma4_main_gguf(metadata) {
+        gemma4_name_to_hf(name)
+    } else if is_gemma4_mmproj_gguf(metadata) {
+        gemma4_mmproj_name_to_hf(name)
+    } else {
+        Some(gguf_name_to_hf(name))
+    }
+}
 
 /// Remap GGUF tensor name to HuggingFace-style name (standard LLM mapping)
 pub fn gguf_name_to_hf(name: &str) -> String {
@@ -831,12 +1042,113 @@ pub fn gguf_name_to_hf(name: &str) -> String {
     result
 }
 
-/// Remap all keys in a weight map from GGUF names to HuggingFace names
-fn remap_keys(weights: HashMap<String, MxArray>) -> HashMap<String, MxArray> {
-    weights
-        .into_iter()
-        .map(|(k, v)| (gguf_name_to_hf(&k), v))
-        .collect()
+/// Remap all keys from GGUF names to HuggingFace names. Reject collisions
+/// rather than letting `HashMap::collect` silently keep one of two semantic
+/// tensors (the failure mode that exposed Gemma4's four-norm mapping gap).
+fn remap_keys(
+    weights: HashMap<String, MxArray>,
+    metadata: &HashMap<String, GgufMetaValue>,
+) -> Result<HashMap<String, MxArray>> {
+    let mut remapped = HashMap::with_capacity(weights.len());
+    let mut sources = HashMap::<String, String>::with_capacity(weights.len());
+    for (source, value) in weights {
+        let Some(dest) = gguf_name_to_hf_for_metadata(&source, metadata) else {
+            continue;
+        };
+        if let Some(previous) = sources.get(&dest) {
+            return Err(Error::from_reason(format!(
+                "GGUF key remap collision: source tensors '{previous}' and '{source}' both map to '{dest}'"
+            )));
+        }
+        sources.insert(dest.clone(), source);
+        remapped.insert(dest, value);
+    }
+    Ok(remapped)
+}
+
+fn square_side_for_chw(flat_dim: i64, key: &str) -> Result<i64> {
+    const CHANNELS: i64 = 3;
+    if flat_dim <= 0 || flat_dim % CHANNELS != 0 {
+        return Err(Error::from_reason(format!(
+            "Gemma4 mmproj tensor '{key}' has flattened dimension {flat_dim}; expected 3 * side * side"
+        )));
+    }
+    let spatial = flat_dim / CHANNELS;
+    let side = (spatial as f64).sqrt() as i64;
+    if side * side != spatial {
+        return Err(Error::from_reason(format!(
+            "Gemma4 mmproj tensor '{key}' has flattened dimension {flat_dim}; {spatial} pixels is not square"
+        )));
+    }
+    Ok(side)
+}
+
+/// GGUF stores Gemma4's flattened image patch state in CHW order, while the
+/// unified MLX/HF checkpoint consumes HWC-flattened values. It also stores the
+/// two position tables as `[2, positions, hidden]`, versus
+/// `[positions, 2, hidden]` in the checkpoint. Apply only to the positively
+/// identified Gemma4 unified mmproj so other CLIP/Qwen layouts stay unchanged.
+fn fixup_gemma4_mmproj_layout(
+    weights: &mut HashMap<String, MxArray>,
+    metadata: &HashMap<String, GgufMetaValue>,
+) -> Result<()> {
+    if !is_gemma4_mmproj_gguf(metadata) {
+        return Ok(());
+    }
+
+    let patch_key = "model.vision_embedder.patch_dense.weight";
+    if let Some(weight) = weights.remove(patch_key) {
+        let shape = weight.shape()?.to_vec();
+        if shape.len() != 2 {
+            return Err(Error::from_reason(format!(
+                "Gemma4 mmproj tensor '{patch_key}' must be 2-D, got {shape:?}"
+            )));
+        }
+        let (out, flat) = (shape[0], shape[1]);
+        let side = square_side_for_chw(flat, patch_key)?;
+        let transformed = weight
+            .reshape(&[out, 3, side, side])?
+            .transpose(Some(&[0, 2, 3, 1]))?
+            .reshape(&[out, flat])?;
+        weights.insert(patch_key.to_string(), transformed);
+    }
+
+    for key in [
+        "model.vision_embedder.patch_ln1.weight",
+        "model.vision_embedder.patch_ln1.bias",
+    ] {
+        if let Some(value) = weights.remove(key) {
+            let shape = value.shape()?.to_vec();
+            if shape.len() != 1 {
+                return Err(Error::from_reason(format!(
+                    "Gemma4 mmproj tensor '{key}' must be 1-D, got {shape:?}"
+                )));
+            }
+            let flat = shape[0];
+            let side = square_side_for_chw(flat, key)?;
+            let transformed = value
+                .reshape(&[3, side, side])?
+                .transpose(Some(&[1, 2, 0]))?
+                .reshape(&[flat])?;
+            weights.insert(key.to_string(), transformed);
+        }
+    }
+
+    let position_key = "model.vision_embedder.pos_embedding";
+    if let Some(position) = weights.remove(position_key) {
+        let shape = position.shape()?.to_vec();
+        if shape.len() != 3 || shape[0] != 2 {
+            return Err(Error::from_reason(format!(
+                "Gemma4 mmproj tensor '{position_key}' must have shape [2, positions, hidden], got {shape:?}"
+            )));
+        }
+        weights.insert(
+            position_key.to_string(),
+            position.transpose(Some(&[1, 0, 2]))?,
+        );
+    }
+
+    Ok(())
 }
 
 /// Post-process weights after remapping to fix shapes/values that differ between GGUF and HF.
@@ -1209,6 +1521,69 @@ pub fn extract_config(metadata: &HashMap<String, GgufMetaValue>) -> serde_json::
     serde_json::Value::Object(config)
 }
 
+/// Describe affine tensors that were already quantized in the GGUF source.
+///
+/// Q4_0/Q4_1/Q8_0 are repacked by `load_quantized_tensor` without changing
+/// their 32-value block geometry. That remains true even when the caller did
+/// not request an additional `--quantize` pass, so the output config must not
+/// fall back to the runtime's generic group-size default (64 for Gemma4).
+fn preserved_source_quantization(gguf: &GgufFile) -> Result<Option<serde_json::Value>> {
+    let mut profiles = std::collections::BTreeMap::<String, i32>::new();
+    let mut bit_counts = HashMap::<i32, usize>::new();
+
+    for tensor in &gguf.tensors {
+        let bits = match tensor.tensor_type {
+            GgufTensorType::Q4_0 | GgufTensorType::Q4_1 => 4,
+            GgufTensorType::Q8_0 => 8,
+            _ => continue,
+        };
+        let Some(mapped) = gguf_name_to_hf_for_metadata(&tensor.name, &gguf.metadata) else {
+            continue;
+        };
+        let prefix = mapped.strip_suffix(".weight").unwrap_or(&mapped);
+        let prefix = super::normalize_override_key(prefix);
+        if let Some(previous) = profiles.insert(prefix.clone(), bits)
+            && previous != bits
+        {
+            return Err(Error::from_reason(format!(
+                "GGUF source quantization collision: '{prefix}' resolves to both {previous}-bit and {bits}-bit tensors"
+            )));
+        }
+        *bit_counts.entry(bits).or_default() += 1;
+    }
+
+    if profiles.is_empty() {
+        return Ok(None);
+    }
+
+    let default_bits = bit_counts
+        .into_iter()
+        .max_by_key(|&(bits, count)| (count, bits))
+        .map(|(bits, _)| bits)
+        .expect("non-empty profiles imply a bit count");
+    let mixed_bits = profiles.values().any(|&bits| bits != default_bits);
+    let mut quant = serde_json::Map::new();
+    quant.insert("bits".to_string(), serde_json::json!(default_bits));
+    quant.insert("group_size".to_string(), serde_json::json!(32));
+    quant.insert("mode".to_string(), serde_json::json!("affine"));
+    if mixed_bits {
+        // Every source-quantized tensor receives an explicit override, so the
+        // top-level modal bit-width is only a fallback and cannot misdecode a
+        // mixed Q4/Q8 GGUF.
+        for (prefix, bits) in profiles {
+            quant.insert(
+                prefix,
+                serde_json::json!({
+                    "bits": bits,
+                    "group_size": 32,
+                    "mode": "affine",
+                }),
+            );
+        }
+    }
+    Ok(Some(serde_json::Value::Object(quant)))
+}
+
 // ── Dtype Conversion ────────────────────────────────────────────────────────
 
 fn convert_tensor_dtype(arr: MxArray, target: DType) -> Result<MxArray> {
@@ -1228,6 +1603,12 @@ pub struct GgufConversionOptions {
 
     /// Output directory for converted SafeTensors model
     pub output_dir: String,
+
+    /// Optional directory containing the authoritative HuggingFace config and
+    /// tokenizer/processor assets. GGUF metadata is not rich enough to recreate
+    /// unified Gemma4 config fields such as head_dim, layer_types, vision, and
+    /// audio configuration exactly.
+    pub config_source_dir: Option<String>,
 
     /// Target dtype: "float32", "float16", "bfloat16" (default: keep original)
     pub dtype: Option<String>,
@@ -1290,12 +1671,21 @@ pub async fn convert_gguf_to_safetensors(
 ) -> Result<GgufConversionResult> {
     let input_path = PathBuf::from(&options.input_path);
     let output_dir = PathBuf::from(&options.output_dir);
+    let config_source_dir = options.config_source_dir.as_deref().map(PathBuf::from);
     let verbose = options.verbose.unwrap_or(false);
 
     if !input_path.exists() {
         return Err(Error::from_reason(format!(
             "GGUF file not found: {}",
             input_path.display()
+        )));
+    }
+    if let Some(ref dir) = config_source_dir
+        && !dir.is_dir()
+    {
+        return Err(Error::from_reason(format!(
+            "Config source directory not found or not a directory: {}",
+            dir.display()
         )));
     }
 
@@ -1366,6 +1756,16 @@ pub async fn convert_gguf_to_safetensors(
         info!("  {ttype}: {count} tensors");
     }
 
+    // Q6_K is deliberately a BF16-only dense fallback. Remember its remapped
+    // key so an optional global dtype request cannot accidentally turn this
+    // one tensor into F32/F16 while all no-request source tensors remain exact.
+    let q6k_bf16_keys: std::collections::HashSet<String> = gguf
+        .tensors
+        .iter()
+        .filter(|t| t.tensor_type == GgufTensorType::Q6K)
+        .filter_map(|t| gguf_name_to_hf_for_metadata(&t.name, &gguf.metadata))
+        .collect();
+
     // Load tensors
     info!("Loading tensors...");
     let mut weights = load_gguf_tensors(&input_path, &gguf, verbose)?;
@@ -1373,7 +1773,11 @@ pub async fn convert_gguf_to_safetensors(
 
     // Remap keys from GGUF to HF naming
     info!("Remapping tensor names to HuggingFace format...");
-    weights = remap_keys(weights);
+    weights = remap_keys(weights, &gguf.metadata)?;
+
+    // Unified Gemma4 mmproj tensors need name-aware CHW→HWC and position-table
+    // permutations after remapping, before the generic shape fixups run.
+    fixup_gemma4_mmproj_layout(&mut weights, &gguf.metadata)?;
 
     // Fix shapes that differ between GGUF and HF format
     fixup_shapes(&mut weights)?;
@@ -1397,6 +1801,9 @@ pub async fn convert_gguf_to_safetensors(
         info!("Converting to {dtype_str}...");
         let keys: Vec<String> = weights.keys().cloned().collect();
         for key in keys {
+            if q6k_bf16_keys.contains(&key) {
+                continue;
+            }
             // Skip quantized weight triplets
             if key.ends_with(".scales") || key.ends_with(".biases") {
                 continue;
@@ -1673,10 +2080,20 @@ pub async fn convert_gguf_to_safetensors(
     let is_primary_model = safetensors_filename == "model.safetensors";
 
     if is_primary_model {
-        // config.json: prefer real config from alongside the GGUF file, fallback to extraction
+        // config.json: an explicit source directory is authoritative (needed by
+        // unified Gemma4, whose full text/vision/audio config cannot be rebuilt
+        // from GGUF metadata). Otherwise preserve the existing alongside-GGUF
+        // lookup and metadata-extraction fallback.
         let gguf_dir = input_path.parent().unwrap_or(Path::new("."));
+        let asset_dir = config_source_dir.as_deref().unwrap_or(gguf_dir);
         let config_path = output_dir.join("config.json");
-        let src_config = gguf_dir.join("config.json");
+        let src_config = asset_dir.join("config.json");
+        if config_source_dir.is_some() && !src_config.exists() {
+            return Err(Error::from_reason(format!(
+                "Authoritative config.json not found in config source directory: {}",
+                asset_dir.display()
+            )));
+        }
 
         // Load or extract config, then inject quantization metadata if needed
         let mut config_json: serde_json::Value = if src_config.exists() {
@@ -1701,6 +2118,13 @@ pub async fn convert_gguf_to_safetensors(
             }
             config_json["quantization"] = quant_obj.clone();
             config_json["quantization_config"] = quant_obj;
+        } else if let Some(quant_obj) = preserved_source_quantization(&gguf)? {
+            // Source Q4_0/Q4_1/Q8_0 tensors were losslessly repacked into MLX
+            // affine groups of 32. Record that even without an extra quantize
+            // request; otherwise Gemma4 defaults to group_size 64 and decodes
+            // the exact packed bytes with the wrong geometry.
+            config_json["quantization"] = quant_obj.clone();
+            config_json["quantization_config"] = quant_obj;
         }
 
         let config_str = serde_json::to_string_pretty(&config_json)
@@ -1709,26 +2133,52 @@ pub async fn convert_gguf_to_safetensors(
             .map_err(|e| Error::from_reason(format!("Failed to write config.json: {e}")))?;
         if do_quantize {
             info!("Wrote config.json with quantization metadata");
+        } else if preserved_source_quantization(&gguf)?.is_some() {
+            info!("Wrote config.json with preserved GGUF affine quantization metadata");
         } else if src_config.exists() {
             info!("Copied config.json from source directory");
         } else {
             info!("Wrote config.json (extracted from GGUF metadata)");
         }
 
-        // Try to copy tokenizer files from alongside the GGUF file
-        let tokenizer_files = ["tokenizer.json", "tokenizer_config.json"];
-        for filename in &tokenizer_files {
-            let src = gguf_dir.join(filename);
+        // Copy the same runtime assets as the SafeTensors converter. In
+        // particular unified Gemma4 requires its external chat template and
+        // processor config in addition to tokenizer.json.
+        let asset_files = [
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "vocab.json",
+            "merges.txt",
+            "special_tokens_map.json",
+            "added_tokens.json",
+            "chat_template.jinja",
+            "generation_config.json",
+            "preprocessor_config.json",
+            "video_preprocessor_config.json",
+            "processor_config.json",
+            "viterbi_calibration.json",
+        ];
+        for filename in &asset_files {
+            let src = asset_dir.join(filename);
             if src.exists() {
                 let dst = output_dir.join(filename);
-                if let Err(e) = fs::copy(&src, &dst) {
+                if src == dst {
+                    continue;
+                }
+                if config_source_dir.is_some() {
+                    fs::copy(&src, &dst).map_err(|e| {
+                        Error::from_reason(format!("Failed to copy {filename}: {e}"))
+                    })?;
+                    info!("Copied {filename}");
+                } else if let Err(e) = fs::copy(&src, &dst) {
                     warn!("Failed to copy {filename}: {e}");
                 } else {
                     info!("Copied {filename}");
                 }
-            } else {
+            } else if matches!(*filename, "tokenizer.json" | "tokenizer_config.json") {
                 warn!(
-                    "{filename} not found alongside GGUF file. You may need to download it separately."
+                    "{filename} not found in asset source directory {}. You may need to download it separately.",
+                    asset_dir.display()
                 );
             }
         }
@@ -1927,6 +2377,439 @@ mod tests {
         assert_eq!(values_vec, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
         fs::remove_file(&tmp).ok();
+    }
+
+    fn pack_q6k_block(q: &[i8; 256], scales: &[i8; 16], d: f32) -> [u8; 210] {
+        let mut block = [0u8; 210];
+        for (value_idx, &signed) in q.iter().enumerate() {
+            assert!((-32..=31).contains(&signed));
+            let encoded = (i32::from(signed) + 32) as u8;
+            let group32 = value_idx / 32;
+            let lane = value_idx % 32;
+            let group_in_half = group32 % 4;
+            let ql_index = (group32 / 4) * 64 + (group_in_half % 2) * 32 + lane;
+            let ql_shift = (group_in_half / 2) * 4;
+            block[ql_index] |= (encoded & 0x0f) << ql_shift;
+
+            let qh_index = 128 + (group32 / 4) * 32 + lane;
+            let qh_shift = group_in_half * 2;
+            block[qh_index] |= ((encoded >> 4) & 0x03) << qh_shift;
+        }
+        for (i, &scale) in scales.iter().enumerate() {
+            block[192 + i] = scale as u8;
+        }
+        block[208..210].copy_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+        block
+    }
+
+    #[test]
+    fn gemma4_q6k_token_embedding_dequantizes_to_bf16() {
+        let mut q = [0i8; 256];
+        for (i, value) in q.iter_mut().enumerate() {
+            *value = (i as i32 % 64 - 32) as i8;
+        }
+        let mut scales = [0i8; 16];
+        for (i, scale) in scales.iter_mut().enumerate() {
+            *scale = i as i8 - 8;
+        }
+        let block = pack_q6k_block(&q, &scales, 0.5);
+        let data = build_minimal_gguf(
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("gemma4".to_string()),
+            )],
+            &[("token_embd.weight", &[256, 1], GgufTensorType::Q6K, &block)],
+        );
+        let tmp = std::env::temp_dir().join(format!(
+            "mlx-node-gemma4-q6k-{}-{}.gguf",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::write(&tmp, data).unwrap();
+
+        let gguf = parse_gguf(&tmp).unwrap();
+        assert_eq!(gguf.tensors[0].tensor_type, GgufTensorType::Q6K);
+        assert_eq!(gguf.tensors[0].data_size(), 210);
+        let weights = load_gguf_tensors(&tmp, &gguf, false).unwrap();
+        let embedding = weights.get("token_embd.weight").unwrap();
+        assert_eq!(embedding.dtype().unwrap(), DType::BFloat16);
+        assert_eq!(embedding.shape().unwrap().as_ref(), &[1, 256]);
+        let got = embedding.to_float32().unwrap();
+        for i in 0..256 {
+            let exact = 0.5 * f32::from(scales[i / 16]) * f32::from(q[i]);
+            let expected = half::bf16::from_f32(exact).to_f32();
+            assert_eq!(got[i], expected, "Q6_K mismatch at value {i}");
+        }
+
+        fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn q6k_rejects_non_gemma_embedding_position() {
+        let block = pack_q6k_block(&[0; 256], &[1; 16], 1.0);
+        let data = build_minimal_gguf(
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("gemma4".to_string()),
+            )],
+            &[(
+                "blk.0.attn_q.weight",
+                &[256, 1],
+                GgufTensorType::Q6K,
+                &block,
+            )],
+        );
+        let tmp =
+            std::env::temp_dir().join(format!("mlx-node-invalid-q6k-{}.gguf", std::process::id()));
+        fs::write(&tmp, data).unwrap();
+        let gguf = parse_gguf(&tmp).unwrap();
+        let err = match load_gguf_tensors(&tmp, &gguf, false) {
+            Ok(_) => panic!("unsupported Q6_K placement unexpectedly loaded"),
+            Err(err) => err,
+        };
+        assert!(format!("{err}").contains("only for Gemma4 token_embd.weight"));
+        fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn q4_0_repack_keeps_payload_and_scale_exact() {
+        let scale_bits = half::f16::from_f32(0.25).to_bits();
+        let mut block = [0u8; 18];
+        block[..2].copy_from_slice(&scale_bits.to_le_bytes());
+        for (i, byte) in block[2..].iter_mut().enumerate() {
+            *byte = ((15 - i) as u8) << 4 | i as u8;
+        }
+        let data = build_minimal_gguf(
+            &[],
+            &[("test.weight", &[32, 1], GgufTensorType::Q4_0, &block)],
+        );
+        let tmp =
+            std::env::temp_dir().join(format!("mlx-node-q4-repack-{}.gguf", std::process::id()));
+        fs::write(&tmp, data).unwrap();
+        let gguf = parse_gguf(&tmp).unwrap();
+        let weights = load_gguf_tensors(&tmp, &gguf, false).unwrap();
+
+        let packed = weights.get("test.weight").unwrap().to_uint32().unwrap();
+        let mut unpacked = [0u8; 32];
+        for i in 0..16 {
+            unpacked[i] = block[2 + i] & 0x0f;
+            unpacked[16 + i] = block[2 + i] >> 4;
+        }
+        let mut expected = [0u32; 4];
+        for (word, out) in expected.iter_mut().enumerate() {
+            for lane in 0..8 {
+                *out |= u32::from(unpacked[word * 8 + lane]) << (lane * 4);
+            }
+        }
+        assert_eq!(packed.iter().copied().collect::<Vec<_>>(), expected);
+        assert_eq!(
+            weights
+                .get("test.scales")
+                .unwrap()
+                .to_uint16_native()
+                .unwrap(),
+            vec![scale_bits]
+        );
+        let expected_bias_bits = half::f16::from_f32(-2.0).to_bits();
+        assert_eq!(
+            weights
+                .get("test.biases")
+                .unwrap()
+                .to_uint16_native()
+                .unwrap(),
+            vec![expected_bias_bits]
+        );
+        assert_eq!(
+            weights.get("test.biases").unwrap().to_float32().unwrap()[0],
+            -2.0
+        );
+        fs::remove_file(&tmp).ok();
+    }
+
+    fn gemma4_metadata() -> HashMap<String, GgufMetaValue> {
+        HashMap::from([(
+            "general.architecture".to_string(),
+            GgufMetaValue::String("gemma4".to_string()),
+        )])
+    }
+
+    fn gemma4_mmproj_metadata() -> HashMap<String, GgufMetaValue> {
+        HashMap::from([
+            (
+                "general.architecture".to_string(),
+                GgufMetaValue::String("clip".to_string()),
+            ),
+            (
+                "clip.vision.projector_type".to_string(),
+                GgufMetaValue::String("gemma4uv".to_string()),
+            ),
+        ])
+    }
+
+    #[test]
+    fn gemma4_mapping_keeps_four_norms_distinct_and_drops_rope_cache() {
+        let metadata = gemma4_metadata();
+        let cases = [
+            (
+                "blk.7.attn_norm.weight",
+                Some("model.layers.7.input_layernorm.weight"),
+            ),
+            (
+                "blk.7.post_attention_norm.weight",
+                Some("model.layers.7.post_attention_layernorm.weight"),
+            ),
+            (
+                "blk.7.ffn_norm.weight",
+                Some("model.layers.7.pre_feedforward_layernorm.weight"),
+            ),
+            (
+                "blk.7.post_ffw_norm.weight",
+                Some("model.layers.7.post_feedforward_layernorm.weight"),
+            ),
+            (
+                "blk.7.layer_output_scale.weight",
+                Some("model.layers.7.layer_scalar"),
+            ),
+            ("rope_freqs.weight", None),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(
+                gguf_name_to_hf_for_metadata(source, &metadata).as_deref(),
+                expected,
+                "mapping mismatch for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemma4_mapping_rejects_destination_collisions() {
+        let weights = HashMap::from([
+            (
+                "blk.0.ffn_norm.weight".to_string(),
+                MxArray::from_float32(&[1.0], &[1]).unwrap(),
+            ),
+            (
+                "model.layers.0.pre_feedforward_layernorm.weight".to_string(),
+                MxArray::from_float32(&[2.0], &[1]).unwrap(),
+            ),
+        ]);
+        let err = match remap_keys(weights, &gemma4_metadata()) {
+            Ok(_) => panic!("colliding Gemma4 keys unexpectedly remapped"),
+            Err(err) => err,
+        };
+        let message = format!("{err}");
+        assert!(message.contains("GGUF key remap collision"));
+        assert!(message.contains("blk.0.ffn_norm.weight"));
+        assert!(message.contains("model.layers.0.pre_feedforward_layernorm.weight"));
+        assert!(message.contains("model.layers.0.pre_feedforward_layernorm.weight'"));
+    }
+
+    #[test]
+    fn gemma4_mmproj_mapping_and_layout_match_unified_checkpoint() {
+        let metadata = gemma4_mmproj_metadata();
+        let raw = HashMap::from([
+            (
+                "v.patch_embd.weight".to_string(),
+                MxArray::from_float32(&(0..12).map(|v| v as f32).collect::<Vec<_>>(), &[1, 12])
+                    .unwrap(),
+            ),
+            (
+                "v.patch_norm.1.weight".to_string(),
+                MxArray::from_float32(&(0..12).map(|v| v as f32).collect::<Vec<_>>(), &[12])
+                    .unwrap(),
+            ),
+            (
+                "v.position_embd.weight".to_string(),
+                MxArray::from_float32(&[0.0, 1.0, 2.0, 3.0], &[2, 2, 1]).unwrap(),
+            ),
+            (
+                "mm.input_projection.weight".to_string(),
+                MxArray::from_float32(&[5.0], &[1, 1]).unwrap(),
+            ),
+            (
+                "mm.a.input_projection.weight".to_string(),
+                MxArray::from_float32(&[6.0], &[1, 1]).unwrap(),
+            ),
+        ]);
+
+        let mut weights = remap_keys(raw, &metadata).unwrap();
+        fixup_gemma4_mmproj_layout(&mut weights, &metadata).unwrap();
+
+        let patch = weights
+            .get("model.vision_embedder.patch_dense.weight")
+            .unwrap();
+        assert_eq!(patch.shape().unwrap().as_ref(), &[1, 12]);
+        assert_eq!(
+            patch
+                .to_float32()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0.0, 4.0, 8.0, 1.0, 5.0, 9.0, 2.0, 6.0, 10.0, 3.0, 7.0, 11.0]
+        );
+
+        assert_eq!(
+            weights
+                .get("model.vision_embedder.patch_ln1.weight")
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0.0, 4.0, 8.0, 1.0, 5.0, 9.0, 2.0, 6.0, 10.0, 3.0, 7.0, 11.0]
+        );
+
+        let position = weights.get("model.vision_embedder.pos_embedding").unwrap();
+        assert_eq!(position.shape().unwrap().as_ref(), &[2, 2, 1]);
+        assert_eq!(
+            position
+                .to_float32()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0.0, 2.0, 1.0, 3.0]
+        );
+        assert!(weights.contains_key("model.embed_vision.embedding_projection.weight"));
+        assert!(weights.contains_key("model.embed_audio.embedding_projection.weight"));
+    }
+
+    #[test]
+    fn q4_source_metadata_is_affine_four_bit_group_32_without_requantizing() {
+        let gguf = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: 2,
+            metadata: gemma4_metadata(),
+            tensors: vec![
+                GgufTensorInfo {
+                    name: "blk.0.attn_q.weight".to_string(),
+                    n_dims: 2,
+                    dims: vec![32, 1],
+                    tensor_type: GgufTensorType::Q4_0,
+                    offset: 0,
+                },
+                GgufTensorInfo {
+                    name: "output_norm.weight".to_string(),
+                    n_dims: 1,
+                    dims: vec![1],
+                    tensor_type: GgufTensorType::F32,
+                    offset: 32,
+                },
+            ],
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let quant = preserved_source_quantization(&gguf).unwrap().unwrap();
+        assert_eq!(quant["bits"], 4);
+        assert_eq!(quant["group_size"], 32);
+        assert_eq!(quant["mode"], "affine");
+    }
+
+    #[tokio::test]
+    async fn conversion_uses_authoritative_config_assets_and_preserves_source_dtypes() {
+        let unique = format!(
+            "mlx-node-gguf-config-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let source = root.join("source");
+        let output = root.join("output");
+        fs::create_dir_all(&source).unwrap();
+
+        let mut q4 = [0u8; 18];
+        q4[..2].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
+        q4[2..].fill(0x87);
+        let norm = 3.25f32.to_le_bytes();
+        let gguf_data = build_minimal_gguf(
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("gemma4".to_string()),
+            )],
+            &[
+                ("blk.0.attn_q.weight", &[32, 1], GgufTensorType::Q4_0, &q4),
+                ("output_norm.weight", &[1], GgufTensorType::F32, &norm),
+            ],
+        );
+        let input = root.join("model.gguf");
+        fs::write(&input, gguf_data).unwrap();
+
+        let source_config = serde_json::json!({
+            "model_type": "gemma4_unified",
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "text_config": {
+                "head_dim": 256,
+                "layer_types": ["full_attention", "sliding_attention"]
+            },
+            "conversion_test_sentinel": "preserve-me"
+        });
+        fs::write(
+            source.join("config.json"),
+            serde_json::to_vec_pretty(&source_config).unwrap(),
+        )
+        .unwrap();
+        let assets = [
+            ("tokenizer.json", "tokenizer-exact"),
+            ("tokenizer_config.json", "tokenizer-config-exact"),
+            ("chat_template.jinja", "chat-template-exact"),
+            ("processor_config.json", "processor-config-exact"),
+        ];
+        for (name, contents) in assets {
+            fs::write(source.join(name), contents).unwrap();
+        }
+
+        convert_gguf_to_safetensors(GgufConversionOptions {
+            input_path: input.to_string_lossy().into_owned(),
+            output_dir: output.to_string_lossy().into_owned(),
+            config_source_dir: Some(source.to_string_lossy().into_owned()),
+            dtype: None,
+            verbose: Some(false),
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            output_filename: None,
+            vlm_key_prefix: Some(false),
+            quant_mxfp: Some(false),
+        })
+        .await
+        .unwrap();
+
+        let mut expected_config = source_config;
+        let expected_quant = serde_json::json!({
+            "bits": 4,
+            "group_size": 32,
+            "mode": "affine"
+        });
+        expected_config["quantization"] = expected_quant.clone();
+        expected_config["quantization_config"] = expected_quant;
+        let converted_config: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
+        assert_eq!(converted_config, expected_config);
+        for (name, contents) in assets {
+            assert_eq!(fs::read_to_string(output.join(name)).unwrap(), contents);
+        }
+
+        let safetensors =
+            crate::utils::safetensors::SafeTensorsFile::load(output.join("model.safetensors"))
+                .unwrap();
+        assert!(matches!(
+            safetensors.tensors["model.norm.weight"].dtype,
+            crate::utils::safetensors::SafeTensorDType::F32
+        ));
+        assert!(matches!(
+            safetensors.tensors["model.layers.0.self_attn.q_proj.weight"].dtype,
+            crate::utils::safetensors::SafeTensorDType::U32
+        ));
+
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

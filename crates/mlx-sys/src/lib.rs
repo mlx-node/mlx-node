@@ -301,6 +301,7 @@ unsafe extern "C-unwind" {
         out_len: usize,
     ) -> bool;
     pub fn mlx_array_delete(arr: *mut mlx_array);
+
     pub fn mlx_synchronize();
     pub fn mlx_clear_cache();
     pub fn mlx_compile_clear_cache() -> bool;
@@ -1323,6 +1324,24 @@ unsafe extern "C-unwind" {
         query_rows: i32,
         max_context_len: i32,
     ) -> i32;
+
+    /// Reset/read the environment-gated experimental Gemma 4 grouped-route
+    /// test probe.
+    pub fn mlx_paged_grouped_gemma4_test_probe_reset();
+    pub fn mlx_paged_grouped_gemma4_test_probe_count() -> u64;
+
+    /// Pure selector guard for the BF16 D512/BS16/16Q/1KV Gemma 4 route.
+    /// selector_mode: 0=disabled, 1=auto, 2=force.
+    pub fn mlx_paged_grouped_gemma4_shape_guard_for_test(
+        selector_mode: i32,
+        query_rows: i32,
+        max_context_len: i32,
+    ) -> i32;
+
+    /// Model-free graph-native numerical parity for the staged Gemma 4
+    /// D512/BS16/16Q/1KV kernel at the requested partial/boundary context.
+    /// Returns 1 on success and -3 without Metal.
+    pub fn mlx_paged_grouped_gemma4_graph_parity(context_len: i32) -> i32;
 }
 
 // ================================================================================

@@ -78,6 +78,17 @@ function finalMessage(events: AssistantMessageEvent[]): AssistantMessage {
 }
 
 describe('TurnEmitter', () => {
+  it('persists MLX thinking-mode provenance without adding a visible content block', async () => {
+    const stream = createAssistantMessageEventStream();
+    const emitter = new TurnEmitter(stream, MODEL, undefined, false);
+    emitter.onDelta(delta('Direct answer'));
+    emitter.onFinal(makeFinal({ text: 'Direct answer' }));
+
+    const message = finalMessage(await collect(stream)) as AssistantMessage & { mlxThinkingEnabled?: boolean };
+    expect(message.mlxThinkingEnabled).toBe(false);
+    expect(message.content).toEqual([{ type: 'text', text: 'Direct answer' }]);
+  });
+
   it('emits a plain-text turn with usage and stopReason on the final message', async () => {
     const { emitter, stream } = makeEmitter();
     emitter.onDelta(delta('Hello'));

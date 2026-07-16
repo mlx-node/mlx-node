@@ -238,6 +238,8 @@ A more compact Gemma-4-12B entry (mxfp4 MLP + mxfp8 attention, ~9 GB, for smalle
 
 pi's config home is `~/.mlx-node/agent` (override with `PI_CODING_AGENT_DIR`) — it holds `settings.json`, saved sessions, extensions, skills, prompts, and themes. A project-local `.pi/` directory still works for per-repo overrides. `mlx agent` also seeds `PI_SKIP_VERSION_CHECK=1` and `MLX_PAGED_PREFILL_CHUNK_SIZE=2048` (both only when unset) so long prompts keep bounded time-to-first-token on the default paged path.
 
+Gemma4 also uses paged autoregressive decoding by default, even when the checkpoint contains an embedded `draft/`: the agent's temporary config overlay hides that directory without modifying the checkpoint. Set `MLX_AGENT_ENABLE_GEMMA_DRAFT=1` to explicitly use the embedded DSpark/assistant draft instead; that opt-in currently uses flat KV cache and may be slower for quantized agent workloads.
+
 ### Permission gate
 
 pi has no permission system of its own, so `mlx agent` installs a safety gate: every `bash`, `write`, and `edit` tool call must be approved before it runs. In an interactive session it prompts (`Yes` / `Always (this session)` / `No`). Without an attached UI — headless print or `--mode json` runs — it blocks those tools unless you opt in with `MLX_AGENT_AUTO_APPROVE=1`:

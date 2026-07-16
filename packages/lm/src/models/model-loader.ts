@@ -30,10 +30,11 @@ export interface LoadModelOptions {
    * (`google/gemma-4-*-it-assistant`); the variant is auto-detected from
    * the draft's config.json (`model_type` `gemma4_assistant` /
    * `gemma4_unified_assistant` → assistant, `architectures` containing
-   * `Gemma4DSparkModel` → DSpark). Draft decoding runs on the flat
-   * KV-cache path, so the target checkpoint must not explicitly enable
-   * `use_block_paged_cache`. Setting this for any other model family is a
-   * hard error — no other loader accepts a draft model.
+   * `Gemma4DSparkModel` → DSpark). When omitted, Gemma4 automatically loads
+   * an embedded draft from `<modelPath>/draft/` when present. Draft decoding
+   * runs on the flat KV-cache path, so the target checkpoint must not
+   * explicitly enable `use_block_paged_cache`. Setting this for any other
+   * model family is a hard error — no other loader accepts a draft model.
    */
   draftModelPath?: string;
 }
@@ -343,6 +344,8 @@ function dispatchLoad(
  * `options.draftModelPath` attaches an external draft checkpoint (DSpark or
  * Google gemma-4 assistant, auto-detected from the draft's config.json) for
  * speculative decoding — gemma4 only; any other detected family rejects it.
+ * Without the option, Gemma4 loads `<modelPath>/draft/` automatically when
+ * that embedded checkpoint is present.
  */
 export async function loadModel(modelPath: string, options?: LoadModelOptions): Promise<LoadableModel> {
   const modelType = await detectModelType(modelPath);
@@ -368,6 +371,8 @@ export async function loadModel(modelPath: string, options?: LoadModelOptions): 
  * `options.draftModelPath` attaches an external draft checkpoint (DSpark or
  * Google gemma-4 assistant, auto-detected from the draft's config.json) for
  * speculative decoding — gemma4 only; any other detected family rejects it.
+ * Without the option, Gemma4 loads `<modelPath>/draft/` automatically when
+ * that embedded checkpoint is present.
  * The resulting session auto-enables the speculative path (the model
  * reports `hasMtpWeights()`); pass `enableMtp: false` per call to opt out.
  */

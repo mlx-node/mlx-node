@@ -157,6 +157,58 @@ describe('PagedConfigOverrideManager launch-claude policy', () => {
       await rm(src, { recursive: true, force: true });
     }
   });
+
+  it('preserves only the conventional nested dense Qwen MTP sidecar file', async () => {
+    const src = await makeFixture('qwen3_5');
+    await mkdir(join(src, 'mtp'));
+    await writeFile(join(src, 'mtp', 'weights.safetensors'), 'fake mtp', 'utf-8');
+    await writeFile(join(src, 'mtp', 'unrelated.bin'), 'do not expose', 'utf-8');
+    const manager = launchClaudeManager();
+    try {
+      const result = await manager.resolve(src);
+      expect(await readlink(join(result, 'mtp', 'weights.safetensors'))).toBe(join(src, 'mtp', 'weights.safetensors'));
+      expect(await pathExists(join(result, 'mtp', 'unrelated.bin'))).toBe(false);
+    } finally {
+      await manager.cleanup();
+      await rm(src, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a config-declared nested dense Qwen MTP sidecar file', async () => {
+    const src = await makeFixture('qwen3_5', {
+      mlx_lm_extra_tensors: { mtp_file: 'custom/mtp-sidecar.safetensors' },
+    });
+    await mkdir(join(src, 'custom'));
+    await writeFile(join(src, 'custom', 'mtp-sidecar.safetensors'), 'fake custom mtp', 'utf-8');
+    await writeFile(join(src, 'custom', 'unrelated.bin'), 'do not expose', 'utf-8');
+    const manager = launchClaudeManager();
+    try {
+      const result = await manager.resolve(src);
+      expect(await readlink(join(result, 'custom', 'mtp-sidecar.safetensors'))).toBe(
+        join(src, 'custom', 'mtp-sidecar.safetensors'),
+      );
+      expect(await pathExists(join(result, 'custom', 'unrelated.bin'))).toBe(false);
+    } finally {
+      await manager.cleanup();
+      await rm(src, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['qwen3_5', 'qwen3_5_moe'])('preserves the embedded %s split MTP drafter directory', async (modelType) => {
+    const src = await makeFixture(modelType);
+    await mkdir(join(src, 'mtp-drafter'));
+    await writeFile(join(src, 'mtp-drafter', 'config.json'), '{"model_type":"qwen3_5_mtp"}', 'utf-8');
+    await writeFile(join(src, 'mtp-drafter', 'model.safetensors'), 'fake drafter', 'utf-8');
+    const manager = launchClaudeManager();
+    try {
+      const result = await manager.resolve(src);
+      expect(await readlink(join(result, 'mtp-drafter'))).toBe(join(src, 'mtp-drafter'));
+      expect(await readFile(join(result, 'mtp-drafter', 'model.safetensors'), 'utf-8')).toBe('fake drafter');
+    } finally {
+      await manager.cleanup();
+      await rm(src, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('PagedConfigOverrideManager agent policy and lifecycle', () => {
@@ -188,6 +240,55 @@ describe('PagedConfigOverrideManager agent policy and lifecycle', () => {
       const config = await readConfig(result);
       expect(config.model_type).toBe('gemma4_unified');
       expect(config.use_block_paged_cache).toBe(true);
+    } finally {
+      await manager.cleanup();
+      await rm(src, { recursive: true, force: true });
+    }
+  });
+
+  it('hides an embedded Gemma4 draft in the default paged AR overlay', async () => {
+    const src = await makeFixture('gemma4_unified');
+    await mkdir(join(src, 'draft'));
+    await writeFile(join(src, 'draft', 'config.json'), '{"architectures":["Gemma4DSparkModel"]}', 'utf-8');
+    await writeFile(join(src, 'draft', 'model.safetensors'), 'fake draft', 'utf-8');
+    const manager = new PagedConfigOverrideManager();
+    try {
+      const result = await manager.resolve(src, 'gemma4');
+      expect(result).not.toBe(src);
+      expect((await readConfig(result)).use_block_paged_cache).toBe(true);
+      expect(await pathExists(join(result, 'draft'))).toBe(false);
+      expect((await readConfig(src)).use_block_paged_cache).toBeUndefined();
+    } finally {
+      await manager.cleanup();
+      await rm(src, { recursive: true, force: true });
+    }
+  });
+
+  it('still hides an embedded Gemma4 draft when the source config is already paged', async () => {
+    const src = await makeFixture('gemma4_unified', { use_block_paged_cache: true });
+    await mkdir(join(src, 'draft'));
+    await writeFile(join(src, 'draft', 'config.json'), '{"architectures":["Gemma4DSparkModel"]}', 'utf-8');
+    const manager = new PagedConfigOverrideManager();
+    try {
+      const result = await manager.resolve(src, 'gemma4');
+      expect(result).not.toBe(src);
+      expect((await readConfig(result)).use_block_paged_cache).toBe(true);
+      expect(await pathExists(join(result, 'draft'))).toBe(false);
+    } finally {
+      await manager.cleanup();
+      await rm(src, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves an embedded Gemma4 draft only when flat speculation is explicit', async () => {
+    const src = await makeFixture('gemma4_unified');
+    await mkdir(join(src, 'draft'));
+    await writeFile(join(src, 'draft', 'config.json'), '{"architectures":["Gemma4DSparkModel"]}', 'utf-8');
+    await writeFile(join(src, 'draft', 'model.safetensors'), 'fake draft', 'utf-8');
+    const manager = new PagedConfigOverrideManager({ preserveEmbeddedGemmaDraft: true });
+    try {
+      expect(await manager.resolve(src, 'gemma4')).toBe(src);
+      expect((await readConfig(src)).use_block_paged_cache).toBeUndefined();
     } finally {
       await manager.cleanup();
       await rm(src, { recursive: true, force: true });

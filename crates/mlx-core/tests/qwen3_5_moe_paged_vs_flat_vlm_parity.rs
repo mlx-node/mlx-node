@@ -148,6 +148,7 @@ fn user_message_with_image(content: &str, image: &[u8]) -> ChatMessage {
         tool_call_id: None,
         is_error: None,
         reasoning_content: None,
+        thinking_enabled: None,
         images: Some(vec![Uint8Array::new(image.to_vec())]),
         audio: None,
     }
@@ -161,6 +162,7 @@ fn user_message(content: &str) -> ChatMessage {
         tool_call_id: None,
         is_error: None,
         reasoning_content: None,
+        thinking_enabled: None,
         images: None,
         audio: None,
     }
@@ -174,6 +176,7 @@ fn assistant_message(content: &str) -> ChatMessage {
         tool_call_id: None,
         is_error: None,
         reasoning_content: None,
+        thinking_enabled: None,
         images: None,
         audio: None,
     }

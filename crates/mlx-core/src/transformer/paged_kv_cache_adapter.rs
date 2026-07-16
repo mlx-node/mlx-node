@@ -142,9 +142,10 @@ pub(crate) fn paged_attention_v2_aux_fits(
 }
 
 /// Conservative partition upper bound across the generic and optional
-/// grouped-Qwen3.5 dispatches. Grouped-kernel enablement, dtype, block size,
-/// and pipeline availability are runtime concerns; taking the larger possible
-/// count keeps this preflight safe regardless of which C++ path wins.
+/// grouped Qwen3.5 and Gemma 4 dispatches. Grouped-kernel enablement, dtype,
+/// block size, and pipeline availability are runtime concerns; taking the
+/// larger possible count keeps this preflight safe regardless of which C++
+/// path wins.
 pub(crate) fn paged_attention_v2_partition_upper_bound(
     layout: PagedAttentionV2Layout,
     num_new_tokens: u32,
@@ -163,19 +164,29 @@ pub(crate) fn paged_attention_v2_partition_upper_bound(
     };
     let grouped_qwen35_candidate = head_size == 256
         && grouped_qwen35_min_context.is_some_and(|minimum| max_context_len >= minimum);
-    if grouped_qwen35_candidate {
-        let grouped = match max_context_len {
+    let grouped_gemma4_candidate = head_size == 512
+        && layout == PagedAttentionV2Layout::SingleRowBatch
+        && num_new_tokens == 1
+        && (num_query_heads, num_kv_heads) == (16, 1)
+        && max_context_len > PAGED_ATTENTION_V2_PARTITION_SIZE as u32;
+    let grouped = if grouped_qwen35_candidate {
+        Some(match max_context_len {
             0..=4_096 => 32,
             4_097..=8_192 => 64,
             8_193..=16_383 => 128,
             16_384..=32_768 => 256,
             32_769..=65_536 => 512,
             _ => 1_024,
-        };
-        generic.max(grouped)
+        })
+    } else if grouped_gemma4_candidate {
+        // The diagnostic stripe override accepts up to 256. This helper runs
+        // before environment-dependent dispatch, so reserve that maximum even
+        // when the automatic policy would choose only 32/64/128.
+        Some(256)
     } else {
-        generic
-    }
+        None
+    };
+    grouped.map_or(generic, |grouped| generic.max(grouped))
 }
 
 /// Outcome of `validate_kv_input`: the (kernel-input dtype, num_tokens) tuple
@@ -5088,6 +5099,53 @@ mod tests {
             114_688,
             256
         ));
+    }
+
+    #[test]
+    fn gemma4_grouped_aux_upper_bound_tracks_diagnostic_stripes() {
+        let bound = |layout, rows, q_heads, kv_heads, context, head_size| {
+            paged_attention_v2_partition_upper_bound(
+                layout, rows, q_heads, kv_heads, context, head_size,
+            )
+        };
+        assert_eq!(
+            bound(PagedAttentionV2Layout::SingleRowBatch, 1, 16, 1, 512, 512),
+            1,
+            "V1 contexts cannot select the grouped V2 kernel"
+        );
+        for (context, expected) in [
+            (513, 256),
+            (4_096, 256),
+            (4_097, 256),
+            (8_192, 256),
+            (8_193, 256),
+            (16_384, 256),
+            (65_537, 256),
+            (131_073, 257),
+        ] {
+            assert_eq!(
+                bound(
+                    PagedAttentionV2Layout::SingleRowBatch,
+                    1,
+                    16,
+                    1,
+                    context,
+                    512
+                ),
+                expected,
+                "wrong Gemma grouped/generic upper bound at context {context}"
+            );
+        }
+        assert_eq!(
+            bound(PagedAttentionV2Layout::Varlen, 1, 16, 1, 3_458, 512),
+            7,
+            "Gemma grouped decode is single-row only"
+        );
+        assert_eq!(
+            bound(PagedAttentionV2Layout::SingleRowBatch, 1, 16, 2, 3_458, 512),
+            7,
+            "nearby head shapes retain the generic bound"
+        );
     }
 
     #[test]

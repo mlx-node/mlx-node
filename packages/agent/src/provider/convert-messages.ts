@@ -86,9 +86,14 @@ function convertMessage(message: Message, supportsImages: boolean): ConvertedMes
       return { message: { role: 'user', ...convertParts(message.content, supportsImages) } };
     }
     case 'assistant': {
-      // Thinking blocks are dropped: the native chat template re-renders
-      // reasoning through its own <think> handling, and replayed thinking
-      // would invalidate the KV prefix of every later turn.
+      // Preserve the parser's reasoning body so thinking-capable templates can
+      // reconstruct the exact channel/tag sequence generated on the prior
+      // turn. The native Gemma4 parser already removes its fixed `thought\n`
+      // channel label; the template adds that label back during replay.
+      const reasoningContent = message.content
+        .filter((part) => part.type === 'thinking')
+        .map((part) => part.thinking)
+        .join('');
       const text = message.content
         .filter((part): part is TextContent => part.type === 'text')
         .map((part) => part.text)
@@ -97,6 +102,9 @@ function convertMessage(message: Message, supportsImages: boolean): ConvertedMes
         .filter((part) => part.type === 'toolCall')
         .map((part) => ({ id: part.id, name: part.name, arguments: JSON.stringify(part.arguments) }));
       const converted: ChatMessage = { role: 'assistant', content: text };
+      if (reasoningContent.length > 0) converted.reasoningContent = reasoningContent;
+      const thinkingEnabled = (message as typeof message & { mlxThinkingEnabled?: boolean }).mlxThinkingEnabled;
+      if (thinkingEnabled !== undefined) converted.thinkingEnabled = thinkingEnabled;
       if (toolCalls.length > 0) converted.toolCalls = toolCalls;
       return { message: converted };
     }

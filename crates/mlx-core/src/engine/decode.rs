@@ -344,7 +344,11 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
                 (t, false)
             };
 
-            profiler.begin("eval_caches");
+            // `eval_step` only schedules the sampled token/logit graph for
+            // asynchronous evaluation. Cache materialization is performed by
+            // the next forward boundary, so calling this phase `eval_caches`
+            // made traces look like duplicate cache work.
+            profiler.begin("schedule_eval");
             step.eval_step(&next_token, &logits, budget_forced);
             profiler.end();
 

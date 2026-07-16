@@ -79,6 +79,163 @@ enum CycleStop {
     Repetition(&'static str),
 }
 
+/// Number of real speculative cycles used to compare DSpark against one
+/// target-only probe on this exact model, context, and host. Two samples
+/// damp the first-cycle lazy-evaluation/warmup skew without making a losing
+/// draft path dominate a short agent response.
+const DSPARK_BREAK_EVEN_SPEC_CYCLES: u8 = 2;
+
+/// Hysteresis above measured target-only throughput. A tie is not enough to
+/// retain the draft: its acceptance and latency can drift with prompt domain
+/// and context length, so speculation must clear the probe by 5%.
+const DSPARK_BREAK_EVEN_MIN_SPEEDUP: f64 = 1.05;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DsparkMeasurementCycle {
+    None,
+    ArProbe,
+    SpecProbe,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DsparkBreakEvenChoice {
+    KeepSpeculation,
+    FallBackToAr,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DsparkBreakEvenDecision {
+    choice: DsparkBreakEvenChoice,
+    ar_tokens_per_second: f64,
+    spec_tokens_per_second: f64,
+    spec_tokens: u64,
+    spec_cycles: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DsparkBreakEvenState {
+    Disabled,
+    ArProbe,
+    SpecProbe {
+        ar_wall_ns: u64,
+        spec_wall_ns: u128,
+        spec_tokens: u64,
+        spec_cycles: u8,
+    },
+    KeepSpeculation,
+    ArFallback,
+}
+
+/// Per-turn, hardware-measured break-even guard for DSpark.
+///
+/// The DeepSpec latency objective is accepted tokens divided by draft plus
+/// target-verify time. That break-even point is host- and context-dependent,
+/// so the guard first measures one exact target-only cycle, then two ordinary
+/// DSpark cycles. A losing draft permanently yields to the target's normal AR
+/// forward for the remainder of the turn. The pure state machine is kept
+/// separate from the model stepper so its decision math is deterministic in
+/// unit tests.
+#[derive(Clone, Copy, Debug)]
+struct DsparkBreakEvenPolicy {
+    state: DsparkBreakEvenState,
+}
+
+impl DsparkBreakEvenPolicy {
+    fn new(enabled: bool) -> Self {
+        Self {
+            state: if enabled {
+                DsparkBreakEvenState::ArProbe
+            } else {
+                DsparkBreakEvenState::Disabled
+            },
+        }
+    }
+
+    /// Select the actual draft cap and label a calibration cycle. A natural
+    /// tail cycle (`normal_cap == 0`) is never mistaken for the AR probe.
+    fn plan_cycle(&self, normal_cap: usize) -> (usize, DsparkMeasurementCycle) {
+        if normal_cap == 0 {
+            return (0, DsparkMeasurementCycle::None);
+        }
+        match self.state {
+            DsparkBreakEvenState::Disabled | DsparkBreakEvenState::KeepSpeculation => {
+                (normal_cap, DsparkMeasurementCycle::None)
+            }
+            DsparkBreakEvenState::ArProbe => (0, DsparkMeasurementCycle::ArProbe),
+            DsparkBreakEvenState::SpecProbe { .. } => {
+                (normal_cap, DsparkMeasurementCycle::SpecProbe)
+            }
+            DsparkBreakEvenState::ArFallback => (0, DsparkMeasurementCycle::None),
+        }
+    }
+
+    fn record_cycle(
+        &mut self,
+        kind: DsparkMeasurementCycle,
+        wall_ns: u64,
+        committed_tokens: u32,
+    ) -> Option<DsparkBreakEvenDecision> {
+        let wall_ns = wall_ns.max(1);
+        match (self.state, kind) {
+            (DsparkBreakEvenState::ArProbe, DsparkMeasurementCycle::ArProbe) => {
+                self.state = DsparkBreakEvenState::SpecProbe {
+                    ar_wall_ns: wall_ns,
+                    spec_wall_ns: 0,
+                    spec_tokens: 0,
+                    spec_cycles: 0,
+                };
+                None
+            }
+            (
+                DsparkBreakEvenState::SpecProbe {
+                    ar_wall_ns,
+                    spec_wall_ns,
+                    spec_tokens,
+                    spec_cycles,
+                },
+                DsparkMeasurementCycle::SpecProbe,
+            ) => {
+                let spec_wall_ns = spec_wall_ns + u128::from(wall_ns);
+                let spec_tokens = spec_tokens + u64::from(committed_tokens);
+                let spec_cycles = spec_cycles + 1;
+                if spec_cycles < DSPARK_BREAK_EVEN_SPEC_CYCLES {
+                    self.state = DsparkBreakEvenState::SpecProbe {
+                        ar_wall_ns,
+                        spec_wall_ns,
+                        spec_tokens,
+                        spec_cycles,
+                    };
+                    return None;
+                }
+
+                let ar_tokens_per_second = 1.0e9 / ar_wall_ns as f64;
+                let spec_tokens_per_second = spec_tokens as f64 * 1.0e9 / spec_wall_ns as f64;
+                let choice = if spec_tokens_per_second
+                    >= ar_tokens_per_second * DSPARK_BREAK_EVEN_MIN_SPEEDUP
+                {
+                    DsparkBreakEvenChoice::KeepSpeculation
+                } else {
+                    DsparkBreakEvenChoice::FallBackToAr
+                };
+                self.state = match choice {
+                    DsparkBreakEvenChoice::KeepSpeculation => DsparkBreakEvenState::KeepSpeculation,
+                    DsparkBreakEvenChoice::FallBackToAr => DsparkBreakEvenState::ArFallback,
+                };
+                Some(DsparkBreakEvenDecision {
+                    choice,
+                    ar_tokens_per_second,
+                    spec_tokens_per_second,
+                    spec_tokens,
+                    spec_cycles,
+                })
+            }
+            // Unmeasured/tail cycles and calls after a terminal decision do
+            // not perturb the calibration state.
+            _ => None,
+        }
+    }
+}
+
 /// Engine-owned DSpark propose/verify whole-turn loop.
 ///
 /// Per cycle: pre-checks (mtp_turn's exact order) → propose (skipped on the
@@ -177,6 +334,34 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         last_in_cache = false;
     }
 
+    // Preserve the old fixed-block behavior on short generations. The
+    // calibration is useful only when the remaining budget can hold one AR
+    // probe plus two FULL speculative cycles even if both accept every draft;
+    // otherwise replacing the first block with a probe could add target
+    // forwards without ever reaching a decision.
+    let calibration_draft_cap = block_size.min(p.mtp_depth);
+    let calibration_required_remaining = 1usize.saturating_add(
+        (calibration_draft_cap.saturating_add(1))
+            .saturating_mul(usize::from(DSPARK_BREAK_EVEN_SPEC_CYCLES)),
+    );
+    let calibration_available_remaining = max_as_usize.saturating_sub(generated.len());
+    let adaptive_ar_fallback = p.mtp_adaptive_depth
+        && step.supports_adaptive_ar_fallback()
+        && calibration_available_remaining >= calibration_required_remaining;
+    let mut break_even = DsparkBreakEvenPolicy::new(adaptive_ar_fallback);
+    if adaptive_ar_fallback {
+        tracing::info!(
+            target: "mlx_core::inference",
+            event = "dspark_break_even_calibration_started",
+            speculative_probe_cycles = DSPARK_BREAK_EVEN_SPEC_CYCLES,
+            draft_cap = calibration_draft_cap,
+            required_remaining_tokens = calibration_required_remaining,
+            available_remaining_tokens = calibration_available_remaining,
+            minimum_speedup = DSPARK_BREAK_EVEN_MIN_SPEEDUP,
+            "DSpark break-even calibration started"
+        );
+    }
+
     // Turn-constant accept-policy gates (params are fixed for the turn).
     // At GREEDY temperature acceptance is ALWAYS argmax-based and never
     // reads proposal dists or consumes RNG (the DsparkProposal contract
@@ -242,12 +427,14 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         }
 
         let _stream_ctx = crate::stream::StreamContext::new(generation_stream);
+        let cycle_started_at = Instant::now();
 
         // Per-cycle draft cap. `remaining >= 1` here (the length check above
         // broke otherwise). `remaining - 1` reserves the boundary token's
         // budget slot: a cycle emits at most `L + 1` tokens.
         let remaining: usize = max_as_usize.saturating_sub(generated.len());
-        let l_cap: usize = block_size.min(p.mtp_depth).min(remaining.saturating_sub(1));
+        let normal_l_cap: usize = block_size.min(p.mtp_depth).min(remaining.saturating_sub(1));
+        let (l_cap, measurement_cycle) = break_even.plan_cycle(normal_l_cap);
 
         // `L_cap == 0` (remaining == 1): skip propose entirely — the cycle
         // degenerates to a single AR step THROUGH verify (verify_ids =
@@ -283,7 +470,19 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         verify_ids.extend(proposal.draft_ids.iter().map(|&id| id as u32));
 
         profiler.begin("dspark_verify");
-        let verify_res = step.verify(&verify_ids);
+        // The one-token calibration path deliberately omits speculative
+        // rollback snapshotting, but still builds the ordinary tapped target
+        // graph needed to seed the following speculative cycle. Start the AR
+        // timer immediately before that method: target graph construction and
+        // dispatch, GPU force, and sampling are measured; only draft-context
+        // fusion in `commit_ar_probe` remains outside it.
+        let ar_probe_started_at =
+            (measurement_cycle == DsparkMeasurementCycle::ArProbe).then(Instant::now);
+        let verify_res = if measurement_cycle == DsparkMeasurementCycle::ArProbe {
+            step.verify_ar_probe(anchor)
+        } else {
+            step.verify(&verify_ids)
+        };
         profiler.end();
         let verify_out = verify_res?;
         let logits = verify_out.logits; // [1, 1+L, vocab]
@@ -410,6 +609,15 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         };
         profiler.end();
         let (accepted_drafts_k, boundary_id) = accept_res?;
+        // Acceptance's token read has now fully forced the target graph.
+        // AR measures from immediately before its dedicated target forward;
+        // speculative probes retain the whole-cycle propose+verify timer.
+        // Both stop before their respective commit/materialization handling.
+        let measured_before_commit_started_at = ar_probe_started_at.unwrap_or(cycle_started_at);
+        let precommit_wall_ns = measured_before_commit_started_at
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
 
         let mut accepted: Vec<u32> = Vec::with_capacity(accepted_drafts_k + 1);
         accepted.extend(
@@ -493,9 +701,73 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         };
         let keep = 1 + kept_drafts;
         profiler.begin("dspark_commit");
-        let commit_res = step.commit(keep, 1 + draft_len);
+        let commit_res = if measurement_cycle == DsparkMeasurementCycle::ArProbe {
+            if keep != 1 || draft_len != 0 {
+                Err(Error::from_reason(format!(
+                    "DSpark AR probe contract violation: keep={keep}, draft_len={draft_len}"
+                )))
+            } else {
+                step.commit_ar_probe()
+            }
+        } else {
+            step.commit(keep, 1 + draft_len)
+        };
         profiler.end();
         commit_res?;
+
+        let break_even_decision = if stop.is_some() {
+            None
+        } else {
+            match measurement_cycle {
+                DsparkMeasurementCycle::None => None,
+                DsparkMeasurementCycle::ArProbe => {
+                    // Build/materialize the context needed by the following
+                    // speculative probes, but deliberately exclude that
+                    // draft-only calibration cost from target-AR throughput.
+                    step.materialize_adaptive_state()?;
+                    break_even.record_cycle(
+                        measurement_cycle,
+                        precommit_wall_ns,
+                        (accepted_drafts_k + 1) as u32,
+                    )
+                }
+                DsparkMeasurementCycle::SpecProbe => {
+                    // Include this cycle's own context append. Without the
+                    // eval, MLX would charge it to the next proposal and make
+                    // the two probe timings order-dependent.
+                    step.materialize_adaptive_state()?;
+                    let wall_ns = cycle_started_at
+                        .elapsed()
+                        .as_nanos()
+                        .min(u128::from(u64::MAX)) as u64;
+                    break_even.record_cycle(
+                        measurement_cycle,
+                        wall_ns,
+                        (accepted_drafts_k + 1) as u32,
+                    )
+                }
+            }
+        };
+
+        if let Some(decision) = break_even_decision {
+            if decision.choice == DsparkBreakEvenChoice::FallBackToAr {
+                step.enter_ar_fallback()?;
+            }
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "dspark_break_even_decision",
+                decision = match decision.choice {
+                    DsparkBreakEvenChoice::KeepSpeculation => "keep_speculation",
+                    DsparkBreakEvenChoice::FallBackToAr => "target_only_ar",
+                },
+                ar_tokens_per_second = decision.ar_tokens_per_second,
+                spec_tokens_per_second = decision.spec_tokens_per_second,
+                spec_tokens = decision.spec_tokens,
+                spec_cycles = decision.spec_cycles,
+                minimum_speedup = DSPARK_BREAK_EVEN_MIN_SPEEDUP,
+                "DSpark break-even decision"
+            );
+        }
 
         // Per-cycle acceptance stats: DRAFTED depth `L` and accepted draft
         // count `k` — the same argument semantics as `run_mtp_cycle`'s
@@ -596,7 +868,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use napi::bindgen_prelude::*;
 
@@ -614,15 +886,89 @@ mod tests {
     use crate::stream::{DeviceType, Stream};
     use crate::tokenizer::Qwen3Tokenizer;
 
-    use super::{DsparkTurnArgs, run_dspark_turn};
+    use super::{
+        DSPARK_BREAK_EVEN_SPEC_CYCLES, DsparkBreakEvenChoice, DsparkBreakEvenPolicy,
+        DsparkMeasurementCycle, DsparkTurnArgs, run_dspark_turn,
+    };
+
+    #[test]
+    fn break_even_policy_falls_back_when_speculation_loses() {
+        let mut policy = DsparkBreakEvenPolicy::new(true);
+        assert_eq!(policy.plan_cycle(7), (0, DsparkMeasurementCycle::ArProbe));
+        assert!(
+            policy
+                .record_cycle(DsparkMeasurementCycle::ArProbe, 10_000_000, 1)
+                .is_none()
+        );
+
+        for cycle in 0..DSPARK_BREAK_EVEN_SPEC_CYCLES {
+            assert_eq!(policy.plan_cycle(7), (7, DsparkMeasurementCycle::SpecProbe));
+            let decision = policy.record_cycle(DsparkMeasurementCycle::SpecProbe, 100_000_000, 2);
+            if cycle + 1 < DSPARK_BREAK_EVEN_SPEC_CYCLES {
+                assert!(decision.is_none());
+            } else {
+                let decision = decision.expect("final calibration cycle must decide");
+                assert_eq!(decision.choice, DsparkBreakEvenChoice::FallBackToAr);
+                assert!(decision.spec_tokens_per_second < decision.ar_tokens_per_second);
+            }
+        }
+        assert_eq!(
+            policy.plan_cycle(7),
+            (0, DsparkMeasurementCycle::None),
+            "a losing draft must stay in target-only mode"
+        );
+    }
+
+    #[test]
+    fn break_even_policy_keeps_profitable_speculation() {
+        let mut policy = DsparkBreakEvenPolicy::new(true);
+        assert!(
+            policy
+                .record_cycle(DsparkMeasurementCycle::ArProbe, 10_000_000, 1)
+                .is_none()
+        );
+        let mut decision = None;
+        for _ in 0..DSPARK_BREAK_EVEN_SPEC_CYCLES {
+            decision = policy.record_cycle(DsparkMeasurementCycle::SpecProbe, 10_000_000, 2);
+        }
+        let decision = decision.expect("calibration must decide after two speculative cycles");
+        assert_eq!(decision.choice, DsparkBreakEvenChoice::KeepSpeculation);
+        assert!(decision.spec_tokens_per_second > decision.ar_tokens_per_second);
+        assert_eq!(
+            policy.plan_cycle(7),
+            (7, DsparkMeasurementCycle::None),
+            "a winning draft must retain the caller's normal cap"
+        );
+    }
+
+    #[test]
+    fn break_even_policy_disabled_and_tail_cycles_are_inert() {
+        let mut disabled = DsparkBreakEvenPolicy::new(false);
+        assert_eq!(disabled.plan_cycle(7), (7, DsparkMeasurementCycle::None));
+        assert!(
+            disabled
+                .record_cycle(DsparkMeasurementCycle::None, 1, 1)
+                .is_none()
+        );
+
+        let enabled = DsparkBreakEvenPolicy::new(true);
+        assert_eq!(
+            enabled.plan_cycle(0),
+            (0, DsparkMeasurementCycle::None),
+            "a natural one-token tail must not consume the AR calibration probe"
+        );
+    }
 
     /// One recorded `DsparkStepper` call, tagged with the payload the loop
     /// handed it so tests assert the exact per-cycle sequencing.
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Call {
         Propose { anchor: u32, max_len: usize },
+        VerifyArProbe { anchor: u32 },
         Verify { ids: Vec<u32> },
+        CommitArProbe,
         Commit { keep: usize, total: usize },
+        EnterArFallback,
         EvalBoundary { token: i32 },
     }
 
@@ -696,6 +1042,12 @@ mod tests {
         /// Flip this flag DURING the Nth (0-based) verify — models a cancel
         /// arriving mid-cycle, between the loop-top check and the clamp.
         cancel_on_verify: Option<(usize, Arc<AtomicBool>)>,
+        adaptive_ar_fallback: bool,
+        ar_fallback: bool,
+        propose_delay: Option<Duration>,
+        /// Synthetic target graph construction/dispatch inside the dedicated
+        /// probe. Calibration must include this delay.
+        ar_probe_target_build_delay: Option<Duration>,
         ledger: Rc<RefCell<Vec<Call>>>,
     }
 
@@ -706,38 +1058,9 @@ mod tests {
                 .cloned()
                 .unwrap_or_else(|| CycleScript::greedy(Vec::new(), Vec::new()))
         }
-    }
 
-    impl DsparkStepper for MockDsparkStepper {
-        fn propose(
-            &mut self,
-            anchor_id: u32,
-            max_len: usize,
-            _params: &ChatParams,
-            _rng: &mut dyn rand::Rng,
-        ) -> Result<DsparkProposal> {
-            self.ledger.borrow_mut().push(Call::Propose {
-                anchor: anchor_id,
-                max_len,
-            });
+        fn scripted_verify_output(&self, rows: usize) -> Result<DsparkVerifyOutput> {
             let script = self.script();
-            let draft_dists = script
-                .draft_dists
-                .iter()
-                .map(|row| MxArray::from_float32(row, &[self.vocab]))
-                .collect::<Result<Vec<_>>>()?;
-            Ok(DsparkProposal {
-                draft_ids: script.draft_ids.clone(),
-                draft_dists,
-            })
-        }
-
-        fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput> {
-            self.ledger.borrow_mut().push(Call::Verify {
-                ids: verify_ids.to_vec(),
-            });
-            let script = self.script();
-            let rows = verify_ids.len();
             let mut flat: Vec<f32> = Vec::with_capacity(rows * self.vocab as usize);
             for j in 0..rows {
                 match script.verify_rows.as_ref().and_then(|r| r.get(j)) {
@@ -757,6 +1080,78 @@ mod tests {
                 flag.store(true, Ordering::Relaxed);
             }
             Ok(DsparkVerifyOutput { logits })
+        }
+    }
+
+    impl DsparkStepper for MockDsparkStepper {
+        fn supports_adaptive_ar_fallback(&self) -> bool {
+            self.adaptive_ar_fallback
+        }
+
+        fn enter_ar_fallback(&mut self) -> Result<()> {
+            if !self.adaptive_ar_fallback {
+                return Err(Error::from_reason("mock fallback is disabled"));
+            }
+            self.ar_fallback = true;
+            self.ledger.borrow_mut().push(Call::EnterArFallback);
+            Ok(())
+        }
+
+        fn verify_ar_probe(&mut self, anchor_id: u32) -> Result<DsparkVerifyOutput> {
+            if let Some(delay) = self.ar_probe_target_build_delay {
+                std::thread::sleep(delay);
+            }
+            self.ledger
+                .borrow_mut()
+                .push(Call::VerifyArProbe { anchor: anchor_id });
+            self.scripted_verify_output(1)
+        }
+
+        fn commit_ar_probe(&mut self) -> Result<()> {
+            self.ledger.borrow_mut().push(Call::CommitArProbe);
+            self.cursor.set(self.cursor.get() + 1);
+            Ok(())
+        }
+
+        fn propose(
+            &mut self,
+            anchor_id: u32,
+            max_len: usize,
+            _params: &ChatParams,
+            _rng: &mut dyn rand::Rng,
+        ) -> Result<DsparkProposal> {
+            if self.ar_fallback {
+                return Err(Error::from_reason("mock propose after AR fallback"));
+            }
+            if let Some(delay) = self.propose_delay {
+                std::thread::sleep(delay);
+            }
+            self.ledger.borrow_mut().push(Call::Propose {
+                anchor: anchor_id,
+                max_len,
+            });
+            let script = self.script();
+            let draft_dists = script
+                .draft_dists
+                .iter()
+                .map(|row| MxArray::from_float32(row, &[self.vocab]))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(DsparkProposal {
+                draft_ids: script.draft_ids.clone(),
+                draft_dists,
+            })
+        }
+
+        fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput> {
+            if self.ar_fallback && verify_ids.len() != 1 {
+                return Err(Error::from_reason(
+                    "mock AR fallback requires a one-token verify",
+                ));
+            }
+            self.ledger.borrow_mut().push(Call::Verify {
+                ids: verify_ids.to_vec(),
+            });
+            self.scripted_verify_output(verify_ids.len())
         }
 
         fn commit(&mut self, keep: usize, total_written: usize) -> Result<()> {
@@ -796,6 +1191,9 @@ mod tests {
         cycles: Vec<CycleScript>,
         neg_fill: f32,
         cancel_on_verify: Option<(usize, Arc<AtomicBool>)>,
+        adaptive_ar_fallback: bool,
+        propose_delay: Option<Duration>,
+        ar_probe_target_build_delay: Option<Duration>,
         ledger: Rc<RefCell<Vec<Call>>>,
         begin_calls: Cell<usize>,
         /// `block_size` observed by `begin_dspark_decode` (setup plumbing).
@@ -809,6 +1207,9 @@ mod tests {
                 cycles,
                 neg_fill: 0.0,
                 cancel_on_verify: None,
+                adaptive_ar_fallback: false,
+                propose_delay: None,
+                ar_probe_target_build_delay: None,
                 ledger: Rc::new(RefCell::new(Vec::new())),
                 begin_calls: Cell::new(0),
                 seen_block_size: Cell::new(usize::MAX),
@@ -821,6 +1222,19 @@ mod tests {
             let mut b = Self::greedy(vocab, cycles);
             b.neg_fill = -1.0e30;
             b
+        }
+
+        fn with_slow_adaptive_fallback(mut self) -> Self {
+            self.adaptive_ar_fallback = true;
+            self.propose_delay = Some(Duration::from_millis(100));
+            self
+        }
+
+        fn with_slow_ar_probe_target_build(mut self) -> Self {
+            self.adaptive_ar_fallback = true;
+            self.propose_delay = Some(Duration::from_millis(20));
+            self.ar_probe_target_build_delay = Some(Duration::from_millis(100));
+            self
         }
 
         fn ledger_snapshot(&self) -> Vec<Call> {
@@ -897,6 +1311,10 @@ mod tests {
                 cursor: Cell::new(0),
                 verify_count: Cell::new(0),
                 cancel_on_verify: self.cancel_on_verify.clone(),
+                adaptive_ar_fallback: self.adaptive_ar_fallback,
+                ar_fallback: false,
+                propose_delay: self.propose_delay,
+                ar_probe_target_build_delay: self.ar_probe_target_build_delay,
                 ledger: Rc::clone(&self.ledger),
             })
         }
@@ -1090,10 +1508,144 @@ mod tests {
         ledger
             .iter()
             .filter_map(|c| match c {
+                Call::CommitArProbe => Some((1, 1)),
                 Call::Commit { keep, total } => Some((*keep, *total)),
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn adaptive_fallback_excludes_ar_cycles_from_mtp_metrics() {
+        // The real target is already warm from prefill. Warm the tiny mock's
+        // first Metal argmax too, so shader compilation is not mistaken for
+        // target AR latency by this sequencing/metrics test.
+        let warm_logits = MxArray::from_float32(&vec![0.0; 16], &[1, 1, 16]).expect("warm logits");
+        let warm_argmax = warm_logits.argmax(-1, None).expect("warm argmax");
+        warm_argmax.eval();
+        let _ = warm_argmax.item_at_int32(0).expect("warm argmax value");
+
+        let mut backend = MockDsparkBackend::greedy(
+            16,
+            vec![
+                // Target-only AR baseline probe.
+                CycleScript::greedy(Vec::new(), vec![1]),
+                // Two deliberately slow, full-accept speculative probes.
+                CycleScript::greedy(vec![2, 3], vec![2, 3, 4]),
+                CycleScript::greedy(vec![5, 6], vec![5, 6, 7]),
+                // Target-only fallback tail.
+                CycleScript::greedy(Vec::new(), vec![8]),
+            ],
+        )
+        .with_slow_adaptive_fallback();
+        let mut p = greedy_params();
+        p.max_new_tokens = 9;
+        p.mtp_adaptive_depth = true;
+        let out = drive_turn(&mut backend, p, 0, 15, 2);
+
+        assert_eq!(out.generated, (0..=8).collect::<Vec<_>>());
+        assert!(
+            !out.last_in_cache,
+            "the final AR boundary remains unmaterialized for family save parity"
+        );
+        assert_eq!(
+            commits(&out.ledger),
+            vec![(1, 1), (3, 3), (3, 3), (1, 1)],
+            "AR probe/fallback keep only the verified anchor; speculative probes keep their accepted drafts"
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::Propose { .. })),
+            2,
+            "only the two speculative calibration cycles may propose"
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::EnterArFallback)),
+            1,
+            "the losing draft must switch exactly once"
+        );
+        let fallback_at = out
+            .ledger
+            .iter()
+            .position(|c| matches!(c, Call::EnterArFallback))
+            .expect("fallback call recorded");
+        assert!(
+            out.ledger[fallback_at + 1..]
+                .iter()
+                .all(|c| !matches!(c, Call::Propose { .. })),
+            "target-only fallback must never propose"
+        );
+
+        let (mean_accepted, _, cycles) = out
+            .acceptance
+            .expect("the two speculative probes must be profiled");
+        assert_eq!(cycles, 2, "AR probe/fallback cycles are not MTP cycles");
+        assert!((mean_accepted - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn adaptive_ar_probe_includes_target_graph_build_in_timer() {
+        // Warm the exact target-force primitive used by the mock. The test
+        // then puts 100 ms of synthetic TARGET graph construction/dispatch
+        // inside the dedicated AR probe and 20 ms in each speculative
+        // proposal. Apples-to-apples timing must include the 100 ms, making
+        // speculation win. The old biased timer started after verify and
+        // incorrectly chose target-only fallback for this exact script.
+        let warm_logits = MxArray::from_float32(&vec![0.0; 16], &[1, 1, 16]).expect("warm logits");
+        let warm_argmax = warm_logits.argmax(-1, None).expect("warm argmax");
+        warm_argmax.eval();
+        let _ = warm_argmax.item_at_int32(0).expect("warm argmax value");
+
+        let mut backend = MockDsparkBackend::greedy(
+            16,
+            vec![
+                CycleScript::greedy(Vec::new(), vec![1]),
+                CycleScript::greedy(vec![2, 3], vec![2, 3, 4]),
+                CycleScript::greedy(vec![5, 6], vec![5, 6, 7]),
+                CycleScript::greedy(Vec::new(), vec![8]),
+            ],
+        )
+        .with_slow_ar_probe_target_build();
+        let mut p = greedy_params();
+        p.max_new_tokens = 9;
+        p.mtp_adaptive_depth = true;
+        let out = drive_turn(&mut backend, p, 0, 15, 2);
+
+        assert_eq!(out.generated, (0..=8).collect::<Vec<_>>());
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::EnterArFallback)),
+            0,
+            "target graph construction/dispatch must be charged to the AR probe"
+        );
+        assert!(
+            matches!(out.ledger.first(), Some(Call::VerifyArProbe { anchor: 0 })),
+            "calibration must use the dedicated no-rollback probe path"
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::CommitArProbe)),
+            1,
+            "the dedicated probe must be committed exactly once"
+        );
+    }
+
+    #[test]
+    fn adaptive_guard_preserves_fixed_dspark_on_short_turns() {
+        let mut backend =
+            MockDsparkBackend::greedy(16, vec![CycleScript::greedy(vec![1, 2], vec![1, 2, 3])])
+                .with_slow_adaptive_fallback();
+        let mut p = greedy_params();
+        p.max_new_tokens = 4;
+        p.mtp_adaptive_depth = true;
+        let out = drive_turn(&mut backend, p, 0, 15, 2);
+
+        assert_eq!(out.generated, vec![0, 1, 2, 3]);
+        assert!(matches!(out.ledger.first(), Some(Call::Propose { .. })));
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::EnterArFallback)),
+            0,
+            "a budget too short to finish calibration keeps the old schedule"
+        );
+        let (_, _, cycles) = out.acceptance.expect("fixed DSpark cycle profiled");
+        assert_eq!(cycles, 1);
     }
 
     // ---- 1. emission order + per-cycle commit ledger ---------------------

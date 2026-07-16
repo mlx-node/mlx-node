@@ -89,6 +89,23 @@ describe('MlxModelHost', () => {
     expect(host.residentId).toBe('qwen-small');
   });
 
+  it('allows Gemma4 with an attached draft to use its flat speculative executor', async () => {
+    const loader = vi.fn(
+      async () =>
+        ({
+          hasBlockPagedCache: () => false,
+          hasMtpWeights: () => true,
+        }) as unknown as LoadableModel,
+    );
+    const host = new MlxModelHost(MODELS, {
+      loadModelFn: loader,
+      requirePagedCache: true,
+    });
+
+    await expect(getSession(host, 'gemma-mid')).resolves.toBeInstanceOf(ChatSession);
+    expect(host.residentId).toBe('gemma-mid');
+  });
+
   it('rejects Qwen3.5 MoE MTP rather than silently routing a paged session through AR', async () => {
     const loader = vi.fn(
       async () =>

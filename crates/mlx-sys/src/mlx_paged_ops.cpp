@@ -6563,45 +6563,38 @@ int mlx_paged_attention_varlen_compile_trace_smoke() {
   return 1;
 }
 
-/// Exact-shape, model-free numerical parity probe for the graph-native
-/// Qwen3.5/3.6 grouped-GQA V2 path. The supported head pairs are 24Q/4KV and
-/// 16Q/2KV. `query_rows=1` exercises normal decode; `query_rows=2` exercises
-/// the varlen MTP verifier. The block table is a non-identity physical
+/// Shared model-free numerical parity implementation for the graph-native
+/// grouped paged kernels. The block table is a non-identity physical
 /// permutation and unused slots in the final physical block are NaNs, so an
-/// addressing or causal-mask regression fails loudly.
-///
-/// Returns 1 on success, -3 when Metal is unavailable, and -1 on failure.
-int mlx_paged_grouped_qwen35_graph_parity(
+/// addressing, staging, or causal-mask regression fails loudly.
+static int grouped_graph_parity_impl(
     int query_rows,
     int num_q_heads,
-    int num_kv_heads) {
+    int num_kv_heads,
+    int head_size,
+    int context_len,
+    float attention_scale,
+    int sliding_window,
+    const char* label) {
   using namespace mlx::core;
   using namespace mlx::core::fast;
 
   if (!mlx::core::metal::is_available()) {
     return -3;
   }
-  const bool supported_heads =
-      (num_q_heads == 24 && num_kv_heads == 4) ||
-      (num_q_heads == 16 && num_kv_heads == 2);
-  if ((query_rows != 1 && query_rows != 2) || !supported_heads) {
+  if ((query_rows != 1 && query_rows != 2) || num_q_heads <= 0 ||
+      num_kv_heads <= 0 || num_q_heads % num_kv_heads != 0 ||
+      head_size <= 0 || context_len <= 512) {
     return -1;
   }
 
   const int kNumQHeads = num_q_heads;
   const int kNumKvHeads = num_kv_heads;
-  constexpr int kHeadSize = 256;
+  const int kHeadSize = head_size;
   constexpr int kBlockSize = 16;
   constexpr int kXPack = 8;
-  constexpr float kScale = 1.0f / 16.0f;
-  constexpr int kSlidingWindow = 73;
-  // These lengths are deliberately at/above the measured selector
-  // thresholds, so this fixture exercises the grouped graph route rather
-  // than merely proving parity for the generic fallback.
-  const bool moe_shape = kNumQHeads == 16;
-  const int context_len = query_rows == 1
-      ? (moe_shape ? 32769 : 16385)
-      : (moe_shape ? 16386 : 8194);
+  const float kScale = attention_scale;
+  const int kSlidingWindow = sliding_window;
   const int logical_blocks =
       (context_len + kBlockSize - 1) / kBlockSize;
   const int num_physical_blocks = logical_blocks + 3;
@@ -6766,8 +6759,9 @@ int mlx_paged_grouped_qwen35_graph_parity(
     size_t max_idx = 0;
     for (int row = 0; row < query_rows; ++row) {
       const int effective_context = context_len - query_rows + row + 1;
-      const int first_token =
-          std::max(0, effective_context - kSlidingWindow);
+      const int first_token = kSlidingWindow > 0
+          ? std::max(0, effective_context - kSlidingWindow)
+          : 0;
       const int visible_tokens = effective_context - first_token;
       for (int head = 0; head < kNumQHeads; ++head) {
         const int kv_head = head / (kNumQHeads / kNumKvHeads);
@@ -6820,8 +6814,9 @@ int mlx_paged_grouped_qwen35_graph_parity(
     if (!std::isfinite(max_diff) || max_diff > 0.01f) {
       fprintf(
           stderr,
-          "[mlx_paged_grouped_qwen35_graph_parity] q=%d kv=%d rows=%d "
+          "[%s] q=%d kv=%d rows=%d "
           "max_diff=%g at output index %zu\n",
+          label,
           kNumQHeads,
           kNumKvHeads,
           query_rows,
@@ -6833,8 +6828,9 @@ int mlx_paged_grouped_qwen35_graph_parity(
   } catch (const std::exception& e) {
     fprintf(
         stderr,
-        "[mlx_paged_grouped_qwen35_graph_parity] q=%d kv=%d rows=%d "
+        "[%s] q=%d kv=%d rows=%d "
         "threw: %s\n",
+        label,
         kNumQHeads,
         kNumKvHeads,
         query_rows,
@@ -6843,6 +6839,45 @@ int mlx_paged_grouped_qwen35_graph_parity(
   } catch (...) {
     return -1;
   }
+}
+
+/// Exact-shape graph parity for the established Qwen3.5/3.6 grouped route.
+int mlx_paged_grouped_qwen35_graph_parity(
+    int query_rows,
+    int num_q_heads,
+    int num_kv_heads) {
+  const bool supported_heads =
+      (num_q_heads == 24 && num_kv_heads == 4) ||
+      (num_q_heads == 16 && num_kv_heads == 2);
+  if ((query_rows != 1 && query_rows != 2) || !supported_heads) {
+    return -1;
+  }
+  const bool moe_shape = num_q_heads == 16;
+  const int context_len = query_rows == 1
+      ? (moe_shape ? 32769 : 16385)
+      : (moe_shape ? 16386 : 8194);
+  return grouped_graph_parity_impl(
+      query_rows,
+      num_q_heads,
+      num_kv_heads,
+      /*head_size=*/256,
+      context_len,
+      /*attention_scale=*/1.0f / 16.0f,
+      /*sliding_window=*/73,
+      "mlx_paged_grouped_qwen35_graph_parity");
+}
+
+/// Exact-shape graph parity for Gemma 4's staged D512/16Q/1KV route.
+int mlx_paged_grouped_gemma4_graph_parity(int context_len) {
+  return grouped_graph_parity_impl(
+      /*query_rows=*/1,
+      /*num_q_heads=*/16,
+      /*num_kv_heads=*/1,
+      /*head_size=*/512,
+      context_len,
+      /*attention_scale=*/1.0f,
+      /*sliding_window=*/0,
+      "mlx_paged_grouped_gemma4_graph_parity");
 }
 
 } // extern "C"

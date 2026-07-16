@@ -10,6 +10,7 @@ import { AuthStorage, type InlineExtension, ModelRegistry } from '@earendil-work
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import {
+  agentGemmaDraftEnabled,
   runAgent,
   type AgentPagedConfigOverrides,
   type RunAgentMain,
@@ -211,5 +212,14 @@ describe('runAgent', () => {
     });
 
     expect(registry.find('groq', groq!.id)).toBeDefined();
+  });
+});
+
+describe('agentGemmaDraftEnabled', () => {
+  it('requires the explicit value 1', () => {
+    expect(agentGemmaDraftEnabled({ MLX_AGENT_ENABLE_GEMMA_DRAFT: '1' })).toBe(true);
+    expect(agentGemmaDraftEnabled({ MLX_AGENT_ENABLE_GEMMA_DRAFT: 'true' })).toBe(false);
+    expect(agentGemmaDraftEnabled({ MLX_AGENT_ENABLE_GEMMA_DRAFT: '0' })).toBe(false);
+    expect(agentGemmaDraftEnabled({})).toBe(false);
   });
 });

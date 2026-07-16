@@ -26,6 +26,7 @@ pub(crate) fn build_synthetic_user_message(user: &str) -> ChatMessage {
         tool_call_id: None,
         is_error: None,
         reasoning_content: None,
+        thinking_enabled: None,
         images: None,
         audio: None,
     }
@@ -305,6 +306,9 @@ pub(crate) struct ChatParams {
     ///   * Neither field set → `false` (pin to default depth 1). Set
     ///     `mtpAdaptiveDepth=true` explicitly to enable the adaptive
     ///     policy.
+    ///
+    /// Families may post-resolve this generic default. Gemma4 DSpark enables
+    /// its measured target-AR break-even guard when both raw fields are unset.
     pub mtp_adaptive_depth: bool,
 }
 

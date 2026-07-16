@@ -1821,8 +1821,10 @@ pub(crate) struct DsparkVerifyOutput {
 ///
 /// The `&mut self` borrow model is strictly sequential: the engine calls
 /// exactly one method at a time, in the fixed per-cycle order
-/// `propose → verify → commit → eval_boundary`. `eval_boundary` is `&self`
-/// (schedule-only, no state mutation), the rest are `&mut self`.
+/// `propose → verify → commit → eval_boundary`. The adaptive calibration
+/// substitutes `verify_ar_probe → commit_ar_probe` for its one-token AR
+/// sample. `eval_boundary` is `&self` (schedule-only, no state mutation),
+/// the rest are `&mut self`.
 ///
 /// # Invariant — tapped hidden states NEVER cross this trait
 ///
@@ -1834,6 +1836,56 @@ pub(crate) struct DsparkVerifyOutput {
 /// stays a stepper-private concern and the trait stays model-agnostic.
 /// Production implementation: `Gemma4DsparkStepper`.
 pub(crate) trait DsparkStepper {
+    /// Whether this stepper can permanently switch the rest of the current
+    /// turn to exact target-only autoregressive decoding. The engine uses
+    /// this capability for DSpark's measured break-even guard; other draft
+    /// variants keep the default `false` and retain their existing loop.
+    fn supports_adaptive_ar_fallback(&self) -> bool {
+        false
+    }
+
+    /// Permanently leave speculative mode for the rest of this turn.
+    /// Called only after the current verify has been committed, so a
+    /// supporting stepper must have no pending rollback/tap state. Once
+    /// entered, the engine sends only single-token `[anchor]` verify blocks.
+    fn enter_ar_fallback(&mut self) -> Result<()> {
+        Err(Error::from_reason(
+            "DSpark stepper does not support target-only AR fallback",
+        ))
+    }
+
+    /// Materialize draft-side state at a calibration boundary. DSpark uses
+    /// this to keep MLX lazy graphs from charging one cycle's context append
+    /// to the next cycle's timer. Called only for the short break-even probe;
+    /// the steady-state loop retains its normal asynchronous scheduling.
+    fn materialize_adaptive_state(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// One-token target AR calibration forward.
+    ///
+    /// Supporting steppers must build and dispatch the SAME target forward
+    /// graph used by ordinary decode and return its logits, but may omit
+    /// rollback state because the anchor's only K/V slot is kept in full.
+    /// Model-private hidden capture needed to seed the next speculative
+    /// cycle is allowed and is consumed by [`Self::commit_ar_probe`]. The
+    /// engine starts the AR timer immediately before this call, so target
+    /// graph construction, GPU evaluation, and sampling are all measured.
+    fn verify_ar_probe(&mut self, _anchor_id: u32) -> Result<DsparkVerifyOutput> {
+        Err(Error::from_reason(
+            "DSpark stepper does not support a target-only AR probe",
+        ))
+    }
+
+    /// Commit the full one-token anchor written by [`Self::verify_ar_probe`]
+    /// and seed any model-private draft context. No target rollback is
+    /// permitted or needed. Called after the AR timer has stopped.
+    fn commit_ar_probe(&mut self) -> Result<()> {
+        Err(Error::from_reason(
+            "DSpark stepper does not support a target-only AR probe commit",
+        ))
+    }
+
     /// Draft up to `max_len` tokens conditioned on `anchor_id` (the last
     /// emitted token, whose K/V is NOT yet in the target cache — the
     /// engine's subsequent [`Self::verify`] writes it at position 0).

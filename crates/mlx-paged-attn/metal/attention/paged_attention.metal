@@ -1189,27 +1189,28 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
 
 // ========================================== Grouped GQA paged attention
 //
-// Long-context Qwen3.5/3.6 dense and MoE decode use 24Q/4KV or 16Q/2KV,
-// respectively, with head_dim=256 and block_size=16. The generic kernel above
-// launches one 256-thread threadgroup per *query* head. Consequently the six
-// or eight query heads mapped to one KV head traverse the same paged K/V range
-// in independent threadgroups.
+// Long-context Qwen3.5/3.6 dense and MoE decode use 24Q/4KV or 16Q/2KV at
+// head_dim=256. Gemma 4 global attention uses 16Q/1KV at head_dim=512. All use
+// block_size=16. The generic kernel above launches one 256-thread threadgroup
+// per *query* head. Consequently every query head mapped to one KV head
+// traverses the same paged K/V range in independent threadgroups.
 //
 // This deliberately narrow two-pass specialization mirrors MLX's
 // `sdpa_vector_2pass_1/2` geometry: one threadgroup is keyed by a KV head and
 // contains one SIMD group per query head (and one set per two-row MTP query).
 // The grid z-axis is a large set of strided *logical-block* stripes. Each SIMD
 // computes all 16 QK scores in a page with two lanes per token, then every lane
-// owns eight output dimensions and vector-loads that dimension's contiguous
-// V[16] row. This preserves the native paged V layout while retaining MLX's
+// owns HEAD_SIZE/32 output dimensions and vector-loads that dimension's
+// contiguous V[16] row. This preserves the native paged V layout while retaining MLX's
 // long-context parallelism, with no threadgroup staging or barriers.
 //
-// The host dispatcher only selects this entry point for the exact BF16
-// D256/BS16/GQA6-or-GQA8 shapes, one sequence, and q_len 1 or 2. Keeping the
-// entry point concrete avoids growing the already-large generic instantiation
-// matrix and leaves every other model/configuration on the proven fallback.
+// The host dispatcher only selects the explicit BF16 D256 or D512, BS16
+// instantiations for their exact head layouts. Keeping this as a two-entry
+// template avoids copying the kernel while leaving every other
+// model/configuration on the proven fallback.
 
-[[kernel]] void paged_attention_grouped_bfloat16_hs256_bs16_striped(
+template <int HEAD_SIZE, bool STAGE_KV>
+[[kernel]] void paged_attention_grouped_bfloat16_bs16_striped(
     device float *exp_sums [[buffer(0)]],
     device float *max_logits [[buffer(1)]],
     device bfloat16_t *tmp_out [[buffer(2)]],
@@ -1234,10 +1235,16 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
     uint3 threads_per_threadgroup [[threads_per_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int HEAD_SIZE = 256;
   constexpr int BLOCK_SIZE = 16;
   constexpr int PACKS_PER_HALF_HEAD = HEAD_SIZE / 8 / 2;
   constexpr int OUTPUTS_PER_LANE = HEAD_SIZE / 32;
+  constexpr int PAGE_ELEMENTS = HEAD_SIZE * BLOCK_SIZE;
+
+  // Gemma's D512/16Q/1KV group has exactly 512 threads and one physical page
+  // is 16 KiB. Cooperatively staging that page lets all 16 query-head SIMD
+  // groups reuse one global read. The D256 instantiation sets STAGE_KV=false;
+  // its one-element dead tile and all related control flow compile away.
+  threadgroup bfloat16_t kv_tile[STAGE_KV ? PAGE_ELEMENTS : 1];
 
   const int kv_head_idx = int(threadgroup_position_in_grid.x);
   // The exact guard fixes num_seqs=1. Query rows occupy grid.y rather than
@@ -1251,8 +1258,14 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
   const int q_pos_in_seq = int(threadgroup_position_in_grid.y);
   const int q_len = int(threadgroups_per_grid.y);
   const int lane = int(thread_position_in_threadgroup.x);
+  const int linear_thread =
+      int(thread_position_in_threadgroup.y) *
+          int(threads_per_threadgroup.x) +
+      int(thread_position_in_threadgroup.x);
+  const int total_threads =
+      int(threads_per_threadgroup.x) * int(threads_per_threadgroup.y);
 
-  // The dispatch guard fixes GQA to 6 or 8, but derive the global query-head
+  // The dispatch guard fixes the supported GQA shape, but derive the query-head
   // index from the actual threadgroup geometry so a host/kernel mismatch fails
   // by producing an obviously invalid launch rather than silently aliasing
   // heads.
@@ -1292,7 +1305,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
       DIVIDE_ROUND_UP(int(context_len), BLOCK_SIZE);
 
   // Each SIMD row owns one (query row, query head). A pair of lanes evaluates
-  // one token: each lane covers half of D256 in sixteen BF16x8 packs.
+  // one token: each lane covers half of the head in BF16x8 packs.
   for (int logical_block = stripe_idx; logical_block < num_context_blocks;
        logical_block += num_stripes) {
     const int block_start_token = logical_block * BLOCK_SIZE;
@@ -1305,16 +1318,29 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     const device bfloat16_t *k_block =
         k_cache + physical_block * int64_t(kv_block_stride) +
         kv_head_idx * kv_head_stride;
+    if constexpr (STAGE_KV) {
+      for (int element = linear_thread; element < PAGE_ELEMENTS;
+           element += total_threads) {
+        kv_tile[element] = k_block[element];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     float partial = 0.0f;
 #pragma unroll
     for (int pack = 0; pack < PACKS_PER_HALF_HEAD; ++pack) {
       const int head_pack = half_head * PACKS_PER_HALF_HEAD + pack;
       const Bfloat8_ q_pack =
           *reinterpret_cast<const device Bfloat8_ *>(q_ptr + head_pack * 8);
-      const Bfloat8_ k_pack =
-          *reinterpret_cast<const device Bfloat8_ *>(
-              k_block +
-              (head_pack * BLOCK_SIZE + token_in_block) * 8);
+      Bfloat8_ k_pack;
+      const int k_offset =
+          (head_pack * BLOCK_SIZE + token_in_block) * 8;
+      if constexpr (STAGE_KV) {
+        k_pack = *reinterpret_cast<const threadgroup Bfloat8_ *>(
+            kv_tile + k_offset);
+      } else {
+        k_pack = *reinterpret_cast<const device Bfloat8_ *>(
+            k_block + k_offset);
+      }
       partial += sum(mul<Float8_, Bfloat8_, Bfloat8_>(q_pack, k_pack));
     }
     float score = (partial + simd_shuffle_xor(partial, 1)) * scale;
@@ -1347,6 +1373,17 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     const device bfloat16_t *v_block =
         v_cache + physical_block * int64_t(kv_block_stride) +
         kv_head_idx * kv_head_stride;
+    if constexpr (STAGE_KV) {
+      // No thread may overwrite the shared K page until every query-head SIMD
+      // has consumed it. Likewise, no V consumer may run before the
+      // cooperative replacement is complete.
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int element = linear_thread; element < PAGE_ELEMENTS;
+           element += total_threads) {
+        kv_tile[element] = v_block[element];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     Bfloat8_ weights0_bf16;
     Bfloat8_ weights1_bf16;
     if (full_valid_block) {
@@ -1364,13 +1401,22 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
 #pragma unroll
     for (int i = 0; i < OUTPUTS_PER_LANE; ++i) {
       const int dim = lane * OUTPUTS_PER_LANE + i;
-      const device bfloat16_t *v_row = v_block + dim * BLOCK_SIZE;
+      const int v_row_offset = dim * BLOCK_SIZE;
       float block_acc = 0.0f;
       if (full_valid_block) {
-        const Bfloat8_ values0 =
-            *reinterpret_cast<const device Bfloat8_ *>(v_row);
-        const Bfloat8_ values1 =
-            *reinterpret_cast<const device Bfloat8_ *>(v_row + 8);
+        Bfloat8_ values0;
+        Bfloat8_ values1;
+        if constexpr (STAGE_KV) {
+          values0 = *reinterpret_cast<const threadgroup Bfloat8_ *>(
+              kv_tile + v_row_offset);
+          values1 = *reinterpret_cast<const threadgroup Bfloat8_ *>(
+              kv_tile + v_row_offset + 8);
+        } else {
+          values0 = *reinterpret_cast<const device Bfloat8_ *>(
+              v_block + v_row_offset);
+          values1 = *reinterpret_cast<const device Bfloat8_ *>(
+              v_block + v_row_offset + 8);
+        }
         block_acc =
             sum(mul<Float8_, Bfloat8_, Bfloat8_>(weights0_bf16, values0)) +
             sum(mul<Float8_, Bfloat8_, Bfloat8_>(weights1_bf16, values1));
@@ -1380,11 +1426,19 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
           const int value_token = block_start_token + token;
           if (value_token < effective_context_len &&
               value_token >= sliding_lower) {
-            block_acc += weights[token] * float(v_row[token]);
+            const bfloat16_t value = STAGE_KV
+                ? kv_tile[v_row_offset + token]
+                : v_block[v_row_offset + token];
+            block_acc += weights[token] * float(value);
           }
         }
       }
       acc[i] = acc[i] * old_factor + block_acc;
+    }
+    if constexpr (STAGE_KV) {
+      // All SIMD groups must finish reading V before the next logical page
+      // overwrites the tile with K.
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     running_max = new_max;
     running_sum = running_sum * old_factor + block_sum;
@@ -1413,7 +1467,8 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
   (void)alibi_slopes;
 }
 
-[[kernel]] void paged_attention_grouped_bfloat16_hs256_striped_reduce(
+template <int HEAD_SIZE>
+[[kernel]] void paged_attention_grouped_bfloat16_striped_reduce(
     device bfloat16_t *out [[buffer(0)]],
     const device float *exp_sums [[buffer(1)]],
     const device float *max_logits [[buffer(2)]],
@@ -1424,7 +1479,6 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int HEAD_SIZE = 256;
   constexpr int NUM_REDUCE_SIMDS = 32;
   constexpr int ELEMS_PER_LANE = HEAD_SIZE / 32;
 
@@ -1439,14 +1493,15 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
       partials + row * num_stripes * HEAD_SIZE;
 
   float global_max = -FLT_MAX;
-  for (int b = 0; b < num_stripes / NUM_REDUCE_SIMDS; ++b) {
-    global_max = max(global_max, row_maxs[int(simd_lid) + NUM_REDUCE_SIMDS * b]);
+  for (int stripe = int(simd_lid); stripe < num_stripes;
+       stripe += NUM_REDUCE_SIMDS) {
+    global_max = max(global_max, row_maxs[stripe]);
   }
   global_max = simd_max(global_max);
 
   float global_sum = 0.0f;
-  for (int b = 0; b < num_stripes / NUM_REDUCE_SIMDS; ++b) {
-    const int stripe = int(simd_lid) + NUM_REDUCE_SIMDS * b;
+  for (int stripe = int(simd_lid); stripe < num_stripes;
+       stripe += NUM_REDUCE_SIMDS) {
     const float factor = fast::exp(row_maxs[stripe] - global_max);
     global_sum += factor * row_sums[stripe];
   }
@@ -1487,6 +1542,54 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
 
   (void)context_lens;
 }
+
+#define instantiate_grouped_bfloat16_attention(head_size, stage_kv)          \
+  template [[host_name(                                                       \
+      "paged_attention_grouped_bfloat16_hs" #head_size                       \
+      "_bs16_striped")]] [[kernel]] void                                     \
+  paged_attention_grouped_bfloat16_bs16_striped<head_size, stage_kv>(        \
+      device float *exp_sums [[buffer(0)]],                                  \
+      device float *max_logits [[buffer(1)]],                                \
+      device bfloat16_t *tmp_out [[buffer(2)]],                              \
+      device const bfloat16_t *q [[buffer(3)]],                              \
+      device const bfloat16_t *k_cache [[buffer(4)]],                        \
+      device const bfloat16_t *v_cache [[buffer(5)]],                        \
+      const device float *__restrict__ k_scale [[buffer(6)]],                \
+      const device float *__restrict__ v_scale [[buffer(7)]],                \
+      const constant int &num_kv_heads [[buffer(8)]],                        \
+      const constant float &scale [[buffer(9)]],                             \
+      const constant float &softcapping [[buffer(10)]],                      \
+      device const uint32_t *block_tables [[buffer(11)]],                    \
+      device const uint32_t *context_lens [[buffer(12)]],                    \
+      const constant int &max_num_blocks_per_seq [[buffer(13)]],             \
+      device const float *alibi_slopes [[buffer(14)]],                       \
+      const constant int &q_stride [[buffer(15)]],                           \
+      const constant int &kv_block_stride [[buffer(16)]],                    \
+      const constant int &kv_head_stride [[buffer(17)]],                     \
+      const constant int &sliding_window [[buffer(18)]],                     \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],   \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                 \
+      uint3 thread_position_in_threadgroup                                   \
+          [[thread_position_in_threadgroup]],                                \
+      uint3 threads_per_threadgroup [[threads_per_threadgroup]],             \
+      uint simd_lid [[thread_index_in_simdgroup]]);                          \
+  template [[host_name(                                                       \
+      "paged_attention_grouped_bfloat16_hs" #head_size                       \
+      "_striped_reduce")]] [[kernel]] void                                   \
+  paged_attention_grouped_bfloat16_striped_reduce<head_size>(                \
+      device bfloat16_t *out [[buffer(0)]],                                  \
+      const device float *exp_sums [[buffer(1)]],                            \
+      const device float *max_logits [[buffer(2)]],                          \
+      const device bfloat16_t *partials [[buffer(3)]],                       \
+      device const uint32_t *context_lens [[buffer(4)]],                     \
+      const constant int &num_stripes [[buffer(5)]],                         \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],   \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                 \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+instantiate_grouped_bfloat16_attention(256, false);
+instantiate_grouped_bfloat16_attention(512, true);
 
 template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
           int PARTITION_SIZE = 0>

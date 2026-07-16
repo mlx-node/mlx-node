@@ -116,15 +116,18 @@ pub struct ChatConfig {
     /// variant instead (`gemma4/model.rs` `resolve_params`, always from the
     /// RAW config value — the engine's central `[1, 5]` clamp is an MTP-head
     /// contract that does not apply to external drafts):
-    /// - DSpark: an unset `mtpDepth` runs full draft blocks (the draft
-    ///   checkpoint's block size — 7 tokens on `dspark_gemma4_12b_block7`),
-    ///   and an explicit `mtpDepth` acts as a CAP on that block (clamped to
-    ///   `[1, blockSize]`).
+    /// - DSpark: with both knobs unset, full draft blocks (the checkpoint's
+    ///   block size — 7 tokens on `dspark_gemma4_12b_block7`) run behind a
+    ///   short target-AR/DSpark break-even calibration. A short generation
+    ///   budget that cannot finish calibration retains the fixed-block
+    ///   schedule. An explicit
+    ///   `mtpDepth` caps and pins the block unless `mtpAdaptiveDepth: true`
+    ///   opts the guard back in; explicit `false` disables it.
     /// - Assistant (Google `gemma-4-*-it-assistant`): an unset `mtpDepth`
     ///   drafts 3 tokens per cycle (`ASSISTANT_DEFAULT_DEPTH`), and an
     ///   explicit `mtpDepth` clamps to `[1, 8]` (`ASSISTANT_MAX_DEPTH`).
     ///
-    /// `mtpAdaptiveDepth` is ignored for both Gemma4 external-draft variants.
+    /// `mtpAdaptiveDepth` is ignored for the Gemma4 assistant variant.
     #[napi(ts_type = "number | undefined")]
     pub mtp_depth: Option<i32>,
     /// MTP: when true, the decode loop runs the adaptive
@@ -136,7 +139,9 @@ pub struct ChatConfig {
     /// `MLX_MTP_EV_ALLOW_DEEPEN=0` to pin the base depth.
     /// When false, the loop pins `mtpDepth` for every cycle.
     ///
-    /// Default: false. An explicit value always wins over the default.
+    /// Default: false, except Gemma4 DSpark enables its measured break-even
+    /// guard when both this field and `mtpDepth` are unset. An explicit value
+    /// always wins over the family default.
     #[napi(ts_type = "boolean | undefined")]
     pub mtp_adaptive_depth: Option<bool>,
 }

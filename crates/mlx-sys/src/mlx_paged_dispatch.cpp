@@ -301,22 +301,103 @@ const std::string& paged_attention_v2_reduce_kernel_name(
   });
 }
 
-const std::string& paged_attention_grouped_qwen35_kernel_name() {
-  // Deliberately concrete: the Metal entry point is a narrow BF16
-  // D256/BS16 GQA6/GQA8 specialization for Qwen3.5/3.6 dense and MoE
-  // long-context decode.
-  static const std::string name =
+enum class GroupedPagedAttentionKind {
+  None,
+  Qwen35D256,
+  Gemma4D512,
+};
+
+enum class GroupedGemma4Mode {
+  Disabled,
+  Auto,
+  Force,
+};
+
+const std::string& paged_attention_grouped_kernel_name(
+    GroupedPagedAttentionKind kind) {
+  static const std::string qwen35 =
       "paged_attention_grouped_bfloat16_hs256_bs16_striped";
-  return name;
+  static const std::string gemma4 =
+      "paged_attention_grouped_bfloat16_hs512_bs16_striped";
+  switch (kind) {
+    case GroupedPagedAttentionKind::Qwen35D256:
+      return qwen35;
+    case GroupedPagedAttentionKind::Gemma4D512:
+      return gemma4;
+    case GroupedPagedAttentionKind::None:
+      throw std::logic_error("grouped paged-attention kernel requested for None");
+  }
+  throw std::logic_error("invalid grouped paged-attention kind");
 }
 
-const std::string& paged_attention_grouped_qwen35_reduce_kernel_name() {
-  static const std::string name =
+const std::string& paged_attention_grouped_reduce_kernel_name(
+    GroupedPagedAttentionKind kind) {
+  static const std::string qwen35 =
       "paged_attention_grouped_bfloat16_hs256_striped_reduce";
-  return name;
+  static const std::string gemma4 =
+      "paged_attention_grouped_bfloat16_hs512_striped_reduce";
+  switch (kind) {
+    case GroupedPagedAttentionKind::Qwen35D256:
+      return qwen35;
+    case GroupedPagedAttentionKind::Gemma4D512:
+      return gemma4;
+    case GroupedPagedAttentionKind::None:
+      throw std::logic_error("grouped paged-attention reducer requested for None");
+  }
+  throw std::logic_error("invalid grouped paged-attention kind");
 }
 
-uint32_t grouped_qwen35_stripe_count(int max_context_len) {
+uint32_t grouped_gemma4_stripe_override() {
+  // Diagnostic-only A/B knob. The D512 reducer supports these power-of-two
+  // stripe counts, including counts below one 32-SIMD reducer group. Ignore
+  // malformed values rather than risking an invalid auxiliary layout.
+  static const uint32_t stripes = []() {
+    const char* value = std::getenv("MLX_PAGED_GROUPED_GEMMA4_STRIPES");
+    if (value == nullptr) {
+      return uint32_t{0};
+    }
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end == value || *end != '\0') {
+      return uint32_t{0};
+    }
+    switch (parsed) {
+      case 4:
+      case 8:
+      case 16:
+      case 32:
+      case 64:
+      case 128:
+      case 256:
+        return static_cast<uint32_t>(parsed);
+      default:
+        return uint32_t{0};
+    }
+  }();
+  return stripes;
+}
+
+uint32_t grouped_stripe_count(
+    GroupedPagedAttentionKind kind,
+    int max_context_len) {
+  if (kind == GroupedPagedAttentionKind::Gemma4D512) {
+    if (const uint32_t override = grouped_gemma4_stripe_override();
+        override != 0) {
+      return override;
+    }
+    // Conservative diagnostic policy for Gemma's single global KV head.
+    // The D512 threadgroup already contains 16 SIMD groups (512 threads), so
+    // 32/64/128 stripes provide substantial occupancy without the Qwen path's
+    // 16K jump to 256 stripes. Root should A/B these boundaries before making
+    // the selector default-on or extending it beyond 16K.
+    if (max_context_len <= 4096) {
+      return 32;
+    }
+    if (max_context_len <= 8192) {
+      return 64;
+    }
+    return 128;
+  }
   // Power-of-two, block-size-aligned stripe counts. Representative long
   // contexts mirror MLX's vector 2-pass occupancy curve: 16K -> 256,
   // 64K -> 512, and >64K -> 1024. Smaller contexts avoid over-dispatch.
@@ -347,6 +428,29 @@ bool grouped_qwen35_paged_attention_enabled() {
     return value == nullptr || std::string(value) != "0";
   }();
   return enabled;
+}
+
+GroupedGemma4Mode grouped_gemma4_paged_attention_mode() {
+  // Experimental and default-off until a model-level A/B establishes the
+  // short-context break-even. `1`/`auto` selects only the conservative
+  // 3K-16K window; `force` is a diagnostic correctness/benchmark override.
+  // Cache once because this runs on every global layer and decode token.
+  static const GroupedGemma4Mode mode = []() {
+    const char* value = std::getenv("MLX_PAGED_GROUPED_GEMMA4");
+    if (value == nullptr) {
+      return GroupedGemma4Mode::Disabled;
+    }
+    const std::string setting(value);
+    if (setting == "1" || setting == "on" || setting == "auto" ||
+        setting == "true") {
+      return GroupedGemma4Mode::Auto;
+    }
+    if (setting == "force") {
+      return GroupedGemma4Mode::Force;
+    }
+    return GroupedGemma4Mode::Disabled;
+  }();
+  return mode;
 }
 
 bool grouped_qwen35_shape_matches(
@@ -397,6 +501,67 @@ bool use_grouped_qwen35_paged_attention(
       block_size,
       query_rows,
       max_context_len);
+}
+
+bool grouped_gemma4_shape_matches(
+    GroupedGemma4Mode mode,
+    KvDtype io_dtype,
+    KvDtype cache_dtype,
+    int num_seqs,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int block_size,
+    int query_rows,
+    int max_context_len) {
+  const bool exact_shape =
+      io_dtype == KvDtype::Bf16 && cache_dtype == KvDtype::Bf16 &&
+      num_seqs == 1 && num_q_heads == 16 && num_kv_heads == 1 &&
+      head_size == 512 && block_size == 16 && query_rows == 1 &&
+      max_context_len > static_cast<int>(kPartitionSize);
+  if (!exact_shape || mode == GroupedGemma4Mode::Disabled) {
+    return false;
+  }
+  return mode == GroupedGemma4Mode::Force ||
+      (max_context_len >= 3072 && max_context_len <= 16384);
+}
+
+GroupedPagedAttentionKind select_grouped_paged_attention(
+    KvDtype io_dtype,
+    KvDtype cache_dtype,
+    int num_seqs,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int block_size,
+    int query_rows,
+    int max_context_len) {
+  if (use_grouped_qwen35_paged_attention(
+          io_dtype,
+          cache_dtype,
+          num_seqs,
+          num_q_heads,
+          num_kv_heads,
+          head_size,
+          block_size,
+          query_rows,
+          max_context_len)) {
+    return GroupedPagedAttentionKind::Qwen35D256;
+  }
+  if (grouped_gemma4_shape_matches(
+          grouped_gemma4_paged_attention_mode(),
+          io_dtype,
+          cache_dtype,
+          num_seqs,
+          num_q_heads,
+          num_kv_heads,
+          head_size,
+          block_size,
+          query_rows,
+          max_context_len)) {
+    return GroupedPagedAttentionKind::Gemma4D512;
+  }
+  return GroupedPagedAttentionKind::None;
 }
 
 const std::string& paged_attention_varlen_v1_kernel_name(
@@ -481,57 +646,67 @@ MTL::ComputePipelineState* load_pipeline(
   return device.get_kernel(kernel_name, lib);
 }
 
-struct GroupedQwen35PipelineLimits {
+struct GroupedPipelineLimits {
   size_t stage_threads;
   size_t reduce_threads;
   bool available;
 };
 
-bool grouped_qwen35_pipelines_supported(
+GroupedPipelineLimits load_grouped_pipeline_limits(
     mlx::core::metal::Device& device,
+    GroupedPagedAttentionKind kind) noexcept {
+  try {
+    auto* stage = load_pipeline(device, paged_attention_grouped_kernel_name(kind));
+    auto* reduce =
+        load_pipeline(device, paged_attention_grouped_reduce_kernel_name(kind));
+    if (stage == nullptr || reduce == nullptr) {
+      std::fprintf(
+          stderr,
+          "[mlx][warn] grouped paged-attention pipeline lookup returned null; "
+          "using generic V2\n");
+      return GroupedPipelineLimits{0, 0, false};
+    }
+    return GroupedPipelineLimits{
+        static_cast<size_t>(stage->maxTotalThreadsPerThreadgroup()),
+        static_cast<size_t>(reduce->maxTotalThreadsPerThreadgroup()),
+        true};
+  } catch (const std::exception& error) {
+    std::fprintf(
+        stderr,
+        "[mlx][warn] grouped paged-attention pipelines unavailable (%s); "
+        "using generic V2\n",
+        error.what());
+    return GroupedPipelineLimits{0, 0, false};
+  } catch (...) {
+    std::fprintf(
+        stderr,
+        "[mlx][warn] grouped paged-attention pipelines unavailable; using "
+        "generic V2\n");
+    return GroupedPipelineLimits{0, 0, false};
+  }
+}
+
+bool grouped_pipelines_supported(
+    mlx::core::metal::Device& device,
+    GroupedPagedAttentionKind kind,
     int num_q_heads,
     int num_kv_heads) {
-  // There is one active Metal device in this backend. Cache the immutable
-  // pipeline capability after first use so every attention layer/token does
-  // not take two additional pipeline-cache locks merely to re-read it.
-  // The specialization is optional: a missing/invalid metallib entry must
-  // permanently select generic V2 instead of failing inference or retrying
-  // pipeline creation for every layer/token. Static initialization completes
-  // even on failure, so this warning can appear at most once in a process.
-  static const GroupedQwen35PipelineLimits limits = [&device]() noexcept {
-    try {
-      auto* stage = load_pipeline(
-          device, paged_attention_grouped_qwen35_kernel_name());
-      auto* reduce = load_pipeline(
-          device, paged_attention_grouped_qwen35_reduce_kernel_name());
-      if (stage == nullptr || reduce == nullptr) {
-        std::fprintf(
-            stderr,
-            "[mlx][warn] grouped Qwen3.5 paged-attention pipeline lookup "
-            "returned null; using generic V2\n");
-        return GroupedQwen35PipelineLimits{0, 0, false};
-      }
-      const auto stage_threads = stage->maxTotalThreadsPerThreadgroup();
-      const auto reduce_threads = reduce->maxTotalThreadsPerThreadgroup();
-      return GroupedQwen35PipelineLimits{
-          static_cast<size_t>(stage_threads),
-          static_cast<size_t>(reduce_threads),
-          true};
-    } catch (const std::exception& error) {
-      std::fprintf(
-          stderr,
-          "[mlx][warn] grouped Qwen3.5 paged-attention pipelines unavailable "
-          "(%s); using generic V2\n",
-          error.what());
-      return GroupedQwen35PipelineLimits{0, 0, false};
-    } catch (...) {
-      std::fprintf(
-          stderr,
-          "[mlx][warn] grouped Qwen3.5 paged-attention pipelines unavailable; "
-          "using generic V2\n");
-      return GroupedQwen35PipelineLimits{0, 0, false};
-    }
-  }();
+  // There is one active Metal device. Cache capability independently for the
+  // two concrete instantiations so an unavailable experimental Gemma pipeline
+  // cannot disable the established Qwen path (or vice versa).
+  const GroupedPipelineLimits* limits_ptr = nullptr;
+  if (kind == GroupedPagedAttentionKind::Qwen35D256) {
+    static const GroupedPipelineLimits qwen35_limits =
+        load_grouped_pipeline_limits(device, kind);
+    limits_ptr = &qwen35_limits;
+  } else if (kind == GroupedPagedAttentionKind::Gemma4D512) {
+    static const GroupedPipelineLimits gemma4_limits =
+        load_grouped_pipeline_limits(device, kind);
+    limits_ptr = &gemma4_limits;
+  } else {
+    return false;
+  }
+  const GroupedPipelineLimits& limits = *limits_ptr;
   if (!limits.available || num_kv_heads <= 0 ||
       num_q_heads % num_kv_heads != 0) {
     return false;
@@ -542,11 +717,16 @@ bool grouped_qwen35_pipelines_supported(
       limits.stage_threads >= required_stage_threads &&
       limits.reduce_threads >= 1024;
   if (!supported) {
-    static std::once_flag warning_once;
+    static std::once_flag qwen_warning_once;
+    static std::once_flag gemma_warning_once;
+    std::once_flag& warning_once =
+        kind == GroupedPagedAttentionKind::Gemma4D512
+        ? gemma_warning_once
+        : qwen_warning_once;
     std::call_once(warning_once, [&]() {
       std::fprintf(
           stderr,
-          "[mlx][warn] grouped Qwen3.5 paged-attention threadgroup limits "
+          "[mlx][warn] grouped paged-attention threadgroup limits "
           "unsupported (stage=%lu, required_stage=%lu, reducer=%lu); "
           "using generic V2\n",
           static_cast<unsigned long>(limits.stage_threads),
@@ -580,6 +760,28 @@ void record_grouped_qwen35_route_for_test() {
   }
 }
 
+std::atomic<uint64_t>& grouped_gemma4_test_probe_counter() {
+  static std::atomic<uint64_t> counter{0};
+  return counter;
+}
+
+bool grouped_gemma4_test_probe_enabled() {
+  static const bool enabled = []() {
+    const char* value = std::getenv("MLX_PAGED_GROUPED_GEMMA4_TEST_PROBE");
+    return value != nullptr && std::string(value) == "1";
+  }();
+  return enabled;
+}
+
+void record_grouped_route_for_test(GroupedPagedAttentionKind kind) {
+  if (kind == GroupedPagedAttentionKind::Qwen35D256) {
+    record_grouped_qwen35_route_for_test();
+  } else if (kind == GroupedPagedAttentionKind::Gemma4D512 &&
+             grouped_gemma4_test_probe_enabled()) {
+    grouped_gemma4_test_probe_counter().fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 } // namespace
 
 extern "C" void mlx_paged_grouped_qwen35_test_probe_reset() {
@@ -588,6 +790,14 @@ extern "C" void mlx_paged_grouped_qwen35_test_probe_reset() {
 
 extern "C" uint64_t mlx_paged_grouped_qwen35_test_probe_count() {
   return grouped_qwen35_test_probe_counter().load(std::memory_order_relaxed);
+}
+
+extern "C" void mlx_paged_grouped_gemma4_test_probe_reset() {
+  grouped_gemma4_test_probe_counter().store(0, std::memory_order_relaxed);
+}
+
+extern "C" uint64_t mlx_paged_grouped_gemma4_test_probe_count() {
+  return grouped_gemma4_test_probe_counter().load(std::memory_order_relaxed);
 }
 
 extern "C" int mlx_paged_grouped_qwen35_shape_guard_for_test(
@@ -603,6 +813,30 @@ extern "C" int mlx_paged_grouped_qwen35_shape_guard_for_test(
       num_q_heads,
       num_kv_heads,
       /*head_size=*/256,
+      /*block_size=*/16,
+      query_rows,
+      max_context_len)
+      ? 1
+      : 0;
+}
+
+extern "C" int mlx_paged_grouped_gemma4_shape_guard_for_test(
+    int selector_mode,
+    int query_rows,
+    int max_context_len) {
+  const GroupedGemma4Mode mode = selector_mode == 2
+      ? GroupedGemma4Mode::Force
+      : (selector_mode == 1
+             ? GroupedGemma4Mode::Auto
+             : GroupedGemma4Mode::Disabled);
+  return grouped_gemma4_shape_matches(
+      mode,
+      KvDtype::Bf16,
+      KvDtype::Bf16,
+      /*num_seqs=*/1,
+      /*num_q_heads=*/16,
+      /*num_kv_heads=*/1,
+      /*head_size=*/512,
       /*block_size=*/16,
       query_rows,
       max_context_len)
@@ -826,7 +1060,7 @@ void dispatch_paged_attention_v2_inner(
     int sliding_window,
     KvDtype io_dtype,
     KvDtype cache_dtype) {
-  const bool grouped_shape = use_grouped_qwen35_paged_attention(
+  const GroupedPagedAttentionKind grouped_kind = select_grouped_paged_attention(
       io_dtype,
       cache_dtype,
       num_seqs,
@@ -836,13 +1070,14 @@ void dispatch_paged_attention_v2_inner(
       block_size,
       /*query_rows=*/1,
       max_context_len);
-  const bool use_grouped = grouped_shape &&
-      grouped_qwen35_pipelines_supported(
-          device, num_q_heads, num_kv_heads);
+  const bool use_grouped =
+      grouped_kind != GroupedPagedAttentionKind::None &&
+      grouped_pipelines_supported(
+          device, grouped_kind, num_q_heads, num_kv_heads);
   // Generic V2 uses contiguous 512-token partitions. The grouped path uses
   // MLX-style strided stripes and its dedicated second pass.
   const uint32_t max_num_partitions = use_grouped
-      ? grouped_qwen35_stripe_count(max_context_len)
+      ? grouped_stripe_count(grouped_kind, max_context_len)
       : (static_cast<uint32_t>(max_context_len) + kPartitionSize - 1) /
           kPartitionSize;
 
@@ -900,7 +1135,7 @@ void dispatch_paged_attention_v2_inner(
   // Stage 1: partitioned attention.
   {
     const std::string& kernel_name = use_grouped
-        ? paged_attention_grouped_qwen35_kernel_name()
+        ? paged_attention_grouped_kernel_name(grouped_kind)
         : paged_attention_v2_kernel_name(
               io_dtype,
               cache_dtype,
@@ -969,7 +1204,7 @@ void dispatch_paged_attention_v2_inner(
       encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
     }
     if (use_grouped) {
-      record_grouped_qwen35_route_for_test();
+      record_grouped_route_for_test(grouped_kind);
     }
     encoder.dispatch_threadgroups(grid, group);
   }
@@ -981,7 +1216,7 @@ void dispatch_paged_attention_v2_inner(
   // here, so MLX's dependency tracking fences via `prev_outputs_`.
   {
     const std::string& kernel_name = use_grouped
-        ? paged_attention_grouped_qwen35_reduce_kernel_name()
+        ? paged_attention_grouped_reduce_kernel_name(grouped_kind)
         : paged_attention_v2_reduce_kernel_name(io_dtype, head_size);
     MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
     encoder.set_compute_pipeline_state(pipeline);
@@ -1242,8 +1477,8 @@ void dispatch_paged_attention_varlen_v2_inner(
     int sliding_window,
     KvDtype io_dtype,
     KvDtype cache_dtype) {
-  const bool grouped_shape = total_queries == 2 &&
-      use_grouped_qwen35_paged_attention(
+  const GroupedPagedAttentionKind grouped_kind = total_queries == 2
+      ? select_grouped_paged_attention(
           io_dtype,
           cache_dtype,
           num_seqs,
@@ -1252,12 +1487,14 @@ void dispatch_paged_attention_varlen_v2_inner(
           head_size,
           block_size,
           total_queries,
-          max_context_len);
-  const bool use_grouped = grouped_shape &&
-      grouped_qwen35_pipelines_supported(
-          device, num_q_heads, num_kv_heads);
+          max_context_len)
+      : GroupedPagedAttentionKind::None;
+  const bool use_grouped =
+      grouped_kind != GroupedPagedAttentionKind::None &&
+      grouped_pipelines_supported(
+          device, grouped_kind, num_q_heads, num_kv_heads);
   const uint32_t max_num_partitions = use_grouped
-      ? grouped_qwen35_stripe_count(max_context_len)
+      ? grouped_stripe_count(grouped_kind, max_context_len)
       : (static_cast<uint32_t>(max_context_len) + kPartitionSize - 1) /
           kPartitionSize;
 
@@ -1300,7 +1537,7 @@ void dispatch_paged_attention_varlen_v2_inner(
   // Stage 1: partitioned varlen attention.
   {
     const std::string& kernel_name = use_grouped
-        ? paged_attention_grouped_qwen35_kernel_name()
+        ? paged_attention_grouped_kernel_name(grouped_kind)
         : paged_attention_varlen_v2_kernel_name(
               io_dtype,
               cache_dtype,
@@ -1372,7 +1609,7 @@ void dispatch_paged_attention_varlen_v2_inner(
       encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
     }
     if (use_grouped) {
-      record_grouped_qwen35_route_for_test();
+      record_grouped_route_for_test(grouped_kind);
     }
     encoder.dispatch_threadgroups(grid, group);
   }
@@ -1380,7 +1617,7 @@ void dispatch_paged_attention_varlen_v2_inner(
   // Stage 2: reduce partitions.
   {
     const std::string& kernel_name = use_grouped
-        ? paged_attention_grouped_qwen35_reduce_kernel_name()
+        ? paged_attention_grouped_reduce_kernel_name(grouped_kind)
         : paged_attention_varlen_v2_reduce_kernel_name(io_dtype, head_size);
     MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
     encoder.set_compute_pipeline_state(pipeline);

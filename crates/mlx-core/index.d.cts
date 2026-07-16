@@ -2469,6 +2469,8 @@ export interface ChatMessage {
   isError?: boolean;
   /** Reasoning content for thinking mode (used with <think> tags) */
   reasoningContent?: string;
+  /** Thinking mode used when this historical assistant message was generated. */
+  thinkingEnabled?: boolean;
   /** Image data for VLM models (encoded image bytes: PNG/JPEG, passed as Uint8Array/Buffer) */
   images?: Array<Uint8Array> | undefined;
   /** Audio data for unified Gemma 4 (encoded audio bytes: WAV, passed as Uint8Array/Buffer) */

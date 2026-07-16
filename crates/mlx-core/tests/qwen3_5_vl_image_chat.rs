@@ -81,6 +81,7 @@ fn user_msg(content: &str, image: Option<&[u8]>) -> ChatMessage {
         tool_call_id: None,
         is_error: None,
         reasoning_content: None,
+        thinking_enabled: None,
         images: image.map(|b| vec![Uint8Array::new(b.to_vec())]),
         audio: None,
     }

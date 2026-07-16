@@ -567,6 +567,27 @@ impl DsparkContextCache {
         Ok(())
     }
 
+    /// Materialize the live context K/V arrays. Production decode normally
+    /// leaves these lazy so the next proposal can fuse work naturally; the
+    /// DSpark break-even calibration calls this at its two measurement
+    /// boundaries so each speculative timer owns its own context-append cost.
+    pub(crate) fn eval(&self) -> Result<()> {
+        let mut arrays: Vec<&MxArray> = Vec::with_capacity(self.caches.len() * 2);
+        for cache in &self.caches {
+            if let Some(keys) = cache.keys_ref() {
+                arrays.push(keys);
+            }
+            if let Some(values) = cache.values_ref() {
+                arrays.push(values);
+            }
+        }
+        if arrays.is_empty() {
+            Ok(())
+        } else {
+            MxArray::eval_arrays(&arrays)
+        }
+    }
+
     /// Number of cached context positions. Production appends only KEPT
     /// rows (the stepper never needs len/reset/trim — a fresh cache is
     /// built every turn); these accessors serve the inline tests and any

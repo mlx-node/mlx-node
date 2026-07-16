@@ -606,6 +606,9 @@ Environment:
   MLX_AGENT_AUTO_APPROVE=1  Auto-approve bash/write/edit/subagent tool calls in headless
                             print/json runs — without an attached UI the
                             permission gate blocks them otherwise.
+  MLX_AGENT_ENABLE_GEMMA_DRAFT=1
+                            Use an embedded Gemma4 draft for flat speculative
+                            decoding instead of the default paged AR path.
   MLX_NODE_LOG              Override the Rust tracing target filter used by --trace.
   MLX_NODE_LOG_FILE         Override the Rust tracing log file used by --trace.
 

@@ -93,6 +93,10 @@ fn dspark_confidence_threshold_from_env() -> f32 {
 pub(crate) struct Gemma4DsparkStepper<'a> {
     inner: &'a mut Gemma4Inner,
     ctx: DsparkContextCache,
+    /// Permanently use exact target-only AR for the rest of this turn after
+    /// the measured break-even guard determines that speculation loses on
+    /// the current hardware/context.
+    ar_fallback: bool,
     /// Absolute position of the next verify block's anchor (== the current
     /// committed sequence length: prompt + anchor-exclusive generation).
     next_pos: i32,
@@ -107,9 +111,150 @@ pub(crate) struct Gemma4DsparkStepper<'a> {
     /// Tapped `[1, 1+L, hidden]` hiddens from the last `verify` (one per
     /// `layer_ids` entry), consumed by `commit`.
     tapped: Option<Vec<MxArray>>,
+    /// A one-token adaptive AR probe wrote its anchor in full and therefore
+    /// has no rollback, but still owns `tapped` until `commit_ar_probe`
+    /// appends the hidden to the draft context.
+    ar_probe_pending: bool,
+}
+
+impl Gemma4DsparkStepper<'_> {
+    fn ensure_no_pending_verify(&self, op: &str) -> Result<()> {
+        if self.rollback.is_some() || self.tapped.is_some() || self.ar_probe_pending {
+            return Err(Error::from_reason(format!(
+                "gemma4 DSpark {op}: previous verify was never committed"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Build the ordinary tapped target graph. This helper performs no
+    /// rollback snapshot and does not mutate transaction fields; callers
+    /// choose whether the write is speculative (`verify`) or the full-keep
+    /// one-token AR calibration path (`verify_ar_probe`).
+    fn tapped_target_forward(
+        &mut self,
+        verify_ids: &[u32],
+        op: &str,
+    ) -> Result<(MxArray, Vec<MxArray>)> {
+        let ids_i32: Vec<i32> = verify_ids.iter().map(|&t| t as i32).collect();
+        let block = MxArray::from_int32(&ids_i32, &[1, verify_ids.len() as i64])?;
+        let inner = &mut *self.inner;
+        let caches = inner
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason(format!("gemma4 DSpark {op}: caches missing")))?;
+        let mut tap = DsparkTap::new(&self.layer_ids);
+        let logits = dspark_verify_forward(
+            &block,
+            &inner.embed_tokens,
+            &inner.layers,
+            caches,
+            &inner.final_norm,
+            &inner.lm_head,
+            inner.embed_weight_t.as_ref(),
+            inner.ple.as_ref(),
+            &inner.config,
+            &mut tap,
+        )?;
+        if tap.captured.len() != self.layer_ids.len() {
+            return Err(Error::from_reason(format!(
+                "gemma4 DSpark {op}: tapped {} hiddens for {} configured target layers",
+                tap.captured.len(),
+                self.layer_ids.len()
+            )));
+        }
+        Ok((logits, tap.captured))
+    }
+
+    fn append_tapped_prefix(&mut self, tapped: &[MxArray], keep: usize, op: &str) -> Result<()> {
+        let draft = self
+            .inner
+            .dspark_draft()
+            .ok_or_else(|| Error::from_reason(format!("gemma4 DSpark {op}: no draft loaded")))?;
+        let mut kept: Vec<MxArray> = Vec::with_capacity(tapped.len());
+        for hidden in tapped {
+            kept.push(hidden.slice_axis(1, 0, keep as i64)?);
+        }
+        let fused = draft.fuse_context(&kept)?;
+        self.ctx.append(draft, &fused, self.next_pos)?;
+        self.next_pos += keep as i32;
+        Ok(())
+    }
 }
 
 impl DsparkStepper for Gemma4DsparkStepper<'_> {
+    fn supports_adaptive_ar_fallback(&self) -> bool {
+        true
+    }
+
+    fn enter_ar_fallback(&mut self) -> Result<()> {
+        if self.rollback.is_some() || self.tapped.is_some() || self.ar_probe_pending {
+            return Err(Error::from_reason(
+                "gemma4 DSpark AR fallback: cannot switch with an uncommitted verify",
+            ));
+        }
+        let num_layers = self
+            .inner
+            .dspark_draft()
+            .ok_or_else(|| Error::from_reason("gemma4 DSpark AR fallback: no draft loaded"))?
+            .num_layers();
+        // Drop the now-unused context arrays/graphs instead of retaining a
+        // growing draft cache during the target-only remainder of the turn.
+        self.ctx = DsparkContextCache::new(num_layers);
+        self.ar_fallback = true;
+        Ok(())
+    }
+
+    fn materialize_adaptive_state(&self) -> Result<()> {
+        self.ctx.eval()
+    }
+
+    fn verify_ar_probe(&mut self, anchor_id: u32) -> Result<DsparkVerifyOutput> {
+        if self.ar_fallback {
+            return Err(Error::from_reason(
+                "gemma4 DSpark AR probe: cannot calibrate after AR fallback",
+            ));
+        }
+        self.ensure_no_pending_verify("AR probe")?;
+
+        // Full-keep one-token target write: unlike speculative verify this
+        // needs no snapshot/rollback. Keep the hidden tap because the next
+        // calibration cycle is speculative and must be conditioned on this
+        // anchor. The engine times this whole call, including target graph
+        // construction/dispatch; fusion happens in commit_ar_probe afterward.
+        let (logits, tapped) = self.tapped_target_forward(&[anchor_id], "AR probe")?;
+        self.tapped = Some(tapped);
+        self.ar_probe_pending = true;
+        Ok(DsparkVerifyOutput { logits })
+    }
+
+    fn commit_ar_probe(&mut self) -> Result<()> {
+        if !self.ar_probe_pending {
+            return Err(Error::from_reason(
+                "gemma4 DSpark AR probe commit: no pending probe",
+            ));
+        }
+        if self.rollback.is_some() {
+            return Err(Error::from_reason(
+                "gemma4 DSpark AR probe commit: unexpected rollback state",
+            ));
+        }
+        let tapped = self.tapped.take().ok_or_else(|| {
+            Error::from_reason("gemma4 DSpark AR probe commit: no stashed tapped hiddens")
+        })?;
+        if let Some(first) = tapped.first()
+            && first.shape_at(1)? != 1
+        {
+            return Err(Error::from_reason(format!(
+                "gemma4 DSpark AR probe commit: tapped hiddens cover {} positions, expected 1",
+                first.shape_at(1)?
+            )));
+        }
+        self.append_tapped_prefix(&tapped, 1, "AR probe commit")?;
+        self.ar_probe_pending = false;
+        Ok(())
+    }
+
     fn propose(
         &mut self,
         anchor_id: u32,
@@ -117,6 +262,11 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
         params: &ChatParams,
         rng: &mut dyn rand::Rng,
     ) -> Result<DsparkProposal> {
+        if self.ar_fallback {
+            return Err(Error::from_reason(
+                "gemma4 DSpark propose: engine called propose after AR fallback",
+            ));
+        }
         let draft = self
             .inner
             .dspark_draft()
@@ -178,48 +328,65 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
         // Commit-exactly-once defense: a second verify before the previous
         // cycle's commit would orphan its rollback (the caches would then
         // hold TWO uncommitted verify blocks).
-        if self.rollback.is_some() || self.tapped.is_some() {
-            return Err(Error::from_reason(
-                "gemma4 DSpark verify: previous verify was never committed",
-            ));
+        self.ensure_no_pending_verify("verify")?;
+
+        if self.ar_fallback {
+            if verify_ids.len() != 1 {
+                return Err(Error::from_reason(format!(
+                    "gemma4 DSpark AR fallback verify requires one anchor token, got {}",
+                    verify_ids.len()
+                )));
+            }
+            let block = MxArray::from_int32(&[verify_ids[0] as i32], &[1, 1])?;
+            let inner = &mut *self.inner;
+            let caches = inner.caches.as_mut().ok_or_else(|| {
+                Error::from_reason("gemma4 DSpark AR fallback verify: caches missing")
+            })?;
+            let logits = forward_inner(
+                &block,
+                &inner.embed_tokens,
+                &inner.layers,
+                caches,
+                &inner.final_norm,
+                &inner.lm_head,
+                inner.embed_weight_t.as_ref(),
+                inner.ple.as_ref(),
+                &inner.config,
+                None,
+            )?;
+            return Ok(DsparkVerifyOutput { logits });
         }
 
-        let inner = &mut *self.inner;
-        let caches = inner
-            .caches
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("gemma4 DSpark verify: caches missing"))?;
-        let rb = snapshot_before_verify(caches, verify_ids.len(), &self.shared_slots)?;
-
-        let ids_i32: Vec<i32> = verify_ids.iter().map(|&t| t as i32).collect();
-        let block = MxArray::from_int32(&ids_i32, &[1, verify_ids.len() as i64])?;
-        let mut tap = DsparkTap::new(&self.layer_ids);
-        let logits = dspark_verify_forward(
-            &block,
-            &inner.embed_tokens,
-            &inner.layers,
-            caches,
-            &inner.final_norm,
-            &inner.lm_head,
-            inner.embed_weight_t.as_ref(),
-            inner.ple.as_ref(),
-            &inner.config,
-            &mut tap,
-        )?;
-        if tap.captured.len() != self.layer_ids.len() {
-            return Err(Error::from_reason(format!(
-                "gemma4 DSpark verify: tapped {} hiddens for {} configured target layers",
-                tap.captured.len(),
-                self.layer_ids.len()
-            )));
-        }
+        let rb = {
+            let caches = self
+                .inner
+                .caches
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("gemma4 DSpark verify: caches missing"))?;
+            snapshot_before_verify(caches, verify_ids.len(), &self.shared_slots)?
+        };
+        let (logits, tapped) = self.tapped_target_forward(verify_ids, "verify")?;
 
         self.rollback = Some(rb);
-        self.tapped = Some(tap.captured);
+        self.tapped = Some(tapped);
         Ok(DsparkVerifyOutput { logits })
     }
 
     fn commit(&mut self, keep: usize, total_written: usize) -> Result<()> {
+        if self.ar_fallback {
+            if keep != 1 || total_written != 1 {
+                return Err(Error::from_reason(format!(
+                    "gemma4 DSpark AR fallback commit requires keep=1,total_written=1, got keep={keep},total_written={total_written}"
+                )));
+            }
+            self.next_pos += 1;
+            return Ok(());
+        }
+        if self.ar_probe_pending {
+            return Err(Error::from_reason(
+                "gemma4 DSpark commit: pending AR probe requires commit_ar_probe",
+            ));
+        }
         let rb = self.rollback.take().ok_or_else(|| {
             Error::from_reason("gemma4 DSpark commit: no pending verify rollback")
         })?;
@@ -258,18 +425,7 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
         // it to the persisted context at the block's base position, then
         // advance the cursor. The boundary token has no slot on either side
         // — it re-enters as the next cycle's verify anchor.
-        let draft = self
-            .inner
-            .dspark_draft()
-            .ok_or_else(|| Error::from_reason("gemma4 DSpark commit: no draft model loaded"))?;
-        let mut kept: Vec<MxArray> = Vec::with_capacity(tapped.len());
-        for hidden in &tapped {
-            kept.push(hidden.slice_axis(1, 0, keep as i64)?);
-        }
-        let fused = draft.fuse_context(&kept)?;
-        self.ctx.append(draft, &fused, self.next_pos)?;
-        self.next_pos += keep as i32;
-        Ok(())
+        self.append_tapped_prefix(&tapped, keep, "commit")
     }
 
     fn eval_boundary(&self, token: &MxArray) {
@@ -291,6 +447,45 @@ pub(crate) enum Gemma4DraftStepper<'a> {
 }
 
 impl DsparkStepper for Gemma4DraftStepper<'_> {
+    fn supports_adaptive_ar_fallback(&self) -> bool {
+        match self {
+            Self::Dspark(stepper) => stepper.supports_adaptive_ar_fallback(),
+            Self::Assistant(stepper) => stepper.supports_adaptive_ar_fallback(),
+        }
+    }
+
+    fn enter_ar_fallback(&mut self) -> Result<()> {
+        match self {
+            Self::Dspark(stepper) => stepper.enter_ar_fallback(),
+            Self::Assistant(stepper) => stepper.enter_ar_fallback(),
+        }
+    }
+
+    fn materialize_adaptive_state(&self) -> Result<()> {
+        match self {
+            Self::Dspark(stepper) => stepper.materialize_adaptive_state(),
+            Self::Assistant(stepper) => stepper.materialize_adaptive_state(),
+        }
+    }
+
+    fn verify_ar_probe(&mut self, anchor_id: u32) -> Result<DsparkVerifyOutput> {
+        match self {
+            Self::Dspark(stepper) => stepper.verify_ar_probe(anchor_id),
+            Self::Assistant(_) => Err(Error::from_reason(
+                "gemma4 assistant draft does not support adaptive AR calibration",
+            )),
+        }
+    }
+
+    fn commit_ar_probe(&mut self) -> Result<()> {
+        match self {
+            Self::Dspark(stepper) => stepper.commit_ar_probe(),
+            Self::Assistant(_) => Err(Error::from_reason(
+                "gemma4 assistant draft does not support adaptive AR calibration",
+            )),
+        }
+    }
+
     fn propose(
         &mut self,
         anchor_id: u32,
@@ -363,12 +558,14 @@ impl DsparkBackend for Gemma4Inner {
                 Ok(Gemma4DraftStepper::Dspark(Gemma4DsparkStepper {
                     inner: self,
                     ctx: state.ctx,
+                    ar_fallback: false,
                     next_pos: state.next_pos,
                     layer_ids,
                     shared_slots,
                     confidence_threshold,
                     rollback: None,
                     tapped: None,
+                    ar_probe_pending: false,
                 }))
             }
             Gemma4DraftTurnState::Assistant(state) => {
@@ -1103,6 +1300,10 @@ pub(crate) mod tests {
         let inner = tiny_inner_with_draft();
         let p = ChatBackend::resolve_params(&inner, &chat_config(None));
         assert_eq!(p.mtp_depth, 3, "unset depth must resolve to block_size");
+        assert!(
+            p.mtp_adaptive_depth,
+            "an entirely unset DSpark config must enable measured AR fallback"
+        );
     }
 
     /// An explicit depth is clamped to `[1, block_size]` from the RAW
@@ -1118,7 +1319,28 @@ pub(crate) mod tests {
                 p.mtp_depth, expected,
                 "mtpDepth={requested} must resolve to {expected}"
             );
+            assert!(
+                !p.mtp_adaptive_depth,
+                "an explicit mtpDepth pins DSpark unless adaptive mode is also explicit"
+            );
         }
+    }
+
+    #[test]
+    fn resolve_params_dspark_explicit_adaptive_override_wins() {
+        let inner = tiny_inner_with_draft();
+
+        let mut disabled = chat_config(None);
+        disabled.mtp_adaptive_depth = Some(false);
+        let p = ChatBackend::resolve_params(&inner, &disabled);
+        assert!(!p.mtp_adaptive_depth);
+        assert_eq!(p.mtp_depth, 3);
+
+        let mut enabled_with_cap = chat_config(Some(2));
+        enabled_with_cap.mtp_adaptive_depth = Some(true);
+        let p = ChatBackend::resolve_params(&inner, &enabled_with_cap);
+        assert!(p.mtp_adaptive_depth);
+        assert_eq!(p.mtp_depth, 2);
     }
 
     /// Without a draft model the family override is inert: the engine's
@@ -1224,11 +1446,182 @@ pub(crate) mod tests {
             );
             assert_eq!(stepper.layer_ids, vec![0, 2]);
             assert_eq!(stepper.next_pos, 7);
-            assert!(stepper.rollback.is_none() && stepper.tapped.is_none());
+            assert!(!stepper.ar_fallback);
+            assert!(
+                stepper.rollback.is_none() && stepper.tapped.is_none() && !stepper.ar_probe_pending
+            );
         }
         assert!(
             inner.draft_turn_state.is_none(),
             "the per-turn stash must be consumed by begin_dspark_decode"
+        );
+    }
+
+    #[test]
+    fn dspark_stepper_ar_fallback_uses_single_token_target_forward() {
+        let mut inner = tiny_inner_with_draft();
+        inner
+            .init_caches_sync()
+            .expect("tiny target caches must initialize");
+        let num_draft_layers = inner.dspark_draft().expect("draft loaded").num_layers();
+        inner.draft_turn_state = Some(Gemma4DraftTurnState::Dspark(DsparkTurnState {
+            ctx: DsparkContextCache::new(num_draft_layers),
+            next_pos: 0,
+        }));
+        let p = ChatBackend::resolve_params(&inner, &chat_config(None));
+        let setup = DsparkTurnSetup {
+            params: &p,
+            block_size: 3,
+        };
+
+        let mut stepper = match inner
+            .begin_dspark_decode(&setup)
+            .expect("prepared DSpark stepper")
+        {
+            Gemma4DraftStepper::Dspark(stepper) => stepper,
+            Gemma4DraftStepper::Assistant(_) => panic!("expected DSpark stepper"),
+        };
+        assert!(stepper.supports_adaptive_ar_fallback());
+        stepper
+            .enter_ar_fallback()
+            .expect("clean stepper can enter AR fallback");
+        assert!(stepper.ar_fallback);
+        assert!(
+            stepper.ctx.is_empty(),
+            "unused draft context must be dropped"
+        );
+
+        let err = stepper
+            .verify(&[1, 2])
+            .err()
+            .expect("fallback must reject speculative verify blocks");
+        assert!(err.reason.contains("requires one anchor token"));
+
+        let out = stepper
+            .verify(&[1])
+            .expect("fallback must run one ordinary target forward");
+        assert_eq!(
+            out.logits.shape().expect("logit shape").as_ref(),
+            &[1, 1, 16]
+        );
+        out.logits.eval();
+        let fallback_logits = out
+            .logits
+            .to_float32()
+            .expect("fallback logits to f32")
+            .to_vec();
+        stepper
+            .commit(1, 1)
+            .expect("single-token target write is already committed");
+        assert_eq!(stepper.next_pos, 1);
+        assert!(
+            stepper.rollback.is_none() && stepper.tapped.is_none() && !stepper.ar_probe_pending
+        );
+        let fallback_offsets: Vec<i32> = stepper
+            .inner
+            .caches
+            .as_ref()
+            .expect("fallback target caches")
+            .iter()
+            .map(|cache| cache.get_offset())
+            .collect();
+        drop(stepper);
+
+        // Replay the identical token through the ordinary Gemma4 AR forward
+        // from fresh caches. Fallback deliberately calls this same primitive
+        // with `tap=None`; pin both logits and physical cache offsets exactly.
+        ChatBackend::reset_caches(&mut inner, ResetScope::PrefixMiss)
+            .expect("reset target caches for AR reference");
+        let block = MxArray::from_int32(&[1], &[1, 1]).expect("reference token");
+        let inner_ref = &mut inner;
+        let caches = inner_ref.caches.as_mut().expect("reference target caches");
+        let direct_logits = forward_inner(
+            &block,
+            &inner_ref.embed_tokens,
+            &inner_ref.layers,
+            caches,
+            &inner_ref.final_norm,
+            &inner_ref.lm_head,
+            inner_ref.embed_weight_t.as_ref(),
+            inner_ref.ple.as_ref(),
+            &inner_ref.config,
+            None,
+        )
+        .expect("ordinary target AR forward");
+        direct_logits.eval();
+        assert_eq!(
+            fallback_logits,
+            direct_logits
+                .to_float32()
+                .expect("reference logits to f32")
+                .to_vec(),
+            "fallback logits must be byte-identical to ordinary target AR"
+        );
+        let direct_offsets: Vec<i32> = inner_ref
+            .caches
+            .as_ref()
+            .expect("reference target caches")
+            .iter()
+            .map(|cache| cache.get_offset())
+            .collect();
+        assert_eq!(
+            fallback_offsets, direct_offsets,
+            "fallback must advance exactly the same physical cache slots as AR"
+        );
+    }
+
+    #[test]
+    fn dspark_ar_probe_avoids_rollback_and_consumes_tapped_state() {
+        let mut inner = tiny_inner_with_draft();
+        inner
+            .init_caches_sync()
+            .expect("tiny target caches must initialize");
+        let num_draft_layers = inner.dspark_draft().expect("draft loaded").num_layers();
+        inner.draft_turn_state = Some(Gemma4DraftTurnState::Dspark(DsparkTurnState {
+            ctx: DsparkContextCache::new(num_draft_layers),
+            next_pos: 0,
+        }));
+        let p = ChatBackend::resolve_params(&inner, &chat_config(None));
+        let setup = DsparkTurnSetup {
+            params: &p,
+            block_size: 3,
+        };
+        let mut stepper = match inner
+            .begin_dspark_decode(&setup)
+            .expect("prepared DSpark stepper")
+        {
+            Gemma4DraftStepper::Dspark(stepper) => stepper,
+            Gemma4DraftStepper::Assistant(_) => panic!("expected DSpark stepper"),
+        };
+
+        // The dedicated calibration path writes exactly one fully-kept target
+        // slot and captures the hidden needed by the next speculative cycle,
+        // but deliberately creates no rollback snapshot.
+        let out = stepper
+            .verify_ar_probe(1)
+            .expect("one-token dedicated AR probe verify");
+        assert!(stepper.rollback.is_none());
+        assert!(stepper.tapped.is_some() && stepper.ar_probe_pending);
+        let sampled = out.logits.argmax(-1, None).expect("probe argmax");
+        sampled.eval();
+        let _ = sampled.item_at_int32(0).expect("force probe target graph");
+
+        // Commit/fusion happens outside the AR timer, but must leave no
+        // speculative transaction behind before the next probe cycle.
+        stepper
+            .commit_ar_probe()
+            .expect("commit full-keep probe anchor");
+        stepper
+            .materialize_adaptive_state()
+            .expect("materialize next-cycle draft context");
+        assert_eq!(stepper.next_pos, 1);
+        assert!(
+            stepper.rollback.is_none() && stepper.tapped.is_none() && !stepper.ar_probe_pending,
+            "AR calibration must not leak rollback/tapped state into the next cycle"
+        );
+        assert!(
+            !stepper.ctx.is_empty(),
+            "the kept probe hidden must seed the following speculative cycle"
         );
     }
 
@@ -1296,6 +1689,10 @@ pub(crate) mod tests {
             cache_owner_id: None,
             cache_root_owner_id: None,
             mtp_depth,
+            // Whole-turn oracle/error tests below exercise the fixed-depth
+            // speculative path; adaptive fallback has its own policy and
+            // stepper tests.
+            mtp_adaptive_depth: Some(false),
             max_new_tokens: Some(max_new_tokens),
             temperature: Some(0.0),
             reuse_cache: Some(true),
@@ -1633,6 +2030,7 @@ pub(crate) mod tests {
                 tool_call_id: None,
                 is_error: None,
                 reasoning_content: None,
+                thinking_enabled: None,
                 images: None,
                 audio: None,
             }

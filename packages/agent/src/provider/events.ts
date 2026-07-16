@@ -104,6 +104,7 @@ export class TurnEmitter {
     stream: AssistantMessageEventStream,
     model: Model<Api>,
     private readonly onPerformance?: (message: AssistantMessage, performance: PerformanceMetrics) => void,
+    thinkingEnabled?: boolean,
   ) {
     this.stream = stream;
     this.partial = {
@@ -116,6 +117,15 @@ export class TurnEmitter {
       stopReason: 'stop',
       timestamp: Date.now(),
     };
+    // Pi persists provider messages as JSON without a provider-specific
+    // metadata bag. Keep this small enumerable provenance field on the
+    // assistant object so a later full-history replay can distinguish a
+    // disabled-thinking empty channel from an enabled-thinking turn that
+    // simply emitted no reasoning. Unknown fields survive Pi's session
+    // JSONL round-trip and are ignored by other providers.
+    if (thinkingEnabled !== undefined) {
+      (this.partial as AssistantMessage & { mlxThinkingEnabled?: boolean }).mlxThinkingEnabled = thinkingEnabled;
+    }
     stream.push({ type: 'start', partial: this.partial });
   }
 

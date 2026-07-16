@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
@@ -28,6 +28,41 @@ use super::quantized_linear::{
     try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
     try_build_quantized_linear, try_build_quantized_switch_linear, try_build_sym8_quantized_linear,
 };
+
+/// Conventional in-checkpoint location for an external Gemma4 speculative
+/// draft. Keeping the draft in a subdirectory avoids colliding with the
+/// target's `config.json` / safetensors while making the combined checkpoint
+/// self-contained and portable.
+const EMBEDDED_DRAFT_DIR: &str = "draft";
+
+/// Resolve the draft checkpoint attached to `model_path`.
+///
+/// An explicit API option always wins. Otherwise `<model_path>/draft/` is
+/// discovered automatically. A present non-directory is rejected loudly:
+/// silently ignoring a malformed combined checkpoint would unexpectedly run
+/// autoregressive decoding instead of the requested speculative path.
+fn resolve_draft_model_path(
+    model_path: &Path,
+    explicit_draft_model_path: Option<&str>,
+) -> Result<Option<PathBuf>> {
+    if let Some(explicit) = explicit_draft_model_path {
+        return Ok(Some(PathBuf::from(explicit)));
+    }
+
+    let embedded = model_path.join(EMBEDDED_DRAFT_DIR);
+    match fs::metadata(&embedded) {
+        Ok(metadata) if metadata.is_dir() => Ok(Some(embedded)),
+        Ok(_) => Err(Error::from_reason(format!(
+            "Embedded Gemma4 draft path {} exists but is not a directory",
+            embedded.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Error::from_reason(format!(
+            "Failed to inspect embedded Gemma4 draft path {}: {error}",
+            embedded.display()
+        ))),
+    }
+}
 
 // Quantization-block parsing now lives in `crate::models::quant_dispatch`,
 // shared with qwen3_5 / qwen3_5_moe. `load_quant_settings_from_disk` returns
@@ -75,12 +110,22 @@ fn merge_split_experts_into_fused(
     }
 }
 
-/// Parse config.json into Gemma4Config.
+/// Parsed model config plus load-only metadata that must not leak into the
+/// public/NAPI [`Gemma4Config`] surface.
+struct ParsedGemma4Config {
+    config: Gemma4Config,
+    /// True only when the nested text config explicitly declares BF16. A
+    /// top-level dtype is deliberately insufficient: unified checkpoints may
+    /// give their text and media towers different activation dtypes.
+    text_config_explicitly_bfloat16: bool,
+}
+
+/// Parse config.json into Gemma4Config plus load-only metadata.
 ///
 /// Handles the nested `text_config` structure used by HuggingFace Gemma4 models.
 /// RoPE parameters are nested under `text_config.rope_parameters.{full_attention,sliding_attention}`.
 /// Layer types are an explicit array `text_config.layer_types`.
-fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
+fn parse_config_with_load_metadata(model_path: &Path) -> Result<ParsedGemma4Config> {
     let config_path = model_path.join("config.json");
     let raw_str = fs::read_to_string(&config_path)
         .map_err(|e| Error::from_reason(format!("Failed to read config.json: {}", e)))?;
@@ -89,6 +134,16 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
 
     // Gemma4 HF configs wrap text params in a `text_config` sub-dict
     let text_cfg = raw.get("text_config");
+    let text_config_explicitly_bfloat16 = text_cfg
+        .and_then(|text| {
+            // `dtype` is the current Transformers spelling; `torch_dtype` is
+            // the legacy fallback. Do not let a stale legacy value override an
+            // explicitly different current dtype.
+            text.get("dtype")
+                .or_else(|| text.get("torch_dtype"))
+                .and_then(Value::as_str)
+        })
+        .is_some_and(|dtype| dtype.eq_ignore_ascii_case("bfloat16"));
 
     // Unified multimodal checkpoint: `model_type == "gemma4_unified"` or the
     // unified conditional-generation architecture. The text decoder is shared
@@ -163,7 +218,7 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
         if v > 0 { Some(v) } else { None }
     };
 
-    Ok(Gemma4Config {
+    let config = Gemma4Config {
         vocab_size: get_config_i32(&raw, text_cfg, &["vocab_size"], 262144),
         hidden_size: get_config_i32(&raw, text_cfg, &["hidden_size"], 2560),
         num_hidden_layers: get_config_i32(&raw, text_cfg, &["num_hidden_layers"], 42),
@@ -312,7 +367,27 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32),
         use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
+    };
+
+    Ok(ParsedGemma4Config {
+        config,
+        text_config_explicitly_bfloat16,
     })
+}
+
+#[cfg(test)]
+fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
+    Ok(parse_config_with_load_metadata(model_path)?.config)
+}
+
+/// Whether this checkpoint needs the converted GGUF media sidecar.
+///
+/// `vision.safetensors` contains the unified model's encoder-free vision and
+/// audio projection tensors. Gate loading on the parsed media capabilities,
+/// not merely `model_type`, so a text-only unified config and every plain
+/// Gemma checkpoint retain the existing main-checkpoint-only behavior.
+fn should_load_media_sidecar(config: &Gemma4Config) -> bool {
+    config.is_unified && (config.unified_vision_config.is_some() || config.has_audio)
 }
 
 /// Parse `layer_types` array from config.
@@ -884,6 +959,153 @@ pub fn sanitize_weights(
     }
 
     Ok(sanitized)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AffineSidecarWidenStats {
+    projections: usize,
+    arrays: usize,
+    source_bytes: usize,
+    resident_bytes: usize,
+}
+
+/// Whether `prefix` names a text projection that `apply_weights` installs on
+/// an affine QMM/GatherQMM path.
+///
+/// Keep this list intentionally narrower than "has a `.scales` suffix": packed
+/// embeddings also carry affine sidecars, but their token-lookup path calls
+/// `mlx_dequantize` directly. Widening those sidecars would change lookup output
+/// from FP16 to FP32 rather than merely hoisting QMM's existing FP16->FP32 cast.
+/// Vision/audio projections are similarly outside the BF16 text contract.
+fn is_gemma4_text_qmm_prefix(prefix: &str) -> bool {
+    if prefix == "lm_head" {
+        return true;
+    }
+
+    let Some(layer_key) = prefix.strip_prefix("layers.") else {
+        return false;
+    };
+    let Some((layer_index, projection)) = layer_key.split_once('.') else {
+        return false;
+    };
+    if layer_index.parse::<usize>().is_err() {
+        return false;
+    }
+
+    matches!(
+        projection,
+        "self_attn.q_proj"
+            | "self_attn.k_proj"
+            | "self_attn.v_proj"
+            | "self_attn.o_proj"
+            | "mlp.gate_proj"
+            | "mlp.up_proj"
+            | "mlp.down_proj"
+            | "router.proj"
+            | "experts.gate_up_proj"
+            | "experts.down_proj"
+    )
+}
+
+/// Hoist MLX affine QMM's lossless FP16->FP32 sidecar casts out of every
+/// inference call and perform them once while loading a BF16 Gemma text model.
+///
+/// MLX promotes `BF16 activation + FP16 scales/biases` to FP32 before affine
+/// QMM. Replacing only those runtime sidecar arrays with their exact FP32
+/// widening preserves that promoted-FP32 arithmetic bit-for-bit; packed weights
+/// and the serialized FP16 tensors remain unchanged. Selection follows the
+/// resolved top-level/per-layer quantization mode and requires packed Uint32
+/// weight storage, so MXFP4/MXFP8/NVFP4, sym8, dense, embedding, and media
+/// tensors cannot enter this path.
+///
+/// The speed/memory tradeoff is deliberate: Gemma-4-12B Q4_0 has about 1.269
+/// GiB of FP16 affine sidecars, which become about 2.538 GiB resident (+1.269
+/// GiB steady state). The final chunked materialization evaluates and detaches
+/// these `astype` nodes, allowing their original mmap-backed FP16 graph inputs
+/// to be released rather than retaining both copies.
+fn widen_bf16_affine_text_qmm_sidecars(
+    params: &mut HashMap<String, MxArray>,
+    text_config_explicitly_bfloat16: bool,
+    quant_bits: i32,
+    quant_group_size: i32,
+    top_level_mode: Option<PerLayerMode>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+) -> Result<AffineSidecarWidenStats> {
+    if !text_config_explicitly_bfloat16 {
+        return Ok(AffineSidecarWidenStats::default());
+    }
+
+    // Match apply_weights' fallback resolution exactly. In particular, the
+    // old uint8-scales heuristic remains only a fallback when config.json has
+    // no explicit top-level mode.
+    let default_mode = resolve_default_mode(top_level_mode, is_mxfp8_checkpoint(params));
+    let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
+
+    let mut prefixes: Vec<String> = params
+        .keys()
+        .filter_map(|key| key.strip_suffix(".scales"))
+        .filter(|prefix| is_gemma4_text_qmm_prefix(prefix))
+        .map(str::to_owned)
+        .collect();
+    prefixes.sort_unstable();
+
+    let mut stats = AffineSidecarWidenStats::default();
+    for prefix in prefixes {
+        let weight_key = format!("{prefix}.weight");
+        let Some(weight) = params.get(&weight_key) else {
+            continue;
+        };
+        if weight.dtype()? != DType::Uint32 {
+            continue;
+        }
+
+        let plq = per_layer_quant.get(&prefix).copied().unwrap_or(default_plq);
+        if plq.mode != PerLayerMode::Affine {
+            continue;
+        }
+
+        let mut widened_projection = false;
+        for suffix in ["scales", "biases"] {
+            let sidecar_key = format!("{prefix}.{suffix}");
+            let Some(sidecar) = params.get(&sidecar_key) else {
+                continue;
+            };
+            if sidecar.dtype()? != DType::Float16 {
+                continue;
+            }
+
+            let source_bytes = sidecar.nbytes();
+            let widened = sidecar.astype(DType::Float32)?;
+            let resident_bytes = widened.nbytes();
+            params.insert(sidecar_key, widened);
+
+            stats.arrays += 1;
+            stats.source_bytes = stats.source_bytes.saturating_add(source_bytes);
+            stats.resident_bytes = stats.resident_bytes.saturating_add(resident_bytes);
+            widened_projection = true;
+        }
+        if widened_projection {
+            stats.projections += 1;
+        }
+    }
+
+    if stats.arrays > 0 {
+        let gib = (1u64 << 30) as f64;
+        let delta_bytes = stats.resident_bytes.saturating_sub(stats.source_bytes);
+        info!(
+            target: "mlx_core::inference",
+            event = "gemma4_affine_sidecar_widen",
+            arrays = stats.arrays,
+            projections = stats.projections,
+            source_gib = stats.source_bytes as f64 / gib,
+            resident_gib = stats.resident_bytes as f64 / gib,
+            steady_delta_gib = delta_bytes as f64 / gib,
+            serialized_weights_unchanged = true,
+            "Gemma4 affine FP16 QMM sidecars widened to FP32 once at load"
+        );
+    }
+
+    Ok(stats)
 }
 
 /// Per-buffer byte budget for sharding the oversized PLE embedding. Defaults to
@@ -1953,29 +2175,49 @@ impl Gemma4Inner {
     ///
     /// `draft_model_path` optionally points at a draft checkpoint directory
     /// (DSpark or assistant — probed from its config.json) loaded alongside
-    /// the target for speculative decoding. Draft decoding runs only on the
-    /// flat KV-cache path, so an explicit `use_block_paged_cache: true` in
-    /// the target config is a hard error (silently ignoring the explicit
-    /// draft request would be worse), and the unset default (paged ON) is
-    /// forced to flat.
+    /// the target for speculative decoding. When it is omitted, a draft in
+    /// `<model_path>/draft/` is discovered automatically. Draft decoding runs
+    /// only on the flat KV-cache path, so an explicit
+    /// `use_block_paged_cache: true` in the target config is a hard error
+    /// (silently ignoring the draft would be worse), and the unset default
+    /// (paged ON) is forced to flat.
     pub fn load_from_dir(model_path: &str, draft_model_path: Option<&str>) -> Result<(Self, u64)> {
         let path = Path::new(model_path);
 
-        // Parse config
-        let mut config = parse_config(path)?;
+        let resolved_draft_model_path = resolve_draft_model_path(path, draft_model_path)?;
+        let draft_source = if draft_model_path.is_some() {
+            "draft_model_path"
+        } else {
+            "embedded draft/ checkpoint"
+        };
+        if draft_model_path.is_none()
+            && let Some(embedded) = resolved_draft_model_path.as_deref()
+        {
+            info!(
+                "[gemma4] Embedded draft checkpoint discovered: {}",
+                embedded.display()
+            );
+        }
+
+        // Parse config plus the nested text dtype used to gate the lossless
+        // affine-sidecar load optimization. A top-level dtype alone is not a
+        // sufficient text activation contract for unified checkpoints.
+        let parsed_config = parse_config_with_load_metadata(path)?;
+        let text_config_explicitly_bfloat16 = parsed_config.text_config_explicitly_bfloat16;
+        let mut config = parsed_config.config;
 
         // DSpark/paged conflict guard — BEFORE any weight I/O so a
         // misconfigured request fails fast. `use_block_paged_cache`
         // defaults ON (`unwrap_or(true)` in `Gemma4Inner::new`); a draft
         // request flips that default to flat, but an EXPLICIT `true` is a
         // config-level conflict the caller must resolve.
-        if draft_model_path.is_some() {
+        if resolved_draft_model_path.is_some() {
             if config.use_block_paged_cache == Some(true) {
-                return Err(Error::from_reason(
-                    "Gemma4 draft_model_path conflicts with use_block_paged_cache=true: DSpark \
-                     speculative decoding runs only on the flat KV-cache path. Remove \
-                     draft_model_path or set use_block_paged_cache to false in config.json.",
-                ));
+                return Err(Error::from_reason(format!(
+                    "Gemma4 {draft_source} conflicts with use_block_paged_cache=true: draft \
+                         speculative decoding runs only on the flat KV-cache path. Remove the \
+                         draft request or set use_block_paged_cache to false in config.json."
+                )));
             }
             config.use_block_paged_cache = Some(false);
         }
@@ -2052,8 +2294,10 @@ impl Gemma4Inner {
             );
         }
 
-        // Load safetensors
-        let mut params = load_all_safetensors(path, false)?;
+        // Converted unified checkpoints keep the encoder-free vision/audio
+        // tensors from GGUF mmproj in `vision.safetensors`. Plain Gemma and
+        // text-only unified configs continue loading only the main checkpoint.
+        let mut params = load_all_safetensors(path, should_load_media_sidecar(&config))?;
 
         // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval
         // of any mmap-backed weight (FP8 dequant in `dequant_fp8_weights`,
@@ -2170,6 +2414,19 @@ impl Gemma4Inner {
             merge_split_experts_into_fused(&mut per_layer_quant, config.num_hidden_layers as usize);
         }
 
+        // BF16 text activations + exact GGUF Q4_0 FP16 affine sidecars promote
+        // to FP32 inside MLX QMM on every call. Hoist that exact widening once
+        // into the sanitized runtime map, after mode metadata and MoE fused
+        // prefixes are final but before builders clone/materialize the arrays.
+        widen_bf16_affine_text_qmm_sidecars(
+            &mut params,
+            text_config_explicitly_bfloat16,
+            quant_bits,
+            quant_group_size,
+            top_level_mode,
+            &per_layer_quant,
+        )?;
+
         // gemma-4-E2B's `embed_tokens_per_layer.weight` is a single ~4GB tensor
         // that can exceed the Metal per-buffer cap on memory-constrained
         // devices, where the whole-tensor materialize eval below would fail to
@@ -2269,8 +2526,7 @@ impl Gemma4Inner {
         // variant's strict loader errors propagate verbatim (they carry the
         // guard-rail messages: geometry pins, bf16-only gates, tensor-set
         // completeness).
-        if let Some(draft_dir) = draft_model_path {
-            let draft_path = Path::new(draft_dir);
+        if let Some(draft_path) = resolved_draft_model_path.as_deref() {
             // Same cold-mmap pre-warm as the target shards: the draft's
             // first forward must not page-fault a cold region on the GPU.
             prewarm_checkpoint_pages(draft_path);
@@ -2564,6 +2820,22 @@ mod tests {
         assert_eq!(uvc.output_proj_dims, 3840);
         assert_eq!(uvc.patch_size, 16);
         assert_eq!(uvc.pooling_kernel_size, 3);
+        assert!(
+            should_load_media_sidecar(&cfg),
+            "unified vision/audio config must request vision.safetensors"
+        );
+        let mut vision_only = cfg.clone();
+        vision_only.has_audio = false;
+        assert!(
+            should_load_media_sidecar(&vision_only),
+            "unified vision-only config must request vision.safetensors"
+        );
+        let mut audio_only = cfg.clone();
+        audio_only.unified_vision_config = None;
+        assert!(
+            should_load_media_sidecar(&audio_only),
+            "unified audio-only config must request vision.safetensors"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2579,6 +2851,10 @@ mod tests {
         assert!(
             cfg.unified_vision_config.is_none(),
             "plain gemma4 must leave unified_vision_config None"
+        );
+        assert!(
+            !should_load_media_sidecar(&cfg),
+            "plain gemma4 must not request vision.safetensors"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2601,6 +2877,95 @@ mod tests {
         )
         .expect("write config.json");
         dir
+    }
+
+    #[test]
+    fn embedded_draft_directory_is_discovered() {
+        let dir = write_config_dir(serde_json::json!({
+            "model_type": "gemma4_text",
+            "text_config": { "hidden_size": 64 }
+        }));
+        let embedded = dir.join(EMBEDDED_DRAFT_DIR);
+        fs::create_dir_all(&embedded).expect("create embedded draft dir");
+
+        let resolved = resolve_draft_model_path(&dir, None)
+            .expect("embedded draft discovery must succeed")
+            .expect("embedded draft must be present");
+        assert_eq!(resolved, embedded);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_without_embedded_draft_keeps_plain_load_policy() {
+        let dir = write_config_dir(serde_json::json!({
+            "model_type": "gemma4_text",
+            "text_config": { "hidden_size": 64 }
+        }));
+
+        let resolved = resolve_draft_model_path(&dir, None)
+            .expect("missing embedded draft must not fail discovery");
+        assert!(resolved.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_draft_path_overrides_embedded_directory() {
+        let dir = write_config_dir(serde_json::json!({
+            "model_type": "gemma4_text",
+            "text_config": { "hidden_size": 64 }
+        }));
+        fs::create_dir_all(dir.join(EMBEDDED_DRAFT_DIR)).expect("create embedded draft dir");
+        let explicit = dir.join("explicit-draft");
+
+        let resolved = resolve_draft_model_path(
+            &dir,
+            Some(explicit.to_str().expect("utf8 explicit draft path")),
+        )
+        .expect("explicit draft resolution must succeed")
+        .expect("explicit draft must be present");
+        assert_eq!(resolved, explicit);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn embedded_draft_non_directory_is_rejected() {
+        let dir = write_config_dir(serde_json::json!({
+            "model_type": "gemma4_text",
+            "text_config": { "hidden_size": 64 }
+        }));
+        fs::write(dir.join(EMBEDDED_DRAFT_DIR), b"not a directory")
+            .expect("write malformed embedded draft path");
+
+        let err = resolve_draft_model_path(&dir, None)
+            .expect_err("a non-directory embedded draft must be rejected");
+        assert!(
+            err.reason.contains("exists but is not a directory"),
+            "unexpected error: {}",
+            err.reason
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn embedded_draft_conflicts_with_explicit_paged_cache() {
+        let dir = write_config_dir(serde_json::json!({
+            "model_type": "gemma4_text",
+            "text_config": { "hidden_size": 64 },
+            "use_block_paged_cache": true
+        }));
+        fs::create_dir_all(dir.join(EMBEDDED_DRAFT_DIR)).expect("create embedded draft dir");
+
+        let err = match Gemma4Inner::load_from_dir(dir.to_str().expect("utf8 temp dir"), None) {
+            Ok(_) => panic!("explicit paged + embedded draft must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.reason.contains("embedded draft/ checkpoint")
+                && err.reason.contains("use_block_paged_cache=true"),
+            "unexpected error: {}",
+            err.reason
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// draft_model_path + an EXPLICIT `use_block_paged_cache: true` is a
@@ -2884,6 +3249,10 @@ mod tests {
             cfg.is_unified,
             "architecture alone must set is_unified=true"
         );
+        assert!(
+            !should_load_media_sidecar(&cfg),
+            "unified text-only config must not request vision.safetensors"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2937,6 +3306,303 @@ mod tests {
             assert_eq!(cfg.audio_samples_per_token, None);
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn affine_sidecar_widen_gate_requires_explicit_nested_bfloat16() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "dtype": "float16",
+                    "text_config": { "dtype": "bfloat16" }
+                }),
+                true,
+            ),
+            (
+                serde_json::json!({
+                    "text_config": { "torch_dtype": "BFLOAT16" }
+                }),
+                true,
+            ),
+            (
+                serde_json::json!({
+                    "dtype": "bfloat16",
+                    "text_config": { "hidden_size": 64 }
+                }),
+                false,
+            ),
+            (
+                serde_json::json!({
+                    "dtype": "bfloat16",
+                    "text_config": { "dtype": "float16" }
+                }),
+                false,
+            ),
+            (
+                serde_json::json!({
+                    "text_config": {
+                        "dtype": "float16",
+                        "torch_dtype": "bfloat16"
+                    }
+                }),
+                false,
+            ),
+        ];
+
+        for (json, expected) in cases {
+            let dir = write_config_dir(json);
+            let parsed = parse_config_with_load_metadata(&dir).expect("parse load metadata");
+            assert_eq!(
+                parsed.text_config_explicitly_bfloat16, expected,
+                "only an explicit nested text dtype may enable widening"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn affine_sidecar_widen_selection_excludes_mixed_modes_embeddings_and_media() {
+        let packed = || MxArray::zeros(&[2, 4], Some(DType::Uint32)).expect("packed weight");
+        let f16 = || {
+            MxArray::from_float32(&[0.03125, 0.0625], &[2, 1])
+                .expect("sidecar")
+                .astype(DType::Float16)
+                .expect("f16 sidecar")
+        };
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        let mut insert_affine_shaped = |prefix: &str| {
+            params.insert(format!("{prefix}.weight"), packed());
+            params.insert(format!("{prefix}.scales"), f16());
+            params.insert(format!("{prefix}.biases"), f16());
+        };
+
+        // These two are real text QMM projections and use the affine default.
+        insert_affine_shaped("layers.0.self_attn.q_proj");
+        insert_affine_shaped("lm_head");
+        // Mixed-mode overrides must win over the affine default even when a
+        // malformed fixture uses FP16 sidecars instead of each MX mode's uint8
+        // scale storage. This proves selection is metadata-driven, not dtype- or
+        // suffix-only.
+        insert_affine_shaped("layers.0.self_attn.k_proj");
+        insert_affine_shaped("layers.0.self_attn.v_proj");
+        insert_affine_shaped("layers.0.self_attn.o_proj");
+        insert_affine_shaped("layers.0.mlp.gate_proj");
+        drop(insert_affine_shaped);
+
+        // Affine-shaped, but not text QMM paths: packed embedding lookup and
+        // unified media projection must retain their FP16 dequant semantics.
+        params.insert("embed_tokens.weight".into(), packed());
+        params.insert("embed_tokens.scales".into(), f16());
+        params.insert("embed_tokens.biases".into(), f16());
+        params.insert("embed_vision.embedding_projection.weight".into(), packed());
+        params.insert("embed_vision.embedding_projection.scales".into(), f16());
+        params.insert("embed_vision.embedding_projection.biases".into(), f16());
+
+        // A dense sibling with a stray scales key cannot be treated as packed
+        // affine storage.
+        params.insert(
+            "layers.0.mlp.up_proj.weight".into(),
+            MxArray::zeros(&[2, 32], Some(DType::BFloat16)).expect("dense weight"),
+        );
+        params.insert("layers.0.mlp.up_proj.scales".into(), f16());
+
+        let plq = |mode| PerLayerQuant {
+            bits: 4,
+            group_size: 32,
+            mode,
+            input_amax: None,
+        };
+        let per_layer_quant = HashMap::from([
+            ("layers.0.self_attn.k_proj".into(), plq(PerLayerMode::Mxfp4)),
+            ("layers.0.self_attn.v_proj".into(), plq(PerLayerMode::Mxfp8)),
+            ("layers.0.self_attn.o_proj".into(), plq(PerLayerMode::Nvfp4)),
+            ("layers.0.mlp.gate_proj".into(), plq(PerLayerMode::Sym8)),
+        ]);
+
+        let stats = widen_bf16_affine_text_qmm_sidecars(
+            &mut params,
+            true,
+            4,
+            32,
+            Some(PerLayerMode::Affine),
+            &per_layer_quant,
+        )
+        .expect("widen selected sidecars");
+        assert_eq!(stats.projections, 2);
+        assert_eq!(stats.arrays, 4);
+        assert_eq!(stats.source_bytes, 16);
+        assert_eq!(stats.resident_bytes, 32);
+
+        for prefix in ["layers.0.self_attn.q_proj", "lm_head"] {
+            assert_eq!(
+                params[&format!("{prefix}.scales")].dtype().unwrap(),
+                DType::Float32
+            );
+            assert_eq!(
+                params[&format!("{prefix}.biases")].dtype().unwrap(),
+                DType::Float32
+            );
+        }
+        for prefix in [
+            "layers.0.self_attn.k_proj",
+            "layers.0.self_attn.v_proj",
+            "layers.0.self_attn.o_proj",
+            "layers.0.mlp.gate_proj",
+            "embed_tokens",
+            "embed_vision.embedding_projection",
+        ] {
+            assert_eq!(
+                params[&format!("{prefix}.scales")].dtype().unwrap(),
+                DType::Float16,
+                "{prefix} must be excluded"
+            );
+            assert_eq!(
+                params[&format!("{prefix}.biases")].dtype().unwrap(),
+                DType::Float16,
+                "{prefix} must be excluded"
+            );
+        }
+        assert_eq!(
+            params["layers.0.mlp.up_proj.scales"].dtype().unwrap(),
+            DType::Float16,
+            "a non-packed sibling must be excluded"
+        );
+    }
+
+    #[test]
+    fn affine_sidecar_widen_is_value_and_qmm_exact_and_config_gated() {
+        let prefix = "layers.0.self_attn.q_proj";
+        let packed_words = [
+            0x7654_3210,
+            0xfedc_ba98,
+            0x1357_9bdf,
+            0xeca8_6420,
+            0x0123_4567,
+            0x89ab_cdef,
+            0x0246_8ace,
+            0x1357_9bdf,
+            0x1111_1111,
+            0x7777_7777,
+            0x9999_9999,
+            0xffff_ffff,
+            0xaaaa_aaaa,
+            0x5555_5555,
+            0x0f0f_f0f0,
+            0x1234_abcd,
+        ];
+        let weight = MxArray::from_uint32(&packed_words, &[4, 4]).expect("packed q4 weight");
+        let scales = MxArray::from_float32(&[0.03125, 0.0625, 0.125, 0.25], &[4, 1])
+            .expect("scales")
+            .astype(DType::Float16)
+            .expect("f16 scales");
+        let biases = MxArray::from_float32(&[-0.25, -0.5, -1.0, -2.0], &[4, 1])
+            .expect("biases")
+            .astype(DType::Float16)
+            .expect("f16 biases");
+        let original_scales = scales.to_float32().expect("read scales").to_vec();
+        let original_biases = biases.to_float32().expect("read biases").to_vec();
+        let input_values: Vec<f32> = (0..64).map(|i| ((i as f32 % 13.0) - 6.0) / 8.0).collect();
+        let input = MxArray::from_float32(&input_values, &[2, 32])
+            .expect("input")
+            .astype(DType::BFloat16)
+            .expect("bf16 input");
+
+        let affine_qmm = |weight: &MxArray, scales: &MxArray, biases: &MxArray| {
+            let handle = unsafe {
+                mlx_sys::mlx_quantized_matmul(
+                    input.as_raw_ptr(),
+                    weight.as_raw_ptr(),
+                    scales.as_raw_ptr(),
+                    biases.as_raw_ptr(),
+                    true,
+                    32,
+                    4,
+                    c"affine".as_ptr(),
+                )
+            };
+            MxArray::from_handle(handle, "test_affine_qmm").expect("affine qmm")
+        };
+
+        let before = {
+            let output = affine_qmm(&weight, &scales, &biases);
+            assert_eq!(output.dtype().unwrap(), DType::Float32);
+            output.to_float32().expect("read original qmm").to_vec()
+        };
+
+        let mut params = HashMap::from([
+            (format!("{prefix}.weight"), weight),
+            (format!("{prefix}.scales"), scales),
+            (format!("{prefix}.biases"), biases),
+        ]);
+
+        let gated_off = widen_bf16_affine_text_qmm_sidecars(
+            &mut params,
+            false,
+            4,
+            32,
+            Some(PerLayerMode::Affine),
+            &HashMap::new(),
+        )
+        .expect("non-bf16 gate");
+        assert_eq!(gated_off, AffineSidecarWidenStats::default());
+        assert_eq!(
+            params[&format!("{prefix}.scales")].dtype().unwrap(),
+            DType::Float16
+        );
+
+        let stats = widen_bf16_affine_text_qmm_sidecars(
+            &mut params,
+            true,
+            4,
+            32,
+            Some(PerLayerMode::Affine),
+            &HashMap::new(),
+        )
+        .expect("bf16 affine widening");
+        assert_eq!(stats.projections, 1);
+        assert_eq!(stats.arrays, 2);
+        assert_eq!(stats.source_bytes, 16);
+        assert_eq!(stats.resident_bytes, 32);
+        assert_eq!(
+            params[&format!("{prefix}.scales")]
+                .to_float32()
+                .expect("read widened scales")
+                .to_vec(),
+            original_scales,
+            "FP16 -> FP32 must preserve every sidecar value exactly"
+        );
+        assert_eq!(
+            params[&format!("{prefix}.biases")]
+                .to_float32()
+                .expect("read widened biases")
+                .to_vec(),
+            original_biases,
+            "FP16 -> FP32 must preserve every sidecar value exactly"
+        );
+
+        // This is the same chunked materialization seam used by model load.
+        // Evaluating the cast outputs detaches their FP16 parent graph, so only
+        // the widened runtime arrays remain retained by params/model clones.
+        let materialize = [
+            &params[&format!("{prefix}.scales")],
+            &params[&format!("{prefix}.biases")],
+        ];
+        crate::array::memory::materialize_weights(&materialize)
+            .expect("materialize widened sidecars");
+
+        let after = {
+            let output = affine_qmm(
+                &params[&format!("{prefix}.weight")],
+                &params[&format!("{prefix}.scales")],
+                &params[&format!("{prefix}.biases")],
+            );
+            assert_eq!(output.dtype().unwrap(), DType::Float32);
+            output.to_float32().expect("read widened qmm").to_vec()
+        };
+        assert_eq!(
+            after, before,
+            "pre-widening must preserve the existing promoted-FP32 QMM result bit-for-bit"
+        );
     }
 
     /// sym8's mandatory f32 `[N]` `.scales` (sibling `.weight` is Int8) must

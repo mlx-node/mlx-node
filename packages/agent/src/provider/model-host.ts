@@ -29,7 +29,10 @@ export interface MlxModelHostOptions {
   /**
    * Reject a loaded model unless its native paged-cache adapter is active.
    * The agent entrypoint enables this so a model/platform incompatibility
-   * fails clearly instead of silently falling back to flat KV cache.
+   * fails clearly instead of silently falling back to flat KV cache. Gemma4
+   * with an attached external draft is the deliberate exception used only by
+   * the agent's explicit draft opt-in: its DSpark / assistant speculative
+   * executor is currently flat-cache-only.
    */
   requirePagedCache?: boolean;
 }
@@ -109,18 +112,15 @@ export class MlxModelHost {
         const resolvedPath = await this.resolveModelPathFn(entry);
         const model = await this.loadModelFn(resolvedPath);
         const sessionModel = model as unknown as SessionCapableModel;
-        if (this.requirePagedCache && sessionModel.hasBlockPagedCache?.() !== true) {
+        const gemmaDraftActive = entry.modelType === 'gemma4' && sessionModel.hasMtpWeights?.() === true;
+        if (this.requirePagedCache && sessionModel.hasBlockPagedCache?.() !== true && !gemmaDraftActive) {
           throw new Error(
             `MlxModelHost: model "${modelId}" (${entry.modelType}) loaded without an active ` +
               `PagedAttention cache; this checkpoint, quantization, or platform is not compatible ` +
               `with the mlx agent paged-cache requirement`,
           );
         }
-        if (
-          this.requirePagedCache &&
-          entry.modelType === 'qwen3_5_moe' &&
-          sessionModel.hasMtpWeights?.() === true
-        ) {
+        if (this.requirePagedCache && entry.modelType === 'qwen3_5_moe' && sessionModel.hasMtpWeights?.() === true) {
           throw new Error(
             `MlxModelHost: model "${modelId}" has Qwen3.5 MoE MTP weights, but the native MoE ` +
               `backend cannot combine MTP with PagedAttention yet; refusing to silently downgrade ` +

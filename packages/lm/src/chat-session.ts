@@ -399,7 +399,9 @@ export interface SessionCapableModel {
    *   drafts resolve the field per draft variant instead — see the
    *   Gemma4 section below.
    * - **`mtpAdaptiveDepth`** — toggles the adaptive depth policy.
-   *   Defaults to OFF. When ON, the default mode runs a 5-state machine
+   *   Defaults to OFF for native MTP and assistants (Gemma4 DSpark has the
+   *   family override documented below). When ON, the native-MTP default
+   *   mode runs a 5-state machine
    *   (`Explore` → `Full` → {`NeighborProbe` | `Reduced` → `Probe`})
    *   with per-depth EMA tracking of
    *   `accepted_tokens / cycle_wall_ns` and picks the depth that
@@ -426,19 +428,23 @@ export interface SessionCapableModel {
    * value — the engine's central `[1, 5]` clamp is an MTP-head
    * contract that does not apply to external drafts):
    *
-   * - **DSpark**: an unset `mtpDepth` runs full draft blocks (the
-   *   draft checkpoint's block size — 7 tokens on
-   *   `dspark_gemma4_12b_block7`), and an explicit `mtpDepth` acts as
-   *   a CAP on that block (clamped to `[1, blockSize]`).
+   * - **DSpark**: with both knobs unset, full draft blocks (the
+   *   checkpoint's block size — 7 tokens on
+   *   `dspark_gemma4_12b_block7`) run behind a short per-turn measurement
+   *   against target-only AR. If DSpark loses on the current host/context,
+   *   that turn permanently falls back to exact target-only decoding. An
+   *   insufficiently long generation budget preserves the fixed-block path.
+   *   An explicit `mtpDepth` acts as a CAP on the block (clamped to
+   *   `[1, blockSize]`) and pins it unless `mtpAdaptiveDepth: true` opts the
+   *   guard back in. Explicit `mtpAdaptiveDepth: false` disables the guard.
    * - **Assistant** (Google `gemma-4-*-it-assistant`): chained AR
    *   drafting has no checkpoint-pinned block size — an unset
    *   `mtpDepth` drafts 3 tokens per cycle (`ASSISTANT_DEFAULT_DEPTH`,
    *   a quality/latency tradeoff, not a checkpoint contract), and an
    *   explicit `mtpDepth` clamps to `[1, 8]` (`ASSISTANT_MAX_DEPTH`).
    *
-   * `mtpAdaptiveDepth` is ignored for BOTH variants — neither external
-   * draft loop has an adaptive depth policy. Qwen3.5 native-MTP
-   * semantics above are unchanged.
+   * `mtpAdaptiveDepth` remains ignored for the assistant variant. Qwen3.5
+   * native-MTP semantics above are unchanged.
    */
   hasMtpWeights?(): boolean;
 }

@@ -26,6 +26,10 @@ pub struct Gemma4LayerCache {
     /// window/full state. Used by KV sharing to get the K/V the anchor
     /// attention actually used.
     stashed_kv: Option<(MxArray, MxArray)>,
+    /// Absolute offsets to snapshot from the next multi-token sliding update.
+    requested_sliding_checkpoint_offsets: Vec<i32>,
+    /// Intermediate snapshots captured from the last sliding attention view.
+    pending_sliding_checkpoint_snapshots: Vec<RotatingKVCacheSnapshot>,
 }
 
 impl Gemma4LayerCache {
@@ -33,6 +37,8 @@ impl Gemma4LayerCache {
         Gemma4LayerCache {
             inner: CacheType::Global(KVCache::new()),
             stashed_kv: None,
+            requested_sliding_checkpoint_offsets: Vec::new(),
+            pending_sliding_checkpoint_snapshots: Vec::new(),
         }
     }
 
@@ -40,6 +46,8 @@ impl Gemma4LayerCache {
         Gemma4LayerCache {
             inner: CacheType::Sliding(RotatingKVCache::new(window_size, None)),
             stashed_kv: None,
+            requested_sliding_checkpoint_offsets: Vec::new(),
+            pending_sliding_checkpoint_snapshots: Vec::new(),
         }
     }
 
@@ -101,9 +109,97 @@ impl Gemma4LayerCache {
             CacheType::Sliding(c) => {
                 c.restore_snapshot(snapshot)?;
                 self.stashed_kv = None;
+                self.requested_sliding_checkpoint_offsets.clear();
+                self.pending_sliding_checkpoint_snapshots.clear();
                 Ok(())
             }
         }
+    }
+
+    /// Request intermediate snapshots from the next sliding-cache append.
+    ///
+    /// Global slots ignore the request. Sliding offsets must be strictly
+    /// increasing and later than the cache's current logical offset; the
+    /// append itself validates that they fall inside the new chunk.
+    pub(crate) fn prepare_sliding_checkpoint_capture(&mut self, offsets: &[u32]) -> Result<()> {
+        self.requested_sliding_checkpoint_offsets.clear();
+        self.pending_sliding_checkpoint_snapshots.clear();
+        let CacheType::Sliding(cache) = &self.inner else {
+            return Ok(());
+        };
+
+        let current = cache.get_offset();
+        let mut previous = current;
+        for &offset in offsets {
+            let offset = i32::try_from(offset).map_err(|_| {
+                Error::new(
+                    Status::InvalidArg,
+                    format!("Gemma4 sliding checkpoint offset {offset} exceeds i32::MAX"),
+                )
+            })?;
+            if offset <= previous {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!(
+                        "Gemma4 sliding checkpoint offsets must be strictly increasing after \
+                         current offset {current}; got {offset} after {previous}"
+                    ),
+                ));
+            }
+            self.requested_sliding_checkpoint_offsets.push(offset);
+            previous = offset;
+        }
+        Ok(())
+    }
+
+    /// Drain intermediate snapshots captured by the most recent sliding-cache
+    /// append. Global slots and updates without requested boundaries return an
+    /// empty vector.
+    pub(crate) fn take_sliding_checkpoint_captures(&mut self) -> Vec<RotatingKVCacheSnapshot> {
+        self.requested_sliding_checkpoint_offsets.clear();
+        std::mem::take(&mut self.pending_sliding_checkpoint_snapshots)
+    }
+
+    fn capture_requested_sliding_checkpoints(
+        cache: &RotatingKVCache,
+        attention_keys: &MxArray,
+        attention_values: &MxArray,
+        previous_offset: i32,
+        requested_offsets: &[i32],
+    ) -> Result<Vec<RotatingKVCacheSnapshot>> {
+        if requested_offsets.is_empty() {
+            return Ok(Vec::new());
+        }
+        if cache.get_offset() == previous_offset + 1 {
+            if requested_offsets != [cache.get_offset()] {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!(
+                        "Gemma4 single-token sliding update at offset {} cannot capture \
+                         intermediate checkpoints {requested_offsets:?}",
+                        cache.get_offset()
+                    ),
+                ));
+            }
+            let snapshot = cache.snapshot()?.ok_or_else(|| {
+                Error::new(
+                    Status::InvalidArg,
+                    "Gemma4 single-token sliding checkpoint requested from an empty cache",
+                )
+            })?;
+            return Ok(vec![snapshot]);
+        }
+        requested_offsets
+            .iter()
+            .map(|&offset| {
+                cache.snapshot_from_attention_view(
+                    attention_keys,
+                    attention_values,
+                    previous_offset,
+                    offset,
+                )
+            })
+            .collect()
     }
 
     /// Get the current cached K/V as (keys, values).
@@ -148,13 +244,24 @@ impl Gemma4LayerCache {
         keys: &MxArray,
         values: &MxArray,
     ) -> Result<(MxArray, MxArray)> {
+        let requested_offsets = self.requested_sliding_checkpoint_offsets.clone();
+        let mut captured = Vec::new();
         let (k, v) = match &mut self.inner {
             CacheType::Global(kvc) => kvc.update_and_fetch(keys, values)?,
             CacheType::Sliding(rkvc) => {
+                let previous_offset = rkvc.get_offset();
                 let kv = rkvc.update_and_fetch(keys, values)?;
+                captured = Self::capture_requested_sliding_checkpoints(
+                    rkvc,
+                    &kv[0],
+                    &kv[1],
+                    previous_offset,
+                    &requested_offsets,
+                )?;
                 (kv[0].clone(), kv[1].clone())
             }
         };
+        self.pending_sliding_checkpoint_snapshots = captured;
         self.stashed_kv = Some((k.clone(), v.clone()));
         Ok((k, v))
     }
@@ -166,13 +273,25 @@ impl Gemma4LayerCache {
         keys: &MxArray,
         values: &MxArray,
     ) -> Result<(MxArray, MxArray)> {
-        match &mut self.inner {
+        let requested_offsets = self.requested_sliding_checkpoint_offsets.clone();
+        let mut captured = Vec::new();
+        let result = match &mut self.inner {
             CacheType::Global(kvc) => kvc.update_and_fetch(keys, values),
             CacheType::Sliding(rkvc) => {
+                let previous_offset = rkvc.get_offset();
                 let kv = rkvc.update_and_fetch(keys, values)?;
+                captured = Self::capture_requested_sliding_checkpoints(
+                    rkvc,
+                    &kv[0],
+                    &kv[1],
+                    previous_offset,
+                    &requested_offsets,
+                )?;
                 Ok((kv[0].clone(), kv[1].clone()))
             }
-        }
+        };
+        self.pending_sliding_checkpoint_snapshots = captured;
+        result
     }
 
     /// Save K/V into the stash (replaces any previous stash).
@@ -252,6 +371,8 @@ impl Gemma4LayerCache {
             CacheType::Sliding(c) => {
                 c.reset();
                 self.stashed_kv = None;
+                self.requested_sliding_checkpoint_offsets.clear();
+                self.pending_sliding_checkpoint_snapshots.clear();
                 Ok(())
             }
         }
@@ -997,6 +1118,44 @@ mod tests {
 
         let (restored_tail, _) = restored.get_cached_kv().unwrap();
         assert_float_data(&restored_tail, &[5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_sliding_checkpoint_capture_keeps_cadence_from_unaligned_prefix() {
+        let mut source = Gemma4LayerCache::new_sliding(4);
+        let (prefix_keys, prefix_values) = kv_pair(&[1.0, 2.0]);
+        source
+            .update_and_fetch(&prefix_keys, &prefix_values)
+            .unwrap();
+
+        // The live cache starts at an unaligned offset and processes one
+        // eight-token compute chunk. Capture both four-token cadence points
+        // without splitting that forward into smaller cache updates.
+        source.prepare_sliding_checkpoint_capture(&[4, 8]).unwrap();
+        let (chunk_keys, chunk_values) = kv_pair(&[3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]);
+        source.update_and_fetch(&chunk_keys, &chunk_values).unwrap();
+        assert!(source.sliding_offset_matches(10).unwrap());
+
+        let captures = source.take_sliding_checkpoint_captures();
+        assert_eq!(
+            captures
+                .iter()
+                .map(|snapshot| snapshot.offset)
+                .collect::<Vec<_>>(),
+            vec![4, 8]
+        );
+
+        let mut at_four = Gemma4LayerCache::new_sliding(4);
+        at_four.restore_sliding_snapshot(&captures[0]).unwrap();
+        let (keys, values) = at_four.get_cached_kv().unwrap();
+        assert_float_data(&keys, &[1.0, 2.0, 3.0, 4.0]);
+        assert_float_data(&values, &[10.0, 20.0, 30.0, 40.0]);
+
+        let mut at_eight = Gemma4LayerCache::new_sliding(4);
+        at_eight.restore_sliding_snapshot(&captures[1]).unwrap();
+        let (keys, values) = at_eight.get_cached_kv().unwrap();
+        assert_float_data(&keys, &[5.0, 6.0, 7.0, 8.0]);
+        assert_float_data(&values, &[50.0, 60.0, 70.0, 80.0]);
     }
 
     #[test]

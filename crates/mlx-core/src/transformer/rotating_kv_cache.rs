@@ -491,6 +491,113 @@ impl RotatingKVCache {
         }))
     }
 
+    /// Snapshot an intermediate logical offset from the temporal attention
+    /// view returned by the most recent multi-token append.
+    ///
+    /// `attention_keys`/`attention_values` contain the ordered cache tail from
+    /// `previous_offset` followed by every token in the new append. This lets a
+    /// caller retain checkpoint cadence inside a large compute chunk without
+    /// splitting that chunk into multiple model forwards. The returned arrays
+    /// are lazy views/concats; callers that keep them beyond the current graph
+    /// must copy+eval them before clearing MLX's cache.
+    pub(crate) fn snapshot_from_attention_view(
+        &self,
+        attention_keys: &MxArray,
+        attention_values: &MxArray,
+        previous_offset: i32,
+        checkpoint_offset: i32,
+    ) -> Result<RotatingKVCacheSnapshot> {
+        Self::validate_config(self.max_size, self.keep)?;
+        if previous_offset < 0
+            || checkpoint_offset <= previous_offset
+            || checkpoint_offset > self.offset
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "RotatingKVCache intermediate snapshot offset out of range: \
+                     previous={previous_offset} checkpoint={checkpoint_offset} current={}",
+                    self.offset
+                ),
+            ));
+        }
+
+        let key_shape = attention_keys.shape()?;
+        let value_shape = attention_values.shape()?;
+        if key_shape.len() != 4
+            || value_shape.len() != 4
+            || key_shape[0] != value_shape[0]
+            || key_shape[1] != value_shape[1]
+            || key_shape[2] != value_shape[2]
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "RotatingKVCache intermediate snapshot expects matching rank-4 K/V views, \
+                     got keys={:?} values={:?}",
+                    key_shape.to_vec(),
+                    value_shape.to_vec()
+                ),
+            ));
+        }
+
+        let previous_cached = Self::expected_cached_tokens(previous_offset, self.max_size)?;
+        let appended_through_checkpoint = checkpoint_offset - previous_offset;
+        let view_end = previous_cached
+            .checked_add(appended_through_checkpoint)
+            .ok_or_else(|| {
+                Error::new(
+                    Status::InvalidArg,
+                    "RotatingKVCache intermediate snapshot view length overflow",
+                )
+            })?;
+        let view_tokens = i32::try_from(key_shape[2]).map_err(|_| {
+            Error::new(
+                Status::InvalidArg,
+                format!(
+                    "RotatingKVCache intermediate snapshot attention view is too long: {}",
+                    key_shape[2]
+                ),
+            )
+        })?;
+        if view_end > view_tokens {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "RotatingKVCache intermediate snapshot needs {view_end} attention tokens \
+                     but the view contains {}",
+                    key_shape[2]
+                ),
+            ));
+        }
+
+        let cached_tokens = Self::expected_cached_tokens(checkpoint_offset, self.max_size)?;
+        let slice_snapshot = |view: &MxArray| -> Result<MxArray> {
+            if self.keep == 0 || checkpoint_offset <= self.max_size {
+                let start = view_end - cached_tokens;
+                return view.slice_axis(2, start as i64, view_end as i64);
+            }
+
+            let keep_len = self.keep.min(cached_tokens);
+            let tail_len = cached_tokens - keep_len;
+            let kept = view.slice_axis(2, 0, keep_len as i64)?;
+            if tail_len == 0 {
+                return Ok(kept);
+            }
+            let tail = view.slice_axis(2, (view_end - tail_len) as i64, view_end as i64)?;
+            MxArray::concatenate(&kept, &tail, 2)
+        };
+
+        Ok(RotatingKVCacheSnapshot {
+            keys: slice_snapshot(attention_keys)?,
+            values: slice_snapshot(attention_values)?,
+            offset: checkpoint_offset,
+            max_size: self.max_size,
+            keep: self.keep,
+            cached_tokens,
+        })
+    }
+
     /// Restore a previously snapshotted ordered K/V tail.
     ///
     /// The restored cache has the same logical `offset` as the source cache and

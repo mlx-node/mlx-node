@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
@@ -31,6 +31,8 @@ Required Arguments:
 Optional Arguments:
   --dtype, -d <type>    Target dtype (default: bfloat16)
                         Options: float32, float16, bfloat16
+  --config-dir <path>   Hugging Face config/tokenizer asset directory to copy
+                        when converting a GGUF model
   --model-type, -m      Model type (auto-detected if not specified)
                         Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_5, qwen3_5_moe, lfm2_moe, lfm2, qianfan-ocr, privacy-filter
   --verbose, -v         Enable verbose logging
@@ -168,6 +170,7 @@ export async function run(argv: string[]) {
       'q-recipe': { type: 'string' },
       'q-mtp': { type: 'string' },
       'imatrix-path': { type: 'string' },
+      'config-dir': { type: 'string' },
       mmproj: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
     },
@@ -392,6 +395,18 @@ export async function run(argv: string[]) {
     }
   }
 
+  const configSourceDir = args['config-dir'] ? resolve(args['config-dir']) : undefined;
+  if (configSourceDir !== undefined) {
+    if (!existsSync(configSourceDir)) {
+      console.error(`Error: config directory not found: ${configSourceDir}`);
+      process.exit(1);
+    }
+    if (!statSync(configSourceDir).isDirectory()) {
+      console.error(`Error: --config-dir must point to a directory: ${configSourceDir}`);
+      process.exit(1);
+    }
+  }
+
   const startTime = Date.now();
 
   // GGUF file detection
@@ -443,6 +458,9 @@ export async function run(argv: string[]) {
     if (mmprojPath) {
       console.log(`mmproj:     ${mmprojPath}`);
     }
+    if (configSourceDir) {
+      console.log(`Config dir: ${configSourceDir}`);
+    }
     console.log('');
 
     try {
@@ -458,6 +476,7 @@ export async function run(argv: string[]) {
         quantMxfp: args['q-mxfp'],
         quantRecipe,
         imatrixPath,
+        configSourceDir,
         vlmKeyPrefix: !!mmprojPath,
       });
 
@@ -483,6 +502,7 @@ export async function run(argv: string[]) {
           dtype: 'bfloat16',
           verbose,
           quantize: false,
+          configSourceDir,
           outputFilename: 'vision.safetensors',
         });
         console.log(`✓ Converted ${visionResult.numTensors} vision tensors`);

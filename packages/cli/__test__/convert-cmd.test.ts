@@ -11,7 +11,7 @@
  * conversion runs; `process.exit` is mocked to throw so the test proves
  * validation halts before reaching the (mocked) native call.
  */
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -64,6 +64,68 @@ describe('mlx convert GGUF validation', () => {
     expect(errors).toContain('--q-mode sym8 is not supported for GGUF input');
     expect(exitSpy).toHaveBeenCalledWith(1);
     expect(convertGgufToSafetensors).not.toHaveBeenCalled();
+  });
+
+  it('rejects --config-dir when the path is not a directory', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+    const configFile = join(tmp, 'config.json');
+    writeFileSync(configFile, '{}');
+
+    await expect(
+      runConvert(['--input', ggufPath, '--output', join(tmp, 'out'), '--config-dir', configFile]),
+    ).rejects.toThrow('process.exit(1)');
+
+    const errors = errSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(errors).toContain('--config-dir must point to a directory');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(convertGgufToSafetensors).not.toHaveBeenCalled();
+  });
+
+  it('forwards --config-dir to both the main and mmproj GGUF conversions', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const configDir = join(tmp, 'hf-config');
+    const mmprojPath = join(tmp, 'mmproj.gguf');
+    mkdirSync(configDir);
+    writeFileSync(mmprojPath, '');
+
+    await runConvert([
+      '--input',
+      ggufPath,
+      '--output',
+      join(tmp, 'out'),
+      '--config-dir',
+      configDir,
+      '--mmproj',
+      mmprojPath,
+    ]);
+
+    const mock = vi.mocked(convertGgufToSafetensors);
+    expect(mock).toHaveBeenCalledTimes(2);
+    expect(mock).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        inputPath: ggufPath,
+        dtype: 'bfloat16',
+        quantize: false,
+        configSourceDir: configDir,
+        vlmKeyPrefix: true,
+      }),
+    );
+    expect(mock).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        inputPath: mmprojPath,
+        dtype: 'bfloat16',
+        quantize: false,
+        configSourceDir: configDir,
+        outputFilename: 'vision.safetensors',
+      }),
+    );
   });
 });
 
@@ -127,6 +189,7 @@ describe('mlx convert Unsloth MXFP messaging', () => {
     await runConvert(['--help']);
 
     const help = logSpy.mock.calls.map((call) => String(call[0])).join('\n');
+    expect(help).toContain('--config-dir <path>');
     expect(help).toContain('Qwen3.5 MXFP map: early FFNs=mxfp4');
     expect(help).toContain('Use --q-mode nvfp4 for the official DGX map');
     expect(help).toContain('Plain affine keeps legacy Dynamic 2.0');

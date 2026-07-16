@@ -1,19 +1,17 @@
-//! Model-free numerical parity for the dedicated grouped Qwen3.5/Qwen3.6
-//! striped-attention reducer.
+//! Model-free numerical parity for the grouped Qwen3.5/Qwen3.6 D256 and
+//! Gemma 4 D512 striped-attention reducers.
 //!
-//! The stage-1 grouped kernel emits one unnormalized BF16 D256 numerator plus
+//! The stage-1 grouped kernel emits one unnormalized BF16 numerator plus
 //! an f32 local maximum and exponential sum per stripe. The dedicated reducer
 //! must reconstruct the global softmax result across 32 SIMD-group stripe
-//! classes. This test directly dispatches that reducer with the representative
-//! production stripe counts (256, 512, and 1024), including deterministic
-//! empty-stripe sentinels.
+//! classes. This test covers both head sizes and Gemma's diagnostic 4/8/16
+//! stripe counts, including deterministic empty-stripe sentinels.
 
 #![cfg(all(target_os = "macos", mlx_node_metal_enabled))]
 
 use metal::{MTLResourceOptions, MTLSize};
 use mlx_paged_attn::metal::MetalState;
 
-const HEAD_SIZE: usize = 256;
 const NUM_HEADS: usize = 3;
 const QUERY_ROWS: usize = 2;
 const NUM_ROWS: usize = NUM_HEADS * QUERY_ROWS;
@@ -42,22 +40,22 @@ struct ReducerInputs {
 }
 
 impl ReducerInputs {
-    fn new(num_stripes: usize) -> Self {
+    fn new(num_stripes: usize, head_size: usize) -> Self {
         let mut exp_sums = vec![0.0f32; NUM_ROWS * num_stripes];
         let mut max_logits = vec![-f32::MAX; NUM_ROWS * num_stripes];
-        let mut partials_bf16 = vec![0u16; NUM_ROWS * num_stripes * HEAD_SIZE];
+        let mut partials_bf16 = vec![0u16; NUM_ROWS * num_stripes * head_size];
 
         for row in 0..NUM_ROWS {
             for stripe in 0..num_stripes {
                 let stats_index = row * num_stripes + stripe;
-                let partial_start = stats_index * HEAD_SIZE;
+                let partial_start = stats_index * head_size;
                 if is_empty_stripe(row, stripe) {
                     // Stage 1 represents an empty stripe with this exact pair.
                     // Poison the associated numerator: the reducer must give it
                     // zero weight rather than accidentally consuming it.
                     exp_sums[stats_index] = 0.0;
                     max_logits[stats_index] = -f32::MAX;
-                    partials_bf16[partial_start..partial_start + HEAD_SIZE]
+                    partials_bf16[partial_start..partial_start + head_size]
                         .fill(f32_to_bf16_bits(29.0 + row as f32));
                     continue;
                 }
@@ -68,7 +66,7 @@ impl ReducerInputs {
                 max_logits[stats_index] = local_max;
                 exp_sums[stats_index] = local_sum;
 
-                for dim in 0..HEAD_SIZE {
+                for dim in 0..head_size {
                     let phase = stripe as f32 * 0.019 + row as f32 * 0.31 + dim as f32 * 0.027;
                     // An unnormalized local softmax numerator should generally
                     // scale with its local exponential sum. Round here so the
@@ -86,8 +84,8 @@ impl ReducerInputs {
         }
     }
 
-    fn host_reference(&self, num_stripes: usize) -> Vec<f32> {
-        let mut output = vec![0.0f32; NUM_ROWS * HEAD_SIZE];
+    fn host_reference(&self, num_stripes: usize, head_size: usize) -> Vec<f32> {
+        let mut output = vec![0.0f32; NUM_ROWS * head_size];
         for row in 0..NUM_ROWS {
             let stats_start = row * num_stripes;
             let stats_end = stats_start + num_stripes;
@@ -104,26 +102,25 @@ impl ReducerInputs {
             }
             assert!(global_sum.is_finite() && global_sum > 0.0);
 
-            for dim in 0..HEAD_SIZE {
+            for dim in 0..head_size {
                 let mut numerator = 0.0f32;
                 for (stripe, &factor) in factors.iter().enumerate() {
-                    let partial_index = (stats_start + stripe) * HEAD_SIZE + dim;
+                    let partial_index = (stats_start + stripe) * head_size + dim;
                     let partial = bf16_bits_to_f32(self.partials_bf16[partial_index]);
                     numerator += factor * partial;
                 }
-                output[row * HEAD_SIZE + dim] = numerator / global_sum;
+                output[row * head_size + dim] = numerator / global_sum;
             }
         }
         output
     }
 }
 
-fn run_reducer_case(state: &MetalState, num_stripes: usize) {
-    assert!(num_stripes.is_multiple_of(32));
-    let inputs = ReducerInputs::new(num_stripes);
-    let expected = inputs.host_reference(num_stripes);
+fn run_reducer_case(state: &MetalState, head_size: usize, num_stripes: usize) {
+    let inputs = ReducerInputs::new(num_stripes, head_size);
+    let expected = inputs.host_reference(num_stripes, head_size);
 
-    let output_bytes = NUM_ROWS * HEAD_SIZE * std::mem::size_of::<u16>();
+    let output_bytes = NUM_ROWS * head_size * std::mem::size_of::<u16>();
     let output = state
         .device
         .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
@@ -148,8 +145,13 @@ fn run_reducer_case(state: &MetalState, num_stripes: usize) {
         .device
         .new_buffer_with_value(&num_stripes_i32, MTLResourceOptions::StorageModeShared);
 
+    let pipeline_name = match head_size {
+        256 => MetalState::paged_attention_grouped_qwen35_reduce_kernel_name(),
+        512 => MetalState::paged_attention_grouped_gemma4_reduce_kernel_name(),
+        _ => panic!("unsupported grouped reducer head size {head_size}"),
+    };
     let pipeline = state
-        .get_pipeline(MetalState::paged_attention_grouped_qwen35_reduce_kernel_name())
+        .get_pipeline(pipeline_name)
         .expect("grouped striped reducer pipeline must load");
     let command_buffer = state.command_queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
@@ -169,7 +171,7 @@ fn run_reducer_case(state: &MetalState, num_stripes: usize) {
     command_buffer.wait_until_completed();
 
     let actual_bits = unsafe {
-        std::slice::from_raw_parts(output.contents() as *const u16, NUM_ROWS * HEAD_SIZE)
+        std::slice::from_raw_parts(output.contents() as *const u16, NUM_ROWS * head_size)
     };
     let actual: Vec<f32> = actual_bits.iter().copied().map(bf16_bits_to_f32).collect();
 
@@ -192,22 +194,22 @@ fn run_reducer_case(state: &MetalState, num_stripes: usize) {
         "S={num_stripes}: mismatch at flat index {} (query_row={}, head={}, dim={}): \
          actual={}, expected={}, abs_diff={}, tolerance={}",
         worst.1,
-        worst.1 / (NUM_HEADS * HEAD_SIZE),
-        (worst.1 / HEAD_SIZE) % NUM_HEADS,
-        worst.1 % HEAD_SIZE,
+        worst.1 / (NUM_HEADS * head_size),
+        (worst.1 / head_size) % NUM_HEADS,
+        worst.1 % head_size,
         actual[worst.1],
         expected_value,
         worst.0,
         tolerance,
     );
     eprintln!(
-        "S={num_stripes}: max_abs_diff={} at flat index {}",
-        worst.0, worst.1
+        "D={head_size} S={num_stripes}: max_abs_diff={} at flat index {}",
+        worst.0, worst.1,
     );
 }
 
 #[test]
-fn grouped_qwen35_striped_reducer_matches_host_reference() {
+fn grouped_striped_reducers_match_host_reference() {
     let state = match MetalState::get() {
         Ok(state) => state,
         Err(error) if error.contains("No Metal device found") => {
@@ -219,7 +221,12 @@ fn grouped_qwen35_striped_reducer_matches_host_reference() {
 
     // Keep allocations and GPU work sequential. Each case drops all of its
     // buffers before the next representative production stripe count begins.
-    for num_stripes in [256, 512, 1024] {
-        run_reducer_case(state, num_stripes);
+    for (head_size, stripe_counts) in [
+        (256, &[256, 512, 1024][..]),
+        (512, &[4, 8, 16, 32, 64, 128][..]),
+    ] {
+        for &num_stripes in stripe_counts {
+            run_reducer_case(state, head_size, num_stripes);
+        }
     }
 }

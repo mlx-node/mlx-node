@@ -139,6 +139,16 @@ pub struct ChatMessage {
     /// Reasoning content for thinking mode (used with <think> tags)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Thinking mode used when this assistant message was generated.
+    ///
+    /// This is replay provenance, not a request override. Gemma4's disabled-
+    /// thinking generation prefix contains an explicit empty thought channel,
+    /// while an enabled-thinking turn that emitted no reasoning contains no
+    /// such channel. Keeping the historical mode on the message lets the chat
+    /// template reproduce either byte sequence even when a later request
+    /// changes its current thinking setting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_enabled: Option<bool>,
     /// Image data for VLM models (encoded image bytes: PNG/JPEG, passed as Uint8Array/Buffer)
     #[napi(ts_type = "Array<Uint8Array> | undefined")]
     #[serde(skip)]
@@ -158,6 +168,7 @@ impl std::fmt::Debug for ChatMessage {
             .field("tool_call_id", &self.tool_call_id)
             .field("is_error", &self.is_error)
             .field("reasoning_content", &self.reasoning_content)
+            .field("thinking_enabled", &self.thinking_enabled)
             .field(
                 "images",
                 &self
@@ -336,7 +347,7 @@ impl Qwen3Tokenizer {
         None
     }
 
-    /// Rewrite the Qwen3.5 chat-template reasoning gate so our `preserve_thinking=true`
+    /// Rewrite chat-template reasoning gates so our `preserve_thinking=true`
     /// context variable takes effect.
     ///
     /// The stock Qwen3.5 template gates `<think>…</think>` rendering on prior assistant
@@ -356,18 +367,42 @@ impl Qwen3Tokenizer {
     ///   `loop.index0 > ns.last_query_index`
     ///     → `preserve_thinking or loop.index0 > ns.last_query_index`
     ///
-    /// Idempotent: if the template already references `preserve_thinking` (future
-    /// upstream templates, or our own re-patched string) the replacement becomes a
-    /// no-op. For templates that don't contain the Qwen3.5 gate at all (e.g. Gemma4,
-    /// LFM2, legacy ChatML) this is a silent pass-through.
+    /// Gemma4 needs one additional stabilization. With `enable_thinking=false`, its
+    /// generation prompt ends in an explicit empty thought channel:
+    ///
+    /// ```text
+    /// <|channel>thought\n<channel|>
+    /// ```
+    ///
+    /// The stock history branch only emits a thought channel when
+    /// `reasoning_content` is non-empty, so replaying that completed assistant turn
+    /// drops the empty channel and diverges at the first generated token. Patch the
+    /// exact stock Gemma4 gate to (a) replay the empty disable-thinking channel only
+    /// when that historical assistant started a fresh model turn, and (b) retain
+    /// non-empty reasoning across a later user turn, just like the Qwen3.5 patch.
+    /// A tool-result continuation deliberately has no second `<|turn>model` prefix,
+    /// so it must not receive a second empty thought channel either. Per-message
+    /// `thinking_enabled` wins over the current request setting; the latter remains
+    /// a compatibility fallback for histories created before provenance existed.
+    ///
+    /// Both rewrites are idempotent and exact-pattern scoped. Templates that contain
+    /// neither stock gate (LFM2, legacy ChatML, custom templates) pass through
+    /// byte-for-byte.
     fn patch_preserve_thinking(template: &str) -> String {
-        if template.contains("preserve_thinking") {
-            return template.to_string();
+        const GEMMA4_STOCK_GATE: &str = "{%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}\n    {%- if thinking_text and loop.index0 > ns_turn.last_user_idx and message.get('tool_calls') -%}\n        {{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}\n    {%- endif -%}";
+        const GEMMA4_STABLE_GATE: &str = "{%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}\n    {%- set historical_thinking_enabled = message.get('thinking_enabled') -%}\n    {%- if preserve_thinking and thinking_text and message['role'] == 'assistant' -%}\n        {{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}\n    {%- elif preserve_thinking and message['role'] == 'assistant' and not continue_same_model_turn and ((historical_thinking_enabled is boolean and not historical_thinking_enabled) or (historical_thinking_enabled is undefined and not enable_thinking)) -%}\n        {{- '<|channel>thought\\n<channel|>' -}}\n    {%- elif thinking_text and loop.index0 > ns_turn.last_user_idx and message.get('tool_calls') -%}\n        {{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}\n    {%- endif -%}";
+
+        let mut patched = template.to_string();
+        if !patched.contains("preserve_thinking or loop.index0 > ns.last_query_index") {
+            patched = patched.replace(
+                "loop.index0 > ns.last_query_index",
+                "preserve_thinking or loop.index0 > ns.last_query_index",
+            );
         }
-        template.replace(
-            "loop.index0 > ns.last_query_index",
-            "preserve_thinking or loop.index0 > ns.last_query_index",
-        )
+        if !patched.contains("historical_thinking_enabled") {
+            patched = patched.replace(GEMMA4_STOCK_GATE, GEMMA4_STABLE_GATE);
+        }
+        patched
     }
 
     /// Neutralize the HuggingFace `{% generation %}` / `{% endgeneration %}`
@@ -996,6 +1031,7 @@ impl Qwen3Tokenizer {
                 tool_call_id: msg.tool_call_id.clone(),
                 is_error: msg.is_error,
                 reasoning_content: msg.reasoning_content.clone(),
+                thinking_enabled: msg.thinking_enabled,
                 images: msg.images.as_ref().map(|imgs| {
                     imgs.iter()
                         .map(|img| Uint8Array::with_data_copied(img.as_ref()))
@@ -1730,6 +1766,12 @@ pub(crate) fn serialize_message_for_jinja(msg: &ChatMessage) -> serde_json::Valu
             serde_json::json!(reasoning),
         );
     }
+    if let Some(thinking_enabled) = msg.thinking_enabled {
+        obj.insert(
+            "thinking_enabled".to_string(),
+            serde_json::json!(thinking_enabled),
+        );
+    }
 
     serde_json::Value::Object(obj)
 }
@@ -1774,6 +1816,7 @@ mod tests {
             tool_call_id: None,
             is_error: None,
             reasoning_content: None,
+            thinking_enabled: None,
             images,
             audio: None,
         }
@@ -1811,6 +1854,7 @@ mod tests {
             tool_call_id: None,
             is_error: None,
             reasoning_content: None,
+            thinking_enabled: None,
             images,
             audio,
         }
@@ -1987,6 +2031,7 @@ mod tests {
                 tool_call_id: None,
                 is_error: None,
                 reasoning_content: None,
+                thinking_enabled: None,
                 images: Some(vec![
                     Uint8Array::new(vec![0x01, 0x02, 0x03, 0x04]),
                     Uint8Array::new(vec![0xaa, 0xbb, 0xcc]),
@@ -2000,6 +2045,7 @@ mod tests {
                 tool_call_id: None,
                 is_error: None,
                 reasoning_content: None,
+                thinking_enabled: None,
                 images: None,
                 audio: None,
             },
@@ -2055,6 +2101,7 @@ mod tests {
             tool_call_id: None,
             is_error: None,
             reasoning_content: None,
+            thinking_enabled: None,
             images: Some(vec![Uint8Array::new(vec![0; 4])]),
             audio: None,
         }];
@@ -2092,6 +2139,12 @@ mod tests {
     /// want these tests self-contained. All test fixtures use plain
     /// user text that never matches that branch anyway.
     const QWEN35_GATE_SLICE: &str = "{%- set ns = namespace(last_query_index=-1) %}\n{%- for message in messages %}\n    {%- if message.role == \"user\" %}\n        {%- set ns.last_query_index = loop.index0 %}\n    {%- endif %}\n{%- endfor %}\n{%- for message in messages %}\n    {%- set content = message.content|trim %}\n    {%- if message.role == \"user\" %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- endif %}\n        {%- set reasoning_content = reasoning_content|trim %}\n        {%- if loop.index0 > ns.last_query_index %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content + '<|im_end|>\\n' }}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}";
+
+    /// Minimal stock Gemma4 reasoning gate embedded in a small turn renderer.
+    /// The history branch intentionally has the upstream bug: an assistant
+    /// with no reasoning omits the empty thought channel that the generation
+    /// prompt emits when thinking is disabled.
+    const GEMMA4_GATE_SLICE: &str = "{%- set ns_turn = namespace(last_user_idx=-1) -%}\n{%- for i in range(messages | length) -%}\n    {%- if messages[i]['role'] == 'user' -%}\n        {%- set ns_turn.last_user_idx = i -%}\n    {%- endif -%}\n{%- endfor -%}\n{%- for message in messages -%}\n    {%- if message['role'] == 'user' -%}\n        {{- '<|turn>user\\n' + message['content'] + '<turn|>\\n' -}}\n    {%- elif message['role'] == 'assistant' -%}\n        {{- '<|turn>model\\n' -}}\n    {%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}\n    {%- if thinking_text and loop.index0 > ns_turn.last_user_idx and message.get('tool_calls') -%}\n        {{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}\n    {%- endif -%}\n        {%- for tool_call in message.get('tool_calls', []) -%}\n            {{- '<|tool_call>call:' + tool_call['function']['name'] + '{}<tool_call|>' -}}\n        {%- endfor -%}\n        {{- message['content'] -}}\n    {%- endif -%}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    {{- '<|turn>model\\n' -}}\n    {%- if not enable_thinking -%}\n        {{- '<|channel>thought\\n<channel|>' -}}\n    {%- endif -%}\n{%- endif -%}";
 
     /// Build the Jinja env the same way `render_chat_template_jinja2` does
     /// (minus the string-method bridge, which this slice doesn't need).
@@ -2133,12 +2186,386 @@ mod tests {
     }
 
     #[test]
+    fn patch_preserve_thinking_is_idempotent_for_gemma4() {
+        let once = Qwen3Tokenizer::patch_preserve_thinking(GEMMA4_GATE_SLICE);
+        let twice = Qwen3Tokenizer::patch_preserve_thinking(&once);
+        assert_eq!(
+            once, twice,
+            "Gemma4's stabilization must only be applied once"
+        );
+        assert!(once.contains("historical_thinking_enabled"));
+        assert!(once.contains("not continue_same_model_turn"));
+        assert!(once.contains("preserve_thinking and thinking_text"));
+    }
+
+    #[test]
     fn patch_preserve_thinking_passthrough_on_unrelated_templates() {
-        // Templates that don't carry the Qwen3.5 gate (Gemma4 / LFM2 /
+        // Templates that don't carry either recognized reasoning gate (LFM2 /
         // minimal ChatML) must survive verbatim — no `replace` call is
         // allowed to silently corrupt their control flow.
-        let gemma4 = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}";
-        assert_eq!(Qwen3Tokenizer::patch_preserve_thinking(gemma4), gemma4);
+        let custom = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}";
+        assert_eq!(Qwen3Tokenizer::patch_preserve_thinking(custom), custom);
+    }
+
+    /// The exact regression from the Gemma4 agent tool loop: turn 1's
+    /// no-thinking generation prompt places an empty thought channel in KV,
+    /// then turn 2 replays the assistant tool call. The replayed assistant
+    /// prefix must contain that same channel byte-for-byte.
+    #[test]
+    fn gemma4_no_thinking_tool_call_replay_matches_generated_prefix() {
+        let template = Qwen3Tokenizer::patch_preserve_thinking(GEMMA4_GATE_SLICE);
+        let user = ChatMessage {
+            role: "user".to_string(),
+            content: "read it".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        };
+        let first_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
+            &template,
+            std::slice::from_ref(&user),
+            None,
+            true,
+            Some(false),
+            "",
+            "",
+        )
+        .unwrap();
+
+        let generated_tool_call = "<|tool_call>call:read{}<tool_call|>";
+        let replay = Qwen3Tokenizer::render_chat_template_jinja2(
+            &template,
+            &[
+                user,
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: String::new(),
+                    tool_calls: Some(vec![ToolCall {
+                        id: Some("call_1".to_string()),
+                        name: "read".to_string(),
+                        arguments: "{}".to_string(),
+                    }]),
+                    tool_call_id: None,
+                    is_error: None,
+                    reasoning_content: None,
+                    thinking_enabled: Some(false),
+                    images: None,
+                    audio: None,
+                },
+            ],
+            None,
+            false,
+            Some(true),
+            "",
+            "",
+        )
+        .unwrap();
+
+        assert_eq!(
+            replay,
+            format!("{first_prompt}{generated_tool_call}"),
+            "the next full-history replay must extend the cached generation prefix exactly",
+        );
+    }
+
+    /// A mode change on the current request must not rewrite older KV. Real
+    /// historical reasoning wins over the current no-thinking fallback, even
+    /// for a final assistant response with no tool call and after a new user
+    /// turn has moved `last_user_idx` past that assistant.
+    #[test]
+    fn gemma4_real_reasoning_survives_no_thinking_mode_change_without_tool_call() {
+        let template = Qwen3Tokenizer::patch_preserve_thinking(GEMMA4_GATE_SLICE);
+        let user = ChatMessage {
+            role: "user".to_string(),
+            content: "question".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        };
+        let first_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
+            &template,
+            std::slice::from_ref(&user),
+            None,
+            true,
+            Some(true),
+            "",
+            "",
+        )
+        .unwrap();
+        let generated = "<|channel>thought\nkept reasoning\n<channel|>final answer";
+        let replay = Qwen3Tokenizer::render_chat_template_jinja2(
+            &template,
+            &[
+                user,
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: "final answer".to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    is_error: None,
+                    reasoning_content: Some("kept reasoning".to_string()),
+                    thinking_enabled: Some(true),
+                    images: None,
+                    audio: None,
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: "follow-up".to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    is_error: None,
+                    reasoning_content: None,
+                    thinking_enabled: None,
+                    images: None,
+                    audio: None,
+                },
+            ],
+            None,
+            true,
+            Some(false),
+            "",
+            "",
+        )
+        .unwrap();
+
+        assert!(
+            replay.starts_with(&format!("{first_prompt}{generated}")),
+            "historical reasoning must extend its original generated prefix even when the current request disables thinking:\nfirst={first_prompt:?}\nreplay={replay:?}",
+        );
+    }
+
+    /// An enabled-thinking turn may legitimately emit no reasoning channel.
+    /// A later disabled-thinking request must not retroactively insert the
+    /// empty channel used by its own generation prompt into that history.
+    #[test]
+    fn gemma4_enabled_thinking_without_reasoning_survives_mode_change() {
+        let template = Qwen3Tokenizer::patch_preserve_thinking(GEMMA4_GATE_SLICE);
+        let user = ChatMessage {
+            role: "user".to_string(),
+            content: "answer directly".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        };
+        let first_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
+            &template,
+            std::slice::from_ref(&user),
+            None,
+            true,
+            Some(true),
+            "",
+            "",
+        )
+        .unwrap();
+        let generated = "direct answer";
+        let replay = Qwen3Tokenizer::render_chat_template_jinja2(
+            &template,
+            &[
+                user,
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: generated.to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    is_error: None,
+                    reasoning_content: None,
+                    thinking_enabled: Some(true),
+                    images: None,
+                    audio: None,
+                },
+            ],
+            None,
+            false,
+            Some(false),
+            "",
+            "",
+        )
+        .unwrap();
+
+        assert_eq!(
+            replay,
+            format!("{first_prompt}{generated}"),
+            "historical enabled-thinking provenance must suppress the current request's empty channel",
+        );
+    }
+
+    /// Exercise the same invariant through the exact stock template used by
+    /// the local Gemma-4-12B agent checkpoint. The file is an optional local
+    /// fixture, matching the existing Gemma4 template tests below; CI without
+    /// model artifacts skips it.
+    #[test]
+    fn gemma4_stock_template_no_thinking_replay_extends_cached_prefix() {
+        let path = "/Users/brooklyn/workspace/github/mlx-node/.cache/models/Gemma-4-12B-IT-q4-mlx/chat_template.jinja";
+        let Ok(stock) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let template = Qwen3Tokenizer::patch_preserve_thinking(&stock);
+        assert!(
+            template.contains("historical_thinking_enabled"),
+            "the stock Gemma4 gate was not recognized"
+        );
+
+        let user = ChatMessage {
+            role: "user".to_string(),
+            content: "Read Cargo.toml.".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        };
+        let first_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
+            &template,
+            std::slice::from_ref(&user),
+            None,
+            true,
+            Some(false),
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+        let generated_tool_call = "<|tool_call>call:read{path:<|\"|>Cargo.toml<|\"|>}<tool_call|>";
+        let replay = Qwen3Tokenizer::render_chat_template_jinja2(
+            &template,
+            &[
+                user,
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: String::new(),
+                    tool_calls: Some(vec![ToolCall {
+                        id: Some("call_1".to_string()),
+                        name: "read".to_string(),
+                        arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
+                    }]),
+                    tool_call_id: None,
+                    is_error: None,
+                    reasoning_content: None,
+                    thinking_enabled: Some(false),
+                    images: None,
+                    audio: None,
+                },
+            ],
+            None,
+            false,
+            Some(false),
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+
+        assert!(
+            replay.starts_with(&format!("{first_prompt}{generated_tool_call}")),
+            "stock Gemma4 replay diverged from the cached no-thinking prefix:\nfirst={first_prompt:?}\nreplay={replay:?}",
+        );
+    }
+
+    /// Gemma4 renders a tool result and the following assistant response in
+    /// one continuous model turn. Replaying the final assistant must append
+    /// its generated text directly; inserting another disabled-thinking
+    /// channel at that continuation point breaks the cached prefix.
+    #[test]
+    fn gemma4_stock_tool_result_final_continuation_has_no_second_thought_channel() {
+        let path = "/Users/brooklyn/workspace/github/mlx-node/.cache/models/Gemma-4-12B-IT-q4-mlx/chat_template.jinja";
+        let Ok(stock) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let template = Qwen3Tokenizer::patch_preserve_thinking(&stock);
+        let messages = |with_final: bool| {
+            let mut messages = vec![
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: "Read Cargo.toml.".to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    is_error: None,
+                    reasoning_content: None,
+                    thinking_enabled: None,
+                    images: None,
+                    audio: None,
+                },
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: String::new(),
+                    tool_calls: Some(vec![ToolCall {
+                        id: Some("call_1".to_string()),
+                        name: "read".to_string(),
+                        arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
+                    }]),
+                    tool_call_id: None,
+                    is_error: None,
+                    reasoning_content: None,
+                    thinking_enabled: Some(false),
+                    images: None,
+                    audio: None,
+                },
+                ChatMessage {
+                    role: "tool".to_string(),
+                    content: "package contents".to_string(),
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                    is_error: Some(false),
+                    reasoning_content: None,
+                    thinking_enabled: None,
+                    images: None,
+                    audio: None,
+                },
+            ];
+            if with_final {
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: "Done.".to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    is_error: None,
+                    reasoning_content: None,
+                    thinking_enabled: Some(false),
+                    images: None,
+                    audio: None,
+                });
+            }
+            messages
+        };
+
+        let continuation_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
+            &template,
+            &messages(false),
+            None,
+            true,
+            Some(false),
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+        let completed_replay = Qwen3Tokenizer::render_chat_template_jinja2(
+            &template,
+            &messages(true),
+            None,
+            false,
+            Some(false),
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+
+        assert_eq!(
+            completed_replay,
+            format!("{continuation_prompt}Done.<turn|>\n"),
+            "tool-result continuation must not gain a second empty thought channel",
+        );
     }
 
     /// Reproduces the turn-15 → turn-16 divergence from
@@ -2238,6 +2665,7 @@ mod tests {
                 tool_call_id: None,
                 is_error: None,
                 reasoning_content: None,
+                thinking_enabled: None,
                 images: None,
                 audio: None,
             },
@@ -2248,6 +2676,7 @@ mod tests {
                 tool_call_id: None,
                 is_error: None,
                 reasoning_content: None,
+                thinking_enabled: None,
                 images: None,
                 audio: None,
             },
@@ -2298,6 +2727,7 @@ mod tests {
             tool_call_id: None,
             is_error: None,
             reasoning_content: None,
+            thinking_enabled: None,
             images: None,
             audio: None,
         };
@@ -2474,6 +2904,7 @@ mod tests {
                 tool_call_id: None,
                 is_error: None,
                 reasoning_content: None,
+                thinking_enabled: None,
                 images: None,
                 audio: None,
             },
@@ -2484,6 +2915,7 @@ mod tests {
                 tool_call_id: None,
                 is_error: None,
                 reasoning_content: None,
+                thinking_enabled: None,
                 images: None,
                 audio: None,
             },
@@ -2548,6 +2980,7 @@ mod tests {
             tool_call_id: None,
             is_error: None,
             reasoning_content: None,
+            thinking_enabled: None,
             images: None,
             audio: None,
         }];
@@ -2600,6 +3033,7 @@ mod tests {
             tool_call_id: None,
             is_error: None,
             reasoning_content: None,
+            thinking_enabled: None,
             images: None,
             audio: None,
         }];
@@ -2660,6 +3094,7 @@ mod tests {
             tool_call_id: None,
             is_error: None,
             reasoning_content: Some("because".to_string()),
+            thinking_enabled: None,
             images: None,
             audio: None,
         };
@@ -2704,6 +3139,7 @@ mod tests {
             tool_call_id: None,
             is_error: None,
             reasoning_content: Some("think".to_string()),
+            thinking_enabled: None,
             images: None,
             audio: None,
         };
@@ -2825,6 +3261,7 @@ mod tests {
                     tool_call_id: None,
                     is_error: None,
                     reasoning_content: None,
+                    thinking_enabled: None,
                     images: None,
                     audio: None,
                 },
@@ -2839,6 +3276,7 @@ mod tests {
                     tool_call_id: None,
                     is_error: None,
                     reasoning_content: Some(reasoning.to_string()),
+                    thinking_enabled: None,
                     images: None,
                     audio: None,
                 },
@@ -2902,6 +3340,7 @@ mod tests {
             tool_call_id: Some("call_xyz".to_string()),
             is_error,
             reasoning_content: None,
+            thinking_enabled: None,
             images: None,
             audio: None,
         }

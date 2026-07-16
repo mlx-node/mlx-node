@@ -423,6 +423,7 @@ mod tests {
             tool_call_id: None,
             is_error: None,
             reasoning_content: None,
+            thinking_enabled: None,
             images: None,
             audio: None,
         }
@@ -437,6 +438,7 @@ mod tests {
             tool_call_id: None,
             is_error: None,
             reasoning_content: None,
+            thinking_enabled: None,
             images: Some(images),
             audio: None,
         }
@@ -454,6 +456,7 @@ mod tests {
             tool_call_id: None,
             is_error: None,
             reasoning_content: Some(reasoning.to_string()),
+            thinking_enabled: None,
             images: None,
             audio: None,
         }
@@ -477,6 +480,7 @@ mod tests {
             tool_call_id: None,
             is_error: None,
             reasoning_content: None,
+            thinking_enabled: None,
             images: None,
             audio: None,
         }
@@ -490,6 +494,7 @@ mod tests {
             tool_call_id: None,
             is_error: None,
             reasoning_content: None,
+            thinking_enabled: None,
             images: None,
             audio: None,
         }

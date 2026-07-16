@@ -290,16 +290,39 @@ describe('contextToChatMessages', () => {
     expect(converted[0]!.content).toBe('line one\nline two');
   });
 
-  it('drops thinking blocks from assistant messages', () => {
+  it('preserves assistant reasoning bodies for byte-stable native template replay', () => {
     const converted = contextToChatMessages({
       messages: [
         assistantMsg([
           { type: 'thinking', thinking: 'pondering...' },
+          { type: 'thinking', thinking: 'still pondering...' },
           { type: 'text', text: 'The answer is 4.' },
         ]),
       ],
     });
-    expect(converted).toEqual([{ role: 'assistant', content: 'The answer is 4.' }]);
+    expect(converted).toEqual([
+      {
+        role: 'assistant',
+        content: 'The answer is 4.',
+        reasoningContent: 'pondering...still pondering...',
+      },
+    ]);
+  });
+
+  it('preserves the per-turn MLX thinking mode used to render historical assistant bytes', () => {
+    const thinkingOff = assistantMsg([{ type: 'text', text: 'Direct answer.' }]) as AssistantMessage & {
+      mlxThinkingEnabled?: boolean;
+    };
+    thinkingOff.mlxThinkingEnabled = false;
+    const thinkingOn = assistantMsg([{ type: 'text', text: 'No visible reasoning this time.' }]) as AssistantMessage & {
+      mlxThinkingEnabled?: boolean;
+    };
+    thinkingOn.mlxThinkingEnabled = true;
+
+    expect(contextToChatMessages({ messages: [thinkingOff, thinkingOn] })).toEqual([
+      { role: 'assistant', content: 'Direct answer.', thinkingEnabled: false },
+      { role: 'assistant', content: 'No visible reasoning this time.', thinkingEnabled: true },
+    ]);
   });
 
   it('skips husk assistant messages (aborted/error with no text and no toolCalls)', () => {

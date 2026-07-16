@@ -110,7 +110,47 @@ impl Default for PagedAttentionParams {
 
 /// Partition size for V2 kernel
 const PARTITION_SIZE: u32 = 512;
-fn grouped_qwen35_stripe_count(max_context_len: u32) -> u32 {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GroupedPagedAttentionKind {
+    Qwen35D256,
+    Gemma4D512,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GroupedGemma4Mode {
+    Disabled,
+    Auto,
+    Force,
+}
+
+fn grouped_gemma4_stripe_override_value(value: Option<&str>) -> Option<u32> {
+    value
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| matches!(value, 4 | 8 | 16 | 32 | 64 | 128 | 256))
+}
+
+fn grouped_gemma4_stripe_override() -> Option<u32> {
+    static STRIPES: OnceLock<Option<u32>> = OnceLock::new();
+    *STRIPES.get_or_init(|| {
+        grouped_gemma4_stripe_override_value(
+            std::env::var("MLX_PAGED_GROUPED_GEMMA4_STRIPES")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn grouped_stripe_count(kind: GroupedPagedAttentionKind, max_context_len: u32) -> u32 {
+    if kind == GroupedPagedAttentionKind::Gemma4D512 {
+        if let Some(stripes) = grouped_gemma4_stripe_override() {
+            return stripes;
+        }
+        return match max_context_len {
+            0..=4096 => 32,
+            4097..=8192 => 64,
+            _ => 128,
+        };
+    }
     match max_context_len {
         0..=4096 => 32,
         4097..=8192 => 64,
@@ -132,6 +172,24 @@ fn grouped_qwen35_paged_attention_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         grouped_qwen35_env_enabled_value(std::env::var("MLX_PAGED_GROUPED_QWEN35").ok().as_deref())
+    })
+}
+
+fn grouped_gemma4_env_mode_value(value: Option<&str>) -> GroupedGemma4Mode {
+    match value {
+        Some("1" | "on" | "auto" | "true") => GroupedGemma4Mode::Auto,
+        Some("force") => GroupedGemma4Mode::Force,
+        _ => GroupedGemma4Mode::Disabled,
+    }
+}
+
+fn grouped_gemma4_paged_attention_mode() -> GroupedGemma4Mode {
+    // Default-off diagnostic selector. Cache once because raw dispatch is also
+    // used in token-level benchmarks and should not read the environment on
+    // every invocation.
+    static MODE: OnceLock<GroupedGemma4Mode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        grouped_gemma4_env_mode_value(std::env::var("MLX_PAGED_GROUPED_GEMMA4").ok().as_deref())
     })
 }
 
@@ -193,8 +251,99 @@ fn use_grouped_qwen35_paged_attention(
     )
 }
 
-fn grouped_qwen35_pipelines_supported(
+#[allow(clippy::too_many_arguments)]
+fn grouped_gemma4_shape_matches(
+    mode: GroupedGemma4Mode,
+    io_dtype: MetalDtype,
+    cache_dtype: MetalDtype,
+    num_seqs: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_size: u32,
+    block_size: u32,
+    query_rows: u32,
+    max_context_len: u32,
+) -> bool {
+    let exact_shape = io_dtype == MetalDtype::BFloat16
+        && cache_dtype == MetalDtype::BFloat16
+        && num_seqs == 1
+        && (num_heads, num_kv_heads) == (16, 1)
+        && head_size == 512
+        && block_size == 16
+        && query_rows == 1
+        && max_context_len > PARTITION_SIZE;
+    exact_shape
+        && mode != GroupedGemma4Mode::Disabled
+        && (mode == GroupedGemma4Mode::Force || (3_072..=16_384).contains(&max_context_len))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_grouped_paged_attention(
+    io_dtype: MetalDtype,
+    cache_dtype: MetalDtype,
+    num_seqs: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_size: u32,
+    block_size: u32,
+    query_rows: u32,
+    max_context_len: u32,
+) -> Option<GroupedPagedAttentionKind> {
+    if use_grouped_qwen35_paged_attention(
+        io_dtype,
+        cache_dtype,
+        num_seqs,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+        query_rows,
+        max_context_len,
+    ) {
+        return Some(GroupedPagedAttentionKind::Qwen35D256);
+    }
+    if grouped_gemma4_shape_matches(
+        grouped_gemma4_paged_attention_mode(),
+        io_dtype,
+        cache_dtype,
+        num_seqs,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+        query_rows,
+        max_context_len,
+    ) {
+        return Some(GroupedPagedAttentionKind::Gemma4D512);
+    }
+    None
+}
+
+fn grouped_kernel_name(kind: GroupedPagedAttentionKind) -> &'static str {
+    match kind {
+        GroupedPagedAttentionKind::Qwen35D256 => {
+            MetalState::paged_attention_grouped_qwen35_kernel_name()
+        }
+        GroupedPagedAttentionKind::Gemma4D512 => {
+            MetalState::paged_attention_grouped_gemma4_kernel_name()
+        }
+    }
+}
+
+fn grouped_reduce_kernel_name(kind: GroupedPagedAttentionKind) -> &'static str {
+    match kind {
+        GroupedPagedAttentionKind::Qwen35D256 => {
+            MetalState::paged_attention_grouped_qwen35_reduce_kernel_name()
+        }
+        GroupedPagedAttentionKind::Gemma4D512 => {
+            MetalState::paged_attention_grouped_gemma4_reduce_kernel_name()
+        }
+    }
+}
+
+fn grouped_pipelines_supported(
     state: &MetalState,
+    kind: GroupedPagedAttentionKind,
     num_heads: u32,
     num_kv_heads: u32,
 ) -> bool {
@@ -204,30 +353,33 @@ fn grouped_qwen35_pipelines_supported(
     // A missing/invalid specialized pipeline is an optional-optimization
     // failure, not an inference failure. Cache `false`, warn once through the
     // normal tracing subscriber, and leave every later token on generic V2.
-    static LIMITS: OnceLock<Option<(u64, u64)>> = OnceLock::new();
-    let Some((stage_threads, reduce_threads)) = *LIMITS.get_or_init(|| {
-        let stage = match state
-            .get_pipeline(MetalState::paged_attention_grouped_qwen35_kernel_name())
-        {
+    static QWEN35_LIMITS: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    static GEMMA4_LIMITS: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    let limits = match kind {
+        GroupedPagedAttentionKind::Qwen35D256 => &QWEN35_LIMITS,
+        GroupedPagedAttentionKind::Gemma4D512 => &GEMMA4_LIMITS,
+    };
+    let Some((stage_threads, reduce_threads)) = *limits.get_or_init(|| {
+        let stage = match state.get_pipeline(grouped_kernel_name(kind)) {
             Ok(stage) => stage,
             Err(error) => {
                 tracing::warn!(
                     target: "mlx_paged_attn::metal",
                     %error,
-                    "grouped Qwen3.5 paged-attention stage pipeline unavailable; using generic V2"
+                    ?kind,
+                    "grouped paged-attention stage pipeline unavailable; using generic V2"
                 );
                 return None;
             }
         };
-        let reduce = match state
-            .get_pipeline(MetalState::paged_attention_grouped_qwen35_reduce_kernel_name())
-        {
+        let reduce = match state.get_pipeline(grouped_reduce_kernel_name(kind)) {
             Ok(reduce) => reduce,
             Err(error) => {
                 tracing::warn!(
                     target: "mlx_paged_attn::metal",
                     %error,
-                    "grouped Qwen3.5 paged-attention reducer pipeline unavailable; using generic V2"
+                    ?kind,
+                    "grouped paged-attention reducer pipeline unavailable; using generic V2"
                 );
                 return None;
             }
@@ -244,14 +396,20 @@ fn grouped_qwen35_pipelines_supported(
     let required_stage_threads = u64::from(32 * (num_heads / num_kv_heads));
     let supported = stage_threads >= required_stage_threads && reduce_threads >= 1024;
     if !supported {
-        static WARNED: OnceLock<()> = OnceLock::new();
-        WARNED.get_or_init(|| {
+        static QWEN35_WARNED: OnceLock<()> = OnceLock::new();
+        static GEMMA4_WARNED: OnceLock<()> = OnceLock::new();
+        let warned = match kind {
+            GroupedPagedAttentionKind::Qwen35D256 => &QWEN35_WARNED,
+            GroupedPagedAttentionKind::Gemma4D512 => &GEMMA4_WARNED,
+        };
+        warned.get_or_init(|| {
             tracing::warn!(
                 target: "mlx_paged_attn::metal",
+                ?kind,
                 stage_threads,
                 required_stage_threads,
                 reduce_threads,
-                "grouped Qwen3.5 paged-attention threadgroup limits unsupported; using generic V2"
+                "grouped paged-attention threadgroup limits unsupported; using generic V2"
             );
         });
     }
@@ -268,6 +426,22 @@ mod grouped_qwen35_selection_tests {
         assert!(grouped_qwen35_env_enabled_value(Some("1")));
         assert!(grouped_qwen35_env_enabled_value(Some("true")));
         assert!(!grouped_qwen35_env_enabled_value(Some("0")));
+        assert_eq!(
+            grouped_gemma4_env_mode_value(None),
+            GroupedGemma4Mode::Disabled
+        );
+        assert_eq!(
+            grouped_gemma4_env_mode_value(Some("1")),
+            GroupedGemma4Mode::Auto
+        );
+        assert_eq!(
+            grouped_gemma4_env_mode_value(Some("force")),
+            GroupedGemma4Mode::Force
+        );
+        assert_eq!(grouped_gemma4_stripe_override_value(Some("4")), Some(4));
+        assert_eq!(grouped_gemma4_stripe_override_value(Some("128")), Some(128));
+        assert_eq!(grouped_gemma4_stripe_override_value(Some("3")), None);
+        assert_eq!(grouped_gemma4_stripe_override_value(Some("oops")), None);
     }
 
     #[test]
@@ -337,6 +511,32 @@ mod grouped_qwen35_selection_tests {
             16_384,
         ));
     }
+
+    #[test]
+    fn exact_gemma4_shape_is_default_off_and_auto_is_bounded() {
+        let matches = |mode, query_rows, max_context_len| {
+            grouped_gemma4_shape_matches(
+                mode,
+                MetalDtype::BFloat16,
+                MetalDtype::BFloat16,
+                1,
+                16,
+                1,
+                512,
+                16,
+                query_rows,
+                max_context_len,
+            )
+        };
+        assert!(!matches(GroupedGemma4Mode::Disabled, 1, 3_458));
+        assert!(!matches(GroupedGemma4Mode::Auto, 1, 3_071));
+        assert!(matches(GroupedGemma4Mode::Auto, 1, 3_072));
+        assert!(matches(GroupedGemma4Mode::Auto, 1, 16_384));
+        assert!(!matches(GroupedGemma4Mode::Auto, 1, 16_385));
+        assert!(!matches(GroupedGemma4Mode::Force, 1, PARTITION_SIZE));
+        assert!(matches(GroupedGemma4Mode::Force, 1, PARTITION_SIZE + 1));
+        assert!(!matches(GroupedGemma4Mode::Force, 2, 3_458));
+    }
 }
 
 /// Output from paged attention dispatch
@@ -359,6 +559,10 @@ pub struct PagedAttentionOutput {
     /// silent generic fallback.
     #[doc(hidden)]
     pub used_grouped_qwen35: bool,
+    /// Whether this dispatch selected the experimental D512 16Q/1KV Gemma 4
+    /// grouped route.
+    #[doc(hidden)]
+    pub used_grouped_gemma4: bool,
 }
 
 impl PagedAttentionOutput {
@@ -705,6 +909,7 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
         head_size: params.head_size,
         dtype: io_dtype,
         used_grouped_qwen35: false,
+        used_grouped_gemma4: false,
     })
 }
 
@@ -739,7 +944,7 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         .device
         .new_buffer(output_size, metal::MTLResourceOptions::StorageModePrivate);
 
-    let grouped_shape = use_grouped_qwen35_paged_attention(
+    let grouped_kind = select_grouped_paged_attention(
         io_dtype,
         cache_dtype,
         params.num_seqs,
@@ -750,10 +955,11 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         1,
         params.max_seq_len,
     );
-    let use_grouped = grouped_shape
-        && grouped_qwen35_pipelines_supported(state, params.num_heads, params.num_kv_heads);
-    let max_num_partitions = if use_grouped {
-        grouped_qwen35_stripe_count(params.max_seq_len)
+    let use_grouped = grouped_kind.is_some_and(|kind| {
+        grouped_pipelines_supported(state, kind, params.num_heads, params.num_kv_heads)
+    });
+    let max_num_partitions = if let Some(kind) = grouped_kind.filter(|_| use_grouped) {
+        grouped_stripe_count(kind, params.max_seq_len)
     } else {
         params.max_seq_len.div_ceil(PARTITION_SIZE)
     };
@@ -787,8 +993,8 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
 
     // Phase 1: Compute partitioned attention
     {
-        let kernel_name = if use_grouped {
-            MetalState::paged_attention_grouped_qwen35_kernel_name().to_string()
+        let kernel_name = if let Some(kind) = grouped_kind.filter(|_| use_grouped) {
+            grouped_kernel_name(kind).to_string()
         } else {
             MetalState::paged_attention_v2_kernel_name(
                 io_dtype,
@@ -912,8 +1118,8 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
 
     // Phase 2: Reduce partitions
     {
-        let kernel_name = if use_grouped {
-            MetalState::paged_attention_grouped_qwen35_reduce_kernel_name().to_string()
+        let kernel_name = if let Some(kind) = grouped_kind.filter(|_| use_grouped) {
+            grouped_reduce_kernel_name(kind).to_string()
         } else {
             MetalState::paged_attention_v2_reduce_kernel_name(io_dtype, params.head_size)
         };
@@ -962,7 +1168,10 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         num_heads: params.num_heads,
         head_size: params.head_size,
         dtype: io_dtype,
-        used_grouped_qwen35: use_grouped,
+        used_grouped_qwen35: use_grouped
+            && grouped_kind == Some(GroupedPagedAttentionKind::Qwen35D256),
+        used_grouped_gemma4: use_grouped
+            && grouped_kind == Some(GroupedPagedAttentionKind::Gemma4D512),
     })
 }
 
@@ -1247,6 +1456,7 @@ pub unsafe fn dispatch_paged_attention_varlen_v1_raw(
         head_size: params.head_size,
         dtype: io_dtype,
         used_grouped_qwen35: false,
+        used_grouped_gemma4: false,
     })
 }
 
@@ -1278,20 +1488,24 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         .device
         .new_buffer(output_size, metal::MTLResourceOptions::StorageModePrivate);
 
-    let grouped_shape = params.total_queries == 2
-        && use_grouped_qwen35_paged_attention(
-            io_dtype,
-            cache_dtype,
-            params.num_seqs,
-            params.num_heads,
-            params.num_kv_heads,
-            params.head_size,
-            params.block_size,
-            params.total_queries,
-            params.max_seq_len,
-        );
-    let use_grouped = grouped_shape
-        && grouped_qwen35_pipelines_supported(state, params.num_heads, params.num_kv_heads);
+    let grouped_kind = (params.total_queries == 2)
+        .then(|| {
+            select_grouped_paged_attention(
+                io_dtype,
+                cache_dtype,
+                params.num_seqs,
+                params.num_heads,
+                params.num_kv_heads,
+                params.head_size,
+                params.block_size,
+                params.total_queries,
+                params.max_seq_len,
+            )
+        })
+        .flatten();
+    let use_grouped = grouped_kind.is_some_and(|kind| {
+        grouped_pipelines_supported(state, kind, params.num_heads, params.num_kv_heads)
+    });
 
     // Sized off the worst-case effective_context_len (the caller's
     // `max_seq_len`), so every query token fits in the allocated grid.
@@ -1299,8 +1513,8 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
     // empty — the reduce kernel skips them via the
     // `effective_context_len`-derived `num_partitions` it computes
     // independently.
-    let max_num_partitions = if use_grouped {
-        grouped_qwen35_stripe_count(params.max_seq_len)
+    let max_num_partitions = if let Some(kind) = grouped_kind.filter(|_| use_grouped) {
+        grouped_stripe_count(kind, params.max_seq_len)
     } else {
         params.max_seq_len.div_ceil(PARTITION_SIZE)
     };
@@ -1332,8 +1546,8 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
 
     // Phase 1: partitioned varlen attention.
     {
-        let kernel_name = if use_grouped {
-            MetalState::paged_attention_grouped_qwen35_kernel_name().to_string()
+        let kernel_name = if let Some(kind) = grouped_kind.filter(|_| use_grouped) {
+            grouped_kernel_name(kind).to_string()
         } else {
             MetalState::paged_attention_varlen_v2_kernel_name(
                 io_dtype,
@@ -1450,8 +1664,8 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
     // ragged query layout the same way as the main kernel (y =
     // q_token_idx, binary-search to seq_idx).
     {
-        let kernel_name = if use_grouped {
-            MetalState::paged_attention_grouped_qwen35_reduce_kernel_name().to_string()
+        let kernel_name = if let Some(kind) = grouped_kind.filter(|_| use_grouped) {
+            grouped_reduce_kernel_name(kind).to_string()
         } else {
             MetalState::paged_attention_varlen_v2_reduce_kernel_name(io_dtype, params.head_size)
         };
@@ -1502,7 +1716,10 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         num_heads: params.num_heads,
         head_size: params.head_size,
         dtype: io_dtype,
-        used_grouped_qwen35: use_grouped,
+        used_grouped_qwen35: use_grouped
+            && grouped_kind == Some(GroupedPagedAttentionKind::Qwen35D256),
+        used_grouped_gemma4: use_grouped
+            && grouped_kind == Some(GroupedPagedAttentionKind::Gemma4D512),
     })
 }
 

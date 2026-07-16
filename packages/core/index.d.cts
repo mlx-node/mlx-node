@@ -2458,15 +2458,18 @@ export interface ChatConfig {
    * variant instead (`gemma4/model.rs` `resolve_params`, always from the
    * RAW config value — the engine's central `[1, 5]` clamp is an MTP-head
    * contract that does not apply to external drafts):
-   * - DSpark: an unset `mtpDepth` runs full draft blocks (the draft
-   *   checkpoint's block size — 7 tokens on `dspark_gemma4_12b_block7`),
-   *   and an explicit `mtpDepth` acts as a CAP on that block (clamped to
-   *   `[1, blockSize]`).
+   * - DSpark: with both knobs unset, full draft blocks (the checkpoint's
+   *   block size — 7 tokens on `dspark_gemma4_12b_block7`) run behind a
+   *   short target-AR/DSpark break-even calibration. A short generation
+   *   budget that cannot finish calibration retains the fixed-block
+   *   schedule. An explicit
+   *   `mtpDepth` caps and pins the block unless `mtpAdaptiveDepth: true`
+   *   opts the guard back in; explicit `false` disables it.
    * - Assistant (Google `gemma-4-*-it-assistant`): an unset `mtpDepth`
    *   drafts 3 tokens per cycle (`ASSISTANT_DEFAULT_DEPTH`), and an
    *   explicit `mtpDepth` clamps to `[1, 8]` (`ASSISTANT_MAX_DEPTH`).
    *
-   * `mtpAdaptiveDepth` is ignored for both Gemma4 external-draft variants.
+   * `mtpAdaptiveDepth` is ignored for the Gemma4 assistant variant.
    */
   mtpDepth?: number | undefined;
   /**
@@ -2479,7 +2482,9 @@ export interface ChatConfig {
    * `MLX_MTP_EV_ALLOW_DEEPEN=0` to pin the base depth.
    * When false, the loop pins `mtpDepth` for every cycle.
    *
-   * Default: false. An explicit value always wins over the default.
+   * Default: false, except Gemma4 DSpark enables its measured break-even
+   * guard when both this field and `mtpDepth` are unset. An explicit value
+   * always wins over the family default.
    */
   mtpAdaptiveDepth?: boolean | undefined;
 }
@@ -2513,6 +2518,17 @@ export interface ChatMessage {
   isError?: boolean;
   /** Reasoning content for thinking mode (used with <think> tags) */
   reasoningContent?: string;
+  /**
+   * Thinking mode used when this assistant message was generated.
+   *
+   * This is replay provenance, not a request override. Gemma4's disabled-
+   * thinking generation prefix contains an explicit empty thought channel,
+   * while an enabled-thinking turn that emitted no reasoning contains no
+   * such channel. Keeping the historical mode on the message lets the chat
+   * template reproduce either byte sequence even when a later request
+   * changes its current thinking setting.
+   */
+  thinkingEnabled?: boolean;
   /** Image data for VLM models (encoded image bytes: PNG/JPEG, passed as Uint8Array/Buffer) */
   images?: Array<Uint8Array> | undefined;
   /** Audio data for unified Gemma 4 (encoded audio bytes: WAV, passed as Uint8Array/Buffer) */
@@ -3056,8 +3072,9 @@ export interface Gemma4LoadOptions {
    * Directory of a draft checkpoint (config.json + safetensors) to load
    * alongside the target model for speculative decoding — either a
    * DSpark draft or a Google assistant draft; the kind is probed from
-   * the draft config.json. Draft decoding runs only on the flat KV-cache
-   * path: setting this while the model config explicitly enables
+   * the draft config.json. When omitted, `<model_path>/draft/` is loaded
+   * automatically when present. Draft decoding runs only on the flat
+   * KV-cache path: setting this while the model config explicitly enables
    * `use_block_paged_cache` is a hard load error, and an unset
    * `use_block_paged_cache` is forced to `false`.
    */
@@ -3239,6 +3256,13 @@ export interface GgufConversionOptions {
   inputPath: string;
   /** Output directory for converted SafeTensors model */
   outputDir: string;
+  /**
+   * Optional directory containing the authoritative HuggingFace config and
+   * tokenizer/processor assets. GGUF metadata is not rich enough to recreate
+   * unified Gemma4 config fields such as head_dim, layer_types, vision, and
+   * audio configuration exactly.
+   */
+  configSourceDir?: string;
   /** Target dtype: "float32", "float16", "bfloat16" (default: keep original) */
   dtype?: string;
   /** Enable verbose logging */

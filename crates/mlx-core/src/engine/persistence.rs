@@ -89,7 +89,8 @@ mod qwen35_vision_weight_prefix_tests {
 /// reads and data is only materialized on eval. This makes loading near-instant
 /// and memory is only allocated when weights are actually used.
 ///
-/// When `load_vision` is true, also loads `vision.safetensors` if present (for VLM models).
+/// When `load_vision` is true, also loads `vision.safetensors` if present (for VLM models),
+/// regardless of whether the main checkpoint is a single file or sharded.
 pub(crate) fn load_all_safetensors(
     dir: &Path,
     load_vision: bool,
@@ -105,21 +106,7 @@ pub(crate) fn load_all_safetensors(
     if let Some(path) = single_path {
         info!("Loading weights from: {} (mmap)", path.display());
         let mut params = load_safetensors_lazy(&path)?;
-
-        // Also load vision.safetensors if present (VLM models)
-        if load_vision {
-            let vision_path = dir.join("vision.safetensors");
-            if vision_path.exists() {
-                info!(
-                    "Loading vision weights from: {} (mmap)",
-                    vision_path.display()
-                );
-                let vision_params = load_safetensors_lazy(&vision_path)?;
-                info!("Loaded {} vision tensors", vision_params.len());
-                params.extend(vision_params);
-            }
-        }
-
+        append_vision_safetensors(dir, load_vision, &mut params)?;
         return Ok(params);
     }
 
@@ -159,7 +146,111 @@ pub(crate) fn load_all_safetensors(
         all_params.extend(shard_params);
     }
 
+    append_vision_safetensors(dir, load_vision, &mut all_params)?;
+
     Ok(all_params)
+}
+
+/// Append the optional media sidecar emitted by converted VLM checkpoints.
+///
+/// Keep this outside the single-vs-sharded branch so `load_vision=true` has
+/// identical semantics for both checkpoint layouts. The sidecar is appended
+/// after the language-model weights, matching the historical single-file
+/// behavior when a key is present in both files.
+fn append_vision_safetensors(
+    dir: &Path,
+    load_vision: bool,
+    params: &mut HashMap<String, MxArray>,
+) -> Result<()> {
+    if !load_vision {
+        return Ok(());
+    }
+
+    let vision_path = dir.join("vision.safetensors");
+    if !vision_path.exists() {
+        return Ok(());
+    }
+
+    info!(
+        "Loading vision weights from: {} (mmap)",
+        vision_path.display()
+    );
+    let vision_params = load_safetensors_lazy(&vision_path)?;
+    info!("Loaded {} vision tensors", vision_params.len());
+    params.extend(vision_params);
+    Ok(())
+}
+
+#[cfg(test)]
+mod safetensors_loading_tests {
+    use super::*;
+    use crate::utils::safetensors::save_safetensors;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_model_dir(label: &str) -> PathBuf {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "load_all_safetensors_{label}_{}_{}",
+            std::process::id(),
+            id
+        ));
+        fs::create_dir_all(&dir).expect("create temp model dir");
+        dir
+    }
+
+    fn save_one(path: &Path, key: &str, value: f32) {
+        let mut tensors = HashMap::from([(
+            key.to_string(),
+            MxArray::from_float32(&[value], &[1]).expect("create test tensor"),
+        )]);
+        save_safetensors(path, &mut tensors, None).expect("save test safetensors");
+    }
+
+    #[test]
+    fn single_checkpoint_loads_vision_sidecar_only_when_requested() {
+        let dir = temp_model_dir("single_vision");
+        save_one(&dir.join("model.safetensors"), "text.weight", 1.0);
+        save_one(&dir.join("vision.safetensors"), "vision.weight", 2.0);
+
+        let text_only = load_all_safetensors(&dir, false).expect("load text-only checkpoint");
+        assert!(text_only.contains_key("text.weight"));
+        assert!(!text_only.contains_key("vision.weight"));
+
+        let with_vision = load_all_safetensors(&dir, true).expect("load vision checkpoint");
+        assert!(with_vision.contains_key("text.weight"));
+        assert!(with_vision.contains_key("vision.weight"));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sharded_checkpoint_appends_vision_sidecar() {
+        let dir = temp_model_dir("sharded_vision");
+        save_one(
+            &dir.join("model-00001-of-00002.safetensors"),
+            "text.0.weight",
+            1.0,
+        );
+        save_one(
+            &dir.join("model-00002-of-00002.safetensors"),
+            "text.1.weight",
+            2.0,
+        );
+        save_one(&dir.join("vision.safetensors"), "vision.weight", 3.0);
+
+        let text_only = load_all_safetensors(&dir, false).expect("load sharded text checkpoint");
+        assert_eq!(text_only.len(), 2);
+        assert!(!text_only.contains_key("vision.weight"));
+
+        let with_vision = load_all_safetensors(&dir, true).expect("load sharded vision checkpoint");
+        assert!(with_vision.contains_key("text.0.weight"));
+        assert!(with_vision.contains_key("text.1.weight"));
+        assert!(with_vision.contains_key("vision.weight"));
+
+        fs::remove_dir_all(dir).ok();
+    }
 }
 
 /// The directories a model loader may mmap checkpoint shards from, scanned

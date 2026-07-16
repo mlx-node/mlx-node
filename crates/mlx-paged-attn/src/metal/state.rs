@@ -251,6 +251,17 @@ impl MetalState {
         "paged_attention_grouped_bfloat16_hs256_striped_reduce"
     }
 
+    /// Experimental Gemma 4 global-attention instantiation of the same
+    /// grouped paged kernel (BF16, D512, block size 16, 16Q/1KV).
+    pub fn paged_attention_grouped_gemma4_kernel_name() -> &'static str {
+        "paged_attention_grouped_bfloat16_hs512_bs16_striped"
+    }
+
+    /// D512 reducer paired with `paged_attention_grouped_gemma4_kernel_name`.
+    pub fn paged_attention_grouped_gemma4_reduce_kernel_name() -> &'static str {
+        "paged_attention_grouped_bfloat16_hs512_striped_reduce"
+    }
+
     /// Varlen counterparts to the V1/V2/reduce kernel name helpers above.
     /// The naming convention mirrors the single-row helpers
     /// 1:1 except for the `varlen` infix so the metallib lookup is

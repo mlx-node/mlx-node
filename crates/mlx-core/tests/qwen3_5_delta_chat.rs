@@ -126,6 +126,7 @@ fn user_message(content: &str) -> ChatMessage {
         tool_call_id: None,
         is_error: None,
         reasoning_content: None,
+        thinking_enabled: None,
         images: None,
         audio: None,
     }
@@ -768,6 +769,7 @@ async fn session_start_accepts_images_for_vlm() {
         tool_call_id: None,
         is_error: None,
         reasoning_content: None,
+        thinking_enabled: None,
         images: Some(vec![image_uint8]),
         audio: None,
     };
