@@ -206,7 +206,9 @@ const COPY = {
     blockDivider: 'block formats — element bits + a shared per-block scale',
     rowAria: (n: string, b: number) => `Select ${n} — ${b} bits`,
     rowAriaBlock: (r: BlockRow) =>
-      `Select ${r.name} — ${r.elemBits}-bit ${r.elemName} element plus one ${r.scaleBits}-bit ${r.scaleName} scale shared by ${r.block} elements`,
+      `Select ${r.name} — ${r.elemBits}-bit ${r.elemName} element plus one ${r.scaleBits}-bit ${r.scaleName} scale shared by ${r.block} elements${
+        r.tensorScale ? ', plus one fp32 per-tensor scale above every block' : ''
+      }`,
     tensorScaleTag: '× fp32 per-tensor', // glossary — English in both locales
     // detail panel
     panelTitle: (n: string) => n,
@@ -331,7 +333,9 @@ const COPY = {
     blockDivider: 'block formats——element bits + 共享 per-block scale',
     rowAria: (n: string, b: number) => `选择 ${n}——${b} bits`,
     rowAriaBlock: (r: BlockRow) =>
-      `选择 ${r.name}——${r.elemBits}-bit ${r.elemName} element，外加每 ${r.block} 个元素共享 1 个 ${r.scaleBits}-bit ${r.scaleName} scale`,
+      `选择 ${r.name}——${r.elemBits}-bit ${r.elemName} element，外加每 ${r.block} 个元素共享 1 个 ${r.scaleBits}-bit ${r.scaleName} scale${
+        r.tensorScale ? '，每个 block 之上还有 1 个 fp32 per-tensor scale' : ''
+      }`,
     tensorScaleTag: '× fp32 per-tensor',
     panelTitle: (n: string) => n,
     totalBits: 'total bits',
