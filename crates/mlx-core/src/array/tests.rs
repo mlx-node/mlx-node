@@ -1307,6 +1307,20 @@ mod edge_cases {
 mod metal_buffer {
     use super::*;
 
+    #[test]
+    fn test_deep_copy_preserves_slice_values() {
+        let source = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[6]).unwrap();
+        let slice = source.slice(&[1], &[5]).unwrap();
+        let copied = slice.deep_copy().unwrap();
+        MxArray::eval_arrays(&[&source, &slice, &copied]).unwrap();
+
+        assert_eq!(
+            slice.to_float32().unwrap().to_vec(),
+            copied.to_float32().unwrap().to_vec()
+        );
+        assert_eq!(copied.shape().unwrap().as_ref(), &[4]);
+    }
+
     // Basic as_raw_ptr tests work on all platforms
     #[test]
     fn test_as_raw_ptr_not_null() {
@@ -1371,6 +1385,42 @@ mod metal_buffer {
             );
             assert!(info.data_size > 0, "Data size should be positive");
             assert_eq!(info.itemsize, 4, "Float32 should have itemsize 4");
+        }
+
+        #[test]
+        fn test_deep_copy_owns_an_independent_metal_buffer() {
+            use mlx_paged_attn::metal::{MlxMetalBuffer, synchronize_mlx};
+
+            let source =
+                MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[8]).unwrap();
+            let slice = source.slice(&[2], &[6]).unwrap();
+            let copied = slice.deep_copy().unwrap();
+            MxArray::eval_arrays(&[&source, &slice, &copied]).unwrap();
+            synchronize_mlx();
+
+            let source_info = unsafe { MlxMetalBuffer::from_mlx_array(source.as_raw_ptr()) }
+                .expect("source should have a Metal buffer");
+            let slice_info = unsafe { MlxMetalBuffer::from_mlx_array(slice.as_raw_ptr()) }
+                .expect("slice should have a Metal buffer");
+            let copy_info = unsafe { MlxMetalBuffer::from_mlx_array(copied.as_raw_ptr()) }
+                .expect("deep copy should have a Metal buffer");
+
+            assert_ne!(
+                copy_info.buffer_ptr, source_info.buffer_ptr,
+                "deep copy must not retain the source allocation"
+            );
+            assert_ne!(
+                copy_info.buffer_ptr, slice_info.buffer_ptr,
+                "deep copy must not share the slice's parent allocation"
+            );
+            assert_eq!(
+                copy_info.offset, 0,
+                "deep copy must begin at its own buffer"
+            );
+            assert_eq!(
+                slice.to_float32().unwrap().to_vec(),
+                copied.to_float32().unwrap().to_vec()
+            );
         }
 
         #[test]

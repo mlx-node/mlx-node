@@ -193,6 +193,17 @@ mlx_array* mlx_array_copy(mlx_array* handle) {
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
+mlx_array* mlx_array_deep_copy(mlx_array* handle) {
+  auto arr = reinterpret_cast<array*>(handle);
+  // `copy()` creates a distinct MLX array handle but its Copy primitive shares
+  // the input buffer after evaluation. Force an AsType primitive even though
+  // the dtype is unchanged: both the CPU and GPU implementations allocate and
+  // populate independent storage. This is required when retaining a slice
+  // without pinning the much larger source allocation.
+  array result = astype(*arr, arr->dtype(), /* copy = */ true);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
 mlx_array* mlx_array_log_softmax(mlx_array* handle, int32_t axis) {
   auto arr = reinterpret_cast<array*>(handle);
   std::vector<int> axes{axis};

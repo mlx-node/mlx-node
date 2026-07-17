@@ -219,27 +219,16 @@ impl WiredLimitContext {
     /// Query GPU's `max_recommended_working_set_size` in bytes.
     /// Returns 0 if Metal is unavailable or device info can't be read.
     pub(crate) fn get_max_working_set_size() -> usize {
-        let ptr = unsafe { sys::mlx_metal_device_info() };
-        if ptr.is_null() {
+        let mut value = 0u64;
+        // Use the typed bridge instead of reparsing the diagnostic device-info
+        // JSON. The emitter intentionally includes whitespace after `:`, and
+        // the former digit-only parser treated that valid representation as
+        // zero, silently disabling both the wired limit and memory budgets
+        // derived from Metal's recommended working set.
+        if unsafe { sys::mlx_max_recommended_working_set_size(&mut value) } != 0 {
             return 0;
         }
-        let json = unsafe { std::ffi::CStr::from_ptr(ptr).to_string_lossy() };
-        Self::parse_max_working_set_size(&json)
-    }
-
-    /// Parse max_recommended_working_set_size from JSON device info
-    pub(crate) fn parse_max_working_set_size(json: &str) -> usize {
-        // Simple JSON parsing (format: {"available": true, "max_recommended_working_set_size": 123456})
-        if let Some(start) = json.find("\"max_recommended_working_set_size\":") {
-            let value_start = start + "\"max_recommended_working_set_size\":".len();
-            let remaining = &json[value_start..];
-            let value_end = remaining
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(remaining.len());
-            let value_str = &remaining[..value_end].trim();
-            return value_str.parse::<usize>().unwrap_or(0);
-        }
-        0
+        usize::try_from(value).unwrap_or(usize::MAX)
     }
 }
 

@@ -90,6 +90,17 @@ impl Qwen3_5VisionEncoder {
         })
     }
 
+    /// Widths used by the vision transformer's largest per-patch
+    /// intermediates. The request planner combines these with the live input
+    /// dtype and allocator headroom to bound cache-miss microbatches.
+    pub(crate) fn memory_widths(&self) -> (u64, u64, u64) {
+        (
+            u64::try_from(self.config.hidden_size).unwrap_or(0),
+            u64::try_from(self.config.intermediate_size).unwrap_or(0),
+            u64::try_from(self.config.out_hidden_size).unwrap_or(0),
+        )
+    }
+
     /// Set patch embedding weights (and optional Conv bias)
     pub fn set_patch_embed(&mut self, weight: &MxArray, bias: Option<&MxArray>) -> Result<()> {
         self.patch_embed = Arc::new(PatchEmbedding::new(
@@ -362,9 +373,31 @@ impl Qwen3_5VisionEncoder {
             )));
         }
 
-        // Forward through encoder layers
-        for layer in &self.layers {
+        // Forward through encoder layers. MLX builds lazy graphs, so leaving all
+        // 27 blocks attached to the final merger output retains every layer's
+        // QKV and expanded MLP activations until the caller evaluates the final
+        // feature tensor. That is untenable for large multi-image requests (one
+        // 200k-patch FC1 activation alone is about 1.6 GiB in bf16). Materialize
+        // the residual stream after every block: evaluating this exact tensor
+        // detaches the complete upstream graph without changing any tensor
+        // shapes or arithmetic, and clearing the allocator cache releases those
+        // now-dead intermediates before constructing the next block.
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
             h = layer.forward_segmented(&h, &segment_boundaries, Some(&rotary_pos_emb))?;
+            let context = format!("qwen3_5_vision_layer_{layer_idx}");
+            MxArray::eval_arrays_with_context(&[&h], &context).map_err(|error| {
+                Error::from_reason(format!(
+                    "Qwen3.5 vision layer {layer_idx} materialization failed: {error}"
+                ))
+            })?;
+            crate::array::clear_cache();
+            tracing::debug!(
+                target: "mlx_core::inference",
+                event = "vision_layer_materialized",
+                layer = layer_idx,
+                patch_count = total_seq_len,
+                "Qwen3.5 vision layer residual materialized"
+            );
         }
 
         // Spatial projector (reduces token count by merge_size^2)
@@ -511,5 +544,37 @@ mod tests {
 
         let shape: Vec<i64> = output.shape().unwrap().as_ref().to_vec();
         assert_eq!(shape, vec![6, 8]);
+    }
+
+    #[test]
+    fn test_combined_and_per_image_microbatches_are_numerically_equivalent() {
+        let encoder = tiny_encoder(2);
+        // Distinct grids, including t=2 for the second image, exercise both
+        // image ordering and per-frame attention boundaries.
+        let hidden_states = random_array(&[1, 8, 3, 2, 2]);
+        let combined_grid = MxArray::from_int32(&[1, 2, 2, 2, 1, 2], &[2, 3]).unwrap();
+        let combined = encoder.forward(&hidden_states, &combined_grid).unwrap();
+
+        let first_pixels = hidden_states.slice_axis(1, 0, 4).unwrap();
+        let second_pixels = hidden_states.slice_axis(1, 4, 8).unwrap();
+        let first_grid = MxArray::from_int32(&[1, 2, 2], &[1, 3]).unwrap();
+        let second_grid = MxArray::from_int32(&[2, 1, 2], &[1, 3]).unwrap();
+        let first = encoder.forward(&first_pixels, &first_grid).unwrap();
+        let second = encoder.forward(&second_pixels, &second_grid).unwrap();
+        let microbatched = MxArray::concatenate_many(vec![&first, &second], Some(0)).unwrap();
+
+        MxArray::eval_arrays(&[&combined, &microbatched]).unwrap();
+        let combined_values = combined.to_float32().unwrap().to_vec();
+        let microbatched_values = microbatched.to_float32().unwrap().to_vec();
+        assert_eq!(combined_values.len(), microbatched_values.len());
+        let max_abs_diff = combined_values
+            .iter()
+            .zip(microbatched_values.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff <= 1e-4,
+            "combined/per-image vision output diverged: max abs diff {max_abs_diff}"
+        );
     }
 }

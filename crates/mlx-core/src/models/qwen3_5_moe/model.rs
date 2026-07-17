@@ -619,10 +619,7 @@ impl Qwen35MoeInner {
             vision_encoder: None,
             image_processor: None,
             spatial_merge_size: None,
-            vision_cache: Arc::new(Mutex::new(VisionCacheInner {
-                entries: HashMap::new(),
-                generation: 0,
-            })),
+            vision_cache: Arc::new(Mutex::new(VisionCacheInner::new())),
             cached_token_history: Vec::new(),
             cached_image_key: None,
             cached_paged_image_token_positions: Vec::new(),
@@ -1481,17 +1478,20 @@ impl Qwen35MoeInner {
     /// on both flat and paged paths.
     pub(crate) fn set_vision_encoder(&mut self, enc: Qwen3_5VisionEncoder) -> Result<()> {
         self.vision_encoder = Some(Arc::new(enc));
+        self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
         Ok(())
     }
 
     /// Set the image processor.
     pub(crate) fn set_image_processor(&mut self, proc: Qwen35VLImageProcessor) {
         self.image_processor = Some(Arc::new(proc));
+        self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
     }
 
     /// Set spatial merge size.
     pub(crate) fn set_spatial_merge_size(&mut self, size: i32) {
         self.spatial_merge_size = Some(size);
+        self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
     }
 
     /// Initialize M-RoPE on all full attention layers (VLM mode).
@@ -1986,7 +1986,7 @@ impl Qwen35MoeInner {
 
         let merge = vlm_prepare_vision_features(
             &input_ids,
-            image_cache_key,
+            &per_image_hashes,
             &processed,
             &vision_encoder,
             sms,
@@ -1994,6 +1994,8 @@ impl Qwen35MoeInner {
             generation_stream,
             &self.vision_cache,
         )?;
+        drop(processed);
+        crate::array::clear_cache();
 
         // === Image-aware paged-prefix lifecycle ===
         let total_budget = expanded_tokens.len() as u32;
@@ -2339,7 +2341,7 @@ impl Qwen35MoeInner {
 
         let merge = vlm_prepare_vision_features(
             &input_ids,
-            image_cache_key,
+            &per_image_hashes,
             &processed,
             &vision_encoder,
             sms,
@@ -2347,6 +2349,8 @@ impl Qwen35MoeInner {
             generation_stream,
             &self.vision_cache,
         )?;
+        drop(processed);
+        crate::array::clear_cache();
 
         // === Image-aware paged-prefix lifecycle ===
         let total_budget = expanded_tokens.len() as u32;

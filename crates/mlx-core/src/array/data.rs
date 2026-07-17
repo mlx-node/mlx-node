@@ -58,6 +58,14 @@ impl MxArray {
         MxArray::from_handle(handle, "array_copy")
     }
 
+    /// Materialize an independent copy whose storage does not alias this
+    /// array. Unlike [`MxArray::copy`], this is suitable for retaining a small
+    /// slice without keeping the source allocation alive.
+    pub(crate) fn deep_copy(&self) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_array_deep_copy(self.handle.0) };
+        MxArray::from_handle(handle, "array_deep_copy")
+    }
+
     #[napi]
     pub fn eval(&self) {
         unsafe { sys::mlx_array_eval(self.handle.0) };

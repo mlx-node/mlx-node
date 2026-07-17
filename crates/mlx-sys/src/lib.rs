@@ -61,6 +61,7 @@ unsafe extern "C-unwind" {
     ) -> *mut mlx_array;
     pub fn mlx_array_astype(handle: *mut mlx_array, dtype: i32) -> *mut mlx_array;
     pub fn mlx_array_copy(handle: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_deep_copy(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_log_softmax(handle: *mut mlx_array, axis: i32) -> *mut mlx_array;
     pub fn mlx_array_logsumexp(
         handle: *mut mlx_array,
