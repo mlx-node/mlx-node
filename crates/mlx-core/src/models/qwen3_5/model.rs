@@ -793,6 +793,12 @@ pub(crate) struct Qwen35Inner {
     /// `prompt_tokens`/`cached_tokens` are reported identically for heal and warm,
     /// so they can't distinguish the two).
     pub(crate) flat_full_reprefill_count: u64,
+    /// Engine-observed accepted-token tail passed to the most recent flat MTP
+    /// turn's `rollback_unemitted` hook. Unlike
+    /// `flat_mtp_caches_desynced`, this value is computed before the family
+    /// stepper handles the rollback, so tests can verify that a positive tail
+    /// actually arms the family latch.
+    pub(crate) flat_mtp_last_rollback_unemitted: usize,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -916,15 +922,16 @@ pub(crate) enum Qwen35Cmd {
     },
     /// Test-only: snapshot the flat-MTP cache state between turns —
     /// `(cached_token_history.len(), flat_mtp_caches_desynced,
-    /// flat_full_reprefill_count)`. The length is the committed prompt+generation
-    /// history (how many tokens a turn actually committed, independent of the
-    /// warm/heal path a later turn takes); the flag is whether a mid-cycle stop
-    /// stranded tokens and armed the heal; the count is the monotonic number of
-    /// full-history re-prefill heals taken so far (so a test can confirm a
-    /// continue turn actually took the heal path).
+    /// flat_full_reprefill_count, flat_mtp_last_rollback_unemitted)`. The length
+    /// is the committed prompt+generation history (how many tokens a turn
+    /// actually committed, independent of the warm/heal path a later turn
+    /// takes); the flag is whether a mid-cycle stop stranded tokens and armed
+    /// the heal; the count is the monotonic number of full-history re-prefill
+    /// heals taken so far; and the final value is the independently
+    /// engine-computed tail passed to the family rollback hook.
     #[doc(hidden)]
     MtpFlatStateForTest {
-        reply: ResponseTx<(usize, bool, u64)>,
+        reply: ResponseTx<(usize, bool, u64, usize)>,
     },
     /// Test-only: arm the flat-MTP desync heal (`flat_mtp_caches_desynced =
     /// true`) so the NEXT delta turn takes the discard+re-prefill path
@@ -1052,6 +1059,7 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
                 inner.cached_token_history.len(),
                 inner.flat_mtp_caches_desynced,
                 inner.flat_full_reprefill_count,
+                inner.flat_mtp_last_rollback_unemitted,
             )));
         }
         Qwen35Cmd::ForceFlatMtpDesyncForTest { reply } => {
@@ -1236,6 +1244,7 @@ impl Qwen35Inner {
             paged_full_attn_caches_dirty: false,
             flat_mtp_caches_desynced: false,
             flat_full_reprefill_count: 0,
+            flat_mtp_last_rollback_unemitted: 0,
             training_state: None,
             mtp,
             mtp_weights_loaded: false,
@@ -2976,6 +2985,7 @@ impl Qwen35Inner {
             )?;
 
             last_in_cache = outcome.last_in_cache;
+            self.flat_mtp_last_rollback_unemitted = outcome.rollback_unemitted;
             // Propagate a mid-cycle stop: self.caches advanced past the emitted
             // history, so force a full re-prefill next turn.
             if outcome.desynced {
@@ -3205,6 +3215,7 @@ impl Qwen35Inner {
         )?;
 
         *last_in_cache = outcome.last_in_cache;
+        self.flat_mtp_last_rollback_unemitted = outcome.rollback_unemitted;
         // Propagate a mid-cycle stop: self.caches advanced past the emitted
         // history, so force a full re-prefill next turn.
         if outcome.desynced {
@@ -9934,7 +9945,8 @@ impl Qwen3_5Model {
     }
 
     /// Test-only snapshot of the flat-MTP cache state, read *between* turns:
-    /// `(committed_history_len, flat_mtp_caches_desynced, full_reprefill_count)`.
+    /// `(committed_history_len, flat_mtp_caches_desynced,
+    /// full_reprefill_count, rollback_unemitted)`.
     ///
     /// `committed_history_len` is `cached_token_history.len()` — the prompt plus
     /// the committed generation of every completed turn — i.e. exactly how many
@@ -9944,12 +9956,12 @@ impl Qwen3_5Model {
     /// `flat_mtp_caches_desynced` reports whether the preceding turn stranded
     /// tokens mid-cycle and armed the heal. `full_reprefill_count` is the
     /// monotonic number of discard+re-prefill heals the streaming delta path has
-    /// taken — the only externally-observable proof a continue turn actually took
-    /// the heal (the reported `prompt_tokens`/`cached_tokens` cannot distinguish
-    /// heal from warm). Serialized behind the model thread, so it observes the
-    /// fully-finalized preceding turn.
+    /// taken. `rollback_unemitted` is the independently engine-computed accepted
+    /// tail sent to the family rollback hook, so a positive value must agree with
+    /// the desync flag on flat MTP. Serialized behind the model thread, so it
+    /// observes the fully-finalized preceding turn.
     #[doc(hidden)]
-    pub async fn mtp_flat_state_for_test(&self) -> (usize, bool, u64) {
+    pub async fn mtp_flat_state_for_test(&self) -> (usize, bool, u64, usize) {
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::MtpFlatStateForTest {
             reply,
         })

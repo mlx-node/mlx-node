@@ -1020,7 +1020,7 @@ async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
 }
 
 // ---------------------------------------------------------------------
-// Regression: cancel MID-MTP-CYCLE must not corrupt the next delta turn
+// Regression: cancel MID-MTP-CYCLE must leave the session recoverable
 // ---------------------------------------------------------------------
 //
 // The eager-MTP decode commits a whole speculative cycle into the flat
@@ -1033,33 +1033,24 @@ async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
 // marks the flat caches desynced on a mid-cycle stop so the next turn
 // discards them and re-prefills the full history into fresh caches.
 //
-// ORACLE: an un-cancelled MTP run. The follow-up after a healed cancel must
-// match the follow-up of a run that committed the IDENTICAL turn-1 history but
-// never desynced. AR is NOT the oracle — speculative MTP and plain AR pick
-// different tokens on T=0 argmax near-ties, so an AR reference diverges from
-// MTP for reasons unrelated to the heal (verified empirically). Running the
-// SAME (MTP) path for both isolates the desync/heal as the only variable, so
-// equal-length turn-1 histories are bit-identical greedy prefixes.
+// This asynchronous cancel has two host-timing-dependent outcomes: it can land
+// on a clean cycle boundary, or it can strand speculative tokens and arm the
+// discard+re-prefill heal. The test therefore observes the state transition
+// directly: a desynced cancel must perform exactly one full re-prefill on the
+// next turn, while a clean cancel must warm-continue without one. In both cases
+// the follow-up must complete and leave the desync flag clear.
 //
-// Two things the async cancel makes non-deterministic, both handled here:
-//   1. HOW MANY turn-1 tokens the cancel commits — the emit loop pushes to
-//      history BEFORE its cancel check, and a "cancelled" stop (unlike
-//      "length") does not force the trailing-token drop, so the committed
-//      count is host-timing-dependent. Read the ACTUAL committed length via
-//      `cached_history_len_for_test` and length-match the reference's budget
-//      so both runs commit the identical greedy prefix.
-//   2. WHETHER the cancel strands u>0 tokens (→ heal) depends on the
-//      checkpoint's per-cycle acceptance, which the public API can't force.
-//      So this is a GUARD: it never false-fails (u==0 -> both runs warm-
-//      continue the same history and agree trivially) and it catches the
-//      desync whenever the cancel lands mid-cycle. A counting prompt (high,
-//      contiguous MTP acceptance) maximises that chance.
+// Do not compare this follow-up byte-for-byte with a separately budget-stopped
+// run. Equal committed-history LENGTHS do not prove equal token vectors, and a
+// short budget can enter serial AR fallback while the cancel run entered MTP
+// verification. The deterministic `desync_heal_reprefills_to_uncancelled` test
+// below uses equivalent turn-1 schedules and remains the exact-output oracle.
 //
 // Gated on an MTP-head checkpoint — the desync only exists on the eager-MTP
 // path; on a non-MTP checkpoint or if MTP did not actually run it skips.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3.5 Dense checkpoint WITH an MTP head"]
-async fn cancel_midcycle_then_continue_mtp_matches_uncancelled() {
+async fn cancel_midcycle_then_continue_mtp_keeps_session_usable() {
     let Ok(model_path) = std::env::var("MLX_TEST_MODEL_PATH") else {
         eprintln!(
             "skipping: MLX_TEST_MODEL_PATH unset (needs an MTP-head Qwen3.5 Dense checkpoint)"
@@ -1079,9 +1070,9 @@ async fn cancel_midcycle_then_continue_mtp_matches_uncancelled() {
         .expect("failed to load Qwen3.5 model");
 
     // MTP-active gate: the desync only exists on the eager-MTP path. If the
-    // checkpoint has no MTP head (or MTP does not actually run) both runs below
-    // fall back to AR, neither desyncs, and the comparison is vacuous — skip
-    // instead of passing as a false positive. Mirrors the probe in
+    // checkpoint has no MTP head (or MTP does not actually run), the turn below
+    // falls back to AR and cannot exercise this state transition — skip instead
+    // of passing as a false positive. Mirrors the probe in
     // `nonpositive_budget_emits_zero_tokens_mtp_matches_ar`.
     if !model.has_mtp_weights() {
         eprintln!("skipping: checkpoint has no MTP head (has_mtp_weights() == false)");
@@ -1112,175 +1103,107 @@ async fn cancel_midcycle_then_continue_mtp_matches_uncancelled() {
         return;
     }
 
-    // Turn-1 stop policy. The MTP path cancels mid-cycle (the desync trigger);
-    // the AR ground truth instead stops cleanly at a fixed new-token budget so
-    // it never races the cancel and commits a deterministic history.
-    #[derive(Clone, Copy)]
-    enum Turn1Stop {
-        CancelAfter(usize),
-        Budget(usize),
-    }
+    let turn1_cfg = ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
+        enable_mtp: Some(true),
+        include_reasoning: Some(true),
+        ..chat_config_default(64)
+    };
+    let (handle, mut rx) = model
+        .chat_stream_session_start_for_test(
+            vec![user_message(
+                "Count slowly upward, one number per step: 1 2 3 4 5 and keep going.",
+            )],
+            Some(turn1_cfg),
+        )
+        .expect("turn 1 stream dispatch failed");
 
-    // Runs turn 1 under `stop`, then a fixed turn-2 follow-up on the resulting
-    // caches. Returns (turn-1 streamed-token count, full turn-2 reply text,
-    // committed history length after turn 1, whether turn 1 armed the desync
-    // heal). The committed length — read from `cached_token_history` between the
-    // turns — is how many tokens (prompt + committed generation) the session
-    // actually committed, the quantity a mid-cycle cancel makes racy. The desync
-    // flag reports whether the cancel actually stranded tokens (so the follow-up
-    // heals) or landed clean (so it warm-continues) — coverage, not a false green.
-    async fn scenario(
-        model: &Qwen3_5Model,
-        enable_mtp: bool,
-        stop: Turn1Stop,
-    ) -> (usize, String, usize, bool) {
-        let max_new = match stop {
-            Turn1Stop::Budget(n) => n as i32,
-            Turn1Stop::CancelAfter(_) => 64,
-        };
-        let turn1_cfg = ChatConfig {
-            cache_owner_id: None,
-            cache_root_owner_id: None,
-            enable_mtp: Some(enable_mtp),
-            include_reasoning: Some(true),
-            ..chat_config_default(max_new)
-        };
-        let (handle, mut rx) = model
-            .chat_stream_session_start_for_test(
-                vec![user_message(
-                    "Count slowly upward, one number per step: 1 2 3 4 5 and keep going.",
-                )],
-                Some(turn1_cfg),
-            )
-            .expect("turn 1 stream dispatch failed");
-        // The streaming emit loop fires the callback once per accepted token on
-        // BOTH paths, so `emitted` is the saved-history token count (pre
-        // drop-last) for either a cancel or a length stop.
-        let mut emitted = 0usize;
-        while let Some(result) = rx.recv().await {
-            let chunk = result.expect("turn 1 stream error");
-            if chunk.done {
-                break;
-            }
-            emitted += 1;
-            if let Turn1Stop::CancelAfter(k) = stop
-                && emitted == k
-            {
-                handle.cancel();
-            }
+    let mut n_mtp = 0usize;
+    let mut turn1_finish_reason = None;
+    while let Some(result) = rx.recv().await {
+        let chunk = result.expect("turn 1 stream error");
+        if chunk.done {
+            turn1_finish_reason = chunk.finish_reason;
+            break;
         }
-
-        // Flat-MTP state, read while the session is idle between turns (the model
-        // thread serializes commands, so this observes turn 1 fully finalized):
-        // the committed length the reference must reproduce (a mid-cycle cancel
-        // commits a host-timing-dependent count), and whether the cancel armed
-        // the desync heal.
-        let (committed_after_turn1, desynced_after_turn1, _) =
-            model.mtp_flat_state_for_test().await;
-
-        // Turn 2: follow-up delta on top of the (possibly desynced) caches.
-        let turn2_cfg = ChatConfig {
-            cache_owner_id: None,
-            cache_root_owner_id: None,
-            enable_mtp: Some(enable_mtp),
-            include_reasoning: Some(true),
-            ..chat_config_default(24)
-        };
-        let (_h2, rx2) = model
-            .chat_stream_session_continue_for_test(
-                "Repeat back, in order, every number you listed so far.".to_string(),
-                None,
-                Some(turn2_cfg),
-            )
-            .expect("turn 2 continue dispatch failed");
-        let (chunks2, _ttft, done2) = drain_stream_turn(rx2).await;
-        assert!(done2, "turn 2 (enable_mtp={enable_mtp}) didn't reach done");
-        let full2: String = chunks2.iter().map(|c| c.text.as_str()).collect();
-        (emitted, full2, committed_after_turn1, desynced_after_turn1)
+        n_mtp += 1;
+        if n_mtp == 3 {
+            handle.cancel();
+        }
     }
-
-    // MTP path: cancel mid-cycle to strand drafted-but-unemitted tokens, the
-    // condition the desync heal must repair. Capture its emitted count, the
-    // committed turn-1 history length the cancel left behind, and whether it
-    // actually armed the heal (`cancel_desynced`).
-    let (n_mtp, mtp_turn2, h1_mtp, cancel_desynced) =
-        scenario(&model, true, Turn1Stop::CancelAfter(3)).await;
     assert!(
         n_mtp >= 3,
         "MTP turn-1 emitted fewer tokens ({n_mtp}) than the cancel point; cannot \
          exercise a mid-cycle cancel"
     );
+    assert_eq!(
+        turn1_finish_reason.as_deref(),
+        Some("cancelled"),
+        "turn 1 completed without observing the requested cancellation"
+    );
 
-    // Reference: an un-cancelled MTP run that commits the SAME turn-1 history.
-    // The heal rebuilds the follow-up's context from the session's COMMITTED
-    // history, so the fair oracle is a run over the identical committed history
-    // that never desynced. The earlier version compared against AR and assumed a
-    // mid-cycle cancel commits `n_mtp - 1` tokens the way a length stop does —
-    // both wrong, and jointly this test's flakiness: only `finish_reason ==
-    // "length"` forces the trailing-token drop (`engine/cache.rs`) while the
-    // streaming loop pushes each token into history BEFORE its cancel check
-    // (`n_mtp` is counted from the callback AFTER it), so a cancel commits a
-    // host-timing-dependent `n_mtp-1 .. n_mtp+1` tokens; and MTP vs AR pick
-    // different T=0 near-tie tokens, so an AR reference diverges regardless.
-    //
-    // Read the committed length instead of guessing. `scenario` returns the
-    // actual `cached_token_history` length after turn 1 (`h1_*`), and `Budget(b)`
-    // commits exactly `b - 1` generation tokens (length stop drops the last) on
-    // top of the fixed turn-1 prompt, so committed length is linear in the
-    // budget. Run one reference turn at `Budget(n_mtp)` and, if it committed a
-    // different length than the cancel, correct the budget by the measured gap
-    // and re-run. Both runs are MTP, so equal committed length ⇒ identical
-    // greedy prefix (T=0 speculative decode is exact within its own path).
-    let (_n_ref0, ref0_turn2, h1_ref0, _) = scenario(&model, true, Turn1Stop::Budget(n_mtp)).await;
-    let (ref_turn2, h1_ref) = if h1_ref0 == h1_mtp {
-        // Cancel happened to commit the same length a `Budget(n_mtp)` stop does;
-        // the reference run already matches — no correction turn needed.
-        (ref0_turn2, h1_ref0)
-    } else {
-        // b* = n_mtp + (h1_mtp − h1_ref0): shifting the budget by the committed-
-        // length gap shifts the committed history by the same amount, so the
-        // reference commits exactly the history the cancel left.
-        let budget_star = n_mtp as i64 + h1_mtp as i64 - h1_ref0 as i64;
-        assert!(
-            budget_star >= 2,
-            "computed reference budget {budget_star} too small to commit a turn-1 \
-             history (n_mtp={n_mtp}, h1_mtp={h1_mtp}, h1_ref0={h1_ref0})"
-        );
-        let (_n_ref, t2, h1, _) =
-            scenario(&model, true, Turn1Stop::Budget(budget_star as usize)).await;
-        (t2, h1)
+    let (committed_after_turn1, desynced_after_turn1, reprefills_before, rollback_unemitted) =
+        model.mtp_flat_state_for_test().await;
+    assert!(
+        committed_after_turn1 > 0,
+        "cancelled turn did not preserve any committed history"
+    );
+    assert_eq!(
+        desynced_after_turn1,
+        rollback_unemitted > 0,
+        "flat MTP must arm the desync heal iff the engine reports an \
+         accepted-but-unemitted cycle tail (rollback_unemitted={rollback_unemitted})"
+    );
+
+    // One output token takes the near-tail AR fallback, so this turn isolates
+    // the pre-decode heal transition and cannot itself strand a new MTP tail.
+    let turn2_cfg = ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
+        enable_mtp: Some(true),
+        include_reasoning: Some(true),
+        ..chat_config_default(1)
     };
+    let (_h2, rx2) = model
+        .chat_stream_session_continue_for_test(
+            "Repeat back, in order, every number you listed so far.".to_string(),
+            None,
+            Some(turn2_cfg),
+        )
+        .expect("turn 2 continue dispatch failed");
+    let (chunks2, _ttft, done2) = drain_stream_turn(rx2).await;
+    assert!(done2, "turn 2 after MTP cancellation didn't reach done");
+    let final2 = chunks2.last().expect("turn 2 produced no chunks");
+    assert!(
+        matches!(
+            final2.finish_reason.as_deref(),
+            Some("stop") | Some("length")
+        ),
+        "unexpected turn-2 finish_reason after MTP cancellation: {:?}",
+        final2.finish_reason
+    );
 
-    // Coverage, not a false green: whether THIS cancel landing armed the heal
-    // (`cancel_desynced`) is host-timing-dependent. When true, the equality below
-    // exercises the discard+re-prefill path; when false the cancel landed clean
-    // and both runs warm-continue. `desync_heal_reprefills_to_uncancelled` covers
-    // the heal deterministically, so this test never needs to force the landing.
+    let (_, desynced_after_turn2, reprefills_after, turn2_rollback_unemitted) =
+        model.mtp_flat_state_for_test().await;
     println!(
-        "cancel: emitted={n_mtp} committed_hist={h1_mtp} desynced={cancel_desynced}  \
-         ref cal={h1_ref0}  ref matched={h1_ref}"
+        "cancel: emitted={n_mtp} committed_hist={committed_after_turn1} \
+         rollback_unemitted={rollback_unemitted} desynced={desynced_after_turn1} \
+         reprefills={reprefills_before}->{reprefills_after}"
     );
-    println!("cancel turn2 = {mtp_turn2:?}");
-    println!("ref    turn2 = {ref_turn2:?}");
-
-    // Precondition for a fair comparison: the budget correction reproduced the
-    // exact committed turn-1 history the cancel left. If this fails the readout
-    // or the model misbehaved — a distinct failure from a broken heal.
-    assert_eq!(
-        h1_ref, h1_mtp,
-        "budget-matched reference run did not reproduce the cancel's committed \
-         history length (h1_ref={h1_ref}, h1_mtp={h1_mtp}); cannot compare turn-2 fairly"
+    assert!(
+        !desynced_after_turn2,
+        "the follow-up must clear the flat-MTP desync flag"
     );
-
-    // KEY: over the identical committed history, a healed cancel yields exactly
-    // the un-cancelled reply. Under the original bug the flat caches were advanced
-    // past the committed history (stranded drafted tokens never rolled back), so
-    // this follow-up diverges grossly. Asserted unconditionally — no skip.
     assert_eq!(
-        mtp_turn2, ref_turn2,
-        "MTP follow-up after a mid-cycle cancel diverged from the un-cancelled \
-         reply over the SAME committed history — flat-cache desync not healed.\n\
-         cancel={mtp_turn2:?}\nref={ref_turn2:?}"
+        turn2_rollback_unemitted, 0,
+        "one-token follow-up must not enter an MTP cycle"
+    );
+    let expected_reprefills = reprefills_before + u64::from(desynced_after_turn1);
+    assert_eq!(
+        reprefills_after, expected_reprefills,
+        "the follow-up must re-prefill exactly once iff cancellation armed the \
+         flat-MTP desync heal"
     );
 }
 
@@ -1288,7 +1211,7 @@ async fn cancel_midcycle_then_continue_mtp_matches_uncancelled() {
 // Regression: the desync HEAL must re-prefill to the un-cancelled reply
 // ---------------------------------------------------------------------
 //
-// Companion to `cancel_midcycle_then_continue_mtp_matches_uncancelled`. That
+// Companion to `cancel_midcycle_then_continue_mtp_keeps_session_usable`. That
 // test only exercises the heal when a mid-cycle cancel happens to strand
 // tokens, which is host-timing-dependent (a fast host lands every cancel on a
 // clean boundary, so the follow-up warm-continues and the comparison never
@@ -1350,14 +1273,14 @@ async fn desync_heal_reprefills_to_uncancelled() {
                 break;
             }
         }
-        let (committed, desynced0, reprefills_before) = model.mtp_flat_state_for_test().await;
+        let (committed, desynced0, reprefills_before, _) = model.mtp_flat_state_for_test().await;
         assert!(
             !desynced0,
             "a clean length-stopped turn 1 must not be desynced"
         );
         if arm_desync {
             model.force_flat_mtp_desync_for_test().await;
-            let (_, armed, _) = model.mtp_flat_state_for_test().await;
+            let (_, armed, _, _) = model.mtp_flat_state_for_test().await;
             assert!(armed, "force_flat_mtp_desync_for_test did not arm the flag");
         }
 
@@ -1378,7 +1301,7 @@ async fn desync_heal_reprefills_to_uncancelled() {
         let (chunks2, _ttft, done2) = drain_stream_turn(rx2).await;
         assert!(done2, "turn 2 didn't reach done");
         let text: String = chunks2.iter().map(|c| c.text.as_str()).collect();
-        let (_, desynced_after, reprefills_after) = model.mtp_flat_state_for_test().await;
+        let (_, desynced_after, reprefills_after, _) = model.mtp_flat_state_for_test().await;
         // Heal ran iff turn 2 took the discard+re-prefill path (the counter
         // incremented). The streaming chunk's `prompt_tokens`/`cached_tokens`
         // report identically for heal and warm, so the counter is the only

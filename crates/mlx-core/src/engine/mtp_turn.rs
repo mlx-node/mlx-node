@@ -1089,9 +1089,9 @@ pub(crate) struct MtpTurnArgs<'a> {
 }
 
 /// Terminal outs of [`run_mtp_turn`] the caller threads into its save /
-/// next-turn bookkeeping — the engine-owned surfaces of the two
-/// side-channels the family code reads AFTER the `decode_loop_mtp!` macro
-/// today (`last_in_cache` and the `mtp_desynced` cell).
+/// next-turn bookkeeping — the engine-owned surfaces of the cache-position,
+/// desync-latch, and rollback-observation side channels the family code reads
+/// after the speculative loop.
 ///
 /// `#[allow(dead_code)]`: SCAFFOLD — produced only by the dead
 /// [`run_mtp_turn`] / the module's mock tests until the family rewire.
@@ -1108,6 +1108,14 @@ pub(crate) struct MtpTurnOutcome {
     /// `false`. The caller propagates it into
     /// `self.flat_mtp_caches_desynced` exactly as the post-macro code does.
     pub desynced: bool,
+    /// Number of accepted cycle tokens that could not be emitted before the
+    /// terminal condition and were passed to
+    /// [`MtpStepper::rollback_unemitted`]. This is computed by the engine,
+    /// independently of the family stepper's desync latch, so integration tests
+    /// can verify the production rollback-to-latch edge instead of trusting the
+    /// latch as its own oracle. Zero means the turn stopped on a clean cycle
+    /// boundary (or never entered a speculative cycle).
+    pub rollback_unemitted: usize,
 }
 
 struct DecodeProgressTrace {
@@ -1301,6 +1309,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // outcome. Default `true`: a clean length/EOS exit on a forwarded
     // token keeps the boundary token in cache.
     let mut last_in_cache = true;
+    let mut rollback_unemitted = 0usize;
 
     // Emit the FIRST token via a normal main-path forward+hidden.
     // The MTP loop needs an established last-committed token AND
@@ -1975,6 +1984,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         if hit_stop {
             let unemitted = outcome.tokens.len().saturating_sub(cycle_emitted);
             if unemitted > 0 {
+                rollback_unemitted = unemitted;
                 step.rollback_unemitted(unemitted);
             }
             break;
@@ -2047,6 +2057,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     Ok(MtpTurnOutcome {
         last_in_cache,
         desynced,
+        rollback_unemitted,
     })
 }
 
@@ -3904,6 +3915,7 @@ mod tests {
         finish_reason: String,
         last_in_cache: bool,
         desynced: bool,
+        rollback_unemitted: usize,
         ledger: Vec<Call>,
     }
 
@@ -3976,6 +3988,7 @@ mod tests {
             finish_reason,
             last_in_cache: outcome.last_in_cache,
             desynced: outcome.desynced,
+            rollback_unemitted: outcome.rollback_unemitted,
             ledger: backend.ledger_snapshot(),
         }
     }
@@ -4043,6 +4056,7 @@ mod tests {
         // rollback_unemitted, no desync.
         assert!(out.last_in_cache, "clean length exit keeps last_in_cache");
         assert!(!out.desynced, "no mid-cycle stop -> not desynced");
+        assert_eq!(out.rollback_unemitted, 0);
         assert_eq!(backend.begin_calls.get(), 1, "exactly one begin_mtp_decode");
 
         // Ledger: TWO Step-A forwards + TWO cycles (begin_cycle / snapshot /
@@ -4136,6 +4150,7 @@ mod tests {
             "EOS is the cycle's unforwarded boundary token -> not in cache"
         );
         assert!(!out.desynced, "stop on the LAST cycle token -> no desync");
+        assert_eq!(out.rollback_unemitted, 0);
         // The EOS landed as the cycle's final emitted token, so the emit loop
         // ran to completion (no unemitted remainder).
         assert_eq!(
@@ -4212,6 +4227,10 @@ mod tests {
         assert!(
             out.desynced,
             "mid-cycle stop with unemitted>0 leaves the flat caches desynced"
+        );
+        assert_eq!(
+            out.rollback_unemitted, 2,
+            "engine outcome must independently report the rolled-back cycle tail"
         );
         // rollback_unemitted fired exactly once with the 2-token remainder
         // ([6, 7], the accepted-but-unemitted cycle tail).
