@@ -264,6 +264,12 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_eval(handle: *mut mlx_array);
     pub fn mlx_async_eval(handles: *mut *mut mlx_array, count: usize);
     pub fn mlx_eval(handles: *mut *mut mlx_array, count: usize) -> bool;
+    pub fn mlx_eval_with_error(
+        handles: *mut *mut mlx_array,
+        count: usize,
+        error_out: *mut std::ffi::c_char,
+        error_capacity: usize,
+    ) -> bool;
     pub fn mlx_array_size(handle: *mut mlx_array) -> usize;
     pub fn mlx_array_ndim(handle: *mut mlx_array) -> usize;
     pub fn mlx_array_shape(handle: *mut mlx_array, out: *mut i64);

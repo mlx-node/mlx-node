@@ -45,9 +45,33 @@ void mlx_async_eval(mlx_array** handles, size_t count) {
   }
 }
 
+namespace {
+
+void mlx_copy_error(char* error_out,
+                    size_t error_capacity,
+                    const char* detail) {
+  if (!error_out || error_capacity == 0) {
+    return;
+  }
+  const char* message = detail ? detail : "unknown exception";
+  const size_t length = std::min(std::strlen(message), error_capacity - 1);
+  std::memcpy(error_out, message, length);
+  error_out[length] = '\0';
+}
+
+}  // namespace
+
 // Synchronous eval — matches Python's mx.eval(arrays).
-// Unlike async_eval, this blocks until all arrays are materialized.
-bool mlx_eval(mlx_array** handles, size_t count) {
+// Unlike async_eval, this blocks until all arrays are materialized. The
+// caller-owned error buffer carries the native exception across the C ABI so
+// Rust can report it through the configured tracing subscriber.
+bool mlx_eval_with_error(mlx_array** handles,
+                         size_t count,
+                         char* error_out,
+                         size_t error_capacity) {
+  if (error_out && error_capacity > 0) {
+    error_out[0] = '\0';
+  }
   try {
     std::vector<array> arrays;
     arrays.reserve(count);
@@ -59,12 +83,20 @@ bool mlx_eval(mlx_array** handles, size_t count) {
     mlx::core::eval(std::move(arrays));
     return true;
   } catch (const std::exception& e) {
+    mlx_copy_error(error_out, error_capacity, e.what());
     mlx_trace_native_error("eval", e.what());
     return false;
   } catch (...) {
+    mlx_copy_error(error_out, error_capacity, "unknown exception");
     mlx_trace_native_error("eval", "unknown exception");
     return false;
   }
+}
+
+// Compatibility wrapper for existing native callers that do not need the
+// exception detail.
+bool mlx_eval(mlx_array** handles, size_t count) {
+  return mlx_eval_with_error(handles, count, nullptr, 0);
 }
 
 size_t mlx_array_size(mlx_array* handle) {

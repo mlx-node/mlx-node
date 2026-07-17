@@ -1,10 +1,37 @@
 use super::handle::MxHandle;
 use super::{DType, MxArray};
-use crate::inference_trace::write as write_inference_trace;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use std::ffi::CStr;
 use std::sync::Arc;
+
+const MLX_EVAL_ERROR_CAPACITY: usize = 4096;
+
+fn eval_native(handles: &mut [*mut sys::mlx_array]) -> std::result::Result<(), String> {
+    let mut error = [0_u8; MLX_EVAL_ERROR_CAPACITY];
+    let ok = unsafe {
+        sys::mlx_eval_with_error(
+            handles.as_mut_ptr(),
+            handles.len(),
+            error.as_mut_ptr().cast(),
+            error.len(),
+        )
+    };
+    if ok {
+        return Ok(());
+    }
+
+    let detail = unsafe { CStr::from_ptr(error.as_ptr().cast()) }
+        .to_string_lossy()
+        .trim()
+        .to_owned();
+    if detail.is_empty() {
+        Err("unknown native MLX exception".to_owned())
+    } else {
+        Err(detail)
+    }
+}
 
 /// Whether MLX's Metal backend is available on this host (cached; constant per
 /// process). False on the CUDA/Linux build, which must use synchronous eval to
@@ -53,14 +80,17 @@ impl MxArray {
         if !metal_backend_available() {
             // Sync eval returns false if materialization threw. This path can't
             // surface a Result (callers are fire-and-forget overlap evals), so
-            // record the failure in the inference trace like `eval_arrays` does
-            // rather than dropping it silently.
-            let ok = unsafe { sys::mlx_eval(handles.as_mut_ptr(), handles.len()) };
-            if !ok {
-                write_inference_trace(format_args!(
-                    "native_error context=async_eval_arrays count={}",
-                    handles.len()
-                ));
+            // record the failure through the configured tracing subscriber
+            // like `eval_arrays` does rather than dropping it silently.
+            if let Err(detail) = eval_native(&mut handles) {
+                tracing::error!(
+                    target: "mlx_core::inference",
+                    event = "mlx_eval_failed",
+                    context = "async_eval_arrays_sync_fallback",
+                    array_count = handles.len(),
+                    error = %detail,
+                    "MLX array materialization failed"
+                );
             }
             return;
         }
@@ -72,22 +102,32 @@ impl MxArray {
     /// Synchronously evaluate multiple arrays (blocking).
     /// Used between prefill chunks to materialize KV caches and break lazy dependency chains.
     pub(crate) fn eval_arrays(arrays: &[&MxArray]) -> Result<()> {
+        Self::eval_arrays_with_context(arrays, "eval_arrays")
+    }
+
+    /// Synchronously evaluate multiple arrays and attach an operation name to
+    /// both the structured trace event and any caller-visible error.
+    pub(crate) fn eval_arrays_with_context(arrays: &[&MxArray], context: &str) -> Result<()> {
         if arrays.is_empty() {
             return Ok(());
         }
         let mut handles: Vec<*mut sys::mlx_array> = arrays.iter().map(|arr| arr.handle.0).collect();
-        let ok = unsafe { sys::mlx_eval(handles.as_mut_ptr(), handles.len()) };
-        if ok {
-            Ok(())
-        } else {
-            write_inference_trace(format_args!(
-                "native_error context=eval_arrays count={}",
-                handles.len()
-            ));
-            Err(Error::from_reason(format!(
-                "MLX eval failed while materializing {} arrays; see MLX_INFERENCE_TRACE_FILE",
-                handles.len()
-            )))
+        match eval_native(&mut handles) {
+            Ok(()) => Ok(()),
+            Err(detail) => {
+                tracing::error!(
+                    target: "mlx_core::inference",
+                    event = "mlx_eval_failed",
+                    context,
+                    array_count = handles.len(),
+                    error = %detail,
+                    "MLX array materialization failed"
+                );
+                Err(Error::from_reason(format!(
+                    "MLX eval failed in {context} while materializing {} arrays: {detail}",
+                    handles.len()
+                )))
+            }
         }
     }
 

@@ -190,12 +190,11 @@ impl VisionAttention {
     ///
     /// # Returns
     /// * Output tensor [seq_len, dim]
-    pub fn forward_with_mask(
+    fn attention_inputs(
         &self,
         x: &MxArray,
-        attention_mask: Option<&MxArray>,
         rotary_pos_emb: Option<&MxArray>,
-    ) -> Result<MxArray> {
+    ) -> Result<(MxArray, MxArray, MxArray, i64)> {
         let shape = x.shape()?;
         let seq_len = shape[0];
         let _dim = shape[1];
@@ -243,10 +242,10 @@ impl VisionAttention {
             .reshape(&[1, seq_len, self.num_heads as i64, self.head_dim as i64])?
             .transpose(Some(&[0, 2, 1, 3]))?;
 
-        // Use fused scaled dot-product attention (Metal kernel)
-        // mask shape [1, seq_len, seq_len] broadcasts to [1, num_heads, seq_len, seq_len]
-        let output = scaled_dot_product_attention(&q, &k, &v, self.scale as f64, attention_mask)?;
+        Ok((q, k, v, seq_len))
+    }
 
+    fn project_attention_output(&self, output: MxArray, seq_len: i64) -> Result<MxArray> {
         // Transpose back: [1, num_heads, seq_len, head_dim] -> [1, seq_len, num_heads, head_dim]
         let output = output.transpose(Some(&[0, 2, 1, 3]))?;
 
@@ -255,6 +254,76 @@ impl VisionAttention {
 
         // Output projection
         self.out_proj.forward(&output)
+    }
+
+    pub fn forward_with_mask(
+        &self,
+        x: &MxArray,
+        attention_mask: Option<&MxArray>,
+        rotary_pos_emb: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        let (q, k, v, seq_len) = self.attention_inputs(x, rotary_pos_emb)?;
+
+        // Use fused scaled dot-product attention (Metal kernel)
+        // mask shape [1, seq_len, seq_len] broadcasts to [1, num_heads, seq_len, seq_len]
+        let output = scaled_dot_product_attention(&q, &k, &v, self.scale as f64, attention_mask)?;
+
+        self.project_attention_output(output, seq_len)
+    }
+
+    /// Forward variable-length image segments without constructing a global
+    /// quadratic block-diagonal mask.
+    ///
+    /// Q/K/V projections and the output projection still run once over the
+    /// concatenated token stream. Only SDPA is split at the cumulative segment
+    /// boundaries, matching mlx-vlm's Qwen3-VL vision attention. Since the old
+    /// additive mask allowed attention only within each segment, this preserves
+    /// the same attention semantics while reducing mask storage from
+    /// `O(total_tokens^2)` to zero and attention work to
+    /// `O(sum(segment_tokens^2))`.
+    pub(crate) fn forward_segmented(
+        &self,
+        x: &MxArray,
+        segment_boundaries: &[i64],
+        rotary_pos_emb: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        let (q, k, v, seq_len) = self.attention_inputs(x, rotary_pos_emb)?;
+        if segment_boundaries.len() < 2
+            || segment_boundaries.first().copied() != Some(0)
+            || segment_boundaries.last().copied() != Some(seq_len)
+            || segment_boundaries.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "vision attention segment boundaries must be a contiguous, non-empty cover of 0..{seq_len}, got {segment_boundaries:?}"
+                ),
+            ));
+        }
+
+        let mut outputs = Vec::with_capacity(segment_boundaries.len() - 1);
+        for pair in segment_boundaries.windows(2) {
+            let start = pair[0];
+            let end = pair[1];
+            let q_segment = q.slice_axis(2, start, end)?;
+            let k_segment = k.slice_axis(2, start, end)?;
+            let v_segment = v.slice_axis(2, start, end)?;
+            outputs.push(scaled_dot_product_attention(
+                &q_segment,
+                &k_segment,
+                &v_segment,
+                self.scale as f64,
+                None,
+            )?);
+        }
+
+        let output = if outputs.len() == 1 {
+            outputs.remove(0)
+        } else {
+            let refs: Vec<&MxArray> = outputs.iter().collect();
+            MxArray::concatenate_many(refs, Some(2))?
+        };
+        self.project_attention_output(output, seq_len)
     }
 
     /// Forward pass, building the attention mask from `cu_seqlens` internally.
@@ -445,6 +514,26 @@ impl VisionEncoderLayer {
         hidden_states.add(&mlp_output)
     }
 
+    /// Forward with attention split at variable-length image/frame boundaries.
+    /// Pointwise norms/MLP and both residuals remain on the concatenated stream;
+    /// only the attention operation is segmented.
+    pub(crate) fn forward_segmented(
+        &self,
+        hidden_states: &MxArray,
+        segment_boundaries: &[i64],
+        rotary_pos_emb: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        let normed = self.layer_norm1.forward(hidden_states)?;
+        let attn_output =
+            self.self_attn
+                .forward_segmented(&normed, segment_boundaries, rotary_pos_emb)?;
+        let hidden_states = hidden_states.add(&attn_output)?;
+
+        let normed = self.layer_norm2.forward(&hidden_states)?;
+        let mlp_output = self.mlp.forward(&normed)?;
+        hidden_states.add(&mlp_output)
+    }
+
     /// Forward pass, building the attention mask from `cu_seqlens` internally.
     ///
     /// Prefer [`Self::forward_with_mask`] when calling this repeatedly with
@@ -546,6 +635,47 @@ mod tests {
 
         let shape: Vec<i64> = output.shape().unwrap().as_ref().to_vec();
         assert_eq!(shape, vec![seq_len, dim as i64]);
+    }
+
+    #[test]
+    fn segmented_attention_matches_block_diagonal_mask() {
+        let dim = 16u32;
+        let num_heads = 4u32;
+        let seq_len = 6i64;
+        let boundaries = [0i64, 4, 6];
+
+        let qkv_weight = random_array(&[(dim * 3) as i64, dim as i64]);
+        let out_weight = random_array(&[dim as i64, dim as i64]);
+        let attn =
+            VisionAttention::new(dim, num_heads, &qkv_weight, None, &out_weight, None).unwrap();
+        let input = random_array(&[seq_len, dim as i64]);
+
+        let cu_seqlens = MxArray::from_int32(&[0, 4, 6], &[3]).unwrap();
+        let mask = VisionAttention::build_attention_mask(
+            &cu_seqlens,
+            seq_len,
+            crate::array::DType::Float32,
+        )
+        .unwrap();
+        let masked = attn.forward_with_mask(&input, Some(&mask), None).unwrap();
+        let segmented = attn.forward_segmented(&input, &boundaries, None).unwrap();
+        MxArray::eval_arrays_with_context(
+            &[&masked, &segmented],
+            "vision_segmented_attention_equivalence",
+        )
+        .unwrap();
+
+        let masked = masked.to_float32().unwrap();
+        let segmented = segmented.to_float32().unwrap();
+        assert_eq!(masked.len(), segmented.len());
+        for (index, (expected, actual)) in masked.iter().zip(segmented.iter()).enumerate() {
+            let error = (expected - actual).abs();
+            assert!(
+                error <= 1e-4,
+                "segmented attention differs from block-mask attention at {index}: \
+                 expected {expected}, got {actual}, error {error}"
+            );
+        }
     }
 
     /// Throwaway microbenchmark (not part of the fix) isolating the exact

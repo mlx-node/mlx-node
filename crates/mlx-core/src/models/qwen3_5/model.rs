@@ -10633,6 +10633,47 @@ pub(crate) fn vlm_prepare_vision_features(
             let _stream_ctx = StreamContext::new(generation_stream);
             vision_encoder.forward(&pv_5d, &grid)?
         };
+        let vision_materialize_start = std::time::Instant::now();
+        let image_count = grid.shape_at(0).unwrap_or(0);
+        tracing::info!(
+            target: "mlx_core::inference",
+            event = "vision_feature_materialization_start",
+            image_count,
+            patch_count = pv_shape[0],
+            "Qwen3.5 vision feature materialization started"
+        );
+
+        // Materialize the complete vision graph before publishing it to the
+        // shared cache or attaching it to the language-model prefill graph.
+        // Besides bounding the lazy DAG lifetime, this keeps a failed vision
+        // computation out of the cache and reports the failure at its actual
+        // lifecycle boundary instead of at a later decoder-layer eval barrier.
+        if let Err(error) =
+            MxArray::eval_arrays_with_context(&[&features], "qwen3_5_vision_features")
+        {
+            tracing::error!(
+                target: "mlx_core::inference",
+                event = "vision_feature_materialization_failed",
+                image_count,
+                patch_count = pv_shape[0],
+                elapsed_ms = elapsed_ms(vision_materialize_start),
+                error = %error,
+                "Qwen3.5 vision feature materialization failed"
+            );
+            return Err(Error::from_reason(format!(
+                "Qwen3.5 vision feature materialization failed: {error}"
+            )));
+        }
+        crate::array::clear_cache();
+        tracing::info!(
+            target: "mlx_core::inference",
+            event = "vision_feature_materialization_done",
+            image_count,
+            patch_count = pv_shape[0],
+            feature_tokens = features.shape_at(0).unwrap_or(0),
+            elapsed_ms = elapsed_ms(vision_materialize_start),
+            "Qwen3.5 vision feature materialization completed"
+        );
 
         {
             let mut cache = vision_cache

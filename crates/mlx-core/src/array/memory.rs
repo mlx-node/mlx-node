@@ -232,7 +232,7 @@ pub fn maybe_eval_clear_for_paged_prefill_layer(
         return Ok(());
     }
     if (layer_idx + 1).is_multiple_of(interval as usize) {
-        super::MxArray::eval_arrays(&[hidden_states])?;
+        super::MxArray::eval_arrays_with_context(&[hidden_states], "paged_prefill_layer_barrier")?;
         clear_cache();
     }
     Ok(())
@@ -474,9 +474,8 @@ fn eval_weight_materialize_chunk(
         chunk_bytes as f64 / (1u64 << 20) as f64,
     ));
 
-    let mut handles: Vec<*mut sys::mlx_array> = chunk.iter().map(|arr| arr.handle.0).collect();
-    let ok = unsafe { sys::mlx_eval(handles.as_mut_ptr(), handles.len()) };
-    if !ok {
+    if let Err(error) = super::MxArray::eval_arrays_with_context(chunk, "weight_materialize_chunk")
+    {
         write_inference_trace(format_args!(
             "[MLX_TRACE] weight_materialize_chunk_error index={} arrays={} bytes_mb={:.1}",
             chunk_index,
@@ -484,7 +483,7 @@ fn eval_weight_materialize_chunk(
             chunk_bytes as f64 / (1u64 << 20) as f64,
         ));
         return Err(Error::from_reason(format!(
-            "MLX eval failed while materializing weight chunk {chunk_index} ({:.1} MB, {} arrays); see MLX_INFERENCE_TRACE_FILE",
+            "MLX eval failed while materializing weight chunk {chunk_index} ({:.1} MB, {} arrays): {error}",
             chunk_bytes as f64 / (1u64 << 20) as f64,
             chunk.len(),
         )));
