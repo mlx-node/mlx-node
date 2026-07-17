@@ -51,7 +51,9 @@ export class PagedConfigOverrideManager {
   private readonly tempDirPrefix: string;
   private readonly preserveEmbeddedGemmaDraft: boolean;
   private readonly overrides = new Map<string, Promise<string>>();
+  private readonly activeResolves = new Set<Promise<string>>();
   private rootPromise: Promise<string> | undefined;
+  private cleanupPromise: Promise<void> | undefined;
   private disposed = false;
 
   constructor(options: PagedConfigOverrideManagerOptions = {}) {
@@ -71,6 +73,16 @@ export class PagedConfigOverrideManager {
       throw new Error('PagedConfigOverrideManager: resolve() called after cleanup()');
     }
 
+    const operation = this.resolveInternal(modelPath, canonicalModelType);
+    this.activeResolves.add(operation);
+    try {
+      return await operation;
+    } finally {
+      this.activeResolves.delete(operation);
+    }
+  }
+
+  private async resolveInternal(modelPath: string, canonicalModelType?: string): Promise<string> {
     const sourcePath = isAbsolute(modelPath) ? modelPath : resolve(modelPath);
     let config: Record<string, unknown>;
     try {
@@ -119,10 +131,16 @@ export class PagedConfigOverrideManager {
   }
 
   /** Remove this manager's temporary root without affecting other managers. */
-  async cleanup(): Promise<void> {
-    if (this.disposed) return;
+  cleanup(): Promise<void> {
+    if (this.cleanupPromise !== undefined) return this.cleanupPromise;
     this.disposed = true;
+    this.cleanupPromise = this.performCleanup();
+    return this.cleanupPromise;
+  }
 
+  private async performCleanup(): Promise<void> {
+    await Promise.allSettled(this.activeResolves);
+    this.activeResolves.clear();
     await Promise.allSettled(this.overrides.values());
     this.overrides.clear();
     if (this.rootPromise === undefined) return;
@@ -140,8 +158,7 @@ export class PagedConfigOverrideManager {
     modelType: string,
   ): Promise<string> {
     const root = await this.getRoot();
-    const overrideDir = join(root, hashPath(sourcePath));
-    await mkdir(overrideDir, { recursive: true });
+    const overrideDir = await mkdtemp(join(root, 'model-'));
 
     const config: Record<string, unknown> = {
       ...sourceConfig,
@@ -281,13 +298,4 @@ function resolveQwen35CacheFloorMb(): number {
   if (raw == null || raw === '') return DEFAULT_QWEN35_PAGED_CACHE_MB;
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_QWEN35_PAGED_CACHE_MB;
-}
-
-function hashPath(path: string): string {
-  let hash = 0x811c9dc5;
-  for (let index = 0; index < path.length; index++) {
-    hash ^= path.charCodeAt(index);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0).toString(16).padStart(8, '0');
 }

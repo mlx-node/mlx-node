@@ -1,3 +1,5 @@
+import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, readlink, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -128,6 +130,51 @@ describe('PagedConfigOverrideManager launch-claude policy', () => {
       await rm(src, { recursive: true, force: true });
     }
   });
+
+  it.skipIf(process.platform === 'win32')(
+    'isolates source paths that collide under the legacy 32-bit hash',
+    async () => {
+      // These two prefixes have the same legacy FNV-1a state. Appending the
+      // same unique suffix preserves that collision while isolating this test.
+      const suffix = `-${process.pid}-${randomUUID()}`;
+      const firstSource = `/tmp/mlx-model-v0puciwe9dbm${suffix}`;
+      const secondSource = `/tmp/mlx-model-to6hjutmfq9d${suffix}`;
+      const weightName = 'model-00001-of-00001.safetensors';
+      const manager = launchClaudeManager();
+
+      await Promise.all([mkdir(firstSource), mkdir(secondSource)]);
+      await Promise.all([
+        writeFile(
+          join(firstSource, 'config.json'),
+          JSON.stringify({ model_type: 'qwen3_5', collision_marker: 'first' }),
+          'utf-8',
+        ),
+        writeFile(join(firstSource, weightName), 'first weights', 'utf-8'),
+        writeFile(
+          join(secondSource, 'config.json'),
+          JSON.stringify({ model_type: 'qwen3_5', collision_marker: 'second' }),
+          'utf-8',
+        ),
+        writeFile(join(secondSource, weightName), 'second weights', 'utf-8'),
+      ]);
+
+      try {
+        const first = await manager.resolve(firstSource);
+        const second = await manager.resolve(secondSource);
+
+        expect(dirname(first)).toBe(dirname(second));
+        expect(first).not.toBe(second);
+        expect((await readConfig(first)).collision_marker).toBe('first');
+        expect((await readConfig(second)).collision_marker).toBe('second');
+        expect(await readlink(join(first, weightName))).toBe(join(firstSource, weightName));
+        expect(await readlink(join(second, weightName))).toBe(join(secondSource, weightName));
+      } finally {
+        await manager.cleanup();
+        await rm(firstSource, { recursive: true, force: true });
+        await rm(secondSource, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('passes through missing or malformed config files', async () => {
     const missing = await mkdtemp(join(tmpdir(), 'mlx-paged-override-no-config-'));
@@ -331,6 +378,30 @@ describe('PagedConfigOverrideManager agent policy and lifecycle', () => {
     } finally {
       await firstManager.cleanup();
       await secondManager.cleanup();
+      await rm(src, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === 'win32')('waits for in-flight resolves before cleanup returns', async () => {
+    const src = await mkdtemp(join(tmpdir(), 'mlx-paged-override-cleanup-race-'));
+    const configPipe = join(src, 'config.json');
+    await writeFile(join(src, 'model.safetensors'), 'fake', 'utf-8');
+    execFileSync('mkfifo', [configPipe]);
+    const manager = launchClaudeManager();
+
+    try {
+      // `readFile(configPipe)` cannot finish until the writer closes. This
+      // deterministically holds resolve() before it registers an override,
+      // reproducing the cleanup race that previously leaked a new root.
+      const resolving = manager.resolve(src);
+      const cleaning = manager.cleanup();
+      const writing = writeFile(configPipe, JSON.stringify({ model_type: 'qwen3_5' }), 'utf-8');
+      const [override] = await Promise.all([resolving, cleaning, writing]);
+
+      expect(override).not.toBe(src);
+      expect(await pathExists(override)).toBe(false);
+    } finally {
+      await manager.cleanup();
       await rm(src, { recursive: true, force: true });
     }
   });
