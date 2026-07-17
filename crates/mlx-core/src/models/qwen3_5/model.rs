@@ -9640,6 +9640,16 @@ impl Qwen3_5Model {
     }
 }
 
+impl Qwen3_5Model {
+    /// Test-only deterministic teardown for memory-constrained real-weight
+    /// integration tests. Requires exclusive command-sender ownership and
+    /// leaves production NAPI drops non-blocking.
+    #[doc(hidden)]
+    pub fn shutdown_for_test(mut self) -> std::result::Result<(), String> {
+        self.thread.shutdown_and_join()
+    }
+}
+
 crate::models::chat_napi::chat_napi_surface! {
     class: Qwen3_5Model,
     thread_cmd: Qwen35Cmd,

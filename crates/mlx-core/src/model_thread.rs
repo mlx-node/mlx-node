@@ -89,6 +89,32 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
             .send(cmd)
             .map_err(|_| napi::Error::from_reason("Model thread has exited"))
     }
+
+    /// Close the command channel and wait for the model thread to release its
+    /// state.
+    ///
+    /// Normal NAPI teardown deliberately detaches in [`Drop`] so JavaScript GC
+    /// never blocks on multi-gigabyte Metal cleanup. Real-weight tests sometimes
+    /// need deterministic teardown before loading a second oracle model on a
+    /// memory-constrained runner; this explicit path provides that stronger
+    /// lifecycle guarantee without changing production drop behavior.
+    pub(crate) fn shutdown_and_join(&mut self) -> Result<(), String> {
+        if let Some(cmd_tx) = self.cmd_tx.as_ref() {
+            let sender_count = cmd_tx.strong_count();
+            if sender_count != 1 {
+                return Err(format!(
+                    "cannot join model thread while {sender_count} command senders are alive"
+                ));
+            }
+        }
+        self.cmd_tx.take();
+        match self._handle.take() {
+            Some(handle) => handle
+                .join()
+                .map_err(|_| "model thread panicked during shutdown".to_string()),
+            None => Ok(()),
+        }
+    }
 }
 
 impl<Cmd: Send + 'static> Drop for ModelThread<Cmd> {
@@ -135,4 +161,51 @@ where
     thread.send(make_cmd(tx))?;
     rx.blocking_recv()
         .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelThread;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct DropState(Arc<AtomicBool>);
+
+    impl Drop for DropState {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn explicit_shutdown_requires_exclusive_sender_and_joins_state_drop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_for_thread = dropped.clone();
+        let (mut model_thread, init_rx) = ModelThread::<()>::spawn_with_init(
+            move || Ok((DropState(dropped_for_thread), ())),
+            |_, _| {},
+        );
+        init_rx
+            .blocking_recv()
+            .expect("model init channel closed")
+            .expect("model init failed");
+
+        let extra_sender = model_thread
+            .cmd_sender()
+            .expect("model sender missing")
+            .clone();
+        let err = model_thread
+            .shutdown_and_join()
+            .expect_err("an outstanding sender must prevent a blocking join");
+        assert!(err.contains("2 command senders"), "unexpected error: {err}");
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        drop(extra_sender);
+        model_thread
+            .shutdown_and_join()
+            .expect("exclusive shutdown should join the worker");
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 }
