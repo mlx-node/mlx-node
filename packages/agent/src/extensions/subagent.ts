@@ -628,7 +628,12 @@ export function createSubagentExtension(options: SubagentExtensionOptions = {}):
             let previous = '';
             for (let i = 0; i < params.chain.length; i++) {
               const item = params.chain[i]!;
-              const result = await run(item.agent, item.task.replace(/\{previous\}/g, previous), item.cwd, i + 1);
+              const result = await run(
+                item.agent,
+                item.task.replace(/\{previous\}/g, () => previous),
+                item.cwd,
+                i + 1,
+              );
               results.push(result);
               if (isFailed(result)) {
                 return {

@@ -354,6 +354,39 @@ describe('mlx subagent extension', () => {
     expect(result.content).toEqual([{ type: 'text', text: 'second result' }]);
   });
 
+  it('substitutes prior chain output literally when it contains JavaScript replacement tokens', async () => {
+    const previousOutput = "literal $& $$ $` $'";
+    const prompts: string[] = [];
+    const tool = captureTool(
+      createSubagentExtension({
+        async createSession() {
+          return new FakeSession((prompt) => {
+            prompts.push(prompt);
+            return prompts.length === 1 ? previousOutput : 'done';
+          });
+        },
+      }),
+    );
+
+    await tool.execute(
+      'call-chain-literal',
+      {
+        chain: [
+          { agent: 'scout', task: 'inspect' },
+          { agent: 'planner', task: 'plan from {previous}; verify {previous}' },
+        ],
+      },
+      undefined,
+      undefined,
+      context(),
+    );
+
+    expect(prompts).toEqual([
+      'Task: inspect',
+      `Task: plan from ${previousOutput}; verify ${previousOutput}`,
+    ]);
+  });
+
   it('rejects a user agent that explicitly requests a cloud provider', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mlx-subagent-test-'));
     try {
