@@ -339,6 +339,23 @@ export async function run(argv: string[]) {
     `official Unsloth ${lowFormat === 'nvfp4' ? 'DGX/NVFP4' : 'MXFP'} map (early FFN=${lowFormat}; final 8 FFN + attention/GDN/head=mxfp8; protected classes=bf16)`;
   const requestedOfficialUnslothSummary = (lowFormat: 'mxfp4' | 'nvfp4') =>
     `requested ${officialUnslothSummary(lowFormat)}; backend verifies Qwen family/shape`;
+  // Render the `Quantize:` line body shared by the GGUF and SafeTensors paths.
+  // `qGsLabel` carries the group-size text (the GGUF path never reaches sym8,
+  // so it always passes `group_size=N`); `mtp` is `'off'` on the GGUF path,
+  // which has no MTP transcode, so its suffix stays empty there.
+  const formatQuantizeSummary = (qBits: number, qMode: string, qGsLabel: string, mtp: string): string => {
+    const mtpSuffix = mtp !== 'off' ? `, mtp=${mtp}` : '';
+    if (usesOfficialUnslothMxfp) {
+      return `${requestedOfficialUnslothSummary('mxfp4')}, recipe=unsloth${mtpSuffix}`;
+    }
+    if (usesOfficialUnslothNvfp4) {
+      return `${requestedOfficialUnslothSummary('nvfp4')}, recipe=unsloth${mtpSuffix}`;
+    }
+    const qMxfpSuffix = args['q-mxfp']
+      ? ', --q-mxfp: eligible 8b->mxfp8/4b->mxfp4 (protected affine keys stay affine)'
+      : '';
+    return `${qBits}-bit ${qMode} (${qGsLabel})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}${mtpSuffix}`;
+  };
 
   // MXFP modes have strict bits/group_size invariants enforced by the MLX
   // backend. Surface the failure here rather than letting it bubble up as a
@@ -439,18 +456,7 @@ export async function run(argv: string[]) {
       const [defaultBits, defaultGs] = QUANT_MODE_DEFAULTS[qMode] ?? [4, 64];
       const qBits = effectiveQuantBits || defaultBits;
       const qGs = quantGroupSize || defaultGs;
-      if (usesOfficialUnslothMxfp) {
-        console.log(`Quantize:   ${requestedOfficialUnslothSummary('mxfp4')}, recipe=unsloth`);
-      } else if (usesOfficialUnslothNvfp4) {
-        console.log(`Quantize:   ${requestedOfficialUnslothSummary('nvfp4')}, recipe=unsloth`);
-      } else {
-        const qMxfpSuffix = args['q-mxfp']
-          ? ', --q-mxfp: eligible 8b->mxfp8/4b->mxfp4 (protected affine keys stay affine)'
-          : '';
-        console.log(
-          `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}`,
-        );
-      }
+      console.log(`Quantize:   ${formatQuantizeSummary(qBits, qMode, `group_size=${qGs}`, 'off')}`);
     }
     if (imatrixPath) {
       console.log(`imatrix:    ${imatrixPath}`);
@@ -615,22 +621,7 @@ export async function run(argv: string[]) {
     const qBits = effectiveQuantBits || defaultBits;
     const qGs = quantGroupSize || defaultGs;
     const qGsLabel = qMode === 'sym8' ? 'per-output-channel' : `group_size=${qGs}`;
-    if (usesOfficialUnslothMxfp) {
-      console.log(
-        `Quantize:   ${requestedOfficialUnslothSummary('mxfp4')}, recipe=unsloth${quantMtp !== 'off' ? `, mtp=${quantMtp}` : ''}`,
-      );
-    } else if (usesOfficialUnslothNvfp4) {
-      console.log(
-        `Quantize:   ${requestedOfficialUnslothSummary('nvfp4')}, recipe=unsloth${quantMtp !== 'off' ? `, mtp=${quantMtp}` : ''}`,
-      );
-    } else {
-      const qMxfpSuffix = args['q-mxfp']
-        ? ', --q-mxfp: eligible 8b->mxfp8/4b->mxfp4 (protected affine keys stay affine)'
-        : '';
-      console.log(
-        `Quantize:   ${qBits}-bit ${qMode} (${qGsLabel})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}${quantMtp !== 'off' ? `, mtp=${quantMtp}` : ''}`,
-      );
-    }
+    console.log(`Quantize:   ${formatQuantizeSummary(qBits, qMode, qGsLabel, quantMtp)}`);
   }
   if (imatrixPath) {
     console.log(`imatrix:    ${imatrixPath}`);
