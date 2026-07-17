@@ -1823,6 +1823,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
             let model_id = inner.model_id;
             let config_out = inner.config.clone();
             let image_processor = inner.image_processor.as_ref().map(Arc::clone);
+            let spatial_merge_size = inner.spatial_merge_size.unwrap_or(2);
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
             let mtp_active = inner.has_mtp_weights();
@@ -1840,6 +1841,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     config_out,
                     model_id,
                     image_processor,
+                    spatial_merge_size,
                     tokenizer_out,
                     cache_limit_guard,
                     paged_active,
@@ -1855,7 +1857,8 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
     let (
         config,
         _model_id,
-        _image_processor,
+        image_processor,
+        spatial_merge_size,
         _tokenizer,
         cache_limit_guard,
         paged_active,
@@ -1872,6 +1875,8 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
         paged_active,
         mtp_active,
         vision_active,
+        image_processor,
+        spatial_merge_size,
         context_limits,
         _cache_limit_guard: cache_limit_guard,
     })

@@ -34,7 +34,8 @@ use crate::models::qwen3_5::gdn_checkpoint_store::{
 use crate::models::qwen3_5::model::{
     IMAGE_TOKEN_ID, Qwen3_5ContextLimits, VisionCache, VisionCacheInner, async_eval_layer_caches,
     compute_image_token_counts_per_image, constrain_paged_context_params, eval_layer_caches,
-    inject_image_placeholders, partition_prefill_chunks, vlm_prepare_vision_features,
+    inject_image_placeholders, partition_prefill_chunks, qwen35_expanded_prompt_token_count,
+    vlm_prepare_vision_features,
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
@@ -8117,6 +8118,10 @@ pub struct Qwen3_5MoeModel {
     /// derived from loaded components rather than `vision_config`, because
     /// sym8 deliberately strips its incompatible vision tower.
     pub(crate) vision_active: bool,
+    /// Same loaded processor and merge-size snapshots used by the model thread,
+    /// retained for exact CPU-only image-token planning before SSE.
+    pub(crate) image_processor: Option<Arc<Qwen35VLImageProcessor>>,
+    pub(crate) spatial_merge_size: i32,
     pub(crate) context_limits: Qwen3_5ContextLimits,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop.
@@ -8171,6 +8176,23 @@ impl Qwen3_5MoeModel {
     #[napi]
     pub fn context_limits(&self) -> Qwen3_5ContextLimits {
         self.context_limits.clone()
+    }
+
+    /// Exact, non-mutating Qwen image-placeholder expansion count for a fully
+    /// rendered prompt and complete message history.
+    #[napi]
+    pub async fn expanded_prompt_token_count(
+        &self,
+        prompt_tokens: Uint32Array,
+        messages: Vec<ChatMessage>,
+    ) -> Result<u32> {
+        qwen35_expanded_prompt_token_count(
+            self.image_processor.clone(),
+            self.spatial_merge_size,
+            prompt_tokens,
+            messages,
+        )
+        .await
     }
 
     /// Load a pretrained model from a directory.

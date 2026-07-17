@@ -970,6 +970,56 @@ describe('handleCreateMessage', () => {
       expect((model.resetCaches as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
     });
 
+    it('returns JSON 400 before SSE when image expansion exceeds capacity', async () => {
+      const expandedPromptTokenCount = vi.fn((_tokens: Uint32Array, messages: ChatMessage[]) => {
+        expect(Array.from(messages[0]?.images?.[0] ?? [])).toEqual([1, 2, 3]);
+        return 65;
+      });
+      const model = Object.assign(createMockStreamModel([]), {
+        contextLimits: () => ({
+          trainedWindowTokens: 262_144,
+          effectiveWindowTokens: 64,
+          pagedBlockCapacity: 4,
+          pagedBlockSize: 16,
+        }),
+        applyChatTemplate: vi.fn(() => new Uint32Array(4)),
+        expandedPromptTokenCount,
+      });
+      const registry = new ModelRegistry();
+      registry.register('test-model', model);
+      const response = createMockRes();
+
+      await handleCreateMessage(
+        response.res,
+        {
+          model: 'test-model',
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: 'describe' },
+                {
+                  type: 'image',
+                  source: { type: 'base64', media_type: 'image/png', data: 'AQID' },
+                },
+              ],
+            },
+          ],
+          max_tokens: 32,
+          stream: true,
+        },
+        registry,
+      );
+
+      expect(response.getStatus()).toBe(400);
+      expect(response.getHeaders()['content-type']).toContain('application/json');
+      expect(response.getBody()).toContain('context_length_exceeded');
+      expect(response.getBody()).not.toContain('event:');
+      expect(expandedPromptTokenCount).toHaveBeenCalledTimes(1);
+      expect((model.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+      expect((model.resetCaches as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+    });
+
     it('commits message_start before a delayed first native stream event', async () => {
       let markEntered!: () => void;
       const entered = new Promise<void>((resolve) => {

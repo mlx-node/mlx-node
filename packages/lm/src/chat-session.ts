@@ -273,6 +273,15 @@ export interface SessionCapableModel {
     enableThinking?: boolean | null,
   ): Promise<Uint32Array> | Uint32Array;
   /**
+   * Optional model-native planner for prompt formats whose media placeholders
+   * expand after chat-template rendering. It returns the exact token length
+   * that inference will prefill, without mutating model/session state.
+   *
+   * Qwen3.5 dense/MoE implement this with their loaded image processor. Models
+   * without post-template expansion omit it and retain raw template counting.
+   */
+  expandedPromptTokenCount?(promptTokens: Uint32Array, messages: ChatMessage[]): Promise<number> | number;
+  /**
    * Optional synchronous load-time snapshot of the model's usable context.
    * Qwen3.5 dense/MoE expose this when adaptive paged-cache sizing is active.
    */
@@ -1523,7 +1532,17 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     const enableThinking =
       effort === 'none' || effort === 'low' ? false : effort === 'medium' || effort === 'high' ? true : null;
     const tokens = await this.model.applyChatTemplate(messages, true, config.tools ?? null, enableThinking);
-    const promptTokens = tokens.length;
+    const hasImages = messages.some((message) => (message.images?.length ?? 0) > 0);
+    let promptTokens = tokens.length;
+    if (hasImages && typeof this.model.expandedPromptTokenCount === 'function') {
+      promptTokens = await this.model.expandedPromptTokenCount(tokens, messages);
+      if (!Number.isSafeInteger(promptTokens) || promptTokens < tokens.length) {
+        throw new Error(
+          `ChatSession: expandedPromptTokenCount returned invalid length ${promptTokens} ` +
+            `(rendered template length is ${tokens.length})`,
+        );
+      }
+    }
     if (promptTokens > capacity) {
       throw new ContextCapacityError(promptTokens, capacity);
     }

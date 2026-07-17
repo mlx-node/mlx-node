@@ -1263,6 +1263,15 @@ export declare class Qwen35Model {
    */
   contextLimits(): Qwen35ContextLimits;
   /**
+   * Compute the exact prompt length after Qwen image-placeholder expansion
+   * without running the vision encoder or touching inference caches.
+   *
+   * `prompt_tokens` is the already-rendered chat-template output. `messages`
+   * supplies the complete image history so both fresh and leased-session
+   * preflights account for every image in template order.
+   */
+  expandedPromptTokenCount(promptTokens: Uint32Array, messages: Array<ChatMessage>): Promise<number>;
+  /**
    * Load a pretrained model from a directory.
    *
    * Expects the directory to contain:
@@ -1416,6 +1425,11 @@ export declare class Qwen35MoeModel {
   supportsImages(): boolean;
   /** Synchronous active-context snapshot shared with the dense wrapper. */
   contextLimits(): Qwen35ContextLimits;
+  /**
+   * Exact, non-mutating Qwen image-placeholder expansion count for a fully
+   * rendered prompt and complete message history.
+   */
+  expandedPromptTokenCount(promptTokens: Uint32Array, messages: Array<ChatMessage>): Promise<number>;
   /** Load a pretrained model from a directory. */
   static load(path: string): Promise<Qwen35MoeModel>;
   /** Generate text from a prompt token sequence. */

@@ -3113,5 +3113,127 @@ describe('ChatSession', () => {
       expect(mock.chatSessionStart).not.toHaveBeenCalled();
       expect(session.turns).toBe(0);
     });
+
+    it('rejects an image prompt whose raw template fits but exact expanded length overflows', async () => {
+      const mock = makeMockModel();
+      const expandedPromptTokenCount = vi.fn((_tokens: Uint32Array, _messages: ChatMessage[]) => 65);
+      const model = {
+        ...withCapacity(mock.model, 64, 4),
+        expandedPromptTokenCount,
+      } satisfies SessionCapableModel;
+      const session = new ChatSession(model);
+      const image = new Uint8Array([1, 2, 3]);
+
+      await expect(session.send('describe', { images: [image] })).rejects.toBeInstanceOf(ContextCapacityError);
+
+      expect(expandedPromptTokenCount).toHaveBeenCalledTimes(1);
+      const [rendered, messages] = expandedPromptTokenCount.mock.calls[0]!;
+      expect(rendered).toHaveLength(4);
+      expect(messages).toEqual([{ role: 'user', content: 'describe', images: [image] }]);
+      expect(mock.chatSessionStart).not.toHaveBeenCalled();
+      expect(mock.chatStreamSessionStart).not.toHaveBeenCalled();
+      expect(mock.resetCaches).not.toHaveBeenCalled();
+      expect(session.turns).toBe(0);
+    });
+
+    it('clamps image output budget from the exact expanded prompt length', async () => {
+      const mock = makeMockModel();
+      const expandedPromptTokenCount = vi.fn(() => 100);
+      const model = {
+        ...withCapacity(mock.model, 128, 4),
+        expandedPromptTokenCount,
+      } satisfies SessionCapableModel;
+      const session = new ChatSession(model);
+
+      await session.send('describe', {
+        images: [new Uint8Array([4, 5, 6])],
+        config: { maxNewTokens: 64 },
+      });
+
+      expect(mock.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBe(29);
+      expect(expandedPromptTokenCount).toHaveBeenCalledTimes(1);
+    });
+
+    it('includes historical images in pending-session exact preflight', async () => {
+      const mock = makeMockModel();
+      const expandedPromptTokenCount = vi.fn((_tokens: Uint32Array, messages: ChatMessage[]) => {
+        expect(messages).toHaveLength(3);
+        expect(messages[0]?.images?.[0]).toEqual(new Uint8Array([9, 8, 7]));
+        return 120;
+      });
+      const model = {
+        ...withCapacity(mock.model, 128, 8),
+        expandedPromptTokenCount,
+      } satisfies SessionCapableModel;
+      const session = new ChatSession(model);
+      session.primeHistory([
+        { role: 'user', content: 'first', images: [new Uint8Array([9, 8, 7])] },
+        { role: 'assistant', content: 'seen' },
+      ]);
+
+      const config = await session.preflightPendingContextCapacity(
+        { role: 'user', content: 'follow up' },
+        { maxNewTokens: 64 },
+      );
+
+      expect(config.maxNewTokens).toBe(9);
+      expect(expandedPromptTokenCount).toHaveBeenCalledTimes(1);
+      expect(mock.chatSessionStart).not.toHaveBeenCalled();
+      expect(mock.chatStreamSessionStart).not.toHaveBeenCalled();
+    });
+
+    it('passes complete multi-turn image history to exact preflight in order', async () => {
+      const mock = makeMockModel();
+      const expandedPromptTokenCount = vi.fn((_tokens: Uint32Array, _messages: ChatMessage[]) => 20);
+      const model = {
+        ...withCapacity(mock.model, 128, 8),
+        expandedPromptTokenCount,
+      } satisfies SessionCapableModel;
+      const session = new ChatSession(model);
+      const imageA = new Uint8Array([1]);
+      const imageB = new Uint8Array([2]);
+      const imageC = new Uint8Array([3]);
+      const messages: ChatMessage[] = [
+        { role: 'user', content: 'first', images: [imageA, imageB] },
+        { role: 'assistant', content: 'seen' },
+        { role: 'user', content: 'second', images: [imageC] },
+      ];
+
+      await session.preflightContextCapacity(messages, { maxNewTokens: 8 });
+
+      expect(expandedPromptTokenCount.mock.calls[0]?.[1]).toEqual(messages);
+      expect(mock.chatSessionStart).not.toHaveBeenCalled();
+      expect(mock.chatStreamSessionStart).not.toHaveBeenCalled();
+    });
+
+    it('rejects an invalid native expanded prompt count before dispatch', async () => {
+      const mock = makeMockModel();
+      const model = {
+        ...withCapacity(mock.model, 64, 4),
+        expandedPromptTokenCount: vi.fn(() => 3),
+      } satisfies SessionCapableModel;
+      const session = new ChatSession(model);
+
+      await expect(session.send('describe', { images: [new Uint8Array([1])] })).rejects.toThrow(
+        'expandedPromptTokenCount returned invalid length 3',
+      );
+      expect(mock.chatSessionStart).not.toHaveBeenCalled();
+      expect(mock.chatStreamSessionStart).not.toHaveBeenCalled();
+    });
+
+    it('keeps text-only preflight on the raw-template fast path', async () => {
+      const mock = makeMockModel();
+      const expandedPromptTokenCount = vi.fn(() => 65);
+      const model = {
+        ...withCapacity(mock.model, 64, 4),
+        expandedPromptTokenCount,
+      } satisfies SessionCapableModel;
+      const session = new ChatSession(model);
+
+      await session.send('text only');
+
+      expect(expandedPromptTokenCount).not.toHaveBeenCalled();
+      expect(mock.chatSessionStart).toHaveBeenCalledTimes(1);
+    });
   });
 });

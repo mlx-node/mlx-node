@@ -603,6 +603,21 @@ function _assertSessionCapable(): void {
 }
 void _assertSessionCapable;
 
+type ExpandedPromptPlanner = Required<Pick<SessionCapableModel, 'expandedPromptTokenCount'>>;
+
+/** Compile-time guard that both Qwen3.5 native classes and wrappers retain the exact media planner. */
+function _assertExpandedPromptPlannerSurfaces(): void {
+  const _nativeDense: ExpandedPromptPlanner = null as unknown as InstanceType<typeof Qwen35ModelNative>;
+  const _nativeMoe: ExpandedPromptPlanner = null as unknown as InstanceType<typeof Qwen35MoeModelNative>;
+  const _wrappedDense: ExpandedPromptPlanner = null as unknown as Qwen35Model;
+  const _wrappedMoe: ExpandedPromptPlanner = null as unknown as Qwen35MoeModel;
+  void _nativeDense;
+  void _nativeMoe;
+  void _wrappedDense;
+  void _wrappedMoe;
+}
+void _assertExpandedPromptPlannerSurfaces;
+
 type PreservedNativeSurface<C extends NativeStreamingCtor> = Omit<InstanceType<C>, NativeStreamingMethod>;
 
 /** Compile-time guard that the factory preserves every non-streaming native member. */

@@ -45,7 +45,7 @@ use super::layer_cache::Qwen3_5LayerCache;
 use super::mtp::Qwen3_5MTPModule;
 use super::mtp_decode;
 use super::persistence;
-use super::processing::Qwen35VLImageProcessor;
+use super::processing::{Qwen35VLImageProcessor, merged_image_token_count};
 use super::vision::Qwen3_5VisionEncoder;
 use crate::engine;
 use crate::engine::vision::VisionMerge;
@@ -9733,6 +9733,13 @@ pub struct Qwen3_5Model {
     /// `vision_config` while deliberately dropping the incompatible vision
     /// weights at load time.
     pub(crate) vision_active: bool,
+    /// Loaded image processor retained by the public wrapper for CPU-only
+    /// expanded-token planning before a streaming response commits headers.
+    /// This is the same `Arc` used by the model thread's real vision prefill.
+    pub(crate) image_processor: Option<Arc<Qwen35VLImageProcessor>>,
+    /// Actual merge size installed on the loaded inner model, paired with
+    /// `image_processor` for exact preflight geometry.
+    pub(crate) spatial_merge_size: i32,
     pub(crate) context_limits: Qwen3_5ContextLimits,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop, so the global cap can shrink once JS GCs
@@ -9788,6 +9795,27 @@ impl Qwen3_5Model {
     #[napi]
     pub fn context_limits(&self) -> Qwen3_5ContextLimits {
         self.context_limits.clone()
+    }
+
+    /// Compute the exact prompt length after Qwen image-placeholder expansion
+    /// without running the vision encoder or touching inference caches.
+    ///
+    /// `prompt_tokens` is the already-rendered chat-template output. `messages`
+    /// supplies the complete image history so both fresh and leased-session
+    /// preflights account for every image in template order.
+    #[napi]
+    pub async fn expanded_prompt_token_count(
+        &self,
+        prompt_tokens: Uint32Array,
+        messages: Vec<ChatMessage>,
+    ) -> Result<u32> {
+        qwen35_expanded_prompt_token_count(
+            self.image_processor.clone(),
+            self.spatial_merge_size,
+            prompt_tokens,
+            messages,
+        )
+        .await
     }
 
     /// Load a pretrained model from a directory.
@@ -10002,6 +10030,42 @@ impl Qwen3_5Model {
         })?;
         Ok(promise)
     }
+}
+
+/// Shared dense/MoE NAPI implementation for exact, non-mutating image prompt
+/// planning. Inputs are copied before entering the blocking worker so no JS
+/// backing-store references cross threads.
+pub(crate) async fn qwen35_expanded_prompt_token_count(
+    image_processor: Option<Arc<Qwen35VLImageProcessor>>,
+    spatial_merge_size: i32,
+    prompt_tokens: Uint32Array,
+    messages: Vec<ChatMessage>,
+) -> Result<u32> {
+    let tokens = prompt_tokens.to_vec();
+    let images = extract_images_from_messages(&messages);
+    if images.is_empty() {
+        return u32::try_from(tokens.len())
+            .map_err(|_| Error::from_reason("rendered prompt token count exceeds u32"));
+    }
+    let image_processor = image_processor.ok_or_else(|| {
+        Error::from_reason(
+            "cannot plan expanded image tokens: Qwen3.5 image processor is not loaded",
+        )
+    })?;
+
+    napi::bindgen_prelude::spawn_blocking(move || {
+        let prompt_len =
+            plan_expanded_image_prompt_len(&image_processor, spatial_merge_size, &tokens, &images)?;
+        u32::try_from(prompt_len)
+            .map_err(|_| Error::from_reason("expanded prompt token count exceeds u32"))
+    })
+    .await
+    .map_err(|join_error| {
+        Error::new(
+            Status::GenericFailure,
+            format!("Expanded prompt planning worker failed: {join_error}"),
+        )
+    })?
 }
 
 impl Qwen3_5Model {
@@ -10543,15 +10607,63 @@ pub(crate) fn compute_image_token_counts_per_image(
 ) -> Result<Vec<usize>> {
     grid.eval();
     let grid_data = grid.to_int32()?;
-    let merge_factor = spatial_merge_size * spatial_merge_size;
     let mut counts = Vec::with_capacity(grid_data.len() / 3);
     for i in 0..(grid_data.len() / 3) {
         let t = grid_data[i * 3];
         let h = grid_data[i * 3 + 1];
         let w = grid_data[i * 3 + 2];
-        counts.push(((t * h * w) / merge_factor) as usize);
+        counts.push(merged_image_token_count(t, h, w, spatial_merge_size)?);
     }
     Ok(counts)
+}
+
+/// Return the exact length produced by [`inject_image_placeholders`] without
+/// allocating the expanded token vector.
+pub(crate) fn expanded_image_prompt_len(
+    tokens: &[u32],
+    per_image_token_counts: &[usize],
+) -> Result<usize> {
+    let total = per_image_token_counts
+        .iter()
+        .try_fold(0usize, |sum, count| {
+            sum.checked_add(*count)
+                .ok_or_else(|| Error::from_reason("expanded image prompt length overflow"))
+        })?;
+    if total == 0 {
+        return Ok(tokens.len());
+    }
+
+    let existing = tokens
+        .iter()
+        .filter(|&&token| token == IMAGE_TOKEN_ID as u32)
+        .count();
+    if existing == 0 || existing == per_image_token_counts.len() {
+        return tokens
+            .len()
+            .checked_add(total)
+            .and_then(|len| len.checked_sub(existing))
+            .ok_or_else(|| Error::from_reason("expanded image prompt length overflow"));
+    }
+
+    // Already-expanded or malformed/unknown placeholder shapes are passed
+    // through unchanged by `inject_image_placeholders`.
+    Ok(tokens.len())
+}
+
+/// CPU-only prompt planner shared by the dense and MoE NAPI wrappers.
+///
+/// It reads encoded image dimensions and applies the loaded Qwen processor's
+/// smart-resize geometry, but never creates normalized pixel tensors, MLX
+/// arrays, vision features, or KV state.
+pub(crate) fn plan_expanded_image_prompt_len(
+    image_processor: &Qwen35VLImageProcessor,
+    spatial_merge_size: i32,
+    tokens: &[u32],
+    images: &[Vec<u8>],
+) -> Result<usize> {
+    let image_refs: Vec<&[u8]> = images.iter().map(Vec::as_slice).collect();
+    let counts = image_processor.plan_merged_token_counts(&image_refs, spatial_merge_size)?;
+    expanded_image_prompt_len(tokens, &counts)
 }
 
 /// Ensure the tokenized prompt contains the right number of
@@ -12008,6 +12120,29 @@ mod image_placeholder_tests {
         let tokens = vec![BOS, USER, 10, 11, IMG, 12, 13];
         let out = inject_image_placeholders(&tokens, &[4]);
         assert_eq!(out, vec![BOS, USER, 10, 11, IMG, IMG, IMG, IMG, 12, 13]);
+    }
+
+    #[test]
+    fn non_allocating_length_plan_matches_placeholder_injection() {
+        let cases = [
+            (vec![BOS, USER, IMG, TEXT], vec![5]),
+            (vec![BOS, IMG, TEXT, IMG], vec![2, 3]),
+            (vec![BOS, USER, TEXT], Vec::new()),
+            (vec![BOS, USER, TEXT], vec![3]),
+            (vec![BOS, USER, IMG, IMG, IMG, IMG, IMG, TEXT], vec![5]),
+            // Unknown placeholder shape is deliberately passed through.
+            (vec![BOS, IMG, IMG, TEXT], vec![3]),
+        ];
+
+        for (tokens, counts) in cases {
+            let planned = expanded_image_prompt_len(&tokens, &counts).expect("plan prompt length");
+            let expanded = inject_image_placeholders(&tokens, &counts);
+            assert_eq!(
+                planned,
+                expanded.len(),
+                "tokens={tokens:?}, counts={counts:?}"
+            );
+        }
     }
 }
 

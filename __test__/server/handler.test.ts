@@ -454,6 +454,51 @@ describe('createHandler', () => {
       expect((model.resetCaches as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
     });
 
+    it('returns JSON 400 before SSE when image expansion exceeds capacity', async () => {
+      const expandedPromptTokenCount = vi.fn((_tokens: Uint32Array, messages: ChatMessage[]) => {
+        expect(messages[0]?.images?.[0]).toEqual(new Uint8Array([1, 2, 3]));
+        return 65;
+      });
+      const model = Object.assign(createMockStreamModel([]), {
+        contextLimits: () => ({
+          trainedWindowTokens: 262_144,
+          effectiveWindowTokens: 64,
+          pagedBlockCapacity: 4,
+          pagedBlockSize: 16,
+        }),
+        applyChatTemplate: vi.fn(() => new Uint32Array(4)),
+        expandedPromptTokenCount,
+      });
+      const registry = new ModelRegistry();
+      registry.register('test-model', model);
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: [
+          {
+            role: 'user',
+            content: [
+              { type: 'input_text', text: 'describe' },
+              { type: 'input_image', image_url: 'data:image/png;base64,AQID' },
+            ],
+          },
+        ],
+        stream: true,
+      });
+      const response = createMockRes();
+
+      await handler(req, response.res);
+      await response.waitForEnd();
+
+      expect(response.getStatus()).toBe(400);
+      expect(response.getHeaders()['content-type']).toContain('application/json');
+      expect(response.getBody()).toContain('context_length_exceeded');
+      expect(response.getBody()).not.toContain('event:');
+      expect(expandedPromptTokenCount).toHaveBeenCalledTimes(1);
+      expect((model.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+      expect((model.resetCaches as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+    });
+
     it('preserves the native output default when streaming preflight has room for it', async () => {
       const model = Object.assign(
         createMockStreamModel([
