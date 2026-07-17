@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 //! Small, ownership-aware adapter over the generated `objc2-metal` bindings.
 //!
 //! This intentionally exposes only the compute and buffer operations used by
