@@ -592,14 +592,14 @@ fn load_q6k_tensor_bf16(
 
     let shape = tensor.mlx_shape();
     let last_dim = shape.last().copied().unwrap_or(0);
-    if last_dim <= 0 || last_dim as usize % QK_K != 0 {
+    if last_dim <= 0 || !(last_dim as usize).is_multiple_of(QK_K) {
         return Err(Error::from_reason(format!(
             "Q6_K tensor '{}' has last dimension {last_dim}; expected a positive multiple of {QK_K}",
             tensor.name
         )));
     }
     let num_elements = tensor.num_elements() as usize;
-    if num_elements % QK_K != 0 {
+    if !num_elements.is_multiple_of(QK_K) {
         return Err(Error::from_reason(format!(
             "Q6_K tensor '{}' has {num_elements} elements; expected a multiple of {QK_K}",
             tensor.name

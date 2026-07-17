@@ -3370,24 +3370,25 @@ mod tests {
                 .expect("f16 sidecar")
         };
         let mut params: HashMap<String, MxArray> = HashMap::new();
-        let mut insert_affine_shaped = |prefix: &str| {
-            params.insert(format!("{prefix}.weight"), packed());
-            params.insert(format!("{prefix}.scales"), f16());
-            params.insert(format!("{prefix}.biases"), f16());
-        };
+        {
+            let mut insert_affine_shaped = |prefix: &str| {
+                params.insert(format!("{prefix}.weight"), packed());
+                params.insert(format!("{prefix}.scales"), f16());
+                params.insert(format!("{prefix}.biases"), f16());
+            };
 
-        // These two are real text QMM projections and use the affine default.
-        insert_affine_shaped("layers.0.self_attn.q_proj");
-        insert_affine_shaped("lm_head");
-        // Mixed-mode overrides must win over the affine default even when a
-        // malformed fixture uses FP16 sidecars instead of each MX mode's uint8
-        // scale storage. This proves selection is metadata-driven, not dtype- or
-        // suffix-only.
-        insert_affine_shaped("layers.0.self_attn.k_proj");
-        insert_affine_shaped("layers.0.self_attn.v_proj");
-        insert_affine_shaped("layers.0.self_attn.o_proj");
-        insert_affine_shaped("layers.0.mlp.gate_proj");
-        drop(insert_affine_shaped);
+            // These two are real text QMM projections and use the affine default.
+            insert_affine_shaped("layers.0.self_attn.q_proj");
+            insert_affine_shaped("lm_head");
+            // Mixed-mode overrides must win over the affine default even when a
+            // malformed fixture uses FP16 sidecars instead of each MX mode's uint8
+            // scale storage. This proves selection is metadata-driven, not dtype- or
+            // suffix-only.
+            insert_affine_shaped("layers.0.self_attn.k_proj");
+            insert_affine_shaped("layers.0.self_attn.v_proj");
+            insert_affine_shaped("layers.0.self_attn.o_proj");
+            insert_affine_shaped("layers.0.mlp.gate_proj");
+        }
 
         // Affine-shaped, but not text QMM paths: packed embedding lookup and
         // unified media projection must retain their FP16 dequant semantics.

@@ -1520,7 +1520,7 @@ mod tests {
         // The real target is already warm from prefill. Warm the tiny mock's
         // first Metal argmax too, so shader compilation is not mistaken for
         // target AR latency by this sequencing/metrics test.
-        let warm_logits = MxArray::from_float32(&vec![0.0; 16], &[1, 1, 16]).expect("warm logits");
+        let warm_logits = MxArray::from_float32(&[0.0; 16], &[1, 1, 16]).expect("warm logits");
         let warm_argmax = warm_logits.argmax(-1, None).expect("warm argmax");
         warm_argmax.eval();
         let _ = warm_argmax.item_at_int32(0).expect("warm argmax value");
@@ -1590,7 +1590,7 @@ mod tests {
         // proposal. Apples-to-apples timing must include the 100 ms, making
         // speculation win. The old biased timer started after verify and
         // incorrectly chose target-only fallback for this exact script.
-        let warm_logits = MxArray::from_float32(&vec![0.0; 16], &[1, 1, 16]).expect("warm logits");
+        let warm_logits = MxArray::from_float32(&[0.0; 16], &[1, 1, 16]).expect("warm logits");
         let warm_argmax = warm_logits.argmax(-1, None).expect("warm argmax");
         warm_argmax.eval();
         let _ = warm_argmax.item_at_int32(0).expect("warm argmax value");

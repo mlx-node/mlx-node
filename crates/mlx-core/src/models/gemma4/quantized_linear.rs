@@ -989,8 +989,7 @@ mod affine_dtype_tests {
     #[test]
     fn affine_q4_forward_preserves_bfloat16_activation_dtype() {
         let input =
-            MxArray::from_bfloat16(&vec![half::bf16::from_f32(0.5).to_bits(); 32], &[1, 32])
-                .unwrap();
+            MxArray::from_bfloat16(&[half::bf16::from_f32(0.5).to_bits(); 32], &[1, 32]).unwrap();
         let weight = MxArray::from_uint32(&[0x8888_8888; 4], &[1, 4]).unwrap();
         let scales =
             MxArray::from_float16(&[half::f16::from_f32(0.25).to_bits()], &[1, 1]).unwrap();
