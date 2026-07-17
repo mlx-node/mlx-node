@@ -48,7 +48,7 @@ import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
 import type { ChatSession, PerformanceMetrics } from '@mlx-node/lm';
 
 import type { DiscoveredModelLike } from '../types.js';
-import { buildChatConfig } from './chat-config.js';
+import { buildChatConfig, resolveReasoningMode, type ResolvedReasoningMode } from './chat-config.js';
 import { contextToChatMessages, toolsToDefinitions } from './convert-messages.js';
 import { coerceErrorMessage } from './error-coercion.js';
 import { emptyUsage, TurnEmitter } from './events.js';
@@ -176,6 +176,7 @@ export function makeMlxStreamSimple(
     let emitter: TurnEmitter | undefined;
     let signal: AbortSignal | undefined;
     let rootCacheOwnerId: string | undefined;
+    let resolvedReasoning: ResolvedReasoningMode;
     let detachAbort: (() => void) | undefined;
 
     /**
@@ -246,7 +247,11 @@ export function makeMlxStreamSimple(
       // another inference. A later /new or /resume must not relabel an older
       // request that was already submitted under the previous root.
       rootCacheOwnerId = resolveRootCacheOwner?.();
-      emitter = new TurnEmitter(stream, model, onPerformance, options?.reasoning !== undefined);
+      // Snapshot once: the native config and the replay provenance must describe
+      // the same resolved template mode. Presence alone is wrong for Pi's
+      // minimal/low levels, both of which resolve to disabled thinking.
+      resolvedReasoning = resolveReasoningMode(options?.reasoning);
+      emitter = new TurnEmitter(stream, model, onPerformance, resolvedReasoning.thinkingEnabled);
     } catch (err) {
       terminalize('error', err);
       return stream;
@@ -305,6 +310,7 @@ export function makeMlxStreamSimple(
             options,
             toolsToDefinitions(context.tools),
             rootCacheOwnerId,
+            resolvedReasoning,
           );
           for await (const event of session.startFromHistoryStream(config, signal)) {
             if (event.done) {

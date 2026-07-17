@@ -18,6 +18,7 @@ import type {
 } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
+import { contextToChatMessages } from '../src/provider/convert-messages.js';
 import { makeMlxStreamSimple, type StreamSimpleHost } from '../src/provider/stream-adapter.js';
 import type { DiscoveredModelLike } from '../src/types.js';
 
@@ -413,6 +414,42 @@ describe('makeMlxStreamSimple', () => {
     expect(session.configSeen?.maxNewTokens).toBe(64);
     expect(session.configSeen?.reasoningEffort).toBe('none');
     expect(session.configSeen?.tools).toBeUndefined();
+  });
+
+  it('persists the resolved native thinking mode for exact history replay', async () => {
+    const cases = [
+      [undefined, 'none', false],
+      ['minimal', 'low', false],
+      ['low', 'low', false],
+      ['medium', 'medium', true],
+      ['high', 'high', true],
+      ['xhigh', 'high', true],
+      ['max', 'high', true],
+    ] as const;
+
+    for (const [reasoning, expectedEffort, expectedEnabled] of cases) {
+      const session = new FakeChatSession([
+        // eslint-disable-next-line @typescript-eslint/require-await
+        async function* () {
+          yield delta('Answer');
+          yield finalEvent({ text: 'Answer' });
+        },
+      ]);
+      const options = reasoning === undefined ? undefined : { reasoning };
+      const message = finalMessage(
+        await collect(makeMlxStreamSimple(makeFakeHost(session))(MODEL, CONTEXT, options)),
+      ) as AssistantMessage & { mlxThinkingEnabled?: boolean };
+
+      expect(session.configSeen?.reasoningEffort, `reasoning=${String(reasoning)}`).toBe(expectedEffort);
+      expect(message.mlxThinkingEnabled, `reasoning=${String(reasoning)}`).toBe(expectedEnabled);
+      expect(contextToChatMessages({ messages: [message] })).toEqual([
+        {
+          role: 'assistant',
+          content: 'Answer',
+          thinkingEnabled: expectedEnabled,
+        },
+      ]);
+    }
   });
 
   it('associates terminal performance metrics with the exact Pi assistant message', async () => {

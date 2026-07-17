@@ -61,11 +61,32 @@ const THINKING_LEVEL_TO_EFFORT: Record<ThinkingLevel, 'low' | 'medium' | 'high'>
   max: 'high',
 };
 
+export interface ResolvedReasoningMode {
+  reasoningEffort: 'none' | 'low' | 'medium' | 'high';
+  /** The `enable_thinking` value implied by `reasoningEffort` for templates. */
+  thinkingEnabled: boolean;
+}
+
+/**
+ * Resolve Pi's thinking level once for both native config and persisted replay
+ * provenance. Keeping these values together prevents a low/minimal turn from
+ * being replayed later as an enabled-thinking turn merely because the Pi
+ * option was present.
+ */
+export function resolveReasoningMode(reasoning: ThinkingLevel | undefined): ResolvedReasoningMode {
+  const reasoningEffort = reasoning === undefined ? 'none' : THINKING_LEVEL_TO_EFFORT[reasoning];
+  return {
+    reasoningEffort,
+    thinkingEnabled: reasoningEffort === 'medium' || reasoningEffort === 'high',
+  };
+}
+
 export function buildChatConfig(
   modelType: ModelType,
   options: SimpleStreamOptions | undefined,
   tools: ToolDefinition[] | undefined,
   rootCacheOwnerId?: string,
+  resolvedReasoning = resolveReasoningMode(options?.reasoning),
 ): ChatConfig {
   const preset = launchPresetFor(modelType);
   if (!preset) {
@@ -76,7 +97,7 @@ export function buildChatConfig(
   const config: ChatConfig = {
     ...preset.sampling,
     maxNewTokens: preset.maxOutputTokens,
-    reasoningEffort: options?.reasoning === undefined ? 'none' : THINKING_LEVEL_TO_EFFORT[options.reasoning],
+    reasoningEffort: resolvedReasoning.reasoningEffort,
     // The terminal native chunk carries TTFT/prefill/decode telemetry when
     // requested. The provider keeps it transient and only renders it in TUI.
     reportPerformance: true,
