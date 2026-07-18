@@ -15,8 +15,11 @@ import type { PerformanceMetrics } from '@mlx-node/lm';
 const STATUS_KEY = 'mlx-performance';
 
 interface ThroughputSample {
+  ttftMs?: number;
   prefillTokensPerSecond: number;
   decodeTokensPerSecond: number;
+  inputTokens?: number;
+  cachedTokens?: number;
 }
 
 interface MessageEndLike {
@@ -27,6 +30,10 @@ function finiteRate(value: number): number | undefined {
   return Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
+function finiteTokenCount(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
 function formatRate(value: number): string {
   return value.toLocaleString('en-US', {
     minimumFractionDigits: 1,
@@ -34,9 +41,38 @@ function formatRate(value: number): string {
   });
 }
 
+function formatDuration(ttftMs: number): string {
+  if (ttftMs < 1000) return `${formatRate(ttftMs)} ms`;
+  return `${(ttftMs / 1000).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })} s`;
+}
+
+function formatTokenCount(value: number): string {
+  if (value < 1000) return value.toLocaleString('en-US');
+  const [divisor, suffix] = value < 1_000_000 ? [1000, 'k'] : [1_000_000, 'm'];
+  return `${(value / divisor).toLocaleString('en-US', { maximumFractionDigits: 1 })}${suffix}`;
+}
+
+function formatContext(sample: ThroughputSample): string {
+  let context = '';
+  if (sample.ttftMs !== undefined) context += ` · TTFT ${formatDuration(sample.ttftMs)}`;
+  if (sample.inputTokens !== undefined && sample.cachedTokens !== undefined) {
+    if (sample.cachedTokens > 0) {
+      context +=
+        ` · input ${formatTokenCount(sample.inputTokens)} new` + ` + ${formatTokenCount(sample.cachedTokens)} cached`;
+    } else {
+      context += ` · input ${formatTokenCount(sample.inputTokens)}`;
+    }
+  }
+  return context;
+}
+
 function formatSample(sample: ThroughputSample): string {
   return (
-    `mlx · prefill ${formatRate(sample.prefillTokensPerSecond)} tok/s` +
+    `mlx${formatContext(sample)}` +
+    ` · prefill ${formatRate(sample.prefillTokensPerSecond)} tok/s` +
     ` · decode ${formatRate(sample.decodeTokensPerSecond)} tok/s`
   );
 }
@@ -49,7 +85,16 @@ export class PerformanceStatus {
     const prefillTokensPerSecond = finiteRate(performance.prefillTokensPerSecond);
     const decodeTokensPerSecond = finiteRate(performance.decodeTokensPerSecond);
     if (prefillTokensPerSecond === undefined || decodeTokensPerSecond === undefined) return;
-    this.byMessage.set(message, { prefillTokensPerSecond, decodeTokensPerSecond });
+    const sample: ThroughputSample = { prefillTokensPerSecond, decodeTokensPerSecond };
+    const ttftMs = finiteRate(performance.ttftMs);
+    if (ttftMs !== undefined) sample.ttftMs = ttftMs;
+    const inputTokens = finiteTokenCount(message.usage?.input);
+    const cachedTokens = finiteTokenCount(message.usage?.cacheRead);
+    if (inputTokens !== undefined && cachedTokens !== undefined) {
+      sample.inputTokens = inputTokens;
+      sample.cachedTokens = cachedTokens;
+    }
+    this.byMessage.set(message, sample);
   };
 
   /** Render the successful mlx inference associated with this exact Pi message. */

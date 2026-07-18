@@ -471,6 +471,7 @@ describe('makeMlxStreamSimple', () => {
 
     expect(record).toHaveBeenCalledOnce();
     expect(record).toHaveBeenCalledWith(message, performance);
+    expect(message.usage).toMatchObject({ input: 12, cacheRead: 8 });
     expect(session.configSeen?.reportPerformance).toBe(true);
   });
 
