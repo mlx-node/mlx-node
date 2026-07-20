@@ -17,7 +17,7 @@ A local web dashboard, started with `mlx dashboard`, shipped inside the `@mlx-no
 | Question | Decision |
 | --- | --- |
 | Persist-cache scope | Full: wire `ColdCacheManager` into inference, add NAPI stats, then dashboard UI |
-| Session metrics source | Reuse `InferenceTrace` (currently opt-in, metadata-only) as the always-on metrics sink |
+| Session metrics source | Metadata-only JSONL trace files as the always-on metrics sink (originally framed as "reuse InferenceTrace"; that class turned out not to exist, so Phase B builds the sink new with the same shape) |
 | UI stack | React + Vite + Tailwind CSS + shadcn/ui, SPA |
 | Session management ops | Browse/inspect, delete, rename/label, resume helper; sessions indexed into local SQLite via `node:sqlite` + Drizzle ORM |
 | Download source | Static recommended model list only. No search, no free-form repo input |
@@ -28,7 +28,7 @@ A local web dashboard, started with `mlx dashboard`, shipped inside the `@mlx-no
 - CLI dispatch is a hand-rolled switch in `packages/cli/src/cli.ts`; each command is a lazily imported `run(argv)` module. `mlx launch claude` is the precedent for starting a local HTTP server.
 - `@mlx-node/server` is plain `node:http`; no package ships static web assets today (all publish `files: ["dist"]`, tsc-only builds). UI asset shipping is net-new.
 - Agent sessions are pi's append-only JSONL trees under `~/.mlx-node/agent/sessions/--<encoded-cwd>--/` (`PI_CODING_AGENT_DIR` seeded by `packages/agent/src/run-agent.ts`). pi's `SessionManager.list/listAll` returns ready-made summaries; `getBranch`/`getTree` read transcripts. Token usage persists per assistant message (`message.usage`, populated in `packages/agent/src/provider/events.ts`).
-- Throughput metrics (TTFT, prefill/decode tok/s, MTP acceptance) are computed natively per turn (`PerformanceMetrics`) but never persisted — TUI footer only (`packages/agent/src/provider/performance-status.ts`). `InferenceTrace` (`packages/agent/src/provider/inference-trace.ts`) is an existing env-gated, metadata-only JSONL trace of exactly these fields.
+- Throughput metrics (TTFT, prefill/decode tok/s, MTP acceptance) are computed natively per turn (`PerformanceMetrics`) but never persisted — TUI footer only (`packages/agent/src/provider/performance-status.ts`, an in-memory `WeakMap` sink). **Correction from planning research:** there is no existing `InferenceTrace` TS writer; the `MLX_INFERENCE_TRACE*` env vars gate a native Rust log in `mlx launch claude`, unrelated to the agent. The metrics sink in Phase B is therefore new code with the same intended shape (metadata-only JSONL trace records).
 - `ColdCacheManager` (`crates/mlx-paged-attn/src/cold_cache.rs`) is a complete SSD cold tier for immutable paged prefix blocks: `~/.mlx-node/cache/paged/v1/<sha256>.safetensors`, quota 10% of FS capped 100 GiB, LRU with mtime-rebuilt recency, checksummed atomic writes, `ColdCacheStats` counters. It is exported but instantiated nowhere; no NAPI bindings exist for its stats, `BlockAllocator` pool counts, or `PagedPrefillMemorySnapshot`.
 - Model downloads use `@huggingface/hub` (`packages/cli/src/commands/download-model.ts`) with manifest-aware resume but console-only progress. Models live under `resolveModelsDir()` (`packages/cli/src/config.ts`): `-o` > `MLX_MODELS_DIR` > `~/.mlx-node/config.json` `modelsDir` > `~/.mlx-node/models`. Discovery = scan subdirs for a recognizable `config.json`. No delete, no size-on-disk, no quant surfacing in TS. Curated catalog: `packages/agent/src/catalog.ts` (`MODEL_CATALOG` / `visibleCatalog()`).
 
@@ -82,13 +82,15 @@ All three phases land in a single PR on this branch. Phases are internal milesto
 - Restore: on in-memory prefix miss, walk the `ColdCacheKey::chain` and `restore_block` before falling back to normal prefill. Any validation failure falls through silently.
 - NAPI additions: `coldCacheStats()` (`ColdCacheStats` counters + root path + quota), allocator pool counts (`num_free_blocks`/`num_allocated_blocks`/`total_blocks`), and cold-tier disk info.
 - Trace hook: expose per-turn cold-cache counter deltas so Phase B can persist them.
-- **Open design question (resolved during Phase A planning, not here):** cold restore is only sound where paged blocks fully determine layer state. Mixed-cache families (Gemma4 sliding-window layers, LFM2 conv, Qwen3.5/3.6 GDN) need either additional state persistence or exclusion. Phase A begins with a dedicated research pass (vLLM automatic-prefix-caching prior art in `~/workspace/github/vllm`, plus our `docs/paged-cache.md` support matrix) and gates each family behind byte-parity tests, mirroring the existing paged parity-gate pattern.
+- **Resolved during planning research:** cold restore is only sound where paged blocks fully determine layer state. Per-family audit: only **qwen3 dense** is fully covered (all layers full-attention); lfm2 (conv), gemma4 (sliding `RotatingKVCache` + KV-shared aliases), and qwen3.5/3.6 (GDN recurrent/conv state + checkpoint store) all keep per-layer state outside the paged pool. **v1 gates cold restore to qwen3 dense**; capture/persist wiring is family-generic so hybrids can be added later by persisting their extra state. This mirrors vLLM, which defaults prefix caching off for hybrid models. Byte-parity tests follow the existing paged parity-gate pattern.
 
 ### Phase B — metrics sink (agent)
 
-- `InferenceTrace` becomes **default-on**, writing to `~/.mlx-node/metrics/traces/<date>-<pid>.jsonl`. Existing env vars stay as overrides/kill switch.
-- Records gain correlation fields: pi session id + message/turn id, plus Phase A cold-cache counter deltas.
-- Field set stays allowlisted and text-free (no prompt/content leakage).
+- New `MetricsTrace` JSONL sink in the agent provider (there is no existing trace writer to promote — see correction above). **Default-on**, writing to `~/.mlx-node/metrics/traces/<date>-<pid>.jsonl`, with an env kill switch (`MLX_AGENT_METRICS=0`).
+- Hooked at the stream-adapter final branch (the one seam that sees the raw `ChatStreamFinal` — prompt/cached/output/reasoning tokens, finish reason, `PerformanceMetrics` — plus the per-request pi `options.sessionId` and root session id/file). Subagent turns flow through the same seam and are recorded with their own session ids.
+- Correlation: a provider-minted `mlxTraceId` UUID stamped on the `AssistantMessage` (custom fields survive pi's JSONL round-trip — `mlxThinkingEnabled` precedent), giving the dashboard a stable join key between trace records and session entries. The pi entry id is unknowable in-turn (pi emits `message_end` before persisting).
+- Phase A cold-cache counter deltas per turn (from the new NAPI stats), plus per-turn `promptTokens`/`cachedTokens`.
+- Field set is allowlisted and text-free (no prompt/content leakage).
 - Retention: the dashboard prunes trace files older than 30 days after ingesting them.
 
 ### Phase C — dashboard package + CLI + UI
