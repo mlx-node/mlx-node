@@ -71,9 +71,9 @@ Principles:
 - JSONL (sessions, traces) is the source of truth. SQLite is a disposable index — deleting `dashboard.db` loses nothing; it is rebuilt on next start.
 - Agent-process runtime counters (cold-cache hits, throughput) reach the dashboard only via trace records; the dashboard never reads another process's memory.
 
-## Phasing — three PRs, in order
+## Phasing — one PR, three phases in order
 
-Phase C works day one even before A/B land (token-derived metrics + disk-level cache view); richer data lights up as A/B ship.
+All three phases land in a single PR on this branch. Phases are internal milestones (A → B → C), each independently testable; C works even with A/B data absent (token-derived metrics + disk-level cache view), so the dashboard degrades gracefully on machines with old sessions.
 
 ### Phase A — cold-cache inference wiring (Rust)
 
