@@ -12,10 +12,16 @@ use napi_derive::napi;
 
 static GLOBAL: OnceLock<Option<Arc<ColdCacheManager>>> = OnceLock::new();
 
-/// Overrides the cold-tier root directory (primarily for tests). Read once
-/// on first `global_cold_cache()` call; an empty value means the default
-/// root (`~/.mlx-node/cache/paged/v1`).
+/// Overrides the cold-tier parent directory (primarily for tests). Read
+/// once on first `global_cold_cache()` call; an empty value means the
+/// default root (`~/.mlx-node/cache/paged/v1`).
 const COLD_CACHE_DIR_ENV: &str = "MLX_COLD_CACHE_DIR";
+
+/// Child of `MLX_COLD_CACHE_DIR` the tier actually operates in. Opening a
+/// root chmods it 0700 and deletes leftover writer temp files, so those
+/// behaviors must only ever touch a directory the cache created itself,
+/// never the user-supplied directory verbatim.
+const MANAGED_SUBDIR: &str = "mlx-paged-v1";
 
 /// Lazily open the process-wide cold tier. Returns `None` when the tier
 /// cannot be opened (fail-open: inference proceeds without persistence).
@@ -23,9 +29,9 @@ pub fn global_cold_cache() -> Option<Arc<ColdCacheManager>> {
     GLOBAL
         .get_or_init(|| {
             let opened = match std::env::var(COLD_CACHE_DIR_ENV) {
-                Ok(dir) if !dir.is_empty() => {
-                    ColdCacheManager::open_default_at(std::path::PathBuf::from(dir))
-                }
+                Ok(dir) if !dir.is_empty() => ColdCacheManager::open_default_at(
+                    std::path::PathBuf::from(dir).join(MANAGED_SUBDIR),
+                ),
                 _ => ColdCacheManager::open_default(),
             };
             opened.ok().map(Arc::new)
@@ -115,11 +121,37 @@ mod tests {
         assert!(cold_cache_stats_snapshot().is_none());
 
         let dir = std::env::temp_dir().join(format!("mlx-cold-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let foreign_tmp = dir.join("foo.tmp");
+        let foreign_data = dir.join("data.txt");
+        std::fs::write(&foreign_tmp, b"foreign").unwrap();
+        std::fs::write(&foreign_data, b"data").unwrap();
+        #[cfg(unix)]
+        let parent_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777
+        };
+
         // SAFETY: this is the only test in the binary touching
         // MLX_COLD_CACHE_DIR and nothing else reads it concurrently.
         unsafe { std::env::set_var(COLD_CACHE_DIR_ENV, &dir) };
         let manager = global_cold_cache().expect("temp-dir cold tier must open");
-        assert!(manager.root().starts_with(&dir));
+        assert_eq!(manager.root(), dir.join("mlx-paged-v1"));
+        assert!(manager.root().is_dir());
+        assert!(
+            foreign_tmp.exists(),
+            "init must not delete files in the user-supplied parent dir"
+        );
+        assert!(foreign_data.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777,
+                parent_mode,
+                "init must not chmod the user-supplied parent dir"
+            );
+        }
 
         let after = cold_cache_stats();
         assert!(after.enabled);

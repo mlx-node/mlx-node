@@ -276,6 +276,9 @@ impl ColdCacheManager {
     }
 
     /// Explicit constructor used by tests and embedders with custom policy.
+    /// The manager takes ownership of `root`: opening chmods it 0700 and
+    /// removes leftover writer temp files, so callers must pass a directory
+    /// dedicated to this cache, never a shared/user directory.
     pub fn open_at(
         root: PathBuf,
         quota_bytes: u64,
@@ -325,6 +328,8 @@ impl ColdCacheManager {
     /// Whether a persisted block for `key` is present in the in-memory
     /// index. No filesystem I/O and no stats side effects, so callers can
     /// probe before deciding to capture without inflating hit/miss counts.
+    /// A file deleted externally leaves a stale `true` only until the next
+    /// `load` for that key misses and prunes the entry.
     pub fn contains(&self, key: &ColdCacheKey) -> bool {
         self.shared
             .index
@@ -400,8 +405,10 @@ impl ColdCacheManager {
         }
     }
 
-    /// Load and validate a block. Corrupt/incompatible entries are removed
-    /// and reported as misses.
+    /// Load and validate a block. Every failed read is a miss and prunes the
+    /// key from the in-memory index (so `contains` recovers when files are
+    /// deleted externally); genuinely corrupt payloads are additionally
+    /// removed from disk and counted as corruptions.
     pub fn load(
         &self,
         key: ColdCacheKey,
@@ -447,8 +454,8 @@ impl ColdCacheManager {
                         .stats
                         .corruptions
                         .fetch_add(1, Ordering::Relaxed);
-                    remove_indexed_file(&self.shared, key);
                 }
+                remove_indexed_file(&self.shared, key);
                 None
             }
         }
@@ -763,7 +770,11 @@ fn rebuild_index(root: &Path) -> Result<CacheIndex, String> {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
         if path.extension().and_then(|v| v.to_str()) != Some("safetensors") {
-            if path.extension().and_then(|v| v.to_str()) == Some("tmp") {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(is_cold_cache_temp_file)
+            {
                 let _ = fs::remove_file(path);
             }
             continue;
@@ -795,6 +806,26 @@ fn rebuild_index(root: &Path) -> Result<CacheIndex, String> {
         index.total_bytes = index.total_bytes.saturating_add(size);
     }
     Ok(index)
+}
+
+/// Matches exactly the temp-file names `persist_block` creates
+/// (`.{64-hex key}.{pid}.{tick}.tmp`) so startup cleanup can never remove
+/// foreign files from a directory it was mistakenly pointed at.
+fn is_cold_cache_temp_file(name: &str) -> bool {
+    let Some(body) = name
+        .strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = body.split('.');
+    let (Some(key), Some(pid), Some(tick), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let is_digits = |value: &str| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+    hex_decode_32(key).is_some() && is_digits(pid) && is_digits(tick)
 }
 
 #[cfg(unix)]
@@ -1090,6 +1121,58 @@ mod tests {
         let stats = manager.stats();
         assert_eq!(stats.hits, 0, "contains must not count as a hit");
         assert_eq!(stats.misses, 0, "contains must not count as a miss");
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_miss_after_external_delete_prunes_index() {
+        let root = temp_root("external-delete");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        assert!(manager.enqueue(block(key)).unwrap());
+        for _ in 0..200 {
+            if manager.contains(&key) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(manager.contains(&key));
+
+        let path = root.join(format!("{}.safetensors", key.to_hex()));
+        fs::remove_file(&path).unwrap();
+        assert!(manager.load(key, fingerprint()).is_none());
+        assert!(
+            !manager.contains(&key),
+            "externally deleted entry must leave the index on the next load miss"
+        );
+        let stats = manager.stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.corruptions, 0, "a missing file is not a corruption");
+        assert_eq!(manager.shared.index.lock().unwrap().total_bytes, 0);
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_cleanup_removes_only_writer_temp_files() {
+        let root = temp_root("tmp-cleanup");
+        fs::create_dir_all(&root).unwrap();
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let stale_writer_tmp = root.join(format!(".{}.{}.{}.tmp", key.to_hex(), 4242, 7));
+        let foreign_tmp = root.join("foo.tmp");
+        let foreign_data = root.join("data.txt");
+        fs::write(&stale_writer_tmp, b"stale").unwrap();
+        fs::write(&foreign_tmp, b"foreign").unwrap();
+        fs::write(&foreign_data, b"data").unwrap();
+
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 1).unwrap();
+        assert!(
+            !stale_writer_tmp.exists(),
+            "leftover writer temp files must be cleaned at startup"
+        );
+        assert!(foreign_tmp.exists(), "unrelated *.tmp files must survive");
+        assert!(foreign_data.exists());
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }
