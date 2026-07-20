@@ -110,7 +110,7 @@ mlx convert --input ./model --output ./model-unsloth --quantize --q-recipe unslo
 
 # Qwen3.5 family: official Unsloth map translated to MXFP4/MXFP8
 mlx convert --input ./model --output ./model-unsloth-mxfp4 --quantize \
-  --q-recipe unsloth --q-mxfp --imatrix-path ./imatrix.gguf
+  --q-recipe unsloth --q-mxfp
 
 # Qwen3.6 with MTPLX-style MTP sidecar
 mlx convert \
@@ -166,7 +166,7 @@ Auto-detected from `config.json` when not specified:
 
 #### Unsloth Recipe
 
-MLX affine equivalent of [Unsloth Dynamic 2.0](https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks) (UD) GGUF quantization. Designed for Qwen3.5's hybrid GatedDeltaNet + full attention architecture. Requires imatrix for AWQ pre-scaling of attention/SSM weights.
+MLX affine equivalent of [Unsloth Dynamic 2.0](https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks) (UD) GGUF quantization. Designed for Qwen3.5's hybrid GatedDeltaNet + full attention architecture. Legacy affine requires an imatrix for AWQ pre-scaling of attention/SSM weights.
 
 ```bash
 # UD-Q3_K_XL equivalent (~17 GB for 35B-A3B)
@@ -179,15 +179,19 @@ mlx convert -i ./model -o ./model-q4 -q --q-bits 4 --q-recipe unsloth --imatrix-
 For verified Qwen3.5/Qwen3.6-family checkpoints, select the fixed [official
 Unsloth class map](https://unsloth.ai/docs/models/qwen3.6#nvfp4) with either
 `--q-mxfp` (NVFP4 → MXFP4, FP8 → MXFP8) or `--q-mode nvfp4` (the official DGX
-map, retaining NVFP4 and using MXFP8 for FP8 classes). AWQ imatrix pre-scaling
-is the same for both. Plain affine Unsloth alone keeps legacy Dynamic 2.0.
+map, retaining NVFP4 and using MXFP8 for FP8 classes). An imatrix is optional
+for these two fixed maps: when omitted, AWQ pre-scaling is skipped and quality
+may be lower, while the class map stays unchanged. Plain affine Unsloth alone
+keeps legacy Dynamic 2.0 and still requires an imatrix. A matching imatrix
+remains preferred for the fixed maps when calibration data is available; add
+`--imatrix-path ./imatrix.gguf` to either command below.
 
 ```bash
 mlx convert -i ./model -o ./model-unsloth-mxfp4 -q \
-  --q-recipe unsloth --q-mxfp --imatrix-path ./imatrix.gguf
+  --q-recipe unsloth --q-mxfp
 
 mlx convert -i ./model -o ./model-unsloth-nvfp4 -q \
-  --q-recipe unsloth --q-mode nvfp4 --imatrix-path ./imatrix.gguf
+  --q-recipe unsloth --q-mode nvfp4
 ```
 
 The two official maps share the high-precision and BF16 classes:

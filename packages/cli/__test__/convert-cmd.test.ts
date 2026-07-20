@@ -196,6 +196,102 @@ describe('mlx convert Unsloth MXFP messaging', () => {
     expect(help).not.toContain('Recommended combo: --q-recipe unsloth --q-bits 4 --q-mxfp');
   });
 
+  it('still rejects legacy affine Unsloth without an imatrix', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    await expect(
+      runConvert([
+        '--input',
+        tmp,
+        '--output',
+        join(tmp, 'out'),
+        '--model-type',
+        'qwen3_5_moe',
+        '--quantize',
+        '--q-recipe',
+        'unsloth',
+      ]),
+    ).rejects.toThrow('process.exit(1)');
+
+    const errors = errSpy.mock.calls.map((call) => String(call[0])).join('\n');
+    expect(errors).toContain('legacy affine --q-recipe unsloth requires --imatrix-path');
+    expect(errors).toContain('--q-mxfp or --q-mode nvfp4');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(convertModel).not.toHaveBeenCalled();
+  });
+
+  it('allows the requested fixed MXFP map without an imatrix and warns about skipped AWQ', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({ model_type: 'qwen3_5_moe' }));
+
+    await runConvert([
+      '--input',
+      tmp,
+      '--output',
+      join(tmp, 'out'),
+      '--model-type',
+      'qwen3_5_moe',
+      '--quantize',
+      '--q-recipe',
+      'unsloth',
+      '--q-mxfp',
+    ]);
+
+    const warnings = warnSpy.mock.calls.map((call) => String(call[0])).join('\n');
+    expect(warnings).toContain('If backend Qwen family/shape validation selects');
+    expect(warnings).toContain('AWQ pre-scaling will be skipped');
+    expect(warnings).toContain('quality may be lower');
+    expect(warnings).toContain('unsupported inputs will be rejected');
+    expect(convertModel).toHaveBeenCalledWith(
+      expect.objectContaining({
+        quantRecipe: 'unsloth',
+        quantMxfp: true,
+        imatrixPath: undefined,
+      }),
+    );
+  });
+
+  it('allows the requested fixed DGX map without an imatrix and warns about skipped AWQ', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+
+    await runConvert([
+      '--input',
+      tmp,
+      '--output',
+      join(tmp, 'out'),
+      '--model-type',
+      'qwen3_5',
+      '--quantize',
+      '--q-mode',
+      'nvfp4',
+      '--q-recipe',
+      'unsloth',
+    ]);
+
+    const warnings = warnSpy.mock.calls.map((call) => String(call[0])).join('\n');
+    expect(warnings).toContain('If backend Qwen family/shape validation selects');
+    expect(warnings).toContain('AWQ pre-scaling will be skipped');
+    expect(warnings).toContain('quality may be lower');
+    expect(warnings).toContain('unsupported inputs will be rejected');
+    expect(convertModel).toHaveBeenCalledWith(
+      expect.objectContaining({
+        quantRecipe: 'unsloth',
+        quantMode: 'nvfp4',
+        quantMxfp: false,
+        imatrixPath: undefined,
+      }),
+    );
+  });
+
   it('reports the requested DGX map and forwards it without replacing its NVFP4 FFNs', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});

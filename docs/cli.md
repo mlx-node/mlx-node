@@ -52,17 +52,19 @@ mlx convert --input ./model --output ./model-q --quantize --q-recipe mixed_4_6
 For verified dense and MoE Qwen3.5/Qwen3.6-family checkpoints, the fixed
 [official Unsloth class map](https://unsloth.ai/docs/models/qwen3.6#nvfp4) is
 available in two forms. Both keep FP8-class weights as MXFP8 and use the same
-AWQ imatrix pre-scaling:
+AWQ imatrix pre-scaling when calibration is provided. The imatrix is optional
+for these fixed maps: without it, AWQ pre-scaling is skipped and quality may be
+lower, while the class map remains unchanged. Plain affine Unsloth still
+requires an imatrix. Matching calibration remains preferred when available;
+add `--imatrix-path ./imatrix_unsloth.gguf_file` to either command below.
 
 ```bash
 # Apple MXFP variant: replace NVFP4 with MXFP4
 mlx convert -m qwen3_5_moe -q --q-recipe unsloth --q-mxfp \
-  --imatrix-path ./imatrix_unsloth.gguf_file \
   -i ./qwen3.5-35b-a3b -o ./qwen3.5-35b-a3b-unsloth-mxfp4-mlx
 
 # Official DGX variant: retain NVFP4
 mlx convert -m qwen3_5_moe -q --q-mode nvfp4 --q-recipe unsloth \
-  --imatrix-path ./imatrix_unsloth.gguf_file \
   -i ./qwen3.5-35b-a3b -o ./qwen3.5-35b-a3b-unsloth-nvfp4-mlx
 ```
 

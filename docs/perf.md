@@ -430,10 +430,12 @@ The Qwen3.5 GDN recurrence uses the **per-step** kernel by default on **every** 
 
 - mlx-lm-style mixed-bit: `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`
 - `qwen3_5` — Qwen3.5-tuned recipe
-- `unsloth` — requires imatrix calibration. `--q-mxfp` selects the official map
-  translated from NVFP4/FP8 to MXFP4/MXFP8; `--q-mode nvfp4` selects the
-  official DGX map with NVFP4/MXFP8. Both use the final-eight FFN split and the
-  same BF16 exclusions. Plain affine alone keeps the legacy Dynamic 2.0 map.
+- `unsloth` — legacy affine requires imatrix calibration. `--q-mxfp` selects
+  the official map translated from NVFP4/FP8 to MXFP4/MXFP8; `--q-mode nvfp4`
+  selects the official DGX map with NVFP4/MXFP8. These fixed maps may omit the
+  imatrix; AWQ pre-scaling is then skipped and quality may be lower, while the
+  class map remains unchanged. Both use the final-eight FFN split and the same
+  BF16 exclusions. Plain affine alone keeps the legacy Dynamic 2.0 map.
 
 AWQ-style imatrix pre-scaling is supported for improved low-bit quality.
 

@@ -60,8 +60,9 @@ Quantization Arguments:
                         attention q/k/v/o, GDN qkv/z/out, and lm_head=mxfp8;
                         embeddings, routers, GDN a/b, vision, MTP, norms, and
                         recurrent tensors stay bf16. AWQ imatrix pre-scaling
-                        remains enabled. --q-bits/--q-group-size do not alter
-                        this fixed map.
+                        is applied when --imatrix-path is provided. Without it,
+                        the fixed class map is unchanged but quality may be
+                        lower. --q-bits/--q-group-size do not alter this map.
 
                         With other recipes (or no recipe), applies after the
                         recipe predicate: any 8-bit affine decision becomes
@@ -86,7 +87,10 @@ Quantization Arguments:
                         "unsloth" defaults to 3-bit base (gate/up=3b, down=4b,
                         embed=5b, lm_head=6b, attn q/k/v=5b+AWQ,
                         o_proj/out_proj/in_proj_a/in_proj_b=8b affine)
-                        "unsloth" requires --imatrix-path for quality
+                        "unsloth" legacy affine requires --imatrix-path.
+                        The fixed --q-mxfp / --q-mode nvfp4 maps may omit it;
+                        AWQ pre-scaling is then skipped and quality may be lower.
+                        A matching imatrix remains preferred when available.
                         Add --q-mxfp for the official Qwen3.5 MXFP class map
                         (NVFP4 translated to MXFP4, FP8 translated to MXFP8).
                         Use --q-mode nvfp4 for the official DGX map: early
@@ -120,7 +124,9 @@ Quantization Arguments:
                         require --quantize/--q-recipe.
   --imatrix-path <path> imatrix GGUF file for AWQ-style pre-scaling
                         Improves quantization quality using calibration data
-                        Required for "unsloth" recipe
+                        Required for legacy affine "unsloth". Optional for its
+                        fixed --q-mxfp / --q-mode nvfp4 maps, but preferred
+                        when matching calibration data is available.
 
 Model Types:
   (default)             SafeTensors dtype conversion (HuggingFace models)
@@ -282,16 +288,27 @@ export async function run(argv: string[]) {
     // embed_tokens at 5-bit, lm_head at 6-bit, attn q/k/v + SSM in_proj_qkv/z at
     // 5-bit with AWQ pre-scaling via input_layernorm, o_proj/out_proj and split
     // in_proj_a/in_proj_b at 8-bit affine for MTP/AR T=0 bit-exactness).
-    // Based on Unsloth's per-tensor KLD analysis. Requires imatrix for AWQ correction
-    // on the attention/SSM projections.
+    // Based on Unsloth's per-tensor KLD analysis. Legacy affine requires an
+    // imatrix for AWQ correction on attention/SSM projections. The fixed
+    // official --q-mxfp / --q-mode nvfp4 maps may run data-free, but the
+    // backend must still verify the Qwen family + hybrid tensor shape before
+    // it is allowed to skip AWQ rather than fall back to Dynamic 2.0.
     if (quantRecipe === 'unsloth' && !args['q-bits'] && quantMode !== 'nvfp4' && !args['q-mxfp']) {
       console.log('Note: unsloth recipe defaults to 3-bit base (override with --q-bits)');
     }
     if (quantRecipe === 'unsloth' && !args['imatrix-path']) {
-      console.error('Error: --q-recipe unsloth requires --imatrix-path for AWQ pre-scaling');
-      console.error('       imatrix calibration data is needed for near-lossless attention/SSM quantization');
-      console.error('       Generate with: llama-imatrix -m model.gguf -f calibration.txt -o imatrix.gguf');
-      process.exit(1);
+      const requestsFixedOfficialMap = args['q-mxfp'] || quantMode === 'nvfp4';
+      if (!requestsFixedOfficialMap) {
+        console.error('Error: legacy affine --q-recipe unsloth requires --imatrix-path for AWQ pre-scaling');
+        console.error(
+          '       without calibration, only the fixed official maps selected by --q-mxfp or --q-mode nvfp4 are supported',
+        );
+        console.error('       Generate with: llama-imatrix -m model.gguf -f calibration.txt -o imatrix.gguf');
+        process.exit(1);
+      }
+      console.warn(
+        'Warning: no --imatrix-path was provided. If backend Qwen family/shape validation selects the requested fixed MXFP4/MXFP8 or NVFP4/MXFP8 map, AWQ pre-scaling will be skipped and quality may be lower; unsupported inputs will be rejected.',
+      );
     }
     // The nvidia recipe is a data-free port with a fixed format map: it reads
     // no imatrix, emits mxfp4/mxfp8 per-layer directly (so --q-mxfp is

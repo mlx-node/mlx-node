@@ -1689,6 +1689,19 @@ pub async fn convert_gguf_to_safetensors(
         )));
     }
 
+    // Match the SafeTensors entry point's early policy gate. Plain affine
+    // Unsloth cannot run without AWQ calibration; fixed-map selectors defer
+    // the decision until GGUF architecture + remapped hybrid shape are known.
+    if let Some(ref recipe) = options.quant_recipe {
+        crate::convert::validate_unsloth_imatrix_selector(
+            recipe,
+            options.imatrix_path.as_deref(),
+            options.quant_mxfp.unwrap_or(false),
+            options.quant_mode.as_deref().unwrap_or("affine"),
+        )
+        .map_err(Error::from_reason)?;
+    }
+
     // The nvidia recipe is documented + validated only for qwen3_5 /
     // qwen3_5_moe and is a data-free port with a fixed format map. Reject an
     // unsupported model type + the flags that would silently alter or
@@ -1946,6 +1959,15 @@ pub async fn convert_gguf_to_safetensors(
                 &quant_mode_str,
                 is_qwen35_hybrid,
             );
+            crate::convert::validate_unsloth_imatrix_after_selection(
+                recipe,
+                options.imatrix_path.as_deref(),
+                official_unsloth_kind,
+            )
+            .map_err(Error::from_reason)?;
+            if recipe == "unsloth" && options.imatrix_path.is_none() {
+                warn!("{}", crate::convert::UNSLOTH_NO_IMATRIX_WARNING);
+            }
             let predicate = match official_unsloth_kind {
                 Some(kind) => crate::convert::build_official_unsloth_recipe(&weight_keys, kind),
                 None => crate::convert::build_predicate_for_recipe(
