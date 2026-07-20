@@ -1566,6 +1566,35 @@
   }
 }
 
+/* ── Motion kit: FlowDots ────────────────────────────────────────────────────
+   Dots travelling along a path, meaning "data is moving along this edge right
+   now". The dots are ONE <path> stroked with a zero-length round-capped dash
+   (see learn/motion/FlowDots.tsx); shifting the dash offset by exactly one dash
+   period animates them forward and loops seamlessly. Compositor-driven — no JS
+   timer, no React re-render.
+
+   The period is passed in as --flow-dot-period so the keyframe stays generic;
+   without a fallback the animation would be a no-op if the var were dropped. */
+.flow-dots {
+  animation: flowDots var(--flow-dot-duration, 900ms) linear infinite;
+  animation-direction: var(--flow-dot-direction, normal);
+}
+
+@keyframes flowDots {
+  to {
+    stroke-dashoffset: calc(-1 * var(--flow-dot-period, 14px));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Freeze the dots but KEEP them painted: a static dotted line still reads as
+     "these two boxes are connected and carry data", which is the part of the
+     meaning that is not motion. */
+  .flow-dots {
+    animation: none;
+  }
+}
+
 .gqa-chip {
   transform-box: fill-box;
   transform-origin: center;
