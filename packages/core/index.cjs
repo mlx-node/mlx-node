@@ -781,6 +781,7 @@ module.exports.buildRewardOutputs = nativeBinding.buildRewardOutputs;
 module.exports.BuiltinRewardType = nativeBinding.BuiltinRewardType;
 module.exports.calibrateActivationAmaxRaw = nativeBinding.calibrateActivationAmaxRaw;
 module.exports.ChatRole = nativeBinding.ChatRole;
+module.exports.coldCacheStats = nativeBinding.coldCacheStats;
 module.exports.convertForeignWeights = nativeBinding.convertForeignWeights;
 module.exports.convertGgufToSafetensors = nativeBinding.convertGgufToSafetensors;
 module.exports.convertModel = nativeBinding.convertModel;

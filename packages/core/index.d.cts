@@ -2645,6 +2645,46 @@ export interface CleanupStats {
 }
 
 /**
+ * Return a snapshot of the process-wide cold tier. Read-only: never opens
+ * the tier itself, so it reports `enabled: false` until inference first
+ * initializes the tier.
+ */
+export declare function coldCacheStats(): ColdCacheStats;
+
+/**
+ * Snapshot of the process-wide SSD cold tier for paged prefix blocks.
+ * Counters are cumulative since the tier was opened; all numeric values
+ * are returned as `f64` to avoid BigInt round-trips in JS.
+ */
+export interface ColdCacheStats {
+  /**
+   * `false` until the tier is first opened by inference, or when opening
+   * failed (fail-open: inference then runs without persistence).
+   */
+  enabled: boolean;
+  /** Cache root directory (empty while disabled). */
+  root: string;
+  /** Disk quota in bytes. */
+  quotaBytes: number;
+  /** Blocks restored from disk after validation. */
+  hits: number;
+  /** Lookups that found no usable block (includes corrupt entries). */
+  misses: number;
+  /** Blocks accepted onto the background write queue. */
+  enqueued: number;
+  /** Writes dropped because the bounded queue was full. */
+  queueDrops: number;
+  /** Total bytes committed to disk. */
+  bytesWritten: number;
+  /** Total bytes read back on validated hits. */
+  bytesRestored: number;
+  /** Entries evicted to respect the quota / free-space reserve. */
+  evictions: number;
+  /** Entries that failed checksum/identity validation and were removed. */
+  corruptions: number;
+}
+
+/**
  * Structured completion information aligned with ChatResult.
  * Contains pre-parsed tool calls, thinking, and clean text.
  */

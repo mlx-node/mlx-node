@@ -9,6 +9,7 @@ pub mod autograd;
 pub mod benchmarks;
 pub mod cache_limit;
 pub mod calibration;
+pub mod cold_tier;
 pub mod convert;
 pub mod convert_gemma_import;
 pub mod dataset;

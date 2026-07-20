@@ -259,7 +259,14 @@ impl ColdCacheManager {
     pub fn open_default() -> Result<Self, String> {
         let home = std::env::var_os("HOME")
             .ok_or_else(|| "HOME is not set; cannot locate the paged cache".to_string())?;
-        let root = PathBuf::from(home).join(".mlx-node/cache/paged/v1");
+        Self::open_default_at(PathBuf::from(home).join(".mlx-node/cache/paged/v1"))
+    }
+
+    /// Open a custom root with the same automatic quota policy as
+    /// [`Self::open_default`]: 10% of filesystem capacity capped at 100 GiB,
+    /// a 5%-or-5-GiB free reserve, and the default queue depth.
+    pub fn open_default_at(root: PathBuf) -> Result<Self, String> {
+        // The root must exist before statvfs can size its filesystem.
         fs::create_dir_all(&root).map_err(|e| format!("create cold-cache root: {e}"))?;
         set_private_dir_permissions(&root)?;
         let (total, _) = filesystem_space(&root)?;
@@ -313,6 +320,17 @@ impl ColdCacheManager {
 
     pub fn stats(&self) -> ColdCacheStats {
         self.shared.stats.snapshot()
+    }
+
+    /// Whether a persisted block for `key` is present in the in-memory
+    /// index. No filesystem I/O and no stats side effects, so callers can
+    /// probe before deciding to capture without inflating hit/miss counts.
+    pub fn contains(&self, key: &ColdCacheKey) -> bool {
+        self.shared
+            .index
+            .lock()
+            .map(|index| index.entries.contains_key(key))
+            .unwrap_or(false)
     }
 
     /// Capture one pinned physical block from Metal, then enqueue only the
@@ -1052,6 +1070,37 @@ mod tests {
         assert!(path_c.exists());
 
         drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn contains_checks_index_without_stats_side_effects() {
+        let root = temp_root("contains");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        assert!(!manager.contains(&key));
+        assert!(manager.enqueue(block(key)).unwrap());
+        for _ in 0..200 {
+            if manager.contains(&key) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(manager.contains(&key));
+        let stats = manager.stats();
+        assert_eq!(stats.hits, 0, "contains must not count as a hit");
+        assert_eq!(stats.misses, 0, "contains must not count as a miss");
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_default_at_applies_auto_quota_policy() {
+        let root = temp_root("default-at");
+        let manager = ColdCacheManager::open_default_at(root.clone()).unwrap();
+        assert_eq!(manager.root(), root.as_path());
+        assert!(manager.quota_bytes() > 0);
+        drop(manager);
         let _ = fs::remove_dir_all(root);
     }
 
