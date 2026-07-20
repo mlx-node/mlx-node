@@ -2477,6 +2477,33 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             }
         );
 
+        // Resolve and validate the fixed Unsloth map before dispatching to a
+        // model-specific quantization branch. Most recipes use the generic
+        // branch below, but privacy-filter owns a dedicated predicate and
+        // would otherwise bypass the late no-imatrix fail-closed gate.
+        let recipe_weight_keys = quant_recipe
+            .as_ref()
+            .map(|_| converted_tensors.keys().cloned().collect::<Vec<_>>());
+        let official_unsloth_kind = match (quant_recipe.as_deref(), recipe_weight_keys.as_deref()) {
+            (Some(recipe), Some(weight_keys)) => {
+                let kind = select_and_validate_official_unsloth_recipe(
+                    recipe,
+                    imatrix_path.as_deref(),
+                    quant_mxfp,
+                    &quant_mode,
+                    &config,
+                    model_type.as_deref(),
+                    weight_keys,
+                )
+                .map_err(Error::from_reason)?;
+                if recipe == "unsloth" && imatrix_path.is_none() {
+                    warn!("{}", UNSLOTH_NO_IMATRIX_WARNING);
+                }
+                kind
+            }
+            _ => None,
+        };
+
         if is_privacy_filter {
             // Privacy-filter has a dedicated predicate: quantize attention
             // projections (q/k/v/o) and MoE experts (gate_up_proj, down_proj);
@@ -2533,7 +2560,9 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 );
             }
         } else if let Some(ref recipe) = quant_recipe {
-            let weight_keys: Vec<String> = converted_tensors.keys().cloned().collect();
+            let weight_keys = recipe_weight_keys
+                .as_deref()
+                .expect("recipe keys are collected whenever quant_recipe is present");
             // Recipes emit affine `Custom` decisions for protected tensors
             // (lm_head, AWQ-corrected attn/SSM projections, etc). Affine
             // quantize only supports group_size ∈ {32, 64, 128}, so when the
@@ -2547,31 +2576,9 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             } else {
                 quant_group_size
             };
-            // Verified Qwen hybrids use Unsloth's official float class map:
-            // `--q-mxfp` translates FP8/NVFP4 to MXFP8/MXFP4, while
-            // `--q-mode nvfp4` preserves NVFP4 for the low FFN class and uses
-            // MXFP8 for the high class. This is not a mechanical rewrite of
-            // the legacy Dynamic 2.0 affine decisions.
-            // The official map is Qwen3.5/Qwen3.6-hybrid-specific. Gate on the
-            // input config (ground truth), the requested sanitizer family, and
-            // the sanitized weight shape. If any of those are unavailable or
-            // disagree, preserve the legacy family-agnostic upgrade wrappers.
-            let is_qwen35_hybrid =
-                is_qwen35_hybrid_checkpoint(&config, model_type.as_deref(), &weight_keys);
-            let official_unsloth_kind =
-                select_official_unsloth_recipe(recipe, quant_mxfp, &quant_mode, is_qwen35_hybrid);
-            validate_unsloth_imatrix_after_selection(
-                recipe,
-                imatrix_path.as_deref(),
-                official_unsloth_kind,
-            )
-            .map_err(Error::from_reason)?;
-            if recipe == "unsloth" && imatrix_path.is_none() {
-                warn!("{}", UNSLOTH_NO_IMATRIX_WARNING);
-            }
             let predicate = match official_unsloth_kind {
-                Some(kind) => build_official_unsloth_recipe(&weight_keys, kind),
-                None => build_predicate_for_recipe(recipe, &weight_keys, quant_bits, recipe_gs)
+                Some(kind) => build_official_unsloth_recipe(weight_keys, kind),
+                None => build_predicate_for_recipe(recipe, weight_keys, quant_bits, recipe_gs)
                     .map_err(Error::from_reason)?,
             };
             let predicate: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
@@ -4132,6 +4139,29 @@ pub(crate) fn select_official_unsloth_recipe(
     } else {
         None
     }
+}
+
+/// Select and validate the SafeTensors fixed Unsloth class map from the input
+/// config, requested sanitizer family, and sanitized tensor inventory.
+///
+/// This helper is deliberately called before model-specific quantization
+/// dispatch. A sanitizer-managed branch (currently privacy-filter) must not be
+/// able to bypass the late no-imatrix gate merely because it uses a dedicated
+/// predicate instead of [`build_predicate_for_recipe`].
+fn select_and_validate_official_unsloth_recipe(
+    recipe: &str,
+    imatrix_path: Option<&str>,
+    quant_mxfp: bool,
+    quant_mode: &str,
+    config: &serde_json::Value,
+    requested_model_type: Option<&str>,
+    weight_keys: &[String],
+) -> std::result::Result<Option<OfficialUnslothRecipeKind>, String> {
+    let is_qwen35_hybrid = is_qwen35_hybrid_checkpoint(config, requested_model_type, weight_keys);
+    let official_kind =
+        select_official_unsloth_recipe(recipe, quant_mxfp, quant_mode, is_qwen35_hybrid);
+    validate_unsloth_imatrix_after_selection(recipe, imatrix_path, official_kind)?;
+    Ok(official_kind)
 }
 
 /// Build the official Unsloth float class map for Qwen3.5 hybrid models.
@@ -11293,6 +11323,56 @@ mod tests {
         }
         validate_unsloth_imatrix_after_selection("unsloth", Some("imatrix.gguf"), None)
             .expect("an imatrix keeps the existing fallback behavior available");
+    }
+
+    #[test]
+    fn unsloth_no_imatrix_privacy_filter_is_rejected_before_dedicated_quantization() {
+        let config = serde_json::json!({
+            "model_type": "privacy-filter",
+            "tie_word_embeddings": false,
+        });
+        let weight_keys = [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.mlp.experts.gate_up_proj.weight",
+            "model.layers.0.mlp.experts.down_proj.weight",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+        for (quant_mxfp, quant_mode) in [(true, "affine"), (false, "nvfp4")] {
+            let err = select_and_validate_official_unsloth_recipe(
+                "unsloth",
+                None,
+                quant_mxfp,
+                quant_mode,
+                &config,
+                Some("privacy-filter"),
+                &weight_keys,
+            )
+            .expect_err("privacy-filter must not bypass no-imatrix official-map validation");
+            assert!(
+                err.contains("verified Qwen3.5/Qwen3.6"),
+                "unexpected error for mode={quant_mode}, q_mxfp={quant_mxfp}: {err}"
+            );
+        }
+
+        assert_eq!(
+            select_and_validate_official_unsloth_recipe(
+                "unsloth",
+                Some("imatrix.gguf"),
+                true,
+                "affine",
+                &config,
+                Some("privacy-filter"),
+                &weight_keys,
+            )
+            .expect("calibrated privacy-filter behavior must remain available"),
+            None,
+        );
     }
 
     fn qwen35_hybrid_test_keys() -> Vec<String> {
