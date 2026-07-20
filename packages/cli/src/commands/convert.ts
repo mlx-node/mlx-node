@@ -211,6 +211,17 @@ export async function run(argv: string[]) {
   const quantMode = args['q-mode'];
   const quantMtp = args['q-mtp'] ?? 'off';
 
+  // The foreign-weight converter only remaps Paddle/PyTorch tensors into
+  // unquantized SafeTensors and accepts no quantization options. Reject the
+  // request before recipe-specific messaging can promise backend validation
+  // that this conversion path never invokes.
+  if ((args['model-type'] === 'pp-lcnet-ori' || args['model-type'] === 'uvdoc') && args.quantize) {
+    console.error(
+      `Error: --quantize is not supported for foreign model type '${args['model-type']}'; foreign conversion only emits unquantized SafeTensors`,
+    );
+    process.exit(1);
+  }
+
   const validQuantModes = ['affine', 'mxfp4', 'mxfp8', 'nvfp4', 'sym8'];
   if (quantMode !== undefined && !validQuantModes.includes(quantMode)) {
     console.error(`Error: --q-mode must be one of ${validQuantModes.join(', ')}`);

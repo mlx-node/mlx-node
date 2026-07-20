@@ -29,7 +29,7 @@ vi.mock('@mlx-node/core', () => ({
   })),
 }));
 
-import { convertModel, convertGgufToSafetensors } from '@mlx-node/core';
+import { convertModel, convertForeignWeights, convertGgufToSafetensors } from '@mlx-node/core';
 
 import { run as runConvert } from '../src/commands/convert.js';
 
@@ -180,6 +180,43 @@ describe('mlx convert model-type auto-detection', () => {
       'gemma4_unified',
     );
   });
+});
+
+describe('mlx convert foreign-weight quantization validation', () => {
+  it.each([
+    ['pp-lcnet-ori', ['--q-recipe', 'unsloth', '--q-mxfp']],
+    ['uvdoc', ['--q-recipe', 'unsloth', '--q-mode', 'nvfp4']],
+  ])(
+    'rejects the fixed Unsloth map for %s before the non-quantizing foreign converter',
+    async (modelType, quantArgs) => {
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      vi.spyOn(console, 'log').mockImplementation(() => {});
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+        throw new Error(`process.exit(${code})`);
+      }) as never);
+
+      await expect(
+        runConvert([
+          '--input',
+          tmp,
+          '--output',
+          join(tmp, 'out'),
+          '--model-type',
+          modelType,
+          '--quantize',
+          ...quantArgs,
+        ]),
+      ).rejects.toThrow('process.exit(1)');
+
+      const errors = errSpy.mock.calls.map((call) => String(call[0])).join('\n');
+      expect(errors).toContain(`--quantize is not supported for foreign model type '${modelType}'`);
+      expect(exitSpy).toHaveBeenCalledWith(1);
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(convertForeignWeights).not.toHaveBeenCalled();
+      expect(convertModel).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe('mlx convert Unsloth MXFP messaging', () => {
