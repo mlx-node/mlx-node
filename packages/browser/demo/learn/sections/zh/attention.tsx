@@ -64,8 +64,8 @@ export function AttentionMemoryWallSection() {
       <MemoryWallDiagram />
 
       <p className="text-muted-foreground">
-        诚实起见的一个限定：这只在 <em>prefill</em>（预填充——把长提示词的各个位置并行算完，无论是一趟还是拆成几个
-        chunked pass）阶段、且只在 6 个全量注意力层上才会咬人。逐 token 的解码（每次只有一行新
+        诚实起见的一个限定：这只在 <em>prefill</em>（预填充——一趟处理很多个提示词位置，无论是一趟还是拆成几个 chunked
+        pass）阶段、且只在 6 个全量注意力层上才会咬人。逐 token 的解码（每次只有一行新
         query，也就是你在本章演示里看的部分）和 18 个 GatedDeltaNet 层从头到尾都不会构造 N×N 矩阵。
       </p>
       <p>而这恰好就是下一个子章节绕开的问题：在完全不把 N×N 矩阵写进 HBM 的情况下，算出同样的答案。</p>
@@ -336,9 +336,9 @@ export function AttentionRooflineSection() {
 
       <h2>prefill 和 decode 各自落在哪</h2>
       <p>
-        推理的两个阶段分坐两侧。<strong>prefill</strong> 并行处理提示词里的各个位置——和 decode
-        不同，位置之间没有从左到右的依赖——所以它读进来的每个权重都被<em>数百个</em>
-        位置同时复用：每字节一座算术大山。（这到底是一趟还是好几趟，是调度的选择，见{' '}
+        推理的两个阶段分坐两侧。<strong>prefill</strong> 一次就拿到整条提示词，所以它一趟能处理<em>很多个</em>
+        位置，读进来的每个权重都被这些位置共同复用：每字节一座算术大山。而 decode 每一趟只能吐一个
+        token。（一趟里装多少个位置是调度的选择，不是固定属性，见{' '}
         <a href="/zh/chapters/kv-cache/batching">chunked prefill</a>；两种情况下它都仍然是 compute-bound。）它稳稳地落在
         ridge 右侧，<strong>compute-bound</strong>。<strong>decode</strong> 在 batch 1 时是另一个极端：为了产出
         <em>一个</em> token，它把整个模型的权重恰好流过芯片一遍，几乎不做什么数学。它跌下最左侧的悬崖，

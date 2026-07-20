@@ -71,7 +71,7 @@ export const learning: ChapterLearningData = {
     {
       term: 'prefill',
       definition:
-        '推理的第一阶段：prompt 的每个位置并行处理，为每个 prompt token 写入 K 和 V——可以是一趟以矩阵乘法为主的传播，也可能在繁忙的服务器上被拆成好几个 chunked pass。',
+        '推理的第一阶段：整条 prompt 一次到齐，所以一趟能处理很多个位置，同时为每个 prompt token 写入 K 和 V——可以是一趟以矩阵乘法为主的传播，也可能在繁忙的服务器上被拆成好几个 chunked pass。相比之下，decode 每趟只处理一个 token。',
     },
     {
       term: 'decode',
@@ -184,8 +184,8 @@ export function KvCacheChapterBody() {
 
         <h2>Prefill 与 decode</h2>
         <p>
-          推理分两个阶段。<strong>Prefill</strong>（预填充）算出每个 prompt token 的 K、V
-          和隐藏状态，这些位置是并行处理的，在一趟以矩阵乘法为主的大计算里完成——或者，在繁忙的服务器上，被拆成好几个{' '}
+          推理分两个阶段。<strong>Prefill</strong>（预填充）一次拿到整条 prompt，算出每个 prompt token 的 K、V
+          和隐藏状态——一趟以矩阵乘法为主的大计算就能吃下很多个位置，或者，在繁忙的服务器上，被拆成好几个{' '}
           <a href="/zh/chapters/kv-cache/batching">chunked pass</a>，每一个都会先把自己的 KV 写进缓存，下一个才去读它。
           <strong>Decode</strong>（解码）则逐 token 生成：把上一个输出送回模型，只为
           <em>这一个</em>新 token 计算 K/V/Q，所有更早 token 的 K/V 直接从缓存里读出，而不是重新计算。没有缓存，每一步

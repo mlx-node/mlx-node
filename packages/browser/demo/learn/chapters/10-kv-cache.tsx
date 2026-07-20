@@ -113,7 +113,7 @@ export const learning: ChapterLearningData = {
     {
       term: 'prefill',
       definition:
-        'First inference phase: every prompt position is processed in parallel, writing K and V for every prompt token — in one matmul-heavy pass, or split across several chunked passes on a busy server.',
+        'First inference phase: the whole prompt arrives at once, so many positions are handled per pass while K and V are written for every prompt token — in one matmul-heavy pass, or split across several chunked passes on a busy server. Decode, by contrast, gets one token per pass.',
     },
     {
       term: 'decode',
@@ -232,13 +232,13 @@ export function KvCacheChapterBody() {
 
         <h2>Prefill versus decode</h2>
         <p>
-          Inference has two phases. <strong>Prefill</strong> computes K, V and the hidden states for every prompt token,
-          processing those positions in parallel in one matmul-heavy pass — or, on a busy server, split across several{' '}
-          <a href="/chapters/kv-cache/batching">chunked passes</a>, each writing its KV into the cache before the next
-          one reads it. <strong>Decode</strong> then generates one token at a time: feed the previous output back in,
-          compute K/V/Q for just <em>that</em> single new token, and read the K/V of all earlier tokens out of a cache
-          instead of recomputing them. Without the cache, each decode step would be as expensive as prefill — with it,
-          decode cost is roughly linear in the cache size.
+          Inference has two phases. <strong>Prefill</strong> gets the whole prompt at once and computes K, V and the
+          hidden states for every prompt token — many positions per matmul-heavy pass, or, on a busy server, split
+          across several <a href="/chapters/kv-cache/batching">chunked passes</a>, each writing its KV into the cache
+          before the next one reads it. <strong>Decode</strong> then generates one token at a time: feed the previous
+          output back in, compute K/V/Q for just <em>that</em> single new token, and read the K/V of all earlier tokens
+          out of a cache instead of recomputing them. Without the cache, each decode step would be as expensive as
+          prefill — with it, decode cost is roughly linear in the cache size.
         </p>
 
         <h2>Why caching K and V works</h2>

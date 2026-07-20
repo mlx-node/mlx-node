@@ -62,9 +62,13 @@ export function FlowDots({
       stroke={color}
       strokeWidth={size}
       strokeLinecap="round"
-      // A dash of length 0 with a round cap paints a single dot; `spacing` is
-      // the gap to the next one. The gap carries the whole period.
-      strokeDasharray={`0 ${spacing}`}
+      // A near-zero dash with a round cap paints a single dot of diameter
+      // `size`; `spacing` is the gap to the next one, so the gap carries the
+      // whole period. The dash is 0.01 rather than a true 0 deliberately:
+      // WebKit has historically dropped zero-length dashes entirely (nothing
+      // renders), while every engine draws the round cap on a tiny non-zero
+      // one. 0.01 user units is invisible on its own — the cap is the dot.
+      strokeDasharray={`0.01 ${spacing}`}
       style={
         {
           '--flow-dot-period': `${spacing}px`,

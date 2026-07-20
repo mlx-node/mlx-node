@@ -77,10 +77,10 @@ export function AttentionMemoryWallSection() {
       <MemoryWallDiagram />
 
       <p className="text-muted-foreground">
-        One caveat for honesty: this only bites during <em>prefill</em> — processing a long prompt&apos;s positions in
-        parallel, whether that takes one pass or several chunked ones — and only on the 6 full-attention layers.
-        Single-token decode (one new query row, the part you watch in the chapter demo) and the 18 GatedDeltaNet layers
-        never build an N×N matrix at all.
+        One caveat for honesty: this only bites during <em>prefill</em> — many prompt positions in one pass, whether
+        that takes a single pass or several chunked ones — and only on the 6 full-attention layers. Single-token decode
+        (one new query row, the part you watch in the chapter demo) and the 18 GatedDeltaNet layers never build an N×N
+        matrix at all.
       </p>
       <p>
         That is exactly the problem the next sub-chapter sidesteps: computing the same answer without ever writing the
@@ -386,11 +386,11 @@ export function AttentionRooflineSection() {
 
       <h2>Where prefill and decode land</h2>
       <p>
-        The two halves of inference sit on opposite sides. <strong>Prefill</strong> processes prompt positions in
-        parallel — there is no left-to-right dependency between them, unlike decode — so every weight it reads is reused
-        across <em>hundreds</em> of positions at a time: a mountain of matmul per byte. (Whether that arrives as one
-        pass or several is a scheduling choice; see <a href="/chapters/kv-cache/batching">chunked prefill</a>. It stays
-        compute-bound either way.) It sits comfortably right of the ridge, <strong>compute-bound</strong>.{' '}
+        The two halves of inference sit on opposite sides. <strong>Prefill</strong> gets the whole prompt at once, so it
+        works through <em>many</em> positions in a single pass and every weight it reads is reused across all of them: a
+        mountain of matmul per byte. Decode is stuck at one token per pass. (How many positions ride in one pass is a
+        scheduling choice, not a fixed property — see <a href="/chapters/kv-cache/batching">chunked prefill</a>. It
+        stays compute-bound either way.) It sits comfortably right of the ridge, <strong>compute-bound</strong>.{' '}
         <strong>Decode</strong> at batch 1 is the opposite extreme: to produce <em>one</em> token it streams the entire
         model&apos;s weights through the chip exactly once, doing almost no math per byte. It falls off the far-left
         cliff, <strong>deeply memory-bound</strong> — the same idle-waiting-on-memory the rest of this course keeps

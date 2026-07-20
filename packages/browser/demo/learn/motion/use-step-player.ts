@@ -68,23 +68,31 @@ export function useStepPlayer(
 
   React.useEffect(() => {
     if (!playing || reducedMotion) return;
+    // The updater must stay PURE — no setPlaying inside it. React may invoke an
+    // updater more than once (StrictMode double-invokes to surface exactly this
+    // kind of hidden side effect), so parking a non-looping sweep is handled by
+    // the separate effect below, driven by the frame value itself.
     const t = window.setInterval(() => {
-      setFrame((f) => {
-        const next = f + 1;
-        if (next < total) return next;
-        if (loop) return 0;
-        // Non-looping: park on the last frame and stop the interval.
-        setPlaying(false);
-        return total - 1;
-      });
+      setFrame((f) => (f + 1 < total ? f + 1 : loop ? 0 : total - 1));
     }, frameMs);
     return () => window.clearInterval(t);
   }, [playing, reducedMotion, total, frameMs, loop]);
 
+  // Non-looping sweeps stop when they reach the end. Separate from the interval
+  // so the updater above has no side effects.
+  React.useEffect(() => {
+    if (loop || reducedMotion) return;
+    if (frame >= total - 1) setPlaying(false);
+  }, [loop, reducedMotion, frame, total]);
+
   const toggle = React.useCallback(() => {
     if (reducedMotion) return;
-    setPlaying((p) => !p);
-  }, [reducedMotion]);
+    // Pressing play on a non-looping sweep that is already parked on the last
+    // frame would otherwise start an interval that can never advance — the
+    // button flips to "Pause" and nothing moves. Replay from the top instead.
+    if (!playing && !loop && frame >= total - 1) setFrame(initialFrame);
+    setPlaying(!playing);
+  }, [reducedMotion, playing, loop, frame, total, initialFrame]);
 
   const step = React.useCallback(() => {
     setPlaying(false);
