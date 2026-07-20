@@ -41,7 +41,9 @@ export function KvCacheBatchingSection() {
       <h2>两个时钟——以及为什么平均值会骗人</h2>
       <p>
         当输出逐 token 流式吐出时，有两个时钟在走，它们量的是不同的东西。<strong>TTFT</strong>（time to first
-        token）是第一个词出现前的停顿——它由<em>受算力限制</em>的 prefill 决定，prefill 要一口气消化你整条提示词。
+        token）是第一个词出现前的停顿——它由<em>受算力限制</em>的 prefill 决定，prefill
+        要走完你提示词里的每一个位置：如果整条提示词装得下这一步的 token budget，就一趟算完，否则会被拆成好几个 chunked
+        pass（见下文）；无论哪种，第一个 token 都要等到最后一个位置算完。
         <strong>TPOT</strong>（time per output token，也叫 <strong>ITL</strong>，inter-token
         latency）是此后稳定的流式速度——由<em>受显存带宽限制</em>的 decode 决定。两者此消彼长，你分开调它们：
         <code>10&nbsp;ms</code> 的 ITL，对那一个用户来说就是 <code>100 tokens/sec</code>。（对于<em>非流式</em>

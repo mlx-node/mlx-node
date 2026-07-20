@@ -113,7 +113,7 @@ export const learning: ChapterLearningData = {
     {
       term: 'prefill',
       definition:
-        'First inference phase: the whole prompt is processed in one matmul-heavy pass that writes K and V for every prompt token.',
+        'First inference phase: every prompt position is processed in parallel, writing K and V for every prompt token — in one matmul-heavy pass, or split across several chunked passes on a busy server.',
     },
     {
       term: 'decode',
@@ -232,11 +232,13 @@ export function KvCacheChapterBody() {
 
         <h2>Prefill versus decode</h2>
         <p>
-          Inference has two phases. <strong>Prefill</strong> takes the whole prompt at once and computes K, V and the
-          hidden states for every token in one big matmul-heavy pass. <strong>Decode</strong> then generates one token
-          at a time: feed the previous output back in, compute K/V/Q for just <em>that</em> single new token, and read
-          the K/V of all earlier tokens out of a cache instead of recomputing them. Without the cache, each decode step
-          would be as expensive as prefill — with it, decode cost is roughly linear in the cache size.
+          Inference has two phases. <strong>Prefill</strong> computes K, V and the hidden states for every prompt token,
+          processing those positions in parallel in one matmul-heavy pass — or, on a busy server, split across several{' '}
+          <a href="/chapters/kv-cache/batching">chunked passes</a>, each writing its KV into the cache before the next
+          one reads it. <strong>Decode</strong> then generates one token at a time: feed the previous output back in,
+          compute K/V/Q for just <em>that</em> single new token, and read the K/V of all earlier tokens out of a cache
+          instead of recomputing them. Without the cache, each decode step would be as expensive as prefill — with it,
+          decode cost is roughly linear in the cache size.
         </p>
 
         <h2>Why caching K and V works</h2>
@@ -296,8 +298,8 @@ export function KvCacheChapterBody() {
         <p>
           With {LINEAR_NUM_HEADS} linear heads at <code>head_dim = {LINEAR_HEAD_DIM}</code>, each linear layer's state
           is a constant <code>{formatBytes(LINEAR_STATE_SIZE_BYTES)}</code> regardless of context. So total cache for
-          Qwen3.5-0.8B is <code>6 × full + 18 × constant</code> — the chart here plots that against a
-          hypothetical Qwen with full attention on every layer.
+          Qwen3.5-0.8B is <code>6 × full + 18 × constant</code> — the chart here plots that against a hypothetical Qwen
+          with full attention on every layer.
         </p>
         <p>
           This is also what makes the model's full{' '}
@@ -306,8 +308,7 @@ export function KvCacheChapterBody() {
           {NUM_LAYERS} layers kept a full token-by-token KV cache the way the {NUM_FULL_LAYERS} attention layers do, the
           cache would track the amber GQA-every-layer curve — on the order of ~4× the hybrid&rsquo;s few-gigabyte
           footprint at that length (the cache still grows linearly with context either way; the hybrid just keeps the
-          slope down). Instead,
-          the {NUM_LINEAR_LAYERS} linear layers each hold a flat{' '}
+          slope down). Instead, the {NUM_LINEAR_LAYERS} linear layers each hold a flat{' '}
           <code>{formatBytes(LINEAR_STATE_SIZE_BYTES)}</code> at any length, so the window can grow roughly 8× past the
           old {formatTokens(DEFAULT_CONTEXT_LEN)} mark without the cache exploding. Only the {NUM_FULL_LAYERS}{' '}
           full-attention layers still pay the per-token price.
@@ -344,9 +345,8 @@ export function KvCacheChapterBody() {
         <p>
           As context lengths push past 1M tokens, quadratic-memory attention becomes untenable — both as cache and as
           compute. Hybrid attention is one of the techniques the field is exploring. Pure state-space models like Mamba
-          — models that replace attention entirely with a rolling state like the GDN slot above — take it further
-          still. The trend is clear: cache is the bottleneck, and
-          architectures will keep getting reshaped around it.
+          — models that replace attention entirely with a rolling state like the GDN slot above — take it further still.
+          The trend is clear: cache is the bottleneck, and architectures will keep getting reshaped around it.
         </p>
 
         <div className="not-prose my-4 rounded-md border border-amber-500/50 bg-amber-500/5 p-4">
@@ -376,11 +376,11 @@ export function KvCacheChapterBody() {
           at the same time, so the cost of the trip is split 1,024 ways.
         </p>
         <p>
-          The hybrid layout adds one more wrinkle here. The linear layers' recurrent state must update strictly one token
-          at a time, in order — step <code>t</code>'s state can't be computed without step <code>t-1</code>'s — while a
-          full-attention layer has no such chain and could score every position at once. So the constant memory comes
-          partly at the cost of some of attention's decode-time parallelism. (This is a decode-only concern: at training
-          time linear attention has parallel-scan forms that recover the lost parallelism.)
+          The hybrid layout adds one more wrinkle here. The linear layers' recurrent state must update strictly one
+          token at a time, in order — step <code>t</code>'s state can't be computed without step <code>t-1</code>'s —
+          while a full-attention layer has no such chain and could score every position at once. So the constant memory
+          comes partly at the cost of some of attention's decode-time parallelism. (This is a decode-only concern: at
+          training time linear attention has parallel-scan forms that recover the lost parallelism.)
         </p>
 
         <PrefillVsDecodeChart />
@@ -395,9 +395,9 @@ export function KvCacheChapterBody() {
         <KvGrowthCurve />
 
         <p className="mt-6 text-muted-foreground">
-          The interactive widget here plots the cache curves for MHA, GQA-only, and Qwen3.5's hybrid layout; drag the context
-          slider to read off memory at any length. The layer strip below it shows the exact interleave — click any layer
-          to see what its cache looks like at the current context length.
+          The interactive widget here plots the cache curves for MHA, GQA-only, and Qwen3.5's hybrid layout; drag the
+          context slider to read off memory at any length. The layer strip below it shows the exact interleave — click
+          any layer to see what its cache looks like at the current context length.
         </p>
       </Prose>
     </ChapterFrame>

@@ -60,8 +60,7 @@ function formatBytes(bytes: number): string {
 export const learning: ChapterLearningData = {
   chapterId: 'kv-cache',
   objective: '解释 KV 缓存为什么存在、它如何随上下文增长，以及 Qwen3.5 的混合注意力在内存上换来了什么。',
-  problem:
-    '如果不缓存 K 和 V，每解码一个 token 都要从头重做全部注意力计算——使生成的代价随上下文长度呈平方增长。',
+  problem: '如果不缓存 K 和 V，每解码一个 token 都要从头重做全部注意力计算——使生成的代价随上下文长度呈平方增长。',
   minutes: 10,
   glossary: [
     {
@@ -71,7 +70,8 @@ export const learning: ChapterLearningData = {
     },
     {
       term: 'prefill',
-      definition: '推理的第一阶段：整个提示词在一趟以矩阵乘法为主的传播中处理完毕，并为每个提示词 token 写入 K 和 V。',
+      definition:
+        '推理的第一阶段：prompt 的每个位置并行处理，为每个 prompt token 写入 K 和 V——可以是一趟以矩阵乘法为主的传播，也可能在繁忙的服务器上被拆成好几个 chunked pass。',
     },
     {
       term: 'decode',
@@ -151,8 +151,7 @@ export const learning: ChapterLearningData = {
       options: [
         {
           id: 'a',
-          label:
-            '线性注意力压缩历史、丢失精确回忆；全量层保留了在模型需要时回看某个特定早期 token 的能力。',
+          label: '线性注意力压缩历史、丢失精确回忆；全量层保留了在模型需要时回看某个特定早期 token 的能力。',
         },
         {
           id: 'b',
@@ -185,18 +184,19 @@ export function KvCacheChapterBody() {
 
         <h2>Prefill 与 decode</h2>
         <p>
-          推理分两个阶段。<strong>Prefill</strong>（预填充）一次性接收整个提示词，在一趟以矩阵乘法为主的大计算中算出每个
-          token 的 K、V 和隐藏状态。<strong>Decode</strong>（解码）则逐 token 生成：把上一个输出送回模型，只为
+          推理分两个阶段。<strong>Prefill</strong>（预填充）算出每个 prompt token 的 K、V
+          和隐藏状态，这些位置是并行处理的，在一趟以矩阵乘法为主的大计算里完成——或者，在繁忙的服务器上，被拆成好几个{' '}
+          <a href="/zh/chapters/kv-cache/batching">chunked pass</a>，每一个都会先把自己的 KV 写进缓存，下一个才去读它。
+          <strong>Decode</strong>（解码）则逐 token 生成：把上一个输出送回模型，只为
           <em>这一个</em>新 token 计算 K/V/Q，所有更早 token 的 K/V 直接从缓存里读出，而不是重新计算。没有缓存，每一步
           decode 都会和 prefill 一样昂贵——有了它，decode 的代价大致与缓存大小成线性关系。
         </p>
 
         <h2>为什么缓存 K 和 V 行得通</h2>
         <p>
-          在 decode 第 <code>t</code> 步，每一层都需要新 token 的注意力输出：{' '}
-          <code>softmax(q_t · K^T / √d) · V</code>——和第 4 章一模一样的注意力公式。Q
-          是全新的（它来自刚算出的隐藏状态）。新 token 的 K 和 V 也是新的。但 token <code>0..t-1</code> 的 K 和 V
-          在更早的步骤里就已经算过了——{' '}
+          在 decode 第 <code>t</code> 步，每一层都需要新 token 的注意力输出： <code>softmax(q_t · K^T / √d) · V</code>
+          ——和第 4 章一模一样的注意力公式。Q 是全新的（它来自刚算出的隐藏状态）。新 token 的 K 和 V 也是新的。但 token{' '}
+          <code>0..t-1</code> 的 K 和 V 在更早的步骤里就已经算过了——{' '}
           <em>
             而且它们不依赖于 token <code>t</code>
           </em>
@@ -204,7 +204,8 @@ export function KvCacheChapterBody() {
         </p>
         <p>
           从形状上看，缓存为每一层存两个形状为 <code>[num_kv_heads, seq_len, head_dim]</code> 的张量。随着{' '}
-          <code>seq_len</code> 增长，缓存线性增长。问题就出在这里：缓存内存与上下文长度成正比，上下文一长，它就会远超权重。
+          <code>seq_len</code>{' '}
+          增长，缓存线性增长。问题就出在这里：缓存内存与上下文长度成正比，上下文一长，它就会远超权重。
         </p>
 
         <GenerationLoopTrace />
@@ -216,9 +217,9 @@ export function KvCacheChapterBody() {
             2 · num_kv_heads · head_dim · 2 bytes = 2 · {NUM_KV_HEADS} · {HEAD_DIM} · {BYTES_PER_FLOAT} ={' '}
             {fullLayerCacheBytes(1)} bytes
           </code>
-          。在 32k token 的上下文下，一个全量注意力层占{' '}
-          <code>{formatBytes(fullLayerCacheBytes(32_768))}</code>。如果全部 {NUM_LAYERS}{' '}
-          层都是全量注意力，整个模型的缓存将达到 <code>{formatBytes(gqaAllLayersBytes(32_768))}</code>——而这还只是
+          。在 32k token 的上下文下，一个全量注意力层占 <code>{formatBytes(fullLayerCacheBytes(32_768))}</code>
+          。如果全部 {NUM_LAYERS} 层都是全量注意力，整个模型的缓存将达到{' '}
+          <code>{formatBytes(gqaAllLayersBytes(32_768))}</code>——而这还只是
           <em>最小</em>的 Qwen3.5 型号。更大的 Qwen3.5 型号在此基础上继续放大。
         </p>
         <p>
@@ -231,13 +232,15 @@ export function KvCacheChapterBody() {
           Qwen3.5 交错使用两种不同的注意力层。{NUM_LAYERS} 层中的<strong>六</strong>层（每四层一个，位于索引{' '}
           {FULL_LAYER_INDICES.join(', ')}）是常规的全量注意力层——就是第 4 章那种，其 KV 缓存随
           <code>seq_len</code> 线性增长。其余 {NUM_LINEAR_LAYERS} 层使用一种
-          <strong>叫 GatedDeltaNet 的线性注意力变体</strong>——之所以叫“线性”，是因为它的开销与序列长度成正比，而不是像全量
-          softmax 注意力那样与其平方成正比。GatedDeltaNet 层不逐 token 缓存 K 和 V，而是把全部历史压缩进一个形状为{' '}
+          <strong>叫 GatedDeltaNet 的线性注意力变体</strong>
+          ——之所以叫“线性”，是因为它的开销与序列长度成正比，而不是像全量 softmax 注意力那样与其平方成正比。GatedDeltaNet
+          层不逐 token 缓存 K 和 V，而是把全部历史压缩进一个形状为{' '}
           <code>
             [{LINEAR_NUM_HEADS}, {LINEAR_HEAD_DIM}, {LINEAR_HEAD_DIM}]
           </code>{' '}
-          的<em>固定大小循环状态</em>（线性 value 头数 × value 维度 × key 维度——与全量注意力那 {NUM_HEADS} 个 head-dim 为{' '}
-          {HEAD_DIM} 的头是两套不同的维度）。这个状态在每一步向前滚动，就像早期的循环神经网络（RNN）维护一份“迄今所见一切”的滚动摘要——与流过多少
+          的<em>固定大小循环状态</em>（线性 value 头数 × value 维度 × key 维度——与全量注意力那 {NUM_HEADS} 个 head-dim
+          为 {HEAD_DIM}{' '}
+          的头是两套不同的维度）。这个状态在每一步向前滚动，就像早期的循环神经网络（RNN）维护一份“迄今所见一切”的滚动摘要——与流过多少
           token 无关。
         </p>
         <p>
@@ -246,14 +249,15 @@ export function KvCacheChapterBody() {
           <code>6 × full + 18 × constant</code>——这里的图表把它和一个每层都用全量注意力的假想 Qwen 画在了一起。
         </p>
         <p>
-          这也正是模型那个完整的{' '}
-          <ChapterLink chapterId="architecture">262,144 token 窗口</ChapterLink>之所以负担得起的原因。设想把一部
-          200 页的小说——就算它 262,144 个 token——整段粘进提示词。如果全部 {NUM_LAYERS}{' '}
-          层都像那 {NUM_FULL_LAYERS} 个注意力层一样逐 token 保留完整的 KV
-          缓存，缓存就会贴着图中那条琥珀色的"GQA 全层"曲线——在这个长度下大约是混合方案那几 GB 占用的 4
+          这也正是模型那个完整的 <ChapterLink chapterId="architecture">262,144 token 窗口</ChapterLink>
+          之所以负担得起的原因。设想把一部 200 页的小说——就算它 262,144 个 token——整段粘进提示词。如果全部 {
+            NUM_LAYERS
+          }{' '}
+          层都像那 {NUM_FULL_LAYERS} 个注意力层一样逐 token 保留完整的 KV 缓存，缓存就会贴着图中那条琥珀色的"GQA
+          全层"曲线——在这个长度下大约是混合方案那几 GB 占用的 4
           倍（无论哪种方式，缓存都随上下文线性增长，混合架构只是把斜率压了下来）。可实际上，那 {NUM_LINEAR_LAYERS}{' '}
-          个线性层无论上下文多长都只占恒定的 <code>{formatBytes(LINEAR_STATE_SIZE_BYTES)}</code>，于是窗口能在原来 32,768
-          这道线之上再放大约 8 倍，而缓存不会爆。只有那 {NUM_FULL_LAYERS} 个全量注意力层仍要按 token 付出代价。
+          个线性层无论上下文多长都只占恒定的 <code>{formatBytes(LINEAR_STATE_SIZE_BYTES)}</code>，于是窗口能在原来
+          32,768 这道线之上再放大约 8 倍，而缓存不会爆。只有那 {NUM_FULL_LAYERS} 个全量注意力层仍要按 token 付出代价。
         </p>
         <p>
           下面把这种对比落到 token 级别：把同一条 token 流分别喂给两种记忆，看一边每来一个 token
@@ -264,12 +268,14 @@ export function KvCacheChapterBody() {
 
         <h2>取舍</h2>
         <p>
-          线性注意力是近似的。它无法像全量 softmax 注意力那样，精确回忆历史深处某个任意的单个 token——它的压缩状态把所有东西混在了一起。它擅长的是语言处理的主体工作：模式延续、句法走向、局部风格。与六个全量注意力层交错，就把精确回忆的能力补回到需要它的地方。具体来说：线性层负责长上下文的语言流转，全量层负责"回看
+          线性注意力是近似的。它无法像全量 softmax 注意力那样，精确回忆历史深处某个任意的单个
+          token——它的压缩状态把所有东西混在了一起。它擅长的是语言处理的主体工作：模式延续、句法走向、局部风格。与六个全量注意力层交错，就把精确回忆的能力补回到需要它的地方。具体来说：线性层负责长上下文的语言流转，全量层负责"回看
           <em>那个</em>特定 token"的任务。
         </p>
         <p>
           这件事的“人类一侧”你大概体会过：在一段很长的对话里，模型把线索跟丢了——你早早提过一个名字，四十轮之后它就溜走了。造成这种情况的原因有两种。第一，你可能已经滑过了
-          262,144 token 这道上限，那么那一早期的轮次已经整段掉出窗口，干脆就没了。第二——也是更有意思的一种——那一轮其实还在窗口内，只是那个细节自始至终只活在那
+          262,144 token
+          这道上限，那么那一早期的轮次已经整段掉出窗口，干脆就没了。第二——也是更有意思的一种——那一轮其实还在窗口内，只是那个细节自始至终只活在那
           {NUM_LINEAR_LAYERS} 个线性层模糊的循环状态里，正是下面面板让你看到的那种被抹开的分布，而那 {NUM_FULL_LAYERS}{' '}
           个全量注意力层只是偶尔出手、还能把它钉住的安全网。两种失败都不是绝对的：一个名字重复得足够多就能熬过这种模糊，而即便滑过了上限，模型先前写下的一段摘要也能把这个事实一路带下去。
         </p>
@@ -278,8 +284,9 @@ export function KvCacheChapterBody() {
 
         <h2>为什么这是未来的方向</h2>
         <p>
-          当上下文长度突破 1M token，平方级内存的注意力将难以为继——缓存和计算都是如此。混合注意力是业界正在探索的技术之一。像
-          Mamba 这样的纯状态空间模型——用上面 GDN
+          当上下文长度突破 1M
+          token，平方级内存的注意力将难以为继——缓存和计算都是如此。混合注意力是业界正在探索的技术之一。像 Mamba
+          这样的纯状态空间模型——用上面 GDN
           那样的滚动状态彻底取代注意力——走得更远。趋势很清楚：缓存就是瓶颈，架构会继续围绕它被重塑。
         </p>
 
@@ -287,7 +294,8 @@ export function KvCacheChapterBody() {
           <div className="text-xs uppercase tracking-wider text-amber-700 dark:text-amber-300">常见误区</div>
           <div className="mt-1 text-sm font-semibold text-foreground">KV 缓存不是一个 Python dict。</div>
           <p className="mt-2 text-[12px] leading-relaxed text-foreground/85">
-            人们有时把它想象成一个从 token 文本或位置映射到 (k, v) 元组的哈希表。不是的。缓存是一个预先分配好的张量，形状为{' '}
+            人们有时把它想象成一个从 token 文本或位置映射到 (k, v)
+            元组的哈希表。不是的。缓存是一个预先分配好的张量，形状为{' '}
             <code className="rounded bg-background px-1 py-0.5 font-mono text-[11px]">
               [layers, 2, batch, kv_heads, max_seq, head_dim]
             </code>{' '}
@@ -308,10 +316,10 @@ export function KvCacheChapterBody() {
           上，搬运成本被摊成 1,024 份。
         </p>
         <p>
-          混合布局在这里还多出一道褶皱。线性层的循环状态必须严格地一次更新一个 token、按顺序来——没有第{' '}
-          <code>t-1</code> 步的状态就算不出第 <code>t</code>{' '}
-          步——而全量注意力层没有这条链，本可以一次性给所有位置打分。所以这份恒定内存，部分是用让出 attention
-          在 decode 时的一些并行性换来的。（这只是 decode 阶段的问题：训练时线性注意力有 parallel-scan
+          混合布局在这里还多出一道褶皱。线性层的循环状态必须严格地一次更新一个 token、按顺序来——没有第 <code>t-1</code>{' '}
+          步的状态就算不出第 <code>t</code>{' '}
+          步——而全量注意力层没有这条链，本可以一次性给所有位置打分。所以这份恒定内存，部分是用让出 attention 在 decode
+          时的一些并行性换来的。（这只是 decode 阶段的问题：训练时线性注意力有 parallel-scan
           形式，能把丢掉的并行性找回来。）
         </p>
 

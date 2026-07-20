@@ -26,9 +26,9 @@ export function AttentionMemoryWallSection() {
         深入阅读 · 第 4 章 自注意力——<code>softmax(QKᵀ)</code> 到底会有多大。
       </p>
       <p>
-        再看一眼 <code>Q · Kᵀ</code>：它是一个 <code>[seq_len, seq_len]</code> 矩阵——每一对 token 一个分数。对一条
-        4,096 token 的提示词，这就是<em>每个头、每一层</em>约 1,680 万个分数。8 个 query
-        头加起来，单个注意力层就是约 1.34 亿个数——在 bf16（每个 2 字节）下约 268
+        再看一眼 <code>Q · Kᵀ</code>：它是一个 <code>[seq_len, seq_len]</code> 矩阵——每一对 token 一个分数。对一条 4,096
+        token 的提示词，这就是<em>每个头、每一层</em>约 1,680 万个分数。8 个 query 头加起来，单个注意力层就是约 1.34
+        亿个数——在 bf16（每个 2 字节）下约 268
         MB。模型从来不需要同时用到全部这些数，朴素做法却把整个矩阵都构造出来、放在一旁。
       </p>
 
@@ -64,13 +64,11 @@ export function AttentionMemoryWallSection() {
       <MemoryWallDiagram />
 
       <p className="text-muted-foreground">
-        诚实起见的一个限定：这只在 <em>prefill</em>（预填充——一口气消化整条长提示词）阶段、且只在 6
-        个全量注意力层上才会咬人。逐 token 的解码（每次只有一行新
+        诚实起见的一个限定：这只在 <em>prefill</em>（预填充——把长提示词的各个位置并行算完，无论是一趟还是拆成几个
+        chunked pass）阶段、且只在 6 个全量注意力层上才会咬人。逐 token 的解码（每次只有一行新
         query，也就是你在本章演示里看的部分）和 18 个 GatedDeltaNet 层从头到尾都不会构造 N×N 矩阵。
       </p>
-      <p>
-        而这恰好就是下一个子章节绕开的问题：在完全不把 N×N 矩阵写进 HBM 的情况下，算出同样的答案。
-      </p>
+      <p>而这恰好就是下一个子章节绕开的问题：在完全不把 N×N 矩阵写进 HBM 的情况下，算出同样的答案。</p>
     </Prose>
   );
 }
@@ -80,9 +78,7 @@ export function AttentionFlashAttentionSection() {
   return (
     <Prose>
       <h1>Flash Attention</h1>
-      <p className="text-muted-foreground">
-        深入阅读 · 第 4 章 自注意力——同样的结果，却没有 N×N 矩阵。
-      </p>
+      <p className="text-muted-foreground">深入阅读 · 第 4 章 自注意力——同样的结果，却没有 N×N 矩阵。</p>
       <p>
         <strong>Flash Attention</strong> 计算的仍然是同一个 <code>softmax(QKᵀ/√d)·V</code>——<em>精确</em>
         的注意力运算本身，而不是稀疏注意力、低秩注意力那样的近似——但从不显式构造 N×N 矩阵。它把 <code>Q</code>、
@@ -106,7 +102,8 @@ export function AttentionFlashAttentionSection() {
         latex={String.raw`m_i = \max(m_{i-1}, \tilde m), \quad \ell_i = e^{\,m_{i-1}-m_i}\,\ell_{i-1} + \tilde\ell, \quad o_i = e^{\,m_{i-1}-m_i}\,o_{i-1} + \tilde o`}
       />
       <p>
-        这些小块住在 GPU 的快速片上内存（SRAM）里，巨大的矩阵从头到尾不去慢速内存。同样的答案，一小部分的内存流量——这种技术叫“IO
+        这些小块住在 GPU
+        的快速片上内存（SRAM）里，巨大的矩阵从头到尾不去慢速内存。同样的答案，一小部分的内存流量——这种技术叫“IO
         感知”（IO-aware）。
       </p>
 
@@ -123,38 +120,49 @@ export function AttentionFlashAttentionSection() {
         内核、NVIDIA 的 cuDNN 融合注意力，以及 PyTorch 的 <code>scaled_dot_product_attention</code>
         （它会自动分派到最快的实现）。而 PagedAttention（来自 vLLM）是表亲，不是某个版本——它是围绕分页 KV
         缓存布局构建的注意力内核，解决的是内存高效的推理服务，与 FlashAttention 的稠密 SRAM
-        内分块是不同的问题。你浏览器里的 Qwen 在 prefill 阶段运行的融合内核是{' '}
-        <strong>FlashAttention-2 风格</strong>的分块内核——v3 的技巧专属于 NVIDIA 的 Hopper GPU 和
-        FP8，在这里用不上。
+        内分块是不同的问题。你浏览器里的 Qwen 在 prefill 阶段运行的融合内核是 <strong>FlashAttention-2 风格</strong>
+        的分块内核——v3 的技巧专属于 NVIDIA 的 Hopper GPU 和 FP8，在这里用不上。
       </p>
 
       <h2>每个版本到底是怎么干的</h2>
-      <p>
-        上面的时间线是地图；下面是地形。每一步都修掉了上一步的瓶颈，所以按顺序读最容易理解——一次一个机制。
-      </p>
+      <p>上面的时间线是地图；下面是地形。每一步都修掉了上一步的瓶颈，所以按顺序读最容易理解——一次一个机制。</p>
 
       <h3>地基：流式 softmax</h3>
       <p>
         一切始于一个技巧，所以我们放慢脚步把它吃透。先看 softmax 本身，用真实数字。softmax
-        通过对每个分数取指数、再除以总和，把一行分数变成和为 1 的权重。拿这一行 <code>[2, 1, 3]</code>{' '}
-        来说：指数分别是 <MathDisplay inline latex={String.raw`e^{2} \approx 7.39`} />、<MathDisplay inline latex={String.raw`e^{1} \approx 2.72`} />、<MathDisplay inline latex={String.raw`e^{3} \approx 20.09`} />；它们的和是{' '}
-        <code>30.19</code>；逐个除一下，权重就是 <code>0.245, 0.090, 0.665</code>
+        通过对每个分数取指数、再除以总和，把一行分数变成和为 1 的权重。拿这一行 <code>[2, 1, 3]</code> 来说：指数分别是{' '}
+        <MathDisplay inline latex={String.raw`e^{2} \approx 7.39`} />、
+        <MathDisplay inline latex={String.raw`e^{1} \approx 2.72`} />、
+        <MathDisplay inline latex={String.raw`e^{3} \approx 20.09`} />
+        ；它们的和是 <code>30.19</code>；逐个除一下，权重就是 <code>0.245, 0.090, 0.665</code>
         。最大的分数赢走大部分权重——这就是它的全部工作。
       </p>
       <p>
-        一个实践层面的麻烦：<MathDisplay inline latex={String.raw`e^{x}`} /> 会爆炸。<MathDisplay inline latex={String.raw`e^{89}`} /> 已经超出 32 位浮点数的表示范围（上限约为 <MathDisplay inline latex={String.raw`e^{88.7}`} />），而原始注意力分数可能很大。标准解法是在取指数之前给每个分数减去该行的最大值——最大的那一项变成 <MathDisplay inline latex={String.raw`e^{0} = 1`} />，什么都不会溢出。除以总和时这个平移会被抵消，所以权重完全相同。但注意这个修复的代价：你必须先拿到
+        一个实践层面的麻烦：
+        <MathDisplay inline latex={String.raw`e^{x}`} /> 会爆炸。
+        <MathDisplay inline latex={String.raw`e^{89}`} /> 已经超出 32 位浮点数的表示范围（上限约为{' '}
+        <MathDisplay inline latex={String.raw`e^{88.7}`} />
+        ），而原始注意力分数可能很大。标准解法是在取指数之前给每个分数减去该行的最大值——最大的那一项变成{' '}
+        <MathDisplay inline latex={String.raw`e^{0} = 1`} />
+        ，什么都不会溢出。除以总和时这个平移会被抵消，所以权重完全相同。但注意这个修复的代价：你必须先拿到
         <em>整行的最大值</em>，才能对<em>任何一个数</em>取指数。于是要扫两遍——一遍找最大值，一遍累加指数。
       </p>
       <p>
         <strong>在线 softmax</strong>（2018）把它压缩成一遍：维护一个<em>滚动</em>最大值和一个<em>滚动</em>
-        和；当后来的值超过迄今的最大值时，给已经累出来的和打个<em>补丁</em>——乘以 <MathDisplay inline latex={String.raw`e^{\,\text{old max}\; -\; \text{new max}}`} />。为什么这恰好是正确的补丁？你累加过的每一项都形如 <MathDisplay inline latex={String.raw`e^{\,\text{score}\; -\; \text{old max}}`} />，而
+        和；当后来的值超过迄今的最大值时，给已经累出来的和打个<em>补丁</em>——乘以{' '}
+        <MathDisplay inline latex={String.raw`e^{\,\text{old max}\; -\; \text{new max}}`} />
+        。为什么这恰好是正确的补丁？你累加过的每一项都形如{' '}
+        <MathDisplay inline latex={String.raw`e^{\,\text{score}\; -\; \text{old max}}`} />
+        ，而
       </p>
-      <MathDisplay latex={String.raw`e^{\,s - m_{\text{old}}} \cdot e^{\,m_{\text{old}} - m_{\text{new}}} = e^{\,s - m_{\text{new}}}`} />
+      <MathDisplay
+        latex={String.raw`e^{\,s - m_{\text{old}}} \cdot e^{\,m_{\text{old}} - m_{\text{new}}} = e^{\,s - m_{\text{new}}}`}
+      />
       <p>
         ——一次乘法就把每个旧项重新表达到新最大值之下，仿佛你早就知道它一样。具体地，在下面的动画里，第一块{' '}
         <code>[2, 1, 3]</code> 结束时最大值是 <code>3</code>；接着第二块里出现了 <code>5</code>
-        ，于是滚动和与滚动输出都先乘上 <MathDisplay inline latex={String.raw`e^{\,3 - 5} \approx 0.135`} />，新的项再并入。2021 年的
-        “memory-efficient attention” 论文注意到，这个流程可以按 key 和 value 的<em>块</em>
+        ，于是滚动和与滚动输出都先乘上 <MathDisplay inline latex={String.raw`e^{\,3 - 5} \approx 0.135`} />
+        ，新的项再并入。2021 年的 “memory-efficient attention” 论文注意到，这个流程可以按 key 和 value 的<em>块</em>
         来跑——于是你永远不需要把整行同时放进内存。
       </p>
 
@@ -170,26 +178,26 @@ export function AttentionFlashAttentionSection() {
         softmax，然后丢掉。只有算完的输出行才写回。巨大的分数矩阵在慢速内存里从未存在过——答案一模一样，流量只剩一个零头。
       </p>
       <p>
-        块要多大？刚好让所有在途数据都摆得上桌面。以常见的 64 宽的头为例，一个 128 行的 query 块是{' '}
-        <code>128 × 64</code> 个数，在 fp32 下 ≈ 32 KB。同样形状的一个 key 块和一个 value 块再各占 32 KB，小小的{' '}
-        <code>128 × 128</code> 分数块是 64 KB——滚动输出 <code>o</code> 自己也是一个 <code>128 × 64</code> 的块，又 32
-        KB（只有 <code>m</code> 和 <code>ℓ</code> 是每行一个标量）。加起来：≈ 190 KB，正好顶到计算单元旁边那 ~200 KB
-        SRAM 的边缘——这恰恰是块取这个尺寸、不能更大的原因。生产内核还会用 16 位的块和更窄的 key
+        块要多大？刚好让所有在途数据都摆得上桌面。以常见的 64 宽的头为例，一个 128 行的 query 块是 <code>128 × 64</code>{' '}
+        个数，在 fp32 下 ≈ 32 KB。同样形状的一个 key 块和一个 value 块再各占 32 KB，小小的 <code>128 × 128</code>{' '}
+        分数块是 64 KB——滚动输出 <code>o</code> 自己也是一个 <code>128 × 64</code> 的块，又 32 KB（只有 <code>m</code>{' '}
+        和 <code>ℓ</code> 是每行一个标量）。加起来：≈ 190 KB，正好顶到计算单元旁边那 ~200 KB SRAM
+        的边缘——这恰恰是块取这个尺寸、不能更大的原因。生产内核还会用 16 位的块和更窄的 key
         块进一步压榨，但决定块尺寸的，正是“SRAM 能装下什么”这笔预算账。
       </p>
       <p className="text-muted-foreground">
-        一个诚实的脚注：v1 确立的不变量是 N×N 分数矩阵永不触碰 HBM。这里展示的<em>循环顺序</em>——query
-        在外层、key/value 在内层流式扫过、每个输出行只写一次——是 <strong>v2</strong> 才定下来的更干净的调度。最初的
-        v1 内核实际上反着循环（key/value 在外、query 在内），一路上反复回写输出。下图画的是现代顺序，因为那才是今天的内核真正运行的方式。
+        一个诚实的脚注：v1 确立的不变量是 N×N 分数矩阵永不触碰 HBM。这里展示的<em>循环顺序</em>——query 在外层、key/value
+        在内层流式扫过、每个输出行只写一次——是 <strong>v2</strong> 才定下来的更干净的调度。最初的 v1
+        内核实际上反着循环（key/value 在外、query
+        在内），一路上反复回写输出。下图画的是现代顺序，因为那才是今天的内核真正运行的方式。
       </p>
 
       <FlashTilingDiagram />
 
       <p>
-        这到底省下多少流量？在 4,096 token 时，朴素做法让分数矩阵在慢速 HBM
-        总线上往返四趟——写出原始分数、读回做 softmax、写出概率、再读回给 <code>V</code> 加权。对这个模型的 8 个头、bf16
-        而言，<em>每个全量注意力层</em>就是 ≈ 1.07 GB
-        的总线流量——而这些分数用一次就被扔掉。分块内核移动的这类字节恰好为零。拖动序列长度，看差距：
+        这到底省下多少流量？在 4,096 token 时，朴素做法让分数矩阵在慢速 HBM 总线上往返四趟——写出原始分数、读回做
+        softmax、写出概率、再读回给 <code>V</code> 加权。对这个模型的 8 个头、bf16 而言，<em>每个全量注意力层</em>就是 ≈
+        1.07 GB 的总线流量——而这些分数用一次就被扔掉。分块内核移动的这类字节恰好为零。拖动序列长度，看差距：
       </p>
 
       <FlashTrafficDiagram />
@@ -227,11 +235,10 @@ export function AttentionFlashAttentionSection() {
         它还重新划分了块<em>内部</em>的工作：不再让每个 warp 各算每行的一个切片、再经共享内存合并结果，而是让每个 warp
         整体拥有一段 query 行——没有任何跨 warp 的对账。它还削减了非矩阵乘法的算术，因为普通运算比 Tensor Core
         慢得多：滚动输出保持<em>未归一化</em>、只在最后除一次 <code>ℓ</code>
-        ，而不是每一步都归一化（按{' '}
-        <MathDisplay inline latex={String.raw`e^{\,m_{i-1}-m_i}`} /> 做的滚动最大值重缩放每一块仍然发生——只是把对{' '}
-        <code>ℓ</code> 的除法推迟了）；对因果掩码而言（未来 token
-        反正不能被注意），注定被完全掩掉的分数块干脆不算——单这一项实测约 1.7–1.8×。合起来：比 v1 快约一倍，注意力内核最高达到
-        A100 理论 FP16 峰值的 73%。（这种占用率思路，正是下文解码故事的驱动力。）
+        ，而不是每一步都归一化（按 <MathDisplay inline latex={String.raw`e^{\,m_{i-1}-m_i}`} />{' '}
+        做的滚动最大值重缩放每一块仍然发生——只是把对 <code>ℓ</code> 的除法推迟了）；对因果掩码而言（未来 token
+        反正不能被注意），注定被完全掩掉的分数块干脆不算——单这一项实测约 1.7–1.8×。合起来：比 v1
+        快约一倍，注意力内核最高达到 A100 理论 FP16 峰值的 73%。（这种占用率思路，正是下文解码故事的驱动力。）
       </p>
 
       <Flash2ParallelismDiagram />
@@ -240,14 +247,14 @@ export function AttentionFlashAttentionSection() {
       <p>
         FlashAttention-3（2024）为 NVIDIA 的 Hopper GPU（H100）调校，它的起点是硬件里一处悬殊得离谱的失衡。H100 的
         Tensor Core 提供约 <strong>989 TFLOPS</strong> 的 fp16 矩阵乘法——而计算指数（每个 softmax
-        都要用）的那些小单元只有约 <strong>3.9 TFLOPS</strong>。注意力来回切换的这两种数学之间，有{' '}
-        <strong>256×</strong> 的速度差。如果严格按 matmul → softmax → matmul
+        都要用）的那些小单元只有约 <strong>3.9 TFLOPS</strong>。注意力来回切换的这两种数学之间，有 <strong>256×</strong>{' '}
+        的速度差。如果严格按 matmul → softmax → matmul
         的顺序轮流跑，芯片上最昂贵的硅就要花大量时间，等便宜的那部分干完。
       </p>
       <p>
-        FlashAttention-3 的答案是不再轮流。Hopper 允许 warp <em>分工（specialize）</em>：<strong>producer</strong>{' '}
-        warp 只负责指挥 <strong>TMA</strong>（一个专用拷贝引擎）从 HBM 取下一批块，<strong>consumer</strong>{' '}
-        warpgroup 只负责算。然后两个 consumer warpgroup 打<em>乒乓（pingpong）</em>：一个在指数单元上跑自己的 softmax
+        FlashAttention-3 的答案是不再轮流。Hopper 允许 warp <em>分工（specialize）</em>：<strong>producer</strong> warp
+        只负责指挥 <strong>TMA</strong>（一个专用拷贝引擎）从 HBM 取下一批块，<strong>consumer</strong> warpgroup
+        只负责算。然后两个 consumer warpgroup 打<em>乒乓（pingpong）</em>：一个在指数单元上跑自己的 softmax
         时，另一个的矩阵乘法持续喂饱 Tensor Core——然后互换。每个块其实是两次矩阵乘法——先是分数 <code>QKᵀ</code>
         ，然后是 value 混合 <code>P·V</code>——softmax 夹在中间，被重叠起来的正是它们：
       </p>
@@ -255,8 +262,8 @@ export function AttentionFlashAttentionSection() {
       <Flash3AsyncDiagram />
 
       <p>
-        第二根杠杆是 <strong>FP8</strong>——它值得放慢看，因为“8 位浮点”听上去人畜无害，直到你看清代价。一个 fp8
-        数（E4M3 格式）只有 256 种位模式，最大值 448；fp8 矩阵乘法约比 fp16
+        第二根杠杆是 <strong>FP8</strong>——它值得放慢看，因为“8 位浮点”听上去人畜无害，直到你看清代价。一个 fp8 数（E4M3
+        格式）只有 256 种位模式，最大值 448；fp8 矩阵乘法约比 fp16
         快一倍。问题在于：可表示的值这么少，一切都押在把你的数据映射上去的<em>缩放因子（scale factor）</em>
         上。真实的注意力输入偶尔会有<em>离群值（outlier）</em>
         ——一片小数中的一个巨大值。给整个张量挑一个缩放，那个离群值就把网格拉得太开，所有小值坍缩到寥寥几级上，它们的信息就没了。FlashAttention-3
@@ -274,18 +281,17 @@ export function AttentionFlashAttentionSection() {
         故事还在继续：<strong>FlashAttention-4</strong>（2026）把同一个不变量带到 NVIDIA 的下一代——Blackwell
         B200——那里矩阵乘法吞吐又差不多翻倍，而芯片的其余部分没有——最高达到 1,613 TFLOPS（71%
         利用率）。我们的深入阅读停在 v3，因为 v4 的技巧是 Blackwell 专属的，但请注意贯穿每个版本的模式：
-        <em>算法的不变量从未改变</em>——N×N
-        矩阵永不触碰慢速内存——每个版本只是把这个不变量重新调校到最新硅片的瓶颈上。
+        <em>算法的不变量从未改变</em>——N×N 矩阵永不触碰慢速内存——每个版本只是把这个不变量重新调校到最新硅片的瓶颈上。
       </p>
 
       <h2>你浏览器里的 Qwen 用它吗？</h2>
       <p>
         用了一部分——而诚实的答案才是有意思的那个。运行这个模型的 WebGPU 后端<em>确实有</em>一个带上面在线 softmax
-        的融合分块 flash-attention 内核，它在 6 个全量注意力层的 <em>prefill</em> 阶段运行。但你在演示里看到的逐
-        token <em>解码</em>故意<em>不</em>用它：在 0.8B、8 个 query 头的情况下，融合内核只会启动 8 个 GPU
+        的融合分块 flash-attention 内核，它在 6 个全量注意力层的 <em>prefill</em> 阶段运行。但你在演示里看到的逐 token{' '}
+        <em>解码</em>故意<em>不</em>用它：在 0.8B、8 个 query 头的情况下，融合内核只会启动 8 个 GPU
         workgroup，让芯片大部分闲置，所以一个占用率闸门把解码路由回普通的三步路径（matmul → softmax →
-        matmul），它能撒出多得多的并行工作，在这里实测快约 90%。而且 24 层中只有 6 层运行 softmax 注意力——其余 18
-        层是 GatedDeltaNet。所以：prefill 用 flash，解码用普通路径，皆是有意为之。
+        matmul），它能撒出多得多的并行工作，在这里实测快约 90%。而且 24 层中只有 6 层运行 softmax 注意力——其余 18 层是
+        GatedDeltaNet。所以：prefill 用 flash，解码用普通路径，皆是有意为之。
       </p>
       <p>在两者之间切换，看分派器把调用路由到真正运行的那个内核：</p>
 
@@ -299,26 +305,28 @@ export function AttentionRooflineSection() {
   return (
     <Prose>
       <h1>roofline 屋顶线</h1>
-      <p className="text-muted-foreground">
-        深入阅读 · 第 4 章 自注意力——给「memory-bound」配上一个真正的数字。
-      </p>
+      <p className="text-muted-foreground">深入阅读 · 第 4 章 自注意力——给「memory-bound」配上一个真正的数字。</p>
       <p>
         <a href="/zh/chapters/attention/memory-wall">显存带宽墙</a>一直靠一个词——<em>memory-bound</em>
         ——来解释为什么注意力、以及一般意义上的逐 token decode，时间都花在等内存而不是算数上。那是个故事。
-        <strong>roofline</strong>（屋顶线）把它变成一个可以画出来的数字，而这个数字会精确告诉你：故事从什么时候起不再成立。
+        <strong>roofline</strong>
+        （屋顶线）把它变成一个可以画出来的数字，而这个数字会精确告诉你：故事从什么时候起不再成立。
       </p>
 
       <h2>两道天花板，你先撞上哪一道</h2>
       <p>
         GPU 会因为两个彼此独立的原因走到尽头，你先够到哪一个，哪一个就是你的天花板。一个是 <strong>compute</strong>
         ——Tensor Core 每秒能做多少次数学运算（H100 的 fp16 上限约 <strong>989 TFLOPS</strong>）。另一个是{' '}
-        <strong>memory bandwidth</strong>——你每秒能从 HBM 里搬出多少字节（同一块 H100：<strong>3.35 TB/s</strong>）。一个封住数学，另一个封住搬运的字节。引擎再快，供油跟不上也没用。
+        <strong>memory bandwidth</strong>——你每秒能从 HBM 里搬出多少字节（同一块 H100：<strong>3.35 TB/s</strong>
+        ）。一个封住数学，另一个封住搬运的字节。引擎再快，供油跟不上也没用。
       </p>
       <p>
         到底哪道天花板困住你，取决于<em>工作负载</em>，而不是芯片：它的 <strong>arithmetic intensity</strong>
         （算术强度）——每搬一个字节所做的 FLOPs 工作量，单位是 <code>ops:byte</code>。
       </p>
-      <MathDisplay latex={String.raw`\text{intensity} = \frac{\text{work (FLOPs)}}{\text{memory traffic (bytes)}}, \qquad \text{ridge} = \frac{\text{peak compute}}{\text{bandwidth}} = \frac{989\ \text{TFLOP/s}}{3.35\ \text{TB/s}} \approx 295\ \text{ops:byte}`} />
+      <MathDisplay
+        latex={String.raw`\text{intensity} = \frac{\text{work (FLOPs)}}{\text{memory traffic (bytes)}}, \qquad \text{ridge} = \frac{\text{peak compute}}{\text{bandwidth}} = \frac{989\ \text{TFLOP/s}}{3.35\ \text{TB/s}} \approx 295\ \text{ops:byte}`}
+      />
       <p>
         那道位于约 295 ops:byte 的 <strong>ridge</strong>（脊线）就是收支平衡点。每字节做的运算<em>少于</em>
         295，你会远在下一批字节到来之前就把数学算完——你是 <strong>memory-bound</strong>，在 ridge 左侧干等。做得
@@ -328,22 +336,26 @@ export function AttentionRooflineSection() {
 
       <h2>prefill 和 decode 各自落在哪</h2>
       <p>
-        推理的两个阶段分坐两侧。<strong>prefill</strong> 一口气消化整条提示词，所以它读进来的每个权重都被
-        <em>数百个</em> token 位置并行复用——每字节一座算术大山。它稳稳地落在 ridge 右侧，<strong>compute-bound</strong>。
-        <strong>decode</strong> 在 batch 1 时是另一个极端：为了产出<em>一个</em> token，它把整个模型的权重恰好流过芯片一遍，几乎不做什么数学。它跌下最左侧的悬崖，<strong>深度
-        memory-bound</strong>——正是本课程一再撞上的那种「闲着等内存」。
+        推理的两个阶段分坐两侧。<strong>prefill</strong> 并行处理提示词里的各个位置——和 decode
+        不同，位置之间没有从左到右的依赖——所以它读进来的每个权重都被<em>数百个</em>
+        位置同时复用：每字节一座算术大山。（这到底是一趟还是好几趟，是调度的选择，见{' '}
+        <a href="/zh/chapters/kv-cache/batching">chunked prefill</a>；两种情况下它都仍然是 compute-bound。）它稳稳地落在
+        ridge 右侧，<strong>compute-bound</strong>。<strong>decode</strong> 在 batch 1 时是另一个极端：为了产出
+        <em>一个</em> token，它把整个模型的权重恰好流过芯片一遍，几乎不做什么数学。它跌下最左侧的悬崖，
+        <strong>深度 memory-bound</strong>——正是本课程一再撞上的那种「闲着等内存」。
       </p>
       <p>
         拖动 batch 滑块，看 decode 点行进。把 <code>N</code> 个请求批在一起，能让这 <code>N</code>
-        个都复用同一次权重读取，于是 intensity 大约按 <code>×N</code> 攀升，点沿对角线向右滑向 ridge——只有当每字节终于有了足够的数学量去喂饱
-        FLOPs 时，它才从 memory-bound 翻成 compute-bound：
+        个都复用同一次权重读取，于是 intensity 大约按 <code>×N</code> 攀升，点沿对角线向右滑向
+        ridge——只有当每字节终于有了足够的数学量去喂饱 FLOPs 时，它才从 memory-bound 翻成 compute-bound：
       </p>
 
       <RooflineDiagram />
 
       <p>
         所以「memory-bound」从来不是模型的一个固定属性——它是<em>你如何运行它</em>的属性。一个用户等一个
-        token，就坐在悬崖上；一台把数百个用户批在一起的服务器，则沿对角线爬升，直到 compute 终于变成那个值得优化的东西。这段攀爬正是后面
+        token，就坐在悬崖上；一台把数百个用户批在一起的服务器，则沿对角线爬升，直到 compute
+        终于变成那个值得优化的东西。这段攀爬正是后面
         <a href="/zh/chapters/kv-cache/batching">batching</a> 子章节的全部主题——roofline 就是它读的那张地图。
       </p>
     </Prose>

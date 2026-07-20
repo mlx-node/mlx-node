@@ -58,11 +58,13 @@ export function KvCacheBatchingSection() {
       <p>
         When output is streamed token-by-token, two clocks matter and they measure different things.{' '}
         <strong>TTFT</strong> (time to first token) is the pause before the first word appears — it&apos;s set by the{' '}
-        <em>compute-bound</em> prefill digesting your whole prompt in one pass. <strong>TPOT</strong> (time per output
-        token, also called <strong>ITL</strong>, inter-token latency) is the steady streaming speed after that — set by
-        the <em>memory-bound</em> decode. They trade off and you tune them separately: an ITL of <code>10&nbsp;ms</code>{' '}
-        is <code>100 tokens/sec</code> for that one user. (For a <em>non-streamed</em> call — an agent making a tool
-        call and waiting for the whole JSON — neither clock is what you feel; you measure total response time instead.)
+        <em>compute-bound</em> prefill working through every position in your prompt — in one pass if the prompt fits
+        the step&apos;s token budget, otherwise split across several chunked passes (below); either way the first token
+        waits for the last position. <strong>TPOT</strong> (time per output token, also called <strong>ITL</strong>,
+        inter-token latency) is the steady streaming speed after that — set by the <em>memory-bound</em> decode. They
+        trade off and you tune them separately: an ITL of <code>10&nbsp;ms</code> is <code>100 tokens/sec</code> for
+        that one user. (For a <em>non-streamed</em> call — an agent making a tool call and waiting for the whole JSON —
+        neither clock is what you feel; you measure total response time instead.)
       </p>
       <p>
         The trap is reporting either one as an <em>average</em>. Inference latency is <strong>right-skewed</strong>:

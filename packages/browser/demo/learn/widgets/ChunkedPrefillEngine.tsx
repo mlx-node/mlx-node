@@ -28,11 +28,13 @@ import { FlowDots, HatchDefs, StepControls, hatchFill, useStepPlayer } from '../
  *    only internal waste — bounded by one block per sequence, instead of the
  *    reserve-for-the-worst-case waste of a contiguous cache.
  *
- * The token counts (18 / 8 / 4) are ILLUSTRATIVE — chosen so the arithmetic is
- * visible at a glance (8 + 8 + 2, and 18 tokens = 4 full blocks + a half-full
- * 5th). Real engines use budgets in the thousands and block sizes of 16 (see
- * the sub-chapter prose). The SHAPE of the animation is what generalises, not
- * the numbers.
+ * The numbers are ILLUSTRATIVE, chosen so every teaching point is exact:
+ * a budget of 8 minus 2 running decodes gives 6-token chunks, 6+6+6 = 18, and
+ * 18 tokens over 4-token blocks = 4 full blocks + a 5th holding 2. Real serving
+ * uses a per-step budget around 2048-8192 and KV blocks of 16 tokens (vLLM) or
+ * 1 token (SGLang) — see `copy.note`, which says so on screen. Block size 4
+ * mirrors the PagedAttention paper's own worked example (7 tokens, block 4).
+ * The SHAPE generalises; the numbers do not.
  *
  * Self-contained and SSR-safe: NO worker, NO model, NO WASM, NO network. Pure
  * React + SVG, so it server-renders for crawlers (createRoot replaces it on
@@ -42,10 +44,20 @@ import { FlowDots, HatchDefs, StepControls, hatchFill, useStepPlayer } from '../
 
 // ── Configuration. Every number the widget teaches lives here. ────────────────
 const PROMPT_TOKENS = 18;
-const CHUNK = 8; // per-engine-step token budget
+const BUDGET = 8; // token budget for ONE engine step — covers decodes AND prefill
+const DECODES = 2; // other requests already in flight, decoding one token each
 const BLOCK = 4; // KV cache block size, in tokens
 
-/** Chunk sizes: full budget until the remainder. → [8, 8, 2] */
+/**
+ * Chunk size = whatever budget is left after the running decodes are placed.
+ * This ordering is the mechanism, not a detail: Sarathi-Serve's "stall-free
+ * batching" admits every running decode FIRST (that is what guarantees no
+ * request stalls), then spends only the leftover budget on a prefill chunk.
+ *   chunk = BUDGET − DECODES = 8 − 2 = 6   → [6, 6, 6]
+ * Note the chunk is 6, NOT the full 8 — and real chunks vary step to step as
+ * the number of running decodes changes. Never present them as fixed-size.
+ */
+const CHUNK = BUDGET - DECODES;
 const CHUNKS: number[] = (() => {
   const out: number[] = [];
   for (let left = PROMPT_TOKENS; left > 0; left -= CHUNK) out.push(Math.min(CHUNK, left));
@@ -54,7 +66,7 @@ const CHUNKS: number[] = (() => {
 
 const N_BLOCKS = Math.ceil(PROMPT_TOKENS / BLOCK); // 5
 
-/** Cumulative tokens cached after chunk i completes. → [8, 16, 18] */
+/** Cumulative tokens cached after chunk i completes. → [6, 12, 18] */
 const CUMULATIVE: number[] = CHUNKS.reduce<number[]>((acc, n) => [...acc, (acc[acc.length - 1] ?? 0) + n], []);
 
 // ── Frame model ──────────────────────────────────────────────────────────────
@@ -92,6 +104,16 @@ const CELL_W = (P_W - 20 - CELL_GAP * (PROMPT_TOKENS - 1)) / PROMPT_TOKENS;
 const CELL_H = 22;
 const CELL_Y = P_Y + P_H - CELL_H - 9;
 const cellX = (i: number) => P_X + 10 + i * (CELL_W + CELL_GAP);
+
+// Token-budget bar — the star of the diagram. BUDGET cells: the first DECODES
+// are claimed by in-flight decodes, the rest is what the prefill chunk gets.
+const BUD_W = 200;
+const BUD_X = 200;
+const BUD_Y = 118;
+const BUD_H = 20;
+const BUD_GAP = 2;
+const BUD_CELL = (BUD_W - BUD_GAP * (BUDGET - 1)) / BUDGET;
+const budX = (i: number) => BUD_X + i * (BUD_CELL + BUD_GAP);
 
 // Forward pass (centre)
 const F_X = 228;
@@ -134,7 +156,9 @@ const EMERALD = '#10b981'; // emerald-500 — cached / done
 const COPY = {
   en: {
     heading: 'Chunked prefill — one engine step at a time',
-    budget: `≤ ${CHUNK} tokens per engine step`,
+    budget: `token budget = ${BUDGET} tokens per engine step`,
+    budgetDecodes: `${DECODES} running decodes — placed first`,
+    budgetChunk: `chunk gets the leftover: ${BUDGET} − ${DECODES} = ${CHUNK}`,
     prompt: `prompt · ${PROMPT_TOKENS} tokens`,
     others: 'other requests',
     forward: ['LLM', 'forward pass'],
@@ -146,20 +170,22 @@ const COPY = {
     phase: {
       idle: 'A long prompt does not have to be one giant forward pass.',
       load: (i: number, n: number) =>
-        `Step ${i}: the scheduler takes the next ${n} tokens — never more than the budget.`,
-      compute: 'One forward pass. Other requests ride along in the same batch, so their decode never stalls.',
+        `Step ${i}: the ${DECODES} running decodes are placed first — they never wait. The chunk takes the ${n} tokens of budget left over.`,
+      compute: 'One forward pass over the whole batch: this chunk and the other requests, together.',
       write: 'The keys and values for this chunk land in cache blocks. Nothing is recomputed later.',
       sample: 'Only now — after the final chunk — are logits sampled into the first output token.',
     },
     legendActive: 'busy this step',
     legendCached: 'cached',
-    note: `Sizes are illustrative: ${PROMPT_TOKENS} tokens, a ${CHUNK}-token budget and ${BLOCK}-token blocks keep the arithmetic visible (${CHUNKS.join(' + ')} = ${PROMPT_TOKENS}). Real engines use budgets in the thousands and 16-token blocks. The shape generalises; the numbers do not.`,
+    note: `Illustrative sizes, chosen so the arithmetic is visible: a ${BUDGET}-token budget minus ${DECODES} decodes gives ${CHUNK}-token chunks (${CHUNKS.join(' + ')} = ${PROMPT_TOKENS}), and ${BLOCK}-token blocks mirror the PagedAttention paper's own worked example. Real serving uses a per-step budget around 2048–8192 tokens and KV blocks of 16 tokens (vLLM) or 1 token (SGLang) — an 8192-token prompt at a 2048 budget is 4 chunks. Chunk sizes also vary step to step in reality, as the number of running decodes changes.`,
     svgAria: (s: string) =>
       `An animated engine diagram. An ${PROMPT_TOKENS}-token prompt is prefilled in ${CHUNKS.length} chunks of at most ${CHUNK} tokens. Each chunk flows into a single LLM forward pass shared with other requests, then its keys and values fill fixed-size blocks of a paged KV cache. The first output token is sampled only after the final chunk. Current step: ${s}`,
   },
   zh: {
     heading: 'Chunked prefill——一次一个 engine step',
-    budget: `每个 engine step ≤ ${CHUNK} tokens`,
+    budget: `token budget = 每个 engine step ${BUDGET} tokens`,
+    budgetDecodes: `${DECODES} 个在跑的 decode——先安排它们`,
+    budgetChunk: `chunk 只拿剩下的：${BUDGET} − ${DECODES} = ${CHUNK}`,
     prompt: `prompt · ${PROMPT_TOKENS} tokens`,
     others: '其他请求',
     forward: ['LLM', 'forward pass'],
@@ -170,14 +196,15 @@ const COPY = {
     sampledNote: ['只在最后一个 chunk', '之后才采样'],
     phase: {
       idle: '一个很长的 prompt，不一定要挤进一次巨大的 forward pass。',
-      load: (i: number, n: number) => `第 ${i} 步：scheduler 取走接下来的 ${n} 个 tokens——绝不超过预算。`,
-      compute: '一次 forward pass。其他请求搭同一趟车，它们的 decode 因此不会被卡住。',
+      load: (i: number, n: number) =>
+        `第 ${i} 步：${DECODES} 个在跑的 decode 先被安排进去——它们永远不用等。chunk 只拿剩下的 ${n} 个 tokens 预算。`,
+      compute: '一次 forward pass，整个 batch 一起算：这个 chunk 和那些其他请求。',
       write: '这个 chunk 的 keys 和 values 写进 cache blocks。后面不会重算。',
       sample: '直到现在——最后一个 chunk 之后——logits 才被采样成第一个输出 token。',
     },
     legendActive: '本步正忙',
     legendCached: '已缓存',
-    note: `这里的尺寸只是示意：${PROMPT_TOKENS} tokens、${CHUNK} tokens 的预算、${BLOCK} tokens 的 block，是为了让算术一眼看得清（${CHUNKS.join(' + ')} = ${PROMPT_TOKENS}）。真实引擎的预算是几千，block 通常是 16 tokens。可以推广的是这个形状，不是这些数字。`,
+    note: `这里的尺寸只是示意，为了让算术一眼看得清：${BUDGET} tokens 的 budget 减去 ${DECODES} 个 decode，得到 ${CHUNK} tokens 的 chunk（${CHUNKS.join(' + ')} = ${PROMPT_TOKENS}），而 ${BLOCK} tokens 的 block 正是 PagedAttention 论文自己举的例子。真实的服务里，每步的 budget 大约在 2048–8192 tokens，KV block 是 16 tokens（vLLM）或 1 token（SGLang）——一个 8192 tokens 的 prompt 在 2048 的 budget 下是 4 个 chunk。而且真实的 chunk 大小每步都在变，因为在跑的 decode 数量在变。`,
     svgAria: (s: string) =>
       `一张动画引擎示意图。${PROMPT_TOKENS} 个 tokens 的 prompt 被拆成 ${CHUNKS.length} 个 chunk，每个最多 ${CHUNK} 个 tokens。每个 chunk 进入一次与其他请求共享的 LLM forward pass，然后它的 keys 和 values 填进 paged KV cache 的固定大小 block。第一个输出 token 只在最后一个 chunk 之后才被采样。当前步骤：${s}`,
   },
@@ -228,16 +255,6 @@ export function ChunkedPrefillEngine() {
 
       <svg viewBox={`0 0 ${VB_W} ${VB_H}`} className="w-full" role="img" aria-label={copy.svgAria(caption)}>
         <HatchDefs />
-
-        {/* budget label, top-left — appears once the sweep starts */}
-        <text
-          x={P_X}
-          y={16}
-          style={{ fill: RED, opacity: phase === 'idle' ? 0 : 1, transition: 'opacity 300ms ease' }}
-          className="text-[10px] font-semibold uppercase tracking-wider"
-        >
-          {copy.budget}
-        </text>
 
         {/* ── Prompt strip ────────────────────────────────────────────────── */}
         <rect
@@ -328,6 +345,68 @@ export function ChunkedPrefillEngine() {
         >
           {chunk >= 0 ? copy.stepLabel(chunk + 1, CHUNKS.length) : ''}
         </text>
+
+        {/* ── Token-budget bar ────────────────────────────────────────────
+            The mechanism in one row: the budget is a fixed number of token
+            slots per step; running decodes claim theirs FIRST (that is the
+            no-stall guarantee), and the prefill chunk only gets what is left.
+            Visible during scheduling and compute, when the batch is being
+            assembled and run. */}
+        {chunkActive ? (
+          <g style={{ transition: player.reducedMotion ? undefined : 'opacity 250ms ease' }}>
+            <text
+              x={BUD_X}
+              y={BUD_Y - 7}
+              style={{ fill: 'var(--muted-foreground)' }}
+              className="text-[9px] uppercase tracking-wider"
+            >
+              {copy.budget}
+            </text>
+            {Array.from({ length: BUDGET }, (_, i) => {
+              const isDecode = i < DECODES;
+              return (
+                <g key={i}>
+                  <rect
+                    x={budX(i)}
+                    y={BUD_Y}
+                    width={BUD_CELL}
+                    height={BUD_H}
+                    rx={2}
+                    style={{
+                      fill: isDecode ? 'var(--muted-foreground)' : RED,
+                      fillOpacity: isDecode ? 0.55 : 0.28,
+                      stroke: isDecode ? 'var(--muted-foreground)' : RED,
+                      strokeOpacity: 0.8,
+                    }}
+                    strokeWidth={1}
+                  />
+                  <text
+                    x={budX(i) + BUD_CELL / 2}
+                    y={BUD_Y + BUD_H / 2 + 3.5}
+                    textAnchor="middle"
+                    style={{ fill: isDecode ? 'var(--background)' : 'var(--foreground)' }}
+                    className="text-[8px] font-semibold"
+                  >
+                    {isDecode ? 'D' : 'c'}
+                  </text>
+                </g>
+              );
+            })}
+            {/* the two halves, named */}
+            <text x={budX(0)} y={BUD_Y + BUD_H + 11} style={{ fill: 'var(--muted-foreground)' }} className="text-[8px]">
+              {copy.budgetDecodes}
+            </text>
+            <text
+              x={budX(BUDGET - 1) + BUD_CELL}
+              y={BUD_Y + BUD_H + 11}
+              textAnchor="end"
+              style={{ fill: RED }}
+              className="text-[8px] font-medium"
+            >
+              {copy.budgetChunk}
+            </text>
+          </g>
+        ) : null}
 
         {/* ── Other requests ──────────────────────────────────────────────── */}
         <rect
@@ -476,9 +555,12 @@ export function ChunkedPrefillEngine() {
           d={elbow(
             chunk >= 0 ? cellX(chunkStart) + ((chunkEnd - chunkStart) * (CELL_W + CELL_GAP)) / 2 : 0,
             CELL_Y + CELL_H + 4,
-            F_X + F_W / 2,
-            F_Y,
-            F_Y - 46,
+            budX(DECODES) + (BUD_CELL * CHUNK) / 2,
+            BUD_Y,
+            // Route above the budget bar — the chunk's tokens are flowing INTO
+            // the leftover slots, so the dots must land on them, not on the
+            // forward pass directly.
+            BUD_Y - 32,
           )}
         />
         {/* other requests → forward pass (they share the batch) */}
