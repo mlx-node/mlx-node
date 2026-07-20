@@ -339,8 +339,9 @@ export function AttentionRooflineSection() {
         推理的两个阶段分坐两侧。<strong>prefill</strong> 一次就拿到整条提示词，所以它一趟能处理<em>很多个</em>
         位置，读进来的每个权重都被这些位置共同复用：每字节一座算术大山。而 decode 每一趟只能吐一个
         token。（一趟里装多少个位置是调度的选择，不是固定属性，见{' '}
-        <a href="/zh/chapters/kv-cache/batching">chunked prefill</a>；两种情况下它都仍然是 compute-bound。）它稳稳地落在
-        ridge 右侧，<strong>compute-bound</strong>。<strong>decode</strong> 在 batch 1 时是另一个极端：为了产出
+        <a href="/zh/chapters/kv-cache/batching">chunked prefill</a>；只要 chunk 够大它就仍然是 compute-bound——把 chunk
+        压到只剩几个 token，它就会滑回 decode 那种 memory-bound 的角落。）它稳稳地落在 ridge 右侧，
+        <strong>compute-bound</strong>。<strong>decode</strong> 在 batch 1 时是另一个极端：为了产出
         <em>一个</em> token，它把整个模型的权重恰好流过芯片一遍，几乎不做什么数学。它跌下最左侧的悬崖，
         <strong>深度 memory-bound</strong>——正是本课程一再撞上的那种「闲着等内存」。
       </p>

@@ -21,6 +21,10 @@ import * as React from 'react';
  * Under reduced motion the CSS animation is disabled by the media query, so the
  * dots render as a STATIC dotted line — which still reads correctly as "these
  * two boxes are connected and carrying data", just without the motion.
+ *
+ * The media query is the ONLY thing CSS can stop by itself, so a widget with a
+ * Pause button must pass `paused` — see the prop. Otherwise the frame timer
+ * stops while these dots keep travelling, and the Pause control is a lie.
  */
 
 export type FlowDotsProps = {
@@ -38,6 +42,13 @@ export type FlowDotsProps = {
   reverse?: boolean;
   /** hide entirely — for frames where this edge is idle */
   hidden?: boolean;
+  /**
+   * Freeze the dots where they are. Pass `!player.playing` — a Pause button
+   * that stops the JS frame timer but leaves this CSS animation running is a
+   * Pause button that visibly does not pause (WCAG 2.2.2 Pause, Stop, Hide).
+   * Freezing rather than hiding keeps the "these boxes are connected" reading.
+   */
+  paused?: boolean;
 };
 
 /** Accent blue for in-flight data. Matches the reference motion language. */
@@ -51,6 +62,7 @@ export function FlowDots({
   durationMs = 900,
   reverse = false,
   hidden = false,
+  paused = false,
 }: FlowDotsProps) {
   if (hidden) return null;
 
@@ -74,6 +86,8 @@ export function FlowDots({
           '--flow-dot-period': `${spacing}px`,
           '--flow-dot-duration': `${durationMs}ms`,
           '--flow-dot-direction': reverse ? 'reverse' : 'normal',
+          // Inline, so it beats the `.flow-dots` class without a CSS edit.
+          animationPlayState: paused ? 'paused' : 'running',
         } as React.CSSProperties
       }
     />

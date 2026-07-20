@@ -31,7 +31,8 @@ import { FlowDots, HatchDefs, StepControls, hatchFill, useStepPlayer } from '../
  * The numbers are ILLUSTRATIVE, chosen so every teaching point is exact:
  * a budget of 8 minus 2 running decodes gives 6-token chunks, 6+6+6 = 18, and
  * 18 tokens over 4-token blocks = 4 full blocks + a 5th holding 2. Real serving
- * uses a per-step budget around 2048-8192 and KV blocks of 16 tokens (vLLM) or
+ * runs a per-step budget from ~2048 (vLLM's default, tuned for latency) up to
+ * 16384+ when tuned for throughput, and KV blocks of 16 tokens (vLLM) or
  * 1 token (SGLang) — see `copy.note`, which says so on screen. Block size 4
  * mirrors the PagedAttention paper's own worked example (7 tokens, block 4).
  * The SHAPE generalises; the numbers do not.
@@ -177,9 +178,8 @@ const COPY = {
     },
     legendActive: 'busy this step',
     legendCached: 'cached',
-    note: `Illustrative sizes, chosen so the arithmetic is visible: a ${BUDGET}-token budget minus ${DECODES} decodes gives ${CHUNK}-token chunks (${CHUNKS.join(' + ')} = ${PROMPT_TOKENS}), and ${BLOCK}-token blocks mirror the PagedAttention paper's own worked example. Real serving uses a per-step budget around 2048–8192 tokens and KV blocks of 16 tokens (vLLM) or 1 token (SGLang) — an 8192-token prompt at a 2048 budget is 4 chunks. Chunk sizes also vary step to step in reality, as the number of running decodes changes.`,
-    svgAria: (s: string) =>
-      `An animated engine diagram. An ${PROMPT_TOKENS}-token prompt is prefilled in ${CHUNKS.length} chunks of at most ${CHUNK} tokens. Each chunk flows into a single LLM forward pass shared with other requests, then its keys and values fill fixed-size blocks of a paged KV cache. The first output token is sampled only after the final chunk. Current step: ${s}`,
+    note: `Illustrative sizes, chosen so the arithmetic is visible: a ${BUDGET}-token budget minus ${DECODES} decodes gives ${CHUNK}-token chunks (${CHUNKS.join(' + ')} = ${PROMPT_TOKENS}), and ${BLOCK}-token blocks mirror the PagedAttention paper's own worked example. Real serving runs a per-step budget from about 2048 (vLLM's default, the low-latency end) up to 16384 or beyond when tuning for throughput, with KV blocks of 16 tokens (vLLM) or 1 token (SGLang) — an 8192-token prompt at a 2048 budget is 4 chunks. Chunk sizes also vary step to step in reality, as the number of running decodes changes.`,
+    svgAria: `An animated engine diagram. An ${PROMPT_TOKENS}-token prompt is prefilled in ${CHUNKS.length} chunks of at most ${CHUNK} tokens. Each chunk flows into a single LLM forward pass shared with other requests, then its keys and values fill fixed-size blocks of a paged KV cache. The first output token is sampled only after the final chunk. The caption below the diagram tracks the current step.`,
   },
   zh: {
     heading: 'Chunked prefill——一次一个 engine step',
@@ -204,9 +204,8 @@ const COPY = {
     },
     legendActive: '本步正忙',
     legendCached: '已缓存',
-    note: `这里的尺寸只是示意，为了让算术一眼看得清：${BUDGET} tokens 的 budget 减去 ${DECODES} 个 decode，得到 ${CHUNK} tokens 的 chunk（${CHUNKS.join(' + ')} = ${PROMPT_TOKENS}），而 ${BLOCK} tokens 的 block 正是 PagedAttention 论文自己举的例子。真实的服务里，每步的 budget 大约在 2048–8192 tokens，KV block 是 16 tokens（vLLM）或 1 token（SGLang）——一个 8192 tokens 的 prompt 在 2048 的 budget 下是 4 个 chunk。而且真实的 chunk 大小每步都在变，因为在跑的 decode 数量在变。`,
-    svgAria: (s: string) =>
-      `一张动画引擎示意图。${PROMPT_TOKENS} 个 tokens 的 prompt 被拆成 ${CHUNKS.length} 个 chunk，每个最多 ${CHUNK} 个 tokens。每个 chunk 进入一次与其他请求共享的 LLM forward pass，然后它的 keys 和 values 填进 paged KV cache 的固定大小 block。第一个输出 token 只在最后一个 chunk 之后才被采样。当前步骤：${s}`,
+    note: `这里的尺寸只是示意，为了让算术一眼看得清：${BUDGET} tokens 的 budget 减去 ${DECODES} 个 decode，得到 ${CHUNK} tokens 的 chunk（${CHUNKS.join(' + ')} = ${PROMPT_TOKENS}），而 ${BLOCK} tokens 的 block 正是 PagedAttention 论文自己举的例子。真实的服务里，每步的 budget 从 2048 左右（vLLM 的默认值，低延迟那一端）到 16384 甚至更高（为了吞吐），KV block 是 16 tokens（vLLM）或 1 token（SGLang）——一个 8192 tokens 的 prompt 在 2048 的 budget 下是 4 个 chunk。而且真实的 chunk 大小每步都在变，因为在跑的 decode 数量在变。`,
+    svgAria: `一张动画引擎示意图。${PROMPT_TOKENS} 个 tokens 的 prompt 被拆成 ${CHUNKS.length} 个 chunk，每个最多 ${CHUNK} 个 tokens。每个 chunk 进入一次与其他请求共享的 LLM forward pass，然后它的 keys 和 values 填进 paged KV cache 的固定大小 block。第一个输出 token 只在最后一个 chunk 之后才被采样。示意图下方的说明文字会跟着当前步骤走。`,
   },
 } as const;
 
@@ -253,7 +252,7 @@ export function ChunkedPrefillEngine() {
         <StepControls player={player} locale={locale} showReset />
       </div>
 
-      <svg viewBox={`0 0 ${VB_W} ${VB_H}`} className="w-full" role="img" aria-label={copy.svgAria(caption)}>
+      <svg viewBox={`0 0 ${VB_W} ${VB_H}`} className="w-full" role="img" aria-label={copy.svgAria}>
         <HatchDefs />
 
         {/* ── Prompt strip ────────────────────────────────────────────────── */}
@@ -551,6 +550,7 @@ export function ChunkedPrefillEngine() {
         {/* ── Travelling dots: the "happening right now" layer ────────────── */}
         {/* prompt chunk → forward pass */}
         <FlowDots
+          paused={!player.playing}
           hidden={phase !== 'load'}
           d={elbow(
             chunk >= 0 ? cellX(chunkStart) + ((chunkEnd - chunkStart) * (CELL_W + CELL_GAP)) / 2 : 0,
@@ -564,15 +564,22 @@ export function ChunkedPrefillEngine() {
           )}
         />
         {/* other requests → forward pass (they share the batch) */}
-        <FlowDots hidden={phase !== 'compute'} d={`M ${O_X + O_W} ${O_Y + 41} L ${F_X} ${O_Y + 41}`} spacing={12} />
+        <FlowDots
+          paused={!player.playing}
+          hidden={phase !== 'compute'}
+          d={`M ${O_X + O_W} ${O_Y + 41} L ${F_X} ${O_Y + 41}`}
+          spacing={12}
+        />
         {/* forward pass → KV cache */}
         <FlowDots
+          paused={!player.playing}
           hidden={phase !== 'write'}
           d={`M ${F_X + F_W / 2} ${F_Y + F_H} L ${F_X + F_W / 2} ${K_Y}`}
           spacing={12}
         />
         {/* forward pass → first token */}
         <FlowDots
+          paused={!player.playing}
           hidden={phase !== 'sample'}
           d={`M ${F_X + F_W} ${T_Y + T_H / 2} L ${T_X} ${T_Y + T_H / 2}`}
           spacing={12}
@@ -668,8 +675,20 @@ export function ChunkedPrefillEngine() {
       </svg>
 
       {/* Caption — the sentence for the beat currently on screen. Fixed height
-          so the layout does not jump as the text changes length. */}
-      <p className="min-h-[2.5rem] text-[12px] leading-relaxed text-muted-foreground" role="status" aria-live="polite">
+          so the layout does not jump as the text changes length.
+
+          `aria-live` is OFF while autoplaying, on purpose. This caption changes
+          on every one of the 11 frames, so a live region here would read a new
+          sentence at a screen reader every FRAME_MS, forever, over the top of
+          the surrounding lesson — the reader never asked for that and cannot
+          stop it. Announcements belong to user intent: pausing flips the region
+          back to polite, so Step and Reset (which change the text while paused)
+          are announced normally. */}
+      <p
+        className="min-h-[2.5rem] text-[12px] leading-relaxed text-muted-foreground"
+        aria-live={player.playing ? 'off' : 'polite'}
+        aria-atomic="true"
+      >
         {caption}
       </p>
 

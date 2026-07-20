@@ -90,7 +90,10 @@ export function useStepPlayer(
     // Pressing play on a non-looping sweep that is already parked on the last
     // frame would otherwise start an interval that can never advance — the
     // button flips to "Pause" and nothing moves. Replay from the top instead.
-    if (!playing && !loop && frame >= total - 1) setFrame(initialFrame);
+    // `initialFrame` itself can be the last frame, in which case rewinding to it
+    // is a no-op and the dead end survives; fall back to 0 so replay always
+    // actually moves.
+    if (!playing && !loop && frame >= total - 1) setFrame(initialFrame < total - 1 ? initialFrame : 0);
     setPlaying(!playing);
   }, [reducedMotion, playing, loop, frame, total, initialFrame]);
 

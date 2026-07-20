@@ -186,7 +186,8 @@ export function KvCacheChapterBody() {
         <p>
           推理分两个阶段。<strong>Prefill</strong>（预填充）一次拿到整条 prompt，算出每个 prompt token 的 K、V
           和隐藏状态——一趟以矩阵乘法为主的大计算就能吃下很多个位置，或者，在繁忙的服务器上，被拆成好几个{' '}
-          <a href="/zh/chapters/kv-cache/batching">chunked pass</a>，每一个都会先把自己的 KV 写进缓存，下一个才去读它。
+          <a href="/zh/chapters/kv-cache/batching">chunked pass</a>，每一个都把自己的状态交给下一个。（这里只有 6
+          个全量注意力层会逐 token 写 KV 缓存；另外 18 层是把一个固定大小的状态向前滚动——本章后半就在讲这个区别。）
           <strong>Decode</strong>（解码）则逐 token 生成：把上一个输出送回模型，只为
           <em>这一个</em>新 token 计算 K/V/Q，所有更早 token 的 K/V 直接从缓存里读出，而不是重新计算。没有缓存，每一步
           decode 都会和 prefill 一样昂贵——有了它，decode 的代价大致与缓存大小成线性关系。
@@ -297,10 +298,10 @@ export function KvCacheChapterBody() {
             人们有时把它想象成一个从 token 文本或位置映射到 (k, v)
             元组的哈希表。不是的。缓存是一个预先分配好的张量，形状为{' '}
             <code className="rounded bg-background px-1 py-0.5 font-mono text-[11px]">
-              [layers, 2, batch, kv_heads, max_seq, head_dim]
+              [full_layers, 2, batch, kv_heads, max_seq, head_dim]
             </code>{' '}
-            （其中 <code>2</code> 是 key/value 这一对——一块给 K，一块给
-            V），每个注意力层向它写入、从中读取，并由一个位置计数器记录张量里有多少是有效数据。所谓的“键”是位置索引，不是哈希。它是一块缓冲区，不是哈希表。
+            （其中 <code>2</code> 是 key/value 这一对——一块给 K，一块给 V），每个<em>全量注意力</em>
+            层向它写入、从中读取，并由一个位置计数器记录张量里有多少是有效数据。所谓的“键”是位置索引，不是哈希。它是一块缓冲区，不是哈希表。
           </p>
         </div>
 

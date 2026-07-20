@@ -18,12 +18,22 @@ import * as React from 'react';
  *     <rect … fill={active ? hatchFill('red') : 'var(--card)'} />
  *   </svg>
  *
- * The pattern ids are module constants rather than `useId()` values: `useId()`
- * produces different strings on the server and on the client, and while this
- * course boots with `createRoot` (so a mismatch would not throw), a stable id
- * keeps the prerendered HTML byte-identical between builds. Two widgets on one
- * page emitting the same `<defs>` id is harmless — the definitions are
- * identical, and the first one wins.
+ * WHY THE IDS ARE MODULE CONSTANTS, AND THE INVARIANT THAT MAKES IT SAFE:
+ *
+ * Stable ids keep the prerendered HTML byte-identical between builds, which
+ * `useId()` would not. The cost is that two instances on one page emit the SAME
+ * `<defs>` ids, and a `url(#id)` fill resolves by document order — re-evaluated
+ * live, so unmounting or reordering one instance silently rebinds every fill on
+ * the page to the other one's `<pattern>`.
+ *
+ * That is only harmless while every instance is BYTE-IDENTICAL, so this
+ * component deliberately takes NO props. An earlier version had an `opacity`
+ * prop, which was exactly the knob that could make two instances differ and
+ * turn the rebinding into a visible bug. It had no callers and is gone.
+ *
+ * If you ever genuinely need per-instance variation, do NOT add a prop here —
+ * scope the ids per instance with `useId()` and return the fill URLs bound to
+ * that same instance, accepting the prerender churn.
  */
 
 export type HatchTone = 'red' | 'emerald' | 'primary' | 'muted';
@@ -55,7 +65,10 @@ export function hatchFill(tone: HatchTone): string {
  * that box's size — with the default `objectBoundingBox` they would stretch to
  * each shape and read as a different texture per box.
  */
-export function HatchDefs({ opacity = 0.28 }: { opacity?: number }) {
+/** Stripe opacity. A module constant, NOT a prop — see the invariant above. */
+const HATCH_OPACITY = 0.28;
+
+export function HatchDefs() {
   return (
     <defs>
       {(Object.keys(IDS) as HatchTone[]).map((tone) => (
@@ -67,7 +80,7 @@ export function HatchDefs({ opacity = 0.28 }: { opacity?: number }) {
           patternUnits="userSpaceOnUse"
           patternTransform="rotate(45)"
         >
-          <line x1={0} y1={0} x2={0} y2={7} stroke={STROKES[tone]} strokeWidth={1.6} opacity={opacity} />
+          <line x1={0} y1={0} x2={0} y2={7} stroke={STROKES[tone]} strokeWidth={1.6} opacity={HATCH_OPACITY} />
         </pattern>
       ))}
     </defs>

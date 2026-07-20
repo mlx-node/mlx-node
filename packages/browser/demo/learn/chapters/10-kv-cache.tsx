@@ -234,11 +234,12 @@ export function KvCacheChapterBody() {
         <p>
           Inference has two phases. <strong>Prefill</strong> gets the whole prompt at once and computes K, V and the
           hidden states for every prompt token — many positions per matmul-heavy pass, or, on a busy server, split
-          across several <a href="/chapters/kv-cache/batching">chunked passes</a>, each writing its KV into the cache
-          before the next one reads it. <strong>Decode</strong> then generates one token at a time: feed the previous
-          output back in, compute K/V/Q for just <em>that</em> single new token, and read the K/V of all earlier tokens
-          out of a cache instead of recomputing them. Without the cache, each decode step would be as expensive as
-          prefill — with it, decode cost is roughly linear in the cache size.
+          across several <a href="/chapters/kv-cache/batching">chunked passes</a>, each handing its state to the next
+          one. (Only the 6 full-attention layers write a token-by-token KV cache; the other 18 roll a fixed-size state
+          forward instead — that split is the rest of this chapter.) <strong>Decode</strong> then generates one token at
+          a time: feed the previous output back in, compute K/V/Q for just <em>that</em> single new token, and read the
+          K/V of all earlier tokens out of a cache instead of recomputing them. Without the cache, each decode step
+          would be as expensive as prefill — with it, decode cost is roughly linear in the cache size.
         </p>
 
         <h2>Why caching K and V works</h2>
@@ -356,11 +357,11 @@ export function KvCacheChapterBody() {
             People sometimes picture it as a hashmap from token text or position to (k, v) tuples. It isn&apos;t. The
             cache is a pre-allocated tensor of shape{' '}
             <code className="rounded bg-background px-1 py-0.5 font-mono text-[11px]">
-              [layers, 2, batch, kv_heads, max_seq, head_dim]
+              [full_layers, 2, batch, kv_heads, max_seq, head_dim]
             </code>{' '}
-            (the <code>2</code> is the key/value pair — one slab for K, one for V) that each attention layer writes into
-            and reads from, with a position counter telling it how much of the tensor is live. The "key" is the position
-            index, not a hash. It&apos;s a buffer, not a hashmap.
+            (the <code>2</code> is the key/value pair — one slab for K, one for V) that each <em>full-attention</em>{' '}
+            layer writes into and reads from, with a position counter telling it how much of the tensor is live. The
+            "key" is the position index, not a hash. It&apos;s a buffer, not a hashmap.
           </p>
         </div>
 

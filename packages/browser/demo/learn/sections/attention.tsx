@@ -390,11 +390,12 @@ export function AttentionRooflineSection() {
         works through <em>many</em> positions in a single pass and every weight it reads is reused across all of them: a
         mountain of matmul per byte. Decode is stuck at one token per pass. (How many positions ride in one pass is a
         scheduling choice, not a fixed property — see <a href="/chapters/kv-cache/batching">chunked prefill</a>. It
-        stays compute-bound either way.) It sits comfortably right of the ridge, <strong>compute-bound</strong>.{' '}
-        <strong>Decode</strong> at batch 1 is the opposite extreme: to produce <em>one</em> token it streams the entire
-        model&apos;s weights through the chip exactly once, doing almost no math per byte. It falls off the far-left
-        cliff, <strong>deeply memory-bound</strong> — the same idle-waiting-on-memory the rest of this course keeps
-        running into.
+        stays compute-bound as long as the chunk is big enough; squeeze it down to a handful of tokens and it slides
+        back toward decode's memory-bound corner.) It sits comfortably right of the ridge,{' '}
+        <strong>compute-bound</strong>. <strong>Decode</strong> at batch 1 is the opposite extreme: to produce{' '}
+        <em>one</em> token it streams the entire model&apos;s weights through the chip exactly once, doing almost no
+        math per byte. It falls off the far-left cliff, <strong>deeply memory-bound</strong> — the same
+        idle-waiting-on-memory the rest of this course keeps running into.
       </p>
       <p>
         Drag the batch slider and watch the decode dot march. Batching <code>N</code> requests lets all <code>N</code>{' '}

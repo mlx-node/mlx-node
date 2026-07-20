@@ -10,9 +10,12 @@ import type { StepPlayer } from './use-step-player';
  *
  * Two conventions worth stating because they are deliberate, not accidental:
  *
- *  - Under reduced motion the controls RENDER NOTHING. A reader who asked for
- *    less motion is shown the resting frame as a still diagram; offering them a
- *    Play button would be offering them the thing they opted out of.
+ *  - Under reduced motion the PLAY button disappears but Step and Reset stay.
+ *    The preference asks to drop non-essential motion, not to drop content or
+ *    navigation — and stepping is an instantaneous state change, not motion.
+ *    Hiding the whole row would strand these readers on the resting frame with
+ *    no way to reach the intermediate states, which for a build-up explainer is
+ *    where the actual lesson lives. Same call TokenJourney makes.
  *  - "Step" always pauses first (see useStepPlayer.step). Stepping while the
  *    interval keeps running is the single most confusing thing these controls
  *    can do.
@@ -42,17 +45,18 @@ export function StepControls({
   showReset?: boolean;
 }) {
   const copy = COPY[locale];
-  if (player.reducedMotion) return null;
 
   return (
     <div className="flex items-center gap-1">
-      <button type="button" onClick={player.toggle} aria-pressed={player.playing} className={BTN}>
-        {player.playing ? copy.pause : copy.play}
-      </button>
+      {player.reducedMotion ? null : (
+        <button type="button" onClick={player.toggle} aria-pressed={player.playing} className={BTN}>
+          {player.playing ? copy.pause : copy.play}
+        </button>
+      )}
       <button type="button" onClick={player.step} className={BTN}>
         {copy.step}
       </button>
-      {showReset ? (
+      {showReset || player.reducedMotion ? (
         <button type="button" onClick={player.reset} className={BTN}>
           {copy.reset}
         </button>
