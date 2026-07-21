@@ -9,19 +9,27 @@
  * (e.g. an SSE reconnect) is never left blank.
  *
  * Downloads are made atomic to close the partial/mixed-revision hole: the whole
- * job is pinned to ONE resolved commit sha; files stage into a private
- * `<modelsDir>/.staging/<slug>@<revision>` dir keyed by that immutable sha (so a
- * different revision never reuses another revision's staged bytes); each staged
- * file is content-verified right after it lands AND the whole staged set is
- * re-verified and pruned to exactly the manifest before publishing; and only
- * then is a completion marker written and the staging dir swapped onto the final
- * `<slug>`. An aborted job leaves only the staging dir (resumable) — never a
- * half-populated final dir that catalog state would call "installed".
+ * job is pinned to ONE resolved IMMUTABLE commit sha (a mutable ref like a
+ * branch name is refused — never pinned); files stage into a JOB-PRIVATE
+ * `<modelsDir>/.staging/<slug>@<revision>.<pid>.<uuid>` dir, unique per
+ * invocation so no two processes ever write into the same tree, and keyed by the
+ * immutable sha so a different revision never reuses another's staged bytes.
+ * Resume comes from the HF cache (`downloadFileToCacheDir`), not the staging dir,
+ * so the job-private dir is removed on both success and failure. Each staged file
+ * is content-verified right after it lands AND the whole staged set is re-verified
+ * and pruned to exactly the manifest before publishing; only then is a completion
+ * marker written and the staging dir swapped onto the final `<slug>`. An aborted
+ * job never leaves a half-populated final dir that catalog state would call
+ * "installed".
  *
  * Publishing never destroys a checkpoint the downloader does not own: a final
  * dir WITHOUT our marker (a manual / `mlx download` copy, possibly fine-tuned) is
- * refused unless an explicit `overwrite` is requested; an OWNED upgrade swaps via
- * a temp backup so a crash mid-rename rolls back to the original.
+ * refused unless an explicit `overwrite` is requested — the ownership guard is
+ * re-checked adjacent to the destructive swap so a dir that races in after the
+ * first check is still never overwritten. An OWNED upgrade swaps via a temp
+ * backup so a crash mid-rename rolls back to the original; an orphaned backup a
+ * crash leaves behind is recovered (or reaped) by a best-effort sweep at the
+ * start of the next download.
  *
  * Pure disk + network — never the native addon.
  */
@@ -29,7 +37,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { createReadStream, existsSync, statSync } from 'node:fs';
-import { copyFile, mkdir, open, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, open, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join, sep } from 'node:path';
 
@@ -347,12 +355,21 @@ export class DownloadManager {
    * Resolve the repo's current commit sha so the WHOLE job reads one immutable
    * snapshot. Threading this same sha to `listFiles` and every
    * `downloadFileToCacheDir` means a repo update mid-download can never assemble
-   * a mixed-revision checkpoint. Falls back to `main` only if the hub omits a sha.
+   * a mixed-revision checkpoint. The sha must be an immutable 40-hex commit: a
+   * missing sha or a mutable ref (a branch like `main`) is refused, never pinned —
+   * the completion marker's `revision` is trusted downstream as a stable identity,
+   * so a mutable value there would let a later same-shaped fine-tune restore stale
+   * state and would break this job's own mid-download atomicity.
    */
   private async resolveRevision(repoName: string): Promise<string> {
     const info = await modelInfo({ name: repoName, additionalFields: ['sha'], fetch: this.wrappedFetch });
     const sha: unknown = info.sha;
-    return typeof sha === 'string' && sha.length > 0 ? sha : 'main';
+    if (!(typeof sha === 'string' && /^[0-9a-f]{40}$/i.test(sha))) {
+      throw new Error(
+        `Cannot resolve an immutable commit for "${repoName}"; refusing to pin to a mutable ref`,
+      );
+    }
+    return sha;
   }
 
   private async processJob(job: JobState): Promise<void> {
@@ -362,12 +379,18 @@ export class DownloadManager {
     const repo = { type: 'model' as const, name: job.repo };
     this.currentJob = job;
 
+    let stagingDir: string | undefined;
     try {
+      // Recover/reap any backup an earlier crash left mid-swap before staging.
+      await this.sweepOrphanedBackups();
+
       const revision = await this.resolveRevision(job.repo);
-      // Staging is keyed by the IMMUTABLE revision, so an interrupted older
-      // revision's staged bytes can never be reused by (and rename into) a
-      // different revision's install.
-      const stagingDir = join(this.modelsDir, '.staging', `${slug}@${revision}`);
+      // Job-private staging: keyed by the IMMUTABLE revision (a different
+      // revision never reuses another's staged bytes) and unique per invocation
+      // (`.<pid>.<uuid>`) so no two processes ever write into the same tree.
+      // Resume is HF-cache-backed, not staging-backed, so this dir is disposable
+      // and removed on both success and failure.
+      stagingDir = join(this.modelsDir, '.staging', `${slug}@${revision}.${process.pid}.${randomUUID()}`);
 
       const files: ListFileEntry[] = [];
       let totalBytes = 0;
@@ -443,8 +466,47 @@ export class DownloadManager {
       job.state = 'error';
       this.emit({ type: 'error', id: job.id, message: (error as Error).message });
     } finally {
+      // Job-private staging is scratch: a successful publish already renamed it
+      // away (this is a no-op), and on failure it must not leak — resume never
+      // reuses it (the HF cache does). Never touches the final dir.
+      if (stagingDir !== undefined) {
+        await rm(stagingDir, { recursive: true, force: true }).catch(() => {});
+      }
       this.currentJob = null;
       this.currentFile = null;
+    }
+  }
+
+  /**
+   * Best-effort recovery of a publish backup an earlier crash left orphaned under
+   * `.staging`. A backup is named `<finalBasename>.backup-<uuid>`, so its final
+   * dir is derivable from the basename: if that final dir is MISSING the swap
+   * died after moving the old dir aside and the backup is renamed back into place;
+   * otherwise the backup is a leaked copy of re-downloadable content and is
+   * removed. Never throws — a sweep failure must never block a download.
+   */
+  private async sweepOrphanedBackups(): Promise<void> {
+    const stagingRoot = join(this.modelsDir, '.staging');
+    let entries: string[];
+    try {
+      entries = await readdir(stagingRoot);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      const marker = name.lastIndexOf('.backup-');
+      if (marker <= 0) continue;
+      const finalDir = join(this.modelsDir, name.slice(0, marker));
+      const backupPath = join(stagingRoot, name);
+      try {
+        if (existsSync(finalDir)) {
+          await rm(backupPath, { recursive: true, force: true });
+        } else {
+          await rename(backupPath, finalDir);
+        }
+      } catch {
+        // A single un-recoverable backup must not block the job.
+      }
     }
   }
 
@@ -475,8 +537,9 @@ export class DownloadManager {
         received: 0,
       };
       this.currentFile = context;
+      let snapshotPath = '';
       try {
-        const snapshotPath = await downloadFileToCacheDir({
+        snapshotPath = await downloadFileToCacheDir({
           repo,
           path: file.path,
           revision,
@@ -490,8 +553,15 @@ export class DownloadManager {
       }
 
       if (await isStagedCopyComplete(destPath, file)) return context;
-      // Content did not match the manifest: drop it and re-fetch (bounded).
+      // Content did not match the manifest: drop the staged copy AND invalidate
+      // the HF cache entry (the snapshot pointer + the blob it resolves to) so the
+      // next attempt actually re-fetches. For a pinned commit `downloadFileToCacheDir`
+      // returns the cached pointer without revalidating, so without this the retry
+      // would recopy the same corrupt bytes.
       await rm(destPath, { force: true });
+      const blob = await realpath(snapshotPath).catch(() => undefined);
+      await rm(snapshotPath, { force: true });
+      if (blob !== undefined) await rm(blob, { force: true });
     }
     throw new Error(`Downloaded file "${file.path}" failed content verification after ${MAX_VERIFY_ATTEMPTS} attempts`);
   }
@@ -547,6 +617,16 @@ export class DownloadManager {
       await rename(stagingDir, finalDir);
       await fsyncDir(dirname(finalDir));
       return;
+    }
+
+    // Re-check ownership adjacent to the destructive swap: the first guard is a
+    // no-op when finalDir was absent then, so an UNOWNED dir that raced in
+    // between must still never be renamed away and deleted. This collapses the
+    // window to the inherent FS-level race an interprocess lock would close.
+    if (!isDownloaderOwned(finalDir) && !overwrite) {
+      throw new Error(
+        `Refusing to overwrite "${finalDir}": it was not created by the dashboard downloader`,
+      );
     }
 
     // Rollback-safe swap of an owned (or explicitly overwritten) final dir. The

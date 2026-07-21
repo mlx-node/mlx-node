@@ -1,5 +1,14 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -9,6 +18,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 import { catalogWithState } from '../src/catalog.js';
 import { type DownloadEvent, DownloadManager } from '../src/download.js';
 import { DOWNLOAD_COMPLETE_MARKER } from '../src/models.js';
+
+/** Filename of the atomic-publish completion marker (kept in sync with models.ts). */
+const MARKER_FILE = '.mlx-download-complete.json';
+
+// The runner now refuses to pin to anything but an immutable 40-hex commit, so
+// every stubbed sha is a valid 40-hex string.
+const SHA_DEFAULT = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+const SHA_A = 'cafef00dcafef00dcafef00dcafef00dcafef00d';
+const SHA_OLD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const SHA_NEW = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 
 /** sha256 of `n` zero bytes — the content the stub download writes for a file of size `n`. */
 function zerosSha256(n: number): string {
@@ -29,32 +48,61 @@ interface ManifestEntry {
 }
 
 // Shared, hoisted state the mocked `@huggingface/hub` reads/writes. Reset per test.
+// The mock models a real HF cache: a `snapshots/<rev>/<path>` symlink pointing at a
+// `blobs/<...>` file. A pinned revision with an existing pointer is a CACHE HIT and
+// is returned WITHOUT re-fetching — so resume (and cache invalidation) are testable.
 const hub = vi.hoisted(() => ({
   manifest: [] as ManifestEntry[],
-  blobDir: '',
   downloaded: [] as string[],
   /** The commit sha `modelInfo` resolves — the snapshot the whole job should pin. */
-  sha: 'commit-deadbeef',
+  sha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
   /** Every `revision` the runner threaded into a list/download call. */
   revisions: [] as string[],
   /** Paths whose `downloadFileToCacheDir` should throw, to simulate a mid-job failure. */
   failOn: [] as string[],
+  /** The blob a snapshot pointer resolves to (content-addressed by rev + path). */
+  cacheBlob: (cacheDir: string, revision: string, p: string): string =>
+    `${cacheDir}/blobs/${revision}__${p.split('/').join('__')}`,
+  /** The snapshot pointer (a symlink into blobs) for a file at a revision. */
+  cachePointer: (cacheDir: string, revision: string, p: string): string =>
+    `${cacheDir}/snapshots/${revision}/${p}`,
 }));
 
-// Injectable fault for `rename`: when the source path equals `failFromPath`, the
-// call throws — used to exercise the publish swap's rollback (the staging→final
-// rename fails, the backup→final rollback must restore the original).
-const renameFault = vi.hoisted(() => ({ failFromPath: null as string | null }));
+// Injectable rename fault used to exercise the publish swap's rollback. A source
+// equal to `failFromPath`, or matching `failFromPrefix`, throws. The prefix form
+// is needed because staging is now job-private (`<slug>@<sha>.<pid>.<uuid>`) — the
+// test can only match its unpredictable name by the stable `<slug>@` prefix, which
+// deliberately excludes the `<slug>.backup-` rollback rename.
+const renameFault = vi.hoisted(() => ({
+  failFromPath: null as string | null,
+  failFromPrefix: null as string | null,
+}));
+
+// Fires once when the completion marker is written, to inject a directory that
+// "races in" between publish's ownership check and its swap (Finding 1).
+const raceHook = vi.hoisted(() => ({ onMarkerWrite: null as (() => void) | null }));
 
 vi.mock('node:fs/promises', async (importActual) => {
   const actual = await importActual<typeof import('node:fs/promises')>();
   return {
     ...actual,
     rename: async (from: string, to: string) => {
-      if (renameFault.failFromPath !== null && String(from) === renameFault.failFromPath) {
-        throw new Error(`simulated rename failure moving ${String(from)}`);
+      const f = String(from);
+      if (
+        (renameFault.failFromPath !== null && f === renameFault.failFromPath) ||
+        (renameFault.failFromPrefix !== null && f.startsWith(renameFault.failFromPrefix))
+      ) {
+        throw new Error(`simulated rename failure moving ${f}`);
       }
       return actual.rename(from, to);
+    },
+    writeFile: async (path: string, data: string | Uint8Array) => {
+      if (raceHook.onMarkerWrite !== null && String(path).endsWith(MARKER_FILE)) {
+        const hook = raceHook.onMarkerWrite;
+        raceHook.onMarkerWrite = null;
+        hook();
+      }
+      return actual.writeFile(path, data);
     },
   };
 });
@@ -68,17 +116,25 @@ vi.mock('@huggingface/hub', () => ({
     if (params.revision !== undefined) hub.revisions.push(params.revision);
     for (const entry of hub.manifest) yield entry;
   },
-  downloadFileToCacheDir: async (params: { path: string; revision?: string; fetch: typeof fetch }) => {
+  downloadFileToCacheDir: async (params: { path: string; revision?: string; cacheDir: string; fetch: typeof fetch }) => {
     if (params.revision !== undefined) hub.revisions.push(params.revision);
     if (hub.failOn.includes(params.path)) throw new Error(`simulated failure for ${params.path}`);
+    const revision = params.revision ?? 'main';
+    const pointer = hub.cachePointer(params.cacheDir, revision, params.path);
+    // Cache hit: a pinned revision returns the existing pointer without re-fetching.
+    if (existsSync(pointer)) return pointer;
+    // Cache miss: drive the injected (counting) fetch so byte progress fires, then
+    // write the blob and link the snapshot pointer at it.
     hub.downloaded.push(params.path);
-    // Drive the injected (counting) fetch so byte progress fires.
     const response = await params.fetch(`https://hf.example/${params.path}`);
     const bytes = Buffer.from(await response.arrayBuffer());
-    const dest = join(hub.blobDir, params.path);
-    mkdirSync(dirname(dest), { recursive: true });
-    writeFileSync(dest, bytes);
-    return dest;
+    const blob = hub.cacheBlob(params.cacheDir, revision, params.path);
+    mkdirSync(dirname(blob), { recursive: true });
+    writeFileSync(blob, bytes);
+    mkdirSync(dirname(pointer), { recursive: true });
+    rmSync(pointer, { force: true });
+    symlinkSync(blob, pointer);
+    return pointer;
   },
 }));
 
@@ -121,9 +177,32 @@ let cacheDir: string;
 function finalDir(): string {
   return join(modelsDir, SLUG);
 }
-/** Staging is revision-scoped (`<slug>@<sha>`); defaults to the current stubbed sha. */
-function stagingDir(revision: string = hub.sha): string {
-  return join(modelsDir, '.staging', `${SLUG}@${revision}`);
+/** The `.staging` root (a dotdir model discovery skips). */
+function stagingRoot(): string {
+  return join(modelsDir, '.staging');
+}
+/** Job-private staging dirs left under `.staging` (`<slug>@...`); empty when clean. */
+function jobStagingDirs(): string[] {
+  return existsSync(stagingRoot()) ? readdirSync(stagingRoot()).filter((n) => n.startsWith(`${SLUG}@`)) : [];
+}
+/** Backup dirs left under `.staging` (`<slug>.backup-...`); empty when clean. */
+function backupDirs(): string[] {
+  return existsSync(stagingRoot()) ? readdirSync(stagingRoot()).filter((n) => n.includes('.backup-')) : [];
+}
+/** The legacy SHARED staging path (`<slug>@<rev>`), used only to plant pre-fix leftovers. */
+function legacyStagingDir(revision: string = hub.sha): string {
+  return join(stagingRoot(), `${SLUG}@${revision}`);
+}
+/** Plant a corrupt (wrong-content) HF cache entry — symlink pointer + blob. */
+function seedCorruptCache(path: string, revision: string, size: number): { pointer: string; blob: string } {
+  const blob = hub.cacheBlob(cacheDir, revision, path);
+  const pointer = hub.cachePointer(cacheDir, revision, path);
+  mkdirSync(dirname(blob), { recursive: true });
+  writeFileSync(blob, Buffer.alloc(size, 0xff));
+  mkdirSync(dirname(pointer), { recursive: true });
+  rmSync(pointer, { force: true });
+  symlinkSync(blob, pointer);
+  return { pointer, blob };
 }
 
 beforeEach(() => {
@@ -131,18 +210,19 @@ beforeEach(() => {
     { type: 'file', path: 'config.json', size: 12 },
     { type: 'file', path: 'model.safetensors', size: 300 },
   ];
-  hub.blobDir = mkdtempSync(join(tmpdir(), 'dash-hub-'));
   hub.downloaded = [];
-  hub.sha = 'commit-deadbeef';
+  hub.sha = SHA_DEFAULT;
   hub.revisions = [];
   hub.failOn = [];
   renameFault.failFromPath = null;
+  renameFault.failFromPrefix = null;
+  raceHook.onMarkerWrite = null;
   modelsDir = mkdtempSync(join(tmpdir(), 'dash-dl-models-'));
   cacheDir = mkdtempSync(join(tmpdir(), 'dash-dl-cache-'));
 });
 
 afterEach(() => {
-  for (const dir of [hub.blobDir, modelsDir, cacheDir]) rmSync(dir, { recursive: true, force: true });
+  for (const dir of [modelsDir, cacheDir]) rmSync(dir, { recursive: true, force: true });
 });
 
 describe('DownloadManager', () => {
@@ -179,9 +259,9 @@ describe('DownloadManager', () => {
 
     expect(existsSync(join(finalDir(), 'config.json'))).toBe(true);
     expect(readFileSync(join(finalDir(), 'model.safetensors')).length).toBe(300);
-    // Completion marker is present in the published dir and the staging dir is gone.
+    // Completion marker is present in the published dir and no job staging remains.
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
-    expect(existsSync(stagingDir())).toBe(false);
+    expect(jobStagingDirs()).toEqual([]);
 
     const job = manager.jobs().find((j) => j.id === id)!;
     expect(job.state).toBe('done');
@@ -190,7 +270,7 @@ describe('DownloadManager', () => {
   });
 
   it('pins one resolved commit sha and threads it into every list/download call', async () => {
-    hub.sha = 'commit-cafef00d';
+    hub.sha = SHA_A;
     const manager = new DownloadManager({
       modelsDir,
       cacheDir,
@@ -201,7 +281,7 @@ describe('DownloadManager', () => {
 
     // listFiles + both downloadFileToCacheDir calls all saw exactly one revision.
     expect(hub.revisions.length).toBeGreaterThan(0);
-    expect(new Set(hub.revisions)).toEqual(new Set(['commit-cafef00d']));
+    expect(new Set(hub.revisions)).toEqual(new Set([SHA_A]));
 
     // The published marker records the pinned revision.
     const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
@@ -209,9 +289,58 @@ describe('DownloadManager', () => {
       repo: string;
       files: string[];
     };
-    expect(marker.revision).toBe('commit-cafef00d');
+    expect(marker.revision).toBe(SHA_A);
     expect(marker.repo).toBe(REPO);
     expect(marker.files).toEqual(expect.arrayContaining(['config.json', 'model.safetensors']));
+  });
+
+  it('refuses to pin a missing or mutable sha and pins the 40-hex commit on the normal path', async () => {
+    // Missing sha → fail closed (never silently pin a mutable "main").
+    hub.sha = '';
+    {
+      const manager = new DownloadManager({
+        modelsDir,
+        cacheDir,
+        fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+      });
+      const events: DownloadEvent[] = [];
+      const id = manager.start(REPO);
+      manager.subscribe(id, (event) => events.push(event));
+      await waitFor(() => events.some((event) => event.type === 'error'));
+      expect(events.some((event) => event.type === 'done')).toBe(false);
+      expect(existsSync(finalDir())).toBe(false);
+    }
+
+    // A branch name (mutable ref) is also refused.
+    hub.sha = 'main';
+    {
+      const manager = new DownloadManager({
+        modelsDir,
+        cacheDir,
+        fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+      });
+      const events: DownloadEvent[] = [];
+      const id = manager.start(REPO);
+      manager.subscribe(id, (event) => events.push(event));
+      await waitFor(() => events.some((event) => event.type === 'error'));
+      expect(existsSync(finalDir())).toBe(false);
+    }
+
+    // Normal path: a 40-hex commit pins and publishes.
+    hub.sha = SHA_A;
+    {
+      const manager = new DownloadManager({
+        modelsDir,
+        cacheDir,
+        fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+      });
+      const id = manager.start(REPO);
+      await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+      const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
+        revision: string;
+      };
+      expect(marker.revision).toBe(SHA_A);
+    }
   });
 
   it('leaves NO final dir when a job errors mid-way; catalog shows not-installed', async () => {
@@ -230,9 +359,10 @@ describe('DownloadManager', () => {
     expect(events.some((event) => event.type === 'done')).toBe(false);
     // config.json got fetched before the failure — the job was genuinely mid-way.
     expect(hub.downloaded).toContain('config.json');
-    // No half-populated FINAL dir; only the resumable staging dir remains.
+    // No half-populated FINAL dir; job-private staging is cleaned on failure (resume
+    // is HF-cache-backed, not staging-backed, so nothing is left to reuse).
     expect(existsSync(finalDir())).toBe(false);
-    expect(existsSync(stagingDir())).toBe(true);
+    expect(jobStagingDirs()).toEqual([]);
     // Catalog must NOT report the aborted download as installed.
     const item = catalogWithState(modelsDir).find((entry) => entry.slug === SLUG)!;
     expect(item.installed).toBe(false);
@@ -275,71 +405,66 @@ describe('DownloadManager', () => {
     expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
   });
 
-  it('re-verifies staged content on resume rather than trusting a right-size file', async () => {
-    // Manifest carries an LFS sha256 for the weight file; the runner must match it.
-    hub.manifest = [
-      { type: 'file', path: 'config.json', size: 12 },
-      {
-        type: 'file',
-        path: 'model.safetensors',
-        size: 300,
-        lfs: { oid: zerosSha256(300), size: 300, pointerSize: 100 },
-      },
-    ];
-    // Pre-stage a same-SIZE but WRONG-content weight (0xFF instead of the 0x00 the
-    // stub download writes) — size matches, sha256 does not.
-    mkdirSync(stagingDir(), { recursive: true });
-    writeFileSync(join(stagingDir(), 'model.safetensors'), Buffer.alloc(300, 0xff));
-
+  it('resumes from the HF cache without re-fetching already-cached files', async () => {
+    // First job caches config.json, then fails on the weight.
+    hub.failOn = ['model.safetensors'];
     const manager = new DownloadManager({
       modelsDir,
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
     });
-    const id = manager.start(REPO);
-    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+    const events1: DownloadEvent[] = [];
+    const id1 = manager.start(REPO);
+    manager.subscribe(id1, (event) => events1.push(event));
+    await waitFor(() => events1.some((event) => event.type === 'error'));
+    expect(hub.downloaded).toContain('config.json');
 
-    // The stale-but-right-size file failed content verification and was re-fetched.
+    // Second job: the weight succeeds; config.json is served from the HF cache.
+    hub.failOn = [];
+    hub.downloaded = [];
+    const id2 = manager.start(REPO);
+    await waitFor(() => manager.jobs().some((j) => j.id === id2 && j.state === 'done'));
+
+    // config.json was a cache hit (no re-fetch); only the weight was fetched.
+    expect(hub.downloaded).not.toContain('config.json');
     expect(hub.downloaded).toContain('model.safetensors');
-  });
-
-  it('skips a staged file whose content hash matches the manifest (resume, no re-fetch)', async () => {
-    hub.manifest = [
-      { type: 'file', path: 'config.json', size: 12 },
-      {
-        type: 'file',
-        path: 'model.safetensors',
-        size: 300,
-        lfs: { oid: zerosSha256(300), size: 300, pointerSize: 100 },
-      },
-    ];
-    // Pre-stage BOTH files with the exact content the download would produce.
-    mkdirSync(stagingDir(), { recursive: true });
-    writeFileSync(join(stagingDir(), 'config.json'), Buffer.alloc(12));
-    writeFileSync(join(stagingDir(), 'model.safetensors'), Buffer.alloc(300));
-
-    const manager = new DownloadManager({
-      modelsDir,
-      cacheDir,
-      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
-    });
-    const id = manager.start(REPO);
-    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
-
-    // Content matched → nothing re-fetched; the job still published atomically.
-    expect(hub.downloaded).toEqual([]);
-    expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
     expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
   });
 
-  it('re-verifies a plain file against its git-blob oid on resume', async () => {
+  it('re-fetches and recovers when a corrupt cached blob fails the sha256 check', async () => {
+    hub.manifest = [
+      { type: 'file', path: 'config.json', size: 12 },
+      {
+        type: 'file',
+        path: 'model.safetensors',
+        size: 300,
+        lfs: { oid: zerosSha256(300), size: 300, pointerSize: 100 },
+      },
+    ];
+    // A pre-existing corrupt cache blob (0xFF instead of the 0x00 the download writes).
+    seedCorruptCache('model.safetensors', hub.sha, 300);
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const id = manager.start(REPO);
+    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+
+    // The corrupt cache entry failed sha256 → was invalidated → really re-fetched →
+    // matched → published (without invalidation the retry would recopy the same blob).
+    expect(hub.downloaded).toContain('model.safetensors');
+    expect(readFileSync(join(finalDir(), 'model.safetensors'))).toEqual(Buffer.alloc(300));
+    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
+  });
+
+  it('re-fetches when a corrupt cached blob fails the git-blob oid check', async () => {
     hub.manifest = [
       { type: 'file', path: 'config.json', size: 12, oid: zerosGitOid(12) },
       { type: 'file', path: 'model.safetensors', size: 300 },
     ];
-    // Pre-stage a same-size but wrong-content config.json (git-blob sha1 differs).
-    mkdirSync(stagingDir(), { recursive: true });
-    writeFileSync(join(stagingDir(), 'config.json'), Buffer.alloc(12, 0xff));
+    seedCorruptCache('config.json', hub.sha, 12);
 
     const manager = new DownloadManager({
       modelsDir,
@@ -349,25 +474,72 @@ describe('DownloadManager', () => {
     const id = manager.start(REPO);
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
-    // Wrong git-blob oid → re-fetched despite the matching size.
+    // Wrong git-blob oid → invalidated → re-fetched → matched.
     expect(hub.downloaded).toContain('config.json');
+    expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12));
+    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
   });
 
-  it('skips a size-matched metadata file with no manifest hash (resume)', async () => {
-    // config.json has no oid/lfs in the manifest → size-only skip is retained.
-    mkdirSync(stagingDir(), { recursive: true });
-    writeFileSync(join(stagingDir(), 'config.json'), Buffer.alloc(12));
+  it('invalidates the cached pointer AND blob when staged bytes never match the manifest', async () => {
+    hub.manifest = [
+      { type: 'file', path: 'config.json', size: 12 },
+      // lfs.oid deliberately WRONG (sha256 of different content); 300 zero-bytes can
+      // never match it → post-copy verification always fails.
+      {
+        type: 'file',
+        path: 'model.safetensors',
+        size: 300,
+        lfs: { oid: zerosSha256(299), size: 300, pointerSize: 100 },
+      },
+    ];
+    const { pointer, blob } = seedCorruptCache('model.safetensors', hub.sha, 300);
 
     const manager = new DownloadManager({
       modelsDir,
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
     });
+    const events: DownloadEvent[] = [];
     const id = manager.start(REPO);
-    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
 
-    expect(hub.downloaded).toContain('model.safetensors');
-    expect(hub.downloaded).not.toContain('config.json');
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+    // Each failed verify removed the cache pointer + blob; the final attempt's
+    // removal is not followed by a re-fetch, so both are gone.
+    expect(existsSync(pointer)).toBe(false);
+    expect(existsSync(blob)).toBe(false);
+    // It genuinely re-fetched (bounded) rather than recopying the seeded blob.
+    expect(hub.downloaded.filter((p) => p === 'model.safetensors').length).toBeGreaterThan(0);
+    expect(existsSync(finalDir())).toBe(false);
+  });
+
+  it('errors without publishing when downloaded bytes never match the manifest hash', async () => {
+    hub.manifest = [
+      { type: 'file', path: 'config.json', size: 12 },
+      {
+        type: 'file',
+        path: 'model.safetensors',
+        size: 300,
+        lfs: { oid: zerosSha256(299), size: 300, pointerSize: 100 },
+      },
+    ];
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
+
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+    // The mismatching file was re-fetched (bounded) before the job gave up.
+    expect(hub.downloaded.filter((p) => p === 'model.safetensors').length).toBeGreaterThan(1);
+    // No publish, no marker, catalog reports not-installed.
+    expect(existsSync(finalDir())).toBe(false);
+    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
   });
 
   it('refuses to overwrite an unowned existing dir and leaves it intact', async () => {
@@ -393,6 +565,37 @@ describe('DownloadManager', () => {
     expect(readFileSync(join(finalDir(), 'model.safetensors'))).toEqual(Buffer.alloc(300, 0xab));
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(false);
     expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
+  });
+
+  it('refuses to overwrite an unowned dir that races in between the ownership check and the swap', async () => {
+    // finalDir is ABSENT at the first ownership check; an external process installs an
+    // UNOWNED dir just before the swap (modeled by creating it when the marker is
+    // written into staging). The swap must re-check ownership and refuse — never
+    // rename+delete the raced-in dir.
+    raceHook.onMarkerWrite = () => {
+      mkdirSync(finalDir(), { recursive: true });
+      writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xcd));
+      writeFileSync(join(finalDir(), 'model.safetensors'), Buffer.alloc(300, 0xcd));
+    };
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
+
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+    // The raced-in unowned dir is byte-for-byte intact; no marker written into it.
+    expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12, 0xcd));
+    expect(readFileSync(join(finalDir(), 'model.safetensors'))).toEqual(Buffer.alloc(300, 0xcd));
+    expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(false);
+    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
+    // No leaked backup was left behind by the refused swap.
+    expect(backupDirs()).toEqual([]);
   });
 
   it('replaces an unowned dir only when overwrite is explicitly requested', async () => {
@@ -422,14 +625,16 @@ describe('DownloadManager', () => {
       join(finalDir(), DOWNLOAD_COMPLETE_MARKER),
       JSON.stringify({
         repo: REPO,
-        revision: 'older',
+        revision: SHA_OLD,
         files: ['config.json', 'model.safetensors'],
         completedAt: 'x',
       }),
     );
 
-    // Fault the staging→final rename so the swap fails AFTER the backup move.
-    renameFault.failFromPath = stagingDir();
+    // Fault the staging→final rename so the swap fails AFTER the backup move. Staging
+    // is job-private, so match its unpredictable name by the stable `<slug>@` prefix
+    // (which excludes the `<slug>.backup-` rollback rename).
+    renameFault.failFromPrefix = join(stagingRoot(), `${SLUG}@`);
 
     const manager = new DownloadManager({
       modelsDir,
@@ -447,46 +652,23 @@ describe('DownloadManager', () => {
     const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
       revision: string;
     };
-    expect(marker.revision).toBe('older');
+    expect(marker.revision).toBe(SHA_OLD);
     // No orphaned backup dir left under modelsDir/.staging.
-    const leftovers = readdirSync(join(modelsDir, '.staging')).filter((n) => n.includes('.backup-'));
-    expect(leftovers).toEqual([]);
+    expect(backupDirs()).toEqual([]);
   });
 
-  it('errors without publishing when downloaded bytes never match the manifest hash', async () => {
-    hub.manifest = [
-      { type: 'file', path: 'config.json', size: 12 },
-      // lfs.oid deliberately WRONG (sha256 of different content); the downloaded
-      // 300 zero-bytes can never match it → post-copy verification always fails.
-      {
-        type: 'file',
-        path: 'model.safetensors',
-        size: 300,
-        lfs: { oid: zerosSha256(299), size: 300, pointerSize: 100 },
-      },
-    ];
-    const manager = new DownloadManager({
-      modelsDir,
-      cacheDir,
-      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
-    });
-    const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
-    manager.subscribe(id, (event) => events.push(event));
-    await waitFor(() => events.some((event) => event.type === 'error'));
-
-    expect(events.some((event) => event.type === 'done')).toBe(false);
-    // The mismatching file was re-fetched (bounded) before the job gave up.
-    expect(hub.downloaded.filter((p) => p === 'model.safetensors').length).toBeGreaterThan(1);
-    // No publish, no marker, catalog reports not-installed.
+  it('recovers an orphaned publish backup whose final dir is missing on the next download', async () => {
+    // A crash left the model missing under an orphaned backup (swap died after the
+    // finalDir→backup move). The backup is a complete owned install.
+    const backup = join(stagingRoot(), `${SLUG}.backup-11111111-1111-1111-1111-111111111111`);
+    mkdirSync(backup, { recursive: true });
+    writeFileSync(join(backup, 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(backup, 'model.safetensors'), Buffer.alloc(300, 0xab));
+    writeFileSync(
+      join(backup, DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: REPO, revision: hub.sha, files: ['config.json', 'model.safetensors'], completedAt: 'x' }),
+    );
     expect(existsSync(finalDir())).toBe(false);
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
-  });
-
-  it('prunes a staged file absent from the manifest so it is not published', async () => {
-    // A stale weight left in staging by an earlier run, not in the current manifest.
-    mkdirSync(stagingDir(), { recursive: true });
-    writeFileSync(join(stagingDir(), 'stale.safetensors'), Buffer.alloc(50, 0x7));
 
     const manager = new DownloadManager({
       modelsDir,
@@ -496,7 +678,58 @@ describe('DownloadManager', () => {
     const id = manager.start(REPO);
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
-    // The stale file was removed; the published set is exactly the manifest.
+    // The sweep renamed the backup back into place; the restored (0xAB) content is
+    // the completed install, so the job short-circuits without re-downloading.
+    expect(existsSync(finalDir())).toBe(true);
+    expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+    expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
+    expect(backupDirs()).toEqual([]);
+    expect(hub.downloaded).toEqual([]);
+  });
+
+  it('reaps a leaked publish backup when its final dir already exists', async () => {
+    // A complete owned install already present.
+    mkdirSync(finalDir(), { recursive: true });
+    writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12));
+    writeFileSync(join(finalDir(), 'model.safetensors'), Buffer.alloc(300));
+    writeFileSync(
+      join(finalDir(), DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: REPO, revision: hub.sha, files: ['config.json', 'model.safetensors'], completedAt: 'x' }),
+    );
+    // A leaked backup from a prior successful swap that never got cleaned.
+    const backup = join(stagingRoot(), `${SLUG}.backup-22222222-2222-2222-2222-222222222222`);
+    mkdirSync(backup, { recursive: true });
+    writeFileSync(join(backup, 'config.json'), Buffer.alloc(12, 0x5));
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const id = manager.start(REPO);
+    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+
+    // The leaked backup was removed; the existing install is untouched.
+    expect(existsSync(backup)).toBe(false);
+    expect(backupDirs()).toEqual([]);
+    expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
+  });
+
+  it('publishes exactly the manifest, ignoring a stale file in a legacy shared staging path', async () => {
+    // A stale weight left by a pre-fix shared-staging layout; job-private staging
+    // never adopts it, so it can never enter the published set.
+    mkdirSync(legacyStagingDir(), { recursive: true });
+    writeFileSync(join(legacyStagingDir(), 'stale.safetensors'), Buffer.alloc(50, 0x7));
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const id = manager.start(REPO);
+    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+
+    // The published set is exactly the manifest — no stale orphan.
     expect(existsSync(join(finalDir(), 'stale.safetensors'))).toBe(false);
     expect(existsSync(join(finalDir(), 'config.json'))).toBe(true);
     expect(existsSync(join(finalDir(), 'model.safetensors'))).toBe(true);
@@ -504,13 +737,13 @@ describe('DownloadManager', () => {
   });
 
   it('does not reuse another revision staged files across a revision change', async () => {
-    // An interrupted OLDER revision left a single-file weight in its own staging.
-    const oldRev = 'commit-oldrev';
-    mkdirSync(stagingDir(oldRev), { recursive: true });
-    writeFileSync(join(stagingDir(oldRev), 'model.safetensors'), Buffer.alloc(999, 0x9));
+    // An interrupted OLDER revision left a single-file weight in its own (legacy
+    // shared) staging scope.
+    mkdirSync(legacyStagingDir(SHA_OLD), { recursive: true });
+    writeFileSync(join(legacyStagingDir(SHA_OLD), 'model.safetensors'), Buffer.alloc(999, 0x9));
 
     // The current revision is SHARDED — no single-file `model.safetensors`.
-    hub.sha = 'commit-newrev';
+    hub.sha = SHA_NEW;
     hub.manifest = [
       { type: 'file', path: 'config.json', size: 12 },
       { type: 'file', path: 'model-00001-of-00002.safetensors', size: 100 },
@@ -534,7 +767,7 @@ describe('DownloadManager', () => {
     expect(existsSync(join(finalDir(), 'model-00001-of-00002.safetensors'))).toBe(true);
     expect(existsSync(join(finalDir(), 'model-00002-of-00002.safetensors'))).toBe(true);
     // The old revision staging dir is a separate scope, left untouched.
-    expect(existsSync(join(stagingDir(oldRev), 'model.safetensors'))).toBe(true);
+    expect(existsSync(join(legacyStagingDir(SHA_OLD), 'model.safetensors'))).toBe(true);
   });
 
   it('replays the last event to a late subscriber', async () => {
