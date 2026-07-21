@@ -482,6 +482,73 @@ fn load_safetensors_mapped(path: &Path) -> Result<HashMap<String, MxArray>> {
     Ok(mapped_params)
 }
 
+/// Filesystem identity of one weight shard, used to detect a mid-load
+/// model-directory swap. `dev`/`ino` change when a separate process
+/// reinstalls a shard as a new file (the common reinstall pattern), and
+/// `len`/`mtime` catch an in-place rewrite. Equality across a snapshot pair
+/// means the mmap'd inode is still the file the cold-tier fingerprint will
+/// read.
+#[derive(PartialEq)]
+struct ShardIdentity {
+    len: u64,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    mtime: i64,
+    #[cfg(unix)]
+    mtime_nsec: i64,
+    #[cfg(not(unix))]
+    mtime: Option<std::time::SystemTime>,
+}
+
+impl ShardIdentity {
+    fn from_metadata(meta: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            ShardIdentity {
+                len: meta.len(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+                mtime: meta.mtime(),
+                mtime_nsec: meta.mtime_nsec(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            ShardIdentity {
+                len: meta.len(),
+                mtime: meta.modified().ok(),
+            }
+        }
+    }
+}
+
+/// Snapshot the on-disk identity of every top-level `.safetensors` shard in
+/// `dir` — the SAME shard set the cold-tier fingerprint
+/// (`cold_tier::build_model_fingerprint` → `shard_file_names`) covers.
+///
+/// Returns `None` if the directory or any shard's metadata cannot be read;
+/// the caller treats `None` as "changed" and leaves cold persistence off
+/// (fail-safe). Keyed by file name so an added/removed shard between two
+/// snapshots also compares unequal.
+fn snapshot_shard_identities(dir: &Path) -> Option<HashMap<String, ShardIdentity>> {
+    let mut identities = HashMap::new();
+    for entry in fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".safetensors") {
+            continue;
+        }
+        // `metadata` follows symlinks, matching the fingerprint's shard reads.
+        let meta = fs::metadata(entry.path()).ok()?;
+        identities.insert(name, ShardIdentity::from_metadata(&meta));
+    }
+    Some(identities)
+}
+
 /// Spawn a dedicated model thread, load all weights inside init_fn.
 ///
 /// Returns a thin `Qwen3Model` NAPI shell with the thread handle.
@@ -539,6 +606,18 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                     // Load weights
                     let mapped_params = load_safetensors_mapped(path)?;
 
+                    // Snapshot each shard's on-disk identity NOW, against the
+                    // same inodes the mmap above pinned. Re-checked just before
+                    // enabling the cold tier so a mid-load model-directory swap
+                    // (a separate process reinstalling a different same-shaped
+                    // revision) can never bind the OLD weights to the NEW
+                    // revision's fingerprint. Only needed when persistence is on.
+                    let shard_snapshot_at_mmap = if config.persist_paged_cache.unwrap_or(false) {
+                        snapshot_shard_identities(path)
+                    } else {
+                        None
+                    };
+
                     // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU
                     // eval of any mmap-backed weight (the per-layer `set_weight`
                     // finalize below). On a slow/cold mmap source (e.g. a model
@@ -572,7 +651,26 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                     ));
                     inner.set_tokenizer(Arc::new(tokenizer.clone()));
                     if config.persist_paged_cache.unwrap_or(false) {
-                        inner.enable_cold_tier(&model_path);
+                        // Fail-closed revalidation: only bind the cold tier if
+                        // every shard is still the same file (dev/ino/size/mtime)
+                        // it was when mmap'd. Any change — or an unreadable shard
+                        // at either snapshot — means the fingerprint could
+                        // describe a different revision than the weights actually
+                        // loaded, so leave persistence off.
+                        let unchanged =
+                            match (&shard_snapshot_at_mmap, snapshot_shard_identities(path)) {
+                                (Some(before), Some(after)) => *before == after,
+                                _ => false,
+                            };
+                        if unchanged {
+                            inner.enable_cold_tier(&model_path);
+                        } else {
+                            tracing::warn!(
+                                "cold-tier persistence disabled for {model_path}: model \
+                                 directory changed during load (shard identity mismatch); \
+                                 KV persistence stays off for safety"
+                            );
+                        }
                     }
 
                     // Load parameters into inner
@@ -819,5 +917,91 @@ mod tests {
 
         let empty_block = json!({ "model_type": "qwen3", "quantization": {} });
         assert!(reject_quantized_checkpoint(&empty_block, "/tmp/model").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod cold_tier_shard_identity_tests {
+    use super::*;
+
+    fn unique_tmp(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "mlx-qwen3-shard-id-{}-{tag}-{n}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn missing_dir_fails_safe_to_none() {
+        let dir =
+            std::env::temp_dir().join(format!("mlx-qwen3-shard-id-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            snapshot_shard_identities(&dir).is_none(),
+            "an unreadable directory must fail safe (None → cold tier stays off)"
+        );
+    }
+
+    #[test]
+    fn stable_when_unchanged() {
+        let dir = unique_tmp("stable");
+        fs::write(dir.join("model.safetensors"), b"weights-v1").unwrap();
+        let a = snapshot_shard_identities(&dir).expect("snapshot A");
+        let b = snapshot_shard_identities(&dir).expect("snapshot B");
+        assert!(a.contains_key("model.safetensors"));
+        assert!(a == b, "two snapshots of an unchanged shard must be equal");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_reinstall_swap() {
+        let dir = unique_tmp("reinstall");
+        let shard = dir.join("model.safetensors");
+        fs::write(&shard, b"weights-v1").unwrap();
+        let before = snapshot_shard_identities(&dir).expect("before");
+
+        // Simulate a reinstall: remove + recreate with different content, so
+        // both the inode (unix) and the byte length change even if the OS
+        // reuses the inode.
+        fs::remove_file(&shard).unwrap();
+        fs::write(&shard, b"weights-v2-different-length").unwrap();
+        let after = snapshot_shard_identities(&dir).expect("after");
+
+        assert!(
+            before != after,
+            "a mid-load shard swap must be detected as changed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_added_shard() {
+        let dir = unique_tmp("added");
+        fs::write(dir.join("model-00001-of-00002.safetensors"), b"a").unwrap();
+        let before = snapshot_shard_identities(&dir).expect("before");
+        fs::write(dir.join("model-00002-of-00002.safetensors"), b"b").unwrap();
+        let after = snapshot_shard_identities(&dir).expect("after");
+        assert!(
+            before != after,
+            "a shard appearing during load must be detected as changed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ignores_non_shard_files() {
+        let dir = unique_tmp("ignore");
+        fs::write(dir.join("model.safetensors"), b"w").unwrap();
+        fs::write(dir.join("config.json"), b"{}").unwrap();
+        fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
+        let snap = snapshot_shard_identities(&dir).expect("snap");
+        assert_eq!(snap.len(), 1, "only .safetensors shards are tracked");
+        assert!(snap.contains_key("model.safetensors"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

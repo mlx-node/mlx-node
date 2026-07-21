@@ -691,6 +691,17 @@ pub struct PagedKVCacheAdapter {
     /// requests, so per-request resets must not clear it.
     cold_tier: Option<ColdTierContext>,
 
+    /// One-shot cold-restore suppressor armed by an EXPLICIT command reset
+    /// (`release_request_and_purge_prefix_cache`). The command reset's
+    /// contract is a fully cold state, but purging only the hot prefix cache
+    /// leaves the just-cleared prefix restorable from the SSD cold tier, so
+    /// the immediate reset-then-rerun would take the suffix-prefill path
+    /// (different bf16 reduction order) instead of a cold full prefill. When
+    /// set, the NEXT `find_cached_prefix_inner` skips the cold-restore branch
+    /// and clears this flag; later same-prompt turns restore normally. Not
+    /// armed by the per-turn `release_request` path.
+    suppress_cold_restore_once: bool,
+
     /// Optional FP8 K/V scale manager. When `Some`, the adapter
     /// reads per-layer K/V scales from the manager and threads them into
     /// `update_keys_values` and `k_scale_array` / `v_scale_array`. When
@@ -900,6 +911,7 @@ impl PagedKVCacheAdapter {
             already_registered: false,
             prefix_lookup_done: false,
             cold_tier: None,
+            suppress_cold_restore_once: false,
             #[cfg(target_os = "macos")]
             scale_manager: None,
             #[cfg(target_os = "macos")]
@@ -1370,6 +1382,10 @@ impl PagedKVCacheAdapter {
                  Call reset_for_new_request() to start a new request."
                 .to_string());
         }
+        // Consume the command-reset one-shot on every processed lookup
+        // (including the forced-miss `skip_lookup` path below), so exactly the
+        // immediately-following request is suppressed.
+        let suppress_cold_restore = std::mem::take(&mut self.suppress_cold_restore_once);
         let block_table = self
             .block_table
             .as_mut()
@@ -1420,7 +1436,10 @@ impl PagedKVCacheAdapter {
         // the hot hit untouched. The hot identity each restored block is
         // published under comes from `chain_hashes`, so a subsequent
         // `find_longest_cache_hit` on this same allocator serves it directly.
-        if let Some(cold) = self.cold_tier.as_ref() {
+        //
+        // Skipped for one lookup after a command reset (`suppress_cold_restore`)
+        // so the just-purged prefix is re-prefilled cold rather than restored.
+        if !suppress_cold_restore && let Some(cold) = self.cold_tier.as_ref() {
             let bs = self.block_size as usize;
             // `checked_div` folds the degenerate `block_size == 0` case into a
             // no-op: both counts become 0, so the extension loop never runs.
@@ -4173,6 +4192,11 @@ impl PagedKVCacheAdapter {
             .lock()
             .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
         guard.purge_prefix_cache();
+        drop(guard);
+        // Purging the hot prefix cache does not touch the SSD cold tier, so
+        // arm a one-shot suppressor: the next lookup must NOT restore the
+        // just-cleared prefix from disk (see `suppress_cold_restore_once`).
+        self.suppress_cold_restore_once = true;
         Ok(released)
     }
 
@@ -5450,6 +5474,73 @@ mod tests {
         // survive the per-request reset.
         adapter.reset_for_new_request(1).unwrap();
         assert!(adapter.cold_tier().is_some());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A command reset (`release_request_and_purge_prefix_cache`) must arm a
+    /// ONE-SHOT cold-restore suppressor so the immediate reset-then-rerun
+    /// re-prefills the whole prompt cold instead of restoring the just-purged
+    /// prefix from the SSD tier. The per-turn `release_request` must NOT arm
+    /// it, and exactly the next lookup consumes it.
+    #[test]
+    fn cold_tier_command_reset_suppresses_next_restore_once() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            return;
+        };
+
+        let root =
+            std::env::temp_dir().join(format!("mlx-adapter-cold-suppress-{}", std::process::id()));
+        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+            .expect("temp-dir cold cache must open");
+        let fingerprint =
+            mlx_paged_attn::ColdCacheFingerprint::from_components([b"qwen3-suppress".as_slice()]);
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::new(manager),
+            fingerprint,
+        });
+
+        // Per-turn release must NOT arm the suppressor.
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.release_request().unwrap();
+        assert!(
+            !adapter.suppress_cold_restore_once,
+            "per-turn release must not arm cold-restore suppression"
+        );
+
+        // A command reset arms it.
+        adapter.release_request_and_purge_prefix_cache().unwrap();
+        assert!(
+            adapter.suppress_cold_restore_once,
+            "command reset must arm the one-shot cold-restore suppressor"
+        );
+
+        // Starting the next request must NOT consume the arming — it has to
+        // survive into that request's prefix lookup.
+        adapter.reset_for_new_request(2).unwrap();
+        assert!(
+            adapter.suppress_cold_restore_once,
+            "reset_for_new_request must preserve the armed suppressor until the lookup"
+        );
+
+        // The lookup consumes the flag and skips the cold-restore branch.
+        adapter
+            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], 0, false)
+            .unwrap();
+        assert!(
+            !adapter.suppress_cold_restore_once,
+            "the immediately-following lookup must consume the one-shot suppressor"
+        );
+
+        // A subsequent same-prompt turn restores normally: the flag stays clear.
+        adapter.reset_for_new_request(3).unwrap();
+        adapter
+            .find_cached_prefix(&[1, 2, 3, 4, 5, 6, 7, 8], &[], 0, false)
+            .unwrap();
+        assert!(
+            !adapter.suppress_cold_restore_once,
+            "later turns must not re-arm suppression"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
