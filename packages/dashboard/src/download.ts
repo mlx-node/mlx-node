@@ -8,12 +8,20 @@
  * through `subscribe`, which replays the last event on attach so a late attacher
  * (e.g. an SSE reconnect) is never left blank.
  *
- * Downloads are made atomic to close finding-6's partial/mixed-revision hole:
- * the whole job is pinned to ONE resolved commit sha; files stage into a private
- * `<modelsDir>/.staging/<slug>` dir; and only after every file is present and
- * content-verified is a completion marker written and the staging dir renamed
- * onto the final `<slug>`. An aborted job leaves only the staging dir (resumable)
- * — never a half-populated final dir that catalog state would call "installed".
+ * Downloads are made atomic to close the partial/mixed-revision hole: the whole
+ * job is pinned to ONE resolved commit sha; files stage into a private
+ * `<modelsDir>/.staging/<slug>@<revision>` dir keyed by that immutable sha (so a
+ * different revision never reuses another revision's staged bytes); each staged
+ * file is content-verified right after it lands AND the whole staged set is
+ * re-verified and pruned to exactly the manifest before publishing; and only
+ * then is a completion marker written and the staging dir swapped onto the final
+ * `<slug>`. An aborted job leaves only the staging dir (resumable) — never a
+ * half-populated final dir that catalog state would call "installed".
+ *
+ * Publishing never destroys a checkpoint the downloader does not own: a final
+ * dir WITHOUT our marker (a manual / `mlx download` copy, possibly fine-tuned) is
+ * refused unless an explicit `overwrite` is requested; an OWNED upgrade swaps via
+ * a temp backup so a crash mid-rename rolls back to the original.
  *
  * Pure disk + network — never the native addon.
  */
@@ -21,14 +29,17 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { createReadStream, existsSync, statSync } from 'node:fs';
-import { copyFile, mkdir, rename, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, open, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join, sep } from 'node:path';
 
 import { downloadFileToCacheDir, listFiles, type ListFileEntry, modelInfo } from '@huggingface/hub';
 import { MODEL_CATALOG } from '@mlx-node/agent/catalog';
 
-import { type DownloadCompletion, DOWNLOAD_COMPLETE_MARKER, isModelInstalled } from './models.js';
+import { type DownloadCompletion, DOWNLOAD_COMPLETE_MARKER, isDownloaderOwned, isModelInstalled } from './models.js';
+
+/** Bounded re-fetch attempts for a staged file that fails post-copy verification. */
+const MAX_VERIFY_ATTEMPTS = 3;
 
 const DEFAULT_CACHE_DIR = join(homedir(), '.cache', 'huggingface');
 
@@ -118,6 +129,42 @@ async function isStagedCopyComplete(destPath: string, file: ListFileEntry): Prom
   return true;
 }
 
+/** Recursive relative (posix) paths of every regular file under `dir`; empty if absent. */
+async function listStagedFiles(dir: string): Promise<string[]> {
+  let raw: string[];
+  try {
+    raw = await readdir(dir, { recursive: true });
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const rel of raw) {
+    try {
+      if (statSync(join(dir, rel)).isFile()) out.push(rel.split(sep).join('/'));
+    } catch {
+      // Vanished/unreadable entry: skip.
+    }
+  }
+  return out;
+}
+
+/**
+ * Best-effort `fsync` of a directory fd so a rename into it is durable before the
+ * backup is removed. Filesystems that reject a directory fsync are tolerated —
+ * durability is a nicety here, not a correctness gate.
+ */
+async function fsyncDir(dir: string): Promise<void> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(dir, 'r');
+    await handle.sync();
+  } catch {
+    // Directory fsync unsupported on this platform/filesystem: ignore.
+  } finally {
+    await handle?.close();
+  }
+}
+
 export type DownloadEvent =
   | { type: 'start'; id: string; repo: string; totalBytes: number; fileCount: number }
   | {
@@ -140,6 +187,8 @@ interface JobState {
   receivedBytes: number;
   /** Sum of manifest file sizes; 0 until the manifest is fetched. */
   totalBytes: number;
+  /** Permit replacing a final dir the downloader does not own (default false). */
+  overwrite: boolean;
 }
 
 /**
@@ -184,13 +233,25 @@ export class DownloadManager {
     this.emitter.setMaxListeners(0);
   }
 
-  /** Queue a catalog repo for download. Rejects any repo not in the catalog. */
-  start(repo: string): string {
+  /**
+   * Queue a catalog repo for download. Rejects any repo not in the catalog.
+   * `overwrite` (default false) permits replacing a final dir the downloader does
+   * not own; callers (the API/UI) leave it unset so an unowned local checkpoint
+   * is never silently destroyed.
+   */
+  start(repo: string, opts?: { overwrite?: boolean }): string {
     if (!MODEL_CATALOG.some((entry) => entry.hfRepo === repo)) {
       throw new Error(`Repo "${repo}" is not in the model catalog`);
     }
     const id = randomUUID();
-    this.jobsById.set(id, { id, repo, state: 'running', receivedBytes: 0, totalBytes: 0 });
+    this.jobsById.set(id, {
+      id,
+      repo,
+      state: 'running',
+      receivedBytes: 0,
+      totalBytes: 0,
+      overwrite: opts?.overwrite ?? false,
+    });
     this.order.push(id);
     this.queue.push(id);
     void this.drain();
@@ -298,12 +359,15 @@ export class DownloadManager {
     const entry = MODEL_CATALOG.find((candidate) => candidate.hfRepo === job.repo)!;
     const slug = entry.hfRepo.split('/').pop()!.toLowerCase();
     const finalDir = join(this.modelsDir, slug);
-    const stagingDir = join(this.modelsDir, '.staging', slug);
     const repo = { type: 'model' as const, name: job.repo };
     this.currentJob = job;
 
     try {
       const revision = await this.resolveRevision(job.repo);
+      // Staging is keyed by the IMMUTABLE revision, so an interrupted older
+      // revision's staged bytes can never be reused by (and rename into) a
+      // different revision's install.
+      const stagingDir = join(this.modelsDir, '.staging', `${slug}@${revision}`);
 
       const files: ListFileEntry[] = [];
       let totalBytes = 0;
@@ -344,26 +408,11 @@ export class DownloadManager {
           continue;
         }
 
-        const context: FileContext = {
-          filePath: file.path,
-          fileSize: file.size,
+        const context = await this.downloadVerifiedFile(repo, revision, file, destPath, {
+          jobBaseBytes,
           fileIndex: index,
           fileCount: files.length,
-          jobBaseBytes,
-          perUrl: new Map(),
-          received: 0,
-        };
-        this.currentFile = context;
-        const snapshotPath = await downloadFileToCacheDir({
-          repo,
-          path: file.path,
-          revision,
-          cacheDir: this.cacheDir,
-          fetch: this.wrappedFetch,
         });
-        await mkdir(dirname(destPath), { recursive: true });
-        await copyFile(snapshotPath, destPath);
-        this.currentFile = null;
 
         // Settle the file at its manifest size (or the counted bytes when the
         // manifest omits a size), so aggregate progress is exact even if a
@@ -373,7 +422,20 @@ export class DownloadManager {
         this.emitFileProgress(job.id, file.path, fileBytes, file.size, index, files.length);
       }
 
-      await this.publish(stagingDir, finalDir, job.repo, revision, files);
+      // Quarantine any staged entry not in the current manifest (a stale file
+      // from an earlier interrupted run), so the published set is exactly the
+      // manifest — no orphan (e.g. an old single-file weight) can win over it.
+      await this.pruneToManifest(stagingDir, files);
+
+      // Re-validate the WHOLE staged set against the manifest immediately before
+      // publishing; any mismatch fails the job rather than shipping bad bytes.
+      for (const file of files) {
+        if (!(await isStagedCopyComplete(join(stagingDir, file.path), file))) {
+          throw new Error(`Staged file "${file.path}" failed content verification before publish`);
+        }
+      }
+
+      await this.publish(stagingDir, finalDir, job.repo, revision, files, job.overwrite);
 
       job.state = 'done';
       this.emit({ type: 'done', id: job.id, outputDir: finalDir });
@@ -387,11 +449,74 @@ export class DownloadManager {
   }
 
   /**
-   * Atomic publish: write the completion marker as the LAST staged step (so it
-   * travels with the rename and only ever coexists with a full file set), then
-   * rename the staging dir onto the final path. A pre-existing final dir here is
-   * an incomplete/legacy copy — a complete one already short-circuited — so it is
-   * removed first, otherwise the rename would fail with ENOTEMPTY.
+   * Download one manifest file into staging and verify the STAGED bytes against
+   * the manifest (size + strongest advertised identity — the same check resume
+   * uses). A mismatch drops the bad copy and re-fetches, bounded by
+   * {@link MAX_VERIFY_ATTEMPTS}; exhaustion throws so the job errors rather than
+   * publishing unverified content. A hard download error propagates immediately
+   * (not a corruption to retry). Returns the final attempt's byte context.
+   */
+  private async downloadVerifiedFile(
+    repo: { type: 'model'; name: string },
+    revision: string,
+    file: ListFileEntry,
+    destPath: string,
+    meta: { jobBaseBytes: number; fileIndex: number; fileCount: number },
+  ): Promise<FileContext> {
+    let context: FileContext | null = null;
+    for (let attempt = 1; attempt <= MAX_VERIFY_ATTEMPTS; attempt++) {
+      context = {
+        filePath: file.path,
+        fileSize: file.size,
+        fileIndex: meta.fileIndex,
+        fileCount: meta.fileCount,
+        jobBaseBytes: meta.jobBaseBytes,
+        perUrl: new Map(),
+        received: 0,
+      };
+      this.currentFile = context;
+      try {
+        const snapshotPath = await downloadFileToCacheDir({
+          repo,
+          path: file.path,
+          revision,
+          cacheDir: this.cacheDir,
+          fetch: this.wrappedFetch,
+        });
+        await mkdir(dirname(destPath), { recursive: true });
+        await copyFile(snapshotPath, destPath);
+      } finally {
+        this.currentFile = null;
+      }
+
+      if (await isStagedCopyComplete(destPath, file)) return context;
+      // Content did not match the manifest: drop it and re-fetch (bounded).
+      await rm(destPath, { force: true });
+    }
+    throw new Error(`Downloaded file "${file.path}" failed content verification after ${MAX_VERIFY_ATTEMPTS} attempts`);
+  }
+
+  /** Remove staged files absent from the manifest (our marker is exempt). */
+  private async pruneToManifest(stagingDir: string, files: ListFileEntry[]): Promise<void> {
+    const manifestPaths = new Set(files.map((file) => file.path));
+    for (const rel of await listStagedFiles(stagingDir)) {
+      if (rel === DOWNLOAD_COMPLETE_MARKER || manifestPaths.has(rel)) continue;
+      await rm(join(stagingDir, rel), { force: true });
+    }
+  }
+
+  /**
+   * Publish staging onto the final path without ever destroying a checkpoint the
+   * downloader does not own. The completion marker is written as the LAST staged
+   * step (so it travels with the rename and only coexists with a full, verified
+   * set). Then:
+   *   - final dir absent → rename staging → final (+ fsync parent);
+   *   - final dir present but UNOWNED (no marker) and no `overwrite` → refuse,
+   *     leaving that dir and its files untouched;
+   *   - otherwise (OWNED, or explicit `overwrite`) → rollback-safe swap: move the
+   *     existing dir to a temp backup, rename staging → final, fsync the parent,
+   *     and only then remove the backup; if the swap rename fails, restore the
+   *     backup so a crash never leaves the model missing.
    */
   private async publish(
     stagingDir: string,
@@ -399,7 +524,17 @@ export class DownloadManager {
     repo: string,
     revision: string,
     files: ListFileEntry[],
+    overwrite: boolean,
   ): Promise<void> {
+    await mkdir(dirname(finalDir), { recursive: true });
+
+    if (existsSync(finalDir) && !isDownloaderOwned(finalDir) && !overwrite) {
+      throw new Error(
+        `Refusing to overwrite "${finalDir}": it was not created by the dashboard downloader. ` +
+          `Remove it manually (or re-run with overwrite) to reinstall.`,
+      );
+    }
+
     const marker: DownloadCompletion = {
       repo,
       revision,
@@ -407,9 +542,26 @@ export class DownloadManager {
       completedAt: new Date().toISOString(),
     };
     await writeFile(join(stagingDir, DOWNLOAD_COMPLETE_MARKER), `${JSON.stringify(marker, null, 2)}\n`);
-    await mkdir(dirname(finalDir), { recursive: true });
-    await rm(finalDir, { recursive: true, force: true });
-    await rename(stagingDir, finalDir);
+
+    if (!existsSync(finalDir)) {
+      await rename(stagingDir, finalDir);
+      await fsyncDir(dirname(finalDir));
+      return;
+    }
+
+    // Rollback-safe swap of an owned (or explicitly overwritten) final dir. The
+    // backup lives under `.staging` (a dotdir skipped by model discovery) so a
+    // crash mid-swap never surfaces it as a phantom model.
+    const backupDir = join(this.modelsDir, '.staging', `${basename(finalDir)}.backup-${randomUUID()}`);
+    await rename(finalDir, backupDir);
+    try {
+      await rename(stagingDir, finalDir);
+    } catch (error) {
+      await rename(backupDir, finalDir).catch(() => {});
+      throw error;
+    }
+    await fsyncDir(dirname(finalDir));
+    await rm(backupDir, { recursive: true, force: true });
   }
 
   private emitFileProgress(

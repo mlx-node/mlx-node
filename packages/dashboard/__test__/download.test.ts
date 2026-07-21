@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -40,6 +40,24 @@ const hub = vi.hoisted(() => ({
   /** Paths whose `downloadFileToCacheDir` should throw, to simulate a mid-job failure. */
   failOn: [] as string[],
 }));
+
+// Injectable fault for `rename`: when the source path equals `failFromPath`, the
+// call throws — used to exercise the publish swap's rollback (the staging→final
+// rename fails, the backup→final rollback must restore the original).
+const renameFault = vi.hoisted(() => ({ failFromPath: null as string | null }));
+
+vi.mock('node:fs/promises', async (importActual) => {
+  const actual = await importActual<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    rename: async (from: string, to: string) => {
+      if (renameFault.failFromPath !== null && String(from) === renameFault.failFromPath) {
+        throw new Error(`simulated rename failure moving ${String(from)}`);
+      }
+      return actual.rename(from, to);
+    },
+  };
+});
 
 vi.mock('@huggingface/hub', () => ({
   modelInfo: async (params: { revision?: string }) => {
@@ -103,8 +121,9 @@ let cacheDir: string;
 function finalDir(): string {
   return join(modelsDir, SLUG);
 }
-function stagingDir(): string {
-  return join(modelsDir, '.staging', SLUG);
+/** Staging is revision-scoped (`<slug>@<sha>`); defaults to the current stubbed sha. */
+function stagingDir(revision: string = hub.sha): string {
+  return join(modelsDir, '.staging', `${SLUG}@${revision}`);
 }
 
 beforeEach(() => {
@@ -117,6 +136,7 @@ beforeEach(() => {
   hub.sha = 'commit-deadbeef';
   hub.revisions = [];
   hub.failOn = [];
+  renameFault.failFromPath = null;
   modelsDir = mkdtempSync(join(tmpdir(), 'dash-dl-models-'));
   cacheDir = mkdtempSync(join(tmpdir(), 'dash-dl-cache-'));
 });
@@ -348,6 +368,173 @@ describe('DownloadManager', () => {
 
     expect(hub.downloaded).toContain('model.safetensors');
     expect(hub.downloaded).not.toContain('config.json');
+  });
+
+  it('refuses to overwrite an unowned existing dir and leaves it intact', async () => {
+    // A valid checkpoint placed manually / by `mlx download` — no completion
+    // marker, so the downloader does not own it.
+    mkdirSync(finalDir(), { recursive: true });
+    writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(finalDir(), 'model.safetensors'), Buffer.alloc(300, 0xab));
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
+
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+    // The manual files are byte-for-byte intact and no marker was written into them.
+    expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+    expect(readFileSync(join(finalDir(), 'model.safetensors'))).toEqual(Buffer.alloc(300, 0xab));
+    expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(false);
+    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
+  });
+
+  it('replaces an unowned dir only when overwrite is explicitly requested', async () => {
+    mkdirSync(finalDir(), { recursive: true });
+    writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xab));
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const id = manager.start(REPO, { overwrite: true });
+    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+
+    // The freshly downloaded (zero-byte) content replaced the manual 0xAB copy.
+    expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12));
+    expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
+    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
+  });
+
+  it('restores the original owned dir when the publish swap rename fails', async () => {
+    // An OWNED but incomplete dir (marker lists a file that is missing) → not
+    // "installed", so the job proceeds to re-download and reach the publish swap.
+    mkdirSync(finalDir(), { recursive: true });
+    writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(
+      join(finalDir(), DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({
+        repo: REPO,
+        revision: 'older',
+        files: ['config.json', 'model.safetensors'],
+        completedAt: 'x',
+      }),
+    );
+
+    // Fault the staging→final rename so the swap fails AFTER the backup move.
+    renameFault.failFromPath = stagingDir();
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
+
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+    // Original owned dir restored intact: its 0xAB config and old marker survive.
+    expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+    const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
+      revision: string;
+    };
+    expect(marker.revision).toBe('older');
+    // No orphaned backup dir left under modelsDir/.staging.
+    const leftovers = readdirSync(join(modelsDir, '.staging')).filter((n) => n.includes('.backup-'));
+    expect(leftovers).toEqual([]);
+  });
+
+  it('errors without publishing when downloaded bytes never match the manifest hash', async () => {
+    hub.manifest = [
+      { type: 'file', path: 'config.json', size: 12 },
+      // lfs.oid deliberately WRONG (sha256 of different content); the downloaded
+      // 300 zero-bytes can never match it → post-copy verification always fails.
+      {
+        type: 'file',
+        path: 'model.safetensors',
+        size: 300,
+        lfs: { oid: zerosSha256(299), size: 300, pointerSize: 100 },
+      },
+    ];
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
+
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+    // The mismatching file was re-fetched (bounded) before the job gave up.
+    expect(hub.downloaded.filter((p) => p === 'model.safetensors').length).toBeGreaterThan(1);
+    // No publish, no marker, catalog reports not-installed.
+    expect(existsSync(finalDir())).toBe(false);
+    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
+  });
+
+  it('prunes a staged file absent from the manifest so it is not published', async () => {
+    // A stale weight left in staging by an earlier run, not in the current manifest.
+    mkdirSync(stagingDir(), { recursive: true });
+    writeFileSync(join(stagingDir(), 'stale.safetensors'), Buffer.alloc(50, 0x7));
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const id = manager.start(REPO);
+    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+
+    // The stale file was removed; the published set is exactly the manifest.
+    expect(existsSync(join(finalDir(), 'stale.safetensors'))).toBe(false);
+    expect(existsSync(join(finalDir(), 'config.json'))).toBe(true);
+    expect(existsSync(join(finalDir(), 'model.safetensors'))).toBe(true);
+    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
+  });
+
+  it('does not reuse another revision staged files across a revision change', async () => {
+    // An interrupted OLDER revision left a single-file weight in its own staging.
+    const oldRev = 'commit-oldrev';
+    mkdirSync(stagingDir(oldRev), { recursive: true });
+    writeFileSync(join(stagingDir(oldRev), 'model.safetensors'), Buffer.alloc(999, 0x9));
+
+    // The current revision is SHARDED — no single-file `model.safetensors`.
+    hub.sha = 'commit-newrev';
+    hub.manifest = [
+      { type: 'file', path: 'config.json', size: 12 },
+      { type: 'file', path: 'model-00001-of-00002.safetensors', size: 100 },
+      { type: 'file', path: 'model-00002-of-00002.safetensors', size: 100 },
+    ];
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({
+        'config.json': 12,
+        'model-00001-of-00002.safetensors': 100,
+        'model-00002-of-00002.safetensors': 100,
+      }),
+    });
+    const id = manager.start(REPO);
+    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+
+    // The stale single-file weight never enters the new sharded install.
+    expect(existsSync(join(finalDir(), 'model.safetensors'))).toBe(false);
+    expect(existsSync(join(finalDir(), 'model-00001-of-00002.safetensors'))).toBe(true);
+    expect(existsSync(join(finalDir(), 'model-00002-of-00002.safetensors'))).toBe(true);
+    // The old revision staging dir is a separate scope, left untouched.
+    expect(existsSync(join(stagingDir(oldRev), 'model.safetensors'))).toBe(true);
   });
 
   it('replays the last event to a late subscriber', async () => {

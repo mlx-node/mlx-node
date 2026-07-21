@@ -87,6 +87,25 @@ export function isModelInstalled(modelDir: string): boolean {
   return marker.files.every((file) => typeof file === 'string' && existsSync(join(modelDir, file)));
 }
 
+/**
+ * Whether a directory was written by the dashboard downloader — i.e. it carries
+ * a parseable completion marker of our shape. Distinct from {@link isModelInstalled}:
+ * ownership does NOT require every listed file to still be present (a partial,
+ * mid-upgrade owned dir is still ours). The downloader uses this to decide
+ * whether it may overwrite a final dir: a dir WITHOUT our marker was placed by a
+ * human or by `mlx download` and must never be destroyed.
+ */
+export function isDownloaderOwned(modelDir: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(join(modelDir, DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as unknown;
+  } catch {
+    return false;
+  }
+  const marker = asObject(parsed);
+  return marker !== undefined && Array.isArray(marker.files);
+}
+
 function asObject(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
