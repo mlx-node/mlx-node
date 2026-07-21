@@ -567,6 +567,63 @@ describe('makeMlxStreamSimple', () => {
     expect(recorded?.final.cachedTokens).toBe(4);
   });
 
+  it('fires onTurnStart inside the serialized closure before any session work (11a snapshot point)', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent({ text: 'ok' });
+      },
+    ]);
+    let logAtStart: string[] | undefined;
+    const onTurnStart = vi.fn(() => {
+      logAtStart = [...session.log];
+    });
+
+    await collect(
+      makeMlxStreamSimple(makeFakeHost(session), undefined, undefined, undefined, onTurnStart)(MODEL, CONTEXT),
+    );
+
+    expect(onTurnStart).toHaveBeenCalledOnce();
+    // The cold-stats snapshot must be taken BEFORE this turn's native work
+    // (prime/prefill/decode) so the recorded delta covers only this turn.
+    expect(logAtStart).toContain('fn1-start:qwen-small');
+    expect(logAtStart).not.toContain('prime');
+    expect(logAtStart).not.toContain('stream-created');
+  });
+
+  it('does not fire onTurnStart for a turn terminated while queued (no native work)', async () => {
+    const session = new FakeChatSession([]);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const host: StreamSimpleHost = {
+      modelInfo: () => DISCOVERED,
+      ...dirtyStubs(),
+      async runWithResident<T>(_modelId: string, fn: (s: ChatSession) => Promise<T>): Promise<T> {
+        await gate;
+        return fn(session.asChatSession());
+      },
+    };
+    const controller = new AbortController();
+    const onTurnStart = vi.fn();
+    const stream = makeMlxStreamSimple(
+      host,
+      undefined,
+      undefined,
+      undefined,
+      onTurnStart,
+    )(MODEL, CONTEXT, { signal: controller.signal });
+    controller.abort(); // abort while queued — the resident closure has not run
+
+    await collect(stream);
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The turn did no native work, so no cold baseline should have been taken.
+    expect(onTurnStart).not.toHaveBeenCalled();
+  });
+
   it('does not record a turn when the native stream errors before a final', async () => {
     const session = new FakeChatSession([
       // eslint-disable-next-line @typescript-eslint/require-await

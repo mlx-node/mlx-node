@@ -17,6 +17,7 @@ export interface TraceIngestResult {
 interface ParsedTrace {
   traceId?: unknown;
   sessionId?: unknown;
+  rootSessionId?: unknown;
   ts?: unknown;
   model?: unknown;
   ttftMs?: unknown;
@@ -115,6 +116,7 @@ export async function ingestTraces(
         .values({
           traceId: rec.traceId,
           sessionId: strOrNull(rec.sessionId),
+          rootSessionId: strOrNull(rec.rootSessionId),
           ts: ts ?? 0,
           model: strOrNull(rec.model),
           ttftMs: numOrNull(rec.ttftMs),

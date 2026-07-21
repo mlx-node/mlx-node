@@ -20,12 +20,16 @@ import type { DiscoveredModelLike } from '../types.js';
 /** Per-load policy handed to {@link MlxModelHostOptions.resolveModelPathFn}. */
 export interface ModelLoadPolicy {
   /**
-   * Ask the config overlay to persist this model's paged prefix blocks to the
-   * SSD cold tier (`persist_paged_cache` in the cloned config.json). Set only
-   * for qwen3-family loads, and only when {@link MlxModelHostOptions.persistPagedCache}
-   * is enabled — omitted entirely otherwise, so no other family ever sees it.
+   * Authoritative cold-tier directive for the config overlay
+   * (`persist_paged_cache` in the cloned config.json). Present ONLY for
+   * qwen3-family loads, carrying the resolved {@link MlxModelHostOptions.persistPagedCache}
+   * value as an EXPLICIT boolean: `true` enables the SSD cold tier, `false`
+   * authoritatively disables it — overriding any `persist_paged_cache` the
+   * checkpoint's own config.json hard-codes, so `mlx agent --no-persist-cache`
+   * truly wins. Non-qwen3 families receive no policy at all, so the overlay
+   * never touches the field for them.
    */
-  persistPagedCache: true;
+  persistPagedCache: boolean;
 }
 
 export interface MlxModelHostOptions {
@@ -131,13 +135,15 @@ export class MlxModelHost {
         session = this.resident.session;
       } else {
         this.resident = null;
-        // Only qwen3 dense has a sound paged cold restore; gate the persist
-        // opt-in on the already-known discovery type so no other family clones
-        // a config carrying the flag.
-        const persistColdTier = this.persistPagedCache && entry.modelType === 'qwen3';
-        const resolvedPath = persistColdTier
-          ? await this.resolveModelPathFn(entry, { persistPagedCache: true })
-          : await this.resolveModelPathFn(entry);
+        // Only qwen3 dense has a sound paged cold restore. Hand it an EXPLICIT
+        // tri-state directive so the overlay can authoritatively set the flag
+        // either way (default-on, or `--no-persist-cache` off — overriding any
+        // value in the checkpoint's config.json). Every other family gets no
+        // policy at all, so the overlay never touches the field for them.
+        const resolvedPath =
+          entry.modelType === 'qwen3'
+            ? await this.resolveModelPathFn(entry, { persistPagedCache: this.persistPagedCache })
+            : await this.resolveModelPathFn(entry);
         const model = await this.loadModelFn(resolvedPath);
         const sessionModel = model as unknown as SessionCapableModel;
         const gemmaDraftActive = entry.modelType === 'gemma4' && sessionModel.hasMtpWeights?.() === true;

@@ -338,7 +338,7 @@ describe('MlxModelHost', () => {
       expect(resolveModelPathFn.mock.calls[0]).toEqual([QWEN3, { persistPagedCache: true }]);
     });
 
-    it('omits persistence when the host option is disabled', async () => {
+    it('passes an authoritative persist-off policy for qwen3 when disabled', async () => {
       const resolveModelPathFn = trackingResolver();
       const host = new MlxModelHost(HOST_MODELS, {
         loadModelFn: makeLoader(),
@@ -348,8 +348,10 @@ describe('MlxModelHost', () => {
 
       await getSession(host, 'qwen3-dense');
 
-      // No policy object at all — the disabled flag must not surface as `false`.
-      expect(resolveModelPathFn.mock.calls[0]).toEqual([QWEN3]);
+      // Tri-state: qwen3 always carries an EXPLICIT policy so the overlay can
+      // authoritatively override a checkpoint whose config.json hard-codes
+      // persistence on. Disabled must surface as `false`, not as omission.
+      expect(resolveModelPathFn.mock.calls[0]).toEqual([QWEN3, { persistPagedCache: false }]);
     });
 
     it('never requests persistence for a non-qwen3 family', async () => {

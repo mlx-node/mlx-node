@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS traces (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   trace_id TEXT NOT NULL UNIQUE,
   session_id TEXT,
+  root_session_id TEXT,
   ts INTEGER NOT NULL,
   model TEXT,
   ttft_ms REAL,
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS traces (
 
 CREATE INDEX IF NOT EXISTS idx_turns_session_id ON turns (session_id);
 CREATE INDEX IF NOT EXISTS idx_traces_session_id ON traces (session_id);
+CREATE INDEX IF NOT EXISTS idx_traces_root_session_id ON traces (root_session_id);
 CREATE INDEX IF NOT EXISTS idx_traces_trace_id ON traces (trace_id);
 `;
 

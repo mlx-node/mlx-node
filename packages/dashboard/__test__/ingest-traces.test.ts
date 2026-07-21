@@ -66,6 +66,33 @@ describe('ingestTraces', () => {
     expect(a.coldBytesRestored).toBe(2048);
   });
 
+  // Finding 11b: a subagent turn's root session id must survive ingest so the
+  // root session's metrics view can include its delegated children.
+  it('stores root_session_id from a subagent trace record', async () => {
+    cpSync(FIXTURE_TRACES, dir, { recursive: true });
+    writeFileSync(
+      join(dir, '2026-07-02-child.jsonl'),
+      `${JSON.stringify({
+        v: 1,
+        traceId: 'trace-child',
+        ts: 1782036302000,
+        sessionId: 'child-x',
+        rootSessionId: 'root-r',
+        model: 'qwen3_5',
+        durationMs: 10,
+        finishReason: 'stop',
+        promptTokens: 1,
+        cachedTokens: 0,
+        outputTokens: 1,
+        reasoningTokens: 0,
+      })}\n`,
+    );
+    await ingestTraces(dash, dir);
+    const row = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-child')).all()[0];
+    expect(row.sessionId).toBe('child-x');
+    expect(row.rootSessionId).toBe('root-r');
+  });
+
   it('is idempotent on duplicate traceId', async () => {
     cpSync(FIXTURE_TRACES, dir, { recursive: true });
     await ingestTraces(dash, dir);

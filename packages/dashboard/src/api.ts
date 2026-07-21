@@ -574,16 +574,20 @@ function handleSessionMetrics({ res, params, deps }: RouteCtx): void {
        ORDER BY t.ts`,
     )
     .all(params.id);
+  // Include this session's own turns AND any subagent turns delegated under it:
+  // a child (subagent) trace carries no persisted session JSONL, but its
+  // root_session_id points back here (Finding 11b).
   const traceRows = deps.dash.sqlite
     .prepare(
-      `SELECT trace_id AS traceId, ts, model, ttft_ms AS ttftMs, prefill_tps AS prefillTps,
+      `SELECT trace_id AS traceId, session_id AS sessionId, root_session_id AS rootSessionId,
+              ts, model, ttft_ms AS ttftMs, prefill_tps AS prefillTps,
               decode_tps AS decodeTps, mtp_cycles AS mtpCycles, mtp_mean_accepted AS mtpMeanAccepted,
               duration_ms AS durationMs, finish_reason AS finishReason,
               cold_hits AS coldHits, cold_misses AS coldMisses,
               cold_bytes_written AS coldBytesWritten, cold_bytes_restored AS coldBytesRestored
-       FROM traces WHERE session_id = ? ORDER BY ts`,
+       FROM traces WHERE session_id = ? OR root_session_id = ? ORDER BY ts`,
     )
-    .all(params.id);
+    .all(params.id, params.id);
   sendJson(res, 200, { sessionId: params.id, turns: turnRows, traces: traceRows });
 }
 

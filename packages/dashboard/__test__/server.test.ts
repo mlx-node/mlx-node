@@ -192,6 +192,37 @@ describe('dashboard server — sessions', () => {
     expect(traced).toBeDefined();
     expect(traced?.ttftMs).toBeCloseTo(120.5, 1);
   });
+
+  // Finding 11b: a subagent (child) turn has no persisted session JSONL of its
+  // own; its trace carries rootSessionId. The root session's metrics view must
+  // surface it via root_session_id, not only its own session_id.
+  it('includes subagent traces under the root session metrics', async () => {
+    writeFileSync(
+      join(tracesDir, '2026-07-02-child.jsonl'),
+      `${JSON.stringify({
+        v: 1,
+        traceId: 'trace-child',
+        ts: 1782036302000,
+        sessionId: 'child-of-fix-1',
+        rootSessionId: 'fix-1',
+        model: 'qwen3_5',
+        durationMs: 10,
+        finishReason: 'stop',
+        promptTokens: 1,
+        cachedTokens: 0,
+        outputTokens: 1,
+        reasoningTokens: 0,
+      })}\n`,
+    );
+    await ingest();
+    const res = await fetch(`${server.url}/api/sessions/fix-1/metrics`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { traces: Array<{ traceId: string }> };
+    const traceIds = body.traces.map((t) => t.traceId);
+    // Both the root's own trace (session_id match) and the child's (root match).
+    expect(traceIds).toContain('trace-aaa');
+    expect(traceIds).toContain('trace-child');
+  });
 });
 
 describe('dashboard server — metrics overview', () => {

@@ -178,6 +178,7 @@ export function makeMlxStreamSimple(
   onPerformance?: PerformanceRecorder,
   resolveRootCacheOwner?: RootCacheOwnerResolver,
   onTurnRecord?: TurnRecorder,
+  onTurnStart?: () => void,
 ): (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream {
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
@@ -301,6 +302,19 @@ export function makeMlxStreamSimple(
         // between stages below): the terminal already went out — skip ALL
         // session work (no warm-reset, no prime, no stream).
         if (terminated) return;
+        // Serialized-turn start: fire before any native work so a metrics
+        // consumer can snapshot process-wide cold-tier counters here and diff
+        // them at the success terminal. Because turns are serialized, a prior
+        // turn that aborted/errored has already fully drained by now, so its
+        // activity is baked into this snapshot and never attributed to this
+        // turn's delta. Best-effort — a throwing hook must not break inference.
+        if (onTurnStart) {
+          try {
+            onTurnStart();
+          } catch {
+            // Telemetry snapshot is best-effort; never break inference.
+          }
+        }
         publishEffectiveContextWindow(model, session);
         const supportsImages = publishImageCapability(model, session);
         const discovered = host.modelInfo(model.id);

@@ -33,6 +33,14 @@ function safeColdStats(): ColdCacheStats | undefined {
   }
 }
 
+/** Injectable seams for {@link createMlxProviderExtension} (unit tests). */
+export interface MlxProviderExtensionDeps {
+  /** Process-wide cold-tier reader; defaults to the native addon (absent in unit tests). */
+  coldStats?: () => ColdCacheStats | undefined;
+  /** Durable per-turn telemetry sink; defaults to a fresh {@link MetricsTrace}. */
+  metricsTrace?: MetricsTrace;
+}
+
 /**
  * Build the `mlx-provider` inline extension serving `models`. The host
  * (one per process — it owns the single GPU-resident model) is created
@@ -40,22 +48,34 @@ function safeColdStats(): ColdCacheStats | undefined {
  * host, but stays lazy about weights: nothing loads until the first
  * `streamSimple` call.
  */
-export function createMlxProviderExtension(models: MlxModelInfo[], host?: MlxModelHost): InlineExtension {
+export function createMlxProviderExtension(
+  models: MlxModelInfo[],
+  host?: MlxModelHost,
+  deps: MlxProviderExtensionDeps = {},
+): InlineExtension {
   const resolvedHost = host ?? new MlxModelHost(models.map((m) => m.discovered));
   const performanceStatus = new PerformanceStatus();
-  const metricsTrace = new MetricsTrace();
+  const metricsTrace = deps.metricsTrace ?? new MetricsTrace();
+  const readColdStats = deps.coldStats ?? safeColdStats;
   // This closure outlives Pi runtime replacement. Pi creates a replacement
   // runtime for /new and /resume and reruns inline extension factories; each
   // new factory's session_start updates the root while child sessions keep
   // using this registered stream.
   let rootCacheOwnerId: string | undefined;
 
-  // Cold-tier counters are cumulative since the tier opened. Keep the prior
-  // snapshot so each turn records its own delta. Inference is serialized per
-  // process (host promise chain), so the SYNCHRONOUS counters (hits/misses/
-  // bytesRestored) are exact per-turn; bytesWritten advances on the async
-  // writer thread, so its delta is approximate (documented on the record).
-  let prevCold = safeColdStats();
+  // Cold-tier counters are cumulative since the tier opened. Snapshot them at
+  // each turn's native start (`onTurnStart`, fired inside the serialized host
+  // closure) and diff at the success terminal, so a turn that aborted or
+  // errored — which never reaches `onTurnRecord` — can't leak its restores into
+  // the next successful turn's delta. Inference is serialized per process (host
+  // promise chain), so by the time a turn snapshots, any prior turn has fully
+  // drained. The SYNCHRONOUS counters (hits/misses/bytesRestored) are exact
+  // per-turn; bytesWritten advances on the async writer thread, so its delta is
+  // approximate (documented on the record).
+  let turnStartCold = readColdStats();
+  const onTurnStart = (): void => {
+    turnStartCold = readColdStats();
+  };
   const onTurnRecord: TurnRecorder = ({ traceId, sessionId, model, final, durationMs }) => {
     const rec: Omit<MetricsTraceRecord, 'v' | 'rootSessionId' | 'rootSessionFile'> = {
       traceId,
@@ -78,14 +98,13 @@ export function createMlxProviderExtension(models: MlxModelInfo[], host?: MlxMod
       // mlx-vlm-comparable headline accept rate (committed tokens per cycle).
       rec.mtpMeanAccepted = perf.mtpMeanAcceptedTokensTotal;
     }
-    const cold = safeColdStats();
-    if (cold && prevCold) {
-      rec.coldHits = cold.hits - prevCold.hits;
-      rec.coldMisses = cold.misses - prevCold.misses;
-      rec.coldBytesWritten = cold.bytesWritten - prevCold.bytesWritten;
-      rec.coldBytesRestored = cold.bytesRestored - prevCold.bytesRestored;
+    const cold = readColdStats();
+    if (cold && turnStartCold) {
+      rec.coldHits = cold.hits - turnStartCold.hits;
+      rec.coldMisses = cold.misses - turnStartCold.misses;
+      rec.coldBytesWritten = cold.bytesWritten - turnStartCold.bytesWritten;
+      rec.coldBytesRestored = cold.bytesRestored - turnStartCold.bytesRestored;
     }
-    if (cold) prevCold = cold;
     metricsTrace.record(rec);
   };
 
@@ -94,6 +113,7 @@ export function createMlxProviderExtension(models: MlxModelInfo[], host?: MlxMod
     performanceStatus.record,
     () => rootCacheOwnerId,
     onTurnRecord,
+    onTurnStart,
   );
   return {
     name: 'mlx-provider',

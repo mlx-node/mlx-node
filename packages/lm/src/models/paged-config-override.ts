@@ -68,10 +68,13 @@ export class PagedConfigOverrideManager {
    * type (for example, `gemma4` for a `gemma4_unified` checkpoint).
    * Unmanaged, unreadable, or malformed checkpoints pass through unchanged.
    *
-   * `persistPagedCache` additionally writes `persist_paged_cache: true` into the
-   * cloned config so the native loader enables its SSD cold tier. Callers gate
-   * this to families with a sound paged cold restore (qwen3 dense); it forces a
-   * clone even for an already-paged checkpoint so the flag actually lands.
+   * `persistPagedCache` is a tri-state cold-tier directive. `undefined` leaves
+   * the field untouched (families with no cold-tier opt-in). A boolean is
+   * AUTHORITATIVE: it writes `persist_paged_cache: <value>` into the cloned
+   * config, overriding whatever the source config.json carries (either alias),
+   * and forces a clone whenever the source's value disagrees so the directive
+   * actually reaches the loader. Callers gate the boolean to families with a
+   * sound paged cold restore (qwen3 dense).
    */
   async resolve(modelPath: string, canonicalModelType?: string, persistPagedCache?: boolean): Promise<string> {
     if (this.disposed) {
@@ -106,9 +109,12 @@ export class PagedConfigOverrideManager {
       return modelPath;
     }
 
-    // A persist request must reach the loader through the config clone; only
-    // skip the clone when the source already carries the flag.
-    const persistNeeded = persistPagedCache === true && config.persist_paged_cache !== true;
+    // A boolean persist directive is authoritative: force a clone whenever the
+    // source config's value disagrees, so the directive actually reaches the
+    // loader (both `--no-persist-cache` off AND default-on). Consider BOTH alias
+    // spellings so a stray value in either can never leak past an override.
+    const sourcePersist = config.persist_paged_cache === true || config.persistPagedCache === true;
+    const persistOverrideNeeded = persistPagedCache !== undefined && persistPagedCache !== sourcePersist;
 
     // Gemma4's DSpark / assistant speculative executor currently owns flat KV
     // caches. Preserve native draft discovery only for explicit callers; the
@@ -125,16 +131,17 @@ export class PagedConfigOverrideManager {
     const memorySatisfied = cacheFloorMb === undefined || (configuredMemoryMb ?? 0) >= cacheFloorMb;
     // Even an already-paged Gemma config must be cloned when `draft/` exists:
     // returning the source would expose the draft to native auto-discovery and
-    // trigger the flat-speculation/paged-cache conflict. An outstanding persist
-    // request likewise blocks the pass-through so the flag reaches the loader.
-    if (pagedEnabled && memorySatisfied && !hasEmbeddedGemmaDraft && !persistNeeded) {
+    // trigger the flat-speculation/paged-cache conflict. An authoritative
+    // persist directive that disagrees with the source likewise blocks the
+    // pass-through so the resolved value reaches the loader.
+    if (pagedEnabled && memorySatisfied && !hasEmbeddedGemmaDraft && !persistOverrideNeeded) {
       return modelPath;
     }
 
     const existing = this.overrides.get(sourcePath);
     if (existing !== undefined) return existing;
 
-    const pending = this.createOverride(sourcePath, config, cacheFloorMb, modelType, persistPagedCache === true);
+    const pending = this.createOverride(sourcePath, config, cacheFloorMb, modelType, persistPagedCache);
     this.overrides.set(sourcePath, pending);
     try {
       return await pending;
@@ -170,7 +177,7 @@ export class PagedConfigOverrideManager {
     sourceConfig: Record<string, unknown>,
     cacheFloorMb: number | undefined,
     modelType: string,
-    persistPagedCache: boolean,
+    persistPagedCache: boolean | undefined,
   ): Promise<string> {
     const root = await this.getRoot();
     const overrideDir = await mkdtemp(join(root, 'model-'));
@@ -179,8 +186,12 @@ export class PagedConfigOverrideManager {
       ...sourceConfig,
       use_block_paged_cache: true,
     };
-    if (persistPagedCache) {
-      config.persist_paged_cache = true;
+    if (persistPagedCache !== undefined) {
+      // Authoritative: the loader reads snake_case, so that spelling is the one
+      // that decides persistence. Reconcile a stray camelCase alias spread from
+      // the source config so it can never contradict the authoritative value.
+      config.persist_paged_cache = persistPagedCache;
+      if ('persistPagedCache' in config) config.persistPagedCache = persistPagedCache;
     }
     if (cacheFloorMb !== undefined) {
       config.paged_cache_memory_mb = Math.max(positiveNumber(sourceConfig.paged_cache_memory_mb) ?? 0, cacheFloorMb);

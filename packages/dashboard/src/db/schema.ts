@@ -30,6 +30,8 @@ export const traces = sqliteTable('traces', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   traceId: text('trace_id').notNull().unique(),
   sessionId: text('session_id'),
+  /** Root pi session id (subagent turns correlate to their delegating root). */
+  rootSessionId: text('root_session_id'),
   ts: integer('ts').notNull(),
   model: text('model'),
   ttftMs: real('ttft_ms'),

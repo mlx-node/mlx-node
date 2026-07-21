@@ -71,4 +71,43 @@ describe('PagedConfigOverrideManager persist-paged-cache', () => {
     const config = await readOverrideConfig(resolved);
     expect(config.persist_paged_cache).toBe(true);
   });
+
+  // Finding 9: an explicit `false` directive is AUTHORITATIVE — it must override
+  // a checkpoint whose config.json hard-codes persistence on, so
+  // `mlx agent --no-persist-cache` truly wins.
+  it('writes an authoritative persist_paged_cache: false over a persist-enabled checkpoint', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3', persist_paged_cache: true });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const resolved = await manager.resolve(source, 'qwen3', false);
+    // A clone is forced so the false actually reaches the loader.
+    expect(resolved).not.toBe(source);
+    const config = await readOverrideConfig(resolved);
+    expect(config.persist_paged_cache).toBe(false);
+  });
+
+  it('reconciles a stray camelCase persistPagedCache alias to the authoritative value', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3', persistPagedCache: true });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const resolved = await manager.resolve(source, 'qwen3', false);
+    expect(resolved).not.toBe(source);
+    const config = await readOverrideConfig(resolved);
+    // Both spellings agree on the authoritative false the loader will read.
+    expect(config.persist_paged_cache).toBe(false);
+    expect(config.persistPagedCache).toBe(false);
+  });
+
+  it('leaves persist untouched for an undirected (undefined) resolve', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3' });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const resolved = await manager.resolve(source, 'qwen3');
+    const config = await readOverrideConfig(resolved);
+    expect('persist_paged_cache' in config).toBe(false);
+    expect('persistPagedCache' in config).toBe(false);
+  });
 });

@@ -6,12 +6,32 @@ import type {
   ProviderConfig,
   SessionStartEvent,
 } from '@earendil-works/pi-coding-agent';
+import type { ColdCacheStats } from '@mlx-node/core';
 import type { ChatConfig, ChatSession, ChatStreamEvent } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { createMlxProviderExtension } from '../src/provider/index.js';
+import { MetricsTrace, type MetricsTraceRecord } from '../src/provider/metrics-trace.js';
 import type { MlxModelHost } from '../src/provider/model-host.js';
 import type { MlxModelInfo } from '../src/provider/models.js';
+
+/** A ColdCacheStats snapshot carrying only the counters the provider diffs. */
+function coldSnapshot(over: Partial<ColdCacheStats>): ColdCacheStats {
+  return {
+    enabled: true,
+    root: '',
+    quotaBytes: 0,
+    hits: 0,
+    misses: 0,
+    enqueued: 0,
+    queueDrops: 0,
+    bytesWritten: 0,
+    bytesRestored: 0,
+    evictions: 0,
+    corruptions: 0,
+    ...over,
+  };
+}
 
 function loadExtension(): {
   handlers: Map<string, (event: never, ctx: ExtensionContext) => void>;
@@ -156,5 +176,127 @@ describe('createMlxProviderExtension', () => {
       { cacheOwnerId: 'child-of-root-1', cacheRootOwnerId: 'root-1' },
       { cacheOwnerId: 'root-2', cacheRootOwnerId: 'root-2' },
     ]);
+  });
+
+  // Finding 11a: an aborted turn's cold-tier activity must not be attributed to
+  // the next successful turn. The recorded delta is computed against a snapshot
+  // taken at THIS turn's native start, so a prior aborted turn's restores are
+  // already baked into the baseline.
+  it('records only the successful turn own cold-cache deltas after an aborted turn', async () => {
+    const cold = { hits: 0, bytesRestored: 0 };
+    const readCold = (): ColdCacheStats => coldSnapshot(cold);
+
+    const controller = new AbortController();
+    const scripts: Array<(config: ChatConfig) => AsyncGenerator<ChatStreamEvent>> = [
+      // Turn 1: restores blocks (cold activity) then the user aborts — no record.
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        cold.hits = 5;
+        cold.bytesRestored = 500;
+        yield { text: 'partial', done: false };
+        controller.abort();
+      },
+      // Turn 2: its OWN restores, then a clean final — records here.
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        cold.hits = 8;
+        cold.bytesRestored = 800;
+        yield {
+          text: '',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 2,
+          promptTokens: 4,
+          reasoningTokens: 0,
+          rawText: '',
+          cachedTokens: 0,
+        };
+      },
+    ];
+    const session = {
+      inFlight: false,
+      history: [] as unknown[],
+      lastImagesKey: null,
+      lastAudioKey: null,
+      turnCount: 0,
+      unresolvedOkToolCallCount: null,
+      needsFullReplay: false,
+      contextLimits: () => undefined,
+      supportsImages: () => false,
+      primeHistory: () => undefined,
+      startFromHistoryStream(config: ChatConfig): AsyncGenerator<ChatStreamEvent> {
+        const script = scripts.shift();
+        if (!script) throw new Error('no script left');
+        return script(config);
+      },
+    } as unknown as ChatSession;
+
+    let chain: Promise<unknown> = Promise.resolve();
+    const host = {
+      modelInfo: () => ({ name: 'qwen', path: '/models/qwen', modelType: 'qwen3_5' }),
+      runWithResident<T>(_modelId: string, fn: (resident: ChatSession) => Promise<T>): Promise<T> {
+        const result = chain.then(() => fn(session));
+        chain = result.then(
+          () => undefined,
+          () => undefined,
+        );
+        return result;
+      },
+      markResidentDirty: () => undefined,
+      consumeResidentDirty: () => false,
+      invalidateResident: () => undefined,
+    } as unknown as MlxModelHost;
+
+    const modelInfo: MlxModelInfo = {
+      discovered: { name: 'qwen', path: '/models/qwen', modelType: 'qwen3_5' },
+      piModel: {
+        id: 'qwen',
+        name: 'qwen',
+        reasoning: true,
+        input: ['text'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 262144,
+        maxTokens: 8192,
+      },
+    };
+    const model: Model<Api> = { ...modelInfo.piModel, api: 'mlx', provider: 'mlx', baseUrl: 'mlx://local' };
+    const context: Context = { systemPrompt: '', messages: [] };
+
+    const trace = new MetricsTrace({ dir: '/tmp/mlx-11a-test' });
+    const records: Array<Omit<MetricsTraceRecord, 'v' | 'rootSessionId' | 'rootSessionFile'>> = [];
+    vi.spyOn(trace, 'record').mockImplementation((rec) => {
+      records.push(rec);
+    });
+
+    const extension = createMlxProviderExtension([modelInfo], host, { coldStats: readCold, metricsTrace: trace });
+    if (typeof extension === 'function') throw new Error('expected a named extension');
+    let provider: ProviderConfig | undefined;
+    const pi = {
+      registerProvider(_name: string, config: ProviderConfig): void {
+        provider = config;
+      },
+      on(): void {
+        // no lifecycle handlers needed for this test
+      },
+    } as unknown as ExtensionAPI;
+    void extension.factory(pi);
+    const streamSimple = provider?.streamSimple;
+    if (!streamSimple) throw new Error('provider did not register streamSimple');
+
+    // Turn 1: aborts mid-stream (records nothing).
+    for await (const _e of streamSimple(model, context, { sessionId: 's', signal: controller.signal })) {
+      // drain
+    }
+    // Turn 2: succeeds and records its own deltas.
+    for await (const _e of streamSimple(model, context, { sessionId: 's' })) {
+      // drain
+    }
+
+    expect(records).toHaveLength(1);
+    // Only turn 2's own activity: 8-5 hits, 800-500 restored — NOT 8 / 800.
+    expect(records[0].coldHits).toBe(3);
+    expect(records[0].coldBytesRestored).toBe(300);
   });
 });
