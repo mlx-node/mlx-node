@@ -83,17 +83,64 @@ interface DerivedSession {
 }
 
 /**
- * The active, compaction-aware branch the detail API renders — pi's
- * `buildContextEntries` follows the current leaf (the last appended entry) back
- * to the root, dropping abandoned tree branches. When that branch carries no
- * messages (e.g. a detached `session_info` leaf), fall back to every entry,
- * mirroring the detail API's own fallback so indexed turns never disagree with
- * a non-empty transcript.
+ * The active, compaction-aware branch both the index and the detail API render —
+ * pi's `buildContextEntries` follows the current leaf (the last appended entry)
+ * back to the root, dropping abandoned tree branches. When that natural leaf is
+ * metadata-only (e.g. a detached `session_info` leaf appended by a rename), it
+ * carries no messages; rather than flattening EVERY branch (which resurrects
+ * superseded turns), re-project from the latest message-bearing leaf so only its
+ * ancestors are indexed. A file with no message entries at all projects to none.
+ *
+ * Caller must have validated topology (`isValidSessionTopology`) first: this
+ * walks the parent chain, which would not terminate on a cyclic tree.
  */
-function activeBranchEntries(entries: FileEntry[]): SessionEntry[] {
+export function activeBranchEntries(entries: FileEntry[]): SessionEntry[] {
   const sessionEntries = entries.filter((e): e is SessionEntry => e.type !== 'session');
   const active = buildContextEntries(sessionEntries);
-  return active.some((e) => e.type === 'message') ? active : sessionEntries;
+  if (active.some((e) => e.type === 'message')) return active;
+  let lastMessageId: string | null = null;
+  for (const entry of sessionEntries) {
+    if (entry.type === 'message') lastMessageId = entry.id;
+  }
+  if (lastMessageId === null) return [];
+  return buildContextEntries(sessionEntries, lastMessageId);
+}
+
+/**
+ * Whether the session entry tree is safe to project. pi's branch walker follows
+ * `parentId` from the leaf to a root with no visited-set, so a self-parented
+ * entry, a multi-entry cycle, or a duplicate id (which aliases an ancestor) grows
+ * an unbounded path → hang/OOM. One damaged file is otherwise retried on every
+ * scan, wedging ingest. Reject: non-string / duplicate ids, and any leaf whose
+ * ancestor chain revisits an id or exceeds the entry count. A `parentId` that
+ * references no in-file entry is a root terminator (matches the walker), not a
+ * cycle.
+ */
+function isValidSessionTopology(entries: FileEntry[]): boolean {
+  const sessionEntries = entries.filter((e): e is SessionEntry => e.type !== 'session');
+  const byId = new Map<string, SessionEntry>();
+  for (const entry of sessionEntries) {
+    if (typeof entry.id !== 'string') return false;
+    if (byId.has(entry.id)) return false;
+    byId.set(entry.id, entry);
+  }
+  const bound = sessionEntries.length;
+  for (const start of sessionEntries) {
+    const visited = new Set<string>();
+    let current: SessionEntry | undefined = start;
+    let steps = 0;
+    while (current) {
+      if (visited.has(current.id)) return false;
+      visited.add(current.id);
+      if (++steps > bound) return false;
+      const parentId = current.parentId;
+      if (parentId === null || parentId === undefined) break;
+      const parent = byId.get(parentId);
+      if (parent === undefined) break;
+      current = parent;
+    }
+  }
+  return true;
 }
 
 /** Fold parsed file entries into the row shapes the index stores. Returns null when unusable. */
@@ -254,6 +301,13 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
         entries = parseSessionEntries(raw);
       } catch (err) {
         warnings.push(`${filePath}: parse failed (${String(err)})`);
+        continue;
+      }
+
+      // Quarantine a topologically broken tree (cycle / duplicate ids) BEFORE any
+      // branch projection: the walker would otherwise loop unbounded and OOM.
+      if (!isValidSessionTopology(entries)) {
+        warnings.push(`${filePath}: invalid session tree (cycle or duplicate entry id); skipped`);
         continue;
       }
 

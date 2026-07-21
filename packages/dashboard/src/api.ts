@@ -19,7 +19,7 @@ import { catalogWithState } from './catalog.js';
 import type { DashboardDb } from './db/open.js';
 import { sessions, turns } from './db/schema.js';
 import type { DownloadManager, DownloadEvent } from './download.js';
-import { verifySessionFileId } from './ingest/sessions.js';
+import { activeBranchEntries, verifySessionFileId } from './ingest/sessions.js';
 import { discoverLocalModels, deleteLocalModel } from './models.js';
 
 /** Runtime dependencies the handlers close over, supplied by `server.ts`. */
@@ -461,13 +461,12 @@ function handleSessionDetail({ res, params, deps }: RouteCtx): void {
   try {
     const manager = SessionManager.open(row.path);
     const isMessage = (entry: TranscriptEntry | null): entry is TranscriptEntry => entry !== null;
-    transcript = manager.buildContextEntries().map(mapTranscriptEntry).filter(isMessage);
-    // The active branch can be a detached `session_info` leaf (e.g. renamed
-    // sessions, or top-level info entries) that carries no messages. Fall back
-    // to the full entry list so a real conversation is never shown blank.
-    if (transcript.length === 0) {
-      transcript = manager.getEntries().map(mapTranscriptEntry).filter(isMessage);
-    }
+    // Project the SAME active, message-bearing branch the index derives its turns
+    // from, so the transcript never disagrees with the indexed turn set. When the
+    // natural leaf is a detached `session_info` (e.g. after a rename), this
+    // re-projects from the latest message-bearing leaf — never a flat union of
+    // every abandoned branch, which would resurrect superseded turns.
+    transcript = activeBranchEntries(manager.getEntries()).map(mapTranscriptEntry).filter(isMessage);
     transcript.sort((a, b) => a.ts - b.ts);
   } catch (err) {
     transcriptError = err instanceof Error ? err.message : String(err);
@@ -508,6 +507,15 @@ async function handleSessionRename({ req, res, params, deps }: RouteCtx): Promis
   }
   if (!insideSessionsRoot(deps.sessionsRoot, found.path)) {
     sendError(res, 403, 'Session file resolves outside the managed sessions root');
+    return;
+  }
+  // The indexed path may have been reused by a newer session since it was
+  // indexed. Verify the file header still identifies THIS session before writing
+  // its name — otherwise `appendSessionInfo` would stamp the name into a foreign
+  // session's file. On mismatch, reconcile the index and refuse rather than mutate.
+  if (!verifySessionFileId(found.path, params.id)) {
+    await deps.runIngest();
+    sendError(res, 409, `Session "${params.id}" no longer matches its indexed file`);
     return;
   }
   try {
@@ -739,13 +747,22 @@ async function handleCacheDelete({ req, res, deps }: RouteCtx): Promise<void> {
     sendError(res, 400, err instanceof Error ? err.message : 'Invalid request body');
     return;
   }
-  const olderThanDays = (body as { olderThanDays?: unknown } | null)?.olderThanDays;
+  const parsed = body as { all?: unknown; olderThanDays?: unknown } | null;
+  const all = parsed?.all;
+  const olderThanDays = parsed?.olderThanDays;
   const root = deps.cacheRoot;
   let result: { removed: number; freedBytes: number };
-  if (typeof olderThanDays === 'number' && Number.isFinite(olderThanDays) && olderThanDays > 0) {
+  // Clear-all needs an explicit `{"all": true}` discriminator; selective
+  // eviction needs a positive finite `olderThanDays`. Anything else (absent,
+  // string, zero, negative, misspelled) is a 400 — never a silent whole-cache
+  // wipe from a typing slip.
+  if (all === true) {
+    result = root !== undefined ? clearColdCache(root) : clearColdCache();
+  } else if (typeof olderThanDays === 'number' && Number.isFinite(olderThanDays) && olderThanDays > 0) {
     result = root !== undefined ? evictOlderThan(olderThanDays, root) : evictOlderThan(olderThanDays);
   } else {
-    result = root !== undefined ? clearColdCache(root) : clearColdCache();
+    sendError(res, 400, 'Body must be {"all":true} to clear all, or {"olderThanDays":<positive number>} to evict');
+    return;
   }
   sendJson(res, 200, result);
 }

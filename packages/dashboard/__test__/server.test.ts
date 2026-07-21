@@ -1,4 +1,4 @@
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -163,6 +163,72 @@ describe('dashboard server — sessions', () => {
     expect(fileText).toContain('Renamed Session');
   });
 
+  // Finding F: a rename must verify the indexed path still holds THIS session
+  // before writing its name — a reused path must not stamp a foreign session.
+  it('refuses to rename when the indexed path was reused by another session', async () => {
+    await ingest();
+    const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+      sessions: Array<{ id: string; path: string }>;
+    };
+    const filePath = before.sessions.find((s) => s.id === 'fix-1')!.path;
+
+    // Replace fix-1's file on disk with a different session (bypassing ingest):
+    // the index still points fix-1 at a path that now holds session 'reused-B'.
+    writeFileSync(
+      filePath,
+      `${JSON.stringify({ type: 'session', version: 3, id: 'reused-B', timestamp: '2026-07-09T10:00:00.000Z', cwd: '/w' })}\n${JSON.stringify({ type: 'message', id: 'b1', parentId: null, timestamp: '2026-07-09T10:00:01.000Z', message: { role: 'user', content: 'from B' } })}\n`,
+    );
+
+    const patch = await fetch(`${server.url}/api/sessions/fix-1`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Hijack' }),
+    });
+    expect(patch.status).toBe(409);
+
+    // Session B's file was never stamped with fix-1's requested name.
+    const fileText = readFileSync(filePath, 'utf-8');
+    expect(fileText).not.toContain('Hijack');
+    expect(fileText).not.toContain('"type":"session_info"');
+    expect(fileText).toContain('reused-B');
+  });
+
+  // Finding H: the detail transcript uses the same active-branch projection as
+  // the index — a detached metadata leaf must not resurrect abandoned turns.
+  it('detail transcript shows only the active branch under a detached metadata leaf', async () => {
+    const forked = [
+      { type: 'session', version: 3, id: 'detach-1', timestamp: '2026-07-08T10:00:00.000Z', cwd: '/w' },
+      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-08T10:00:01.000Z', message: { role: 'user', content: 'q' } },
+      {
+        type: 'message',
+        id: 'a1',
+        parentId: 'u1',
+        timestamp: '2026-07-08T10:00:02.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'ABANDONED' }], model: 'gemma4', usage: { input: 999, output: 999 } },
+      },
+      {
+        type: 'message',
+        id: 'a2',
+        parentId: 'u1',
+        timestamp: '2026-07-08T10:00:03.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'ACTIVE' }], model: 'qwen3_5', usage: { input: 1, output: 2 } },
+      },
+      { type: 'session_info', id: 'si1', parentId: null, timestamp: '2026-07-08T10:00:04.000Z', name: 'Detached' },
+    ];
+    writeFileSync(
+      join(sessionsRoot, '--w--', '2026-07-08T10-00-00_detach-1.jsonl'),
+      `${forked.map((l) => JSON.stringify(l)).join('\n')}\n`,
+    );
+    await ingest();
+
+    const body = (await (await fetch(`${server.url}/api/sessions/detach-1`)).json()) as {
+      transcript: Array<{ text: string }>;
+    };
+    const texts = body.transcript.map((t) => t.text);
+    expect(texts.some((t) => t.includes('ACTIVE'))).toBe(true);
+    expect(texts.some((t) => t.includes('ABANDONED'))).toBe(false);
+  });
+
   it('deletes a session (file and rows removed)', async () => {
     await ingest();
     const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
@@ -246,14 +312,18 @@ describe('dashboard server — metrics overview', () => {
 });
 
 describe('dashboard server — cache', () => {
-  it('scans and clears the cold cache', async () => {
+  it('scans and clears the cold cache with an explicit {all:true}', async () => {
     const res = await fetch(`${server.url}/api/cache`);
     expect(res.status).toBe(200);
     const body = (await res.json()) as { disk: { entryCount: number; totalBytes: number } };
     expect(body.disk.entryCount).toBe(2);
     expect(body.disk.totalBytes).toBe(300);
 
-    const del = await fetch(`${server.url}/api/cache`, { method: 'DELETE' });
+    const del = await fetch(`${server.url}/api/cache`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ all: true }),
+    });
     expect(del.status).toBe(200);
     const cleared = (await del.json()) as { removed: number; freedBytes: number };
     expect(cleared.removed).toBe(2);
@@ -261,6 +331,48 @@ describe('dashboard server — cache', () => {
 
     const after = (await (await fetch(`${server.url}/api/cache`)).json()) as { disk: { entryCount: number } };
     expect(after.disk.entryCount).toBe(0);
+  });
+
+  // Finding I: an ambiguous body must 400, never fall through to a whole wipe.
+  it('rejects an ambiguous clear body instead of wiping the whole cache', async () => {
+    const bodies: Array<string | undefined> = [
+      undefined,
+      '{}',
+      JSON.stringify({ olderThanDays: '7' }),
+      JSON.stringify({ olderThanDays: 0 }),
+      JSON.stringify({ olderThanDays: -1 }),
+    ];
+    for (const b of bodies) {
+      const del = await fetch(`${server.url}/api/cache`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        ...(b === undefined ? {} : { body: b }),
+      });
+      expect(del.status).toBe(400);
+      // Nothing was cleared — both blocks survive.
+      const after = (await (await fetch(`${server.url}/api/cache`)).json()) as { disk: { entryCount: number } };
+      expect(after.disk.entryCount).toBe(2);
+    }
+  });
+
+  it('evicts only blocks older than a positive olderThanDays', async () => {
+    // Age one block past the 7-day cutoff; the other stays recent.
+    const oldBlock = join(cacheRoot, hexBlock(1));
+    const oldSec = (Date.now() - 10 * 86_400_000) / 1000;
+    utimesSync(oldBlock, oldSec, oldSec);
+
+    const del = await fetch(`${server.url}/api/cache`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ olderThanDays: 7 }),
+    });
+    expect(del.status).toBe(200);
+    const evicted = (await del.json()) as { removed: number; freedBytes: number };
+    expect(evicted.removed).toBe(1);
+    expect(evicted.freedBytes).toBe(100);
+
+    const after = (await (await fetch(`${server.url}/api/cache`)).json()) as { disk: { entryCount: number } };
+    expect(after.disk.entryCount).toBe(1);
   });
 });
 

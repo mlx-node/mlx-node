@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { eq } from 'drizzle-orm';
+import { eq, isNotNull } from 'drizzle-orm';
 
 import type { DashboardDb } from '../db/open.js';
 import { traces } from '../db/schema.js';
@@ -68,7 +68,14 @@ export async function ingestTraces(
   let files = 0;
   let records = 0;
   let pruned = 0;
-  if (!existsSync(traceDir)) return { files, records, pruned };
+  if (!existsSync(traceDir)) {
+    // A vanished trace directory means zero live source files: run the same
+    // retention reconciliation the non-empty path does, against an empty live
+    // set, so deleting the dir never leaves ingested rows visible forever. Rows
+    // with a NULL source_file predate tracking and are left untouched.
+    db.delete(traces).where(isNotNull(traces.sourceFile)).run();
+    return { files, records, pruned };
+  }
 
   for (const name of readdirSync(traceDir)) {
     if (!name.endsWith('.jsonl')) continue;

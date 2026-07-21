@@ -146,4 +146,17 @@ describe('ingestTraces', () => {
     expect(res.files).toBe(0);
     expect(dash.db.select().from(traces).all()).toHaveLength(0);
   });
+
+  // Finding J: deleting the WHOLE trace dir must still reconcile tracked rows,
+  // not short-circuit before reconciliation and leave them visible forever.
+  it('reconciles all tracked rows when the entire trace dir is deleted', async () => {
+    cpSync(FIXTURE_TRACES, dir, { recursive: true });
+    await ingestTraces(dash, dir);
+    expect(dash.db.select().from(traces).all()).toHaveLength(3);
+
+    rmSync(dir, { recursive: true, force: true });
+    const res = await ingestTraces(dash, dir);
+    expect(res.files).toBe(0);
+    expect(dash.db.select().from(traces).all()).toHaveLength(0);
+  });
 });

@@ -265,4 +265,85 @@ describe('ingestSessions', () => {
 
     rmSync(soloBase, { recursive: true, force: true });
   });
+
+  // Finding G: a cyclic entry tree must be quarantined, not walked unbounded
+  // (pi's branch walker has no visited-set → self-parent/cycle hangs/OOMs).
+  it('quarantines a cyclic session tree without hanging and still ingests valid siblings', async () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-cycle-'));
+    const root = join(soloBase, 'sessions');
+    // Self-parented leaf: `x.parentId === 'x'` — the walker would loop forever.
+    writeSessionFile(soloBase, 'cyclic.jsonl', [
+      { type: 'session', version: 3, id: 'cyc-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
+      { type: 'message', id: 'x', parentId: 'x', timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'loop' } },
+    ]);
+    writeSessionFile(soloBase, 'valid.jsonl', [
+      { type: 'session', version: 3, id: 'ok-1', timestamp: '2026-07-02T10:00:00.000Z', cwd: '/w' },
+      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-02T10:00:01.000Z', message: { role: 'user', content: 'hi' } },
+      {
+        type: 'message',
+        id: 'a1',
+        parentId: 'u1',
+        timestamp: '2026-07-02T10:00:02.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }], model: 'qwen3_5', usage: { input: 3, output: 4 } },
+      },
+    ]);
+
+    const res = await ingestSessions(dash, root);
+    expect(res.warnings.some((w) => /cycle|duplicate|invalid session tree/i.test(w))).toBe(true);
+
+    // The cyclic file is skipped; the valid sibling in the same run still lands.
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'cyc-1')).all()).toHaveLength(0);
+    const ok = dash.db.select().from(sessions).where(eq(sessions.id, 'ok-1')).all();
+    expect(ok).toHaveLength(1);
+    expect(ok[0].messageCount).toBe(2);
+    expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'ok-1')).all()).toHaveLength(1);
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
+
+  // Finding H: when the leaf is detached metadata (a `session_info` from a
+  // rename), only the active message-bearing branch is indexed — never a flat
+  // union of every abandoned branch.
+  it('indexes only the active branch when the leaf is detached metadata', async () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-detached-'));
+    const root = join(soloBase, 'sessions');
+    writeSessionFile(soloBase, 'forked.jsonl', [
+      { type: 'session', version: 3, id: 'fk-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
+      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'q' } },
+      // Abandoned 999-token assistant off u1 (must NOT be indexed).
+      {
+        type: 'message',
+        id: 'a1',
+        parentId: 'u1',
+        timestamp: '2026-07-01T10:00:02.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'abandoned' }], model: 'gemma4', usage: { input: 999, output: 999 } },
+      },
+      // Active 1-token replacement off u1.
+      {
+        type: 'message',
+        id: 'a2',
+        parentId: 'u1',
+        timestamp: '2026-07-01T10:00:03.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'active' }], model: 'qwen3_5', usage: { input: 1, output: 2 } },
+      },
+      // Detached metadata leaf appended last (a rename) — carries no message.
+      { type: 'session_info', id: 'si1', parentId: null, timestamp: '2026-07-01T10:00:04.000Z', name: 'Forked' },
+    ]);
+
+    await ingestSessions(dash, root);
+
+    const turnRows = dash.db.select().from(turns).where(eq(turns.sessionId, 'fk-1')).all();
+    expect(turnRows).toHaveLength(1);
+    expect(turnRows[0].entryId).toBe('a2');
+    expect(turnRows[0].model).toBe('qwen3_5');
+    expect(turnRows[0].inputTokens).toBe(1);
+
+    const row = dash.db.select().from(sessions).where(eq(sessions.id, 'fk-1')).all()[0];
+    // Active branch is [u1, a2]; abandoned a1 and the detached info leaf excluded.
+    expect(row.messageCount).toBe(2);
+    // Session-level name still derives from the whole file, separate from turns.
+    expect(row.name).toBe('Forked');
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
 });
