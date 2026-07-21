@@ -3868,6 +3868,44 @@ impl PagedKVCacheAdapter {
             )
             .map_err(|e| format!("cache_full_blocks failed: {e}"))?;
 
+        // Release the shared allocator before the cold-tier capture below:
+        // `capture_and_enqueue` blits every layer's block bytes off Metal,
+        // and holding the lock across that would serialize other requests.
+        // The blocks stay pinned by this request's own references until
+        // `release_request`, so dropping the lock cannot race an eviction.
+        drop(guard);
+
+        // SSD cold-tier capture, fail-open: a persistence error only means
+        // the next process recomputes this prefix. Keys follow the hot
+        // chain-hash contract — parent-linked per block, `cache_salt`
+        // mixed into block 0 only — so Task A4's restore walk recomputes
+        // the identical chain. `contains` dedups re-publishes of a chain
+        // that is already on disk without touching Metal.
+        if let Some(cold) = self.cold_tier.as_ref() {
+            let mut parent: Option<mlx_paged_attn::ColdCacheKey> = None;
+            for (i, block) in blocks_slice.iter().enumerate() {
+                let toks = &self.request_tokens[i * block_size_us..(i + 1) * block_size_us];
+                let key = mlx_paged_attn::ColdCacheKey::chain(
+                    cold.fingerprint,
+                    parent,
+                    toks,
+                    extra_keys,
+                    cache_salt,
+                    i,
+                );
+                if !cold.manager.contains(&key) {
+                    let _ = cold.manager.capture_and_enqueue(
+                        &self.layer_kv_pool,
+                        block,
+                        key,
+                        cold.fingerprint,
+                        toks,
+                    );
+                }
+                parent = Some(key);
+            }
+        }
+
         // Mark registered ONLY on the success path so an Err leaves
         // already_registered == false (callers may retry / move on, and a
         // future correct call should still be able to do the work). A
@@ -5336,6 +5374,87 @@ mod tests {
         // survive the per-request reset.
         adapter.reset_for_new_request(1).unwrap();
         assert!(adapter.cold_tier().is_some());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Publishing full blocks for cross-request reuse must also capture
+    /// them into the SSD cold tier when one is wired, under the chained
+    /// key contract shared with the hot cache (parent-linked, salt mixed
+    /// into block 0 only). Re-registering the same chain must dedup via
+    /// the manager's index probe instead of re-enqueueing identical bytes.
+    #[test]
+    fn register_full_blocks_captures_to_cold_tier_once() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping register_full_blocks_captures_to_cold_tier_once: Metal unavailable"
+            );
+            return;
+        };
+
+        let root =
+            std::env::temp_dir().join(format!("mlx-adapter-cold-capture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let manager = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                .expect("temp-dir cold cache must open"),
+        );
+        let fingerprint =
+            mlx_paged_attn::ColdCacheFingerprint::from_components([b"qwen3-test".as_slice()]);
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager),
+            fingerprint,
+        });
+
+        let tokens: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        let registered = adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
+        assert_eq!(registered, 2, "two full blocks of size 4 = 8 tokens");
+
+        let key0 = mlx_paged_attn::ColdCacheKey::chain(fingerprint, None, &tokens[..4], &[], 0, 0);
+        let key1 =
+            mlx_paged_attn::ColdCacheKey::chain(fingerprint, Some(key0), &tokens[4..], &[], 0, 1);
+        let paths = [
+            root.join(format!("{}.safetensors", key0.to_hex())),
+            root.join(format!("{}.safetensors", key1.to_hex())),
+        ];
+
+        // The manager's writer thread persists asynchronously; poll for
+        // both committed files instead of asserting immediately.
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while paths.iter().any(|p| !p.exists()) {
+            assert!(
+                Instant::now() < deadline,
+                "cold-tier files not committed within 2s: {paths:?}; stats: {:?}",
+                manager.stats()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(manager.contains(&key0), "index must publish block 0");
+        assert!(manager.contains(&key1), "index must publish block 1");
+        assert_eq!(manager.stats().enqueued, 2);
+
+        // A follow-up request re-registering the identical chain must not
+        // re-capture: the pre-enqueue `contains` probe sees both keys.
+        adapter.release_request().unwrap();
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
+        assert_eq!(
+            manager.stats().enqueued,
+            2,
+            "identical chain must dedup via contains, not re-enqueue"
+        );
+        let persisted = std::fs::read_dir(&root)
+            .expect("cold root must be listable")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
+            .count();
+        assert_eq!(persisted, 2, "exactly one file per full block");
 
         let _ = std::fs::remove_dir_all(&root);
     }
