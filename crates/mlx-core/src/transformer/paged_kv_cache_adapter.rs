@@ -1402,13 +1402,89 @@ impl PagedKVCacheAdapter {
             .unwrap_or(prompt_tokens.len());
         let lookup_tokens = &prompt_tokens[..lookup_len];
 
-        let (blocks, cached_tokens) = {
+        let (mut blocks, mut cached_tokens) = {
             let mut guard = self
                 .allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
             guard.find_longest_cache_hit(lookup_tokens, self.block_size, extra_keys, cache_salt)
         };
+
+        // SSD cold-tier restore on a hot-cache prefix miss: for each full
+        // block the in-memory lookup did NOT cover, recompute the persisted
+        // chain (Task A3's capture contract — parent-linked per block,
+        // `cache_salt` mixed into block 0 only) and transactionally restore
+        // it into a fresh physical slot before falling back to prefill.
+        // Fail-open everywhere: the first block that misses on disk, fails
+        // validation, or cannot be uploaded stops the extension and leaves
+        // the hot hit untouched. The hot identity each restored block is
+        // published under comes from `chain_hashes`, so a subsequent
+        // `find_longest_cache_hit` on this same allocator serves it directly.
+        if let Some(cold) = self.cold_tier.as_ref() {
+            let bs = self.block_size as usize;
+            // `checked_div` folds the degenerate `block_size == 0` case into a
+            // no-op: both counts become 0, so the extension loop never runs.
+            let full_blocks = lookup_tokens.len().checked_div(bs).unwrap_or(0);
+            let mut idx = cached_tokens
+                .min(lookup_tokens.len())
+                .checked_div(bs)
+                .unwrap_or(0);
+            if idx < full_blocks {
+                let hot = mlx_paged_attn::chain_hashes(
+                    &lookup_tokens[..full_blocks * bs],
+                    self.block_size,
+                    extra_keys,
+                    cache_salt,
+                );
+                // Rebuild the cold keys of the already-covered leading blocks
+                // so the first restore chains off the correct parent key.
+                let mut parent_key: Option<mlx_paged_attn::ColdCacheKey> = None;
+                for i in 0..idx {
+                    parent_key = Some(mlx_paged_attn::ColdCacheKey::chain(
+                        cold.fingerprint,
+                        parent_key,
+                        &lookup_tokens[i * bs..(i + 1) * bs],
+                        extra_keys,
+                        cache_salt,
+                        i,
+                    ));
+                }
+                while idx < full_blocks {
+                    let toks = &lookup_tokens[idx * bs..(idx + 1) * bs];
+                    let key = mlx_paged_attn::ColdCacheKey::chain(
+                        cold.fingerprint,
+                        parent_key,
+                        toks,
+                        extra_keys,
+                        cache_salt,
+                        idx,
+                    );
+                    let identity = mlx_paged_attn::RestorePrefixIdentity {
+                        hot_hash: hot[idx],
+                        tokens: toks.to_vec(),
+                        parent_hot_hash: if idx == 0 { 0 } else { hot[idx - 1] },
+                        extra_keys: extra_keys.to_vec(),
+                        cache_salt,
+                        block_index: idx,
+                    };
+                    match cold.manager.restore_block(
+                        &self.layer_kv_pool,
+                        &self.allocator,
+                        key,
+                        cold.fingerprint,
+                        &identity,
+                    ) {
+                        Some(block) => {
+                            blocks.push(block);
+                            cached_tokens += bs;
+                            parent_key = Some(key);
+                            idx += 1;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
 
         for block in &blocks {
             block_table.add_block(Arc::clone(block));
@@ -5455,6 +5531,164 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
             .count();
         assert_eq!(persisted, 2, "exactly one file per full block");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Full restart round-trip through the public adapter API: an adapter
+    /// captures a two-block prefix to the SSD cold tier, then a FRESH
+    /// allocator + pool + adapter (a new process, same fingerprint) resolves
+    /// the identical prompt through `find_cached_prefix` alone. The restore
+    /// hook must rebuild the whole prefix — `cached_token_count` covers every
+    /// full block — and each restored physical block must be byte-identical
+    /// to what the first adapter captured, on every layer. This exercises the
+    /// A3 capture hook and the A4 restore loop end-to-end with real KV bytes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn find_cached_prefix_restores_persisted_prefix_on_fresh_adapter() {
+        use mlx_paged_attn::metal::MetalDtype;
+
+        let make_config = || PagedAttentionConfig {
+            block_size: 8,
+            gpu_memory_mb: 256,
+            head_size: 64,
+            num_kv_heads: 1,
+            num_layers: 2,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(1),
+        };
+        // Real pools (not `new_for_test`) so KV bytes actually round-trip.
+        let pool_src = match LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16) {
+            Ok(pool) => Arc::new(pool),
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!(
+                    "skipping find_cached_prefix_restores_persisted_prefix_on_fresh_adapter: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let num_layers = pool_src.num_layers();
+        let bytes_per_side = 64 * 8 * 2usize;
+        // Distinct per (layer, block position, side) so a mixed-up block or
+        // layer cannot pass by coincidence.
+        let pattern = |layer: usize, pos: usize| -> (Vec<u8>, Vec<u8>) {
+            let keys = (0..bytes_per_side)
+                .map(|i| ((i + layer * 31 + pos * 97) % 251) as u8)
+                .collect();
+            let values = (0..bytes_per_side)
+                .map(|i| ((i * 2 + layer * 17 + pos * 53) % 251) as u8)
+                .collect();
+            (keys, values)
+        };
+
+        let tokens: [u32; 16] = [
+            11, 12, 13, 14, 15, 16, 17, 18, 21, 22, 23, 24, 25, 26, 27, 28,
+        ];
+        let fingerprint =
+            mlx_paged_attn::ColdCacheFingerprint::from_components([b"qwen3-restore".as_slice()]);
+        let root = std::env::temp_dir().join(format!(
+            "mlx-adapter-cold-restore-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // --- Capture side: adapter1 persists the prefix. ---
+        let alloc_src = new_allocator(8, 8);
+        let mut adapter_src = PagedKVCacheAdapter::new(alloc_src, Arc::clone(&pool_src), 8)
+            .expect("capture adapter ctor");
+        let manager_src = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                .expect("temp-dir cold cache must open"),
+        );
+        adapter_src.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager_src),
+            fingerprint,
+        });
+
+        adapter_src.reset_for_new_request(0).unwrap();
+        adapter_src.allocate_suffix_blocks(16).unwrap();
+        adapter_src.record_tokens(&tokens).unwrap();
+        let source_ids: Vec<u32> = adapter_src
+            .block_table()
+            .unwrap()
+            .blocks()
+            .iter()
+            .map(|b| b.block_id)
+            .collect();
+        assert_eq!(source_ids.len(), 2, "two full blocks of size 8 = 16 tokens");
+        for (pos, &block_id) in source_ids.iter().enumerate() {
+            for layer in 0..num_layers {
+                let (keys, values) = pattern(layer, pos);
+                pool_src
+                    .write_blocks_from_host(layer as u32, &[block_id], &keys, &values)
+                    .unwrap();
+            }
+        }
+        let registered = adapter_src.register_full_blocks_for_reuse(&[], 0).unwrap();
+        assert_eq!(registered, 2);
+
+        let key0 = mlx_paged_attn::ColdCacheKey::chain(fingerprint, None, &tokens[..8], &[], 0, 0);
+        let key1 =
+            mlx_paged_attn::ColdCacheKey::chain(fingerprint, Some(key0), &tokens[8..], &[], 0, 1);
+        let paths = [
+            root.join(format!("{}.safetensors", key0.to_hex())),
+            root.join(format!("{}.safetensors", key1.to_hex())),
+        ];
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while paths.iter().any(|p| !p.exists()) {
+            assert!(
+                Instant::now() < deadline,
+                "cold-tier files not committed within 5s: {paths:?}; stats: {:?}",
+                manager_src.stats()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // --- Restart: fresh allocator + pool + adapter, same fingerprint. ---
+        drop(adapter_src);
+        drop(manager_src);
+        let pool_dst = Arc::new(LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16).unwrap());
+        let alloc_dst = new_allocator(8, 8);
+        let mut adapter_dst = PagedKVCacheAdapter::new(alloc_dst, Arc::clone(&pool_dst), 8)
+            .expect("restore adapter ctor");
+        let manager_dst = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                .expect("reopen cold cache"),
+        );
+        adapter_dst.set_cold_tier(ColdTierContext {
+            manager: manager_dst,
+            fingerprint,
+        });
+
+        adapter_dst.reset_for_new_request(0).unwrap();
+        let prefix = adapter_dst
+            .find_cached_prefix(&tokens, &[], 0, false)
+            .unwrap();
+        assert_eq!(
+            prefix.cached_token_count, 16,
+            "the whole two-block prefix must be restored from the cold tier"
+        );
+        assert_eq!(prefix.blocks.len(), 2);
+
+        for (pos, block) in prefix.blocks.iter().enumerate() {
+            for layer in 0..num_layers {
+                let (rk, rv) = pool_dst
+                    .read_blocks_to_host(layer as u32, &[block.block_id])
+                    .unwrap();
+                let (ek, ev) = pattern(layer, pos);
+                assert_eq!(
+                    rk, ek,
+                    "restored keys mismatch (block {pos}, layer {layer})"
+                );
+                assert_eq!(
+                    rv, ev,
+                    "restored values mismatch (block {pos}, layer {layer})"
+                );
+            }
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

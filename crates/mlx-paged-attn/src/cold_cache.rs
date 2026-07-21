@@ -2578,4 +2578,149 @@ mod tests {
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }
+
+    /// End-to-end multi-block restart: capture a two-block prefix, drop the
+    /// manager, reopen the cache from disk (index rebuilt), and restore both
+    /// blocks into a FRESH allocator + pool by mirroring the exact chain the
+    /// restore hook uses — hot hashes from [`chain_hashes`], cold keys from
+    /// [`ColdCacheKey::chain`]. Each restored block must be byte-identical to
+    /// the captured source, and the fresh hot cache must then serve the whole
+    /// prefix. This is the cold_cache-level proof for Task A4's restore loop.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn multi_block_prefix_restores_after_restart() {
+        use crate::metal::MetalDtype;
+        use crate::{PagedAttentionConfig, chain_hashes};
+
+        let config = PagedAttentionConfig {
+            block_size: 8,
+            gpu_memory_mb: 256,
+            head_size: 64,
+            num_kv_heads: 1,
+            num_layers: 1,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(1),
+        };
+        // Separate capture and restore pools so a byte match can only come
+        // from the cold tier, never from source bytes lingering in a shared
+        // physical block (a genuine restart discards the GPU buffers).
+        let pool_src = match LayerKVPool::new(config.clone(), 4, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping multi_block_prefix_restores_after_restart: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let pool_dst = LayerKVPool::new(config, 4, MetalDtype::BFloat16).unwrap();
+
+        let bytes_per_side = 64 * 8 * 2usize;
+        let pattern = |seed: usize| -> (Vec<u8>, Vec<u8>) {
+            let keys = (0..bytes_per_side)
+                .map(|i| ((i + seed * 7) % 251) as u8)
+                .collect();
+            let values = (0..bytes_per_side)
+                .map(|i| ((i * 3 + seed * 13) % 251) as u8)
+                .collect();
+            (keys, values)
+        };
+        let (k0, v0) = pattern(1);
+        let (k1, v1) = pattern(2);
+
+        let capture_alloc = Mutex::new(BlockAllocator::new(4, 8));
+        let src0 = capture_alloc.lock().unwrap().allocate().unwrap();
+        let src1 = capture_alloc.lock().unwrap().allocate().unwrap();
+        pool_src
+            .write_blocks_from_host(0, &[src0.block_id], &k0, &v0)
+            .unwrap();
+        pool_src
+            .write_blocks_from_host(0, &[src1.block_id], &k1, &v1)
+            .unwrap();
+
+        let tokens: Vec<u32> = (1..=16).collect();
+        let extra_keys: &[u64] = &[];
+        let cache_salt = 0u64;
+        let fp = fingerprint();
+        let key0 = ColdCacheKey::chain(fp, None, &tokens[0..8], extra_keys, cache_salt, 0);
+        let key1 = ColdCacheKey::chain(fp, Some(key0), &tokens[8..16], extra_keys, cache_salt, 1);
+
+        let root = temp_root("multi-restore");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 4).unwrap();
+        assert!(
+            manager
+                .capture_and_enqueue(&pool_src, &src0, key0, fp, &tokens[0..8])
+                .unwrap()
+        );
+        assert!(
+            manager
+                .capture_and_enqueue(&pool_src, &src1, key1, fp, &tokens[8..16])
+                .unwrap()
+        );
+
+        let path0 = root.join(format!("{}.safetensors", key0.to_hex()));
+        let path1 = root.join(format!("{}.safetensors", key1.to_hex()));
+        for _ in 0..200 {
+            if path0.exists() && path1.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(path0.exists() && path1.exists(), "both blocks must persist");
+
+        // Simulate a process restart: release the source handles, tear down
+        // the manager, reopen the cache from disk with a fresh allocator.
+        capture_alloc.lock().unwrap().free(src0);
+        capture_alloc.lock().unwrap().free(src1);
+        drop(manager);
+
+        let reopened = ColdCacheManager::open_at(root.clone(), GIB, 0, 4).unwrap();
+        let fresh_alloc = Mutex::new(BlockAllocator::new(4, 8));
+
+        let hot = chain_hashes(&tokens, 8, extra_keys, cache_salt);
+        assert_eq!(hot.len(), 2);
+        let mut parent_key: Option<ColdCacheKey> = None;
+        let mut restored = Vec::new();
+        for idx in 0..2usize {
+            let toks = &tokens[idx * 8..(idx + 1) * 8];
+            let key = ColdCacheKey::chain(fp, parent_key, toks, extra_keys, cache_salt, idx);
+            let identity = RestorePrefixIdentity {
+                hot_hash: hot[idx],
+                tokens: toks.to_vec(),
+                parent_hot_hash: if idx == 0 { 0 } else { hot[idx - 1] },
+                extra_keys: extra_keys.to_vec(),
+                cache_salt,
+                block_index: idx,
+            };
+            let block = reopened
+                .restore_block(&pool_dst, &fresh_alloc, key, fp, &identity)
+                .expect("cold block restore");
+            let (rk, rv) = pool_dst.read_blocks_to_host(0, &[block.block_id]).unwrap();
+            let (ek, ev) = if idx == 0 { (&k0, &v0) } else { (&k1, &v1) };
+            assert_eq!(&rk, ek, "restored keys must match captured block {idx}");
+            assert_eq!(&rv, ev, "restored values must match captured block {idx}");
+            parent_key = Some(key);
+            restored.push(block);
+        }
+
+        // The fresh hot cache now serves the entire two-block prefix.
+        let (hits, hit_tokens) = fresh_alloc
+            .lock()
+            .unwrap()
+            .find_longest_cache_hit(&tokens, 8, extra_keys, cache_salt);
+        assert_eq!(hit_tokens, 16, "restored prefix must be fully hot-hittable");
+        assert_eq!(hits.len(), 2);
+
+        {
+            let mut allocator = fresh_alloc.lock().unwrap();
+            for block in restored {
+                allocator.free(block);
+            }
+            for hit in hits {
+                allocator.free(hit);
+            }
+        }
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
 }
