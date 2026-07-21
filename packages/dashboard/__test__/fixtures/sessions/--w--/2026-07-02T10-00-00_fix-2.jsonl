@@ -1,0 +1,4 @@
+{"type":"session","version":3,"id":"fix-2","timestamp":"2026-07-02T10:00:00.000Z","cwd":"/w"}
+{"type":"session_info","id":"si2","parentId":null,"timestamp":"2026-07-02T10:00:00.300Z","name":"Second session"}
+{"type":"message","id":"n1","parentId":null,"timestamp":"2026-07-02T10:00:01.000Z","message":{"role":"user","content":"How are you?","timestamp":1782122401000}}
+{"type":"message","id":"n2","parentId":"n1","timestamp":"2026-07-02T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Doing well"}],"api":"openai-completions","provider":"mlx","model":"gemma4","usage":{"input":40,"output":20,"cacheRead":0,"cacheWrite":0,"reasoning":0,"totalTokens":60,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1782122402000}}

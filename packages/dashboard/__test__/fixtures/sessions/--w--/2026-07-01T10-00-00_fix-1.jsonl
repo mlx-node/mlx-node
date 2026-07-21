@@ -1,0 +1,8 @@
+{"type":"session","version":3,"id":"fix-1","timestamp":"2026-07-01T10:00:00.000Z","cwd":"/w"}
+{"type":"session_info","id":"si0","parentId":null,"timestamp":"2026-07-01T10:00:00.200Z","name":"Draft name"}
+{"type":"model_change","id":"mc1","parentId":null,"timestamp":"2026-07-01T10:00:00.500Z","provider":"mlx","modelId":"qwen3_5"}
+{"type":"message","id":"m1","parentId":null,"timestamp":"2026-07-01T10:00:01.000Z","message":{"role":"user","content":"Hello, world","timestamp":1782036001000}}
+{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-07-01T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Hi there"}],"api":"openai-completions","provider":"mlx","model":"qwen3_5","usage":{"input":100,"output":50,"cacheRead":10,"cacheWrite":0,"reasoning":5,"totalTokens":150,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1782036002000,"mlxTraceId":"trace-aaa"}}
+{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-07-01T10:00:03.000Z","message":{"role":"user","content":[{"type":"text","text":"Second question"}],"timestamp":1782036003000}}
+{"type":"message","id":"m4","parentId":"m3","timestamp":"2026-07-01T10:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"An answer"}],"api":"openai-completions","provider":"mlx","model":"qwen3_5","usage":{"input":180,"output":60,"cacheRead":100,"cacheWrite":0,"reasoning":12,"totalTokens":240,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1782036004000}}
+{"type":"session_info","id":"si1","parentId":null,"timestamp":"2026-07-01T10:00:05.000Z","name":"First session"}
