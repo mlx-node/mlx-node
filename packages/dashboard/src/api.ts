@@ -632,7 +632,9 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
        FROM turns ${turnsWhere('')}`,
     )
     .get(...turnsRange.args);
-  const traceTotals = sqlite.prepare(`SELECT COUNT(*) AS traces FROM traces ${tracesWhere('')}`).get(...tracesRange.args);
+  const traceTotals = sqlite
+    .prepare(`SELECT COUNT(*) AS traces FROM traces ${tracesWhere('')}`)
+    .get(...tracesRange.args);
 
   const overview: MetricsOverview = {
     range: { from, to },
@@ -721,7 +723,12 @@ const ROUTES: Route[] = [
  * written), `false` when the path is not an API route (caller serves static).
  * A path under `/api` that matches no route yields a 404 JSON here.
  */
-export async function handleApiRequest(req: IncomingMessage, res: ServerResponse, url: URL, deps: ApiDeps): Promise<boolean> {
+export async function handleApiRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  deps: ApiDeps,
+): Promise<boolean> {
   const pathname = url.pathname;
   const isApi = pathname === '/health' || pathname === '/api' || pathname.startsWith('/api/');
   if (!isApi) return false;

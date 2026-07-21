@@ -1,10 +1,5 @@
 export type { MetricsOverview, TranscriptEntry } from './api.js';
-export {
-  type ColdCacheDiskInfo,
-  clearColdCache,
-  evictOlderThan,
-  scanColdCache,
-} from './cache.js';
+export { type ColdCacheDiskInfo, clearColdCache, evictOlderThan, scanColdCache } from './cache.js';
 export { type CatalogItem, catalogSlug, catalogWithState } from './catalog.js';
 export { type DashboardDb, openDashboardDb } from './db/open.js';
 export { sessions, traces, turns } from './db/schema.js';

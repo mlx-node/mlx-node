@@ -1,6 +1,8 @@
 # @mlx-node/cli
 
-Command-line tool for downloading models and datasets from HuggingFace Hub and converting model weights for use with `@mlx-node/*` packages.
+Command-line tool for downloading models and datasets from HuggingFace Hub, converting model weights, running the fully-local `mlx agent`, and launching the `mlx dashboard`, for use with `@mlx-node/*` packages.
+
+Top-level commands: `download`, `convert`, `calibrate`, `agent`, `dashboard`, `launch`. See [docs/cli.md](https://github.com/mlx-node/mlx-node/blob/main/docs/cli.md) for `agent`, `calibrate`, and `launch`, and [docs/dashboard.md](https://github.com/mlx-node/mlx-node/blob/main/docs/dashboard.md) for the dashboard.
 
 ## Requirements
 
@@ -226,6 +228,19 @@ Per-tensor bit assignments (N = `--q-bits`):
 | `linear_attn.out_proj`      | 8 affine | Worst tensor (KLD ~6.0) — kept 8-bit for MTP/AR parity     |
 | `linear_attn.in_proj_a/b`   | 8 affine | Split GDN low-rank projs — kept 8-bit for MTP/AR parity    |
 | GDN params (`A_log`, etc.)  | bf16     | Recurrent state params, errors compound over time          |
+
+### Dashboard
+
+Start the local web dashboard (browse models, agent sessions, inference metrics, and
+the paged-attention cold cache):
+
+```bash
+mlx dashboard                 # start on 127.0.0.1:6590 and open a browser
+mlx dashboard --no-open       # start without a browser
+mlx dashboard --port 8080     # pick a port
+```
+
+Binds `127.0.0.1` with no authentication. See [docs/dashboard.md](https://github.com/mlx-node/mlx-node/blob/main/docs/dashboard.md) for flags, pages, and the security model. Requires Node.js ≥ 22.19.
 
 ## Examples
 

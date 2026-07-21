@@ -22,6 +22,7 @@ There are already some wild used inference implementations for your reference:
 - [docs/perf.md](docs/perf.md) — Profiling, env-var inventory, GPU arch detection, quantization
 - [docs/cli.md](docs/cli.md) — `mlx download`, `mlx convert`, `mlx launch claude`
 - [docs/convert-quantize.md](docs/convert-quantize.md) — Convert/quantize internals: on-disk formats, recipe decision engine, GGUF import, provenance, gotchas
+- [docs/dashboard.md](docs/dashboard.md) — `mlx dashboard`: local web UI for models/sessions/metrics/cache, `persistPagedCache`, data sources
 
 ## Build, test, lint
 

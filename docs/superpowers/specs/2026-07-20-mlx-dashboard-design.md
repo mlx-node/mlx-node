@@ -14,14 +14,14 @@ A local web dashboard, started with `mlx dashboard`, shipped inside the `@mlx-no
 
 ## Decisions made during brainstorm
 
-| Question | Decision |
-| --- | --- |
-| Persist-cache scope | Full: wire `ColdCacheManager` into inference, add NAPI stats, then dashboard UI |
+| Question               | Decision                                                                                                                                                                                            |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Persist-cache scope    | Full: wire `ColdCacheManager` into inference, add NAPI stats, then dashboard UI                                                                                                                     |
 | Session metrics source | Metadata-only JSONL trace files as the always-on metrics sink (originally framed as "reuse InferenceTrace"; that class turned out not to exist, so Phase B builds the sink new with the same shape) |
-| UI stack | React + Vite + Tailwind CSS + shadcn/ui, SPA |
-| Session management ops | Browse/inspect, delete, rename/label, resume helper; sessions indexed into local SQLite via `node:sqlite` + Drizzle ORM |
-| Download source | Static recommended model list only. No search, no free-form repo input |
-| Code location | New workspace `packages/dashboard`; thin `mlx dashboard` command in `packages/cli` |
+| UI stack               | React + Vite + Tailwind CSS + shadcn/ui, SPA                                                                                                                                                        |
+| Session management ops | Browse/inspect, delete, rename/label, resume helper; sessions indexed into local SQLite via `node:sqlite` + Drizzle ORM                                                                             |
+| Download source        | Static recommended model list only. No search, no free-form repo input                                                                                                                              |
+| Code location          | New workspace `packages/dashboard`; thin `mlx dashboard` command in `packages/cli`                                                                                                                  |
 
 ## Current-state facts the design builds on
 
@@ -123,21 +123,21 @@ packages/cli/src/commands/dashboard.ts   thin: flags, start server, open browser
 
 #### HTTP API
 
-| Route | Method | Purpose |
-| --- | --- | --- |
-| `/api/models` | GET | local models: name, path, family, quant summary, size on disk, ctx window |
-| `/api/models/:name` | DELETE | delete model dir (path-checked, confirmed in UI) |
-| `/api/catalog` | GET | static recommended list + installed/installable state |
-| `/api/downloads` | GET/POST | list active jobs / start a catalog download |
-| `/api/downloads/:id/events` | GET (SSE) | per-file + byte progress, resume-aware |
-| `/api/sessions` | GET | indexed session list; search + filters (cwd, model, date) |
-| `/api/sessions/:id` | GET | transcript (active branch) + per-turn usage |
-| `/api/sessions/:id` | PATCH/DELETE | rename (pi `session_info` entry) / delete file + rows |
-| `/api/sessions/:id/metrics` | GET | joined trace metrics for the session |
-| `/api/metrics/overview` | GET | aggregates: tokens/day, tok/s + TTFT trends, MTP acceptance, model share |
-| `/api/cache` | GET | cold tier: entries, bytes, quota, age histogram; hit/miss trend from traces |
-| `/api/cache` | DELETE | clear all, or evict older-than-N-days |
-| `/api/ingest` | POST | trigger incremental rescan |
+| Route                       | Method       | Purpose                                                                     |
+| --------------------------- | ------------ | --------------------------------------------------------------------------- |
+| `/api/models`               | GET          | local models: name, path, family, quant summary, size on disk, ctx window   |
+| `/api/models/:name`         | DELETE       | delete model dir (path-checked, confirmed in UI)                            |
+| `/api/catalog`              | GET          | static recommended list + installed/installable state                       |
+| `/api/downloads`            | GET/POST     | list active jobs / start a catalog download                                 |
+| `/api/downloads/:id/events` | GET (SSE)    | per-file + byte progress, resume-aware                                      |
+| `/api/sessions`             | GET          | indexed session list; search + filters (cwd, model, date)                   |
+| `/api/sessions/:id`         | GET          | transcript (active branch) + per-turn usage                                 |
+| `/api/sessions/:id`         | PATCH/DELETE | rename (pi `session_info` entry) / delete file + rows                       |
+| `/api/sessions/:id/metrics` | GET          | joined trace metrics for the session                                        |
+| `/api/metrics/overview`     | GET          | aggregates: tokens/day, tok/s + TTFT trends, MTP acceptance, model share    |
+| `/api/cache`                | GET          | cold tier: entries, bytes, quota, age histogram; hit/miss trend from traces |
+| `/api/cache`                | DELETE       | clear all, or evict older-than-N-days                                       |
+| `/api/ingest`               | POST         | trigger incremental rescan                                                  |
 
 #### SQLite schema (Drizzle, `~/.mlx-node/dashboard.db`)
 
@@ -149,14 +149,14 @@ Ingest: full scan on start, then incremental by file mtime; manual refresh endpo
 
 #### UI pages
 
-| Page | Content | Actions |
-| --- | --- | --- |
-| Overview | stat tiles (models/disk, sessions, tokens 7d, cache size + hit rate), recent sessions, active downloads | — |
-| Models | local table: name, family, quant, size, ctx window | delete; install from recommended list w/ live progress |
-| Sessions | table w/ search + filters | open, rename, delete, copy resume command (`mlx agent --session <file>`) |
-| Session detail | transcript (collapsible tool calls) + per-turn tokens/tok-s chips + charts | — |
-| Metrics | tokens/day (in/out/cached), tok/s + TTFT trends per model, MTP acceptance, model usage share; date range | — |
-| Cache | disk usage vs quota, entry count + age histogram, hit/miss trend | clear all, evict older-than |
+| Page           | Content                                                                                                  | Actions                                                                  |
+| -------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Overview       | stat tiles (models/disk, sessions, tokens 7d, cache size + hit rate), recent sessions, active downloads  | —                                                                        |
+| Models         | local table: name, family, quant, size, ctx window                                                       | delete; install from recommended list w/ live progress                   |
+| Sessions       | table w/ search + filters                                                                                | open, rename, delete, copy resume command (`mlx agent --session <file>`) |
+| Session detail | transcript (collapsible tool calls) + per-turn tokens/tok-s chips + charts                               | —                                                                        |
+| Metrics        | tokens/day (in/out/cached), tok/s + TTFT trends per model, MTP acceptance, model usage share; date range | —                                                                        |
+| Cache          | disk usage vs quota, entry count + age histogram, hit/miss trend                                         | clear all, evict older-than                                              |
 
 ## Error handling & safety
 

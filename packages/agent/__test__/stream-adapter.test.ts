@@ -542,7 +542,12 @@ describe('makeMlxStreamSimple', () => {
     });
 
     const events = await collect(
-      makeMlxStreamSimple(makeFakeHost(session), undefined, undefined, recorder)(MODEL, CONTEXT, {
+      makeMlxStreamSimple(
+        makeFakeHost(session),
+        undefined,
+        undefined,
+        recorder,
+      )(MODEL, CONTEXT, {
         sessionId: 'sess-9',
       }),
     );
@@ -610,7 +615,12 @@ describe('makeMlxStreamSimple', () => {
     const recorder = vi.fn();
 
     const events = await collect(
-      makeMlxStreamSimple(makeFakeHost(session), undefined, undefined, recorder)(MODEL, CONTEXT, {
+      makeMlxStreamSimple(
+        makeFakeHost(session),
+        undefined,
+        undefined,
+        recorder,
+      )(MODEL, CONTEXT, {
         signal: controller.signal,
       }),
     );

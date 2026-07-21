@@ -1,6 +1,6 @@
 # CLI (`@mlx-node/cli`)
 
-The `mlx` binary is built from `packages/cli/` and exposes three top-level commands: `download`, `convert`, and `launch`.
+The `mlx` binary is built from `packages/cli/` and exposes the top-level commands `download`, `convert`, `calibrate`, `launch`, `agent`, and `dashboard`.
 
 ## `mlx download`
 
@@ -338,3 +338,29 @@ mlx agent config             # edit which are enabled
 ```
 
 `mlx agent update` is intentionally blocked (it maps to pi's npm self-update, which would fight the installed `@mlx-node/cli`); update `@mlx-node/cli` through your package manager instead. `mlx agent -h`/`--help` prints the mlx options above and then pi's full flag list. `mlx agent --version`/`-v` and `mlx agent --export <session>` are answered by pi directly — no local model needed, so the first-run wizard stays out — and `--version` prints the embedded pi version, not `@mlx-node/cli`'s (`mlx --version`).
+
+## `mlx dashboard`
+
+Starts the local web dashboard (`@mlx-node/dashboard`) for browsing local models,
+`mlx agent` sessions, inference metrics, and the paged-attention cold cache. It is a
+separate viewer process that never links the native addon — all data comes from disk
+under `~/.mlx-node`. Requires Node.js ≥ 22.19.
+
+```bash
+mlx dashboard                       # start on 127.0.0.1:6590, open a browser
+mlx dashboard --port 8080           # pick a port
+mlx dashboard --no-open             # do not launch a browser
+```
+
+| Flag           | Default                    | Purpose                                                             |
+| -------------- | -------------------------- | ------------------------------------------------------------------- |
+| `--port`       | `6590`                     | Port to listen on (`0` = ephemeral)                                 |
+| `--host`       | `127.0.0.1`                | Host to bind; a non-loopback host prints a no-auth exposure warning |
+| `--no-open`    | (opens a browser)          | Do not open a browser                                               |
+| `--db`         | `~/.mlx-node/dashboard.db` | Override the disposable SQLite index path                           |
+| `--models-dir` | `~/.mlx-node/models`       | Directory to read local models from                                 |
+
+Binds `127.0.0.1` by default with no authentication; mutating requests are guarded by
+a local-origin check. See [docs/dashboard.md](dashboard.md) for pages, data sources,
+`persistPagedCache` (qwen3-dense-only cold restore), the `MLX_AGENT_METRICS` kill
+switch, `MLX_COLD_CACHE_DIR`, and the security model.

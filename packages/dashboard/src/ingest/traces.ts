@@ -104,8 +104,7 @@ export async function ingestTraces(
       }
       if (typeof rec.traceId !== 'string') continue;
       const ts = numOrNull(rec.ts);
-      db
-        .insert(traces)
+      db.insert(traces)
         .values({
           traceId: rec.traceId,
           sessionId: strOrNull(rec.sessionId),

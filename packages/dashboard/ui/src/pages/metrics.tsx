@@ -180,8 +180,24 @@ export default function Metrics() {
                 wrapperStyle={{ fontSize: 12 }}
                 formatter={(value) => <span className="text-foreground">{value}</span>}
               />
-              <Bar dataKey="input" stackId="tokens" name="Input" fill="var(--viz-input)" stroke="var(--color-card)" strokeWidth={1} isAnimationActive={false} />
-              <Bar dataKey="output" stackId="tokens" name="Output" fill="var(--viz-output)" stroke="var(--color-card)" strokeWidth={1} isAnimationActive={false} />
+              <Bar
+                dataKey="input"
+                stackId="tokens"
+                name="Input"
+                fill="var(--viz-input)"
+                stroke="var(--color-card)"
+                strokeWidth={1}
+                isAnimationActive={false}
+              />
+              <Bar
+                dataKey="output"
+                stackId="tokens"
+                name="Output"
+                fill="var(--viz-output)"
+                stroke="var(--color-card)"
+                strokeWidth={1}
+                isAnimationActive={false}
+              />
               <Bar
                 dataKey="cached"
                 stackId="tokens"
@@ -216,11 +232,19 @@ export default function Metrics() {
             isEmpty={ttftData.length === 0}
             empty={<ChartEmpty icon={Timer} message="No TTFT samples in this range." hint={RECORD_HINT} />}
           >
-            <ModelBarChart data={ttftData} unit=" ms" valueFormat={(v) => Math.round(v).toString()} colorFor={colorFor} />
+            <ModelBarChart
+              data={ttftData}
+              unit=" ms"
+              valueFormat={(v) => Math.round(v).toString()}
+              colorFor={colorFor}
+            />
           </ChartBody>
         </ChartCard>
 
-        <ChartCard title="MTP mean accepted per model" subtitle="Average speculative-decoding tokens accepted per cycle">
+        <ChartCard
+          title="MTP mean accepted per model"
+          subtitle="Average speculative-decoding tokens accepted per cycle"
+        >
           <ChartBody
             loading={loading}
             error={error}
@@ -309,7 +333,13 @@ function ModelBarChart({ data, unit, valueFormat, colorFor }: ModelBarChartProps
     <ResponsiveContainer width="100%" height="100%">
       <BarChart layout="vertical" data={data} margin={{ top: 4, right: 44, bottom: 0, left: 8 }}>
         <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" horizontal={false} />
-        <XAxis type="number" tick={AXIS_TICK} tickLine={false} axisLine={false} tickFormatter={(v) => valueFormat(Number(v))} />
+        <XAxis
+          type="number"
+          tick={AXIS_TICK}
+          tickLine={false}
+          axisLine={false}
+          tickFormatter={(v) => valueFormat(Number(v))}
+        />
         <YAxis
           type="category"
           dataKey="model"

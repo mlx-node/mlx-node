@@ -84,7 +84,15 @@ export function ChartCard({ title, subtitle, children, heightClass = 'h-56' }: C
  * produces the data. Sized to fill a `ChartCard`'s plot area so cards keep an
  * even height whether populated or empty.
  */
-export function ChartEmpty({ icon: Icon, message, hint }: { icon: ComponentType<{ className?: string }>; message: string; hint: string }) {
+export function ChartEmpty({
+  icon: Icon,
+  message,
+  hint,
+}: {
+  icon: ComponentType<{ className?: string }>;
+  message: string;
+  hint: string;
+}) {
   return (
     <div className="text-muted-foreground flex h-full flex-col items-center justify-center gap-2 px-4 text-center text-sm">
       <Icon className="size-6" aria-hidden />

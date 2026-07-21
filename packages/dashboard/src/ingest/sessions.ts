@@ -191,8 +191,7 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
       try {
         db.delete(turns).where(eq(turns.sessionId, derived.id)).run();
         db.delete(sessions).where(eq(sessions.id, derived.id)).run();
-        db
-          .insert(sessions)
+        db.insert(sessions)
           .values({
             id: derived.id,
             path: filePath,

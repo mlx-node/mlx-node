@@ -1,0 +1,139 @@
+# Dashboard (`mlx dashboard`)
+
+A local web dashboard for browsing models, agent sessions, inference metrics, and
+the paged-attention cold cache. It ships inside `@mlx-node/dashboard` and starts
+with `mlx dashboard`.
+
+The dashboard is a **separate viewer process**. It never links the native addon
+(no Metal init, instant start). All data comes from disk under `~/.mlx-node`;
+live-ish behavior is polling + SSE. Requires Node.js ≥ 22.19.
+
+```bash
+mlx dashboard                       # start on 127.0.0.1:6590, open a browser
+mlx dashboard --port 8080           # pick a port
+mlx dashboard --no-open             # do not launch a browser
+mlx dashboard --host 0.0.0.0        # bind elsewhere (LOUD warning; no auth)
+mlx dashboard --db ./scratch.db     # override the SQLite index path
+mlx dashboard --models-dir ./models # read local models from a specific dir
+```
+
+| Flag           | Default                    | Purpose                                                               |
+| -------------- | -------------------------- | --------------------------------------------------------------------- |
+| `--port`       | `6590`                     | Port to listen on (`0` = ephemeral)                                   |
+| `--host`       | `127.0.0.1`                | Host to bind; any non-loopback host prints a no-auth exposure warning |
+| `--no-open`    | (opens a browser)          | Do not open the dashboard in a browser                                |
+| `--db`         | `~/.mlx-node/dashboard.db` | Override the disposable SQLite index path                             |
+| `--models-dir` | `~/.mlx-node/models`       | Directory to read local models from                                   |
+| `-h`, `--help` | —                          | Print help                                                            |
+
+## Pages
+
+| Page           | Content                                                                                                 | Actions                                                          |
+| -------------- | ------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| Overview       | Stat tiles (models/disk, sessions, tokens 7d, cache size + hit rate), recent sessions, active downloads | —                                                                |
+| Models         | Local table: name, family, quant, size, ctx window                                                      | delete; install from the recommended catalog (live SSE progress) |
+| Sessions       | Table with search + filters (cwd, model, date)                                                          | open, rename, delete, copy resume command                        |
+| Session detail | Transcript (collapsible tool calls) + per-turn tokens / tok-s chips + charts                            | —                                                                |
+| Metrics        | Tokens/day (in/out/cached), tok/s + TTFT per model, MTP acceptance, model share                         | date range                                                       |
+| Cache          | Cold-tier disk usage vs quota, entry count + age histogram, hit/miss trend                              | clear all, evict older-than-N-days                               |
+
+## Data sources
+
+All state lives on disk; SQLite is only an index.
+
+| Source                          | Location                                                                                            | Role                                                             |
+| ------------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| pi session JSONL                | `~/.mlx-node/agent/sessions/--<cwd>--/*.jsonl`                                                      | Transcripts + per-turn token usage; the source of truth          |
+| `MetricsTrace` JSONL            | `~/.mlx-node/metrics/traces/<date>-<pid>.jsonl`                                                     | Per-turn throughput / cold-cache deltas (see Phase B below)      |
+| Disposable SQLite index         | `~/.mlx-node/dashboard.db`                                                                          | Index over the JSONL above; **rebuilt on next start if deleted** |
+| Local models                    | `--models-dir` → `MLX_MODELS_DIR` → `modelsDir` in `~/.mlx-node/config.json` → `~/.mlx-node/models` | Model list, size on disk, family/quant/ctx from `config.json`    |
+| Cold tier (paged prefix blocks) | `~/.mlx-node/cache/paged/v1/` (`MLX_COLD_CACHE_DIR` override)                                       | Cache page scan + management                                     |
+
+The SQLite index is **disposable**: deleting `dashboard.db` loses nothing — it is
+rebuilt from the JSONL on next start. Ingest runs on boot, then incrementally by
+file mtime every 30 s (plus a manual `POST /api/ingest`). Trace files older than
+30 days are pruned after ingest.
+
+Trace records are metadata-only: every field is a number, a small enumerated
+string, or an identifier — never prompt content, tool arguments, or model output.
+Records join to session entries via `mlxTraceId`, a UUID the agent provider mints
+per turn and stamps on both the trace record and the pi assistant message.
+
+## Persist paged cache (`persistPagedCache`)
+
+Phase A wires the existing `ColdCacheManager` SSD cold tier into paged inference.
+When enabled, full paged prefix blocks are captured to the cold tier on publish and
+restored on a hot-cache miss before falling back to a normal prefill.
+
+- Library default is **off** (`persistPagedCache` per-model config field, TS
+  `persistPagedCache`). `mlx agent` turns it **on by default** for qwen3 models
+  (disable with `mlx agent --no-persist-cache`) via a temporary config overlay.
+- **Restore is gated to qwen3 dense only.** Other families (gemma4, lfm2,
+  qwen3.5/3.6) keep per-layer state outside the paged pool — sliding-window
+  `RotatingKVCache`, LFM2 conv state, GDN recurrent/conv state — so paged blocks do
+  not fully determine their layer state, and they are **not** restore-eligible.
+  Capture/persist wiring is family-generic so hybrids can be added later by
+  persisting their extra state. This mirrors vLLM defaulting prefix caching off for
+  hybrid models.
+- The tier is fail-open: any validation or I/O failure falls through silently to a
+  fresh prefill. Quota is 10 % of FS capacity capped at 100 GiB, LRU by rebuilt
+  mtime recency. All destructive I/O is descriptor-relative and no-follow, contained
+  to a managed `mlx-paged-v1` child.
+- `MLX_COLD_CACHE_DIR=<parent>` relocates the tier; the cache operates in a
+  `mlx-paged-v1` child of that parent (never the parent verbatim). Default root is
+  `~/.mlx-node/cache/paged/v1`. `coldCacheStats()` (NAPI) exposes cumulative
+  counters, root path, and quota.
+
+## Environment variables
+
+| Var                   | Effect                                                                                                                                                              |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MLX_AGENT_METRICS=0` | Kill switch for the always-on metrics sink (`0` / `false` / `off`). Without it, the agent writes a trace per turn — no metrics page data means no traces to ingest. |
+| `MLX_COLD_CACHE_DIR`  | Parent dir for the cold tier (operates in its `mlx-paged-v1` child). Default `~/.mlx-node/cache/paged/v1`.                                                          |
+| `MLX_MODELS_DIR`      | Local models directory when `--models-dir` is omitted.                                                                                                              |
+
+## Security model
+
+- Binds `127.0.0.1` by default. Binding any other host prints a loud warning: the
+  dashboard has **no authentication** and exposes local models, sessions, and cache
+  to anyone who can reach the address.
+- **No auth.** Mutating (non-GET/HEAD) requests are guarded by a local-origin check:
+  the `Host` header must name a loopback host (optionally with the server port), and
+  any present `Origin` must be an `http` loopback origin. This blocks drive-by CSRF /
+  DNS-rebinding against the loopback port. GET/HEAD (static assets + read endpoints)
+  are unguarded.
+- Destructive ops (delete model/session, clear/evict cache) require UI confirmation
+  and resolve paths strictly inside their managed roots before any removal.
+
+## Known limitation
+
+The Metrics page's "trend per model" charts render as **per-model comparison bars,
+not time-series lines**, because `/api/metrics/overview` returns per-model aggregates
+rather than per-day-per-model rows. A future follow-up would add a daily-bucketed
+per-model query to plot true trends over time.
+
+## HTTP API
+
+Read-only `GET` endpoints plus a few guarded mutations. `GET /health` returns
+`{ status, modelsDir, sessionsRoot, tracesDir }`.
+
+| Route                       | Method       | Purpose                                                     |
+| --------------------------- | ------------ | ----------------------------------------------------------- |
+| `/api/models`               | GET          | Local models: name, path, family, quant, size, ctx window   |
+| `/api/models/:name`         | DELETE       | Delete a model dir (path-checked)                           |
+| `/api/catalog`              | GET          | Recommended catalog + installed/installable state           |
+| `/api/downloads`            | GET / POST   | List active jobs / start a catalog download                 |
+| `/api/downloads/:id/events` | GET (SSE)    | Per-file + byte progress, resume-aware                      |
+| `/api/sessions`             | GET          | Indexed session list; search + filters                      |
+| `/api/sessions/:id`         | GET          | Transcript (active branch) + per-turn usage                 |
+| `/api/sessions/:id`         | PATCH/DELETE | Rename / delete file + rows                                 |
+| `/api/sessions/:id/metrics` | GET          | Joined trace metrics for the session                        |
+| `/api/metrics/overview`     | GET          | Aggregates: tokens/day, tok/s + TTFT, MTP acceptance, share |
+| `/api/cache`                | GET / DELETE | Cold-tier scan / clear all or evict older-than-N-days       |
+| `/api/ingest`               | POST         | Trigger an incremental rescan                               |
+
+## Design
+
+The full design and phasing (Phase A cold-cache wiring, Phase B metrics sink,
+Phase C dashboard package) live in
+`docs/superpowers/specs/2026-07-20-mlx-dashboard-design.md`.

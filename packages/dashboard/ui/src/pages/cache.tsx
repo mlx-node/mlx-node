@@ -74,13 +74,20 @@ export default function Cache() {
   const quotaFraction = quotaBytes > 0 ? Math.min(1, totalBytes / quotaBytes) : 0;
 
   const trendTotals = useMemo(
-    () => trend.reduce((acc, row) => ({ hits: acc.hits + row.hits, misses: acc.misses + row.misses }), { hits: 0, misses: 0 }),
+    () =>
+      trend.reduce((acc, row) => ({ hits: acc.hits + row.hits, misses: acc.misses + row.misses }), {
+        hits: 0,
+        misses: 0,
+      }),
     [trend],
   );
   const lookups = trendTotals.hits + trendTotals.misses;
   const hitRate = lookups > 0 ? trendTotals.hits / lookups : null;
 
-  const trendData = useMemo(() => trend.map((row) => ({ day: formatDay(row.day), hits: row.hits, misses: row.misses })), [trend]);
+  const trendData = useMemo(
+    () => trend.map((row) => ({ day: formatDay(row.day), hits: row.hits, misses: row.misses })),
+    [trend],
+  );
   const hasTrend = lookups > 0;
   const hasBlocks = entryCount > 0;
 
@@ -91,9 +98,14 @@ export default function Cache() {
     try {
       const body = action.kind === 'evict' ? { olderThanDays: action.days } : undefined;
       const result = await mutate<CacheMutationResult>('DELETE', '/cache', body);
-      toast.success(action.kind === 'evict' ? `Evicted blocks older than ${action.days} day${action.days === 1 ? '' : 's'}` : 'Cleared cold cache', {
-        description: `${formatNumber(result.removed)} block${result.removed === 1 ? '' : 's'} removed · ${formatBytes(result.freedBytes)} freed`,
-      });
+      toast.success(
+        action.kind === 'evict'
+          ? `Evicted blocks older than ${action.days} day${action.days === 1 ? '' : 's'}`
+          : 'Cleared cold cache',
+        {
+          description: `${formatNumber(result.removed)} block${result.removed === 1 ? '' : 's'} removed · ${formatBytes(result.freedBytes)} freed`,
+        },
+      );
       setPending(null);
       cache.reload();
     } catch (err) {
@@ -156,7 +168,9 @@ export default function Cache() {
             <StatTile
               label="Hit rate"
               icon={Percent}
-              value={cache.loading ? <Skeleton className="h-8 w-16" /> : hitRate !== null ? formatPercent(hitRate) : '—'}
+              value={
+                cache.loading ? <Skeleton className="h-8 w-16" /> : hitRate !== null ? formatPercent(hitRate) : '—'
+              }
               sub={
                 cache.loading ? (
                   <Skeleton className="h-4 w-32" />
@@ -225,7 +239,13 @@ export default function Cache() {
                         return [`${formatNumber(Number(value))} blocks · ${formatBytes(bytes)}`, 'Blocks'];
                       }}
                     />
-                    <Bar dataKey="count" name="Blocks" fill="var(--viz-input)" radius={[4, 4, 0, 0]} isAnimationActive={false} />
+                    <Bar
+                      dataKey="count"
+                      name="Blocks"
+                      fill="var(--viz-input)"
+                      radius={[4, 4, 0, 0]}
+                      isAnimationActive={false}
+                    />
                   </BarChart>
                 </ResponsiveContainer>
               </ChartBody>
@@ -265,8 +285,24 @@ export default function Cache() {
                       wrapperStyle={{ fontSize: 12 }}
                       formatter={(value) => <span className="text-foreground">{value}</span>}
                     />
-                    <Bar dataKey="hits" name="Hits" fill="var(--viz-output)" stroke="var(--color-card)" strokeWidth={1} radius={[4, 4, 0, 0]} isAnimationActive={false} />
-                    <Bar dataKey="misses" name="Misses" fill="var(--viz-cached)" stroke="var(--color-card)" strokeWidth={1} radius={[4, 4, 0, 0]} isAnimationActive={false} />
+                    <Bar
+                      dataKey="hits"
+                      name="Hits"
+                      fill="var(--viz-output)"
+                      stroke="var(--color-card)"
+                      strokeWidth={1}
+                      radius={[4, 4, 0, 0]}
+                      isAnimationActive={false}
+                    />
+                    <Bar
+                      dataKey="misses"
+                      name="Misses"
+                      fill="var(--viz-cached)"
+                      stroke="var(--color-card)"
+                      strokeWidth={1}
+                      radius={[4, 4, 0, 0]}
+                      isAnimationActive={false}
+                    />
                   </BarChart>
                 </ResponsiveContainer>
               </ChartBody>
@@ -367,7 +403,15 @@ export default function Cache() {
 }
 
 /** Usage-vs-quota bar with an accessible progressbar role. */
-function UsageMeter({ fraction, totalBytes, quotaBytes }: { fraction: number; totalBytes: number; quotaBytes: number }) {
+function UsageMeter({
+  fraction,
+  totalBytes,
+  quotaBytes,
+}: {
+  fraction: number;
+  totalBytes: number;
+  quotaBytes: number;
+}) {
   const pct = Math.round(fraction * 100);
   return (
     <div
