@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -92,6 +92,35 @@ describe('deleteLocalModel', () => {
 
   it('throws when the model does not exist', () => {
     expect(() => deleteLocalModel(modelsDir, 'ghost')).toThrow();
+  });
+
+  it('throws on a name containing a path separator', () => {
+    expect(() => deleteLocalModel(modelsDir, 'a/b')).toThrow();
+    expect(() => deleteLocalModel(modelsDir, 'a\\b')).toThrow();
+    // Siblings untouched.
+    expect(existsSync(join(modelsDir, 'model-a'))).toBe(true);
+  });
+
+  it("throws on a '..' traversal name", () => {
+    expect(() => deleteLocalModel(modelsDir, '..')).toThrow();
+    expect(existsSync(modelsDir)).toBe(true);
+  });
+
+  it('refuses to delete a symlinked child and leaves its target untouched', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'dash-outside-'));
+    const keep = join(outside, 'victim.txt');
+    writeFileSync(keep, 'important');
+    // <modelsDir>/link -> outside (an intermediate symlink rmSync must not follow).
+    symlinkSync(outside, join(modelsDir, 'link'));
+
+    expect(() => deleteLocalModel(modelsDir, 'link')).toThrow(/symlink/i);
+    // The symlink target's contents survive.
+    expect(existsSync(keep)).toBe(true);
+    // And the encoded child-of-a-symlink attack is rejected by the separator guard.
+    expect(() => deleteLocalModel(modelsDir, 'link/victim.txt')).toThrow();
+    expect(existsSync(keep)).toBe(true);
+
+    rmSync(outside, { recursive: true, force: true });
   });
 });
 

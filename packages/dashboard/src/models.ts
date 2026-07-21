@@ -8,9 +8,9 @@
  * the same trade-off already made in `packages/agent/src/provider/models.ts`.
  */
 
-import { type Dirent, existsSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { type Dirent, lstatSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve, sep } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 export interface LocalModel {
   /** Checkpoint directory name under `modelsDir` (the model's local id). */
@@ -203,18 +203,41 @@ export function discoverLocalModels(modelsDir: string): { models: LocalModel[]; 
 }
 
 /**
- * Delete a checkpoint directory by name. The resolved target must stay strictly
- * inside `modelsDir` (a child, never the root itself), so a traversal name like
- * `../../etc` or `.` throws instead of removing anything outside the store.
+ * Delete a checkpoint directory by its exact name. `name` must be a single
+ * direct child of `modelsDir`: any path separator, `.`/`..`, or NUL is rejected,
+ * so a decoded route param like `link%2Fvictim` (→ `link/victim`) or `../../etc`
+ * can never traverse out of the store. The resolved child is `lstat`-ed without
+ * following the final component, and a symlinked child is refused outright —
+ * otherwise `rmSync(..., { recursive })` would follow the link and recursively
+ * delete whatever lives outside the store that it points at.
  */
 export function deleteLocalModel(modelsDir: string, name: string): void {
+  if (
+    name.length === 0 ||
+    name === '.' ||
+    name === '..' ||
+    name.includes('/') ||
+    name.includes('\\') ||
+    name.includes('\0')
+  ) {
+    throw new Error(`Refusing to delete "${name}": not a direct child of the models directory`);
+  }
+
   const root = resolve(modelsDir);
-  const target = resolve(modelsDir, name);
-  if (!target.startsWith(root + sep)) {
+  const target = join(root, name);
+  // Belt-and-braces: the resolved child must sit exactly one level under root.
+  if (dirname(target) !== root) {
     throw new Error(`Refusing to delete "${name}": resolves outside the models directory`);
   }
-  if (!existsSync(target)) {
+
+  let stat;
+  try {
+    stat = lstatSync(target);
+  } catch {
     throw new Error(`Model "${name}" not found`);
+  }
+  if (stat.isSymbolicLink()) {
+    throw new Error(`Refusing to delete "${name}": target is a symlink, not a model directory`);
   }
   rmSync(target, { recursive: true, force: true });
 }

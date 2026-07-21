@@ -19,6 +19,7 @@ import { catalogWithState } from './catalog.js';
 import type { DashboardDb } from './db/open.js';
 import { sessions, turns } from './db/schema.js';
 import type { DownloadManager, DownloadEvent } from './download.js';
+import { verifySessionFileId } from './ingest/sessions.js';
 import { discoverLocalModels, deleteLocalModel } from './models.js';
 
 /** Runtime dependencies the handlers close over, supplied by `server.ts`. */
@@ -531,7 +532,10 @@ function handleSessionDelete({ res, params, deps }: RouteCtx): void {
     sendError(res, 403, 'Session file resolves outside the managed sessions root');
     return;
   }
-  if (existsSync(found.path)) {
+  // Last-defense guard: only unlink the file if it still belongs to this id. A
+  // stale index row (path since reused by a newer session) must not delete the
+  // newer session's file — drop our rows and let re-ingest reconcile instead.
+  if (existsSync(found.path) && verifySessionFileId(found.path, params.id)) {
     rmSync(found.path, { force: true });
   }
   const { db, sqlite } = deps.dash;

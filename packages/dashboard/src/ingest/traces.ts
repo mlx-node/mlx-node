@@ -1,6 +1,8 @@
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { eq } from 'drizzle-orm';
+
 import type { DashboardDb } from '../db/open.js';
 import { traces } from '../db/schema.js';
 import { metricsTraceDir } from '../paths.js';
@@ -48,14 +50,16 @@ function strOrNull(value: unknown): string | null {
  * Ingest every trace JSONL under `dir` into the SQLite index. Each line is an
  * independent `MetricsTraceRecord`; malformed lines are skipped. Inserts are
  * idempotent on `trace_id`. Files whose mtime is older than `retentionDays` are
- * unlinked (JSONL is the source of truth, so the on-disk retention drives it).
+ * unlinked AND their rows deleted (JSONL is the source of truth, so the on-disk
+ * retention drives it). Rows whose backing file no longer exists are reconciled
+ * away so expired telemetry is never stored indefinitely.
  */
 export async function ingestTraces(
   dash: DashboardDb,
   dir?: string,
   opts?: { retentionDays?: number },
 ): Promise<TraceIngestResult> {
-  const { db } = dash;
+  const { db, sqlite } = dash;
   const traceDir = dir ?? metricsTraceDir();
   const retentionDays = opts?.retentionDays ?? 30;
   const cutoff = Date.now() - retentionDays * DAY_MS;
@@ -78,10 +82,13 @@ export async function ingestTraces(
     if (stat.mtimeMs < cutoff) {
       try {
         unlinkSync(filePath);
-        pruned++;
       } catch {
-        // Best-effort prune: a file we cannot remove is left in place.
+        // Best-effort prune: a file we cannot remove is left in place, and its
+        // rows are kept (the file is still the source of truth).
+        continue;
       }
+      pruned++;
+      db.delete(traces).where(eq(traces.sourceFile, name)).run();
       continue;
     }
 
@@ -131,6 +138,17 @@ export async function ingestTraces(
         .run();
       records++;
     }
+  }
+
+  // Reconcile rows whose backing file has vanished (manually deleted, or pruned
+  // in an earlier partial run). Rows with a NULL source_file predate source
+  // tracking and are left untouched.
+  const live = new Set(readdirSync(traceDir).filter((n) => n.endsWith('.jsonl')));
+  const tracked = sqlite
+    .prepare('SELECT DISTINCT source_file AS sf FROM traces WHERE source_file IS NOT NULL')
+    .all() as Array<{ sf: string }>;
+  for (const { sf } of tracked) {
+    if (!live.has(sf)) db.delete(traces).where(eq(traces.sourceFile, sf)).run();
   }
 
   return { files, records, pruned };

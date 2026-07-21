@@ -1,4 +1,4 @@
-import { cpSync, mkdtempSync, existsSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, existsSync, rmSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -87,5 +87,36 @@ describe('ingestTraces', () => {
     expect(existsSync(oldFile)).toBe(false);
     expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-old')).all()).toHaveLength(0);
     expect(dash.db.select().from(traces).all()).toHaveLength(3);
+  });
+
+  // Finding 8: pruning a file must delete its DB rows in the same operation.
+  it('deletes a pruned file rows, not just the file', async () => {
+    cpSync(FIXTURE_TRACES, dir, { recursive: true });
+    await ingestTraces(dash, dir);
+    expect(dash.db.select().from(traces).all()).toHaveLength(3);
+
+    // Age the ingested fixture file past retention, then re-ingest.
+    const fixtureFile = join(dir, '2026-07-01-99999.jsonl');
+    const oldSec = (Date.now() - 60 * DAY_MS) / 1000;
+    utimesSync(fixtureFile, oldSec, oldSec);
+
+    const res = await ingestTraces(dash, dir, { retentionDays: 30 });
+    expect(res.pruned).toBe(1);
+    expect(existsSync(fixtureFile)).toBe(false);
+    // The rows it produced are gone with it — no orphaned telemetry.
+    expect(dash.db.select().from(traces).all()).toHaveLength(0);
+  });
+
+  // Finding 8: rows whose source file vanished by other means are reconciled.
+  it('reconciles rows when a source file is manually deleted', async () => {
+    cpSync(FIXTURE_TRACES, dir, { recursive: true });
+    await ingestTraces(dash, dir);
+    expect(dash.db.select().from(traces).all()).toHaveLength(3);
+
+    // Delete the source file out from under the index, then re-ingest.
+    unlinkSync(join(dir, '2026-07-01-99999.jsonl'));
+    const res = await ingestTraces(dash, dir);
+    expect(res.files).toBe(0);
+    expect(dash.db.select().from(traces).all()).toHaveLength(0);
   });
 });

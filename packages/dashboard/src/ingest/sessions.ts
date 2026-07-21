@@ -2,13 +2,15 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
+  buildContextEntries,
   parseSessionEntries,
   type FileEntry,
+  type SessionEntry,
   type SessionHeader,
   type SessionInfoEntry,
   type SessionMessageEntry,
 } from '@earendil-works/pi-coding-agent';
-import { eq } from 'drizzle-orm';
+import { and, eq, ne } from 'drizzle-orm';
 
 import type { DashboardDb } from '../db/open.js';
 import { sessions, turns } from '../db/schema.js';
@@ -80,22 +82,42 @@ interface DerivedSession {
   turnRows: TurnRow[];
 }
 
+/**
+ * The active, compaction-aware branch the detail API renders — pi's
+ * `buildContextEntries` follows the current leaf (the last appended entry) back
+ * to the root, dropping abandoned tree branches. When that branch carries no
+ * messages (e.g. a detached `session_info` leaf), fall back to every entry,
+ * mirroring the detail API's own fallback so indexed turns never disagree with
+ * a non-empty transcript.
+ */
+function activeBranchEntries(entries: FileEntry[]): SessionEntry[] {
+  const sessionEntries = entries.filter((e): e is SessionEntry => e.type !== 'session');
+  const active = buildContextEntries(sessionEntries);
+  return active.some((e) => e.type === 'message') ? active : sessionEntries;
+}
+
 /** Fold parsed file entries into the row shapes the index stores. Returns null when unusable. */
 function deriveSession(entries: FileEntry[]): DerivedSession | null {
   const header = entries.find((e) => e.type === 'session') as SessionHeader | undefined;
   if (!header || typeof header.id !== 'string') return null;
 
+  // Session name is session-level metadata (the rename API appends a
+  // `session_info` leaf); track the latest across ALL entries so a detached
+  // info line still names the session.
   let name: string | null = null;
-  let firstMessage: string | null = null;
-  let messageCount = 0;
-  const turnRows: TurnRow[] = [];
-
   for (const entry of entries) {
     if (entry.type === 'session_info') {
       const infoName = (entry as SessionInfoEntry).name;
       if (typeof infoName === 'string') name = infoName;
-      continue;
     }
+  }
+
+  // Token/turn metrics and counts must match the rendered transcript, which
+  // follows the active branch — not abandoned branches in the append-only tree.
+  let firstMessage: string | null = null;
+  let messageCount = 0;
+  const turnRows: TurnRow[] = [];
+  for (const entry of activeBranchEntries(entries)) {
     if (entry.type !== 'message') continue;
     messageCount++;
     const msg = (entry as SessionMessageEntry).message as unknown as ParsedMessage;
@@ -126,6 +148,53 @@ function deriveSession(entries: FileEntry[]): DerivedSession | null {
     firstMessage,
     turnRows,
   };
+}
+
+/** Count non-blank JSONL lines the way pi's `parseSessionEntries` iterates them. */
+function countJsonlLines(raw: string): number {
+  const trimmed = raw.trim();
+  if (trimmed === '') return 0;
+  let count = 0;
+  for (const line of trimmed.split('\n')) {
+    if (line.trim() !== '') count++;
+  }
+  return count;
+}
+
+/** Whether the last non-blank JSONL line is itself valid JSON (an incomplete trailing write is not). */
+function lastLineParses(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (trimmed === '') return true;
+  const lines = trimmed.split('\n').filter((line) => line.trim() !== '');
+  try {
+    JSON.parse(lines[lines.length - 1]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether the session file at `path` currently parses to `expectedId`. Used as a
+ * last-defense guard before deleting a session file: a stale index row for id A
+ * must not `rmSync` a file whose path was reused by a newer session B. A
+ * missing/unreadable/headerless file returns `false` — never delete on doubt.
+ */
+export function verifySessionFileId(path: string, expectedId: string): boolean {
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch {
+    return false;
+  }
+  let entries: FileEntry[];
+  try {
+    entries = parseSessionEntries(raw);
+  } catch {
+    return false;
+  }
+  const header = entries.find((e) => e.type === 'session') as SessionHeader | undefined;
+  return header !== undefined && header.id === expectedId;
 }
 
 /** All `<root>/--*--/*.jsonl` session files, in directory-listing order. */
@@ -173,9 +242,16 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
         continue;
       }
 
+      let raw: string;
+      try {
+        raw = readFileSync(filePath, 'utf8');
+      } catch (err) {
+        warnings.push(`${filePath}: read failed (${String(err)})`);
+        continue;
+      }
       let entries: FileEntry[];
       try {
-        entries = parseSessionEntries(readFileSync(filePath, 'utf8'));
+        entries = parseSessionEntries(raw);
       } catch (err) {
         warnings.push(`${filePath}: parse failed (${String(err)})`);
         continue;
@@ -187,8 +263,33 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
         continue;
       }
 
+      // pi's parser silently drops malformed JSONL lines. If more non-blank
+      // lines exist than entries parsed, the file is truncated/corrupt: index
+      // what parsed but do NOT stamp the current mtime/size as fully-ingested,
+      // so a later completed write re-ingests instead of being skipped.
+      const droppedLines = countJsonlLines(raw) - entries.length;
+      const complete = droppedLines <= 0;
+      if (!complete) {
+        const kind =
+          droppedLines === 1 && !lastLineParses(raw) ? 'incomplete trailing line' : `${droppedLines} malformed line(s)`;
+        warnings.push(`${filePath}: ${kind}; indexed ${entries.length} entries, not marking fully-ingested`);
+      }
+
       sqlite.exec('BEGIN');
       try {
+        // A path holds exactly one current session. If a prior row recorded
+        // THIS path under a different id (the file was replaced by a new
+        // session), drop it first so a later delete of the stale id cannot
+        // rmSync the new session's file.
+        const staleOnPath = db
+          .select({ id: sessions.id })
+          .from(sessions)
+          .where(and(eq(sessions.path, filePath), ne(sessions.id, derived.id)))
+          .all();
+        for (const stale of staleOnPath) {
+          db.delete(turns).where(eq(turns.sessionId, stale.id)).run();
+          db.delete(sessions).where(eq(sessions.id, stale.id)).run();
+        }
         db.delete(turns).where(eq(turns.sessionId, derived.id)).run();
         db.delete(sessions).where(eq(sessions.id, derived.id)).run();
         db.insert(sessions)
@@ -201,8 +302,8 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
             modified: mtime,
             messageCount: derived.messageCount,
             firstMessage: derived.firstMessage,
-            lastIngestedMtime: mtime,
-            lastIngestedSize: size,
+            lastIngestedMtime: complete ? mtime : 0,
+            lastIngestedSize: complete ? size : 0,
           })
           .run();
         if (derived.turnRows.length > 0) {
