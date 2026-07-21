@@ -16,11 +16,22 @@
  */
 
 import type { ExtensionAPI, InlineExtension } from '@earendil-works/pi-coding-agent';
+import { coldCacheStats, type ColdCacheStats } from '@mlx-node/core';
 
+import { MetricsTrace, type MetricsTraceRecord } from './metrics-trace.js';
 import { MlxModelHost } from './model-host.js';
 import type { MlxModelInfo } from './models.js';
 import { PerformanceStatus } from './performance-status.js';
-import { makeMlxStreamSimple } from './stream-adapter.js';
+import { makeMlxStreamSimple, type TurnRecorder } from './stream-adapter.js';
+
+/** Read the process-wide cold-tier snapshot; the native addon may be absent (unit tests). */
+function safeColdStats(): ColdCacheStats | undefined {
+  try {
+    return coldCacheStats();
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Build the `mlx-provider` inline extension serving `models`. The host
@@ -32,12 +43,58 @@ import { makeMlxStreamSimple } from './stream-adapter.js';
 export function createMlxProviderExtension(models: MlxModelInfo[], host?: MlxModelHost): InlineExtension {
   const resolvedHost = host ?? new MlxModelHost(models.map((m) => m.discovered));
   const performanceStatus = new PerformanceStatus();
+  const metricsTrace = new MetricsTrace();
   // This closure outlives Pi runtime replacement. Pi creates a replacement
   // runtime for /new and /resume and reruns inline extension factories; each
   // new factory's session_start updates the root while child sessions keep
   // using this registered stream.
   let rootCacheOwnerId: string | undefined;
-  const streamSimple = makeMlxStreamSimple(resolvedHost, performanceStatus.record, () => rootCacheOwnerId);
+
+  // Cold-tier counters are cumulative since the tier opened. Keep the prior
+  // snapshot so each turn records its own delta. Inference is serialized per
+  // process (host promise chain), so the SYNCHRONOUS counters (hits/misses/
+  // bytesRestored) are exact per-turn; bytesWritten advances on the async
+  // writer thread, so its delta is approximate (documented on the record).
+  let prevCold = safeColdStats();
+  const onTurnRecord: TurnRecorder = ({ traceId, sessionId, model, final, durationMs }) => {
+    const rec: Omit<MetricsTraceRecord, 'v' | 'rootSessionId' | 'rootSessionFile'> = {
+      traceId,
+      ts: Date.now(),
+      sessionId,
+      model,
+      durationMs,
+      finishReason: final.finishReason,
+      promptTokens: final.promptTokens,
+      cachedTokens: final.cachedTokens ?? 0,
+      outputTokens: final.numTokens,
+      reasoningTokens: final.reasoningTokens,
+    };
+    const perf = final.performance;
+    if (perf) {
+      rec.ttftMs = perf.ttftMs;
+      rec.prefillTps = perf.prefillTokensPerSecond;
+      rec.decodeTps = perf.decodeTokensPerSecond;
+      rec.mtpCycles = perf.mtpCycles;
+      // mlx-vlm-comparable headline accept rate (committed tokens per cycle).
+      rec.mtpMeanAccepted = perf.mtpMeanAcceptedTokensTotal;
+    }
+    const cold = safeColdStats();
+    if (cold && prevCold) {
+      rec.coldHits = cold.hits - prevCold.hits;
+      rec.coldMisses = cold.misses - prevCold.misses;
+      rec.coldBytesWritten = cold.bytesWritten - prevCold.bytesWritten;
+      rec.coldBytesRestored = cold.bytesRestored - prevCold.bytesRestored;
+    }
+    if (cold) prevCold = cold;
+    metricsTrace.record(rec);
+  };
+
+  const streamSimple = makeMlxStreamSimple(
+    resolvedHost,
+    performanceStatus.record,
+    () => rootCacheOwnerId,
+    onTurnRecord,
+  );
   return {
     name: 'mlx-provider',
     factory: (pi: ExtensionAPI) => {
@@ -50,6 +107,10 @@ export function createMlxProviderExtension(models: MlxModelInfo[], host?: MlxMod
       });
       pi.on('session_start', (_event, ctx) => {
         rootCacheOwnerId = ctx.sessionManager.getSessionId();
+        // Correlate every subsequent turn's MetricsTrace record with the
+        // active root session. `getSessionFile` is optional-chained so a
+        // minimal test/mock session manager without it still works.
+        metricsTrace.setRootSession(ctx.sessionManager.getSessionId(), ctx.sessionManager.getSessionFile?.());
       });
       pi.on('message_end', (event, ctx) => {
         performanceStatus.showMessage(event, ctx);

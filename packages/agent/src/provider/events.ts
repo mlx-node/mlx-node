@@ -13,6 +13,8 @@
  *     the emitter to throw, so internal failures route to {@link onError}.
  */
 
+import { randomUUID } from 'node:crypto';
+
 import type {
   Api,
   AssistantMessage,
@@ -86,6 +88,15 @@ function toPiToolCall(call: ToolCallResult): ToolCall {
 }
 
 export class TurnEmitter {
+  /**
+   * Correlation id for this turn. Minted here, stamped on the partial message
+   * as the custom `mlxTraceId` field (survives pi's JSONL round-trip like
+   * `mlxThinkingEnabled`), and surfaced so the stream adapter can join a
+   * `MetricsTrace` record to the persisted pi message. The pi entry id is not
+   * knowable in-turn (pi emits `message_end` before persisting), so this
+   * minted id is the durable join key.
+   */
+  readonly traceId: string;
   private readonly stream: AssistantMessageEventStream;
   private readonly partial: AssistantMessage;
   private readonly textBuffer = new ToolCallTagBuffer();
@@ -107,6 +118,8 @@ export class TurnEmitter {
     thinkingEnabled?: boolean,
   ) {
     this.stream = stream;
+    const traceId = randomUUID();
+    this.traceId = traceId;
     this.partial = {
       role: 'assistant',
       content: [],
@@ -126,6 +139,9 @@ export class TurnEmitter {
     if (thinkingEnabled !== undefined) {
       (this.partial as AssistantMessage & { mlxThinkingEnabled?: boolean }).mlxThinkingEnabled = thinkingEnabled;
     }
+    // Same custom-field mechanism: stamp the trace id so a dashboard can join
+    // the durable MetricsTrace record back to this persisted pi message.
+    (this.partial as AssistantMessage & { mlxTraceId?: string }).mlxTraceId = traceId;
     stream.push({ type: 'start', partial: this.partial });
   }
 

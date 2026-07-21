@@ -51,6 +51,9 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
+    // Tests must never write inference telemetry to the developer's real
+    // ~/.mlx-node. metrics-trace.test.ts manages this var itself (temp dirs).
+    env: { MLX_AGENT_METRICS: '0' },
     maxConcurrency: 1,
     watch: false,
     testTimeout: 120000, // 2 minutes

@@ -1087,6 +1087,7 @@ __metadata:
   dependencies:
     "@earendil-works/pi-ai": "npm:0.80.6"
     "@earendil-works/pi-coding-agent": "npm:0.80.6"
+    "@mlx-node/core": "workspace:*"
     "@mlx-node/lm": "workspace:*"
     "@mlx-node/server": "workspace:*"
     "@types/node": "npm:^26.0.0"

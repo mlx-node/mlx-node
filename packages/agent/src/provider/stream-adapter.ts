@@ -45,7 +45,7 @@ import type {
   SimpleStreamOptions,
 } from '@earendil-works/pi-ai';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
-import type { ChatSession, PerformanceMetrics } from '@mlx-node/lm';
+import type { ChatSession, ChatStreamFinal, PerformanceMetrics } from '@mlx-node/lm';
 
 import type { DiscoveredModelLike } from '../types.js';
 import { buildChatConfig, resolveReasoningMode, type ResolvedReasoningMode } from './chat-config.js';
@@ -74,6 +74,21 @@ export interface StreamSimpleHost {
 
 export type PerformanceRecorder = (message: AssistantMessage, performance: PerformanceMetrics) => void;
 export type RootCacheOwnerResolver = () => string | undefined;
+
+/**
+ * Durable per-turn telemetry hook. Fires exactly once, only on a SUCCESSFUL
+ * native final (never on abort / error / load failure), from the one seam
+ * that sees the raw `ChatStreamFinal` alongside the per-request
+ * `options.sessionId` and the turn's minted `traceId`. Best-effort: the
+ * adapter guards the call so a throwing recorder can never break inference.
+ */
+export type TurnRecorder = (rec: {
+  traceId: string;
+  sessionId?: string;
+  model: string;
+  final: ChatStreamFinal;
+  durationMs: number;
+}) => void;
 
 /** Property read that must not throw (poisoned getters on a hostile `Model`). */
 function safeString(read: () => string, fallback: string): string {
@@ -162,6 +177,7 @@ export function makeMlxStreamSimple(
   host: StreamSimpleHost,
   onPerformance?: PerformanceRecorder,
   resolveRootCacheOwner?: RootCacheOwnerResolver,
+  onTurnRecord?: TurnRecorder,
 ): (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream {
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
@@ -276,6 +292,10 @@ export function makeMlxStreamSimple(
 
     void (async () => {
       let sawNativeFinal = false;
+      // Bracket the whole serialized turn (queue wait + resident selection +
+      // prefill + decode) so a MetricsTrace record can report wall-clock
+      // duration. Read at the terminal only on the success path below.
+      const turnStartedAt = Date.now();
       await host.runWithResident(model.id, async (session) => {
         // Terminated while queued behind earlier inference/loading (or
         // between stages below): the terminal already went out — skip ALL
@@ -345,6 +365,22 @@ export function makeMlxStreamSimple(
                   detachAbort = undefined;
                   try {
                     turn.onFinal(event);
+                    // Durable per-turn telemetry: only a successful final gets
+                    // here. Guarded independently of onFinal so a throwing
+                    // recorder cannot derail the (already-emitted) terminal.
+                    if (onTurnRecord) {
+                      try {
+                        onTurnRecord({
+                          traceId: turn.traceId,
+                          sessionId: options?.sessionId,
+                          model: model.id,
+                          final: event,
+                          durationMs: Math.max(0, Date.now() - turnStartedAt),
+                        });
+                      } catch {
+                        // Telemetry is best-effort; never break inference.
+                      }
+                    }
                   } catch (err) {
                     pushFailsafeTerminal('error', coerceErrorMessage(err));
                   }

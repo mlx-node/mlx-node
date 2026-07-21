@@ -19,8 +19,10 @@ import type {
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { contextToChatMessages } from '../src/provider/convert-messages.js';
-import { makeMlxStreamSimple, type StreamSimpleHost } from '../src/provider/stream-adapter.js';
+import { makeMlxStreamSimple, type StreamSimpleHost, type TurnRecorder } from '../src/provider/stream-adapter.js';
 import type { DiscoveredModelLike } from '../src/types.js';
+
+type TurnRecord = Parameters<TurnRecorder>[0];
 
 const DISCOVERED: DiscoveredModelLike = { name: 'qwen-small', path: '/models/qwen-small', modelType: 'qwen3_5' };
 
@@ -522,6 +524,117 @@ describe('makeMlxStreamSimple', () => {
     const events = await collect(makeMlxStreamSimple(makeFakeHost(session), record)(MODEL, CONTEXT));
 
     expect(record).toHaveBeenCalledOnce();
+    expect(events.at(-1)?.type).toBe('done');
+    expect(finalMessage(events).stopReason).toBe('stop');
+  });
+
+  it('records one turn with the request sessionId, the message traceId, and a non-negative duration', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield delta('Hi');
+        yield finalEvent({ text: 'Hi', numTokens: 3, promptTokens: 10, cachedTokens: 4, reasoningTokens: 2 });
+      },
+    ]);
+    let recorded: TurnRecord | undefined;
+    const recorder = vi.fn((rec: TurnRecord) => {
+      recorded = rec;
+    });
+
+    const events = await collect(
+      makeMlxStreamSimple(makeFakeHost(session), undefined, undefined, recorder)(MODEL, CONTEXT, {
+        sessionId: 'sess-9',
+      }),
+    );
+    const message = finalMessage(events) as AssistantMessage & { mlxTraceId?: string };
+
+    expect(recorder).toHaveBeenCalledOnce();
+    expect(recorded?.sessionId).toBe('sess-9');
+    expect(recorded?.model).toBe('qwen-small');
+    // The join key on the record matches the custom field stamped on the message.
+    expect(typeof message.mlxTraceId).toBe('string');
+    expect(recorded?.traceId).toBe(message.mlxTraceId);
+    expect(recorded?.durationMs).toBeGreaterThanOrEqual(0);
+    // The raw native final is handed through for field mapping.
+    expect(recorded?.final.finishReason).toBe('stop');
+    expect(recorded?.final.numTokens).toBe(3);
+    expect(recorded?.final.promptTokens).toBe(10);
+    expect(recorded?.final.cachedTokens).toBe(4);
+  });
+
+  it('does not record a turn when the native stream errors before a final', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield delta('half');
+        throw new Error('native decode fault');
+      },
+    ]);
+    const recorder = vi.fn();
+
+    const events = await collect(
+      makeMlxStreamSimple(makeFakeHost(session), undefined, undefined, recorder)(MODEL, CONTEXT),
+    );
+
+    expect(finalMessage(events).stopReason).toBe('error');
+    expect(recorder).not.toHaveBeenCalled();
+  });
+
+  it('does not record a turn on an in-band finishReason=error final', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield delta('par');
+        yield finalEvent({ finishReason: 'error' });
+      },
+    ]);
+    const recorder = vi.fn();
+
+    const events = await collect(
+      makeMlxStreamSimple(makeFakeHost(session), undefined, undefined, recorder)(MODEL, CONTEXT),
+    );
+
+    expect(finalMessage(events).stopReason).toBe('error');
+    expect(recorder).not.toHaveBeenCalled();
+  });
+
+  it('does not record a turn that is aborted before a final', async () => {
+    const controller = new AbortController();
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield delta('partial');
+        controller.abort();
+      },
+    ]);
+    const recorder = vi.fn();
+
+    const events = await collect(
+      makeMlxStreamSimple(makeFakeHost(session), undefined, undefined, recorder)(MODEL, CONTEXT, {
+        signal: controller.signal,
+      }),
+    );
+
+    expect(finalMessage(events).stopReason).toBe('aborted');
+    expect(recorder).not.toHaveBeenCalled();
+  });
+
+  it('still completes the Pi stream when the best-effort turn recorder throws', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent({ text: 'ok' });
+      },
+    ]);
+    const recorder = vi.fn(() => {
+      throw new Error('metrics sink failed');
+    });
+
+    const events = await collect(
+      makeMlxStreamSimple(makeFakeHost(session), undefined, undefined, recorder)(MODEL, CONTEXT),
+    );
+
+    expect(recorder).toHaveBeenCalledOnce();
     expect(events.at(-1)?.type).toBe('done');
     expect(finalMessage(events).stopReason).toBe('stop');
   });
