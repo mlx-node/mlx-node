@@ -740,30 +740,28 @@ impl ColdCacheManager {
 
     /// Load and validate a block. Every failed read is a miss; a payload
     /// that existed but failed validation additionally counts as a
-    /// corruption (a missing file never does). Failure cleanup runs under
-    /// the same index lock the writer holds across [rename + index publish]
-    /// and unlinks only the exact file generation (dev+inode) that was
-    /// read, so an in-process writer's freshly committed replacement is
-    /// never deleted or de-indexed — except that a directory entry which is
-    /// no longer a regular file (and so can never be a writer commit nor be
-    /// opened again) is cleared from the canonical name (unlinked, or for a
-    /// non-empty directory renamed aside) and only then de-indexed, without
-    /// touching what it points at. Coordination is in-process only: a
-    /// concurrent
-    /// *process* mutating the same root stays fail-open — the identity
-    /// guard still refuses to unlink its replacement, and the worst case is
-    /// a stale index entry or one recomputed prefix.
+    /// corruption (an entry that could not be opened never does). Failure
+    /// cleanup runs under the same index lock the writer holds across
+    /// [rename + index publish]; [`prune_failed_load`] clears the canonical
+    /// name only when the entry there is the one observed to fail
+    /// (dev+inode) or is a non-regular type that can never be a writer
+    /// commit, so an in-process writer's freshly committed replacement is
+    /// never deleted or de-indexed. Coordination is in-process only: a
+    /// concurrent *process* mutating the same root stays fail-open — the
+    /// worst case is a stale index entry, one recomputed prefix, or one
+    /// lost persist (an external actor swapping the entry inside the stat
+    /// window right after a failed open).
     pub fn load(
         &self,
         key: ColdCacheKey,
         fingerprint: ColdCacheFingerprint,
     ) -> Option<ColdCacheBlock> {
         let name = block_file_name(&key);
-        let mut read_identity = None;
+        let mut observed_identity = None;
         let mut opened_file = None;
         let result = match self.shared.root.open_existing(&name) {
             Ok(mut file) => {
-                read_identity = open_identity(&file);
+                observed_identity = open_identity(&file);
                 let mut bytes = Vec::new();
                 let read = file
                     .read_to_end(&mut bytes)
@@ -772,7 +770,21 @@ impl ColdCacheManager {
                 opened_file = Some(file);
                 read
             }
-            Err(e) => Err(e.to_string()),
+            Err(e) => {
+                // Capture the identity of the entry that made the open
+                // fail so pruning can distinguish it from a later writer
+                // replacement. Skipped for NotFound: an entry committed
+                // after a plain miss must never be mistaken for the one
+                // that failed.
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    observed_identity = self
+                        .shared
+                        .root
+                        .stat_identity(&name)
+                        .map(|(identity, _)| identity);
+                }
+                Err(e.to_string())
+            }
         };
         match result {
             Ok(block) => {
@@ -817,7 +829,7 @@ impl ColdCacheManager {
                 {
                     hook();
                 }
-                prune_failed_load(&self.shared, key, &name, read_identity);
+                prune_failed_load(&self.shared, key, &name, observed_identity);
                 None
             }
         }
@@ -949,20 +961,48 @@ fn persist_block(shared: &Shared, block: &ColdCacheBlock) -> Result<(), String> 
     Ok(())
 }
 
+/// Evict least-recently-used entries until `incoming` fits both the quota
+/// and the free-space reserve. Clearing goes through the same type-safe
+/// [`clear_entry`] path as failed-load pruning, and an entry is de-indexed
+/// (bytes debited, eviction counted) only once its canonical name is
+/// actually clear — quarantining an obstructing directory counts, since
+/// the name becomes writable again. A name that cannot be cleared keeps
+/// its index entry and is skipped for the rest of this pass, so one stuck
+/// entry can neither spin the loop nor falsify accounting. `available` is
+/// a same-call statvfs estimate credited with the indexed size of cleared
+/// entries; an externally swapped entry can overstate it, in which case
+/// the following write simply fails fail-open.
 fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
     let (_, mut available) = shared.root.space()?;
     let mut index = shared
         .index
         .lock()
         .map_err(|_| "cold-cache index mutex poisoned".to_string())?;
+    let mut unclearable: Vec<ColdCacheKey> = Vec::new();
     while index.total_bytes.saturating_add(incoming) > shared.quota_bytes
         || available < shared.reserve_bytes.saturating_add(incoming)
     {
-        let Some((&key, _)) = index.entries.iter().min_by_key(|(_, e)| e.last_access) else {
+        let Some((&key, entry)) = index
+            .entries
+            .iter()
+            .filter(|&(key, _)| !unclearable.contains(key))
+            .min_by_key(|(_, entry)| entry.last_access)
+        else {
             return Err("insufficient disk space for cold-cache write".to_string());
         };
+        let name = entry.file_name.clone();
+        let cleared = match shared.root.stat_identity(&name) {
+            Some((_, kind)) => clear_entry(&shared.root, &name, kind),
+            // Either the entry already vanished (the unlink then observes
+            // NotFound) or this platform reports no identities and the
+            // plain unlink decides.
+            None => entry_gone(shared.root.unlink(&name)),
+        };
+        if !cleared {
+            unclearable.push(key);
+            continue;
+        }
         if let Some(entry) = index.entries.remove(&key) {
-            let _ = shared.root.unlink(&entry.file_name);
             index.total_bytes = index.total_bytes.saturating_sub(entry.size);
             available = available.saturating_add(entry.size);
             shared.stats.evictions.fetch_add(1, Ordering::Relaxed);
@@ -974,46 +1014,57 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
 /// Cleanup after a failed load, under the same index lock the writer holds
 /// across [rename + index publish]. The key is de-indexed only once the
 /// canonical name is actually clear, so a de-indexed key can never leave
-/// behind an obstruction that fails every later writer commit rename:
-/// - Entry still the generation that was read (`read_identity`): unlinked
-///   (descriptor-relative), as a corrupt payload that can only fail again.
-/// - A different regular file: left on disk with its index entry, because
-///   it may be a writer's freshly renamed-in commit.
-/// - A directory: never a writer commit and never openable
-///   (`open_existing` rejects every non-regular type after `fstat`), so it
-///   only obstructs the name. Removed with `unlinkat(REMOVEDIR)` when
-///   empty; otherwise renamed aside to a quarantine name — unknown content
-///   is never deleted — that the index scanner and startup cleanup ignore.
-/// - Any other non-regular entry (symlink, FIFO, ...): its directory entry
-///   is unlinked. `unlinkat` removes the entry itself, never a symlink's
-///   target, matching eviction semantics.
+/// behind an obstruction that fails every later writer commit rename.
 ///
-/// When clearing fails the index entry stays, and the next load miss for
-/// the key retries.
+/// `observed_identity` identifies the entry that produced the failure:
+/// `fstat` of the descriptor when the open succeeded, else a no-follow
+/// stat taken right after a non-NotFound open failure. A regular file at
+/// the name is preserved (with its index entry) only on positive
+/// replacement evidence — it carries a different identity than the
+/// observed one, or it appeared where the failed open found nothing —
+/// because only then can it be a writer's freshly renamed-in commit.
+/// Without such evidence the entry can only fail again (corrupt payload,
+/// or unopenable, e.g. mode 000), and a non-regular entry can never be a
+/// writer commit nor be opened at all (`open_existing` rejects every
+/// non-regular type after `fstat`), so both are cleared via
+/// [`clear_entry`] and then de-indexed. When clearing fails the index
+/// entry stays, and the next load miss for the key retries.
 fn prune_failed_load(
     shared: &Shared,
     key: ColdCacheKey,
     name: &str,
-    read_identity: Option<FileIdentity>,
+    observed_identity: Option<FileIdentity>,
 ) {
     let Ok(mut index) = shared.index.lock() else {
         return;
     };
     let cleared = match shared.root.stat_identity(name) {
-        Some((current, _)) if read_identity == Some(current) => {
-            entry_gone(shared.root.unlink(name))
-        }
-        Some((_, EntryKind::Regular)) => false,
-        Some((_, EntryKind::Directory)) => match shared.root.remove_dir_entry(name) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-            Err(_) => shared.root.rename(name, &quarantine_name(name)).is_ok(),
-        },
-        Some((_, EntryKind::Other)) => entry_gone(shared.root.unlink(name)),
+        Some((current, EntryKind::Regular)) if observed_identity != Some(current) => false,
+        Some((_, kind)) => clear_entry(&shared.root, name, kind),
         None => true,
     };
     if cleared && let Some(entry) = index.entries.remove(&key) {
         index.total_bytes = index.total_bytes.saturating_sub(entry.size);
+    }
+}
+
+/// Clear whatever entry currently occupies canonical `name`, by observed
+/// type — the single clearing path shared by eviction and failed-load
+/// pruning. Regular and other non-directory entries have their directory
+/// entry unlinked (`unlinkat` removes the entry itself, never a symlink's
+/// target). An empty directory is removed with `unlinkat(REMOVEDIR)`; a
+/// non-empty one is renamed aside to a quarantine name — unknown content
+/// is never deleted — that the index scanner and startup cleanup ignore.
+/// Returns whether the canonical name is clear afterwards (an entry that
+/// vanished concurrently counts as cleared).
+fn clear_entry(root: &RootDir, name: &str, kind: EntryKind) -> bool {
+    match kind {
+        EntryKind::Regular | EntryKind::Other => entry_gone(root.unlink(name)),
+        EntryKind::Directory => match root.remove_dir_entry(name) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => root.rename(name, &quarantine_name(name)).is_ok(),
+        },
     }
 }
 
@@ -1746,6 +1797,150 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(manager.load(key, fingerprint()), Some(block(key)));
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_miss_after_unreadable_entry_clears_index_and_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("unreadable-entry");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        persist_block(&manager.shared, &block(key)).unwrap();
+        assert!(manager.contains(&key));
+
+        let path = root.join(format!("{}.safetensors", key.to_hex()));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert!(manager.load(key, fingerprint()).is_none());
+        assert!(
+            !manager.contains(&key),
+            "an unopenable entry must leave the index on the load miss"
+        );
+        assert!(
+            fs::symlink_metadata(&path).is_err(),
+            "the unopenable file must be unlinked from the canonical name"
+        );
+        assert_eq!(manager.shared.index.lock().unwrap().total_bytes, 0);
+        let stats = manager.stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.corruptions, 0, "nothing was opened, nothing was read");
+
+        persist_block(&manager.shared, &block(key))
+            .expect("clearing must unblock re-persisting the same key");
+        assert_eq!(manager.load(key, fingerprint()), Some(block(key)));
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eviction_quarantines_directory_swapped_onto_lru_entry() {
+        let root = temp_root("evict-dir-swap");
+        let fp = fingerprint();
+        let key_a = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[1], 0, 0);
+        let key_b = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[2], 0, 0);
+        let one = encode_block(&block(key_a)).unwrap().len() as u64;
+        let manager = ColdCacheManager::open_at(root.clone(), one + one / 2, 0, 2).unwrap();
+
+        persist_block(&manager.shared, &block(key_a)).unwrap();
+        assert!(manager.contains(&key_a));
+
+        let name_a = format!("{}.safetensors", key_a.to_hex());
+        let path_a = root.join(&name_a);
+        fs::remove_file(&path_a).unwrap();
+        fs::create_dir(&path_a).unwrap();
+        fs::write(path_a.join("marker.txt"), b"marker").unwrap();
+
+        persist_block(&manager.shared, &block(key_b))
+            .expect("eviction must clear the obstructed LRU name and let the write proceed");
+        assert!(manager.contains(&key_b));
+        assert!(!manager.contains(&key_a));
+        assert!(
+            fs::symlink_metadata(&path_a).is_err(),
+            "the canonical name must actually be clear after the eviction pass"
+        );
+
+        let quarantine_prefix = format!(".blocked.{name_a}.");
+        let quarantined: Vec<PathBuf> = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(&quarantine_prefix))
+            })
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the obstructing directory must be quarantined, not deleted or left in place"
+        );
+        assert_eq!(
+            fs::read(quarantined[0].join("marker.txt")).unwrap(),
+            b"marker",
+            "quarantine must preserve the directory's content"
+        );
+
+        let stats = manager.stats();
+        assert_eq!(
+            stats.evictions, 1,
+            "only the actually-cleared entry may count as an eviction"
+        );
+        assert_eq!(
+            manager.shared.index.lock().unwrap().total_bytes,
+            one,
+            "byte accounting must reflect exactly the surviving entry"
+        );
+
+        persist_block(&manager.shared, &block(key_a))
+            .expect("subsequent writes to the freed key must succeed");
+        assert_eq!(manager.load(key_a, fp), Some(block(key_a)));
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eviction_retains_unclearable_entry_and_terminates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("evict-unclearable");
+        let fp = fingerprint();
+        let key_a = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[1], 0, 0);
+        let key_b = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[2], 0, 0);
+        let one = encode_block(&block(key_a)).unwrap().len() as u64;
+        let manager = ColdCacheManager::open_at(root.clone(), one + one / 2, 0, 2).unwrap();
+
+        persist_block(&manager.shared, &block(key_a)).unwrap();
+        assert!(manager.contains(&key_a));
+
+        // A write-protected root makes every unlink fail: the pass must
+        // skip the entry (keeping it indexed and counted) and end in an
+        // error instead of spinning or falsifying accounting.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(
+            persist_block(&manager.shared, &block(key_b)).is_err(),
+            "an eviction pass with no clearable candidate must fail the write"
+        );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            manager.contains(&key_a),
+            "an entry whose name could not be cleared must stay indexed"
+        );
+        assert_eq!(manager.shared.index.lock().unwrap().total_bytes, one);
+        assert_eq!(
+            manager.stats().evictions,
+            0,
+            "a failed clearing must not count as an eviction"
+        );
+        assert_eq!(manager.load(key_a, fp), Some(block(key_a)));
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }
