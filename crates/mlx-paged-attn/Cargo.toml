@@ -16,6 +16,9 @@ libc.workspace = true
 safetensors = "0.8"
 sha2 = "0.11"
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { package = "mlx-metal", path = "../mlx-metal" }
 tracing.workspace = true

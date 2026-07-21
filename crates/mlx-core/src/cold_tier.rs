@@ -36,19 +36,17 @@ pub fn global_cold_cache() -> Option<Arc<ColdCacheManager>> {
 }
 
 /// Open the tier in the `mlx-paged-v1` child of `parent`, creating the
-/// child when absent. A pre-existing child that is a symlink or not a
-/// directory is refused (`None`, fail-open) so the tier's chmod/temp
+/// child when absent. Validation lives in the cold-cache root opener: on
+/// unix the child is opened descriptor-relative with `O_NOFOLLOW` (and the
+/// manager keeps that dirfd for all later I/O), elsewhere a static pre-open
+/// check applies; either way a pre-existing child that is a symlink or not
+/// a directory is refused (`None`, fail-open) so the tier's chmod/temp
 /// cleanup/eviction can never follow a planted link into a foreign
-/// directory. Checked with `symlink_metadata` before any destructive or
-/// permission operation.
+/// directory.
 fn open_managed_cold_cache(parent: &Path) -> Option<Arc<ColdCacheManager>> {
-    let child = parent.join(MANAGED_SUBDIR);
-    match std::fs::symlink_metadata(&child) {
-        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => return None,
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return None,
-        _ => {}
-    }
-    ColdCacheManager::open_default_at(child).ok().map(Arc::new)
+    ColdCacheManager::open_default_at(parent.join(MANAGED_SUBDIR))
+        .ok()
+        .map(Arc::new)
 }
 
 /// Counter snapshot of the global tier for Rust-side consumers (per-turn

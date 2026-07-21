@@ -4,11 +4,22 @@
 //! immutable blocks and restores them transactionally: bytes are validated and
 //! uploaded into a reserved physical slot before the prefix is published.
 //! Every I/O error is a cache miss, never an inference failure.
+//!
+//! On unix the cache root is held as an `O_DIRECTORY` descriptor acquired by
+//! a no-follow component walk, and every mutating filesystem operation is
+//! descriptor-relative, so a pathname replaced with a symlink can never
+//! redirect cache I/O. Non-unix platforms keep path-based operations behind a
+//! static pre-open symlink check (no-follow hardening is unix-only, matching
+//! the supported platforms).
 
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
@@ -222,7 +233,7 @@ impl AtomicStats {
 
 #[derive(Clone, Debug)]
 struct IndexEntry {
-    path: PathBuf,
+    file_name: String,
     size: u64,
     last_access: u128,
 }
@@ -233,8 +244,276 @@ struct CacheIndex {
     total_bytes: u64,
 }
 
+/// Handle to the cache root directory. On unix it owns the directory file
+/// descriptor from the no-follow opener and performs every mutating
+/// operation relative to that descriptor (`openat`/`renameat`/`unlinkat`/
+/// `fchmod`/`fsync`), so replacing the root pathname after open cannot
+/// redirect writes, eviction, or cleanup. Non-unix stores only the path and
+/// keeps the previous path-based operations.
+struct RootDir {
+    path: PathBuf,
+    #[cfg(unix)]
+    fd: OwnedFd,
+}
+
+#[cfg(unix)]
+impl RootDir {
+    /// Secure opener: absolutize `root`, absolutely open its deepest
+    /// existing strict ancestor (the caller-trusted base), then walk every
+    /// remaining component with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`,
+    /// creating missing ones with `mkdirat` mode 0700. The final directory
+    /// must be owned by the current effective uid. Any symlink at or below
+    /// the first walked component is refused.
+    fn open_at_path(root: PathBuf) -> Result<Self, String> {
+        let absolute =
+            std::path::absolute(&root).map_err(|e| format!("resolve cold-cache root: {e}"))?;
+        let Some(parent) = absolute.parent() else {
+            return Err("cold-cache root must not be a filesystem root".to_string());
+        };
+        let mut anchor = parent;
+        while fs::symlink_metadata(anchor).is_err() {
+            anchor = anchor
+                .parent()
+                .ok_or_else(|| "cold-cache root has no existing ancestor".to_string())?;
+        }
+        let rel = absolute
+            .strip_prefix(anchor)
+            .expect("anchor is a lexical ancestor")
+            .to_path_buf();
+        Self::open_beneath(anchor, &rel, root)
+    }
+
+    fn open_beneath(anchor: &Path, rel: &Path, display: PathBuf) -> Result<Self, String> {
+        use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
+        let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let no_follow = dir_flags | OFlags::NOFOLLOW;
+        let mut fd = open(anchor, dir_flags, Mode::empty())
+            .map_err(|e| format!("open cold-cache ancestor {}: {e}", anchor.display()))?;
+        for component in rel.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(format!(
+                    "cold-cache root {} has a non-plain path component",
+                    display.display()
+                ));
+            };
+            fd = match openat(&fd, name, no_follow, Mode::empty()) {
+                Ok(next) => next,
+                Err(e) if e == rustix::io::Errno::NOENT => {
+                    if let Err(e) = mkdirat(&fd, name, Mode::RWXU)
+                        && e != rustix::io::Errno::EXIST
+                    {
+                        return Err(format!("create cold-cache root: {e}"));
+                    }
+                    openat(&fd, name, no_follow, Mode::empty())
+                        .map_err(|e| format!("open cold-cache root: {e}"))?
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "open cold-cache root component {}: {e}",
+                        name.to_string_lossy()
+                    ));
+                }
+            };
+        }
+        let stat = rustix::fs::fstat(&fd).map_err(|e| format!("stat cold-cache root: {e}"))?;
+        if !file_type_of(&stat).is_dir() {
+            return Err("cold-cache root is not a directory".to_string());
+        }
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if stat.st_uid != unsafe { libc::geteuid() } {
+            return Err("cold-cache root is not owned by the current user".to_string());
+        }
+        Ok(Self { path: display, fd })
+    }
+
+    fn set_root_permissions(&self) -> Result<(), String> {
+        rustix::fs::fchmod(&self.fd, rustix::fs::Mode::RWXU)
+            .map_err(|e| format!("set cold-cache directory permissions: {e}"))
+    }
+
+    fn open_existing(&self, name: &str) -> std::io::Result<File> {
+        use rustix::fs::{Mode, OFlags, openat};
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        openat(&self.fd, name, flags, Mode::empty())
+            .map(File::from)
+            .map_err(std::io::Error::from)
+    }
+
+    fn create_exclusive(&self, name: &str) -> Result<File, String> {
+        use rustix::fs::{Mode, OFlags, fchmod, openat};
+        let flags =
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mode = Mode::RUSR | Mode::WUSR;
+        let fd = openat(&self.fd, name, flags, mode)
+            .map_err(|e| format!("create cold-cache temp file: {e}"))?;
+        fchmod(&fd, mode).map_err(|e| format!("set cold-cache file permissions: {e}"))?;
+        Ok(File::from(fd))
+    }
+
+    fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+        rustix::fs::renameat(&self.fd, from, &self.fd, to)
+            .map_err(|e| format!("commit cold-cache file: {e}"))
+    }
+
+    fn unlink(&self, name: &str) -> std::io::Result<()> {
+        rustix::fs::unlinkat(&self.fd, name, rustix::fs::AtFlags::empty())
+            .map_err(std::io::Error::from)
+    }
+
+    fn sync(&self) -> Result<(), String> {
+        rustix::fs::fsync(&self.fd).map_err(|e| format!("sync cold-cache directory: {e}"))
+    }
+
+    fn space(&self) -> Result<(u64, u64), String> {
+        let vfs =
+            rustix::fs::fstatvfs(&self.fd).map_err(|e| format!("statvfs cold-cache root: {e}"))?;
+        Ok((
+            vfs.f_blocks.saturating_mul(vfs.f_frsize),
+            vfs.f_bavail.saturating_mul(vfs.f_frsize),
+        ))
+    }
+
+    fn entry_names(&self) -> Result<Vec<String>, String> {
+        let dir = rustix::fs::Dir::read_from(&self.fd)
+            .map_err(|e| format!("scan cold-cache root: {e}"))?;
+        let mut names = Vec::new();
+        for entry in dir {
+            let Ok(entry) = entry else { continue };
+            let Ok(name) = entry.file_name().to_str() else {
+                continue;
+            };
+            if name != "." && name != ".." {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
+    }
+
+    /// Size and mtime of `name` when it is a regular file (never following
+    /// symlinks); `None` otherwise, so symlinked entries are never indexed.
+    fn stat_file(&self, name: &str) -> Option<(u64, u128)> {
+        let stat = self.stat_no_follow(name)?;
+        if !file_type_of(&stat).is_file() {
+            return None;
+        }
+        Some((
+            u64::try_from(stat.st_size).unwrap_or(0),
+            mtime_nanos_of(&stat),
+        ))
+    }
+
+    fn stat_identity(&self, name: &str) -> Option<FileIdentity> {
+        self.stat_no_follow(name).map(|stat| identity_of(&stat))
+    }
+
+    fn stat_no_follow(&self, name: &str) -> Option<rustix::fs::Stat> {
+        rustix::fs::statat(&self.fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).ok()
+    }
+}
+
+// Stat field widths vary across unix targets, so some of these casts are
+// identities on one platform and lossless widenings on another.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn file_type_of(stat: &rustix::fs::Stat) -> rustix::fs::FileType {
+    rustix::fs::FileType::from_raw_mode(stat.st_mode as rustix::fs::RawMode)
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn identity_of(stat: &rustix::fs::Stat) -> FileIdentity {
+    FileIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn mtime_nanos_of(stat: &rustix::fs::Stat) -> u128 {
+    if stat.st_mtime < 0 {
+        return 0;
+    }
+    (stat.st_mtime as u128) * 1_000_000_000 + (stat.st_mtime_nsec.max(0) as u128)
+}
+
+#[cfg(not(unix))]
+impl RootDir {
+    fn open_at_path(root: PathBuf) -> Result<Self, String> {
+        match fs::symlink_metadata(&root) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err("cold-cache root exists but is not a plain directory".to_string());
+            }
+            _ => {}
+        }
+        fs::create_dir_all(&root).map_err(|e| format!("create cold-cache root: {e}"))?;
+        Ok(Self { path: root })
+    }
+
+    fn set_root_permissions(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn open_existing(&self, name: &str) -> std::io::Result<File> {
+        File::open(self.path.join(name))
+    }
+
+    fn create_exclusive(&self, name: &str) -> Result<File, String> {
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(self.path.join(name))
+            .map_err(|e| format!("create cold-cache temp file: {e}"))
+    }
+
+    fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+        fs::rename(self.path.join(from), self.path.join(to))
+            .map_err(|e| format!("commit cold-cache file: {e}"))
+    }
+
+    fn unlink(&self, name: &str) -> std::io::Result<()> {
+        fs::remove_file(self.path.join(name))
+    }
+
+    fn sync(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn space(&self) -> Result<(u64, u64), String> {
+        Err("automatic cold-cache quota requires a Unix statvfs implementation".to_string())
+    }
+
+    fn entry_names(&self) -> Result<Vec<String>, String> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&self.path).map_err(|e| format!("scan cold-cache root: {e}"))? {
+            let Ok(entry) = entry else { continue };
+            if let Ok(name) = entry.file_name().into_string() {
+                names.push(name);
+            }
+        }
+        Ok(names)
+    }
+
+    fn stat_file(&self, name: &str) -> Option<(u64, u128)> {
+        let meta = fs::symlink_metadata(self.path.join(name)).ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_nanos());
+        Some((meta.len(), mtime))
+    }
+
+    fn stat_identity(&self, _name: &str) -> Option<FileIdentity> {
+        None
+    }
+}
+
 struct Shared {
-    root: PathBuf,
+    root: RootDir,
     quota_bytes: u64,
     reserve_bytes: u64,
     index: Mutex<CacheIndex>,
@@ -270,21 +549,36 @@ impl ColdCacheManager {
     /// [`Self::open_default`]: 10% of filesystem capacity capped at 100 GiB,
     /// a 5%-or-5-GiB free reserve, and the default queue depth.
     pub fn open_default_at(root: PathBuf) -> Result<Self, String> {
-        // The root must exist before statvfs can size its filesystem.
-        fs::create_dir_all(&root).map_err(|e| format!("create cold-cache root: {e}"))?;
-        set_private_dir_permissions(&root)?;
-        let (total, _) = filesystem_space(&root)?;
+        let root = RootDir::open_at_path(root)?;
+        let (total, _) = root.space()?;
         let quota = (total / 10).min(MAX_DEFAULT_QUOTA);
         let reserve = (total / 20).max(MIN_FREE_RESERVE);
-        Self::open_at(root, quota, reserve, DEFAULT_QUEUE_DEPTH)
+        Self::open_prepared(root, quota, reserve, DEFAULT_QUEUE_DEPTH)
     }
 
     /// Explicit constructor used by tests and embedders with custom policy.
     /// The manager takes ownership of `root`: opening chmods it 0700 and
     /// removes leftover writer temp files, so callers must pass a directory
-    /// dedicated to this cache, never a shared/user directory.
+    /// dedicated to this cache, never a shared/user directory. On unix the
+    /// root must resolve without symlinks below its deepest pre-existing
+    /// ancestor, must be owned by the current effective uid, and is held as
+    /// a directory descriptor for all later cache I/O.
     pub fn open_at(
         root: PathBuf,
+        quota_bytes: u64,
+        reserve_bytes: u64,
+        queue_depth: usize,
+    ) -> Result<Self, String> {
+        Self::open_prepared(
+            RootDir::open_at_path(root)?,
+            quota_bytes,
+            reserve_bytes,
+            queue_depth,
+        )
+    }
+
+    fn open_prepared(
+        root: RootDir,
         quota_bytes: u64,
         reserve_bytes: u64,
         queue_depth: usize,
@@ -292,8 +586,7 @@ impl ColdCacheManager {
         if quota_bytes == 0 || queue_depth == 0 {
             return Err("cold-cache quota and queue depth must be non-zero".to_string());
         }
-        fs::create_dir_all(&root).map_err(|e| format!("create cold-cache root: {e}"))?;
-        set_private_dir_permissions(&root)?;
+        root.set_root_permissions()?;
         let index = rebuild_index(&root)?;
         let shared = Arc::new(Shared {
             root,
@@ -320,7 +613,7 @@ impl ColdCacheManager {
     }
 
     pub fn root(&self) -> &Path {
-        &self.shared.root
+        &self.shared.root.path
     }
 
     pub fn quota_bytes(&self) -> u64 {
@@ -426,20 +719,19 @@ impl ColdCacheManager {
         key: ColdCacheKey,
         fingerprint: ColdCacheFingerprint,
     ) -> Option<ColdCacheBlock> {
-        let path = self
-            .shared
-            .root
-            .join(format!("{}.safetensors", key.to_hex()));
+        let name = block_file_name(&key);
         let mut read_identity = None;
-        let mut found_existing = false;
-        let result = match File::open(&path) {
+        let mut opened_file = None;
+        let result = match self.shared.root.open_existing(&name) {
             Ok(mut file) => {
-                found_existing = true;
                 read_identity = open_identity(&file);
                 let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)
+                let read = file
+                    .read_to_end(&mut bytes)
                     .map_err(|e| e.to_string())
-                    .and_then(|_| decode_block(&bytes, key, fingerprint))
+                    .and_then(|_| decode_block(&bytes, key, fingerprint));
+                opened_file = Some(file);
+                read
             }
             Err(e) => Err(e.to_string()),
         };
@@ -451,13 +743,16 @@ impl ColdCacheManager {
                     .bytes_restored
                     .fetch_add(block.encoded_len(), Ordering::Relaxed);
                 // Startup rebuild derives recency from file mtime. Persist
-                // every validated hit so a process restart preserves the
-                // same LRU order instead of reverting to original write age.
-                // Touch failure is deliberately fail-open: the block is
-                // already validated and useful to inference; only future
-                // eviction precision is affected.
+                // every validated hit (on the descriptor that was read, so a
+                // swapped pathname is never touched) so a process restart
+                // preserves the same LRU order instead of reverting to
+                // original write age. Touch failure is deliberately
+                // fail-open: the block is already validated and useful to
+                // inference; only future eviction precision is affected.
                 let touched_at = SystemTime::now();
-                let _ = touch_file_recency(&path, touched_at);
+                if let Some(file) = &opened_file {
+                    let _ = file.set_times(std::fs::FileTimes::new().set_modified(touched_at));
+                }
                 let touched_tick = touched_at
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -471,7 +766,7 @@ impl ColdCacheManager {
             }
             Err(_) => {
                 self.shared.stats.misses.fetch_add(1, Ordering::Relaxed);
-                if found_existing {
+                if opened_file.is_some() {
                     self.shared
                         .stats
                         .corruptions
@@ -483,7 +778,7 @@ impl ColdCacheManager {
                 {
                     hook();
                 }
-                prune_failed_load(&self.shared, key, &path, read_identity);
+                prune_failed_load(&self.shared, key, &name, read_identity);
                 None
             }
         }
@@ -563,21 +858,14 @@ fn persist_block(shared: &Shared, block: &ColdCacheBlock) -> Result<(), String> 
     block.validate()?;
     let bytes = encode_block(block)?;
     evict_for_write(shared, bytes.len() as u64)?;
-    let destination = shared
-        .root
-        .join(format!("{}.safetensors", block.key.to_hex()));
-    let temp = shared.root.join(format!(
+    let destination = block_file_name(&block.key);
+    let temp = format!(
         ".{}.{}.{}.tmp",
         block.key.to_hex(),
         std::process::id(),
         now_tick()
-    ));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temp)
-        .map_err(|e| format!("create cold-cache temp file: {e}"))?;
-    set_private_file_permissions(&temp)?;
+    );
+    let mut file = shared.root.create_exclusive(&temp)?;
     let size = bytes.len() as u64;
     if let Err(error) = (|| -> Result<(), String> {
         file.write_all(&bytes)
@@ -591,12 +879,12 @@ fn persist_block(shared: &Shared, block: &ColdCacheBlock) -> Result<(), String> 
             .index
             .lock()
             .map_err(|_| "cold-cache index mutex poisoned".to_string())?;
-        fs::rename(&temp, &destination).map_err(|e| format!("commit cold-cache file: {e}"))?;
-        sync_directory(&shared.root)?;
+        shared.root.rename(&temp, &destination)?;
+        shared.root.sync()?;
         if let Some(old) = index.entries.insert(
             block.key,
             IndexEntry {
-                path: destination.clone(),
+                file_name: destination.clone(),
                 size,
                 last_access: now_tick(),
             },
@@ -606,7 +894,7 @@ fn persist_block(shared: &Shared, block: &ColdCacheBlock) -> Result<(), String> 
         index.total_bytes = index.total_bytes.saturating_add(size);
         Ok(())
     })() {
-        let _ = fs::remove_file(&temp);
+        let _ = shared.root.unlink(&temp);
         return Err(error);
     }
     shared
@@ -617,7 +905,7 @@ fn persist_block(shared: &Shared, block: &ColdCacheBlock) -> Result<(), String> 
 }
 
 fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
-    let (_, mut available) = filesystem_space(&shared.root)?;
+    let (_, mut available) = shared.root.space()?;
     let mut index = shared
         .index
         .lock()
@@ -629,7 +917,7 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
             return Err("insufficient disk space for cold-cache write".to_string());
         };
         if let Some(entry) = index.entries.remove(&key) {
-            let _ = fs::remove_file(&entry.path);
+            let _ = shared.root.unlink(&entry.file_name);
             index.total_bytes = index.total_bytes.saturating_sub(entry.size);
             available = available.saturating_add(entry.size);
             shared.stats.evictions.fetch_add(1, Ordering::Relaxed);
@@ -639,21 +927,22 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
 }
 
 /// Cleanup after a failed load, under the same index lock the writer holds
-/// across [rename + index publish]. Unlinks only when the file at `path` is
-/// still the generation that was read (`read_identity`); a renamed-in
-/// replacement (new inode) is left on disk and keeps its index entry.
+/// across [rename + index publish]. Unlinks (descriptor-relative) only when
+/// the directory entry `name` is still the generation that was read
+/// (`read_identity`); a renamed-in replacement (new inode) is left on disk
+/// and keeps its index entry.
 fn prune_failed_load(
     shared: &Shared,
     key: ColdCacheKey,
-    path: &Path,
+    name: &str,
     read_identity: Option<FileIdentity>,
 ) {
     let Ok(mut index) = shared.index.lock() else {
         return;
     };
-    match path_identity(path) {
+    match shared.root.stat_identity(name) {
         Some(current) if read_identity == Some(current) => {
-            let _ = fs::remove_file(path);
+            let _ = shared.root.unlink(name);
             if let Some(entry) = index.entries.remove(&key) {
                 index.total_bytes = index.total_bytes.saturating_sub(entry.size);
             }
@@ -687,20 +976,8 @@ fn open_identity(_file: &File) -> Option<FileIdentity> {
     None
 }
 
-#[cfg(unix)]
-fn path_identity(path: &Path) -> Option<FileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    fs::symlink_metadata(path)
-        .ok()
-        .map(|metadata| FileIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-}
-
-#[cfg(not(unix))]
-fn path_identity(_path: &Path) -> Option<FileIdentity> {
-    None
+fn block_file_name(key: &ColdCacheKey) -> String {
+    format!("{}.safetensors", key.to_hex())
 }
 
 fn encode_block(block: &ColdCacheBlock) -> Result<Vec<u8>, String> {
@@ -850,41 +1127,25 @@ fn payload_checksum(tensors: &[(String, Vec<u8>)]) -> String {
     hex_encode(&hasher.finalize())
 }
 
-fn rebuild_index(root: &Path) -> Result<CacheIndex, String> {
+fn rebuild_index(root: &RootDir) -> Result<CacheIndex, String> {
     let mut index = CacheIndex::default();
-    for entry in fs::read_dir(root).map_err(|e| format!("scan cold-cache root: {e}"))? {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if path.extension().and_then(|v| v.to_str()) != Some("safetensors") {
-            if entry
-                .file_name()
-                .to_str()
-                .is_some_and(is_cold_cache_temp_file)
-            {
-                let _ = fs::remove_file(path);
+    for name in root.entry_names()? {
+        let Some(stem) = name.strip_suffix(".safetensors") else {
+            if is_cold_cache_temp_file(&name) {
+                let _ = root.unlink(&name);
             }
             continue;
-        }
-        let Some(key) = path
-            .file_stem()
-            .and_then(|v| v.to_str())
-            .and_then(ColdCacheKey::from_hex)
-        else {
+        };
+        let Some(key) = ColdCacheKey::from_hex(stem) else {
             continue;
         };
-        let Ok(metadata) = entry.metadata() else {
+        let Some((size, last_access)) = root.stat_file(&name) else {
             continue;
         };
-        let size = metadata.len();
-        let last_access = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |duration| duration.as_nanos());
         index.entries.insert(
             key,
             IndexEntry {
-                path,
+                file_name: name,
                 size,
                 last_access,
             },
@@ -914,84 +1175,11 @@ fn is_cold_cache_temp_file(name: &str) -> bool {
     hex_decode_32(key).is_some() && is_digits(pid) && is_digits(tick)
 }
 
-#[cfg(unix)]
-fn filesystem_space(path: &Path) -> Result<(u64, u64), String> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| "cold-cache path contains NUL".to_string())?;
-    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: c_path is NUL terminated and stats points to writable storage.
-    if unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return Err(format!(
-            "statvfs cold-cache root: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: successful statvfs initialized the structure.
-    let stats = unsafe { stats.assume_init() };
-    let fragment = stats.f_frsize;
-    Ok((
-        (stats.f_blocks as u64).saturating_mul(fragment),
-        (stats.f_bavail as u64).saturating_mul(fragment),
-    ))
-}
-
-#[cfg(not(unix))]
-fn filesystem_space(_path: &Path) -> Result<(u64, u64), String> {
-    Err("automatic cold-cache quota requires a Unix statvfs implementation".to_string())
-}
-
-#[cfg(unix)]
-fn set_private_dir_permissions(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("set cold-cache directory permissions: {e}"))
-}
-
-#[cfg(not(unix))]
-fn set_private_dir_permissions(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_private_file_permissions(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("set cold-cache file permissions: {e}"))
-}
-
-#[cfg(not(unix))]
-fn set_private_file_permissions(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<(), String> {
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|e| format!("sync cold-cache directory: {e}"))
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
-
 fn now_tick() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
-}
-
-fn touch_file_recency(path: &Path, modified: SystemTime) -> Result<(), String> {
-    let file = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(|e| format!("open cold-cache file for recency update: {e}"))?;
-    file.set_times(std::fs::FileTimes::new().set_modified(modified))
-        .map_err(|e| format!("persist cold-cache recency: {e}"))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1295,6 +1483,118 @@ mod tests {
         assert!(foreign_data.exists());
         drop(manager);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_shape_symlink_child_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = temp_root("default-symlink");
+        let victim = base.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        let marker = victim.join("marker.txt");
+        fs::write(&marker, b"marker").unwrap();
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let victim_tmp = victim.join(format!(".{}.{}.{}.tmp", key.to_hex(), 4242, 7));
+        fs::write(&victim_tmp, b"stale").unwrap();
+        let victim_mode = fs::metadata(&victim).unwrap().permissions().mode() & 0o7777;
+
+        let parent = base.join("home/.mlx-node/cache/paged");
+        fs::create_dir_all(&parent).unwrap();
+        std::os::unix::fs::symlink(&victim, parent.join("v1")).unwrap();
+        assert!(
+            ColdCacheManager::open_default_at(parent.join("v1")).is_err(),
+            "a symlinked default root must be refused, not followed"
+        );
+        assert!(marker.exists());
+        assert!(
+            victim_tmp.exists(),
+            "refusal must precede writer-temp cleanup through the link"
+        );
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o7777,
+            victim_mode,
+            "refusal must precede any chmod through the link"
+        );
+
+        let fresh = base.join("home2/.mlx-node/cache/paged/v1");
+        let manager = ColdCacheManager::open_default_at(fresh.clone()).unwrap();
+        assert_eq!(manager.root(), fresh.as_path());
+        assert!(fresh.is_dir());
+        drop(manager);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_open_symlink_swap_cannot_redirect_io() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = temp_root("swap");
+        let root = base.join("root");
+        let moved = base.join("moved");
+        let victim = base.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        let marker = victim.join("marker.txt");
+        fs::write(&marker, b"marker").unwrap();
+        let victim_mode = fs::metadata(&victim).unwrap().permissions().mode() & 0o7777;
+
+        let fp = fingerprint();
+        let key_a = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[1], 0, 0);
+        let key_b = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[2], 0, 0);
+        let one = encode_block(&block(key_a)).unwrap().len() as u64;
+        let manager = ColdCacheManager::open_at(root.clone(), one + one / 2, 0, 2).unwrap();
+
+        assert!(manager.enqueue(block(key_a)).unwrap());
+        for _ in 0..200 {
+            if manager.contains(&key_a) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(manager.contains(&key_a));
+
+        fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(&victim, &root).unwrap();
+
+        assert!(manager.enqueue(block(key_b)).unwrap());
+        for _ in 0..200 {
+            if manager.contains(&key_b) && !manager.contains(&key_a) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let name_a = format!("{}.safetensors", key_a.to_hex());
+        let name_b = format!("{}.safetensors", key_b.to_hex());
+        assert!(
+            moved.join(&name_b).exists(),
+            "persist must land via the dirfd in the original directory"
+        );
+        assert!(
+            !moved.join(&name_a).exists(),
+            "eviction must unlink via the dirfd in the original directory"
+        );
+        assert!(
+            !victim.join(&name_a).exists() && !victim.join(&name_b).exists(),
+            "victim behind the swapped-in symlink must never receive cache I/O"
+        );
+        assert_eq!(manager.stats().evictions, 1);
+        assert_eq!(
+            manager.load(key_b, fp),
+            Some(block(key_b)),
+            "load must read via the dirfd, not the swapped pathname"
+        );
+        assert!(marker.exists());
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o7777,
+            victim_mode
+        );
+        assert_eq!(
+            fs::read_dir(&victim).unwrap().count(),
+            1,
+            "victim must contain exactly its own marker file"
+        );
+        drop(manager);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
