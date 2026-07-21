@@ -238,6 +238,56 @@ async function handleDownloadStart({ req, res, deps }: RouteCtx): Promise<void> 
   }
 }
 
+/** Minimal writable surface a backpressure-aware SSE sender depends on. */
+interface SseWritable {
+  write(chunk: string): boolean;
+  on(event: 'drain', listener: () => void): void;
+}
+
+function sseFrame(event: DownloadEvent): string {
+  return `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+}
+
+/**
+ * Backpressure-aware SSE sender for download progress. `res.write` returning
+ * false means the socket buffer is full; further frames are queued in memory
+ * until `'drain'`. A subscriber that never reads during a multi-GB download
+ * would otherwise accumulate one buffered frame per progress tick without
+ * bound, so a run of consecutive `progress` frames is coalesced to the latest.
+ * Lifecycle frames (`start`/`done`/`error`) are kept in order so terminal
+ * delivery is never dropped, bounding the queue to at most one frame between
+ * lifecycle events.
+ */
+export function createDownloadSseSender(res: SseWritable): (event: DownloadEvent) => void {
+  let blocked = false;
+  const pending: DownloadEvent[] = [];
+
+  const flush = (): void => {
+    blocked = false;
+    while (pending.length > 0) {
+      if (!res.write(sseFrame(pending[0]))) {
+        blocked = true;
+        return;
+      }
+      pending.shift();
+    }
+  };
+  res.on('drain', flush);
+
+  return (event: DownloadEvent): void => {
+    if (blocked) {
+      const last = pending[pending.length - 1];
+      if (event.type === 'progress' && last !== undefined && last.type === 'progress') {
+        pending[pending.length - 1] = event;
+      } else {
+        pending.push(event);
+      }
+      return;
+    }
+    if (!res.write(sseFrame(event))) blocked = true;
+  };
+}
+
 function handleDownloadEvents({ req, res, params, deps }: RouteCtx): void {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -246,9 +296,7 @@ function handleDownloadEvents({ req, res, params, deps }: RouteCtx): void {
   });
   res.write(': connected\n\n');
 
-  const send = (event: DownloadEvent): void => {
-    res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
-  };
+  const send = createDownloadSseSender(res);
   const unsubscribe = deps.downloads.subscribe(params.id, send);
 
   const heartbeat = setInterval(() => res.write(': ping\n\n'), 15_000);

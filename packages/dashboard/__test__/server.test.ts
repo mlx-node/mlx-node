@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
+import { createDownloadSseSender } from '../src/api.js';
+import type { DownloadEvent } from '../src/download.js';
 import { startDashboardServer, type DashboardServer } from '../src/server.js';
 
 const FIXTURE_SESSIONS = fileURLToPath(new URL('./fixtures/sessions', import.meta.url));
@@ -304,6 +306,107 @@ describe('dashboard server — local-origin guard', () => {
       Origin: 'https://evil.example',
     });
     expect(res.status).toBe(200);
+  });
+});
+
+describe('dashboard server — loopback Host guard (all methods)', () => {
+  it('rejects a GET read with a non-loopback Host (DNS-rebinding)', async () => {
+    const res = await rawRequest(server.port, 'GET', '/api/models', { Host: 'evil.example' });
+    expect(res.status).toBe(403);
+  });
+
+  it('allows a GET read with a loopback Host', async () => {
+    const res = await rawRequest(server.port, 'GET', '/api/models', { Host: `127.0.0.1:${server.port}` });
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('dashboard server — malformed Host header', () => {
+  it('answers 400 for a malformed Host and stays alive', async () => {
+    const bad = await rawRequest(server.port, 'GET', '/health', { Host: '[' });
+    expect(bad.status).toBe(400);
+    // The process must survive: a subsequent well-formed request still answers.
+    const ok = await rawRequest(server.port, 'GET', '/health', { Host: `127.0.0.1:${server.port}` });
+    expect(ok.status).toBe(200);
+  });
+});
+
+describe('dashboard SSE progress — backpressure coalescing', () => {
+  const progress = (received: number): DownloadEvent => ({
+    type: 'progress',
+    id: 'job',
+    file: 'model.safetensors',
+    receivedBytes: received,
+    totalBytes: 1000,
+    fileIndex: 0,
+    fileCount: 1,
+  });
+
+  /** A writable whose backpressure is driven manually. */
+  function fakeWritable(): {
+    write(chunk: string): boolean;
+    on(event: 'drain', listener: () => void): void;
+    writes: string[];
+    setCanWrite(v: boolean): void;
+    drain(): void;
+  } {
+    const writes: string[] = [];
+    let canWrite = true;
+    let drainListener: (() => void) | null = null;
+    return {
+      writes,
+      write(chunk: string): boolean {
+        writes.push(chunk);
+        return canWrite;
+      },
+      on(event: 'drain', listener: () => void): void {
+        if (event === 'drain') drainListener = listener;
+      },
+      setCanWrite(v: boolean): void {
+        canWrite = v;
+      },
+      drain(): void {
+        drainListener?.();
+      },
+    };
+  }
+
+  it('coalesces a flood of progress frames while the socket is backpressured', () => {
+    const res = fakeWritable();
+    const send = createDownloadSseSender(res);
+
+    send(progress(1));
+    expect(res.writes.length).toBe(1); // drained synchronously
+
+    res.setCanWrite(false);
+    send(progress(2)); // written, returns false → now blocked
+    expect(res.writes.length).toBe(2);
+
+    for (let i = 3; i <= 1000; i++) send(progress(i)); // 998 more, all coalesced
+    expect(res.writes.length).toBe(2); // bounded: nothing extra buffered to the socket
+
+    res.setCanWrite(true);
+    res.drain();
+    expect(res.writes.length).toBe(3); // exactly one coalesced frame flushed
+    expect(res.writes[2]).toContain('"receivedBytes":1000'); // carrying the latest bytes
+  });
+
+  it('keeps a terminal done frame after coalesced progress', () => {
+    const res = fakeWritable();
+    const send = createDownloadSseSender(res);
+
+    res.setCanWrite(false);
+    send(progress(1)); // written, returns false → blocked
+    for (let i = 2; i <= 100; i++) send(progress(i)); // coalesced
+    send({ type: 'done', id: 'job', outputDir: '/models/job' }); // queued, not dropped
+    expect(res.writes.length).toBe(1);
+
+    res.setCanWrite(true);
+    res.drain();
+    // Latest progress then the terminal frame, in order.
+    expect(res.writes.length).toBe(3);
+    expect(res.writes[1]).toContain('"receivedBytes":100');
+    expect(res.writes[2]).toContain('event: done');
   });
 });
 

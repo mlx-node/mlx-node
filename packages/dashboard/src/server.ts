@@ -3,9 +3,10 @@
  *
  * Lifecycle and routing live here; the route handlers are in `api.ts` and the
  * SPA file serving in `static.ts`. The server binds `127.0.0.1` by default and
- * guards every mutating (non-GET) request with a local-origin check to block
- * drive-by CSRF / DNS-rebinding against the loopback port. It never links the
- * native addon — all data comes from disk via the C1–C4 modules.
+ * validates a loopback `Host` on EVERY request (reads included) to block
+ * DNS-rebinding against the loopback port, additionally requiring a local
+ * `Origin` on mutations to block drive-by CSRF. It never links the native
+ * addon — all data comes from disk via the C1–C4 modules.
  */
 
 import { mkdirSync } from 'node:fs';
@@ -63,22 +64,44 @@ function splitHostPort(authority: string): { hostname: string; port: string } {
   return { hostname: authority.slice(0, colon), port: authority.slice(colon + 1) };
 }
 
-/** Whether an authority names a loopback host, optionally carrying the server port. */
-function isLocalAuthority(authority: string | undefined, port: number): boolean {
+/** Whether an authority names an allowed host, optionally carrying the server port. */
+function isAllowedAuthority(authority: string | undefined, port: number, allowedHosts: Set<string>): boolean {
   if (authority === undefined || authority === '') return false;
   const { hostname, port: hostPort } = splitHostPort(authority);
-  if (!LOCAL_HOSTNAMES.has(hostname)) return false;
+  if (!allowedHosts.has(hostname)) return false;
   return hostPort === '' || hostPort === String(port);
 }
 
+type HostVerdict = 'allowed' | 'foreign' | 'malformed';
+
 /**
- * Local-origin guard for mutating requests. The `Host` header must name a
- * loopback host (optionally with the server's port); when an `Origin` header is
- * present it must additionally be an `http` origin of a loopback host. GET/HEAD
- * are unguarded (static assets + read-only endpoints).
+ * Classify the untrusted `Host` header against the allowlist. A syntactically
+ * invalid authority (e.g. `[`) is `malformed` (→ 400) rather than throwing; a
+ * well-formed but non-loopback host is `foreign` (→ 403). Validating this on
+ * EVERY request — including reads — blocks DNS-rebinding: an attacker page
+ * rebound to the loopback port still carries its own hostname in `Host`.
  */
-function isRequestAllowed(req: IncomingMessage, port: number): boolean {
-  if (!isLocalAuthority(req.headers.host, port)) return false;
+function classifyHost(authority: string | undefined, port: number, allowedHosts: Set<string>): HostVerdict {
+  if (authority === undefined || authority === '') return 'foreign';
+  let normalizedHost: string;
+  try {
+    // Reject a malformed authority here instead of letting an unguarded
+    // `new URL` throw an unhandled rejection later; `.host` also strips any
+    // userinfo/path smuggled into the header so only the real host is matched.
+    normalizedHost = new URL(`http://${authority}`).host;
+  } catch {
+    return 'malformed';
+  }
+  return isAllowedAuthority(normalizedHost, port, allowedHosts) ? 'allowed' : 'foreign';
+}
+
+/**
+ * Cross-origin guard for mutating requests, layered on top of the per-request
+ * `Host` check. When an `Origin` header is present it must be an `http` origin
+ * of an allowed (loopback) host; a missing Origin (curl-style clients) passes.
+ */
+function isRequestAllowed(req: IncomingMessage, port: number, allowedHosts: Set<string>): boolean {
+  if (!isAllowedAuthority(req.headers.host, port, allowedHosts)) return false;
   const origin = req.headers.origin;
   if (origin === undefined || origin === '' || origin === 'null') {
     // No Origin (curl-style / same-origin GET-less clients) is allowed once Host passed.
@@ -91,7 +114,7 @@ function isRequestAllowed(req: IncomingMessage, port: number): boolean {
     return false;
   }
   if (parsed.protocol !== 'http:') return false;
-  return isLocalAuthority(parsed.host, port);
+  return isAllowedAuthority(parsed.host, port, allowedHosts);
 }
 
 function defaultWebRoot(): string {
@@ -152,16 +175,59 @@ export async function startDashboardServer(opts: DashboardServerOptions = {}): P
   // The actual bound port (may differ from requested when 0 is used).
   let boundPort = requestedPort;
 
+  // Hosts accepted in the `Host`/`Origin` allowlist: the loopback names plus the
+  // explicitly configured bind host, so an intentional (warned) non-loopback
+  // bind stays reachable without weakening the loopback default.
+  const allowedHosts = new Set([...LOCAL_HOSTNAMES, host]);
+
   const server: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    void handle(req, res);
+    handle(req, res).catch((err: unknown) => {
+      // Terminal safety net: no request handler may reject unhandled (which
+      // would crash the process). Respond 500 if nothing was sent yet.
+      console.error('[mlx-dashboard] unhandled request error', err);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'Internal server error' }));
+      } else {
+        try {
+          res.end();
+        } catch {
+          // Socket already destroyed: nothing to do.
+        }
+      }
+    });
   });
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const method = req.method ?? 'GET';
-    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
 
-    // Guard every mutating request; reads (GET/HEAD) are unguarded.
-    if (method !== 'GET' && method !== 'HEAD' && !isRequestAllowed(req, boundPort)) {
+    // Validate the untrusted Host on EVERY request (reads included) before
+    // routing, so DNS-rebinding cannot reach read handlers.
+    const verdict = classifyHost(req.headers.host, boundPort, allowedHosts);
+    if (verdict === 'malformed') {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'Bad Request: malformed Host header' }));
+      return;
+    }
+    if (verdict === 'foreign') {
+      res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'Forbidden: request must originate from a local origin' }));
+      return;
+    }
+
+    // Parse the request target against a constant, trusted base so a malformed
+    // target yields 400 instead of throwing; the Host is never used here.
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://localhost');
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: 'Bad Request: malformed request target' }));
+      return;
+    }
+
+    // Mutations additionally require a local Origin (CSRF defense).
+    if (method !== 'GET' && method !== 'HEAD' && !isRequestAllowed(req, boundPort, allowedHosts)) {
       res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ error: 'Forbidden: request must originate from a local origin' }));
       return;
