@@ -1,3 +1,4 @@
+export type { MetricsOverview, TranscriptEntry } from './api.js';
 export {
   type ColdCacheDiskInfo,
   clearColdCache,
@@ -12,3 +13,4 @@ export { ingestSessions, type SessionIngestResult } from './ingest/sessions.js';
 export { ingestTraces, type TraceIngestResult } from './ingest/traces.js';
 export { defaultModelsDir, deleteLocalModel, discoverLocalModels, type LocalModel } from './models.js';
 export { agentSessionsRoot, dashboardDbPath, metricsTraceDir, mlxNodeHome } from './paths.js';
+export { type DashboardServer, type DashboardServerOptions, startDashboardServer } from './server.js';

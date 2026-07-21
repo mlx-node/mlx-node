@@ -1,0 +1,766 @@
+/**
+ * JSON + SSE API route handlers for the dashboard, over plain `node:http`.
+ *
+ * A tiny `(method, pathname)` matcher with `:param` segments dispatches to the
+ * handlers below; there is no web framework. All data comes from the C1–C4
+ * modules (SQLite index, local model store, cold-tier scan, download runner)
+ * and pi's `SessionManager` for transcripts/rename — never the native addon.
+ */
+
+import { existsSync, rmSync } from 'node:fs';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { resolve, sep } from 'node:path';
+
+import { SessionManager, type SessionEntry } from '@earendil-works/pi-coding-agent';
+import { eq } from 'drizzle-orm';
+
+import { scanColdCache, clearColdCache, evictOlderThan } from './cache.js';
+import { catalogWithState } from './catalog.js';
+import type { DashboardDb } from './db/open.js';
+import { sessions, turns } from './db/schema.js';
+import type { DownloadManager, DownloadEvent } from './download.js';
+import { discoverLocalModels, deleteLocalModel } from './models.js';
+
+/** Runtime dependencies the handlers close over, supplied by `server.ts`. */
+export interface ApiDeps {
+  dash: DashboardDb;
+  modelsDir: string;
+  sessionsRoot: string;
+  tracesDir: string;
+  /** Cold-tier root; `undefined` lets `cache.ts` resolve the running-tier default. */
+  cacheRoot: string | undefined;
+  downloads: DownloadManager;
+  /** Serialized incremental rescan (sessions + traces). */
+  runIngest: () => Promise<IngestSummary>;
+  /** Live SSE connections, tracked so `close()` can end them. */
+  sseClients: Set<SseClient>;
+}
+
+export interface IngestSummary {
+  sessions: { scanned: number; updated: number; removed: number; warnings: string[] };
+  traces: { files: number; records: number; pruned: number };
+}
+
+export interface SseClient {
+  res: ServerResponse;
+  cleanup: () => void;
+}
+
+/** One transcript message projected from a pi session entry. */
+export interface TranscriptEntry {
+  role: string;
+  text: string;
+  toolCalls: Array<{ id: string; name: string; arguments: unknown }>;
+  ts: number;
+  /** Present for `toolResult` messages. */
+  toolName?: string;
+  isError?: boolean;
+}
+
+/**
+ * Shape of `GET /api/metrics/overview`. Documented here because the C10 UI is
+ * the sole consumer. All token/count fields are non-negative integers; average
+ * fields are `number | null` (null when no sample carried that column).
+ */
+export interface MetricsOverview {
+  range: { from: number | null; to: number | null };
+  tokensByDay: Array<{ day: string; input: number; output: number; cached: number; reasoning: number }>;
+  throughputByModel: Array<{
+    model: string;
+    avgDecodeTps: number | null;
+    avgPrefillTps: number | null;
+    avgTtftMs: number | null;
+    samples: number;
+  }>;
+  mtpByModel: Array<{ model: string; meanAccepted: number | null; avgCycles: number | null; samples: number }>;
+  modelShare: Array<{ model: string; turns: number; outputTokens: number }>;
+  totals: {
+    turns: number;
+    traces: number;
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+    reasoningTokens: number;
+  };
+}
+
+const MAX_BODY_BYTES = 1024 * 1024;
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' });
+  res.end(payload);
+}
+
+function sendError(res: ServerResponse, status: number, message: string): void {
+  sendJson(res, status, { error: message });
+}
+
+/** Read a JSON request body, capped at 1 MB. Empty body resolves to `null`. */
+function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  return new Promise((resolveBody, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    req.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > MAX_BODY_BYTES) {
+        reject(new Error('Request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf-8').trim();
+      if (raw === '') {
+        resolveBody(null);
+        return;
+      }
+      try {
+        resolveBody(JSON.parse(raw));
+      } catch {
+        reject(new Error('Invalid JSON in request body'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function toNum(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'bigint') return Number(value);
+  return null;
+}
+
+function toInt(value: unknown): number {
+  const n = toNum(value);
+  return n === null ? 0 : Math.trunc(n);
+}
+
+/** Positive-integer query param, or `null`. */
+function queryInt(url: URL, name: string): number | null {
+  const raw = url.searchParams.get(name);
+  if (raw === null || raw === '') return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+// --- Route table ------------------------------------------------------------
+
+type Handler = (ctx: RouteCtx) => void | Promise<void>;
+
+interface RouteCtx {
+  req: IncomingMessage;
+  res: ServerResponse;
+  url: URL;
+  params: Record<string, string>;
+  deps: ApiDeps;
+}
+
+interface Route {
+  method: string;
+  segments: string[];
+  handler: Handler;
+}
+
+function route(method: string, pattern: string, handler: Handler): Route {
+  return { method, segments: pattern.split('/').filter((s) => s.length > 0), handler };
+}
+
+/** Match a `:param` route against concrete path segments. */
+function matchRoute(route: Route, method: string, segments: string[]): Record<string, string> | null {
+  if (route.method !== method) return null;
+  if (route.segments.length !== segments.length) return null;
+  const params: Record<string, string> = {};
+  for (let i = 0; i < route.segments.length; i++) {
+    const pat = route.segments[i];
+    if (pat.startsWith(':')) {
+      params[pat.slice(1)] = decodeURIComponent(segments[i]);
+    } else if (pat !== segments[i]) {
+      return null;
+    }
+  }
+  return params;
+}
+
+// --- Handlers ---------------------------------------------------------------
+
+function handleHealth({ res, deps }: RouteCtx): void {
+  sendJson(res, 200, {
+    status: 'ok',
+    modelsDir: deps.modelsDir,
+    sessionsRoot: deps.sessionsRoot,
+    tracesDir: deps.tracesDir,
+  });
+}
+
+function handleModels({ res, deps }: RouteCtx): void {
+  const { models, warnings } = discoverLocalModels(deps.modelsDir);
+  sendJson(res, 200, { models, warnings });
+}
+
+function handleDeleteModel({ res, params, deps }: RouteCtx): void {
+  try {
+    deleteLocalModel(deps.modelsDir, params.name);
+    sendJson(res, 200, { deleted: true, name: params.name });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    sendError(res, /not found/i.test(message) ? 404 : 400, message);
+  }
+}
+
+function handleCatalog({ res, deps }: RouteCtx): void {
+  sendJson(res, 200, { items: catalogWithState(deps.modelsDir) });
+}
+
+function handleDownloadsList({ res, deps }: RouteCtx): void {
+  sendJson(res, 200, { jobs: deps.downloads.jobs() });
+}
+
+async function handleDownloadStart({ req, res, deps }: RouteCtx): Promise<void> {
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch (err) {
+    sendError(res, 400, err instanceof Error ? err.message : 'Invalid request body');
+    return;
+  }
+  const repo = (body as { repo?: unknown } | null)?.repo;
+  if (typeof repo !== 'string' || repo === '') {
+    sendError(res, 400, 'Body must include a "repo" string');
+    return;
+  }
+  try {
+    const id = deps.downloads.start(repo);
+    sendJson(res, 202, { id, repo });
+  } catch (err) {
+    sendError(res, 400, err instanceof Error ? err.message : 'Failed to start download');
+  }
+}
+
+function handleDownloadEvents({ req, res, params, deps }: RouteCtx): void {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  res.write(': connected\n\n');
+
+  const send = (event: DownloadEvent): void => {
+    res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+  };
+  const unsubscribe = deps.downloads.subscribe(params.id, send);
+
+  const heartbeat = setInterval(() => res.write(': ping\n\n'), 15_000);
+  heartbeat.unref();
+
+  const client: SseClient = {
+    res,
+    cleanup: () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+    },
+  };
+  deps.sseClients.add(client);
+
+  req.on('close', () => {
+    client.cleanup();
+    deps.sseClients.delete(client);
+  });
+}
+
+function handleSessionsList({ res, url, deps }: RouteCtx): void {
+  const q = url.searchParams.get('q');
+  const cwd = url.searchParams.get('cwd');
+  const model = url.searchParams.get('model');
+  const from = queryInt(url, 'from');
+  const to = queryInt(url, 'to');
+
+  const where: string[] = [];
+  const args: Array<string | number> = [];
+  if (q !== null && q !== '') {
+    where.push('(s.name LIKE ? OR s.first_message LIKE ?)');
+    args.push(`%${q}%`, `%${q}%`);
+  }
+  if (cwd !== null && cwd !== '') {
+    where.push('s.cwd = ?');
+    args.push(cwd);
+  }
+  if (model !== null && model !== '') {
+    where.push('EXISTS (SELECT 1 FROM turns t WHERE t.session_id = s.id AND t.model = ?)');
+    args.push(model);
+  }
+  if (from !== null) {
+    where.push('s.modified >= ?');
+    args.push(from);
+  }
+  if (to !== null) {
+    where.push('s.modified <= ?');
+    args.push(to);
+  }
+
+  const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+  const sql = `
+    SELECT s.id, s.path, s.cwd, s.name, s.created, s.modified,
+           s.message_count AS messageCount, s.first_message AS firstMessage,
+           (SELECT group_concat(DISTINCT t.model) FROM turns t
+              WHERE t.session_id = s.id AND t.model IS NOT NULL) AS models,
+           (SELECT COALESCE(SUM(t.input_tokens), 0) FROM turns t WHERE t.session_id = s.id) AS inputTokens,
+           (SELECT COALESCE(SUM(t.output_tokens), 0) FROM turns t WHERE t.session_id = s.id) AS outputTokens
+    FROM sessions s
+    ${whereSql}
+    ORDER BY s.modified DESC
+    LIMIT 500`;
+
+  const rows = deps.dash.sqlite.prepare(sql).all(...args);
+  const list = rows.map((row) => ({
+    id: String(row.id),
+    path: String(row.path),
+    cwd: String(row.cwd),
+    name: row.name === null ? null : String(row.name),
+    created: toInt(row.created),
+    modified: toInt(row.modified),
+    messageCount: toInt(row.messageCount),
+    firstMessage: row.firstMessage === null ? null : String(row.firstMessage),
+    models: typeof row.models === 'string' && row.models !== '' ? row.models.split(',') : [],
+    inputTokens: toInt(row.inputTokens),
+    outputTokens: toInt(row.outputTokens),
+  }));
+  sendJson(res, 200, { sessions: list });
+}
+
+function lookupSession(deps: ApiDeps, id: string): { path: string; row: typeof sessions.$inferSelect } | null {
+  const rows = deps.dash.db.select().from(sessions).where(eq(sessions.id, id)).all();
+  if (rows.length === 0) return null;
+  return { path: rows[0].path, row: rows[0] };
+}
+
+/** Guard: the resolved session file must stay inside the managed sessions root. */
+function insideSessionsRoot(sessionsRoot: string, path: string): boolean {
+  const root = resolve(sessionsRoot);
+  const target = resolve(path);
+  return target === root || target.startsWith(root + sep);
+}
+
+function extractText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content) {
+    if (block && typeof block === 'object' && (block as { type?: unknown }).type === 'text') {
+      const text = (block as { text?: unknown }).text;
+      if (typeof text === 'string') parts.push(text);
+    }
+  }
+  return parts.join('\n');
+}
+
+function extractToolCalls(content: unknown): TranscriptEntry['toolCalls'] {
+  if (!Array.isArray(content)) return [];
+  const calls: TranscriptEntry['toolCalls'] = [];
+  for (const block of content) {
+    if (block && typeof block === 'object' && (block as { type?: unknown }).type === 'toolCall') {
+      const call = block as { id?: unknown; name?: unknown; arguments?: unknown };
+      calls.push({
+        id: typeof call.id === 'string' ? call.id : '',
+        name: typeof call.name === 'string' ? call.name : '',
+        arguments: call.arguments ?? null,
+      });
+    }
+  }
+  return calls;
+}
+
+function mapTranscriptEntry(entry: SessionEntry): TranscriptEntry | null {
+  if (entry.type !== 'message') return null;
+  const msg = entry.message as {
+    role?: unknown;
+    content?: unknown;
+    timestamp?: unknown;
+    toolName?: unknown;
+    isError?: unknown;
+  };
+  const role = typeof msg.role === 'string' ? msg.role : 'unknown';
+  const ts =
+    typeof entry.timestamp === 'string' && !Number.isNaN(Date.parse(entry.timestamp))
+      ? Date.parse(entry.timestamp)
+      : typeof msg.timestamp === 'number'
+        ? msg.timestamp
+        : 0;
+  const mapped: TranscriptEntry = {
+    role,
+    text: extractText(msg.content),
+    toolCalls: extractToolCalls(msg.content),
+    ts,
+  };
+  if (role === 'toolResult') {
+    if (typeof msg.toolName === 'string') mapped.toolName = msg.toolName;
+    if (typeof msg.isError === 'boolean') mapped.isError = msg.isError;
+  }
+  return mapped;
+}
+
+function handleSessionDetail({ res, params, deps }: RouteCtx): void {
+  const found = lookupSession(deps, params.id);
+  if (found === null) {
+    sendError(res, 404, `Session "${params.id}" not found`);
+    return;
+  }
+  const { row } = found;
+  let transcript: TranscriptEntry[] = [];
+  let transcriptError: string | undefined;
+  try {
+    const manager = SessionManager.open(row.path);
+    const isMessage = (entry: TranscriptEntry | null): entry is TranscriptEntry => entry !== null;
+    transcript = manager.buildContextEntries().map(mapTranscriptEntry).filter(isMessage);
+    // The active branch can be a detached `session_info` leaf (e.g. renamed
+    // sessions, or top-level info entries) that carries no messages. Fall back
+    // to the full entry list so a real conversation is never shown blank.
+    if (transcript.length === 0) {
+      transcript = manager.getEntries().map(mapTranscriptEntry).filter(isMessage);
+    }
+    transcript.sort((a, b) => a.ts - b.ts);
+  } catch (err) {
+    transcriptError = err instanceof Error ? err.message : String(err);
+  }
+  sendJson(res, 200, {
+    session: {
+      id: row.id,
+      path: row.path,
+      cwd: row.cwd,
+      name: row.name,
+      created: row.created,
+      modified: row.modified,
+      messageCount: row.messageCount,
+      firstMessage: row.firstMessage,
+    },
+    transcript,
+    ...(transcriptError !== undefined ? { transcriptError } : {}),
+  });
+}
+
+async function handleSessionRename({ req, res, params, deps }: RouteCtx): Promise<void> {
+  const found = lookupSession(deps, params.id);
+  if (found === null) {
+    sendError(res, 404, `Session "${params.id}" not found`);
+    return;
+  }
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch (err) {
+    sendError(res, 400, err instanceof Error ? err.message : 'Invalid request body');
+    return;
+  }
+  const name = (body as { name?: unknown } | null)?.name;
+  if (typeof name !== 'string' || name === '') {
+    sendError(res, 400, 'Body must include a non-empty "name" string');
+    return;
+  }
+  if (!insideSessionsRoot(deps.sessionsRoot, found.path)) {
+    sendError(res, 403, 'Session file resolves outside the managed sessions root');
+    return;
+  }
+  try {
+    const manager = SessionManager.open(found.path);
+    manager.appendSessionInfo(name);
+  } catch (err) {
+    sendError(res, 500, err instanceof Error ? err.message : 'Failed to rename session');
+    return;
+  }
+  // Re-index so the stored name reflects the freshly appended session_info line.
+  await deps.runIngest();
+  sendJson(res, 200, { id: params.id, name });
+}
+
+function handleSessionDelete({ res, params, deps }: RouteCtx): void {
+  const found = lookupSession(deps, params.id);
+  if (found === null) {
+    sendError(res, 404, `Session "${params.id}" not found`);
+    return;
+  }
+  if (!insideSessionsRoot(deps.sessionsRoot, found.path)) {
+    sendError(res, 403, 'Session file resolves outside the managed sessions root');
+    return;
+  }
+  if (existsSync(found.path)) {
+    rmSync(found.path, { force: true });
+  }
+  const { db, sqlite } = deps.dash;
+  sqlite.exec('BEGIN');
+  try {
+    db.delete(turns).where(eq(turns.sessionId, params.id)).run();
+    db.delete(sessions).where(eq(sessions.id, params.id)).run();
+    sqlite.exec('COMMIT');
+  } catch (err) {
+    sqlite.exec('ROLLBACK');
+    sendError(res, 500, err instanceof Error ? err.message : 'Failed to delete session rows');
+    return;
+  }
+  sendJson(res, 200, { deleted: true, id: params.id });
+}
+
+function handleSessionMetrics({ res, params, deps }: RouteCtx): void {
+  const found = lookupSession(deps, params.id);
+  if (found === null) {
+    sendError(res, 404, `Session "${params.id}" not found`);
+    return;
+  }
+  const turnRows = deps.dash.sqlite
+    .prepare(
+      `SELECT t.entry_id AS entryId, t.trace_id AS traceId, t.ts, t.model,
+              t.input_tokens AS inputTokens, t.output_tokens AS outputTokens,
+              t.cached_tokens AS cachedTokens, t.reasoning_tokens AS reasoningTokens,
+              tr.ttft_ms AS ttftMs, tr.prefill_tps AS prefillTps, tr.decode_tps AS decodeTps,
+              tr.mtp_cycles AS mtpCycles, tr.mtp_mean_accepted AS mtpMeanAccepted,
+              tr.duration_ms AS durationMs, tr.finish_reason AS finishReason,
+              tr.cold_hits AS coldHits, tr.cold_misses AS coldMisses,
+              tr.cold_bytes_written AS coldBytesWritten, tr.cold_bytes_restored AS coldBytesRestored
+       FROM turns t
+       LEFT JOIN traces tr ON tr.trace_id = t.trace_id
+       WHERE t.session_id = ?
+       ORDER BY t.ts`,
+    )
+    .all(params.id);
+  const traceRows = deps.dash.sqlite
+    .prepare(
+      `SELECT trace_id AS traceId, ts, model, ttft_ms AS ttftMs, prefill_tps AS prefillTps,
+              decode_tps AS decodeTps, mtp_cycles AS mtpCycles, mtp_mean_accepted AS mtpMeanAccepted,
+              duration_ms AS durationMs, finish_reason AS finishReason,
+              cold_hits AS coldHits, cold_misses AS coldMisses,
+              cold_bytes_written AS coldBytesWritten, cold_bytes_restored AS coldBytesRestored
+       FROM traces WHERE session_id = ? ORDER BY ts`,
+    )
+    .all(params.id);
+  sendJson(res, 200, { sessionId: params.id, turns: turnRows, traces: traceRows });
+}
+
+function rangeClause(from: number | null, to: number | null, column: string): { sql: string; args: number[] } {
+  const parts: string[] = [];
+  const args: number[] = [];
+  if (from !== null) {
+    parts.push(`${column} >= ?`);
+    args.push(from);
+  }
+  if (to !== null) {
+    parts.push(`${column} <= ?`);
+    args.push(to);
+  }
+  return { sql: parts.length > 0 ? parts.join(' AND ') : '', args };
+}
+
+function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
+  const from = queryInt(url, 'from');
+  const to = queryInt(url, 'to');
+  const { sqlite } = deps.dash;
+
+  const turnsRange = rangeClause(from, to, 'ts');
+  const tracesRange = rangeClause(from, to, 'ts');
+  const turnsWhere = (extra: string): string => {
+    const parts = [extra, turnsRange.sql].filter((p) => p !== '');
+    return parts.length > 0 ? `WHERE ${parts.join(' AND ')}` : '';
+  };
+  const tracesWhere = (extra: string): string => {
+    const parts = [extra, tracesRange.sql].filter((p) => p !== '');
+    return parts.length > 0 ? `WHERE ${parts.join(' AND ')}` : '';
+  };
+
+  const tokensByDay = sqlite
+    .prepare(
+      `SELECT date(ts / 1000, 'unixepoch') AS day,
+              COALESCE(SUM(input_tokens), 0) AS input,
+              COALESCE(SUM(output_tokens), 0) AS output,
+              COALESCE(SUM(cached_tokens), 0) AS cached,
+              COALESCE(SUM(reasoning_tokens), 0) AS reasoning
+       FROM turns ${turnsWhere('ts > 0')} GROUP BY day ORDER BY day`,
+    )
+    .all(...turnsRange.args)
+    .map((row) => ({
+      day: String(row.day),
+      input: toInt(row.input),
+      output: toInt(row.output),
+      cached: toInt(row.cached),
+      reasoning: toInt(row.reasoning),
+    }));
+
+  const throughputByModel = sqlite
+    .prepare(
+      `SELECT COALESCE(model, 'unknown') AS model,
+              AVG(decode_tps) AS avgDecodeTps, AVG(prefill_tps) AS avgPrefillTps,
+              AVG(ttft_ms) AS avgTtftMs, COUNT(*) AS samples
+       FROM traces ${tracesWhere('')} GROUP BY model ORDER BY samples DESC`,
+    )
+    .all(...tracesRange.args)
+    .map((row) => ({
+      model: String(row.model),
+      avgDecodeTps: toNum(row.avgDecodeTps),
+      avgPrefillTps: toNum(row.avgPrefillTps),
+      avgTtftMs: toNum(row.avgTtftMs),
+      samples: toInt(row.samples),
+    }));
+
+  const mtpByModel = sqlite
+    .prepare(
+      `SELECT COALESCE(model, 'unknown') AS model,
+              AVG(mtp_mean_accepted) AS meanAccepted, AVG(mtp_cycles) AS avgCycles,
+              COUNT(mtp_mean_accepted) AS samples
+       FROM traces ${tracesWhere('mtp_mean_accepted IS NOT NULL')} GROUP BY model ORDER BY samples DESC`,
+    )
+    .all(...tracesRange.args)
+    .map((row) => ({
+      model: String(row.model),
+      meanAccepted: toNum(row.meanAccepted),
+      avgCycles: toNum(row.avgCycles),
+      samples: toInt(row.samples),
+    }));
+
+  const modelShare = sqlite
+    .prepare(
+      `SELECT COALESCE(model, 'unknown') AS model, COUNT(*) AS turns,
+              COALESCE(SUM(output_tokens), 0) AS outputTokens
+       FROM turns ${turnsWhere('')} GROUP BY model ORDER BY turns DESC`,
+    )
+    .all(...turnsRange.args)
+    .map((row) => ({ model: String(row.model), turns: toInt(row.turns), outputTokens: toInt(row.outputTokens) }));
+
+  const turnTotals = sqlite
+    .prepare(
+      `SELECT COUNT(*) AS turns, COALESCE(SUM(input_tokens), 0) AS inputTokens,
+              COALESCE(SUM(output_tokens), 0) AS outputTokens,
+              COALESCE(SUM(cached_tokens), 0) AS cachedTokens,
+              COALESCE(SUM(reasoning_tokens), 0) AS reasoningTokens
+       FROM turns ${turnsWhere('')}`,
+    )
+    .get(...turnsRange.args);
+  const traceTotals = sqlite.prepare(`SELECT COUNT(*) AS traces FROM traces ${tracesWhere('')}`).get(...tracesRange.args);
+
+  const overview: MetricsOverview = {
+    range: { from, to },
+    tokensByDay,
+    throughputByModel,
+    mtpByModel,
+    modelShare,
+    totals: {
+      turns: toInt(turnTotals?.turns),
+      traces: toInt(traceTotals?.traces),
+      inputTokens: toInt(turnTotals?.inputTokens),
+      outputTokens: toInt(turnTotals?.outputTokens),
+      cachedTokens: toInt(turnTotals?.cachedTokens),
+      reasoningTokens: toInt(turnTotals?.reasoningTokens),
+    },
+  };
+  sendJson(res, 200, overview);
+}
+
+function handleCacheGet({ res, deps }: RouteCtx): void {
+  const disk = deps.cacheRoot !== undefined ? scanColdCache(deps.cacheRoot) : scanColdCache();
+  const trend = deps.dash.sqlite
+    .prepare(
+      `SELECT date(ts / 1000, 'unixepoch') AS day,
+              COALESCE(SUM(cold_hits), 0) AS hits, COALESCE(SUM(cold_misses), 0) AS misses,
+              COALESCE(SUM(cold_bytes_written), 0) AS bytesWritten,
+              COALESCE(SUM(cold_bytes_restored), 0) AS bytesRestored
+       FROM traces WHERE ts > 0 GROUP BY day ORDER BY day`,
+    )
+    .all()
+    .map((row) => ({
+      day: String(row.day),
+      hits: toInt(row.hits),
+      misses: toInt(row.misses),
+      bytesWritten: toInt(row.bytesWritten),
+      bytesRestored: toInt(row.bytesRestored),
+    }));
+  sendJson(res, 200, { disk, trend });
+}
+
+async function handleCacheDelete({ req, res, deps }: RouteCtx): Promise<void> {
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch (err) {
+    sendError(res, 400, err instanceof Error ? err.message : 'Invalid request body');
+    return;
+  }
+  const olderThanDays = (body as { olderThanDays?: unknown } | null)?.olderThanDays;
+  const root = deps.cacheRoot;
+  let result: { removed: number; freedBytes: number };
+  if (typeof olderThanDays === 'number' && Number.isFinite(olderThanDays) && olderThanDays > 0) {
+    result = root !== undefined ? evictOlderThan(olderThanDays, root) : evictOlderThan(olderThanDays);
+  } else {
+    result = root !== undefined ? clearColdCache(root) : clearColdCache();
+  }
+  sendJson(res, 200, result);
+}
+
+async function handleIngest({ res, deps }: RouteCtx): Promise<void> {
+  const summary = await deps.runIngest();
+  sendJson(res, 200, summary);
+}
+
+const ROUTES: Route[] = [
+  route('GET', '/health', handleHealth),
+  route('GET', '/api/models', handleModels),
+  route('DELETE', '/api/models/:name', handleDeleteModel),
+  route('GET', '/api/catalog', handleCatalog),
+  route('GET', '/api/downloads', handleDownloadsList),
+  route('POST', '/api/downloads', handleDownloadStart),
+  route('GET', '/api/downloads/:id/events', handleDownloadEvents),
+  route('GET', '/api/sessions', handleSessionsList),
+  route('GET', '/api/sessions/:id', handleSessionDetail),
+  route('PATCH', '/api/sessions/:id', handleSessionRename),
+  route('DELETE', '/api/sessions/:id', handleSessionDelete),
+  route('GET', '/api/sessions/:id/metrics', handleSessionMetrics),
+  route('GET', '/api/metrics/overview', handleMetricsOverview),
+  route('GET', '/api/cache', handleCacheGet),
+  route('DELETE', '/api/cache', handleCacheDelete),
+  route('POST', '/api/ingest', handleIngest),
+];
+
+/**
+ * Dispatch an API/health request. Returns `true` when a route matched (response
+ * written), `false` when the path is not an API route (caller serves static).
+ * A path under `/api` that matches no route yields a 404 JSON here.
+ */
+export async function handleApiRequest(req: IncomingMessage, res: ServerResponse, url: URL, deps: ApiDeps): Promise<boolean> {
+  const pathname = url.pathname;
+  const isApi = pathname === '/health' || pathname === '/api' || pathname.startsWith('/api/');
+  if (!isApi) return false;
+
+  const method = req.method ?? 'GET';
+  const segments = pathname.split('/').filter((s) => s.length > 0);
+  let pathMatched = false;
+  for (const r of ROUTES) {
+    const params = matchRoute(r, method, segments);
+    if (params === null) {
+      if (segmentsMatch(r.segments, segments)) pathMatched = true;
+      continue;
+    }
+    try {
+      await r.handler({ req, res, url, params, deps });
+    } catch (err) {
+      if (!res.headersSent) {
+        sendError(res, 500, err instanceof Error ? err.message : 'Internal server error');
+      } else {
+        res.end();
+      }
+    }
+    return true;
+  }
+
+  // A known path with the wrong method → 405; otherwise 404.
+  if (pathMatched) {
+    sendError(res, 405, `Method ${method} not allowed for ${pathname}`);
+  } else {
+    sendError(res, 404, `No route matches ${method} ${pathname}`);
+  }
+  return true;
+}
+
+/** Whether a route's segment pattern shape matches concrete segments (ignoring method/values). */
+function segmentsMatch(pattern: string[], segments: string[]): boolean {
+  if (pattern.length !== segments.length) return false;
+  for (let i = 0; i < pattern.length; i++) {
+    if (!pattern[i].startsWith(':') && pattern[i] !== segments[i]) return false;
+  }
+  return true;
+}
