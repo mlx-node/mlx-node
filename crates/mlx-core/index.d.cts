@@ -2600,7 +2600,7 @@ export interface ColdCacheStats {
   misses: number;
   /** Blocks accepted onto the background write queue. */
   enqueued: number;
-  /** Writes dropped because the bounded queue was full. */
+  /** Writes dropped without landing on disk: queue full at enqueue, or the commit rename failed. */
   queueDrops: number;
   /** Total bytes committed to disk. */
   bytesWritten: number;

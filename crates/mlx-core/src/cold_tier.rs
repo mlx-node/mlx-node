@@ -75,7 +75,7 @@ pub struct ColdCacheStatsJs {
     pub misses: f64,
     /// Blocks accepted onto the background write queue.
     pub enqueued: f64,
-    /// Writes dropped because the bounded queue was full.
+    /// Writes dropped without landing on disk: queue full at enqueue, or the commit rename failed.
     pub queue_drops: f64,
     /// Total bytes committed to disk.
     pub bytes_written: f64,

@@ -196,6 +196,9 @@ pub struct ColdCacheStats {
     pub hits: u64,
     pub misses: u64,
     pub enqueued: u64,
+    /// Writes dropped without landing on disk: the bounded queue was full
+    /// at enqueue, or the commit rename failed after the queue accepted
+    /// the job.
     pub queue_drops: u64,
     pub bytes_written: u64,
     pub bytes_restored: u64,
@@ -412,11 +415,25 @@ impl RootDir {
         ))
     }
 
-    /// Identity of the current directory entry plus whether it is a regular
-    /// file, never following symlinks; `None` when no entry exists.
-    fn stat_identity(&self, name: &str) -> Option<(FileIdentity, bool)> {
-        self.stat_no_follow(name)
-            .map(|stat| (identity_of(&stat), file_type_of(&stat).is_file()))
+    /// Identity and concrete type of the current directory entry, never
+    /// following symlinks; `None` when no entry exists.
+    fn stat_identity(&self, name: &str) -> Option<(FileIdentity, EntryKind)> {
+        self.stat_no_follow(name).map(|stat| {
+            let file_type = file_type_of(&stat);
+            let kind = if file_type.is_file() {
+                EntryKind::Regular
+            } else if file_type.is_dir() {
+                EntryKind::Directory
+            } else {
+                EntryKind::Other
+            };
+            (identity_of(&stat), kind)
+        })
+    }
+
+    fn remove_dir_entry(&self, name: &str) -> std::io::Result<()> {
+        rustix::fs::unlinkat(&self.fd, name, rustix::fs::AtFlags::REMOVEDIR)
+            .map_err(std::io::Error::from)
     }
 
     fn stat_no_follow(&self, name: &str) -> Option<rustix::fs::Stat> {
@@ -520,8 +537,12 @@ impl RootDir {
         Some((meta.len(), mtime))
     }
 
-    fn stat_identity(&self, _name: &str) -> Option<(FileIdentity, bool)> {
+    fn stat_identity(&self, _name: &str) -> Option<(FileIdentity, EntryKind)> {
         None
+    }
+
+    fn remove_dir_entry(&self, name: &str) -> std::io::Result<()> {
+        fs::remove_dir(self.path.join(name))
     }
 }
 
@@ -725,8 +746,10 @@ impl ColdCacheManager {
     /// read, so an in-process writer's freshly committed replacement is
     /// never deleted or de-indexed — except that a directory entry which is
     /// no longer a regular file (and so can never be a writer commit nor be
-    /// opened again) is de-indexed and its entry unlinked without touching
-    /// what it points at. Coordination is in-process only: a concurrent
+    /// opened again) is cleared from the canonical name (unlinked, or for a
+    /// non-empty directory renamed aside) and only then de-indexed, without
+    /// touching what it points at. Coordination is in-process only: a
+    /// concurrent
     /// *process* mutating the same root stays fail-open — the identity
     /// guard still refuses to unlink its replacement, and the worst case is
     /// a stale index entry or one recomputed prefix.
@@ -895,7 +918,13 @@ fn persist_block(shared: &Shared, block: &ColdCacheBlock) -> Result<(), String> 
             .index
             .lock()
             .map_err(|_| "cold-cache index mutex poisoned".to_string())?;
-        shared.root.rename(&temp, &destination)?;
+        // A failed commit rename drops a write the queue already accepted;
+        // counting it in `queue_drops` keeps enqueue/write accounting
+        // honest, since the worker itself is fail-open and returns the
+        // error to nobody.
+        shared.root.rename(&temp, &destination).inspect_err(|_| {
+            shared.stats.queue_drops.fetch_add(1, Ordering::Relaxed);
+        })?;
         shared.root.sync()?;
         if let Some(old) = index.entries.insert(
             block.key,
@@ -943,17 +972,24 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
 }
 
 /// Cleanup after a failed load, under the same index lock the writer holds
-/// across [rename + index publish]. Unlinks (descriptor-relative) only when
-/// the directory entry `name` is still the generation that was read
-/// (`read_identity`); a regular-file replacement (new inode) is left on
-/// disk and keeps its index entry, because it may be a writer's freshly
-/// renamed-in commit. A non-regular entry (symlink, FIFO, or other) can
-/// never be a writer commit (writers rename in regular files only) and can
-/// never be opened again (`open_existing` is `O_NOFOLLOW` and rejects every
-/// non-regular type after `fstat`), so keeping it would pin
-/// a permanently dead index entry: it is de-indexed and its directory
-/// entry unlinked. `unlinkat` removes the entry itself, never a symlink's
-/// target, matching eviction semantics.
+/// across [rename + index publish]. The key is de-indexed only once the
+/// canonical name is actually clear, so a de-indexed key can never leave
+/// behind an obstruction that fails every later writer commit rename:
+/// - Entry still the generation that was read (`read_identity`): unlinked
+///   (descriptor-relative), as a corrupt payload that can only fail again.
+/// - A different regular file: left on disk with its index entry, because
+///   it may be a writer's freshly renamed-in commit.
+/// - A directory: never a writer commit and never openable
+///   (`open_existing` rejects every non-regular type after `fstat`), so it
+///   only obstructs the name. Removed with `unlinkat(REMOVEDIR)` when
+///   empty; otherwise renamed aside to a quarantine name — unknown content
+///   is never deleted — that the index scanner and startup cleanup ignore.
+/// - Any other non-regular entry (symlink, FIFO, ...): its directory entry
+///   is unlinked. `unlinkat` removes the entry itself, never a symlink's
+///   target, matching eviction semantics.
+///
+/// When clearing fails the index entry stays, and the next load miss for
+/// the key retries.
 fn prune_failed_load(
     shared: &Shared,
     key: ColdCacheKey,
@@ -963,17 +999,46 @@ fn prune_failed_load(
     let Ok(mut index) = shared.index.lock() else {
         return;
     };
-    let (unlink_entry, deindex) = match shared.root.stat_identity(name) {
-        Some((current, _)) if read_identity == Some(current) => (true, true),
-        Some((_, is_regular)) => (!is_regular, !is_regular),
-        None => (false, true),
+    let cleared = match shared.root.stat_identity(name) {
+        Some((current, _)) if read_identity == Some(current) => {
+            entry_gone(shared.root.unlink(name))
+        }
+        Some((_, EntryKind::Regular)) => false,
+        Some((_, EntryKind::Directory)) => match shared.root.remove_dir_entry(name) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => shared.root.rename(name, &quarantine_name(name)).is_ok(),
+        },
+        Some((_, EntryKind::Other)) => entry_gone(shared.root.unlink(name)),
+        None => true,
     };
-    if unlink_entry {
-        let _ = shared.root.unlink(name);
-    }
-    if deindex && let Some(entry) = index.entries.remove(&key) {
+    if cleared && let Some(entry) = index.entries.remove(&key) {
         index.total_bytes = index.total_bytes.saturating_sub(entry.size);
     }
+}
+
+fn entry_gone(result: std::io::Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Quarantine name for a directory obstructing a canonical block name.
+/// Shaped like the writer temp convention (leading dot, pid + tick for
+/// uniqueness) but matches neither `*.safetensors` nor
+/// [`is_cold_cache_temp_file`], so quarantined directories are never
+/// indexed and never deleted by startup cleanup.
+fn quarantine_name(name: &str) -> String {
+    format!(".blocked.{name}.{}.{}", std::process::id(), now_tick())
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum EntryKind {
+    Regular,
+    Directory,
+    Other,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1566,6 +1631,186 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(manager.load(key, fingerprint()), Some(block(key)));
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_miss_after_empty_dir_swap_removes_dir_and_unblocks_key() {
+        let root = temp_root("empty-dir-swap");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        assert!(manager.enqueue(block(key)).unwrap());
+        for _ in 0..200 {
+            if manager.contains(&key) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(manager.contains(&key));
+
+        let path = root.join(format!("{}.safetensors", key.to_hex()));
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+
+        assert!(manager.load(key, fingerprint()).is_none());
+        assert!(
+            fs::symlink_metadata(&path).is_err(),
+            "an empty directory swapped onto the canonical name must be removed"
+        );
+        assert!(
+            !manager.contains(&key),
+            "the cleared entry must leave the index on the load miss"
+        );
+        assert_eq!(manager.shared.index.lock().unwrap().total_bytes, 0);
+        let stats = manager.stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.corruptions, 0, "nothing was opened, nothing was read");
+
+        assert!(
+            manager.enqueue(block(key)).unwrap(),
+            "removing the directory must unblock re-persisting the same key"
+        );
+        for _ in 0..200 {
+            if manager.contains(&key) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(manager.load(key, fingerprint()), Some(block(key)));
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_miss_after_nonempty_dir_swap_quarantines_without_deleting_content() {
+        let root = temp_root("nonempty-dir-swap");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        assert!(manager.enqueue(block(key)).unwrap());
+        for _ in 0..200 {
+            if manager.contains(&key) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(manager.contains(&key));
+
+        let name = format!("{}.safetensors", key.to_hex());
+        let path = root.join(&name);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("marker.txt"), b"marker").unwrap();
+
+        assert!(manager.load(key, fingerprint()).is_none());
+        assert!(
+            fs::symlink_metadata(&path).is_err(),
+            "the canonical name must be freed on the load miss"
+        );
+        assert!(!manager.contains(&key));
+        assert_eq!(manager.shared.index.lock().unwrap().total_bytes, 0);
+
+        let quarantine_prefix = format!(".blocked.{name}.");
+        let quarantined: Vec<PathBuf> = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(&quarantine_prefix))
+            })
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the obstructing directory must be renamed aside, not deleted"
+        );
+        assert_eq!(
+            fs::read(quarantined[0].join("marker.txt")).unwrap(),
+            b"marker",
+            "quarantine must preserve the directory's content"
+        );
+
+        assert!(
+            manager.enqueue(block(key)).unwrap(),
+            "quarantining must unblock re-persisting the same key"
+        );
+        for _ in 0..200 {
+            if manager.contains(&key) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(manager.load(key, fingerprint()), Some(block(key)));
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_rebuild_ignores_quarantined_directories() {
+        let root = temp_root("quarantine-rebuild");
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let quarantined = root.join(format!(".blocked.{}.safetensors.4242.7", key.to_hex()));
+        fs::create_dir_all(&quarantined).unwrap();
+        let marker = quarantined.join("marker.txt");
+        fs::write(&marker, b"marker").unwrap();
+
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 1).unwrap();
+        assert!(
+            quarantined.is_dir() && marker.exists(),
+            "startup cleanup must never delete quarantined directories"
+        );
+        assert_eq!(
+            manager.shared.index.lock().unwrap().entries.len(),
+            0,
+            "quarantined names must never be indexed"
+        );
+        assert!(!is_cold_cache_temp_file(
+            quarantined.file_name().unwrap().to_str().unwrap()
+        ));
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_commit_rename_failure_counts_drop_and_removes_temp() {
+        let root = temp_root("commit-rename-failure");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let path = root.join(format!("{}.safetensors", key.to_hex()));
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("marker.txt"), b"marker").unwrap();
+
+        assert!(manager.enqueue(block(key)).unwrap());
+        for _ in 0..200 {
+            if manager.stats().queue_drops >= 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let stats = manager.stats();
+        assert_eq!(
+            stats.queue_drops, 1,
+            "a failed commit rename must be counted, not silently discarded"
+        );
+        assert_eq!(stats.bytes_written, 0);
+        assert!(!manager.contains(&key));
+        assert!(
+            !fs::read_dir(&root).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.ends_with(".tmp"))
+            }),
+            "the orphaned temp file must be removed after a failed commit"
+        );
+        assert!(path.is_dir() && path.join("marker.txt").exists());
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }
