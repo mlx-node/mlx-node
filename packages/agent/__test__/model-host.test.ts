@@ -317,6 +317,51 @@ describe('MlxModelHost', () => {
     expect(host.residentId).toBe('qwen-small');
   });
 
+  describe('persistPagedCache cold-tier policy', () => {
+    const QWEN3: DiscoveredModelLike = { name: 'qwen3-dense', path: '/models/qwen3-dense', modelType: 'qwen3' };
+    const HOST_MODELS: DiscoveredModelLike[] = [
+      QWEN3,
+      { name: 'gemma-mid', path: '/models/gemma-mid', modelType: 'gemma4' },
+    ];
+
+    /** Records the exact argument list the host hands the config-override seam. */
+    function trackingResolver() {
+      return vi.fn(async (model: DiscoveredModelLike) => `/paged${model.path}`);
+    }
+
+    it('requests qwen3 cold-tier persistence by default', async () => {
+      const resolveModelPathFn = trackingResolver();
+      const host = new MlxModelHost(HOST_MODELS, { loadModelFn: makeLoader(), resolveModelPathFn });
+
+      await getSession(host, 'qwen3-dense');
+
+      expect(resolveModelPathFn.mock.calls[0]).toEqual([QWEN3, { persistPagedCache: true }]);
+    });
+
+    it('omits persistence when the host option is disabled', async () => {
+      const resolveModelPathFn = trackingResolver();
+      const host = new MlxModelHost(HOST_MODELS, {
+        loadModelFn: makeLoader(),
+        resolveModelPathFn,
+        persistPagedCache: false,
+      });
+
+      await getSession(host, 'qwen3-dense');
+
+      // No policy object at all — the disabled flag must not surface as `false`.
+      expect(resolveModelPathFn.mock.calls[0]).toEqual([QWEN3]);
+    });
+
+    it('never requests persistence for a non-qwen3 family', async () => {
+      const resolveModelPathFn = trackingResolver();
+      const host = new MlxModelHost(HOST_MODELS, { loadModelFn: makeLoader(), resolveModelPathFn });
+
+      await getSession(host, 'gemma-mid');
+
+      expect(resolveModelPathFn.mock.calls[0]).toEqual([HOST_MODELS[1]]);
+    });
+  });
+
   it('leaves no resident on load failure and allows a retry', async () => {
     const loader = makeLoader();
     const host = new MlxModelHost(MODELS, { loadModelFn: loader });

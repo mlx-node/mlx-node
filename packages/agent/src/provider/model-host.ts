@@ -17,15 +17,27 @@ import { ChatSession, loadModel, type SessionCapableModel } from '@mlx-node/lm';
 
 import type { DiscoveredModelLike } from '../types.js';
 
+/** Per-load policy handed to {@link MlxModelHostOptions.resolveModelPathFn}. */
+export interface ModelLoadPolicy {
+  /**
+   * Ask the config overlay to persist this model's paged prefix blocks to the
+   * SSD cold tier (`persist_paged_cache` in the cloned config.json). Set only
+   * for qwen3-family loads, and only when {@link MlxModelHostOptions.persistPagedCache}
+   * is enabled — omitted entirely otherwise, so no other family ever sees it.
+   */
+  persistPagedCache: true;
+}
+
 export interface MlxModelHostOptions {
   /** Injectable model loader so tests can stub native loading. */
   loadModelFn?: typeof loadModel;
   /**
    * Optional load-path policy. `mlx agent` uses this to point the loader at
    * an ephemeral config overlay with block-paged attention enabled while
-   * leaving the checkpoint directory untouched.
+   * leaving the checkpoint directory untouched. The optional per-load policy
+   * carries the qwen3 cold-tier opt-in (see {@link ModelLoadPolicy}).
    */
-  resolveModelPathFn?: (model: DiscoveredModelLike) => Promise<string>;
+  resolveModelPathFn?: (model: DiscoveredModelLike, policy?: ModelLoadPolicy) => Promise<string>;
   /**
    * Reject a loaded model unless its native paged-cache adapter is active.
    * The agent entrypoint enables this so a model/platform incompatibility
@@ -35,6 +47,14 @@ export interface MlxModelHostOptions {
    * executor is currently flat-cache-only.
    */
   requirePagedCache?: boolean;
+  /**
+   * Enable the qwen3 dense cold tier (persisted paged prefix blocks) by
+   * default. `mlx agent` turns this on; `mlx agent --no-persist-cache` sets it
+   * false. Applied to qwen3-family loads only — qwen3 dense is the sole family
+   * with a sound paged cold restore (gemma4/lfm2/qwen3.5 keep per-layer state
+   * outside the paged pool). Defaults true.
+   */
+  persistPagedCache?: boolean;
 }
 
 interface ResidentModel {
@@ -57,8 +77,9 @@ interface ResidentModel {
 export class MlxModelHost {
   private readonly byName = new Map<string, DiscoveredModelLike>();
   private readonly loadModelFn: typeof loadModel;
-  private readonly resolveModelPathFn: (model: DiscoveredModelLike) => Promise<string>;
+  private readonly resolveModelPathFn: (model: DiscoveredModelLike, policy?: ModelLoadPolicy) => Promise<string>;
   private readonly requirePagedCache: boolean;
+  private readonly persistPagedCache: boolean;
   private resident: ResidentModel | null = null;
   private chain: Promise<unknown> = Promise.resolve();
 
@@ -67,6 +88,7 @@ export class MlxModelHost {
     this.loadModelFn = opts.loadModelFn ?? loadModel;
     this.resolveModelPathFn = opts.resolveModelPathFn ?? (async (model) => model.path);
     this.requirePagedCache = opts.requirePagedCache ?? false;
+    this.persistPagedCache = opts.persistPagedCache ?? true;
   }
 
   get residentId(): string | null {
@@ -109,7 +131,13 @@ export class MlxModelHost {
         session = this.resident.session;
       } else {
         this.resident = null;
-        const resolvedPath = await this.resolveModelPathFn(entry);
+        // Only qwen3 dense has a sound paged cold restore; gate the persist
+        // opt-in on the already-known discovery type so no other family clones
+        // a config carrying the flag.
+        const persistColdTier = this.persistPagedCache && entry.modelType === 'qwen3';
+        const resolvedPath = persistColdTier
+          ? await this.resolveModelPathFn(entry, { persistPagedCache: true })
+          : await this.resolveModelPathFn(entry);
         const model = await this.loadModelFn(resolvedPath);
         const sessionModel = model as unknown as SessionCapableModel;
         const gemmaDraftActive = entry.modelType === 'gemma4' && sessionModel.hasMtpWeights?.() === true;

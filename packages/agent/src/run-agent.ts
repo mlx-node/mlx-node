@@ -45,7 +45,7 @@ export interface RunAgentPi {
 
 /** @internal Narrow lifecycle seam for the agent's paged config overlays. */
 export interface AgentPagedConfigOverrides {
-  resolve(modelPath: string, modelType?: string): Promise<string>;
+  resolve(modelPath: string, modelType?: string, persistPagedCache?: boolean): Promise<string>;
   cleanup(): Promise<void>;
 }
 
@@ -58,6 +58,13 @@ export interface RunAgentOptions {
   argv: string[];
   /** Native inference-log path to surface after Pi takes over the TUI. */
   traceLogFile?: string;
+  /**
+   * Enable the qwen3 dense cold tier by default (the agent's default; the CLI
+   * sets it false for `--no-persist-cache`). Forwarded to {@link MlxModelHost},
+   * which applies it to qwen3-family loads only. `undefined` keeps the host's
+   * on-by-default behavior.
+   */
+  persistPagedCache?: boolean;
   /** @internal Test seam; when set, the pi dynamic import is skipped entirely. */
   piImpl?: RunAgentPi;
   /** @internal Test seam for paged model-path resolution and cleanup. */
@@ -98,8 +105,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   const modelHost = new MlxModelHost(
     opts.models.map((model) => model.discovered),
     {
-      resolveModelPathFn: (model) => pagedConfigOverrides.resolve(model.path, model.modelType),
+      resolveModelPathFn: (model, policy) =>
+        pagedConfigOverrides.resolve(model.path, model.modelType, policy?.persistPagedCache),
       requirePagedCache: true,
+      persistPagedCache: opts.persistPagedCache,
     },
   );
 

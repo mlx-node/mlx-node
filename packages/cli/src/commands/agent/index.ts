@@ -30,6 +30,12 @@ export interface AgentArgScan {
   /** `--trace-dir` was present without a value — usage error. */
   traceDirMissingValue: boolean;
   /**
+   * Whether to persist the qwen3 dense paged cold tier (on by default; the
+   * mlx-owned `--no-persist-cache` flag turns it off). Lifted out of the argv
+   * like the other mlx flags — never forwarded to pi.
+   */
+  persistPagedCache: boolean;
+  /**
    * `-h`/`--help` seen and this is NOT a pi pass-through invocation
    * (`install`/`remove`/`uninstall`/`list`/`config` print their own
    * per-command help inside pi, so those pass through untouched).
@@ -127,6 +133,7 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   let trace = false;
   let traceDir: string | undefined;
   let traceDirMissingValue = false;
+  let persistPagedCache = true;
   let helpSeen = false;
   let piOneShot = false;
 
@@ -179,6 +186,10 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       trace = true;
       continue;
     }
+    if (arg === '--no-persist-cache') {
+      persistPagedCache = false;
+      continue;
+    }
     if (arg === '--trace-dir') {
       trace = true;
       const next = argv[i + 1];
@@ -223,6 +234,7 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     trace,
     traceDir,
     traceDirMissingValue,
+    persistPagedCache,
     help: helpSeen && !PI_PASSTHROUGH_COMMANDS.has(passthrough[0] ?? ''),
     update: passthrough[0] === 'update',
     piOneShot,
@@ -598,6 +610,8 @@ mlx options (handled before pi sees the args):
   --trace                   Enable bounded native inference diagnostics.
   --trace-dir <dir>         Write inference.log in this directory (implies
                             --trace; dash-leading paths need --trace-dir=<dir>).
+  --no-persist-cache        Disable the on-by-default SSD cold tier for qwen3
+                            dense paged prefix blocks (other families unaffected).
 
 First run: when no local model exists, an interactive wizard offers a curated
 download. Agent config home: ~/.mlx-node/agent (override: PI_CODING_AGENT_DIR).
@@ -760,5 +774,5 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     console.error(notice);
   }
 
-  await runAgent({ modelsDir, models, argv: agentArgv, traceLogFile });
+  await runAgent({ modelsDir, models, argv: agentArgv, traceLogFile, persistPagedCache: scan.persistPagedCache });
 }

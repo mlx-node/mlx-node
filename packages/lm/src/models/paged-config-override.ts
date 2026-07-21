@@ -67,13 +67,18 @@ export class PagedConfigOverrideManager {
    * A caller-supplied canonical family takes precedence over the raw config
    * type (for example, `gemma4` for a `gemma4_unified` checkpoint).
    * Unmanaged, unreadable, or malformed checkpoints pass through unchanged.
+   *
+   * `persistPagedCache` additionally writes `persist_paged_cache: true` into the
+   * cloned config so the native loader enables its SSD cold tier. Callers gate
+   * this to families with a sound paged cold restore (qwen3 dense); it forces a
+   * clone even for an already-paged checkpoint so the flag actually lands.
    */
-  async resolve(modelPath: string, canonicalModelType?: string): Promise<string> {
+  async resolve(modelPath: string, canonicalModelType?: string, persistPagedCache?: boolean): Promise<string> {
     if (this.disposed) {
       throw new Error('PagedConfigOverrideManager: resolve() called after cleanup()');
     }
 
-    const operation = this.resolveInternal(modelPath, canonicalModelType);
+    const operation = this.resolveInternal(modelPath, canonicalModelType, persistPagedCache);
     this.activeResolves.add(operation);
     try {
       return await operation;
@@ -82,7 +87,11 @@ export class PagedConfigOverrideManager {
     }
   }
 
-  private async resolveInternal(modelPath: string, canonicalModelType?: string): Promise<string> {
+  private async resolveInternal(
+    modelPath: string,
+    canonicalModelType?: string,
+    persistPagedCache?: boolean,
+  ): Promise<string> {
     const sourcePath = isAbsolute(modelPath) ? modelPath : resolve(modelPath);
     let config: Record<string, unknown>;
     try {
@@ -96,6 +105,10 @@ export class PagedConfigOverrideManager {
     if (modelType === null || !this.modelTypes.has(modelType)) {
       return modelPath;
     }
+
+    // A persist request must reach the loader through the config clone; only
+    // skip the clone when the source already carries the flag.
+    const persistNeeded = persistPagedCache === true && config.persist_paged_cache !== true;
 
     // Gemma4's DSpark / assistant speculative executor currently owns flat KV
     // caches. Preserve native draft discovery only for explicit callers; the
@@ -112,15 +125,16 @@ export class PagedConfigOverrideManager {
     const memorySatisfied = cacheFloorMb === undefined || (configuredMemoryMb ?? 0) >= cacheFloorMb;
     // Even an already-paged Gemma config must be cloned when `draft/` exists:
     // returning the source would expose the draft to native auto-discovery and
-    // trigger the flat-speculation/paged-cache conflict.
-    if (pagedEnabled && memorySatisfied && !hasEmbeddedGemmaDraft) {
+    // trigger the flat-speculation/paged-cache conflict. An outstanding persist
+    // request likewise blocks the pass-through so the flag reaches the loader.
+    if (pagedEnabled && memorySatisfied && !hasEmbeddedGemmaDraft && !persistNeeded) {
       return modelPath;
     }
 
     const existing = this.overrides.get(sourcePath);
     if (existing !== undefined) return existing;
 
-    const pending = this.createOverride(sourcePath, config, cacheFloorMb, modelType);
+    const pending = this.createOverride(sourcePath, config, cacheFloorMb, modelType, persistPagedCache === true);
     this.overrides.set(sourcePath, pending);
     try {
       return await pending;
@@ -156,6 +170,7 @@ export class PagedConfigOverrideManager {
     sourceConfig: Record<string, unknown>,
     cacheFloorMb: number | undefined,
     modelType: string,
+    persistPagedCache: boolean,
   ): Promise<string> {
     const root = await this.getRoot();
     const overrideDir = await mkdtemp(join(root, 'model-'));
@@ -164,6 +179,9 @@ export class PagedConfigOverrideManager {
       ...sourceConfig,
       use_block_paged_cache: true,
     };
+    if (persistPagedCache) {
+      config.persist_paged_cache = true;
+    }
     if (cacheFloorMb !== undefined) {
       config.paged_cache_memory_mb = Math.max(positiveNumber(sourceConfig.paged_cache_memory_mb) ?? 0, cacheFloorMb);
     }
