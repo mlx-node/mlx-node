@@ -418,15 +418,16 @@ impl Qwen3Inner {
 
     /// Wire the process-global SSD cold tier into the paged adapter.
     ///
-    /// The fingerprint binds to weight CONTENT (a bounded, deterministic
-    /// per-shard data sample), not just shard names/sizes, so two
-    /// same-architecture finetunes — identical shard filenames and byte
-    /// sizes — never share a fingerprint and cross-restore each other's KV.
-    /// Cache geometry and, when present, the weight_map index and the
-    /// download manifest revision strengthen it further. No-op (fail-open)
-    /// when the paged adapter is absent or the cold tier cannot be opened,
-    /// and fail-SAFE (persistence stays off) when a complete content
-    /// fingerprint cannot be established — see
+    /// The fingerprint binds to the COMPLETE weight identity of every shard —
+    /// the download manifest's immutable commit revision when it covers all
+    /// shards (cheap, no weight read), else a full streaming digest of each
+    /// shard's bytes — never a sampled slice, so two same-architecture
+    /// finetunes (identical shard filenames and byte sizes) can never share a
+    /// fingerprint and cross-restore each other's KV. Cache geometry and the
+    /// weight_map index strengthen it further. No-op (fail-open) when the
+    /// paged adapter is absent or the cold tier cannot be opened, and
+    /// fail-SAFE (persistence stays off) when a complete content fingerprint
+    /// cannot be established — see
     /// [`crate::cold_tier::build_model_fingerprint`].
     pub fn enable_cold_tier(&mut self, model_path: &str) {
         let Some(adapter) = self.paged_adapter.as_mut() else {

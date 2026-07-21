@@ -10,11 +10,12 @@
 //! same prompt with persistence disabled.
 //!
 //! Instances 1 and 2 load from the SAME on-disk clone (persist on) so their
-//! cold-tier fingerprints — parsed config bytes + a bounded per-shard
-//! weight-content sample + pool geometry/dtype (see
+//! cold-tier fingerprints — parsed config bytes + a full per-shard
+//! weight-content digest + pool geometry/dtype (see
 //! `cold_tier::build_model_fingerprint`) — are byte-identical (the clone's
-//! weight files are symlinks the sampler follows to the real bytes), which is
-//! what makes the restart lookup hit. Instance
+//! weight files are symlinks the digest follows to the real bytes, and the
+//! clone carries no download marker so this exercises the full-hash fallback),
+//! which is what makes the restart lookup hit. Instance
 //! 3 loads from a separate clone with persistence off; with no
 //! `ColdTierContext` its adapter never touches the tier, so it is a clean
 //! fresh-prefill baseline.
@@ -60,8 +61,8 @@ const BLOCK_SIZE: u32 = 16;
 /// the workspace `target/` so the OS doesn't garbage-collect it mid-run)
 /// and patch `config.json` to force the block-paged adapter on and set the
 /// `persist_paged_cache` flag. Weight files are symlinked (only
-/// `config.json` is mutated per clone), so `enable_cold_tier`'s shard-size
-/// hashing still sees the real byte sizes through the links.
+/// `config.json` is mutated per clone), so `enable_cold_tier`'s full-shard
+/// digest still hashes the real bytes through the links.
 fn clone_model_dir(src: &Path, suffix: &str, persist: bool) -> Result<PathBuf, String> {
     let pid = std::process::id();
     let workspace_target = std::env::var_os("CARGO_TARGET_DIR")

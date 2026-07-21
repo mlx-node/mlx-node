@@ -17,6 +17,7 @@ parquet = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.11"
 tokio = { workspace = true }
 tokenizers = { workspace = true }
 minijinja = { workspace = true }

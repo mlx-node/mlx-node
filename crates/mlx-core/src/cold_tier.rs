@@ -6,12 +6,13 @@
 //! without persistence and `coldCacheStats()` reports `enabled: false`.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use mlx_paged_attn::{ColdCacheFingerprint, ColdCacheManager, ColdCacheStats};
 use napi_derive::napi;
+use sha2::{Digest, Sha256};
 
 static GLOBAL: OnceLock<Option<Arc<ColdCacheManager>>> = OnceLock::new();
 
@@ -59,19 +60,14 @@ pub fn cold_cache_stats_snapshot() -> Option<ColdCacheStats> {
 }
 
 /// Filename the dashboard downloader writes as the last step of an atomic
-/// publish. Carries the pinned HuggingFace commit `revision`, the strongest
-/// (cryptographic) available identity for a downloaded checkpoint.
+/// publish (see `packages/dashboard/src/download.ts`). Carries the pinned
+/// HuggingFace commit `revision` — an immutable content identity for the
+/// whole snapshot — plus the list of `files` the snapshot contains.
 const DOWNLOAD_COMPLETE_MARKER: &str = ".mlx-download-complete.json";
 
-/// Fixed weight-data window sampled at three offsets per shard. Two
-/// same-architecture finetunes share tensor names/shapes/offsets — so their
-/// safetensors headers AND total byte sizes are identical — yet differ in
-/// the actual weight bytes, so the fingerprint MUST sample the data region.
-const SHARD_DATA_WINDOW: u64 = 256 * 1024;
-
-/// Upper bound on the safetensors header bytes folded per shard, so a
-/// corrupt or absurd header-length prefix can never drive unbounded I/O.
-const SHARD_HEADER_SAMPLE_CAP: u64 = 1024 * 1024;
+/// Read-buffer size for the streaming full-shard digest. Bounds peak memory
+/// during the O(weight-bytes) fallback hash regardless of shard size.
+const FULL_DIGEST_CHUNK: usize = 1024 * 1024;
 
 /// Cache geometry whose drift must invalidate persisted blocks.
 pub(crate) struct ColdTierGeometry {
@@ -82,24 +78,36 @@ pub(crate) struct ColdTierGeometry {
     pub cache_dtype: String,
 }
 
-/// Build the cold-tier fingerprint for a model directory, binding it to
-/// weight CONTENT rather than only shard names and sizes.
+/// Build the cold-tier fingerprint for a model directory, binding it to the
+/// COMPLETE weight identity of every shard rather than a sampled slice.
 ///
 /// Two same-architecture finetunes of the same base normally have identical
 /// shard filenames AND identical byte sizes (same tensor shapes), so a
 /// name+size fingerprint would collide and let one model restore the other's
-/// persisted KV for a shared token prefix — silent output corruption. To
-/// discriminate them cheaply and deterministically, each shard contributes a
-/// bounded, content-sensitive sample of its weight DATA region (three fixed
-/// 256 KiB windows) plus its safetensors header; total I/O is O(shards) and
-/// independent of model size. When present, the weight_map index and the
-/// dashboard download manifest's immutable revision are folded in as
-/// additive (stronger) identities.
+/// persisted KV for a shared token prefix — silent output corruption. A
+/// windowed sample of each shard is not enough either: two checkpoints that
+/// differ only in an UNSAMPLED tensor between the windows would still collide.
+/// The identity must therefore be complete. Two paths deliver that, both
+/// sound and both deterministic:
 ///
-/// Returns `None` when any `.safetensors` shard cannot be read for a
-/// complete content sample, or when the directory holds no shard at all: the
-/// caller then leaves persistence OFF (fail-safe) rather than persisting
-/// under a weak fingerprint that could collide with another model.
+///  * **Manifest path (cheap, preferred).** When the dashboard download marker
+///    is present, pins an immutable commit `revision`, and its `files` list
+///    covers every on-disk shard, that repo+revision cryptographically
+///    identifies the exact bytes of the whole snapshot — so the weight bytes
+///    need not be read at all. This is the common case (catalog models
+///    installed via the dashboard downloader).
+///  * **Full-digest fallback (sound, O(weight bytes)).** Otherwise stream a
+///    SHA-256 over each shard's entire bytes. This runs once per model load,
+///    only when persistence is enabled and no trusted manifest covers the
+///    shards, so a manually-placed checkpoint without a marker pays a one-time
+///    full hash at load. Correct KV identity outweighs that one-time cost.
+///
+/// The weight_map index and geometry are folded in additively either way.
+///
+/// Returns `None` when the directory holds no shard, or when a shard on the
+/// full-digest path cannot be read to completion: the caller then leaves
+/// persistence OFF (fail-safe) rather than persisting under a partial identity
+/// that could collide with another model.
 pub(crate) fn build_model_fingerprint(
     model_type: &str,
     model_path: &str,
@@ -107,34 +115,61 @@ pub(crate) fn build_model_fingerprint(
     geometry: &ColdTierGeometry,
 ) -> Option<ColdCacheFingerprint> {
     let dir = Path::new(model_path);
+
+    // Deterministic (sorted) shard enumeration. A missing/unreadable directory
+    // or an empty shard set means there is no weight content to bind to.
+    let shard_names = shard_file_names(dir)?;
+    if shard_names.is_empty() {
+        return None;
+    }
+
     let mut components: Vec<Vec<u8>> = vec![model_type.as_bytes().to_vec()];
     if let Some(cfg) = config_json {
         components.push(cfg.to_vec());
     }
 
-    // Provenance-independent baseline: weight-content sample per shard. A
-    // single unreadable shard disables persistence for this model.
-    let shards = sample_shard_digests(dir)?;
-    if shards.is_empty() {
-        return None;
-    }
-    for (name, size, digest) in &shards {
-        components.push(name.as_bytes().to_vec());
-        components.push(size.to_le_bytes().to_vec());
-        components.push(digest.to_vec());
+    let manifest = read_download_manifest(dir);
+    let trusted = manifest
+        .as_ref()
+        .filter(|m| m.covers_all_shards(&shard_names));
+
+    match trusted {
+        // Cheap manifest identity: the immutable repo+revision pins the exact
+        // snapshot bytes, so shard bytes are NOT read. Names+sizes come from
+        // metadata (no data read) and guard against an on-disk shard swap.
+        Some(m) => {
+            components.push(b"cold-identity:manifest:v1\0".to_vec());
+            for name in &shard_names {
+                let size = std::fs::metadata(dir.join(name)).ok()?.len();
+                components.push(name.as_bytes().to_vec());
+                components.push(size.to_le_bytes().to_vec());
+            }
+            components.push(m.identity_bytes());
+        }
+        // Sound fallback: a full streaming digest of every shard's bytes. A
+        // single shard that cannot be read to completion disables persistence.
+        None => {
+            components.push(b"cold-identity:full-digest:v1\0".to_vec());
+            for name in &shard_names {
+                let (size, digest) = full_shard_digest(&dir.join(name))?;
+                components.push(name.as_bytes().to_vec());
+                components.push(size.to_le_bytes().to_vec());
+                components.push(digest.to_vec());
+            }
+            // A present-but-incomplete marker still contributes its revision
+            // additively; a stronger identity than the bytes alone never hurts.
+            if let Some(m) = &manifest {
+                components.push(b"download-marker\0".to_vec());
+                components.push(m.identity_bytes());
+            }
+        }
     }
 
-    // Additive strengthenings that never read weights. The weight_map index
-    // encodes the tensor->shard layout; the download manifest carries the
-    // immutable commit revision (excluding its timestamp so an innocuous
-    // re-download of the SAME snapshot never shifts the fingerprint).
+    // Additive: the weight_map index encodes the tensor->shard layout. Read
+    // without touching weight bytes; absent for single-shard checkpoints.
     if let Ok(index_bytes) = std::fs::read(dir.join("model.safetensors.index.json")) {
         components.push(b"index.json\0".to_vec());
         components.push(index_bytes);
-    }
-    if let Some(revision) = download_marker_identity(dir) {
-        components.push(b"download-marker\0".to_vec());
-        components.push(revision);
     }
 
     components.push(geometry.block_size.to_le_bytes().to_vec());
@@ -148,107 +183,107 @@ pub(crate) fn build_model_fingerprint(
     ))
 }
 
-/// Per-shard `(file_name, size, content_digest)` for every `.safetensors`
-/// file in `dir`, sorted by name for restart-determinism. `None` if ANY
-/// shard cannot be opened or a required sample cannot be read — a partial
-/// identity must disable persistence rather than weaken it.
-fn sample_shard_digests(dir: &Path) -> Option<Vec<(String, u64, [u8; 32])>> {
+/// Sorted file names of every top-level `.safetensors` shard in `dir`.
+/// `None` only if the directory itself cannot be read.
+fn shard_file_names(dir: &Path) -> Option<Vec<String>> {
     let read_dir = std::fs::read_dir(dir).ok()?;
-    let mut shards = Vec::new();
-    for entry in read_dir.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with(".safetensors") {
-            continue;
-        }
-        let (size, digest) = sample_one_shard(&dir.join(&name))?;
-        shards.push((name, size, digest));
-    }
-    shards.sort();
-    Some(shards)
+    let mut names: Vec<String> = read_dir
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.ends_with(".safetensors"))
+        .collect();
+    names.sort();
+    Some(names)
 }
 
-/// Bounded content digest of one safetensors shard: total size, the header
-/// length prefix, a bounded slice of the JSON header (tensor layout), and
-/// three fixed data-region windows (head, middle, tail). `File::open`
-/// follows symlinks so symlinked checkpoints sample the real weight bytes.
-/// `None` on any hard I/O error, including a shard too short to hold the
-/// 8-byte safetensors length prefix.
-fn sample_one_shard(path: &Path) -> Option<(u64, [u8; 32])> {
+/// Streaming SHA-256 over a shard's ENTIRE bytes (domain-separated, size
+/// prefixed), read in bounded chunks so peak memory is independent of shard
+/// size. `File::open` follows symlinks so symlinked checkpoints digest the
+/// real weight bytes. `None` on any hard I/O error — a shard whose complete
+/// identity cannot be established must disable persistence, not weaken it.
+fn full_shard_digest(path: &Path) -> Option<(u64, [u8; 32])> {
     let mut file = File::open(path).ok()?;
     let size = file.metadata().ok()?.len();
 
-    let mut len_prefix = [0u8; 8];
-    file.read_exact(&mut len_prefix).ok()?;
-    let header_len = u64::from_le_bytes(len_prefix);
-    let header_sample = read_window(&mut file, 8, header_len.min(SHARD_HEADER_SAMPLE_CAP))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"mlx-node:cold-shard-full:v1\0");
+    hasher.update(size.to_le_bytes());
 
-    let data_start = 8u64.saturating_add(header_len);
-    let data_len = size.saturating_sub(data_start);
-    let mut windows: Vec<Vec<u8>> = Vec::with_capacity(3);
-    for offset in data_window_offsets(data_start, data_len) {
-        windows.push(read_window(&mut file, offset, SHARD_DATA_WINDOW)?);
-    }
-
-    let size_le = size.to_le_bytes();
-    let mut components: Vec<&[u8]> = vec![
-        b"mlx-node:cold-shard-sample:v1".as_slice(),
-        &size_le,
-        &len_prefix,
-        &header_sample,
-    ];
-    for window in &windows {
-        components.push(window.as_slice());
-    }
-    let digest = ColdCacheFingerprint::from_components(components);
-    Some((size, *digest.as_bytes()))
-}
-
-/// Head/middle/tail window start offsets inside the data region
-/// `[data_start, data_start + data_len)`. Saturating arithmetic clamps every
-/// offset into the region so a data region smaller than the window overlaps
-/// deterministically instead of underflowing.
-fn data_window_offsets(data_start: u64, data_len: u64) -> [u64; 3] {
-    let head = data_start;
-    let middle = data_start + (data_len / 2).saturating_sub(SHARD_DATA_WINDOW / 2);
-    let tail = data_start + data_len.saturating_sub(SHARD_DATA_WINDOW);
-    [head, middle, tail]
-}
-
-/// Read up to `len` bytes at `offset`. A short read at EOF returns fewer
-/// bytes (offsets past EOF yield an empty window); only a hard I/O error
-/// returns `None`, so the caller disables persistence.
-fn read_window(file: &mut File, offset: u64, len: u64) -> Option<Vec<u8>> {
-    file.seek(SeekFrom::Start(offset)).ok()?;
-    let mut buf = vec![0u8; len as usize];
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        match file.read(&mut buf[filled..]) {
+    let mut buf = vec![0u8; FULL_DIGEST_CHUNK];
+    loop {
+        match file.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => filled += n,
+            Ok(n) => hasher.update(&buf[..n]),
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return None,
         }
     }
-    buf.truncate(filled);
-    Some(buf)
+    Some((size, hasher.finalize().into()))
 }
 
-/// Immutable identity from the dashboard download manifest: `repo` plus the
-/// pinned commit `revision`. Excludes the manifest's `completedAt` timestamp
-/// so re-downloading the SAME snapshot does not shift the fingerprint.
-/// `None` when the marker is absent or unparseable — it is additive only,
-/// and the weight-window sample already discriminates every model.
-fn download_marker_identity(dir: &Path) -> Option<Vec<u8>> {
+/// The dashboard download manifest's trusted fields: the pinned commit
+/// `revision`, the source `repo`, and the `files` the snapshot contains.
+struct DownloadManifest {
+    repo: Option<String>,
+    revision: String,
+    files: Vec<String>,
+}
+
+impl DownloadManifest {
+    /// True when the manifest lists every on-disk shard, so its immutable
+    /// repo+revision fully pins those exact bytes. Manifest paths are
+    /// repo-relative; top-level shards match by name (== basename).
+    fn covers_all_shards(&self, shard_names: &[String]) -> bool {
+        shard_names.iter().all(|shard| {
+            self.files.iter().any(|file| {
+                file == shard
+                    || Path::new(file)
+                        .file_name()
+                        .and_then(|base| base.to_str())
+                        .is_some_and(|base| base == shard.as_str())
+            })
+        })
+    }
+
+    /// Immutable identity bytes: `repo\0revision`. Excludes the manifest's
+    /// `completedAt` timestamp so re-downloading the SAME snapshot does not
+    /// shift the fingerprint.
+    fn identity_bytes(&self) -> Vec<u8> {
+        let mut identity = Vec::new();
+        if let Some(repo) = &self.repo {
+            identity.extend_from_slice(repo.as_bytes());
+        }
+        identity.push(0);
+        identity.extend_from_slice(self.revision.as_bytes());
+        identity
+    }
+}
+
+/// Parse the download marker. `None` when the marker is absent, unparseable,
+/// or missing the required `revision` — it is trusted provenance only when
+/// fully formed; otherwise the full-digest fallback establishes identity.
+fn read_download_manifest(dir: &Path) -> Option<DownloadManifest> {
     let bytes = std::fs::read(dir.join(DOWNLOAD_COMPLETE_MARKER)).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let revision = value.get("revision")?.as_str()?;
-    let mut identity = Vec::new();
-    if let Some(repo) = value.get("repo").and_then(|v| v.as_str()) {
-        identity.extend_from_slice(repo.as_bytes());
-    }
-    identity.push(0);
-    identity.extend_from_slice(revision.as_bytes());
-    Some(identity)
+    let revision = value.get("revision")?.as_str()?.to_string();
+    let repo = value
+        .get("repo")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let files = value
+        .get("files")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(DownloadManifest {
+        repo,
+        revision,
+        files,
+    })
 }
 
 /// Snapshot of the process-wide SSD cold tier for paged prefix blocks.
@@ -357,26 +392,31 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_binds_to_weight_content_not_name_or_size() {
-        // Regression for the cross-model collision: identical config,
-        // identical shard filename, identical shard SIZE — but different
-        // weight bytes. A name+size fingerprint (the old builder) returned
-        // EQUAL here; binding to content must return DIFFERENT.
-        let base = unique_tmp("cold-fp-content");
+    fn fingerprint_binds_to_full_content_beyond_sampled_windows() {
+        // Regression for the sampling gap the round-1 fix left open: identical
+        // config, identical shard filename, identical shard SIZE, and bytes
+        // that match inside the old head/middle/tail 256 KiB windows — they
+        // differ ONLY at an offset BETWEEN the windows. Fixed-window sampling
+        // returned EQUAL here (silent cross-model KV restore); a full content
+        // digest must return DIFFERENT. Data region is 2 MiB so the three
+        // 256 KiB windows leave uncovered gaps; the mutated offset (500_000)
+        // sits in the first gap `[256 KiB, ~896 KiB)`.
+        const DATA_LEN: usize = 2 * 1024 * 1024;
+        const GAP_OFFSET: usize = 500_000;
+        let base = unique_tmp("cold-fp-gap");
         let dir_a = base.join("a");
         let dir_b = base.join("b");
         std::fs::create_dir_all(&dir_a).unwrap();
         std::fs::create_dir_all(&dir_b).unwrap();
-        write_safetensors(
-            &dir_a.join("model.safetensors"),
-            SHARED_HEADER,
-            &[0u8; 4096],
-        );
-        write_safetensors(
-            &dir_b.join("model.safetensors"),
-            SHARED_HEADER,
-            &[7u8; 4096],
-        );
+
+        let mut data_a = vec![0u8; DATA_LEN];
+        let mut data_b = vec![0u8; DATA_LEN];
+        // Mutate ONE byte deep in the sampling gap; everything the old windows
+        // covered (first/middle/last 256 KiB) stays byte-identical.
+        data_a[GAP_OFFSET] = 0x11;
+        data_b[GAP_OFFSET] = 0x22;
+        write_safetensors(&dir_a.join("model.safetensors"), SHARED_HEADER, &data_a);
+        write_safetensors(&dir_b.join("model.safetensors"), SHARED_HEADER, &data_b);
 
         let size_a = std::fs::metadata(dir_a.join("model.safetensors"))
             .unwrap()
@@ -390,7 +430,7 @@ mod tests {
         let fp_b = build(&dir_b).expect("fingerprint b");
         assert_ne!(
             fp_a, fp_b,
-            "same shard name+size but different weight bytes must not collide"
+            "a byte differing only OUTSIDE the sampled windows must still split the fingerprint"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -425,14 +465,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[cfg(unix)]
     #[test]
     fn unreadable_shard_disables_persistence() {
-        // A shard too short to even hold the 8-byte safetensors length prefix
-        // is an I/O read failure: a complete identity cannot be established,
-        // so the builder must fail-safe to `None`.
+        // A shard the full digest cannot read to completion (here a dangling
+        // symlink whose `File::open` fails) means a COMPLETE identity cannot be
+        // established, so the builder must fail-safe to `None` rather than bind
+        // under a partial identity that could collide with another model.
         let dir = unique_tmp("cold-fp-unreadable");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("model.safetensors"), [0u8; 3]).unwrap();
+        std::os::unix::fs::symlink(
+            dir.join("nonexistent-target"),
+            dir.join("model.safetensors"),
+        )
+        .unwrap();
         assert!(
             build(&dir).is_none(),
             "an unreadable shard must disable persistence, not weaken the fingerprint"
@@ -453,7 +499,9 @@ mod tests {
     }
 
     #[test]
-    fn download_marker_revision_discriminates_identical_weights() {
+    fn manifest_revision_discriminates_identical_weights() {
+        // Cheap manifest path: markers whose `files` cover the shard, so the
+        // immutable repo+revision identifies the bytes without reading them.
         let base = unique_tmp("cold-fp-marker");
         let dir_a = base.join("a");
         let dir_b = base.join("b");
@@ -473,16 +521,16 @@ mod tests {
         );
         assert_eq!(build(&dir_a).unwrap(), build(&dir_b).unwrap());
 
-        // A differing pinned revision must split them even though every
-        // sampled weight window matches.
+        // A differing pinned revision must split them even though every weight
+        // byte matches.
         std::fs::write(
             dir_a.join(DOWNLOAD_COMPLETE_MARKER),
-            br#"{"repo":"acme/base","revision":"aaaaaaaa","files":["config.json"],"completedAt":"2026-01-01T00:00:00Z"}"#,
+            br#"{"repo":"acme/base","revision":"aaaaaaaa","files":["config.json","model.safetensors"],"completedAt":"2026-01-01T00:00:00Z"}"#,
         )
         .unwrap();
         std::fs::write(
             dir_b.join(DOWNLOAD_COMPLETE_MARKER),
-            br#"{"repo":"acme/base","revision":"bbbbbbbb","files":["config.json"],"completedAt":"2026-01-02T00:00:00Z"}"#,
+            br#"{"repo":"acme/base","revision":"bbbbbbbb","files":["config.json","model.safetensors"],"completedAt":"2026-01-02T00:00:00Z"}"#,
         )
         .unwrap();
         assert_ne!(
@@ -494,7 +542,72 @@ mod tests {
     }
 
     #[test]
-    fn download_marker_timestamp_does_not_shift_fingerprint() {
+    fn manifest_path_uses_provenance_not_weight_bytes() {
+        // When the marker covers the shard, the fingerprint is driven by the
+        // immutable repo+revision and NOT by the weight bytes. Two dirs with
+        // the SAME marker but DIFFERENT shard bytes therefore fingerprint
+        // EQUAL — observable proof the cheap path never reads the weights.
+        let base = unique_tmp("cold-fp-marker-cheap");
+        let dir_a = base.join("a");
+        let dir_b = base.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        // Same size, DIFFERENT bytes — a full digest would split them.
+        write_safetensors(
+            &dir_a.join("model.safetensors"),
+            SHARED_HEADER,
+            &[1u8; 4096],
+        );
+        write_safetensors(
+            &dir_b.join("model.safetensors"),
+            SHARED_HEADER,
+            &[2u8; 4096],
+        );
+        let marker = br#"{"repo":"acme/base","revision":"deadbeef","files":["config.json","model.safetensors"],"completedAt":"2026-01-01T00:00:00Z"}"#;
+        std::fs::write(dir_a.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
+        std::fs::write(dir_b.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
+        assert_eq!(
+            build(&dir_a).unwrap(),
+            build(&dir_b).unwrap(),
+            "the manifest path must bind to repo+revision and skip reading weight bytes"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn incomplete_manifest_falls_back_to_full_digest() {
+        // A marker that does NOT list every on-disk shard cannot be trusted to
+        // pin the bytes, so the builder falls back to the full digest — which
+        // splits differing bytes even under an otherwise identical marker.
+        let base = unique_tmp("cold-fp-marker-partial");
+        let dir_a = base.join("a");
+        let dir_b = base.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        write_safetensors(
+            &dir_a.join("model.safetensors"),
+            SHARED_HEADER,
+            &[3u8; 4096],
+        );
+        write_safetensors(
+            &dir_b.join("model.safetensors"),
+            SHARED_HEADER,
+            &[4u8; 4096],
+        );
+        // `files` omits the shard -> not covered -> fallback path.
+        let marker = br#"{"repo":"acme/base","revision":"cafef00d","files":["config.json"],"completedAt":"2026-01-01T00:00:00Z"}"#;
+        std::fs::write(dir_a.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
+        std::fs::write(dir_b.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
+        assert_ne!(
+            build(&dir_a).unwrap(),
+            build(&dir_b).unwrap(),
+            "an incomplete marker must not suppress the full-digest split"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn manifest_timestamp_does_not_shift_fingerprint() {
         // Re-downloading the SAME snapshot rewrites `completedAt` but keeps
         // `repo`/`revision`; the fingerprint must not move (no false miss).
         let base = unique_tmp("cold-fp-marker-ts");
@@ -514,12 +627,12 @@ mod tests {
         );
         std::fs::write(
             dir_a.join(DOWNLOAD_COMPLETE_MARKER),
-            br#"{"repo":"acme/base","revision":"cccccccc","files":["config.json"],"completedAt":"2026-01-01T00:00:00Z"}"#,
+            br#"{"repo":"acme/base","revision":"cccccccc","files":["config.json","model.safetensors"],"completedAt":"2026-01-01T00:00:00Z"}"#,
         )
         .unwrap();
         std::fs::write(
             dir_b.join(DOWNLOAD_COMPLETE_MARKER),
-            br#"{"repo":"acme/base","revision":"cccccccc","files":["config.json"],"completedAt":"2026-07-20T12:34:56Z"}"#,
+            br#"{"repo":"acme/base","revision":"cccccccc","files":["config.json","model.safetensors"],"completedAt":"2026-07-20T12:34:56Z"}"#,
         )
         .unwrap();
         assert_eq!(
