@@ -24,6 +24,7 @@ export default defineConfig({
     },
     ignorePatterns: [
       '**/dist/**',
+      'packages/dashboard/web/**',
       '**/tests/**',
       '**/generated/**',
       '**/fixtures/**',
