@@ -145,14 +145,17 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
  */
 function assertSchemaSignature(sqlite: DatabaseSync): void {
   for (const [table, expected] of Object.entries(EXPECTED_COLUMNS)) {
-    // `PRAGMA table_info` also reports a VIEW's columns, so a view exposing the
-    // expected columns would clear the column check — then `CREATE INDEX ON
-    // <view>` throws "views may not be indexed", an error outside the rebuildable
-    // set that wedges startup. Require an actual table first; a view or a missing
-    // object rebuilds instead (a missing object → meta undefined, same as before).
-    const meta = sqlite
-      .prepare(`SELECT type FROM sqlite_schema WHERE name = ? AND type IN ('table', 'view')`)
-      .get(table) as { type?: unknown } | undefined;
+    // `PRAGMA table_info` reports the columns of a VIEW and of an FTS5 VIRTUAL
+    // table too, so either could clear the column check and then wedge startup
+    // (`CREATE INDEX` throws "views may not be indexed" / "virtual tables may not
+    // be indexed", both outside the rebuildable set). `sqlite_schema.type` cannot
+    // tell them apart — it reports a virtual table as `'table'`. `PRAGMA
+    // table_list` exposes a distinct `type` (ordinary → `'table'`, FTS5 →
+    // `'virtual'`, its shadow tables → `'shadow'`, view → `'view'`), so requiring
+    // `'table'` rejects virtual/shadow/view in one check; a missing object returns
+    // undefined → rebuild (same path as before). Table names are fixed internal
+    // constants, never user input — safe to inline.
+    const meta = sqlite.prepare(`PRAGMA table_list(${table})`).get() as { type?: unknown } | undefined;
     if (meta?.type !== 'table') {
       const actualType = typeof meta?.type === 'string' ? meta.type : 'missing';
       throw new RebuildRequiredError(`schema signature mismatch: ${table} is ${actualType}, expected a table`);

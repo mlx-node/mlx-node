@@ -290,7 +290,13 @@ export async function startDashboardServer(opts: DashboardServerOptions = {}): P
   }, INGEST_INTERVAL_MS);
   ingestTimer.unref();
 
-  const displayHost = host === '::1' ? '[::1]' : host;
+  // A wildcard bind has no connectable literal host: advertise a loopback the
+  // Host allowlist accepts. `::` binds IPv6 → `[::1]`; `0.0.0.0`/'' bind IPv4 →
+  // `127.0.0.1`. Both are in LOCAL_HOSTNAMES, so the printed/opened URL passes
+  // classifyHost, unlike the raw wildcard (`0.0.0.0` → 403, `::`/'' → malformed).
+  // A concrete host is advertised as-is, bracketing the IPv6 loopback literal.
+  const wildcard = host === '0.0.0.0' || host === '::' || host === '';
+  const displayHost = wildcard ? (host === '::' ? '[::1]' : '127.0.0.1') : host === '::1' ? '[::1]' : host;
   const url = `http://${displayHost}:${boundPort}`;
 
   return {

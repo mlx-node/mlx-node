@@ -360,6 +360,56 @@ describe('dashboard db', () => {
     rmSync(d, { recursive: true, force: true });
   });
 
+  // Finding 5: a pre-existing db whose `turns` object is an FTS5 VIRTUAL table
+  // exposing the expected columns must be quarantined+rebuilt. `sqlite_schema`
+  // reports a virtual table as type='table', so the earlier type probe passed it;
+  // PRAGMA table_info reports its columns, so the column check passed too — then
+  // CREATE INDEX ON turns throws "virtual tables may not be indexed", an error
+  // outside the rebuildable set that would wedge startup. The table_list type
+  // guard (type='virtual' for FTS5) must rebuild instead.
+  it('quarantines a db whose turns object is an FTS5 VIRTUAL table and rebuilds', () => {
+    const d = mkdtempSync(join(tmpdir(), 'dash-fts5-'));
+    const file = join(d, 'index.db');
+    const raw = new DatabaseSync(file);
+    // sessions + traces are real tables; `turns` is an FTS5 virtual table whose
+    // declared columns are exactly the expected `turns` column set.
+    raw.exec(
+      `CREATE TABLE sessions (
+        id TEXT PRIMARY KEY, path TEXT NOT NULL, cwd TEXT NOT NULL, name TEXT,
+        created INTEGER NOT NULL, modified INTEGER NOT NULL,
+        message_count INTEGER NOT NULL DEFAULT 0, first_message TEXT,
+        last_ingested_mtime INTEGER NOT NULL DEFAULT 0, last_ingested_size INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE traces (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT NOT NULL UNIQUE,
+        session_id TEXT, root_session_id TEXT, ts INTEGER NOT NULL, model TEXT,
+        ttft_ms REAL, prefill_tps REAL, decode_tps REAL, mtp_cycles INTEGER,
+        mtp_mean_accepted REAL, duration_ms REAL, finish_reason TEXT,
+        prompt_tokens INTEGER, cached_tokens INTEGER, output_tokens INTEGER,
+        reasoning_tokens INTEGER, cold_hits INTEGER, cold_misses INTEGER,
+        cold_bytes_written INTEGER, cold_bytes_restored INTEGER, source_file TEXT
+      );
+      CREATE VIRTUAL TABLE turns USING fts5(
+        id, session_id, entry_id, trace_id, ts, model,
+        input_tokens, output_tokens, cached_tokens, reasoning_tokens
+      );`,
+    );
+    raw.exec('PRAGMA user_version = 1;'); // matches SCHEMA_VERSION → version check passes
+    raw.close();
+
+    const dash = openDashboardDb(file);
+    // Rebuilt schema carries a real `turns` table; an insert round-trips.
+    dash.db.insert(turns).values({ sessionId: 's1', ts: 1, model: 'qwen3_5', inputTokens: 5 }).run();
+    const rows = dash.db.select().from(turns).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].model).toBe('qwen3_5');
+    dash.close();
+
+    const quarantined = readdirSync(d).filter((n) => n.startsWith('index.db.corrupt-'));
+    expect(quarantined).toHaveLength(1);
+    rmSync(d, { recursive: true, force: true });
+  });
+
   // Finding 6: a complete current-schema db must open WITHOUT rebuilding — the
   // full signature check must not false-positive on a matching schema.
   it('opens a complete current-schema db without rebuilding', () => {

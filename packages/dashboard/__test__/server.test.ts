@@ -1,4 +1,15 @@
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { request } from 'node:http';
 import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -325,6 +336,58 @@ describe('dashboard server — sessions', () => {
   });
 });
 
+// Finding 4: session-file symlink containment. Primary — a symlinked transcript
+// is never indexed, so its external id is simply unknown (404). Defense-in-depth
+// — a GET whose indexed path resolves outside the managed root (via a symlink
+// swapped in after indexing) is refused (403) by the realpath containment guard.
+describe('dashboard server — session symlink containment (Finding 4)', () => {
+  it('never indexes a symlinked transcript, so its external id 404s on GET and PATCH', async () => {
+    const externalFile = join(base, 'external.jsonl');
+    writeFileSync(
+      externalFile,
+      `${[
+        { type: 'session', version: 3, id: 'external-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/secret' },
+        {
+          type: 'message',
+          id: 'm1',
+          parentId: null,
+          timestamp: '2026-07-01T10:00:01.000Z',
+          message: { role: 'user', content: 'secret transcript' },
+        },
+      ]
+        .map((l) => JSON.stringify(l))
+        .join('\n')}\n`,
+    );
+    symlinkSync(externalFile, join(sessionsRoot, '--w--', 'evil.jsonl'));
+    await ingest();
+
+    expect((await fetch(`${server.url}/api/sessions/external-1`)).status).toBe(404);
+    const patch = await fetch(`${server.url}/api/sessions/external-1`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'x' }),
+    });
+    expect(patch.status).toBe(404);
+  });
+
+  it('refuses a GET whose indexed file was swapped to an external symlink', async () => {
+    await ingest();
+    const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+      sessions: Array<{ id: string; path: string }>;
+    };
+    const filePath = before.sessions.find((s) => s.id === 'fix-1')!.path;
+
+    // Swap the indexed real file for a symlink pointing outside the managed root.
+    const externalFile = join(base, 'external-detail.jsonl');
+    writeFileSync(externalFile, readFileSync(filePath));
+    unlinkSync(filePath);
+    symlinkSync(externalFile, filePath);
+
+    // The row still points at filePath, but it now resolves outside the root.
+    expect((await fetch(`${server.url}/api/sessions/fix-1`)).status).toBe(403);
+  });
+});
+
 describe('dashboard server — metrics overview', () => {
   it('returns aggregate arrays', async () => {
     await ingest();
@@ -559,6 +622,76 @@ describe('dashboard server — wildcard bind Host allowlist', () => {
       }
     } finally {
       await wild.close();
+    }
+  });
+});
+
+describe('dashboard server — connectable display URL', () => {
+  async function startWild(host: string): Promise<DashboardServer | undefined> {
+    try {
+      return await startDashboardServer({
+        port: 0,
+        host,
+        dbPath: ':memory:',
+        sessionsRoot,
+        tracesDir,
+        modelsDir,
+        cacheRoot,
+        webRoot,
+      });
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // Some sandboxes forbid a wildcard/non-loopback bind; an environment limit.
+      if (code === 'EPERM' || code === 'EACCES') return undefined;
+      throw err;
+    }
+  }
+
+  it('advertises the literal loopback host for a concrete bind (default 127.0.0.1)', () => {
+    // beforeEach binds the default host; its URL must carry the literal host.
+    expect(server.url).toBe(`http://127.0.0.1:${server.port}`);
+  });
+
+  it('advertises a bracketed [::1] for a concrete ::1 bind', async () => {
+    const s = await startWild('::1');
+    if (s === undefined) return; // IPv6 loopback bind blocked in this sandbox.
+    try {
+      expect(s.url).toBe(`http://[::1]:${s.port}`);
+      const res = await fetch(`${s.url}/health`);
+      expect(res.status).toBe(200);
+    } finally {
+      await s.close();
+    }
+  });
+
+  // Finding 6: a wildcard bind has no connectable literal host — advertising the
+  // raw wildcard yields a URL the server's own Host allowlist rejects
+  // (`0.0.0.0` → 403 from classifyHost) or that `new URL` cannot even parse
+  // (`::` → `:::`, '' → `:`). The returned URL must instead name a loopback the
+  // allowlist accepts and a client can actually reach.
+  it('advertises a connectable loopback URL for each wildcard bind', async () => {
+    const cases: Array<{ host: string; authority: string }> = [
+      { host: '0.0.0.0', authority: '127.0.0.1' },
+      { host: '::', authority: '[::1]' },
+      { host: '', authority: '127.0.0.1' },
+    ];
+    for (const { host, authority } of cases) {
+      const s = await startWild(host);
+      if (s === undefined) continue; // wildcard bind blocked in this sandbox.
+      try {
+        // Parses cleanly: the '' and '::' cases previously produced malformed URLs.
+        const u = new URL(s.url);
+        expect(u.protocol).toBe('http:');
+        expect(u.hostname).toBe(authority); // URL keeps the [] for an IPv6 literal.
+        expect(u.port).toBe(String(s.port));
+        expect(s.url).toBe(`http://${authority}:${s.port}`);
+        // Loopback is in the Host allowlist AND actually reachable → 200, unlike
+        // the raw wildcard Host (0.0.0.0 → 403, ::/'' → malformed) it replaces.
+        const res = await fetch(`${s.url}/health`);
+        expect(res.status).toBe(200);
+      } finally {
+        await s.close();
+      }
     }
   });
 });
