@@ -75,8 +75,46 @@ export interface SessionsResponse {
   sessions: SessionRow[];
 }
 
+/** One day's token totals from `GET /api/metrics/overview` `tokensByDay` (UTC day). */
+export interface TokensByDayRow {
+  /** `YYYY-MM-DD` (UTC). */
+  day: string;
+  input: number;
+  output: number;
+  cached: number;
+  reasoning: number;
+}
+
+/** Per-model throughput averages (not a time series) — averages are null when no sample carried the column. */
+export interface ThroughputByModelRow {
+  model: string;
+  avgDecodeTps: number | null;
+  avgPrefillTps: number | null;
+  avgTtftMs: number | null;
+  samples: number;
+}
+
+/** Per-model speculative-decoding (MTP) acceptance averages; only models with a recorded mean appear. */
+export interface MtpByModelRow {
+  model: string;
+  meanAccepted: number | null;
+  avgCycles: number | null;
+  samples: number;
+}
+
+/** Per-model usage totals for the share chart. */
+export interface ModelShareRow {
+  model: string;
+  turns: number;
+  outputTokens: number;
+}
+
 export interface MetricsOverviewResponse {
   range: { from: number | null; to: number | null };
+  tokensByDay: TokensByDayRow[];
+  throughputByModel: ThroughputByModelRow[];
+  mtpByModel: MtpByModelRow[];
+  modelShare: ModelShareRow[];
   totals: {
     turns: number;
     traces: number;
@@ -109,6 +147,12 @@ export interface CacheTrendRow {
 export interface CacheResponse {
   disk: ColdCacheDiskInfo;
   trend: CacheTrendRow[];
+}
+
+/** Result of `DELETE /api/cache` (clear all or evict older-than). */
+export interface CacheMutationResult {
+  removed: number;
+  freedBytes: number;
 }
 
 export interface TranscriptToolCall {

@@ -1,7 +1,8 @@
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Toaster } from '@/components/ui/sonner';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
+import Cache from '@/pages/cache';
+import Metrics from '@/pages/metrics';
 import Models from '@/pages/models';
 import Overview from '@/pages/overview';
 import SessionDetail from '@/pages/session-detail';
@@ -66,18 +67,6 @@ function Layout() {
   );
 }
 
-function Placeholder({ title, description }: { title: string; description: string }) {
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{title}</CardTitle>
-        <CardDescription>{description}</CardDescription>
-      </CardHeader>
-      <CardContent className="text-muted-foreground text-sm">This page is under construction.</CardContent>
-    </Card>
-  );
-}
-
 export default function App() {
   return (
     <TooltipProvider>
@@ -88,14 +77,8 @@ export default function App() {
             <Route path="models" element={<Models />} />
             <Route path="sessions" element={<Sessions />} />
             <Route path="sessions/:id" element={<SessionDetail />} />
-            <Route
-              path="metrics"
-              element={<Placeholder title="Metrics" description="Throughput, token, and acceptance trends." />}
-            />
-            <Route
-              path="cache"
-              element={<Placeholder title="Cache" description="PagedAttention cold-tier usage and management." />}
-            />
+            <Route path="metrics" element={<Metrics />} />
+            <Route path="cache" element={<Cache />} />
           </Route>
         </Routes>
       </BrowserRouter>
