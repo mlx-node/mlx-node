@@ -2,6 +2,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Toaster } from '@/components/ui/sonner';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
+import Models from '@/pages/models';
+import Overview from '@/pages/overview';
 import { Boxes, HardDrive, LayoutDashboard, type LucideIcon, MessagesSquare, TrendingUp } from 'lucide-react';
 import { BrowserRouter, NavLink, Outlet, Route, Routes } from 'react-router-dom';
 
@@ -80,16 +82,8 @@ export default function App() {
       <BrowserRouter>
         <Routes>
           <Route element={<Layout />}>
-            <Route
-              index
-              element={<Placeholder title="Overview" description="Models, sessions, tokens, and cache at a glance." />}
-            />
-            <Route
-              path="models"
-              element={
-                <Placeholder title="Models" description="Local models and downloads from the recommended list." />
-              }
-            />
+            <Route index element={<Overview />} />
+            <Route path="models" element={<Models />} />
             <Route
               path="sessions"
               element={<Placeholder title="Sessions" description="Browse, rename, and resume agent sessions." />}

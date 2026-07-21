@@ -72,20 +72,30 @@ export interface SseSubscription {
  * Subscribe to a Server-Sent Events endpoint. `onEvent` receives each frame's
  * `data` parsed as JSON (`T`); malformed frames are ignored. `onError` (if
  * given) receives the raw `EventSource` error event.
+ *
+ * `eventNames` lists the named SSE event types (`event:` lines) to also listen
+ * for — `EventSource.onmessage` fires only for the default (unnamed) `message`
+ * event, so a server that tags frames (e.g. the download stream's
+ * `event: progress`) delivers nothing unless those names are registered here.
  */
 export function subscribeSSE<T = unknown>(
   path: string,
   onEvent: (data: T) => void,
   onError?: (err: Event) => void,
+  eventNames?: readonly string[],
 ): SseSubscription {
   const source = new EventSource(apiUrl(path));
-  source.onmessage = (ev: MessageEvent<string>): void => {
+  const handle = (ev: MessageEvent<string>): void => {
     try {
       onEvent(JSON.parse(ev.data) as T);
     } catch {
       // Ignore frames that are not valid JSON.
     }
   };
+  source.onmessage = handle;
+  for (const name of eventNames ?? []) {
+    source.addEventListener(name, handle as EventListener);
+  }
   if (onError !== undefined) source.onerror = onError;
   return {
     close(): void {
