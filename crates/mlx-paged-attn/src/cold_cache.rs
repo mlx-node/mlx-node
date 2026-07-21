@@ -546,6 +546,9 @@ impl RootDir {
     }
 }
 
+#[cfg(test)]
+type TestSpaceOverride = Mutex<Option<Box<dyn Fn() -> Result<(u64, u64), String> + Send>>>;
+
 struct Shared {
     root: RootDir,
     quota_bytes: u64,
@@ -556,6 +559,27 @@ struct Shared {
     /// writer replacement at exactly that interleaving point.
     #[cfg(test)]
     failed_load_cleanup_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Invoked between a failed open and its identity snapshot so tests can
+    /// race a writer commit into exactly that window.
+    #[cfg(test)]
+    failed_open_identity_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Replaces filesystem space probes so reserve-floor decisions are
+    /// deterministic under test.
+    #[cfg(test)]
+    space_override: TestSpaceOverride,
+}
+
+impl Shared {
+    /// Filesystem `(total, available)` bytes backing eviction decisions.
+    fn space(&self) -> Result<(u64, u64), String> {
+        #[cfg(test)]
+        if let Ok(hook) = self.space_override.lock()
+            && let Some(hook) = hook.as_ref()
+        {
+            return hook();
+        }
+        self.root.space()
+    }
 }
 
 struct WriteJob {
@@ -630,6 +654,10 @@ impl ColdCacheManager {
             stats: AtomicStats::default(),
             #[cfg(test)]
             failed_load_cleanup_hook: Mutex::new(None),
+            #[cfg(test)]
+            failed_open_identity_hook: Mutex::new(None),
+            #[cfg(test)]
+            space_override: Mutex::new(None),
         });
         let (sender, receiver) = mpsc::sync_channel::<WriteJob>(queue_depth);
         let worker_shared = Arc::clone(&shared);
@@ -746,11 +774,13 @@ impl ColdCacheManager {
     /// name only when the entry there is the one observed to fail
     /// (dev+inode) or is a non-regular type that can never be a writer
     /// commit, so an in-process writer's freshly committed replacement is
-    /// never deleted or de-indexed. Coordination is in-process only: a
-    /// concurrent *process* mutating the same root stays fail-open — the
-    /// worst case is a stale index entry, one recomputed prefix, or one
-    /// lost persist (an external actor swapping the entry inside the stat
-    /// window right after a failed open).
+    /// never deleted or de-indexed; the failed-open identity snapshot is
+    /// itself taken under that lock, so the writer can never publish
+    /// between a failed open and the snapshot. Coordination is in-process
+    /// only: a concurrent *process* mutating the same root stays fail-open
+    /// — the worst case is a stale index entry, one recomputed prefix, or
+    /// one lost persist (an external actor swapping the entry inside the
+    /// stat window right after a failed open).
     pub fn load(
         &self,
         key: ColdCacheKey,
@@ -759,7 +789,38 @@ impl ColdCacheManager {
         let name = block_file_name(&key);
         let mut observed_identity = None;
         let mut opened_file = None;
-        let result = match self.shared.root.open_existing(&name) {
+        // The index lock spans [open → failed-open identity snapshot]: the
+        // writer publishes replacements under the same lock, so an identity
+        // captured here is genuinely the entry that failed, never a
+        // replacement renamed in between the failed open and the stat.
+        // Released before any read/decode work; a successful open needs no
+        // exclusion because its identity comes from the descriptor itself.
+        let open_result = {
+            let _index_guard = self.shared.index.lock().ok();
+            let result = self.shared.root.open_existing(&name);
+            if let Err(e) = &result
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                #[cfg(test)]
+                if let Ok(hook) = self.shared.failed_open_identity_hook.lock()
+                    && let Some(hook) = hook.as_ref()
+                {
+                    hook();
+                }
+                // Capture the identity of the entry that made the open
+                // fail so pruning can distinguish it from a later writer
+                // replacement. Skipped for NotFound: an entry committed
+                // after a plain miss must never be mistaken for the one
+                // that failed.
+                observed_identity = self
+                    .shared
+                    .root
+                    .stat_identity(&name)
+                    .map(|(identity, _)| identity);
+            }
+            result
+        };
+        let result = match open_result {
             Ok(mut file) => {
                 observed_identity = open_identity(&file);
                 let mut bytes = Vec::new();
@@ -770,21 +831,7 @@ impl ColdCacheManager {
                 opened_file = Some(file);
                 read
             }
-            Err(e) => {
-                // Capture the identity of the entry that made the open
-                // fail so pruning can distinguish it from a later writer
-                // replacement. Skipped for NotFound: an entry committed
-                // after a plain miss must never be mistaken for the one
-                // that failed.
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    observed_identity = self
-                        .shared
-                        .root
-                        .stat_identity(&name)
-                        .map(|(identity, _)| identity);
-                }
-                Err(e.to_string())
-            }
+            Err(e) => Err(e.to_string()),
         };
         match result {
             Ok(block) => {
@@ -961,19 +1008,20 @@ fn persist_block(shared: &Shared, block: &ColdCacheBlock) -> Result<(), String> 
     Ok(())
 }
 
-/// Evict least-recently-used entries until `incoming` fits both the quota
-/// and the free-space reserve. Clearing goes through the same type-safe
-/// [`clear_entry`] path as failed-load pruning, and an entry is de-indexed
-/// (bytes debited, eviction counted) only once its canonical name is
-/// actually clear — quarantining an obstructing directory counts, since
-/// the name becomes writable again. A name that cannot be cleared keeps
-/// its index entry and is skipped for the rest of this pass, so one stuck
-/// entry can neither spin the loop nor falsify accounting. `available` is
-/// a same-call statvfs estimate credited with the indexed size of cleared
-/// entries; an externally swapped entry can overstate it, in which case
-/// the following write simply fails fail-open.
+/// Evict least-recently-used entries until `incoming` fits both the
+/// logical quota and the physical free-space reserve. Clearing goes
+/// through the same type-safe [`clear_entry`] path as failed-load pruning,
+/// and an entry is de-indexed (bytes debited, eviction counted) only once
+/// its canonical name is actually clear — quarantining an obstructing
+/// directory counts, since the name becomes writable again. A name that
+/// cannot be cleared keeps its index entry and is skipped for the rest of
+/// this pass, so one stuck entry can neither spin the loop nor falsify
+/// accounting. The reserve check never trusts logical index sizes:
+/// availability is re-sampled (statvfs) after every clearing, so entries
+/// that free no bytes — already missing, or quarantined rather than
+/// deleted — can never admit a write that would breach the reserve floor.
 fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
-    let (_, mut available) = shared.root.space()?;
+    let (_, mut available) = shared.space()?;
     let mut index = shared
         .index
         .lock()
@@ -1004,9 +1052,10 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
         }
         if let Some(entry) = index.entries.remove(&key) {
             index.total_bytes = index.total_bytes.saturating_sub(entry.size);
-            available = available.saturating_add(entry.size);
             shared.stats.evictions.fetch_add(1, Ordering::Relaxed);
         }
+        let (_, resampled) = shared.space()?;
+        available = resampled;
     }
     Ok(())
 }
@@ -1018,7 +1067,8 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
 ///
 /// `observed_identity` identifies the entry that produced the failure:
 /// `fstat` of the descriptor when the open succeeded, else a no-follow
-/// stat taken right after a non-NotFound open failure. A regular file at
+/// stat taken right after a non-NotFound open failure, under the index
+/// lock, so it can never be a writer replacement. A regular file at
 /// the name is preserved (with its index entry) only on positive
 /// replacement evidence — it carries a different identity than the
 /// observed one, or it appeared where the failed open found nothing —
@@ -1941,6 +1991,246 @@ mod tests {
             "a failed clearing must not count as an eviction"
         );
         assert_eq!(manager.load(key_a, fp), Some(block(key_a)));
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_open_identity_snapshot_excludes_concurrent_writer() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let root = temp_root("failed-open-writer-race");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        persist_block(&manager.shared, &block(key)).unwrap();
+        let size = encode_block(&block(key)).unwrap().len() as u64;
+
+        let path = root.join(format!("{}.safetensors", key.to_hex()));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (start_tx, start_rx) = mpsc::channel::<()>();
+        let (published_tx, published_rx) = mpsc::channel::<()>();
+        let writer_shared = Arc::clone(&manager.shared);
+        let replacement = block(key);
+        let writer = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            persist_block(&writer_shared, &replacement).unwrap();
+            let _ = published_tx.send(());
+        });
+        *manager.shared.failed_open_identity_hook.lock().unwrap() = Some(Box::new(move || {
+            let _ = start_tx.send(());
+            // Unfixed, the writer publishes its replacement inside this
+            // window and the recv succeeds; fixed, the writer blocks on the
+            // index lock until the snapshot is done and the wait expires.
+            let _ = published_rx.recv_timeout(Duration::from_secs(1));
+        }));
+
+        assert!(manager.load(key, fingerprint()).is_none());
+        writer.join().unwrap();
+        *manager.shared.failed_open_identity_hook.lock().unwrap() = None;
+
+        assert!(
+            manager.contains(&key),
+            "the writer's replacement index entry must survive failed-load pruning"
+        );
+        assert!(
+            path.exists(),
+            "the writer's replacement file must survive failed-load pruning"
+        );
+        assert_eq!(
+            manager.load(key, fingerprint()),
+            Some(block(key)),
+            "the surviving replacement must be loadable"
+        );
+        let stats = manager.stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.corruptions, 0, "nothing was opened, nothing was read");
+        assert_eq!(
+            stats.bytes_written,
+            size * 2,
+            "both persisted generations must stay accounted"
+        );
+        assert_eq!(manager.shared.index.lock().unwrap().total_bytes, size);
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    fn dir_regular_bytes(dir: &Path) -> u64 {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut total = 0;
+        for entry in entries.flatten() {
+            let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if meta.is_file() {
+                total += meta.len();
+            } else if meta.is_dir() {
+                total += dir_regular_bytes(&entry.path());
+            }
+        }
+        total
+    }
+
+    /// Emulates a filesystem whose free space is `base` minus the regular
+    /// bytes physically present under `root`: unlinking a file frees its
+    /// size, quarantining a directory frees nothing, and an already-missing
+    /// entry is already reflected — exactly the physics the reserve floor
+    /// must respect.
+    #[cfg(unix)]
+    fn install_space_override(manager: &ColdCacheManager, root: &Path, base: &Arc<AtomicU64>) {
+        let root = root.to_path_buf();
+        let base = Arc::clone(base);
+        *manager.shared.space_override.lock().unwrap() = Some(Box::new(move || {
+            Ok((
+                u64::MAX,
+                base.load(Ordering::Relaxed)
+                    .saturating_sub(dir_regular_bytes(&root)),
+            ))
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eviction_of_missing_entry_frees_nothing_and_keeps_reserve() {
+        let root = temp_root("evict-missing-reserve");
+        let fp = fingerprint();
+        let key_a = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[1], 0, 0);
+        let key_b = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[2], 0, 0);
+        let one = encode_block(&block(key_a)).unwrap().len() as u64;
+        let reserve = 5 * one;
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, reserve, 2).unwrap();
+        let base = Arc::new(AtomicU64::new(reserve + 2 * one));
+        install_space_override(&manager, &root, &base);
+
+        persist_block(&manager.shared, &block(key_a)).unwrap();
+        assert!(manager.contains(&key_a));
+        fs::remove_file(root.join(format!("{}.safetensors", key_a.to_hex()))).unwrap();
+
+        // Available space is now exactly the reserve: clearing the
+        // already-missing LRU entry frees zero bytes, so the write must be
+        // refused instead of dipping below the floor.
+        base.store(reserve, Ordering::Relaxed);
+        assert!(
+            persist_block(&manager.shared, &block(key_b)).is_err(),
+            "clearing an already-missing entry must not admit a write below the reserve"
+        );
+        assert!(
+            !root
+                .join(format!("{}.safetensors", key_b.to_hex()))
+                .exists(),
+            "the refused write must not land on disk"
+        );
+        assert!(
+            !manager.contains(&key_a),
+            "the dead index entry must still be pruned by the pass"
+        );
+        assert!(!manager.contains(&key_b));
+        assert_eq!(manager.shared.index.lock().unwrap().total_bytes, 0);
+        assert_eq!(manager.stats().evictions, 1);
+
+        base.store(reserve + 2 * one, Ordering::Relaxed);
+        persist_block(&manager.shared, &block(key_b))
+            .expect("restored headroom must admit the write again");
+        assert_eq!(manager.load(key_b, fp), Some(block(key_b)));
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eviction_quarantine_frees_nothing_and_keeps_reserve() {
+        let root = temp_root("evict-quarantine-reserve");
+        let fp = fingerprint();
+        let key_a = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[1], 0, 0);
+        let key_b = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[2], 0, 0);
+        let one = encode_block(&block(key_a)).unwrap().len() as u64;
+        let reserve = 5 * one;
+        let marker = b"marker";
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, reserve, 2).unwrap();
+        let base = Arc::new(AtomicU64::new(reserve + 2 * one));
+        install_space_override(&manager, &root, &base);
+
+        persist_block(&manager.shared, &block(key_a)).unwrap();
+        let name_a = format!("{}.safetensors", key_a.to_hex());
+        let path_a = root.join(&name_a);
+        fs::remove_file(&path_a).unwrap();
+        fs::create_dir(&path_a).unwrap();
+        fs::write(path_a.join("marker.txt"), marker).unwrap();
+
+        // Quarantining the obstructing directory renames it aside without
+        // freeing a byte, so the reserve floor must still refuse the write.
+        base.store(reserve + marker.len() as u64, Ordering::Relaxed);
+        assert!(
+            persist_block(&manager.shared, &block(key_b)).is_err(),
+            "a quarantine that frees no bytes must not admit a write below the reserve"
+        );
+        assert!(
+            !root
+                .join(format!("{}.safetensors", key_b.to_hex()))
+                .exists(),
+            "the refused write must not land on disk"
+        );
+        assert!(
+            fs::symlink_metadata(&path_a).is_err(),
+            "the canonical name must still be cleared by the pass"
+        );
+        assert!(!manager.contains(&key_a));
+        assert_eq!(manager.shared.index.lock().unwrap().total_bytes, 0);
+        assert_eq!(manager.stats().evictions, 1);
+        let quarantine_prefix = format!(".blocked.{name_a}.");
+        let quarantined: Vec<PathBuf> = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(&quarantine_prefix))
+            })
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(fs::read(quarantined[0].join("marker.txt")).unwrap(), marker);
+
+        base.store(reserve + marker.len() as u64 + 2 * one, Ordering::Relaxed);
+        persist_block(&manager.shared, &block(key_b))
+            .expect("restored headroom must admit the write again");
+        assert_eq!(manager.load(key_b, fp), Some(block(key_b)));
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eviction_of_regular_file_frees_space_and_admits_write() {
+        let root = temp_root("evict-regular-reserve");
+        let fp = fingerprint();
+        let key_a = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[1], 0, 0);
+        let key_b = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[2], 0, 0);
+        let one = encode_block(&block(key_a)).unwrap().len() as u64;
+        let reserve = 5 * one;
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, reserve, 2).unwrap();
+        let base = Arc::new(AtomicU64::new(reserve + 2 * one));
+        install_space_override(&manager, &root, &base);
+
+        persist_block(&manager.shared, &block(key_a)).unwrap();
+
+        // Unlinking the LRU file genuinely frees its bytes, which is
+        // exactly enough to clear the reserve floor for the incoming write.
+        base.store(reserve + one, Ordering::Relaxed);
+        persist_block(&manager.shared, &block(key_b))
+            .expect("a genuine regular-file eviction must still admit the write");
+        assert!(!manager.contains(&key_a));
+        assert!(manager.contains(&key_b));
+        assert_eq!(manager.stats().evictions, 1);
+        assert_eq!(manager.shared.index.lock().unwrap().total_bytes, one);
+        assert_eq!(manager.load(key_b, fp), Some(block(key_b)));
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }
