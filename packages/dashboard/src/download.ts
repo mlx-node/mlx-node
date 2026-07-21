@@ -2,25 +2,33 @@
  * Resumable catalog download runner for the dashboard.
  *
  * Ports the manifest/resume behavior of `packages/cli/src/commands/download-model.ts`
- * (list files → per-file `downloadFileToCacheDir` into the HF cache → `copyFile`
- * into the model dir, skipping files already present at the right size) and adds
- * structured, per-file byte progress by wrapping the injected `fetch` in a
- * counting `TransformStream`. Jobs run one at a time; consumers observe progress
+ * (list files → per-file `downloadFileToCacheDir` into the HF cache → `copyFile`)
+ * and adds structured, per-file byte progress by wrapping the injected `fetch` in
+ * a counting `TransformStream`. Jobs run one at a time; consumers observe progress
  * through `subscribe`, which replays the last event on attach so a late attacher
  * (e.g. an SSE reconnect) is never left blank.
+ *
+ * Downloads are made atomic to close finding-6's partial/mixed-revision hole:
+ * the whole job is pinned to ONE resolved commit sha; files stage into a private
+ * `<modelsDir>/.staging/<slug>` dir; and only after every file is present and
+ * content-verified is a completion marker written and the staging dir renamed
+ * onto the final `<slug>`. An aborted job leaves only the staging dir (resumable)
+ * — never a half-populated final dir that catalog state would call "installed".
  *
  * Pure disk + network — never the native addon.
  */
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { existsSync, statSync } from 'node:fs';
-import { copyFile, mkdir } from 'node:fs/promises';
+import { createReadStream, existsSync, statSync } from 'node:fs';
+import { copyFile, mkdir, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { downloadFileToCacheDir, listFiles, type ListFileEntry } from '@huggingface/hub';
+import { downloadFileToCacheDir, listFiles, type ListFileEntry, modelInfo } from '@huggingface/hub';
 import { MODEL_CATALOG } from '@mlx-node/agent/catalog';
+
+import { type DownloadCompletion, DOWNLOAD_COMPLETE_MARKER, isModelInstalled } from './models.js';
 
 const DEFAULT_CACHE_DIR = join(homedir(), '.cache', 'huggingface');
 
@@ -46,15 +54,68 @@ function isWantedFile(path: string): boolean {
   );
 }
 
-/** Per-file resume check: present on disk AND byte size matches the manifest. */
-function isLocalCopyComplete(destPath: string, expectedSize: number): boolean {
+/** A file that makes a directory a model: a config, or any weight payload. */
+function isWeightFile(path: string): boolean {
+  return path.endsWith('.safetensors') || path.endsWith('.gguf') || path.endsWith('.pdiparams');
+}
+
+/**
+ * True when the manifest actually describes a model: at least one file, and
+ * among them a `config.json` or a weight file. A repo that resolves to zero
+ * model files (404-shaped listing, auth-stripped repo, non-model repo) must
+ * error rather than publish a hollow "installed" directory.
+ */
+function hasModelPayload(files: ListFileEntry[]): boolean {
+  return files.some((file) => file.path === 'config.json' || isWeightFile(file.path));
+}
+
+/** Streaming hex digest of a file's raw bytes (no git header). */
+async function hashFile(path: string, algo: 'sha1' | 'sha256'): Promise<string> {
+  const hash = createHash(algo);
+  for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
+  return hash.digest('hex');
+}
+
+/** Git blob sha1 (`sha1("blob <size>\0" + bytes)`) — the top-level `oid` of a non-LFS file. */
+async function gitBlobSha1(path: string): Promise<string> {
+  const size = statSync(path).size;
+  const hash = createHash('sha1');
+  hash.update(`blob ${size}\0`);
+  for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
+  return hash.digest('hex');
+}
+
+/**
+ * Resume check for a file already staged on disk. Verifies CONTENT identity, not
+ * merely size, so a stale/truncated-but-right-size file is never trusted:
+ *
+ *   - size must match the manifest (fast gate, catches truncation);
+ *   - if the manifest advertises `lfs.oid` (the LFS sha256 of the content), the
+ *     file's sha256 must match it;
+ *   - else, for a plain file (no LFS, no Xet), the top-level git `oid` is the
+ *     git-blob sha1 of the actual content, so the file's git-blob sha1 must match
+ *     it. For Xet-backed files that `oid` hashes the pointer, not the content, so
+ *     it is deliberately NOT used (a mismatch would force a needless re-fetch);
+ *   - otherwise (no usable hash) fall back to size alone — the runner still
+ *     cross-checks the full manifest before writing the completion marker, so a
+ *     partial set can never be published as complete.
+ */
+async function isStagedCopyComplete(destPath: string, file: ListFileEntry): Promise<boolean> {
   if (!existsSync(destPath)) return false;
-  if (expectedSize <= 0) return true;
-  try {
-    return statSync(destPath).size === expectedSize;
-  } catch {
-    return false;
+  if (file.size > 0) {
+    try {
+      if (statSync(destPath).size !== file.size) return false;
+    } catch {
+      return false;
+    }
   }
+  if (file.lfs?.oid !== undefined) {
+    return (await hashFile(destPath, 'sha256')) === file.lfs.oid;
+  }
+  if (file.lfs === undefined && file.xetHash === undefined && file.oid !== undefined) {
+    return (await gitBlobSha1(destPath)) === file.oid;
+  }
+  return true;
 }
 
 export type DownloadEvent =
@@ -221,33 +282,62 @@ export class DownloadManager {
     }
   }
 
+  /**
+   * Resolve the repo's current commit sha so the WHOLE job reads one immutable
+   * snapshot. Threading this same sha to `listFiles` and every
+   * `downloadFileToCacheDir` means a repo update mid-download can never assemble
+   * a mixed-revision checkpoint. Falls back to `main` only if the hub omits a sha.
+   */
+  private async resolveRevision(repoName: string): Promise<string> {
+    const info = await modelInfo({ name: repoName, additionalFields: ['sha'], fetch: this.wrappedFetch });
+    const sha: unknown = info.sha;
+    return typeof sha === 'string' && sha.length > 0 ? sha : 'main';
+  }
+
   private async processJob(job: JobState): Promise<void> {
     const entry = MODEL_CATALOG.find((candidate) => candidate.hfRepo === job.repo)!;
     const slug = entry.hfRepo.split('/').pop()!.toLowerCase();
-    const outputDir = join(this.modelsDir, slug);
+    const finalDir = join(this.modelsDir, slug);
+    const stagingDir = join(this.modelsDir, '.staging', slug);
     const repo = { type: 'model' as const, name: job.repo };
     this.currentJob = job;
 
     try {
+      const revision = await this.resolveRevision(job.repo);
+
       const files: ListFileEntry[] = [];
       let totalBytes = 0;
-      for await (const file of listFiles({ repo, recursive: true, fetch: this.wrappedFetch })) {
+      for await (const file of listFiles({ repo, recursive: true, revision, fetch: this.wrappedFetch })) {
         if (file.type !== 'directory' && isWantedFile(file.path)) {
           files.push(file);
           if (file.size > 0) totalBytes += file.size;
         }
       }
+
+      if (!hasModelPayload(files)) {
+        throw new Error(`Repo "${job.repo}" has no downloadable model files (no config.json or weights)`);
+      }
+
       job.totalBytes = totalBytes;
       this.emit({ type: 'start', id: job.id, repo: job.repo, totalBytes, fileCount: files.length });
 
-      await mkdir(outputDir, { recursive: true });
+      // Already published and complete (marker present): the resume/skip case —
+      // re-downloading nothing.
+      if (isModelInstalled(finalDir)) {
+        job.receivedBytes = totalBytes;
+        job.state = 'done';
+        this.emit({ type: 'done', id: job.id, outputDir: finalDir });
+        return;
+      }
+
+      await mkdir(stagingDir, { recursive: true });
 
       for (let index = 0; index < files.length; index++) {
         const file = files[index];
-        const destPath = join(outputDir, file.path);
+        const destPath = join(stagingDir, file.path);
         const jobBaseBytes = job.receivedBytes;
 
-        if (isLocalCopyComplete(destPath, file.size)) {
+        if (await isStagedCopyComplete(destPath, file)) {
           const fileBytes = file.size > 0 ? file.size : 0;
           job.receivedBytes = jobBaseBytes + fileBytes;
           this.emitFileProgress(job.id, file.path, fileBytes, file.size, index, files.length);
@@ -267,6 +357,7 @@ export class DownloadManager {
         const snapshotPath = await downloadFileToCacheDir({
           repo,
           path: file.path,
+          revision,
           cacheDir: this.cacheDir,
           fetch: this.wrappedFetch,
         });
@@ -282,8 +373,10 @@ export class DownloadManager {
         this.emitFileProgress(job.id, file.path, fileBytes, file.size, index, files.length);
       }
 
+      await this.publish(stagingDir, finalDir, job.repo, revision, files);
+
       job.state = 'done';
-      this.emit({ type: 'done', id: job.id, outputDir });
+      this.emit({ type: 'done', id: job.id, outputDir: finalDir });
     } catch (error) {
       job.state = 'error';
       this.emit({ type: 'error', id: job.id, message: (error as Error).message });
@@ -291,6 +384,32 @@ export class DownloadManager {
       this.currentJob = null;
       this.currentFile = null;
     }
+  }
+
+  /**
+   * Atomic publish: write the completion marker as the LAST staged step (so it
+   * travels with the rename and only ever coexists with a full file set), then
+   * rename the staging dir onto the final path. A pre-existing final dir here is
+   * an incomplete/legacy copy — a complete one already short-circuited — so it is
+   * removed first, otherwise the rename would fail with ENOTEMPTY.
+   */
+  private async publish(
+    stagingDir: string,
+    finalDir: string,
+    repo: string,
+    revision: string,
+    files: ListFileEntry[],
+  ): Promise<void> {
+    const marker: DownloadCompletion = {
+      repo,
+      revision,
+      files: files.map((file) => file.path),
+      completedAt: new Date().toISOString(),
+    };
+    await writeFile(join(stagingDir, DOWNLOAD_COMPLETE_MARKER), `${JSON.stringify(marker, null, 2)}\n`);
+    await mkdir(dirname(finalDir), { recursive: true });
+    await rm(finalDir, { recursive: true, force: true });
+    await rename(stagingDir, finalDir);
   }
 
   private emitFileProgress(

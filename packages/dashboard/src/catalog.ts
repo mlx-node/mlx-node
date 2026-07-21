@@ -6,15 +6,20 @@
  * installed/slug state derived from the local models directory.
  */
 
-import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { type CatalogEntry, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 
+import { isModelInstalled } from './models.js';
+
 export interface CatalogItem extends CatalogEntry {
   /** Local directory name a download lands in (`hfRepo` basename, lowercased). */
   slug: string;
-  /** Whether `<modelsDir>/<slug>` already exists on disk. */
+  /**
+   * Whether a completed download of `<slug>` is present under `modelsDir` — keyed
+   * on the atomic-publish completion marker, not bare directory existence, so a
+   * partial/aborted download never masquerades as installed.
+   */
   installed: boolean;
 }
 
@@ -32,6 +37,6 @@ export function catalogSlug(entry: CatalogEntry): string {
 export function catalogWithState(modelsDir: string): CatalogItem[] {
   return MODEL_CATALOG.map((entry) => {
     const slug = catalogSlug(entry);
-    return { ...entry, slug, installed: existsSync(join(modelsDir, slug)) };
+    return { ...entry, slug, installed: isModelInstalled(join(modelsDir, slug)) };
   });
 }

@@ -8,7 +8,7 @@
  * the same trade-off already made in `packages/agent/src/provider/models.ts`.
  */
 
-import { type Dirent, lstatSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { type Dirent, existsSync, lstatSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
@@ -47,6 +47,45 @@ const RAW_MODEL_TYPE_TO_LABEL: Record<string, string> = {
   internvl_chat: 'internvl_chat',
   'qianfan-ocr': 'qianfan-ocr',
 };
+
+/**
+ * Filename of the atomic-publish completion marker the download runner writes as
+ * the LAST step of a download (inside the staging dir, before it is renamed onto
+ * the final path). Its presence — not bare directory existence — is what marks a
+ * checkpoint "installed".
+ */
+export const DOWNLOAD_COMPLETE_MARKER = '.mlx-download-complete.json';
+
+/** Contents of {@link DOWNLOAD_COMPLETE_MARKER}: the pinned snapshot a dir holds. */
+export interface DownloadCompletion {
+  /** HuggingFace repo the checkpoint came from. */
+  repo: string;
+  /** The exact commit sha the whole download was pinned to (one snapshot). */
+  revision: string;
+  /** Repo-relative paths of every file published into the final dir. */
+  files: string[];
+  /** ISO timestamp of the atomic publish. */
+  completedAt: string;
+}
+
+/**
+ * A checkpoint counts as installed only when its atomic-publish completion
+ * marker is present, parses, and every file it lists still exists on disk —
+ * never bare directory existence, which a half-written or aborted download (a
+ * partial `config.json` + missing weights) would also satisfy and thus falsely
+ * report as installed, hiding the retry.
+ */
+export function isModelInstalled(modelDir: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(join(modelDir, DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as unknown;
+  } catch {
+    return false;
+  }
+  const marker = asObject(parsed);
+  if (marker === undefined || !Array.isArray(marker.files)) return false;
+  return marker.files.every((file) => typeof file === 'string' && existsSync(join(modelDir, file)));
+}
 
 function asObject(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -169,6 +208,9 @@ export function discoverLocalModels(modelsDir: string): { models: LocalModel[]; 
 
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
+    // Hidden dirs are runner scratch (`.staging/<slug>`), never checkpoints:
+    // skip them silently so an in-flight download raises no spurious warning.
+    if (entry.name.startsWith('.')) continue;
     const full = join(modelsDir, entry.name);
     const configPath = join(full, 'config.json');
 
