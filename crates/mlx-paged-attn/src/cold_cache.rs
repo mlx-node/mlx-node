@@ -402,8 +402,11 @@ impl RootDir {
         ))
     }
 
-    fn stat_identity(&self, name: &str) -> Option<FileIdentity> {
-        self.stat_no_follow(name).map(|stat| identity_of(&stat))
+    /// Identity of the current directory entry plus whether it is a regular
+    /// file, never following symlinks; `None` when no entry exists.
+    fn stat_identity(&self, name: &str) -> Option<(FileIdentity, bool)> {
+        self.stat_no_follow(name)
+            .map(|stat| (identity_of(&stat), file_type_of(&stat).is_file()))
     }
 
     fn stat_no_follow(&self, name: &str) -> Option<rustix::fs::Stat> {
@@ -507,7 +510,7 @@ impl RootDir {
         Some((meta.len(), mtime))
     }
 
-    fn stat_identity(&self, _name: &str) -> Option<FileIdentity> {
+    fn stat_identity(&self, _name: &str) -> Option<(FileIdentity, bool)> {
         None
     }
 }
@@ -706,11 +709,14 @@ impl ColdCacheManager {
 
     /// Load and validate a block. Every failed read is a miss; a payload
     /// that existed but failed validation additionally counts as a
-    /// corruption (a missing file never does). Failure cleanup unlinks only
-    /// the exact file generation (dev+inode) that was read, under the same
-    /// index lock the writer holds across [rename + index publish], so an
-    /// in-process writer's freshly committed replacement is never deleted
-    /// or de-indexed. Coordination is in-process only: a concurrent
+    /// corruption (a missing file never does). Failure cleanup runs under
+    /// the same index lock the writer holds across [rename + index publish]
+    /// and unlinks only the exact file generation (dev+inode) that was
+    /// read, so an in-process writer's freshly committed replacement is
+    /// never deleted or de-indexed — except that a directory entry which is
+    /// no longer a regular file (and so can never be a writer commit nor be
+    /// opened again) is de-indexed and its entry unlinked without touching
+    /// what it points at. Coordination is in-process only: a concurrent
     /// *process* mutating the same root stays fail-open — the identity
     /// guard still refuses to unlink its replacement, and the worst case is
     /// a stale index entry or one recomputed prefix.
@@ -929,8 +935,14 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
 /// Cleanup after a failed load, under the same index lock the writer holds
 /// across [rename + index publish]. Unlinks (descriptor-relative) only when
 /// the directory entry `name` is still the generation that was read
-/// (`read_identity`); a renamed-in replacement (new inode) is left on disk
-/// and keeps its index entry.
+/// (`read_identity`); a regular-file replacement (new inode) is left on
+/// disk and keeps its index entry, because it may be a writer's freshly
+/// renamed-in commit. A non-regular entry (symlink or other) can never be
+/// a writer commit (writers rename in regular files only) and can never be
+/// opened again (`open_existing` is `O_NOFOLLOW`), so keeping it would pin
+/// a permanently dead index entry: it is de-indexed and its directory
+/// entry unlinked. `unlinkat` removes the entry itself, never a symlink's
+/// target, matching eviction semantics.
 fn prune_failed_load(
     shared: &Shared,
     key: ColdCacheKey,
@@ -940,19 +952,16 @@ fn prune_failed_load(
     let Ok(mut index) = shared.index.lock() else {
         return;
     };
-    match shared.root.stat_identity(name) {
-        Some(current) if read_identity == Some(current) => {
-            let _ = shared.root.unlink(name);
-            if let Some(entry) = index.entries.remove(&key) {
-                index.total_bytes = index.total_bytes.saturating_sub(entry.size);
-            }
-        }
-        Some(_) => {}
-        None => {
-            if let Some(entry) = index.entries.remove(&key) {
-                index.total_bytes = index.total_bytes.saturating_sub(entry.size);
-            }
-        }
+    let (unlink_entry, deindex) = match shared.root.stat_identity(name) {
+        Some((current, _)) if read_identity == Some(current) => (true, true),
+        Some((_, is_regular)) => (!is_regular, !is_regular),
+        None => (false, true),
+    };
+    if unlink_entry {
+        let _ = shared.root.unlink(name);
+    }
+    if deindex && let Some(entry) = index.entries.remove(&key) {
+        index.total_bytes = index.total_bytes.saturating_sub(entry.size);
     }
 }
 
@@ -1426,6 +1435,64 @@ mod tests {
         assert_eq!(manager.shared.index.lock().unwrap().total_bytes, 0);
         drop(manager);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_miss_after_symlink_swap_prunes_index_and_spares_target() {
+        let base = temp_root("symlink-swap-entry");
+        let root = base.join("root");
+        let victim = base.join("victim.bin");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&victim, b"victim payload").unwrap();
+
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        assert!(manager.enqueue(block(key)).unwrap());
+        for _ in 0..200 {
+            if manager.contains(&key) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(manager.contains(&key));
+
+        let path = root.join(format!("{}.safetensors", key.to_hex()));
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        assert!(manager.load(key, fingerprint()).is_none());
+        assert!(
+            !manager.contains(&key),
+            "an entry replaced by a symlink must leave the index on the next load miss"
+        );
+        assert_eq!(manager.shared.index.lock().unwrap().total_bytes, 0);
+        assert!(
+            fs::symlink_metadata(&path).is_err(),
+            "the dead symlink directory entry itself must be unlinked"
+        );
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"victim payload",
+            "the symlink target must never be followed or unlinked"
+        );
+        let stats = manager.stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.corruptions, 0, "nothing was opened, nothing was read");
+
+        assert!(
+            manager.enqueue(block(key)).unwrap(),
+            "pruning must unblock re-persisting the same key"
+        );
+        for _ in 0..200 {
+            if manager.contains(&key) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(manager.load(key, fingerprint()), Some(block(key)));
+        drop(manager);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
