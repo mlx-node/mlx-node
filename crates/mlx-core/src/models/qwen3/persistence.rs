@@ -424,6 +424,9 @@ fn parse_config(raw_config: &Value) -> Result<Qwen3Config> {
         use_block_paged_cache: raw_config["use_block_paged_cache"]
             .as_bool()
             .or_else(|| raw_config["useBlockPagedCache"].as_bool()),
+        persist_paged_cache: raw_config["persist_paged_cache"]
+            .as_bool()
+            .or_else(|| raw_config["persistPagedCache"].as_bool()),
     })
 }
 
@@ -568,6 +571,9 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                         path,
                     ));
                     inner.set_tokenizer(Arc::new(tokenizer.clone()));
+                    if config.persist_paged_cache.unwrap_or(false) {
+                        inner.enable_cold_tier(&model_path);
+                    }
 
                     // Load parameters into inner
                     let num_layers = config.num_layers as usize;

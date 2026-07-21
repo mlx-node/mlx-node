@@ -1757,6 +1757,7 @@ mod forward_pass_equivalence_tests {
             // codepath (Metal pool + per-layer dispatch), so we MUST stay
             // on the flat path to keep the assertion meaningful.
             use_block_paged_cache: Some(false),
+            persist_paged_cache: None,
         }
     }
 
@@ -2202,6 +2203,7 @@ mod chunked_forward_tests {
             // equality against the full flat forward. The block-paged
             // adapter is a different codepath, so stay on the flat path.
             use_block_paged_cache: Some(false),
+            persist_paged_cache: None,
         }
     }
 

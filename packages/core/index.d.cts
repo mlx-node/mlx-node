@@ -4342,6 +4342,11 @@ export interface Qwen3Config {
    * Default: true.
    */
   useBlockPagedCache?: boolean | undefined;
+  /**
+   * Persist full paged KV blocks to the SSD cold tier so warm prefixes
+   * survive process restarts. Off unless explicitly enabled.
+   */
+  persistPagedCache?: boolean | undefined;
 }
 
 /** Qwen3 language model configuration */

@@ -416,6 +416,55 @@ impl Qwen3Inner {
         self.tokenizer = Some(tokenizer);
     }
 
+    /// Wire the process-global SSD cold tier into the paged adapter.
+    ///
+    /// Fingerprint = model dir identity (config bytes + weight shard
+    /// names/sizes) + cache layout. Any drift must invalidate persisted
+    /// blocks. No-op (fail-open) when the paged adapter is absent or the
+    /// cold tier cannot be opened.
+    pub fn enable_cold_tier(&mut self, model_path: &str) {
+        let Some(adapter) = self.paged_adapter.as_mut() else {
+            return;
+        };
+        let Some(manager) = crate::cold_tier::global_cold_cache() else {
+            return;
+        };
+        let mut components: Vec<Vec<u8>> = vec![b"qwen3".to_vec()];
+        if let Ok(cfg) = serde_json::to_vec(&self.config) {
+            components.push(cfg);
+        }
+        let mut shards: Vec<(String, u64)> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(model_path) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.ends_with(".safetensors") {
+                    let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                    shards.push((name, size));
+                }
+            }
+        }
+        shards.sort();
+        for (name, size) in &shards {
+            components.push(name.as_bytes().to_vec());
+            components.push(size.to_le_bytes().to_vec());
+        }
+        let pool = adapter.layer_kv_pool();
+        components.push((pool.block_size() as u64).to_le_bytes().to_vec());
+        components.push((pool.num_layers() as u64).to_le_bytes().to_vec());
+        components.push((pool.config().num_kv_heads as u64).to_le_bytes().to_vec());
+        components.push((pool.config().head_size as u64).to_le_bytes().to_vec());
+        components.push(format!("{:?}", pool.cache_dtype()).into_bytes());
+        let fingerprint = mlx_paged_attn::ColdCacheFingerprint::from_components(
+            components.iter().map(|c| c.as_slice()),
+        );
+        adapter.set_cold_tier(
+            crate::transformer::paged_kv_cache_adapter::ColdTierContext {
+                manager,
+                fingerprint,
+            },
+        );
+    }
+
     /// Store the checkpoint's parsed `generation_config.json` defaults.
     /// Called once at load time after construction.
     pub(crate) fn set_gen_defaults(&mut self, defaults: crate::engine::ModelGenerationDefaults) {
@@ -4029,6 +4078,7 @@ mod tests {
             paged_block_size: Some(16),
             // The flag under test.
             use_block_paged_cache: use_block_paged,
+            persist_paged_cache: None,
         }
     }
 

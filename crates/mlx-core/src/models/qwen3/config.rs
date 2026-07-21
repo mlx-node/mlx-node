@@ -49,4 +49,10 @@ pub struct Qwen3Config {
     #[serde(default)]
     #[napi(ts_type = "boolean | undefined")]
     pub use_block_paged_cache: Option<bool>,
+
+    /// Persist full paged KV blocks to the SSD cold tier so warm prefixes
+    /// survive process restarts. Off unless explicitly enabled.
+    #[serde(default)]
+    #[napi(ts_type = "boolean | undefined")]
+    pub persist_paged_cache: Option<bool>,
 }

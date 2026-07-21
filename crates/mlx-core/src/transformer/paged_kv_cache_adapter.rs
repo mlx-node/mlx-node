@@ -638,6 +638,15 @@ pub struct PagedPrefillMemorySnapshot {
     pub paged_pool_allocated_bytes: Option<u64>,
 }
 
+/// SSD cold-tier handle for persisting full paged KV blocks across process
+/// restarts. `fingerprint` binds every persisted block to one model + cache
+/// layout identity; any drift (weights, config, pool geometry, dtype) must
+/// produce a different fingerprint so stale blocks can never validate.
+pub struct ColdTierContext {
+    pub manager: std::sync::Arc<mlx_paged_attn::ColdCacheManager>,
+    pub fingerprint: mlx_paged_attn::ColdCacheFingerprint,
+}
+
 /// Per-model session-friendly KV cache adapter.
 ///
 /// Holds shared `BlockAllocator` (`Arc<Mutex<...>>`) so multiple in-flight
@@ -675,6 +684,12 @@ pub struct PagedKVCacheAdapter {
     /// the shared allocator). Both violate the documented at-most-once
     /// lifecycle.
     prefix_lookup_done: bool,
+
+    /// Optional SSD cold tier for persisting full blocks across process
+    /// restarts. `None` (the default) keeps persistence fully off. Lives
+    /// for the adapter's whole lifetime — cross-request prefix reuse spans
+    /// requests, so per-request resets must not clear it.
+    cold_tier: Option<ColdTierContext>,
 
     /// Optional FP8 K/V scale manager. When `Some`, the adapter
     /// reads per-layer K/V scales from the manager and threads them into
@@ -884,6 +899,7 @@ impl PagedKVCacheAdapter {
             request_tokens: Vec::new(),
             already_registered: false,
             prefix_lookup_done: false,
+            cold_tier: None,
             #[cfg(target_os = "macos")]
             scale_manager: None,
             #[cfg(target_os = "macos")]
@@ -901,6 +917,23 @@ impl PagedKVCacheAdapter {
             #[cfg(target_os = "macos")]
             prefill_memory_snapshot_cache: None,
         })
+    }
+
+    /// Wire the SSD cold tier into this adapter. Capture/restore paths key
+    /// every persisted block off `ctx.fingerprint`.
+    pub fn set_cold_tier(&mut self, ctx: ColdTierContext) {
+        self.cold_tier = Some(ctx);
+    }
+
+    pub fn cold_tier(&self) -> Option<&ColdTierContext> {
+        self.cold_tier.as_ref()
+    }
+
+    /// Shared per-layer K/V pool. Exposed so callers can fold the pool's
+    /// cache layout (block size, layers, heads, head size, dtype) into the
+    /// cold-tier fingerprint.
+    pub fn layer_kv_pool(&self) -> &Arc<LayerKVPool> {
+        &self.layer_kv_pool
     }
 
     /// Begin a new request. Releases any prior request's blocks first.
@@ -5273,6 +5306,38 @@ mod tests {
         block_size: u32,
     ) -> Option<PagedKVCacheAdapter> {
         Some(maybe_make_adapter(allocator, block_size)?.expect("adapter ctor must succeed"))
+    }
+
+    #[test]
+    fn cold_tier_defaults_none_and_holds_context_across_resets() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            return;
+        };
+        assert!(
+            adapter.cold_tier().is_none(),
+            "cold tier must be off unless explicitly wired"
+        );
+
+        let root =
+            std::env::temp_dir().join(format!("mlx-adapter-cold-tier-{}", std::process::id()));
+        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+            .expect("temp-dir cold cache must open");
+        let fingerprint =
+            mlx_paged_attn::ColdCacheFingerprint::from_components([b"qwen3-test".as_slice()]);
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::new(manager),
+            fingerprint,
+        });
+
+        let ctx = adapter.cold_tier().expect("context must be stored");
+        assert_eq!(ctx.fingerprint, fingerprint);
+
+        // Cross-request prefix reuse spans requests, so the context must
+        // survive the per-request reset.
+        adapter.reset_for_new_request(1).unwrap();
+        assert!(adapter.cold_tier().is_some());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(target_os = "macos")]
