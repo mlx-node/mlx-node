@@ -18,7 +18,8 @@
   },
   "scripts": {
     "build": "tsc -b && yarn build:ui",
-    "build:ui": "cd ui && vite build"
+    "build:ui": "cd ui && vp build",
+    "prepack": "yarn build:ui"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.6",

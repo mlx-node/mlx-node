@@ -470,6 +470,14 @@ jobs:
       - name: Build TypeScript
         run: yarn build:ts
 
+      # tsc -b only emits dashboard server `dist/`; the Vite SPA under `web/`
+      # is gitignored and built separately. Build it explicitly so the tarball
+      # ships `web/index.html` (dashboard's `prepack` also covers `npm pack`).
+      # `vp` is a workspace-local bin present after `yarn install`, so no vite
+      # shim / setup-vp is required here.
+      - name: Build dashboard UI
+        run: yarn workspace @mlx-node/dashboard build:ui
+
       - uses: actions/download-artifact@v7
         with:
           name: mlx-node
