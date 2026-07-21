@@ -231,21 +231,16 @@ struct DownloadManifest {
 
 impl DownloadManifest {
     /// True when the manifest lists every on-disk shard, so its immutable
-    /// repo+revision fully pins those exact bytes.
+    /// repo+revision fully pins those exact bytes. Coverage is decided by raw
+    /// string equality: on-disk shards are top-level basenames, so only a
+    /// byte-for-byte equal manifest entry names the same repo-relative file. A
+    /// directory prefix, absolute path, or trailing slash/dot is a DIFFERENT or
+    /// malformed entry and never covers a bare basename.
     fn covers_all_shards(&self, shard_names: &[String]) -> bool {
         shard_names.iter().all(|shard| {
-            self.files.iter().any(|file| {
-                // On-disk shards are top-level basenames. Only a manifest entry
-                // that is exactly that basename (a single Normal component: no
-                // directory prefix, not absolute, no `.`/`..`) names the same
-                // repo-relative file. A `subdir/x`, `/abs/x`, or `../x` entry
-                // names a DIFFERENT file -> not coverage -> full digest.
-                let mut comps = Path::new(file).components();
-                matches!(
-                    comps.next(),
-                    Some(std::path::Component::Normal(c)) if c.to_str() == Some(shard.as_str())
-                ) && comps.next().is_none()
-            })
+            // Raw equality, NOT path normalization: `Path::components()` would
+            // fold `x/`, `x/.`, `x//` back to `x` and wrongly report coverage.
+            self.files.iter().any(|file| file == shard)
         })
     }
 
@@ -270,6 +265,12 @@ fn read_download_manifest(dir: &Path) -> Option<DownloadManifest> {
     let bytes = std::fs::read(dir.join(DOWNLOAD_COMPLETE_MARKER)).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let revision = value.get("revision")?.as_str()?.to_string();
+    // A cold-tier identity is only trustworthy if the revision is an immutable
+    // commit sha; a mutable ref (e.g. "main") could point at different weights
+    // across downloads. Reject anything but 40 hex chars -> full digest fallback.
+    if revision.len() != 40 || !revision.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     let repo = value
         .get("repo")
         .and_then(|v| v.as_str())
@@ -529,12 +530,12 @@ mod tests {
         // byte matches.
         std::fs::write(
             dir_a.join(DOWNLOAD_COMPLETE_MARKER),
-            br#"{"repo":"acme/base","revision":"aaaaaaaa","files":["config.json","model.safetensors"],"completedAt":"2026-01-01T00:00:00Z"}"#,
+            br#"{"repo":"acme/base","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","files":["config.json","model.safetensors"],"completedAt":"2026-01-01T00:00:00Z"}"#,
         )
         .unwrap();
         std::fs::write(
             dir_b.join(DOWNLOAD_COMPLETE_MARKER),
-            br#"{"repo":"acme/base","revision":"bbbbbbbb","files":["config.json","model.safetensors"],"completedAt":"2026-01-02T00:00:00Z"}"#,
+            br#"{"repo":"acme/base","revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","files":["config.json","model.safetensors"],"completedAt":"2026-01-02T00:00:00Z"}"#,
         )
         .unwrap();
         assert_ne!(
@@ -567,7 +568,7 @@ mod tests {
             SHARED_HEADER,
             &[2u8; 4096],
         );
-        let marker = br#"{"repo":"acme/base","revision":"deadbeef","files":["config.json","model.safetensors"],"completedAt":"2026-01-01T00:00:00Z"}"#;
+        let marker = br#"{"repo":"acme/base","revision":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","files":["config.json","model.safetensors"],"completedAt":"2026-01-01T00:00:00Z"}"#;
         std::fs::write(dir_a.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
         std::fs::write(dir_b.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
         assert_eq!(
@@ -599,7 +600,7 @@ mod tests {
             &[4u8; 4096],
         );
         // `files` omits the shard -> not covered -> fallback path.
-        let marker = br#"{"repo":"acme/base","revision":"cafef00d","files":["config.json"],"completedAt":"2026-01-01T00:00:00Z"}"#;
+        let marker = br#"{"repo":"acme/base","revision":"cafef00dcafef00dcafef00dcafef00dcafef00d","files":["config.json"],"completedAt":"2026-01-01T00:00:00Z"}"#;
         std::fs::write(dir_a.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
         std::fs::write(dir_b.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
         assert_ne!(
@@ -636,13 +637,51 @@ mod tests {
         );
         // `files` lists the shard under a subdir -> does not cover the top-level
         // `model.safetensors` -> full-digest fallback.
-        let marker = br#"{"repo":"acme/base","revision":"deadbeef","files":["config.json","weights/model.safetensors"],"completedAt":"2026-01-01T00:00:00Z"}"#;
+        let marker = br#"{"repo":"acme/base","revision":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","files":["config.json","weights/model.safetensors"],"completedAt":"2026-01-01T00:00:00Z"}"#;
         std::fs::write(dir_a.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
         std::fs::write(dir_b.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
         assert_ne!(
             build(&dir_a).unwrap(),
             build(&dir_b).unwrap(),
             "a subdir-prefixed manifest entry must not cover a distinct top-level shard"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn mutable_revision_marker_is_rejected() {
+        // A legacy marker can pin a MUTABLE ref (e.g. "main") that could point
+        // at different weights across downloads. `read_download_manifest` must
+        // reject any non-40-hex revision, forcing the sound full-digest path.
+        let base = unique_tmp("cold-fp-mutable-rev");
+        let dir_a = base.join("a");
+        let dir_b = base.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        // Same size, DIFFERENT bytes: the cheap path (same marker) would bind
+        // them EQUAL; only a full digest splits them.
+        write_safetensors(
+            &dir_a.join("model.safetensors"),
+            SHARED_HEADER,
+            &[1u8; 4096],
+        );
+        write_safetensors(
+            &dir_b.join("model.safetensors"),
+            SHARED_HEADER,
+            &[2u8; 4096],
+        );
+        // Otherwise valid marker (files cover the shard) but a mutable revision.
+        let marker = br#"{"repo":"acme/base","revision":"main","files":["config.json","model.safetensors"],"completedAt":"2026-01-01T00:00:00Z"}"#;
+        std::fs::write(dir_a.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
+        std::fs::write(dir_b.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
+        assert!(
+            read_download_manifest(&dir_a).is_none(),
+            "a mutable (non-40-hex) revision must be rejected outright"
+        );
+        assert_ne!(
+            build(&dir_a).unwrap(),
+            build(&dir_b).unwrap(),
+            "a mutable-revision marker must not take the cheap path: full digest must split differing bytes"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -663,6 +702,12 @@ mod tests {
         assert!(!manifest(&["/model.safetensors"]).covers_all_shards(&shards));
         assert!(!manifest(&["../model.safetensors"]).covers_all_shards(&shards));
         assert!(!manifest(&["./model.safetensors"]).covers_all_shards(&shards));
+        // Negative: a trailing slash/dot is a DIFFERENT raw string. `Path`
+        // normalization would fold these back to `model.safetensors` and
+        // wrongly report coverage; raw equality must reject them.
+        assert!(!manifest(&["model.safetensors/"]).covers_all_shards(&shards));
+        assert!(!manifest(&["model.safetensors/."]).covers_all_shards(&shards));
+        assert!(!manifest(&["model.safetensors//"]).covers_all_shards(&shards));
     }
 
     #[test]
@@ -686,12 +731,12 @@ mod tests {
         );
         std::fs::write(
             dir_a.join(DOWNLOAD_COMPLETE_MARKER),
-            br#"{"repo":"acme/base","revision":"cccccccc","files":["config.json","model.safetensors"],"completedAt":"2026-01-01T00:00:00Z"}"#,
+            br#"{"repo":"acme/base","revision":"cccccccccccccccccccccccccccccccccccccccc","files":["config.json","model.safetensors"],"completedAt":"2026-01-01T00:00:00Z"}"#,
         )
         .unwrap();
         std::fs::write(
             dir_b.join(DOWNLOAD_COMPLETE_MARKER),
-            br#"{"repo":"acme/base","revision":"cccccccc","files":["config.json","model.safetensors"],"completedAt":"2026-07-20T12:34:56Z"}"#,
+            br#"{"repo":"acme/base","revision":"cccccccccccccccccccccccccccccccccccccccc","files":["config.json","model.safetensors"],"completedAt":"2026-07-20T12:34:56Z"}"#,
         )
         .unwrap();
         assert_eq!(
