@@ -44,7 +44,6 @@ import { basename, dirname, join, sep } from 'node:path';
 import { downloadFileToCacheDir, listFiles, type ListFileEntry, modelInfo } from '@huggingface/hub';
 import { MODEL_CATALOG } from '@mlx-node/agent/catalog';
 
-import { acquireLock, type LockHandle, pidAlive } from './lock.js';
 import { type DownloadCompletion, DOWNLOAD_COMPLETE_MARKER, isDownloaderOwned, isModelInstalled } from './models.js';
 
 /** Bounded re-fetch attempts for a staged file that fails post-copy verification. */
@@ -52,6 +51,26 @@ const MAX_VERIFY_ATTEMPTS = 3;
 
 /** Job-private staging dir name `<slug>@<40hex-sha>.<pid>.<uuid>` — captures the owner pid. */
 const STAGING_DIR_RE = /@[0-9a-f]{40}\.(\d+)\.[0-9a-f-]+$/i;
+
+/** Publish backup dir name `<slug>.backup-<pid>.<uuid>` — captures the owner pid (disjoint from STAGING_DIR_RE). */
+const BACKUP_DIR_RE = /\.backup-(\d+)\.[0-9a-f-]+$/i;
+
+/**
+ * Liveness of a pid via signal 0. An unparseable/invalid pid is treated as ALIVE
+ * (never reaped) so a corrupt value can't drive a deletion; a delivered signal or
+ * EPERM means alive; only ESRCH proves the process is gone. This is the sole
+ * cross-process safety mechanism the sweep relies on to leave a live peer's
+ * private staging tree and active publish backup untouched.
+ */
+export function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
 
 const DEFAULT_CACHE_DIR = join(homedir(), '.cache', 'huggingface');
 
@@ -384,19 +403,15 @@ export class DownloadManager {
     this.currentJob = job;
 
     const stagingRoot = join(this.modelsDir, '.staging');
-    const lockPath = join(stagingRoot, `${slug}.lock`);
 
     let stagingDir: string | undefined;
-    let lock: LockHandle | undefined;
     try {
-      // The lockfile lives on the same fs as staging; ensure the dir exists first.
       await mkdir(stagingRoot, { recursive: true });
-      // Serialize same-model downloads across processes BEFORE any recovery sweep,
-      // so a live peer's active backup/staging is never reclaimed out from under it.
-      lock = await acquireLock(lockPath);
 
-      // Reap a crashed job's private staging tree (pid-proven, process-wide) and
-      // recover/reap an orphaned publish backup for THIS model (safe under our lock).
+      // Reap a crashed job's private staging tree and recover/reap an orphaned
+      // publish backup for THIS model. Both are gated by pid-liveness, so a live
+      // peer's private staging tree and active publish backup are never reclaimed
+      // out from under it.
       await this.sweepStaging(slug);
 
       const revision = await this.resolveRevision(job.repo);
@@ -487,16 +502,15 @@ export class DownloadManager {
       if (stagingDir !== undefined) {
         await rm(stagingDir, { recursive: true, force: true }).catch(() => {});
       }
-      if (lock !== undefined) {
-        await lock.release().catch(() => {});
-      }
       this.currentJob = null;
       this.currentFile = null;
     }
   }
 
   /**
-   * Startup recovery sweep of `.staging`, run under this job's per-model lock:
+   * Startup recovery sweep of `.staging`, gated entirely by pid-liveness — no
+   * interprocess lock. The owner pid encoded in each dir name is the sole proof of
+   * whether it is safe to reclaim:
    *
    *   - Process-wide, pid-proven: a crashed/SIGKILLed job's private staging tree
    *     (`<slug>@<sha>.<pid>.<uuid>`) is reaped when its owner pid is gone (it is
@@ -504,11 +518,12 @@ export class DownloadManager {
    *     otherwise). A live — or reused — pid is kept; pid-reuse only preserves a
    *     leak, it can never reap a live job.
    *
-   *   - Slug-scoped (this model only): a publish backup this job's lock proves is
-   *     orphaned (`<slug>.backup-<uuid>`) is renamed back into place when the swap
-   *     died mid-rename (final dir absent), else the leaked copy is removed. Other
-   *     models' backups are never touched — only their own lock-holder may, so a
-   *     live peer's active backup is never reclaimed. Never throws.
+   *   - Slug-scoped (this model only): a publish backup whose owner pid is DEAD
+   *     (`<slug>.backup-<pid>.<uuid>`) is orphaned — renamed back into place when
+   *     the swap died mid-rename (final dir absent), else the leaked copy is
+   *     removed. A backup whose owner pid is still ALIVE belongs to a peer that is
+   *     mid-publish and is never touched, so its active backup is never reclaimed.
+   *     Never throws.
    */
   private async sweepStaging(slug: string): Promise<void> {
     const stagingRoot = join(this.modelsDir, '.staging');
@@ -527,6 +542,9 @@ export class DownloadManager {
         continue;
       }
       if (name.startsWith(backupPrefix)) {
+        const backupMatch = BACKUP_DIR_RE.exec(name);
+        // A backup whose owner pid is still alive is a peer mid-publish: never touch it.
+        if (backupMatch !== null && pidAlive(Number(backupMatch[1]))) continue;
         const backupPath = join(stagingRoot, name);
         try {
           if (existsSync(finalDir)) {
@@ -590,19 +608,25 @@ export class DownloadManager {
       // returns the cached pointer without revalidating, so without this the retry
       // would recopy the same corrupt bytes.
       await rm(destPath, { force: true });
-      // Resolve the pointer's target BEFORE unlinking it (rm on a symlink never
-      // follows it, so the pointer removal is always safe). `etag`/`oid` is
-      // server-controlled and can contain `../`, so the blob may resolve OUTSIDE
-      // the managed cache (a poisoned repo, or a foreign symlink already in the
-      // shared HF cache); delete it ONLY when it is contained under the realpath'd
-      // cache root, never an unrelated same-user file.
-      const blob = await realpath(snapshotPath).catch(() => undefined);
-      await rm(snapshotPath, { force: true });
-      if (blob !== undefined) {
-        const cacheRoot = await realpath(this.cacheDir).catch(() => undefined);
-        if (cacheRoot !== undefined && (blob === cacheRoot || blob.startsWith(cacheRoot + sep))) {
-          await rm(blob, { force: true });
-        }
+      // Invalidate the HF cache entry so the next attempt re-fetches, but never
+      // delete anything outside the managed cache. Contain BOTH ends:
+      //   - the POINTER by canonicalizing its PARENT (never follow the final
+      //     symlink component) — a pointer whose parent escapes the cache is not
+      //     unlinked at all;
+      //   - the BLOB by canonicalizing the pointer's target — `etag`/`oid` is
+      //     server-controlled and can contain `../`, so the blob may resolve
+      //     OUTSIDE the cache (a poisoned repo, or a foreign symlink already in
+      //     the shared HF cache); delete it ONLY when contained under the cache.
+      const cacheRoot = await realpath(this.cacheDir).catch(() => undefined);
+      const pointerParent = await realpath(dirname(snapshotPath)).catch(() => undefined);
+      const inCache = (p: string | undefined): p is string =>
+        cacheRoot !== undefined && p !== undefined && (p === cacheRoot || p.startsWith(cacheRoot + sep));
+      // Out-of-cache pointer is impossible via the hub, but never delete a foreign
+      // file. Skip invalidation; the bounded retry then surfaces a clean verify error.
+      if (inCache(pointerParent)) {
+        const blob = await realpath(snapshotPath).catch(() => undefined);
+        await rm(snapshotPath, { force: true });
+        if (inCache(blob)) await rm(blob, { force: true });
       }
     }
     throw new Error(`Downloaded file "${file.path}" failed content verification after ${MAX_VERIFY_ATTEMPTS} attempts`);
@@ -663,8 +687,8 @@ export class DownloadManager {
 
     // Re-check ownership adjacent to the destructive swap: the first guard is a
     // no-op when finalDir was absent then, so an UNOWNED dir that raced in
-    // between must still never be renamed away and deleted. This collapses the
-    // window to the inherent FS-level race an interprocess lock would close.
+    // between must still never be renamed away and deleted. This narrows the
+    // window to the irreducible FS-level check-then-swap race.
     if (!isDownloaderOwned(finalDir) && !overwrite) {
       throw new Error(
         `Refusing to overwrite "${finalDir}": it was not created by the dashboard downloader`,
@@ -674,7 +698,11 @@ export class DownloadManager {
     // Rollback-safe swap of an owned (or explicitly overwritten) final dir. The
     // backup lives under `.staging` (a dotdir skipped by model discovery) so a
     // crash mid-swap never surfaces it as a phantom model.
-    const backupDir = join(this.modelsDir, '.staging', `${basename(finalDir)}.backup-${randomUUID()}`);
+    const backupDir = join(
+      this.modelsDir,
+      '.staging',
+      `${basename(finalDir)}.backup-${process.pid}.${randomUUID()}`,
+    );
     await rename(finalDir, backupDir);
     try {
       await rename(stagingDir, finalDir);

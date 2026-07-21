@@ -16,8 +16,7 @@ import { MODEL_CATALOG } from '@mlx-node/agent/catalog';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { catalogWithState } from '../src/catalog.js';
-import { type DownloadEvent, DownloadManager } from '../src/download.js';
-import { acquireLock, pidAlive } from '../src/lock.js';
+import { type DownloadEvent, DownloadManager, pidAlive } from '../src/download.js';
 import { DOWNLOAD_COMPLETE_MARKER } from '../src/models.js';
 
 /** Filename of the atomic-publish completion marker (kept in sync with models.ts). */
@@ -658,10 +657,11 @@ describe('DownloadManager', () => {
     expect(backupDirs()).toEqual([]);
   });
 
-  it('recovers an orphaned publish backup whose final dir is missing on the next download', async () => {
+  it('recovers an orphaned dead-owner publish backup whose final dir is missing on the next download', async () => {
     // A crash left the model missing under an orphaned backup (swap died after the
-    // finalDir→backup move). The backup is a complete owned install.
-    const backup = join(stagingRoot(), `${SLUG}.backup-11111111-1111-1111-1111-111111111111`);
+    // finalDir→backup move). The backup is a complete owned install; its owner pid
+    // (999999999) is DEAD, so the sweep is free to reclaim it.
+    const backup = join(stagingRoot(), `${SLUG}.backup-999999999.11111111-1111-1111-1111-111111111111`);
     mkdirSync(backup, { recursive: true });
     writeFileSync(join(backup, 'config.json'), Buffer.alloc(12, 0xab));
     writeFileSync(join(backup, 'model.safetensors'), Buffer.alloc(300, 0xab));
@@ -688,7 +688,7 @@ describe('DownloadManager', () => {
     expect(hub.downloaded).toEqual([]);
   });
 
-  it('reaps a leaked publish backup when its final dir already exists', async () => {
+  it('reaps a leaked dead-owner publish backup when its final dir already exists', async () => {
     // A complete owned install already present.
     mkdirSync(finalDir(), { recursive: true });
     writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12));
@@ -697,8 +697,9 @@ describe('DownloadManager', () => {
       join(finalDir(), DOWNLOAD_COMPLETE_MARKER),
       JSON.stringify({ repo: REPO, revision: hub.sha, files: ['config.json', 'model.safetensors'], completedAt: 'x' }),
     );
-    // A leaked backup from a prior successful swap that never got cleaned.
-    const backup = join(stagingRoot(), `${SLUG}.backup-22222222-2222-2222-2222-222222222222`);
+    // A leaked backup from a prior successful swap that never got cleaned; its owner
+    // pid (999999999) is DEAD, so the sweep reaps it.
+    const backup = join(stagingRoot(), `${SLUG}.backup-999999999.22222222-2222-2222-2222-222222222222`);
     mkdirSync(backup, { recursive: true });
     writeFileSync(join(backup, 'config.json'), Buffer.alloc(12, 0x5));
 
@@ -714,6 +715,80 @@ describe('DownloadManager', () => {
     expect(existsSync(backup)).toBe(false);
     expect(backupDirs()).toEqual([]);
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
+  });
+
+  it('never touches a live-owner publish backup (a peer mid-publish), and does not restore it over a fresh download', async () => {
+    // finalDir is ABSENT; a backup tagged with a LIVE owner pid (this process) is a
+    // peer mid-swap — the sweep must leave it alone rather than reclaim it. The job
+    // then downloads fresh into finalDir; the live backup survives byte-for-byte.
+    const liveBackup = join(stagingRoot(), `${SLUG}.backup-${process.pid}.33333333-3333-3333-3333-333333333333`);
+    mkdirSync(liveBackup, { recursive: true });
+    writeFileSync(join(liveBackup, 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(liveBackup, 'model.safetensors'), Buffer.alloc(300, 0xab));
+    expect(existsSync(finalDir())).toBe(false);
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const id = manager.start(REPO);
+    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+
+    // The live-owner backup was NEVER restored/reaped: it survives intact…
+    expect(existsSync(liveBackup)).toBe(true);
+    expect(readFileSync(join(liveBackup, 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+    // …and finalDir holds the freshly downloaded (zero-byte) content, not the backup's 0xAB.
+    expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12));
+    expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
+  });
+
+  it('does NOT invalidate or unlink a cache pointer whose PARENT resolves outside the cache dir', async () => {
+    // The pointer's PARENT dir is a symlink escaping the managed cache (only possible
+    // via a foreign/poisoned cache layout, never via the hub). On verify failure the
+    // containment guard must skip invalidation entirely: neither the pointer symlink
+    // nor its out-of-cache target may be removed.
+    hub.manifest = [
+      { type: 'file', path: 'config.json', size: 12 },
+      {
+        type: 'file',
+        path: 'model.safetensors',
+        // lfs.oid deliberately WRONG so post-copy verification always fails and the
+        // invalidation path runs on every attempt.
+        size: 300,
+        lfs: { oid: zerosSha256(299), size: 300, pointerSize: 100 },
+      },
+    ];
+    // Redirect the revision dir under snapshots/ to an EXTERNAL location so the
+    // pointer's parent realpaths OUTSIDE cacheDir.
+    const extRevDir = join(modelsDir, 'ext-rev');
+    mkdirSync(extRevDir, { recursive: true });
+    mkdirSync(join(cacheDir, 'snapshots'), { recursive: true });
+    symlinkSync(extRevDir, join(cacheDir, 'snapshots', hub.sha));
+    // A foreign blob (outside the cache) with wrong content, reached via a cache-HIT
+    // pointer symlink that lives inside the escaped revision dir.
+    const foreignBlob = join(modelsDir, 'ext-victim.bin');
+    writeFileSync(foreignBlob, Buffer.alloc(300, 0xff));
+    const pointerInExt = join(extRevDir, 'model.safetensors');
+    symlinkSync(foreignBlob, pointerInExt);
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
+
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+    // The foreign blob SURVIVES (containment refused to delete it)…
+    expect(existsSync(foreignBlob)).toBe(true);
+    expect(readFileSync(foreignBlob)).toEqual(Buffer.alloc(300, 0xff));
+    // …and the pointer symlink itself was NOT unlinked (its parent escaped the cache).
+    expect(readdirSync(extRevDir)).toContain('model.safetensors');
+    expect(existsSync(finalDir())).toBe(false);
   });
 
   it('publishes exactly the manifest, ignoring a stale file in a legacy shared staging path', async () => {
@@ -862,53 +937,15 @@ describe('DownloadManager', () => {
   });
 });
 
-describe('model lock (lock.ts)', () => {
-  function makeLockPath(): string {
-    mkdirSync(stagingRoot(), { recursive: true });
-    return join(stagingRoot(), 'somemodel.lock');
-  }
-
-  it('makes a second acquire wait then throw while a live holder is held (never silently proceeds)', async () => {
-    const p = makeLockPath();
-    const held = await acquireLock(p);
-    await expect(acquireLock(p, { waitMs: 60, pollMs: 10 })).rejects.toThrow(/already downloading/);
-    await held.release();
-    expect(existsSync(p)).toBe(false);
-  });
-
-  it('steals a lock whose holder pid is dead', async () => {
-    const p = makeLockPath();
-    writeFileSync(p, JSON.stringify({ pid: 999999999, at: Date.now() }));
-    const stolen = await acquireLock(p, { waitMs: 60, pollMs: 10 });
-    // We now own it: the lockfile records our pid.
-    expect((JSON.parse(readFileSync(p, 'utf-8')) as { pid: number }).pid).toBe(process.pid);
-    await stolen.release();
-    expect(existsSync(p)).toBe(false);
-  });
-
-  it('steals a lock whose holder is alive but past the staleness backstop', async () => {
-    const p = makeLockPath();
-    // Our own (alive) pid, written long ago; a tiny staleMs makes it stealable anyway.
-    writeFileSync(p, JSON.stringify({ pid: process.pid, at: Date.now() - 10_000 }));
-    const stolen = await acquireLock(p, { staleMs: 1, waitMs: 60, pollMs: 10 });
-    expect((JSON.parse(readFileSync(p, 'utf-8')) as { at: number }).at).toBeGreaterThan(Date.now() - 5_000);
-    await stolen.release();
-    expect(existsSync(p)).toBe(false);
-  });
-
-  it('release unlinks only the holder this process owns, never a stealer that took over', async () => {
-    const p = makeLockPath();
-    const held = await acquireLock(p);
-    // A stealer overwrites the lockfile with its own pid.
-    writeFileSync(p, JSON.stringify({ pid: 424242, at: Date.now() }));
-    await held.release();
-    // Our release must NOT remove the stealer's lock.
-    expect(existsSync(p)).toBe(true);
-    expect((JSON.parse(readFileSync(p, 'utf-8')) as { pid: number }).pid).toBe(424242);
-  });
-
-  it('pidAlive: the current process is alive; a nonexistent pid is dead', () => {
+describe('pidAlive (download.ts)', () => {
+  it('reports the current process alive and a nonexistent pid dead', () => {
     expect(pidAlive(process.pid)).toBe(true);
     expect(pidAlive(999999999)).toBe(false);
+  });
+
+  it('treats an invalid pid as ALIVE so a corrupt value can never drive a deletion', () => {
+    expect(pidAlive(0)).toBe(true);
+    expect(pidAlive(-1)).toBe(true);
+    expect(pidAlive(Number.NaN)).toBe(true);
   });
 });
