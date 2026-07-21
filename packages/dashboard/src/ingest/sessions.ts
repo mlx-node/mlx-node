@@ -421,10 +421,22 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
     }
   }
 
+  // A row survives reconciliation only while its path is still a REGULAR file —
+  // the same lstat predicate the scanner uses. `existsSync` follows a symlink, so
+  // a row whose file was swapped for an in-root symlink to another transcript
+  // would otherwise persist and serve a foreign session's content on detail.
+  const stillPresent = (p: string): boolean => {
+    try {
+      return lstatSync(p).isFile();
+    } catch {
+      return false;
+    }
+  };
+
   let removed = 0;
   const known = db.select({ id: sessions.id, path: sessions.path }).from(sessions).all();
   for (const row of known) {
-    if (existsSync(row.path)) continue;
+    if (stillPresent(row.path)) continue;
     sqlite.exec('BEGIN');
     try {
       db.delete(turns).where(eq(turns.sessionId, row.id)).run();

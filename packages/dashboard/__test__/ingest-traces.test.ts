@@ -1,4 +1,4 @@
-import { cpSync, mkdtempSync, existsSync, rmSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, existsSync, rmSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -145,6 +145,37 @@ describe('ingestTraces', () => {
     const res = await ingestTraces(dash, dir);
     expect(res.files).toBe(0);
     expect(dash.db.select().from(traces).all()).toHaveLength(0);
+  });
+
+  // Finding 6: a `null` JSONL line is valid JSON but not an object. Field access
+  // on it throws; that throw must be contained per-line, not abort the whole pass
+  // (which would skip every later valid record and the reconciliation forever).
+  it('skips a null line and still ingests a following valid trace', async () => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '2026-07-01-nullline.jsonl'), `null\n${traceLine('trace-after-null')}`);
+
+    const res = await ingestTraces(dash, dir);
+    expect(res.files).toBe(1);
+    expect(res.records).toBe(1);
+
+    const row = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-after-null')).all()[0];
+    expect(row).toBeDefined();
+    expect(row.traceId).toBe('trace-after-null');
+  });
+
+  // Finding 6 (precision): other non-object scalars/arrays are also skipped, and a
+  // valid record on the same line-loop still lands — one bad line never wins.
+  it('skips scalar and array lines without aborting the file', async () => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, '2026-07-01-mixed.jsonl'),
+      `42\n"a string"\n[1,2,3]\n{"not":"a trace"}\n${traceLine('trace-survivor')}`,
+    );
+
+    const res = await ingestTraces(dash, dir);
+    expect(res.files).toBe(1);
+    expect(res.records).toBe(1);
+    expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-survivor')).all()).toHaveLength(1);
   });
 
   // Finding J: deleting the WHOLE trace dir must still reconcile tracked rows,

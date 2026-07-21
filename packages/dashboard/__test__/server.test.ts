@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { request } from 'node:http';
-import { networkInterfaces, tmpdir } from 'node:os';
+import { homedir, networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -19,7 +19,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import { createDownloadSseSender } from '../src/api.js';
 import type { DownloadEvent } from '../src/download.js';
-import { startDashboardServer, type DashboardServer } from '../src/server.js';
+import { agentSessionsRoot } from '../src/paths.js';
+import { bracketHost, startDashboardServer, type DashboardServer } from '../src/server.js';
 
 const FIXTURE_SESSIONS = fileURLToPath(new URL('./fixtures/sessions', import.meta.url));
 const FIXTURE_TRACES = fileURLToPath(new URL('./fixtures/traces', import.meta.url));
@@ -386,6 +387,41 @@ describe('dashboard server — session symlink containment (Finding 4)', () => {
     // The row still points at filePath, but it now resolves outside the root.
     expect((await fetch(`${server.url}/api/sessions/fix-1`)).status).toBe(403);
   });
+
+  // Finding 5: an IN-ROOT swap passes realpath containment (the target is a real
+  // session inside the root), so the detail handler must additionally require the
+  // parsed header id to still be THIS row. A file (or in-root symlink) that now
+  // holds a different session → 409, and reconciling the stale row → 404 next.
+  it('409s a GET whose indexed file resolves in-root to a different session, then drops the row', async () => {
+    await ingest();
+    const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+      sessions: Array<{ id: string; path: string }>;
+    };
+    const aPath = before.sessions.find((s) => s.id === 'fix-1')!.path;
+
+    // A genuine in-root session B (the symlink target — a regular file in the root).
+    const bPath = join(sessionsRoot, '--w--', '2026-07-11T10-00-00_sess-B.jsonl');
+    writeFileSync(
+      bPath,
+      `${[
+        { type: 'session', version: 3, id: 'sess-B', timestamp: '2026-07-11T10:00:00.000Z', cwd: '/w' },
+        { type: 'message', id: 'b1', parentId: null, timestamp: '2026-07-11T10:00:01.000Z', message: { role: 'user', content: 'B in root' } },
+      ]
+        .map((l) => JSON.stringify(l))
+        .join('\n')}\n`,
+    );
+
+    // Swap A's real file for an in-root symlink to B: containment passes, header id won't.
+    unlinkSync(aPath);
+    symlinkSync(bPath, aPath);
+
+    // fix-1's row resolves (in-root) to B, whose header id is sess-B, not fix-1 → 409.
+    expect((await fetch(`${server.url}/api/sessions/fix-1`)).status).toBe(409);
+    // The 409 path reconciles: A's row (now a symlink, not a regular file) is dropped.
+    expect((await fetch(`${server.url}/api/sessions/fix-1`)).status).toBe(404);
+    // B itself indexes and serves normally.
+    expect((await fetch(`${server.url}/api/sessions/sess-B`)).status).toBe(200);
+  });
 });
 
 describe('dashboard server — metrics overview', () => {
@@ -405,6 +441,55 @@ describe('dashboard server — metrics overview', () => {
     expect(Array.isArray(body.modelShare)).toBe(true);
     expect(body.totals.turns).toBeGreaterThan(0);
     expect(body.totals.outputTokens).toBeGreaterThan(0);
+  });
+
+  // Finding 4: a forked session copies fix-1's turns verbatim (same entry ids and
+  // mlxTraceId) into a new session file. The per-session views keep every copy,
+  // but the GLOBAL overview must count each inference once.
+  it('counts a forked inference once in the global overview, not per copy', async () => {
+    const fork = [
+      { type: 'session', version: 3, id: 'fork-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
+      { type: 'message', id: 'm1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'Hello, world', timestamp: 1782036001000 } },
+      {
+        type: 'message',
+        id: 'm2',
+        parentId: 'm1',
+        timestamp: '2026-07-01T10:00:02.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Hi there' }], model: 'qwen3_5', usage: { input: 100, output: 50, cacheRead: 10, reasoning: 5 }, timestamp: 1782036002000, mlxTraceId: 'trace-aaa' },
+      },
+      { type: 'message', id: 'm3', parentId: 'm2', timestamp: '2026-07-01T10:00:03.000Z', message: { role: 'user', content: 'Second question', timestamp: 1782036003000 } },
+      {
+        type: 'message',
+        id: 'm4',
+        parentId: 'm3',
+        timestamp: '2026-07-01T10:00:04.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'An answer' }], model: 'qwen3_5', usage: { input: 180, output: 60, cacheRead: 100, reasoning: 12 }, timestamp: 1782036004000 },
+      },
+    ];
+    writeFileSync(
+      join(sessionsRoot, '--w--', '2026-07-01T11-00-00_fork-1.jsonl'),
+      `${fork.map((l) => JSON.stringify(l)).join('\n')}\n`,
+    );
+    await ingest();
+
+    const body = (await (await fetch(`${server.url}/api/metrics/overview`)).json()) as {
+      modelShare: Array<{ model: string; turns: number; outputTokens: number }>;
+      totals: { turns: number; inputTokens: number; outputTokens: number; cachedTokens: number; reasoningTokens: number };
+    };
+    // fix-1 (2 turns) + fix-2 (1) + fork-1 (2 verbatim copies of fix-1) → 3 distinct.
+    expect(body.totals.turns).toBe(3);
+    expect(body.totals.inputTokens).toBe(320); // 100 + 180 + 40 — fork copies collapsed
+    expect(body.totals.outputTokens).toBe(130); // 50 + 60 + 20
+    expect(body.totals.cachedTokens).toBe(110); // 10 + 100 + 0
+    expect(body.totals.reasoningTokens).toBe(17); // 5 + 12 + 0
+
+    // Distinct real inferences per model stay separate: qwen3_5 (2), gemma4 (1).
+    const qwen = body.modelShare.find((m) => m.model === 'qwen3_5');
+    const gemma = body.modelShare.find((m) => m.model === 'gemma4');
+    expect(qwen?.turns).toBe(2);
+    expect(qwen?.outputTokens).toBe(110);
+    expect(gemma?.turns).toBe(1);
+    expect(gemma?.outputTokens).toBe(20);
   });
 });
 
@@ -786,5 +871,74 @@ describe('dashboard server — SSE downloads', () => {
     expect(new TextDecoder().decode(value)).toContain('connected');
     await reader.cancel();
     controller.abort();
+  });
+});
+
+// Finding low: the round-6 display fix bracketed ONLY the `::1` loopback literal,
+// so a concrete non-loopback IPv6 bind (`--host 2001:db8::1`) rendered
+// `http://2001:db8::1:PORT`, which `new URL()` rejects → the CLI prints/opens a
+// broken address. Every bare IPv6 literal must be bracketed. Verified via the
+// exported `bracketHost` so the assertion is deterministic without an actual
+// non-loopback bind (which a sandbox cannot perform); the `::1` and wildcard
+// binds still exercise the full path in the blocks above.
+describe('dashboard server — bracketHost display URL (every IPv6 literal)', () => {
+  it('brackets bare IPv6 literals and leaves IPv4/hostnames/pre-bracketed hosts alone', () => {
+    expect(bracketHost('127.0.0.1')).toBe('127.0.0.1');
+    expect(bracketHost('localhost')).toBe('localhost');
+    expect(bracketHost('::1')).toBe('[::1]');
+    expect(bracketHost('2001:db8::1')).toBe('[2001:db8::1]');
+    expect(bracketHost('[::1]')).toBe('[::1]'); // already bracketed → unchanged
+  });
+
+  it('yields a URL new URL() accepts for a concrete non-loopback IPv6 bind', () => {
+    const url = `http://${bracketHost('2001:db8::1')}:6590`;
+    const parsed = new URL(url);
+    expect(parsed.protocol).toBe('http:');
+    expect(parsed.hostname).toBe('[2001:db8::1]');
+    expect(parsed.port).toBe('6590');
+    expect(url).toBe('http://[2001:db8::1]:6590');
+  });
+
+  it('brackets a scoped link-local literal so the string stays well-formed', () => {
+    // A `%zone` id cannot ride in a WHATWG URL, but the printed string must at
+    // least be bracketed (not a raw `fe80::1%en0:PORT`) and must not crash.
+    expect(bracketHost('fe80::1%en0')).toBe('[fe80::1%en0]');
+  });
+});
+
+// Finding 7: sessions written under a custom agent home (`PI_CODING_AGENT_DIR`)
+// must be discoverable. `agentSessionsRoot()` resolves that env var the same way
+// the agent/pi do, falling back to the default home.
+describe('paths — agentSessionsRoot honors PI_CODING_AGENT_DIR', () => {
+  const KEY = 'PI_CODING_AGENT_DIR';
+
+  function withEnv(value: string | undefined, fn: () => void): void {
+    const saved = process.env[KEY];
+    if (value === undefined) delete process.env[KEY];
+    else process.env[KEY] = value;
+    try {
+      fn();
+    } finally {
+      if (saved === undefined) delete process.env[KEY];
+      else process.env[KEY] = saved;
+    }
+  }
+
+  it('falls back to ~/.mlx-node/agent/sessions when unset', () => {
+    withEnv(undefined, () => {
+      expect(agentSessionsRoot()).toBe(join(homedir(), '.mlx-node', 'agent', 'sessions'));
+    });
+  });
+
+  it('derives <PI_CODING_AGENT_DIR>/sessions for an absolute override', () => {
+    withEnv('/tmp/custom-agent', () => {
+      expect(agentSessionsRoot()).toBe(join('/tmp/custom-agent', 'sessions'));
+    });
+  });
+
+  it('expands a ~/ override with the pi tilde rule', () => {
+    withEnv('~/agent-home', () => {
+      expect(agentSessionsRoot()).toBe(join(homedir(), 'agent-home', 'sessions'));
+    });
   });
 });

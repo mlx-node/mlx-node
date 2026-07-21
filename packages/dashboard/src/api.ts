@@ -11,7 +11,7 @@ import { existsSync, realpathSync, rmSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { basename, dirname, join, sep } from 'node:path';
 
-import { SessionManager, type SessionEntry } from '@earendil-works/pi-coding-agent';
+import { SessionManager, type FileEntry, type SessionEntry } from '@earendil-works/pi-coding-agent';
 import { eq } from 'drizzle-orm';
 
 import { scanColdCache, clearColdCache, evictOlderThan } from './cache.js';
@@ -476,7 +476,7 @@ function mapTranscriptEntry(entry: SessionEntry): TranscriptEntry | null {
   return mapped;
 }
 
-function handleSessionDetail({ res, params, deps }: RouteCtx): void {
+async function handleSessionDetail({ res, params, deps }: RouteCtx): Promise<void> {
   const found = lookupSession(deps, params.id);
   if (found === null) {
     sendError(res, 404, `Session "${params.id}" not found`);
@@ -491,6 +491,7 @@ function handleSessionDetail({ res, params, deps }: RouteCtx): void {
     return;
   }
   const { row } = found;
+  let entries: FileEntry[] | null = null;
   let transcript: TranscriptEntry[] = [];
   let transcriptError: string | undefined;
   try {
@@ -499,7 +500,22 @@ function handleSessionDetail({ res, params, deps }: RouteCtx): void {
     // write and migrates on construction, so a plain GET of a v1 or partially
     // corrupt session would persist the migration and permanently drop malformed
     // lines — a read must never mutate the source of truth.
-    const entries = readSessionEntries(row.path);
+    entries = readSessionEntries(row.path);
+  } catch (err) {
+    transcriptError = err instanceof Error ? err.message : String(err);
+  }
+  if (entries !== null) {
+    // The indexed path may resolve (in-root) to a DIFFERENT session than this row
+    // — its file swapped for another transcript, or for an in-root symlink to one.
+    // Containment alone can't catch that (the target is still in-root), so require
+    // the parsed header id to still be THIS row before serving its metadata with
+    // that file's transcript. On mismatch, reconcile the stale row and refuse.
+    const header = entries.find((e) => e.type === 'session') as { id?: unknown } | undefined;
+    if (header === undefined || header.id !== row.id) {
+      await deps.runIngest();
+      sendError(res, 409, `Session "${params.id}" no longer matches its indexed file`);
+      return;
+    }
     // A file mutated into a cycle/self-parent since it was indexed (ingest
     // warns+skips but leaves the stale row) would send pi's visited-set-free
     // branch walker into a non-terminating loop that no try/catch can intercept.
@@ -517,8 +533,6 @@ function handleSessionDetail({ res, params, deps }: RouteCtx): void {
       transcript = activeBranchEntries(entries).map(mapTranscriptEntry).filter(isMessage);
       transcript.sort((a, b) => a.ts - b.ts);
     }
-  } catch (err) {
-    transcriptError = err instanceof Error ? err.message : String(err);
   }
   sendJson(res, 200, {
     session: {
@@ -678,6 +692,14 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
     return parts.length > 0 ? `WHERE ${parts.join(' AND ')}` : '';
   };
 
+  // A forked session copies inherited turns VERBATIM (same trace_id/entry_id) into
+  // a new session file, so the same inference lands as multiple `turns` rows. The
+  // per-session views keep every copy (each transcript is correct), but these
+  // GLOBAL token sums must count each inference once — collapse copies on their
+  // canonical identity `COALESCE(trace_id, entry_id, CAST(id AS TEXT))` (the
+  // autoincrement id keeps genuinely-distinct, both-null rows separate).
+  const dedupKey = 'COALESCE(trace_id, entry_id, CAST(id AS TEXT))';
+
   const tokensByDay = sqlite
     .prepare(
       `SELECT date(ts / 1000, 'unixepoch') AS day,
@@ -685,7 +707,9 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
               COALESCE(SUM(output_tokens), 0) AS output,
               COALESCE(SUM(cached_tokens), 0) AS cached,
               COALESCE(SUM(reasoning_tokens), 0) AS reasoning
-       FROM turns ${turnsWhere('ts > 0')} GROUP BY day ORDER BY day`,
+       FROM (SELECT input_tokens, output_tokens, cached_tokens, reasoning_tokens, ts
+             FROM turns ${turnsWhere('ts > 0')} GROUP BY ${dedupKey})
+       GROUP BY day ORDER BY day`,
     )
     .all(...turnsRange.args)
     .map((row) => ({
@@ -731,7 +755,9 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
     .prepare(
       `SELECT COALESCE(model, 'unknown') AS model, COUNT(*) AS turns,
               COALESCE(SUM(output_tokens), 0) AS outputTokens
-       FROM turns ${turnsWhere('')} GROUP BY model ORDER BY turns DESC`,
+       FROM (SELECT model, output_tokens
+             FROM turns ${turnsWhere('')} GROUP BY ${dedupKey})
+       GROUP BY model ORDER BY turns DESC`,
     )
     .all(...turnsRange.args)
     .map((row) => ({ model: String(row.model), turns: toInt(row.turns), outputTokens: toInt(row.outputTokens) }));
@@ -742,7 +768,8 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
               COALESCE(SUM(output_tokens), 0) AS outputTokens,
               COALESCE(SUM(cached_tokens), 0) AS cachedTokens,
               COALESCE(SUM(reasoning_tokens), 0) AS reasoningTokens
-       FROM turns ${turnsWhere('')}`,
+       FROM (SELECT input_tokens, output_tokens, cached_tokens, reasoning_tokens
+             FROM turns ${turnsWhere('')} GROUP BY ${dedupKey})`,
     )
     .get(...turnsRange.args);
   const traceTotals = sqlite

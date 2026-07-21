@@ -51,6 +51,19 @@ const INGEST_INTERVAL_MS = 30_000;
 const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1']);
 
 /**
+ * Wrap a bare IPv6 literal in `[...]` so it is safe inside a URL authority. Any
+ * host carrying a `:` that is not already bracketed is an IPv6 literal (`::1`,
+ * `2001:db8::1`, or a scoped `fe80::1%en0`); an unbracketed one makes the trailing
+ * `:<port>` ambiguous and `new URL()` reject it. IPv4/hostnames (no `:`) and
+ * already-bracketed literals pass through unchanged. A scoped literal is bracketed
+ * too: `new URL` still rejects the `%`, but the printed string stays well-formed
+ * rather than crashing the caller.
+ */
+export function bracketHost(host: string): string {
+  return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+}
+
+/**
  * Build the Host/Origin allowlist for a bind. A concrete host allows the
  * loopback names plus that exact host. A wildcard bind (`0.0.0.0`, `::`, or the
  * empty string) cannot allowlist the literal wildcard — no browser ever sends it
@@ -294,9 +307,10 @@ export async function startDashboardServer(opts: DashboardServerOptions = {}): P
   // Host allowlist accepts. `::` binds IPv6 → `[::1]`; `0.0.0.0`/'' bind IPv4 →
   // `127.0.0.1`. Both are in LOCAL_HOSTNAMES, so the printed/opened URL passes
   // classifyHost, unlike the raw wildcard (`0.0.0.0` → 403, `::`/'' → malformed).
-  // A concrete host is advertised as-is, bracketing the IPv6 loopback literal.
+  // A concrete host is advertised as-is, bracketing any IPv6 literal (`::1`,
+  // `2001:db8::1`, …) so the URL parses.
   const wildcard = host === '0.0.0.0' || host === '::' || host === '';
-  const displayHost = wildcard ? (host === '::' ? '[::1]' : '127.0.0.1') : host === '::1' ? '[::1]' : host;
+  const displayHost = wildcard ? (host === '::' ? '[::1]' : '127.0.0.1') : bracketHost(host);
   const url = `http://${displayHost}:${boundPort}`;
 
   return {

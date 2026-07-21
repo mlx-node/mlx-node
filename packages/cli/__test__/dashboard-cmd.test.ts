@@ -6,6 +6,9 @@
  * addon is never touched. `process.exit` is mocked to throw so validation
  * failures are observable as rejections instead of tearing down the worker.
  */
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vite-plus/test';
 
 vi.mock('@mlx-node/dashboard', () => ({
@@ -53,6 +56,11 @@ describe('mlx dashboard flag parsing', () => {
     expect(args.db).toBe('/tmp/dash.db');
     expect(args.modelsDir).toBe('/tmp/models');
     expect(args.host).toBe('localhost');
+  });
+
+  it('accepts --session-dir and defaults it to undefined', () => {
+    expect(parseDashboardArgs([]).sessionDir).toBeUndefined();
+    expect(parseDashboardArgs(['--session-dir', '/tmp/agent/sessions']).sessionDir).toBe('/tmp/agent/sessions');
   });
 
   it('throws on a non-numeric --port at the parse layer', () => {
@@ -105,6 +113,38 @@ describe('mlx dashboard run()', () => {
     await runDashboard([], { openBrowser });
 
     expect(openBrowser).toHaveBeenCalledWith('http://127.0.0.1:6590');
+  });
+
+  it('forwards --session-dir to the server as sessionsRoot (highest precedence)', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const openBrowser = vi.fn();
+
+    await runDashboard(['--session-dir', '/tmp/custom-sessions', '--no-open'], { openBrowser });
+
+    expect(startDashboardServer).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionsRoot: '/tmp/custom-sessions' }),
+    );
+  });
+
+  it('expands a ~/ --session-dir with the pi tilde rule', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const openBrowser = vi.fn();
+
+    await runDashboard(['--session-dir', '~/agent-home/sessions', '--no-open'], { openBrowser });
+
+    expect(startDashboardServer).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionsRoot: join(homedir(), 'agent-home/sessions') }),
+    );
+  });
+
+  it('leaves sessionsRoot undefined without --session-dir (server falls back to env/default)', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const openBrowser = vi.fn();
+
+    await runDashboard(['--no-open'], { openBrowser });
+
+    const call = vi.mocked(startDashboardServer).mock.calls[0]![0]!;
+    expect(call.sessionsRoot).toBeUndefined();
   });
 
   it('warns loudly when binding a non-loopback host', async () => {

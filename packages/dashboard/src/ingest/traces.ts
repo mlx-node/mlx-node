@@ -111,36 +111,42 @@ export async function ingestTraces(
     for (const line of content.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed) continue;
-      let rec: ParsedTrace;
+      let rec: unknown;
       try {
-        rec = JSON.parse(trimmed) as ParsedTrace;
+        rec = JSON.parse(trimmed);
       } catch {
         continue;
       }
-      if (typeof rec.traceId !== 'string') continue;
-      const ts = numOrNull(rec.ts);
+      // A syntactically-valid but non-object line (`null`, a scalar, an array)
+      // carries no fields to read. Skip it here — before any field access — so a
+      // single bad record cannot throw out of this per-line loop and abort the
+      // rest of the file, later files, or the retention reconciliation below.
+      if (typeof rec !== 'object' || rec === null || Array.isArray(rec)) continue;
+      const trace = rec as ParsedTrace;
+      if (typeof trace.traceId !== 'string') continue;
+      const ts = numOrNull(trace.ts);
       db.insert(traces)
         .values({
-          traceId: rec.traceId,
-          sessionId: strOrNull(rec.sessionId),
-          rootSessionId: strOrNull(rec.rootSessionId),
+          traceId: trace.traceId,
+          sessionId: strOrNull(trace.sessionId),
+          rootSessionId: strOrNull(trace.rootSessionId),
           ts: ts ?? 0,
-          model: strOrNull(rec.model),
-          ttftMs: numOrNull(rec.ttftMs),
-          prefillTps: numOrNull(rec.prefillTps),
-          decodeTps: numOrNull(rec.decodeTps),
-          mtpCycles: numOrNull(rec.mtpCycles),
-          mtpMeanAccepted: numOrNull(rec.mtpMeanAccepted),
-          durationMs: numOrNull(rec.durationMs),
-          finishReason: strOrNull(rec.finishReason),
-          promptTokens: numOrNull(rec.promptTokens),
-          cachedTokens: numOrNull(rec.cachedTokens),
-          outputTokens: numOrNull(rec.outputTokens),
-          reasoningTokens: numOrNull(rec.reasoningTokens),
-          coldHits: numOrNull(rec.coldHits),
-          coldMisses: numOrNull(rec.coldMisses),
-          coldBytesWritten: numOrNull(rec.coldBytesWritten),
-          coldBytesRestored: numOrNull(rec.coldBytesRestored),
+          model: strOrNull(trace.model),
+          ttftMs: numOrNull(trace.ttftMs),
+          prefillTps: numOrNull(trace.prefillTps),
+          decodeTps: numOrNull(trace.decodeTps),
+          mtpCycles: numOrNull(trace.mtpCycles),
+          mtpMeanAccepted: numOrNull(trace.mtpMeanAccepted),
+          durationMs: numOrNull(trace.durationMs),
+          finishReason: strOrNull(trace.finishReason),
+          promptTokens: numOrNull(trace.promptTokens),
+          cachedTokens: numOrNull(trace.cachedTokens),
+          outputTokens: numOrNull(trace.outputTokens),
+          reasoningTokens: numOrNull(trace.reasoningTokens),
+          coldHits: numOrNull(trace.coldHits),
+          coldMisses: numOrNull(trace.coldMisses),
+          coldBytesWritten: numOrNull(trace.coldBytesWritten),
+          coldBytesRestored: numOrNull(trace.coldBytesRestored),
           sourceFile: name,
         })
         .onConflictDoNothing()

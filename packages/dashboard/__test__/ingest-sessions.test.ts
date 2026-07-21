@@ -294,6 +294,54 @@ describe('ingestSessions', () => {
     rmSync(soloBase, { recursive: true, force: true });
   });
 
+  // Finding 5: reconciliation must drop a row whose indexed file was swapped for a
+  // symlink. `existsSync` follows the link (keeping the stale row), so the removal
+  // loop uses the same lstat-is-regular predicate the scanner does.
+  it('reconciles a row whose file was replaced by an in-root symlink', async () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-relink-'));
+    const root = join(soloBase, 'sessions');
+    const dir = join(root, '--w--');
+    mkdirSync(dir, { recursive: true });
+
+    const aFile = join(dir, 'a.jsonl');
+    writeFileSync(
+      aFile,
+      `${[
+        { type: 'session', version: 3, id: 'link-A', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
+        { type: 'message', id: 'a1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'A' } },
+      ]
+        .map((l) => JSON.stringify(l))
+        .join('\n')}\n`,
+    );
+    // A genuine sibling B (the symlink target — a regular file elsewhere in root).
+    const bFile = join(dir, 'b.jsonl');
+    writeFileSync(
+      bFile,
+      `${[
+        { type: 'session', version: 3, id: 'link-B', timestamp: '2026-07-02T10:00:00.000Z', cwd: '/w' },
+        { type: 'message', id: 'b1', parentId: null, timestamp: '2026-07-02T10:00:01.000Z', message: { role: 'user', content: 'B' } },
+      ]
+        .map((l) => JSON.stringify(l))
+        .join('\n')}\n`,
+    );
+
+    await ingestSessions(dash, root);
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'link-A')).all()).toHaveLength(1);
+
+    // Swap A's real file for a symlink to B. `existsSync(aFile)` still resolves
+    // true (it follows the link), but lstat sees a non-regular file → drop the row.
+    unlinkSync(aFile);
+    symlinkSync(bFile, aFile);
+
+    const res = await ingestSessions(dash, root);
+    expect(res.removed).toBe(1);
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'link-A')).all()).toHaveLength(0);
+    // B (a real file) stays indexed.
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'link-B')).all()).toHaveLength(1);
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
+
   // Finding 3: the delete-time guard used by the API before rmSync.
   it('verifySessionFileId matches only the file current header id', () => {
     const soloBase = mkdtempSync(join(tmpdir(), 'dash-verify-'));

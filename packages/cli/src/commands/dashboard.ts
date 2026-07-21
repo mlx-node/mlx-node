@@ -5,6 +5,8 @@ import { parseArgs } from 'node:util';
 
 import { startDashboardServer } from '@mlx-node/dashboard';
 
+import { expandPiAgentDir } from './agent/index.js';
+
 const DEFAULT_PORT = 6590;
 const DEFAULT_HOST = '127.0.0.1';
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
@@ -16,6 +18,7 @@ export interface DashboardArgs {
   open: boolean;
   db?: string;
   modelsDir?: string;
+  sessionDir?: string;
 }
 
 /** Dependencies injected only by tests; production callers pass nothing. */
@@ -40,6 +43,9 @@ Options:
                       (default: ~/.mlx-node/dashboard.db)
   --models-dir <path> Directory to read local models from
                       (default: ~/.mlx-node/models)
+  --session-dir <dir> Agent sessions root to list (default: honors
+                      PI_CODING_AGENT_DIR, else ~/.mlx-node/agent/sessions).
+                      Pass the same dir the agent uses to see custom sessions.
   -h, --help          Show this help message
 
 Examples:
@@ -64,6 +70,7 @@ export function parseDashboardArgs(argv: string[]): DashboardArgs {
       'no-open': { type: 'boolean', default: false },
       db: { type: 'string' },
       'models-dir': { type: 'string' },
+      'session-dir': { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
     },
     allowPositionals: false,
@@ -86,6 +93,7 @@ export function parseDashboardArgs(argv: string[]): DashboardArgs {
     open: !(values['no-open'] ?? false),
     db: values.db,
     modelsDir: values['models-dir'],
+    sessionDir: values['session-dir'],
   };
 }
 
@@ -149,11 +157,17 @@ export async function run(argv: string[], deps: DashboardRunOptions = {}): Promi
 
   const openBrowser = deps.openBrowser ?? openInBrowser;
 
+  // Explicit `--session-dir` wins; expanded via the SAME tilde/file-URL rule the
+  // agent applies to `PI_CODING_AGENT_DIR`. Left undefined, the server falls back
+  // to `agentSessionsRoot()`, which honors `PI_CODING_AGENT_DIR` then the default.
+  const sessionsRoot = args.sessionDir === undefined ? undefined : expandPiAgentDir(args.sessionDir);
+
   const server = await startDashboardServer({
     port: args.port,
     host: args.host,
     dbPath: args.db,
     modelsDir: args.modelsDir,
+    sessionsRoot,
   });
 
   console.log(`mlx dashboard listening on ${server.url}`);
