@@ -9,6 +9,14 @@ export interface DashboardDb {
   close: () => void;
 }
 
+/**
+ * On-disk schema revision. Bump on every DDL change: an existing db stamped
+ * with an older version (or never stamped, i.e. 0) is quarantined+rebuilt
+ * rather than migrated in place. The index is disposable and repopulated from
+ * JSONL on boot, so a rebuild never loses source-of-truth data.
+ */
+const SCHEMA_VERSION = 1;
+
 const DDL = `
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
@@ -70,14 +78,54 @@ CREATE INDEX IF NOT EXISTS idx_traces_trace_id ON traces (trace_id);
 /** SQLite errors that mean the file on disk is not a usable database. */
 const CORRUPTION_RE = /not a database|malformed|disk image|corrupt/i;
 
+/** SQLite DDL errors that mean the on-disk schema predates this build. */
+const SCHEMA_MISMATCH_RE = /no such (table|column)|has no column named/i;
+
 function isCorruptionError(err: unknown): boolean {
   return CORRUPTION_RE.test(err instanceof Error ? err.message : String(err));
 }
 
+function isSchemaMismatchError(err: unknown): boolean {
+  return SCHEMA_MISMATCH_RE.test(err instanceof Error ? err.message : String(err));
+}
+
+/** An existing db whose pages are damaged or whose schema is older than this
+ * build expects. Both are unrecoverable for a disposable index → rebuild. */
+class RebuildRequiredError extends Error {}
+
+/**
+ * Reject an existing db this build cannot safely use:
+ *  - `quick_check` catches page-level damage OUTSIDE the schema pages. The DDL
+ *    only no-ops on an existing schema and never walks data leaf pages, so such
+ *    damage would otherwise slip past open and throw later at query time.
+ *  - `user_version` below SCHEMA_VERSION means an older/foreign schema (e.g. a
+ *    `traces` table predating root_session_id) the current DDL cannot extend in
+ *    place — a stale index rebuilt in place would wedge on CREATE INDEX.
+ * A non-database file makes `quick_check` throw "file is not a database", which
+ * the caller treats as corruption; both routes lead to quarantine+rebuild.
+ */
+function assertUsableSchema(sqlite: DatabaseSync): void {
+  const check = sqlite.prepare('PRAGMA quick_check').get() as { quick_check?: unknown } | undefined;
+  const status = typeof check?.quick_check === 'string' ? check.quick_check : '';
+  if (status.toLowerCase() !== 'ok') {
+    throw new RebuildRequiredError(`quick_check failed: ${status || 'no result'}`);
+  }
+  const uv = sqlite.prepare('PRAGMA user_version').get() as { user_version?: unknown } | undefined;
+  const version = typeof uv?.user_version === 'number' ? uv.user_version : 0;
+  if (version < SCHEMA_VERSION) {
+    throw new RebuildRequiredError(`schema version ${version} < ${SCHEMA_VERSION}`);
+  }
+}
+
 function openWithSchema(path: string): DatabaseSync {
+  // Only validate a file that already existed; a fresh (or quarantined-then-
+  // reopened) path starts empty and is bootstrapped below.
+  const preExisting = path !== ':memory:' && existsSync(path);
   const sqlite = new DatabaseSync(path);
   try {
+    if (preExisting) assertUsableSchema(sqlite);
     sqlite.exec(DDL);
+    sqlite.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
   } catch (err) {
     try {
       sqlite.close();
@@ -118,17 +166,22 @@ function quarantineDbFiles(path: string): void {
  * the file loses nothing — it is rebuilt from JSONL on next open. Pass ':memory:'
  * for an ephemeral in-process index.
  *
- * The index is disposable, so a corrupt file (non-SQLite bytes / malformed db)
- * must not block startup: such errors quarantine the file aside and recreate an
- * empty schema for boot ingest to repopulate. Non-corruption errors (permission,
- * unrelated I/O) are rethrown — they are not a reason to discard data.
+ * The index is disposable, so a file that cannot back the current schema must
+ * not block startup. Three cases quarantine the file aside and recreate an
+ * empty schema for boot ingest to repopulate: non-SQLite bytes / a malformed db
+ * (corruption), page-level damage a `quick_check` flags on open, and an
+ * older/incompatible on-disk schema (`user_version` below SCHEMA_VERSION, or a
+ * DDL that references a column an earlier build never created). Non-recoverable
+ * errors (permission, unrelated I/O) are rethrown — not a reason to discard data.
  */
 export function openDashboardDb(path: string): DashboardDb {
   let sqlite: DatabaseSync;
   try {
     sqlite = openWithSchema(path);
   } catch (err) {
-    if (path === ':memory:' || !isCorruptionError(err)) throw err;
+    const rebuildable =
+      err instanceof RebuildRequiredError || isCorruptionError(err) || isSchemaMismatchError(err);
+    if (path === ':memory:' || !rebuildable) throw err;
     quarantineDbFiles(path);
     sqlite = openWithSchema(path);
   }
