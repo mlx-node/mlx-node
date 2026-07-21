@@ -231,16 +231,20 @@ struct DownloadManifest {
 
 impl DownloadManifest {
     /// True when the manifest lists every on-disk shard, so its immutable
-    /// repo+revision fully pins those exact bytes. Manifest paths are
-    /// repo-relative; top-level shards match by name (== basename).
+    /// repo+revision fully pins those exact bytes.
     fn covers_all_shards(&self, shard_names: &[String]) -> bool {
         shard_names.iter().all(|shard| {
             self.files.iter().any(|file| {
-                file == shard
-                    || Path::new(file)
-                        .file_name()
-                        .and_then(|base| base.to_str())
-                        .is_some_and(|base| base == shard.as_str())
+                // On-disk shards are top-level basenames. Only a manifest entry
+                // that is exactly that basename (a single Normal component: no
+                // directory prefix, not absolute, no `.`/`..`) names the same
+                // repo-relative file. A `subdir/x`, `/abs/x`, or `../x` entry
+                // names a DIFFERENT file -> not coverage -> full digest.
+                let mut comps = Path::new(file).components();
+                matches!(
+                    comps.next(),
+                    Some(std::path::Component::Normal(c)) if c.to_str() == Some(shard.as_str())
+                ) && comps.next().is_none()
             })
         })
     }
@@ -604,6 +608,61 @@ mod tests {
             "an incomplete marker must not suppress the full-digest split"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn subdir_manifest_entry_does_not_cover_top_level_shard() {
+        // On-disk shards enumerate as top-level basenames. A marker whose
+        // `files` list the real weight under a subdir names a DIFFERENT file, so
+        // it must NOT cover a distinct top-level shard of the same basename:
+        // coverage fails, the builder falls to the full digest, and
+        // byte-different top-level shards of equal size fingerprint DIFFERENTLY
+        // (no basename-collision cross-model KV restore).
+        let base = unique_tmp("cold-fp-subdir");
+        let dir_a = base.join("a");
+        let dir_b = base.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        // Same size, DIFFERENT bytes: only the full digest can split them.
+        write_safetensors(
+            &dir_a.join("model.safetensors"),
+            SHARED_HEADER,
+            &[1u8; 4096],
+        );
+        write_safetensors(
+            &dir_b.join("model.safetensors"),
+            SHARED_HEADER,
+            &[2u8; 4096],
+        );
+        // `files` lists the shard under a subdir -> does not cover the top-level
+        // `model.safetensors` -> full-digest fallback.
+        let marker = br#"{"repo":"acme/base","revision":"deadbeef","files":["config.json","weights/model.safetensors"],"completedAt":"2026-01-01T00:00:00Z"}"#;
+        std::fs::write(dir_a.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
+        std::fs::write(dir_b.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
+        assert_ne!(
+            build(&dir_a).unwrap(),
+            build(&dir_b).unwrap(),
+            "a subdir-prefixed manifest entry must not cover a distinct top-level shard"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn covers_all_shards_requires_single_component_basename() {
+        let shards = vec!["model.safetensors".to_string()];
+        let manifest = |files: &[&str]| DownloadManifest {
+            repo: Some("acme/base".to_string()),
+            revision: "deadbeef".to_string(),
+            files: files.iter().map(|s| s.to_string()).collect(),
+        };
+        // Positive: the bare top-level basename covers (cheap path preserved).
+        assert!(manifest(&["model.safetensors"]).covers_all_shards(&shards));
+        // Negative: any directory prefix / absolute / dot segment names a
+        // DIFFERENT (or malformed) file and must fall through to full digest.
+        assert!(!manifest(&["weights/model.safetensors"]).covers_all_shards(&shards));
+        assert!(!manifest(&["/model.safetensors"]).covers_all_shards(&shards));
+        assert!(!manifest(&["../model.safetensors"]).covers_all_shards(&shards));
+        assert!(!manifest(&["./model.safetensors"]).covers_all_shards(&shards));
     }
 
     #[test]
