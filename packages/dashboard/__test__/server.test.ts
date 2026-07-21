@@ -229,6 +229,40 @@ describe('dashboard server — sessions', () => {
     expect(texts.some((t) => t.includes('ABANDONED'))).toBe(false);
   });
 
+  // Finding 5: a GET of the session detail must be READ-ONLY. A v1 session with a
+  // malformed trailing line (the case where an open-for-write migrate would both
+  // persist the v1→v3 rewrite and drop the malformed line) must be left byte-for-
+  // byte unchanged on disk while still returning the valid transcript.
+  it('detail GET does not rewrite a v1 session with a malformed trailing line', async () => {
+    const dir = join(sessionsRoot, '--w--');
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-07-10T10-00-00_ro-1.jsonl');
+    const header = JSON.stringify({ type: 'session', version: 1, id: 'ro-1', timestamp: '2026-07-10T10:00:00.000Z', cwd: '/w' });
+    const user = JSON.stringify({ type: 'message', timestamp: '2026-07-10T10:00:01.000Z', message: { role: 'user', content: 'READ ONLY hi' } });
+    const asst = JSON.stringify({
+      type: 'message',
+      timestamp: '2026-07-10T10:00:02.000Z',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'READ ONLY yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+    });
+    const truncated = '{"type":"message","message":{"role":"asst';
+    const original = `${header}\n${user}\n${asst}\n${truncated}`;
+    writeFileSync(file, original);
+    await ingest();
+    const before = readFileSync(file);
+
+    const res = await fetch(`${server.url}/api/sessions/ro-1`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { transcript: Array<{ text: string }> };
+    const texts = body.transcript.map((t) => t.text);
+    expect(texts.some((t) => t.includes('READ ONLY hi'))).toBe(true);
+    expect(texts.some((t) => t.includes('READ ONLY yo'))).toBe(true);
+
+    // The GET never mutated the source of truth.
+    const after = readFileSync(file);
+    expect(after.equals(before)).toBe(true);
+    expect(after.toString('utf-8')).toBe(original);
+  });
+
   it('deletes a session (file and rows removed)', async () => {
     await ingest();
     const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {

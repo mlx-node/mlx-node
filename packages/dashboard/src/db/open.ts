@@ -1,7 +1,10 @@
 import { existsSync, renameSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 
+import { getTableColumns } from 'drizzle-orm';
 import { drizzle, type NodeSQLiteDatabase } from 'drizzle-orm/node-sqlite';
+
+import { sessions, traces, turns } from './schema.js';
 
 export interface DashboardDb {
   db: NodeSQLiteDatabase;
@@ -119,24 +122,36 @@ function assertUsableSchema(sqlite: DatabaseSync): void {
 }
 
 /**
- * Probe the newest columns of each table so a DDL change that dropped, renamed,
- * or reordered a column WITHOUT bumping SCHEMA_VERSION is caught at open time. A
- * matching `user_version` alone does not prove the columns exist: `CREATE TABLE
- * IF NOT EXISTS` silently no-ops on an already-present table, so drift would
- * otherwise only surface at the first insert/select. A zero-row prepared SELECT
- * touches the schema, never data; a missing column throws → quarantine+rebuild.
+ * Complete expected column set per table, derived straight from the drizzle
+ * schema so a column added to `schema.ts` (without a matching SCHEMA_VERSION
+ * bump) is automatically part of this open-time contract. Keys are the SQLite
+ * table names; values the full set of DB column names each must carry.
+ */
+const EXPECTED_COLUMNS: Record<string, string[]> = {
+  sessions: Object.values(getTableColumns(sessions)).map((c) => c.name),
+  turns: Object.values(getTableColumns(turns)).map((c) => c.name),
+  traces: Object.values(getTableColumns(traces)).map((c) => c.name),
+};
+
+/**
+ * Verify every expected table carries every expected column on the UNTOUCHED
+ * pre-existing db — this MUST run BEFORE the DDL. A matching `user_version` alone
+ * does not prove the schema: `CREATE TABLE IF NOT EXISTS` recreates a dropped
+ * table EMPTY and no-ops over a table missing a newer column, so a signature
+ * check run after the DDL would inspect a state the DDL just fabricated (and the
+ * watermark-gated ingest would never re-populate a silently recreated table).
+ * `PRAGMA table_info` touches only the schema, never data; a missing table
+ * returns zero rows (every column absent). Any gap → quarantine+rebuild.
  */
 function assertSchemaSignature(sqlite: DatabaseSync): void {
-  const probes = [
-    'SELECT id, path, cwd, message_count, first_message, last_ingested_mtime, last_ingested_size FROM sessions LIMIT 0',
-    'SELECT session_id, entry_id, trace_id, model, reasoning_tokens FROM turns LIMIT 0',
-    'SELECT trace_id, root_session_id, cold_hits, cold_bytes_restored, source_file FROM traces LIMIT 0',
-  ];
-  for (const sql of probes) {
-    try {
-      sqlite.prepare(sql).get();
-    } catch (err) {
-      throw new RebuildRequiredError(`schema signature mismatch: ${err instanceof Error ? err.message : String(err)}`);
+  for (const [table, expected] of Object.entries(EXPECTED_COLUMNS)) {
+    // Table names are fixed internal constants, never user input — safe to inline.
+    const rows = sqlite.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: unknown }>;
+    const actual = new Set(rows.map((r) => (typeof r.name === 'string' ? r.name : '')));
+    for (const col of expected) {
+      if (!actual.has(col)) {
+        throw new RebuildRequiredError(`schema signature mismatch: ${table}.${col} missing`);
+      }
     }
   }
 }
@@ -147,12 +162,17 @@ function openWithSchema(path: string): DatabaseSync {
   const preExisting = path !== ':memory:' && existsSync(path);
   const sqlite = new DatabaseSync(path);
   try {
-    if (preExisting) assertUsableSchema(sqlite);
+    // Validate the UNTOUCHED pre-existing db BEFORE any DDL: `CREATE TABLE IF NOT
+    // EXISTS` would recreate a dropped table empty (masking data loss) or no-op
+    // over a table missing a newer column, so a post-DDL probe inspects a
+    // fabricated state. A fresh or just-rebuilt path (preExisting === false)
+    // carries no drift and skips straight to DDL bootstrap.
+    if (preExisting) {
+      assertUsableSchema(sqlite);
+      assertSchemaSignature(sqlite);
+    }
     sqlite.exec(DDL);
     sqlite.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
-    // Only an existing file can carry drifted columns; a freshly created or
-    // just-rebuilt schema is known-good and needs no probe.
-    if (preExisting) assertSchemaSignature(sqlite);
   } catch (err) {
     try {
       sqlite.close();

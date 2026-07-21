@@ -230,6 +230,23 @@ function lastLineParses(raw: string): boolean {
 }
 
 /**
+ * Read a pi session file into the in-memory entry list the index and the detail
+ * API both project from — READ-ONLY. `parseSessionEntries` does not migrate, so
+ * legacy v1 message entries carry no id/parentId the topology guard and branch
+ * walker require; migrate in place (v1→v3) exactly as `ingestSessions` does. This
+ * assigns id/parentId in memory only and never rewrites the file, so a plain read
+ * of a v1 or partially-corrupt session cannot persist the migration or drop
+ * malformed lines the way `SessionManager.open` (which opens for write) would.
+ * Read/parse errors propagate to the caller.
+ */
+export function readSessionEntries(path: string): FileEntry[] {
+  const raw = readFileSync(path, 'utf8');
+  const entries = parseSessionEntries(raw);
+  migrateSessionEntries(entries);
+  return entries;
+}
+
+/**
  * Whether the session file at `path` currently parses to `expectedId`. Used as a
  * last-defense guard before deleting a session file: a stale index row for id A
  * must not `rmSync` a file whose path was reused by a newer session B. A

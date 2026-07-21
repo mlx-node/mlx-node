@@ -19,7 +19,12 @@ import { catalogWithState } from './catalog.js';
 import type { DashboardDb } from './db/open.js';
 import { sessions, turns } from './db/schema.js';
 import type { DownloadManager, DownloadEvent } from './download.js';
-import { activeBranchEntries, isValidSessionTopology, verifySessionFileId } from './ingest/sessions.js';
+import {
+  activeBranchEntries,
+  isValidSessionTopology,
+  readSessionEntries,
+  verifySessionFileId,
+} from './ingest/sessions.js';
 import { discoverLocalModels, deleteLocalModel } from './models.js';
 
 /** Runtime dependencies the handlers close over, supplied by `server.ts`. */
@@ -459,8 +464,12 @@ function handleSessionDetail({ res, params, deps }: RouteCtx): void {
   let transcript: TranscriptEntry[] = [];
   let transcriptError: string | undefined;
   try {
-    const manager = SessionManager.open(row.path);
-    const entries = manager.getEntries();
+    // Read-only, byte-for-byte the way ingest reads a session (parse + in-memory
+    // v1→v3 migrate, never a rewrite). `SessionManager.open` opens the file for
+    // write and migrates on construction, so a plain GET of a v1 or partially
+    // corrupt session would persist the migration and permanently drop malformed
+    // lines — a read must never mutate the source of truth.
+    const entries = readSessionEntries(row.path);
     // A file mutated into a cycle/self-parent since it was indexed (ingest
     // warns+skips but leaves the stale row) would send pi's visited-set-free
     // branch walker into a non-terminating loop that no try/catch can intercept.

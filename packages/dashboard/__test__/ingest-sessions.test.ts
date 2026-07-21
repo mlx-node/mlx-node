@@ -3,6 +3,7 @@ import {
   cpSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   unlinkSync,
   utimesSync,
@@ -17,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import { openDashboardDb, type DashboardDb } from '../src/db/open.js';
 import { sessions, turns } from '../src/db/schema.js';
-import { ingestSessions, verifySessionFileId } from '../src/ingest/sessions.js';
+import { ingestSessions, readSessionEntries, verifySessionFileId } from '../src/ingest/sessions.js';
 
 /** Write JSONL lines (objects) to a fresh `--w--` session dir; returns the file path. */
 function writeSessionFile(base: string, fileName: string, lines: object[]): string {
@@ -245,6 +246,46 @@ describe('ingestSessions', () => {
     expect(verifySessionFileId(file, 'sess-B')).toBe(true);
     expect(verifySessionFileId(file, 'sess-A')).toBe(false);
     expect(verifySessionFileId(join(soloBase, 'missing.jsonl'), 'sess-B')).toBe(false);
+    rmSync(soloBase, { recursive: true, force: true });
+  });
+
+  // Finding 5: the GET detail read path (readSessionEntries) must be READ-ONLY.
+  // A v1 session with a malformed trailing line — the case where SessionManager's
+  // open-for-write would persist the v1→v3 migration AND drop the malformed line —
+  // must leave the file byte-for-byte unchanged while still projecting the valid
+  // messages (migrated in memory so the v1 entries carry ids).
+  it('readSessionEntries reads a v1 + malformed-trailing session without touching disk', () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-readonly-'));
+    const dir = join(soloBase, 'sessions', '--w--');
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, 'v1-partial.jsonl');
+
+    // Genuine v1: message entries carry no id/parentId. Trailing line is truncated.
+    const header = JSON.stringify({ type: 'session', version: 1, id: 'ro-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' });
+    const user = JSON.stringify({ type: 'message', timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'hello v1' } });
+    const asst = JSON.stringify({
+      type: 'message',
+      timestamp: '2026-07-01T10:00:02.000Z',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'hi v1' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+    });
+    const truncated = '{"type":"message","message":{"role":"asst';
+    const original = `${header}\n${user}\n${asst}\n${truncated}`;
+    writeFileSync(file, original);
+    const before = readFileSync(file);
+
+    const entries = readSessionEntries(file);
+    // Valid messages projected; migration assigned ids in memory.
+    const messages = entries.filter((e) => e.type === 'message');
+    expect(messages).toHaveLength(2);
+    for (const m of messages) expect(typeof m.id).toBe('string');
+
+    // The file on disk is byte-for-byte unchanged: no migration persisted, no
+    // malformed line dropped.
+    const after = readFileSync(file);
+    expect(after.length).toBe(before.length);
+    expect(after.equals(before)).toBe(true);
+    expect(after.toString('utf-8')).toBe(original);
+
     rmSync(soloBase, { recursive: true, force: true });
   });
 
