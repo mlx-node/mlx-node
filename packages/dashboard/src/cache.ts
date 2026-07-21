@@ -70,12 +70,23 @@ interface BlockEntry {
 }
 
 /**
- * Canonical block files under `root`. Entries are typed with `lstatSync`, so a
- * symlink at a block name is never followed or counted — mirroring the
- * manager's no-follow `stat_file`, which indexes regular files only. A missing
- * or unreadable directory yields an empty list.
+ * Canonical block files under `root`. The root itself is typed with `lstatSync`
+ * first: a symlinked or non-directory root is refused (empty list), mirroring
+ * the native manager's opener (cold_cache.rs `symlink_metadata` root check),
+ * so clear/evict can never unlink through a symlinked root into foreign files.
+ * Entries are likewise typed with `lstatSync`, so a symlink at a block name is
+ * never followed or counted — mirroring the manager's no-follow `stat_file`,
+ * which indexes regular files only. A missing or unreadable directory yields an
+ * empty list.
  */
 function listBlocks(root: string): BlockEntry[] {
+  let rootStat: Stats;
+  try {
+    rootStat = lstatSync(root);
+  } catch {
+    return [];
+  }
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) return [];
   let names: string[];
   try {
     names = readdirSync(root);

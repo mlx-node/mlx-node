@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readdirSync, statSync, type Stats } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -269,7 +269,14 @@ export function verifySessionFileId(path: string, expectedId: string): boolean {
   return header !== undefined && header.id === expectedId;
 }
 
-/** All `<root>/--*--/*.jsonl` session files, in directory-listing order. */
+/**
+ * All `<root>/--*--/*.jsonl` session files, in directory-listing order. The
+ * outer `Dirent.isDirectory()` already skips a symlinked project dir; each
+ * candidate `.jsonl` is then `lstatSync`'d and skipped unless it is a regular
+ * file (`isFile()` is false for a symlink). A symlinked transcript is never
+ * indexed, so an external Pi session cannot be surfaced under the target's id
+ * — matching the native cold tier's no-follow policy.
+ */
 function listSessionFiles(root: string): string[] {
   if (!existsSync(root)) return [];
   const files: string[] = [];
@@ -278,7 +285,16 @@ function listSessionFiles(root: string): string[] {
     if (!dir.name.startsWith('--') || !dir.name.endsWith('--')) continue;
     const dirPath = join(root, dir.name);
     for (const name of readdirSync(dirPath)) {
-      if (name.endsWith('.jsonl')) files.push(join(dirPath, name));
+      if (!name.endsWith('.jsonl')) continue;
+      const full = join(dirPath, name);
+      let stat: Stats;
+      try {
+        stat = lstatSync(full);
+      } catch {
+        continue;
+      }
+      if (!stat.isFile()) continue;
+      files.push(full);
     }
   }
   return files;

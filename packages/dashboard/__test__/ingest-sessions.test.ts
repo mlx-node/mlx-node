@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   unlinkSync,
   utimesSync,
   writeFileSync,
@@ -233,6 +234,62 @@ describe('ingestSessions', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].id).toBe('sess-B');
     expect(dash.db.select().from(sessions).where(eq(sessions.id, 'sess-A')).all()).toHaveLength(0);
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
+
+  // Finding 4: a symlinked .jsonl must never be indexed (it could point at an
+  // external Pi transcript), while a genuine sibling file still indexes.
+  it('skips a symlinked transcript but still indexes a real sibling', async () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-symlink-'));
+    const root = join(soloBase, 'sessions');
+    const dir = join(root, '--w--');
+    mkdirSync(dir, { recursive: true });
+
+    // A valid external Pi session living OUTSIDE the managed sessions root.
+    const externalDir = join(soloBase, 'external');
+    mkdirSync(externalDir, { recursive: true });
+    const externalFile = join(externalDir, 'external.jsonl');
+    writeFileSync(
+      externalFile,
+      `${[
+        { type: 'session', version: 3, id: 'external-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/secret' },
+        {
+          type: 'message',
+          id: 'm1',
+          parentId: null,
+          timestamp: '2026-07-01T10:00:01.000Z',
+          message: { role: 'user', content: 'secret transcript' },
+        },
+      ]
+        .map((l) => JSON.stringify(l))
+        .join('\n')}\n`,
+    );
+    // Symlink the external file into the managed project dir.
+    symlinkSync(externalFile, join(dir, 'evil.jsonl'));
+
+    // A genuine local session in the same dir must still be indexed.
+    writeFileSync(
+      join(dir, 'real.jsonl'),
+      `${[
+        { type: 'session', version: 3, id: 'real-1', timestamp: '2026-07-02T10:00:00.000Z', cwd: '/w' },
+        {
+          type: 'message',
+          id: 'r1',
+          parentId: null,
+          timestamp: '2026-07-02T10:00:01.000Z',
+          message: { role: 'user', content: 'local hi' },
+        },
+      ]
+        .map((l) => JSON.stringify(l))
+        .join('\n')}\n`,
+    );
+
+    const res = await ingestSessions(dash, root);
+    // Only the real file was scanned; the symlink was skipped at listing time.
+    expect(res.scanned).toBe(1);
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'external-1')).all()).toHaveLength(0);
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'real-1')).all()).toHaveLength(1);
 
     rmSync(soloBase, { recursive: true, force: true });
   });

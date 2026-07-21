@@ -7,9 +7,9 @@
  * and pi's `SessionManager` for transcripts/rename — never the native addon.
  */
 
-import { existsSync, rmSync } from 'node:fs';
+import { existsSync, realpathSync, rmSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { resolve, sep } from 'node:path';
+import { basename, dirname, join, sep } from 'node:path';
 
 import { SessionManager, type SessionEntry } from '@earendil-works/pi-coding-agent';
 import { eq } from 'drizzle-orm';
@@ -389,11 +389,33 @@ function lookupSession(deps: ApiDeps, id: string): { path: string; row: typeof s
   return { path: rows[0].path, row: rows[0] };
 }
 
-/** Guard: the resolved session file must stay inside the managed sessions root. */
+/**
+ * Guard: the CANONICAL session file must stay inside the canonical sessions
+ * root. Both sides are resolved through `realpathSync` so a symlink at any
+ * component can't escape a purely lexical containment check. When the target
+ * itself does not exist (e.g. its file was already removed — the delete path
+ * still cleans up its stale rows), a missing path has no symlink to follow, so
+ * its existing parent is canonicalized and the final segment re-attached
+ * lexically. A root that cannot be canonicalized, or a target whose parent is
+ * also gone, is treated as outside (fail closed).
+ */
 function insideSessionsRoot(sessionsRoot: string, path: string): boolean {
-  const root = resolve(sessionsRoot);
-  const target = resolve(path);
-  return target === root || target.startsWith(root + sep);
+  const contained = (real: string, root: string): boolean => real === root || real.startsWith(root + sep);
+  let root: string;
+  try {
+    root = realpathSync(sessionsRoot);
+  } catch {
+    return false;
+  }
+  try {
+    return contained(realpathSync(path), root);
+  } catch {
+    try {
+      return contained(join(realpathSync(dirname(path)), basename(path)), root);
+    } catch {
+      return false;
+    }
+  }
 }
 
 function extractText(content: unknown): string {
@@ -458,6 +480,14 @@ function handleSessionDetail({ res, params, deps }: RouteCtx): void {
   const found = lookupSession(deps, params.id);
   if (found === null) {
     sendError(res, 404, `Session "${params.id}" not found`);
+    return;
+  }
+  // A GET must not disclose a transcript whose file resolves outside the managed
+  // root (a stale/symlinked row). Ingestion no longer indexes symlinked files,
+  // but a row predating that fix, or a path swapped to a symlink after indexing,
+  // is caught here — the same guard PATCH/DELETE already apply.
+  if (!insideSessionsRoot(deps.sessionsRoot, found.path)) {
+    sendError(res, 403, 'Session file resolves outside the managed sessions root');
     return;
   }
   const { row } = found;

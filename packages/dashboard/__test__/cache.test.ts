@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -165,6 +165,36 @@ describe('evictOlderThan', () => {
   it('is a no-op for a missing root', () => {
     const result = evictOlderThan(7, join(root, 'nope'));
     expect(result).toEqual({ removed: 0, freedBytes: 0 });
+  });
+});
+
+// Finding 3: a symlinked cache root must be refused, matching the native tier's
+// opener (cold_cache.rs `symlink_metadata` root check). clear/evict must never
+// unlink through the symlink into foreign files.
+describe('symlinked cold-cache root (Finding 3)', () => {
+  it('is not traversed and its target block is never deleted by clear/evict', () => {
+    const victimBase = mkdtempSync(join(tmpdir(), 'dash-cold-victim-'));
+    try {
+      // A foreign canonical-looking block behind a symlinked root, aged well past
+      // any eviction cutoff so a followed symlink would definitely delete it.
+      const block = join(victimBase, hexName(1));
+      writeFileSync(block, Buffer.alloc(10));
+      const old = new Date(Date.now() - 40 * DAY_MS);
+      utimesSync(block, old, old);
+
+      const linkRoot = join(root, 'link-to-victim');
+      symlinkSync(victimBase, linkRoot);
+
+      // Not traversed: nothing listed, nothing removed.
+      expect(scanColdCache(linkRoot).entryCount).toBe(0);
+      expect(clearColdCache(linkRoot)).toEqual({ removed: 0, freedBytes: 0 });
+      expect(evictOlderThan(7, linkRoot)).toEqual({ removed: 0, freedBytes: 0 });
+
+      // The foreign target survives untouched.
+      expect(existsSync(block)).toBe(true);
+    } finally {
+      rmSync(victimBase, { recursive: true, force: true });
+    }
   });
 });
 
