@@ -4,6 +4,8 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
 import Models from '@/pages/models';
 import Overview from '@/pages/overview';
+import SessionDetail from '@/pages/session-detail';
+import Sessions from '@/pages/sessions';
 import { Boxes, HardDrive, LayoutDashboard, type LucideIcon, MessagesSquare, TrendingUp } from 'lucide-react';
 import { BrowserRouter, NavLink, Outlet, Route, Routes } from 'react-router-dom';
 
@@ -84,16 +86,8 @@ export default function App() {
           <Route element={<Layout />}>
             <Route index element={<Overview />} />
             <Route path="models" element={<Models />} />
-            <Route
-              path="sessions"
-              element={<Placeholder title="Sessions" description="Browse, rename, and resume agent sessions." />}
-            />
-            <Route
-              path="sessions/:id"
-              element={
-                <Placeholder title="Session detail" description="Transcript and per-turn metrics for a session." />
-              }
-            />
+            <Route path="sessions" element={<Sessions />} />
+            <Route path="sessions/:id" element={<SessionDetail />} />
             <Route
               path="metrics"
               element={<Placeholder title="Metrics" description="Throughput, token, and acceptance trends." />}

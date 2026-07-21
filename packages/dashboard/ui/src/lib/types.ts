@@ -110,3 +110,99 @@ export interface CacheResponse {
   disk: ColdCacheDiskInfo;
   trend: CacheTrendRow[];
 }
+
+export interface TranscriptToolCall {
+  id: string;
+  name: string;
+  arguments: unknown;
+}
+
+/** One flattened transcript message from `GET /api/sessions/:id` (server: `TranscriptEntry`). */
+export interface TranscriptEntry {
+  role: string;
+  text: string;
+  toolCalls: TranscriptToolCall[];
+  ts: number;
+  /** Present on `toolResult` messages. */
+  toolName?: string;
+  isError?: boolean;
+}
+
+export interface SessionSummary {
+  id: string;
+  path: string;
+  cwd: string;
+  name: string | null;
+  created: number;
+  modified: number;
+  messageCount: number;
+  firstMessage: string | null;
+}
+
+export interface SessionDetailResponse {
+  session: SessionSummary;
+  transcript: TranscriptEntry[];
+  /** Set when the transcript could not be read from the session file. */
+  transcriptError?: string;
+}
+
+/**
+ * A row from `GET /api/sessions/:id/metrics` `turns` — a turn LEFT JOINed to its
+ * trace, so the trace-derived fields (`ttftMs`/`decodeTps`/…) are null when the
+ * turn has no matching trace. Numeric fields arrive raw from SQLite.
+ */
+export interface SessionTurnMetric {
+  entryId: string | null;
+  traceId: string | null;
+  ts: number;
+  model: string | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cachedTokens: number | null;
+  reasoningTokens: number | null;
+  ttftMs: number | null;
+  prefillTps: number | null;
+  decodeTps: number | null;
+  mtpCycles: number | null;
+  mtpMeanAccepted: number | null;
+  durationMs: number | null;
+  finishReason: string | null;
+  coldHits: number | null;
+  coldMisses: number | null;
+  coldBytesWritten: number | null;
+  coldBytesRestored: number | null;
+}
+
+/** A row from `GET /api/sessions/:id/metrics` `traces` (session traces, unjoined). */
+export interface SessionTraceMetric {
+  traceId: string;
+  ts: number;
+  model: string | null;
+  ttftMs: number | null;
+  prefillTps: number | null;
+  decodeTps: number | null;
+  mtpCycles: number | null;
+  mtpMeanAccepted: number | null;
+  durationMs: number | null;
+  finishReason: string | null;
+  coldHits: number | null;
+  coldMisses: number | null;
+  coldBytesWritten: number | null;
+  coldBytesRestored: number | null;
+}
+
+export interface SessionMetricsResponse {
+  sessionId: string;
+  turns: SessionTurnMetric[];
+  traces: SessionTraceMetric[];
+}
+
+export interface SessionRenameResponse {
+  id: string;
+  name: string;
+}
+
+export interface SessionDeleteResponse {
+  deleted: boolean;
+  id: string;
+}

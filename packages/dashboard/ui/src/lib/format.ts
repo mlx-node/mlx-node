@@ -36,6 +36,18 @@ export function formatPercent(fraction: number): string {
   return `${Math.round(fraction * 100)}%`;
 }
 
+/** Absolute local date + time from an ms-epoch timestamp (`Jul 20, 2026, 3:41 PM`). */
+export function formatDateTime(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return 'unknown';
+  return new Date(ms).toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
 /** Coarse relative time from an ms-epoch timestamp (`3m ago`, `2d ago`). */
 export function formatRelativeTime(ms: number): string {
   if (!Number.isFinite(ms) || ms <= 0) return 'unknown';

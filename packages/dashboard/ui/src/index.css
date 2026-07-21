@@ -75,6 +75,24 @@
   }
 }
 
+/* Accessible categorical chart series (blue/green/magenta), stepped per surface.
+   Colorblind-safe as an adjacent triple (validated); dark values are their own
+   steps for the dark surface, not an auto-flip. Charts pair these with a legend
+   and direct labels so identity is never carried by color alone. */
+:root {
+  --viz-input: #2a78d6;
+  --viz-output: #008300;
+  --viz-cached: #e87ba4;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --viz-input: #3987e5;
+    --viz-output: #008300;
+    --viz-cached: #d55181;
+  }
+}
+
 @theme inline {
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
