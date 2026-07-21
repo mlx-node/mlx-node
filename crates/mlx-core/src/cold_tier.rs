@@ -5,6 +5,7 @@
 //! cannot be opened (no HOME, unwritable disk, ...) inference proceeds
 //! without persistence and `coldCacheStats()` reports `enabled: false`.
 
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use mlx_paged_attn::{ColdCacheManager, ColdCacheStats};
@@ -27,16 +28,27 @@ const MANAGED_SUBDIR: &str = "mlx-paged-v1";
 /// cannot be opened (fail-open: inference proceeds without persistence).
 pub fn global_cold_cache() -> Option<Arc<ColdCacheManager>> {
     GLOBAL
-        .get_or_init(|| {
-            let opened = match std::env::var(COLD_CACHE_DIR_ENV) {
-                Ok(dir) if !dir.is_empty() => ColdCacheManager::open_default_at(
-                    std::path::PathBuf::from(dir).join(MANAGED_SUBDIR),
-                ),
-                _ => ColdCacheManager::open_default(),
-            };
-            opened.ok().map(Arc::new)
+        .get_or_init(|| match std::env::var(COLD_CACHE_DIR_ENV) {
+            Ok(dir) if !dir.is_empty() => open_managed_cold_cache(Path::new(&dir)),
+            _ => ColdCacheManager::open_default().ok().map(Arc::new),
         })
         .clone()
+}
+
+/// Open the tier in the `mlx-paged-v1` child of `parent`, creating the
+/// child when absent. A pre-existing child that is a symlink or not a
+/// directory is refused (`None`, fail-open) so the tier's chmod/temp
+/// cleanup/eviction can never follow a planted link into a foreign
+/// directory. Checked with `symlink_metadata` before any destructive or
+/// permission operation.
+fn open_managed_cold_cache(parent: &Path) -> Option<Arc<ColdCacheManager>> {
+    let child = parent.join(MANAGED_SUBDIR);
+    match std::fs::symlink_metadata(&child) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => return None,
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return None,
+        _ => {}
+    }
+    ColdCacheManager::open_default_at(child).ok().map(Arc::new)
 }
 
 /// Counter snapshot of the global tier for Rust-side consumers (per-turn
@@ -162,5 +174,47 @@ mod tests {
         // SAFETY: see above.
         unsafe { std::env::remove_var(COLD_CACHE_DIR_ENV) };
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Uses the non-global helper only: never initializes GLOBAL and never
+    // reads MLX_COLD_CACHE_DIR, so it stays independent of the single
+    // OnceLock-initializing test above.
+    #[cfg(unix)]
+    #[test]
+    fn managed_child_symlink_or_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("mlx-cold-symlink-{}", std::process::id()));
+        let victim = base.join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        let marker = victim.join("marker.txt");
+        let victim_tmp = victim.join("foo.tmp");
+        std::fs::write(&marker, b"marker").unwrap();
+        std::fs::write(&victim_tmp, b"tmp").unwrap();
+        let victim_mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o7777;
+
+        let parent = base.join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::os::unix::fs::symlink(&victim, parent.join(MANAGED_SUBDIR)).unwrap();
+        assert!(
+            open_managed_cold_cache(&parent).is_none(),
+            "a symlinked managed child must be refused, not followed"
+        );
+        assert!(marker.exists());
+        assert!(victim_tmp.exists());
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o7777,
+            victim_mode,
+            "refusal must precede any chmod through the link"
+        );
+
+        let file_parent = base.join("parent-file");
+        std::fs::create_dir_all(&file_parent).unwrap();
+        std::fs::write(file_parent.join(MANAGED_SUBDIR), b"not a directory").unwrap();
+        assert!(
+            open_managed_cold_cache(&file_parent).is_none(),
+            "a non-directory managed child must be refused"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

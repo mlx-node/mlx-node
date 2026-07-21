@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
@@ -239,6 +239,10 @@ struct Shared {
     reserve_bytes: u64,
     index: Mutex<CacheIndex>,
     stats: AtomicStats,
+    /// Invoked between a failed read and its cleanup so tests can commit a
+    /// writer replacement at exactly that interleaving point.
+    #[cfg(test)]
+    failed_load_cleanup_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 struct WriteJob {
@@ -297,6 +301,8 @@ impl ColdCacheManager {
             reserve_bytes,
             index: Mutex::new(index),
             stats: AtomicStats::default(),
+            #[cfg(test)]
+            failed_load_cleanup_hook: Mutex::new(None),
         });
         let (sender, receiver) = mpsc::sync_channel::<WriteJob>(queue_depth);
         let worker_shared = Arc::clone(&shared);
@@ -405,10 +411,16 @@ impl ColdCacheManager {
         }
     }
 
-    /// Load and validate a block. Every failed read is a miss and prunes the
-    /// key from the in-memory index (so `contains` recovers when files are
-    /// deleted externally); genuinely corrupt payloads are additionally
-    /// removed from disk and counted as corruptions.
+    /// Load and validate a block. Every failed read is a miss; a payload
+    /// that existed but failed validation additionally counts as a
+    /// corruption (a missing file never does). Failure cleanup unlinks only
+    /// the exact file generation (dev+inode) that was read, under the same
+    /// index lock the writer holds across [rename + index publish], so an
+    /// in-process writer's freshly committed replacement is never deleted
+    /// or de-indexed. Coordination is in-process only: a concurrent
+    /// *process* mutating the same root stays fail-open — the identity
+    /// guard still refuses to unlink its replacement, and the worst case is
+    /// a stale index entry or one recomputed prefix.
     pub fn load(
         &self,
         key: ColdCacheKey,
@@ -418,9 +430,19 @@ impl ColdCacheManager {
             .shared
             .root
             .join(format!("{}.safetensors", key.to_hex()));
-        let result = fs::read(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|bytes| decode_block(&bytes, key, fingerprint));
+        let mut read_identity = None;
+        let mut found_existing = false;
+        let result = match File::open(&path) {
+            Ok(mut file) => {
+                found_existing = true;
+                read_identity = open_identity(&file);
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)
+                    .map_err(|e| e.to_string())
+                    .and_then(|_| decode_block(&bytes, key, fingerprint))
+            }
+            Err(e) => Err(e.to_string()),
+        };
         match result {
             Ok(block) => {
                 self.shared.stats.hits.fetch_add(1, Ordering::Relaxed);
@@ -449,13 +471,19 @@ impl ColdCacheManager {
             }
             Err(_) => {
                 self.shared.stats.misses.fetch_add(1, Ordering::Relaxed);
-                if path.exists() {
+                if found_existing {
                     self.shared
                         .stats
                         .corruptions
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                remove_indexed_file(&self.shared, key);
+                #[cfg(test)]
+                if let Ok(hook) = self.shared.failed_load_cleanup_hook.lock()
+                    && let Some(hook) = hook.as_ref()
+                {
+                    hook();
+                }
+                prune_failed_load(&self.shared, key, &path, read_identity);
                 None
             }
         }
@@ -550,25 +578,25 @@ fn persist_block(shared: &Shared, block: &ColdCacheBlock) -> Result<(), String> 
         .open(&temp)
         .map_err(|e| format!("create cold-cache temp file: {e}"))?;
     set_private_file_permissions(&temp)?;
+    let size = bytes.len() as u64;
     if let Err(error) = (|| -> Result<(), String> {
         file.write_all(&bytes)
             .map_err(|e| format!("write cold-cache file: {e}"))?;
         file.sync_all()
             .map_err(|e| format!("sync cold-cache file: {e}"))?;
+        // The index lock spans [rename + index publish] so a concurrent
+        // failed-load cleanup can never observe the renamed file without
+        // its index entry (or delete it in between).
+        let mut index = shared
+            .index
+            .lock()
+            .map_err(|_| "cold-cache index mutex poisoned".to_string())?;
         fs::rename(&temp, &destination).map_err(|e| format!("commit cold-cache file: {e}"))?;
         sync_directory(&shared.root)?;
-        Ok(())
-    })() {
-        let _ = fs::remove_file(&temp);
-        return Err(error);
-    }
-
-    let size = bytes.len() as u64;
-    if let Ok(mut index) = shared.index.lock() {
         if let Some(old) = index.entries.insert(
             block.key,
             IndexEntry {
-                path: destination,
+                path: destination.clone(),
                 size,
                 last_access: now_tick(),
             },
@@ -576,6 +604,10 @@ fn persist_block(shared: &Shared, block: &ColdCacheBlock) -> Result<(), String> 
             index.total_bytes = index.total_bytes.saturating_sub(old.size);
         }
         index.total_bytes = index.total_bytes.saturating_add(size);
+        Ok(())
+    })() {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
     }
     shared
         .stats
@@ -606,15 +638,69 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn remove_indexed_file(shared: &Shared, key: ColdCacheKey) {
-    if let Ok(mut index) = shared.index.lock() {
-        if let Some(entry) = index.entries.remove(&key) {
-            let _ = fs::remove_file(&entry.path);
-            index.total_bytes = index.total_bytes.saturating_sub(entry.size);
-        } else {
-            let _ = fs::remove_file(shared.root.join(format!("{}.safetensors", key.to_hex())));
+/// Cleanup after a failed load, under the same index lock the writer holds
+/// across [rename + index publish]. Unlinks only when the file at `path` is
+/// still the generation that was read (`read_identity`); a renamed-in
+/// replacement (new inode) is left on disk and keeps its index entry.
+fn prune_failed_load(
+    shared: &Shared,
+    key: ColdCacheKey,
+    path: &Path,
+    read_identity: Option<FileIdentity>,
+) {
+    let Ok(mut index) = shared.index.lock() else {
+        return;
+    };
+    match path_identity(path) {
+        Some(current) if read_identity == Some(current) => {
+            let _ = fs::remove_file(path);
+            if let Some(entry) = index.entries.remove(&key) {
+                index.total_bytes = index.total_bytes.saturating_sub(entry.size);
+            }
+        }
+        Some(_) => {}
+        None => {
+            if let Some(entry) = index.entries.remove(&key) {
+                index.total_bytes = index.total_bytes.saturating_sub(entry.size);
+            }
         }
     }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn open_identity(file: &File) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().ok().map(|metadata| FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn open_identity(_file: &File) -> Option<FileIdentity> {
+    None
+}
+
+#[cfg(unix)]
+fn path_identity(path: &Path) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path)
+        .ok()
+        .map(|metadata| FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+}
+
+#[cfg(not(unix))]
+fn path_identity(_path: &Path) -> Option<FileIdentity> {
+    None
 }
 
 fn encode_block(block: &ColdCacheBlock) -> Result<Vec<u8>, String> {
@@ -1150,6 +1236,40 @@ mod tests {
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.corruptions, 0, "a missing file is not a corruption");
         assert_eq!(manager.shared.index.lock().unwrap().total_bytes, 0);
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_load_cleanup_spares_concurrent_writer_replacement() {
+        let root = temp_root("replace-race");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let path = root.join(format!("{}.safetensors", key.to_hex()));
+        fs::write(&path, b"corrupt generation").unwrap();
+
+        let shared = Arc::clone(&manager.shared);
+        let replacement = block(key);
+        let commit = replacement.clone();
+        *manager.shared.failed_load_cleanup_hook.lock().unwrap() = Some(Box::new(move || {
+            persist_block(&shared, &commit).unwrap();
+        }));
+
+        assert!(manager.load(key, fingerprint()).is_none());
+        assert!(
+            path.exists(),
+            "cleanup must not delete the writer's renamed-in replacement"
+        );
+        assert!(
+            manager.contains(&key),
+            "the writer's index publish must survive failed-load cleanup"
+        );
+        let stats = manager.stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.corruptions, 1, "the generation read was corrupt");
+
+        *manager.shared.failed_load_cleanup_hook.lock().unwrap() = None;
+        assert_eq!(manager.load(key, fingerprint()), Some(replacement));
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }
