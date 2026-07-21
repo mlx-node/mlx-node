@@ -1197,6 +1197,55 @@ describe('makeMlxStreamSimple', () => {
     expect(seenRoots).toEqual(['root-0', 'root-1']);
   });
 
+  it('attributes a completed turn to the root it was SUBMITTED under, not a root that switched mid-flight (Finding 8)', async () => {
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const firstStartedPromise = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+    const releaseFirstPromise = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const session = new FakeChatSession([
+      async function* () {
+        firstStarted();
+        await releaseFirstPromise;
+        yield finalEvent({ text: 'first' });
+      },
+    ]);
+
+    let currentRootId: string | undefined = 'root-S1';
+    let currentRootFile: string | undefined = '/sessions/root-S1.jsonl';
+    const records: TurnRecord[] = [];
+    const recorder = vi.fn((rec: TurnRecord) => {
+      records.push(rec);
+    });
+    const streamSimple = makeMlxStreamSimple(
+      makeFakeHost(session),
+      undefined,
+      () => currentRootId,
+      recorder,
+      undefined,
+      () => currentRootFile,
+    );
+
+    // Submit under root S1, let it reach native work, THEN switch the live root
+    // to S2 (a /new or /resume) while the turn is still in flight.
+    const turn = collect(streamSimple(MODEL, CONTEXT, { sessionId: 'child-of-S1' }));
+    await firstStartedPromise;
+    currentRootId = 'root-S2';
+    currentRootFile = '/sessions/root-S2.jsonl';
+    releaseFirst();
+    await turn;
+
+    // The record must carry S1 (id AND file): stamping the now-live S2 would make
+    // this subagent turn vanish from S1's dashboard (its only join key is the root).
+    expect(recorder).toHaveBeenCalledOnce();
+    expect(records[0]?.rootSessionId).toBe('root-S1');
+    expect(records[0]?.rootSessionFile).toBe('/sessions/root-S1.jsonl');
+    expect(records[0]?.sessionId).toBe('child-of-S1');
+  });
+
   describe('post-error KV recovery (full reset instead of warm reuse)', () => {
     it('full-resets on the turn AFTER a native ERROR terminal', async () => {
       const session = new FakeChatSession([

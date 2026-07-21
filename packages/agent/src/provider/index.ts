@@ -60,8 +60,10 @@ export function createMlxProviderExtension(
   // This closure outlives Pi runtime replacement. Pi creates a replacement
   // runtime for /new and /resume and reruns inline extension factories; each
   // new factory's session_start updates the root while child sessions keep
-  // using this registered stream.
+  // using this registered stream. The root id doubles as the cache owner and
+  // the metrics-trace root; the JSONL path travels alongside it for metrics.
   let rootCacheOwnerId: string | undefined;
+  let rootSessionFile: string | undefined;
 
   // Cold-tier counters are cumulative since the tier opened. Snapshot them at
   // each turn's native start (`onTurnStart`, fired inside the serialized host
@@ -76,11 +78,13 @@ export function createMlxProviderExtension(
   const onTurnStart = (): void => {
     turnStartCold = readColdStats();
   };
-  const onTurnRecord: TurnRecorder = ({ traceId, sessionId, model, final, durationMs }) => {
-    const rec: Omit<MetricsTraceRecord, 'v' | 'rootSessionId' | 'rootSessionFile'> = {
+  const onTurnRecord: TurnRecorder = ({ traceId, sessionId, rootSessionId, rootSessionFile, model, final, durationMs }) => {
+    const rec: Omit<MetricsTraceRecord, 'v'> = {
       traceId,
       ts: Date.now(),
       sessionId,
+      rootSessionId,
+      rootSessionFile,
       model,
       durationMs,
       finishReason: final.finishReason,
@@ -114,6 +118,7 @@ export function createMlxProviderExtension(
     () => rootCacheOwnerId,
     onTurnRecord,
     onTurnStart,
+    () => rootSessionFile,
   );
   return {
     name: 'mlx-provider',
@@ -127,10 +132,11 @@ export function createMlxProviderExtension(
       });
       pi.on('session_start', (_event, ctx) => {
         rootCacheOwnerId = ctx.sessionManager.getSessionId();
-        // Correlate every subsequent turn's MetricsTrace record with the
-        // active root session. `getSessionFile` is optional-chained so a
-        // minimal test/mock session manager without it still works.
-        metricsTrace.setRootSession(ctx.sessionManager.getSessionId(), ctx.sessionManager.getSessionFile?.());
+        // Snapshot the root JSONL path so a turn submitted under this root is
+        // correlated to it at completion — even for subagent turns, which have
+        // no session file of their own. `getSessionFile` is optional-chained so
+        // a minimal test/mock session manager without it still works.
+        rootSessionFile = ctx.sessionManager.getSessionFile?.();
       });
       pi.on('message_end', (event, ctx) => {
         performanceStatus.showMessage(event, ctx);

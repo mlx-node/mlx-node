@@ -74,6 +74,8 @@ export interface StreamSimpleHost {
 
 export type PerformanceRecorder = (message: AssistantMessage, performance: PerformanceMetrics) => void;
 export type RootCacheOwnerResolver = () => string | undefined;
+/** Resolves the root session's JSONL path for the metrics-trace root correlation. */
+export type RootSessionFileResolver = () => string | undefined;
 
 /**
  * Durable per-turn telemetry hook. Fires exactly once, only on a SUCCESSFUL
@@ -85,6 +87,9 @@ export type RootCacheOwnerResolver = () => string | undefined;
 export type TurnRecorder = (rec: {
   traceId: string;
   sessionId?: string;
+  /** Root session id/file snapshotted when this turn was submitted (see below). */
+  rootSessionId?: string;
+  rootSessionFile?: string;
   model: string;
   final: ChatStreamFinal;
   durationMs: number;
@@ -179,6 +184,7 @@ export function makeMlxStreamSimple(
   resolveRootCacheOwner?: RootCacheOwnerResolver,
   onTurnRecord?: TurnRecorder,
   onTurnStart?: () => void,
+  resolveRootSessionFile?: RootSessionFileResolver,
 ): (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream {
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
@@ -193,6 +199,7 @@ export function makeMlxStreamSimple(
     let emitter: TurnEmitter | undefined;
     let signal: AbortSignal | undefined;
     let rootCacheOwnerId: string | undefined;
+    let rootSessionFile: string | undefined;
     let resolvedReasoning: ResolvedReasoningMode;
     let detachAbort: (() => void) | undefined;
 
@@ -262,8 +269,11 @@ export function makeMlxStreamSimple(
       signal = options?.signal;
       // Snapshot the top-level owner before this request can queue behind
       // another inference. A later /new or /resume must not relabel an older
-      // request that was already submitted under the previous root.
+      // request that was already submitted under the previous root. The metrics
+      // root id reuses this same session_start value; only the JSONL path is a
+      // separate snapshot, taken here so it can never drift from the id.
       rootCacheOwnerId = resolveRootCacheOwner?.();
+      rootSessionFile = resolveRootSessionFile?.();
       // Snapshot once: the native config and the replay provenance must describe
       // the same resolved template mode. Presence alone is wrong for Pi's
       // minimal/low levels, both of which resolve to disabled thinking.
@@ -387,6 +397,11 @@ export function makeMlxStreamSimple(
                         onTurnRecord({
                           traceId: turn.traceId,
                           sessionId: options?.sessionId,
+                          // Root correlation is the SUBMIT-time snapshot, not the
+                          // live root, so a /new or /resume that landed while this
+                          // turn ran can't reattribute it (id == cacheOwner root).
+                          rootSessionId: rootCacheOwnerId,
+                          rootSessionFile,
                           model: model.id,
                           final: event,
                           durationMs: Math.max(0, Date.now() - turnStartedAt),

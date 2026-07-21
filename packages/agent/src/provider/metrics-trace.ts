@@ -35,9 +35,9 @@ export interface MetricsTraceRecord {
   ts: number;
   /** pi per-request session id (parent vs each subagent differ). */
   sessionId?: string;
-  /** Root pi session id at turn time (from `session_start`). */
+  /** Root pi session id the turn was SUBMITTED under (snapshotted at submit). */
   rootSessionId?: string;
-  /** Root pi session JSONL file path at turn time. */
+  /** Root pi session JSONL file path the turn was SUBMITTED under (snapshotted at submit). */
   rootSessionFile?: string;
   /** Model id served this turn (`mlx/<dir-name>`'s `<dir-name>`). */
   model: string;
@@ -68,7 +68,7 @@ export interface MetricsTraceRecord {
   coldBytesRestored?: number;
 }
 
-type MetricsTraceInput = Omit<MetricsTraceRecord, 'v' | 'rootSessionId' | 'rootSessionFile'>;
+type MetricsTraceInput = Omit<MetricsTraceRecord, 'v'>;
 
 function envDisabled(): boolean {
   const raw = process.env.MLX_AGENT_METRICS;
@@ -86,19 +86,11 @@ export class MetricsTrace {
   readonly enabled: boolean;
   private readonly dir: string;
   private readonly now: () => number;
-  private rootSessionId: string | undefined;
-  private rootSessionFile: string | undefined;
 
   constructor(opts?: { dir?: string; now?: () => number }) {
     this.enabled = !envDisabled();
     this.dir = opts?.dir ?? metricsTraceDir();
     this.now = opts?.now ?? Date.now;
-  }
-
-  /** Update the root-session correlation stamped onto every subsequent record. */
-  setRootSession(id: string | undefined, file: string | undefined): void {
-    this.rootSessionId = id;
-    this.rootSessionFile = file;
   }
 
   /** `<dir>/<YYYY-MM-DD>-<pid>.jsonl` — UTC date so rotation is timezone-stable. */
@@ -128,8 +120,8 @@ export class MetricsTrace {
         reasoningTokens: rec.reasoningTokens,
       };
       if (rec.sessionId !== undefined) out.sessionId = rec.sessionId;
-      if (this.rootSessionId !== undefined) out.rootSessionId = this.rootSessionId;
-      if (this.rootSessionFile !== undefined) out.rootSessionFile = this.rootSessionFile;
+      if (rec.rootSessionId !== undefined) out.rootSessionId = rec.rootSessionId;
+      if (rec.rootSessionFile !== undefined) out.rootSessionFile = rec.rootSessionFile;
       const ttftMs = finite(rec.ttftMs);
       if (ttftMs !== undefined) out.ttftMs = ttftMs;
       const prefillTps = finite(rec.prefillTps);

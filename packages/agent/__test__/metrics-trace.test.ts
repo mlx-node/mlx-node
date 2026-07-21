@@ -10,7 +10,7 @@ import { MetricsTrace, type MetricsTraceRecord } from '../src/provider/metrics-t
 const FIXED_NOW = Date.UTC(2026, 6, 21, 12, 34, 56); // 2026-07-21
 const FIXED_DATE = '2026-07-21';
 
-type RecordInput = Omit<MetricsTraceRecord, 'v' | 'rootSessionId' | 'rootSessionFile'>;
+type RecordInput = Omit<MetricsTraceRecord, 'v'>;
 
 function baseRecord(overrides: Partial<RecordInput> = {}): RecordInput {
   return {
@@ -79,10 +79,9 @@ describe('MetricsTrace', () => {
     });
   });
 
-  it('stamps the root session id/file set via setRootSession onto every record', () => {
+  it('stamps the root session id/file supplied WITH the record (per-turn snapshot)', () => {
     const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
-    trace.setRootSession('root-7', '/sessions/root-7.jsonl');
-    trace.record(baseRecord());
+    trace.record(baseRecord({ rootSessionId: 'root-7', rootSessionFile: '/sessions/root-7.jsonl' }));
 
     const [line] = readLines(trace.currentFile()) as MetricsTraceRecord[];
     expect(line.rootSessionId).toBe('root-7');
