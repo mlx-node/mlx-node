@@ -331,12 +331,22 @@ impl RootDir {
             .map_err(|e| format!("set cold-cache directory permissions: {e}"))
     }
 
+    /// Opens only regular files. `NONBLOCK` keeps a FIFO swapped in for a
+    /// block file from parking the open until a writer appears; the `fstat`
+    /// gate then rejects every non-regular type. `O_NONBLOCK` has no effect
+    /// on regular-file reads, so the returned `File` needs no flag reset.
     fn open_existing(&self, name: &str) -> std::io::Result<File> {
         use rustix::fs::{Mode, OFlags, openat};
-        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        openat(&self.fd, name, flags, Mode::empty())
-            .map(File::from)
-            .map_err(std::io::Error::from)
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+        let fd = openat(&self.fd, name, flags, Mode::empty()).map_err(std::io::Error::from)?;
+        let stat = rustix::fs::fstat(&fd).map_err(std::io::Error::from)?;
+        if !file_type_of(&stat).is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cold-cache entry is not a regular file",
+            ));
+        }
+        Ok(File::from(fd))
     }
 
     fn create_exclusive(&self, name: &str) -> Result<File, String> {
@@ -937,9 +947,10 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
 /// the directory entry `name` is still the generation that was read
 /// (`read_identity`); a regular-file replacement (new inode) is left on
 /// disk and keeps its index entry, because it may be a writer's freshly
-/// renamed-in commit. A non-regular entry (symlink or other) can never be
-/// a writer commit (writers rename in regular files only) and can never be
-/// opened again (`open_existing` is `O_NOFOLLOW`), so keeping it would pin
+/// renamed-in commit. A non-regular entry (symlink, FIFO, or other) can
+/// never be a writer commit (writers rename in regular files only) and can
+/// never be opened again (`open_existing` is `O_NOFOLLOW` and rejects every
+/// non-regular type after `fstat`), so keeping it would pin
 /// a permanently dead index entry: it is de-indexed and its directory
 /// entry unlinked. `unlinkat` removes the entry itself, never a symlink's
 /// target, matching eviction semantics.
@@ -1493,6 +1504,70 @@ mod tests {
         assert_eq!(manager.load(key, fingerprint()), Some(block(key)));
         drop(manager);
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_returns_promptly_when_entry_replaced_by_fifo() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = temp_root("fifo-swap");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        assert!(manager.enqueue(block(key)).unwrap());
+        for _ in 0..200 {
+            if manager.contains(&key) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(manager.contains(&key));
+
+        let path = root.join(format!("{}.safetensors", key.to_hex()));
+        fs::remove_file(&path).unwrap();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is a valid NUL-terminated path for the whole call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        // A blocking read-only open of a writerless FIFO parks forever, so a
+        // regression must fail this timeout instead of hanging the suite.
+        let manager = Arc::new(manager);
+        let (done, loaded) = std::sync::mpsc::channel();
+        let loader = Arc::clone(&manager);
+        std::thread::spawn(move || {
+            let _ = done.send(loader.load(key, fingerprint()));
+        });
+        let result = loaded
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("load of a FIFO-swapped entry must return promptly, not block for a writer");
+        assert!(result.is_none());
+
+        assert!(
+            !manager.contains(&key),
+            "an entry replaced by a FIFO must leave the index on the load miss"
+        );
+        assert_eq!(manager.shared.index.lock().unwrap().total_bytes, 0);
+        assert!(
+            fs::symlink_metadata(&path).is_err(),
+            "the dead FIFO directory entry itself must be unlinked"
+        );
+        let stats = manager.stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.corruptions, 0, "a type mismatch is not a corruption");
+
+        assert!(
+            manager.enqueue(block(key)).unwrap(),
+            "pruning must unblock re-persisting the same key"
+        );
+        for _ in 0..200 {
+            if manager.contains(&key) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(manager.load(key, fingerprint()), Some(block(key)));
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
