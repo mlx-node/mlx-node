@@ -110,10 +110,16 @@ export class PagedConfigOverrideManager {
     }
 
     // A boolean persist directive is authoritative: force a clone whenever the
-    // source config's value disagrees, so the directive actually reaches the
-    // loader (both `--no-persist-cache` off AND default-on). Consider BOTH alias
-    // spellings so a stray value in either can never leak past an override.
-    const sourcePersist = config.persist_paged_cache === true || config.persistPagedCache === true;
+    // source config's EFFECTIVE value disagrees, so the directive actually reaches
+    // the loader (both `--no-persist-cache` off AND default-on). Mirror the native
+    // parser's snake-first precedence — `persist_paged_cache` wins when present,
+    // else the camelCase alias — so a config with snake=false AND camel=true does
+    // not read as `true` here (an OR) while native reads snake=false, silently
+    // dropping an authoritative `true` request.
+    const sourcePersist =
+      typeof config.persist_paged_cache === 'boolean'
+        ? config.persist_paged_cache
+        : config.persistPagedCache === true;
     const persistOverrideNeeded = persistPagedCache !== undefined && persistPagedCache !== sourcePersist;
 
     // Gemma4's DSpark / assistant speculative executor currently owns flat KV

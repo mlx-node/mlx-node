@@ -173,6 +173,40 @@ describe('ingestSessions', () => {
     rmSync(soloBase, { recursive: true, force: true });
   });
 
+  // Finding 9: a genuine legacy v1 session (message entries carry no id/parentId)
+  // must be migrated in memory BEFORE the topology guard, so its history lands in
+  // the index instead of being dropped as an invalid tree.
+  it('migrates a legacy v1 session and indexes it instead of dropping it', async () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-v1-'));
+    const root = join(soloBase, 'sessions');
+    // parseSessionEntries does not migrate: v1 message entries have no id here.
+    writeSessionFile(soloBase, 'legacy.jsonl', [
+      { type: 'session', version: 1, id: 'v1-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
+      { type: 'message', timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'legacy hi' } },
+      {
+        type: 'message',
+        timestamp: '2026-07-01T10:00:02.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'legacy yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+      },
+    ]);
+
+    const res = await ingestSessions(dash, root);
+    expect(res.updated).toBe(1);
+    expect(res.warnings).toHaveLength(0);
+
+    const row = dash.db.select().from(sessions).where(eq(sessions.id, 'v1-1')).all()[0];
+    expect(row).toBeDefined();
+    expect(row.messageCount).toBe(2);
+    expect(row.firstMessage).toBe('legacy hi');
+
+    const turnRows = dash.db.select().from(turns).where(eq(turns.sessionId, 'v1-1')).all();
+    expect(turnRows).toHaveLength(1);
+    expect(turnRows[0].model).toBe('qwen3_5');
+    expect(turnRows[0].inputTokens).toBe(5);
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
+
   // Finding 3: a reused path must not leave a stale row that can delete the new file.
   it('reconciles a stale row when a path is reused by a new session', async () => {
     const soloBase = mkdtempSync(join(tmpdir(), 'dash-reuse-'));

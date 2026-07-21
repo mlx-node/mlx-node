@@ -3,6 +3,7 @@ import { join } from 'node:path';
 
 import {
   buildContextEntries,
+  migrateSessionEntries,
   parseSessionEntries,
   type FileEntry,
   type SessionEntry,
@@ -116,7 +117,7 @@ export function activeBranchEntries(entries: FileEntry[]): SessionEntry[] {
  * references no in-file entry is a root terminator (matches the walker), not a
  * cycle.
  */
-function isValidSessionTopology(entries: FileEntry[]): boolean {
+export function isValidSessionTopology(entries: FileEntry[]): boolean {
   const sessionEntries = entries.filter((e): e is SessionEntry => e.type !== 'session');
   const byId = new Map<string, SessionEntry>();
   for (const entry of sessionEntries) {
@@ -124,21 +125,28 @@ function isValidSessionTopology(entries: FileEntry[]): boolean {
     if (byId.has(entry.id)) return false;
     byId.set(entry.id, entry);
   }
-  const bound = sessionEntries.length;
+  // Amortized O(n): once an id is proven to reach a root terminator without a
+  // cycle it is memoized in `safe`, so a shared ancestor spine is walked once
+  // total rather than re-walked per descendant (the naive per-entry walk is
+  // O(n²) and stalls the event loop on a ~20k-entry session).
+  const safe = new Set<string>();
   for (const start of sessionEntries) {
-    const visited = new Set<string>();
+    if (safe.has(start.id)) continue;
+    const path = new Set<string>();
+    const chain: string[] = [];
     let current: SessionEntry | undefined = start;
-    let steps = 0;
     while (current) {
-      if (visited.has(current.id)) return false;
-      visited.add(current.id);
-      if (++steps > bound) return false;
+      if (safe.has(current.id)) break;
+      if (path.has(current.id)) return false;
+      path.add(current.id);
+      chain.push(current.id);
       const parentId = current.parentId;
       if (parentId === null || parentId === undefined) break;
       const parent = byId.get(parentId);
       if (parent === undefined) break;
       current = parent;
     }
+    for (const id of chain) safe.add(id);
   }
   return true;
 }
@@ -303,6 +311,12 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
         warnings.push(`${filePath}: parse failed (${String(err)})`);
         continue;
       }
+      // `parseSessionEntries` does not migrate: genuine legacy v1 message entries
+      // carry no id/parentId, which the topology guard and branch walker require.
+      // Migrate in place (v1→v3) before validating or deriving. This assigns
+      // id/parentId in memory only (no disk write) and never changes the entry
+      // count, so the `countJsonlLines` completeness check below still holds.
+      migrateSessionEntries(entries);
 
       // Quarantine a topologically broken tree (cycle / duplicate ids) BEFORE any
       // branch projection: the walker would otherwise loop unbounded and OOM.

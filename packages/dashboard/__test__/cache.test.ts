@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import { clearColdCache, evictOlderThan, scanColdCache } from '../src/cache.js';
+import { mutate } from '../ui/src/lib/api.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -164,5 +165,39 @@ describe('evictOlderThan', () => {
   it('is a no-op for a missing root', () => {
     const result = evictOlderThan(7, join(root, 'nope'));
     expect(result).toEqual({ removed: 0, freedBytes: 0 });
+  });
+});
+
+// Finding 11: the Cache page's "Clear all" builds `{ all: true }` (not
+// `undefined`). The `mutate` client omits the request body entirely when it is
+// `undefined`, so the old clear-all body reached the server as an empty payload
+// that `handleCacheDelete` rejects with 400 (its explicit `{all:true}` guard).
+// This pins the client contract for both the clear and evict request bodies.
+describe('cache DELETE request body (Cache page → mutate)', () => {
+  it('sends {all:true} for clear and {olderThanDays} for evict, and no body for undefined', async () => {
+    const calls: Array<{ method: string; body?: unknown }> = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      calls.push({ method: init?.method ?? 'GET', body: init?.body });
+      return new Response(JSON.stringify({ removed: 0, freedBytes: 0 }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      // The bodies cache.tsx constructs per action kind.
+      await mutate('DELETE', '/cache', { all: true });
+      await mutate('DELETE', '/cache', { olderThanDays: 7 });
+      // The OLD clear-all body: an omitted payload the server rejects.
+      await mutate('DELETE', '/cache', undefined);
+    } finally {
+      globalThis.fetch = original;
+    }
+
+    expect(calls).toHaveLength(3);
+    expect(JSON.parse(calls[0].body as string)).toEqual({ all: true });
+    expect(JSON.parse(calls[1].body as string)).toEqual({ olderThanDays: 7 });
+    expect(calls[2].body).toBeUndefined();
   });
 });

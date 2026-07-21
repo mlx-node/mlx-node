@@ -100,6 +100,28 @@ describe('PagedConfigOverrideManager persist-paged-cache', () => {
     expect(config.persistPagedCache).toBe(false);
   });
 
+  // Finding 12: snake-first precedence. A config with persist_paged_cache:false
+  // AND persistPagedCache:true reads as the authoritative snake=false (native
+  // reads snake first), so a requested `true` DISAGREES and must force a clone
+  // that writes snake=true. The old OR misread this as already-true and passed
+  // an already-paged checkpoint straight through, silently dropping persistence.
+  it('forces a clone writing persist_paged_cache:true when snake=false conflicts with camel=true', async () => {
+    const source = await makeModelDir({
+      model_type: 'qwen3',
+      use_block_paged_cache: true, // already paged: only the persist override can force a clone
+      persist_paged_cache: false,
+      persistPagedCache: true,
+    });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const resolved = await manager.resolve(source, 'qwen3', true);
+    expect(resolved).not.toBe(source);
+    const config = await readOverrideConfig(resolved);
+    expect(config.persist_paged_cache).toBe(true);
+    expect(config.persistPagedCache).toBe(true);
+  });
+
   it('leaves persist untouched for an undirected (undefined) resolve', async () => {
     const source = await makeModelDir({ model_type: 'qwen3' });
     const manager = new PagedConfigOverrideManager();

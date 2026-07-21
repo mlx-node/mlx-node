@@ -98,9 +98,10 @@ class RebuildRequiredError extends Error {}
  *  - `quick_check` catches page-level damage OUTSIDE the schema pages. The DDL
  *    only no-ops on an existing schema and never walks data leaf pages, so such
  *    damage would otherwise slip past open and throw later at query time.
- *  - `user_version` below SCHEMA_VERSION means an older/foreign schema (e.g. a
- *    `traces` table predating root_session_id) the current DDL cannot extend in
- *    place — a stale index rebuilt in place would wedge on CREATE INDEX.
+ *  - `user_version` other than SCHEMA_VERSION means a foreign schema — older
+ *    (e.g. a `traces` table predating root_session_id) OR newer (a future schema
+ *    this build predates). The index is disposable and rebuilt from JSONL, so an
+ *    exact match is required; anything else is rebuilt rather than opened blind.
  * A non-database file makes `quick_check` throw "file is not a database", which
  * the caller treats as corruption; both routes lead to quarantine+rebuild.
  */
@@ -112,8 +113,31 @@ function assertUsableSchema(sqlite: DatabaseSync): void {
   }
   const uv = sqlite.prepare('PRAGMA user_version').get() as { user_version?: unknown } | undefined;
   const version = typeof uv?.user_version === 'number' ? uv.user_version : 0;
-  if (version < SCHEMA_VERSION) {
-    throw new RebuildRequiredError(`schema version ${version} < ${SCHEMA_VERSION}`);
+  if (version !== SCHEMA_VERSION) {
+    throw new RebuildRequiredError(`schema version ${version} != ${SCHEMA_VERSION}`);
+  }
+}
+
+/**
+ * Probe the newest columns of each table so a DDL change that dropped, renamed,
+ * or reordered a column WITHOUT bumping SCHEMA_VERSION is caught at open time. A
+ * matching `user_version` alone does not prove the columns exist: `CREATE TABLE
+ * IF NOT EXISTS` silently no-ops on an already-present table, so drift would
+ * otherwise only surface at the first insert/select. A zero-row prepared SELECT
+ * touches the schema, never data; a missing column throws → quarantine+rebuild.
+ */
+function assertSchemaSignature(sqlite: DatabaseSync): void {
+  const probes = [
+    'SELECT id, path, cwd, message_count, first_message, last_ingested_mtime, last_ingested_size FROM sessions LIMIT 0',
+    'SELECT session_id, entry_id, trace_id, model, reasoning_tokens FROM turns LIMIT 0',
+    'SELECT trace_id, root_session_id, cold_hits, cold_bytes_restored, source_file FROM traces LIMIT 0',
+  ];
+  for (const sql of probes) {
+    try {
+      sqlite.prepare(sql).get();
+    } catch (err) {
+      throw new RebuildRequiredError(`schema signature mismatch: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 }
 
@@ -126,6 +150,9 @@ function openWithSchema(path: string): DatabaseSync {
     if (preExisting) assertUsableSchema(sqlite);
     sqlite.exec(DDL);
     sqlite.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
+    // Only an existing file can carry drifted columns; a freshly created or
+    // just-rebuilt schema is known-good and needs no probe.
+    if (preExisting) assertSchemaSignature(sqlite);
   } catch (err) {
     try {
       sqlite.close();

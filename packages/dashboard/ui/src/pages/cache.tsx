@@ -96,7 +96,7 @@ export default function Cache() {
   const runDelete = async (action: Exclude<PendingAction, null>): Promise<void> => {
     setBusy(true);
     try {
-      const body = action.kind === 'evict' ? { olderThanDays: action.days } : undefined;
+      const body = action.kind === 'evict' ? { olderThanDays: action.days } : { all: true };
       const result = await mutate<CacheMutationResult>('DELETE', '/cache', body);
       toast.success(
         action.kind === 'evict'

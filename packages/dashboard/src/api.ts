@@ -19,7 +19,7 @@ import { catalogWithState } from './catalog.js';
 import type { DashboardDb } from './db/open.js';
 import { sessions, turns } from './db/schema.js';
 import type { DownloadManager, DownloadEvent } from './download.js';
-import { activeBranchEntries, verifySessionFileId } from './ingest/sessions.js';
+import { activeBranchEntries, isValidSessionTopology, verifySessionFileId } from './ingest/sessions.js';
 import { discoverLocalModels, deleteLocalModel } from './models.js';
 
 /** Runtime dependencies the handlers close over, supplied by `server.ts`. */
@@ -460,14 +460,24 @@ function handleSessionDetail({ res, params, deps }: RouteCtx): void {
   let transcriptError: string | undefined;
   try {
     const manager = SessionManager.open(row.path);
-    const isMessage = (entry: TranscriptEntry | null): entry is TranscriptEntry => entry !== null;
-    // Project the SAME active, message-bearing branch the index derives its turns
-    // from, so the transcript never disagrees with the indexed turn set. When the
-    // natural leaf is a detached `session_info` (e.g. after a rename), this
-    // re-projects from the latest message-bearing leaf — never a flat union of
-    // every abandoned branch, which would resurrect superseded turns.
-    transcript = activeBranchEntries(manager.getEntries()).map(mapTranscriptEntry).filter(isMessage);
-    transcript.sort((a, b) => a.ts - b.ts);
+    const entries = manager.getEntries();
+    // A file mutated into a cycle/self-parent since it was indexed (ingest
+    // warns+skips but leaves the stale row) would send pi's visited-set-free
+    // branch walker into a non-terminating loop that no try/catch can intercept.
+    // Gate the projection on the same topology guard ingest uses, surfacing the
+    // failure through `transcriptError` like every other detail error here.
+    if (!isValidSessionTopology(entries)) {
+      transcriptError = 'Session tree is invalid (cycle or duplicate entry id); transcript unavailable';
+    } else {
+      const isMessage = (entry: TranscriptEntry | null): entry is TranscriptEntry => entry !== null;
+      // Project the SAME active, message-bearing branch the index derives its turns
+      // from, so the transcript never disagrees with the indexed turn set. When the
+      // natural leaf is a detached `session_info` (e.g. after a rename), this
+      // re-projects from the latest message-bearing leaf — never a flat union of
+      // every abandoned branch, which would resurrect superseded turns.
+      transcript = activeBranchEntries(entries).map(mapTranscriptEntry).filter(isMessage);
+      transcript.sort((a, b) => a.ts - b.ts);
+    }
   } catch (err) {
     transcriptError = err instanceof Error ? err.message : String(err);
   }
