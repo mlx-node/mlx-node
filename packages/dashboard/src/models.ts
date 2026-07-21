@@ -283,6 +283,12 @@ export function deleteLocalModel(modelsDir: string, name: string): void {
   ) {
     throw new Error(`Refusing to delete "${name}": not a direct child of the models directory`);
   }
+  // A legitimate checkpoint dir never starts with `.` — discovery skips dotdirs.
+  // Rejecting them keeps the runner's reserved scratch (`.staging`, and any leaked
+  // `<slug>.backup-*` / `<slug>@<sha>...` under it) out of reach of a delete route.
+  if (name.startsWith('.')) {
+    throw new Error(`Refusing to delete "${name}": reserved dashboard directory`);
+  }
 
   const root = resolve(modelsDir);
   const target = join(root, name);

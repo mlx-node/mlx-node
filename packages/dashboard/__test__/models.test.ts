@@ -106,6 +106,16 @@ describe('deleteLocalModel', () => {
     expect(existsSync(modelsDir)).toBe(true);
   });
 
+  it('refuses to delete a dot-prefixed reserved dir (e.g. .staging) and leaves it intact', () => {
+    const staging = join(modelsDir, '.staging');
+    mkdirSync(staging, { recursive: true });
+    writeFileSync(join(staging, 'in-flight.txt'), 'active publish');
+
+    expect(() => deleteLocalModel(modelsDir, '.staging')).toThrow(/reserved/i);
+    expect(existsSync(staging)).toBe(true);
+    expect(existsSync(join(staging, 'in-flight.txt'))).toBe(true);
+  });
+
   it('refuses to delete a symlinked child and leaves its target untouched', () => {
     const outside = mkdtempSync(join(tmpdir(), 'dash-outside-'));
     const keep = join(outside, 'victim.txt');

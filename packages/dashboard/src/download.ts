@@ -547,7 +547,11 @@ export class DownloadManager {
         if (backupMatch !== null && pidAlive(Number(backupMatch[1]))) continue;
         const backupPath = join(stagingRoot, name);
         try {
-          if (existsSync(finalDir)) {
+          // Reap the redundant backup ONLY when finalDir is a proven-complete
+          // install; otherwise restore. If finalDir unexpectedly exists but is
+          // incomplete, the restore rename fails and the (complete) backup is
+          // retained -- the safe direction.
+          if (isModelInstalled(finalDir)) {
             await rm(backupPath, { recursive: true, force: true });
           } else {
             await rename(backupPath, finalDir);
