@@ -72,6 +72,7 @@ export default defineConfig({
       '@mlx-node/privacy': resolve(__dirname, './packages/privacy/src/index.ts'),
       '@mlx-node/trl': resolve(__dirname, './packages/trl/src/index.ts'),
       '@mlx-node/server': resolve(__dirname, './packages/server/src/index.ts'),
+      '@mlx-node/dashboard': resolve(__dirname, './packages/dashboard/src/index.ts'),
     },
   },
 });

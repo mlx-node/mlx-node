@@ -510,6 +510,18 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@earendil-works/pi-agent-core@npm:^0.80.10":
+  version: 0.80.10
+  resolution: "@earendil-works/pi-agent-core@npm:0.80.10"
+  dependencies:
+    "@earendil-works/pi-ai": "npm:^0.80.10"
+    ignore: "npm:7.0.5"
+    typebox: "npm:1.1.38"
+    yaml: "npm:2.9.0"
+  checksum: 10c0/9bdb96b2aad4bfa41555965b9e0cdd4ea75a305b4955f97fa1caed190a9accd048741076cfc6785a82eafcea1b8597236c798d54a782eae474be54951bb3e778
+  languageName: node
+  linkType: hard
+
 "@earendil-works/pi-agent-core@npm:^0.80.6":
   version: 0.80.6
   resolution: "@earendil-works/pi-agent-core@npm:0.80.6"
@@ -543,6 +555,27 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@earendil-works/pi-ai@npm:^0.80.10":
+  version: 0.80.10
+  resolution: "@earendil-works/pi-ai@npm:0.80.10"
+  dependencies:
+    "@anthropic-ai/sdk": "npm:0.91.1"
+    "@aws-sdk/client-bedrock-runtime": "npm:3.1048.0"
+    "@google/genai": "npm:1.52.0"
+    "@mistralai/mistralai": "npm:2.2.6"
+    "@opentelemetry/api": "npm:1.9.0"
+    "@smithy/node-http-handler": "npm:4.7.3"
+    http-proxy-agent: "npm:7.0.2"
+    https-proxy-agent: "npm:7.0.6"
+    openai: "npm:6.26.0"
+    partial-json: "npm:0.1.7"
+    typebox: "npm:1.1.38"
+  bin:
+    pi-ai: dist/cli.js
+  checksum: 10c0/e13104c00e6993505c86170e5e7384f2a45a5b5579e6311c8d6afc7820e823b97b384cb2ba7d2d731647b7af63b5ecf18808c484b6a86a9ae8a8f649ec1627ce
+  languageName: node
+  linkType: hard
+
 "@earendil-works/pi-coding-agent@npm:0.80.6":
   version: 0.80.6
   resolution: "@earendil-works/pi-coding-agent@npm:0.80.6"
@@ -572,6 +605,48 @@ __metadata:
   bin:
     pi: dist/cli.js
   checksum: 10c0/ec21f7d9a033ff9f998990f189e405188816c5255d2d0e39747e52b83216dbb26d4ade3e44a96655eafce99b60ded2be624a107f639a0281f1fa2f3b3e0c2506
+  languageName: node
+  linkType: hard
+
+"@earendil-works/pi-coding-agent@npm:^0.80.6":
+  version: 0.80.10
+  resolution: "@earendil-works/pi-coding-agent@npm:0.80.10"
+  dependencies:
+    "@earendil-works/pi-agent-core": "npm:^0.80.10"
+    "@earendil-works/pi-ai": "npm:^0.80.10"
+    "@earendil-works/pi-tui": "npm:^0.80.10"
+    "@mariozechner/clipboard": "npm:0.3.9"
+    "@silvia-odwyer/photon-node": "npm:0.3.4"
+    chalk: "npm:5.6.2"
+    cross-spawn: "npm:7.0.6"
+    diff: "npm:8.0.4"
+    glob: "npm:13.0.6"
+    highlight.js: "npm:10.7.3"
+    hosted-git-info: "npm:9.0.3"
+    ignore: "npm:7.0.5"
+    jiti: "npm:2.7.0"
+    minimatch: "npm:10.2.5"
+    proper-lockfile: "npm:4.1.2"
+    semver: "npm:7.8.0"
+    typebox: "npm:1.1.38"
+    undici: "npm:8.5.0"
+    yaml: "npm:2.9.0"
+  dependenciesMeta:
+    "@mariozechner/clipboard":
+      optional: true
+  bin:
+    pi: dist/cli.js
+  checksum: 10c0/9d63be9232a261d626a078eaa9a384b884e610bea0a7dd192ad17c61e12bce8d6104e79638ed3c52670abf397023a71e353e2be1ec228d6d2fb44bafabb48be4
+  languageName: node
+  linkType: hard
+
+"@earendil-works/pi-tui@npm:^0.80.10":
+  version: 0.80.10
+  resolution: "@earendil-works/pi-tui@npm:0.80.10"
+  dependencies:
+    get-east-asian-width: "npm:1.6.0"
+    marked: "npm:18.0.5"
+  checksum: 10c0/b963478e67f50f425dd27cd5e7b1358f1efbcc0c02b30f9929b00bd99aad61cb1023fa219479ecda86a8ab9ff68f4aa62bca7003e2c6c149c702805fec8e3407
   languageName: node
   linkType: hard
 
@@ -1130,6 +1205,19 @@ __metadata:
   dependenciesMeta:
     "@mlx-node/core-darwin-arm64":
       optional: true
+  languageName: unknown
+  linkType: soft
+
+"@mlx-node/dashboard@workspace:packages/dashboard":
+  version: 0.0.0-use.local
+  resolution: "@mlx-node/dashboard@workspace:packages/dashboard"
+  dependencies:
+    "@earendil-works/pi-coding-agent": "npm:^0.80.6"
+    "@huggingface/hub": "npm:^2.13.2"
+    "@mlx-node/agent": "workspace:*"
+    "@types/node": "catalog:"
+    drizzle-orm: "npm:1.0.0-rc.4"
+    vite: "catalog:"
   languageName: unknown
   linkType: soft
 
@@ -3722,7 +3810,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@voidzero-dev/vite-plus-core@npm:0.1.24":
+"@voidzero-dev/vite-plus-core@npm:0.1.24, vite@npm:@voidzero-dev/vite-plus-core@0.1.24":
   version: 0.1.24
   resolution: "@voidzero-dev/vite-plus-core@npm:0.1.24"
   dependencies:
@@ -4332,6 +4420,156 @@ __metadata:
   version: 16.6.1
   resolution: "dotenv@npm:16.6.1"
   checksum: 10c0/15ce56608326ea0d1d9414a5c8ee6dcf0fffc79d2c16422b4ac2268e7e2d76ff5a572d37ffe747c377de12005f14b3cc22361e79fc7f1061cce81f77d2c973dc
+  languageName: node
+  linkType: hard
+
+"drizzle-orm@npm:1.0.0-rc.4":
+  version: 1.0.0-rc.4
+  resolution: "drizzle-orm@npm:1.0.0-rc.4"
+  peerDependencies:
+    "@aws-sdk/client-rds-data": ">=3"
+    "@cloudflare/workers-types": ">=4"
+    "@effect/sql-d1": ">=4.0.0-beta.83 || >=4.0.0"
+    "@effect/sql-libsql": ">=4.0.0-beta.83 || >=4.0.0"
+    "@effect/sql-mysql2": ">=4.0.0-beta.83 || >=4.0.0"
+    "@effect/sql-pg": ">=4.0.0-beta.83 || >=4.0.0"
+    "@effect/sql-pglite": ">=4.0.0-beta.83 || >=4.0.0"
+    "@effect/sql-sqlite-bun": ">=4.0.0-beta.83 || >=4.0.0"
+    "@effect/sql-sqlite-do": ">=4.0.0-beta.83 || >=4.0.0"
+    "@effect/sql-sqlite-node": ">=4.0.0-beta.83 || >=4.0.0"
+    "@effect/sql-sqlite-wasm": ">=4.0.0-beta.83 || >=4.0.0"
+    "@electric-sql/pglite": ">=0.2.0"
+    "@libsql/client": ">=0.10.0"
+    "@libsql/client-wasm": ">=0.10.0"
+    "@neondatabase/serverless": ">=0.10.0"
+    "@op-engineering/op-sqlite": ">=2"
+    "@opentelemetry/api": ^1.4.1
+    "@planetscale/database": ">=1.13"
+    "@sinclair/typebox": ">=0.34.8"
+    "@sqlitecloud/drivers": ">=1.0.653"
+    "@tidbcloud/serverless": "*"
+    "@tursodatabase/database": ">=0.6.0-pre.28 || >=0.6.0"
+    "@tursodatabase/database-common": ">=0.6.0-pre.28 || >=0.6.0"
+    "@tursodatabase/database-wasm": ">=0.6.0-pre.28 || >=0.6.0"
+    "@tursodatabase/serverless": ">=1.1.3"
+    "@tursodatabase/sync": ">=0.6.0-pre.28 || >=0.6.0"
+    "@types/better-sqlite3": "*"
+    "@types/mssql": ^9.1.4
+    "@types/pg": "*"
+    "@types/sql.js": "*"
+    "@upstash/redis": ">=1.34.7"
+    "@vercel/postgres": ">=0.8.0"
+    "@xata.io/client": "*"
+    arktype: ">=2.0.0"
+    better-sqlite3: ">=9.3.0"
+    bun-types: "*"
+    effect: ">=4.0.0-beta.83 || >=4.0.0"
+    expo-sqlite: ">=14.0.0"
+    mssql: ^11.0.1
+    mysql2: ">=2"
+    pg: ">=8"
+    postgres: ">=3"
+    sql.js: ">=1"
+    sqlite3: ">=5"
+    typebox: ">=1.0.0"
+    valibot: ">=1.0.0-beta.7"
+    zod: ^3.25.0 || ^4.0.0
+  peerDependenciesMeta:
+    "@aws-sdk/client-rds-data":
+      optional: true
+    "@cloudflare/workers-types":
+      optional: true
+    "@effect/sql-d1":
+      optional: true
+    "@effect/sql-libsql":
+      optional: true
+    "@effect/sql-mysql2":
+      optional: true
+    "@effect/sql-pg":
+      optional: true
+    "@effect/sql-pglite":
+      optional: true
+    "@effect/sql-sqlite-bun":
+      optional: true
+    "@effect/sql-sqlite-do":
+      optional: true
+    "@effect/sql-sqlite-node":
+      optional: true
+    "@effect/sql-sqlite-wasm":
+      optional: true
+    "@electric-sql/pglite":
+      optional: true
+    "@libsql/client":
+      optional: true
+    "@libsql/client-wasm":
+      optional: true
+    "@neondatabase/serverless":
+      optional: true
+    "@op-engineering/op-sqlite":
+      optional: true
+    "@opentelemetry/api":
+      optional: true
+    "@planetscale/database":
+      optional: true
+    "@sinclair/typebox":
+      optional: true
+    "@sqlitecloud/drivers":
+      optional: true
+    "@tidbcloud/serverless":
+      optional: true
+    "@tursodatabase/database":
+      optional: true
+    "@tursodatabase/database-common":
+      optional: true
+    "@tursodatabase/database-wasm":
+      optional: true
+    "@tursodatabase/serverless":
+      optional: true
+    "@tursodatabase/sync":
+      optional: true
+    "@types/better-sqlite3":
+      optional: true
+    "@types/mssql":
+      optional: true
+    "@types/pg":
+      optional: true
+    "@types/sql.js":
+      optional: true
+    "@upstash/redis":
+      optional: true
+    "@vercel/postgres":
+      optional: true
+    "@xata.io/client":
+      optional: true
+    arktype:
+      optional: true
+    better-sqlite3:
+      optional: true
+    bun-types:
+      optional: true
+    effect:
+      optional: true
+    expo-sqlite:
+      optional: true
+    mssql:
+      optional: true
+    mysql2:
+      optional: true
+    pg:
+      optional: true
+    postgres:
+      optional: true
+    sql.js:
+      optional: true
+    sqlite3:
+      optional: true
+    typebox:
+      optional: true
+    valibot:
+      optional: true
+    zod:
+      optional: true
+  checksum: 10c0/b1ffbba1b4013a6ef7ebed1bd81c2badb7a91edb94e3c5167a38b71454e3dbb220c39272049ece67d05574034759eda3efb6b38f0c492899150e09218eedc9d2
   languageName: node
   linkType: hard
 

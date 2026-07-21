@@ -9,6 +9,7 @@
     { "path": "./packages/cli" },
     { "path": "./packages/privacy" },
     { "path": "./packages/server" },
+    { "path": "./packages/dashboard" },
     { "path": "./examples" },
     { "path": "./__test__" }
   ],

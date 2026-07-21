@@ -202,6 +202,9 @@ packages/*/src/**/*.js
 src/**/*.js
 __test__/**/*.js
 
+# Dashboard UI build output (built by the package build script; not source)
+packages/dashboard/web/
+
 # Python virtual environments
 .venv
 venv/
