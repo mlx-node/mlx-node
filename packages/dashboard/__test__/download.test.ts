@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 
 import { catalogWithState } from '../src/catalog.js';
 import { type DownloadEvent, DownloadManager } from '../src/download.js';
+import { acquireLock, pidAlive } from '../src/lock.js';
 import { DOWNLOAD_COMPLETE_MARKER } from '../src/models.js';
 
 /** Filename of the atomic-publish completion marker (kept in sync with models.ts). */
@@ -785,8 +786,129 @@ describe('DownloadManager', () => {
     expect(replayed[0]).toMatchObject({ type: 'done' });
   });
 
+  it('unlinks the snapshot pointer but never deletes a blob resolving OUTSIDE the cache dir', async () => {
+    // A poisoned/foreign snapshot pointer whose realpath escapes the managed cache
+    // (a server-controlled `oid`/`etag` with `../`, or a pre-existing foreign symlink
+    // in the shared HF cache). On verify failure the pointer must be unlinked, but the
+    // out-of-cache target it resolves to must NOT be deleted.
+    const victim = join(modelsDir, 'external', 'victim.bin');
+    mkdirSync(dirname(victim), { recursive: true });
+    writeFileSync(victim, Buffer.alloc(300, 0xff));
+
+    // lfs.oid deliberately WRONG so post-copy verification always fails and the retry
+    // path (the code that removes the pointer + blob) actually runs.
+    hub.manifest = [
+      { type: 'file', path: 'config.json', size: 12 },
+      {
+        type: 'file',
+        path: 'model.safetensors',
+        size: 300,
+        lfs: { oid: zerosSha256(299), size: 300, pointerSize: 100 },
+      },
+    ];
+    // Seed a cache-HIT pointer as a symlink pointing at the out-of-cache victim.
+    const pointer = hub.cachePointer(cacheDir, hub.sha, 'model.safetensors');
+    mkdirSync(dirname(pointer), { recursive: true });
+    symlinkSync(victim, pointer);
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
+
+    // The out-of-cache blob SURVIVES (the containment gate refused to delete it)…
+    expect(existsSync(victim)).toBe(true);
+    expect(readFileSync(victim)).toEqual(Buffer.alloc(300, 0xff));
+    // …while the snapshot pointer itself was unlinked (safe — a symlink rm is never followed).
+    expect(existsSync(pointer)).toBe(false);
+    expect(existsSync(finalDir())).toBe(false);
+  });
+
+  it('reaps a dead-pid staging tree on the next download but keeps a live-pid one', async () => {
+    mkdirSync(stagingRoot(), { recursive: true });
+    // A crashed/SIGKILLed job's private staging tree: pid 999999999 cannot be live.
+    const deadDir = join(stagingRoot(), `${SLUG}@${hub.sha}.999999999.11111111-1111-1111-1111-111111111111`);
+    mkdirSync(deadDir, { recursive: true });
+    writeFileSync(join(deadDir, 'model.safetensors'), Buffer.alloc(10, 0x1));
+    // A concurrent live job's private staging tree (this process' own, alive pid).
+    const liveDir = join(stagingRoot(), `${SLUG}@${hub.sha}.${process.pid}.22222222-2222-2222-2222-222222222222`);
+    mkdirSync(liveDir, { recursive: true });
+    writeFileSync(join(liveDir, 'model.safetensors'), Buffer.alloc(10, 0x2));
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const id = manager.start(REPO);
+    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+
+    // The dead-pid tree was reaped; the live-pid tree was left intact.
+    expect(existsSync(deadDir)).toBe(false);
+    expect(existsSync(liveDir)).toBe(true);
+    expect(readFileSync(join(liveDir, 'model.safetensors'))).toEqual(Buffer.alloc(10, 0x2));
+    // The job still published normally.
+    expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
+  });
+
   it('rejects a repo that is not in the catalog', () => {
     const manager = new DownloadManager({ modelsDir, cacheDir, fetchImpl: makeFetchImpl({}) });
     expect(() => manager.start('someone/not-in-catalog')).toThrow();
+  });
+});
+
+describe('model lock (lock.ts)', () => {
+  function makeLockPath(): string {
+    mkdirSync(stagingRoot(), { recursive: true });
+    return join(stagingRoot(), 'somemodel.lock');
+  }
+
+  it('makes a second acquire wait then throw while a live holder is held (never silently proceeds)', async () => {
+    const p = makeLockPath();
+    const held = await acquireLock(p);
+    await expect(acquireLock(p, { waitMs: 60, pollMs: 10 })).rejects.toThrow(/already downloading/);
+    await held.release();
+    expect(existsSync(p)).toBe(false);
+  });
+
+  it('steals a lock whose holder pid is dead', async () => {
+    const p = makeLockPath();
+    writeFileSync(p, JSON.stringify({ pid: 999999999, at: Date.now() }));
+    const stolen = await acquireLock(p, { waitMs: 60, pollMs: 10 });
+    // We now own it: the lockfile records our pid.
+    expect((JSON.parse(readFileSync(p, 'utf-8')) as { pid: number }).pid).toBe(process.pid);
+    await stolen.release();
+    expect(existsSync(p)).toBe(false);
+  });
+
+  it('steals a lock whose holder is alive but past the staleness backstop', async () => {
+    const p = makeLockPath();
+    // Our own (alive) pid, written long ago; a tiny staleMs makes it stealable anyway.
+    writeFileSync(p, JSON.stringify({ pid: process.pid, at: Date.now() - 10_000 }));
+    const stolen = await acquireLock(p, { staleMs: 1, waitMs: 60, pollMs: 10 });
+    expect((JSON.parse(readFileSync(p, 'utf-8')) as { at: number }).at).toBeGreaterThan(Date.now() - 5_000);
+    await stolen.release();
+    expect(existsSync(p)).toBe(false);
+  });
+
+  it('release unlinks only the holder this process owns, never a stealer that took over', async () => {
+    const p = makeLockPath();
+    const held = await acquireLock(p);
+    // A stealer overwrites the lockfile with its own pid.
+    writeFileSync(p, JSON.stringify({ pid: 424242, at: Date.now() }));
+    await held.release();
+    // Our release must NOT remove the stealer's lock.
+    expect(existsSync(p)).toBe(true);
+    expect((JSON.parse(readFileSync(p, 'utf-8')) as { pid: number }).pid).toBe(424242);
+  });
+
+  it('pidAlive: the current process is alive; a nonexistent pid is dead', () => {
+    expect(pidAlive(process.pid)).toBe(true);
+    expect(pidAlive(999999999)).toBe(false);
   });
 });
