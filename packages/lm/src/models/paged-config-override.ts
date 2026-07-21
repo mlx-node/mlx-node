@@ -144,15 +144,21 @@ export class PagedConfigOverrideManager {
       return modelPath;
     }
 
-    const existing = this.overrides.get(sourcePath);
+    // Memoize per (source, resolved family, persist directive): the same
+    // checkpoint resolved with a different persist tri-state must yield a distinct
+    // clone, not the first one cached under the bare path. `cleanup()` iterates
+    // every value, so multiple entries per path are all still disposed.
+    const persistKey = persistPagedCache === undefined ? 'u' : persistPagedCache ? 't' : 'f';
+    const cacheKey = `${sourcePath}\0${modelType}\0${persistKey}`;
+    const existing = this.overrides.get(cacheKey);
     if (existing !== undefined) return existing;
 
     const pending = this.createOverride(sourcePath, config, cacheFloorMb, modelType, persistPagedCache);
-    this.overrides.set(sourcePath, pending);
+    this.overrides.set(cacheKey, pending);
     try {
       return await pending;
     } catch (error) {
-      this.overrides.delete(sourcePath);
+      this.overrides.delete(cacheKey);
       throw error;
     }
   }

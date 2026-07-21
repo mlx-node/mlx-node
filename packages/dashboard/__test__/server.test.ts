@@ -1,6 +1,6 @@
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
-import { tmpdir } from 'node:os';
+import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -505,6 +505,61 @@ describe('dashboard server — malformed Host header', () => {
     // The process must survive: a subsequent well-formed request still answers.
     const ok = await rawRequest(server.port, 'GET', '/health', { Host: `127.0.0.1:${server.port}` });
     expect(ok.status).toBe(200);
+  });
+});
+
+describe('dashboard server — wildcard bind Host allowlist', () => {
+  function firstLocalIpv4(): string | undefined {
+    for (const addrs of Object.values(networkInterfaces())) {
+      for (const a of addrs ?? []) {
+        if (a.family === 'IPv4' && !a.internal) return a.address;
+      }
+    }
+    return undefined;
+  }
+
+  // Finding E: `--host 0.0.0.0` is a documented feature. A wildcard bind must
+  // accept a LAN client whose Host carries a real local interface IP while still
+  // rejecting a rebound attacker domain (no matching local IP). The loopback
+  // default is covered by the existing rebinding tests and stays unchanged.
+  it('allows a real local-interface Host and still rejects a rebound domain under a wildcard bind', async () => {
+    let wild: DashboardServer;
+    try {
+      wild = await startDashboardServer({
+        port: 0,
+        host: '0.0.0.0',
+        dbPath: ':memory:',
+        sessionsRoot,
+        tracesDir,
+        modelsDir,
+        cacheRoot,
+        webRoot,
+      });
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // Some sandboxes forbid a wildcard bind; an environment limit, not a defect.
+      if (code === 'EPERM' || code === 'EACCES') return;
+      throw err;
+    }
+    try {
+      // A rebound attacker domain has no matching local IP → still 403.
+      const evil = await rawRequest(wild.port, 'GET', '/api/models', { Host: `evil.example:${wild.port}` });
+      expect(evil.status).toBe(403);
+
+      // Loopback stays reachable under a wildcard bind.
+      const loop = await rawRequest(wild.port, 'GET', '/api/models', { Host: `127.0.0.1:${wild.port}` });
+      expect(loop.status).toBe(200);
+
+      // A real local-interface IP (LAN reachability) is now allowed. If the host
+      // has no external interface, skip that leg without weakening the assertions.
+      const ip = firstLocalIpv4();
+      if (ip !== undefined) {
+        const lan = await rawRequest(wild.port, 'GET', '/api/models', { Host: `${ip}:${wild.port}` });
+        expect(lan.status).toBe(200);
+      }
+    } finally {
+      await wild.close();
+    }
   });
 });
 

@@ -122,6 +122,28 @@ describe('PagedConfigOverrideManager persist-paged-cache', () => {
     expect(config.persistPagedCache).toBe(true);
   });
 
+  // Finding D: the memo key folds in the persist tri-state, so resolving the SAME
+  // source with persist=true then persist=false yields two DISTINCT overrides —
+  // the second must not return the first (persist=true) clone cached under the
+  // bare path. Same directive still memoizes.
+  it('resolves distinct overrides for the same source under different persist directives', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3' });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const enabled = await manager.resolve(source, 'qwen3', true);
+    const disabled = await manager.resolve(source, 'qwen3', false);
+    expect(disabled).not.toBe(enabled);
+
+    const enabledConfig = await readOverrideConfig(enabled);
+    const disabledConfig = await readOverrideConfig(disabled);
+    expect(enabledConfig.persist_paged_cache).toBe(true);
+    expect(disabledConfig.persist_paged_cache).toBe(false);
+
+    // Re-resolving with the same directive returns the memoized override.
+    expect(await manager.resolve(source, 'qwen3', true)).toBe(enabled);
+  });
+
   it('leaves persist untouched for an undirected (undefined) resolve', async () => {
     const source = await makeModelDir({ model_type: 'qwen3' });
     const manager = new PagedConfigOverrideManager();

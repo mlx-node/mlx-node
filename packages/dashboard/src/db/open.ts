@@ -145,6 +145,18 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
  */
 function assertSchemaSignature(sqlite: DatabaseSync): void {
   for (const [table, expected] of Object.entries(EXPECTED_COLUMNS)) {
+    // `PRAGMA table_info` also reports a VIEW's columns, so a view exposing the
+    // expected columns would clear the column check — then `CREATE INDEX ON
+    // <view>` throws "views may not be indexed", an error outside the rebuildable
+    // set that wedges startup. Require an actual table first; a view or a missing
+    // object rebuilds instead (a missing object → meta undefined, same as before).
+    const meta = sqlite
+      .prepare(`SELECT type FROM sqlite_schema WHERE name = ? AND type IN ('table', 'view')`)
+      .get(table) as { type?: unknown } | undefined;
+    if (meta?.type !== 'table') {
+      const actualType = typeof meta?.type === 'string' ? meta.type : 'missing';
+      throw new RebuildRequiredError(`schema signature mismatch: ${table} is ${actualType}, expected a table`);
+    }
     // Table names are fixed internal constants, never user input — safe to inline.
     const rows = sqlite.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: unknown }>;
     const actual = new Set(rows.map((r) => (typeof r.name === 'string' ? r.name : '')));

@@ -11,6 +11,7 @@
 
 import { mkdirSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { networkInterfaces } from 'node:os';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -48,6 +49,27 @@ const RETENTION_DAYS = 30;
 const INGEST_INTERVAL_MS = 30_000;
 
 const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1']);
+
+/**
+ * Build the Host/Origin allowlist for a bind. A concrete host allows the
+ * loopback names plus that exact host. A wildcard bind (`0.0.0.0`, `::`, or the
+ * empty string) cannot allowlist the literal wildcard — no browser ever sends it
+ * as `Host` — so it enumerates the machine's real interface addresses instead: a
+ * LAN client's `Host: <iface-ip>:<port>` then matches while a rebound
+ * `Host: evil.example` (no matching local IP) is still rejected, preserving the
+ * DNS-rebinding defense. `networkInterfaces()` is a boot snapshot, adequate for a
+ * local tool; IPv6 zone ids (`fe80::1%en0`) never appear in a browser Host, so
+ * link-local entries are inert.
+ */
+function bindAllowedHosts(host: string): Set<string> {
+  const wildcard = host === '0.0.0.0' || host === '::' || host === '';
+  if (!wildcard) return new Set([...LOCAL_HOSTNAMES, host]);
+  const hosts = new Set<string>(LOCAL_HOSTNAMES);
+  for (const addrs of Object.values(networkInterfaces())) {
+    for (const a of addrs ?? []) hosts.add(a.address);
+  }
+  return hosts;
+}
 
 /** Split a `Host`/URL authority into hostname + optional port, handling `[::1]`. */
 function splitHostPort(authority: string): { hostname: string; port: string } {
@@ -176,9 +198,10 @@ export async function startDashboardServer(opts: DashboardServerOptions = {}): P
   let boundPort = requestedPort;
 
   // Hosts accepted in the `Host`/`Origin` allowlist: the loopback names plus the
-  // explicitly configured bind host, so an intentional (warned) non-loopback
-  // bind stays reachable without weakening the loopback default.
-  const allowedHosts = new Set([...LOCAL_HOSTNAMES, host]);
+  // explicitly configured bind host (or, for a wildcard bind, the machine's real
+  // interface addresses), so an intentional (warned) non-loopback bind stays
+  // reachable without weakening the loopback default.
+  const allowedHosts = bindAllowedHosts(host);
 
   const server: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
     handle(req, res).catch((err: unknown) => {
