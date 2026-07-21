@@ -10,9 +10,11 @@
 //! same prompt with persistence disabled.
 //!
 //! Instances 1 and 2 load from the SAME on-disk clone (persist on) so their
-//! cold-tier fingerprints — parsed config bytes + sorted safetensors shard
-//! names/sizes + pool geometry/dtype (see `Qwen3Inner::enable_cold_tier`) —
-//! are byte-identical, which is what makes the restart lookup hit. Instance
+//! cold-tier fingerprints — parsed config bytes + a bounded per-shard
+//! weight-content sample + pool geometry/dtype (see
+//! `cold_tier::build_model_fingerprint`) — are byte-identical (the clone's
+//! weight files are symlinks the sampler follows to the real bytes), which is
+//! what makes the restart lookup hit. Instance
 //! 3 loads from a separate clone with persistence off; with no
 //! `ColdTierContext` its adapter never touches the tier, so it is a clean
 //! fresh-prefill baseline.
