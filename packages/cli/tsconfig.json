@@ -12,6 +12,7 @@
   "references": [
     { "path": "../agent" },
     { "path": "../core" },
+    { "path": "../dashboard" },
     { "path": "../lm" },
     { "path": "../privacy" },
     { "path": "../server" }

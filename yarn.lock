@@ -1178,6 +1178,7 @@ __metadata:
     "@inquirer/prompts": "npm:^8.5.2"
     "@mlx-node/agent": "workspace:*"
     "@mlx-node/core": "workspace:*"
+    "@mlx-node/dashboard": "workspace:*"
     "@mlx-node/lm": "workspace:*"
     "@mlx-node/privacy": "workspace:*"
     "@mlx-node/server": "workspace:*"
@@ -1208,7 +1209,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@mlx-node/dashboard@workspace:packages/dashboard":
+"@mlx-node/dashboard@workspace:*, @mlx-node/dashboard@workspace:packages/dashboard":
   version: 0.0.0-use.local
   resolution: "@mlx-node/dashboard@workspace:packages/dashboard"
   dependencies:
