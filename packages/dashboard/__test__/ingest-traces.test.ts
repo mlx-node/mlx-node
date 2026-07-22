@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   existsSync,
   rmSync,
+  symlinkSync,
   unlinkSync,
   utimesSync,
   writeFileSync,
@@ -355,6 +356,34 @@ describe('ingestTraces', () => {
     expect(dash.db.select().from(traces).all()).toHaveLength(2);
     expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-A')).all()).toHaveLength(1);
     expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-B')).all()).toHaveLength(1);
+  });
+
+  // F2: the 30-day prune must never follow a SYMLINKED trace root and delete
+  // external files in the link target. `statSync`/`unlinkSync` follow symlinks, so
+  // a relocated-metrics symlink pointing at an external dir would let the prune age
+  // out and delete real external *.jsonl. The no-follow root guard skips the whole
+  // pass (prunes nothing, ingests nothing) rather than reaching through the link.
+  it('never prunes through a symlinked trace root (no external deletion)', async () => {
+    // An external dir OUTSIDE any managed root, holding a victim old enough to prune.
+    const external = join(base, 'external-target');
+    mkdirSync(external, { recursive: true });
+    const victim = join(external, '2026-01-01-victim.jsonl');
+    writeFileSync(victim, traceLine('trace-victim'));
+    const oldSec = (Date.now() - 60 * DAY_MS) / 1000;
+    utimesSync(victim, oldSec, oldSec);
+
+    // The trace ROOT is a symlink to that external dir (a user relocating metrics
+    // onto another volume via `ln -s`).
+    const linkRoot = join(base, 'traces-link');
+    symlinkSync(external, linkRoot);
+
+    const res = await ingestTraces(dash, linkRoot, { retentionDays: 30 });
+
+    // The external victim survives untouched and nothing was pruned/ingested.
+    expect(existsSync(victim)).toBe(true);
+    expect(res.pruned).toBe(0);
+    expect(res.files).toBe(0);
+    expect(res.records).toBe(0);
   });
 
   // Finding J: deleting the WHOLE trace dir must still reconcile tracked rows,

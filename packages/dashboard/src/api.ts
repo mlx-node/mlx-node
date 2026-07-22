@@ -757,6 +757,18 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
   // autoincrement id keeps genuinely-distinct, both-null rows separate).
   const dedupKey = 'COALESCE(trace_id, entry_id, CAST(id AS TEXT))';
 
+  // Subagent turns run on an in-memory session manager (no session JSONL → no
+  // `turns` row), yet the shared provider still writes a `traces` row carrying the
+  // token columns. UNION those TRACE-ONLY rows into the turns-derived token
+  // aggregates below so delegated work is not silently underreported. This guard
+  // admits ONLY traces with no correlated `turns` row, so a normal/forked turn's
+  // tokens stay sourced from `turns` and are never counted twice. The inner
+  // `WHERE trace_id IS NOT NULL` is load-bearing: a NULL in the subquery would make
+  // `NOT IN` evaluate to NULL for every row and drop the whole trace-only set. Each
+  // trace-only row is one delegated turn of real work, so it also adds 1 to the
+  // per-model / overall turn COUNT.
+  const traceOnly = 'trace_id NOT IN (SELECT trace_id FROM turns WHERE trace_id IS NOT NULL)';
+
   const tokensByDay = sqlite
     .prepare(
       `SELECT date(ts / 1000, 'unixepoch') AS day,
@@ -765,10 +777,13 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
               COALESCE(SUM(cached_tokens), 0) AS cached,
               COALESCE(SUM(reasoning_tokens), 0) AS reasoning
        FROM (SELECT input_tokens, output_tokens, cached_tokens, reasoning_tokens, ts
-             FROM turns ${turnsWhere('ts > 0')} GROUP BY ${dedupKey})
+             FROM turns ${turnsWhere('ts > 0')} GROUP BY ${dedupKey}
+             UNION ALL
+             SELECT prompt_tokens, output_tokens, cached_tokens, reasoning_tokens, ts
+             FROM traces ${tracesWhere(`ts > 0 AND ${traceOnly}`)})
        GROUP BY day ORDER BY day`,
     )
-    .all(...turnsRange.args)
+    .all(...turnsRange.args, ...tracesRange.args)
     .map((row) => ({
       day: String(row.day),
       input: toInt(row.input),
@@ -834,10 +849,13 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
       `SELECT COALESCE(model, 'unknown') AS model, COUNT(*) AS turns,
               COALESCE(SUM(output_tokens), 0) AS outputTokens
        FROM (SELECT model, output_tokens
-             FROM turns ${turnsWhere('')} GROUP BY ${dedupKey})
+             FROM turns ${turnsWhere('')} GROUP BY ${dedupKey}
+             UNION ALL
+             SELECT model, output_tokens
+             FROM traces ${tracesWhere(traceOnly)})
        GROUP BY model ORDER BY turns DESC`,
     )
-    .all(...turnsRange.args)
+    .all(...turnsRange.args, ...tracesRange.args)
     .map((row) => ({ model: String(row.model), turns: toInt(row.turns), outputTokens: toInt(row.outputTokens) }));
 
   const turnTotals = sqlite
@@ -847,9 +865,12 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
               COALESCE(SUM(cached_tokens), 0) AS cachedTokens,
               COALESCE(SUM(reasoning_tokens), 0) AS reasoningTokens
        FROM (SELECT input_tokens, output_tokens, cached_tokens, reasoning_tokens
-             FROM turns ${turnsWhere('')} GROUP BY ${dedupKey})`,
+             FROM turns ${turnsWhere('')} GROUP BY ${dedupKey}
+             UNION ALL
+             SELECT prompt_tokens, output_tokens, cached_tokens, reasoning_tokens
+             FROM traces ${tracesWhere(traceOnly)})`,
     )
-    .get(...turnsRange.args);
+    .get(...turnsRange.args, ...tracesRange.args);
   const traceTotals = sqlite
     .prepare(`SELECT COUNT(*) AS traces FROM traces ${tracesWhere('')}`)
     .get(...tracesRange.args);

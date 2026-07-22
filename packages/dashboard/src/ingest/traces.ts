@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { eq, isNotNull } from 'drizzle-orm';
@@ -84,6 +84,19 @@ export async function ingestTraces(
     // No live files means no valid watermarks; clear them so a recreated dir is
     // re-ingested from scratch and the table never tracks vanished files.
     db.delete(traceFiles).run();
+    return { files, records, pruned };
+  }
+
+  // No-follow root guard (same lstat stance as `download.ts` `assertRealDirOrAbsent`):
+  // the prune below enumerates with `readdirSync`, ages entries with `statSync`, and
+  // deletes with `unlinkSync` — all of which FOLLOW symlinks. If `traceDir` itself is
+  // a symlink (or any non-directory), a relocated-metrics link could redirect the
+  // 30-day prune onto an EXTERNAL target and delete real files there. This is
+  // best-effort background work, so rather than throw we skip the whole pass (prune
+  // nothing, ingest nothing) and leave everything untouched; a real directory behaves
+  // exactly as before.
+  const rootStat = lstatSync(traceDir);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
     return { files, records, pruned };
   }
 

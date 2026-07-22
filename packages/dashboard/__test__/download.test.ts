@@ -828,6 +828,75 @@ describe('DownloadManager', () => {
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
   });
 
+  // F4: a MALFORMED backup dir name (`<slug>.backup-<garbage>` / `<slug>.backup-`)
+  // whose owner pid can't be parsed by BACKUP_DIR_RE must fail CLOSED — left
+  // untouched, never promoted into the model path and never reaped — mirroring
+  // `pidAlive`'s unknown-owner→alive stance. Here finalDir is ABSENT: pre-fix, the
+  // null match short-circuited the live-PID guard and the unparseable backup was
+  // renamed onto finalDir; the fix leaves it in `.staging` and downloads fresh.
+  it('leaves an unparseable backup dir untouched when finalDir is absent (fails closed)', async () => {
+    const garbage = join(stagingRoot(), `${SLUG}.backup-garbage`);
+    const emptyPid = join(stagingRoot(), `${SLUG}.backup-`);
+    mkdirSync(garbage, { recursive: true });
+    writeFileSync(join(garbage, 'config.json'), Buffer.alloc(12, 0xab));
+    mkdirSync(emptyPid, { recursive: true });
+    writeFileSync(join(emptyPid, 'config.json'), Buffer.alloc(12, 0xcd));
+    expect(existsSync(finalDir())).toBe(false);
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const id = manager.start(REPO);
+    await waitFor(() => manager.jobs().some((j) => j.id === id && (j.state === 'done' || j.state === 'error')));
+
+    // Both unparseable backups survive byte-for-byte in `.staging` (not renamed away).
+    expect(existsSync(garbage)).toBe(true);
+    expect(readFileSync(join(garbage, 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+    expect(existsSync(emptyPid)).toBe(true);
+    expect(readFileSync(join(emptyPid, 'config.json'))).toEqual(Buffer.alloc(12, 0xcd));
+    // finalDir holds the FRESHLY downloaded (zero-byte) content + marker, not the garbage.
+    expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
+    expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12));
+  });
+
+  // F4: the same fail-closed guard when a COMPLETE owned install already occupies
+  // finalDir. Pre-fix, the null match let the unparseable backup be `rm`'d (owner
+  // treated as dead); the fix leaves it untouched while the job short-circuits on
+  // the existing install.
+  it('leaves an unparseable backup dir untouched when finalDir is already installed (fails closed)', async () => {
+    mkdirSync(finalDir(), { recursive: true });
+    writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12));
+    writeFileSync(join(finalDir(), 'model.safetensors'), Buffer.alloc(300));
+    writeFileSync(
+      join(finalDir(), DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: REPO, revision: hub.sha, files: ['config.json', 'model.safetensors'], completedAt: 'x' }),
+    );
+    const garbage = join(stagingRoot(), `${SLUG}.backup-garbage`);
+    const emptyPid = join(stagingRoot(), `${SLUG}.backup-`);
+    mkdirSync(garbage, { recursive: true });
+    writeFileSync(join(garbage, 'config.json'), Buffer.alloc(12, 0xab));
+    mkdirSync(emptyPid, { recursive: true });
+    writeFileSync(join(emptyPid, 'config.json'), Buffer.alloc(12, 0xcd));
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const id = manager.start(REPO);
+    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+
+    // The unparseable backups were neither reaped nor promoted: both survive intact.
+    expect(existsSync(garbage)).toBe(true);
+    expect(readFileSync(join(garbage, 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+    expect(existsSync(emptyPid)).toBe(true);
+    expect(readFileSync(join(emptyPid, 'config.json'))).toEqual(Buffer.alloc(12, 0xcd));
+    // The existing install is untouched and the job resumed (no re-download).
+    expect(hub.downloaded).toEqual([]);
+  });
+
   it('does NOT invalidate or unlink a cache pointer whose PARENT resolves outside the cache dir', async () => {
     // The pointer's PARENT dir is a symlink escaping the managed cache (only possible
     // via a foreign/poisoned cache layout, never via the hub). On verify failure the

@@ -105,10 +105,13 @@ restored on a hot-cache miss before falling back to a normal prefill.
   dashboard has **no authentication** and exposes local models, sessions, and cache
   to anyone who can reach the address.
 - **No auth.** Mutating (non-GET/HEAD) requests are guarded by a local-origin check:
-  the `Host` header must name a loopback host (optionally with the server port), and
-  any present `Origin` must be an `http` loopback origin. This blocks drive-by CSRF /
-  DNS-rebinding against the loopback port. GET/HEAD (static assets + read endpoints)
-  are unguarded.
+  under the default loopback bind the `Host` header must name a loopback host
+  (optionally with the server port), and any present `Origin` must be an `http`
+  loopback origin. An explicit non-loopback `--host` bind intentionally widens the
+  accepted `Host` set to that bound interface's address(es) — the no-auth exposure
+  noted above — while still rejecting a rebound foreign host. This blocks drive-by
+  CSRF / DNS-rebinding against the loopback port. GET/HEAD (static assets + read
+  endpoints) are unguarded.
 - Destructive ops (delete model/session, clear/evict cache) require UI confirmation
   and resolve paths strictly inside their managed roots before any removal.
 

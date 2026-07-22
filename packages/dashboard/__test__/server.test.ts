@@ -514,20 +514,87 @@ describe('dashboard server — metrics overview', () => {
       modelShare: Array<{ model: string; turns: number; outputTokens: number }>;
       totals: { turns: number; inputTokens: number; outputTokens: number; cachedTokens: number; reasoningTokens: number };
     };
-    // fix-1 (2 turns) + fix-2 (1) + fork-1 (2 verbatim copies of fix-1) → 3 distinct.
-    expect(body.totals.turns).toBe(3);
-    expect(body.totals.inputTokens).toBe(320); // 100 + 180 + 40 — fork copies collapsed
-    expect(body.totals.outputTokens).toBe(130); // 50 + 60 + 20
-    expect(body.totals.cachedTokens).toBe(110); // 10 + 100 + 0
-    expect(body.totals.reasoningTokens).toBe(17); // 5 + 12 + 0
+    // fix-1 (2 turns) + fix-2 (1) + fork-1 (2 verbatim copies of fix-1) → 3 distinct
+    // turns, PLUS the two trace-only fixture rows that carry no correlating `turns`
+    // row (trace-bbb=gemma4, trace-ccc=lfm2), which the F3 union counts as delegated
+    // subagent turns → 5 total.
+    expect(body.totals.turns).toBe(5);
+    expect(body.totals.inputTokens).toBe(595); // 100 + 180 + 40 (fork collapsed) + 200 + 75 (trace-only)
+    expect(body.totals.outputTokens).toBe(270); // 50 + 60 + 20 + 128 + 12
+    expect(body.totals.cachedTokens).toBe(135); // 10 + 100 + 0 + 0 + 25
+    expect(body.totals.reasoningTokens).toBe(17); // 5 + 12 + 0 + 0 + 0
 
-    // Distinct real inferences per model stay separate: qwen3_5 (2), gemma4 (1).
+    // Distinct real inferences per model stay separate: qwen3_5's forked copies
+    // collapse to 2 (trace-aaa correlates, so it is not double-counted); gemma4 is
+    // the n2 turn (20) plus the trace-only trace-bbb (128) → 2 turns / 148 output.
     const qwen = body.modelShare.find((m) => m.model === 'qwen3_5');
     const gemma = body.modelShare.find((m) => m.model === 'gemma4');
     expect(qwen?.turns).toBe(2);
     expect(qwen?.outputTokens).toBe(110);
-    expect(gemma?.turns).toBe(1);
-    expect(gemma?.outputTokens).toBe(20);
+    expect(gemma?.turns).toBe(2);
+    expect(gemma?.outputTokens).toBe(148);
+  });
+
+  // F3: subagent turns run on an in-memory session manager → no session JSONL → no
+  // `turns` row, but the shared provider still writes a `traces` row carrying token
+  // columns. Those trace-only rows must be UNIONed into tokensByDay/modelShare/
+  // turnTotals (which otherwise read `turns` only), each counted ONCE and never
+  // double-counting a normal turn whose trace correlates 1:1 to a `turns` row.
+  it('includes trace-only (subagent) turns in token aggregates without double-counting', async () => {
+    const dayStart = Date.parse('2026-07-05T00:00:00.000Z');
+    const dayEnd = Date.parse('2026-07-05T23:59:59.999Z');
+    const midMs = Date.parse('2026-07-05T12:00:00.000Z');
+
+    // A NORMAL turn: a persisted assistant turn whose trace correlates 1:1 (same
+    // trace_id `corr-1`). Its authoritative tokens live in `turns`.
+    const root = [
+      { type: 'session', version: 3, id: 'sub-root', timestamp: '2026-07-05T12:00:00.000Z', cwd: '/w' },
+      { type: 'message', id: 'sm1', parentId: null, timestamp: '2026-07-05T12:00:00.500Z', message: { role: 'user', content: 'root question', timestamp: midMs } },
+      {
+        type: 'message',
+        id: 'sm2',
+        parentId: 'sm1',
+        timestamp: '2026-07-05T12:00:01.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'root answer' }], model: 'corr-model', usage: { input: 300, output: 90, cacheRead: 30, reasoning: 9 }, timestamp: midMs, mlxTraceId: 'corr-1' },
+      },
+    ];
+    writeFileSync(
+      join(sessionsRoot, '--w--', '2026-07-05T12-00-00_sub-root.jsonl'),
+      `${root.map((l) => JSON.stringify(l)).join('\n')}\n`,
+    );
+
+    // Two trace rows on the same day: `corr-1` correlates to the turn above (must NOT
+    // double-count), `sub-1` is a subagent (trace-only: no `turns` row references it).
+    writeFileSync(
+      join(tracesDir, '2026-07-05-subagent.jsonl'),
+      `${JSON.stringify({ v: 1, traceId: 'corr-1', ts: midMs, sessionId: 'sub-root', model: 'corr-model', promptTokens: 300, cachedTokens: 30, outputTokens: 90, reasoningTokens: 9 })}\n${JSON.stringify({ v: 1, traceId: 'sub-1', ts: midMs, rootSessionId: 'sub-root', model: 'sub-model', promptTokens: 500, cachedTokens: 40, outputTokens: 200, reasoningTokens: 15 })}\n`,
+    );
+    await ingest();
+
+    // Scope to the seeded day so totals are deterministic regardless of other fixtures.
+    const body = (await (await fetch(`${server.url}/api/metrics/overview?from=${dayStart}&to=${dayEnd}`)).json()) as {
+      tokensByDay: Array<{ day: string; input: number; output: number; cached: number; reasoning: number }>;
+      modelShare: Array<{ model: string; turns: number; outputTokens: number }>;
+      totals: { turns: number; inputTokens: number; outputTokens: number; cachedTokens: number; reasoningTokens: number };
+    };
+
+    // turnTotals: normal turn (300/90/30/9) + trace-only sub-1 (500/200/40/15), each once.
+    expect(body.totals.turns).toBe(2);
+    expect(body.totals.inputTokens).toBe(800);
+    expect(body.totals.outputTokens).toBe(290);
+    expect(body.totals.cachedTokens).toBe(70);
+    expect(body.totals.reasoningTokens).toBe(24);
+
+    // tokensByDay: one 2026-07-05 bucket with the combined tokens (correlated once).
+    const bucket = body.tokensByDay.find((d) => d.day === '2026-07-05');
+    expect(bucket).toEqual({ day: '2026-07-05', input: 800, output: 290, cached: 70, reasoning: 24 });
+
+    // modelShare: the correlated turn counted ONCE under corr-model (90, not 180),
+    // and the trace-only subagent surfaced under sub-model.
+    const corr = body.modelShare.find((m) => m.model === 'corr-model');
+    const sub = body.modelShare.find((m) => m.model === 'sub-model');
+    expect(corr).toEqual({ model: 'corr-model', turns: 1, outputTokens: 90 });
+    expect(sub).toEqual({ model: 'sub-model', turns: 1, outputTokens: 200 });
   });
 
   // Finding 9-query: the overview must expose a day-bucketed throughput/TTFT trend

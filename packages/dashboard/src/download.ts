@@ -721,8 +721,14 @@ export class DownloadManager {
       }
       if (name.startsWith(backupPrefix)) {
         const backupMatch = BACKUP_DIR_RE.exec(name);
+        // Fail closed on an unparseable owner: a name that carries the backup prefix
+        // but no readable pid is left untouched (never promoted onto finalDir, never
+        // reaped), mirroring `pidAlive`'s unknown-owner→alive stance. Without this,
+        // the null match would short-circuit the live-PID guard below and treat the
+        // dir as owner-dead.
+        if (backupMatch === null) continue;
         // A backup whose owner pid is still alive is a peer mid-publish: never touch it.
-        if (backupMatch !== null && pidAlive(Number(backupMatch[1]))) continue;
+        if (pidAlive(Number(backupMatch[1]))) continue;
         const backupPath = join(stagingRoot, name);
         try {
           // Reap the redundant backup ONLY when finalDir is a proven-complete
