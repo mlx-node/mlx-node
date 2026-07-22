@@ -446,6 +446,90 @@ describe('ingestSessions', () => {
     rmSync(soloBase, { recursive: true, force: true });
   });
 
+  // F3: a valid header + a malformed INTERIOR line (a valid line after it) must
+  // NOT be indexed as a real transcript. pi's parser silently drops the interior
+  // line and keeps going; the orphaned child (its parent was the dropped line) is
+  // accepted by the topology guard as a false root, so the derived transcript is
+  // a corrupt subset (here: missing u1). Since this is not a single-trailing-line
+  // live-append, it must be quarantined/skipped, not indexed.
+  it('does not index a session with a malformed interior line (false transcript)', async () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-interior-'));
+    const root = join(soloBase, 'sessions');
+    const dir = join(root, '--w--');
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, 'interior.jsonl');
+
+    const header = JSON.stringify({ type: 'session', version: 3, id: 'int-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' });
+    const user = JSON.stringify({ type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'q' } });
+    // A truncated INTERIOR record — pi drops it and continues parsing.
+    const brokenInterior = '{"type":"message","id":"m2","parentId":"u1","timestamp":"2026-07-01T10:00:02.000Z","message":{"role":"asst';
+    // Its child references the DROPPED m2 → orphaned → accepted as a false root.
+    const orphan = JSON.stringify({
+      type: 'message',
+      id: 'a3',
+      parentId: 'm2',
+      timestamp: '2026-07-01T10:00:03.000Z',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'orphan' }], model: 'qwen3_5', usage: { input: 7, output: 8 } },
+    });
+    // 4 non-blank lines; the LAST line (orphan) parses → this is an interior drop,
+    // not a trailing incomplete-prefix.
+    writeFileSync(file, `${header}\n${user}\n${brokenInterior}\n${orphan}\n`);
+
+    const res = await ingestSessions(dash, root);
+    expect(res.warnings.some((w) => /malformed|skipped/i.test(w))).toBe(true);
+    // The corrupt session is absent — never indexed as a false transcript.
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'int-1')).all()).toHaveLength(0);
+    expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'int-1')).all()).toHaveLength(0);
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
+
+  // F3: when a previously-indexed valid transcript is swapped (same path) to one
+  // with an interior drop, its stale rows must be QUARANTINED (removed), not left
+  // feeding the overview — mirroring the topology/no-header quarantine branches.
+  it('quarantines stale rows when a regular file is swapped to an interior-drop transcript', async () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-interior-swap-'));
+    const root = join(soloBase, 'sessions');
+    const file = writeSessionFile(soloBase, 's.jsonl', [
+      { type: 'session', version: 3, id: 'sw-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
+      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'hi' } },
+      {
+        type: 'message',
+        id: 'a1',
+        parentId: 'u1',
+        timestamp: '2026-07-01T10:00:02.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+      },
+    ]);
+    await ingestSessions(dash, root);
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'sw-1')).all()).toHaveLength(1);
+    expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'sw-1')).all()).toHaveLength(1);
+
+    // Swap the SAME path to a valid-header file with a dropped interior record.
+    const header = JSON.stringify({ type: 'session', version: 3, id: 'sw-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' });
+    const user = JSON.stringify({ type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-02T10:00:01.000Z', message: { role: 'user', content: 'hi' } });
+    const brokenInterior = '{"type":"message","id":"m2","parentId":"u1","timestamp":"2026-07-02T10:00:02.000Z","message":{"role":"asst';
+    const orphan = JSON.stringify({
+      type: 'message',
+      id: 'a3',
+      parentId: 'm2',
+      timestamp: '2026-07-02T10:00:03.000Z',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'orphan' }], model: 'qwen3_5', usage: { input: 7, output: 8 } },
+    });
+    writeFileSync(file, `${header}\n${user}\n${brokenInterior}\n${orphan}\n`);
+    const later = Date.now() / 1000 + 5;
+    utimesSync(file, later, later);
+
+    const res = await ingestSessions(dash, root);
+    expect(res.warnings.some((w) => /malformed|skipped/i.test(w))).toBe(true);
+    expect(res.removed).toBe(1);
+    // The stale rows are GONE, not merely skipped.
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'sw-1')).all()).toHaveLength(0);
+    expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'sw-1')).all()).toHaveLength(0);
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
+
   // Finding G: a cyclic entry tree must be quarantined, not walked unbounded
   // (pi's branch walker has no visited-set → self-parent/cycle hangs/OOMs).
   it('quarantines a cyclic session tree without hanging and still ingests valid siblings', async () => {

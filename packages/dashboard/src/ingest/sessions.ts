@@ -390,15 +390,31 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
       }
 
       // pi's parser silently drops malformed JSONL lines. If more non-blank
-      // lines exist than entries parsed, the file is truncated/corrupt: index
-      // what parsed but do NOT stamp the current mtime/size as fully-ingested,
-      // so a later completed write re-ingests instead of being skipped.
+      // lines exist than entries parsed, the file is truncated/corrupt.
       const droppedLines = countJsonlLines(raw) - entries.length;
       const complete = droppedLines <= 0;
+      // Only a single non-parsing FINAL line is a legitimate live-append
+      // in-progress prefix (`droppedLines === 1` with the last line failing to
+      // parse ⇒ the dropped line IS the last line). Anything else — an interior
+      // drop, or more than one dropped line — means pi silently discarded a
+      // record and kept going: an orphaned child whose parent was dropped is
+      // accepted by the topology guard as a false root, so the derived
+      // transcript is a corrupt subset. That must NOT be indexed as a real
+      // session; quarantine any stale rows and skip, mirroring the
+      // topology/no-header branches.
+      const trailingOnly = droppedLines === 1 && !lastLineParses(raw);
+      if (!complete && !trailingOnly) {
+        warnings.push(`${filePath}: malformed session records; skipped`);
+        if (quarantinePath(filePath)) removed++;
+        continue;
+      }
       if (!complete) {
-        const kind =
-          droppedLines === 1 && !lastLineParses(raw) ? 'incomplete trailing line' : `${droppedLines} malformed line(s)`;
-        warnings.push(`${filePath}: ${kind}; indexed ${entries.length} entries, not marking fully-ingested`);
+        // trailingOnly: index what parsed but do NOT stamp the current
+        // mtime/size as fully-ingested, so a later completed write re-ingests
+        // instead of being skipped.
+        warnings.push(
+          `${filePath}: incomplete trailing line; indexed ${entries.length} entries, not marking fully-ingested`,
+        );
       }
 
       sqlite.exec('BEGIN');

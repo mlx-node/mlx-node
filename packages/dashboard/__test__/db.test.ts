@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { openDashboardDb } from '../src/db/open.js';
-import { sessions, traces, turns } from '../src/db/schema.js';
+import { sessions, traceFiles, traces, turns } from '../src/db/schema.js';
 
 describe('dashboard db', () => {
   it('bootstraps schema and round-trips a session row', () => {
@@ -131,7 +131,7 @@ describe('dashboard db', () => {
     const seed = openDashboardDb(file);
     seed.close();
     const bump = new DatabaseSync(file);
-    bump.exec('PRAGMA user_version = 2;'); // > SCHEMA_VERSION (1)
+    bump.exec('PRAGMA user_version = 3;'); // > SCHEMA_VERSION (2)
     bump.close();
 
     const dash = openDashboardDb(file);
@@ -185,7 +185,7 @@ describe('dashboard db', () => {
         cold_hits INTEGER, cold_bytes_restored INTEGER
       );`,
     );
-    raw.exec('PRAGMA user_version = 1;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 2;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
 
     const dash = openDashboardDb(file);
@@ -231,7 +231,7 @@ describe('dashboard db', () => {
         cold_bytes_written INTEGER, cold_bytes_restored INTEGER, source_file TEXT
       );`,
     );
-    raw.exec('PRAGMA user_version = 1;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 2;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
 
     const dash = openDashboardDb(file);
@@ -277,7 +277,7 @@ describe('dashboard db', () => {
         cold_bytes_written INTEGER, cold_bytes_restored INTEGER, source_file TEXT
       );`,
     );
-    raw.exec('PRAGMA user_version = 1;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 2;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
 
     const dash = openDashboardDb(file);
@@ -344,7 +344,7 @@ describe('dashboard db', () => {
         input_tokens, output_tokens, cached_tokens, reasoning_tokens
       FROM turns_backing;`,
     );
-    raw.exec('PRAGMA user_version = 1;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 2;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
 
     const dash = openDashboardDb(file);
@@ -394,7 +394,7 @@ describe('dashboard db', () => {
         input_tokens, output_tokens, cached_tokens, reasoning_tokens
       );`,
     );
-    raw.exec('PRAGMA user_version = 1;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 2;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
 
     const dash = openDashboardDb(file);
@@ -443,7 +443,7 @@ describe('dashboard db', () => {
         cold_bytes_written INTEGER, cold_bytes_restored INTEGER, source_file TEXT
       );`,
     );
-    raw.exec('PRAGMA user_version = 1;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 2;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
 
     // First open: signature probe finds queue_ms/resident missing → quarantine+rebuild.
@@ -462,6 +462,65 @@ describe('dashboard db', () => {
     // validates in place — the seeded row survives and nothing new is quarantined.
     const second = openDashboardDb(file);
     expect(second.db.select().from(traces).all()).toHaveLength(1);
+    second.close();
+    expect(readdirSync(d).filter((n) => n.startsWith('index.db.corrupt-'))).toHaveLength(1);
+
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  // F2: a db predating the trace_files watermark table (matching version, every
+  // other table complete) must be quarantined+rebuilt. The auto-derived
+  // EXPECTED_COLUMNS now includes trace_files, so its absence is caught by the
+  // signature probe (it iterates last, after sessions/turns/traces all pass).
+  // The rebuilt db round-trips a trace_files row AND re-validates on a second
+  // open — proving the SCHEMA_VERSION bump + DDL + validation all agree (no
+  // startup wedge, no re-quarantine loop).
+  it('quarantines a db missing the trace_files table and rebuilds, then re-validates without wedging', () => {
+    const d = mkdtempSync(join(tmpdir(), 'dash-notracefiles-'));
+    const file = join(d, 'index.db');
+    const raw = new DatabaseSync(file);
+    // Full sessions + turns + traces, but NO trace_files watermark table.
+    raw.exec(
+      `CREATE TABLE sessions (
+        id TEXT PRIMARY KEY, path TEXT NOT NULL, cwd TEXT NOT NULL, name TEXT,
+        created INTEGER NOT NULL, modified INTEGER NOT NULL,
+        message_count INTEGER NOT NULL DEFAULT 0, first_message TEXT,
+        last_ingested_mtime INTEGER NOT NULL DEFAULT 0, last_ingested_size INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE turns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, entry_id TEXT,
+        trace_id TEXT, ts INTEGER NOT NULL, model TEXT, input_tokens INTEGER,
+        output_tokens INTEGER, cached_tokens INTEGER, reasoning_tokens INTEGER
+      );
+      CREATE TABLE traces (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT NOT NULL UNIQUE,
+        session_id TEXT, root_session_id TEXT, ts INTEGER NOT NULL, model TEXT,
+        ttft_ms REAL, prefill_tps REAL, decode_tps REAL, mtp_cycles INTEGER,
+        mtp_mean_accepted REAL, duration_ms REAL, queue_ms INTEGER, finish_reason TEXT,
+        resident INTEGER, prompt_tokens INTEGER, cached_tokens INTEGER, output_tokens INTEGER,
+        reasoning_tokens INTEGER, cold_hits INTEGER, cold_misses INTEGER,
+        cold_bytes_written INTEGER, cold_bytes_restored INTEGER, source_file TEXT
+      );`,
+    );
+    raw.exec('PRAGMA user_version = 2;'); // matches SCHEMA_VERSION → version check passes
+    raw.close();
+
+    // First open: signature probe finds trace_files missing → quarantine+rebuild.
+    const first = openDashboardDb(file);
+    first.db.insert(traceFiles).values({ name: 'f.jsonl', lastIngestedMtime: 5, lastIngestedSize: 9 }).run();
+    const rows = first.db.select().from(traceFiles).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].name).toBe('f.jsonl');
+    expect(rows[0].lastIngestedMtime).toBe(5);
+    first.close();
+
+    const quarantined = readdirSync(d).filter((n) => n.startsWith('index.db.corrupt-'));
+    expect(quarantined).toHaveLength(1);
+
+    // Second open of the freshly-rebuilt db: DDL and EXPECTED_COLUMNS agree, so
+    // it validates in place — the seeded row survives, nothing new is quarantined.
+    const second = openDashboardDb(file);
+    expect(second.db.select().from(traceFiles).all()).toHaveLength(1);
     second.close();
     expect(readdirSync(d).filter((n) => n.startsWith('index.db.corrupt-'))).toHaveLength(1);
 

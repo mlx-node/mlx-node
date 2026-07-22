@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { eq, isNotNull } from 'drizzle-orm';
 
 import type { DashboardDb } from '../db/open.js';
-import { traces } from '../db/schema.js';
+import { traceFiles, traces } from '../db/schema.js';
 import { metricsTraceDir } from '../paths.js';
 
 export interface TraceIngestResult {
@@ -81,6 +81,9 @@ export async function ingestTraces(
     // set, so deleting the dir never leaves ingested rows visible forever. Rows
     // with a NULL source_file predate tracking and are left untouched.
     db.delete(traces).where(isNotNull(traces.sourceFile)).run();
+    // No live files means no valid watermarks; clear them so a recreated dir is
+    // re-ingested from scratch and the table never tracks vanished files.
+    db.delete(traceFiles).run();
     return { files, records, pruned };
   }
 
@@ -104,6 +107,21 @@ export async function ingestTraces(
       }
       pruned++;
       db.delete(traces).where(eq(traces.sourceFile, name)).run();
+      continue;
+    }
+
+    // Incremental skip (mirrors the session ingest watermark): a file whose
+    // floored mtime AND size match its stored watermark has already been fully
+    // ingested, so skip the read/parse/insert entirely. Without this, every 30s
+    // rescan re-reads and re-parses the whole retention window on the event loop.
+    const mtime = Math.floor(stat.mtimeMs);
+    const size = stat.size;
+    const watermark = db
+      .select({ mtime: traceFiles.lastIngestedMtime, size: traceFiles.lastIngestedSize })
+      .from(traceFiles)
+      .where(eq(traceFiles.name, name))
+      .all();
+    if (watermark.length > 0 && watermark[0].mtime === mtime && watermark[0].size === size) {
       continue;
     }
 
@@ -162,6 +180,18 @@ export async function ingestTraces(
         .run();
       records++;
     }
+
+    // Stamp the watermark AFTER every line landed, so a crash mid-file simply
+    // re-reads next pass (the traceId conflict guard keeps that idempotent). A
+    // file with only malformed lines still records a watermark, so a permanently
+    // garbage file is not re-parsed on every rescan.
+    db.insert(traceFiles)
+      .values({ name, lastIngestedMtime: mtime, lastIngestedSize: size })
+      .onConflictDoUpdate({
+        target: traceFiles.name,
+        set: { lastIngestedMtime: mtime, lastIngestedSize: size },
+      })
+      .run();
   }
 
   // Reconcile rows whose backing file has vanished (manually deleted, or pruned
@@ -173,6 +203,14 @@ export async function ingestTraces(
     .all() as Array<{ sf: string }>;
   for (const { sf } of tracked) {
     if (!live.has(sf)) db.delete(traces).where(eq(traces.sourceFile, sf)).run();
+  }
+
+  // Reconcile watermark rows the same way: drop any whose file has vanished
+  // (pruned or manually deleted) so the table tracks only live files and a
+  // reused filename is never wrongly skipped.
+  const trackedFiles = db.select({ name: traceFiles.name }).from(traceFiles).all();
+  for (const { name: tracked } of trackedFiles) {
+    if (!live.has(tracked)) db.delete(traceFiles).where(eq(traceFiles.name, tracked)).run();
   }
 
   return { files, records, pruned };

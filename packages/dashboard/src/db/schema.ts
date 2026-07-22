@@ -55,3 +55,16 @@ export const traces = sqliteTable('traces', {
   coldBytesRestored: integer('cold_bytes_restored'),
   sourceFile: text('source_file'),
 });
+
+/**
+ * Per-file ingest watermark for the trace JSONL directory. Trace rows are keyed
+ * by `traceId` (many per file), so — unlike `sessions` — there is no 1:1
+ * file↔row anchor to hang the watermark on; this dedicated table records the
+ * `(mtime, size)` of each fully-ingested trace file so a 30s rescan can skip
+ * unchanged files instead of re-reading the entire history every pass.
+ */
+export const traceFiles = sqliteTable('trace_files', {
+  name: text('name').primaryKey(),
+  lastIngestedMtime: integer('last_ingested_mtime').notNull(),
+  lastIngestedSize: integer('last_ingested_size').notNull(),
+});

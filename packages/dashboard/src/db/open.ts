@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { getTableColumns } from 'drizzle-orm';
 import { drizzle, type NodeSQLiteDatabase } from 'drizzle-orm/node-sqlite';
 
-import { sessions, traces, turns } from './schema.js';
+import { sessions, traceFiles, traces, turns } from './schema.js';
 
 export interface DashboardDb {
   db: NodeSQLiteDatabase;
@@ -18,7 +18,7 @@ export interface DashboardDb {
  * rather than migrated in place. The index is disposable and repopulated from
  * JSONL on boot, so a rebuild never loses source-of-truth data.
  */
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS sessions (
@@ -72,6 +72,12 @@ CREATE TABLE IF NOT EXISTS traces (
   cold_bytes_written INTEGER,
   cold_bytes_restored INTEGER,
   source_file TEXT
+);
+
+CREATE TABLE IF NOT EXISTS trace_files (
+  name TEXT PRIMARY KEY,
+  last_ingested_mtime INTEGER NOT NULL,
+  last_ingested_size INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_turns_session_id ON turns (session_id);
@@ -133,6 +139,7 @@ const EXPECTED_COLUMNS: Record<string, string[]> = {
   sessions: Object.values(getTableColumns(sessions)).map((c) => c.name),
   turns: Object.values(getTableColumns(turns)).map((c) => c.name),
   traces: Object.values(getTableColumns(traces)).map((c) => c.name),
+  trace_files: Object.values(getTableColumns(traceFiles)).map((c) => c.name),
 };
 
 /**

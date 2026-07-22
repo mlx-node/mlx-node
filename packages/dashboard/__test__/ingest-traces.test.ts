@@ -1,4 +1,14 @@
-import { cpSync, mkdirSync, mkdtempSync, existsSync, rmSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  existsSync,
+  rmSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,7 +17,7 @@ import { eq } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import { openDashboardDb, type DashboardDb } from '../src/db/open.js';
-import { traces } from '../src/db/schema.js';
+import { traceFiles, traces } from '../src/db/schema.js';
 import { ingestTraces } from '../src/ingest/traces.js';
 
 const FIXTURE_TRACES = fileURLToPath(new URL('./fixtures/traces', import.meta.url));
@@ -151,9 +161,57 @@ describe('ingestTraces', () => {
   it('is idempotent on duplicate traceId', async () => {
     cpSync(FIXTURE_TRACES, dir, { recursive: true });
     await ingestTraces(dash, dir);
+    // F2: the unchanged file is now skipped by its watermark, so the second pass
+    // reads/parses nothing — yet the index still holds exactly the 3 rows (no
+    // duplicates). The onConflict guard still covers a genuine re-read (see the
+    // appended-file test below).
     const second = await ingestTraces(dash, dir);
-    expect(second.records).toBe(3);
+    expect(second.files).toBe(0);
+    expect(second.records).toBe(0);
     expect(dash.db.select().from(traces).all()).toHaveLength(3);
+  });
+
+  // F2: a fully-ingested file records a watermark; an unchanged file is skipped
+  // on the next rescan (not re-read/re-parsed) so a 30s poll is O(new files).
+  it('skips an unchanged file on the second ingest (watermark)', async () => {
+    cpSync(FIXTURE_TRACES, dir, { recursive: true });
+    const first = await ingestTraces(dash, dir);
+    expect(first.files).toBe(1);
+    expect(first.records).toBe(3);
+
+    // The watermark for the file was written.
+    const wm = dash.db.select().from(traceFiles).all();
+    expect(wm).toHaveLength(1);
+    expect(wm[0].name).toBe('2026-07-01-99999.jsonl');
+    expect(wm[0].lastIngestedSize).toBeGreaterThan(0);
+
+    // Second pass: the file matches its watermark → not read (files === 0), not
+    // re-parsed (records === 0), and the row set is unchanged.
+    const second = await ingestTraces(dash, dir);
+    expect(second.files).toBe(0);
+    expect(second.records).toBe(0);
+    expect(dash.db.select().from(traces).all()).toHaveLength(3);
+  });
+
+  // F2: a file that grew since its watermark (a new appended record) is re-read;
+  // the new record lands while the existing rows dedupe via onConflict.
+  it('re-ingests a file that was appended to after its watermark', async () => {
+    cpSync(FIXTURE_TRACES, dir, { recursive: true });
+    await ingestTraces(dash, dir);
+    expect(dash.db.select().from(traces).all()).toHaveLength(3);
+
+    const file = join(dir, '2026-07-01-99999.jsonl');
+    appendFileSync(file, traceLine('trace-appended'));
+    // Bump mtime forward so the (mtime, size) watermark definitively mismatches.
+    const later = Date.now() / 1000 + 5;
+    utimesSync(file, later, later);
+
+    const res = await ingestTraces(dash, dir);
+    // The changed file is read again (files === 1); the 3 originals re-process
+    // idempotently and the appended record is added → 4 rows total.
+    expect(res.files).toBe(1);
+    expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-appended')).all()).toHaveLength(1);
+    expect(dash.db.select().from(traces).all()).toHaveLength(4);
   });
 
   it('prunes files older than retentionDays', async () => {
