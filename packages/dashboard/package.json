@@ -18,7 +18,7 @@
   },
   "scripts": {
     "build": "tsc -b && yarn build:ui",
-    "build:ui": "cd ui && vp build",
+    "build:ui": "cd ui && yarn exec vp build",
     "prepack": "yarn build:ui"
   },
   "dependencies": {

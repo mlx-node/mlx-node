@@ -473,8 +473,8 @@ jobs:
       # tsc -b only emits dashboard server `dist/`; the Vite SPA under `web/`
       # is gitignored and built separately. Build it explicitly so the tarball
       # ships `web/index.html` (dashboard's `prepack` also covers `npm pack`).
-      # `vp` is a workspace-local bin present after `yarn install`, so no vite
-      # shim / setup-vp is required here.
+      # `build:ui` invokes `vp` via `yarn exec`, which resolves the workspace's
+      # own vite-plus bin (no global `vp` / setup-vp needed on this runner).
       - name: Build dashboard UI
         run: yarn workspace @mlx-node/dashboard build:ui
 
