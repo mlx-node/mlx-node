@@ -242,41 +242,85 @@ function detectContextWindow(config: Record<string, unknown>): number | null {
   return null;
 }
 
-/** Recursive size + file count of a directory. Unreadable entries are skipped. */
-function walkDirStats(dir: string): { sizeBytes: number; fileCount: number } {
+/**
+ * Belt-and-braces cap on entries examined while sizing one checkpoint dir. A real
+ * HF checkpoint holds a few dozen files; anything far larger is pathological (a
+ * cycle the no-follow walk below already breaks, or a runaway tree), so the walk
+ * aborts and returns a partial (lower-bound) size rather than wedging the
+ * synchronous `/api/models` handler.
+ */
+const MAX_WALK_ENTRIES = 100_000;
+
+/**
+ * Recursive size + file count of a directory, bounded so it can never hang the
+ * event loop. Recursion descends ONLY into REAL directories (`Dirent` carries
+ * lstat semantics, so a symlink whose target is a directory reports
+ * `isDirectory() === false` and is never entered) — this is what breaks a symlink
+ * cycle (`self -> .`, or two `-> .` links whose exponential fan-out used to freeze
+ * the handler) and keeps an external symlinked tree's bytes out of the total. A
+ * symlink is still `statSync`'d for its real byte size (preserving the HF-cache
+ * blob-link intent) but never recursed into. A `dev:ino` visited-set guards
+ * against a real-directory hardlink/mount loop, and {@link MAX_WALK_ENTRIES} caps
+ * the total work. Unreadable entries are skipped. `truncated` is set when the
+ * budget was hit (the returned size is then a lower bound).
+ */
+function walkDirStats(dir: string): { sizeBytes: number; fileCount: number; truncated: boolean } {
   let sizeBytes = 0;
   let fileCount = 0;
-  let entries: Dirent[];
-  try {
-    entries = readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return { sizeBytes, fileCount };
-  }
-  for (const entry of entries) {
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) {
-      const nested = walkDirStats(full);
-      sizeBytes += nested.sizeBytes;
-      fileCount += nested.fileCount;
-      continue;
-    }
+  let entriesSeen = 0;
+  let truncated = false;
+  const visited = new Set<string>();
+
+  const walk = (current: string): void => {
+    if (truncated) return;
+    // Break any real-directory cycle (hardlink/bind loop) by identity. The
+    // no-follow recursion below already excludes symlinked dirs, so this is
+    // defense-in-depth for the rare non-symlink loop.
     try {
-      // `statSync` follows symlinks so HF-cache-symlinked blobs count at
-      // their real byte size rather than the ~100-byte link.
-      const stat = statSync(full);
-      if (stat.isDirectory()) {
-        const nested = walkDirStats(full);
-        sizeBytes += nested.sizeBytes;
-        fileCount += nested.fileCount;
-      } else {
-        sizeBytes += stat.size;
-        fileCount += 1;
-      }
+      const self = lstatSync(current);
+      const key = `${self.dev}:${self.ino}`;
+      if (visited.has(key)) return;
+      visited.add(key);
     } catch {
-      // Broken symlink / unreadable file: skip.
+      return;
     }
-  }
-  return { sizeBytes, fileCount };
+
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entriesSeen >= MAX_WALK_ENTRIES) {
+        truncated = true;
+        return;
+      }
+      entriesSeen++;
+      const full = join(current, entry.name);
+      // Descend ONLY into a real directory; a symlink-to-directory is never entered.
+      if (entry.isDirectory()) {
+        walk(full);
+        if (truncated) return;
+        continue;
+      }
+      try {
+        // `statSync` follows symlinks so HF-cache-symlinked blobs count at their
+        // real byte size rather than the ~100-byte link. A symlink whose target is
+        // a directory contributes neither bytes nor a recursion (never followed).
+        const stat = statSync(full);
+        if (!stat.isDirectory()) {
+          sizeBytes += stat.size;
+          fileCount += 1;
+        }
+      } catch {
+        // Broken symlink / unreadable file: skip.
+      }
+    }
+  };
+
+  walk(dir);
+  return { sizeBytes, fileCount, truncated };
 }
 
 /**
@@ -318,7 +362,10 @@ export function discoverLocalModels(modelsDir: string): { models: LocalModel[]; 
       continue;
     }
 
-    const { sizeBytes, fileCount } = walkDirStats(full);
+    const { sizeBytes, fileCount, truncated } = walkDirStats(full);
+    if (truncated) {
+      warnings.push(`${entry.name}: directory too large to size fully; reported size is a lower bound`);
+    }
     models.push({
       name: entry.name,
       path: full,

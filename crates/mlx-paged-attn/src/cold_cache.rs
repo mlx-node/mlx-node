@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use safetensors::tensor::{Dtype, TensorView};
 use safetensors::{SafeTensors, serialize};
@@ -601,8 +601,16 @@ impl Shared {
     }
 }
 
-struct WriteJob {
-    block: ColdCacheBlock,
+/// A unit of work for the single background writer thread. FIFO delivery on
+/// the bounded channel means a `Barrier` enqueued after a run of `Block`s is
+/// processed only once every one of those blocks has been fully persisted —
+/// the property [`ColdCacheManager::drain`] relies on for a shutdown flush.
+enum WriteJob {
+    Block(ColdCacheBlock),
+    /// Drain marker: the writer acks it (unblocking `drain`) after every
+    /// earlier `Block` has been persisted. A dropped `rx` makes the ack a
+    /// harmless no-op.
+    Barrier(SyncSender<()>),
 }
 
 /// Bounded background SSD cache. Clones share one queue/index.
@@ -686,9 +694,20 @@ impl ColdCacheManager {
             .name("mlx-paged-ssd-writer".to_string())
             .spawn(move || {
                 while let Ok(job) = receiver.recv() {
-                    // Fail-open: inference already has a valid hot block. A
-                    // persistence error only means the next process recomputes.
-                    let _ = persist_block(&worker_shared, &job.block);
+                    match job {
+                        // Fail-open: inference already has a valid hot block. A
+                        // persistence error only means the next process
+                        // recomputes.
+                        WriteJob::Block(block) => {
+                            let _ = persist_block(&worker_shared, &block);
+                        }
+                        // Every earlier `Block` has already been persisted (FIFO,
+                        // single consumer), so acking here signals the drain is
+                        // complete. A gone receiver (drain timed out) is fine.
+                        WriteJob::Barrier(ack) => {
+                            let _ = ack.send(());
+                        }
+                    }
                 }
             })
             .map_err(|e| format!("spawn cold-cache writer: {e}"))?;
@@ -771,7 +790,7 @@ impl ColdCacheManager {
     /// write so host buffers cannot grow without bound.
     pub fn enqueue(&self, block: ColdCacheBlock) -> Result<bool, String> {
         block.validate()?;
-        match self.sender.try_send(WriteJob { block }) {
+        match self.sender.try_send(WriteJob::Block(block)) {
             Ok(()) => {
                 self.shared.stats.enqueued.fetch_add(1, Ordering::Relaxed);
                 Ok(true)
@@ -785,6 +804,27 @@ impl ColdCacheManager {
             }
             Err(TrySendError::Disconnected(_)) => Err("cold-cache writer stopped".to_string()),
         }
+    }
+
+    /// Block until every write accepted before this call is fully durable
+    /// (payload fsync + rename + directory fsync), or `timeout` elapses.
+    ///
+    /// A `Barrier` is pushed with a BLOCKING `send` — during shutdown, waiting
+    /// for a queue slot is fine, and unlike the non-blocking block enqueue the
+    /// barrier must never be dropped. FIFO ordering on the single-consumer
+    /// writer guarantees the ack lands only after every earlier `Block`'s
+    /// `persist_block` has returned, so on `true` every `enqueue` that returned
+    /// `Ok(true)` before this call is on disk. Returns `false` on timeout so a
+    /// stuck fsync cannot hang process exit, and `true` immediately when the
+    /// writer is already gone (tier disabled/torn down: nothing left to flush).
+    pub fn drain(&self, timeout: Duration) -> bool {
+        let (tx, rx) = mpsc::sync_channel::<()>(1);
+        if self.sender.send(WriteJob::Barrier(tx)).is_err() {
+            // Writer thread absent/stopped: no queued block can still be in
+            // flight, so the drain is trivially satisfied.
+            return true;
+        }
+        rx.recv_timeout(timeout).is_ok()
     }
 
     /// Load and validate a block, bounding the restore read by the manager's
@@ -1649,6 +1689,60 @@ mod tests {
         assert!(reopened.load(key, fingerprint()).is_some());
         assert_eq!(reopened.shared.index.lock().unwrap().entries.len(), 1);
         drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // A shutdown drain must guarantee every ACCEPTED (`Ok(true)`) block is on
+    // disk before it returns, even when more blocks were pushed than the queue
+    // depth so the barrier has to wait behind in-flight writes. `persist_block`
+    // is filesystem-only, so this exercises the full FIFO ordering contract
+    // without Metal.
+    #[test]
+    fn drain_flushes_accepted_blocks_before_returning() {
+        let root = temp_root("drain-accepted");
+        // Queue depth 2 with 8 rapid enqueues forces the barrier to sit behind
+        // blocks the writer has not yet persisted.
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let mut accepted = Vec::new();
+        for i in 0..8u32 {
+            let toks = vec![i, i + 100, i + 200, i + 300];
+            let key = ColdCacheKey::chain(fingerprint(), None, &toks, &[], 0, 0);
+            let mut candidate = block(key);
+            candidate.tokens = toks;
+            // Non-blocking enqueue may drop under a momentarily full queue; only
+            // ACCEPTED blocks carry the drain durability guarantee.
+            if manager.enqueue(candidate).unwrap() {
+                accepted.push(key);
+            }
+        }
+
+        assert!(
+            manager.drain(Duration::from_secs(5)),
+            "drain must ack within the timeout"
+        );
+        for key in &accepted {
+            let path = root.join(format!("{}.safetensors", key.to_hex()));
+            assert!(
+                path.exists(),
+                "every accepted block must be fsynced to disk before drain returns"
+            );
+        }
+        // The barrier is one-shot: a second drain over a now-idle writer also
+        // returns true.
+        assert!(manager.drain(Duration::from_secs(5)));
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn drain_returns_true_when_empty() {
+        let root = temp_root("drain-empty");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        assert!(
+            manager.drain(Duration::from_secs(5)),
+            "an empty tier drains immediately"
+        );
+        drop(manager);
         let _ = fs::remove_dir_all(root);
     }
 

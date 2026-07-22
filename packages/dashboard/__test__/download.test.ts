@@ -64,8 +64,7 @@ const hub = vi.hoisted(() => ({
   cacheBlob: (cacheDir: string, revision: string, p: string): string =>
     `${cacheDir}/blobs/${revision}__${p.split('/').join('__')}`,
   /** The snapshot pointer (a symlink into blobs) for a file at a revision. */
-  cachePointer: (cacheDir: string, revision: string, p: string): string =>
-    `${cacheDir}/snapshots/${revision}/${p}`,
+  cachePointer: (cacheDir: string, revision: string, p: string): string => `${cacheDir}/snapshots/${revision}/${p}`,
 }));
 
 // Injectable rename fault used to exercise the publish swap's rollback. A source
@@ -131,7 +130,12 @@ vi.mock('@huggingface/hub', () => ({
     if (params.revision !== undefined) hub.revisions.push(params.revision);
     for (const entry of hub.manifest) yield entry;
   },
-  downloadFileToCacheDir: async (params: { path: string; revision?: string; cacheDir: string; fetch: typeof fetch }) => {
+  downloadFileToCacheDir: async (params: {
+    path: string;
+    revision?: string;
+    cacheDir: string;
+    fetch: typeof fetch;
+  }) => {
     if (params.revision !== undefined) hub.revisions.push(params.revision);
     if (hub.failOn.includes(params.path)) throw new Error(`simulated failure for ${params.path}`);
     const revision = params.revision ?? 'main';
@@ -477,7 +481,12 @@ describe('DownloadManager', () => {
     // A marker referencing a missing file must NOT count as installed.
     writeFileSync(
       join(finalDir(), DOWNLOAD_COMPLETE_MARKER),
-      JSON.stringify({ repo: REPO, revision: hub.sha, files: ['config.json', 'missing.safetensors'], completedAt: 'x' }),
+      JSON.stringify({
+        repo: REPO,
+        revision: hub.sha,
+        files: ['config.json', 'missing.safetensors'],
+        completedAt: 'x',
+      }),
     );
     expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
 
@@ -690,6 +699,43 @@ describe('DownloadManager', () => {
     // No publish, no marker, catalog reports not-installed.
     expect(existsSync(finalDir())).toBe(false);
     expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
+  });
+
+  it('fails fast on an unowned existing dir — before listing or downloading any bytes', async () => {
+    // A valid checkpoint placed manually / by `mlx download` — no completion
+    // marker, so the downloader does not own it. The refusal must land UP FRONT,
+    // never after a multi-GB download+hash.
+    mkdirSync(finalDir(), { recursive: true });
+    writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(finalDir(), 'model.safetensors'), Buffer.alloc(300, 0xab));
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
+
+    // Refused BEFORE the manifest was listed (no `start`) and BEFORE any file was
+    // fetched (no bytes copied, no staging tree created).
+    expect(events.some((event) => event.type === 'start')).toBe(false);
+    expect(hub.downloaded).toEqual([]);
+    expect(jobStagingDirs()).toEqual([]);
+
+    const err = events.find((event) => event.type === 'error');
+    expect(err?.type).toBe('error');
+    if (err?.type === 'error') {
+      // The message must not advertise an `overwrite` mode the API/UI never expose.
+      expect(err.message).not.toMatch(/overwrite/i);
+      expect(err.message).toMatch(/not created by the dashboard/i);
+    }
+
+    // The manual files are byte-for-byte intact; no marker written.
+    expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+    expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(false);
   });
 
   it('refuses to overwrite an unowned existing dir and leaves it intact', async () => {

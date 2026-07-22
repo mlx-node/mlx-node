@@ -24,9 +24,10 @@
  *
  * Publishing never destroys a checkpoint the downloader does not own: a final
  * dir WITHOUT our marker (a manual / `mlx download` copy, possibly fine-tuned) is
- * refused unless an explicit `overwrite` is requested — the ownership guard is
- * re-checked adjacent to the destructive swap so a dir that races in after the
- * first check is still never overwritten. An OWNED upgrade swaps via a temp
+ * refused unless an explicit `overwrite` is requested — up front (a fast-fail
+ * ownership preflight before any download, so no bytes move for a doomed job) and
+ * again adjacent to the destructive swap so a dir that races in after the first
+ * check is still never overwritten. An OWNED upgrade swaps via a temp
  * backup so a crash mid-rename rolls back to the original; an orphaned backup a
  * crash leaves behind is recovered (or reaped) by a best-effort sweep at the
  * start of the next download.
@@ -502,9 +503,7 @@ export class DownloadManager {
     const info = await modelInfo({ name: repoName, additionalFields: ['sha'], fetch: this.wrappedFetch });
     const sha: unknown = info.sha;
     if (!(typeof sha === 'string' && /^[0-9a-f]{40}$/i.test(sha))) {
-      throw new Error(
-        `Cannot resolve an immutable commit for "${repoName}"; refusing to pin to a mutable ref`,
-      );
+      throw new Error(`Cannot resolve an immutable commit for "${repoName}"; refusing to pin to a mutable ref`);
     }
     return sha;
   }
@@ -534,6 +533,19 @@ export class DownloadManager {
       // out from under it.
       await this.sweepStaging(slug);
 
+      // Preflight ownership BEFORE any hub-list / download / copy / hash: a final
+      // dir the downloader does not own (a manual copy or an `mlx download`
+      // install — no completion marker) is refused up front, so an unowned local
+      // checkpoint never triggers a full multi-GB download+hash only to be refused
+      // at publish. The publish-time checks below still guard the narrow
+      // check-then-swap race for a dir that races in after this point.
+      if (existsSync(finalDir) && !isDownloaderOwned(finalDir) && !job.overwrite) {
+        throw new Error(
+          `Refusing to install over "${finalDir}": it was not created by the dashboard downloader. ` +
+            `Remove it manually to reinstall.`,
+        );
+      }
+
       const revision = await this.resolveRevision(job.repo);
       // Job-private staging: keyed by the IMMUTABLE revision (a different
       // revision never reuses another's staged bytes) and unique per invocation
@@ -553,9 +565,7 @@ export class DownloadManager {
           // admitted. Unreachable for the curated 4-repo catalog (git/HF tree
           // paths cannot express `..`/absolute), but never trust the boundary.
           if (!isSafeRelPath(file.path)) {
-            throw new Error(
-              `Refusing to download "${file.path}" from "${job.repo}": path is not a safe relative path`,
-            );
+            throw new Error(`Refusing to download "${file.path}" from "${job.repo}": path is not a safe relative path`);
           }
           files.push(file);
           if (file.size > 0) totalBytes += file.size;
@@ -563,9 +573,7 @@ export class DownloadManager {
       }
 
       if (!hasModelPayload(files)) {
-        throw new Error(
-          `Repo "${job.repo}" is not a complete model (needs both a config.json and a weight file)`,
-        );
+        throw new Error(`Repo "${job.repo}" is not a complete model (needs both a config.json and a weight file)`);
       }
 
       job.totalBytes = totalBytes;
@@ -871,7 +879,7 @@ export class DownloadManager {
     if (existsSync(finalDir) && !isDownloaderOwned(finalDir) && !overwrite) {
       throw new Error(
         `Refusing to overwrite "${finalDir}": it was not created by the dashboard downloader. ` +
-          `Remove it manually (or re-run with overwrite) to reinstall.`,
+          `Remove it manually to reinstall.`,
       );
     }
 
@@ -894,19 +902,13 @@ export class DownloadManager {
     // between must still never be renamed away and deleted. This narrows the
     // window to the irreducible FS-level check-then-swap race.
     if (!isDownloaderOwned(finalDir) && !overwrite) {
-      throw new Error(
-        `Refusing to overwrite "${finalDir}": it was not created by the dashboard downloader`,
-      );
+      throw new Error(`Refusing to overwrite "${finalDir}": it was not created by the dashboard downloader`);
     }
 
     // Rollback-safe swap of an owned (or explicitly overwritten) final dir. The
     // backup lives under `.staging` (a dotdir skipped by model discovery) so a
     // crash mid-swap never surfaces it as a phantom model.
-    const backupDir = join(
-      this.modelsDir,
-      '.staging',
-      `${basename(finalDir)}.backup-${process.pid}.${randomUUID()}`,
-    );
+    const backupDir = join(this.modelsDir, '.staging', `${basename(finalDir)}.backup-${process.pid}.${randomUUID()}`);
     await rename(finalDir, backupDir);
     try {
       await rename(stagingDir, finalDir);

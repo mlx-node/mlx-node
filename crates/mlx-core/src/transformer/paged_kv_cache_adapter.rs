@@ -3989,13 +3989,23 @@ impl PagedKVCacheAdapter {
                     i,
                 );
                 if !cold.manager.contains(&key) {
-                    let _ = cold.manager.capture_and_enqueue(
+                    // Stop the chain on the first non-`Ok(true)`: a saturated
+                    // writer queue (`Ok(false)`) or a capture error means this
+                    // block did not land, so every descendant would either pay
+                    // a full Metal blit only to be dropped again or, worse, be
+                    // persisted under a missing parent (a chain hole that is
+                    // unrestorable after restart). Breaking keeps the enqueued
+                    // set a contiguous prefix.
+                    match cold.manager.capture_and_enqueue(
                         &self.layer_kv_pool,
                         block,
                         key,
                         cold.fingerprint,
                         toks,
-                    );
+                    ) {
+                        Ok(true) => {}
+                        _ => break,
+                    }
                 }
                 parent = Some(key);
             }

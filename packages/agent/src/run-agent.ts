@@ -21,6 +21,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import type { InlineExtension } from '@earendil-works/pi-coding-agent';
+import { coldCacheDrain } from '@mlx-node/core';
 import { PagedConfigOverrideManager } from '@mlx-node/lm';
 
 import { createPermissionGateExtension } from './extensions/permission-gate.js';
@@ -137,6 +138,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
       restoreModelRegistry();
     } finally {
       await pagedConfigOverrides.cleanup();
+      // `mlx agent -p` is one-shot: flush any accepted cold-tier prefix blocks
+      // to disk before the process exits, otherwise a prompt's just-persisted
+      // KV could still be queued/mid-write when we return. No-op when the tier
+      // was never opened, bounded so a stuck fsync can't hang exit, and never
+      // allowed to throw out of cleanup (best-effort durability).
+      try {
+        coldCacheDrain(5000);
+      } catch {
+        // Best-effort: a drain failure must never mask the real exit path.
+      }
     }
   }
 }

@@ -218,16 +218,34 @@ describe('dashboard server — sessions', () => {
     const dir = join(sessionsRoot, '--w--');
     mkdirSync(dir, { recursive: true });
     const file = join(dir, '2026-07-12T10-00-00_rn-trunc.jsonl');
-    const header = JSON.stringify({ type: 'session', version: 3, id: 'rn-trunc', timestamp: '2026-07-12T10:00:00.000Z', cwd: '/w' });
-    const user = JSON.stringify({ type: 'message', id: 'm1', parentId: null, timestamp: '2026-07-12T10:00:01.000Z', message: { role: 'user', content: 'keep me' } });
+    const header = JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'rn-trunc',
+      timestamp: '2026-07-12T10:00:00.000Z',
+      cwd: '/w',
+    });
+    const user = JSON.stringify({
+      type: 'message',
+      id: 'm1',
+      parentId: null,
+      timestamp: '2026-07-12T10:00:01.000Z',
+      message: { role: 'user', content: 'keep me' },
+    });
     const asst = JSON.stringify({
       type: 'message',
       id: 'm2',
       parentId: 'm1',
       timestamp: '2026-07-12T10:00:02.000Z',
-      message: { role: 'assistant', content: [{ type: 'text', text: 'and me' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'and me' }],
+        model: 'qwen3_5',
+        usage: { input: 5, output: 6 },
+      },
     });
-    const truncated = '{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-07-12T10:00:03.000Z","message":{"role":"asst';
+    const truncated =
+      '{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-07-12T10:00:03.000Z","message":{"role":"asst';
     const original = `${header}\n${user}\n${asst}\n${truncated}`;
     writeFileSync(file, original);
     await ingest();
@@ -257,20 +275,36 @@ describe('dashboard server — sessions', () => {
     mkdirSync(dir, { recursive: true });
     const completeSession = (id: string, hour: string): object[] => [
       { type: 'session', version: 3, id, timestamp: `2026-07-13T${hour}:00:00.000Z`, cwd: '/w' },
-      { type: 'message', id: 'u1', parentId: null, timestamp: `2026-07-13T${hour}:00:01.000Z`, message: { role: 'user', content: 'hi' } },
+      {
+        type: 'message',
+        id: 'u1',
+        parentId: null,
+        timestamp: `2026-07-13T${hour}:00:01.000Z`,
+        message: { role: 'user', content: 'hi' },
+      },
       {
         type: 'message',
         id: 'a1',
         parentId: 'u1',
         timestamp: `2026-07-13T${hour}:00:02.000Z`,
-        message: { role: 'assistant', content: [{ type: 'text', text: 'yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'yo' }],
+          model: 'qwen3_5',
+          usage: { input: 5, output: 6 },
+        },
       },
     ];
 
     // A complete, valid session with a very recent mtime → reaches (and trips) the
     // liveness pre-check rather than a records/identity 409.
     const liveFile = join(dir, '2026-07-13T10-00-00_rn-live.jsonl');
-    writeFileSync(liveFile, `${completeSession('rn-live', '10').map((l) => JSON.stringify(l)).join('\n')}\n`);
+    writeFileSync(
+      liveFile,
+      `${completeSession('rn-live', '10')
+        .map((l) => JSON.stringify(l))
+        .join('\n')}\n`,
+    );
     const now = Date.now() / 1000;
     utimesSync(liveFile, now, now);
     await ingest();
@@ -290,7 +324,12 @@ describe('dashboard server — sessions', () => {
 
     // An idle session (mtime well beyond the window) renames normally.
     const idleFile = join(dir, '2026-07-13T09-00-00_rn-idle.jsonl');
-    writeFileSync(idleFile, `${completeSession('rn-idle', '09').map((l) => JSON.stringify(l)).join('\n')}\n`);
+    writeFileSync(
+      idleFile,
+      `${completeSession('rn-idle', '09')
+        .map((l) => JSON.stringify(l))
+        .join('\n')}\n`,
+    );
     const old = Date.now() / 1000 - 600; // 10 minutes ago
     utimesSync(idleFile, old, old);
     await ingest();
@@ -313,20 +352,36 @@ describe('dashboard server — sessions', () => {
   it('detail transcript shows only the active branch under a detached metadata leaf', async () => {
     const forked = [
       { type: 'session', version: 3, id: 'detach-1', timestamp: '2026-07-08T10:00:00.000Z', cwd: '/w' },
-      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-08T10:00:01.000Z', message: { role: 'user', content: 'q' } },
+      {
+        type: 'message',
+        id: 'u1',
+        parentId: null,
+        timestamp: '2026-07-08T10:00:01.000Z',
+        message: { role: 'user', content: 'q' },
+      },
       {
         type: 'message',
         id: 'a1',
         parentId: 'u1',
         timestamp: '2026-07-08T10:00:02.000Z',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'ABANDONED' }], model: 'gemma4', usage: { input: 999, output: 999 } },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'ABANDONED' }],
+          model: 'gemma4',
+          usage: { input: 999, output: 999 },
+        },
       },
       {
         type: 'message',
         id: 'a2',
         parentId: 'u1',
         timestamp: '2026-07-08T10:00:03.000Z',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'ACTIVE' }], model: 'qwen3_5', usage: { input: 1, output: 2 } },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'ACTIVE' }],
+          model: 'qwen3_5',
+          usage: { input: 1, output: 2 },
+        },
       },
       { type: 'session_info', id: 'si1', parentId: null, timestamp: '2026-07-08T10:00:04.000Z', name: 'Detached' },
     ];
@@ -352,12 +407,27 @@ describe('dashboard server — sessions', () => {
     const dir = join(sessionsRoot, '--w--');
     mkdirSync(dir, { recursive: true });
     const file = join(dir, '2026-07-10T10-00-00_ro-1.jsonl');
-    const header = JSON.stringify({ type: 'session', version: 1, id: 'ro-1', timestamp: '2026-07-10T10:00:00.000Z', cwd: '/w' });
-    const user = JSON.stringify({ type: 'message', timestamp: '2026-07-10T10:00:01.000Z', message: { role: 'user', content: 'READ ONLY hi' } });
+    const header = JSON.stringify({
+      type: 'session',
+      version: 1,
+      id: 'ro-1',
+      timestamp: '2026-07-10T10:00:00.000Z',
+      cwd: '/w',
+    });
+    const user = JSON.stringify({
+      type: 'message',
+      timestamp: '2026-07-10T10:00:01.000Z',
+      message: { role: 'user', content: 'READ ONLY hi' },
+    });
     const asst = JSON.stringify({
       type: 'message',
       timestamp: '2026-07-10T10:00:02.000Z',
-      message: { role: 'assistant', content: [{ type: 'text', text: 'READ ONLY yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'READ ONLY yo' }],
+        model: 'qwen3_5',
+        usage: { input: 5, output: 6 },
+      },
     });
     const truncated = '{"type":"message","message":{"role":"asst';
     const original = `${header}\n${user}\n${asst}\n${truncated}`;
@@ -438,6 +508,68 @@ describe('dashboard server — sessions', () => {
     expect(traceIds).toContain('trace-aaa');
     expect(traceIds).toContain('trace-child');
   });
+
+  // #7: a delegated subagent turn has a `traces` row (rootSessionId → root) but no
+  // persisted `turns` row, so the counts/tokens/charts the SPA computes from the
+  // `turns` array used to omit it — disagreeing with the child badge + throughput
+  // it already shows (and with the global overview). The session metrics `turns`
+  // set must UNION the trace-only child rows, net-of-cache and deduped (mirroring
+  // the global fix in handleMetricsOverview).
+  it('merges delegated subagent turns into the session metric turn set (net-of-cache, deduped)', async () => {
+    writeFileSync(
+      join(tracesDir, '2026-07-03-delegated.jsonl'),
+      `${JSON.stringify({
+        v: 1,
+        traceId: 'trace-deleg',
+        ts: 1782036402000,
+        sessionId: 'child-session',
+        rootSessionId: 'fix-1',
+        model: 'child-model',
+        durationMs: 20,
+        finishReason: 'stop',
+        promptTokens: 300,
+        cachedTokens: 40,
+        outputTokens: 90,
+        reasoningTokens: 9,
+        ttftMs: 55.5,
+        decodeTps: 42,
+      })}\n`,
+    );
+    await ingest();
+    const res = await fetch(`${server.url}/api/sessions/fix-1/metrics`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      turns: Array<{
+        entryId: string | null;
+        traceId: string | null;
+        inputTokens: number | null;
+        outputTokens: number | null;
+        cachedTokens: number | null;
+        reasoningTokens: number | null;
+        model: string | null;
+        ttftMs: number | null;
+        decodeTps: number | null;
+      }>;
+    };
+
+    const child = body.turns.filter((t) => t.traceId === 'trace-deleg');
+    // Exactly one merged row for the delegated turn (deduped by trace_id).
+    expect(child).toHaveLength(1);
+    // Tokens are NET of cache (300 gross prompt − 40 cached = 260), never gross.
+    expect(child[0].inputTokens).toBe(260);
+    expect(child[0].outputTokens).toBe(90);
+    expect(child[0].cachedTokens).toBe(40);
+    expect(child[0].reasoningTokens).toBe(9);
+    expect(child[0].model).toBe('child-model');
+    // No persisted turn row → no entryId; its trace-derived fields are carried.
+    expect(child[0].entryId).toBeNull();
+    expect(child[0].ttftMs).toBeCloseTo(55.5, 1);
+    expect(child[0].decodeTps).toBeCloseTo(42, 1);
+
+    // The root's own persisted turn (trace-aaa) stays present exactly once — the
+    // dedup excludes only trace-only rows, never a correlated turn.
+    expect(body.turns.filter((t) => t.traceId === 'trace-aaa')).toHaveLength(1);
+  });
 });
 
 // Finding 4: session-file symlink containment. Primary — a symlinked transcript
@@ -508,7 +640,13 @@ describe('dashboard server — session symlink containment (Finding 4)', () => {
       bPath,
       `${[
         { type: 'session', version: 3, id: 'sess-B', timestamp: '2026-07-11T10:00:00.000Z', cwd: '/w' },
-        { type: 'message', id: 'b1', parentId: null, timestamp: '2026-07-11T10:00:01.000Z', message: { role: 'user', content: 'B in root' } },
+        {
+          type: 'message',
+          id: 'b1',
+          parentId: null,
+          timestamp: '2026-07-11T10:00:01.000Z',
+          message: { role: 'user', content: 'B in root' },
+        },
       ]
         .map((l) => JSON.stringify(l))
         .join('\n')}\n`,
@@ -552,21 +690,46 @@ describe('dashboard server — metrics overview', () => {
   it('counts a forked inference once in the global overview, not per copy', async () => {
     const fork = [
       { type: 'session', version: 3, id: 'fork-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
-      { type: 'message', id: 'm1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'Hello, world', timestamp: 1782036001000 } },
+      {
+        type: 'message',
+        id: 'm1',
+        parentId: null,
+        timestamp: '2026-07-01T10:00:01.000Z',
+        message: { role: 'user', content: 'Hello, world', timestamp: 1782036001000 },
+      },
       {
         type: 'message',
         id: 'm2',
         parentId: 'm1',
         timestamp: '2026-07-01T10:00:02.000Z',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'Hi there' }], model: 'qwen3_5', usage: { input: 100, output: 50, cacheRead: 10, reasoning: 5 }, timestamp: 1782036002000, mlxTraceId: 'trace-aaa' },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Hi there' }],
+          model: 'qwen3_5',
+          usage: { input: 100, output: 50, cacheRead: 10, reasoning: 5 },
+          timestamp: 1782036002000,
+          mlxTraceId: 'trace-aaa',
+        },
       },
-      { type: 'message', id: 'm3', parentId: 'm2', timestamp: '2026-07-01T10:00:03.000Z', message: { role: 'user', content: 'Second question', timestamp: 1782036003000 } },
+      {
+        type: 'message',
+        id: 'm3',
+        parentId: 'm2',
+        timestamp: '2026-07-01T10:00:03.000Z',
+        message: { role: 'user', content: 'Second question', timestamp: 1782036003000 },
+      },
       {
         type: 'message',
         id: 'm4',
         parentId: 'm3',
         timestamp: '2026-07-01T10:00:04.000Z',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'An answer' }], model: 'qwen3_5', usage: { input: 180, output: 60, cacheRead: 100, reasoning: 12 }, timestamp: 1782036004000 },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'An answer' }],
+          model: 'qwen3_5',
+          usage: { input: 180, output: 60, cacheRead: 100, reasoning: 12 },
+          timestamp: 1782036004000,
+        },
       },
     ];
     writeFileSync(
@@ -577,7 +740,13 @@ describe('dashboard server — metrics overview', () => {
 
     const body = (await (await fetch(`${server.url}/api/metrics/overview`)).json()) as {
       modelShare: Array<{ model: string; turns: number; outputTokens: number }>;
-      totals: { turns: number; inputTokens: number; outputTokens: number; cachedTokens: number; reasoningTokens: number };
+      totals: {
+        turns: number;
+        inputTokens: number;
+        outputTokens: number;
+        cachedTokens: number;
+        reasoningTokens: number;
+      };
     };
     // fix-1 (2 turns) + fix-2 (1) + fork-1 (2 verbatim copies of fix-1) → 3 distinct
     // turns, PLUS the two trace-only fixture rows that carry no correlating `turns`
@@ -614,13 +783,26 @@ describe('dashboard server — metrics overview', () => {
     // trace_id `corr-1`). Its authoritative tokens live in `turns`.
     const root = [
       { type: 'session', version: 3, id: 'sub-root', timestamp: '2026-07-05T12:00:00.000Z', cwd: '/w' },
-      { type: 'message', id: 'sm1', parentId: null, timestamp: '2026-07-05T12:00:00.500Z', message: { role: 'user', content: 'root question', timestamp: midMs } },
+      {
+        type: 'message',
+        id: 'sm1',
+        parentId: null,
+        timestamp: '2026-07-05T12:00:00.500Z',
+        message: { role: 'user', content: 'root question', timestamp: midMs },
+      },
       {
         type: 'message',
         id: 'sm2',
         parentId: 'sm1',
         timestamp: '2026-07-05T12:00:01.000Z',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'root answer' }], model: 'corr-model', usage: { input: 300, output: 90, cacheRead: 30, reasoning: 9 }, timestamp: midMs, mlxTraceId: 'corr-1' },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'root answer' }],
+          model: 'corr-model',
+          usage: { input: 300, output: 90, cacheRead: 30, reasoning: 9 },
+          timestamp: midMs,
+          mlxTraceId: 'corr-1',
+        },
       },
     ];
     writeFileSync(
@@ -640,7 +822,13 @@ describe('dashboard server — metrics overview', () => {
     const body = (await (await fetch(`${server.url}/api/metrics/overview?from=${dayStart}&to=${dayEnd}`)).json()) as {
       tokensByDay: Array<{ day: string; input: number; output: number; cached: number; reasoning: number }>;
       modelShare: Array<{ model: string; turns: number; outputTokens: number }>;
-      totals: { turns: number; inputTokens: number; outputTokens: number; cachedTokens: number; reasoningTokens: number };
+      totals: {
+        turns: number;
+        inputTokens: number;
+        outputTokens: number;
+        cachedTokens: number;
+        reasoningTokens: number;
+      };
     };
 
     // turnTotals: normal turn (300 net/90/30/9) + trace-only sub-1 (500 gross −40

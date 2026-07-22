@@ -150,13 +150,24 @@ describe('ingestSessions', () => {
       join(dirA, 'a.jsonl'),
       `${[
         { type: 'session', version: 3, id: 'root-A', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/a' },
-        { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'from A' } },
+        {
+          type: 'message',
+          id: 'u1',
+          parentId: null,
+          timestamp: '2026-07-01T10:00:01.000Z',
+          message: { role: 'user', content: 'from A' },
+        },
         {
           type: 'message',
           id: 'a1',
           parentId: 'u1',
           timestamp: '2026-07-01T10:00:02.000Z',
-          message: { role: 'assistant', content: [{ type: 'text', text: 'yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'yo' }],
+            model: 'qwen3_5',
+            usage: { input: 5, output: 6 },
+          },
         },
       ]
         .map((l) => JSON.stringify(l))
@@ -166,7 +177,13 @@ describe('ingestSessions', () => {
       join(dirB, 'b.jsonl'),
       `${[
         { type: 'session', version: 3, id: 'root-B', timestamp: '2026-07-02T10:00:00.000Z', cwd: '/b' },
-        { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-02T10:00:01.000Z', message: { role: 'user', content: 'from B' } },
+        {
+          type: 'message',
+          id: 'u1',
+          parentId: null,
+          timestamp: '2026-07-02T10:00:01.000Z',
+          message: { role: 'user', content: 'from B' },
+        },
       ]
         .map((l) => JSON.stringify(l))
         .join('\n')}\n`,
@@ -194,13 +211,24 @@ describe('ingestSessions', () => {
     const root = join(soloBase, 'sessions');
     writeSessionFile(soloBase, 's.jsonl', [
       { type: 'session', version: 3, id: 'keep-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
-      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'hi' } },
+      {
+        type: 'message',
+        id: 'u1',
+        parentId: null,
+        timestamp: '2026-07-01T10:00:01.000Z',
+        message: { role: 'user', content: 'hi' },
+      },
       {
         type: 'message',
         id: 'a1',
         parentId: 'u1',
         timestamp: '2026-07-01T10:00:02.000Z',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'yo' }],
+          model: 'qwen3_5',
+          usage: { input: 5, output: 6 },
+        },
       },
     ]);
     await ingestSessions(dash, root);
@@ -223,14 +251,25 @@ describe('ingestSessions', () => {
     const root = join(soloBase, 'sessions');
     writeSessionFile(soloBase, 'branched.jsonl', [
       { type: 'session', version: 3, id: 'br-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
-      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'q' } },
+      {
+        type: 'message',
+        id: 'u1',
+        parentId: null,
+        timestamp: '2026-07-01T10:00:01.000Z',
+        message: { role: 'user', content: 'q' },
+      },
       // Abandoned assistant branch off u1 (huge tokens — must NOT be counted).
       {
         type: 'message',
         id: 'a1',
         parentId: 'u1',
         timestamp: '2026-07-01T10:00:02.000Z',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'abandoned' }], model: 'gemma4', usage: { input: 999, output: 999 } },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'abandoned' }],
+          model: 'gemma4',
+          usage: { input: 999, output: 999 },
+        },
       },
       // Active replacement off u1, appended last → the leaf.
       {
@@ -238,7 +277,12 @@ describe('ingestSessions', () => {
         id: 'a2',
         parentId: 'u1',
         timestamp: '2026-07-01T10:00:03.000Z',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'active' }], model: 'qwen3_5', usage: { input: 1, output: 2 } },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'active' }],
+          model: 'qwen3_5',
+          usage: { input: 1, output: 2 },
+        },
       },
     ]);
 
@@ -270,7 +314,12 @@ describe('ingestSessions', () => {
       {
         type: 'message',
         timestamp: '2026-07-01T10:00:02.000Z',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'legacy yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'legacy yo' }],
+          model: 'qwen3_5',
+          usage: { input: 5, output: 6 },
+        },
       },
     ]);
 
@@ -297,7 +346,13 @@ describe('ingestSessions', () => {
     const root = join(soloBase, 'sessions');
     const file = writeSessionFile(soloBase, 's.jsonl', [
       { type: 'session', version: 3, id: 'sess-A', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
-      { type: 'message', id: 'a1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'from A' } },
+      {
+        type: 'message',
+        id: 'a1',
+        parentId: null,
+        timestamp: '2026-07-01T10:00:01.000Z',
+        message: { role: 'user', content: 'from A' },
+      },
     ]);
     await ingestSessions(dash, root);
     expect(dash.db.select().from(sessions).where(eq(sessions.id, 'sess-A')).all()).toHaveLength(1);
@@ -316,6 +371,115 @@ describe('ingestSessions', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].id).toBe('sess-B');
     expect(dash.db.select().from(sessions).where(eq(sessions.id, 'sess-A')).all()).toHaveLength(0);
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
+
+  // #4: pi with an explicit `--session-dir X` writes sessions FLAT as
+  // `X/<ts>_<id>.jsonl` (no `--<cwd>--` subdir), and `mlx dashboard --session-dir`
+  // is documented to point at exactly that dir. Both the flat root-level layout AND
+  // the `--*--/` project-subdir layout must be indexed, with no file double-counted.
+  it('indexes flat root-level session files AND --cwd-- subdir files together', async () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-flat-'));
+    const root = join(soloBase, 'sessions');
+    mkdirSync(root, { recursive: true });
+
+    // Flat pi explicit-session-dir file, sitting directly under the root.
+    writeFileSync(
+      join(root, '2026-07-01T10-00-00_flat-1.jsonl'),
+      `${[
+        { type: 'session', version: 3, id: 'flat-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/flat' },
+        {
+          type: 'message',
+          id: 'f1',
+          parentId: null,
+          timestamp: '2026-07-01T10:00:01.000Z',
+          message: { role: 'user', content: 'flat hi' },
+        },
+      ]
+        .map((l) => JSON.stringify(l))
+        .join('\n')}\n`,
+    );
+
+    // A classic `--<cwd>--/` project-subdir file in the same root.
+    const subDir = join(root, '--sub--');
+    mkdirSync(subDir, { recursive: true });
+    writeFileSync(
+      join(subDir, '2026-07-02T10-00-00_sub-1.jsonl'),
+      `${[
+        { type: 'session', version: 3, id: 'sub-1', timestamp: '2026-07-02T10:00:00.000Z', cwd: '/sub' },
+        {
+          type: 'message',
+          id: 's1',
+          parentId: null,
+          timestamp: '2026-07-02T10:00:01.000Z',
+          message: { role: 'user', content: 'sub hi' },
+        },
+      ]
+        .map((l) => JSON.stringify(l))
+        .join('\n')}\n`,
+    );
+
+    const res = await ingestSessions(dash, root);
+    // Exactly two files scanned — the flat one and the subdir one, no double-count.
+    expect(res.scanned).toBe(2);
+    expect(res.updated).toBe(2);
+
+    const flat = dash.db.select().from(sessions).where(eq(sessions.id, 'flat-1')).all();
+    expect(flat).toHaveLength(1);
+    expect(flat[0].cwd).toBe('/flat');
+    const sub = dash.db.select().from(sessions).where(eq(sessions.id, 'sub-1')).all();
+    expect(sub).toHaveLength(1);
+    expect(sub[0].cwd).toBe('/sub');
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
+
+  // #4 defense: a symlinked root-level `.jsonl` must be skipped too (same no-follow
+  // guard as the subdir scan), so it cannot surface an external transcript.
+  it('skips a symlinked root-level transcript (no-follow), still indexes a real one', async () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-flat-link-'));
+    const root = join(soloBase, 'sessions');
+    mkdirSync(root, { recursive: true });
+
+    const externalFile = join(soloBase, 'external.jsonl');
+    writeFileSync(
+      externalFile,
+      `${[
+        { type: 'session', version: 3, id: 'flat-external', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/secret' },
+        {
+          type: 'message',
+          id: 'e1',
+          parentId: null,
+          timestamp: '2026-07-01T10:00:01.000Z',
+          message: { role: 'user', content: 'secret' },
+        },
+      ]
+        .map((l) => JSON.stringify(l))
+        .join('\n')}\n`,
+    );
+    symlinkSync(externalFile, join(root, '2026-07-01T10-00-00_flat-external.jsonl'));
+
+    writeFileSync(
+      join(root, '2026-07-02T10-00-00_flat-real.jsonl'),
+      `${[
+        { type: 'session', version: 3, id: 'flat-real', timestamp: '2026-07-02T10:00:00.000Z', cwd: '/flat' },
+        {
+          type: 'message',
+          id: 'r1',
+          parentId: null,
+          timestamp: '2026-07-02T10:00:01.000Z',
+          message: { role: 'user', content: 'local' },
+        },
+      ]
+        .map((l) => JSON.stringify(l))
+        .join('\n')}\n`,
+    );
+
+    const res = await ingestSessions(dash, root);
+    expect(res.scanned).toBe(1);
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'flat-external')).all()).toHaveLength(0);
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'flat-real')).all()).toHaveLength(1);
 
     rmSync(soloBase, { recursive: true, force: true });
   });
@@ -390,7 +554,13 @@ describe('ingestSessions', () => {
       aFile,
       `${[
         { type: 'session', version: 3, id: 'link-A', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
-        { type: 'message', id: 'a1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'A' } },
+        {
+          type: 'message',
+          id: 'a1',
+          parentId: null,
+          timestamp: '2026-07-01T10:00:01.000Z',
+          message: { role: 'user', content: 'A' },
+        },
       ]
         .map((l) => JSON.stringify(l))
         .join('\n')}\n`,
@@ -401,7 +571,13 @@ describe('ingestSessions', () => {
       bFile,
       `${[
         { type: 'session', version: 3, id: 'link-B', timestamp: '2026-07-02T10:00:00.000Z', cwd: '/w' },
-        { type: 'message', id: 'b1', parentId: null, timestamp: '2026-07-02T10:00:01.000Z', message: { role: 'user', content: 'B' } },
+        {
+          type: 'message',
+          id: 'b1',
+          parentId: null,
+          timestamp: '2026-07-02T10:00:01.000Z',
+          message: { role: 'user', content: 'B' },
+        },
       ]
         .map((l) => JSON.stringify(l))
         .join('\n')}\n`,
@@ -448,12 +624,27 @@ describe('ingestSessions', () => {
     const file = join(dir, 'v1-partial.jsonl');
 
     // Genuine v1: message entries carry no id/parentId. Trailing line is truncated.
-    const header = JSON.stringify({ type: 'session', version: 1, id: 'ro-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' });
-    const user = JSON.stringify({ type: 'message', timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'hello v1' } });
+    const header = JSON.stringify({
+      type: 'session',
+      version: 1,
+      id: 'ro-1',
+      timestamp: '2026-07-01T10:00:00.000Z',
+      cwd: '/w',
+    });
+    const user = JSON.stringify({
+      type: 'message',
+      timestamp: '2026-07-01T10:00:01.000Z',
+      message: { role: 'user', content: 'hello v1' },
+    });
     const asst = JSON.stringify({
       type: 'message',
       timestamp: '2026-07-01T10:00:02.000Z',
-      message: { role: 'assistant', content: [{ type: 'text', text: 'hi v1' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'hi v1' }],
+        model: 'qwen3_5',
+        usage: { input: 5, output: 6 },
+      },
     });
     const truncated = '{"type":"message","message":{"role":"asst';
     const original = `${header}\n${user}\n${asst}\n${truncated}`;
@@ -484,16 +675,34 @@ describe('ingestSessions', () => {
     mkdirSync(dir, { recursive: true });
     const file = join(dir, 'partial.jsonl');
 
-    const header = JSON.stringify({ type: 'session', version: 3, id: 'trunc-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' });
-    const user = JSON.stringify({ type: 'message', id: 'm1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'hi' } });
+    const header = JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'trunc-1',
+      timestamp: '2026-07-01T10:00:00.000Z',
+      cwd: '/w',
+    });
+    const user = JSON.stringify({
+      type: 'message',
+      id: 'm1',
+      parentId: null,
+      timestamp: '2026-07-01T10:00:01.000Z',
+      message: { role: 'user', content: 'hi' },
+    });
     const asst = JSON.stringify({
       type: 'message',
       id: 'm2',
       parentId: 'm1',
       timestamp: '2026-07-01T10:00:02.000Z',
-      message: { role: 'assistant', content: [{ type: 'text', text: 'yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'yo' }],
+        model: 'qwen3_5',
+        usage: { input: 5, output: 6 },
+      },
     });
-    const truncated = '{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-07-01T10:00:03.000Z","message":{"role":"asst';
+    const truncated =
+      '{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-07-01T10:00:03.000Z","message":{"role":"asst';
 
     writeFileSync(file, `${header}\n${user}\n${asst}\n${truncated}`);
     const res1 = await ingestSessions(dash, root);
@@ -511,7 +720,12 @@ describe('ingestSessions', () => {
       id: 'm3',
       parentId: 'm2',
       timestamp: '2026-07-01T10:00:03.000Z',
-      message: { role: 'assistant', content: [{ type: 'text', text: 'done' }], model: 'qwen3_5', usage: { input: 7, output: 8 } },
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'done' }],
+        model: 'qwen3_5',
+        usage: { input: 7, output: 8 },
+      },
     });
     writeFileSync(file, `${header}\n${user}\n${asst}\n${asst3}\n`);
     const later = Date.now() / 1000 + 5;
@@ -541,17 +755,35 @@ describe('ingestSessions', () => {
     mkdirSync(dir, { recursive: true });
     const file = join(dir, 'interior.jsonl');
 
-    const header = JSON.stringify({ type: 'session', version: 3, id: 'int-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' });
-    const user = JSON.stringify({ type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'q' } });
+    const header = JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'int-1',
+      timestamp: '2026-07-01T10:00:00.000Z',
+      cwd: '/w',
+    });
+    const user = JSON.stringify({
+      type: 'message',
+      id: 'u1',
+      parentId: null,
+      timestamp: '2026-07-01T10:00:01.000Z',
+      message: { role: 'user', content: 'q' },
+    });
     // A truncated INTERIOR record — pi drops it and continues parsing.
-    const brokenInterior = '{"type":"message","id":"m2","parentId":"u1","timestamp":"2026-07-01T10:00:02.000Z","message":{"role":"asst';
+    const brokenInterior =
+      '{"type":"message","id":"m2","parentId":"u1","timestamp":"2026-07-01T10:00:02.000Z","message":{"role":"asst';
     // Its child references the DROPPED m2 → orphaned → accepted as a false root.
     const orphan = JSON.stringify({
       type: 'message',
       id: 'a3',
       parentId: 'm2',
       timestamp: '2026-07-01T10:00:03.000Z',
-      message: { role: 'assistant', content: [{ type: 'text', text: 'orphan' }], model: 'qwen3_5', usage: { input: 7, output: 8 } },
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'orphan' }],
+        model: 'qwen3_5',
+        usage: { input: 7, output: 8 },
+      },
     });
     // 4 non-blank lines; the LAST line (orphan) parses → this is an interior drop,
     // not a trailing incomplete-prefix.
@@ -574,13 +806,24 @@ describe('ingestSessions', () => {
     const root = join(soloBase, 'sessions');
     const file = writeSessionFile(soloBase, 's.jsonl', [
       { type: 'session', version: 3, id: 'sw-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
-      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'hi' } },
+      {
+        type: 'message',
+        id: 'u1',
+        parentId: null,
+        timestamp: '2026-07-01T10:00:01.000Z',
+        message: { role: 'user', content: 'hi' },
+      },
       {
         type: 'message',
         id: 'a1',
         parentId: 'u1',
         timestamp: '2026-07-01T10:00:02.000Z',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'yo' }],
+          model: 'qwen3_5',
+          usage: { input: 5, output: 6 },
+        },
       },
     ]);
     await ingestSessions(dash, root);
@@ -588,15 +831,33 @@ describe('ingestSessions', () => {
     expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'sw-1')).all()).toHaveLength(1);
 
     // Swap the SAME path to a valid-header file with a dropped interior record.
-    const header = JSON.stringify({ type: 'session', version: 3, id: 'sw-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' });
-    const user = JSON.stringify({ type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-02T10:00:01.000Z', message: { role: 'user', content: 'hi' } });
-    const brokenInterior = '{"type":"message","id":"m2","parentId":"u1","timestamp":"2026-07-02T10:00:02.000Z","message":{"role":"asst';
+    const header = JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'sw-1',
+      timestamp: '2026-07-01T10:00:00.000Z',
+      cwd: '/w',
+    });
+    const user = JSON.stringify({
+      type: 'message',
+      id: 'u1',
+      parentId: null,
+      timestamp: '2026-07-02T10:00:01.000Z',
+      message: { role: 'user', content: 'hi' },
+    });
+    const brokenInterior =
+      '{"type":"message","id":"m2","parentId":"u1","timestamp":"2026-07-02T10:00:02.000Z","message":{"role":"asst';
     const orphan = JSON.stringify({
       type: 'message',
       id: 'a3',
       parentId: 'm2',
       timestamp: '2026-07-02T10:00:03.000Z',
-      message: { role: 'assistant', content: [{ type: 'text', text: 'orphan' }], model: 'qwen3_5', usage: { input: 7, output: 8 } },
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'orphan' }],
+        model: 'qwen3_5',
+        usage: { input: 7, output: 8 },
+      },
     });
     writeFileSync(file, `${header}\n${user}\n${brokenInterior}\n${orphan}\n`);
     const later = Date.now() / 1000 + 5;
@@ -620,17 +881,34 @@ describe('ingestSessions', () => {
     // Self-parented leaf: `x.parentId === 'x'` — the walker would loop forever.
     writeSessionFile(soloBase, 'cyclic.jsonl', [
       { type: 'session', version: 3, id: 'cyc-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
-      { type: 'message', id: 'x', parentId: 'x', timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'loop' } },
+      {
+        type: 'message',
+        id: 'x',
+        parentId: 'x',
+        timestamp: '2026-07-01T10:00:01.000Z',
+        message: { role: 'user', content: 'loop' },
+      },
     ]);
     writeSessionFile(soloBase, 'valid.jsonl', [
       { type: 'session', version: 3, id: 'ok-1', timestamp: '2026-07-02T10:00:00.000Z', cwd: '/w' },
-      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-02T10:00:01.000Z', message: { role: 'user', content: 'hi' } },
+      {
+        type: 'message',
+        id: 'u1',
+        parentId: null,
+        timestamp: '2026-07-02T10:00:01.000Z',
+        message: { role: 'user', content: 'hi' },
+      },
       {
         type: 'message',
         id: 'a1',
         parentId: 'u1',
         timestamp: '2026-07-02T10:00:02.000Z',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }], model: 'qwen3_5', usage: { input: 3, output: 4 } },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'ok' }],
+          model: 'qwen3_5',
+          usage: { input: 3, output: 4 },
+        },
       },
     ]);
 
@@ -655,14 +933,25 @@ describe('ingestSessions', () => {
     const root = join(soloBase, 'sessions');
     writeSessionFile(soloBase, 'forked.jsonl', [
       { type: 'session', version: 3, id: 'fk-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
-      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'q' } },
+      {
+        type: 'message',
+        id: 'u1',
+        parentId: null,
+        timestamp: '2026-07-01T10:00:01.000Z',
+        message: { role: 'user', content: 'q' },
+      },
       // Abandoned 999-token assistant off u1 (must NOT be indexed).
       {
         type: 'message',
         id: 'a1',
         parentId: 'u1',
         timestamp: '2026-07-01T10:00:02.000Z',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'abandoned' }], model: 'gemma4', usage: { input: 999, output: 999 } },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'abandoned' }],
+          model: 'gemma4',
+          usage: { input: 999, output: 999 },
+        },
       },
       // Active 1-token replacement off u1.
       {
@@ -670,7 +959,12 @@ describe('ingestSessions', () => {
         id: 'a2',
         parentId: 'u1',
         timestamp: '2026-07-01T10:00:03.000Z',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'active' }], model: 'qwen3_5', usage: { input: 1, output: 2 } },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'active' }],
+          model: 'qwen3_5',
+          usage: { input: 1, output: 2 },
+        },
       },
       // Detached metadata leaf appended last (a rename) — carries no message.
       { type: 'session_info', id: 'si1', parentId: null, timestamp: '2026-07-01T10:00:04.000Z', name: 'Forked' },
@@ -702,13 +996,24 @@ describe('ingestSessions', () => {
     const root = join(soloBase, 'sessions');
     const file = writeSessionFile(soloBase, 's.jsonl', [
       { type: 'session', version: 3, id: 'q-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
-      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'hi' } },
+      {
+        type: 'message',
+        id: 'u1',
+        parentId: null,
+        timestamp: '2026-07-01T10:00:01.000Z',
+        message: { role: 'user', content: 'hi' },
+      },
       {
         type: 'message',
         id: 'a1',
         parentId: 'u1',
         timestamp: '2026-07-01T10:00:02.000Z',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'yo' }],
+          model: 'qwen3_5',
+          usage: { input: 5, output: 6 },
+        },
       },
     ]);
     await ingestSessions(dash, root);
@@ -743,13 +1048,24 @@ describe('ingestSessions', () => {
     const root = join(soloBase, 'sessions');
     const file = writeSessionFile(soloBase, 's.jsonl', [
       { type: 'session', version: 3, id: 'qc-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
-      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'hi' } },
+      {
+        type: 'message',
+        id: 'u1',
+        parentId: null,
+        timestamp: '2026-07-01T10:00:01.000Z',
+        message: { role: 'user', content: 'hi' },
+      },
       {
         type: 'message',
         id: 'a1',
         parentId: 'u1',
         timestamp: '2026-07-01T10:00:02.000Z',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'yo' }],
+          model: 'qwen3_5',
+          usage: { input: 5, output: 6 },
+        },
       },
     ]);
     await ingestSessions(dash, root);
@@ -783,13 +1099,24 @@ describe('ingestSessions', () => {
     const root = join(soloBase, 'sessions');
     const file = writeSessionFile(soloBase, 's.jsonl', [
       { type: 'session', version: 3, id: 'nl-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
-      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'hi' } },
+      {
+        type: 'message',
+        id: 'u1',
+        parentId: null,
+        timestamp: '2026-07-01T10:00:01.000Z',
+        message: { role: 'user', content: 'hi' },
+      },
       {
         type: 'message',
         id: 'a1',
         parentId: 'u1',
         timestamp: '2026-07-01T10:00:02.000Z',
-        message: { role: 'assistant', content: [{ type: 'text', text: 'yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'yo' }],
+          model: 'qwen3_5',
+          usage: { input: 5, output: 6 },
+        },
       },
     ]);
     await ingestSessions(dash, root);
@@ -797,7 +1124,13 @@ describe('ingestSessions', () => {
     expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'nl-1')).all()).toHaveLength(1);
 
     // Swap the SAME path to a valid header followed by a literal `null` line.
-    const header = JSON.stringify({ type: 'session', version: 3, id: 'nl-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' });
+    const header = JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'nl-1',
+      timestamp: '2026-07-01T10:00:00.000Z',
+      cwd: '/w',
+    });
     writeFileSync(file, `${header}\nnull\n`);
     const later = Date.now() / 1000 + 5;
     utimesSync(file, later, later);

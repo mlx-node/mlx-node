@@ -282,32 +282,45 @@ export function verifySessionFileId(path: string, expectedId: string): boolean {
 }
 
 /**
- * All `<root>/--*--/*.jsonl` session files, in directory-listing order. The
- * outer `Dirent.isDirectory()` already skips a symlinked project dir; each
- * candidate `.jsonl` is then `lstatSync`'d and skipped unless it is a regular
- * file (`isFile()` is false for a symlink). A symlinked transcript is never
- * indexed, so an external Pi session cannot be surfaced under the target's id
- * — matching the native cold tier's no-follow policy.
+ * Every session `.jsonl` file under `root`, in directory-listing order, across
+ * BOTH pi layouts:
+ *   - the project-scoped layout `<root>/--<cwd>--/*.jsonl` (pi's default), and
+ *   - the flat explicit-session-dir layout `<root>/*.jsonl` (what pi writes with
+ *     `--session-dir X`, which `mlx dashboard --session-dir` is documented to
+ *     point at) — root-level files that would otherwise be ignored.
+ * The two sets are disjoint (a subdir file is never a root-level file), so no file
+ * is double-counted. Every candidate is `lstatSync`'d and kept only if it is a
+ * regular file (`isFile()` is false for a symlink), and a root-level symlinked
+ * directory is never descended — so a symlinked transcript is never indexed and an
+ * external Pi session cannot be surfaced under the target's id, matching the native
+ * cold tier's no-follow policy.
  */
 function listSessionFiles(root: string): string[] {
   if (!existsSync(root)) return [];
   const files: string[] = [];
-  for (const dir of readdirSync(root, { withFileTypes: true })) {
-    if (!dir.isDirectory()) continue;
-    if (!dir.name.startsWith('--') || !dir.name.endsWith('--')) continue;
-    const dirPath = join(root, dir.name);
-    for (const name of readdirSync(dirPath)) {
-      if (!name.endsWith('.jsonl')) continue;
-      const full = join(dirPath, name);
-      let stat: Stats;
-      try {
-        stat = lstatSync(full);
-      } catch {
-        continue;
-      }
-      if (!stat.isFile()) continue;
-      files.push(full);
+
+  const pushIfRegularJsonl = (full: string): void => {
+    if (!full.endsWith('.jsonl')) return;
+    let stat: Stats;
+    try {
+      stat = lstatSync(full);
+    } catch {
+      return;
     }
+    if (stat.isFile()) files.push(full);
+  };
+
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    // `--<cwd>--/` project subdir: scan the `.jsonl` files inside it.
+    if (entry.isDirectory()) {
+      if (!entry.name.startsWith('--') || !entry.name.endsWith('--')) continue;
+      const dirPath = join(root, entry.name);
+      for (const name of readdirSync(dirPath)) pushIfRegularJsonl(join(dirPath, name));
+      continue;
+    }
+    // Flat explicit-session-dir layout: a `.jsonl` directly under the root. The
+    // same no-follow guard applies — `pushIfRegularJsonl` lstat-skips a symlink.
+    pushIfRegularJsonl(join(root, entry.name));
   }
   return files;
 }

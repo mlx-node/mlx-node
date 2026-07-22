@@ -380,6 +380,22 @@ pub fn cold_cache_stats() -> ColdCacheStatsJs {
     }
 }
 
+/// Flush every accepted cold-tier block to disk, blocking until the
+/// background writer has fsync+renamed each write enqueued before this call,
+/// or `timeout_ms` elapses. Returns `true` when the drain completed — or when
+/// the tier was never opened (nothing to flush) — and `false` on timeout.
+///
+/// Called from the agent's one-shot (`mlx agent -p`) shutdown so a prompt's
+/// just-persisted prefix blocks are durable before the process exits, rather
+/// than being abandoned in the write queue.
+#[napi]
+pub fn cold_cache_drain(timeout_ms: u32) -> bool {
+    match GLOBAL.get().and_then(|slot| slot.clone()) {
+        Some(manager) => manager.drain(std::time::Duration::from_millis(timeout_ms as u64)),
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

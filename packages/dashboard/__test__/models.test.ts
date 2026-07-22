@@ -74,6 +74,44 @@ describe('discoverLocalModels', () => {
     expect(models).toHaveLength(0);
     expect(warnings).toHaveLength(0);
   });
+
+  // A checkpoint dir can contain symlinks (HF-cache blob links, or hostile links a
+  // caller planted). Sizing must NEVER descend into a symlinked directory: a
+  // self-referential link is a cycle that used to recurse until the OS symlink-loop
+  // limit, inflating the size/count (a directory with two `-> .` links is an
+  // exponential ~2^31-stat freeze of the synchronous /api/models handler), and a
+  // link to an external tree would wrongly fold that tree's bytes into the model.
+  it('does not recurse into symlinked directories (breaks cycles, excludes external trees)', () => {
+    const modelDir = join(modelsDir, 'linky');
+    mkdirSync(modelDir, { recursive: true });
+    const CONFIG = JSON.stringify({ model_type: 'qwen3' });
+    const WEIGHT_BYTES = 512;
+    writeFileSync(join(modelDir, 'config.json'), CONFIG);
+    writeFileSync(join(modelDir, 'model.safetensors'), Buffer.alloc(WEIGHT_BYTES));
+
+    // A self-referential symlink → a 1-cycle. Following it recurses without bound.
+    symlinkSync('.', join(modelDir, 'self'));
+
+    // A symlink to an external directory holding a large file — must not be counted.
+    const externalDir = mkdtempSync(join(tmpdir(), 'dash-ext-'));
+    writeFileSync(join(externalDir, 'huge.bin'), Buffer.alloc(1_000_000));
+    symlinkSync(externalDir, join(modelDir, 'ext'));
+
+    const t0 = Date.now();
+    const { models } = discoverLocalModels(modelsDir);
+    const elapsedMs = Date.now() - t0;
+
+    const linky = models.find((m) => m.name === 'linky')!;
+    expect(linky).toBeDefined();
+    // Exactly the two real files — the symlinked dirs contribute neither bytes nor
+    // recursion, and the external tree's 1 MB file is excluded.
+    expect(linky.fileCount).toBe(2);
+    expect(linky.sizeBytes).toBe(Buffer.byteLength(CONFIG) + WEIGHT_BYTES);
+    // And it returned promptly rather than spinning on the cycle.
+    expect(elapsedMs).toBeLessThan(5000);
+
+    rmSync(externalDir, { recursive: true, force: true });
+  });
 });
 
 describe('deleteLocalModel', () => {

@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { formatCount, formatDateTime, formatNumber } from '@/lib/format';
+import { shQuote } from '@/lib/shell';
 import type { SessionDetailResponse, SessionMetricsResponse, SessionTurnMetric } from '@/lib/types';
 import { useJson } from '@/lib/use-api';
 import { AlertCircle, ArrowLeft, Copy, FileWarning, Inbox } from 'lucide-react';
@@ -98,7 +99,7 @@ export default function SessionDetail() {
 
   const copyResume = (): void => {
     if (session === undefined) return;
-    const command = `mlx agent --session ${session.path}`;
+    const command = `mlx agent --session ${shQuote(session.path)}`;
     void navigator.clipboard.writeText(command).then(
       () => toast.success('Resume command copied', { description: command }),
       () => toast.error('Failed to copy to clipboard'),

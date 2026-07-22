@@ -2645,6 +2645,18 @@ export interface CleanupStats {
 }
 
 /**
+ * Flush every accepted cold-tier block to disk, blocking until the
+ * background writer has fsync+renamed each write enqueued before this call,
+ * or `timeout_ms` elapses. Returns `true` when the drain completed — or when
+ * the tier was never opened (nothing to flush) — and `false` on timeout.
+ *
+ * Called from the agent's one-shot (`mlx agent -p`) shutdown so a prompt's
+ * just-persisted prefix blocks are durable before the process exits, rather
+ * than being abandoned in the write queue.
+ */
+export declare function coldCacheDrain(timeoutMs: number): boolean;
+
+/**
  * Return a snapshot of the process-wide cold tier. Read-only: never opens
  * the tier itself, so it reports `enabled: false` until inference first
  * initializes the tier.

@@ -11,7 +11,12 @@ import { existsSync, readFileSync, realpathSync, rmSync, statSync } from 'node:f
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { basename, dirname, join, sep } from 'node:path';
 
-import { SessionManager, parseSessionEntries, type FileEntry, type SessionEntry } from '@earendil-works/pi-coding-agent';
+import {
+  SessionManager,
+  parseSessionEntries,
+  type FileEntry,
+  type SessionEntry,
+} from '@earendil-works/pi-coding-agent';
 import { eq } from 'drizzle-orm';
 
 import { scanColdCache, clearColdCache, evictOlderThan } from './cache.js';
@@ -723,22 +728,50 @@ function handleSessionMetrics({ res, params, deps }: RouteCtx): void {
     sendError(res, 404, `Session "${params.id}" not found`);
     return;
   }
+  // The per-turn set the SPA charts / counts / token totals are built from is this
+  // session's persisted `turns` (LEFT JOINed to their trace) UNIONed with any
+  // delegated subagent turns: a child runs on an in-memory session manager (no
+  // session JSONL → no `turns` row), yet its shared-provider `traces` row carries
+  // the token columns and points back here via `root_session_id`. Without the union
+  // the child's tokens/count are dropped from the totals even though the SPA already
+  // shows its model badge + folds its throughput in (from the `traces` array below),
+  // and it disagrees with the global overview. The dedup admits ONLY traces with no
+  // correlated `turns` row for THIS session (the inner `AND trace_id IS NOT NULL`
+  // keeps `NOT IN` from going NULL and dropping the whole set), and — mirroring the
+  // global fix in handleMetricsOverview — the trace side stores GROSS `prompt_tokens`
+  // so its `inputTokens` is clamped to the producer's net value `MAX(prompt-cached,0)`
+  // to avoid a gross-vs-net double-count against the turns side's already-net input.
   const turnRows = deps.dash.sqlite
     .prepare(
-      `SELECT t.entry_id AS entryId, t.trace_id AS traceId, t.ts, t.model,
-              t.input_tokens AS inputTokens, t.output_tokens AS outputTokens,
-              t.cached_tokens AS cachedTokens, t.reasoning_tokens AS reasoningTokens,
-              tr.ttft_ms AS ttftMs, tr.prefill_tps AS prefillTps, tr.decode_tps AS decodeTps,
-              tr.mtp_cycles AS mtpCycles, tr.mtp_mean_accepted AS mtpMeanAccepted,
-              tr.duration_ms AS durationMs, tr.finish_reason AS finishReason,
-              tr.cold_hits AS coldHits, tr.cold_misses AS coldMisses,
-              tr.cold_bytes_written AS coldBytesWritten, tr.cold_bytes_restored AS coldBytesRestored
-       FROM turns t
-       LEFT JOIN traces tr ON tr.trace_id = t.trace_id
-       WHERE t.session_id = ?
-       ORDER BY t.ts`,
+      `SELECT * FROM (
+         SELECT t.entry_id AS entryId, t.trace_id AS traceId, t.ts AS ts, t.model AS model,
+                t.input_tokens AS inputTokens, t.output_tokens AS outputTokens,
+                t.cached_tokens AS cachedTokens, t.reasoning_tokens AS reasoningTokens,
+                tr.ttft_ms AS ttftMs, tr.prefill_tps AS prefillTps, tr.decode_tps AS decodeTps,
+                tr.mtp_cycles AS mtpCycles, tr.mtp_mean_accepted AS mtpMeanAccepted,
+                tr.duration_ms AS durationMs, tr.finish_reason AS finishReason,
+                tr.cold_hits AS coldHits, tr.cold_misses AS coldMisses,
+                tr.cold_bytes_written AS coldBytesWritten, tr.cold_bytes_restored AS coldBytesRestored
+         FROM turns t
+         LEFT JOIN traces tr ON tr.trace_id = t.trace_id
+         WHERE t.session_id = ?
+         UNION ALL
+         SELECT NULL AS entryId, tr.trace_id AS traceId, tr.ts AS ts, tr.model AS model,
+                MAX(COALESCE(tr.prompt_tokens, 0) - COALESCE(tr.cached_tokens, 0), 0) AS inputTokens,
+                tr.output_tokens AS outputTokens, tr.cached_tokens AS cachedTokens,
+                tr.reasoning_tokens AS reasoningTokens,
+                tr.ttft_ms AS ttftMs, tr.prefill_tps AS prefillTps, tr.decode_tps AS decodeTps,
+                tr.mtp_cycles AS mtpCycles, tr.mtp_mean_accepted AS mtpMeanAccepted,
+                tr.duration_ms AS durationMs, tr.finish_reason AS finishReason,
+                tr.cold_hits AS coldHits, tr.cold_misses AS coldMisses,
+                tr.cold_bytes_written AS coldBytesWritten, tr.cold_bytes_restored AS coldBytesRestored
+         FROM traces tr
+         WHERE (tr.session_id = ? OR tr.root_session_id = ?)
+           AND tr.trace_id NOT IN (SELECT trace_id FROM turns WHERE session_id = ? AND trace_id IS NOT NULL)
+       )
+       ORDER BY ts`,
     )
-    .all(params.id);
+    .all(params.id, params.id, params.id, params.id);
   // Include this session's own turns AND any subagent turns delegated under it:
   // a child (subagent) trace carries no persisted session JSONL, but its
   // root_session_id points back here (Finding 11b).

@@ -79,6 +79,14 @@ restored on a hot-cache miss before falling back to a normal prefill.
   fresh prefill. Quota is 10 % of FS capacity capped at 100 GiB, LRU by rebuilt
   mtime recency. All destructive I/O is descriptor-relative and no-follow, contained
   to a managed `mlx-paged-v1` child.
+- **Cold-tier eviction is per-block global-LRU and NOT chain-aware.** Prefix chains
+  are written head-to-tail, so under sustained quota pressure the oldest blocks —
+  the root/head of a chain — are evicted first. Because restore stops at the first
+  missing block, an evicted head makes the rest of that chain unrestorable while its
+  suffix blocks still occupy quota; the tier then falls open to a normal prefill
+  (correct, just no speedup). The common case — a working set within quota — is
+  unaffected. Chain-aware eviction (evict leaves/tails first, or cascade a head's
+  descendants) is a future improvement.
 - The quota is a **per-process best-effort cap**, not a strict cross-process limit:
   each `mlx agent` process enforces it against its own startup scan, so several
   processes sharing one root before either writes can transiently exceed it (up to
@@ -127,23 +135,23 @@ per-model query to plot true trends over time.
 Read-only `GET` endpoints plus a few guarded mutations. `GET /health` returns
 `{ status, modelsDir, sessionsRoot, tracesDir }`.
 
-| Route                       | Method       | Purpose                                                     |
-| --------------------------- | ------------ | ----------------------------------------------------------- |
-| `/api/models`               | GET          | Local models: name, path, family, quant, size, ctx window   |
-| `/api/models/:name`         | DELETE       | Delete a model dir (path-checked)                           |
-| `/api/catalog`              | GET          | Recommended catalog + installed/installable state           |
-| `/api/downloads`            | GET / POST   | List active jobs / start a catalog download                 |
-| `/api/downloads/:id/events` | GET (SSE)    | Per-file + byte progress, resume-aware                      |
-| `/api/sessions`             | GET          | Indexed session list; search + filters                      |
-| `/api/sessions/:id`         | GET          | Transcript (active branch) + per-turn usage                 |
+| Route                       | Method       | Purpose                                                       |
+| --------------------------- | ------------ | ------------------------------------------------------------- |
+| `/api/models`               | GET          | Local models: name, path, family, quant, size, ctx window     |
+| `/api/models/:name`         | DELETE       | Delete a model dir (path-checked)                             |
+| `/api/catalog`              | GET          | Recommended catalog + installed/installable state             |
+| `/api/downloads`            | GET / POST   | List active jobs / start a catalog download                   |
+| `/api/downloads/:id/events` | GET (SSE)    | Per-file + byte progress, resume-aware                        |
+| `/api/sessions`             | GET          | Indexed session list; search + filters                        |
+| `/api/sessions/:id`         | GET          | Transcript (active branch) + per-turn usage                   |
 | `/api/sessions/:id`         | PATCH/DELETE | Rename (refused while active, see below) / delete file + rows |
-| `/api/sessions/:id/metrics` | GET          | Joined trace metrics for the session                        |
-| `/api/metrics/overview`     | GET          | Aggregates: tokens/day, tok/s + TTFT, MTP acceptance, share |
-| `/api/cache`                | GET / DELETE | Cold-tier scan / clear all or evict older-than-N-days       |
-| `/api/ingest`               | POST         | Trigger an incremental rescan                               |
+| `/api/sessions/:id/metrics` | GET          | Joined trace metrics for the session                          |
+| `/api/metrics/overview`     | GET          | Aggregates: tokens/day, tok/s + TTFT, MTP acceptance, share   |
+| `/api/cache`                | GET / DELETE | Cold-tier scan / clear all or evict older-than-N-days         |
+| `/api/ingest`               | POST         | Trigger an incremental rescan                                 |
 
 **Rename is durable but idle-only.** A rename appends a `session_info` entry to the
-pi session JSONL (the source of truth) — it is *not* stored index-only, because the
+pi session JSONL (the source of truth) — it is _not_ stored index-only, because the
 SQLite index is disposable and would lose the name on the next rebuild. pi has no
 cross-process lock, so if a live agent (a separate process) appends a turn between
 the dashboard's snapshot of the file and its append, one of the two writes is

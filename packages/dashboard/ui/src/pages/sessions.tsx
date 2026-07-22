@@ -17,6 +17,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { mutate } from '@/lib/api';
 import { formatCount, formatNumber, formatRelativeTime } from '@/lib/format';
+import { shQuote } from '@/lib/shell';
 import type { SessionRenameResponse, SessionRow, SessionsResponse } from '@/lib/types';
 import { useJson } from '@/lib/use-api';
 import { AlertCircle, Copy, Inbox, Loader2, Pencil, Search, Trash2 } from 'lucide-react';
@@ -31,7 +32,7 @@ function errMessage(err: unknown): string {
 }
 
 function copyResume(session: SessionRow): void {
-  const command = `mlx agent --session ${session.path}`;
+  const command = `mlx agent --session ${shQuote(session.path)}`;
   void navigator.clipboard.writeText(command).then(
     () => toast.success('Resume command copied', { description: command }),
     () => toast.error('Failed to copy to clipboard'),
@@ -262,8 +263,8 @@ export default function Sessions() {
               <span className="text-foreground font-medium">
                 {deleteTarget !== null ? sessionTitle(deleteTarget) : ''}
               </span>{' '}
-              and deletes its file from disk. This cannot be undone. If an agent is
-              currently using this session, deleting it may orphan in-progress turns.
+              and deletes its file from disk. This cannot be undone. If an agent is currently using this session,
+              deleting it may orphan in-progress turns.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
