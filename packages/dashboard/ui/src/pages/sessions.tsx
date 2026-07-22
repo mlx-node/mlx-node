@@ -262,7 +262,8 @@ export default function Sessions() {
               <span className="text-foreground font-medium">
                 {deleteTarget !== null ? sessionTitle(deleteTarget) : ''}
               </span>{' '}
-              and deletes its file from disk. This cannot be undone.
+              and deletes its file from disk. This cannot be undone. If an agent is
+              currently using this session, deleting it may orphan in-progress turns.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
