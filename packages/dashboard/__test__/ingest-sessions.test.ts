@@ -135,6 +135,88 @@ describe('ingestSessions', () => {
     rmSync(soloBase, { recursive: true, force: true });
   });
 
+  // G4: the shared DB is not keyed by session root. After switching --session-dir
+  // A→B (both roots' files still on disk), A's out-of-root rows must be reconciled
+  // away — reconciliation retains only paths discoverable under the CURRENT root.
+  it('drops the old root sessions after switching --session-dir', async () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-switchroot-'));
+    const rootA = join(soloBase, 'A', 'sessions');
+    const rootB = join(soloBase, 'B', 'sessions');
+    const dirA = join(rootA, '--w--');
+    const dirB = join(rootB, '--w--');
+    mkdirSync(dirA, { recursive: true });
+    mkdirSync(dirB, { recursive: true });
+    writeFileSync(
+      join(dirA, 'a.jsonl'),
+      `${[
+        { type: 'session', version: 3, id: 'root-A', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/a' },
+        { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'from A' } },
+        {
+          type: 'message',
+          id: 'a1',
+          parentId: 'u1',
+          timestamp: '2026-07-01T10:00:02.000Z',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+        },
+      ]
+        .map((l) => JSON.stringify(l))
+        .join('\n')}\n`,
+    );
+    writeFileSync(
+      join(dirB, 'b.jsonl'),
+      `${[
+        { type: 'session', version: 3, id: 'root-B', timestamp: '2026-07-02T10:00:00.000Z', cwd: '/b' },
+        { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-02T10:00:01.000Z', message: { role: 'user', content: 'from B' } },
+      ]
+        .map((l) => JSON.stringify(l))
+        .join('\n')}\n`,
+    );
+
+    await ingestSessions(dash, rootA);
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'root-A')).all()).toHaveLength(1);
+    expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'root-A')).all()).toHaveLength(1);
+
+    const res = await ingestSessions(dash, rootB);
+    // A's session + turn rows are reconciled away; B is indexed.
+    expect(res.removed).toBe(1);
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'root-A')).all()).toHaveLength(0);
+    expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'root-A')).all()).toHaveLength(0);
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'root-B')).all()).toHaveLength(1);
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
+
+  // G4: reconciling against the current-root discoverable set must NOT drop an
+  // in-root session skipped by the mtime/size watermark (unchanged files are
+  // still present in listSessionFiles output).
+  it('preserves an in-root unchanged session across re-ingest', async () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-inroot-'));
+    const root = join(soloBase, 'sessions');
+    writeSessionFile(soloBase, 's.jsonl', [
+      { type: 'session', version: 3, id: 'keep-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
+      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'hi' } },
+      {
+        type: 'message',
+        id: 'a1',
+        parentId: 'u1',
+        timestamp: '2026-07-01T10:00:02.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+      },
+    ]);
+    await ingestSessions(dash, root);
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'keep-1')).all()).toHaveLength(1);
+
+    // Re-ingest the same root with the file unchanged (watermark skip) → the row
+    // must survive reconciliation, not be dropped as "not rescanned this pass".
+    const res = await ingestSessions(dash, root);
+    expect(res.updated).toBe(0);
+    expect(res.removed).toBe(0);
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'keep-1')).all()).toHaveLength(1);
+    expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'keep-1')).all()).toHaveLength(1);
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
+
   // Finding 12: turns must follow the active branch, not abandoned tree branches.
   it('indexes only the active-branch turn, not an abandoned one', async () => {
     const soloBase = mkdtempSync(join(tmpdir(), 'dash-branch-'));

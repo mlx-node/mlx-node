@@ -801,6 +801,19 @@ impl ColdCacheManager {
     /// fail-open — the worst case is a stale index entry, one recomputed
     /// prefix, or one lost persist (an external actor swapping the entry
     /// inside the stat window right after a failed open).
+    ///
+    /// The byte quota is therefore a per-process *best-effort* cap, not a
+    /// strict cross-process invariant: each process admits blocks against its
+    /// own startup-scan view, so N processes that each start on the same root
+    /// before either writes may transiently hold up to ~N×quota on disk. This
+    /// self-corrects — the next process whose [`rebuild_index`] scan sees the
+    /// combined on-disk total evicts LRU down to the quota on its first write.
+    /// The free-space floor, by contrast, is checked against a live `statvfs`
+    /// re-sampled after every eviction, so the only cross-process slack there
+    /// is the handful of in-flight block writes, far below the reserve. The
+    /// strict-quota fix (an interprocess lock spanning scan→evict→reserve→
+    /// rename→publish) would invert this deliberately lock-free design and is
+    /// out of scope for the v1 best-effort cache.
     fn load_bounded(
         &self,
         key: ColdCacheKey,

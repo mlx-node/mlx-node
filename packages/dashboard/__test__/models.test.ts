@@ -4,7 +4,13 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
-import { defaultModelsDir, deleteLocalModel, discoverLocalModels } from '../src/models.js';
+import {
+  DOWNLOAD_COMPLETE_MARKER,
+  defaultModelsDir,
+  deleteLocalModel,
+  discoverLocalModels,
+  isModelInstalled,
+} from '../src/models.js';
 
 let modelsDir: string;
 
@@ -131,6 +137,52 @@ describe('deleteLocalModel', () => {
     expect(existsSync(keep)).toBe(true);
 
     rmSync(outside, { recursive: true, force: true });
+  });
+});
+
+describe('isModelInstalled', () => {
+  /** Write a completion marker listing `files` into `<modelsDir>/<name>`. */
+  function writeMarker(name: string, files: string[]): string {
+    const dir = join(modelsDir, name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: 'owner/repo', revision: 'a'.repeat(40), files, completedAt: 'x' }),
+    );
+    return dir;
+  }
+
+  it('is installed only when the marker lists a config AND a weight, all present', () => {
+    const dir = writeMarker('good', ['config.json', 'model.safetensors']);
+    writeFileSync(join(dir, 'config.json'), Buffer.alloc(4));
+    writeFileSync(join(dir, 'model.safetensors'), Buffer.alloc(8));
+    expect(isModelInstalled(dir)).toBe(true);
+  });
+
+  it('is NOT installed for a one-sided marker listing only config.json (Finding G2)', () => {
+    const dir = writeMarker('config-only', ['config.json']);
+    writeFileSync(join(dir, 'config.json'), Buffer.alloc(4));
+    expect(isModelInstalled(dir)).toBe(false);
+  });
+
+  it('is NOT installed for a weights-only marker (no config.json)', () => {
+    const dir = writeMarker('weights-only', ['model.safetensors']);
+    writeFileSync(join(dir, 'model.safetensors'), Buffer.alloc(8));
+    expect(isModelInstalled(dir)).toBe(false);
+  });
+
+  it('is NOT installed when a listed file is missing on disk, nor without a marker', () => {
+    const dir = writeMarker('missing-weight', ['config.json', 'model.safetensors']);
+    writeFileSync(join(dir, 'config.json'), Buffer.alloc(4));
+    // model.safetensors is listed but never written.
+    expect(isModelInstalled(dir)).toBe(false);
+
+    // A bare dir with no marker at all is never installed.
+    const bare = join(modelsDir, 'bare');
+    mkdirSync(bare, { recursive: true });
+    writeFileSync(join(bare, 'config.json'), Buffer.alloc(4));
+    writeFileSync(join(bare, 'model.safetensors'), Buffer.alloc(8));
+    expect(isModelInstalled(bare)).toBe(false);
   });
 });
 

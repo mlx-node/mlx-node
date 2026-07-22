@@ -79,6 +79,13 @@ restored on a hot-cache miss before falling back to a normal prefill.
   fresh prefill. Quota is 10 % of FS capacity capped at 100 GiB, LRU by rebuilt
   mtime recency. All destructive I/O is descriptor-relative and no-follow, contained
   to a managed `mlx-paged-v1` child.
+- The quota is a **per-process best-effort cap**, not a strict cross-process limit:
+  each `mlx agent` process enforces it against its own startup scan, so several
+  processes sharing one root before either writes can transiently exceed it (up to
+  ~N×quota for N concurrent writers). It self-corrects — the next process to scan the
+  root evicts LRU back down to quota on its first write — and the free-space floor is
+  enforced against a live `statvfs` re-sampled per eviction. Strict cross-process
+  quota enforcement (interprocess locking) is out of scope for v1.
 - `MLX_COLD_CACHE_DIR=<parent>` relocates the tier; the cache operates in a
   `mlx-paged-v1` child of that parent (never the parent verbatim). Default root is
   `~/.mlx-node/cache/paged/v1`. `coldCacheStats()` (NAPI) exposes cumulative

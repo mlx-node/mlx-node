@@ -463,14 +463,17 @@ function ModelTrendChart({ points, models, pick, unit, valueFormat, colorFor }: 
     const present = new Set<string>();
     const sorted = [...points].sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
     for (const p of sorted) {
-      const value = pick(p);
-      if (value === null || !Number.isFinite(value)) continue;
-      present.add(p.model);
+      // Create the day row unconditionally so a day whose metric is null still
+      // occupies an x position; leaving the series key absent lets connectNulls=false
+      // draw a gap there instead of bridging neighbours into false continuity.
       let row = byDay.get(p.day);
       if (!row) {
         row = { day: formatDay(p.day) };
         byDay.set(p.day, row);
       }
+      const value = pick(p);
+      if (value === null || !Number.isFinite(value)) continue;
+      present.add(p.model);
       row[p.model] = value;
     }
     // Map insertion order follows the day-sorted scan, so values() is chronological.

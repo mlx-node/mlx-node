@@ -69,11 +69,23 @@ export interface DownloadCompletion {
 }
 
 /**
+ * A file that carries a model's weights: safetensors, GGUF, or PaddlePaddle
+ * params. The single source of truth for "is this a weight payload" — shared
+ * with the download runner (`download.ts` imports it) so the publish-time
+ * payload gate and the install check agree on the same extension set.
+ */
+export function isWeightFile(path: string): boolean {
+  return path.endsWith('.safetensors') || path.endsWith('.gguf') || path.endsWith('.pdiparams');
+}
+
+/**
  * A checkpoint counts as installed only when its atomic-publish completion
- * marker is present, parses, and every file it lists still exists on disk —
- * never bare directory existence, which a half-written or aborted download (a
- * partial `config.json` + missing weights) would also satisfy and thus falsely
- * report as installed, hiding the retry.
+ * marker is present, parses, lists BOTH a `config.json` and at least one weight
+ * file, and every file it lists still exists on disk — never bare directory
+ * existence (a half-written or aborted download with a partial `config.json` +
+ * missing weights) nor a one-sided manifest (config-only or weights-only), both
+ * of which `loadModel` would reject yet a laxer check would falsely report as
+ * installed, hiding the retry.
  */
 export function isModelInstalled(modelDir: string): boolean {
   let parsed: unknown;
@@ -84,7 +96,13 @@ export function isModelInstalled(modelDir: string): boolean {
   }
   const marker = asObject(parsed);
   if (marker === undefined || !Array.isArray(marker.files)) return false;
-  return marker.files.every((file) => typeof file === 'string' && existsSync(join(modelDir, file)));
+  const files = marker.files;
+  // A loadable checkpoint needs a config AND a weight; a marker missing either
+  // describes a hollow/one-sided publish that must NOT read as installed.
+  const hasConfig = files.some((file) => file === 'config.json');
+  const hasWeight = files.some((file) => typeof file === 'string' && isWeightFile(file));
+  if (!hasConfig || !hasWeight) return false;
+  return files.every((file) => typeof file === 'string' && existsSync(join(modelDir, file)));
 }
 
 /**

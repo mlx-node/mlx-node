@@ -50,6 +50,7 @@ import {
   isDownloaderOwned,
   isModelInstalled,
   isSafeRelPath,
+  isWeightFile,
 } from './models.js';
 
 /** Bounded re-fetch attempts for a staged file that fails post-copy verification. */
@@ -102,19 +103,16 @@ function isWantedFile(path: string): boolean {
   );
 }
 
-/** A file that makes a directory a model: a config, or any weight payload. */
-function isWeightFile(path: string): boolean {
-  return path.endsWith('.safetensors') || path.endsWith('.gguf') || path.endsWith('.pdiparams');
-}
-
 /**
- * True when the manifest actually describes a model: at least one file, and
- * among them a `config.json` or a weight file. A repo that resolves to zero
- * model files (404-shaped listing, auth-stripped repo, non-model repo) must
- * error rather than publish a hollow "installed" directory.
+ * True when the manifest actually describes a loadable model: it must carry a
+ * `config.json` AND at least one weight file. A repo that resolves to a
+ * one-sided set (config-only or weights-only — e.g. a catalog repo caught
+ * mid-re-upload with the config committed before the weights) must error rather
+ * than publish a hollow, one-sided "installed" directory that `loadModel` would
+ * then fail to open while the catalog reports it Installed with retry disabled.
  */
 function hasModelPayload(files: ListFileEntry[]): boolean {
-  return files.some((file) => file.path === 'config.json' || isWeightFile(file.path));
+  return files.some((file) => file.path === 'config.json') && files.some((file) => isWeightFile(file.path));
 }
 
 /** Streaming hex digest of a file's raw bytes (no git header). */
@@ -338,14 +336,22 @@ export class DownloadManager {
   }
 
   /**
-   * Cancel a running (in-flight or still-queued) job. Signals the in-flight
-   * `processJob` to unwind — aborting its `@huggingface/hub` fetch and tripping
-   * its next boundary check — so its `finally` removes the job-private staging
-   * dir; a still-queued job is dropped from the queue and settled here. The job
-   * is marked `cancelled` and a terminal `cancelled` event is emitted. Returns
-   * `false` for an unknown id, an already-terminal id, or a job that has entered
-   * the non-cancellable `committing` state (the `state !== 'running'` gate) — so a
-   * cancel racing an in-progress publish is refused rather than reporting success.
+   * Cancel a running job, or DISMISS a terminal one. Behavior by state:
+   *
+   *   - unknown id → `false` (nothing to do);
+   *   - `running` (in-flight or still-queued) → signal the in-flight `processJob`
+   *     to unwind (abort its `@huggingface/hub` fetch, trip its next boundary
+   *     check) so its `finally` removes the job-private staging dir; a still-queued
+   *     job is dropped from the queue and settled here, marked `cancelled` with a
+   *     terminal `cancelled` event. Returns `true`;
+   *   - `committing` → `false`: a cancel racing an in-progress publish is refused
+   *     rather than reporting success while the model still installs;
+   *   - terminal (`error`/`cancelled`/`done`) → DISMISS: evict the job entirely
+   *     (`jobsById` + `order` + `lastEvent`) and return `true`, so
+   *     `DELETE /api/downloads/:id` clears a failed/finished card server-side
+   *     instead of 404ing and retaining the row forever. A terminal id is never in
+   *     `queue` and is never the in-flight `currentJob` (which still holds
+   *     `running`/`committing`), so this only ever evicts a truly-finished job.
    *
    * Deliberately never touches the shared HF blob cache (`~/.cache/huggingface`):
    * the `mlx download` CLI relies on it to resume, so cancel only aborts the job
@@ -353,7 +359,22 @@ export class DownloadManager {
    */
   cancel(id: string): boolean {
     const job = this.jobsById.get(id);
-    if (job === undefined || job.state !== 'running') return false;
+    if (job === undefined) return false;
+
+    // Terminal-dismiss: a settled job carries no in-flight work and is not the
+    // `currentJob`, so evicting it from every tracking structure is safe and lets
+    // the DELETE route succeed instead of 404ing on a failed card.
+    if (job.state === 'error' || job.state === 'cancelled' || job.state === 'done') {
+      this.jobsById.delete(id);
+      const at = this.order.indexOf(id);
+      if (at !== -1) this.order.splice(at, 1);
+      this.lastEvent.delete(id);
+      return true;
+    }
+
+    // Only `running` is cancellable; `committing` (the non-cancellable publish
+    // window) is refused so a late cancel never reports success mid-install.
+    if (job.state !== 'running') return false;
     job.cancelled = true;
     // Interrupt any in-flight hub fetch so a multi-GB download stops promptly
     // rather than only at the next between-files boundary check.
@@ -541,7 +562,9 @@ export class DownloadManager {
       }
 
       if (!hasModelPayload(files)) {
-        throw new Error(`Repo "${job.repo}" has no downloadable model files (no config.json or weights)`);
+        throw new Error(
+          `Repo "${job.repo}" is not a complete model (needs both a config.json and a weight file)`,
+        );
       }
 
       job.totalBytes = totalBytes;

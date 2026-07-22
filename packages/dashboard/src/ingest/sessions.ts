@@ -337,7 +337,18 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
     }
   };
 
-  for (const filePath of listSessionFiles(sessionRoot)) {
+  // Snapshot the current root's discoverable files ONCE, up front. The scan
+  // iterates it, and reconciliation (below) retains a row only if its path is in
+  // this set — i.e. a regular file UNDER THE CURRENT root. The shared DB is not
+  // keyed by session root, so after switching --session-dir A→B the old root's
+  // files still exist on disk; a plain "is a regular file anywhere" check would
+  // keep A's out-of-root rows (whose detail/rename/delete all 403). Unchanged
+  // files skipped by the mtime/size watermark are still in this set, so valid
+  // in-root rows are never wrongly dropped.
+  const discoverable = listSessionFiles(sessionRoot);
+  const discoverableSet = new Set(discoverable);
+
+  for (const filePath of discoverable) {
     scanned++;
     try {
       const stat = statSync(filePath);
@@ -462,21 +473,16 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
     }
   }
 
-  // A row survives reconciliation only while its path is still a REGULAR file —
-  // the same lstat predicate the scanner uses. `existsSync` follows a symlink, so
-  // a row whose file was swapped for an in-root symlink to another transcript
-  // would otherwise persist and serve a foreign session's content on detail.
-  const stillPresent = (p: string): boolean => {
-    try {
-      return lstatSync(p).isFile();
-    } catch {
-      return false;
-    }
-  };
-
+  // A row survives reconciliation only while its path is in the CURRENT root's
+  // discoverable set (`listSessionFiles`, which no-follow-`lstat`s each candidate
+  // and keeps only regular files). This is strictly stronger than an
+  // "is a regular file anywhere" check: it also drops a row whose file was
+  // swapped for an in-root symlink (`existsSync` would follow it and keep serving
+  // a foreign transcript) AND a row left behind by switching --session-dir to a
+  // different root (the old root's file still exists but is no longer discoverable).
   const known = db.select({ id: sessions.id, path: sessions.path }).from(sessions).all();
   for (const row of known) {
-    if (stillPresent(row.path)) continue;
+    if (discoverableSet.has(row.path)) continue;
     sqlite.exec('BEGIN');
     try {
       db.delete(turns).where(eq(turns.sessionId, row.id)).run();

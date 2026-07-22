@@ -262,10 +262,12 @@ async function handleDownloadStart({ req, res, deps }: RouteCtx): Promise<void> 
 }
 
 /**
- * Cancel/abort an in-flight or queued download. Aborts the job and lets its
- * job-private staging dir clean up; deliberately never touches the shared HF
- * blob cache (the `mlx download` CLI resumes from it). Unknown or already-terminal
- * ids are a 404.
+ * Cancel/abort or dismiss a download. A `running` job is aborted (its
+ * job-private staging dir cleans up); a terminal job (`done`/`error`/`cancelled`)
+ * is dismissed from the registry. Both cases return 200. This deliberately never
+ * touches the shared HF blob cache (the `mlx download` CLI resumes from it). A
+ * 404 means no such id, or the job is in its brief non-cancellable `committing`
+ * (publish) window.
  */
 function handleDownloadCancel({ res, params, deps }: RouteCtx): void {
   if (deps.downloads.cancel(params.id)) {

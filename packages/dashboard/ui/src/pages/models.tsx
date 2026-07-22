@@ -89,11 +89,19 @@ export default function Models() {
 
   const onDownloadError = (repo: string, message: string): void => {
     toast.error('Download failed', { description: message });
+    const id = active[repo];
     setActive((prev) => {
       const next = { ...prev };
       delete next[repo];
       return next;
     });
+    // The job has settled terminally on the server; dismiss it via DELETE so
+    // GET /api/downloads stops returning the failed row and a retry (Install)
+    // starts clean. Best-effort — a failed eviction just leaves an inert row the
+    // next dismiss/restart can still clear. Mirrors `cancel`'s DELETE (no abort).
+    if (id !== undefined) {
+      void mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(id)}`).catch(() => {});
+    }
   };
 
   const cancel = async (repo: string, id: string): Promise<void> => {

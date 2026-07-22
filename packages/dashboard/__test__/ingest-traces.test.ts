@@ -291,6 +291,72 @@ describe('ingestTraces', () => {
     expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-survivor')).all()).toHaveLength(1);
   });
 
+  // G3: a changed file is the authoritative snapshot of its own rows. When its
+  // records are REPLACED ([A,B] → [C]), re-ingest must leave C only — insert-only
+  // ingest would retain the stale A and B.
+  it('replaces a changed file rows from the current snapshot ([A,B] → [C])', async () => {
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-07-05-replace.jsonl');
+    writeFileSync(file, `${traceLine('trace-A')}${traceLine('trace-B')}`);
+    await ingestTraces(dash, dir);
+    expect(dash.db.select().from(traces).all()).toHaveLength(2);
+
+    // Rewrite the file down to a single, different record; bump mtime forward.
+    writeFileSync(file, traceLine('trace-C'));
+    const later = Date.now() / 1000 + 5;
+    utimesSync(file, later, later);
+
+    await ingestTraces(dash, dir);
+    const rows = dash.db.select().from(traces).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].traceId).toBe('trace-C');
+    expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-A')).all()).toHaveLength(0);
+    expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-B')).all()).toHaveLength(0);
+  });
+
+  // G3: rewriting a record in place (a corrected field, same trace_id) must be
+  // reflected — the insert-only + onConflictDoNothing path keeps the OLD value.
+  it('reflects a corrected field when a record is rewritten in place', async () => {
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-07-05-rewrite.jsonl');
+    writeFileSync(
+      file,
+      `${JSON.stringify({ v: 1, traceId: 'trace-fix', ts: 1782036002000, model: 'qwen3_5', durationMs: 100 })}\n`,
+    );
+    await ingestTraces(dash, dir);
+    expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-fix')).all()[0].durationMs).toBe(100);
+
+    // Rewrite the SAME trace_id with a corrected durationMs; bump mtime.
+    writeFileSync(
+      file,
+      `${JSON.stringify({ v: 1, traceId: 'trace-fix', ts: 1782036002000, model: 'qwen3_5', durationMs: 777 })}\n`,
+    );
+    const later = Date.now() / 1000 + 5;
+    utimesSync(file, later, later);
+
+    await ingestTraces(dash, dir);
+    expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-fix')).all()[0].durationMs).toBe(777);
+  });
+
+  // G3: an APPEND ([A] → [A,B]) still ends with both records after the
+  // delete-then-reinsert snapshot replace (no rows are lost).
+  it('keeps both records when a file is appended ([A] → [A,B])', async () => {
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-07-05-append.jsonl');
+    writeFileSync(file, traceLine('trace-A'));
+    await ingestTraces(dash, dir);
+    expect(dash.db.select().from(traces).all()).toHaveLength(1);
+
+    appendFileSync(file, traceLine('trace-B'));
+    const later = Date.now() / 1000 + 5;
+    utimesSync(file, later, later);
+
+    await ingestTraces(dash, dir);
+    expect(dash.db.select().from(traces).all()).toHaveLength(2);
+    expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-A')).all()).toHaveLength(1);
+    expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-B')).all()).toHaveLength(1);
+  });
+
   // Finding J: deleting the WHOLE trace dir must still reconcile tracked rows,
   // not short-circuit before reconciliation and leave them visible forever.
   it('reconciles all tracked rows when the entire trace dir is deleted', async () => {

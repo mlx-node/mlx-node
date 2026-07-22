@@ -133,65 +133,89 @@ export async function ingestTraces(
     }
     files++;
 
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      let rec: unknown;
-      try {
-        rec = JSON.parse(trimmed);
-      } catch {
-        continue;
+    // A changed file is the authoritative snapshot of its OWN rows, so replace
+    // that file's set transactionally instead of appending to it: DELETE this
+    // file's prior rows, re-insert every record parsed from the current snapshot,
+    // then stamp the watermark — all-or-nothing. Insert-only ingest keyed on the
+    // globally-unique trace_id would strand a record dropped from the file
+    // ([A,B]→[C] keeps A,B) or keep the OLD field values when a record is
+    // rewritten in place (onConflictDoNothing skips the existing trace_id). The
+    // disposable index must mirror the JSONL source of truth exactly. Rows for a
+    // trace_id owned by a DIFFERENT file are untouched (the delete is scoped to
+    // source_file === name); that cross-file case does not arise under the
+    // per-turn-UUID + per-(date,pid) append-only writer anyway. onConflictDoNothing
+    // stays for intra-file idempotency (a duplicate trace_id within the same file).
+    sqlite.exec('BEGIN');
+    let fileRecords = 0;
+    try {
+      db.delete(traces).where(eq(traces.sourceFile, name)).run();
+      for (const line of content.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let rec: unknown;
+        try {
+          rec = JSON.parse(trimmed);
+        } catch {
+          continue;
+        }
+        // A syntactically-valid but non-object line (`null`, a scalar, an array)
+        // carries no fields to read. Skip it here — before any field access — so a
+        // single bad record cannot throw out of this per-line loop and roll back
+        // the rest of the file's valid records.
+        if (typeof rec !== 'object' || rec === null || Array.isArray(rec)) continue;
+        const trace = rec as ParsedTrace;
+        if (typeof trace.traceId !== 'string') continue;
+        const ts = numOrNull(trace.ts);
+        db.insert(traces)
+          .values({
+            traceId: trace.traceId,
+            sessionId: strOrNull(trace.sessionId),
+            rootSessionId: strOrNull(trace.rootSessionId),
+            ts: ts ?? 0,
+            model: strOrNull(trace.model),
+            ttftMs: numOrNull(trace.ttftMs),
+            prefillTps: numOrNull(trace.prefillTps),
+            decodeTps: numOrNull(trace.decodeTps),
+            mtpCycles: numOrNull(trace.mtpCycles),
+            mtpMeanAccepted: numOrNull(trace.mtpMeanAccepted),
+            durationMs: numOrNull(trace.durationMs),
+            queueMs: numOrNull(trace.queueMs),
+            resident: boolToInt(trace.resident),
+            finishReason: strOrNull(trace.finishReason),
+            promptTokens: numOrNull(trace.promptTokens),
+            cachedTokens: numOrNull(trace.cachedTokens),
+            outputTokens: numOrNull(trace.outputTokens),
+            reasoningTokens: numOrNull(trace.reasoningTokens),
+            coldHits: numOrNull(trace.coldHits),
+            coldMisses: numOrNull(trace.coldMisses),
+            coldBytesWritten: numOrNull(trace.coldBytesWritten),
+            coldBytesRestored: numOrNull(trace.coldBytesRestored),
+            sourceFile: name,
+          })
+          .onConflictDoNothing()
+          .run();
+        fileRecords++;
       }
-      // A syntactically-valid but non-object line (`null`, a scalar, an array)
-      // carries no fields to read. Skip it here — before any field access — so a
-      // single bad record cannot throw out of this per-line loop and abort the
-      // rest of the file, later files, or the retention reconciliation below.
-      if (typeof rec !== 'object' || rec === null || Array.isArray(rec)) continue;
-      const trace = rec as ParsedTrace;
-      if (typeof trace.traceId !== 'string') continue;
-      const ts = numOrNull(trace.ts);
-      db.insert(traces)
-        .values({
-          traceId: trace.traceId,
-          sessionId: strOrNull(trace.sessionId),
-          rootSessionId: strOrNull(trace.rootSessionId),
-          ts: ts ?? 0,
-          model: strOrNull(trace.model),
-          ttftMs: numOrNull(trace.ttftMs),
-          prefillTps: numOrNull(trace.prefillTps),
-          decodeTps: numOrNull(trace.decodeTps),
-          mtpCycles: numOrNull(trace.mtpCycles),
-          mtpMeanAccepted: numOrNull(trace.mtpMeanAccepted),
-          durationMs: numOrNull(trace.durationMs),
-          queueMs: numOrNull(trace.queueMs),
-          resident: boolToInt(trace.resident),
-          finishReason: strOrNull(trace.finishReason),
-          promptTokens: numOrNull(trace.promptTokens),
-          cachedTokens: numOrNull(trace.cachedTokens),
-          outputTokens: numOrNull(trace.outputTokens),
-          reasoningTokens: numOrNull(trace.reasoningTokens),
-          coldHits: numOrNull(trace.coldHits),
-          coldMisses: numOrNull(trace.coldMisses),
-          coldBytesWritten: numOrNull(trace.coldBytesWritten),
-          coldBytesRestored: numOrNull(trace.coldBytesRestored),
-          sourceFile: name,
-        })
-        .onConflictDoNothing()
-        .run();
-      records++;
-    }
 
-    // Stamp the watermark AFTER every line landed, so a crash mid-file simply
-    // re-reads next pass (the traceId conflict guard keeps that idempotent). A
-    // file with only malformed lines still records a watermark, so a permanently
-    // garbage file is not re-parsed on every rescan.
-    db.insert(traceFiles)
-      .values({ name, lastIngestedMtime: mtime, lastIngestedSize: size })
-      .onConflictDoUpdate({
-        target: traceFiles.name,
-        set: { lastIngestedMtime: mtime, lastIngestedSize: size },
-      })
-      .run();
+      // Stamp the watermark AFTER every line landed, in the SAME transaction so a
+      // crash mid-file re-reads next pass rather than committing a partial replace.
+      // A file with only malformed lines still records a watermark, so a
+      // permanently garbage file is not re-parsed on every rescan.
+      db.insert(traceFiles)
+        .values({ name, lastIngestedMtime: mtime, lastIngestedSize: size })
+        .onConflictDoUpdate({
+          target: traceFiles.name,
+          set: { lastIngestedMtime: mtime, lastIngestedSize: size },
+        })
+        .run();
+      sqlite.exec('COMMIT');
+      records += fileRecords;
+    } catch {
+      // Roll back this file's replace so a DB error never leaves a half-deleted or
+      // half-inserted set (nor a stamped watermark); the next rescan retries it.
+      sqlite.exec('ROLLBACK');
+      continue;
+    }
   }
 
   // Reconcile rows whose backing file has vanished (manually deleted, or pruned

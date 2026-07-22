@@ -425,23 +425,67 @@ describe('DownloadManager', () => {
     expect(item.installed).toBe(false);
   });
 
+  // Finding G2: a one-sided manifest — config-only OR weights-only — is not a
+  // loadable model. The job must error (no marker, nothing published, catalog
+  // reports not-installed) rather than publish a hollow "installed" dir.
+  it('errors on a one-sided manifest (config-only or weights-only) instead of publishing', async () => {
+    const cases: ManifestEntry[][] = [
+      [{ type: 'file', path: 'config.json', size: 12 }],
+      [{ type: 'file', path: 'model.safetensors', size: 300 }],
+    ];
+    for (const manifest of cases) {
+      hub.manifest = manifest;
+      const manager = new DownloadManager({
+        modelsDir,
+        cacheDir,
+        fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+      });
+      const events: DownloadEvent[] = [];
+      const id = manager.start(REPO);
+      manager.subscribe(id, (event) => events.push(event));
+      await waitFor(() => events.some((event) => event.type === 'error'));
+
+      expect(events.some((event) => event.type === 'done')).toBe(false);
+      expect(existsSync(finalDir())).toBe(false);
+      expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(false);
+      expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
+      expect(jobStagingDirs()).toEqual([]);
+
+      rmSync(finalDir(), { recursive: true, force: true });
+    }
+  });
+
   it('marks installed only with the completion marker, never bare directory existence', async () => {
-    // A bare dir with config.json but no marker (a legacy/partial download).
+    // A bare dir with config.json + a weight but no marker (a legacy/partial download).
     mkdirSync(finalDir(), { recursive: true });
     writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12));
+    writeFileSync(join(finalDir(), 'model.safetensors'), Buffer.alloc(300));
     expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
 
-    // Add a marker whose listed files all exist → now installed.
+    // A marker listing both a config and a weight, all present → installed.
     writeFileSync(
       join(finalDir(), DOWNLOAD_COMPLETE_MARKER),
-      JSON.stringify({ repo: REPO, revision: hub.sha, files: ['config.json'], completedAt: '2026-07-21T00:00:00Z' }),
+      JSON.stringify({
+        repo: REPO,
+        revision: hub.sha,
+        files: ['config.json', 'model.safetensors'],
+        completedAt: '2026-07-21T00:00:00Z',
+      }),
     );
     expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
 
     // A marker referencing a missing file must NOT count as installed.
     writeFileSync(
       join(finalDir(), DOWNLOAD_COMPLETE_MARKER),
-      JSON.stringify({ repo: REPO, revision: hub.sha, files: ['config.json', 'model.safetensors'], completedAt: 'x' }),
+      JSON.stringify({ repo: REPO, revision: hub.sha, files: ['config.json', 'missing.safetensors'], completedAt: 'x' }),
+    );
+    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
+
+    // A one-sided marker (config-only, no weight) is never installed either — a
+    // hollow publish `loadModel` would reject (Finding G2).
+    writeFileSync(
+      join(finalDir(), DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: REPO, revision: hub.sha, files: ['config.json'], completedAt: 'x' }),
     );
     expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
   });
@@ -1050,7 +1094,10 @@ describe('DownloadManager', () => {
     expect(existsSync(cachedPointer)).toBe(true);
     expect(existsSync(cachedBlob)).toBe(true);
 
-    // Cancelling an already-terminal id is a no-op.
+    // Dismissing an already-terminal id now evicts it (Finding G6) and returns
+    // true; a second dismiss of the now-unknown id is a no-op.
+    expect(manager.cancel(id)).toBe(true);
+    expect(manager.jobs().some((j) => j.id === id)).toBe(false);
     expect(manager.cancel(id)).toBe(false);
     // An unknown id is a no-op too.
     expect(manager.cancel('no-such-job')).toBe(false);
@@ -1146,6 +1193,58 @@ describe('DownloadManager', () => {
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
     expect(events.some((event) => event.type === 'cancelled')).toBe(false);
     expect(events.some((event) => event.type === 'done')).toBe(true);
+    expect(manager.jobs().find((j) => j.id === id)!.state).toBe('done');
+  });
+
+  // Finding G6: a FAILED (terminal) job can be DISMISSED via cancel — it is
+  // evicted from jobsById/order/lastEvent and no longer listed, so
+  // DELETE /api/downloads/:id clears a failed card server-side instead of 404ing
+  // and retaining the row forever.
+  it('dismisses a failed job: cancel returns true and the job is fully evicted', async () => {
+    hub.failOn = ['model.safetensors'];
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'error'));
+
+    // Present (and listed) before dismissal…
+    expect(manager.jobs().some((j) => j.id === id)).toBe(true);
+    // …dismiss evicts it entirely: gone from jobsById/order (so `jobs()` drops it)…
+    expect(manager.cancel(id)).toBe(true);
+    expect(manager.jobs().some((j) => j.id === id)).toBe(false);
+    // …and lastEvent is cleared, so a late subscriber gets NO replayed frame.
+    const replayed: DownloadEvent[] = [];
+    manager.subscribe(id, (event) => replayed.push(event));
+    expect(replayed).toEqual([]);
+    // A second dismiss of the now-unknown id is a no-op.
+    expect(manager.cancel(id)).toBe(false);
+  });
+
+  // Finding G6: dismiss is refused for a non-terminal `committing` job (the
+  // publish window) — only settled jobs are evictable.
+  it('refuses to dismiss a committing job (still non-terminal)', async () => {
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    let dismissWhileCommitting: boolean | null = null;
+    const id = manager.start(REPO);
+    // The marker is written inside `publish`, AFTER the barrier set state to
+    // `committing`; a dismiss here must be refused (returns false) and the job
+    // must remain listed and install to completion.
+    raceHook.onMarkerWrite = () => {
+      dismissWhileCommitting = manager.cancel(id);
+    };
+
+    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+    expect(dismissWhileCommitting).toBe(false);
+    expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
     expect(manager.jobs().find((j) => j.id === id)!.state).toBe('done');
   });
 

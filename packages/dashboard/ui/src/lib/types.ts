@@ -38,7 +38,7 @@ export interface CatalogResponse {
 export interface DownloadJob {
   id: string;
   repo: string;
-  state: 'running' | 'done' | 'error' | 'cancelled';
+  state: 'running' | 'committing' | 'done' | 'error' | 'cancelled';
   receivedBytes: number;
   totalBytes: number;
 }
