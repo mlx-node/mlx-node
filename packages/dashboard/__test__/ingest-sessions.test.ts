@@ -526,4 +526,83 @@ describe('ingestSessions', () => {
 
     rmSync(soloBase, { recursive: true, force: true });
   });
+
+  // Finding 6: a valid transcript swapped to a headerless (but REGULAR) JSONL must
+  // have its previously-indexed rows QUARANTINED (removed), not merely skipped —
+  // reconciliation only removes rows whose path is no longer a regular file, so a
+  // swapped-to-garbage regular file would otherwise feed the overview forever.
+  it('quarantines stale rows when a regular file is swapped to a headerless transcript', async () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-quarantine-'));
+    const root = join(soloBase, 'sessions');
+    const file = writeSessionFile(soloBase, 's.jsonl', [
+      { type: 'session', version: 3, id: 'q-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
+      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'hi' } },
+      {
+        type: 'message',
+        id: 'a1',
+        parentId: 'u1',
+        timestamp: '2026-07-01T10:00:02.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+      },
+    ]);
+    await ingestSessions(dash, root);
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'q-1')).all()).toHaveLength(1);
+    expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'q-1')).all()).toHaveLength(1);
+
+    // Swap the SAME path for a headerless (regular) JSONL — no `type:session`
+    // line, so deriveSession returns null. Bump mtime so the watermark re-reads it.
+    writeFileSync(
+      file,
+      `${JSON.stringify({ type: 'message', id: 'm1', parentId: null, timestamp: '2026-07-02T10:00:00.000Z', message: { role: 'user', content: 'headerless' } })}\n`,
+    );
+    const later = Date.now() / 1000 + 5;
+    utimesSync(file, later, later);
+
+    const res = await ingestSessions(dash, root);
+    expect(res.warnings.some((w) => /no valid session header/i.test(w))).toBe(true);
+    expect(res.removed).toBe(1);
+    // The stale rows are GONE, not just skipped.
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'q-1')).all()).toHaveLength(0);
+    expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'q-1')).all()).toHaveLength(0);
+    expect(dash.db.select().from(sessions).all()).toHaveLength(0);
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
+
+  // Finding 6: the same quarantine applies when a valid transcript is swapped to a
+  // cyclic (topologically invalid) but REGULAR JSONL — caught at the topology guard
+  // before deriveSession, its stale rows must still be removed.
+  it('quarantines stale rows when a regular file is swapped to a cyclic transcript', async () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-quarantine-cyc-'));
+    const root = join(soloBase, 'sessions');
+    const file = writeSessionFile(soloBase, 's.jsonl', [
+      { type: 'session', version: 3, id: 'qc-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
+      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'hi' } },
+      {
+        type: 'message',
+        id: 'a1',
+        parentId: 'u1',
+        timestamp: '2026-07-01T10:00:02.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+      },
+    ]);
+    await ingestSessions(dash, root);
+    expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'qc-1')).all()).toHaveLength(1);
+
+    // Swap for a self-parented (cyclic) tree: valid header, invalid topology.
+    writeFileSync(
+      file,
+      `${JSON.stringify({ type: 'session', version: 3, id: 'qc-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' })}\n${JSON.stringify({ type: 'message', id: 'x', parentId: 'x', timestamp: '2026-07-02T10:00:01.000Z', message: { role: 'user', content: 'loop' } })}\n`,
+    );
+    const later = Date.now() / 1000 + 5;
+    utimesSync(file, later, later);
+
+    const res = await ingestSessions(dash, root);
+    expect(res.warnings.some((w) => /cycle|duplicate|invalid session tree/i.test(w))).toBe(true);
+    expect(res.removed).toBe(1);
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'qc-1')).all()).toHaveLength(0);
+    expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'qc-1')).all()).toHaveLength(0);
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
 });

@@ -205,6 +205,44 @@ describe('dashboard server — sessions', () => {
     expect(fileText).toContain('reused-B');
   });
 
+  // Finding 3: renaming a session whose file has an incomplete trailing line must
+  // be refused (409). SessionManager.open migrates + rewrites on construction,
+  // persisting only the parsed entries, so opening would permanently truncate the
+  // malformed trailing record. The file must be left byte-for-byte unchanged.
+  it('refuses to rename a session with an incomplete trailing line and leaves the file byte-identical', async () => {
+    const dir = join(sessionsRoot, '--w--');
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-07-12T10-00-00_rn-trunc.jsonl');
+    const header = JSON.stringify({ type: 'session', version: 3, id: 'rn-trunc', timestamp: '2026-07-12T10:00:00.000Z', cwd: '/w' });
+    const user = JSON.stringify({ type: 'message', id: 'm1', parentId: null, timestamp: '2026-07-12T10:00:01.000Z', message: { role: 'user', content: 'keep me' } });
+    const asst = JSON.stringify({
+      type: 'message',
+      id: 'm2',
+      parentId: 'm1',
+      timestamp: '2026-07-12T10:00:02.000Z',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'and me' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+    });
+    const truncated = '{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-07-12T10:00:03.000Z","message":{"role":"asst';
+    const original = `${header}\n${user}\n${asst}\n${truncated}`;
+    writeFileSync(file, original);
+    await ingest();
+    const before = readFileSync(file);
+
+    const patch = await fetch(`${server.url}/api/sessions/rn-trunc`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Should Not Apply' }),
+    });
+    expect(patch.status).toBe(409);
+
+    // No write happened: byte-for-byte unchanged, no session_info stamped.
+    const after = readFileSync(file);
+    expect(after.equals(before)).toBe(true);
+    expect(after.toString('utf-8')).toBe(original);
+    expect(after.toString('utf-8')).not.toContain('"type":"session_info"');
+    expect(after.toString('utf-8')).not.toContain('Should Not Apply');
+  });
+
   // Finding H: the detail transcript uses the same active-branch projection as
   // the index — a detached metadata leaf must not resurrect abandoned turns.
   it('detail transcript shows only the active branch under a detached metadata leaf', async () => {
@@ -490,6 +528,43 @@ describe('dashboard server — metrics overview', () => {
     expect(qwen?.outputTokens).toBe(110);
     expect(gemma?.turns).toBe(1);
     expect(gemma?.outputTokens).toBe(20);
+  });
+
+  // Finding 9-query: the overview must expose a day-bucketed throughput/TTFT trend
+  // per model — one row per (model, day) with that day's averages — not just the
+  // single range-wide average per model in `throughputByModel`.
+  it('returns a per-model, per-day throughput trend, not one range-wide average', async () => {
+    const day1 = Date.parse('2026-07-01T12:00:00.000Z');
+    const day2 = Date.parse('2026-07-02T12:00:00.000Z');
+    writeFileSync(
+      join(tracesDir, '2026-07-02-trend.jsonl'),
+      `${JSON.stringify({ v: 1, traceId: 'trend-d1', ts: day1, model: 'trend-model', decodeTps: 100, prefillTps: 500, ttftMs: 20 })}\n${JSON.stringify({ v: 1, traceId: 'trend-d2', ts: day2, model: 'trend-model', decodeTps: 200, prefillTps: 700, ttftMs: 40 })}\n`,
+    );
+    await ingest();
+
+    const body = (await (await fetch(`${server.url}/api/metrics/overview`)).json()) as {
+      throughputTrend: Array<{
+        model: string;
+        day: string;
+        decodeTps: number;
+        prefillTps: number;
+        ttftMs: number;
+        samples: number;
+      }>;
+    };
+    const rows = body.throughputTrend.filter((r) => r.model === 'trend-model');
+    // One row per day (not a single averaged 150), ordered by day.
+    expect(rows).toHaveLength(2);
+    expect(rows[0].day).toBe('2026-07-01');
+    expect(rows[1].day).toBe('2026-07-02');
+    const d1 = rows.find((r) => r.day === '2026-07-01');
+    const d2 = rows.find((r) => r.day === '2026-07-02');
+    expect(d1?.decodeTps).toBe(100);
+    expect(d1?.prefillTps).toBe(500);
+    expect(d1?.ttftMs).toBe(20);
+    expect(d1?.samples).toBe(1);
+    expect(d2?.decodeTps).toBe(200);
+    expect(d2?.samples).toBe(1);
   });
 });
 

@@ -7,11 +7,11 @@
  * and pi's `SessionManager` for transcripts/rename — never the native addon.
  */
 
-import { existsSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { basename, dirname, join, sep } from 'node:path';
 
-import { SessionManager, type FileEntry, type SessionEntry } from '@earendil-works/pi-coding-agent';
+import { SessionManager, parseSessionEntries, type FileEntry, type SessionEntry } from '@earendil-works/pi-coding-agent';
 import { eq } from 'drizzle-orm';
 
 import { scanColdCache, clearColdCache, evictOlderThan } from './cache.js';
@@ -21,7 +21,9 @@ import { sessions, turns } from './db/schema.js';
 import type { DownloadManager, DownloadEvent } from './download.js';
 import {
   activeBranchEntries,
+  countJsonlLines,
   isValidSessionTopology,
+  lastLineParses,
   readSessionEntries,
   verifySessionFileId,
 } from './ingest/sessions.js';
@@ -76,6 +78,21 @@ export interface MetricsOverview {
     avgDecodeTps: number | null;
     avgPrefillTps: number | null;
     avgTtftMs: number | null;
+    samples: number;
+  }>;
+  /**
+   * Day-bucketed throughput/TTFT trend per model — the time series the spec
+   * promises alongside the range-wide `throughputByModel` averages. Buckets share
+   * `tokensByDay`'s `date(ts/1000,'unixepoch')` expression so the UI can align
+   * them. Numeric averages are coerced to a number (0 when the bucket carried no
+   * sample for that column).
+   */
+  throughputTrend: Array<{
+    model: string;
+    day: string;
+    decodeTps: number;
+    prefillTps: number;
+    ttftMs: number;
     samples: number;
   }>;
   mtpByModel: Array<{ model: string; meanAccepted: number | null; avgCycles: number | null; samples: number }>;
@@ -595,6 +612,30 @@ async function handleSessionRename({ req, res, params, deps }: RouteCtx): Promis
     sendError(res, 409, `Session "${params.id}" no longer matches its indexed file`);
     return;
   }
+  // `SessionManager.open` migrates and rewrites the file on construction,
+  // persisting only the successfully-parsed in-memory entries — so an unparseable
+  // line or an incomplete trailing write would be permanently truncated from disk
+  // (the GET detail handler avoids this exact call by reading read-only). There is
+  // no non-destructive rename in the pi SDK, so refuse rather than lose records:
+  // an unparseable line (parsed count < non-blank line count) or a malformed
+  // trailing line means opening for write would drop data. A complete v1 file is
+  // still safe — its migration preserves every record — so only true data loss
+  // is blocked here.
+  let wouldDropRecords: boolean;
+  try {
+    const raw = readFileSync(found.path, 'utf8');
+    wouldDropRecords = countJsonlLines(raw) !== parseSessionEntries(raw).length || !lastLineParses(raw);
+  } catch {
+    // The file changed under us since the header check; refuse rather than open
+    // for write, and reconcile the index to reflect reality.
+    await deps.runIngest();
+    sendError(res, 409, `Session "${params.id}" no longer matches its indexed file`);
+    return;
+  }
+  if (wouldDropRecords) {
+    sendError(res, 409, 'Session file has incomplete/malformed records; cannot rename without data loss');
+    return;
+  }
   try {
     const manager = SessionManager.open(found.path);
     manager.appendSessionInfo(name);
@@ -750,6 +791,27 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
       samples: toInt(row.samples),
     }));
 
+  // Same per-model averages as above, but bucketed per day so the UI can chart a
+  // trend. Uses the identical `date(ts/1000,'unixepoch')` bucket and `ts > 0`
+  // guard as `tokensByDay` so the two series line up on the same day keys.
+  const throughputTrend = sqlite
+    .prepare(
+      `SELECT COALESCE(model, 'unknown') AS model,
+              date(ts / 1000, 'unixepoch') AS day,
+              AVG(decode_tps) AS avgDecodeTps, AVG(prefill_tps) AS avgPrefillTps,
+              AVG(ttft_ms) AS avgTtftMs, COUNT(*) AS samples
+       FROM traces ${tracesWhere('ts > 0')} GROUP BY model, day ORDER BY day, model`,
+    )
+    .all(...tracesRange.args)
+    .map((row) => ({
+      model: String(row.model),
+      day: String(row.day),
+      decodeTps: toNum(row.avgDecodeTps) ?? 0,
+      prefillTps: toNum(row.avgPrefillTps) ?? 0,
+      ttftMs: toNum(row.avgTtftMs) ?? 0,
+      samples: toInt(row.samples),
+    }));
+
   const mtpByModel = sqlite
     .prepare(
       `SELECT COALESCE(model, 'unknown') AS model,
@@ -794,6 +856,7 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
     range: { from, to },
     tokensByDay,
     throughputByModel,
+    throughputTrend,
     mtpByModel,
     modelShare,
     totals: {

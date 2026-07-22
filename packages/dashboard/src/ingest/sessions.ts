@@ -206,7 +206,7 @@ function deriveSession(entries: FileEntry[]): DerivedSession | null {
 }
 
 /** Count non-blank JSONL lines the way pi's `parseSessionEntries` iterates them. */
-function countJsonlLines(raw: string): number {
+export function countJsonlLines(raw: string): number {
   const trimmed = raw.trim();
   if (trimmed === '') return 0;
   let count = 0;
@@ -217,7 +217,7 @@ function countJsonlLines(raw: string): number {
 }
 
 /** Whether the last non-blank JSONL line is itself valid JSON (an incomplete trailing write is not). */
-function lastLineParses(raw: string): boolean {
+export function lastLineParses(raw: string): boolean {
   const trimmed = raw.trim();
   if (trimmed === '') return true;
   const lines = trimmed.split('\n').filter((line) => line.trim() !== '');
@@ -313,6 +313,29 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
   const warnings: string[] = [];
   let scanned = 0;
   let updated = 0;
+  let removed = 0;
+
+  // Drop any previously-indexed rows for a path whose CURRENT content is
+  // definitively invalid (broken topology or no header), so a transcript swapped
+  // to garbage stops feeding the overview and session lists forever. Mirrors the
+  // transactional delete reconciliation and stale-path handling use. Returns
+  // whether any rows were actually removed.
+  const quarantinePath = (path: string): boolean => {
+    const rowsOnPath = db.select({ id: sessions.id }).from(sessions).where(eq(sessions.path, path)).all();
+    if (rowsOnPath.length === 0) return false;
+    sqlite.exec('BEGIN');
+    try {
+      for (const stale of rowsOnPath) {
+        db.delete(turns).where(eq(turns.sessionId, stale.id)).run();
+      }
+      db.delete(sessions).where(eq(sessions.path, path)).run();
+      sqlite.exec('COMMIT');
+      return true;
+    } catch {
+      sqlite.exec('ROLLBACK');
+      return false;
+    }
+  };
 
   for (const filePath of listSessionFiles(sessionRoot)) {
     scanned++;
@@ -355,12 +378,14 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
       // branch projection: the walker would otherwise loop unbounded and OOM.
       if (!isValidSessionTopology(entries)) {
         warnings.push(`${filePath}: invalid session tree (cycle or duplicate entry id); skipped`);
+        if (quarantinePath(filePath)) removed++;
         continue;
       }
 
       const derived = deriveSession(entries);
       if (!derived) {
         warnings.push(`${filePath}: no valid session header`);
+        if (quarantinePath(filePath)) removed++;
         continue;
       }
 
@@ -433,7 +458,6 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
     }
   };
 
-  let removed = 0;
   const known = db.select({ id: sessions.id, path: sessions.path }).from(sessions).all();
   for (const row of known) {
     if (stillPresent(row.path)) continue;
