@@ -26,7 +26,14 @@ const model = (provider: string, id: string): FakeModel => ({
 
 function makeRuntimeClass() {
   return class FakeModelRuntime implements FilterableModelRuntime<FakeModel> {
+    /** Records the allowNetwork the last refresh saw — proves the offline override. */
+    lastRefreshAllowNetwork: boolean | undefined;
+
     constructor(private models: FakeModel[]) {}
+
+    private providerIds(): string[] {
+      return [...new Set(this.models.map((entry) => entry.provider))];
+    }
 
     getModels(providerId?: string): FakeModel[] {
       return providerId ? this.models.filter((entry) => entry.provider === providerId) : this.models;
@@ -44,26 +51,58 @@ function makeRuntimeClass() {
       return this.models.find((entry) => entry.provider === provider && entry.id === modelId);
     }
 
+    getProvider(providerId: string): { id: string } | undefined {
+      return this.providerIds().includes(providerId) ? { id: providerId } : undefined;
+    }
+
     hasConfiguredAuth(providerId: string): boolean {
-      return this.models.some((entry) => entry.provider === providerId);
+      return this.providerIds().includes(providerId);
+    }
+
+    async checkAuth(providerId: string): Promise<{ providerId: string } | undefined> {
+      return this.providerIds().includes(providerId) ? { providerId } : undefined;
+    }
+
+    isUsingOAuth(providerId: string): boolean {
+      // Model a cloud provider as OAuth-configured; mlx uses a literal apiKey.
+      return providerId !== 'mlx' && this.providerIds().includes(providerId);
     }
 
     getProviders(): { id: string }[] {
-      return [...new Set(this.models.map((entry) => entry.provider))].map((id) => ({ id }));
+      return this.providerIds().map((id) => ({ id }));
+    }
+
+    async listCredentials(): Promise<{ providerId: string }[]> {
+      return this.providerIds().map((providerId) => ({ providerId }));
+    }
+
+    getProviderAuthStatus(providerId: string): { configured: boolean } {
+      return { configured: this.providerIds().includes(providerId) };
+    }
+
+    async getAuth(providerOrModel: unknown, _overrides?: unknown): Promise<{ provider: string } | undefined> {
+      const id =
+        typeof providerOrModel === 'string' ? providerOrModel : (providerOrModel as FakeModel | undefined)?.provider;
+      return id !== undefined && this.providerIds().includes(id) ? { provider: id } : undefined;
     }
 
     async login(providerId: string, _type?: unknown, _interaction?: unknown): Promise<{ providerId: string }> {
       return { providerId };
     }
 
-    refresh(models: FakeModel[]): void {
+    async refresh(options?: { allowNetwork?: boolean }): Promise<void> {
+      this.lastRefreshAllowNetwork = options?.allowNetwork;
+    }
+
+    /** Test helper (not part of the pi surface) to mutate the served model set. */
+    setModels(models: FakeModel[]): void {
       this.models = models;
     }
   };
 }
 
 describe('installMlxOnlyModelRegistryFilter', () => {
-  it('filters every runtime read path to exact discovered local models, then restores', async () => {
+  it('filters every runtime read/auth path to mlx-only, then restores', async () => {
     const Runtime = makeRuntimeClass();
     const restore = installMlxOnlyModelRegistryFilter(Runtime, ['local-a', 'local-b', 'wrong-api', 'wrong-url']);
     const runtime = new Runtime([
@@ -90,28 +129,54 @@ describe('installMlxOnlyModelRegistryFilter', () => {
     expect(runtime.hasConfiguredAuth('mlx')).toBe(true);
     expect(runtime.hasConfiguredAuth('groq')).toBe(false);
     expect(runtime.hasConfiguredAuth('anthropic')).toBe(false);
-    // `/login` enumeration and dispatch are mlx-only too: cloud providers are
-    // hidden from the login list and non-mlx sign-in is rejected before dispatch.
+
+    // Provider/auth reads are mlx-only: no cloud provider surfaces, resolves auth,
+    // reports configured, or lists a credential.
+    expect(runtime.getProvider('mlx')).toEqual({ id: 'mlx' });
+    expect(runtime.getProvider('groq')).toBeUndefined();
+    expect(await runtime.checkAuth('mlx')).toEqual({ providerId: 'mlx' });
+    expect(await runtime.checkAuth('groq')).toBeUndefined();
+    expect(runtime.isUsingOAuth('groq')).toBe(false);
+    expect(await runtime.getAuth('mlx')).toEqual({ provider: 'mlx' });
+    expect(await runtime.getAuth('groq')).toBeUndefined();
+    // Model-object form (the streaming path) passes through for mlx, blocks cloud.
+    expect(await runtime.getAuth(model('mlx', 'local-a'))).toEqual({ provider: 'mlx' });
+    expect(await runtime.getAuth(model('groq', 'llama'))).toBeUndefined();
+    expect((await runtime.listCredentials()).map((cred) => cred.providerId)).toEqual(['mlx']);
+    expect(runtime.getProviderAuthStatus('mlx')).toEqual({ configured: true });
+    expect(runtime.getProviderAuthStatus('groq')).toEqual({ configured: false });
+
+    // `/login` enumeration and dispatch are mlx-only too.
     expect(runtime.getProviders().map((entry) => entry.id)).toEqual(['mlx']);
     await expect(runtime.login('groq', undefined, undefined)).rejects.toThrow(/offline/);
     await expect(runtime.login('mlx', undefined, undefined)).resolves.toEqual({ providerId: 'mlx' });
+
+    // An explicit allowNetwork:true refresh is forced offline.
+    await runtime.refresh({ allowNetwork: true });
+    expect(runtime.lastRefreshAllowNetwork).toBe(false);
 
     restore();
     restore();
     expect(runtime.getModel('groq', 'llama')).toEqual(model('groq', 'llama'));
     expect(runtime.getModel('mlx', 'undiscovered')).toEqual(model('mlx', 'undiscovered'));
     expect(runtime.hasConfiguredAuth('groq')).toBe(true);
+    expect(runtime.getProvider('groq')).toEqual({ id: 'groq' });
+    expect(await runtime.getAuth('groq')).toEqual({ provider: 'groq' });
+    expect((await runtime.listCredentials()).map((cred) => cred.providerId)).toEqual(['groq', 'mlx', 'anthropic']);
+    expect(runtime.getProviderAuthStatus('groq')).toEqual({ configured: true });
     expect(runtime.getProviders().map((entry) => entry.id)).toEqual(['groq', 'mlx', 'anthropic']);
     await expect(runtime.login('groq', undefined, undefined)).resolves.toEqual({ providerId: 'groq' });
+    await runtime.refresh({ allowNetwork: true });
+    expect(runtime.lastRefreshAllowNetwork).toBe(true);
   });
 
-  it('survives refreshes, rejects concurrent installation, and can be reinstalled after restore', () => {
+  it('survives model-set changes, rejects concurrent installation, and can be reinstalled after restore', () => {
     const Runtime = makeRuntimeClass();
     const restore = installMlxOnlyModelRegistryFilter(Runtime, ['before', 'after-a', 'after-b']);
     expect(() => installMlxOnlyModelRegistryFilter(Runtime, ['other'])).toThrow(/concurrent/);
     const runtime = new Runtime([model('mlx', 'before')]);
 
-    runtime.refresh([model('groq', 'late-cloud'), model('mlx', 'after-a'), model('mlx', 'after-b')]);
+    runtime.setModels([model('groq', 'late-cloud'), model('mlx', 'after-a'), model('mlx', 'after-b')]);
 
     expect(runtime.getModels().map((entry) => entry.id)).toEqual(['after-a', 'after-b']);
     expect(runtime.getAvailableSnapshot().map((entry) => entry.id)).toEqual(['after-a', 'after-b']);
@@ -129,7 +194,7 @@ describe('installMlxOnlyModelRegistryFilter', () => {
     );
   });
 
-  it('filters the pinned pi ModelRuntime catalog to mlx-only and restores it', async () => {
+  it('filters the pinned pi ModelRuntime catalog + auth to mlx-only and restores it', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'mlx-runtime-filter-'));
     try {
       const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null });
@@ -164,6 +229,11 @@ describe('installMlxOnlyModelRegistryFilter', () => {
       expect(runtime.getAvailableSnapshot().some((entry) => entry.provider === 'anthropic')).toBe(true);
       expect((await runtime.getAvailable()).some((entry) => entry.provider === 'anthropic')).toBe(true);
       expect(runtime.getModel('anthropic', cloud!.id)).toBeDefined();
+      // Pre-filter, anthropic really is a resolvable, configured, enumerable provider.
+      expect(runtime.getProvider('anthropic')).toBeDefined();
+      expect(await runtime.getAuth('anthropic')).toBeDefined();
+      expect(await runtime.checkAuth('anthropic')).toBeDefined();
+      expect(runtime.getProviderAuthStatus('anthropic').configured).toBe(true);
 
       const restore = installMlxOnlyModelRegistryFilter(ModelRuntime, ['local']);
       try {
@@ -179,6 +249,13 @@ describe('installMlxOnlyModelRegistryFilter', () => {
         expect(runtime.hasConfiguredAuth('mlx')).toBe(true);
         // Suppressed even though anthropic auth is really configured.
         expect(runtime.hasConfiguredAuth('anthropic')).toBe(false);
+        // Provider/auth reads suppress the configured cloud provider entirely.
+        expect(runtime.getProvider('anthropic')).toBeUndefined();
+        expect(await runtime.getAuth('anthropic')).toBeUndefined();
+        expect(await runtime.checkAuth('anthropic')).toBeUndefined();
+        expect(runtime.isUsingOAuth('anthropic')).toBe(false);
+        expect(runtime.getProviderAuthStatus('anthropic').configured).toBe(false);
+        expect((await runtime.listCredentials()).every((cred) => cred.providerId === 'mlx')).toBe(true);
       } finally {
         restore();
       }
@@ -186,16 +263,19 @@ describe('installMlxOnlyModelRegistryFilter', () => {
       // Restored: the real cloud auth/availability is visible again.
       expect(runtime.getModel(cloud!.provider, cloud!.id)).toBeDefined();
       expect(runtime.hasConfiguredAuth('anthropic')).toBe(true);
+      expect(runtime.getProvider('anthropic')).toBeDefined();
+      expect(await runtime.getAuth('anthropic')).toBeDefined();
+      expect(runtime.getProviderAuthStatus('anthropic').configured).toBe(true);
       expect(runtime.getAvailableSnapshot().some((entry) => entry.provider === 'anthropic')).toBe(true);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
   });
 
-  it('hides cloud providers from /login and rejects non-mlx sign-in with no network', async () => {
+  it('blocks /login, provider-auth, and explicit-network refresh with no outbound fetch', async () => {
     const savedOffline = process.env.PI_OFFLINE;
     // Hermetic: force offline at create() time, and fail any outbound fetch so a
-    // leaked OAuth request is impossible to miss.
+    // leaked OAuth/catalog request is impossible to miss.
     process.env.PI_OFFLINE = '1';
     const realFetch = globalThis.fetch;
     const fetchTargets: string[] = [];
@@ -232,12 +312,19 @@ describe('installMlxOnlyModelRegistryFilter', () => {
       try {
         // `/login` sees only mlx — every cloud provider is hidden.
         expect(runtime.getProviders().map((entry) => entry.id)).toEqual(['mlx']);
+        expect(runtime.getProvider('radius')).toBeUndefined();
         // An explicit `/login radius` is rejected BEFORE any OAuth fetch fires.
         // The interaction arg is never consulted (login rejects first), so a cast
         // stub is fine.
         await expect(
           runtime.login('radius', 'oauth', {} as Parameters<typeof runtime.login>[2]),
         ).rejects.toThrow(/offline/);
+        // Provider auth resolution for a cloud provider returns nothing, no network.
+        expect(await runtime.getAuth('radius')).toBeUndefined();
+        // An explicit allowNetwork:true refresh (pi's `update --models` package
+        // command) is forced offline: no pi.dev catalog fetch despite the composed
+        // builtin cloud providers.
+        await runtime.refresh({ allowNetwork: true, force: true });
         expect(fetchTargets).toEqual([]);
       } finally {
         restore();
