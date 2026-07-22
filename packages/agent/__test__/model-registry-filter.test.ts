@@ -48,6 +48,14 @@ function makeRuntimeClass() {
       return this.models.some((entry) => entry.provider === providerId);
     }
 
+    getProviders(): { id: string }[] {
+      return [...new Set(this.models.map((entry) => entry.provider))].map((id) => ({ id }));
+    }
+
+    async login(providerId: string, _type?: unknown, _interaction?: unknown): Promise<{ providerId: string }> {
+      return { providerId };
+    }
+
     refresh(models: FakeModel[]): void {
       this.models = models;
     }
@@ -82,12 +90,19 @@ describe('installMlxOnlyModelRegistryFilter', () => {
     expect(runtime.hasConfiguredAuth('mlx')).toBe(true);
     expect(runtime.hasConfiguredAuth('groq')).toBe(false);
     expect(runtime.hasConfiguredAuth('anthropic')).toBe(false);
+    // `/login` enumeration and dispatch are mlx-only too: cloud providers are
+    // hidden from the login list and non-mlx sign-in is rejected before dispatch.
+    expect(runtime.getProviders().map((entry) => entry.id)).toEqual(['mlx']);
+    await expect(runtime.login('groq', undefined, undefined)).rejects.toThrow(/offline/);
+    await expect(runtime.login('mlx', undefined, undefined)).resolves.toEqual({ providerId: 'mlx' });
 
     restore();
     restore();
     expect(runtime.getModel('groq', 'llama')).toEqual(model('groq', 'llama'));
     expect(runtime.getModel('mlx', 'undiscovered')).toEqual(model('mlx', 'undiscovered'));
     expect(runtime.hasConfiguredAuth('groq')).toBe(true);
+    expect(runtime.getProviders().map((entry) => entry.id)).toEqual(['groq', 'mlx', 'anthropic']);
+    await expect(runtime.login('groq', undefined, undefined)).resolves.toEqual({ providerId: 'groq' });
   });
 
   it('survives refreshes, rejects concurrent installation, and can be reinstalled after restore', () => {
@@ -174,6 +189,67 @@ describe('installMlxOnlyModelRegistryFilter', () => {
       expect(runtime.getAvailableSnapshot().some((entry) => entry.provider === 'anthropic')).toBe(true);
     } finally {
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('hides cloud providers from /login and rejects non-mlx sign-in with no network', async () => {
+    const savedOffline = process.env.PI_OFFLINE;
+    // Hermetic: force offline at create() time, and fail any outbound fetch so a
+    // leaked OAuth request is impossible to miss.
+    process.env.PI_OFFLINE = '1';
+    const realFetch = globalThis.fetch;
+    const fetchTargets: string[] = [];
+    globalThis.fetch = (async (input: unknown): Promise<never> => {
+      fetchTargets.push(String(input));
+      throw new Error('network blocked in test');
+    }) as unknown as typeof fetch;
+
+    const dir = await mkdtemp(join(tmpdir(), 'mlx-runtime-login-'));
+    try {
+      const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null });
+      // `radius` is a builtin OAuth (cloud) provider; before the filter it is
+      // enumerable by `/login`.
+      expect(runtime.getProviders().some((entry) => entry.id === 'radius')).toBe(true);
+
+      runtime.registerProvider('mlx', {
+        api: 'mlx',
+        baseUrl: 'mlx://local',
+        apiKey: 'mlx-local',
+        models: [
+          {
+            id: 'local',
+            name: 'local',
+            reasoning: true,
+            input: ['text'],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 4096,
+            maxTokens: 1024,
+          },
+        ],
+      });
+
+      const restore = installMlxOnlyModelRegistryFilter(ModelRuntime, ['local']);
+      try {
+        // `/login` sees only mlx — every cloud provider is hidden.
+        expect(runtime.getProviders().map((entry) => entry.id)).toEqual(['mlx']);
+        // An explicit `/login radius` is rejected BEFORE any OAuth fetch fires.
+        // The interaction arg is never consulted (login rejects first), so a cast
+        // stub is fine.
+        await expect(
+          runtime.login('radius', 'oauth', {} as Parameters<typeof runtime.login>[2]),
+        ).rejects.toThrow(/offline/);
+        expect(fetchTargets).toEqual([]);
+      } finally {
+        restore();
+      }
+
+      // Restored: radius is enumerable again.
+      expect(runtime.getProviders().some((entry) => entry.id === 'radius')).toBe(true);
+    } finally {
+      globalThis.fetch = realFetch;
+      await rm(dir, { recursive: true, force: true });
+      if (savedOffline === undefined) delete process.env.PI_OFFLINE;
+      else process.env.PI_OFFLINE = savedOffline;
     }
   });
 });

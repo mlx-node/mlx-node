@@ -11,6 +11,14 @@
  * serves. Patching the runtime (not the extension-only facade) is what keeps
  * the mlx-only guarantee across the selector / listing / resolution paths.
  *
+ * Beyond model reads, pi builds the `/login` command from the runtime's
+ * `getProviders()` list and dispatches sign-in through `login()`. That OAuth
+ * path performs its own `fetch` (e.g. `radius.pi.dev`) and consults neither
+ * `PI_OFFLINE` nor any allow-network flag, so it is a distinct offline-boundary
+ * leak from the catalog reads. Cover it here too: expose only `mlx` to the login
+ * enumeration and reject any non-`mlx` login before dispatch. The `mlx` provider
+ * is registered with a literal apiKey and never needs `/login`.
+ *
  * Keep this adapter isolated: once pi exposes a first-class provider allowlist
  * in `MainOptions`, this file can be replaced by that option without touching
  * the provider or CLI layers.
@@ -23,12 +31,19 @@ interface RuntimeModel {
   baseUrl: string;
 }
 
+/** Minimal shape of a pi `Provider` — only the id is needed to gate `/login`. */
+interface RuntimeProvider {
+  id: string;
+}
+
 export interface FilterableModelRuntime<TModel extends RuntimeModel = RuntimeModel> {
   getModels(providerId?: string): readonly TModel[];
   getAvailableSnapshot(): readonly TModel[];
   getAvailable(providerId?: string): Promise<readonly TModel[]>;
   getModel(provider: string, modelId: string): TModel | undefined;
   hasConfiguredAuth(providerId: string): boolean;
+  getProviders(): readonly RuntimeProvider[];
+  login(providerId: string, type: unknown, interaction: unknown): Promise<unknown>;
 }
 
 export interface FilterableModelRuntimeConstructor<TModel extends RuntimeModel = RuntimeModel> {
@@ -70,12 +85,16 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
     getAvailable: requireMethodDescriptor(prototype, 'getAvailable'),
     getModel: requireMethodDescriptor(prototype, 'getModel'),
     hasConfiguredAuth: requireMethodDescriptor(prototype, 'hasConfiguredAuth'),
+    getProviders: requireMethodDescriptor(prototype, 'getProviders'),
+    login: requireMethodDescriptor(prototype, 'login'),
   };
   const getModels = descriptors.getModels.value as FilterableModelRuntime<TModel>['getModels'];
   const getAvailableSnapshot = descriptors.getAvailableSnapshot.value as FilterableModelRuntime<TModel>['getAvailableSnapshot'];
   const getAvailable = descriptors.getAvailable.value as FilterableModelRuntime<TModel>['getAvailable'];
   const getModel = descriptors.getModel.value as FilterableModelRuntime<TModel>['getModel'];
   const hasConfiguredAuth = descriptors.hasConfiguredAuth.value as FilterableModelRuntime<TModel>['hasConfiguredAuth'];
+  const getProviders = descriptors.getProviders.value as FilterableModelRuntime<TModel>['getProviders'];
+  const login = descriptors.login.value as FilterableModelRuntime<TModel>['login'];
 
   Object.defineProperties(prototype, {
     getModels: {
@@ -112,6 +131,31 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
       // the provider id alone: only 'mlx' may ever report configured auth.
       value(this: FilterableModelRuntime<TModel>, providerId: string): boolean {
         return providerId === 'mlx' && hasConfiguredAuth.call(this, providerId);
+      },
+    },
+    getProviders: {
+      ...descriptors.getProviders,
+      // `/login` enumerates from here; hide every cloud provider so only mlx is
+      // ever offered for sign-in.
+      value(this: FilterableModelRuntime<TModel>): RuntimeProvider[] {
+        return getProviders.call(this).filter((provider) => provider.id === 'mlx');
+      },
+    },
+    login: {
+      ...descriptors.login,
+      // Authoritative offline gate: reject any non-mlx login BEFORE dispatch, so
+      // the cloud OAuth `fetch` (e.g. radius.pi.dev) can never fire — even if some
+      // path passes a provider id directly, bypassing the filtered enumeration.
+      value(
+        this: FilterableModelRuntime<TModel>,
+        providerId: string,
+        type: unknown,
+        interaction: unknown,
+      ): Promise<unknown> {
+        if (providerId !== 'mlx') {
+          return Promise.reject(new Error('mlx agent is offline: provider login is disabled'));
+        }
+        return login.call(this, providerId, type, interaction);
       },
     },
   });
