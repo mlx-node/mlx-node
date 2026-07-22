@@ -39,12 +39,18 @@ import { EventEmitter } from 'node:events';
 import { createReadStream, existsSync, statSync } from 'node:fs';
 import { copyFile, mkdir, open, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, dirname, join, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 
 import { downloadFileToCacheDir, listFiles, type ListFileEntry, modelInfo } from '@huggingface/hub';
 import { MODEL_CATALOG } from '@mlx-node/agent/catalog';
 
-import { type DownloadCompletion, DOWNLOAD_COMPLETE_MARKER, isDownloaderOwned, isModelInstalled } from './models.js';
+import {
+  type DownloadCompletion,
+  DOWNLOAD_COMPLETE_MARKER,
+  isDownloaderOwned,
+  isModelInstalled,
+  isSafeRelPath,
+} from './models.js';
 
 /** Bounded re-fetch attempts for a staged file that fails post-copy verification. */
 const MAX_VERIFY_ATTEMPTS = 3;
@@ -208,18 +214,30 @@ export type DownloadEvent =
       fileCount: number;
     }
   | { type: 'done'; id: string; outputDir: string }
-  | { type: 'error'; id: string; message: string };
+  | { type: 'error'; id: string; message: string }
+  | { type: 'cancelled'; id: string };
+
+type JobStatus = 'running' | 'done' | 'error' | 'cancelled';
 
 interface JobState {
   id: string;
   repo: string;
-  state: 'running' | 'done' | 'error';
+  state: JobStatus;
   /** Job-level aggregate bytes across all files. */
   receivedBytes: number;
   /** Sum of manifest file sizes; 0 until the manifest is fetched. */
   totalBytes: number;
   /** Permit replacing a final dir the downloader does not own (default false). */
   overwrite: boolean;
+  /**
+   * Set by {@link DownloadManager.cancel}. An in-flight `processJob` unwinds at
+   * its next boundary check (and its in-flight fetch is aborted via `controller`),
+   * so its `finally` removes the job-private staging dir. NEVER used to delete
+   * shared HF-cache blobs — the `mlx download` CLI resumes from that cache.
+   */
+  cancelled: boolean;
+  /** Aborts the job's in-flight `@huggingface/hub` fetch when it is cancelled. */
+  controller: AbortController;
 }
 
 /**
@@ -282,6 +300,8 @@ export class DownloadManager {
       receivedBytes: 0,
       totalBytes: 0,
       overwrite: opts?.overwrite ?? false,
+      cancelled: false,
+      controller: new AbortController(),
     });
     this.order.push(id);
     this.queue.push(id);
@@ -289,10 +309,42 @@ export class DownloadManager {
     return id;
   }
 
+  /**
+   * Cancel a running (in-flight or still-queued) job. Signals the in-flight
+   * `processJob` to unwind — aborting its `@huggingface/hub` fetch and tripping
+   * its next boundary check — so its `finally` removes the job-private staging
+   * dir; a still-queued job is dropped from the queue and settled here. The job
+   * is marked `cancelled` and a terminal `cancelled` event is emitted. Returns
+   * `false` for an unknown or already-terminal id.
+   *
+   * Deliberately never touches the shared HF blob cache (`~/.cache/huggingface`):
+   * the `mlx download` CLI relies on it to resume, so cancel only aborts the job
+   * and lets its disposable staging dir clean up.
+   */
+  cancel(id: string): boolean {
+    const job = this.jobsById.get(id);
+    if (job === undefined || job.state !== 'running') return false;
+    job.cancelled = true;
+    // Interrupt any in-flight hub fetch so a multi-GB download stops promptly
+    // rather than only at the next between-files boundary check.
+    job.controller.abort();
+    if (this.currentJob?.id === id) {
+      // In flight: let `processJob` emit the terminal `cancelled` event and run
+      // its `finally` (staging cleanup) as it unwinds — avoid a double emit here.
+      return true;
+    }
+    // Still queued (never started): drop it so it never runs, and settle it now.
+    const queued = this.queue.indexOf(id);
+    if (queued !== -1) this.queue.splice(queued, 1);
+    job.state = 'cancelled';
+    this.emit({ type: 'cancelled', id });
+    return true;
+  }
+
   jobs(): Array<{
     id: string;
     repo: string;
-    state: 'running' | 'done' | 'error';
+    state: JobStatus;
     receivedBytes: number;
     totalBytes: number;
   }> {
@@ -325,7 +377,17 @@ export class DownloadManager {
 
   private makeCountingFetch(): typeof fetch {
     return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-      const response = await this.fetchImpl(input, init);
+      // Thread the active job's abort signal into every hub fetch so a cancel
+      // interrupts an in-flight download mid-stream (combined with any signal the
+      // caller already supplied). No active job → pass the caller's init through.
+      const jobSignal = this.currentJob?.controller.signal;
+      let requestInit = init;
+      if (jobSignal !== undefined) {
+        const existing = init?.signal ?? undefined;
+        const signal = existing !== undefined ? AbortSignal.any([existing, jobSignal]) : jobSignal;
+        requestInit = { ...init, signal };
+      }
+      const response = await this.fetchImpl(input, requestInit);
       const file = this.currentFile;
       const job = this.currentJob;
       // No active file (manifest listing / metadata) or bodyless response:
@@ -426,6 +488,17 @@ export class DownloadManager {
       let totalBytes = 0;
       for await (const file of listFiles({ repo, recursive: true, revision, fetch: this.wrappedFetch })) {
         if (file.type !== 'directory' && isWantedFile(file.path)) {
+          // Defense-in-depth: `file.path` is a third-party string about to become
+          // a `join(stagingDir, file.path)` write/read/verify/publish target (every
+          // downstream site derives from this `files[]` array). Refuse — fail
+          // closed — any entry that could escape the staging dir before it is
+          // admitted. Unreachable for the curated 4-repo catalog (git/HF tree
+          // paths cannot express `..`/absolute), but never trust the boundary.
+          if (!isSafeRelPath(file.path)) {
+            throw new Error(
+              `Refusing to download "${file.path}" from "${job.repo}": path is not a safe relative path`,
+            );
+          }
           files.push(file);
           if (file.size > 0) totalBytes += file.size;
         }
@@ -447,11 +520,25 @@ export class DownloadManager {
         return;
       }
 
+      if (job.cancelled) throw new Error('Download cancelled');
+
       await mkdir(stagingDir, { recursive: true });
 
       for (let index = 0; index < files.length; index++) {
+        // Stop promptly between files when cancelled (the in-flight fetch of the
+        // current file is aborted via the job's controller); the `finally` then
+        // removes this staging dir.
+        if (job.cancelled) throw new Error('Download cancelled');
         const file = files[index];
         const destPath = join(stagingDir, file.path);
+        // Belt-and-braces at the write boundary: even with `isSafeRelPath` gating
+        // ingestion, re-assert the resolved target stays inside stagingDir before
+        // any mkdir/copy/read derived from it.
+        const stagingResolved = resolve(stagingDir);
+        const destResolved = resolve(destPath);
+        if (destResolved !== stagingResolved && !destResolved.startsWith(stagingResolved + sep)) {
+          throw new Error(`Refusing to write "${file.path}" outside the staging directory`);
+        }
         const jobBaseBytes = job.receivedBytes;
 
         if (await isStagedCopyComplete(destPath, file)) {
@@ -493,8 +580,16 @@ export class DownloadManager {
       job.state = 'done';
       this.emit({ type: 'done', id: job.id, outputDir: finalDir });
     } catch (error) {
-      job.state = 'error';
-      this.emit({ type: 'error', id: job.id, message: (error as Error).message });
+      // A cancelled job unwinds via a boundary check or an aborted in-flight
+      // fetch: classify EITHER as a clean `cancelled` terminal (not a red error),
+      // so the abort's raw message never surfaces as a failure.
+      if (job.cancelled) {
+        job.state = 'cancelled';
+        this.emit({ type: 'cancelled', id: job.id });
+      } else {
+        job.state = 'error';
+        this.emit({ type: 'error', id: job.id, message: (error as Error).message });
+      }
     } finally {
       // Job-private staging is scratch: a successful publish already renamed it
       // away (this is a no-op), and on failure it must not leak — resume never

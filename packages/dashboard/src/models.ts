@@ -112,6 +112,29 @@ function asObject(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+/**
+ * Whether `p` is a safe repo-relative path — one that, joined onto a base dir,
+ * can only ever resolve INSIDE that base. Rejects anything a `join(base, p)`
+ * could use to escape: an empty string; a backslash or NUL; a Windows drive
+ * prefix (`C:`); an absolute (leading-slash) path; and any `/`-separated segment
+ * that is empty (a leading/trailing/double slash), `.`, or `..`. This is the
+ * shared component-rejection rule behind both {@link deleteLocalModel}'s stricter
+ * single-child check and the download runner's gate on untrusted `listFiles`
+ * paths before they become `join(stagingDir, path)` write targets.
+ */
+export function isSafeRelPath(p: string): boolean {
+  if (p.length === 0) return false;
+  if (p.includes('\\') || p.includes('\0')) return false;
+  if (p.startsWith('/')) return false; // absolute (posix)
+  if (/^[a-zA-Z]:/.test(p)) return false; // Windows drive prefix (e.g. C:)
+  // Every path segment must be a real name — never empty (leading/trailing/double
+  // slash) and never a `.`/`..` traversal component.
+  for (const segment of p.split('/')) {
+    if (segment === '' || segment === '.' || segment === '..') return false;
+  }
+  return true;
+}
+
 function collectArchitectures(config: Record<string, unknown>): string[] {
   const raw = config.architectures;
   if (Array.isArray(raw)) return raw.filter((entry): entry is string => typeof entry === 'string');
@@ -273,14 +296,11 @@ export function discoverLocalModels(modelsDir: string): { models: LocalModel[]; 
  * delete whatever lives outside the store that it points at.
  */
 export function deleteLocalModel(modelsDir: string, name: string): void {
-  if (
-    name.length === 0 ||
-    name === '.' ||
-    name === '..' ||
-    name.includes('/') ||
-    name.includes('\\') ||
-    name.includes('\0')
-  ) {
+  // A deletable model is a SINGLE direct child: it must be a safe relative path
+  // (no `.`/`..`/backslash/NUL/drive prefix — shared with the download gate) AND
+  // carry no separator, so a decoded route param like `link%2Fvictim` or
+  // `../../etc` can never traverse out of the store.
+  if (!isSafeRelPath(name) || name.includes('/')) {
     throw new Error(`Refusing to delete "${name}": not a direct child of the models directory`);
   }
   // A legitimate checkpoint dir never starts with `.` — discovery skips dotdirs.

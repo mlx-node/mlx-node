@@ -244,6 +244,20 @@ async function handleDownloadStart({ req, res, deps }: RouteCtx): Promise<void> 
   }
 }
 
+/**
+ * Cancel/abort an in-flight or queued download. Aborts the job and lets its
+ * job-private staging dir clean up; deliberately never touches the shared HF
+ * blob cache (the `mlx download` CLI resumes from it). Unknown or already-terminal
+ * ids are a 404.
+ */
+function handleDownloadCancel({ res, params, deps }: RouteCtx): void {
+  if (deps.downloads.cancel(params.id)) {
+    sendJson(res, 200, { cancelled: true, id: params.id });
+  } else {
+    sendError(res, 404, `No cancellable download "${params.id}"`);
+  }
+}
+
 /** Minimal writable surface a backpressure-aware SSE sender depends on. */
 interface SseWritable {
   write(chunk: string): boolean;
@@ -855,6 +869,7 @@ const ROUTES: Route[] = [
   route('GET', '/api/catalog', handleCatalog),
   route('GET', '/api/downloads', handleDownloadsList),
   route('POST', '/api/downloads', handleDownloadStart),
+  route('DELETE', '/api/downloads/:id', handleDownloadCancel),
   route('GET', '/api/downloads/:id/events', handleDownloadEvents),
   route('GET', '/api/sessions', handleSessionsList),
   route('GET', '/api/sessions/:id', handleSessionDetail),

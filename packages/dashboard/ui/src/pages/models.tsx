@@ -17,6 +17,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { mutate } from '@/lib/api';
 import { formatBytes, formatCount, formatNumber } from '@/lib/format';
 import type {
+  CancelDownloadResponse,
   CatalogItem,
   CatalogResponse,
   DeleteModelResponse,
@@ -26,7 +27,7 @@ import type {
   ModelsResponse,
 } from '@/lib/types';
 import { useJson } from '@/lib/use-api';
-import { AlertCircle, Check, Download, FileWarning, Inbox, Loader2, Package, Trash2 } from 'lucide-react';
+import { AlertCircle, Check, Download, FileWarning, Inbox, Loader2, Package, Trash2, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { toast } from 'sonner';
 
@@ -93,6 +94,23 @@ export default function Models() {
       delete next[repo];
       return next;
     });
+  };
+
+  const cancel = async (repo: string, id: string): Promise<void> => {
+    try {
+      await mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(id)}`);
+      toast.success('Download cancelled', { description: repo });
+      // Mirror onDownloadError's reset: drop the active job so the card reverts to
+      // the Install state. Cancel only aborts the job (its staging cleans up); the
+      // shared HF cache is deliberately left intact for `mlx download` to resume.
+      setActive((prev) => {
+        const next = { ...prev };
+        delete next[repo];
+        return next;
+      });
+    } catch (err) {
+      toast.error('Failed to cancel download', { description: errMessage(err) });
+    }
   };
 
   const confirmDelete = async (): Promise<void> => {
@@ -253,6 +271,7 @@ export default function Models() {
               onInstall={() => install(item.hfRepo)}
               onDone={() => onDownloadDone(item.hfRepo)}
               onError={(message) => onDownloadError(item.hfRepo, message)}
+              onCancel={(id) => void cancel(item.hfRepo, id)}
             />
           ))}
         </div>
@@ -290,9 +309,10 @@ interface CatalogCardProps {
   onInstall: () => void;
   onDone: () => void;
   onError: (message: string) => void;
+  onCancel: (id: string) => void;
 }
 
-function CatalogCard({ item, jobId, onInstall, onDone, onError }: CatalogCardProps) {
+function CatalogCard({ item, jobId, onInstall, onDone, onError, onCancel }: CatalogCardProps) {
   const downloading = jobId !== undefined && !item.installed;
 
   return (
@@ -316,7 +336,18 @@ function CatalogCard({ item, jobId, onInstall, onDone, onError }: CatalogCardPro
           <span className="tabular-nums">~{item.sizeGb} GB</span>
         </div>
         {downloading && jobId !== undefined ? (
-          <DownloadProgress id={jobId} onDone={onDone} onError={onError} />
+          <div className="space-y-2">
+            <DownloadProgress id={jobId} onDone={onDone} onError={onError} />
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-muted-foreground hover:text-destructive w-full"
+              onClick={() => onCancel(jobId)}
+            >
+              <X className="size-4" />
+              Cancel
+            </Button>
+          </div>
         ) : item.installed ? (
           <Button variant="outline" className="w-full" disabled>
             <Check className="size-4" />

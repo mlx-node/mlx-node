@@ -80,7 +80,7 @@ All three phases land in a single PR on this branch. Phases are internal milesto
 - Config: `persistPagedCache` (per-model config + env override), **off by default at library level**; `mlx agent` enables it by default with a `--no-persist-cache` flag.
 - Capture: when the allocator registers full blocks for cross-request reuse, `capture_and_enqueue` them to the cold tier (existing fail-open bounded queue; a full queue drops writes).
 - Restore: on in-memory prefix miss, walk the `ColdCacheKey::chain` and `restore_block` before falling back to normal prefill. Any validation failure falls through silently.
-- NAPI additions: `coldCacheStats()` (`ColdCacheStats` counters + root path + quota), allocator pool counts (`num_free_blocks`/`num_allocated_blocks`/`total_blocks`), and cold-tier disk info.
+- NAPI additions: `coldCacheStats()` (`ColdCacheStats` counters + root path + quota) + cold-tier disk info. (Live paged-pool capacity counters — `num_free_blocks`/`num_allocated_blocks`/`total_blocks` — stay internal to Rust and are intentionally **not** exposed via NAPI: the dashboard never links the native addon and receives all runtime data through trace records (see Phase B), so a direct export would have no consumer. If ever needed on the cache page, they belong in the Phase B trace schema, not a direct NAPI.)
 - Trace hook: expose per-turn cold-cache counter deltas so Phase B can persist them.
 - **Resolved during planning research:** cold restore is only sound where paged blocks fully determine layer state. Per-family audit: only **qwen3 dense** is fully covered (all layers full-attention); lfm2 (conv), gemma4 (sliding `RotatingKVCache` + KV-shared aliases), and qwen3.5/3.6 (GDN recurrent/conv state + checkpoint store) all keep per-layer state outside the paged pool. **v1 gates cold restore to qwen3 dense**; capture/persist wiring is family-generic so hybrids can be added later by persisting their extra state. This mirrors vLLM, which defaults prefix caching off for hybrid models. Byte-parity tests follow the existing paged parity-gate pattern.
 
@@ -130,6 +130,7 @@ packages/cli/src/commands/dashboard.ts   thin: flags, start server, open browser
 | `/api/catalog`              | GET          | static recommended list + installed/installable state                       |
 | `/api/downloads`            | GET/POST     | list active jobs / start a catalog download                                 |
 | `/api/downloads/:id/events` | GET (SSE)    | per-file + byte progress, resume-aware                                      |
+| `/api/downloads/:id`        | DELETE       | cancel an in-flight/failed job (aborts + cleans its staging; leaves the shared HF cache for resume) |
 | `/api/sessions`             | GET          | indexed session list; search + filters (cwd, model, date)                   |
 | `/api/sessions/:id`         | GET          | transcript (active branch) + per-turn usage                                 |
 | `/api/sessions/:id`         | PATCH/DELETE | rename (pi `session_info` entry) / delete file + rows                       |
@@ -152,7 +153,7 @@ Ingest: full scan on start, then incremental by file mtime; manual refresh endpo
 | Page           | Content                                                                                                  | Actions                                                                  |
 | -------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
 | Overview       | stat tiles (models/disk, sessions, tokens 7d, cache size + hit rate), recent sessions, active downloads  | —                                                                        |
-| Models         | local table: name, family, quant, size, ctx window                                                       | delete; install from recommended list w/ live progress                   |
+| Models         | local table: name, family, quant, size, ctx window                                                       | delete; install from recommended list w/ live progress; cancel/dismiss an in-flight or failed download |
 | Sessions       | table w/ search + filters                                                                                | open, rename, delete, copy resume command (`mlx agent --session <file>`) |
 | Session detail | transcript (collapsible tool calls) + per-turn tokens/tok-s chips + charts                               | —                                                                        |
 | Metrics        | tokens/day (in/out/cached), tok/s + TTFT trends per model, MTP acceptance, model usage share; date range | —                                                                        |
@@ -163,7 +164,7 @@ Ingest: full scan on start, then incremental by file mtime; manual refresh endpo
 - Binds `127.0.0.1` by default; loud warning for any other host. No auth; mutating routes verify `Origin`/`Host` are local to block drive-by CSRF / DNS rebinding against localhost.
 - Destructive ops (delete model/session, clear cache) require UI confirmation and resolve paths strictly inside their managed roots before any `rm`.
 - Fail-soft: missing dirs → empty states; malformed session file → skipped with a visible warning; missing/corrupt DB → rebuilt from JSONL.
-- Downloads: resume-aware (same manifest checks as the CLI); job failures surface in the UI and are retryable; partial files are left for resume, with an explicit "remove partial" action.
+- Downloads: resume-aware via the shared Hugging Face blob cache (same cache the `mlx download` CLI uses, so an interrupted job resumes from already-fetched blobs). Each job stages into a private dir that is **atomically published on success and auto-deleted on failure** — no partial files linger in the managed models dir. Job failures surface in the UI and are retryable; an in-flight or failed job can be cancelled (`DELETE /api/downloads/:id`), which aborts it and removes its staging area but deliberately does **not** purge the shared HF cache (that would break CLI/next-run resume).
 
 ## Testing
 

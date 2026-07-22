@@ -10,14 +10,14 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { request } from 'node:http';
+import { request, type IncomingMessage, type ServerResponse } from 'node:http';
 import { homedir, networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
-import { createDownloadSseSender } from '../src/api.js';
+import { createDownloadSseSender, handleApiRequest, type ApiDeps } from '../src/api.js';
 import type { DownloadEvent } from '../src/download.js';
 import { agentSessionsRoot } from '../src/paths.js';
 import { bracketHost, startDashboardServer, type DashboardServer } from '../src/server.js';
@@ -569,6 +569,72 @@ describe('dashboard server — downloads', () => {
       body: JSON.stringify({ repo: 'someone/not-in-catalog' }),
     });
     expect(bad.status).toBe(400);
+  });
+
+  // Finding E: the cancel route is wired end-to-end through the real server; an
+  // unknown/terminal id is a 404 (nothing to cancel). The known-id → 200 branch
+  // is exercised deterministically below without a live download.
+  it('404s DELETE /api/downloads/:id for an unknown job', async () => {
+    const res = await fetch(`${server.url}/api/downloads/no-such-job`, { method: 'DELETE' });
+    expect(res.status).toBe(404);
+    expect(res.headers.get('content-type')).toContain('application/json');
+  });
+});
+
+/** Minimal `ServerResponse` capturing the status + JSON body a handler writes. */
+function fakeRes(): { res: ServerResponse; captured: { status: number; body: string } } {
+  const captured = { status: 0, body: '' };
+  const res = {
+    headersSent: false,
+    writeHead(status: number, _headers?: unknown) {
+      captured.status = status;
+      (res as { headersSent: boolean }).headersSent = true;
+      return res;
+    },
+    end(chunk?: string) {
+      if (chunk !== undefined) captured.body = chunk;
+      return res;
+    },
+  };
+  return { res: res as unknown as ServerResponse, captured };
+}
+
+// Finding E: the DELETE /api/downloads/:id handler invokes DownloadManager.cancel
+// with the decoded id and maps its boolean to 200 (cancelled) / 404 (unknown or
+// already-terminal) — verified at the route layer with a stub manager so no live
+// download or network is needed.
+describe('dashboard server — cancel download route', () => {
+  function depsWith(cancel: (id: string) => boolean): ApiDeps {
+    return { downloads: { cancel } } as unknown as ApiDeps;
+  }
+
+  it('returns 200 and cancels a known job id', async () => {
+    const seen: string[] = [];
+    const deps = depsWith((id) => {
+      seen.push(id);
+      return id === 'known-job';
+    });
+    const { res, captured } = fakeRes();
+    const url = new URL('http://localhost/api/downloads/known-job');
+    const req = { method: 'DELETE' } as IncomingMessage;
+
+    const handled = await handleApiRequest(req, res, url, deps);
+    expect(handled).toBe(true);
+    expect(seen).toEqual(['known-job']);
+    expect(captured.status).toBe(200);
+    expect(JSON.parse(captured.body)).toEqual({ cancelled: true, id: 'known-job' });
+  });
+
+  it('returns 404 for an unknown/terminal job id', async () => {
+    const deps = depsWith(() => false);
+    const { res, captured } = fakeRes();
+    const url = new URL('http://localhost/api/downloads/ghost');
+    const req = { method: 'DELETE' } as IncomingMessage;
+
+    const handled = await handleApiRequest(req, res, url, deps);
+    expect(handled).toBe(true);
+    expect(captured.status).toBe(404);
+    expect((JSON.parse(captured.body) as { error: string }).error).toContain('ghost');
   });
 });
 

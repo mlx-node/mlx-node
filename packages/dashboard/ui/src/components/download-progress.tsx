@@ -17,7 +17,8 @@ type DownloadEvent =
       fileCount: number;
     }
   | { type: 'done'; id: string; outputDir: string }
-  | { type: 'error'; id: string; message: string };
+  | { type: 'error'; id: string; message: string }
+  | { type: 'cancelled'; id: string };
 
 type Phase = 'connecting' | 'running' | 'done' | 'error';
 
@@ -95,13 +96,19 @@ export function DownloadProgress({ id, onDone, onError }: DownloadProgressProps)
               };
             case 'error':
               return { ...prev, phase: 'error', message: event.message };
+            case 'cancelled':
+              // The Cancel action reverts the card to Install via the DELETE
+              // response (this component then unmounts); if the terminal frame
+              // still arrives first, settle on a non-spinning "stopped" state
+              // rather than a false "Complete".
+              return { ...prev, phase: 'error', message: 'Cancelled' };
           }
         });
         if (event.type === 'done') doneCb.current?.();
         if (event.type === 'error') errorCb.current?.(event.message);
       },
       undefined,
-      ['start', 'progress', 'done', 'error'],
+      ['start', 'progress', 'done', 'error', 'cancelled'],
     );
     return () => sub.close();
   }, [id]);

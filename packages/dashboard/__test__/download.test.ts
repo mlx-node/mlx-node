@@ -160,6 +160,31 @@ function makeFetchImpl(sizes: Record<string, number>): typeof fetch {
   };
 }
 
+/**
+ * A fetch that streams normally EXCEPT for `blockPath`, whose response never
+ * settles until the job's abort signal fires — simulating a long in-flight
+ * download that only stops when the job is cancelled. `onBlock` fires once the
+ * blocked fetch is entered so a test can cancel at a deterministic point.
+ */
+function makeCancelFetch(sizes: Record<string, number>, blockPath: string, onBlock: () => void): typeof fetch {
+  const normal = makeFetchImpl(sizes);
+  return (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const path = url.split('/').slice(3).join('/');
+    if (path !== blockPath) return normal(input, init);
+    return new Promise<Response>((_resolve, reject) => {
+      onBlock();
+      const signal = init?.signal;
+      const abort = (): void => reject(new DOMException('The operation was aborted', 'AbortError'));
+      if (signal?.aborted) {
+        abort();
+        return;
+      }
+      signal?.addEventListener('abort', abort);
+    });
+  };
+}
+
 async function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<void> {
   const t0 = Date.now();
   while (!cond()) {
@@ -934,6 +959,116 @@ describe('DownloadManager', () => {
   it('rejects a repo that is not in the catalog', () => {
     const manager = new DownloadManager({ modelsDir, cacheDir, fetchImpl: makeFetchImpl({}) });
     expect(() => manager.start('someone/not-in-catalog')).toThrow();
+  });
+
+  // Finding C: an untrusted `listFiles` path is about to become a
+  // `join(stagingDir, path)` write target. A traversal or absolute path must be
+  // refused (fail closed) at ingestion — nothing is written outside stagingDir.
+  it('fails closed on an unsafe manifest path (traversal or absolute) and writes nothing outside staging', async () => {
+    for (const badPath of ['../escape.json', '/etc/evil.json']) {
+      hub.manifest = [
+        { type: 'file', path: 'config.json', size: 12 },
+        { type: 'file', path: badPath, size: 5 },
+        { type: 'file', path: 'model.safetensors', size: 300 },
+      ];
+      const manager = new DownloadManager({
+        modelsDir,
+        cacheDir,
+        fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+      });
+      const events: DownloadEvent[] = [];
+      const id = manager.start(REPO);
+      manager.subscribe(id, (event) => events.push(event));
+      await waitFor(() => events.some((event) => event.type === 'error'));
+
+      expect(events.some((event) => event.type === 'done')).toBe(false);
+      const err = events.find((event) => event.type === 'error');
+      expect(err !== undefined && err.type === 'error' ? err.message : '').toContain('safe relative path');
+      // Nothing published, and no traversal/absolute target materialized anywhere.
+      expect(existsSync(finalDir())).toBe(false);
+      expect(existsSync(join(modelsDir, 'escape.json'))).toBe(false);
+      expect(existsSync(join(stagingRoot(), 'escape.json'))).toBe(false);
+      expect(existsSync(join(modelsDir, 'evil.json'))).toBe(false);
+      expect(jobStagingDirs()).toEqual([]);
+
+      rmSync(finalDir(), { recursive: true, force: true });
+    }
+  });
+
+  // Finding E: cancelling an in-flight job aborts its download, unwinds so its
+  // job-private staging dir is removed, and NEVER purges the shared HF blob cache
+  // (the `mlx download` CLI resumes from it).
+  it('cancels an in-flight job: aborts the download, cleans staging, leaves the HF cache intact', async () => {
+    let blocked = false;
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeCancelFetch({ 'config.json': 12, 'model.safetensors': 300 }, 'model.safetensors', () => {
+        blocked = true;
+      }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+
+    // config.json completes and caches; the weight fetch blocks (in flight).
+    await waitFor(() => blocked);
+    expect(jobStagingDirs().length).toBe(1);
+    const cachedPointer = hub.cachePointer(cacheDir, hub.sha, 'config.json');
+    const cachedBlob = hub.cacheBlob(cacheDir, hub.sha, 'config.json');
+    expect(existsSync(cachedPointer)).toBe(true);
+    expect(existsSync(cachedBlob)).toBe(true);
+
+    // Cancel the in-flight job → the aborted fetch unwinds processJob.
+    expect(manager.cancel(id)).toBe(true);
+
+    await waitFor(() => events.some((event) => event.type === 'cancelled'));
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(manager.jobs().find((j) => j.id === id)!.state).toBe('cancelled');
+
+    // Staging cleaned; nothing published.
+    expect(jobStagingDirs()).toEqual([]);
+    expect(existsSync(finalDir())).toBe(false);
+    // Shared HF cache UNTOUCHED — config.json's cached pointer + blob survive.
+    expect(existsSync(cachedPointer)).toBe(true);
+    expect(existsSync(cachedBlob)).toBe(true);
+
+    // Cancelling an already-terminal id is a no-op.
+    expect(manager.cancel(id)).toBe(false);
+    // An unknown id is a no-op too.
+    expect(manager.cancel('no-such-job')).toBe(false);
+  });
+
+  // Finding E: a still-queued job (behind a busy one) is dropped and settled
+  // terminally by cancel without ever starting a download.
+  it('cancels a queued job before it starts, without fetching anything', async () => {
+    let blocked = false;
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeCancelFetch({ 'config.json': 12, 'model.safetensors': 300 }, 'model.safetensors', () => {
+        blocked = true;
+      }),
+    });
+    // Job 1 occupies the single-threaded drain (its weight fetch blocks).
+    const id1 = manager.start(REPO);
+    await waitFor(() => blocked);
+
+    // Job 2 queues behind it and is cancelled before it can run.
+    const id2 = manager.start(REPO);
+    const events2: DownloadEvent[] = [];
+    manager.subscribe(id2, (event) => events2.push(event));
+    expect(manager.cancel(id2)).toBe(true);
+
+    expect(manager.jobs().find((j) => j.id === id2)!.state).toBe('cancelled');
+    expect(events2.some((event) => event.type === 'cancelled')).toBe(true);
+    // The queued job never emitted a `start` (it never ran).
+    expect(events2.some((event) => event.type === 'start')).toBe(false);
+
+    // Clean up job 1 so no blocked fetch lingers.
+    expect(manager.cancel(id1)).toBe(true);
+    await waitFor(() => manager.jobs().find((j) => j.id === id1)!.state === 'cancelled');
   });
 });
 

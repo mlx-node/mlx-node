@@ -38,7 +38,7 @@ export interface CatalogResponse {
 export interface DownloadJob {
   id: string;
   repo: string;
-  state: 'running' | 'done' | 'error';
+  state: 'running' | 'done' | 'error' | 'cancelled';
   receivedBytes: number;
   totalBytes: number;
 }
@@ -50,6 +50,12 @@ export interface DownloadsResponse {
 export interface DownloadStartResponse {
   id: string;
   repo: string;
+}
+
+/** Result of `DELETE /api/downloads/:id` (cancel an in-flight/queued download). */
+export interface CancelDownloadResponse {
+  cancelled: boolean;
+  id: string;
 }
 
 export interface DeleteModelResponse {
