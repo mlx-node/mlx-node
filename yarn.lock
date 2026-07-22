@@ -1267,6 +1267,7 @@ __metadata:
     tw-animate-css: "npm:^1.4.0"
     typescript: "npm:^7.0.2"
     vite: "catalog:"
+    vite-plus: "catalog:"
   languageName: unknown
   linkType: soft
 
