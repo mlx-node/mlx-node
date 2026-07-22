@@ -90,9 +90,9 @@ export interface MetricsOverview {
   throughputTrend: Array<{
     model: string;
     day: string;
-    decodeTps: number;
-    prefillTps: number;
-    ttftMs: number;
+    decodeTps: number | null;
+    prefillTps: number | null;
+    ttftMs: number | null;
     samples: number;
   }>;
   mtpByModel: Array<{ model: string; meanAccepted: number | null; avgCycles: number | null; samples: number }>;
@@ -806,9 +806,9 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
     .map((row) => ({
       model: String(row.model),
       day: String(row.day),
-      decodeTps: toNum(row.avgDecodeTps) ?? 0,
-      prefillTps: toNum(row.avgPrefillTps) ?? 0,
-      ttftMs: toNum(row.avgTtftMs) ?? 0,
+      decodeTps: toNum(row.avgDecodeTps),
+      prefillTps: toNum(row.avgPrefillTps),
+      ttftMs: toNum(row.avgTtftMs),
       samples: toInt(row.samples),
     }));
 

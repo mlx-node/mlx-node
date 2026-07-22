@@ -566,6 +566,52 @@ describe('dashboard server — metrics overview', () => {
     expect(d2?.decodeTps).toBe(200);
     expect(d2?.samples).toBe(1);
   });
+
+  // Finding F4: the trace perf columns (ttft_ms/prefill_tps/decode_tps) are
+  // nullable and legitimately null for a valid trace recorded without timing.
+  // A bucket whose traces carry no perf → AVG over an all-NULL group is NULL and
+  // MUST surface as `null`, not a fabricated `0` (which would plot a fake
+  // `0 tok/s` point and defeat the UI's `Number.isFinite` empty-state guard). A
+  // sibling bucket that DOES carry perf must be unchanged (finite values).
+  it('reports null (not 0) throughput for a bucket whose traces carry no perf', async () => {
+    const day = Date.parse('2026-07-02T12:00:00.000Z');
+    writeFileSync(
+      join(tracesDir, '2026-07-02-nullperf.jsonl'),
+      `${JSON.stringify({ v: 1, traceId: 'np-perf', ts: day, model: 'perf-model', decodeTps: 150, prefillTps: 600, ttftMs: 30 })}\n${JSON.stringify({ v: 1, traceId: 'np-null', ts: day, model: 'nullperf-model' })}\n`,
+    );
+    await ingest();
+
+    const body = (await (await fetch(`${server.url}/api/metrics/overview`)).json()) as {
+      throughputTrend: Array<{
+        model: string;
+        day: string;
+        decodeTps: number | null;
+        prefillTps: number | null;
+        ttftMs: number | null;
+        samples: number;
+      }>;
+    };
+
+    // The bucket WITH perf keeps its finite averages, unchanged.
+    const perf = body.throughputTrend.find((r) => r.model === 'perf-model');
+    expect(perf?.decodeTps).toBe(150);
+    expect(perf?.prefillTps).toBe(600);
+    expect(perf?.ttftMs).toBe(30);
+    expect(perf?.samples).toBe(1);
+
+    // The bucket with only null-perf traces: COUNT(*) still counts the row (the
+    // bucket exists), but every AVG is NULL → surfaced as `null`, never `0`.
+    const nullPerf = body.throughputTrend.find((r) => r.model === 'nullperf-model');
+    expect(nullPerf).toBeDefined();
+    expect(nullPerf?.samples).toBe(1);
+    expect(nullPerf?.decodeTps).toBeNull();
+    expect(nullPerf?.prefillTps).toBeNull();
+    expect(nullPerf?.ttftMs).toBeNull();
+    // Guard against the old `?? 0` regression re-appearing.
+    expect(nullPerf?.decodeTps).not.toBe(0);
+    expect(nullPerf?.prefillTps).not.toBe(0);
+    expect(nullPerf?.ttftMs).not.toBe(0);
+  });
 });
 
 describe('dashboard server — cache', () => {

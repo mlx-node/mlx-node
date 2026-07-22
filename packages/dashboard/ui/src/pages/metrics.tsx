@@ -62,8 +62,8 @@ function shortModel(model: string): string {
 }
 
 /** Stable trend pickers (module-level so they never re-trigger the pivot memo). */
-const pickDecodeTps = (p: ThroughputTrendPoint): number => p.decodeTps;
-const pickTtftMs = (p: ThroughputTrendPoint): number => p.ttftMs;
+const pickDecodeTps = (p: ThroughputTrendPoint): number | null => p.decodeTps;
+const pickTtftMs = (p: ThroughputTrendPoint): number | null => p.ttftMs;
 
 interface ModelValue {
   model: string;
@@ -441,7 +441,7 @@ interface ModelTrendChartProps {
   points: ThroughputTrendPoint[];
   /** Ordered model list (legend + z-order); only models with finite data are drawn. */
   models: string[];
-  pick: (point: ThroughputTrendPoint) => number;
+  pick: (point: ThroughputTrendPoint) => number | null;
   unit: string;
   valueFormat: (value: number) => string;
   colorFor: (model: string) => string;
@@ -464,7 +464,7 @@ function ModelTrendChart({ points, models, pick, unit, valueFormat, colorFor }: 
     const sorted = [...points].sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
     for (const p of sorted) {
       const value = pick(p);
-      if (!Number.isFinite(value)) continue;
+      if (value === null || !Number.isFinite(value)) continue;
       present.add(p.model);
       let row = byDay.get(p.day);
       if (!row) {
@@ -512,7 +512,7 @@ function ModelTrendChart({ points, models, pick, unit, valueFormat, colorFor }: 
             strokeWidth={2}
             dot={{ r: 2 }}
             activeDot={{ r: 5 }}
-            connectNulls
+            connectNulls={false}
             isAnimationActive={false}
           />
         ))}

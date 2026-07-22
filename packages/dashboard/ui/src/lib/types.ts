@@ -110,9 +110,10 @@ export interface ThroughputTrendPoint {
   model: string;
   /** `YYYY-MM-DD` (UTC). */
   day: string;
-  decodeTps: number;
-  prefillTps: number;
-  ttftMs: number;
+  /** Averages are null when no trace in the bucket carried the column. */
+  decodeTps: number | null;
+  prefillTps: number | null;
+  ttftMs: number | null;
   samples: number;
 }
 
