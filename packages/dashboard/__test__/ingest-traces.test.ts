@@ -93,6 +93,61 @@ describe('ingestTraces', () => {
     expect(row.rootSessionId).toBe('root-r');
   });
 
+  // Finding #7: queue_ms + resident telemetry must land in their own columns;
+  // the boolean `resident` is encoded 0/1.
+  it('stores queueMs and resident (boolean → 0/1) from a trace record', async () => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, '2026-07-20-metrics.jsonl'),
+      `${JSON.stringify({
+        v: 1,
+        traceId: 'trace-warm',
+        ts: 1782036402000,
+        model: 'qwen3_5',
+        durationMs: 500,
+        queueMs: 42,
+        resident: true,
+        finishReason: 'stop',
+        promptTokens: 1,
+        cachedTokens: 0,
+        outputTokens: 1,
+        reasoningTokens: 0,
+      })}\n${JSON.stringify({
+        v: 1,
+        traceId: 'trace-cold',
+        ts: 1782036403000,
+        model: 'qwen3_5',
+        durationMs: 900,
+        queueMs: 3100,
+        resident: false,
+        finishReason: 'stop',
+        promptTokens: 1,
+        cachedTokens: 0,
+        outputTokens: 1,
+        reasoningTokens: 0,
+      })}\n`,
+    );
+    const res = await ingestTraces(dash, dir);
+    expect(res.records).toBe(2);
+
+    const warm = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-warm')).all()[0];
+    expect(warm.queueMs).toBe(42);
+    expect(warm.resident).toBe(1);
+
+    const cold = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-cold')).all()[0];
+    expect(cold.queueMs).toBe(3100);
+    expect(cold.resident).toBe(0);
+  });
+
+  // Finding #7: older JSONL without the new fields ingests them as NULL, not 0.
+  it('leaves queueMs/resident NULL when a trace record omits them', async () => {
+    cpSync(FIXTURE_TRACES, dir, { recursive: true });
+    await ingestTraces(dash, dir);
+    const row = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-bbb')).all()[0];
+    expect(row.queueMs).toBeNull();
+    expect(row.resident).toBeNull();
+  });
+
   it('is idempotent on duplicate traceId', async () => {
     cpSync(FIXTURE_TRACES, dir, { recursive: true });
     await ingestTraces(dash, dir);

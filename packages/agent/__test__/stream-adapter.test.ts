@@ -180,12 +180,12 @@ function makeFakeHost(session: FakeChatSession, log: string[] = session.log): Fa
   const invalidatedIds: string[] = [];
   return {
     modelInfo: (modelId) => (modelId === DISCOVERED.name ? DISCOVERED : undefined),
-    runWithResident<T>(modelId: string, fn: (s: ChatSession) => Promise<T>): Promise<T> {
+    runWithResident<T>(modelId: string, fn: (s: ChatSession, resident: boolean) => Promise<T>): Promise<T> {
       const n = ++calls;
       const run = async (): Promise<T> => {
         log.push(`fn${n}-start:${modelId}`);
         try {
-          return await fn(session.asChatSession());
+          return await fn(session.asChatSession(), true);
         } finally {
           log.push(`fn${n}-end:${modelId}`);
         }
@@ -600,9 +600,9 @@ describe('makeMlxStreamSimple', () => {
     const host: StreamSimpleHost = {
       modelInfo: () => DISCOVERED,
       ...dirtyStubs(),
-      async runWithResident<T>(_modelId: string, fn: (s: ChatSession) => Promise<T>): Promise<T> {
+      async runWithResident<T>(_modelId: string, fn: (s: ChatSession, resident: boolean) => Promise<T>): Promise<T> {
         await gate;
-        return fn(session.asChatSession());
+        return fn(session.asChatSession(), true);
       },
     };
     const controller = new AbortController();
@@ -894,10 +894,10 @@ describe('makeMlxStreamSimple', () => {
     const host: StreamSimpleHost = {
       modelInfo: () => DISCOVERED,
       ...dirtyStubs(),
-      async runWithResident<T>(_modelId: string, fn: (s: ChatSession) => Promise<T>): Promise<T> {
+      async runWithResident<T>(_modelId: string, fn: (s: ChatSession, resident: boolean) => Promise<T>): Promise<T> {
         await gate; // prior work that never yields until released
         closureRan = true;
-        return fn(session.asChatSession());
+        return fn(session.asChatSession(), true);
       },
     };
     const controller = new AbortController();
@@ -1399,10 +1399,10 @@ describe('makeMlxStreamSimple', () => {
           return was;
         },
         invalidateResident: () => undefined,
-        runWithResident<T>(id: string, fn: (s: ChatSession) => Promise<T>): Promise<T> {
+        runWithResident<T>(id: string, fn: (s: ChatSession, resident: boolean) => Promise<T>): Promise<T> {
           const run = async (): Promise<T> => {
             try {
-              return await fn(session.asChatSession());
+              return await fn(session.asChatSession(), true);
             } catch (err) {
               // At fn's rejection: with the fix, dirty is already set
               // (synchronous, in the callback). Reverting leaves this false.

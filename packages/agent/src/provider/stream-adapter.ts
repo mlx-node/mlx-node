@@ -62,8 +62,12 @@ import { resetPreservingNativeCacheForWarmReuse } from './warm-reuse.js';
 export interface StreamSimpleHost {
   /** Discovery record for `modelId` (source of the `ModelType` → launch preset). */
   modelInfo(modelId: string): DiscoveredModelLike | undefined;
-  /** Atomic resident selection + serialized inference closure (see `MlxModelHost`). */
-  runWithResident<T>(modelId: string, fn: (session: ChatSession) => Promise<T>): Promise<T>;
+  /**
+   * Atomic resident selection + serialized inference closure (see `MlxModelHost`).
+   * `fn` receives a `resident` boolean: `true` when the model was already warm
+   * (reused), `false` when this turn had to load/swap it.
+   */
+  runWithResident<T>(modelId: string, fn: (session: ChatSession, resident: boolean) => Promise<T>): Promise<T>;
   /** Flag the resident as post-error so the next turn does a full reset (see `MlxModelHost`). */
   markResidentDirty(modelId: string): void;
   /** Read-and-clear the resident's post-error flag; `true` ⇒ full-reset this turn. */
@@ -92,7 +96,17 @@ export type TurnRecorder = (rec: {
   rootSessionFile?: string;
   model: string;
   final: ChatStreamFinal;
+  /** Whole-turn wall-clock (ms): queue wait + resident selection + prefill + decode. */
   durationMs: number;
+  /**
+   * Queue + cold-load wait (ms) BEFORE native work began this turn: the gap
+   * between turn submission and the serialized `runWithResident` callback
+   * firing (behind earlier inference and/or a model load/swap). Subtract from
+   * `durationMs` to recover execution-only time.
+   */
+  queueMs: number;
+  /** `true` when the model was already warm/resident, `false` on a cold load/swap this turn. */
+  resident: boolean;
 }) => void;
 
 /** Property read that must not throw (poisoned getters on a hostile `Model`). */
@@ -307,7 +321,13 @@ export function makeMlxStreamSimple(
       // prefill + decode) so a MetricsTrace record can report wall-clock
       // duration. Read at the terminal only on the success path below.
       const turnStartedAt = Date.now();
-      await host.runWithResident(model.id, async (session) => {
+      await host.runWithResident(model.id, async (session, resident) => {
+        // Callback entry: the queue wait + any cold model load/swap have now
+        // resolved, but no native work (prime/prefill/decode) has started. This
+        // is the seam that separates queue+load latency from execution time —
+        // `durationMs` (read at the terminal) still brackets the whole turn.
+        const execStartedAt = Date.now();
+        const queueMs = Math.max(0, execStartedAt - turnStartedAt);
         // Terminated while queued behind earlier inference/loading (or
         // between stages below): the terminal already went out — skip ALL
         // session work (no warm-reset, no prime, no stream).
@@ -405,6 +425,11 @@ export function makeMlxStreamSimple(
                           model: model.id,
                           final: event,
                           durationMs: Math.max(0, Date.now() - turnStartedAt),
+                          // Queue+load wait captured at callback entry, and the
+                          // warm/cold distinction from `runWithResident` — so the
+                          // record can attribute wait vs execution latency.
+                          queueMs,
+                          resident,
                         });
                       } catch {
                         // Telemetry is best-effort; never break inference.

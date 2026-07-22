@@ -26,6 +26,8 @@ interface ParsedTrace {
   mtpCycles?: unknown;
   mtpMeanAccepted?: unknown;
   durationMs?: unknown;
+  queueMs?: unknown;
+  resident?: unknown;
   finishReason?: unknown;
   promptTokens?: unknown;
   cachedTokens?: unknown;
@@ -45,6 +47,11 @@ function numOrNull(value: unknown): number | null {
 
 function strOrNull(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
+}
+
+/** Encode a JSONL boolean (`resident`) into the SQLite 0/1 column; non-booleans → null. */
+function boolToInt(value: unknown): number | null {
+  return typeof value === 'boolean' ? (value ? 1 : 0) : null;
 }
 
 /**
@@ -138,6 +145,8 @@ export async function ingestTraces(
           mtpCycles: numOrNull(trace.mtpCycles),
           mtpMeanAccepted: numOrNull(trace.mtpMeanAccepted),
           durationMs: numOrNull(trace.durationMs),
+          queueMs: numOrNull(trace.queueMs),
+          resident: boolToInt(trace.resident),
           finishReason: strOrNull(trace.finishReason),
           promptTokens: numOrNull(trace.promptTokens),
           cachedTokens: numOrNull(trace.cachedTokens),

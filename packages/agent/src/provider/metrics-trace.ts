@@ -43,6 +43,14 @@ export interface MetricsTraceRecord {
   model: string;
   /** Turn duration (ms) bracketing resident selection + prefill + decode. */
   durationMs: number;
+  /**
+   * Queue + cold-load wait (ms) before native work began this turn — the gap
+   * between turn submission and the serialized inference callback firing.
+   * Subtract from `durationMs` to isolate execution-only latency.
+   */
+  queueMs?: number;
+  /** `true` when the model was already warm/resident, `false` on a cold load/swap. */
+  resident?: boolean;
   /** Native finish reason (`stop` / `length` / `tool_calls` / …). */
   finishReason: string;
   promptTokens: number;
@@ -122,6 +130,9 @@ export class MetricsTrace {
       if (rec.sessionId !== undefined) out.sessionId = rec.sessionId;
       if (rec.rootSessionId !== undefined) out.rootSessionId = rec.rootSessionId;
       if (rec.rootSessionFile !== undefined) out.rootSessionFile = rec.rootSessionFile;
+      const queueMs = finite(rec.queueMs);
+      if (queueMs !== undefined) out.queueMs = queueMs;
+      if (typeof rec.resident === 'boolean') out.resident = rec.resident;
       const ttftMs = finite(rec.ttftMs);
       if (ttftMs !== undefined) out.ttftMs = ttftMs;
       const prefillTps = finite(rec.prefillTps);

@@ -40,7 +40,11 @@ export const traces = sqliteTable('traces', {
   mtpCycles: integer('mtp_cycles'),
   mtpMeanAccepted: real('mtp_mean_accepted'),
   durationMs: real('duration_ms'),
+  /** Queue + cold-load wait (ms) before native work began this turn. */
+  queueMs: integer('queue_ms'),
   finishReason: text('finish_reason'),
+  /** 1 when the model was already warm/resident, 0 on a cold load/swap; null if unknown. */
+  resident: integer('resident'),
   promptTokens: integer('prompt_tokens'),
   cachedTokens: integer('cached_tokens'),
   outputTokens: integer('output_tokens'),

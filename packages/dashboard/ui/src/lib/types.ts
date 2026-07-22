@@ -100,6 +100,22 @@ export interface ThroughputByModelRow {
   samples: number;
 }
 
+/**
+ * One (model, UTC-day) throughput bucket from `GET /api/metrics/overview`
+ * `throughputTrend` — the time-bucketed series backing the temporal charts.
+ * Shared contract with the server overview query; the values are per-day
+ * averages over `samples` traces for that model.
+ */
+export interface ThroughputTrendPoint {
+  model: string;
+  /** `YYYY-MM-DD` (UTC). */
+  day: string;
+  decodeTps: number;
+  prefillTps: number;
+  ttftMs: number;
+  samples: number;
+}
+
 /** Per-model speculative-decoding (MTP) acceptance averages; only models with a recorded mean appear. */
 export interface MtpByModelRow {
   model: string;
@@ -119,6 +135,7 @@ export interface MetricsOverviewResponse {
   range: { from: number | null; to: number | null };
   tokensByDay: TokensByDayRow[];
   throughputByModel: ThroughputByModelRow[];
+  throughputTrend: ThroughputTrendPoint[];
   mtpByModel: MtpByModelRow[];
   modelShare: ModelShareRow[];
   totals: {

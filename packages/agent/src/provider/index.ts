@@ -78,7 +78,17 @@ export function createMlxProviderExtension(
   const onTurnStart = (): void => {
     turnStartCold = readColdStats();
   };
-  const onTurnRecord: TurnRecorder = ({ traceId, sessionId, rootSessionId, rootSessionFile, model, final, durationMs }) => {
+  const onTurnRecord: TurnRecorder = ({
+    traceId,
+    sessionId,
+    rootSessionId,
+    rootSessionFile,
+    model,
+    final,
+    durationMs,
+    queueMs,
+    resident,
+  }) => {
     const rec: Omit<MetricsTraceRecord, 'v'> = {
       traceId,
       ts: Date.now(),
@@ -87,6 +97,8 @@ export function createMlxProviderExtension(
       rootSessionFile,
       model,
       durationMs,
+      queueMs,
+      resident,
       finishReason: final.finishReason,
       promptTokens: final.promptTokens,
       cachedTokens: final.cachedTokens ?? 0,

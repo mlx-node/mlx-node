@@ -15,6 +15,7 @@ import type {
   ModelShareRow,
   MtpByModelRow,
   ThroughputByModelRow,
+  ThroughputTrendPoint,
   TokensByDayRow,
 } from '@/lib/types';
 import { useJson } from '@/lib/use-api';
@@ -27,6 +28,8 @@ import {
   Cell,
   LabelList,
   Legend,
+  Line,
+  LineChart,
   Pie,
   PieChart,
   ResponsiveContainer,
@@ -58,6 +61,10 @@ function shortModel(model: string): string {
   return model.length > 22 ? `${model.slice(0, 21)}…` : model;
 }
 
+/** Stable trend pickers (module-level so they never re-trigger the pivot memo). */
+const pickDecodeTps = (p: ThroughputTrendPoint): number => p.decodeTps;
+const pickTtftMs = (p: ThroughputTrendPoint): number => p.ttftMs;
+
 interface ModelValue {
   model: string;
   value: number;
@@ -84,6 +91,7 @@ export default function Metrics() {
 
   const tokensByDay: TokensByDayRow[] = useMemo(() => metrics.data?.tokensByDay ?? [], [metrics.data]);
   const throughput: ThroughputByModelRow[] = useMemo(() => metrics.data?.throughputByModel ?? [], [metrics.data]);
+  const throughputTrend: ThroughputTrendPoint[] = useMemo(() => metrics.data?.throughputTrend ?? [], [metrics.data]);
   const mtp: MtpByModelRow[] = useMemo(() => metrics.data?.mtpByModel ?? [], [metrics.data]);
   const modelShare: ModelShareRow[] = useMemo(() => metrics.data?.modelShare ?? [], [metrics.data]);
 
@@ -93,7 +101,7 @@ export default function Metrics() {
   const colorFor = useMemo(() => {
     const seen = new Set<string>();
     const ordered: string[] = [];
-    for (const rows of [modelShare, throughput, mtp] as Array<Array<{ model: string }>>) {
+    for (const rows of [modelShare, throughput, mtp, throughputTrend] as Array<Array<{ model: string }>>) {
       for (const row of rows) {
         if (!seen.has(row.model)) {
           seen.add(row.model);
@@ -103,7 +111,7 @@ export default function Metrics() {
     }
     const map = buildSeriesColorMap(ordered);
     return (model: string): string => map.get(model) ?? OTHER_SERIES_COLOR;
-  }, [modelShare, throughput, mtp]);
+  }, [modelShare, throughput, mtp, throughputTrend]);
 
   const tokensData = useMemo(
     () =>
@@ -120,6 +128,20 @@ export default function Metrics() {
   const decodeData = useMemo(() => toModelValues(throughput, (r) => r.avgDecodeTps), [throughput]);
   const ttftData = useMemo(() => toModelValues(throughput, (r) => r.avgTtftMs), [throughput]);
   const mtpData = useMemo(() => toModelValues(mtp, (r) => r.meanAccepted), [mtp]);
+
+  // Ordered model list for the temporal trend series (most-sampled first, name
+  // tie-break) so both trend charts share one stable legend order and colour.
+  const trendModels = useMemo(() => {
+    const totals = new Map<string, number>();
+    for (const p of throughputTrend) {
+      totals.set(p.model, (totals.get(p.model) ?? 0) + (Number.isFinite(p.samples) ? p.samples : 0));
+    }
+    return [...totals.entries()]
+      .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .map(([model]) => model);
+  }, [throughputTrend]);
+  const hasDecodeTrend = throughputTrend.some((p) => Number.isFinite(p.decodeTps));
+  const hasTtftTrend = throughputTrend.some((p) => Number.isFinite(p.ttftMs));
   const shareData = useMemo(() => modelShare.filter((row) => row.turns > 0), [modelShare]);
   const shareTotal = useMemo(() => shareData.reduce((sum, row) => sum + row.turns, 0), [shareData]);
 
@@ -210,6 +232,50 @@ export default function Metrics() {
               />
             </BarChart>
           </ResponsiveContainer>
+        </ChartBody>
+      </ChartCard>
+
+      <ChartCard
+        title="Decode throughput over time"
+        subtitle="Average decode tokens/second per day, per model (UTC)"
+        heightClass="h-64"
+      >
+        <ChartBody
+          loading={loading}
+          error={error}
+          isEmpty={!hasDecodeTrend}
+          empty={<ChartEmpty icon={Zap} message="No decode throughput in this range." hint={RECORD_HINT} />}
+        >
+          <ModelTrendChart
+            points={throughputTrend}
+            models={trendModels}
+            pick={pickDecodeTps}
+            unit=" tok/s"
+            valueFormat={(v) => v.toFixed(0)}
+            colorFor={colorFor}
+          />
+        </ChartBody>
+      </ChartCard>
+
+      <ChartCard
+        title="Time to first token over time"
+        subtitle="Average TTFT in milliseconds per day, per model (UTC)"
+        heightClass="h-64"
+      >
+        <ChartBody
+          loading={loading}
+          error={error}
+          isEmpty={!hasTtftTrend}
+          empty={<ChartEmpty icon={Timer} message="No TTFT samples in this range." hint={RECORD_HINT} />}
+        >
+          <ModelTrendChart
+            points={throughputTrend}
+            models={trendModels}
+            pick={pickTtftMs}
+            unit=" ms"
+            valueFormat={(v) => Math.round(v).toString()}
+            colorFor={colorFor}
+          />
         </ChartBody>
       </ChartCard>
 
@@ -367,6 +433,90 @@ function ModelBarChart({ data, unit, valueFormat, colorFor }: ModelBarChartProps
           />
         </Bar>
       </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+interface ModelTrendChartProps {
+  points: ThroughputTrendPoint[];
+  /** Ordered model list (legend + z-order); only models with finite data are drawn. */
+  models: string[];
+  pick: (point: ThroughputTrendPoint) => number;
+  unit: string;
+  valueFormat: (value: number) => string;
+  colorFor: (model: string) => string;
+}
+
+/** One pivoted day row: a formatted day label plus one numeric column per model. */
+type TrendRow = { day: string } & Record<string, number | string>;
+
+/**
+ * Temporal multi-series line: x = UTC day, one line per model, coloured by the
+ * page-wide model palette. Mirrors the tokens/day chart's day bucketing, pivoting
+ * the flat `(model, day)` trend points into one row per day. Days are sorted by
+ * their raw `YYYY-MM-DD` key before formatting so the axis stays chronological,
+ * and only models carrying a finite value for `pick` become series.
+ */
+function ModelTrendChart({ points, models, pick, unit, valueFormat, colorFor }: ModelTrendChartProps) {
+  const { rows, series } = useMemo(() => {
+    const byDay = new Map<string, TrendRow>();
+    const present = new Set<string>();
+    const sorted = [...points].sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
+    for (const p of sorted) {
+      const value = pick(p);
+      if (!Number.isFinite(value)) continue;
+      present.add(p.model);
+      let row = byDay.get(p.day);
+      if (!row) {
+        row = { day: formatDay(p.day) };
+        byDay.set(p.day, row);
+      }
+      row[p.model] = value;
+    }
+    // Map insertion order follows the day-sorted scan, so values() is chronological.
+    return { rows: [...byDay.values()], series: models.filter((model) => present.has(model)) };
+  }, [points, models, pick]);
+
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <LineChart data={rows} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+        <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" vertical={false} />
+        <XAxis dataKey="day" tick={AXIS_TICK} tickLine={false} axisLine={false} minTickGap={16} />
+        <YAxis
+          tick={AXIS_TICK}
+          tickLine={false}
+          axisLine={false}
+          width={48}
+          tickFormatter={(v) => valueFormat(Number(v))}
+        />
+        <Tooltip
+          cursor={{ stroke: 'var(--color-muted-foreground)', strokeWidth: 1 }}
+          contentStyle={TOOLTIP_CONTENT_STYLE}
+          formatter={(value, name) => [`${valueFormat(Number(value))}${unit}`, shortModel(String(name))]}
+        />
+        <Legend
+          wrapperStyle={{ fontSize: 12 }}
+          formatter={(value) => (
+            <span className="text-foreground" title={String(value)}>
+              {shortModel(String(value))}
+            </span>
+          )}
+        />
+        {series.map((model) => (
+          <Line
+            key={model}
+            type="monotone"
+            dataKey={model}
+            name={model}
+            stroke={colorFor(model)}
+            strokeWidth={2}
+            dot={{ r: 2 }}
+            activeDot={{ r: 5 }}
+            connectNulls
+            isAnimationActive={false}
+          />
+        ))}
+      </LineChart>
     </ResponsiveContainer>
   );
 }

@@ -410,6 +410,64 @@ describe('dashboard db', () => {
     rmSync(d, { recursive: true, force: true });
   });
 
+  // Finding #7: a db predating the traces.queue_ms + traces.resident columns
+  // (but matching version) must be caught by the signature probe and rebuilt.
+  // The auto-derived EXPECTED_COLUMNS must include the new columns, and the
+  // rebuilt DDL must carry them — a divergence would either wedge startup or
+  // re-quarantine on every open. This asserts both: the rebuilt db round-trips
+  // the new columns AND re-validates in place on a second open (no wedge).
+  it('quarantines a traces db missing queue_ms/resident and rebuilds, then re-validates without wedging', () => {
+    const d = mkdtempSync(join(tmpdir(), 'dash-metrics-'));
+    const file = join(d, 'index.db');
+    const raw = new DatabaseSync(file);
+    // Full sessions + turns; traces omits ONLY the newest queue_ms + resident.
+    raw.exec(
+      `CREATE TABLE sessions (
+        id TEXT PRIMARY KEY, path TEXT NOT NULL, cwd TEXT NOT NULL, name TEXT,
+        created INTEGER NOT NULL, modified INTEGER NOT NULL,
+        message_count INTEGER NOT NULL DEFAULT 0, first_message TEXT,
+        last_ingested_mtime INTEGER NOT NULL DEFAULT 0, last_ingested_size INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE turns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, entry_id TEXT,
+        trace_id TEXT, ts INTEGER NOT NULL, model TEXT, input_tokens INTEGER,
+        output_tokens INTEGER, cached_tokens INTEGER, reasoning_tokens INTEGER
+      );
+      CREATE TABLE traces (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT NOT NULL UNIQUE,
+        session_id TEXT, root_session_id TEXT, ts INTEGER NOT NULL, model TEXT,
+        ttft_ms REAL, prefill_tps REAL, decode_tps REAL, mtp_cycles INTEGER,
+        mtp_mean_accepted REAL, duration_ms REAL, finish_reason TEXT,
+        prompt_tokens INTEGER, cached_tokens INTEGER, output_tokens INTEGER,
+        reasoning_tokens INTEGER, cold_hits INTEGER, cold_misses INTEGER,
+        cold_bytes_written INTEGER, cold_bytes_restored INTEGER, source_file TEXT
+      );`,
+    );
+    raw.exec('PRAGMA user_version = 1;'); // matches SCHEMA_VERSION → version check passes
+    raw.close();
+
+    // First open: signature probe finds queue_ms/resident missing → quarantine+rebuild.
+    const first = openDashboardDb(file);
+    first.db.insert(traces).values({ traceId: 't1', ts: 1, queueMs: 42, resident: 1 }).run();
+    const rows = first.db.select().from(traces).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].queueMs).toBe(42);
+    expect(rows[0].resident).toBe(1);
+    first.close();
+
+    const quarantined = readdirSync(d).filter((n) => n.startsWith('index.db.corrupt-'));
+    expect(quarantined).toHaveLength(1);
+
+    // Second open of the freshly-rebuilt db: DDL and EXPECTED_COLUMNS agree, so it
+    // validates in place — the seeded row survives and nothing new is quarantined.
+    const second = openDashboardDb(file);
+    expect(second.db.select().from(traces).all()).toHaveLength(1);
+    second.close();
+    expect(readdirSync(d).filter((n) => n.startsWith('index.db.corrupt-'))).toHaveLength(1);
+
+    rmSync(d, { recursive: true, force: true });
+  });
+
   // Finding 6: a complete current-schema db must open WITHOUT rebuilding — the
   // full signature check must not false-positive on a matching schema.
   it('opens a complete current-schema db without rebuilding', () => {

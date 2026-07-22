@@ -117,13 +117,19 @@ export class MlxModelHost {
    * use the resident session; there is deliberately no method that
    * returns a session outside the serialized section.
    *
+   * `fn` also receives a `resident` boolean: `true` when the turn reused
+   * the already-loaded model (warm — no load happened), `false` when it had
+   * to load or swap the checkpoint first. This is the same warm/cold
+   * distinction the branch below already makes; surfacing it lets a metrics
+   * consumer separate queue wait from cold-load time without another channel.
+   *
    * Swaps drop the old session + model refs BEFORE loading the new
    * checkpoint so GC + native destructors can reclaim the old weights
    * during the load. A load failure leaves no resident (next call
    * retries); a failure thrown by `fn` rejects only this call's promise
    * and keeps the resident loaded for later callers.
    */
-  runWithResident<T>(modelId: string, fn: (session: ChatSession) => Promise<T>): Promise<T> {
+  runWithResident<T>(modelId: string, fn: (session: ChatSession, resident: boolean) => Promise<T>): Promise<T> {
     const entry = this.byName.get(modelId);
     if (!entry) {
       const known = [...this.byName.keys()].join(', ');
@@ -131,9 +137,14 @@ export class MlxModelHost {
     }
     return this.runSerialized(async () => {
       let session: ChatSession;
+      // `true` when this turn reuses the loaded resident (warm), `false` when
+      // it loaded/swapped the checkpoint first (cold).
+      let resident: boolean;
       if (this.resident?.id === modelId) {
         session = this.resident.session;
+        resident = true;
       } else {
+        resident = false;
         this.resident = null;
         // Only qwen3 dense has a sound paged cold restore. Hand it an EXPLICIT
         // tri-state directive so the overlay can authoritatively set the flag
@@ -164,7 +175,7 @@ export class MlxModelHost {
         session = new ChatSession(sessionModel);
         this.resident = { id: modelId, session, model, dirty: false };
       }
-      return await fn(session);
+      return await fn(session, resident);
     });
   }
 
