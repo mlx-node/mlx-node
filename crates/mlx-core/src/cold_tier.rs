@@ -115,6 +115,18 @@ pub(crate) struct ColdTierGeometry {
 /// full-digest path cannot be read to completion: the caller then leaves
 /// persistence OFF (fail-safe) rather than persisting under a partial identity
 /// that could collide with another model.
+///
+/// **Temporal residual (lazy materialization).** This fingerprint is computed —
+/// and the cold tier attached — BEFORE the weights are materialized: MLX reads
+/// shard bytes lazily, at `array::memory::materialize_weights`, after this
+/// returns. A same-inode in-place shard rewrite in that fingerprint→materialize
+/// window therefore materializes NEW bytes under the OLD fingerprint, and —
+/// unlike the mtime-preserving swap guarded above — it need not preserve mtime,
+/// since no identity snapshot follows it before materialization. The loader's
+/// `shard_identities_stable` snapshots bracket the mmap but do NOT prove
+/// continuous identity through materialization. Closing this soundly requires an
+/// fd-coupled fingerprint derived from the same held mapping/fd that backs the
+/// loaded arrays; that is out of scope for v1.
 pub(crate) fn build_model_fingerprint(
     model_type: &str,
     model_path: &str,

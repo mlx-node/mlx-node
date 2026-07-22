@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   existsSync,
+  renameSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -384,6 +385,32 @@ describe('ingestTraces', () => {
     expect(res.pruned).toBe(0);
     expect(res.files).toBe(0);
     expect(res.records).toBe(0);
+  });
+
+  // Finding #7: a trace_id is globally UNIQUE (independent of source_file). When a
+  // trace file is renamed (a.jsonl → b.jsonl), ingesting b cannot insert the trace
+  // while a.jsonl still owns the unique row, so the vanished-file reconciliation of
+  // a.jsonl must run BEFORE the ingest loop — otherwise a's row is deleted after b
+  // was skipped by onConflict, and the trace is lost from every row forever.
+  it('re-indexes a trace whose file was renamed (moved), not dropping its row', async () => {
+    mkdirSync(dir, { recursive: true });
+    const aFile = join(dir, 'a.jsonl');
+    writeFileSync(aFile, traceLine('trace-moved'));
+    await ingestTraces(dash, dir);
+    const before = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-moved')).all();
+    expect(before).toHaveLength(1);
+    expect(before[0].sourceFile).toBe('a.jsonl');
+
+    // Rename the file on disk; the trace_id inside is unchanged.
+    renameSync(aFile, join(dir, 'b.jsonl'));
+
+    await ingestTraces(dash, dir);
+    // The moved trace is still indexed — now owned by b.jsonl, not dropped.
+    const after = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-moved')).all();
+    expect(after).toHaveLength(1);
+    expect(after[0].sourceFile).toBe('b.jsonl');
+    // No orphaned row left behind under the old name.
+    expect(dash.db.select().from(traces).where(eq(traces.sourceFile, 'a.jsonl')).all()).toHaveLength(0);
   });
 
   // Finding J: deleting the WHOLE trace dir must still reconcile tracked rows,

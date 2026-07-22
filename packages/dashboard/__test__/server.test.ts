@@ -157,6 +157,11 @@ describe('dashboard server — sessions', () => {
       sessions: Array<{ id: string; path: string }>;
     };
     const filePath = before.sessions.find((s) => s.id === 'fix-1')!.path;
+    // The fixture file was just copied (recent mtime); age it past the liveness
+    // window so this idle session renames instead of tripping the active-session
+    // refusal (Finding 3).
+    const old = Date.now() / 1000 - 600;
+    utimesSync(filePath, old, old);
 
     const patch = await fetch(`${server.url}/api/sessions/fix-1`, {
       method: 'PATCH',
@@ -241,6 +246,66 @@ describe('dashboard server — sessions', () => {
     expect(after.toString('utf-8')).toBe(original);
     expect(after.toString('utf-8')).not.toContain('"type":"session_info"');
     expect(after.toString('utf-8')).not.toContain('Should Not Apply');
+  });
+
+  // Finding 3 (liveness): renaming a session that appears actively written by a
+  // live agent turn is refused (409). pi has no cross-process lock, so appending a
+  // `session_info` to a file a concurrent turn is extending would race that turn.
+  // An IDLE session (mtime well beyond the liveness window) renames normally.
+  it('refuses to rename a session that looks active, but renames an idle one', async () => {
+    const dir = join(sessionsRoot, '--w--');
+    mkdirSync(dir, { recursive: true });
+    const completeSession = (id: string, hour: string): object[] => [
+      { type: 'session', version: 3, id, timestamp: `2026-07-13T${hour}:00:00.000Z`, cwd: '/w' },
+      { type: 'message', id: 'u1', parentId: null, timestamp: `2026-07-13T${hour}:00:01.000Z`, message: { role: 'user', content: 'hi' } },
+      {
+        type: 'message',
+        id: 'a1',
+        parentId: 'u1',
+        timestamp: `2026-07-13T${hour}:00:02.000Z`,
+        message: { role: 'assistant', content: [{ type: 'text', text: 'yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+      },
+    ];
+
+    // A complete, valid session with a very recent mtime → reaches (and trips) the
+    // liveness pre-check rather than a records/identity 409.
+    const liveFile = join(dir, '2026-07-13T10-00-00_rn-live.jsonl');
+    writeFileSync(liveFile, `${completeSession('rn-live', '10').map((l) => JSON.stringify(l)).join('\n')}\n`);
+    const now = Date.now() / 1000;
+    utimesSync(liveFile, now, now);
+    await ingest();
+    const before = readFileSync(liveFile);
+
+    const live = await fetch(`${server.url}/api/sessions/rn-live`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Should Not Apply (active)' }),
+    });
+    expect(live.status).toBe(409);
+    // The active session's file is byte-for-byte untouched — no session_info stamped.
+    const after = readFileSync(liveFile);
+    expect(after.equals(before)).toBe(true);
+    expect(after.toString('utf-8')).not.toContain('"type":"session_info"');
+    expect(after.toString('utf-8')).not.toContain('Should Not Apply');
+
+    // An idle session (mtime well beyond the window) renames normally.
+    const idleFile = join(dir, '2026-07-13T09-00-00_rn-idle.jsonl');
+    writeFileSync(idleFile, `${completeSession('rn-idle', '09').map((l) => JSON.stringify(l)).join('\n')}\n`);
+    const old = Date.now() / 1000 - 600; // 10 minutes ago
+    utimesSync(idleFile, old, old);
+    await ingest();
+
+    const idle = await fetch(`${server.url}/api/sessions/rn-idle`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Idle Renamed' }),
+    });
+    expect(idle.status).toBe(200);
+    const detail = (await (await fetch(`${server.url}/api/sessions/rn-idle`)).json()) as {
+      session: { name: string | null };
+    };
+    expect(detail.session.name).toBe('Idle Renamed');
+    expect(readFileSync(idleFile, 'utf-8')).toContain('Idle Renamed');
   });
 
   // Finding H: the detail transcript uses the same active-branch projection as
@@ -519,7 +584,7 @@ describe('dashboard server — metrics overview', () => {
     // row (trace-bbb=gemma4, trace-ccc=lfm2), which the F3 union counts as delegated
     // subagent turns → 5 total.
     expect(body.totals.turns).toBe(5);
-    expect(body.totals.inputTokens).toBe(595); // 100 + 180 + 40 (fork collapsed) + 200 + 75 (trace-only)
+    expect(body.totals.inputTokens).toBe(570); // 100 + 180 + 40 (fork collapsed) + 200 + 50 (trace-only, net of cache)
     expect(body.totals.outputTokens).toBe(270); // 50 + 60 + 20 + 128 + 12
     expect(body.totals.cachedTokens).toBe(135); // 10 + 100 + 0 + 0 + 25
     expect(body.totals.reasoningTokens).toBe(17); // 5 + 12 + 0 + 0 + 0
@@ -578,16 +643,19 @@ describe('dashboard server — metrics overview', () => {
       totals: { turns: number; inputTokens: number; outputTokens: number; cachedTokens: number; reasoningTokens: number };
     };
 
-    // turnTotals: normal turn (300/90/30/9) + trace-only sub-1 (500/200/40/15), each once.
+    // turnTotals: normal turn (300 net/90/30/9) + trace-only sub-1 (500 gross −40
+    // cache = 460 net / 200 / 40 / 15), each once. inputTokens is NET of cache on
+    // both sides: turns store `usage.input` (already net), traces store gross
+    // `promptTokens`, so the trace side clamps `MAX(prompt − cached, 0)`.
     expect(body.totals.turns).toBe(2);
-    expect(body.totals.inputTokens).toBe(800);
+    expect(body.totals.inputTokens).toBe(760); // 300 (net) + 460 (net of cache)
     expect(body.totals.outputTokens).toBe(290);
     expect(body.totals.cachedTokens).toBe(70);
     expect(body.totals.reasoningTokens).toBe(24);
 
     // tokensByDay: one 2026-07-05 bucket with the combined tokens (correlated once).
     const bucket = body.tokensByDay.find((d) => d.day === '2026-07-05');
-    expect(bucket).toEqual({ day: '2026-07-05', input: 800, output: 290, cached: 70, reasoning: 24 });
+    expect(bucket).toEqual({ day: '2026-07-05', input: 760, output: 290, cached: 70, reasoning: 24 });
 
     // modelShare: the correlated turn counted ONCE under corr-model (90, not 180),
     // and the trace-only subagent surfaced under sub-model.

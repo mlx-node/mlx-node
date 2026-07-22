@@ -549,6 +549,9 @@ impl RootDir {
 #[cfg(test)]
 type TestSpaceOverride = Mutex<Option<Box<dyn Fn() -> Result<(u64, u64), String> + Send>>>;
 
+#[cfg(test)]
+type TestSyncOverride = Mutex<Option<Box<dyn Fn() -> Result<(), String> + Send>>>;
+
 struct Shared {
     root: RootDir,
     quota_bytes: u64,
@@ -567,6 +570,11 @@ struct Shared {
     /// deterministic under test.
     #[cfg(test)]
     space_override: TestSpaceOverride,
+    /// Forces the writer commit's directory fsync to fail so tests can drive
+    /// a post-rename dir-sync error and assert index accounting stays
+    /// consistent with the on-disk canonical file.
+    #[cfg(test)]
+    dir_sync_override: TestSyncOverride,
 }
 
 impl Shared {
@@ -579,6 +587,17 @@ impl Shared {
             return hook();
         }
         self.root.space()
+    }
+
+    /// Directory fsync backing the writer commit's durability barrier.
+    fn sync(&self) -> Result<(), String> {
+        #[cfg(test)]
+        if let Ok(hook) = self.dir_sync_override.lock()
+            && let Some(hook) = hook.as_ref()
+        {
+            return hook();
+        }
+        self.root.sync()
     }
 }
 
@@ -658,6 +677,8 @@ impl ColdCacheManager {
             failed_open_identity_hook: Mutex::new(None),
             #[cfg(test)]
             space_override: Mutex::new(None),
+            #[cfg(test)]
+            dir_sync_override: Mutex::new(None),
         });
         let (sender, receiver) = mpsc::sync_channel::<WriteJob>(queue_depth);
         let worker_shared = Arc::clone(&shared);
@@ -1092,7 +1113,6 @@ fn persist_block(shared: &Shared, block: &ColdCacheBlock) -> Result<(), String> 
         shared.root.rename(&temp, &destination).inspect_err(|_| {
             shared.stats.queue_drops.fetch_add(1, Ordering::Relaxed);
         })?;
-        shared.root.sync()?;
         if let Some(old) = index.entries.insert(
             block.key,
             IndexEntry {
@@ -1104,6 +1124,14 @@ fn persist_block(shared: &Shared, block: &ColdCacheBlock) -> Result<(), String> 
             index.total_bytes = index.total_bytes.saturating_sub(old.size);
         }
         index.total_bytes = index.total_bytes.saturating_add(size);
+        // The rename is the true commit point (the payload was already
+        // `sync_all`'d), so the index publish above is bound to rename
+        // success, not to this directory fsync. A dir-fsync failure here
+        // therefore leaves in-process accounting consistent with the
+        // renamed canonical file — the cleanup `unlink(&temp)` stays a
+        // harmless NotFound no-op and `rebuild_index` still heals on
+        // restart — rather than orphaning the block outside the quota.
+        shared.sync()?;
         Ok(())
     })() {
         let _ = shared.root.unlink(&temp);
@@ -1621,6 +1649,54 @@ mod tests {
         assert!(reopened.load(key, fingerprint()).is_some());
         assert_eq!(reopened.shared.index.lock().unwrap().entries.len(), 1);
         drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // A post-rename directory fsync failure must leave in-process accounting
+    // consistent with the on-disk canonical file: the rename is the true
+    // commit point (the payload was already `sync_all`'d), so the index entry
+    // and its byte credit belong to a renamed block even when the durability
+    // barrier afterwards fails. Otherwise the file is orphaned outside the
+    // quota until the next `rebuild_index` re-credits it on restart.
+    #[test]
+    fn post_rename_dir_sync_failure_keeps_index_consistent() {
+        let root = temp_root("dir-sync-fail");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let expected = block(key);
+        // The index credits the actual encoded byte length, matching
+        // `persist_block`'s `size = bytes.len()` (not the `encoded_len`
+        // upper bound used for read-time allocation caps).
+        let size = encode_block(&expected).unwrap().len() as u64;
+
+        *manager.shared.dir_sync_override.lock().unwrap() =
+            Some(Box::new(|| Err("injected dir fsync failure".to_string())));
+
+        let result = persist_block(&manager.shared, &expected);
+        assert!(
+            result.is_err(),
+            "the injected dir fsync error must surface to the fail-open worker"
+        );
+
+        let path = root.join(format!("{}.safetensors", key.to_hex()));
+        assert!(
+            path.exists(),
+            "the renamed canonical file survives a post-rename fsync failure"
+        );
+
+        let index = manager.shared.index.lock().unwrap();
+        assert!(
+            index.entries.contains_key(&key),
+            "the index entry must be published for the renamed canonical file"
+        );
+        assert_eq!(
+            index.total_bytes, size,
+            "the renamed block must be credited so it stays inside the quota"
+        );
+        drop(index);
+
+        *manager.shared.dir_sync_override.lock().unwrap() = None;
+        drop(manager);
         let _ = fs::remove_dir_all(root);
     }
 

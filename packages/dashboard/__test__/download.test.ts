@@ -516,6 +516,71 @@ describe('DownloadManager', () => {
     expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
   });
 
+  // Finding #4: the install-skip gate must match the marker's repo AND revision,
+  // not merely "a complete same-slug install exists". A same-slug install pinned to
+  // the SAME resolved revision short-circuits (idempotent, no re-fetch).
+  it('short-circuits to done when the installed marker matches the resolved repo+revision', async () => {
+    // A complete owned install pinned to the exact revision resolveRevision returns.
+    mkdirSync(finalDir(), { recursive: true });
+    writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(finalDir(), 'model.safetensors'), Buffer.alloc(300, 0xab));
+    writeFileSync(
+      join(finalDir(), DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: REPO, revision: hub.sha, files: ['config.json', 'model.safetensors'], completedAt: 'x' }),
+    );
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const id = manager.start(REPO);
+    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+
+    // Idempotent: nothing re-fetched, the existing install untouched.
+    expect(hub.downloaded).toEqual([]);
+    expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+    const job = manager.jobs().find((j) => j.id === id)!;
+    expect(job.receivedBytes).toBe(job.totalBytes);
+  });
+
+  // Finding #4: a complete install of a DIFFERENT revision (same slug) must NOT
+  // short-circuit to `done` at the new revision's byte total — the job must download
+  // the resolved revision and let publish's owned-swap replace the stale one.
+  it('does NOT short-circuit when the installed marker is a different revision; downloads and swaps', async () => {
+    // A complete OWNED install pinned to an OLD revision (marker present + every file
+    // there → isModelInstalled true), but resolveRevision returns hub.sha (newer).
+    mkdirSync(finalDir(), { recursive: true });
+    writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(finalDir(), 'model.safetensors'), Buffer.alloc(300, 0xab));
+    writeFileSync(
+      join(finalDir(), DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: REPO, revision: SHA_OLD, files: ['config.json', 'model.safetensors'], completedAt: 'x' }),
+    );
+    hub.sha = SHA_NEW; // the resolved revision differs from the installed SHA_OLD
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const id = manager.start(REPO);
+    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+
+    // It genuinely downloaded the resolved revision (never falsely reported done)…
+    expect(hub.downloaded).toEqual(expect.arrayContaining(['config.json', 'model.safetensors']));
+    // …and the owned-swap replaced the old 0xAB content with the fresh zero-bytes.
+    expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12));
+    expect(readFileSync(join(finalDir(), 'model.safetensors'))).toEqual(Buffer.alloc(300));
+    // The published marker now records the newly resolved revision; no backup leaked.
+    const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
+      revision: string;
+    };
+    expect(marker.revision).toBe(SHA_NEW);
+    expect(backupDirs()).toEqual([]);
+    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
+  });
+
   it('re-fetches and recovers when a corrupt cached blob fails the sha256 check', async () => {
     hub.manifest = [
       { type: 'file', path: 'config.json', size: 12 },

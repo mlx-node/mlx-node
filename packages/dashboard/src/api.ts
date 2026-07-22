@@ -7,7 +7,7 @@
  * and pi's `SessionManager` for transcripts/rename — never the native addon.
  */
 
-import { existsSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { basename, dirname, join, sep } from 'node:path';
 
@@ -108,6 +108,25 @@ export interface MetricsOverview {
 }
 
 const MAX_BODY_BYTES = 1024 * 1024;
+
+/**
+ * A session file modified within this window may be actively written by a live
+ * agent turn (a SEPARATE process — pi has no cross-process lock). The rename writes
+ * the durable name into the pi session JSONL: `SessionManager.open` snapshots the
+ * current leaf and `appendSessionInfo` parents the new entry to it, so a turn
+ * appended by a concurrent agent between our snapshot and append becomes a sibling
+ * of the rename — on the next resume one of them is orphaned (the turn is lost, or
+ * the rename silently vanishes). We refuse the rename while the file looks active
+ * (mtime inside this window) and only proceed for an idle session.
+ *
+ * This is a best-effort PRODUCT rule, not a hard guarantee: a session idle past this
+ * window that then goes live, or one that goes live within the stat→append window,
+ * can still race. It removes the realistic reachability, not the theoretical race.
+ * Storing the name index-only is not an alternative — it would break the disposable-
+ * index invariant (the rename would be lost when `dashboard.db` is rebuilt from the
+ * JSONL source of truth), so the durable JSONL write is the only correct home.
+ */
+const LIVE_SESSION_WINDOW_MS = 30_000;
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
@@ -638,6 +657,24 @@ async function handleSessionRename({ req, res, params, deps }: RouteCtx): Promis
     sendError(res, 409, 'Session file has incomplete/malformed records; cannot rename without data loss');
     return;
   }
+  // Liveness pre-check: a session whose file was modified within LIVE_SESSION_WINDOW_MS
+  // may be actively written by a concurrent agent turn (see the constant's note).
+  // Renaming it would race that turn with no cross-process lock to protect us, so
+  // refuse while it looks active and only append for an idle session.
+  let mtimeMs: number;
+  try {
+    mtimeMs = statSync(found.path).mtimeMs;
+  } catch {
+    // The file changed under us since the checks above; reconcile and refuse rather
+    // than open a file that may have been swapped out.
+    await deps.runIngest();
+    sendError(res, 409, `Session "${params.id}" no longer matches its indexed file`);
+    return;
+  }
+  if (Date.now() - mtimeMs < LIVE_SESSION_WINDOW_MS) {
+    sendError(res, 409, 'Cannot rename a session that is currently active; try again once the agent is idle.');
+    return;
+  }
   try {
     const manager = SessionManager.open(found.path);
     manager.appendSessionInfo(name);
@@ -769,6 +806,15 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
   // per-model / overall turn COUNT.
   const traceOnly = 'trace_id NOT IN (SELECT trace_id FROM turns WHERE trace_id IS NOT NULL)';
 
+  // The turns side's `input_tokens` is pi `usage.input`, already NET of cache
+  // (`max(0, promptTokens - cacheRead)`; see packages/agent/src/provider/events.ts).
+  // A trace row instead stores GROSS `prompt_tokens` (provider/index.ts). Projecting
+  // gross into the same `input` column as the turns side double-counts cached tokens
+  // for trace-only rows, so clamp the trace side to the producer's net value:
+  // `MAX(prompt - cached, 0)` (SQLite two-arg `MAX(a,b)` is the scalar clamp). The
+  // other projected trace columns are already apples-to-apples with turns.
+  const traceNetInput = 'MAX(COALESCE(prompt_tokens, 0) - COALESCE(cached_tokens, 0), 0)';
+
   const tokensByDay = sqlite
     .prepare(
       `SELECT date(ts / 1000, 'unixepoch') AS day,
@@ -779,7 +825,7 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
        FROM (SELECT input_tokens, output_tokens, cached_tokens, reasoning_tokens, ts
              FROM turns ${turnsWhere('ts > 0')} GROUP BY ${dedupKey}
              UNION ALL
-             SELECT prompt_tokens, output_tokens, cached_tokens, reasoning_tokens, ts
+             SELECT ${traceNetInput}, output_tokens, cached_tokens, reasoning_tokens, ts
              FROM traces ${tracesWhere(`ts > 0 AND ${traceOnly}`)})
        GROUP BY day ORDER BY day`,
     )
@@ -867,7 +913,7 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
        FROM (SELECT input_tokens, output_tokens, cached_tokens, reasoning_tokens
              FROM turns ${turnsWhere('')} GROUP BY ${dedupKey}
              UNION ALL
-             SELECT prompt_tokens, output_tokens, cached_tokens, reasoning_tokens
+             SELECT ${traceNetInput}, output_tokens, cached_tokens, reasoning_tokens
              FROM traces ${tracesWhere(traceOnly)})`,
     )
     .get(...turnsRange.args, ...tracesRange.args);

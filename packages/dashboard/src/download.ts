@@ -51,6 +51,7 @@ import {
   isModelInstalled,
   isSafeRelPath,
   isWeightFile,
+  readCompletion,
 } from './models.js';
 
 /** Bounded re-fetch attempts for a staged file that fails post-copy verification. */
@@ -570,9 +571,20 @@ export class DownloadManager {
       job.totalBytes = totalBytes;
       this.emit({ type: 'start', id: job.id, repo: job.repo, totalBytes, fileCount: files.length });
 
-      // Already published and complete (marker present): the resume/skip case —
-      // re-downloading nothing.
-      if (isModelInstalled(finalDir)) {
+      // Already published, complete, AND pinned to THIS repo+revision (marker
+      // present): the resume/skip case — re-downloading nothing. Gating on the
+      // marker's identity is load-bearing: a complete install of a DIFFERENT
+      // revision (or repo) of the same slug must NOT read as done at this revision's
+      // byte total. On a mismatch, fall through to download the resolved revision;
+      // publish's `isDownloaderOwned`-guarded owned-swap then replaces the stale one
+      // (an UNOWNED dir without our marker is still refused there, never destroyed).
+      const installed = readCompletion(finalDir);
+      if (
+        installed !== undefined &&
+        installed.repo === job.repo &&
+        installed.revision === revision &&
+        isModelInstalled(finalDir)
+      ) {
         job.receivedBytes = totalBytes;
         job.state = 'done';
         this.emit({ type: 'done', id: job.id, outputDir: finalDir });

@@ -771,4 +771,45 @@ describe('ingestSessions', () => {
 
     rmSync(soloBase, { recursive: true, force: true });
   });
+
+  // Finding 8: a file swapped to `<header>\nnull\n` is valid JSONL (parses to
+  // [header, null]) but a top-level `null` entry has no `.type`/`.id` to walk.
+  // `isValidSessionTopology` must reject it (return false) instead of throwing a
+  // TypeError that escapes every quarantine branch — otherwise the stale session +
+  // turn rows survive every rescan forever and keep feeding overview metrics. The
+  // rejection routes the file into the topology-quarantine branch, removing them.
+  it('quarantines stale rows when a regular file is swapped to a top-level null transcript', async () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-null-topology-'));
+    const root = join(soloBase, 'sessions');
+    const file = writeSessionFile(soloBase, 's.jsonl', [
+      { type: 'session', version: 3, id: 'nl-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
+      { type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-01T10:00:01.000Z', message: { role: 'user', content: 'hi' } },
+      {
+        type: 'message',
+        id: 'a1',
+        parentId: 'u1',
+        timestamp: '2026-07-01T10:00:02.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'yo' }], model: 'qwen3_5', usage: { input: 5, output: 6 } },
+      },
+    ]);
+    await ingestSessions(dash, root);
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'nl-1')).all()).toHaveLength(1);
+    expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'nl-1')).all()).toHaveLength(1);
+
+    // Swap the SAME path to a valid header followed by a literal `null` line.
+    const header = JSON.stringify({ type: 'session', version: 3, id: 'nl-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' });
+    writeFileSync(file, `${header}\nnull\n`);
+    const later = Date.now() / 1000 + 5;
+    utimesSync(file, later, later);
+
+    const res = await ingestSessions(dash, root);
+    // Quarantined via the topology branch (not thrown past every branch).
+    expect(res.warnings.some((w) => /cycle|duplicate|invalid session tree/i.test(w))).toBe(true);
+    expect(res.removed).toBe(1);
+    // The stale session AND its token turns are REMOVED, not retained forever.
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'nl-1')).all()).toHaveLength(0);
+    expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'nl-1')).all()).toHaveLength(0);
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
 });

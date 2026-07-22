@@ -32,7 +32,7 @@ mlx dashboard --models-dir ./models # read local models from a specific dir
 | -------------- | ------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
 | Overview       | Stat tiles (models/disk, sessions, tokens 7d, cache size + hit rate), recent sessions, active downloads | —                                                                |
 | Models         | Local table: name, family, quant, size, ctx window                                                      | delete; install from the recommended catalog (live SSE progress) |
-| Sessions       | Table with search + filters (cwd, model, date)                                                          | open, rename, delete, copy resume command                        |
+| Sessions       | Table with search + filters (cwd, model, date)                                                          | open, rename (idle only, see below), delete, copy resume command |
 | Session detail | Transcript (collapsible tool calls) + per-turn tokens / tok-s chips + charts                            | —                                                                |
 | Metrics        | Tokens/day (in/out/cached), tok/s + TTFT per model, MTP acceptance, model share                         | date range                                                       |
 | Cache          | Cold-tier disk usage vs quota, entry count + age histogram, hit/miss trend                              | clear all, evict older-than-N-days                               |
@@ -136,11 +136,23 @@ Read-only `GET` endpoints plus a few guarded mutations. `GET /health` returns
 | `/api/downloads/:id/events` | GET (SSE)    | Per-file + byte progress, resume-aware                      |
 | `/api/sessions`             | GET          | Indexed session list; search + filters                      |
 | `/api/sessions/:id`         | GET          | Transcript (active branch) + per-turn usage                 |
-| `/api/sessions/:id`         | PATCH/DELETE | Rename / delete file + rows                                 |
+| `/api/sessions/:id`         | PATCH/DELETE | Rename (refused while active, see below) / delete file + rows |
 | `/api/sessions/:id/metrics` | GET          | Joined trace metrics for the session                        |
 | `/api/metrics/overview`     | GET          | Aggregates: tokens/day, tok/s + TTFT, MTP acceptance, share |
 | `/api/cache`                | GET / DELETE | Cold-tier scan / clear all or evict older-than-N-days       |
 | `/api/ingest`               | POST         | Trigger an incremental rescan                               |
+
+**Rename is durable but idle-only.** A rename appends a `session_info` entry to the
+pi session JSONL (the source of truth) — it is *not* stored index-only, because the
+SQLite index is disposable and would lose the name on the next rebuild. pi has no
+cross-process lock, so if a live agent (a separate process) appends a turn between
+the dashboard's snapshot of the file and its append, one of the two writes is
+orphaned on the next resume. To avoid that race the rename is **refused with 409
+while the session file appears active** (modified within the last ~30 s); rename an
+idle session instead. This is a best-effort product rule, not a hard guarantee: a
+session that goes idle and is then written concurrently, or one that goes live
+inside the brief check→append window, can still race — the pre-check removes the
+realistic reachability, it does not eliminate the theoretical race.
 
 ## Design
 

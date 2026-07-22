@@ -106,6 +106,36 @@ export function isModelInstalled(modelDir: string): boolean {
 }
 
 /**
+ * Parse the atomic-publish completion marker in `finalDir` into its typed shape, or
+ * `undefined` when the marker is absent or invalid. Unlike {@link isModelInstalled}
+ * (a boolean "is a loadable checkpoint present") this surfaces the pinned snapshot's
+ * IDENTITY — `repo` + `revision` — so a caller can tell WHICH revision a complete
+ * install holds. The download runner uses it to avoid falsely reporting a complete
+ * install of a DIFFERENT revision as already-done. It does not verify the listed
+ * files still exist on disk (that is `isModelInstalled`'s job); callers pair the two.
+ */
+export function readCompletion(finalDir: string): DownloadCompletion | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(join(finalDir, DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as unknown;
+  } catch {
+    return undefined;
+  }
+  const marker = asObject(parsed);
+  if (
+    marker === undefined ||
+    typeof marker.repo !== 'string' ||
+    typeof marker.revision !== 'string' ||
+    typeof marker.completedAt !== 'string' ||
+    !Array.isArray(marker.files) ||
+    !marker.files.every((file) => typeof file === 'string')
+  ) {
+    return undefined;
+  }
+  return { repo: marker.repo, revision: marker.revision, files: marker.files, completedAt: marker.completedAt };
+}
+
+/**
  * Whether a directory was written by the dashboard downloader — i.e. it carries
  * a parseable completion marker of our shape. Distinct from {@link isModelInstalled}:
  * ownership does NOT require every listed file to still be present (a partial,

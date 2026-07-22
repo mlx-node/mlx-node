@@ -100,6 +100,22 @@ export async function ingestTraces(
     return { files, records, pruned };
   }
 
+  // Reconcile rows whose backing file has vanished (renamed or manually deleted)
+  // BEFORE the per-file ingest loop. `traces.trace_id` is globally UNIQUE and
+  // independent of source_file, so a trace moved from a.jsonl to b.jsonl cannot be
+  // inserted under b while a.jsonl still owns its unique row (`onConflictDoNothing`
+  // skips it); if a.jsonl's row were only reconciled AFTER the loop, that skipped
+  // trace would end up in NO row and never re-insert (the next scan skips b by its
+  // watermark). Deleting a.jsonl's rows up front lets b's insert find no conflict.
+  // Rows with a NULL source_file predate source tracking and are left untouched.
+  const liveFiles = new Set(readdirSync(traceDir).filter((n) => n.endsWith('.jsonl')));
+  const trackedSources = sqlite
+    .prepare('SELECT DISTINCT source_file AS sf FROM traces WHERE source_file IS NOT NULL')
+    .all() as Array<{ sf: string }>;
+  for (const { sf } of trackedSources) {
+    if (!liveFiles.has(sf)) db.delete(traces).where(eq(traces.sourceFile, sf)).run();
+  }
+
   for (const name of readdirSync(traceDir)) {
     if (!name.endsWith('.jsonl')) continue;
     const filePath = join(traceDir, name);
@@ -231,20 +247,13 @@ export async function ingestTraces(
     }
   }
 
-  // Reconcile rows whose backing file has vanished (manually deleted, or pruned
-  // in an earlier partial run). Rows with a NULL source_file predate source
-  // tracking and are left untouched.
+  // Reconcile watermark rows whose file has vanished (pruned in the loop above, or
+  // manually deleted) so the table tracks only live files and a reused filename is
+  // never wrongly skipped. Recomputed here — AFTER the loop — so a file just pruned
+  // is included in the vanished set. (The trace-row reconciliation runs BEFORE the
+  // loop; see the note there — a renamed file's row must be freed before its new
+  // name is ingested.)
   const live = new Set(readdirSync(traceDir).filter((n) => n.endsWith('.jsonl')));
-  const tracked = sqlite
-    .prepare('SELECT DISTINCT source_file AS sf FROM traces WHERE source_file IS NOT NULL')
-    .all() as Array<{ sf: string }>;
-  for (const { sf } of tracked) {
-    if (!live.has(sf)) db.delete(traces).where(eq(traces.sourceFile, sf)).run();
-  }
-
-  // Reconcile watermark rows the same way: drop any whose file has vanished
-  // (pruned or manually deleted) so the table tracks only live files and a
-  // reused filename is never wrongly skipped.
   const trackedFiles = db.select({ name: traceFiles.name }).from(traceFiles).all();
   for (const { name: tracked } of trackedFiles) {
     if (!live.has(tracked)) db.delete(traceFiles).where(eq(traceFiles.name, tracked)).run();

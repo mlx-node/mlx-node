@@ -566,6 +566,17 @@ fn snapshot_shard_identities(dir: &Path) -> Option<HashMap<String, ShardIdentity
 /// of scope; closing it soundly would require the fingerprint to hash the same
 /// held fd that backs the loaded arrays (an fd-coupled loader restructure), not
 /// point-in-time stat snapshots.
+///
+/// A second residual is temporal, not spatial: this bracket closes BEFORE the
+/// weights are materialized. MLX reads shard bytes lazily, at
+/// `array::memory::materialize_weights`, well after `attach_cold_tier` — so a
+/// same-inode in-place shard rewrite in the resulting fingerprint→materialize
+/// window materializes new bytes under the already-attached fingerprint. Unlike
+/// the ABA swap above it need not preserve mtime or be restored, since no
+/// snapshot follows it before materialization. These snapshots bracket the mmap,
+/// not the materialize; only the same fd-coupled fingerprint (hashing the held
+/// fd that backs the loaded arrays) would close this window too, and it stays
+/// out of scope.
 fn shard_identities_stable(
     before_mmap: &Option<HashMap<String, ShardIdentity>>,
     at_mmap: &Option<HashMap<String, ShardIdentity>>,

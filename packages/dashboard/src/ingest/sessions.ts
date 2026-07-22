@@ -118,6 +118,18 @@ export function activeBranchEntries(entries: FileEntry[]): SessionEntry[] {
  * cycle.
  */
 export function isValidSessionTopology(entries: FileEntry[]): boolean {
+  // A syntactically-valid but non-object entry (`null`, a scalar, an array) has no
+  // `type`/`id`/`parentId` to walk. `parseSessionEntries` keeps such lines verbatim
+  // (a `header\nnull\n` file parses to `[header, null]`), so dereferencing one —
+  // starting with the `.type` filter just below — throws a TypeError that escapes
+  // every ingest quarantine branch, leaving the stale rows to feed the overview
+  // forever. Reject the whole file's topology BEFORE any `.type`/`.id` access so the
+  // caller routes it into the existing topology-quarantine branch (removing the
+  // rows), and so the downstream `activeBranchEntries`/`deriveSession` projections
+  // — which would throw the same way — are never reached.
+  for (const entry of entries) {
+    if (entry === null || typeof entry !== 'object') return false;
+  }
   const sessionEntries = entries.filter((e): e is SessionEntry => e.type !== 'session');
   const byId = new Map<string, SessionEntry>();
   for (const entry of sessionEntries) {
