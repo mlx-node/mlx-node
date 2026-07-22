@@ -264,6 +264,16 @@ function ChapterPager({
   const locale = useLocale();
   const chapters = localizedChapters(locale);
 
+  // Preserve the active query string (e.g. ?model_url=…) on the native href so a
+  // modifier / middle-click that opens the neighbor in a NEW tab carries the same
+  // model config the in-app SPA nav already preserves (locale-navigate keeps it
+  // via `search: (prev) => prev`). Read after mount so the initial prerendered
+  // href stays param-free — no hydration mismatch.
+  const [search, setSearch] = React.useState('');
+  React.useEffect(() => {
+    setSearch(window.location.search);
+  }, []);
+
   const flat: PagerEntry[] = [];
   for (const c of chapters) {
     if (!c.available) continue;
@@ -288,12 +298,12 @@ function ChapterPager({
     <nav aria-label={ui.lessonLayout.pagerLabel} className="mt-12 grid grid-cols-2 gap-3 border-t border-border pt-6">
       {/* Empty cells keep a lone Previous left and a lone Next right. */}
       {prev ? (
-        <PagerLink entry={prev} direction="prev" label={ui.lessonLayout.prevLabel} locale={locale} onOpen={open} />
+        <PagerLink entry={prev} direction="prev" label={ui.lessonLayout.prevLabel} locale={locale} search={search} onOpen={open} />
       ) : (
         <span aria-hidden="true" />
       )}
       {next ? (
-        <PagerLink entry={next} direction="next" label={ui.lessonLayout.nextLabel} locale={locale} onOpen={open} />
+        <PagerLink entry={next} direction="next" label={ui.lessonLayout.nextLabel} locale={locale} search={search} onOpen={open} />
       ) : (
         <span aria-hidden="true" />
       )}
@@ -306,12 +316,14 @@ function PagerLink({
   direction,
   label,
   locale,
+  search,
   onOpen,
 }: {
   entry: PagerEntry;
   direction: 'prev' | 'next';
   label: string;
   locale: Parameters<typeof localePath>[0];
+  search: string;
   onOpen: (entry: PagerEntry) => void;
 }) {
   const isNext = direction === 'next';
@@ -324,7 +336,7 @@ function PagerLink({
   };
   return (
     <a
-      href={localePath(locale, entry.path)}
+      href={localePath(locale, entry.path) + search}
       onClick={handleClick}
       aria-label={`${label}: ${entry.title}`}
       className={[
