@@ -766,25 +766,46 @@ impl ColdCacheManager {
         }
     }
 
-    /// Load and validate a block. Every failed read is a miss; a payload
-    /// that existed but failed validation additionally counts as a
-    /// corruption (an entry that could not be opened never does). Failure
-    /// cleanup runs under the same index lock the writer holds across
-    /// [rename + index publish]; [`prune_failed_load`] clears the canonical
-    /// name only when the entry there is the one observed to fail
-    /// (dev+inode) or is a non-regular type that can never be a writer
-    /// commit, so an in-process writer's freshly committed replacement is
-    /// never deleted or de-indexed; the failed-open identity snapshot is
-    /// itself taken under that lock, so the writer can never publish
-    /// between a failed open and the snapshot. Coordination is in-process
-    /// only: a concurrent *process* mutating the same root stays fail-open
-    /// — the worst case is a stale index entry, one recomputed prefix, or
-    /// one lost persist (an external actor swapping the entry inside the
-    /// stat window right after a failed open).
+    /// Load and validate a block, bounding the restore read by the manager's
+    /// quota — no single persisted entry can exceed it, since the writer
+    /// evicts to keep the whole index within quota. The geometry-aware restore
+    /// path ([`Self::restore_block`]) instead passes a tighter, pool-derived
+    /// cap via [`Self::load_bounded`]. See [`Self::load_bounded`] for the full
+    /// failure/pruning contract.
     pub fn load(
         &self,
         key: ColdCacheKey,
         fingerprint: ColdCacheFingerprint,
+    ) -> Option<ColdCacheBlock> {
+        self.load_bounded(key, fingerprint, self.shared.quota_bytes)
+    }
+
+    /// Load and validate a block, reading at most `max_encoded` bytes so a
+    /// corrupt/tampered oversized entry (possibly a sparse regular file whose
+    /// `st_size` reports gigabytes) can never drive an unbounded allocation:
+    /// the read streams through `take(max_encoded + 1)` and an entry longer
+    /// than `max_encoded` is treated as corruption (miss + `corruptions`
+    /// bump + prune), identical to any decode failure — fail-open.
+    ///
+    /// Every failed read is a miss; a payload that existed but failed
+    /// validation additionally counts as a corruption (an entry that could
+    /// not be opened never does). Failure cleanup runs under the same index
+    /// lock the writer holds across [rename + index publish];
+    /// [`prune_failed_load`] clears the canonical name only when the entry
+    /// there is the one observed to fail (dev+inode) or is a non-regular type
+    /// that can never be a writer commit, so an in-process writer's freshly
+    /// committed replacement is never deleted or de-indexed; the failed-open
+    /// identity snapshot is itself taken under that lock, so the writer can
+    /// never publish between a failed open and the snapshot. Coordination is
+    /// in-process only: a concurrent *process* mutating the same root stays
+    /// fail-open — the worst case is a stale index entry, one recomputed
+    /// prefix, or one lost persist (an external actor swapping the entry
+    /// inside the stat window right after a failed open).
+    fn load_bounded(
+        &self,
+        key: ColdCacheKey,
+        fingerprint: ColdCacheFingerprint,
+        max_encoded: u64,
     ) -> Option<ColdCacheBlock> {
         let name = block_file_name(&key);
         let mut observed_identity = None;
@@ -824,10 +845,22 @@ impl ColdCacheManager {
             Ok(mut file) => {
                 observed_identity = open_identity(&file);
                 let mut bytes = Vec::new();
-                let read = file
+                // Bounded slurp: cap the read at the caller's geometry-derived
+                // maximum (+1 so an over-cap file is detectable). A sparse
+                // regular file reports a huge `st_size`, but `take` caps the
+                // allocation; anything exceeding the bound is treated as
+                // corruption and never read in full.
+                let read = (&mut file)
+                    .take(max_encoded.saturating_add(1))
                     .read_to_end(&mut bytes)
                     .map_err(|e| e.to_string())
-                    .and_then(|_| decode_block(&bytes, key, fingerprint));
+                    .and_then(|_| {
+                        if bytes.len() as u64 > max_encoded {
+                            Err("cold-cache entry exceeds geometry bound".to_string())
+                        } else {
+                            decode_block(&bytes, key, fingerprint)
+                        }
+                    });
                 opened_file = Some(file);
                 read
             }
@@ -892,7 +925,10 @@ impl ColdCacheManager {
         fingerprint: ColdCacheFingerprint,
         identity: &RestorePrefixIdentity,
     ) -> Option<Arc<PhysicalBlock>> {
-        let cold = self.load(key, fingerprint)?;
+        // Bound the restore read by the exact pool geometry this block's layout
+        // is validated against just below, so a tampered oversized entry at the
+        // canonical name is a bounded miss, never a gigabyte allocation.
+        let cold = self.load_bounded(key, fingerprint, max_encoded_len_for_pool(pool))?;
         if cold.tokens != identity.tokens || !layout_matches_pool(&cold.layout, pool) {
             return None;
         }
@@ -942,6 +978,27 @@ impl ColdCacheManager {
             }
         }
     }
+}
+
+/// Upper bound on a legitimately-encoded block for `pool`, mirroring
+/// [`ColdCacheBlock::encoded_len`]: all layers' K+V bytes (via
+/// [`crate::profile::bytes_per_block`], which is exactly
+/// `num_layers * (key_bytes_per_layer + value_bytes_per_layer)`), the block's
+/// per-token `u32` ids, and the encoder's fixed header/JSON slop (`+4096`).
+/// A degenerate (zero-factor) geometry yields the slop-only floor, which fails
+/// closed by rejecting every real block — the pool would fail
+/// [`layout_matches_pool`] anyway.
+fn max_encoded_len_for_pool(pool: &LayerKVPool) -> u64 {
+    let kv_bytes = crate::profile::bytes_per_block(
+        pool.num_layers() as u32,
+        pool.config().num_kv_heads,
+        pool.config().head_size,
+        pool.block_size(),
+        pool.cache_dtype(),
+    )
+    .unwrap_or(0);
+    let token_bytes = pool.block_size() as u64 * size_of::<u32>() as u64;
+    kv_bytes.saturating_add(token_bytes).saturating_add(4096)
 }
 
 fn layout_matches_pool(layout: &ColdCacheLayout, pool: &LayerKVPool) -> bool {
@@ -1882,6 +1939,70 @@ mod tests {
         persist_block(&manager.shared, &block(key))
             .expect("clearing must unblock re-persisting the same key");
         assert_eq!(manager.load(key, fingerprint()), Some(block(key)));
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_bounded_rejects_oversized_entry_without_unbounded_alloc() {
+        let root = temp_root("bounded-oversized");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let good = block(key);
+        // Tight, geometry-derived cap: the legit entry's encoded upper bound.
+        let max_encoded = good.encoded_len();
+        persist_block(&manager.shared, &good).unwrap();
+        assert!(manager.contains(&key));
+        assert_eq!(
+            manager.load_bounded(key, fingerprint(), max_encoded),
+            Some(good.clone()),
+            "the legitimate entry must still load within its own encoded bound"
+        );
+
+        // Replace the committed entry with a huge SPARSE regular file:
+        // `st_size` reports gigabytes but no data blocks are allocated. An
+        // unbounded `read_to_end` would try to allocate that many bytes; the
+        // bounded read must cap the allocation and treat it as corruption.
+        let path = root.join(format!("{}.safetensors", key.to_hex()));
+        fs::remove_file(&path).unwrap();
+        let huge = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        huge.set_len(8 * GIB).unwrap();
+        drop(huge);
+
+        let before = manager.stats().corruptions;
+        assert!(
+            manager
+                .load_bounded(key, fingerprint(), max_encoded)
+                .is_none(),
+            "an entry exceeding the geometry bound must miss, not slurp gigabytes"
+        );
+        let after = manager.stats();
+        assert_eq!(
+            after.corruptions,
+            before + 1,
+            "an oversized entry counts as a corruption, like any decode failure"
+        );
+        assert_eq!(after.misses, 1);
+        assert!(
+            !manager.contains(&key),
+            "the oversized entry must be pruned from the index on the miss"
+        );
+        assert!(
+            fs::symlink_metadata(&path).is_err(),
+            "the oversized file must be cleared from the canonical name"
+        );
+
+        // Pruning must unblock re-persisting the same key, which then loads
+        // back cleanly through the geometry-free public wrapper.
+        persist_block(&manager.shared, &good)
+            .expect("clearing must unblock re-persisting the same key");
+        assert_eq!(manager.load(key, fingerprint()), Some(good));
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }

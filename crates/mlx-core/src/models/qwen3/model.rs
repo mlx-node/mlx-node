@@ -416,26 +416,29 @@ impl Qwen3Inner {
         self.tokenizer = Some(tokenizer);
     }
 
-    /// Wire the process-global SSD cold tier into the paged adapter.
+    /// Build the process-global SSD cold-tier context (manager + COMPLETE
+    /// content fingerprint) for `model_path` WITHOUT attaching it, so the
+    /// caller can re-verify shard identity is unchanged across the fingerprint
+    /// read before committing (see `load_with_thread`'s bracketing snapshots).
     ///
     /// The fingerprint binds to the COMPLETE weight identity of every shard —
-    /// the download manifest's immutable commit revision when it covers all
-    /// shards (cheap, no weight read), else a full streaming digest of each
-    /// shard's bytes — never a sampled slice, so two same-architecture
-    /// finetunes (identical shard filenames and byte sizes) can never share a
-    /// fingerprint and cross-restore each other's KV. Cache geometry and the
-    /// weight_map index strengthen it further. No-op (fail-open) when the
-    /// paged adapter is absent or the cold tier cannot be opened, and
-    /// fail-SAFE (persistence stays off) when a complete content fingerprint
-    /// cannot be established — see
+    /// the download manifest's immutable commit revision (plus each shard's
+    /// size and mtime) when it covers all shards (cheap, no weight read), else
+    /// a full streaming digest of each shard's bytes — never a sampled slice,
+    /// so two same-architecture finetunes (identical shard filenames and byte
+    /// sizes) can never share a fingerprint and cross-restore each other's KV.
+    /// Cache geometry and the weight_map index strengthen it further.
+    ///
+    /// Returns `None` (fail-open) when the paged adapter is absent or the cold
+    /// tier cannot be opened, and fail-SAFE (with a warning) when a complete
+    /// content fingerprint cannot be established — see
     /// [`crate::cold_tier::build_model_fingerprint`].
-    pub fn enable_cold_tier(&mut self, model_path: &str) {
-        let Some(adapter) = self.paged_adapter.as_mut() else {
-            return;
-        };
-        let Some(manager) = crate::cold_tier::global_cold_cache() else {
-            return;
-        };
+    pub(crate) fn build_cold_tier_context(
+        &self,
+        model_path: &str,
+    ) -> Option<crate::transformer::paged_kv_cache_adapter::ColdTierContext> {
+        let adapter = self.paged_adapter.as_ref()?;
+        let manager = crate::cold_tier::global_cold_cache()?;
         let config_json = serde_json::to_vec(&self.config).ok();
         let pool = adapter.layer_kv_pool();
         let geometry = crate::cold_tier::ColdTierGeometry {
@@ -445,24 +448,40 @@ impl Qwen3Inner {
             head_size: pool.config().head_size as u64,
             cache_dtype: format!("{:?}", pool.cache_dtype()),
         };
-        let Some(fingerprint) = crate::cold_tier::build_model_fingerprint(
+        match crate::cold_tier::build_model_fingerprint(
             "qwen3",
             model_path,
             config_json.as_deref(),
             &geometry,
-        ) else {
-            warn!(
-                "cold-tier persistence disabled for {model_path}: could not establish a \
-                 content fingerprint (unreadable or missing weight shard)"
-            );
-            return;
-        };
-        adapter.set_cold_tier(
-            crate::transformer::paged_kv_cache_adapter::ColdTierContext {
-                manager,
-                fingerprint,
-            },
-        );
+        ) {
+            Some(fingerprint) => Some(
+                crate::transformer::paged_kv_cache_adapter::ColdTierContext {
+                    manager,
+                    fingerprint,
+                },
+            ),
+            None => {
+                warn!(
+                    "cold-tier persistence disabled for {model_path}: could not establish a \
+                     content fingerprint (unreadable or missing weight shard)"
+                );
+                None
+            }
+        }
+    }
+
+    /// Attach a previously-built cold-tier context to the paged adapter. A
+    /// no-op (fail-open) when the paged adapter is absent. Split from
+    /// [`Self::build_cold_tier_context`] so the caller can verify shard
+    /// identity is still stable AFTER the fingerprint read and BEFORE the cold
+    /// tier is committed.
+    pub(crate) fn attach_cold_tier(
+        &mut self,
+        ctx: crate::transformer::paged_kv_cache_adapter::ColdTierContext,
+    ) {
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            adapter.set_cold_tier(ctx);
+        }
     }
 
     /// Store the checkpoint's parsed `generation_config.json` defaults.

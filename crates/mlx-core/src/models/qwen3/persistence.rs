@@ -549,6 +549,25 @@ fn snapshot_shard_identities(dir: &Path) -> Option<HashMap<String, ShardIdentity
     Some(identities)
 }
 
+/// True only if the shard identity is provably unchanged across all three
+/// bracketing snapshots: before the mmap, right after the mmap, and after the
+/// cold-tier fingerprint has read the shards. Any `None` (a shard/directory
+/// that could not be stat'd at some checkpoint) or any difference means the
+/// mmap'd bytes might not be the bytes the fingerprint described, so the caller
+/// must leave cold persistence off (fail-safe). Requiring equality across the
+/// full bracket closes both the swap-straddles-mmap and the
+/// swap-during-fingerprint-read windows.
+fn shard_identities_stable(
+    before_mmap: &Option<HashMap<String, ShardIdentity>>,
+    at_mmap: &Option<HashMap<String, ShardIdentity>>,
+    after_fingerprint: &Option<HashMap<String, ShardIdentity>>,
+) -> bool {
+    match (before_mmap, at_mmap, after_fingerprint) {
+        (Some(before), Some(at), Some(after)) => before == at && at == after,
+        _ => false,
+    }
+}
+
 /// Spawn a dedicated model thread, load all weights inside init_fn.
 ///
 /// Returns a thin `Qwen3Model` NAPI shell with the thread handle.
@@ -603,16 +622,33 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                         config.num_kv_heads,
                     );
 
-                    // Load weights
+                    // Snapshot each shard's on-disk identity BEFORE the mmap.
+                    // The mmap below (`load_safetensors_mapped`) maps+closes
+                    // internally, so Rust never holds the fd; this snapshot pins
+                    // the file the mmap is ABOUT to map, closing the window in
+                    // which a swap straddling the mmap syscall would leave OLD
+                    // bytes mapped under a NEW inode. Paired with the
+                    // after-fingerprint snapshot below it brackets the ENTIRE
+                    // load-to-fingerprint span. Only needed when persistence is
+                    // on.
+                    let persist_cold = config.persist_paged_cache.unwrap_or(false);
+                    let shard_snapshot_before_mmap = if persist_cold {
+                        snapshot_shard_identities(path)
+                    } else {
+                        None
+                    };
+
+                    // Load weights (mmap)
                     let mapped_params = load_safetensors_mapped(path)?;
 
-                    // Snapshot each shard's on-disk identity NOW, against the
-                    // same inodes the mmap above pinned. Re-checked just before
+                    // Second snapshot, against the same inodes the mmap pinned.
+                    // Re-checked (with the before-mmap snapshot and a third
+                    // snapshot taken after the fingerprint read) just before
                     // enabling the cold tier so a mid-load model-directory swap
                     // (a separate process reinstalling a different same-shaped
                     // revision) can never bind the OLD weights to the NEW
-                    // revision's fingerprint. Only needed when persistence is on.
-                    let shard_snapshot_at_mmap = if config.persist_paged_cache.unwrap_or(false) {
+                    // revision's fingerprint.
+                    let shard_snapshot_at_mmap = if persist_cold {
                         snapshot_shard_identities(path)
                     } else {
                         None
@@ -650,26 +686,32 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                         path,
                     ));
                     inner.set_tokenizer(Arc::new(tokenizer.clone()));
-                    if config.persist_paged_cache.unwrap_or(false) {
-                        // Fail-closed revalidation: only bind the cold tier if
-                        // every shard is still the same file (dev/ino/size/mtime)
-                        // it was when mmap'd. Any change — or an unreadable shard
-                        // at either snapshot — means the fingerprint could
-                        // describe a different revision than the weights actually
-                        // loaded, so leave persistence off.
-                        let unchanged =
-                            match (&shard_snapshot_at_mmap, snapshot_shard_identities(path)) {
-                                (Some(before), Some(after)) => *before == after,
-                                _ => false,
-                            };
-                        if unchanged {
-                            inner.enable_cold_tier(&model_path);
-                        } else {
-                            tracing::warn!(
-                                "cold-tier persistence disabled for {model_path}: model \
-                                 directory changed during load (shard identity mismatch); \
-                                 KV persistence stays off for safety"
-                            );
+                    if persist_cold {
+                        // Fail-closed revalidation bracketing the WHOLE
+                        // load-to-fingerprint span. Compute the content
+                        // fingerprint FIRST (this reads the shards from disk),
+                        // then re-stat and require shard identity to be
+                        // unchanged across [before-mmap .. at-mmap .. after the
+                        // fingerprint read]. Only then attach the cold tier: any
+                        // change at any checkpoint — or an unreadable shard —
+                        // means the fingerprint could describe a different
+                        // revision than the weights the mmap actually loaded, so
+                        // leave persistence off.
+                        if let Some(ctx) = inner.build_cold_tier_context(&model_path) {
+                            let after_fingerprint = snapshot_shard_identities(path);
+                            if shard_identities_stable(
+                                &shard_snapshot_before_mmap,
+                                &shard_snapshot_at_mmap,
+                                &after_fingerprint,
+                            ) {
+                                inner.attach_cold_tier(ctx);
+                            } else {
+                                tracing::warn!(
+                                    "cold-tier persistence disabled for {model_path}: model \
+                                     directory changed during load (shard identity mismatch); \
+                                     KV persistence stays off for safety"
+                                );
+                            }
                         }
                     }
 
@@ -1002,6 +1044,84 @@ mod cold_tier_shard_identity_tests {
         let snap = snapshot_shard_identities(&dir).expect("snap");
         assert_eq!(snap.len(), 1, "only .safetensors shards are tracked");
         assert!(snap.contains_key("model.safetensors"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bracket_stable_across_all_three_snapshots() {
+        let dir = unique_tmp("bracket-stable");
+        fs::write(dir.join("model.safetensors"), b"weights-v1").unwrap();
+        let before = snapshot_shard_identities(&dir);
+        let at_mmap = snapshot_shard_identities(&dir);
+        let after_fp = snapshot_shard_identities(&dir);
+        assert!(
+            shard_identities_stable(&before, &at_mmap, &after_fp),
+            "unchanged shards across the whole bracket must stay eligible for cold tier"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bracket_swap_straddling_mmap_disables() {
+        // Window 1: a swap between the before-mmap snapshot and the mmap makes
+        // `at_mmap` differ from `before`, even though `at_mmap == after_fp`.
+        let dir = unique_tmp("bracket-window1");
+        let shard = dir.join("model.safetensors");
+        fs::write(&shard, b"weights-v1").unwrap();
+        let before = snapshot_shard_identities(&dir);
+        fs::remove_file(&shard).unwrap();
+        fs::write(&shard, b"weights-v2-different-length").unwrap();
+        let at_mmap = snapshot_shard_identities(&dir);
+        let after_fp = snapshot_shard_identities(&dir);
+        assert!(
+            at_mmap == after_fp,
+            "identity is stable after the straddling swap"
+        );
+        assert!(
+            !shard_identities_stable(&before, &at_mmap, &after_fp),
+            "a swap straddling the mmap must disable cold persistence"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bracket_swap_during_fingerprint_read_disables() {
+        // Window 2: `before == at_mmap`, but a swap during the fingerprint read
+        // makes the after-fingerprint snapshot differ → cold disabled.
+        let dir = unique_tmp("bracket-window2");
+        let shard = dir.join("model.safetensors");
+        fs::write(&shard, b"weights-v1").unwrap();
+        let before = snapshot_shard_identities(&dir);
+        let at_mmap = snapshot_shard_identities(&dir);
+        assert!(before == at_mmap, "no change before the fingerprint read");
+        fs::remove_file(&shard).unwrap();
+        fs::write(&shard, b"weights-v2-different-length").unwrap();
+        let after_fp = snapshot_shard_identities(&dir);
+        assert!(
+            !shard_identities_stable(&before, &at_mmap, &after_fp),
+            "a swap during the fingerprint read must disable cold persistence"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bracket_unreadable_at_any_checkpoint_disables() {
+        let dir = unique_tmp("bracket-none");
+        fs::write(dir.join("model.safetensors"), b"w").unwrap();
+        let snap = snapshot_shard_identities(&dir);
+        assert!(snap.is_some());
+        assert!(
+            !shard_identities_stable(&None, &snap, &snap),
+            "an unreadable before-mmap snapshot must fail safe"
+        );
+        assert!(
+            !shard_identities_stable(&snap, &None, &snap),
+            "an unreadable at-mmap snapshot must fail safe"
+        );
+        assert!(
+            !shard_identities_stable(&snap, &snap, &None),
+            "an unreadable after-fingerprint snapshot must fail safe"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

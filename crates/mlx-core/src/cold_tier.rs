@@ -95,7 +95,14 @@ pub(crate) struct ColdTierGeometry {
 ///    covers every on-disk shard, that repo+revision cryptographically
 ///    identifies the exact bytes of the whole snapshot — so the weight bytes
 ///    need not be read at all. This is the common case (catalog models
-///    installed via the dashboard downloader).
+///    installed via the dashboard downloader). Each shard's on-disk size AND
+///    modification time (nanoseconds) are folded in from the metadata already
+///    read, so any out-of-band write that changes a shard's size OR mtime
+///    yields a different key (safe miss) instead of silently reusing another
+///    revision's persisted KV. The only residual evasion — a deliberate
+///    mtime-preserving, same-size in-place swap — is out of scope (the sound
+///    alternative, a full per-load digest, is a deliberate cold-cache perf
+///    non-goal here).
 ///  * **Full-digest fallback (sound, O(weight bytes)).** Otherwise stream a
 ///    SHA-256 over each shard's entire bytes. This runs once per model load,
 ///    only when persistence is enabled and no trusted manifest covers the
@@ -135,14 +142,27 @@ pub(crate) fn build_model_fingerprint(
 
     match trusted {
         // Cheap manifest identity: the immutable repo+revision pins the exact
-        // snapshot bytes, so shard bytes are NOT read. Names+sizes come from
-        // metadata (no data read) and guard against an on-disk shard swap.
+        // snapshot bytes, so shard bytes are NOT read. Names, sizes, and
+        // modification times come from the SAME metadata (no data read) and
+        // guard against an on-disk shard swap: any out-of-band write that
+        // changes a shard's size OR mtime yields a different key (safe miss),
+        // so a same-size in-place rewrite can no longer silently reuse another
+        // revision's persisted KV. A shard whose mtime cannot be read disables
+        // the cheap path for this load (`?` -> None, fail-safe) rather than
+        // trusting it.
         Some(m) => {
             components.push(b"cold-identity:manifest:v1\0".to_vec());
             for name in &shard_names {
-                let size = std::fs::metadata(dir.join(name)).ok()?.len();
+                let meta = std::fs::metadata(dir.join(name)).ok()?;
+                let size = meta.len();
+                let mtime_nanos = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())?;
                 components.push(name.as_bytes().to_vec());
                 components.push(size.to_le_bytes().to_vec());
+                components.push(mtime_nanos.to_le_bytes().to_vec());
             }
             components.push(m.identity_bytes());
         }
@@ -396,6 +416,18 @@ mod tests {
         build_model_fingerprint("qwen3", dir.to_str().unwrap(), Some(config), &geometry())
     }
 
+    /// Pin a shard file's modification time. The cheap manifest path now folds
+    /// mtime into the fingerprint, so tests that assert cross-dir EQUALITY of
+    /// the cheap path must equalize the shard mtime across the two dirs.
+    fn set_shard_mtime(path: &Path, time: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
     #[test]
     fn fingerprint_binds_to_full_content_beyond_sampled_windows() {
         // Regression for the sampling gap the round-1 fix left open: identical
@@ -571,10 +603,59 @@ mod tests {
         let marker = br#"{"repo":"acme/base","revision":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","files":["config.json","model.safetensors"],"completedAt":"2026-01-01T00:00:00Z"}"#;
         std::fs::write(dir_a.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
         std::fs::write(dir_b.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
+        // Equalize the shard mtime so the ONLY difference is the weight bytes:
+        // the cheap path folds in name+size+mtime+provenance, so proving it
+        // still fingerprints EQUAL here proves it never read the weight bytes.
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        set_shard_mtime(&dir_a.join("model.safetensors"), mtime);
+        set_shard_mtime(&dir_b.join("model.safetensors"), mtime);
         assert_eq!(
             build(&dir_a).unwrap(),
             build(&dir_b).unwrap(),
             "the manifest path must bind to repo+revision and skip reading weight bytes"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn manifest_mtime_discriminates_identical_provenance() {
+        // Regression guard for the cheap-path mtime binding: two dirs identical
+        // in marker (repo+revision), shard filename, shard BYTES, and size, but
+        // with DIFFERENT shard mtimes, must fingerprint DIFFERENTLY. An
+        // out-of-band in-place rewrite that preserves size still moves mtime, so
+        // stale KV can no longer silently cross-restore under an unchanged
+        // marker.
+        let base = unique_tmp("cold-fp-marker-mtime");
+        let dir_a = base.join("a");
+        let dir_b = base.join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        // Byte-identical, same size: only the differing mtime can split them.
+        write_safetensors(
+            &dir_a.join("model.safetensors"),
+            SHARED_HEADER,
+            &[7u8; 4096],
+        );
+        write_safetensors(
+            &dir_b.join("model.safetensors"),
+            SHARED_HEADER,
+            &[7u8; 4096],
+        );
+        let marker = br#"{"repo":"acme/base","revision":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","files":["config.json","model.safetensors"],"completedAt":"2026-01-01T00:00:00Z"}"#;
+        std::fs::write(dir_a.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
+        std::fs::write(dir_b.join(DOWNLOAD_COMPLETE_MARKER), marker).unwrap();
+        set_shard_mtime(
+            &dir_a.join("model.safetensors"),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000),
+        );
+        set_shard_mtime(
+            &dir_b.join("model.safetensors"),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000),
+        );
+        assert_ne!(
+            build(&dir_a).unwrap(),
+            build(&dir_b).unwrap(),
+            "the cheap path must fold in shard mtime so a same-size in-place rewrite splits the fingerprint"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -739,6 +820,12 @@ mod tests {
             br#"{"repo":"acme/base","revision":"cccccccccccccccccccccccccccccccccccccccc","files":["config.json","model.safetensors"],"completedAt":"2026-07-20T12:34:56Z"}"#,
         )
         .unwrap();
+        // Only the manifest `completedAt` differs; equalize the shard mtime so
+        // the cheap-path fingerprint (name+size+mtime+provenance) is driven
+        // purely by the identical repo+revision.
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        set_shard_mtime(&dir_a.join("model.safetensors"), mtime);
+        set_shard_mtime(&dir_b.join("model.safetensors"), mtime);
         assert_eq!(
             build(&dir_a).unwrap(),
             build(&dir_b).unwrap(),
