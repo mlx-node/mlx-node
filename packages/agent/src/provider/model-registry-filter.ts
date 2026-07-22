@@ -31,6 +31,14 @@
  * `/login`; streaming still works because `prepareRequest` calls `getAuth(model)`
  * with `model.provider === 'mlx'`, which passes through.
  *
+ * Surfaces 1-3 patch the runtime's PUBLIC facade, but pi's own internals read the
+ * composed provider map `this.models` (pi-ai `ModelsImpl`) directly — a boundary
+ * the facade patches cannot reach (e.g. `refresh` resolving a command-backed
+ * cloud credential). So there is a 4th, structural surface: the `recomposeProvider`
+ * choke composes ONLY `mlx` into `this.models`, making every internal read
+ * mlx-only by construction. It requires installation before the runtime is
+ * constructed (which `runAgent` guarantees).
+ *
  * Keep this adapter isolated: once pi exposes a first-class provider allowlist
  * in `MainOptions`, this file can be replaced by that option without touching
  * the provider or CLI layers.
@@ -135,6 +143,9 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
   const originals: Record<string, PropertyDescriptor> = {};
   for (const name of STRUCTURAL_METHODS) originals[name] = requireMethodDescriptor(prototype, name);
   originals.getAuth = requireMethodDescriptor(prototype, 'getAuth');
+  // `recomposeProvider` is a private funnel method; capture it by name (it is not
+  // part of the structural interface — see the choke wrapper below).
+  originals.recomposeProvider = requireMethodDescriptor(prototype, 'recomposeProvider');
 
   const iface = originals as unknown as {
     [K in (typeof STRUCTURAL_METHODS)[number]]: { value: FilterableModelRuntime<TModel>[K] };
@@ -153,6 +164,7 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
   const login = iface.login.value;
   const refresh = iface.refresh.value;
   const getAuth = originals.getAuth.value as GetAuthMethod;
+  const recomposeProvider = originals.recomposeProvider.value as (this: object, providerId: string) => void;
 
   Object.defineProperties(prototype, {
     getModels: {
@@ -280,6 +292,25 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
         options: { allowNetwork?: boolean; force?: boolean; signal?: unknown } = {},
       ): Promise<unknown> {
         return refresh.call(this, { ...options, allowNetwork: false });
+      },
+    },
+    recomposeProvider: {
+      ...originals.recomposeProvider,
+      // CHOKE POINT (structural backbone). `recomposeProvider` is the single
+      // funnel that writes a provider into the runtime's model map `this.models`
+      // (pi's `rebuildProviders` sweep of builtins/config + the extension
+      // `registerProvider`/`registerNativeProvider`/`unregisterProvider` paths).
+      // Compose ONLY `mlx`, so `this.models` is mlx-only by construction. That
+      // closes the whole class of INTERNAL `this.models.*` reads the public gates
+      // above cannot reach — most importantly `refresh`'s availability pass, which
+      // resolves a configured cloud provider's credential (executing a
+      // command-backed apiKey) with no allowNetwork gate — plus the `/llama`
+      // getAuth and catalog-refresh paths. Requires install before the runtime is
+      // created (runAgent installs before pi.main constructs it); the mlx provider
+      // registers later via its own `recomposeProvider('mlx')`, allowed through.
+      value(this: object, providerId: string): void {
+        if (providerId !== 'mlx') return;
+        recomposeProvider.call(this, providerId);
       },
     },
   });

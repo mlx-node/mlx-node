@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -93,6 +93,10 @@ function makeRuntimeClass() {
     async refresh(options?: { allowNetwork?: boolean }): Promise<void> {
       this.lastRefreshAllowNetwork = options?.allowNetwork;
     }
+
+    // Present so the filter's fail-closed descriptor check finds it. The fake has
+    // no real composed map, so the choke is exercised against the real runtime.
+    recomposeProvider(_providerId: string): void {}
 
     /** Test helper (not part of the pi surface) to mutate the served model set. */
     setModels(models: FakeModel[]): void {
@@ -334,6 +338,73 @@ describe('installMlxOnlyModelRegistryFilter', () => {
       expect(runtime.getProviders().some((entry) => entry.id === 'radius')).toBe(true);
     } finally {
       globalThis.fetch = realFetch;
+      await rm(dir, { recursive: true, force: true });
+      if (savedOffline === undefined) delete process.env.PI_OFFLINE;
+      else process.env.PI_OFFLINE = savedOffline;
+    }
+  });
+
+  it('choke: cloud providers never compose, so their command-backed credentials never resolve', async () => {
+    const savedOffline = process.env.PI_OFFLINE;
+    process.env.PI_OFFLINE = '1';
+    const dir = await mkdtemp(join(tmpdir(), 'mlx-runtime-choke-'));
+    // A cloud provider configured with a command-backed apiKey (`!<cmd>`); pi's
+    // refresh resolves it by running the command (execSync), NOT gated by
+    // allowNetwork. The command touches a sentinel file if it ever runs.
+    const controlSentinel = join(dir, 'control-ran');
+    const chokeSentinel = join(dir, 'choke-ran');
+    const writeModels = (file: string, sentinel: string): Promise<void> =>
+      writeFile(file, JSON.stringify({ providers: { anthropic: { apiKey: `!touch '${sentinel}'` } } }));
+
+    try {
+      // Control: WITHOUT the filter, anthropic composes into this.models and its
+      // command apiKey resolves during refresh → the sentinel is created. This
+      // proves the mechanism is real (guards the choke assertion from vacuity).
+      const controlModels = join(dir, 'control-models.json');
+      await writeModels(controlModels, controlSentinel);
+      const control = await ModelRuntime.create({
+        authPath: join(dir, 'control-auth.json'),
+        modelsPath: controlModels,
+      });
+      await control.refresh({ allowNetwork: false, force: true });
+      await access(controlSentinel); // rejects (fails the test) if the command never ran
+
+      // Choke: WITH the filter installed BEFORE create, anthropic never composes,
+      // so its command apiKey is never resolved → the sentinel is NOT created.
+      const chokeModels = join(dir, 'choke-models.json');
+      await writeModels(chokeModels, chokeSentinel);
+      const restore = installMlxOnlyModelRegistryFilter(ModelRuntime, ['local']);
+      try {
+        const runtime = await ModelRuntime.create({
+          authPath: join(dir, 'choke-auth.json'),
+          modelsPath: chokeModels,
+        });
+        runtime.registerProvider('mlx', {
+          api: 'mlx',
+          baseUrl: 'mlx://local',
+          apiKey: 'mlx-local',
+          models: [
+            {
+              id: 'local',
+              name: 'local',
+              reasoning: true,
+              input: ['text'],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 4096,
+              maxTokens: 1024,
+            },
+          ],
+        });
+        await runtime.refresh({ allowNetwork: true, force: true });
+
+        await expect(access(chokeSentinel)).rejects.toThrow(); // never created
+        // mlx still composes and is the only provider.
+        expect(runtime.getProviders().map((entry) => entry.id)).toEqual(['mlx']);
+        expect(runtime.getModel('mlx', 'local')).toBeDefined();
+      } finally {
+        restore();
+      }
+    } finally {
       await rm(dir, { recursive: true, force: true });
       if (savedOffline === undefined) delete process.env.PI_OFFLINE;
       else process.env.PI_OFFLINE = savedOffline;
