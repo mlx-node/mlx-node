@@ -93,6 +93,15 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   // Mirrors `mlx launch claude`: chunked paged prefill keeps long-prompt
   // TTFT bounded on the default paged path.
   process.env.MLX_PAGED_PREFILL_CHUNK_SIZE ??= '2048';
+  // Hard offline invariant — NOT a user-overridable default, hence `=` not `??=`.
+  // `mlx agent` is local-only: no cloud provider may ever be contacted. pi 0.81.1's
+  // interactive and RPC startup call `ModelRuntime.refresh()`, which when PI_OFFLINE
+  // is unset fetches remote provider catalogs from pi.dev and can refresh a persisted
+  // cloud credential — a network path the mlx-only prototype filter does NOT cover
+  // (it patches the read methods, not `refresh`). Forcing PI_OFFLINE=1 here, before pi
+  // is imported below, also pins every ModelRuntime in this process to `allowNetwork`
+  // off, so no ambient/prior cloud credential can leak outbound traffic.
+  process.env.PI_OFFLINE = '1';
 
   // Force every paged-capable agent family through an isolated config clone.
   // This includes quantized LFM2 (whose standalone default is deliberately

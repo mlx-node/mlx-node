@@ -118,8 +118,8 @@ describe('installMlxOnlyModelRegistryFilter', () => {
     const dir = await mkdtemp(join(tmpdir(), 'mlx-runtime-filter-'));
     try {
       const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null });
-      // The full builtin catalog contains cloud providers regardless of auth.
-      const cloud = runtime.getModels().find((entry) => entry.provider === 'groq' || entry.provider === 'anthropic');
+      // `anthropic` is a builtin cloud provider present offline (bundled catalog).
+      const cloud = runtime.getModels().find((entry) => entry.provider === 'anthropic');
       expect(cloud).toBeDefined();
 
       runtime.registerProvider('mlx', {
@@ -139,10 +139,21 @@ describe('installMlxOnlyModelRegistryFilter', () => {
         ],
       });
 
+      // Deterministically configure a REAL cloud provider's auth with a fake key,
+      // fully offline (`allowNetwork:false` writes the credential in-memory and
+      // refreshes without any fetch). This makes anthropic genuinely authenticated
+      // AND available BEFORE the filter, so the availability/auth assertions below
+      // actually exercise the wrappers instead of passing on an empty auth store.
+      await runtime.setRuntimeApiKey('anthropic', 'sk-ant-fake-key', { allowNetwork: false });
+      expect(runtime.hasConfiguredAuth('anthropic')).toBe(true);
+      expect(runtime.getAvailableSnapshot().some((entry) => entry.provider === 'anthropic')).toBe(true);
+      expect((await runtime.getAvailable()).some((entry) => entry.provider === 'anthropic')).toBe(true);
+      expect(runtime.getModel('anthropic', cloud!.id)).toBeDefined();
+
       const restore = installMlxOnlyModelRegistryFilter(ModelRuntime, ['local']);
       try {
         expect(runtime.getModels().map((entry) => `${entry.provider}/${entry.id}`)).toEqual(['mlx/local']);
-        // Availability reads are mlx-only regardless of any ambient cloud auth.
+        // Availability reads are mlx-only despite the live, configured cloud auth.
         expect(runtime.getAvailableSnapshot().every((entry) => entry.provider === 'mlx')).toBe(true);
         expect(runtime.getAvailableSnapshot().map((entry) => `${entry.provider}/${entry.id}`)).toEqual(['mlx/local']);
         const available = await runtime.getAvailable();
@@ -151,12 +162,16 @@ describe('installMlxOnlyModelRegistryFilter', () => {
         expect(runtime.getModel('mlx', 'local')).toBeDefined();
         expect(runtime.getModel(cloud!.provider, cloud!.id)).toBeUndefined();
         expect(runtime.hasConfiguredAuth('mlx')).toBe(true);
+        // Suppressed even though anthropic auth is really configured.
         expect(runtime.hasConfiguredAuth('anthropic')).toBe(false);
       } finally {
         restore();
       }
 
+      // Restored: the real cloud auth/availability is visible again.
       expect(runtime.getModel(cloud!.provider, cloud!.id)).toBeDefined();
+      expect(runtime.hasConfiguredAuth('anthropic')).toBe(true);
+      expect(runtime.getAvailableSnapshot().some((entry) => entry.provider === 'anthropic')).toBe(true);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

@@ -375,12 +375,15 @@ export async function createProductionSession(
   // Build a fresh runtime that carries the parent's in-process mlx provider. The
   // config's `streamSimple` closure is bound to the single shared `MlxModelHost`,
   // so all subagent inference stays serialized on the one GPU-resident model.
-  // `create` does no network (allowModelNetwork defaults false), and reuses the
-  // parent's `authPath`/`modelsPath`; `registerProvider` marks mlx configured
-  // (apiKey present) so streaming works immediately, dispatched by provider id.
+  // `create` does no network (`allowModelNetwork:false`, also the default — set
+  // explicitly to keep the offline invariant local to this call, independent of
+  // the process-wide PI_OFFLINE seed in `runAgent`), and reuses the parent's
+  // `authPath`/`modelsPath`; `registerProvider` marks mlx configured (apiKey
+  // present) so streaming works immediately, dispatched by provider id.
   const modelRuntime = await ModelRuntime.create({
     authPath: path.join(agentDir, 'auth.json'),
     modelsPath: path.join(agentDir, 'models.json'),
+    allowModelNetwork: false,
   });
   modelRuntime.registerProvider('mlx', options.mlxProviderConfig);
 
