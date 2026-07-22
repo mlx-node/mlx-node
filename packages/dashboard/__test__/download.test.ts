@@ -821,6 +821,66 @@ describe('DownloadManager', () => {
     rmSync(external, { recursive: true, force: true });
   });
 
+  it('does NOT reap a dead-owner rollback backup when finalDir is a LIVE foreign symlink (preflight before sweep)', async () => {
+    // finalDir is a LIVE symlink into an EXTERNAL complete marked model AND a
+    // dead-owner rollback backup (`<slug>.backup-<deadpid>.<uuid>`) sits under
+    // `.staging`. The recovery sweep's reap branch uses `isModelInstalled(finalDir)`,
+    // which FOLLOWS symlinks: if the sweep runs before the no-follow ownership
+    // preflight refuses the link, it follows the link → reads the foreign marker as
+    // "installed" → permanently deletes the recoverable backup — data loss for a
+    // doomed job. The preflight must run BEFORE the sweep (and the reap site must
+    // classify finalDir no-follow), so a foreign symlink leaves the backup untouched.
+    const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
+    writeFileSync(join(external, 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(external, 'model.safetensors'), Buffer.alloc(300, 0xab));
+    writeFileSync(
+      join(external, DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: REPO, revision: SHA_OLD, files: ['config.json', 'model.safetensors'], completedAt: 'x' }),
+    );
+    // A recoverable dead-owner rollback backup (pid 999999999 is DEAD).
+    const backup = join(stagingRoot(), `${SLUG}.backup-999999999.44444444-4444-4444-4444-444444444444`);
+    mkdirSync(backup, { recursive: true });
+    writeFileSync(join(backup, 'config.json'), Buffer.alloc(12, 0x5a));
+    writeFileSync(join(backup, 'model.safetensors'), Buffer.alloc(300, 0x5a));
+    writeFileSync(
+      join(backup, DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: REPO, revision: SHA_OLD, files: ['config.json', 'model.safetensors'], completedAt: 'x' }),
+    );
+    symlinkSync(external, finalDir());
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
+
+    // Fast-fail: refused up front — no manifest listing, no bytes, never done.
+    expect(events.some((event) => event.type === 'start')).toBe(false);
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+    expect(hub.downloaded).toEqual([]);
+    const err = events.find((event) => event.type === 'error');
+    expect(err?.type).toBe('error');
+    if (err?.type === 'error') {
+      expect(err.message).toMatch(/not created by the dashboard/i);
+    }
+
+    // The recoverable dead-owner rollback backup was NOT reaped — byte-for-byte intact.
+    expect(existsSync(backup)).toBe(true);
+    expect(readFileSync(join(backup, 'config.json'))).toEqual(Buffer.alloc(12, 0x5a));
+    expect(readFileSync(join(backup, 'model.safetensors'))).toEqual(Buffer.alloc(300, 0x5a));
+    expect(backupDirs()).toEqual([`${SLUG}.backup-999999999.44444444-4444-4444-4444-444444444444`]);
+
+    // The external symlink target is byte-for-byte intact — nothing written through the link.
+    expect(readFileSync(join(external, 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+    expect(readFileSync(join(external, 'model.safetensors'))).toEqual(Buffer.alloc(300, 0xab));
+
+    rmSync(external, { recursive: true, force: true });
+  });
+
   it('refuses to overwrite an unowned existing dir and leaves it intact', async () => {
     // A valid checkpoint placed manually / by `mlx download` — no completion
     // marker, so the downloader does not own it.

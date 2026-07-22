@@ -20,11 +20,21 @@ const fsCounters = vi.hoisted(() => ({
   readSync: 0,
   openHandles: 0,
   maxOpenHandles: 0,
+  /** Every path passed to `opendirSync` (to prove a swapped-in symlink is never followed). */
+  opened: [] as string[],
 }));
 
 // When set, `opendirSync`/`Dir.readSync` on EXACTLY this path throws a resource
 // error (EMFILE / EIO), simulating fd exhaustion or a mid-directory read fault.
-const fsFail = vi.hoisted(() => ({ opendirThrowOn: null as string | null, readThrowOn: null as string | null }));
+// `lstatSymlinkOn` makes `lstatSync` on EXACTLY that path report a SYMLINK
+// (`isDirectory() === false`) while the real on-disk entry is still a directory —
+// modelling a concurrent swap of a queued real dir to a symlink between enqueue and
+// pop, so a test can prove the walk does NOT `opendirSync`/follow it.
+const fsFail = vi.hoisted(() => ({
+  opendirThrowOn: null as string | null,
+  readThrowOn: null as string | null,
+  lstatSymlinkOn: null as string | null,
+}));
 
 vi.mock('node:fs', async (importOriginal) => {
   const real = await importOriginal<typeof import('node:fs')>();
@@ -34,9 +44,25 @@ vi.mock('node:fs', async (importOriginal) => {
       fsCounters.readdir++;
       return real.readdirSync(...(args as Parameters<typeof real.readdirSync>));
     },
+    lstatSync: ((...args: Parameters<typeof real.lstatSync>) => {
+      const path = String(args[0]);
+      const stat = real.lstatSync(...(args as Parameters<typeof real.lstatSync>));
+      if (fsFail.lstatSymlinkOn !== null && path === fsFail.lstatSymlinkOn) {
+        // Report a symlink at this path (no-follow lstat): keep the real dev/ino so
+        // the walk's visited-set is unperturbed, but flip the type predicates so the
+        // walk sees a swapped-in symlink, not a directory.
+        return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
+          isDirectory: () => false,
+          isSymbolicLink: () => true,
+          isFile: () => false,
+        });
+      }
+      return stat;
+    }) as typeof real.lstatSync,
     opendirSync: (...args: Parameters<typeof real.opendirSync>) => {
       fsCounters.opendir++;
       const path = String(args[0]);
+      fsCounters.opened.push(path);
       if (fsFail.opendirThrowOn !== null && path === fsFail.opendirThrowOn) {
         const err = new Error(`EMFILE: too many open files, opendir '${path}'`) as NodeJS.ErrnoException;
         err.code = 'EMFILE';
@@ -81,8 +107,10 @@ beforeEach(() => {
   fsCounters.readSync = 0;
   fsCounters.openHandles = 0;
   fsCounters.maxOpenHandles = 0;
+  fsCounters.opened = [];
   fsFail.opendirThrowOn = null;
   fsFail.readThrowOn = null;
+  fsFail.lstatSymlinkOn = null;
 });
 
 afterEach(() => {
@@ -199,4 +227,31 @@ it('marks truncated when a nested Dir.readSync throws mid-directory', () => {
   // The root file still counted; the faulted child contributed nothing.
   expect(stats.fileCount).toBe(1);
   expect(stats.sizeBytes).toBe(4);
+});
+
+// No-follow across the whole enqueue→pop window: the walker queues child PATHS and
+// opens them later. A child enqueued as a REAL directory (its `Dirent.isDirectory()`
+// true during `readSync`) can be swapped to a symlink before it is popped; the pop's
+// `lstatSync` (no-follow) then reports a symlink. The walk must reject it BEFORE
+// `opendirSync` (which FOLLOWS symlinks), or it descends into and sizes the external
+// target — a no-follow escape widened from the immediate-recursion window to the whole
+// parent-enumeration interval.
+it('does not opendir/follow a queued dir that is swapped to a symlink before it is popped', () => {
+  writeFileSync(join(dir, 'top.bin'), Buffer.alloc(4));
+  const sub = join(dir, 'sub');
+  mkdirSync(sub, { recursive: true });
+  // A large "external" payload the walk must NOT count if it follows the swapped link.
+  writeFileSync(join(sub, 'external.bin'), Buffer.alloc(4096));
+
+  // `sub` is a real dir at enumeration (so it is enqueued), but a concurrent swap
+  // turns it into a symlink: its no-follow `lstatSync` now reports a symlink.
+  fsFail.lstatSymlinkOn = sub;
+  const stats = walkDirStats(dir, 100_000);
+
+  // The swapped-in symlink was never opendir'd/followed …
+  expect(fsCounters.opened).not.toContain(sub);
+  // … so only the root's own file is counted — the external payload stays out.
+  expect(stats.fileCount).toBe(1);
+  expect(stats.sizeBytes).toBe(4);
+  expect(stats.truncated).toBe(false);
 });

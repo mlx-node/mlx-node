@@ -541,6 +541,26 @@ export class DownloadManager {
 
     let stagingDir: string | undefined;
     try {
+      // Preflight ownership BEFORE any recovery/staging work — and specifically
+      // before `sweepStaging`: a final dir the downloader does not own (a manual
+      // copy or an `mlx download` install with no completion marker, OR any
+      // symlink, which `isDownloaderOwned` rejects no-follow) is refused up front,
+      // so an unowned local checkpoint never triggers a full multi-GB
+      // download+hash only to be refused at publish. Hoisting it above the sweep
+      // is load-bearing: the sweep's dead-owner backup reap classifies finalDir
+      // with `isModelInstalled`, which FOLLOWS symlinks — so a foreign `finalDir`
+      // link must be refused BEFORE the sweep could follow it and reap a
+      // recoverable rollback backup. This block reads only `finalDir` (no
+      // dependency on the staging root or the resolved revision), so it is safe to
+      // run first. The publish-time checks below still guard the narrow
+      // check-then-swap race for a dir that races in after this point.
+      if (occupied(finalDir) && !isDownloaderOwned(finalDir) && !job.overwrite) {
+        throw new Error(
+          `Refusing to install over "${finalDir}": it was not created by the dashboard downloader. ` +
+            `Remove it manually to reinstall.`,
+        );
+      }
+
       // Refuse a symlinked (or non-directory) `.staging` root BEFORE creating it:
       // otherwise `mkdir(..., { recursive })` follows the link and every staged
       // write, the sweep, the publish backup, and the `finally` cleanup all land
@@ -554,19 +574,6 @@ export class DownloadManager {
       // peer's private staging tree and active publish backup are never reclaimed
       // out from under it.
       await this.sweepStaging(slug);
-
-      // Preflight ownership BEFORE any hub-list / download / copy / hash: a final
-      // dir the downloader does not own (a manual copy or an `mlx download`
-      // install — no completion marker) is refused up front, so an unowned local
-      // checkpoint never triggers a full multi-GB download+hash only to be refused
-      // at publish. The publish-time checks below still guard the narrow
-      // check-then-swap race for a dir that races in after this point.
-      if (occupied(finalDir) && !isDownloaderOwned(finalDir) && !job.overwrite) {
-        throw new Error(
-          `Refusing to install over "${finalDir}": it was not created by the dashboard downloader. ` +
-            `Remove it manually to reinstall.`,
-        );
-      }
 
       const revision = await this.resolveRevision(job.repo);
       // Job-private staging: keyed by the IMMUTABLE revision (a different
@@ -772,16 +779,28 @@ export class DownloadManager {
         // A backup whose owner pid is still alive is a peer mid-publish: never touch it.
         if (pidAlive(Number(backupMatch[1]))) continue;
         const backupPath = join(stagingRoot, name);
+        // Classify finalDir NO-FOLLOW before reaping/restoring. `isModelInstalled`
+        // alone FOLLOWS symlinks, so a live `finalDir` link into an external marked
+        // model would read as a complete install and REAP a recoverable rollback
+        // backup. Reap ONLY a proven owned-complete REAL directory; restore ONLY
+        // when finalDir is absent (a crashed swap); otherwise — a foreign symlink,
+        // an unowned dir, or an incomplete-owned dir — RETAIN the backup untouched
+        // and never clobber whatever occupies finalDir.
+        let finalOwnedComplete = false;
+        let finalAbsent = false;
         try {
-          // Reap the redundant backup ONLY when finalDir is a proven-complete
-          // install; otherwise restore. If finalDir unexpectedly exists but is
-          // incomplete, the restore rename fails and the (complete) backup is
-          // retained -- the safe direction.
-          if (isModelInstalled(finalDir)) {
-            await rm(backupPath, { recursive: true, force: true });
-          } else {
-            await rename(backupPath, finalDir);
+          const st = lstatSync(finalDir);
+          finalOwnedComplete = st.isDirectory() && isDownloaderOwned(finalDir) && isModelInstalled(finalDir);
+        } catch {
+          finalAbsent = true;
+        }
+        try {
+          if (finalOwnedComplete) {
+            await rm(backupPath, { recursive: true, force: true }); // redundant backup
+          } else if (finalAbsent) {
+            await rename(backupPath, finalDir); // restore a crashed swap
           }
+          // else foreign symlink / unowned dir / incomplete-owned → retain untouched
         } catch {
           // A single un-recoverable backup must not block the job.
         }

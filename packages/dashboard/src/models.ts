@@ -310,6 +310,13 @@ export function walkDirStats(
       const key = `${self.dev}:${self.ino}`;
       if (visited.has(key)) continue;
       visited.add(key);
+      // A queued path is opened later (deferred), so a real directory can be swapped
+      // to a symlink between enqueue and pop. `opendirSync` FOLLOWS symlinks, so a
+      // swapped-in link would be descended into and its external target sized. `lstat`
+      // is no-follow — a symlink's `lstat` is never a directory — so reject any
+      // non-directory here BEFORE `opendirSync`, closing the escape across the whole
+      // enqueue→pop window (discovery already filters symlink roots, so real roots stay).
+      if (!self.isDirectory()) continue;
     } catch {
       continue;
     }
