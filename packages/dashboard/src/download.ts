@@ -36,7 +36,7 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { createReadStream, existsSync, statSync } from 'node:fs';
+import { createReadStream, existsSync, lstatSync, realpathSync, statSync } from 'node:fs';
 import { copyFile, mkdir, open, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
@@ -202,6 +202,28 @@ async function fsyncDir(dir: string): Promise<void> {
   }
 }
 
+/**
+ * Refuse a path that already exists but is a symlink or a non-directory; a
+ * missing path is allowed (the caller then creates a real directory there).
+ * `mkdir(..., { recursive })` FOLLOWS a pre-existing symlink, so without this a
+ * planted `.staging` → external dir would silently redirect every staged write
+ * and every recursive cleanup onto that foreign target. Same no-follow `lstat`
+ * guard as `models.ts` `deleteLocalModel` and `cache.ts`.
+ */
+function assertRealDirOrAbsent(path: string): void {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    return; // absent — safe to mkdir a real directory here
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(
+      `Refusing to use staging root "${path}": it must be a real directory (found a symlink or non-directory)`,
+    );
+  }
+}
+
 export type DownloadEvent =
   | { type: 'start'; id: string; repo: string; totalBytes: number; fileCount: number }
   | {
@@ -217,7 +239,13 @@ export type DownloadEvent =
   | { type: 'error'; id: string; message: string }
   | { type: 'cancelled'; id: string };
 
-type JobStatus = 'running' | 'done' | 'error' | 'cancelled';
+/**
+ * `committing` is the brief, non-cancellable window from just before `publish`
+ * until the job settles: `cancel()`'s `state !== 'running'` gate rejects it, so a
+ * cancel that arrives once the atomic swap has begun can no longer report success
+ * while the model still installs.
+ */
+type JobStatus = 'running' | 'committing' | 'done' | 'error' | 'cancelled';
 
 interface JobState {
   id: string;
@@ -315,7 +343,9 @@ export class DownloadManager {
    * its next boundary check — so its `finally` removes the job-private staging
    * dir; a still-queued job is dropped from the queue and settled here. The job
    * is marked `cancelled` and a terminal `cancelled` event is emitted. Returns
-   * `false` for an unknown or already-terminal id.
+   * `false` for an unknown id, an already-terminal id, or a job that has entered
+   * the non-cancellable `committing` state (the `state !== 'running'` gate) — so a
+   * cancel racing an in-progress publish is refused rather than reporting success.
    *
    * Deliberately never touches the shared HF blob cache (`~/.cache/huggingface`):
    * the `mlx download` CLI relies on it to resume, so cancel only aborts the job
@@ -468,6 +498,12 @@ export class DownloadManager {
 
     let stagingDir: string | undefined;
     try {
+      // Refuse a symlinked (or non-directory) `.staging` root BEFORE creating it:
+      // otherwise `mkdir(..., { recursive })` follows the link and every staged
+      // write, the sweep, the publish backup, and the `finally` cleanup all land
+      // on the external target. Rejecting a symlinked root closes the escape at the
+      // source — every downstream path is built under this root.
+      assertRealDirOrAbsent(stagingRoot);
       await mkdir(stagingRoot, { recursive: true });
 
       // Reap a crashed job's private staging tree and recover/reap an orphaned
@@ -523,6 +559,11 @@ export class DownloadManager {
       if (job.cancelled) throw new Error('Download cancelled');
 
       await mkdir(stagingDir, { recursive: true });
+      // Canonicalize the staging dir ONCE (it now exists as a real dir under the
+      // symlink-checked root). Per-file write targets are validated against this
+      // REAL path rather than a lexical `resolve` (which never resolves symlinks),
+      // so a staged write can never land outside the canonical staging tree.
+      const stagingReal = realpathSync(stagingDir);
 
       for (let index = 0; index < files.length; index++) {
         // Stop promptly between files when cancelled (the in-flight fetch of the
@@ -532,11 +573,10 @@ export class DownloadManager {
         const file = files[index];
         const destPath = join(stagingDir, file.path);
         // Belt-and-braces at the write boundary: even with `isSafeRelPath` gating
-        // ingestion, re-assert the resolved target stays inside stagingDir before
-        // any mkdir/copy/read derived from it.
-        const stagingResolved = resolve(stagingDir);
-        const destResolved = resolve(destPath);
-        if (destResolved !== stagingResolved && !destResolved.startsWith(stagingResolved + sep)) {
+        // ingestion, re-assert the target stays inside the CANONICAL stagingDir
+        // before any mkdir/copy/read derived from it.
+        const destResolved = resolve(stagingReal, file.path);
+        if (destResolved !== stagingReal && !destResolved.startsWith(stagingReal + sep)) {
           throw new Error(`Refusing to write "${file.path}" outside the staging directory`);
         }
         const jobBaseBytes = job.receivedBytes;
@@ -562,6 +602,12 @@ export class DownloadManager {
         this.emitFileProgress(job.id, file.path, fileBytes, file.size, index, files.length);
       }
 
+      // A cancel issued after the fetch loop must still unwind here — before the
+      // prune and the multi-GB whole-set hash — rather than silently install. The
+      // `catch` reclassifies this throw as a clean `cancelled` terminal and the
+      // `finally` removes the private staging dir.
+      if (job.cancelled) throw new Error('Download cancelled');
+
       // Quarantine any staged entry not in the current manifest (a stale file
       // from an earlier interrupted run), so the published set is exactly the
       // manifest — no orphan (e.g. an old single-file weight) can win over it.
@@ -570,10 +616,21 @@ export class DownloadManager {
       // Re-validate the WHOLE staged set against the manifest immediately before
       // publishing; any mismatch fails the job rather than shipping bad bytes.
       for (const file of files) {
+        // Re-check each iteration so a cancel during the (minutes-long, multi-GB)
+        // hash unwinds promptly instead of hashing every remaining file first.
+        if (job.cancelled) throw new Error('Download cancelled');
         if (!(await isStagedCopyComplete(join(stagingDir, file.path), file))) {
           throw new Error(`Staged file "${file.path}" failed content verification before publish`);
         }
       }
+
+      // Commit barrier: this is the last cancellable instant. Check, then flip to
+      // the non-cancellable `committing` state with NO intervening await (atomic in
+      // JS) so a cancel can never slip between the guard and publish. Once
+      // `committing`, `cancel()`'s `state !== 'running'` gate rejects it (the route
+      // 404s) and publish runs to completion.
+      if (job.cancelled) throw new Error('Download cancelled');
+      job.state = 'committing';
 
       await this.publish(stagingDir, finalDir, job.repo, revision, files, job.overwrite);
 
@@ -593,7 +650,10 @@ export class DownloadManager {
     } finally {
       // Job-private staging is scratch: a successful publish already renamed it
       // away (this is a no-op), and on failure it must not leak — resume never
-      // reuses it (the HF cache does). Never touches the final dir.
+      // reuses it (the HF cache does). Never touches the final dir. This recursive
+      // rm cannot escape the store: the root symlink guard proved `.staging` is a
+      // real directory, and `stagingDir` is a fresh-uuid child that cannot be a
+      // pre-existing symlink — so no per-target canonical re-check is needed here.
       if (stagingDir !== undefined) {
         await rm(stagingDir, { recursive: true, force: true }).catch(() => {});
       }
@@ -701,6 +761,10 @@ export class DownloadManager {
       }
 
       if (await isStagedCopyComplete(destPath, file)) return context;
+      // A cancel that lands mid-verify must never mutate the shared HF cache (the
+      // `mlx download` CLI resumes from it): unwind here — before the staged drop
+      // and the pointer/blob invalidation below — so cancel never purges a blob.
+      if (this.currentJob?.cancelled) throw new Error('Download cancelled');
       // Content did not match the manifest: drop the staged copy AND invalidate
       // the HF cache entry (the snapshot pointer + the blob it resolves to) so the
       // next attempt actually re-fetches. For a pinned commit `downloadFileToCacheDir`

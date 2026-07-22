@@ -79,8 +79,15 @@ const renameFault = vi.hoisted(() => ({
 }));
 
 // Fires once when the completion marker is written, to inject a directory that
-// "races in" between publish's ownership check and its swap (Finding 1).
+// "races in" between publish's ownership check and its swap (Finding 1). Also
+// reused (Finding E) to fire a cancel WHILE the job is committing (publishing).
 const raceHook = vi.hoisted(() => ({ onMarkerWrite: null as (() => void) | null }));
+
+// Fires once when the runner enters the post-fetch prune/verify window — the
+// recursive `readdir` of the job-private staging dir inside `listStagedFiles`.
+// Lets a test cancel AFTER the fetch loop but BEFORE the commit barrier
+// (Finding E), the window where cancellation used to be ignored.
+const stagingHook = vi.hoisted(() => ({ onVerifyWindow: null as (() => void) | null }));
 
 vi.mock('node:fs/promises', async (importActual) => {
   const actual = await importActual<typeof import('node:fs/promises')>();
@@ -103,6 +110,14 @@ vi.mock('node:fs/promises', async (importActual) => {
         hook();
       }
       return actual.writeFile(path, data);
+    },
+    readdir: async (path: string, options?: { recursive?: boolean }) => {
+      if (stagingHook.onVerifyWindow !== null && options?.recursive === true && path.includes('.staging')) {
+        const hook = stagingHook.onVerifyWindow;
+        stagingHook.onVerifyWindow = null;
+        hook();
+      }
+      return actual.readdir(path, options);
     },
   };
 });
@@ -242,6 +257,7 @@ beforeEach(() => {
   renameFault.failFromPath = null;
   renameFault.failFromPrefix = null;
   raceHook.onMarkerWrite = null;
+  stagingHook.onVerifyWindow = null;
   modelsDir = mkdtempSync(join(tmpdir(), 'dash-dl-models-'));
   cacheDir = mkdtempSync(join(tmpdir(), 'dash-dl-cache-'));
 });
@@ -1069,6 +1085,103 @@ describe('DownloadManager', () => {
     // Clean up job 1 so no blocked fetch lingers.
     expect(manager.cancel(id1)).toBe(true);
     await waitFor(() => manager.jobs().find((j) => j.id === id1)!.state === 'cancelled');
+  });
+
+  // Finding E (regression): a cancel that lands AFTER the fetch loop — during the
+  // prune/verify window, while the job is still `running` — must unwind to a
+  // `cancelled` terminal and NEVER publish. Before the commit barrier this cancel
+  // returned 200 yet the model still installed and the job marked `done`.
+  it('cancels during the post-fetch verify window: ends cancelled, never publishes', async () => {
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    // Fire the cancel the instant the runner enters the prune/verify window (the
+    // recursive readdir of staging) — after every file has been fetched, before
+    // the commit barrier. Cancel is still accepted (job is `running`).
+    stagingHook.onVerifyWindow = () => {
+      expect(manager.cancel(id)).toBe(true);
+    };
+
+    await waitFor(() => events.some((event) => event.type === 'cancelled'));
+    // No `done`, no `error` — a clean cancelled terminal.
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(manager.jobs().find((j) => j.id === id)!.state).toBe('cancelled');
+    // Nothing published: no final dir, no install marker.
+    expect(existsSync(finalDir())).toBe(false);
+    expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(false);
+    // The job-private staging dir is removed by the job's `finally` (async, runs
+    // just after the terminal event) — wait for it rather than racing the rm.
+    await waitFor(() => jobStagingDirs().length === 0);
+  });
+
+  // Finding E: once the job enters the non-cancellable `committing` state (the
+  // atomic swap has begun), `cancel()` is REFUSED (route would 404) and the model
+  // installs to completion — a late cancel can never report success mid-publish.
+  it('refuses to cancel once committing (publish in progress) and still installs', async () => {
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    // The marker is written inside `publish`, AFTER the barrier set state to
+    // `committing`; a cancel here must be refused (returns false).
+    let cancelWhileCommitting: boolean | null = null;
+    raceHook.onMarkerWrite = () => {
+      cancelWhileCommitting = manager.cancel(id);
+    };
+
+    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+    // The commit-time cancel was refused (the DELETE route would return 404).
+    expect(cancelWhileCommitting).toBe(false);
+    // The model installed to completion despite the racing cancel.
+    expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
+    expect(events.some((event) => event.type === 'cancelled')).toBe(false);
+    expect(events.some((event) => event.type === 'done')).toBe(true);
+    expect(manager.jobs().find((j) => j.id === id)!.state).toBe('done');
+  });
+
+  // Finding #5: a pre-existing `.staging` SYMLINK pointing at an external dir must
+  // be refused before any write — `mkdir(recursive)` would otherwise follow it and
+  // redirect every staged write and recursive cleanup onto the foreign target.
+  it('refuses a symlinked .staging root: writes nothing to and deletes nothing from the external target', async () => {
+    // An external dir with a pre-existing file the runner must never touch.
+    const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
+    const externalFile = join(external, 'do-not-touch.bin');
+    writeFileSync(externalFile, Buffer.alloc(16, 0xee));
+    // Plant `.staging` as a symlink → external (a local, pre-existing symlink).
+    symlinkSync(external, stagingRoot());
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
+
+    // The job errored (refused the symlinked root) and never published.
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+    const err = events.find((event) => event.type === 'error');
+    expect(err !== undefined && err.type === 'error' ? err.message : '').toContain('real directory');
+    expect(existsSync(finalDir())).toBe(false);
+    // The external target is untouched: its file survives byte-for-byte and NO
+    // staged files (config.json / model.safetensors) were written into it.
+    expect(existsSync(externalFile)).toBe(true);
+    expect(readFileSync(externalFile)).toEqual(Buffer.alloc(16, 0xee));
+    expect(readdirSync(external)).toEqual(['do-not-touch.bin']);
+
+    rmSync(external, { recursive: true, force: true });
   });
 });
 
