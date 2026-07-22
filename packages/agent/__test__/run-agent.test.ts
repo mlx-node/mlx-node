@@ -3,10 +3,11 @@
  * `??=` semantics, the exact extension set, registry-policy lifecycle, and
  * verbatim argv forwarding.
  */
-import { homedir } from 'node:os';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { AuthStorage, type InlineExtension, ModelRegistry } from '@earendil-works/pi-coding-agent';
+import { type InlineExtension, ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import {
@@ -49,7 +50,7 @@ function makeSeam(): { main: RunAgentMain; calls: SeamCapture[] } {
 }
 
 function piImpl(main: RunAgentMain): RunAgentPi {
-  return { main, ModelRegistry };
+  return { main, ModelRuntime };
 }
 
 function pagedConfigOverrides(): AgentPagedConfigOverrides & { cleanup: ReturnType<typeof vi.fn> } {
@@ -195,23 +196,35 @@ describe('runAgent', () => {
     expect(paged.cleanup).toHaveBeenCalledOnce();
   });
 
-  it('applies the registry policy while main runs and restores it afterward', async () => {
-    const authStorage = AuthStorage.inMemory({ groq: { type: 'api_key', key: 'test-groq-key' } });
-    const registry = ModelRegistry.inMemory(authStorage);
-    const groq = registry.getAll().find((model) => model.provider === 'groq');
-    expect(groq).toBeDefined();
+  it('applies the runtime policy while main runs and restores it afterward', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'mlx-run-agent-policy-'));
+    try {
+      // Isolated runtime: no models.json, an empty temp auth file. The full
+      // builtin catalog still contains cloud providers regardless of auth.
+      const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null });
+      const groq = runtime.getModels().find((model) => model.provider === 'groq');
+      expect(groq).toBeDefined();
 
-    await runAgent({
-      modelsDir: '/models',
-      models: [FAKE_MODEL],
-      argv: [],
-      piImpl: piImpl(async () => {
-        expect(registry.find('groq', groq!.id)).toBeUndefined();
-        expect(registry.getAll()).toEqual([]);
-      }),
-    });
+      await runAgent({
+        modelsDir: '/models',
+        models: [FAKE_MODEL],
+        argv: [],
+        piImpl: {
+          main: async () => {
+            // The filter installs on the runtime prototype for `main`'s lifetime,
+            // so this concrete instance's reads become mlx-only. No mlx/local is
+            // registered on it, so the filtered catalog collapses to empty.
+            expect(runtime.getModel('groq', groq!.id)).toBeUndefined();
+            expect(runtime.getModels()).toEqual([]);
+          },
+          ModelRuntime,
+        },
+      });
 
-    expect(registry.find('groq', groq!.id)).toBeDefined();
+      expect(runtime.getModel('groq', groq!.id)).toBeDefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

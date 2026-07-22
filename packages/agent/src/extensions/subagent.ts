@@ -86,7 +86,17 @@ export interface InProcessSubagentSession {
 export interface SubagentSessionCreateOptions {
   cwd: string;
   model: NonNullable<ExtensionContext['model']>;
-  modelRegistry: ExtensionContext['modelRegistry'];
+  /**
+   * Parent's registered in-process mlx provider config. Registering it on the
+   * subagent's fresh runtime reuses the parent's `streamSimple` closure, which
+   * is bound to the single shared `MlxModelHost` — so subagent inference stays
+   * serialized on the one GPU-resident model. `ProviderConfigInput` is not
+   * exported at the package root, so type it structurally from the facade
+   * method's return type (survives a future pi rename of the type).
+   */
+  mlxProviderConfig: NonNullable<
+    ReturnType<ExtensionContext['modelRegistry']['getRegisteredProviderConfig']>
+  >;
   tools?: string[];
   systemPrompt: string;
 }
@@ -336,10 +346,12 @@ async function mapWithConcurrencyLimit<T, R>(items: T[], fn: (item: T, index: nu
   return results;
 }
 
-async function createProductionSession(options: SubagentSessionCreateOptions): Promise<InProcessSubagentSession> {
+export async function createProductionSession(
+  options: SubagentSessionCreateOptions,
+): Promise<InProcessSubagentSession> {
   // `runAgent()` seeds pi's config environment before the extension can execute,
   // so defer the runtime import until now instead of importing pi at module load.
-  const { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, SettingsManager } =
+  const { createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, SettingsManager } =
     await import('@earendil-works/pi-coding-agent');
   const agentDir = getAgentDir();
   const settingsManager = SettingsManager.create(options.cwd, agentDir);
@@ -358,11 +370,25 @@ async function createProductionSession(options: SubagentSessionCreateOptions): P
     appendSystemPromptOverride: (base) => (options.systemPrompt.trim() ? [...base, options.systemPrompt] : base),
   });
   await resourceLoader.reload();
+
+  // 0.81.1: `createAgentSession` takes a `ModelRuntime`, not a `ModelRegistry`.
+  // Build a fresh runtime that carries the parent's in-process mlx provider. The
+  // config's `streamSimple` closure is bound to the single shared `MlxModelHost`,
+  // so all subagent inference stays serialized on the one GPU-resident model.
+  // `create` does no network (allowModelNetwork defaults false), and reuses the
+  // parent's `authPath`/`modelsPath`; `registerProvider` marks mlx configured
+  // (apiKey present) so streaming works immediately, dispatched by provider id.
+  const modelRuntime = await ModelRuntime.create({
+    authPath: path.join(agentDir, 'auth.json'),
+    modelsPath: path.join(agentDir, 'models.json'),
+  });
+  modelRuntime.registerProvider('mlx', options.mlxProviderConfig);
+
   const { session } = await createAgentSession({
     cwd: options.cwd,
     agentDir,
     model: options.model,
-    modelRegistry: options.modelRegistry,
+    modelRuntime,
     tools: options.tools,
     resourceLoader,
     sessionManager: SessionManager.inMemory(options.cwd),
@@ -427,6 +453,24 @@ async function runSingleAgent(
     };
   }
 
+  // The subagent runs on a fresh runtime (no mlx provider extension), so it must
+  // inherit the parent's exact registered mlx config to reuse the shared host.
+  // Fail closed if the parent has no 'mlx' provider — never fall back to an
+  // unconfigured/cloud provider.
+  const mlxProviderConfig = context.modelRegistry.getRegisteredProviderConfig('mlx');
+  if (!mlxProviderConfig) {
+    return {
+      agent: agent.name,
+      agentSource: agent.source,
+      task,
+      exitCode: 1,
+      messages: [],
+      stderr: `Agent ${agent.name} could not inherit the parent mlx provider (no 'mlx' provider registered).`,
+      usage: emptyUsage(),
+      step,
+    };
+  }
+
   const result: SingleResult = {
     agent: agent.name,
     agentSource: agent.source,
@@ -458,7 +502,7 @@ async function runSingleAgent(
     session = await (options.createSession ?? createProductionSession)({
       cwd: cwd ?? defaultCwd,
       model,
-      modelRegistry: context.modelRegistry,
+      mlxProviderConfig,
       tools: agent.tools,
       systemPrompt: agent.systemPrompt,
     });

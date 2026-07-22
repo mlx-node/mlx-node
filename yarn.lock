@@ -510,33 +510,21 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@earendil-works/pi-agent-core@npm:^0.80.10":
-  version: 0.80.10
-  resolution: "@earendil-works/pi-agent-core@npm:0.80.10"
+"@earendil-works/pi-agent-core@npm:^0.81.1":
+  version: 0.81.1
+  resolution: "@earendil-works/pi-agent-core@npm:0.81.1"
   dependencies:
-    "@earendil-works/pi-ai": "npm:^0.80.10"
+    "@earendil-works/pi-ai": "npm:^0.81.1"
     ignore: "npm:7.0.5"
     typebox: "npm:1.1.38"
     yaml: "npm:2.9.0"
-  checksum: 10c0/9bdb96b2aad4bfa41555965b9e0cdd4ea75a305b4955f97fa1caed190a9accd048741076cfc6785a82eafcea1b8597236c798d54a782eae474be54951bb3e778
+  checksum: 10c0/69256aca2efdf5a36f290b51ebd687cd372bab7f4fdd62e8d4dffb8ebacca1c632eb71cdccdd1dbc583363ead29b59f82bc3db04ab142b1d5ee2ca80860041c1
   languageName: node
   linkType: hard
 
-"@earendil-works/pi-agent-core@npm:^0.80.6":
-  version: 0.80.6
-  resolution: "@earendil-works/pi-agent-core@npm:0.80.6"
-  dependencies:
-    "@earendil-works/pi-ai": "npm:^0.80.6"
-    ignore: "npm:7.0.5"
-    typebox: "npm:1.1.38"
-    yaml: "npm:2.9.0"
-  checksum: 10c0/4f83f80c91c68b48b709996b1862d960c2f4f999d06ab613ae690afcf529ceb58f68bfa73bcc2c8e2769638a1804fb3911f4d55f35afcfa8097fd5f954da3d51
-  languageName: node
-  linkType: hard
-
-"@earendil-works/pi-ai@npm:0.80.6, @earendil-works/pi-ai@npm:^0.80.6":
-  version: 0.80.6
-  resolution: "@earendil-works/pi-ai@npm:0.80.6"
+"@earendil-works/pi-ai@npm:0.81.1, @earendil-works/pi-ai@npm:^0.81.1":
+  version: 0.81.1
+  resolution: "@earendil-works/pi-ai@npm:0.81.1"
   dependencies:
     "@anthropic-ai/sdk": "npm:0.91.1"
     "@aws-sdk/client-bedrock-runtime": "npm:3.1048.0"
@@ -551,38 +539,17 @@ __metadata:
     typebox: "npm:1.1.38"
   bin:
     pi-ai: dist/cli.js
-  checksum: 10c0/c9a9c8eab315ba84d26f4ad757d846ab77799d6092a885b6be3d2cdd0fd4e1154b848471e540438b11f708627b9fd240be980f54f8ea9dc6d26232e52b7d7b84
+  checksum: 10c0/e94bc7550f48d9ff9528a8bd3f3b2b60847341d962d1fdea57cb6e36c3684b6a148fa3e28b1414c8fe8cfbbdeece46152340a7af00017d42a59d4e8122914ba1
   languageName: node
   linkType: hard
 
-"@earendil-works/pi-ai@npm:^0.80.10":
-  version: 0.80.10
-  resolution: "@earendil-works/pi-ai@npm:0.80.10"
+"@earendil-works/pi-coding-agent@npm:0.81.1, @earendil-works/pi-coding-agent@npm:^0.81.1":
+  version: 0.81.1
+  resolution: "@earendil-works/pi-coding-agent@npm:0.81.1"
   dependencies:
-    "@anthropic-ai/sdk": "npm:0.91.1"
-    "@aws-sdk/client-bedrock-runtime": "npm:3.1048.0"
-    "@google/genai": "npm:1.52.0"
-    "@mistralai/mistralai": "npm:2.2.6"
-    "@opentelemetry/api": "npm:1.9.0"
-    "@smithy/node-http-handler": "npm:4.7.3"
-    http-proxy-agent: "npm:7.0.2"
-    https-proxy-agent: "npm:7.0.6"
-    openai: "npm:6.26.0"
-    partial-json: "npm:0.1.7"
-    typebox: "npm:1.1.38"
-  bin:
-    pi-ai: dist/cli.js
-  checksum: 10c0/e13104c00e6993505c86170e5e7384f2a45a5b5579e6311c8d6afc7820e823b97b384cb2ba7d2d731647b7af63b5ecf18808c484b6a86a9ae8a8f649ec1627ce
-  languageName: node
-  linkType: hard
-
-"@earendil-works/pi-coding-agent@npm:0.80.6":
-  version: 0.80.6
-  resolution: "@earendil-works/pi-coding-agent@npm:0.80.6"
-  dependencies:
-    "@earendil-works/pi-agent-core": "npm:^0.80.6"
-    "@earendil-works/pi-ai": "npm:^0.80.6"
-    "@earendil-works/pi-tui": "npm:^0.80.6"
+    "@earendil-works/pi-agent-core": "npm:^0.81.1"
+    "@earendil-works/pi-ai": "npm:^0.81.1"
+    "@earendil-works/pi-tui": "npm:^0.81.1"
     "@mariozechner/clipboard": "npm:0.3.9"
     "@silvia-odwyer/photon-node": "npm:0.3.4"
     chalk: "npm:5.6.2"
@@ -604,59 +571,17 @@ __metadata:
       optional: true
   bin:
     pi: dist/cli.js
-  checksum: 10c0/ec21f7d9a033ff9f998990f189e405188816c5255d2d0e39747e52b83216dbb26d4ade3e44a96655eafce99b60ded2be624a107f639a0281f1fa2f3b3e0c2506
+  checksum: 10c0/834a2ccdfefdc211d679b29f36b7b596ad063b353433b74d3ee2f3120d8228c44b26a51bf1f580863282297151be7fd7979fd72f171cadda6147a431f5c93ba0
   languageName: node
   linkType: hard
 
-"@earendil-works/pi-coding-agent@npm:^0.80.6":
-  version: 0.80.10
-  resolution: "@earendil-works/pi-coding-agent@npm:0.80.10"
-  dependencies:
-    "@earendil-works/pi-agent-core": "npm:^0.80.10"
-    "@earendil-works/pi-ai": "npm:^0.80.10"
-    "@earendil-works/pi-tui": "npm:^0.80.10"
-    "@mariozechner/clipboard": "npm:0.3.9"
-    "@silvia-odwyer/photon-node": "npm:0.3.4"
-    chalk: "npm:5.6.2"
-    cross-spawn: "npm:7.0.6"
-    diff: "npm:8.0.4"
-    glob: "npm:13.0.6"
-    highlight.js: "npm:10.7.3"
-    hosted-git-info: "npm:9.0.3"
-    ignore: "npm:7.0.5"
-    jiti: "npm:2.7.0"
-    minimatch: "npm:10.2.5"
-    proper-lockfile: "npm:4.1.2"
-    semver: "npm:7.8.0"
-    typebox: "npm:1.1.38"
-    undici: "npm:8.5.0"
-    yaml: "npm:2.9.0"
-  dependenciesMeta:
-    "@mariozechner/clipboard":
-      optional: true
-  bin:
-    pi: dist/cli.js
-  checksum: 10c0/9d63be9232a261d626a078eaa9a384b884e610bea0a7dd192ad17c61e12bce8d6104e79638ed3c52670abf397023a71e353e2be1ec228d6d2fb44bafabb48be4
-  languageName: node
-  linkType: hard
-
-"@earendil-works/pi-tui@npm:^0.80.10":
-  version: 0.80.10
-  resolution: "@earendil-works/pi-tui@npm:0.80.10"
+"@earendil-works/pi-tui@npm:^0.81.1":
+  version: 0.81.1
+  resolution: "@earendil-works/pi-tui@npm:0.81.1"
   dependencies:
     get-east-asian-width: "npm:1.6.0"
     marked: "npm:18.0.5"
-  checksum: 10c0/b963478e67f50f425dd27cd5e7b1358f1efbcc0c02b30f9929b00bd99aad61cb1023fa219479ecda86a8ab9ff68f4aa62bca7003e2c6c149c702805fec8e3407
-  languageName: node
-  linkType: hard
-
-"@earendil-works/pi-tui@npm:^0.80.6":
-  version: 0.80.6
-  resolution: "@earendil-works/pi-tui@npm:0.80.6"
-  dependencies:
-    get-east-asian-width: "npm:1.6.0"
-    marked: "npm:18.0.5"
-  checksum: 10c0/0b2909c62d38f82b15c146d467b58b86264a9080f1110b40e760b651e61654cfc7ec610fd9a8458da39e7b05241abd21b584d0e15a0af8e8d38e46d36d371891
+  checksum: 10c0/1e75c277547a0ad49450747be54b4175e083d0e3a04076a17677b5f2f989fec6f8cc878e3f01d87e7a580bb932448435220ced8de3c3e3a692b9439e854bd5ec
   languageName: node
   linkType: hard
 
@@ -1261,8 +1186,8 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@mlx-node/agent@workspace:packages/agent"
   dependencies:
-    "@earendil-works/pi-ai": "npm:0.80.6"
-    "@earendil-works/pi-coding-agent": "npm:0.80.6"
+    "@earendil-works/pi-ai": "npm:0.81.1"
+    "@earendil-works/pi-coding-agent": "npm:0.81.1"
     "@mlx-node/core": "workspace:*"
     "@mlx-node/lm": "workspace:*"
     "@mlx-node/server": "workspace:*"
@@ -1314,7 +1239,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@mlx-node/dashboard@workspace:packages/dashboard"
   dependencies:
-    "@earendil-works/pi-coding-agent": "npm:^0.80.6"
+    "@earendil-works/pi-coding-agent": "npm:^0.81.1"
     "@huggingface/hub": "npm:^2.13.2"
     "@mlx-node/agent": "workspace:*"
     "@radix-ui/react-dialog": "npm:^1.1.20"

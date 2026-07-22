@@ -2,11 +2,13 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { Message } from '@earendil-works/pi-ai';
+import type { Api, AssistantMessage, Message, Model } from '@earendil-works/pi-ai';
+import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
 import type { ExtensionAPI, ExtensionContext, InlineExtension, ToolDefinition } from '@earendil-works/pi-coding-agent';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 import {
+  createProductionSession,
   createSubagentExtension,
   discoverSubagents,
   scaleSubagentCompactionSettings,
@@ -14,14 +16,27 @@ import {
   type SubagentSessionCreateOptions,
 } from '../src/extensions/subagent.js';
 
+/** The parent's in-process mlx provider config the subagent inherits. */
+type MlxProviderConfig = SubagentSessionCreateOptions['mlxProviderConfig'];
+
 const PARENT_MODEL = { provider: 'mlx', id: 'agents-a1' } as NonNullable<ExtensionContext['model']>;
 const ALT_MODEL = { provider: 'mlx', id: 'alternate' } as NonNullable<ExtensionContext['model']>;
+const MLX_PROVIDER_CONFIG: MlxProviderConfig = {
+  api: 'mlx',
+  baseUrl: 'mlx://local',
+  apiKey: 'mlx-local',
+  streamSimple: () => createAssistantMessageEventStream(),
+  models: [],
+};
 const MODEL_REGISTRY = {
   find(provider: string, id: string) {
     if (provider !== 'mlx') return undefined;
     if (id === PARENT_MODEL.id) return PARENT_MODEL;
     if (id === ALT_MODEL.id) return ALT_MODEL;
     return undefined;
+  },
+  getRegisteredProviderConfig(provider: string) {
+    return provider === 'mlx' ? MLX_PROVIDER_CONFIG : undefined;
   },
 } as unknown as ExtensionContext['modelRegistry'];
 
@@ -207,7 +222,7 @@ describe('mlx subagent extension', () => {
 
     expect(result.content).toEqual([{ type: 'text', text: 'finished' }]);
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toMatchObject({ cwd: '/repo/nested', model: PARENT_MODEL, modelRegistry: MODEL_REGISTRY });
+    expect(calls[0]).toMatchObject({ cwd: '/repo/nested', model: PARENT_MODEL, mlxProviderConfig: MLX_PROVIDER_CONFIG });
     expect(calls[0]!.tools).toEqual(['read', 'grep', 'find', 'ls', 'bash']);
     expect(calls[0]!.systemPrompt).toContain('You are a scout');
     expect(sessions[0]!.prompts).toEqual(['Task: inspect the code']);
@@ -235,11 +250,142 @@ describe('mlx subagent extension', () => {
       );
       await tool.execute('call-model', { agent: 'alternate', task: 'work' }, undefined, undefined, context());
       expect(created?.model).toBe(ALT_MODEL);
-      expect(created?.modelRegistry).toBe(MODEL_REGISTRY);
+      expect(created?.mlxProviderConfig).toBe(MLX_PROVIDER_CONFIG);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('fails closed when the parent has no registered mlx provider', async () => {
+    let created = false;
+    const tool = captureTool(
+      createSubagentExtension({
+        async createSession() {
+          created = true;
+          return new FakeSession(() => 'unexpected');
+        },
+      }),
+    );
+    // Parent resolves the mlx model but exposes no registered mlx provider config,
+    // so the subagent cannot inherit the shared MlxModelHost and must fail closed.
+    const noProviderRegistry = {
+      find(provider: string, id: string) {
+        if (provider !== 'mlx') return undefined;
+        return id === PARENT_MODEL.id ? PARENT_MODEL : undefined;
+      },
+      getRegisteredProviderConfig() {
+        return undefined;
+      },
+    } as unknown as ExtensionContext['modelRegistry'];
+
+    const result = await tool.execute(
+      'call-no-mlx-provider',
+      { agent: 'worker', task: 'work' },
+      undefined,
+      undefined,
+      context({ modelRegistry: noProviderRegistry }),
+    );
+
+    expect(created).toBe(false);
+    expect((result as typeof result & { isError?: boolean }).isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain("no 'mlx' provider registered");
+  });
+
+  it('drives a fresh runtime through createProductionSession and round-trips streamSimple', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-subagent-runtime-'));
+    process.env.PI_CODING_AGENT_DIR = root;
+    const SCRIPTED_TEXT = 'scripted subagent reply';
+    let streamCalls = 0;
+    const seamModel: NonNullable<ExtensionContext['model']> = {
+      id: 'seam-model',
+      name: 'seam-model',
+      api: 'mlx',
+      provider: 'mlx',
+      baseUrl: 'mlx://local',
+      reasoning: false,
+      input: ['text'],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 4096,
+      maxTokens: 1024,
+    };
+    const mlxProviderConfig: MlxProviderConfig = {
+      api: 'mlx',
+      baseUrl: 'mlx://local',
+      apiKey: 'mlx-local',
+      // Dispatch through a FRESH runtime proves provider-id (not object-identity)
+      // routing to the shared host's streamSimple. Script a minimal terminal turn.
+      streamSimple: (streamedModel: Model<Api>) => {
+        streamCalls++;
+        const stream = createAssistantMessageEventStream();
+        const message: AssistantMessage = {
+          role: 'assistant',
+          content: [{ type: 'text', text: SCRIPTED_TEXT }],
+          api: streamedModel.api,
+          provider: streamedModel.provider,
+          model: streamedModel.id,
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 2,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: 'stop',
+          timestamp: Date.now(),
+        };
+        stream.push({ type: 'start', partial: message });
+        stream.push({ type: 'text_start', contentIndex: 0, partial: message });
+        stream.push({ type: 'text_delta', contentIndex: 0, delta: SCRIPTED_TEXT, partial: message });
+        stream.push({ type: 'text_end', contentIndex: 0, content: SCRIPTED_TEXT, partial: message });
+        stream.push({ type: 'done', reason: 'stop', message });
+        stream.end();
+        return stream;
+      },
+      models: [
+        {
+          id: 'seam-model',
+          name: 'seam-model',
+          api: 'mlx',
+          baseUrl: 'mlx://local',
+          reasoning: false,
+          input: ['text'],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 4096,
+          maxTokens: 1024,
+        },
+      ],
+    };
+
+    let session: InProcessSubagentSession | undefined;
+    try {
+      session = await createProductionSession({
+        cwd: root,
+        model: seamModel,
+        mlxProviderConfig,
+        tools: ['read'],
+        systemPrompt: 'You are a runtime-seam probe.',
+      });
+      const assistantTexts: string[] = [];
+      const unsubscribe = session.subscribe((raw) => {
+        const event = raw as { type?: string; message?: Message };
+        if (event.type !== 'message_end' || event.message?.role !== 'assistant') return;
+        const content = event.message.content;
+        const text = Array.isArray(content) ? content.find((part) => part.type === 'text') : undefined;
+        if (text?.type === 'text') assistantTexts.push(text.text);
+      });
+      await session.prompt('probe the seam');
+      unsubscribe();
+
+      // One dispatch through the fresh runtime, and the scripted reply round-trips
+      // back out of the real AgentSession — proving shared-host wiring end to end.
+      expect(streamCalls).toBe(1);
+      expect(assistantTexts).toContain(SCRIPTED_TEXT);
+    } finally {
+      session?.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   it('propagates abort to the in-process session and disposes it', async () => {
     const session = new FakeSession();

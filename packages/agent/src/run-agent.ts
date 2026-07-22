@@ -31,7 +31,7 @@ import { createTraceNoticeExtension } from './extensions/trace-notice.js';
 import { createMlxProviderExtension } from './provider/index.js';
 import { MlxModelHost } from './provider/model-host.js';
 import {
-  type FilterableModelRegistryConstructor,
+  type FilterableModelRuntimeConstructor,
   installMlxOnlyModelRegistryFilter,
 } from './provider/model-registry-filter.js';
 import type { MlxModelInfo } from './provider/models.js';
@@ -41,7 +41,7 @@ export type RunAgentMain = (args: string[], opts: { extensionFactories: InlineEx
 
 export interface RunAgentPi {
   main: RunAgentMain;
-  ModelRegistry: FilterableModelRegistryConstructor;
+  ModelRuntime: FilterableModelRuntimeConstructor;
 }
 
 /** @internal Narrow lifecycle seam for the agent's paged config overlays. */
@@ -113,12 +113,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
     },
   );
 
-  // Keep the pi import strictly behind the seam. The seam carries BOTH main
-  // and its registry class, so tests and production exercise the same policy
-  // installation/lifecycle instead of being able to bypass it accidentally.
+  // Keep the pi import strictly behind the seam. The seam carries BOTH main and
+  // the ModelRuntime class, so tests and production exercise the same policy
+  // installation/lifecycle instead of being able to bypass it accidentally. The
+  // filter patches the runtime prototype (not the extension-only ModelRegistry
+  // facade), which is where the selector / listing / resolution paths read.
   const pi: RunAgentPi = opts.piImpl ?? (await import('@earendil-works/pi-coding-agent'));
   const restoreModelRegistry = installMlxOnlyModelRegistryFilter(
-    pi.ModelRegistry,
+    pi.ModelRuntime,
     opts.models.map((model) => model.discovered.name),
   );
   const subagentsEnabled =

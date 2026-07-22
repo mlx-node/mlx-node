@@ -22,7 +22,7 @@
     "prepack": "yarn build:ui"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.6",
+    "@earendil-works/pi-coding-agent": "^0.81.1",
     "@huggingface/hub": "^2.13.2",
     "@mlx-node/agent": "workspace:*",
     "drizzle-orm": "1.0.0-rc.4"
