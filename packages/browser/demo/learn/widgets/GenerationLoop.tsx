@@ -129,7 +129,9 @@ const COPY = {
 export function GenerationLoop() {
   const copy = COPY[useLocale()];
   const [frame, setFrame] = React.useState(0);
-  const [playing, setPlaying] = React.useState(true);
+  const [playing, setPlaying] = React.useState(() =>
+    typeof window !== 'undefined' ? !window.matchMedia('(prefers-reduced-motion: reduce)').matches : true,
+  );
 
   React.useEffect(() => {
     if (!playing) return;
@@ -218,7 +220,13 @@ export function GenerationLoop() {
 
         {/* Candidate distribution for this step. */}
         <div className="space-y-1">
-          <div className="text-[11px] text-muted-foreground">{copy.phaseCaption[phase]}</div>
+          <div
+            className="text-[11px] text-muted-foreground"
+            aria-live={playing ? 'off' : 'polite'}
+            aria-atomic="true"
+          >
+            {copy.phaseCaption[phase]}
+          </div>
           <TopKBars ids={ids} probs={probs} texts={texts} sampledTokenId={sampledTokenId} runKey={frame} />
         </div>
       </div>

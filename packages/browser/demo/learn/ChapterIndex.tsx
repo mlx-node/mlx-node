@@ -59,24 +59,36 @@ export function ChapterIndex({
   return (
     <div className="absolute inset-0 z-10 overflow-y-auto bg-background">
       <div className="mx-auto flex w-full max-w-5xl flex-col px-6 py-10">
-        {/* Top bar */}
-        <div className="mb-8 flex items-center justify-between">
+        {/* Top bar. At 375px the full "Back" + "Open free chat" + language
+            toggle can't sit side-by-side, so — mirroring the LessonLayout
+            header — the Back link and the free-chat action collapse to
+            icon-only below `sm` (labels stay `sr-only`, returning at `sm`),
+            and every group is `shrink-0` so nothing overlaps and the 中文
+            toggle keeps its width instead of wrapping. */}
+        <div className="mb-8 flex items-center justify-between gap-2">
           <button
             type="button"
             onClick={onBackToLanding}
             // 44px tap target on touch; `-mx-2` outsets the padding as pure hit
             // area so the row height is unchanged, compact (h-8) from sm up.
-            className="-mx-2 inline-flex h-11 items-center gap-2 px-2 text-sm text-muted-foreground hover:text-foreground sm:h-8"
+            // Label is `sr-only` below `sm` so the icon alone shows on a phone.
+            className="-mx-2 inline-flex h-11 shrink-0 items-center gap-2 px-2 text-sm text-muted-foreground hover:text-foreground sm:h-8"
           >
             <ArrowLeftIcon className="size-4" />
-            {ui.chapterIndex.back}
+            <span className="sr-only sm:not-sr-only">{ui.chapterIndex.back}</span>
           </button>
-          <div className="flex items-center gap-2">
-            <Button variant="outline" size="sm" onClick={onOpenFreeChat} className="gap-2">
+          <div className="flex shrink-0 items-center gap-1 sm:gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onOpenFreeChat}
+              // Icon-only 44px square below `sm`; full label + auto width from `sm` up.
+              className="h-11 w-11 gap-2 sm:h-8 sm:w-auto"
+            >
               <MessageSquareIcon className="size-4" />
-              {ui.chapterIndex.openFreeChat}
+              <span className="sr-only sm:not-sr-only">{ui.chapterIndex.openFreeChat}</span>
             </Button>
-            <LanguageSwitcher />
+            <LanguageSwitcher className="shrink-0" />
           </div>
         </div>
 
@@ -556,9 +568,7 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef, modelReady, onLoa
         if (activeStage === 'sampling') return ui.forwardPass.statusReplayingStage(ui.forwardPass.stageSampling);
         return ui.forwardPass.statusReplaying;
       case 'paused':
-        return activeLayer
-          ? ui.forwardPass.statusPausedLayer(layerProgress, NUM_LAYERS)
-          : ui.forwardPass.statusPaused;
+        return activeLayer ? ui.forwardPass.statusPausedLayer(layerProgress, NUM_LAYERS) : ui.forwardPass.statusPaused;
       case 'done':
         return ui.forwardPass.statusDone;
       case 'aborted':

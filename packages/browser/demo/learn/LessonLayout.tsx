@@ -1,9 +1,10 @@
-import { ArrowLeftIcon, CheckIcon, DownloadIcon, MessageSquareIcon, PlayIcon } from 'lucide-react';
+import { ArrowLeftIcon, ArrowRightIcon, CheckIcon, DownloadIcon, MessageSquareIcon, PlayIcon } from 'lucide-react';
 import * as React from 'react';
 
 import { LanguageSwitcher } from '../components/LanguageSwitcher';
 import { Button } from '../components/ui/button';
 import { detectModelBlockReason } from '../lib/device-capability';
+import { localePath } from '../lib/i18n';
 import { useLocale } from '../lib/i18n-react';
 import type { ChapterMeta, SectionMeta } from './chapters';
 import { localizedChapters } from './i18n/localized';
@@ -121,9 +122,7 @@ export function LessonLayout({
                   truncates to "Chapter N · Ti…" on a phone, dropping the section's
                   own identity. Below sm, show just the section title (its most
                   specific name); the full breadcrumb returns from sm up. */}
-              <span className="hidden sm:inline">
-                {ui.lessonLayout.breadcrumb(current.number, current.title)}
-              </span>
+              <span className="hidden sm:inline">{ui.lessonLayout.breadcrumb(current.number, current.title)}</span>
               <span className="hidden text-foreground/80 sm:inline"> › </span>
               <span className="text-foreground/80">{sectionTitle}</span>
             </>
@@ -143,12 +142,7 @@ export function LessonLayout({
               <span className="sr-only sm:not-sr-only">{ui.lessonLayout.loadModel}</span>
             </Button>
           ) : null}
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={onOpenFreeChat}
-            className="h-11 w-11 gap-2 sm:h-8 sm:w-auto"
-          >
+          <Button variant="ghost" size="sm" onClick={onOpenFreeChat} className="h-11 w-11 gap-2 sm:h-8 sm:w-auto">
             <MessageSquareIcon className="size-4" />
             <span className="sr-only sm:not-sr-only">{ui.lessonLayout.freeChat}</span>
           </Button>
@@ -182,10 +176,31 @@ export function LessonLayout({
               poster) gets the full poster width. Without this cap a reading
               lesson's narrow left-aligned prose strands in the left third with
               a large empty right half. */}
+          {/* Prev/next pager threaded through the whole reading order — the
+              only cross-chapter control below `lg`, where the sidebar is hidden.
+              Kept inside the same width-capped wrapper as the body so it lines
+              up with the prose in every layout. Shown at all widths (a familiar
+              docs-footer affordance even when the sidebar is present). */}
           {hasTryIt ? (
-            children
+            <>
+              {children}
+              <ChapterPager
+                currentId={current.id}
+                currentSectionId={currentSectionId}
+                onOpenChapter={onOpenChapter}
+                onOpenSection={onOpenSection}
+              />
+            </>
           ) : (
-            <div className={['mx-auto w-full', wideBody ? 'max-w-[1400px]' : 'max-w-3xl'].join(' ')}>{children}</div>
+            <div className={['mx-auto w-full', wideBody ? 'max-w-[1400px]' : 'max-w-3xl'].join(' ')}>
+              {children}
+              <ChapterPager
+                currentId={current.id}
+                currentSectionId={currentSectionId}
+                onOpenChapter={onOpenChapter}
+                onOpenSection={onOpenSection}
+              />
+            </div>
           )}
         </main>
 
@@ -205,6 +220,127 @@ export function LessonLayout({
         ) : null}
       </div>
     </div>
+  );
+}
+
+/** One flattened step in the reading order — a chapter or a sub-chapter. */
+type PagerEntry = {
+  chapterId: string;
+  /** Set when the entry is a sub-chapter (its own /chapters/<id>/<sectionId> page). */
+  sectionId?: string;
+  title: string;
+  /** Unprefixed app path; locale prefix is applied by the link at render time. */
+  path: string;
+};
+
+/**
+ * Prev/next pager at the foot of a chapter/sub-chapter body.
+ *
+ * Neighbors come from the SAME registry the sidebar uses (`localizedChapters`),
+ * flattened into the linear reading order a learner walks top-to-bottom: each
+ * available chapter, immediately followed by its "go deeper" sub-chapters —
+ * mirroring the sidebar's nesting. So Next from a chapter with sub-chapters
+ * steps INTO the first sub-chapter, and Next from the last sub-chapter steps to
+ * the following chapter. Coming-soon chapters are skipped (never link to a page
+ * that refuses to open). First entry has no Previous; last has no Next.
+ *
+ * Links are real `<a href>` (locale-prefixed via `localePath`) so they are
+ * crawlable and open-in-new-tab works; a plain left-click is intercepted for
+ * in-app SPA navigation through the same locale-aware callbacks the sidebar
+ * uses (modifier/middle clicks fall through to the browser).
+ */
+function ChapterPager({
+  currentId,
+  currentSectionId,
+  onOpenChapter,
+  onOpenSection,
+}: {
+  currentId: string;
+  currentSectionId?: string;
+  onOpenChapter: (chapterId: string) => void;
+  onOpenSection?: (chapterId: string, sectionId: string) => void;
+}) {
+  const ui = useUiStrings();
+  const locale = useLocale();
+  const chapters = localizedChapters(locale);
+
+  const flat: PagerEntry[] = [];
+  for (const c of chapters) {
+    if (!c.available) continue;
+    flat.push({ chapterId: c.id, title: c.title, path: `/chapters/${c.id}` });
+    for (const s of c.sections ?? []) {
+      flat.push({ chapterId: c.id, sectionId: s.id, title: s.title, path: `/chapters/${c.id}/${s.id}` });
+    }
+  }
+
+  const index = flat.findIndex((e) => e.chapterId === currentId && e.sectionId === currentSectionId);
+  if (index === -1) return null; // current page not in the reading order (defensive)
+  const prev = index > 0 ? flat[index - 1] : undefined;
+  const next = index < flat.length - 1 ? flat[index + 1] : undefined;
+  if (!prev && !next) return null;
+
+  const open = (entry: PagerEntry) => {
+    if (entry.sectionId) onOpenSection?.(entry.chapterId, entry.sectionId);
+    else onOpenChapter(entry.chapterId);
+  };
+
+  return (
+    <nav aria-label={ui.lessonLayout.pagerLabel} className="mt-12 grid grid-cols-2 gap-3 border-t border-border pt-6">
+      {/* Empty cells keep a lone Previous left and a lone Next right. */}
+      {prev ? (
+        <PagerLink entry={prev} direction="prev" label={ui.lessonLayout.prevLabel} locale={locale} onOpen={open} />
+      ) : (
+        <span aria-hidden="true" />
+      )}
+      {next ? (
+        <PagerLink entry={next} direction="next" label={ui.lessonLayout.nextLabel} locale={locale} onOpen={open} />
+      ) : (
+        <span aria-hidden="true" />
+      )}
+    </nav>
+  );
+}
+
+function PagerLink({
+  entry,
+  direction,
+  label,
+  locale,
+  onOpen,
+}: {
+  entry: PagerEntry;
+  direction: 'prev' | 'next';
+  label: string;
+  locale: Parameters<typeof localePath>[0];
+  onOpen: (entry: PagerEntry) => void;
+}) {
+  const isNext = direction === 'next';
+  const handleClick = (ev: React.MouseEvent<HTMLAnchorElement>) => {
+    // Let the browser own modifier / non-primary clicks (open in new tab etc.);
+    // a plain left-click does an in-app SPA navigation.
+    if (ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+    ev.preventDefault();
+    onOpen(entry);
+  };
+  return (
+    <a
+      href={localePath(locale, entry.path)}
+      onClick={handleClick}
+      aria-label={`${label}: ${entry.title}`}
+      className={[
+        'group flex min-w-0 flex-col gap-1 rounded-lg border border-border p-3 transition-colors hover:bg-accent/40 sm:p-4',
+        isNext ? 'items-end text-right' : 'items-start text-left',
+      ].join(' ')}
+    >
+      <span className="flex items-center gap-1 font-mono text-[0.65rem] uppercase tracking-[0.15em] text-muted-foreground">
+        {isNext ? null : <ArrowLeftIcon aria-hidden="true" className="size-3.5" />}
+        {label}
+        {isNext ? <ArrowRightIcon aria-hidden="true" className="size-3.5" /> : null}
+      </span>
+      <span className="line-clamp-2 text-sm font-medium text-foreground/90 group-hover:text-foreground">
+        {entry.title}
+      </span>
+    </a>
   );
 }
 
@@ -253,15 +389,7 @@ function ChapterSidebar({
   );
 }
 
-function SectionRow({
-  section,
-  active,
-  onOpen,
-}: {
-  section: SectionMeta;
-  active: boolean;
-  onOpen: () => void;
-}) {
+function SectionRow({ section, active, onOpen }: { section: SectionMeta; active: boolean; onOpen: () => void }) {
   return (
     <button
       type="button"

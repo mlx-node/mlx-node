@@ -100,7 +100,9 @@ const COPY = {
 export function LmHeadWalkthrough() {
   const copy = COPY[useLocale()];
   const [beamCol, setBeamCol] = React.useState(0);
-  const [playing, setPlaying] = React.useState(true);
+  const [playing, setPlaying] = React.useState(() =>
+    typeof window !== 'undefined' ? !window.matchMedia('(prefers-reduced-motion: reduce)').matches : true,
+  );
 
   React.useEffect(() => {
     if (!playing) return;
@@ -163,6 +165,13 @@ export function LmHeadWalkthrough() {
       </div>
 
       <p className="text-[12px] text-foreground/85">{copy.intro}</p>
+
+      {/* The scanning beam lives inside the SVG (an SVG <text>), so mirror its
+          label into an sr-only live region. Muted while autoplaying to avoid a
+          firehose at the 110ms scan rate; announced once when static/paused. */}
+      <div className="sr-only" aria-live={playing ? 'off' : 'polite'} aria-atomic="true">
+        {copy.beamLabel(beamCol, SAMPLE_TOKENS[beamCol]!)}
+      </div>
 
       <svg viewBox={`0 0 ${W} ${H}`} className="block h-auto w-full" role="img" aria-label={copy.svgAria}>
         {/* hidden state column */}

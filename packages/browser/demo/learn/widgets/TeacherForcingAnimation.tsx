@@ -140,7 +140,9 @@ const COPY = {
 export function TeacherForcingAnimation() {
   const copy = COPY[useLocale()];
   const [step, setStep] = React.useState<0 | 1 | 2 | 3>(0);
-  const [playing, setPlaying] = React.useState(true);
+  const [playing, setPlaying] = React.useState(() =>
+    typeof window !== 'undefined' ? !window.matchMedia('(prefers-reduced-motion: reduce)').matches : true,
+  );
 
   React.useEffect(() => {
     if (!playing) return;
@@ -174,7 +176,11 @@ export function TeacherForcingAnimation() {
         </div>
       </div>
 
-      <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-[12px] text-foreground/95">
+      <div
+        className="rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-[12px] text-foreground/95"
+        aria-live={playing ? 'off' : 'polite'}
+        aria-atomic="true"
+      >
         {stepLabels[step]}
       </div>
 

@@ -56,11 +56,27 @@ export function Landing({
     <div className="overlay-screen">
       <DriftingLibrary />
       {/* Language switcher pinned to the top-right corner — the landing has no
-          header bar, so this floats above the hero like the footer floats below. */}
-      <div className="absolute right-5 top-5 z-20">
+          header bar, so this floats above the hero like the footer floats below.
+          Hidden below `sm`: at 375px the near-full-width hero badge (the "Real
+          LLM · 100% Local · WebGPU" pill spans almost edge-to-edge) sits right
+          under this corner, so the toggle would occlude the badge's right end.
+          On a phone the in-flow switcher below the header renders instead. */}
+      <div className="absolute right-5 top-5 z-20 hidden sm:block">
         <LanguageSwitcher />
       </div>
-      <div className="landing-content">
+      {/* `self-start` top-anchors the hero on a phone (overriding the parent's
+          vertical centering from the child — no stylesheet edit). The overlay
+          does not scroll, so a vertically-centered hero taller than a short
+          viewport would clip its TOP — which would hide the in-flow switcher
+          below. Top-anchoring keeps that switcher (and the badge) on-screen.
+          `sm:self-center` restores the centered hero on wider screens. */}
+      <div className="landing-content self-start sm:self-center">
+        {/* Mobile-only in-flow switcher: rides at the top of the hero, right-
+            aligned, so it always sits ABOVE the wide badge and can never overlap
+            it at any viewport height. Replaced by the corner switcher from `sm` up. */}
+        <div className="mb-5 self-end sm:hidden">
+          <LanguageSwitcher />
+        </div>
         <div className="landing-tag">{ui.landing.tag}</div>
         <h1 className="landing-title">
           {ui.landing.heroTitlePre}

@@ -94,6 +94,12 @@ function upsertJsonLd(payload: object | object[] | null): void {
 export function applySeoHead(seo: PageSeo, jsonLd: object | object[] | null): void {
   if (typeof document === 'undefined') return;
   document.documentElement.lang = htmlLang(seo.locale);
+  // The app is dark-only, but `@custom-variant dark (&:is(.dark *))` gates every
+  // `dark:` utility on a `.dark` ancestor that nothing ever added — leaving the
+  // intended dark callout/button colors inert (light base rendered, failing
+  // contrast). Add it here so it is captured by the prerender's
+  // documentElement.outerHTML serialization AND applied at runtime.
+  document.documentElement.classList.add('dark');
   document.title = seo.title;
   upsertLink('canonical', seo.canonical);
   syncAlternateLinks(seo.alternates);

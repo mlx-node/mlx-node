@@ -28,6 +28,12 @@ export type UiStrings = {
     soonBadge: string;
     /** Right-hand demo column heading. */
     tryItNow: string;
+    /** aria-label for the prev/next pager at the foot of a chapter. */
+    pagerLabel: string;
+    /** Pager "Previous" eyebrow (the target title sits beneath it). */
+    prevLabel: string;
+    /** Pager "Next" eyebrow. */
+    nextLabel: string;
   };
 
   chapterPage: {
@@ -215,6 +221,9 @@ const EN: UiStrings = {
     chaptersHeading: 'Chapters',
     soonBadge: 'soon',
     tryItNow: 'Try it now',
+    pagerLabel: 'Chapter navigation',
+    prevLabel: 'Previous',
+    nextLabel: 'Next',
   },
 
   chapterPage: {
@@ -372,8 +381,7 @@ const EN: UiStrings = {
     chipTokenize: 'Tokenize',
     chipEmbedding: 'Embedding lookup',
     chipLayers: '× 24 layers',
-    chipLayersTitle:
-      'Hybrid stack: 6 full-attention layers + 18 cheaper linear-attention (GatedDeltaNet) layers',
+    chipLayersTitle: 'Hybrid stack: 6 full-attention layers + 18 cheaper linear-attention (GatedDeltaNet) layers',
     chipFinalNorm: 'Final RMSNorm',
     chipLmHead: 'LM head',
     chipSampling: 'Sampling',
@@ -408,6 +416,9 @@ const ZH: UiStrings = {
     chaptersHeading: '章节',
     soonBadge: '即将上线',
     tryItNow: '动手试试',
+    pagerLabel: '章节导航',
+    prevLabel: '上一篇',
+    nextLabel: '下一篇',
   },
 
   chapterPage: {
@@ -509,14 +520,17 @@ const ZH: UiStrings = {
       '观察堆叠：全量注意力层（青色）对所有历史 token 计算 Q · Kᵀ · softmax；线性层（琥珀色，GatedDeltaNet）维护一个循环状态——Qwen3.5 以 1:3 的比例交错使用它们。',
     footerLoop1: '这是循环的一轮。模型把预测出的 token 追加到末尾，再把整个堆叠跑一遍——但下一轮不会重算前缀：',
     footerLoopKvLink: (chapterNum) => `KV 缓存（第 ${chapterNum} 章）`,
-    footerLoop2: '会被复用——前缀无需重算，因此生成每个新 token 都远比重新处理整个上下文便宜。生成就是这个前向传播的循环。',
+    footerLoop2:
+      '会被复用——前缀无需重算，因此生成每个新 token 都远比重新处理整个上下文便宜。生成就是这个前向传播的循环。',
     footerHonest1: '坦白说明：这张图展示的是',
     footerHonestGreedy: '贪心',
-    footerHonest2: '补全——它永远选 logit 最高的那一个 token，所以这里相同的提示词每次给出相同的答案。真实的生成通常会从分布中',
+    footerHonest2:
+      '补全——它永远选 logit 最高的那一个 token，所以这里相同的提示词每次给出相同的答案。真实的生成通常会从分布中',
     footerHonestSamplesLink: '采样',
     footerHonest3: '，因此同一个提示词每次运行的结果可能不同。展示的续写也被',
     footerHonestCapped: '截断',
-    footerHonest4: (cap) => `在 ${cap} 个 token——原始贪心解码超过这个长度会陷入循环——所以这只是前几个预测的窗口，不是完整回复。完整图景及其局限见`,
+    footerHonest4: (cap) =>
+      `在 ${cap} 个 token——原始贪心解码超过这个长度会陷入循环——所以这只是前几个预测的窗口，不是完整回复。完整图景及其局限见`,
     footerHonestWholeModelLink: '全模型章节',
     footerHonest5: '。',
   },

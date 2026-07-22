@@ -123,7 +123,9 @@ const COPY = {
 export function WeightTyingVisual() {
   const copy = COPY[useLocale()];
   const [step, setStep] = React.useState(0);
-  const [playing, setPlaying] = React.useState(true);
+  const [playing, setPlaying] = React.useState(() =>
+    typeof window !== 'undefined' ? !window.matchMedia('(prefers-reduced-motion: reduce)').matches : true,
+  );
 
   React.useEffect(() => {
     if (!playing) return;
@@ -362,7 +364,11 @@ export function WeightTyingVisual() {
         </text>
       </svg>
 
-      <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-[12px] text-foreground/95">
+      <div
+        className="rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-[12px] text-foreground/95"
+        aria-live={playing ? 'off' : 'polite'}
+        aria-atomic="true"
+      >
         <span className="text-muted-foreground">{copy.stepPrefix(step + 1)}</span>
         {copy.steps[step]}
       </div>

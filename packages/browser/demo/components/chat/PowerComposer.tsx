@@ -1,4 +1,4 @@
-import { ArrowUp, ImagePlus, Mic } from 'lucide-react';
+import { ArrowUp, ImagePlus } from 'lucide-react';
 import { type FormEvent, type RefObject } from 'react';
 
 import { type ReasoningEffort } from '../../lib/display-helpers';
@@ -65,9 +65,6 @@ export function PowerComposer(props: PowerComposerProps) {
             className="composer-textarea"
             onInput={onTextareaInput}
           />
-          <button type="button" className="composer-icon-btn" aria-label="Voice input">
-            <Mic size={18} aria-hidden="true" />
-          </button>
           <button
             ref={sendRef}
             type="button"

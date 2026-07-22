@@ -12,7 +12,11 @@
   --border: #2f2a36;
   --text: #ece4da;
   --text-dim: #9e928a;
-  --text-muted: #6a6168;
+  /* Raised from #6a6168 (~2.9–3.2:1, failed WCAG AA) to clear 4.5:1 on every
+     muted background up to --surface-2. Used only for text (utility
+     `text-muted-foreground` + a handful of `color: var(--text-muted)` rules and
+     the JSpace placeholder), so lightening is safe. */
+  --text-muted: #9a908a;
 
   /* Mascot palette — primary accent family */
   --book-pink: #f4c8d7;
@@ -1329,6 +1333,17 @@
   }
   .assistant-inspect-btn {
     padding: 8px 14px;
+  }
+  /* The shared <Button> primitive (h-8/9/10 = 32/36/40px) is never matched by
+     the class rules above, so on touch its Run / nav / segmented controls stay
+     below the 44px comfort floor. Raise it via min-height (a floor — it beats
+     the utility's fixed height without disturbing desktop-pointer pixels), and
+     widen icon buttons to stay square. */
+  [data-slot='button'] {
+    min-height: 44px;
+  }
+  [data-slot='button'][data-size='icon'] {
+    min-width: 44px;
   }
   /* 16px is the exact iOS Safari auto-zoom threshold: focusing an input below
      it zooms the whole page in and never zooms back. Keep the field at 16px on

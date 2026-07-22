@@ -11,9 +11,9 @@
 import { useNavigate, useRouterState } from '@tanstack/react-router';
 import * as React from 'react';
 
+import { UI_STRINGS } from '../learn/i18n/ui';
 import { LOCALES, LOCALE_LABELS, localePath, storeLocale, stripLocalePrefix, type Locale } from '../lib/i18n';
 import { useLocale } from '../lib/i18n-react';
-import { UI_STRINGS } from '../learn/i18n/ui';
 
 export function LanguageSwitcher({ className }: { className?: string }) {
   const locale = useLocale();
@@ -44,8 +44,10 @@ export function LanguageSwitcher({ className }: { className?: string }) {
             onClick={() => switchTo(l)}
             className={[
               // 44px tap target on touch/small screens, compact (h-8, matching the
-              // header's other controls) from sm up.
-              'inline-flex min-h-11 items-center justify-center rounded-md border px-3 py-1 text-xs font-medium transition-colors outline-none sm:min-h-8',
+              // header's other controls) from sm up. `shrink-0` + `whitespace-nowrap`
+              // keep each pill at its label's intrinsic width so a squeezed header
+              // row can never compress "中文" or wrap it onto two lines.
+              'inline-flex min-h-11 shrink-0 items-center justify-center whitespace-nowrap rounded-md border px-3 py-1 text-xs font-medium transition-colors outline-none sm:min-h-8',
               'focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50',
               active
                 ? 'border-primary/60 bg-primary/10 text-foreground'
