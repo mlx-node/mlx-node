@@ -94,9 +94,7 @@ export interface SubagentSessionCreateOptions {
    * exported at the package root, so type it structurally from the facade
    * method's return type (survives a future pi rename of the type).
    */
-  mlxProviderConfig: NonNullable<
-    ReturnType<ExtensionContext['modelRegistry']['getRegisteredProviderConfig']>
-  >;
+  mlxProviderConfig: NonNullable<ReturnType<ExtensionContext['modelRegistry']['getRegisteredProviderConfig']>>;
   tools?: string[];
   systemPrompt: string;
 }

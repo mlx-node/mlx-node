@@ -19,6 +19,7 @@ import type { ExtensionAPI, InlineExtension } from '@earendil-works/pi-coding-ag
 import { coldCacheStats, type ColdCacheStats } from '@mlx-node/core';
 
 import { MetricsTrace, type MetricsTraceRecord } from './metrics-trace.js';
+import { MLX_API, MLX_API_KEY, MLX_BASE_URL, MLX_PROVIDER_ID } from './mlx-identity.js';
 import { MlxModelHost } from './model-host.js';
 import type { MlxModelInfo } from './models.js';
 import { PerformanceStatus } from './performance-status.js';
@@ -135,10 +136,10 @@ export function createMlxProviderExtension(
   return {
     name: 'mlx-provider',
     factory: (pi: ExtensionAPI) => {
-      pi.registerProvider('mlx', {
-        api: 'mlx',
-        baseUrl: 'mlx://local',
-        apiKey: 'mlx-local',
+      pi.registerProvider(MLX_PROVIDER_ID, {
+        api: MLX_API,
+        baseUrl: MLX_BASE_URL,
+        apiKey: MLX_API_KEY,
         streamSimple,
         models: models.map((m) => m.piModel),
       });

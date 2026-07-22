@@ -153,12 +153,9 @@ describe('createMlxProviderExtension', () => {
         },
       } as unknown as ExtensionAPI;
       void extension.factory(pi);
-      handlers.get('session_start')!(
-        { type: 'session_start', reason },
-        {
-          sessionManager: { getSessionId: () => rootSessionId },
-        } as unknown as ExtensionContext,
-      );
+      handlers.get('session_start')!({ type: 'session_start', reason }, {
+        sessionManager: { getSessionId: () => rootSessionId },
+      } as unknown as ExtensionContext);
       const streamSimple = provider?.streamSimple;
       if (!streamSimple) throw new Error('provider did not register streamSimple');
       const stream = streamSimple(model, context, { sessionId: activeSessionId } satisfies SimpleStreamOptions);

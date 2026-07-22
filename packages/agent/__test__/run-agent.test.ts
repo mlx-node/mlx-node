@@ -23,7 +23,12 @@ const FAKE_MODEL = {
   piModel: {},
 } as never;
 
-const ENV_KEYS = ['PI_CODING_AGENT_DIR', 'PI_SKIP_VERSION_CHECK', 'MLX_PAGED_PREFILL_CHUNK_SIZE', 'PI_OFFLINE'] as const;
+const ENV_KEYS = [
+  'PI_CODING_AGENT_DIR',
+  'PI_SKIP_VERSION_CHECK',
+  'MLX_PAGED_PREFILL_CHUNK_SIZE',
+  'PI_OFFLINE',
+] as const;
 
 type EnvKey = (typeof ENV_KEYS)[number];
 

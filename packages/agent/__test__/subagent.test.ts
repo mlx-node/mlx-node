@@ -222,7 +222,11 @@ describe('mlx subagent extension', () => {
 
     expect(result.content).toEqual([{ type: 'text', text: 'finished' }]);
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toMatchObject({ cwd: '/repo/nested', model: PARENT_MODEL, mlxProviderConfig: MLX_PROVIDER_CONFIG });
+    expect(calls[0]).toMatchObject({
+      cwd: '/repo/nested',
+      model: PARENT_MODEL,
+      mlxProviderConfig: MLX_PROVIDER_CONFIG,
+    });
     expect(calls[0]!.tools).toEqual(['read', 'grep', 'find', 'ls', 'bash']);
     expect(calls[0]!.systemPrompt).toContain('You are a scout');
     expect(sessions[0]!.prompts).toEqual(['Task: inspect the code']);
@@ -527,10 +531,7 @@ describe('mlx subagent extension', () => {
       context(),
     );
 
-    expect(prompts).toEqual([
-      'Task: inspect',
-      `Task: plan from ${previousOutput}; verify ${previousOutput}`,
-    ]);
+    expect(prompts).toEqual(['Task: inspect', `Task: plan from ${previousOutput}; verify ${previousOutput}`]);
   });
 
   it('rejects a user agent that explicitly requests a cloud provider', async () => {

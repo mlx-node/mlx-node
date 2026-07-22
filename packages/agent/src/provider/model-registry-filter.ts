@@ -44,6 +44,8 @@
  * the provider or CLI layers.
  */
 
+import { MLX_API, MLX_API_KEY, MLX_BASE_URL, MLX_PROVIDER_ID } from './mlx-identity.js';
+
 interface RuntimeModel {
   provider: string;
   id: string;
@@ -92,9 +94,9 @@ const activePrototypes = new WeakSet<object>();
  * `getAuth` is intentionally NOT part of {@link FilterableModelRuntime}: pi types
  * it with two overloads (`getAuth(providerId)` and `getAuth(model)`), which a
  * single structural signature cannot capture without breaking the runtime→
- * interface assignment. It is wrapped by name with the loose shape below.
+ * interface assignment. It is wrapped by name (mlx pins a fixed resolution; the
+ * original is never delegated to).
  */
-type GetAuthMethod = (this: object, providerOrModel: unknown, overrides?: unknown) => Promise<unknown>;
 
 /** Method names wrapped through the structural interface, plus the loose `getAuth`. */
 const STRUCTURAL_METHODS = [
@@ -136,7 +138,10 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
 
   const allowedIds = new Set(modelIds);
   const isAllowed = (model: TModel): boolean =>
-    model.provider === 'mlx' && allowedIds.has(model.id) && model.api === 'mlx' && model.baseUrl === 'mlx://local';
+    model.provider === MLX_PROVIDER_ID &&
+    allowedIds.has(model.id) &&
+    model.api === MLX_API &&
+    model.baseUrl === MLX_BASE_URL;
 
   // Capture every original descriptor up front (fail-closed if pi's method shape
   // changed), so restore can put them all back verbatim.
@@ -163,7 +168,6 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
   const getProviderAuthStatus = iface.getProviderAuthStatus.value;
   const login = iface.login.value;
   const refresh = iface.refresh.value;
-  const getAuth = originals.getAuth.value as GetAuthMethod;
   const recomposeProvider = originals.recomposeProvider.value as (this: object, providerId: string) => void;
 
   Object.defineProperties(prototype, {
@@ -190,7 +194,7 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
     getModel: {
       ...originals.getModel,
       value(this: FilterableModelRuntime<TModel>, provider: string, modelId: string): TModel | undefined {
-        if (provider !== 'mlx' || !allowedIds.has(modelId)) return undefined;
+        if (provider !== MLX_PROVIDER_ID || !allowedIds.has(modelId)) return undefined;
         const model = getModel.call(this, provider, modelId);
         return model && isAllowed(model) ? model : undefined;
       },
@@ -200,7 +204,7 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
       // Streaming uses `this.models.getProvider` (a different object); this only
       // gates external reads (e.g. `/logout`). Non-mlx must never surface.
       value(this: FilterableModelRuntime<TModel>, providerId: string): RuntimeProvider | undefined {
-        return providerId === 'mlx' ? getProvider.call(this, providerId) : undefined;
+        return providerId === MLX_PROVIDER_ID ? getProvider.call(this, providerId) : undefined;
       },
     },
     hasConfiguredAuth: {
@@ -208,19 +212,19 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
       // The runtime signature takes a providerId string (not a model), so gate on
       // the provider id alone: only 'mlx' may ever report configured auth.
       value(this: FilterableModelRuntime<TModel>, providerId: string): boolean {
-        return providerId === 'mlx' && hasConfiguredAuth.call(this, providerId);
+        return providerId === MLX_PROVIDER_ID && hasConfiguredAuth.call(this, providerId);
       },
     },
     checkAuth: {
       ...originals.checkAuth,
       value(this: FilterableModelRuntime<TModel>, providerId: string): Promise<unknown> {
-        return providerId === 'mlx' ? checkAuth.call(this, providerId) : Promise.resolve(undefined);
+        return providerId === MLX_PROVIDER_ID ? checkAuth.call(this, providerId) : Promise.resolve(undefined);
       },
     },
     isUsingOAuth: {
       ...originals.isUsingOAuth,
       value(this: FilterableModelRuntime<TModel>, providerId: string): boolean {
-        return providerId === 'mlx' && isUsingOAuth.call(this, providerId);
+        return providerId === MLX_PROVIDER_ID && isUsingOAuth.call(this, providerId);
       },
     },
     getProviders: {
@@ -228,7 +232,7 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
       // `/login` enumerates from here; hide every cloud provider so only mlx is
       // ever offered for sign-in.
       value(this: FilterableModelRuntime<TModel>): RuntimeProvider[] {
-        return getProviders.call(this).filter((provider) => provider.id === 'mlx');
+        return getProviders.call(this).filter((provider) => provider.id === MLX_PROVIDER_ID);
       },
     },
     listCredentials: {
@@ -236,7 +240,7 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
       // `/logout` enumerates stored credentials from here (bypassing the composed
       // model map); never reveal a non-mlx credential.
       value(this: FilterableModelRuntime<TModel>): Promise<RuntimeCredential[]> {
-        return listCredentials.call(this).then((creds) => creds.filter((cred) => cred.providerId === 'mlx'));
+        return listCredentials.call(this).then((creds) => creds.filter((cred) => cred.providerId === MLX_PROVIDER_ID));
       },
     },
     getProviderAuthStatus: {
@@ -244,25 +248,31 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
       // Reads the raw credential/config layer (not the model map); only mlx may
       // report configured.
       value(this: FilterableModelRuntime<TModel>, providerId: string): RuntimeAuthStatus {
-        return providerId === 'mlx' ? getProviderAuthStatus.call(this, providerId) : { configured: false };
+        return providerId === MLX_PROVIDER_ID ? getProviderAuthStatus.call(this, providerId) : { configured: false };
       },
     },
     getAuth: {
       ...originals.getAuth,
-      // Pivotal offline gate. `/login`, `/logout`, and the built-in `/llama`
-      // command resolve auth through the runtime's `getAuth`, whose OAuth /
-      // `LLAMA_BASE_URL` fetch ignores PI_OFFLINE. Resolve auth ONLY for mlx
-      // (string form `getAuth('mlx')` or model form `model.provider === 'mlx'`);
-      // returning undefined for anything else makes those commands stop before any
-      // network or second-model-host load. Streaming passes through: prepareRequest
-      // calls getAuth(model) with an mlx model.
-      value(this: object, providerOrModel: unknown, overrides?: unknown): Promise<unknown> {
+      // Pivotal offline gate + reserved-id invariant. `/login`, `/logout`, and the
+      // built-in `/llama` command resolve auth through the runtime's `getAuth`,
+      // whose OAuth / `LLAMA_BASE_URL` fetch ignores PI_OFFLINE — so non-mlx must
+      // resolve to nothing (string form `getAuth(id)` or model form via
+      // `model.provider`). For mlx we do NOT delegate to the composed provider:
+      // a persisted `models.json` `{ oauth:'radius', baseUrl }` overlay under the
+      // `mlx` id promotes a Radius builtin that merges a radius OAuth method into
+      // the composed `mlx` auth; with a stored/expired `mlx` oauth credential the
+      // real resolution would trigger an offline OAuth refresh throw ("OAuth
+      // refresh failed for mlx") and never reach our local stream. Pin mlx to the
+      // fixed local credential instead — identical to the no-overlay case, but
+      // immune to the overlay. prepareRequest reads only auth.apiKey/baseUrl(/headers)
+      // and dispatches streamSimple on the (api-matched) local closure.
+      value(this: object, providerOrModel: unknown, _overrides?: unknown): Promise<unknown> {
         const providerId =
           typeof providerOrModel === 'string'
             ? providerOrModel
             : (providerOrModel as { provider?: unknown } | null | undefined)?.provider;
-        if (providerId !== 'mlx') return Promise.resolve(undefined);
-        return getAuth.call(this, providerOrModel, overrides);
+        if (providerId !== MLX_PROVIDER_ID) return Promise.resolve(undefined);
+        return Promise.resolve({ auth: { apiKey: MLX_API_KEY, baseUrl: MLX_BASE_URL } });
       },
     },
     login: {
@@ -276,7 +286,7 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
         type: unknown,
         interaction: unknown,
       ): Promise<unknown> {
-        if (providerId !== 'mlx') {
+        if (providerId !== MLX_PROVIDER_ID) {
           return Promise.reject(new Error('mlx agent is offline: provider login is disabled'));
         }
         return login.call(this, providerId, type, interaction);
@@ -309,7 +319,7 @@ export function installMlxOnlyModelRegistryFilter<TModel extends RuntimeModel>(
       // created (runAgent installs before pi.main constructs it); the mlx provider
       // registers later via its own `recomposeProvider('mlx')`, allowed through.
       value(this: object, providerId: string): void {
-        if (providerId !== 'mlx') return;
+        if (providerId !== MLX_PROVIDER_ID) return;
         recomposeProvider.call(this, providerId);
       },
     },

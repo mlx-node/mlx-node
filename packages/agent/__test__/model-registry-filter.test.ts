@@ -141,10 +141,13 @@ describe('installMlxOnlyModelRegistryFilter', () => {
     expect(await runtime.checkAuth('mlx')).toEqual({ providerId: 'mlx' });
     expect(await runtime.checkAuth('groq')).toBeUndefined();
     expect(runtime.isUsingOAuth('groq')).toBe(false);
-    expect(await runtime.getAuth('mlx')).toEqual({ provider: 'mlx' });
+    // mlx auth is PINNED to the fixed local credential (never delegated), so a
+    // tampered overlay on the reserved id can't redirect it; cloud resolves nothing.
+    const pinnedAuth = { auth: { apiKey: 'mlx-local', baseUrl: 'mlx://local' } };
+    expect(await runtime.getAuth('mlx')).toEqual(pinnedAuth);
     expect(await runtime.getAuth('groq')).toBeUndefined();
-    // Model-object form (the streaming path) passes through for mlx, blocks cloud.
-    expect(await runtime.getAuth(model('mlx', 'local-a'))).toEqual({ provider: 'mlx' });
+    // Model-object form (the streaming path) is pinned for mlx, blocks cloud.
+    expect(await runtime.getAuth(model('mlx', 'local-a'))).toEqual(pinnedAuth);
     expect(await runtime.getAuth(model('groq', 'llama'))).toBeUndefined();
     expect((await runtime.listCredentials()).map((cred) => cred.providerId)).toEqual(['mlx']);
     expect(runtime.getProviderAuthStatus('mlx')).toEqual({ configured: true });
@@ -320,9 +323,9 @@ describe('installMlxOnlyModelRegistryFilter', () => {
         // An explicit `/login radius` is rejected BEFORE any OAuth fetch fires.
         // The interaction arg is never consulted (login rejects first), so a cast
         // stub is fine.
-        await expect(
-          runtime.login('radius', 'oauth', {} as Parameters<typeof runtime.login>[2]),
-        ).rejects.toThrow(/offline/);
+        await expect(runtime.login('radius', 'oauth', {} as Parameters<typeof runtime.login>[2])).rejects.toThrow(
+          /offline/,
+        );
         // Provider auth resolution for a cloud provider returns nothing, no network.
         expect(await runtime.getAuth('radius')).toBeUndefined();
         // An explicit allowNetwork:true refresh (pi's `update --models` package
@@ -405,6 +408,67 @@ describe('installMlxOnlyModelRegistryFilter', () => {
         restore();
       }
     } finally {
+      await rm(dir, { recursive: true, force: true });
+      if (savedOffline === undefined) delete process.env.PI_OFFLINE;
+      else process.env.PI_OFFLINE = savedOffline;
+    }
+  });
+
+  it('reserved id: mlx auth is pinned to the local credential under a radius mlx overlay, no network', async () => {
+    const savedOffline = process.env.PI_OFFLINE;
+    process.env.PI_OFFLINE = '1';
+    const realFetch = globalThis.fetch;
+    const fetchTargets: string[] = [];
+    globalThis.fetch = (async (input: unknown): Promise<never> => {
+      fetchTargets.push(String(input));
+      throw new Error('network blocked in test');
+    }) as unknown as typeof fetch;
+
+    const dir = await mkdtemp(join(tmpdir(), 'mlx-runtime-reserved-'));
+    try {
+      // A crafted models.json hijacks the reserved `mlx` id with a radius OAuth
+      // overlay; pi promotes it into a Radius builtin and merges a radius oauth
+      // method into the composed `mlx` provider's auth.
+      const models = join(dir, 'models.json');
+      await writeFile(
+        models,
+        JSON.stringify({ providers: { mlx: { oauth: 'radius', baseUrl: 'https://radius.example/v1' } } }),
+      );
+
+      const restore = installMlxOnlyModelRegistryFilter(ModelRuntime, ['local']);
+      try {
+        const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: models });
+        runtime.registerProvider('mlx', {
+          api: 'mlx',
+          baseUrl: 'mlx://local',
+          apiKey: 'mlx-local',
+          models: [
+            {
+              id: 'local',
+              name: 'local',
+              reasoning: true,
+              input: ['text'],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 4096,
+              maxTokens: 1024,
+            },
+          ],
+        });
+
+        // getAuth resolves to OUR fixed local credential (never the merged radius
+        // oauth), for both the string form and the model form (the streaming path).
+        // So streaming uses local auth and no radius refresh can fire.
+        const fixed = { auth: { apiKey: 'mlx-local', baseUrl: 'mlx://local' } };
+        expect(await runtime.getAuth('mlx')).toEqual(fixed);
+        const mlxModel = runtime.getModel('mlx', 'local');
+        expect(mlxModel).toBeDefined();
+        expect(await runtime.getAuth(mlxModel!)).toEqual(fixed);
+        expect(fetchTargets).toEqual([]);
+      } finally {
+        restore();
+      }
+    } finally {
+      globalThis.fetch = realFetch;
       await rm(dir, { recursive: true, force: true });
       if (savedOffline === undefined) delete process.env.PI_OFFLINE;
       else process.env.PI_OFFLINE = savedOffline;
