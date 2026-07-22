@@ -3,9 +3,8 @@
 //! Mixed-recipe checkpoints (produced by `--q-mxfp` and friends) can carry a
 //! different quantization mode for each layer: affine (4/8-bit affine
 //! packing), MXFP8 (E8M0 uint8 scales), MXFP4 (E2M1 4-bit format with uint8
-//! scales), NVFP4 (E2M1 4-bit format with E4M3 uint8 scales, group_size 16),
-//! or plain E4M3 FP8 (raw uint8 weights plus one float dequant scale per output
-//! channel). The persistence layer dispatches to the matching `try_build_*`
+//! scales), or NVFP4 (E2M1 4-bit format with E4M3 uint8 scales, group_size
+//! 16). The persistence layer dispatches to the matching `try_build_*`
 //! builder per layer based on a `PerLayerQuant` record.
 //!
 //! This module is family-neutral on purpose: `qwen3_5`, `qwen3_5_moe`, and
@@ -22,8 +21,6 @@ use tracing::warn;
 
 use crate::array::{DType, MxArray};
 
-const SYM8_GROUP_SIZE_SENTINEL: i32 = -1;
-
 /// Per-layer quantization mode discriminator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PerLayerMode {
@@ -35,10 +32,6 @@ pub enum PerLayerMode {
     Mxfp4,
     /// NVFP4 (E2M1 4-bit format with E4M3 uint8 scales, group_size 16).
     Nvfp4,
-    /// Plain E4M3 FP8 weight storage: uint8 `[...,N,K]` weight plus floating
-    /// `[...,N,1]` per-output-channel dequant scale. Runtime reconstructs BF16
-    /// weights and keeps activations A16; this is not MLX MXFP8 or native W8A8.
-    Fp8E4m3,
     /// sym8: per-output-channel symmetric int8 (int8 `[N,K]` weight + f32
     /// `[N]` scales, no biases, group_size is null/meaningless). Consumed by
     /// the int8 kernels (`int8_w8a16_qmv` decode / `int8_w8a8_matmul`
@@ -58,26 +51,12 @@ pub enum PerLayerMode {
 ///
 /// `bits` and `group_size` are the affine packing parameters; for `Mxfp8`,
 /// `Mxfp4`, and `Nvfp4` they are forced to the matching constants by the
-/// builders and are kept here only for fallback/reporting. `Fp8E4m3` has no
-/// K-axis group and uses `group_size = -1` as an in-memory sentinel.
-///
-/// `input_amax` is the per-tensor static FP8 (E4M3) activation scale calibrated
-/// by NVIDIA modelopt's MaxCalibrator (`max|activation|` over the calib mix),
-/// read from an optional `"input_amax"` field on the tensor's `config.json`
-/// quantization override. It is `None` for every layer whose config carries no
-/// such field (all non-`Mxfp8` attention/GDN sites and unquantized layers).
-/// Carrying it here lets the attention/GDN `QuantizedLinear` fake-quant its
-/// activations to E4M3 for modelopt W8A8 numeric parity (consumed downstream).
-//
-// NOTE: `Eq` is intentionally NOT derived — `Option<f32>` is not `Eq` (floats
-// have no total equality). `PartialEq` is sufficient for the map-value and
-// merge-conflict comparisons this type is used in.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// builders and are kept here only for fallback/reporting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PerLayerQuant {
     pub bits: i32,
     pub group_size: i32,
     pub mode: PerLayerMode,
-    pub input_amax: Option<f32>,
 }
 
 /// Decode a `quantization.mode` string into a `PerLayerMode`.
@@ -90,7 +69,6 @@ pub fn parse_mode_str(s: Option<&str>) -> Option<PerLayerMode> {
         Some("mxfp4") => Some(PerLayerMode::Mxfp4),
         Some("mxfp8") => Some(PerLayerMode::Mxfp8),
         Some("nvfp4") => Some(PerLayerMode::Nvfp4),
-        Some("fp8_e4m3") => Some(PerLayerMode::Fp8E4m3),
         Some("affine") => Some(PerLayerMode::Affine),
         Some("sym8") => Some(PerLayerMode::Sym8),
         _ => None,
@@ -169,40 +147,6 @@ pub fn ensure_int8_storage_resolves_sym8(
     Ok(())
 }
 
-/// Fail-loud guard for plain E4M3 storage whose metadata resolves to another
-/// mode. MXFP8 may also store its weight bytes as `Uint8`, so weight dtype alone
-/// is not sufficient: plain FP8 is identified by `Uint8` weight plus a real
-/// floating `.scales` sidecar (MX/NVFP float modes use `Uint8` encoded scales;
-/// affine uses a non-Uint8 packed weight). If that pair's per-layer override is
-/// missing or stale, handing it to `mlx_quantized_matmul` would silently decode
-/// garbage.
-pub fn ensure_plain_fp8_storage_resolves_fp8_e4m3(
-    params: &HashMap<String, MxArray>,
-    base: &str,
-    mode: PerLayerMode,
-    family: &str,
-) -> Result<()> {
-    if mode == PerLayerMode::Fp8E4m3 {
-        return Ok(());
-    }
-    if let (Some(w), Some(scales)) = (
-        params.get(&format!("{base}.weight")),
-        params.get(&format!("{base}.scales")),
-    ) && w.dtype().ok() == Some(DType::Uint8)
-        && matches!(
-            scales.dtype().ok(),
-            Some(DType::Float32 | DType::Float16 | DType::BFloat16)
-        )
-    {
-        return Err(Error::from_reason(format!(
-            "{family}: '{base}.weight' is Uint8 (plain E4M3 FP8 storage) but its per-layer \
-             quant mode resolves to {mode:?} — config drift / missing fp8_e4m3 override, \
-             refusing to load"
-        )));
-    }
-    Ok(())
-}
-
 /// Build the fallback `PerLayerQuant` used when no per-layer override exists.
 ///
 /// Honors the top-level `quantization.mode` (passed in as `default_mode`)
@@ -219,9 +163,6 @@ pub fn default_per_layer_quant(
         bits,
         group_size,
         mode: default_mode,
-        // Fallback default for layers without an explicit override never
-        // carries a calibrated activation scale.
-        input_amax: None,
     }
 }
 
@@ -258,223 +199,6 @@ pub fn normalize_per_layer_key(k: &str) -> String {
     crate::models::mtp_drafter::strip_wrapper_prefix(k).to_string()
 }
 
-fn parse_explicit_mode(value: Option<&Value>, context: &str) -> Result<Option<PerLayerMode>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let mode = value.as_str().ok_or_else(|| {
-        Error::from_reason(format!(
-            "Invalid quantization mode at {context}: expected a string, got {value}"
-        ))
-    })?;
-    parse_mode_str(Some(mode)).map(Some).ok_or_else(|| {
-        Error::from_reason(format!(
-            "Unknown quantization mode '{mode}' at {context}; supported modes are affine, \
-             mxfp4, mxfp8, nvfp4, fp8_e4m3, and sym8"
-        ))
-    })
-}
-
-fn quant_object(quant_cfg: Option<&Value>) -> Result<Option<&serde_json::Map<String, Value>>> {
-    let Some(value) = quant_cfg else {
-        return Ok(None);
-    };
-    value.as_object().map(Some).ok_or_else(|| {
-        Error::from_reason(format!(
-            "Invalid quantization metadata: expected quantization block to be an object, got {value}"
-        ))
-    })
-}
-
-/// Select the modern or legacy quantization block without silent alias
-/// shadowing. Generated checkpoints duplicate both aliases byte-for-byte; a
-/// null/non-object alias or divergent pair is malformed and must fail before
-/// any dtype-based legacy mode heuristic runs.
-pub fn select_quantization_block(raw: &Value) -> Result<Option<&Value>> {
-    let modern = raw.get("quantization");
-    let legacy = raw.get("quantization_config");
-    for (name, value) in [("quantization", modern), ("quantization_config", legacy)] {
-        if let Some(value) = value
-            && !value.is_object()
-        {
-            return Err(Error::from_reason(format!(
-                "Invalid {name} alias: expected an object, got {value}"
-            )));
-        }
-    }
-    match (modern, legacy) {
-        (Some(modern), Some(legacy)) if modern != legacy => Err(Error::from_reason(
-            "Conflicting quantization aliases: 'quantization' and 'quantization_config' must be identical when both are present"
-                .to_string(),
-        )),
-        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
-        (None, None) => Ok(None),
-    }
-}
-
-fn parse_i32(value: &Value, context: &str) -> Result<i32> {
-    let raw = value.as_i64().ok_or_else(|| {
-        Error::from_reason(format!(
-            "Invalid {context}: expected an integer, got {value}"
-        ))
-    })?;
-    i32::try_from(raw).map_err(|_| {
-        Error::from_reason(format!(
-            "Invalid {context}: integer {raw} is outside the supported i32 range"
-        ))
-    })
-}
-
-fn parse_bits(value: &Value, mode: Option<PerLayerMode>, context: &str) -> Result<i32> {
-    let bits = parse_i32(value, context)?;
-    let valid = match mode {
-        Some(PerLayerMode::Mxfp4) | Some(PerLayerMode::Nvfp4) => bits == 4,
-        Some(PerLayerMode::Mxfp8) | Some(PerLayerMode::Fp8E4m3) | Some(PerLayerMode::Sym8) => {
-            bits == 8
-        }
-        Some(PerLayerMode::Affine) | None => matches!(bits, 2 | 3 | 4 | 5 | 6 | 8),
-    };
-    if !valid {
-        return Err(Error::from_reason(format!(
-            "Invalid {context}={bits} for mode {mode:?}; affine supports bits 2, 3, 4, 5, 6, or 8, \
-             while mxfp4/nvfp4 require 4 and mxfp8/fp8_e4m3/sym8 require 8"
-        )));
-    }
-    Ok(bits)
-}
-
-fn parse_group_size(value: &Value, mode: Option<PerLayerMode>, context: &str) -> Result<i32> {
-    if value.is_null() {
-        return match mode {
-            Some(PerLayerMode::Fp8E4m3) => Ok(crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE),
-            Some(PerLayerMode::Sym8) => Ok(SYM8_GROUP_SIZE_SENTINEL),
-            _ => Err(Error::from_reason(format!(
-                "Invalid {context}=null for mode {mode:?}; only fp8_e4m3 and sym8 have no quantization group"
-            ))),
-        };
-    }
-
-    let group_size = parse_i32(value, context)?;
-    let valid = match mode {
-        Some(PerLayerMode::Mxfp4) | Some(PerLayerMode::Mxfp8) => group_size == 32,
-        Some(PerLayerMode::Nvfp4) => group_size == 16,
-        Some(PerLayerMode::Fp8E4m3) | Some(PerLayerMode::Sym8) => false,
-        Some(PerLayerMode::Affine) | None => matches!(group_size, 32 | 64 | 128),
-    };
-    if !valid {
-        return Err(Error::from_reason(format!(
-            "Invalid {context}={group_size} for mode {mode:?}; affine supports 32, 64, or 128, \
-             mxfp4/mxfp8 require 32, nvfp4 requires 16, and fp8_e4m3/sym8 require null"
-        )));
-    }
-    Ok(group_size)
-}
-
-fn parse_input_amax(
-    value: Option<&Value>,
-    mode: PerLayerMode,
-    context: &str,
-) -> Result<Option<f32>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    if mode != PerLayerMode::Mxfp8 {
-        return Err(Error::from_reason(format!(
-            "Invalid {context}: input_amax is supported only for mxfp8 activation calibration, got mode {mode:?}"
-        )));
-    }
-    let raw = value.as_f64().ok_or_else(|| {
-        Error::from_reason(format!(
-            "Invalid {context}: expected a positive finite number, got {value}"
-        ))
-    })?;
-    let cast = raw as f32;
-    if !raw.is_finite() || raw <= 0.0 || !cast.is_finite() || cast <= 0.0 {
-        return Err(Error::from_reason(format!(
-            "Invalid {context}: input_amax must be positive, finite, and representable as f32, got {raw}"
-        )));
-    }
-    Ok(Some(cast))
-}
-
-fn parse_per_layer_overrides(
-    obj: Option<&serde_json::Map<String, Value>>,
-    fallback_group_size: i32,
-) -> Result<HashMap<String, PerLayerQuant>> {
-    let mut per_layer = HashMap::new();
-    let Some(obj) = obj else {
-        return Ok(per_layer);
-    };
-
-    for (key, value) in obj {
-        let Some(child) = value.as_object() else {
-            let normalized = normalize_per_layer_key(key);
-            let looks_like_tensor_path = normalized.starts_with("layers.")
-                || normalized.starts_with("mtp.")
-                || normalized == "lm_head"
-                || normalized == "embedding"
-                || normalized.starts_with("embed_tokens")
-                || key.ends_with(".weight");
-            if looks_like_tensor_path {
-                return Err(Error::from_reason(format!(
-                    "Invalid per-layer quantization override '{key}': expected an object, got {value}"
-                )));
-            }
-            continue;
-        };
-        let looks_quantized = child.contains_key("bits")
-            || child.contains_key("group_size")
-            || child.contains_key("mode")
-            || child.contains_key("input_amax");
-        if !looks_quantized {
-            // Compatibility: unrelated nested metadata objects with no quant
-            // schema fields remain outside the per-layer override map.
-            continue;
-        }
-
-        let context = format!("per-layer quantization override '{key}'");
-        let mode = parse_explicit_mode(child.get("mode"), &format!("{context}.mode"))?
-            .unwrap_or(PerLayerMode::Affine);
-        let bits_value = child.get("bits").ok_or_else(|| {
-            Error::from_reason(format!(
-                "Invalid {context}: an object containing mode/group_size must also contain integer bits"
-            ))
-        })?;
-        let bits = parse_bits(bits_value, Some(mode), &format!("{context}.bits"))?;
-        let group_size = match child.get("group_size") {
-            Some(value) => parse_group_size(value, Some(mode), &format!("{context}.group_size"))?,
-            None if matches!(mode, PerLayerMode::Mxfp4 | PerLayerMode::Mxfp8) => 32,
-            None if mode == PerLayerMode::Nvfp4 => 16,
-            None if mode == PerLayerMode::Fp8E4m3 => crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
-            None if mode == PerLayerMode::Sym8 => SYM8_GROUP_SIZE_SENTINEL,
-            None => {
-                if !matches!(fallback_group_size, 32 | 64 | 128) {
-                    return Err(Error::from_reason(format!(
-                        "Invalid {context}: affine override omits group_size but would inherit \
-                         unsupported top-level group_size {fallback_group_size}; specify 32, 64, or 128"
-                    )));
-                }
-                fallback_group_size
-            }
-        };
-        let input_amax = parse_input_amax(
-            child.get("input_amax"),
-            mode,
-            &format!("{context}.input_amax"),
-        )?;
-        per_layer.insert(
-            normalize_per_layer_key(key),
-            PerLayerQuant {
-                bits,
-                group_size,
-                mode,
-                input_amax,
-            },
-        );
-    }
-    Ok(per_layer)
-}
-
 /// Parse the `quantization` (or legacy `quantization_config`) block from a
 /// pre-loaded JSON value into a `(top_level_mode, per_layer_overrides)` pair.
 ///
@@ -482,71 +206,42 @@ fn parse_per_layer_overrides(
 /// (it is the affine packing default for that family, e.g. 64). The
 /// `top_level_mode` comes from `quantization.mode` and is what should drive
 /// the fallback `PerLayerQuant` for layers without an explicit override; if
-/// the field is missing, this returns `None` and the caller should fall back to
-/// the legacy `is_mxfp8` heuristic. An explicitly present but unknown or
-/// non-string mode is rejected; it must never silently select another decoder.
+/// the field is missing or unrecognised, this returns `None` and the caller
+/// should fall back to the `is_mxfp8` heuristic.
 pub fn parse_quant_block(
     quant_cfg: Option<&Value>,
     fallback_group_size: i32,
-) -> Result<(Option<PerLayerMode>, HashMap<String, PerLayerQuant>)> {
-    let obj = quant_object(quant_cfg)?;
-    let top_level_mode = parse_explicit_mode(
-        obj.and_then(|q| q.get("mode")),
-        "top-level quantization.mode",
-    )?;
-    if let Some(value) = obj.and_then(|q| q.get("bits")) {
-        parse_bits(value, top_level_mode, "top-level quantization.bits")?;
-    }
-    if let Some(value) = obj.and_then(|q| q.get("group_size")) {
-        parse_group_size(value, top_level_mode, "top-level quantization.group_size")?;
-    }
-    if obj.is_some_and(|q| q.contains_key("input_amax")) {
-        return Err(Error::from_reason(
-            "Invalid top-level quantization.input_amax: activation calibration is supported only on per-layer mxfp8 overrides"
-                .to_string(),
-        ));
-    }
-    let per_layer = parse_per_layer_overrides(obj, fallback_group_size)?;
-    Ok((top_level_mode, per_layer))
-}
+) -> (Option<PerLayerMode>, HashMap<String, PerLayerQuant>) {
+    let top_level_mode = quant_cfg
+        .and_then(|q| q.get("mode"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| parse_mode_str(Some(s)));
 
-/// Extract numeric defaults plus fallible mode metadata from an already
-/// selected quantization block. This is shared by the in-memory Qwen loaders
-/// and the disk-backed Gemma/LFM loaders so explicit-mode validation cannot
-/// diverge by family.
-pub fn parse_quant_settings(
-    quant_cfg: Option<&Value>,
-    default_bits: i32,
-    default_group_size: i32,
-) -> Result<(
-    i32,
-    i32,
-    Option<PerLayerMode>,
-    HashMap<String, PerLayerQuant>,
-)> {
-    let obj = quant_object(quant_cfg)?;
-    let top_level_mode = parse_explicit_mode(
-        obj.and_then(|q| q.get("mode")),
-        "top-level quantization.mode",
-    )?;
-    let bits = match obj.and_then(|q| q.get("bits")) {
-        Some(value) => parse_bits(value, top_level_mode, "top-level quantization.bits")?,
-        None => default_bits,
-    };
-    let group_size = match obj.and_then(|q| q.get("group_size")) {
-        Some(value) => {
-            parse_group_size(value, top_level_mode, "top-level quantization.group_size")?
-        }
-        None => default_group_size,
-    };
-    if obj.is_some_and(|q| q.contains_key("input_amax")) {
-        return Err(Error::from_reason(
-            "Invalid top-level quantization.input_amax: activation calibration is supported only on per-layer mxfp8 overrides"
-                .to_string(),
-        ));
-    }
-    let per_layer = parse_per_layer_overrides(obj, group_size)?;
-    Ok((bits, group_size, top_level_mode, per_layer))
+    let per_layer = quant_cfg
+        .and_then(|q| q.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter(|(_, v)| v.is_object())
+                .filter_map(|(k, v)| {
+                    let bits = v["bits"].as_i64()? as i32;
+                    let gs = v["group_size"]
+                        .as_i64()
+                        .unwrap_or(fallback_group_size as i64) as i32;
+                    let mode = parse_mode_str(v["mode"].as_str()).unwrap_or(PerLayerMode::Affine);
+                    Some((
+                        normalize_per_layer_key(k),
+                        PerLayerQuant {
+                            bits,
+                            group_size: gs,
+                            mode,
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (top_level_mode, per_layer)
 }
 
 /// Read `config.json` from `model_path` and return the parsed
@@ -560,21 +255,34 @@ pub fn load_quant_settings_from_disk(
     model_path: &Path,
     default_bits: i32,
     default_group_size: i32,
-) -> Result<(
+) -> (
     i32,
     i32,
     Option<PerLayerMode>,
     HashMap<String, PerLayerQuant>,
-)> {
+) {
     let config_path = model_path.join("config.json");
     let Ok(raw_str) = std::fs::read_to_string(&config_path) else {
-        return Ok((default_bits, default_group_size, None, HashMap::new()));
+        return (default_bits, default_group_size, None, HashMap::new());
     };
     let Ok(raw) = serde_json::from_str::<Value>(&raw_str) else {
-        return Ok((default_bits, default_group_size, None, HashMap::new()));
+        return (default_bits, default_group_size, None, HashMap::new());
     };
-    let quant_cfg = select_quantization_block(&raw)?;
-    parse_quant_settings(quant_cfg, default_bits, default_group_size)
+    let quant_cfg = raw
+        .get("quantization")
+        .or_else(|| raw.get("quantization_config"));
+    let bits = quant_cfg
+        .and_then(|q| q.get("bits"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .unwrap_or(default_bits);
+    let group_size = quant_cfg
+        .and_then(|q| q.get("group_size"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .unwrap_or(default_group_size);
+    let (top_level_mode, per_layer) = parse_quant_block(quant_cfg, group_size);
+    (bits, group_size, top_level_mode, per_layer)
 }
 
 /// Resolve the effective `PerLayerQuant` for a sanitized projection prefix.
@@ -651,9 +359,11 @@ pub fn effective_plq_for(
 /// keys (e.g. `in_proj_qkv` + `in_proj_z`) but our model expects the merged
 /// projection (`in_proj_qkvz`). When the two sides disagree we pick the
 /// higher-precision side: higher `bits` wins; on equal bits, prefer
-/// `Affine` > `Fp8E4m3` > `Sym8` > `Mxfp8` > `Nvfp4` > `Mxfp4`. (Plain FP8
-/// has a floating per-output scale and ranks below affine-8 but above sym8;
-/// in practice convert emits the same mode on both GDN split sides.)
+/// `Affine` > `Sym8` > `Mxfp8` > `Nvfp4` > `Mxfp4`. (Sym8 ranks below
+/// Affine-8 — group-wise scale+bias beats per-output-channel symmetric —
+/// and above Mxfp8's power-of-two E8M0 scales. In practice convert emits
+/// the same mode on both GDN split sides, so a sym8 merge conflict never
+/// occurs from our own pipeline.)
 pub fn merge_per_layer(
     lhs: Option<&PerLayerQuant>,
     rhs: Option<&PerLayerQuant>,
@@ -663,8 +373,7 @@ pub fn merge_per_layer(
 ) -> Option<PerLayerQuant> {
     fn mode_rank(m: PerLayerMode) -> u8 {
         match m {
-            PerLayerMode::Affine => 5,
-            PerLayerMode::Fp8E4m3 => 4,
+            PerLayerMode::Affine => 4,
             PerLayerMode::Sym8 => 3,
             PerLayerMode::Mxfp8 => 2,
             PerLayerMode::Nvfp4 => 1,
@@ -725,410 +434,15 @@ mod tests {
         assert_eq!(normalize_per_layer_key("layers.0.self_attn.q_proj"), bare);
     }
 
-    /// The per-layer parse lifts an optional `"input_amax"` (the calibrated
-    /// FP8 activation scale) off each tensor's quantization override — present
-    /// → `Some`, absent → `None`. Keys are stored under the normalized bare
-    /// form, so we look them up through `normalize_per_layer_key`.
-    #[test]
-    fn parse_quant_block_reads_input_amax() {
-        let cfg = serde_json::json!({
-            "mode": "affine",
-            "language_model.model.layers.0.self_attn.q_proj": {"bits":8,"group_size":32,"mode":"mxfp8","input_amax":37.5},
-            "language_model.model.layers.0.self_attn.k_proj": {"bits":8,"group_size":32,"mode":"mxfp8"}
-        });
-        let (_mode, per_layer) = parse_quant_block(Some(&cfg), 64).unwrap();
-        let q = normalize_per_layer_key("language_model.model.layers.0.self_attn.q_proj");
-        let k = normalize_per_layer_key("language_model.model.layers.0.self_attn.k_proj");
-        assert_eq!(per_layer[&q].input_amax, Some(37.5));
-        assert_eq!(per_layer[&k].input_amax, None);
-    }
-
     #[test]
     fn parse_mode_str_recognises_nvfp4() {
         assert_eq!(parse_mode_str(Some("nvfp4")), Some(PerLayerMode::Nvfp4));
-        assert_eq!(
-            parse_mode_str(Some("fp8_e4m3")),
-            Some(PerLayerMode::Fp8E4m3)
-        );
         assert_eq!(parse_mode_str(Some("mxfp4")), Some(PerLayerMode::Mxfp4));
         assert_eq!(parse_mode_str(Some("mxfp8")), Some(PerLayerMode::Mxfp8));
         assert_eq!(parse_mode_str(Some("affine")), Some(PerLayerMode::Affine));
         assert_eq!(parse_mode_str(Some("sym8")), Some(PerLayerMode::Sym8));
         assert_eq!(parse_mode_str(Some("bogus")), None);
         assert_eq!(parse_mode_str(None), None);
-    }
-
-    #[test]
-    fn parse_plain_fp8_override_uses_no_group_sentinel() {
-        let cfg = serde_json::json!({
-            "mode": "nvfp4",
-            "language_model.model.layers.0.self_attn.q_proj": {
-                "bits": 8,
-                "group_size": null,
-                "mode": "fp8_e4m3"
-            }
-        });
-        let (top, per_layer) = parse_quant_block(Some(&cfg), 16).unwrap();
-        assert_eq!(top, Some(PerLayerMode::Nvfp4));
-        let q = &per_layer["layers.0.self_attn.q_proj"];
-        assert_eq!(q.mode, PerLayerMode::Fp8E4m3);
-        assert_eq!(q.bits, crate::quant::fp8_weight::FP8_E4M3_BITS);
-        assert_eq!(q.group_size, crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE);
-    }
-
-    #[test]
-    fn plain_fp8_storage_guard_distinguishes_float_scales_from_mxfp8() {
-        let weight = MxArray::from_uint8(&[0; 8], &[2, 4]).unwrap();
-        let mx_scales = MxArray::from_uint8(&[127, 127], &[2, 1]).unwrap();
-        let mx_params = HashMap::from([
-            ("proj.weight".to_string(), weight.clone()),
-            ("proj.scales".to_string(), mx_scales),
-        ]);
-        ensure_plain_fp8_storage_resolves_fp8_e4m3(&mx_params, "proj", PerLayerMode::Mxfp8, "test")
-            .expect("Uint8 weight + Uint8 scales is MXFP storage, not plain FP8");
-
-        let fp8_params = HashMap::from([
-            ("proj.weight".to_string(), weight),
-            (
-                "proj.scales".to_string(),
-                MxArray::from_float32(&[1.0, 1.0], &[2, 1])
-                    .unwrap()
-                    .astype(DType::BFloat16)
-                    .unwrap(),
-            ),
-        ]);
-        assert!(
-            ensure_plain_fp8_storage_resolves_fp8_e4m3(
-                &fp8_params,
-                "proj",
-                PerLayerMode::Nvfp4,
-                "test",
-            )
-            .is_err(),
-            "plain FP8 storage with stale NVFP4 metadata must fail loud"
-        );
-        ensure_plain_fp8_storage_resolves_fp8_e4m3(
-            &fp8_params,
-            "proj",
-            PerLayerMode::Fp8E4m3,
-            "test",
-        )
-        .expect("plain FP8 storage with fp8_e4m3 metadata must pass");
-    }
-
-    #[test]
-    fn absent_modes_keep_legacy_fallback_but_explicit_unknown_modes_reject() {
-        let legacy = serde_json::json!({
-            "bits": 8,
-            "group_size": 32,
-            "language_model.model.layers.0.self_attn.q_proj": {
-                "bits": 4,
-                "group_size": 64
-            }
-        });
-        let (bits, group_size, top, per_layer) =
-            parse_quant_settings(Some(&legacy), 4, 64).unwrap();
-        assert_eq!((bits, group_size), (8, 32));
-        assert_eq!(top, None, "missing top-level mode keeps legacy inference");
-        assert_eq!(
-            resolve_default_mode(top, /* is_mxfp8 */ true),
-            PerLayerMode::Mxfp8,
-            "legacy Uint8-scale heuristic remains available only when mode is absent"
-        );
-        assert_eq!(
-            per_layer["layers.0.self_attn.q_proj"].mode,
-            PerLayerMode::Affine,
-            "legacy per-layer records without mode remain affine"
-        );
-
-        for typo in ["nvpf4", "fp8_e4m", "definitely_unknown"] {
-            let top_typo = serde_json::json!({
-                "bits": 4,
-                "group_size": 16,
-                "mode": typo
-            });
-            let err = parse_quant_settings(Some(&top_typo), 4, 64).unwrap_err();
-            let message = err.reason.to_string();
-            assert!(message.contains(typo), "error must name typo: {message}");
-            assert!(
-                message.contains("top-level"),
-                "error must name scope: {message}"
-            );
-
-            let layer_typo = serde_json::json!({
-                "bits": 4,
-                "group_size": 16,
-                "mode": "nvfp4",
-                "language_model.model.layers.0.self_attn.q_proj": {
-                    "bits": 8,
-                    "group_size": null,
-                    "mode": typo
-                }
-            });
-            let err = parse_quant_settings(Some(&layer_typo), 4, 64).unwrap_err();
-            let message = err.reason.to_string();
-            assert!(message.contains(typo), "error must name typo: {message}");
-            assert!(
-                message.contains("per-layer"),
-                "error must name scope: {message}"
-            );
-        }
-
-        let non_string = serde_json::json!({"bits": 4, "group_size": 16, "mode": 7});
-        assert!(parse_quant_settings(Some(&non_string), 4, 64).is_err());
-    }
-
-    #[test]
-    fn malformed_mixed_quant_metadata_cannot_fall_through_to_mxfp8_heuristic() {
-        let non_object = serde_json::json!("mxfp4");
-        let err = parse_quant_settings(Some(&non_object), 4, 64).unwrap_err();
-        assert!(
-            err.reason
-                .contains("expected quantization block to be an object")
-        );
-
-        let missing_bits = serde_json::json!({
-            "bits": 8,
-            "group_size": 32,
-            "mode": "mxfp8",
-            "language_model.model.layers.0.mlp.gate_proj": {
-                "mode": "mxfp4",
-                "group_size": 32
-            }
-        });
-        let err = parse_quant_settings(Some(&missing_bits), 4, 64).unwrap_err();
-        let message = err.reason.to_string();
-        assert!(message.contains("gate_proj"), "{message}");
-        assert!(message.contains("bits"), "{message}");
-
-        let path_scalar = serde_json::json!({
-            "bits": 8,
-            "group_size": 32,
-            "mode": "mxfp8",
-            "language_model.model.layers.0.mlp.gate_proj": "mxfp4"
-        });
-        assert!(parse_quant_settings(Some(&path_scalar), 4, 64).is_err());
-
-        // This is exactly the dangerous fallback malformed metadata used to
-        // reach: Uint8 scales make the legacy heuristic choose MXFP8, which
-        // would misdecode a skipped MXFP4 override. The parser errors above,
-        // so callers never get this default.
-        assert_eq!(
-            resolve_default_mode(None, /* is_mxfp8_checkpoint */ true),
-            PerLayerMode::Mxfp8
-        );
-    }
-
-    #[test]
-    fn quantization_alias_selector_rejects_null_shadow_and_divergent_duplicates() {
-        let valid = serde_json::json!({"mode":"mxfp4", "bits":4, "group_size":32});
-        let null_shadow = serde_json::json!({
-            "quantization": null,
-            "quantization_config": valid.clone()
-        });
-        let err = select_quantization_block(&null_shadow).unwrap_err();
-        assert!(err.reason.contains("quantization"), "{}", err.reason);
-        assert!(err.reason.contains("expected an object"), "{}", err.reason);
-
-        let divergent = serde_json::json!({
-            "quantization": valid.clone(),
-            "quantization_config": {"mode":"mxfp8", "bits":8, "group_size":32}
-        });
-        let err = select_quantization_block(&divergent).unwrap_err();
-        assert!(err.reason.contains("Conflicting"), "{}", err.reason);
-
-        let equal = serde_json::json!({
-            "quantization": valid.clone(),
-            "quantization_config": valid.clone()
-        });
-        assert_eq!(select_quantization_block(&equal).unwrap(), Some(&valid));
-
-        let legacy_only = serde_json::json!({"quantization_config": valid.clone()});
-        assert_eq!(
-            select_quantization_block(&legacy_only).unwrap(),
-            legacy_only.get("quantization_config")
-        );
-    }
-
-    #[test]
-    fn present_numeric_fields_validate_types_ranges_and_mode_constants() {
-        for malformed in [
-            serde_json::json!({"mode":"affine", "bits":"4", "group_size":64}),
-            serde_json::json!({"mode":"affine", "bits":7, "group_size":64}),
-            serde_json::json!({"mode":"affine", "bits":4, "group_size":0}),
-            serde_json::json!({"mode":"mxfp4", "bits":8, "group_size":32}),
-            serde_json::json!({"mode":"mxfp8", "bits":8, "group_size":64}),
-            serde_json::json!({"mode":"nvfp4", "bits":4, "group_size":32}),
-            serde_json::json!({"mode":"fp8_e4m3", "bits":8, "group_size":32}),
-            serde_json::json!({"mode":"sym8", "bits":8, "group_size":64}),
-            serde_json::json!({"mode":"affine", "bits":2147483648_i64, "group_size":64}),
-        ] {
-            assert!(
-                parse_quant_settings(Some(&malformed), 4, 64).is_err(),
-                "malformed metadata must reject: {malformed}"
-            );
-        }
-
-        let valid_ungrouped = serde_json::json!({
-            "mode": "sym8",
-            "bits": 8,
-            "group_size": null,
-            "layers.0.self_attn.q_proj": {
-                "mode": "fp8_e4m3",
-                "bits": 8,
-                "group_size": null
-            },
-            "unrelated_metadata": {"producer": "legacy-tool"}
-        });
-        let (bits, group_size, mode, per_layer) =
-            parse_quant_settings(Some(&valid_ungrouped), 4, 64).unwrap();
-        assert_eq!(bits, 8);
-        assert_eq!(group_size, SYM8_GROUP_SIZE_SENTINEL);
-        assert_eq!(mode, Some(PerLayerMode::Sym8));
-        assert_eq!(
-            per_layer["layers.0.self_attn.q_proj"].group_size,
-            crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE
-        );
-        assert_eq!(per_layer.len(), 1, "unrelated nested metadata is ignored");
-    }
-
-    #[test]
-    fn affine_override_cannot_inherit_non_affine_group_or_ungrouped_sentinel() {
-        for raw in [
-            serde_json::json!({
-                "mode": "nvfp4",
-                "bits": 4,
-                "group_size": 16,
-                "layers.0.mlp.gate_proj": {"mode":"affine", "bits":4}
-            }),
-            serde_json::json!({
-                "mode": "sym8",
-                "bits": 8,
-                "group_size": null,
-                "layers.0.mlp.gate_proj": {"mode":"affine", "bits":4}
-            }),
-        ] {
-            let err = parse_quant_settings(Some(&raw), 4, 64).unwrap_err();
-            let message = err.reason.to_string();
-            assert!(message.contains("gate_proj"), "{message}");
-            assert!(message.contains("group_size"), "{message}");
-        }
-
-        let explicit = serde_json::json!({
-            "mode": "nvfp4",
-            "bits": 4,
-            "group_size": 16,
-            "layers.0.mlp.gate_proj": {
-                "mode":"affine", "bits":4, "group_size":64
-            }
-        });
-        let (_, _, _, overrides) = parse_quant_settings(Some(&explicit), 4, 64).unwrap();
-        assert_eq!(overrides["layers.0.mlp.gate_proj"].group_size, 64);
-    }
-
-    #[test]
-    fn input_amax_requires_positive_finite_f32_mxfp8_override() {
-        let valid = serde_json::json!({
-            "mode": "mxfp8",
-            "bits": 8,
-            "group_size": 32,
-            "layers.0.self_attn.q_proj": {
-                "mode": "mxfp8",
-                "bits": 8,
-                "group_size": 32,
-                "input_amax": 12.5
-            }
-        });
-        let (_, _, _, overrides) = parse_quant_settings(Some(&valid), 4, 64).unwrap();
-        assert_eq!(
-            overrides["layers.0.self_attn.q_proj"].input_amax,
-            Some(12.5)
-        );
-
-        for bad in [
-            serde_json::json!(0.0),
-            serde_json::json!(-1.0),
-            serde_json::json!("12.5"),
-            serde_json::json!(1.0e300),
-        ] {
-            let raw = serde_json::json!({
-                "mode": "mxfp8",
-                "bits": 8,
-                "group_size": 32,
-                "layers.0.self_attn.q_proj": {
-                    "mode": "mxfp8",
-                    "bits": 8,
-                    "group_size": 32,
-                    "input_amax": bad
-                }
-            });
-            assert!(parse_quant_settings(Some(&raw), 4, 64).is_err());
-        }
-
-        let wrong_mode = serde_json::json!({
-            "mode": "affine",
-            "bits": 4,
-            "group_size": 64,
-            "layers.0.mlp.gate_proj": {
-                "mode": "affine",
-                "bits": 4,
-                "group_size": 64,
-                "input_amax": 1.0
-            }
-        });
-        assert!(parse_quant_settings(Some(&wrong_mode), 4, 64).is_err());
-
-        let top_level = serde_json::json!({
-            "mode": "mxfp8",
-            "bits": 8,
-            "group_size": 32,
-            "input_amax": 1.0
-        });
-        assert!(parse_quant_settings(Some(&top_level), 4, 64).is_err());
-    }
-
-    /// Gemma4 and LFM2 both consume quantization metadata through the
-    /// disk-backed helper. Preserve the same fail-closed behavior there (for
-    /// both modern and legacy config aliases), instead of only exercising the
-    /// in-memory Qwen parser above.
-    #[test]
-    fn disk_backed_gemma_lfm_quant_settings_reject_explicit_unknown_modes() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        for (alias, typo) in [
-            ("quantization", "nvpf4"),
-            ("quantization_config", "fp8_e4m"),
-        ] {
-            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "mlx_quant_dispatch_unknown_mode_{}_{}",
-                std::process::id(),
-                id
-            ));
-            std::fs::create_dir_all(&dir).expect("create quant settings temp directory");
-            let raw = serde_json::json!({
-                alias: {
-                    "bits": 4,
-                    "group_size": 16,
-                    "mode": typo
-                }
-            });
-            std::fs::write(
-                dir.join("config.json"),
-                serde_json::to_vec(&raw).expect("serialize quantization config"),
-            )
-            .expect("write quantization config");
-
-            let err = load_quant_settings_from_disk(&dir, 4, 64).unwrap_err();
-            let message = err.reason.to_string();
-            assert!(message.contains(typo), "error must name typo: {message}");
-            assert!(
-                message.contains("top-level"),
-                "error must name scope: {message}"
-            );
-            let _ = std::fs::remove_dir_all(&dir);
-        }
     }
 
     /// A sym8-default checkpoint carries complete affine override entries for
@@ -1147,7 +461,7 @@ mod tests {
                 "mode": "affine"
             }
         });
-        let (top_level_mode, per_layer) = parse_quant_block(Some(&quant_cfg), 64).unwrap();
+        let (top_level_mode, per_layer) = parse_quant_block(Some(&quant_cfg), 64);
         assert_eq!(top_level_mode, Some(PerLayerMode::Sym8));
         assert!(has_sym8_mode(top_level_mode, &per_layer));
 
@@ -1185,7 +499,6 @@ mod tests {
                 bits: 8,
                 group_size: 64,
                 mode: PerLayerMode::Sym8,
-                input_amax: None,
             },
         );
         assert!(has_sym8_mode(None, &overrides));
@@ -1213,7 +526,6 @@ mod tests {
             bits,
             group_size,
             mode: PerLayerMode::Affine,
-            input_amax: None,
         }
     }
 
@@ -1222,7 +534,6 @@ mod tests {
             bits: 8,
             group_size: 32,
             mode: PerLayerMode::Mxfp8,
-            input_amax: None,
         }
     }
 
@@ -1231,7 +542,6 @@ mod tests {
             bits: 4,
             group_size: 32,
             mode: PerLayerMode::Mxfp4,
-            input_amax: None,
         }
     }
 

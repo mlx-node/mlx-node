@@ -91,47 +91,20 @@ use crate::inference_trace::{
 const PAGED_ATTENTION_V2_PARTITION_SIZE: u64 = 512;
 const PAGED_ATTENTION_V2_AUX_ELEM_LIMIT: u128 = i32::MAX as u128;
 
-/// The two paged-attention V2 entry points assign query rows differently.
-/// The fixed-row path treats each row as a sequence, while varlen keeps one
-/// sequence and assigns multiple query rows through `cu_seqlens_q`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PagedAttentionV2Layout {
-    SingleRowBatch,
-    Varlen,
-}
-
-pub(crate) fn paged_attention_v2_aux_fits(
-    layout: PagedAttentionV2Layout,
+fn paged_attention_v2_aux_fits(
     num_new_tokens: u32,
     num_query_heads: u32,
-    num_kv_heads: u32,
     max_context_len: u32,
     head_size: u32,
 ) -> bool {
     if num_new_tokens == 0 || num_query_heads == 0 || max_context_len == 0 || head_size == 0 {
         return false;
     }
-    let signed_limit = i32::MAX as u32;
-    if num_new_tokens > signed_limit
-        || num_query_heads > signed_limit
-        || num_kv_heads > signed_limit
-        || max_context_len > signed_limit
-        || head_size > signed_limit
-    {
-        return false;
-    }
     if max_context_len as u64 <= PAGED_ATTENTION_V2_PARTITION_SIZE {
         return true;
     }
 
-    let max_num_partitions = paged_attention_v2_partition_upper_bound(
-        layout,
-        num_new_tokens,
-        num_query_heads,
-        num_kv_heads,
-        max_context_len,
-        head_size,
-    );
+    let max_num_partitions = (max_context_len as u64).div_ceil(PAGED_ATTENTION_V2_PARTITION_SIZE);
     let exp_sums_size = (num_new_tokens as u128)
         .saturating_mul(num_query_heads as u128)
         .saturating_mul(max_num_partitions as u128);
@@ -139,54 +112,6 @@ pub(crate) fn paged_attention_v2_aux_fits(
 
     exp_sums_size <= PAGED_ATTENTION_V2_AUX_ELEM_LIMIT
         && tmp_out_size <= PAGED_ATTENTION_V2_AUX_ELEM_LIMIT
-}
-
-/// Conservative partition upper bound across the generic and optional
-/// grouped Qwen3.5 and Gemma 4 dispatches. Grouped-kernel enablement, dtype,
-/// block size, and pipeline availability are runtime concerns; taking the
-/// larger possible count keeps this preflight safe regardless of which C++
-/// path wins.
-pub(crate) fn paged_attention_v2_partition_upper_bound(
-    layout: PagedAttentionV2Layout,
-    num_new_tokens: u32,
-    num_query_heads: u32,
-    num_kv_heads: u32,
-    max_context_len: u32,
-    head_size: u32,
-) -> u64 {
-    let generic = (max_context_len as u64).div_ceil(PAGED_ATTENTION_V2_PARTITION_SIZE);
-    let grouped_qwen35_min_context = match (num_query_heads, num_kv_heads, layout, num_new_tokens) {
-        (24, 4, PagedAttentionV2Layout::SingleRowBatch, 1) => Some(16_384),
-        (24, 4, PagedAttentionV2Layout::Varlen, 2) => Some(8_192),
-        (16, 2, PagedAttentionV2Layout::SingleRowBatch, 1) => Some(32_768),
-        (16, 2, PagedAttentionV2Layout::Varlen, 2) => Some(16_384),
-        _ => None,
-    };
-    let grouped_qwen35_candidate = head_size == 256
-        && grouped_qwen35_min_context.is_some_and(|minimum| max_context_len >= minimum);
-    let grouped_gemma4_candidate = head_size == 512
-        && layout == PagedAttentionV2Layout::SingleRowBatch
-        && num_new_tokens == 1
-        && (num_query_heads, num_kv_heads) == (16, 1)
-        && max_context_len > PAGED_ATTENTION_V2_PARTITION_SIZE as u32;
-    let grouped = if grouped_qwen35_candidate {
-        Some(match max_context_len {
-            0..=4_096 => 32,
-            4_097..=8_192 => 64,
-            8_193..=16_383 => 128,
-            16_384..=32_768 => 256,
-            32_769..=65_536 => 512,
-            _ => 1_024,
-        })
-    } else if grouped_gemma4_candidate {
-        // The diagnostic stripe override accepts up to 256. This helper runs
-        // before environment-dependent dispatch, so reserve that maximum even
-        // when the automatic policy would choose only 32/64/128.
-        Some(256)
-    } else {
-        None
-    };
-    grouped.map_or(generic, |grouped| generic.max(grouped))
 }
 
 /// Outcome of `validate_kv_input`: the (kernel-input dtype, num_tokens) tuple
@@ -522,66 +447,6 @@ fn build_prefill_block_ids_for_total(
         .collect())
 }
 
-/// Pure-data compact metadata for one continuing prefill sequence.
-///
-/// Unlike the legacy prefill bridge, this representation keeps exactly one
-/// block-table row. `cu_seqlens_q = [0, query_len]` tells the varlen kernel
-/// that all query tokens belong to that sequence; the kernel derives each
-/// query token's causal cutoff from its position within the query span.
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CompactPrefillMetadata {
-    block_ids: Vec<i32>,
-    seq_lens: [i32; 1],
-    cu_seqlens_q: [i32; 2],
-    total_context: u32,
-}
-
-#[cfg(test)]
-fn build_compact_prefill_metadata(
-    table: &SequenceBlockTable,
-    cached_prefix_len: u32,
-    query_len: u32,
-    block_size: u32,
-) -> Result<CompactPrefillMetadata, String> {
-    if query_len == 0 {
-        return Err("compact prefill metadata requires query_len > 0".to_string());
-    }
-    let total_context = cached_prefix_len
-        .checked_add(query_len)
-        .ok_or_else(|| "compact prefill metadata total context overflow".to_string())?;
-    if total_context > i32::MAX as u32 {
-        return Err(format!(
-            "compact prefill metadata total context {total_context} exceeds i32::MAX"
-        ));
-    }
-    if query_len > i32::MAX as u32 {
-        return Err(format!(
-            "compact prefill metadata query length {query_len} exceeds i32::MAX"
-        ));
-    }
-    let recorded = table.num_tokens();
-    if recorded < total_context {
-        return Err(format!(
-            "compact prefill metadata: recorded token count {recorded} is less than \
-             cached_prefix_len + query_len ({cached_prefix_len} + {query_len} = \
-             {total_context}); call record_tokens for the whole chunk first"
-        ));
-    }
-
-    let block_ids = build_prefill_block_ids_for_total(table, total_context, block_size)?;
-    if block_ids.is_empty() {
-        return Err("compact prefill metadata: active request has no allocated blocks".to_string());
-    }
-
-    Ok(CompactPrefillMetadata {
-        block_ids,
-        seq_lens: [total_context as i32],
-        cu_seqlens_q: [0, query_len as i32],
-        total_context,
-    })
-}
-
 /// Result of a prefix-cache lookup.
 #[derive(Debug)]
 pub struct CachedPrefix {
@@ -607,35 +472,6 @@ pub struct PagedTurnPlan {
     pub total_budget: u32,
     pub suffix_len: u32,
     pub reason: PagedTurnPlanReason,
-}
-
-/// Prefix-cache identity supplied to the shared turn-preparation lifecycle.
-///
-/// The turn lifecycle itself (live continuation, reset, suffix allocation,
-/// and plan reporting) is identical for both variants. Only the cold
-/// prefix-cache lookup differs: text-only callers use one uniform key vector,
-/// while multimodal callers use image-aware keys for each block.
-#[derive(Clone, Copy)]
-enum PreparePrefixKeys<'a> {
-    Uniform(&'a [u64]),
-    PerBlock(&'a [Vec<u64>]),
-}
-
-/// Process-local Metal/MLX memory counters captured once for a prefill chunk.
-///
-/// `metal_current_allocated_bytes` includes buffers allocated outside MLX's
-/// allocator, notably [`LayerKVPool`]'s private Metal K/V buffers. The MLX
-/// counters remain useful for identifying reclaimable cache and the allocator
-/// limit. Consumers combine both bounds rather than treating either one as a
-/// complete process-memory measurement.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PagedPrefillMemorySnapshot {
-    pub allocator_active_bytes: Option<u64>,
-    pub allocator_cached_bytes: Option<u64>,
-    pub allocator_limit_bytes: Option<u64>,
-    pub metal_recommended_working_set_bytes: Option<u64>,
-    pub metal_current_allocated_bytes: Option<u64>,
-    pub paged_pool_allocated_bytes: Option<u64>,
 }
 
 /// Per-model session-friendly KV cache adapter.
@@ -700,16 +536,6 @@ pub struct PagedKVCacheAdapter {
     #[cfg(target_os = "macos")]
     prefill_attention_inputs_cache: Option<PrefillPagedAttentionInputsCache>,
 
-    /// Compact one-row prefill metadata shared by the varlen attention and
-    /// graph-native SDPA gather paths. This is invalidated alongside the
-    /// legacy prefill cache whenever the request cursor changes.
-    #[cfg(target_os = "macos")]
-    compact_prefill_inputs_cache: Option<CompactPrefillInputsCache>,
-
-    /// Varlen-specific sequence metadata for the current prefill chunk.
-    #[cfg(target_os = "macos")]
-    varlen_prefill_inputs_cache: Option<VarlenPrefillInputsCache>,
-
     /// Cached per-decode-token metadata for the MLX `paged_attention` bridge.
     /// Decode calls every full-attention layer with the same active block table
     /// and seq_len after `record_tokens(&[token])`; cache the small metadata
@@ -730,13 +556,6 @@ pub struct PagedKVCacheAdapter {
     /// rebuilding and re-evaluating identical int64 metadata per layer.
     #[cfg(target_os = "macos")]
     write_slot_mapping_cache: Option<WriteSlotMappingCache>,
-
-    /// One process-memory sample per recorded prefill chunk. Every
-    /// full-attention layer in that chunk must make the same routing decision;
-    /// re-running the probes per layer is both wasteful and can produce a
-    /// mixed SDPA/varlen plan as lazy graph allocations change.
-    #[cfg(target_os = "macos")]
-    prefill_memory_snapshot_cache: Option<PrefillMemorySnapshotCache>,
 }
 
 #[cfg(target_os = "macos")]
@@ -747,26 +566,6 @@ struct PrefillPagedAttentionInputsCache {
     block_count: u32,
     block_table: MxArray,
     seq_lens: MxArray,
-}
-
-#[cfg(target_os = "macos")]
-struct CompactPrefillInputsCache {
-    token_count: u32,
-    required_tokens: u32,
-    block_count: u32,
-    /// One-dimensional physical block IDs, suitable for `take(axis=0)`.
-    block_ids: MxArray,
-}
-
-#[cfg(target_os = "macos")]
-struct VarlenPrefillInputsCache {
-    token_count: u32,
-    cached_prefix_len: u32,
-    query_len: u32,
-    block_count: u32,
-    block_table: MxArray,
-    seq_lens: MxArray,
-    cu_seqlens_q: MxArray,
 }
 
 #[cfg(target_os = "macos")]
@@ -795,20 +594,10 @@ struct WriteSlotMappingCache {
     slot_mapping: MxArray,
 }
 
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy)]
-struct PrefillMemorySnapshotCache {
-    token_count: u32,
-    snapshot: PagedPrefillMemorySnapshot,
-}
-
 impl PagedKVCacheAdapter {
     #[cfg(target_os = "macos")]
     fn clear_prefill_attention_inputs_cache(&mut self) {
         self.prefill_attention_inputs_cache = None;
-        self.compact_prefill_inputs_cache = None;
-        self.varlen_prefill_inputs_cache = None;
-        self.prefill_memory_snapshot_cache = None;
     }
 
     #[cfg(target_os = "macos")]
@@ -889,17 +678,11 @@ impl PagedKVCacheAdapter {
             #[cfg(target_os = "macos")]
             prefill_attention_inputs_cache: None,
             #[cfg(target_os = "macos")]
-            compact_prefill_inputs_cache: None,
-            #[cfg(target_os = "macos")]
-            varlen_prefill_inputs_cache: None,
-            #[cfg(target_os = "macos")]
             decode_attention_inputs_cache: None,
             #[cfg(target_os = "macos")]
             native_pool_arrays: (0..num_layers).map(|_| None).collect(),
             #[cfg(target_os = "macos")]
             write_slot_mapping_cache: None,
-            #[cfg(target_os = "macos")]
-            prefill_memory_snapshot_cache: None,
         })
     }
 
@@ -950,7 +733,7 @@ impl PagedKVCacheAdapter {
             prompt_tokens,
             total_budget,
             reuse_cache,
-            PreparePrefixKeys::Uniform(extra_keys),
+            extra_keys,
             cache_salt,
             skip_lookup,
             None,
@@ -981,86 +764,10 @@ impl PagedKVCacheAdapter {
             prompt_tokens,
             total_budget,
             reuse_cache,
-            PreparePrefixKeys::Uniform(extra_keys),
+            extra_keys,
             cache_salt,
             skip_lookup,
             Some(max_cache_hit_tokens),
-        )
-    }
-
-    /// Per-block-extra-keys variant of
-    /// [`Self::prepare_turn_with_max_cache_hit_tokens`].
-    ///
-    /// This preserves the exact active-turn lifecycle of the uniform-key API:
-    /// a compatible live request continues in place; otherwise the old request
-    /// is released, a fresh request is installed, a capped prefix lookup runs,
-    /// and enough blocks are allocated for `total_budget`. The only difference
-    /// is that a cold lookup uses
-    /// [`Self::find_cached_prefix_per_block_with_max_tokens`], so image-bearing
-    /// prompts can isolate blocks by image content.
-    ///
-    /// Callers must use the same per-block key construction when publishing the
-    /// completed request via [`Self::finalize_turn_keep_live_per_block`]. The
-    /// vector must cover every full block the lookup may scan; a missing entry
-    /// is treated as a cache-chain miss by the allocator. Finalization has the
-    /// stricter convention that its key vector must cover every full block in
-    /// the completed request.
-    ///
-    /// Live continuation does not perform a prefix-cache read and therefore
-    /// does not compare `extra_keys_per_block`. The caller remains responsible
-    /// for authorizing live continuation only when non-token inputs (for
-    /// example, the ordered image-byte identity) still match the live request;
-    /// pass `reuse_cache = false` after a media change.
-    #[allow(clippy::too_many_arguments)]
-    pub fn prepare_turn_per_block_with_max_cache_hit_tokens(
-        &mut self,
-        seq_id: u32,
-        prompt_tokens: &[u32],
-        total_budget: u32,
-        reuse_cache: bool,
-        extra_keys_per_block: &[Vec<u64>],
-        cache_salt: u64,
-        skip_lookup: bool,
-        max_cache_hit_tokens: u32,
-    ) -> Result<PagedTurnPlan, String> {
-        self.prepare_turn_inner(
-            seq_id,
-            prompt_tokens,
-            total_budget,
-            reuse_cache,
-            PreparePrefixKeys::PerBlock(extra_keys_per_block),
-            cache_salt,
-            skip_lookup,
-            Some(max_cache_hit_tokens),
-        )
-    }
-
-    /// Discard a prepared cache-hit/live-continuation candidate and restart the
-    /// same per-block-keyed request as a clean cold prefill.
-    ///
-    /// Hybrid VLMs use this after the paged K/V lookup succeeds but the
-    /// corresponding recurrent-state sidecar does not. Reusing only the K/V
-    /// half would produce a model state that never existed, so this helper
-    /// releases every candidate block reference, skips the shared prefix cache,
-    /// and allocates the full prompt from position zero.
-    #[allow(clippy::too_many_arguments)]
-    pub fn restart_prepared_turn_cold_per_block(
-        &mut self,
-        seq_id: u32,
-        prompt_tokens: &[u32],
-        total_budget: u32,
-        extra_keys_per_block: &[Vec<u64>],
-        cache_salt: u64,
-    ) -> Result<PagedTurnPlan, String> {
-        self.prepare_turn_inner(
-            seq_id,
-            prompt_tokens,
-            total_budget,
-            /* reuse_cache */ false,
-            PreparePrefixKeys::PerBlock(extra_keys_per_block),
-            cache_salt,
-            /* skip_lookup */ true,
-            /* max_cache_hit_tokens */ Some(0),
         )
     }
 
@@ -1071,39 +778,7 @@ impl PagedKVCacheAdapter {
         prompt_tokens: &[u32],
         total_budget: u32,
         reuse_cache: bool,
-        prefix_keys: PreparePrefixKeys<'_>,
-        cache_salt: u64,
-        skip_lookup: bool,
-        max_cache_hit_tokens: Option<u32>,
-    ) -> Result<PagedTurnPlan, String> {
-        let result = self.prepare_turn_inner_mutating(
-            seq_id,
-            prompt_tokens,
-            total_budget,
-            reuse_cache,
-            prefix_keys,
-            cache_salt,
-            skip_lookup,
-            max_cache_hit_tokens,
-        );
-        if result.is_err() {
-            // Prefix lookup attaches cache-owned block references before suffix
-            // allocation. A later allocation failure must not leave those
-            // references (or an empty live request) pinned until another turn
-            // happens to clean them up.
-            let _ = self.release_request();
-        }
-        result
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn prepare_turn_inner_mutating(
-        &mut self,
-        seq_id: u32,
-        prompt_tokens: &[u32],
-        total_budget: u32,
-        reuse_cache: bool,
-        prefix_keys: PreparePrefixKeys<'_>,
+        extra_keys: &[u64],
         cache_salt: u64,
         skip_lookup: bool,
         max_cache_hit_tokens: Option<u32>,
@@ -1129,9 +804,9 @@ impl PagedKVCacheAdapter {
                     Err(_) => {
                         let _ = self.release_request();
                         self.reset_for_new_request(seq_id)?;
-                        let prefix = self.find_cached_prefix_for_prepare(
+                        let prefix = self.find_cached_prefix_inner(
                             prompt_tokens,
-                            prefix_keys,
+                            extra_keys,
                             cache_salt,
                             skip_lookup,
                             max_cache_hit_tokens,
@@ -1151,9 +826,9 @@ impl PagedKVCacheAdapter {
                     let _ = self.release_request();
                 }
                 self.reset_for_new_request(seq_id)?;
-                let prefix = self.find_cached_prefix_for_prepare(
+                let prefix = self.find_cached_prefix_inner(
                     prompt_tokens,
-                    prefix_keys,
+                    extra_keys,
                     cache_salt,
                     skip_lookup,
                     max_cache_hit_tokens,
@@ -1184,33 +859,6 @@ impl PagedKVCacheAdapter {
             suffix_len,
             reason,
         })
-    }
-
-    fn find_cached_prefix_for_prepare(
-        &mut self,
-        prompt_tokens: &[u32],
-        prefix_keys: PreparePrefixKeys<'_>,
-        cache_salt: u64,
-        skip_lookup: bool,
-        max_cache_hit_tokens: Option<u32>,
-    ) -> Result<CachedPrefix, String> {
-        match prefix_keys {
-            PreparePrefixKeys::Uniform(extra_keys) => self.find_cached_prefix_inner(
-                prompt_tokens,
-                extra_keys,
-                cache_salt,
-                skip_lookup,
-                max_cache_hit_tokens,
-            ),
-            PreparePrefixKeys::PerBlock(extra_keys_per_block) => self
-                .find_cached_prefix_per_block_inner(
-                    prompt_tokens,
-                    extra_keys_per_block,
-                    cache_salt,
-                    skip_lookup,
-                    max_cache_hit_tokens,
-                ),
-        }
     }
 
     /// Look up the longest cached prefix matching `prompt_tokens` and
@@ -1584,12 +1232,6 @@ impl PagedKVCacheAdapter {
     /// the prompt's blocks are reserved at prefill, decode allocates one
     /// block every `block_size` tokens.
     pub fn allocate_suffix_blocks(&mut self, total_tokens: u32) -> Result<u32, String> {
-        let capacity = self.max_capacity_tokens();
-        if total_tokens > capacity {
-            return Err(format!(
-                "context_length_exceeded: requested {total_tokens} tokens, paged cache capacity is {capacity} tokens"
-            ));
-        }
         let block_table = self.block_table.as_mut().ok_or_else(|| {
             "allocate_suffix_blocks called before reset_for_new_request".to_string()
         })?;
@@ -1621,10 +1263,8 @@ impl PagedKVCacheAdapter {
                         guard.free(partial);
                     }
                     return Err(format!(
-                        "context_length_exceeded: paged cache could not reserve {needed_blocks} \
-                         block(s) for {total_tokens} tokens (reserved {i} before rollback, \
-                         capacity {} tokens)",
-                        capacity
+                        "BlockAllocator exhausted: needed {needed_blocks} blocks, allocated {i} \
+                         before running out"
                     ));
                 }
             }
@@ -1649,13 +1289,6 @@ impl PagedKVCacheAdapter {
     /// (caller-visible state stays consistent with the pre-call state and
     /// the next decode step can choose to abort gracefully).
     fn ensure_blocks_for_total_tokens(&mut self, new_total_tokens: u32) -> Result<u32, String> {
-        let capacity = self.max_capacity_tokens();
-        if new_total_tokens > capacity {
-            return Err(format!(
-                "context_length_exceeded: requested {new_total_tokens} tokens during decode, \
-                 paged cache capacity is {capacity} tokens"
-            ));
-        }
         let block_table = self.block_table.as_mut().ok_or_else(|| {
             "ensure_blocks_for_total_tokens called before reset_for_new_request".to_string()
         })?;
@@ -1683,11 +1316,10 @@ impl PagedKVCacheAdapter {
                         guard.free(partial);
                     }
                     return Err(format!(
-                        "context_length_exceeded: paged decode could not reserve {to_allocate} \
-                         more block(s) (request had {current_blocks}, needs {needed_total_blocks} \
-                         for {new_total_tokens} tokens, reserved {i} before rollback, capacity \
-                         {} tokens)",
-                        capacity
+                        "BlockAllocator exhausted: lazy decode allocation needed \
+                         {to_allocate} more block(s) (request had {current_blocks}, \
+                         needs {needed_total_blocks} for {new_total_tokens} tokens), \
+                         allocated {i} before running out"
                     ));
                 }
             }
@@ -2150,9 +1782,7 @@ impl PagedKVCacheAdapter {
         self.eval_pending_pool_write_for_layer(layer_idx)?;
         let slot_mapping = self.build_slot_mapping(first_logical_position, num_tokens)?;
         let trace_enabled = inference_trace_enabled();
-        let inference_debug_enabled =
-            tracing::enabled!(target: "mlx_core::inference", tracing::Level::DEBUG);
-        let write_trace_start = (trace_enabled || inference_debug_enabled).then(Instant::now);
+        let write_trace_start = trace_enabled.then(Instant::now);
         if trace_enabled {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] paged_kv update_keys_values_start layer={} first_position={} num_tokens={} current_tokens={} blocks={} first_slot={} last_slot={}",
@@ -2193,17 +1823,6 @@ impl PagedKVCacheAdapter {
                 num_tokens,
                 write_trace_start.map(elapsed_ms).unwrap_or(0.0)
             ));
-        }
-        if inference_debug_enabled {
-            tracing::debug!(
-                target: "mlx_core::inference",
-                event = "paged_kv_legacy_write_done",
-                layer = layer_idx,
-                first_position = first_logical_position,
-                sequence_tokens = num_tokens,
-                elapsed_ms = write_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                "paged KV legacy layer write completed"
-            );
         }
         self.clear_native_pool_arrays_for_layer(layer_idx)?;
         Ok(())
@@ -2263,11 +1882,8 @@ impl PagedKVCacheAdapter {
         }
 
         let trace_enabled = inference_trace_enabled();
-        let inference_debug_enabled =
-            tracing::enabled!(target: "mlx_core::inference", tracing::Level::DEBUG);
-        let detail_enabled = trace_enabled || inference_debug_enabled;
-        let write_trace_start = detail_enabled.then(Instant::now);
-        let metadata_trace_start = detail_enabled.then(Instant::now);
+        let write_trace_start = trace_enabled.then(Instant::now);
+        let metadata_trace_start = trace_enabled.then(Instant::now);
         let (slot_mapping, first_slot, last_slot) =
             self.write_slot_mapping_array(first_logical_position, num_tokens)?;
         let metadata_ms = metadata_trace_start.map(elapsed_ms).unwrap_or(0.0);
@@ -2290,7 +1906,7 @@ impl PagedKVCacheAdapter {
         let v_scale = self.v_scale_array(layer_idx)?;
         let kv_dtype_raw = self.kv_dtype_raw()?;
 
-        let ffi_trace_start = detail_enabled.then(Instant::now);
+        let ffi_trace_start = trace_enabled.then(Instant::now);
         let mut out_k_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
         let mut out_v_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
         let ok = unsafe {
@@ -2350,19 +1966,6 @@ impl PagedKVCacheAdapter {
                 ffi_trace_start.map(elapsed_ms).unwrap_or(0.0),
                 write_trace_start.map(elapsed_ms).unwrap_or(0.0)
             ));
-        }
-        if inference_debug_enabled {
-            tracing::debug!(
-                target: "mlx_core::inference",
-                event = "paged_kv_native_write_done",
-                layer = layer_idx,
-                first_position = first_logical_position,
-                sequence_tokens = num_tokens,
-                metadata_ms,
-                ffi_ms = ffi_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                elapsed_ms = write_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                "paged KV native layer write completed"
-            );
         }
         Ok(())
     }
@@ -2689,434 +2292,6 @@ impl PagedKVCacheAdapter {
             .map_err(|e| format!("gather_kv_for_decode: failed to wrap output array: {e}"))
     }
 
-    /// Build and cache a compact one-dimensional physical block-ID array for
-    /// the first `required_tokens` logical positions of the active request.
-    /// Both graph-native prefill paths consume this representation: varlen
-    /// attention reshapes it to one block-table row, while SDPA gathering uses
-    /// it directly as the `take(axis=0)` index vector.
-    #[cfg(target_os = "macos")]
-    fn compact_prefill_block_ids(
-        &mut self,
-        required_tokens: u32,
-    ) -> Result<(MxArray, u32), String> {
-        if required_tokens == 0 {
-            return Err("compact prefill block IDs require at least one token".to_string());
-        }
-        if required_tokens > i32::MAX as u32 {
-            return Err(format!(
-                "compact prefill required token count {required_tokens} exceeds i32::MAX"
-            ));
-        }
-        let block_table = self.block_table.as_ref().ok_or_else(|| {
-            "compact prefill block IDs requested before reset_for_new_request".to_string()
-        })?;
-        let recorded = block_table.num_tokens();
-        if recorded < required_tokens {
-            return Err(format!(
-                "compact prefill: recorded token count {recorded} is less than required \
-                 token count {required_tokens}; call record_tokens first"
-            ));
-        }
-
-        if let Some(cache) = self.compact_prefill_inputs_cache.as_ref()
-            && cache.token_count == recorded
-            && cache.required_tokens == required_tokens
-        {
-            return Ok((cache.block_ids.clone(), cache.block_count));
-        }
-
-        let block_ids =
-            build_prefill_block_ids_for_total(block_table, required_tokens, self.block_size)
-                .map_err(|e| format!("compact prefill: {e}"))?;
-        if block_ids.is_empty() {
-            return Err("compact prefill: active request has no allocated blocks".to_string());
-        }
-        let block_count = u32::try_from(block_ids.len()).map_err(|_| {
-            format!(
-                "compact prefill: too many blocks for i32 shape: {}",
-                block_ids.len()
-            )
-        })?;
-        let pool_block_count = self.layer_kv_pool.num_blocks();
-        for (idx, &block_id) in block_ids.iter().enumerate() {
-            if block_id < 0 || block_id as u32 >= pool_block_count {
-                return Err(format!(
-                    "compact prefill: block_table[{idx}]={block_id} out of range for \
-                     pool block count {pool_block_count}"
-                ));
-            }
-        }
-        let capacity = block_count
-            .checked_mul(self.block_size)
-            .ok_or_else(|| "compact prefill block capacity overflow".to_string())?;
-        if required_tokens > capacity {
-            return Err(format!(
-                "compact prefill: required token count {required_tokens} exceeds block \
-                 table capacity {block_count} * {} = {capacity}",
-                self.block_size
-            ));
-        }
-
-        let block_ids_arr = MxArray::from_int32(&block_ids, &[block_count as i64])
-            .map_err(|e| format!("compact prefill block IDs: {e}"))?;
-        MxArray::eval_arrays(&[&block_ids_arr])
-            .map_err(|e| format!("compact prefill block ID eval: {e}"))?;
-        self.compact_prefill_inputs_cache = Some(CompactPrefillInputsCache {
-            token_count: recorded,
-            required_tokens,
-            block_count,
-            block_ids: block_ids_arr,
-        });
-        let cache = self
-            .compact_prefill_inputs_cache
-            .as_ref()
-            .expect("compact_prefill_inputs_cache was just populated");
-        Ok((cache.block_ids.clone(), cache.block_count))
-    }
-
-    /// Build the compact metadata for a single continuing prefill sequence.
-    /// The block table has shape `[1, block_count]`, `seq_lens` contains the
-    /// complete context length after the chunk, and `cu_seqlens_q=[0,q_len]`
-    /// assigns every query row to that one sequence.
-    #[cfg(target_os = "macos")]
-    fn varlen_prefill_attention_inputs(
-        &mut self,
-        cached_prefix_len: u32,
-        query_len: u32,
-    ) -> Result<(MxArray, MxArray, MxArray, u32, u32), String> {
-        if query_len == 0 {
-            return Err("varlen prefill requires query_len > 0".to_string());
-        }
-        let total_context = cached_prefix_len
-            .checked_add(query_len)
-            .ok_or_else(|| "varlen prefill total context overflow".to_string())?;
-        if total_context > i32::MAX as u32 || query_len > i32::MAX as u32 {
-            return Err(format!(
-                "varlen prefill metadata exceeds int32 range \
-                 (query_len={query_len}, total_context={total_context})"
-            ));
-        }
-        let recorded = self
-            .block_table
-            .as_ref()
-            .ok_or_else(|| "varlen prefill requested before reset_for_new_request".to_string())?
-            .num_tokens();
-        if recorded < total_context {
-            return Err(format!(
-                "varlen prefill: recorded token count {recorded} is less than \
-                 cached_prefix_len + query_len ({cached_prefix_len} + {query_len} = \
-                 {total_context}); call record_tokens for the whole chunk first"
-            ));
-        }
-
-        if let Some(cache) = self.varlen_prefill_inputs_cache.as_ref()
-            && cache.token_count == recorded
-            && cache.cached_prefix_len == cached_prefix_len
-            && cache.query_len == query_len
-        {
-            return Ok((
-                cache.block_table.clone(),
-                cache.seq_lens.clone(),
-                cache.cu_seqlens_q.clone(),
-                cache.block_count,
-                total_context,
-            ));
-        }
-
-        let (block_ids, block_count) = self.compact_prefill_block_ids(total_context)?;
-        let block_table = block_ids
-            .reshape(&[1, block_count as i64])
-            .map_err(|e| format!("varlen prefill block_table reshape: {e}"))?;
-        let seq_lens = MxArray::from_int32(&[total_context as i32], &[1])
-            .map_err(|e| format!("varlen prefill seq_lens: {e}"))?;
-        let cu_seqlens_q = MxArray::from_int32(&[0, query_len as i32], &[2])
-            .map_err(|e| format!("varlen prefill cu_seqlens_q: {e}"))?;
-        MxArray::eval_arrays(&[&block_table, &seq_lens, &cu_seqlens_q])
-            .map_err(|e| format!("varlen prefill metadata eval: {e}"))?;
-
-        self.varlen_prefill_inputs_cache = Some(VarlenPrefillInputsCache {
-            token_count: recorded,
-            cached_prefix_len,
-            query_len,
-            block_count,
-            block_table,
-            seq_lens,
-            cu_seqlens_q,
-        });
-        let cache = self
-            .varlen_prefill_inputs_cache
-            .as_ref()
-            .expect("varlen_prefill_inputs_cache was just populated");
-        Ok((
-            cache.block_table.clone(),
-            cache.seq_lens.clone(),
-            cache.cu_seqlens_q.clone(),
-            cache.block_count,
-            total_context,
-        ))
-    }
-
-    /// Graph-native compact paged attention for a multi-token prefill suffix.
-    ///
-    /// This keeps the active paged K/V pool authoritative but represents the
-    /// suffix as one continuing sequence. It therefore uploads one physical
-    /// block-table row instead of duplicating that row for every query token.
-    #[cfg(target_os = "macos")]
-    pub fn gather_kv_for_prefill_chunk_varlen(
-        &mut self,
-        layer_idx: u32,
-        queries: &MxArray,
-        cached_prefix_len: u32,
-        scale: f32,
-    ) -> Result<MxArray, String> {
-        let q_meta = KvTensorMeta::from_array(queries, "prefill_queries")?;
-        if (layer_idx as usize) >= self.layer_kv_pool.num_layers() {
-            return Err(format!(
-                "gather_kv_for_prefill_chunk_varlen: layer_idx {layer_idx} out of range \
-                 (num_layers = {})",
-                self.layer_kv_pool.num_layers()
-            ));
-        }
-        if q_meta.ndim != 3 || q_meta.shape.len() < 3 {
-            return Err(format!(
-                "gather_kv_for_prefill_chunk_varlen: queries must be rank 3 \
-                 [num_new_tokens, num_query_heads, head_size]; got ndim={} shape_len={}",
-                q_meta.ndim,
-                q_meta.shape.len()
-            ));
-        }
-        let query_len = u32::try_from(q_meta.shape[0]).map_err(|_| {
-            format!(
-                "gather_kv_for_prefill_chunk_varlen: invalid query length {}",
-                q_meta.shape[0]
-            )
-        })?;
-        if query_len == 0 {
-            return Err("gather_kv_for_prefill_chunk_varlen: query length must be > 0".to_string());
-        }
-        let num_query_heads = u32::try_from(q_meta.shape[1]).map_err(|_| {
-            format!(
-                "gather_kv_for_prefill_chunk_varlen: invalid num_query_heads {}",
-                q_meta.shape[1]
-            )
-        })?;
-        if num_query_heads == 0 {
-            return Err(
-                "gather_kv_for_prefill_chunk_varlen: num_query_heads must be > 0".to_string(),
-            );
-        }
-        let expected_head_size = self.layer_kv_pool.config().head_size;
-        if q_meta.shape[2] != expected_head_size as i64 {
-            return Err(format!(
-                "gather_kv_for_prefill_chunk_varlen: query head_size {} != expected {}",
-                q_meta.shape[2], expected_head_size
-            ));
-        }
-        let total_context = cached_prefix_len.checked_add(query_len).ok_or_else(|| {
-            "gather_kv_for_prefill_chunk_varlen: total context overflow".to_string()
-        })?;
-        if !paged_attention_v2_aux_fits(
-            PagedAttentionV2Layout::Varlen,
-            query_len,
-            num_query_heads,
-            self.layer_kv_pool.config().num_kv_heads,
-            total_context,
-            expected_head_size,
-        ) {
-            return Err(format!(
-                "gather_kv_for_prefill_chunk_varlen: paged-attention V2 metadata or auxiliary \
-                 buffer would exceed INT_MAX (query_len={query_len}, \
-                 num_query_heads={num_query_heads}, total_context={total_context}, \
-                 head_size={expected_head_size}); reduce MLX_PAGED_PREFILL_CHUNK_SIZE"
-            ));
-        }
-
-        let query_dtype = match q_meta.dtype {
-            DType::Float16 => mlx_paged_attn::metal::MetalDtype::Float16,
-            DType::BFloat16 => mlx_paged_attn::metal::MetalDtype::BFloat16,
-            other => {
-                return Err(format!(
-                    "gather_kv_for_prefill_chunk_varlen: query dtype {other:?} is not supported"
-                ));
-            }
-        };
-        let cache_dtype = self.layer_kv_pool.cache_dtype();
-        if !cache_dtype.is_fp8() && query_dtype != cache_dtype {
-            return Err(format!(
-                "gather_kv_for_prefill_chunk_varlen: query_dtype ({query_dtype:?}) must \
-                 equal cache_dtype ({cache_dtype:?}) for non-FP8 caches"
-            ));
-        }
-        let kv_dtype_raw = self.kv_dtype_raw()?;
-
-        let (block_table, seq_lens, cu_seqlens_q, block_count, _) =
-            self.varlen_prefill_attention_inputs(cached_prefix_len, query_len)?;
-        let (k_pool, v_pool) = self.native_pool_arrays_for_layer(layer_idx)?;
-        let k_scale = self.k_scale_array(layer_idx)?;
-        let v_scale = self.v_scale_array(layer_idx)?;
-
-        let raw = unsafe {
-            mlx_sys::mlx_paged_attention_varlen_forward(
-                queries.as_raw_ptr(),
-                k_pool.as_raw_ptr(),
-                v_pool.as_raw_ptr(),
-                block_table.as_raw_ptr(),
-                seq_lens.as_raw_ptr(),
-                cu_seqlens_q.as_raw_ptr(),
-                k_scale.as_raw_ptr(),
-                v_scale.as_raw_ptr(),
-                scale,
-                0.0,
-                0,
-                self.block_size as i32,
-                num_query_heads as i32,
-                self.layer_kv_pool.config().num_kv_heads as i32,
-                expected_head_size as i32,
-                kv_dtype_raw,
-            )
-        };
-        if raw.is_null() {
-            return Err(format!(
-                "gather_kv_for_prefill_chunk_varlen: \
-                 mlx_paged_attention_varlen_forward returned null \
-                 (layer={layer_idx}, query_len={query_len}, \
-                 total_context={total_context}, block_count={block_count})"
-            ));
-        }
-
-        MxArray::from_handle(raw, "gather_kv_for_prefill_chunk_varlen").map_err(|e| {
-            format!("gather_kv_for_prefill_chunk_varlen: failed to wrap output array: {e}")
-        })
-    }
-
-    /// Gather the first `total_context` paged K/V positions into flat,
-    /// SDPA-ready arrays without leaving the MLX graph.
-    ///
-    /// The native pool arrays are used directly, retaining any lazy
-    /// `paged_kv_write` dependency. This path intentionally rejects FP8: a
-    /// plain `take` cannot apply the per-layer dequantization scales.
-    #[cfg(target_os = "macos")]
-    pub fn gather_kv_for_prefill_sdpa(
-        &mut self,
-        layer_idx: u32,
-        total_context: u32,
-    ) -> Result<(MxArray, MxArray), String> {
-        if (layer_idx as usize) >= self.layer_kv_pool.num_layers() {
-            return Err(format!(
-                "gather_kv_for_prefill_sdpa: layer_idx {layer_idx} out of range \
-                 (num_layers = {})",
-                self.layer_kv_pool.num_layers()
-            ));
-        }
-        let cache_dtype = self.layer_kv_pool.cache_dtype();
-        if cache_dtype.is_fp8() {
-            return Err(
-                "gather_kv_for_prefill_sdpa: FP8 cache is unsupported because graph-native \
-                 take does not apply K/V dequantization scales"
-                    .to_string(),
-            );
-        }
-        let dtype_size = cache_dtype.size();
-        if dtype_size != 2 {
-            return Err(format!(
-                "gather_kv_for_prefill_sdpa: unsupported non-FP8 cache dtype \
-                 {cache_dtype:?} with element size {dtype_size}"
-            ));
-        }
-        let x_pack = 16usize / dtype_size;
-        let head_size = self.layer_kv_pool.config().head_size as usize;
-        let num_kv_heads = self.layer_kv_pool.config().num_kv_heads as usize;
-        if !head_size.is_multiple_of(x_pack) {
-            return Err(format!(
-                "gather_kv_for_prefill_sdpa: head_size {head_size} is not divisible by \
-                 x_pack {x_pack}"
-            ));
-        }
-
-        let (block_ids, block_count) = self.compact_prefill_block_ids(total_context)?;
-        let padded_tokens = block_count
-            .checked_mul(self.block_size)
-            .ok_or_else(|| "gather_kv_for_prefill_sdpa: padded token count overflow".to_string())?;
-        let (k_pool, v_pool) = self.native_pool_arrays_for_layer(layer_idx)?;
-
-        // K pool: [B,H,D/x,T,x] -> [H,B,T,D/x,x] -> [1,H,B*T,D].
-        let k = k_pool
-            .take(&block_ids, 0)
-            .map_err(|e| format!("gather_kv_for_prefill_sdpa: K block take failed: {e}"))?
-            .transpose(Some(&[1, 0, 3, 2, 4]))
-            .map_err(|e| format!("gather_kv_for_prefill_sdpa: K transpose failed: {e}"))?
-            .reshape(&[
-                1,
-                num_kv_heads as i64,
-                padded_tokens as i64,
-                head_size as i64,
-            ])
-            .map_err(|e| format!("gather_kv_for_prefill_sdpa: K reshape failed: {e}"))?
-            .slice(
-                &[0, 0, 0, 0],
-                &[
-                    1,
-                    num_kv_heads as i64,
-                    total_context as i64,
-                    head_size as i64,
-                ],
-            )
-            .map_err(|e| format!("gather_kv_for_prefill_sdpa: K slice failed: {e}"))?
-            .copy()
-            .map_err(|e| format!("gather_kv_for_prefill_sdpa: K contiguous copy failed: {e}"))?;
-
-        // V pool: [B,H,D,T] -> [H,B,T,D] -> [1,H,B*T,D].
-        let v = v_pool
-            .take(&block_ids, 0)
-            .map_err(|e| format!("gather_kv_for_prefill_sdpa: V block take failed: {e}"))?
-            .transpose(Some(&[1, 0, 3, 2]))
-            .map_err(|e| format!("gather_kv_for_prefill_sdpa: V transpose failed: {e}"))?
-            .reshape(&[
-                1,
-                num_kv_heads as i64,
-                padded_tokens as i64,
-                head_size as i64,
-            ])
-            .map_err(|e| format!("gather_kv_for_prefill_sdpa: V reshape failed: {e}"))?
-            .slice(
-                &[0, 0, 0, 0],
-                &[
-                    1,
-                    num_kv_heads as i64,
-                    total_context as i64,
-                    head_size as i64,
-                ],
-            )
-            .map_err(|e| format!("gather_kv_for_prefill_sdpa: V slice failed: {e}"))?
-            .copy()
-            .map_err(|e| format!("gather_kv_for_prefill_sdpa: V contiguous copy failed: {e}"))?;
-
-        Ok((k, v))
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    pub fn gather_kv_for_prefill_chunk_varlen(
-        &mut self,
-        _layer_idx: u32,
-        _queries: &MxArray,
-        _cached_prefix_len: u32,
-        _scale: f32,
-    ) -> Result<MxArray, String> {
-        Err(
-            "gather_kv_for_prefill_chunk_varlen is only supported on macOS (Metal backend)"
-                .to_string(),
-        )
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    pub fn gather_kv_for_prefill_sdpa(
-        &mut self,
-        _layer_idx: u32,
-        _total_context: u32,
-    ) -> Result<(MxArray, MxArray), String> {
-        Err("gather_kv_for_prefill_sdpa is only supported on macOS (Metal backend)".to_string())
-    }
-
     /// Run MLX-graph paged attention for a multi-token prefill suffix chunk.
     ///
     /// `queries` must be `[num_new_tokens, num_query_heads, head_size]`.
@@ -3186,16 +2361,14 @@ impl PagedKVCacheAdapter {
                 "gather_kv_for_prefill_chunk: max context length overflow".to_string()
             })?;
         if !paged_attention_v2_aux_fits(
-            PagedAttentionV2Layout::SingleRowBatch,
             num_new_tokens,
             num_query_heads,
-            self.layer_kv_pool.config().num_kv_heads,
             max_context_len,
             expected_head_size,
         ) {
             return Err(format!(
-                "gather_kv_for_prefill_chunk: paged-attention V2 metadata or auxiliary buffer \
-                 would exceed INT_MAX (num_new_tokens={num_new_tokens}, num_query_heads={num_query_heads}, \
+                "gather_kv_for_prefill_chunk: paged-attention V2 auxiliary buffer would exceed \
+                 INT_MAX (num_new_tokens={num_new_tokens}, num_query_heads={num_query_heads}, \
                  max_context_len={max_context_len}, head_size={expected_head_size}); \
                  reduce MLX_PAGED_PREFILL_CHUNK_SIZE or let Gemma4 dynamic chunking split the request"
             ));
@@ -4301,115 +3474,8 @@ impl PagedKVCacheAdapter {
         self.block_size
     }
 
-    /// Hard token capacity of this adapter's physical KV pool.
-    pub fn max_capacity_tokens(&self) -> u32 {
-        self.layer_kv_pool
-            .num_blocks()
-            .saturating_mul(self.block_size)
-    }
-
-    /// Number of physical blocks shared by the allocator and layer pool.
-    pub fn block_capacity(&self) -> u32 {
-        self.layer_kv_pool.num_blocks()
-    }
-
-    /// Capture the process-local memory bounds used by cache-hit prefill.
-    ///
-    /// The snapshot is cached until the adapter's token cursor changes, so a
-    /// Qwen3.6 chunk probes once and all 16 full-attention layers use the same
-    /// numbers. Metal's `currentAllocatedSize` is process-wide for the device
-    /// and therefore includes the private buffers backing `LayerKVPool`, which
-    /// MLX's active/cache counters intentionally do not own or report.
-    pub fn prefill_memory_snapshot(&mut self) -> PagedPrefillMemorySnapshot {
-        #[cfg(target_os = "macos")]
-        {
-            self.prefill_memory_snapshot_with(Self::probe_prefill_memory_snapshot)
-        }
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            PagedPrefillMemorySnapshot::default()
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn prefill_memory_snapshot_with(
-        &mut self,
-        probe: impl FnOnce(&Self) -> PagedPrefillMemorySnapshot,
-    ) -> PagedPrefillMemorySnapshot {
-        let token_count = self.current_token_count();
-        if let Some(cached) = self.prefill_memory_snapshot_cache
-            && cached.token_count == token_count
-        {
-            return cached.snapshot;
-        }
-
-        let snapshot = probe(self);
-        self.prefill_memory_snapshot_cache = Some(PrefillMemorySnapshotCache {
-            token_count,
-            snapshot,
-        });
-        snapshot
-    }
-
-    #[cfg(target_os = "macos")]
-    fn probe_prefill_memory_snapshot(&self) -> PagedPrefillMemorySnapshot {
-        let mut active = 0u64;
-        let mut cached = 0u64;
-        let mut limit = 0u64;
-        let allocator_ok = unsafe {
-            mlx_sys::mlx_get_active_memory(&mut active) == 0
-                && mlx_sys::mlx_get_cache_memory(&mut cached) == 0
-                && mlx_sys::mlx_get_memory_limit(&mut limit) == 0
-                && limit > 0
-        };
-
-        let metal = mlx_paged_attn::metal::MetalState::get()
-            .ok()
-            .map(|state| {
-                (
-                    state.device.recommended_max_working_set_size(),
-                    state.device.current_allocated_size(),
-                )
-            })
-            .filter(|(recommended, _)| *recommended > 0);
-        let pool_cfg = self.layer_kv_pool.config();
-        let paged_pool_allocated_bytes = mlx_paged_attn::profile::bytes_per_block(
-            self.layer_kv_pool.num_layers() as u32,
-            pool_cfg.num_kv_heads,
-            pool_cfg.head_size,
-            pool_cfg.block_size,
-            self.layer_kv_pool.cache_dtype(),
-        )
-        .ok()
-        .map(|bytes_per_block| {
-            bytes_per_block.saturating_mul(self.layer_kv_pool.num_blocks() as u64)
-        });
-
-        PagedPrefillMemorySnapshot {
-            allocator_active_bytes: allocator_ok.then_some(active),
-            allocator_cached_bytes: allocator_ok.then_some(cached),
-            allocator_limit_bytes: allocator_ok.then_some(limit),
-            metal_recommended_working_set_bytes: metal.map(|(recommended, _)| recommended),
-            metal_current_allocated_bytes: metal.map(|(_, current)| current),
-            paged_pool_allocated_bytes,
-        }
-    }
-
     pub fn cached_token_count(&self) -> u32 {
         self.cached_token_count
-    }
-
-    /// Element dtype exposed by a graph-native paged K/V gather. `None`
-    /// means the cache requires dequantization and cannot feed plain MLX
-    /// SDPA directly.
-    pub(crate) fn prefill_sdpa_cache_dtype(&self) -> Option<DType> {
-        match self.layer_kv_pool.cache_dtype() {
-            mlx_paged_attn::metal::MetalDtype::Float16 => Some(DType::Float16),
-            mlx_paged_attn::metal::MetalDtype::BFloat16 => Some(DType::BFloat16),
-            mlx_paged_attn::metal::MetalDtype::Float32 => Some(DType::Float32),
-            mlx_paged_attn::metal::MetalDtype::UChar => None,
-        }
     }
 
     pub fn current_token_count(&self) -> u32 {
@@ -4883,318 +3949,9 @@ mod tests {
 
     #[test]
     fn test_paged_attention_v2_aux_limit_matches_gemma4_overflow_shape() {
-        assert!(paged_attention_v2_aux_fits(
-            PagedAttentionV2Layout::Varlen,
-            8192,
-            16,
-            8,
-            8208,
-            512
-        ));
-        assert!(!paged_attention_v2_aux_fits(
-            PagedAttentionV2Layout::Varlen,
-            8192,
-            16,
-            8,
-            16400,
-            512
-        ));
-        assert!(paged_attention_v2_aux_fits(
-            PagedAttentionV2Layout::Varlen,
-            8176,
-            16,
-            8,
-            16384,
-            512
-        ));
-        assert!(!paged_attention_v2_aux_fits(
-            PagedAttentionV2Layout::SingleRowBatch,
-            1,
-            24,
-            4,
-            i32::MAX as u32 + 1,
-            256,
-        ));
-        assert!(!paged_attention_v2_aux_fits(
-            PagedAttentionV2Layout::SingleRowBatch,
-            i32::MAX as u32 + 1,
-            24,
-            4,
-            i32::MAX as u32 + 1,
-            256,
-        ));
-    }
-
-    #[test]
-    fn qwen35_dense_and_moe_aux_upper_bound_tracks_dispatch_layout() {
-        assert_eq!(
-            paged_attention_v2_partition_upper_bound(
-                PagedAttentionV2Layout::SingleRowBatch,
-                1,
-                24,
-                4,
-                16_384,
-                256,
-            ),
-            256
-        );
-        assert_eq!(
-            paged_attention_v2_partition_upper_bound(
-                PagedAttentionV2Layout::SingleRowBatch,
-                2,
-                24,
-                4,
-                114_688,
-                256,
-            ),
-            224,
-            "two fixed rows are two sequences and cannot use grouped Qwen paging"
-        );
-        assert_eq!(
-            paged_attention_v2_partition_upper_bound(
-                PagedAttentionV2Layout::Varlen,
-                1,
-                24,
-                4,
-                114_688,
-                256,
-            ),
-            224,
-            "one varlen query cannot use the two-row grouped verifier"
-        );
-        assert_eq!(
-            paged_attention_v2_partition_upper_bound(
-                PagedAttentionV2Layout::Varlen,
-                2,
-                24,
-                4,
-                8_192,
-                256,
-            ),
-            64
-        );
-        assert_eq!(
-            paged_attention_v2_partition_upper_bound(
-                PagedAttentionV2Layout::Varlen,
-                2,
-                24,
-                4,
-                16_384,
-                256,
-            ),
-            256
-        );
-        assert_eq!(
-            paged_attention_v2_partition_upper_bound(
-                PagedAttentionV2Layout::Varlen,
-                2,
-                24,
-                4,
-                65_537,
-                256,
-            ),
-            1_024
-        );
-        assert_eq!(
-            paged_attention_v2_partition_upper_bound(
-                PagedAttentionV2Layout::SingleRowBatch,
-                1,
-                16,
-                2,
-                65_537,
-                256,
-            ),
-            1_024,
-            "Qwen3.5 MoE decode must reserve the grouped-stripe upper bound"
-        );
-        assert_eq!(
-            paged_attention_v2_partition_upper_bound(
-                PagedAttentionV2Layout::SingleRowBatch,
-                1,
-                16,
-                2,
-                32_767,
-                256,
-            ),
-            64,
-            "Qwen3.5 MoE decode must retain the generic bound below its measured cutoff"
-        );
-        assert_eq!(
-            paged_attention_v2_partition_upper_bound(
-                PagedAttentionV2Layout::SingleRowBatch,
-                1,
-                16,
-                2,
-                32_768,
-                256,
-            ),
-            256,
-            "Qwen3.5 MoE decode must switch bounds at its measured cutoff"
-        );
-        assert_eq!(
-            paged_attention_v2_partition_upper_bound(
-                PagedAttentionV2Layout::Varlen,
-                2,
-                16,
-                2,
-                16_383,
-                256,
-            ),
-            32,
-            "Qwen3.5 MoE verifier must retain the generic bound below its measured cutoff"
-        );
-        assert_eq!(
-            paged_attention_v2_partition_upper_bound(
-                PagedAttentionV2Layout::Varlen,
-                2,
-                16,
-                2,
-                16_384,
-                256,
-            ),
-            256,
-            "Qwen3.5 MoE verifier must switch bounds at its measured cutoff"
-        );
-        assert_eq!(
-            paged_attention_v2_partition_upper_bound(
-                PagedAttentionV2Layout::Varlen,
-                2,
-                16,
-                2,
-                65_537,
-                256,
-            ),
-            1_024,
-            "Qwen3.5 MoE verifier must reserve the grouped-stripe upper bound"
-        );
-        assert_eq!(
-            paged_attention_v2_partition_upper_bound(
-                PagedAttentionV2Layout::SingleRowBatch,
-                1,
-                16,
-                4,
-                65_537,
-                256,
-            ),
-            129,
-            "nearby unsupported head shapes must retain the generic bound"
-        );
-        assert_eq!(
-            paged_attention_v2_partition_upper_bound(
-                PagedAttentionV2Layout::Varlen,
-                2,
-                24,
-                4,
-                524_289,
-                256,
-            ),
-            1_025,
-            "generic fallback must win once it exceeds the fixed stripe count"
-        );
-        assert!(paged_attention_v2_aux_fits(
-            PagedAttentionV2Layout::Varlen,
-            2,
-            24,
-            4,
-            114_688,
-            256
-        ));
-    }
-
-    #[test]
-    fn gemma4_grouped_aux_upper_bound_tracks_diagnostic_stripes() {
-        let bound = |layout, rows, q_heads, kv_heads, context, head_size| {
-            paged_attention_v2_partition_upper_bound(
-                layout, rows, q_heads, kv_heads, context, head_size,
-            )
-        };
-        assert_eq!(
-            bound(PagedAttentionV2Layout::SingleRowBatch, 1, 16, 1, 512, 512),
-            1,
-            "V1 contexts cannot select the grouped V2 kernel"
-        );
-        for (context, expected) in [
-            (513, 256),
-            (4_096, 256),
-            (4_097, 256),
-            (8_192, 256),
-            (8_193, 256),
-            (16_384, 256),
-            (65_537, 256),
-            (131_073, 257),
-        ] {
-            assert_eq!(
-                bound(
-                    PagedAttentionV2Layout::SingleRowBatch,
-                    1,
-                    16,
-                    1,
-                    context,
-                    512
-                ),
-                expected,
-                "wrong Gemma grouped/generic upper bound at context {context}"
-            );
-        }
-        assert_eq!(
-            bound(PagedAttentionV2Layout::Varlen, 1, 16, 1, 3_458, 512),
-            7,
-            "Gemma grouped decode is single-row only"
-        );
-        assert_eq!(
-            bound(PagedAttentionV2Layout::SingleRowBatch, 1, 16, 2, 3_458, 512),
-            7,
-            "nearby head shapes retain the generic bound"
-        );
-    }
-
-    #[test]
-    fn qwen27b_varlen_aux_limit_matches_dispatch_boundaries() {
-        // With q=2,048, 24 heads and D=256, context 87,040 is the last
-        // generic 512-token partition count whose partial output fits i32.
-        assert!(paged_attention_v2_aux_fits(
-            PagedAttentionV2Layout::Varlen,
-            2_048,
-            24,
-            4,
-            87_040,
-            256
-        ));
-        assert!(!paged_attention_v2_aux_fits(
-            PagedAttentionV2Layout::Varlen,
-            2_048,
-            24,
-            4,
-            87_041,
-            256
-        ));
-        assert!(!paged_attention_v2_aux_fits(
-            PagedAttentionV2Layout::Varlen,
-            2_048,
-            24,
-            4,
-            114_688,
-            256
-        ));
-
-        // At context 114,688 (224 partitions), q=1,560 is the exact
-        // maximum; one more query row crosses the same element limit.
-        assert!(paged_attention_v2_aux_fits(
-            PagedAttentionV2Layout::Varlen,
-            1_560,
-            24,
-            4,
-            114_688,
-            256
-        ));
-        assert!(!paged_attention_v2_aux_fits(
-            PagedAttentionV2Layout::Varlen,
-            1_561,
-            24,
-            4,
-            114_688,
-            256
-        ));
+        assert!(paged_attention_v2_aux_fits(8192, 16, 8208, 512));
+        assert!(!paged_attention_v2_aux_fits(8192, 16, 16400, 512));
+        assert!(paged_attention_v2_aux_fits(8176, 16, 16384, 512));
     }
 
     fn new_allocator(num_blocks: u32, block_size: u32) -> Arc<Mutex<BlockAllocator>> {
@@ -5275,50 +4032,6 @@ mod tests {
         Some(maybe_make_adapter(allocator, block_size)?.expect("adapter ctor must succeed"))
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn prefill_memory_snapshot_is_probed_once_per_chunk() {
-        use std::cell::Cell;
-
-        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
-            return;
-        };
-        let probes = Cell::new(0u32);
-        let expected = PagedPrefillMemorySnapshot {
-            allocator_active_bytes: Some(1),
-            allocator_cached_bytes: Some(2),
-            allocator_limit_bytes: Some(3),
-            metal_recommended_working_set_bytes: Some(4),
-            metal_current_allocated_bytes: Some(5),
-            paged_pool_allocated_bytes: Some(6),
-        };
-
-        let first = adapter.prefill_memory_snapshot_with(|_| {
-            probes.set(probes.get() + 1);
-            expected
-        });
-        let second = adapter.prefill_memory_snapshot_with(|_| {
-            probes.set(probes.get() + 1);
-            PagedPrefillMemorySnapshot::default()
-        });
-
-        assert_eq!(first, expected);
-        assert_eq!(second, expected);
-        assert_eq!(probes.get(), 1);
-
-        adapter.reset_for_new_request(1).unwrap();
-        adapter.record_tokens(&[7]).unwrap();
-        let third = adapter.prefill_memory_snapshot_with(|_| {
-            probes.set(probes.get() + 1);
-            PagedPrefillMemorySnapshot {
-                allocator_active_bytes: Some(7),
-                ..PagedPrefillMemorySnapshot::default()
-            }
-        });
-        assert_eq!(third.allocator_active_bytes, Some(7));
-        assert_eq!(probes.get(), 2);
-    }
-
     /// Convenience: simulates a previous completed request that registered
     /// its blocks for cross-request reuse. Mirrors the combined effect of
     /// `register_full_blocks_for_reuse` followed by `release_request`:
@@ -5346,31 +4059,6 @@ mod tests {
         // alive at ref_count = 1.
         for b in blocks {
             guard.free(b);
-        }
-    }
-
-    fn seed_prefix_cache_per_block(
-        allocator: &Arc<Mutex<BlockAllocator>>,
-        tokens: &[u32],
-        block_size: u32,
-        extra_keys_per_block: &[Vec<u64>],
-    ) {
-        let mut guard = allocator.lock().unwrap();
-        let block_size_us = block_size as usize;
-        let num_full = tokens.len() / block_size_us;
-        let mut blocks = Vec::with_capacity(num_full);
-        for _ in 0..num_full {
-            blocks.push(
-                guard
-                    .allocate()
-                    .expect("seed_prefix_cache_per_block: free block"),
-            );
-        }
-        guard
-            .cache_full_blocks_per_block(tokens, &blocks, block_size, extra_keys_per_block, 0)
-            .expect("seed_prefix_cache_per_block: cache_full_blocks_per_block");
-        for block in blocks {
-            guard.free(block);
         }
     }
 
@@ -7270,59 +5958,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn compact_prefill_metadata_uses_one_block_row_for_all_queries() {
-        let allocator = new_allocator(64, 4);
-        let mut table = SequenceBlockTable::new(0, 4);
-        let mut all = Vec::with_capacity(64);
-        {
-            let mut guard = allocator.lock().unwrap();
-            for _ in 0..64 {
-                all.push(guard.allocate().expect("alloc"));
-            }
-        }
-        for &block_id in &[42u32, 3, 17, 5] {
-            table.add_block(Arc::clone(&all[block_id as usize]));
-        }
-        // The request may already be recorded beyond this replay subrange.
-        // Compact metadata must still expose only the blocks required by
-        // cached_prefix_len + query_len.
-        table.set_num_tokens(16);
-
-        let metadata = build_compact_prefill_metadata(&table, 6, 3, 4)
-            .expect("6 cached + 3 query tokens require three blocks");
-        assert_eq!(metadata.total_context, 9);
-        assert_eq!(metadata.block_ids, vec![42, 3, 17]);
-        assert_eq!(metadata.seq_lens, [9]);
-        assert_eq!(metadata.cu_seqlens_q, [0, 3]);
-        assert_eq!(
-            metadata.block_ids.len(),
-            3,
-            "the compact representation must not duplicate one row per query token"
-        );
-    }
-
-    #[test]
-    fn compact_prefill_metadata_rejects_unrecorded_or_empty_query() {
-        let allocator = new_allocator(4, 4);
-        let mut table = SequenceBlockTable::new(0, 4);
-        {
-            let mut guard = allocator.lock().unwrap();
-            table.add_block(guard.allocate().expect("block 0"));
-            table.add_block(guard.allocate().expect("block 1"));
-            table.add_block(guard.allocate().expect("block 2"));
-        }
-        table.set_num_tokens(8);
-
-        let err = build_compact_prefill_metadata(&table, 6, 3, 4)
-            .expect_err("total context 9 exceeds the recorded cursor 8");
-        assert!(err.contains("recorded token count 8"), "got: {err}");
-
-        let err = build_compact_prefill_metadata(&table, 8, 0, 4)
-            .expect_err("an empty query chunk is invalid");
-        assert!(err.contains("query_len > 0"), "got: {err}");
-    }
-
     /// Happy-path Metal dispatch on a tiny pool. Allocate 4 tokens worth
     /// (block_size 8 → 1 block fits), record them, write zero-K/V, and
     /// dispatch `gather_kv_for_decode`. Validates the kernel name lookup,
@@ -7542,22 +6177,6 @@ mod tests {
             DType::Float16,
             "MLX paged_attention bridge should keep output on-device in the IO dtype"
         );
-
-        let compact_out = match adapter.gather_kv_for_prefill_chunk_varlen(0, &q, 2, scale) {
-            Ok(arr) => arr,
-            Err(e) if e.contains("Metal GPU not available") => {
-                eprintln!(
-                    "skipping compact half of test_gather_kv_for_prefill_chunk_writes_succeed_on_metal: {e}"
-                );
-                return;
-            }
-            Err(e) => panic!("unexpected error from compact varlen prefill: {e}"),
-        };
-        assert_eq!(compact_out.ndim().unwrap(), 3);
-        assert_eq!(compact_out.shape_at(0).unwrap(), 2);
-        assert_eq!(compact_out.shape_at(1).unwrap(), 2);
-        assert_eq!(compact_out.shape_at(2).unwrap(), 64);
-        assert_eq!(compact_out.dtype().unwrap(), DType::Float16);
     }
 
     #[cfg(target_os = "macos")]
@@ -7645,103 +6264,6 @@ mod tests {
                     "token {token_idx} head {head_idx}: got {actual}, expected {expected}"
                 );
             }
-        }
-
-        let compact_out = adapter
-            .gather_kv_for_prefill_chunk_varlen(0, &q, 2, scale)
-            .expect("compact varlen prefill");
-        let compact_values = compact_out
-            .to_float32()
-            .expect("compact prefill output to_float32");
-        for (token_idx, expected) in expected_by_token.iter().copied().enumerate() {
-            for head_idx in 0..2 {
-                let base = (token_idx * 2 + head_idx) * 64;
-                let actual = compact_values[base];
-                assert!(
-                    (actual - expected).abs() < 0.05,
-                    "compact token {token_idx} head {head_idx}: got {actual}, expected {expected}"
-                );
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_gather_kv_for_prefill_sdpa_preserves_layout_and_native_dependency() {
-        let cfg = mlx_paged_attn::PagedAttentionConfig {
-            block_size: 8,
-            num_kv_heads: 1,
-            head_size: 64,
-            num_layers: 2,
-            gpu_memory_mb: 256,
-            use_fp8_cache: Some(false),
-            max_seq_len: Some(64),
-            max_batch_size: Some(2),
-        };
-        let pool = match mlx_paged_attn::LayerKVPool::new(
-            cfg,
-            4,
-            mlx_paged_attn::metal::MetalDtype::Float16,
-        ) {
-            Ok(pool) => Arc::new(pool),
-            Err(e) => {
-                eprintln!(
-                    "skipping test_gather_kv_for_prefill_sdpa_preserves_layout_and_native_dependency: {e}"
-                );
-                return;
-            }
-        };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
-        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
-        adapter.reset_for_new_request(11).unwrap();
-        adapter.allocate_suffix_blocks(4).unwrap();
-        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
-
-        let mut k_bits = Vec::with_capacity(4 * 64);
-        let mut v_bits = Vec::with_capacity(4 * 64);
-        for token_idx in 0..4 {
-            k_bits.extend(std::iter::repeat_n(
-                f16::from_f32((token_idx + 1) as f32).to_bits(),
-                64,
-            ));
-            v_bits.extend(std::iter::repeat_n(
-                f16::from_f32((token_idx + 11) as f32).to_bits(),
-                64,
-            ));
-        }
-        let k = MxArray::from_float16(&k_bits, &[4, 1, 64]).expect("K input");
-        let v = MxArray::from_float16(&v_bits, &[4, 1, 64]).expect("V input");
-        // Keep the write lazy. The gather must consume the dependency-carrying
-        // native pool arrays rather than wrapping raw physical buffers.
-        match adapter.update_keys_values_native(0, &k, &v, 0) {
-            Ok(()) => {}
-            Err(e) if e.contains("Metal GPU not available") => {
-                eprintln!(
-                    "skipping test_gather_kv_for_prefill_sdpa_preserves_layout_and_native_dependency: {e}"
-                );
-                return;
-            }
-            Err(e) => panic!("unexpected native write failure: {e}"),
-        }
-
-        let (gathered_k, gathered_v) = adapter
-            .gather_kv_for_prefill_sdpa(0, 4)
-            .expect("graph-native SDPA gather");
-        for array in [&gathered_k, &gathered_v] {
-            assert_eq!(array.ndim().unwrap(), 4);
-            assert_eq!(array.shape_at(0).unwrap(), 1);
-            assert_eq!(array.shape_at(1).unwrap(), 1);
-            assert_eq!(array.shape_at(2).unwrap(), 4);
-            assert_eq!(array.shape_at(3).unwrap(), 64);
-            assert_eq!(array.dtype().unwrap(), DType::Float16);
-        }
-
-        let gathered_k = gathered_k.to_float32().expect("gathered K values");
-        let gathered_v = gathered_v.to_float32().expect("gathered V values");
-        for token_idx in 0..4 {
-            let base = token_idx * 64;
-            assert!((gathered_k[base] - (token_idx + 1) as f32).abs() < 0.01);
-            assert!((gathered_v[base] - (token_idx + 11) as f32).abs() < 0.01);
         }
     }
 
@@ -7901,8 +6423,10 @@ mod tests {
         );
         let msg = res.err().unwrap();
         assert!(
-            msg.starts_with("context_length_exceeded:"),
-            "error must expose the recoverable context-capacity marker, got: {msg}"
+            msg.contains("BlockAllocator exhausted")
+                || msg.contains("lazy decode allocation")
+                || msg.contains("running out"),
+            "error must indicate allocator exhaustion, got: {msg}"
         );
         // Caller-visible state must be unchanged on failure (token cursor
         // and block table not advanced past the prior successful state).
@@ -8356,116 +6880,6 @@ mod tests {
         assert_eq!(adapter.current_token_count(), 4);
 
         adapter.release_request().unwrap();
-    }
-
-    #[test]
-    fn test_restart_prepared_turn_cold_per_block_discards_candidate_hit() {
-        let allocator = new_allocator(6, 4);
-        let tokens: Vec<u32> = (1..=8).collect();
-        let per_block = vec![vec![0xA11C_E001], Vec::new()];
-        seed_prefix_cache_per_block(&allocator, &tokens, 4, &per_block);
-        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
-            eprintln!(
-                "skipping test_restart_prepared_turn_cold_per_block_discards_candidate_hit: Metal unavailable"
-            );
-            return;
-        };
-
-        let candidate = adapter
-            .prepare_turn_per_block_with_max_cache_hit_tokens(
-                7,
-                &tokens,
-                tokens.len() as u32,
-                true,
-                &per_block,
-                0,
-                false,
-                tokens.len() as u32 - 1,
-            )
-            .expect("prepare image-keyed cache candidate");
-        assert_eq!(candidate.cached_prefix_len, 4);
-        assert_eq!(adapter.request_tokens(), &tokens[..4]);
-
-        let cold = adapter
-            .restart_prepared_turn_cold_per_block(7, &tokens, tokens.len() as u32, &per_block, 0)
-            .expect("downgrade candidate to cold prefill");
-        assert_eq!(cold.cached_prefix_len, 0);
-        assert_eq!(cold.cached_blocks, 0);
-        assert_eq!(cold.allocated_blocks, 2);
-        assert_eq!(cold.suffix_len, tokens.len() as u32);
-        assert!(adapter.request_tokens().is_empty());
-        assert_eq!(adapter.block_table().unwrap().num_blocks(), 2);
-        adapter.release_request().unwrap();
-    }
-
-    #[test]
-    fn test_prepare_turn_allocation_error_releases_attached_prefix_blocks() {
-        // The candidate occupies one cached block while an unrelated cached
-        // chain occupies the remaining two physical blocks. The candidate hit
-        // therefore attaches successfully, but its one-block suffix cannot be
-        // allocated. Preparation must detach the candidate request reference
-        // before returning the error.
-        let allocator = new_allocator(3, 4);
-        let cached_tokens: Vec<u32> = (1..=4).collect();
-        let prompt_tokens: Vec<u32> = (1..=8).collect();
-        let cached_keys = vec![vec![0xA11C_E001]];
-        let prompt_keys = vec![vec![0xA11C_E001], Vec::new()];
-        seed_prefix_cache_per_block(&allocator, &cached_tokens, 4, &cached_keys);
-        let unrelated_tokens: Vec<u32> = (101..=108).collect();
-        let unrelated_keys = vec![vec![0xDEAD_BEEF], Vec::new()];
-        seed_prefix_cache_per_block(&allocator, &unrelated_tokens, 4, &unrelated_keys);
-        let held_unrelated = {
-            let mut guard = allocator.lock().unwrap();
-            let (blocks, cached) =
-                guard.find_longest_cache_hit_per_block(&unrelated_tokens, 4, &unrelated_keys, 0);
-            assert_eq!(cached, unrelated_tokens.len());
-            blocks
-        };
-        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
-            eprintln!(
-                "skipping test_prepare_turn_allocation_error_releases_attached_prefix_blocks: Metal unavailable"
-            );
-            return;
-        };
-
-        let error = adapter
-            .prepare_turn_per_block_with_max_cache_hit_tokens(
-                9,
-                &prompt_tokens,
-                prompt_tokens.len() as u32,
-                true,
-                &prompt_keys,
-                0,
-                false,
-                prompt_tokens.len() as u32 - 1,
-            )
-            .expect_err("one-block suffix must exhaust the fully cached pool");
-        assert!(error.contains("could not reserve 1 block(s)"), "{error}");
-        assert!(adapter.block_table().is_none());
-        assert!(adapter.request_tokens().is_empty());
-        assert_eq!(adapter.cached_token_count(), 0);
-        assert_eq!(adapter.release_request().unwrap(), 0);
-
-        // The prefix-cache's logical reference remains valid; only the failed
-        // request reference was removed.
-        let retry = adapter
-            .prepare_turn_per_block_with_max_cache_hit_tokens(
-                10,
-                &cached_tokens,
-                cached_tokens.len() as u32,
-                true,
-                &cached_keys,
-                0,
-                false,
-                cached_tokens.len() as u32,
-            )
-            .expect("cached prefix remains reusable after failed request cleanup");
-        assert_eq!(retry.cached_prefix_len, cached_tokens.len() as u32);
-        adapter.release_request().unwrap();
-        let mut guard = allocator.lock().unwrap();
-        for block in held_unrelated {
-            guard.free(block);
-        }
     }
 
     /// `continue_turn` rejects a prompt that does NOT strictly extend

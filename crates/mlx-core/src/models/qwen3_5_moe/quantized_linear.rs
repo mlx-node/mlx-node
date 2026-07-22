@@ -9,21 +9,18 @@ use napi::bindgen_prelude::*;
 // get the same concrete type.
 pub use crate::models::qwen3_5::quantized_linear::QuantizedLinear;
 pub use crate::models::qwen3_5::quantized_linear::{
-    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, DEFAULT_QUANT_MODE, FP8_E4M3_BITS,
-    FP8_E4M3_GROUP_SIZE, FP8_E4M3_MODE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE, LinearProj,
-    MLPVariant, MXFP4_BITS, MXFP4_GROUP_SIZE, MXFP4_MODE, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
-    NVFP4_BITS, NVFP4_GROUP_SIZE, NVFP4_MODE, PerLayerMode, PerLayerQuant, SYM8_BITS,
-    SYM8_GROUP_SIZE, SYM8_MODE, is_mxfp8_checkpoint, is_quantized_checkpoint,
-    try_build_fp8_e4m3_quantized_linear, try_build_mxfp4_quantized_linear,
-    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear, try_build_quantized_linear,
-    try_build_sym8_quantized_linear,
+    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, DEFAULT_QUANT_MODE, GATE_QUANT_BITS,
+    GATE_QUANT_GROUP_SIZE, LinearProj, MLPVariant, MXFP4_BITS, MXFP4_GROUP_SIZE, MXFP4_MODE,
+    MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE, NVFP4_BITS, NVFP4_GROUP_SIZE, NVFP4_MODE,
+    PerLayerMode, PerLayerQuant, SYM8_BITS, SYM8_GROUP_SIZE, SYM8_MODE, is_mxfp8_checkpoint,
+    is_quantized_checkpoint, try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
+    try_build_nvfp4_quantized_linear, try_build_quantized_linear, try_build_sym8_quantized_linear,
 };
 
-/// Expert-indexed linear backed by a serialized quantized weight format.
+/// QuantizedSwitchLinear: Expert-indexed quantized linear layer using gather_qmm.
 ///
-/// Affine/MX/NVFP modes use fused gather_qmm. Plain `fp8_e4m3` retains raw
-/// Uint8 checkpoint storage, reconstructs a BF16 expert stack once at load,
-/// and runs ordinary A16 gather_mm; it does not claim native W8A8.
+/// Like SwitchLinear but with quantized weights for ~4x memory reduction.
+/// Uses MLX's fused gather_qmm Metal kernel for efficient MoE inference.
 pub struct QuantizedSwitchLinear {
     weight: MxArray,         // Packed uint32 [num_experts, out, in_packed]
     scales: MxArray,         // Quantization scales [num_experts, out, groups]
@@ -31,8 +28,6 @@ pub struct QuantizedSwitchLinear {
     group_size: i32,
     bits: i32,
     mode: String,
-    // Pre-transposed BF16 `[E,K,N]` reconstruction for fp8_e4m3 fallback.
-    fp8_dequant_weight_t: Option<MxArray>,
 }
 
 impl QuantizedSwitchLinear {
@@ -51,33 +46,11 @@ impl QuantizedSwitchLinear {
             group_size,
             bits,
             mode,
-            fp8_dequant_weight_t: None,
-        }
-    }
-
-    pub fn new_fp8_e4m3(weight: MxArray, scales: MxArray, dequant_weight_t: MxArray) -> Self {
-        Self {
-            weight,
-            scales,
-            biases: None,
-            group_size: FP8_E4M3_GROUP_SIZE,
-            bits: FP8_E4M3_BITS,
-            mode: FP8_E4M3_MODE.to_string(),
-            fp8_dequant_weight_t: Some(dequant_weight_t),
         }
     }
 
     /// Forward pass using gather_qmm.
     pub fn forward(&self, x: &MxArray, indices: &MxArray, sorted: bool) -> Result<MxArray> {
-        if self.mode == FP8_E4M3_MODE {
-            let weight_t = self.fp8_dequant_weight_t.as_ref().ok_or_else(|| {
-                Error::from_reason(
-                    "plain FP8 QuantizedSwitchLinear missing load-time BF16 reconstruction",
-                )
-            })?;
-            return x.gather_mm(weight_t, indices, sorted);
-        }
-
         let mode_c = CString::new(self.mode.as_str())
             .map_err(|e| Error::from_reason(format!("Invalid mode string: {}", e)))?;
 
@@ -106,16 +79,10 @@ impl QuantizedSwitchLinear {
 
     pub fn set_weight(&mut self, weight: MxArray) {
         self.weight = weight;
-        if self.mode == FP8_E4M3_MODE {
-            self.fp8_dequant_weight_t = None;
-        }
     }
 
     pub fn set_scales(&mut self, scales: MxArray) {
         self.scales = scales;
-        if self.mode == FP8_E4M3_MODE {
-            self.fp8_dequant_weight_t = None;
-        }
     }
 
     pub fn set_biases(&mut self, biases: Option<MxArray>) {
@@ -144,7 +111,6 @@ impl Clone for QuantizedSwitchLinear {
             group_size: self.group_size,
             bits: self.bits,
             mode: self.mode.clone(),
-            fp8_dequant_weight_t: self.fp8_dequant_weight_t.clone(),
         }
     }
 }
@@ -200,128 +166,4 @@ pub fn try_build_nvfp4_quantized_switch_linear(
         NVFP4_BITS,
         NVFP4_MODE.to_string(),
     ))
-}
-
-/// Build a plain E4M3 expert stack and reconstruct it to BF16 once at load.
-/// Storage is Uint8 `[E,N,K]` + floating `[E,N,1]`; runtime uses ordinary
-/// A16 `gather_mm`, not native W8A8.
-pub fn try_build_fp8_e4m3_quantized_switch_linear(
-    params: &HashMap<String, MxArray>,
-    key_prefix: &str,
-) -> Result<Option<QuantizedSwitchLinear>> {
-    let weight = params.get(&format!("{key_prefix}.weight"));
-    let scales = params.get(&format!("{key_prefix}.scales"));
-    let (weight, scales) = match (weight, scales) {
-        (None, None) => return Ok(None),
-        (Some(_), None) => {
-            return Err(Error::from_reason(format!(
-                "plain FP8 expert layer '{key_prefix}': .weight present but mandatory .scales missing"
-            )));
-        }
-        (None, Some(_)) => {
-            return Err(Error::from_reason(format!(
-                "plain FP8 expert layer '{key_prefix}': .scales present but .weight missing"
-            )));
-        }
-        (Some(weight), Some(scales)) => (weight, scales),
-    };
-    if params.contains_key(&format!("{key_prefix}.biases")) {
-        return Err(Error::from_reason(format!(
-            "plain FP8 expert layer '{key_prefix}': unexpected .biases sidecar"
-        )));
-    }
-    let dequant = crate::quant::fp8_weight::validate_and_dequantize(weight, scales, 3, key_prefix)?;
-    let dequant_weight_t = dequant.transpose(Some(&[0, 2, 1]))?;
-    Ok(Some(QuantizedSwitchLinear::new_fp8_e4m3(
-        weight.clone(),
-        scales.clone(),
-        dequant_weight_t,
-    )))
-}
-
-#[cfg(test)]
-mod plain_fp8_expert_tests {
-    use super::*;
-    use crate::array::DType;
-
-    #[test]
-    fn plain_fp8_expert_builder_uses_bf16_gather_mm_fallback() {
-        let values = (0..24).map(|i| (i as f32 - 12.0) / 8.0).collect::<Vec<_>>();
-        let source = MxArray::from_float32(&values, &[2, 3, 4])
-            .unwrap()
-            .astype(DType::BFloat16)
-            .unwrap();
-        let (weight, scales) =
-            crate::quant::fp8_weight::quantize_per_output_channel(&source, "experts").unwrap();
-        let params = HashMap::from([
-            ("experts.weight".into(), weight.clone()),
-            ("experts.scales".into(), scales.clone()),
-        ]);
-        let qsl = try_build_fp8_e4m3_quantized_switch_linear(&params, "experts")
-            .unwrap()
-            .unwrap();
-        assert_eq!(qsl.get_weight().dtype().unwrap(), DType::Uint8);
-        assert_eq!(qsl.get_scales().shape().unwrap().to_vec(), vec![2, 3, 1]);
-
-        let x = MxArray::from_float32(
-            &[1.0, -0.5, 0.25, 2.0, -1.0, 0.75, 0.5, 1.25],
-            &[2, 1, 1, 4],
-        )
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap();
-        let indices = MxArray::from_int32(&[0, 1], &[2, 1]).unwrap();
-        let got = qsl.forward(&x, &indices, false).unwrap();
-        let dequant =
-            crate::quant::fp8_weight::validate_and_dequantize(&weight, &scales, 3, "experts")
-                .unwrap();
-        let want = x
-            .gather_mm(
-                &dequant.transpose(Some(&[0, 2, 1])).unwrap(),
-                &indices,
-                false,
-            )
-            .unwrap();
-        got.eval();
-        want.eval();
-        assert_eq!(
-            got.to_uint16_native().unwrap(),
-            want.to_uint16_native().unwrap()
-        );
-    }
-
-    #[test]
-    fn plain_fp8_expert_builder_rejects_malformed_storage() {
-        let weight = MxArray::from_uint8(&[0; 24], &[2, 3, 4]).unwrap();
-        let scales = MxArray::from_float32(&[1.0, 1.0, 1.0], &[3, 1]).unwrap();
-        let params = HashMap::from([
-            ("experts.weight".into(), weight),
-            ("experts.scales".into(), scales),
-        ]);
-        assert!(try_build_fp8_e4m3_quantized_switch_linear(&params, "experts").is_err());
-
-        let wrong_weight_dtype = MxArray::from_float32(&[0.0; 24], &[2, 3, 4]).unwrap();
-        let valid_scales = MxArray::from_float32(&[1.0; 6], &[2, 3, 1]).unwrap();
-        let params = HashMap::from([
-            ("experts.weight".into(), wrong_weight_dtype),
-            ("experts.scales".into(), valid_scales.clone()),
-        ]);
-        assert!(try_build_fp8_e4m3_quantized_switch_linear(&params, "experts").is_err());
-
-        let wrong_scale_dtype = MxArray::from_uint8(&[1; 6], &[2, 3, 1]).unwrap();
-        let params = HashMap::from([
-            (
-                "experts.weight".into(),
-                MxArray::from_uint8(&[0; 24], &[2, 3, 4]).unwrap(),
-            ),
-            ("experts.scales".into(), wrong_scale_dtype),
-        ]);
-        assert!(try_build_fp8_e4m3_quantized_switch_linear(&params, "experts").is_err());
-
-        let params = HashMap::from([(
-            "experts.weight".into(),
-            MxArray::from_uint8(&[0; 24], &[2, 3, 4]).unwrap(),
-        )]);
-        assert!(try_build_fp8_e4m3_quantized_switch_linear(&params, "experts").is_err());
-    }
 }

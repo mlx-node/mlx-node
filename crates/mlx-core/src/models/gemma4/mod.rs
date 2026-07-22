@@ -1,13 +1,9 @@
-pub(crate) mod assistant;
-pub(crate) mod assistant_decode;
 pub mod attention;
 pub mod audio_processor;
 pub mod clippable_linear;
 pub mod config;
 pub mod decoder_layer;
 pub(crate) mod diagnostic;
-pub(crate) mod dspark;
-pub(crate) mod dspark_decode;
 pub mod image_processor;
 pub mod layer_cache;
 pub mod mlp;

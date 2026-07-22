@@ -13,9 +13,8 @@ use crate::engine::persistence::{
 };
 use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, default_per_layer_quant, effective_plq_for,
-    ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
-    ensure_plain_fp8_storage_resolves_fp8_e4m3, has_sym8_mode, load_quant_settings_from_disk,
-    resolve_default_mode,
+    ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8, has_sym8_mode,
+    load_quant_settings_from_disk, resolve_default_mode,
 };
 use crate::models::qwen3_5_moe::persistence::try_build_quantized_switch_linear;
 use crate::models::qwen3_5_moe::quantized_linear::{
@@ -52,17 +51,10 @@ fn build_lfm2_qsl(
     // int8 STORAGE with non-sym8 metadata = config drift — fail loud before
     // the int8 stack can flow into the affine/mxfp QSL builders.
     ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "lfm2_moe")?;
-    ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "lfm2_moe")?;
     Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
         PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, prefix),
-        PerLayerMode::Fp8E4m3 => {
-            return Err(Error::from_reason(format!(
-                "lfm2_moe: expert projection '{prefix}' resolved to fp8_e4m3, but plain \
-                 per-output E4M3 storage is supported only by Qwen3.5 DGX artifacts"
-            )));
-        }
         PerLayerMode::Affine => {
             try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
         }
@@ -100,17 +92,10 @@ fn build_lfm2_gate_ql(
     // int8 STORAGE with non-sym8 metadata = config drift — fail loud before
     // the int8 tensor can flow into the affine/mxfp builders.
     ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "lfm2_moe")?;
-    ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "lfm2_moe")?;
     Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
         PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
-        PerLayerMode::Fp8E4m3 => {
-            return Err(Error::from_reason(format!(
-                "lfm2_moe: router gate '{prefix}' resolved to fp8_e4m3, but plain \
-                 per-output E4M3 storage is supported only by Qwen3.5 DGX artifacts"
-            )));
-        }
         PerLayerMode::Affine => {
             try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
         }
@@ -155,17 +140,10 @@ fn build_lfm2_non_moe_ql(
     // sym8 checkpoint out of the compiled C++ path's affine quant-info
     // registration (the compiled gate keys on config metadata only).
     ensure_int8_storage_resolves_sym8(params, base, plq.mode, "lfm2")?;
-    ensure_plain_fp8_storage_resolves_fp8_e4m3(params, base, plq.mode, "lfm2")?;
     Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, base),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, base),
         PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, base),
-        PerLayerMode::Fp8E4m3 => {
-            return Err(Error::from_reason(format!(
-                "lfm2: projection '{base}' resolved to fp8_e4m3, but plain per-output \
-                 E4M3 storage is supported only by Qwen3.5 DGX artifacts"
-            )));
-        }
         PerLayerMode::Affine => try_build_quantized_linear(params, base, plq.group_size, plq.bits),
         PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, base)?,
     })
@@ -326,12 +304,6 @@ fn plq_to_packed_params(plq: PerLayerQuant, ctx: &str) -> Result<(i32, i32, &'st
         PerLayerMode::Mxfp8 => (MXFP8_GROUP_SIZE, MXFP8_BITS, "mxfp8"),
         PerLayerMode::Mxfp4 => (MXFP4_GROUP_SIZE, MXFP4_BITS, "mxfp4"),
         PerLayerMode::Nvfp4 => (NVFP4_GROUP_SIZE, NVFP4_BITS, "nvfp4"),
-        PerLayerMode::Fp8E4m3 => {
-            return Err(Error::from_reason(format!(
-                "lfm2: '{ctx}' resolved to fp8_e4m3, but the packed embedding/quant-info \
-                 path has no plain per-output E4M3 representation"
-            )));
-        }
         PerLayerMode::Sym8 => {
             return Err(Error::from_reason(format!(
                 "lfm2: '{ctx}' resolved to sym8 quantization, but this packed-quant path \
@@ -1441,7 +1413,7 @@ impl Lfm2Inner {
         // affine defaults with empty overrides and `apply_weights`'s dense
         // branch ignores them.
         let (quant_bits, quant_group_size, top_level_mode, per_layer_quant) =
-            load_quant_settings_from_disk(path, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE)?;
+            load_quant_settings_from_disk(path, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE);
 
         // Load safetensors
         let mut params = load_all_safetensors(path, false)?;
@@ -3030,89 +3002,6 @@ mod tests {
         assert!(
             msg.contains("w1") && msg.contains("alias"),
             "error should name the stray w1 alias, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn lfm_ql_qsl_and_gate_reject_plain_fp8_storage_before_packed_dispatch() {
-        let stale = PerLayerQuant {
-            bits: 4,
-            group_size: 32,
-            mode: PerLayerMode::Mxfp4,
-            input_amax: None,
-        };
-        let explicit_fp8 = PerLayerQuant {
-            bits: 8,
-            group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
-            mode: PerLayerMode::Fp8E4m3,
-            input_amax: None,
-        };
-        let dense_prefix = "layers.0.self_attn.q_proj";
-        let dense_params = HashMap::from([
-            (
-                format!("{dense_prefix}.weight"),
-                MxArray::from_uint8(&[0; 8], &[2, 4]).unwrap(),
-            ),
-            (
-                format!("{dense_prefix}.scales"),
-                MxArray::from_float32(&[1.0, 1.0], &[2, 1]).unwrap(),
-            ),
-        ]);
-        let err = build_lfm2_non_moe_ql(&dense_params, dense_prefix, &HashMap::new(), stale)
-            .err()
-            .expect("stale plain-FP8 LFM QL metadata must reject");
-        assert!(
-            err.reason.contains("plain E4M3 FP8 storage"),
-            "{}",
-            err.reason
-        );
-        let err = build_lfm2_non_moe_ql(&dense_params, dense_prefix, &HashMap::new(), explicit_fp8)
-            .err()
-            .expect("LFM plain-FP8 QL is unsupported");
-        assert!(
-            err.reason.contains("supported only by Qwen3.5"),
-            "{}",
-            err.reason
-        );
-
-        let gate_prefix = "layers.0.feed_forward.gate";
-        let gate_params = HashMap::from([
-            (
-                format!("{gate_prefix}.weight"),
-                MxArray::from_uint8(&[0; 8], &[2, 4]).unwrap(),
-            ),
-            (
-                format!("{gate_prefix}.scales"),
-                MxArray::from_float32(&[1.0, 1.0], &[2, 1]).unwrap(),
-            ),
-        ]);
-        let err = build_lfm2_gate_ql(&gate_params, gate_prefix, &HashMap::new(), stale)
-            .err()
-            .expect("stale plain-FP8 LFM gate metadata must reject");
-        assert!(
-            err.reason.contains("plain E4M3 FP8 storage"),
-            "{}",
-            err.reason
-        );
-
-        let expert_prefix = "layers.0.feed_forward.experts.gate_up_proj";
-        let expert_params = HashMap::from([
-            (
-                format!("{expert_prefix}.weight"),
-                MxArray::from_uint8(&[0; 24], &[2, 3, 4]).unwrap(),
-            ),
-            (
-                format!("{expert_prefix}.scales"),
-                MxArray::from_float32(&[1.0; 6], &[2, 3, 1]).unwrap(),
-            ),
-        ]);
-        let err = build_lfm2_qsl(&expert_params, expert_prefix, &HashMap::new(), stale)
-            .err()
-            .expect("stale plain-FP8 LFM QSL metadata must reject");
-        assert!(
-            err.reason.contains("plain E4M3 FP8 storage"),
-            "{}",
-            err.reason
         );
     }
 

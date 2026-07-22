@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 
-use crate::array::{DType, MxArray};
+use crate::array::MxArray;
 // The int8 W8A8/W8A16 kernels are family-agnostic; importing them from
 // qwen3_5 follows the existing cross-family precedent
 // (`gemma4::persistence` imports the shared `engine::persistence` helpers).
@@ -627,7 +627,14 @@ impl QuantizedLinear {
         Ok(result)
     }
 
-    fn forward_qmm(&self, x: &MxArray, activation_dtype: DType) -> Result<MxArray> {
+    /// Forward pass using quantized_matmul (sym8 routes to the int8 W8A8
+    /// kernels instead — `mlx_quantized_matmul` has no sym8 pack and its
+    /// legacy no-biases heuristic would misread sym8 as MXFP8).
+    pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
+        if self.mode == SYM8_MODE {
+            return self.forward_sym8(x);
+        }
+
         let mode_c = CString::new(self.mode.as_str())
             .map_err(|e| Error::from_reason(format!("Invalid mode string: {}", e)))?;
 
@@ -654,29 +661,7 @@ impl QuantizedLinear {
             result = result.add(b)?;
         }
 
-        if result.dtype()? != activation_dtype {
-            result = result.astype(activation_dtype)?;
-        }
-
         Ok(result)
-    }
-
-    /// Forward pass using quantized_matmul (sym8 routes to the int8 W8A8
-    /// kernels instead — `mlx_quantized_matmul` has no sym8 pack and its
-    /// legacy no-biases heuristic would misread sym8 as MXFP8).
-    pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
-        if self.mode == SYM8_MODE {
-            return self.forward_sym8(x);
-        }
-
-        // MLX promotes affine QMM to FP32 when a BF16 activation is paired
-        // with GGUF Q4_0's sidecars (including their exact load-time FP32
-        // widening). Restore the model's activation dtype at the projection
-        // boundary. Otherwise promoted K/V reaches the two-byte paged cache
-        // and is rejected, while residual/MLP paths drift to FP32 too.
-        let activation_dtype = x.dtype()?;
-
-        self.forward_qmm(x, activation_dtype)
     }
 
     pub fn get_weight(&self) -> &MxArray {
@@ -928,84 +913,5 @@ mod sym8_tests {
             MxArray::from_float32(&short_scales, &[n - 1]).unwrap(),
         );
         assert!(try_build_sym8_quantized_linear(&p, "l").is_err());
-    }
-}
-
-#[cfg(test)]
-mod quantized_mlp_tests {
-    use super::*;
-
-    fn affine_q4(seed: u32) -> QuantizedLinear {
-        let packed: Vec<u32> = (0..32 * 4)
-            .map(|i| 0x7654_3210u32.rotate_left(((i as u32 + seed) % 8) * 4))
-            .collect();
-        let scales = vec![half::f16::from_f32(0.0625).to_bits(); 32];
-        let biases = vec![half::f16::from_f32(-0.5).to_bits(); 32];
-        QuantizedLinear::new(
-            MxArray::from_uint32(&packed, &[32, 4]).unwrap(),
-            MxArray::from_float16(&scales, &[32, 1]).unwrap(),
-            Some(MxArray::from_float16(&biases, &[32, 1]).unwrap()),
-            None,
-            32,
-            4,
-            DEFAULT_QUANT_MODE.to_string(),
-        )
-    }
-
-    fn values(array: &MxArray) -> Vec<f32> {
-        array.eval();
-        array.to_float32().unwrap().as_ref().to_vec()
-    }
-
-    #[test]
-    fn separate_q4_projections_preserve_bfloat16() {
-        let input_bits: Vec<u16> = (0..64)
-            .map(|i| half::bf16::from_f32(((i % 13) as f32 - 6.0) / 8.0).to_bits())
-            .collect();
-        let input = MxArray::from_bfloat16(&input_bits, &[1, 2, 32]).unwrap();
-
-        let mlp = Gemma4MLPVariant::Quantized {
-            gate_proj: affine_q4(2),
-            up_proj: affine_q4(7),
-            down_proj: affine_q4(11),
-        };
-        let actual = mlp.forward(&input).unwrap();
-
-        let gate = affine_q4(2).forward(&input).unwrap();
-        let up = affine_q4(7).forward(&input).unwrap();
-        let gated = Activations::gelu(&gate).unwrap().mul(&up).unwrap();
-        let expected = affine_q4(11).forward(&gated).unwrap();
-
-        assert_eq!(actual.dtype().unwrap(), DType::BFloat16);
-        assert_eq!(actual.shape().unwrap().to_vec(), vec![1, 2, 32]);
-        assert_eq!(values(&actual), values(&expected));
-    }
-}
-
-#[cfg(test)]
-mod affine_dtype_tests {
-    use super::*;
-
-    #[test]
-    fn affine_q4_forward_preserves_bfloat16_activation_dtype() {
-        let input =
-            MxArray::from_bfloat16(&[half::bf16::from_f32(0.5).to_bits(); 32], &[1, 32]).unwrap();
-        let weight = MxArray::from_uint32(&[0x8888_8888; 4], &[1, 4]).unwrap();
-        let scales =
-            MxArray::from_float16(&[half::f16::from_f32(0.25).to_bits()], &[1, 1]).unwrap();
-        let biases =
-            MxArray::from_float16(&[half::f16::from_f32(-2.0).to_bits()], &[1, 1]).unwrap();
-        let linear = QuantizedLinear::new(
-            weight,
-            scales,
-            Some(biases),
-            None,
-            32,
-            4,
-            DEFAULT_QUANT_MODE.to_string(),
-        );
-
-        let output = linear.forward(&input).unwrap();
-        assert_eq!(output.dtype().unwrap(), crate::array::DType::BFloat16);
     }
 }

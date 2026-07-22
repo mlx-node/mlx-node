@@ -305,13 +305,6 @@ impl Qwen3_5MoeMTPModule {
         default_gate_plq: PerLayerQuant,
         per_layer_quant: &HashMap<String, PerLayerQuant>,
     ) -> Result<()> {
-        crate::models::qwen3_5::mtp::reject_unsupported_fp8_mtp_state(
-            params,
-            default_plq,
-            Some(default_gate_plq),
-            per_layer_quant,
-            "Qwen3_5MoeMTPModule::apply_weights",
-        )?;
         let is_quantized = is_quantized_checkpoint(params);
 
         // Per-projection PLQ resolution delegates to `effective_plq_for`
@@ -336,21 +329,12 @@ impl Qwen3_5MoeMTPModule {
         let plq_for = |prefix: &str| -> PerLayerQuant {
             effective_plq_for(prefix, per_layer_quant, default_plq, Some(default_gate_plq))
         };
-        // Unlike the body loader's `try_build_ql`, this deliberately does NOT
-        // thread `plq.input_amax` onto the built projection: the nvidia
-        // activation-fp8 recipe keeps the MTP head Skip/bf16 (never an
-        // activation-fp8 site), so a calibrated per-tensor amax is never
-        // recorded for an `mtp.*` prefix — the threading would be a no-op here.
         let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
             let plq = plq_for(prefix);
             match plq.mode {
                 PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
                 PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
                 PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
-                // The upfront state guard rejects explicit metadata / Uint8
-                // storage. A body-level FP8 default with BF16 MTP weights may
-                // still resolve here and correctly takes the dense fallback.
-                PerLayerMode::Fp8E4m3 => None,
                 PerLayerMode::Affine => {
                     try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
                 }
@@ -367,7 +351,6 @@ impl Qwen3_5MoeMTPModule {
                 PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
                 PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
                 PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, prefix),
-                PerLayerMode::Fp8E4m3 => None,
                 PerLayerMode::Affine => try_build_affine_quantized_switch_linear(
                     params,
                     prefix,
@@ -648,10 +631,10 @@ impl Qwen3_5MoeMTPModule {
     /// quantized MTP head that dense slot is not a faithful bf16 copy of the
     /// quantized payload (packed uint32 for `QuantizedLinear`s, a lossy
     /// dequant for the `fc` `nn::Linear`), so emitting it would masquerade as
-    /// a valid bf16 head on reload. The save path calls this before any
-    /// filesystem mutation and rejects the whole save when any sub-linear is
-    /// quantized. `mtp_weights_loaded` alone does not distinguish quantized vs
-    /// bf16.
+    /// a valid bf16 head on reload — strictly worse than dropping it. The save
+    /// path calls this to skip MTP serialization (with a warning) when any
+    /// sub-linear is quantized. `mtp_weights_loaded` alone does not
+    /// distinguish quantized vs bf16.
     pub fn has_quantized_weights(&self) -> bool {
         if self.fc.is_quantized() {
             return true;
@@ -661,7 +644,7 @@ impl Qwen3_5MoeMTPModule {
                 AttentionType::Full(a) => a.is_quantized(),
                 // MTP layers are full-attention only (enforced in `new`);
                 // treat an unexpected Linear conservatively as "quantized"
-                // so the save path rejects rather than emits garbage.
+                // so the save path drops rather than emits garbage.
                 AttentionType::Linear(_) => true,
             };
             let mlp_quantized = match &layer.mlp {
@@ -928,88 +911,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_weights_rejects_explicit_or_stored_plain_fp8_before_dense_fallback() {
-        let label = "apply_weights_rejects_explicit_or_stored_plain_fp8_before_dense_fallback";
-        let default_plq = PerLayerQuant {
-            bits: 4,
-            group_size: 64,
-            mode: PerLayerMode::Affine,
-            input_amax: None,
-        };
-        let gate_plq = PerLayerQuant {
-            bits: 8,
-            group_size: 64,
-            mode: PerLayerMode::Affine,
-            input_amax: None,
-        };
-
-        let Some((mut mtp, _)) = build_mtp_or_skip(label) else {
-            return;
-        };
-        let stored_fp8 = HashMap::from([
-            (
-                "mtp.fc.weight".to_string(),
-                MxArray::from_uint8(&[0; 8], &[2, 4]).unwrap(),
-            ),
-            (
-                "mtp.fc.scales".to_string(),
-                MxArray::from_float32(&[1.0, 1.0], &[2, 1]).unwrap(),
-            ),
-        ]);
-        let err = mtp
-            .apply_weights(&stored_fp8, default_plq, gate_plq, &HashMap::new())
-            .expect_err("raw Uint8 MoE MTP storage must not reach Linear::set_weight");
-        assert!(err.reason.contains("Uint8 MTP storage"), "{}", err.reason);
-        assert!(err.reason.contains("dense fallback"), "{}", err.reason);
-
-        // Uint8 weight + Uint8 scales is structurally MXFP8, but the MoE
-        // resolver must still agree on Mxfp8 for this exact projection. A
-        // missing override falls back to affine here and therefore rejects.
-        let Some((mut mtp, _)) = build_mtp_or_skip(label) else {
-            return;
-        };
-        let stale_mxfp8 = HashMap::from([
-            (
-                "mtp.fc.weight".to_string(),
-                MxArray::from_uint8(&[0; 8], &[2, 4]).unwrap(),
-            ),
-            (
-                "mtp.fc.scales".to_string(),
-                MxArray::from_uint8(&[127, 127], &[2, 1]).unwrap(),
-            ),
-        ]);
-        let err = mtp
-            .apply_weights(&stale_mxfp8, default_plq, gate_plq, &HashMap::new())
-            .expect_err("MXFP8 MoE MTP storage with stale affine metadata must reject");
-        assert!(err.reason.contains("MXFP8 MTP storage"), "{}", err.reason);
-        assert!(err.reason.contains("resolves to Affine"), "{}", err.reason);
-
-        let Some((mut mtp, _)) = build_mtp_or_skip(label) else {
-            return;
-        };
-        let dense = HashMap::from([(
-            "mtp.fc.weight".to_string(),
-            MxArray::from_float32(&[0.0; 8], &[2, 4])
-                .unwrap()
-                .astype(DType::BFloat16)
-                .unwrap(),
-        )]);
-        let explicit = HashMap::from([(
-            "mtp.fc".to_string(),
-            PerLayerQuant {
-                bits: 8,
-                group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
-                mode: PerLayerMode::Fp8E4m3,
-                input_amax: None,
-            },
-        )]);
-        let err = mtp
-            .apply_weights(&dense, default_plq, gate_plq, &explicit)
-            .expect_err("explicit fp8_e4m3 MoE MTP metadata must reject");
-        assert!(err.reason.contains("explicit fp8_e4m3"), "{}", err.reason);
-    }
-
-    #[test]
     fn fresh_caches_match_num_layers() {
         let cfg = tiny_mtp_cfg();
         let caches = Qwen3_5MoeMTPModule::fresh_caches(&cfg);
@@ -1160,8 +1061,7 @@ mod tests {
             cfg.n_mtp_layers,
             &MTP_MOE_LAYER_LINEAR_SUFFIXES,
             &mut per_layer_quant,
-        )
-        .expect("valid MTP quantization metadata");
+        );
 
         // Fresh module to load the quantized weights into.
         let Some((mut mtp, _cfg2)) = build_mtp_or_skip(label) else {
@@ -1174,7 +1074,6 @@ mod tests {
             bits: 8,
             group_size: 64,
             mode: PerLayerMode::Affine,
-            input_amax: None,
         };
         if let Err(err) =
             mtp.apply_weights(&q_params, default_plq, default_gate_plq, &per_layer_quant)
@@ -1382,13 +1281,11 @@ mod tests {
             bits: 4,
             group_size: 64,
             mode: PerLayerMode::Affine,
-            input_amax: None,
         };
         let default_gate_plq = PerLayerQuant {
             bits: 8,
             group_size: 64,
             mode: PerLayerMode::Affine,
-            input_amax: None,
         };
         // Empty override table — MTP keys are never recorded here, so
         // `effective_plq_for` must take the gate-default fallback.
@@ -1511,13 +1408,11 @@ mod tests {
             bits: 4,
             group_size: 64,
             mode: PerLayerMode::Affine,
-            input_amax: None,
         };
         let default_gate_plq = PerLayerQuant {
             bits: 8,
             group_size: 64,
             mode: PerLayerMode::Affine,
-            input_amax: None,
         };
 
         // (a) affine quantized fc → Quantized (mode "affine").
@@ -1536,7 +1431,6 @@ mod tests {
                     bits: 4,
                     group_size: 32,
                     mode: PerLayerMode::Affine,
-                    input_amax: None,
                 },
             );
             if !apply_fc_or_skip(
@@ -1578,7 +1472,6 @@ mod tests {
                     bits: MXFP8_BITS,
                     group_size: MXFP8_GROUP_SIZE,
                     mode: PerLayerMode::Mxfp8,
-                    input_amax: None,
                 },
             );
             if !apply_fc_or_skip(

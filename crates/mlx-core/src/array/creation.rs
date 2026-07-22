@@ -91,14 +91,6 @@ impl MxArray {
         MxArray::from_handle(handle, "from_fp8")
     }
 
-    /// Convert a float array to FP8 E4M3 using MLX's to_fp8.
-    /// Output is a uint8 array holding raw E4M3 bytes (no scale applied);
-    /// round-trips back to a float dtype via `from_fp8`.
-    pub fn to_fp8(&self) -> Result<Self> {
-        let handle = unsafe { sys::mlx_to_fp8(self.as_raw_ptr()) };
-        MxArray::from_handle(handle, "to_fp8")
-    }
-
     /// Create an MxArray from raw bfloat16 bytes (as u16 values).
     /// This enables zero-copy loading of bf16 weights from safetensors.
     /// The input is the raw bytes reinterpreted as u16 (2 bytes per element).
@@ -1876,21 +1868,5 @@ impl MxArray {
             return vec![-999.0];
         }
         buf[..n as usize].iter().map(|v| *v as f64).collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn to_fp8_roundtrips_representable_values() {
-        // 1.5, -2.0, and 0.0 are exact E4M3 grid points → lossless roundtrip.
-        let x = MxArray::from_float32(&[1.5, -2.0, 0.0], &[3]).unwrap();
-        let q = x.to_fp8().unwrap();
-        assert_eq!(q.dtype().unwrap(), DType::Uint8);
-        let back = q.from_fp8(DType::Float32).unwrap();
-        let v = back.to_float32().unwrap().as_ref().to_vec();
-        assert_eq!(v, vec![1.5, -2.0, 0.0]);
     }
 }

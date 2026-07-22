@@ -261,18 +261,4 @@ impl DecoderLayer {
             down_proj,
         });
     }
-
-    /// Whether any main-model projection in this decoder layer is quantized,
-    /// including routed experts and shared-expert projections.
-    pub fn is_quantized(&self) -> bool {
-        let attention = match &self.attn {
-            AttentionType::Linear(gdn) => gdn.is_quantized(),
-            AttentionType::Full(attn) => attn.is_quantized(),
-        };
-        let mlp = match &self.mlp {
-            MLPType::Dense(mlp) => mlp.is_quantized(),
-            MLPType::MoE(moe) => moe.is_quantized(),
-        };
-        attention || mlp
-    }
 }

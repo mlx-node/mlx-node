@@ -472,15 +472,6 @@ impl RotatingKVCache {
             ));
         }
 
-        // Full-range slices, not clones: `temporal_order` returns a CLONE of
-        // the live storage when it is already in temporal order, and a cloned
-        // `MxArray` shares the same underlying handle. The single-token
-        // update path overwrites that handle's descriptor in place, which
-        // would silently rewrite the snapshot. Slicing creates a new array
-        // object that captures the current descriptor by value.
-        let ordered_keys = ordered_keys.slice_axis(2, 0, cached_tokens as i64)?;
-        let ordered_values = ordered_values.slice_axis(2, 0, cached_tokens as i64)?;
-
         Ok(Some(RotatingKVCacheSnapshot {
             keys: ordered_keys,
             values: ordered_values,
@@ -489,113 +480,6 @@ impl RotatingKVCache {
             keep: self.keep,
             cached_tokens,
         }))
-    }
-
-    /// Snapshot an intermediate logical offset from the temporal attention
-    /// view returned by the most recent multi-token append.
-    ///
-    /// `attention_keys`/`attention_values` contain the ordered cache tail from
-    /// `previous_offset` followed by every token in the new append. This lets a
-    /// caller retain checkpoint cadence inside a large compute chunk without
-    /// splitting that chunk into multiple model forwards. The returned arrays
-    /// are lazy views/concats; callers that keep them beyond the current graph
-    /// must copy+eval them before clearing MLX's cache.
-    pub(crate) fn snapshot_from_attention_view(
-        &self,
-        attention_keys: &MxArray,
-        attention_values: &MxArray,
-        previous_offset: i32,
-        checkpoint_offset: i32,
-    ) -> Result<RotatingKVCacheSnapshot> {
-        Self::validate_config(self.max_size, self.keep)?;
-        if previous_offset < 0
-            || checkpoint_offset <= previous_offset
-            || checkpoint_offset > self.offset
-        {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!(
-                    "RotatingKVCache intermediate snapshot offset out of range: \
-                     previous={previous_offset} checkpoint={checkpoint_offset} current={}",
-                    self.offset
-                ),
-            ));
-        }
-
-        let key_shape = attention_keys.shape()?;
-        let value_shape = attention_values.shape()?;
-        if key_shape.len() != 4
-            || value_shape.len() != 4
-            || key_shape[0] != value_shape[0]
-            || key_shape[1] != value_shape[1]
-            || key_shape[2] != value_shape[2]
-        {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!(
-                    "RotatingKVCache intermediate snapshot expects matching rank-4 K/V views, \
-                     got keys={:?} values={:?}",
-                    key_shape.to_vec(),
-                    value_shape.to_vec()
-                ),
-            ));
-        }
-
-        let previous_cached = Self::expected_cached_tokens(previous_offset, self.max_size)?;
-        let appended_through_checkpoint = checkpoint_offset - previous_offset;
-        let view_end = previous_cached
-            .checked_add(appended_through_checkpoint)
-            .ok_or_else(|| {
-                Error::new(
-                    Status::InvalidArg,
-                    "RotatingKVCache intermediate snapshot view length overflow",
-                )
-            })?;
-        let view_tokens = i32::try_from(key_shape[2]).map_err(|_| {
-            Error::new(
-                Status::InvalidArg,
-                format!(
-                    "RotatingKVCache intermediate snapshot attention view is too long: {}",
-                    key_shape[2]
-                ),
-            )
-        })?;
-        if view_end > view_tokens {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!(
-                    "RotatingKVCache intermediate snapshot needs {view_end} attention tokens \
-                     but the view contains {}",
-                    key_shape[2]
-                ),
-            ));
-        }
-
-        let cached_tokens = Self::expected_cached_tokens(checkpoint_offset, self.max_size)?;
-        let slice_snapshot = |view: &MxArray| -> Result<MxArray> {
-            if self.keep == 0 || checkpoint_offset <= self.max_size {
-                let start = view_end - cached_tokens;
-                return view.slice_axis(2, start as i64, view_end as i64);
-            }
-
-            let keep_len = self.keep.min(cached_tokens);
-            let tail_len = cached_tokens - keep_len;
-            let kept = view.slice_axis(2, 0, keep_len as i64)?;
-            if tail_len == 0 {
-                return Ok(kept);
-            }
-            let tail = view.slice_axis(2, (view_end - tail_len) as i64, view_end as i64)?;
-            MxArray::concatenate(&kept, &tail, 2)
-        };
-
-        Ok(RotatingKVCacheSnapshot {
-            keys: slice_snapshot(attention_keys)?,
-            values: slice_snapshot(attention_values)?,
-            offset: checkpoint_offset,
-            max_size: self.max_size,
-            keep: self.keep,
-            cached_tokens,
-        })
     }
 
     /// Restore a previously snapshotted ordered K/V tail.
@@ -658,12 +542,8 @@ impl RotatingKVCache {
             ));
         }
 
-        // Full-range slices, not clones, so the restored cache does not share
-        // the snapshot's array handles: a later single-token in-place update
-        // on this cache must not rewrite the snapshot (which callers may
-        // restore again, e.g. checkpoint heal paths).
-        self.keys = Some(snapshot.keys.slice_axis(2, 0, cached_tokens as i64)?);
-        self.values = Some(snapshot.values.slice_axis(2, 0, cached_tokens as i64)?);
+        self.keys = Some(snapshot.keys.clone());
+        self.values = Some(snapshot.values.clone());
         self.offset = snapshot.offset;
         self.idx = cached_tokens;
         Ok(())
@@ -979,45 +859,6 @@ mod tests {
         assert_float_data(&stored_after_chunk2, &[10.0, 11.0, 12.0, 13.0]);
         assert_eq!(cache.get_offset(), 13);
         assert_eq!(cache.get_cached_token_count().unwrap(), 4);
-    }
-
-    /// A snapshot must stay intact when the source cache (or a cache
-    /// restored from it) later takes the single-token IN-PLACE update path,
-    /// which overwrites the live array's descriptor instead of rebinding it.
-    #[test]
-    fn test_snapshot_is_immune_to_in_place_updates() {
-        // Single over-window concat leaves storage in temporal order with
-        // idx == max_size, so the next single-token update writes in place.
-        let mut source = RotatingKVCache::new(4, None);
-        let keys = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[1, 1, 6, 1]).unwrap();
-        let values =
-            MxArray::from_float32(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[1, 1, 6, 1]).unwrap();
-        source.update_and_fetch(&keys, &values).unwrap();
-
-        let snapshot = source.snapshot().unwrap().unwrap();
-        assert_float_data(&snapshot.keys, &[3.0, 4.0, 5.0, 6.0]);
-
-        // In-place single-token update on the SOURCE must not leak into the
-        // snapshot.
-        let k7 = MxArray::from_float32(&[7.0], &[1, 1, 1, 1]).unwrap();
-        let v7 = MxArray::from_float32(&[70.0], &[1, 1, 1, 1]).unwrap();
-        source.update_and_fetch(&k7, &v7).unwrap();
-        assert_float_data(&snapshot.keys, &[3.0, 4.0, 5.0, 6.0]);
-        assert_float_data(&snapshot.values, &[30.0, 40.0, 50.0, 60.0]);
-
-        // In-place single-token update on a RESTORED cache must not leak
-        // into the snapshot either; a second restore still sees the
-        // original tail.
-        let mut restored = RotatingKVCache::new(4, None);
-        restored.restore_snapshot(&snapshot).unwrap();
-        restored.update_and_fetch(&k7, &v7).unwrap();
-        assert_float_data(&snapshot.keys, &[3.0, 4.0, 5.0, 6.0]);
-
-        let mut restored_again = RotatingKVCache::new(4, None);
-        restored_again.restore_snapshot(&snapshot).unwrap();
-        let (again_keys, again_values) = restored_again.fetch_current_kv().unwrap();
-        assert_float_data(&again_keys, &[3.0, 4.0, 5.0, 6.0]);
-        assert_float_data(&again_values, &[30.0, 40.0, 50.0, 60.0]);
     }
 
     #[test]
