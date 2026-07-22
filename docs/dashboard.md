@@ -122,6 +122,13 @@ restored on a hot-cache miss before falling back to a normal prefill.
   endpoints) are unguarded.
 - Destructive ops (delete model/session, clear/evict cache) require UI confirmation
   and resolve paths strictly inside their managed roots before any removal.
+- The per-model **size on disk** shown in the Models table (and the delete-confirmation
+  "(X GB)" hint) is a **best-effort, display-only estimate**, not a security boundary:
+  the directory walk no-follows the final component but traverses lexical paths, so a
+  concurrent symlink swap of an ancestor directory in the user's own local store could
+  redirect sizing onto an external tree. The worst outcome is a wrong size number —
+  deletion never uses the size, only the path-checked model name — and a fully robust
+  defense would need descriptor-relative traversal that `node:fs` does not expose.
 
 ## Known limitation
 

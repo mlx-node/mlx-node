@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -1337,6 +1338,105 @@ describe('DownloadManager', () => {
     expect(readFileSync(join(liveDir, 'model.safetensors'))).toEqual(Buffer.alloc(10, 0x2));
     // The job still published normally.
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
+  });
+
+  // Finding 3: the dead-owner private-staging-tree reap must run BEFORE the
+  // ownership preflight, so a job the preflight REFUSES still frees a crashed
+  // multi-GB staging tree instead of leaking it until some other eligible download
+  // for the slug happens to run. Pre-fix (preflight above the sweep) the refused job
+  // threw before the reap ever ran → the dead tree remained.
+  it('reaps a dead-pid staging tree even when the ownership preflight refuses the job', async () => {
+    mkdirSync(stagingRoot(), { recursive: true });
+    // A crashed/SIGKILLed job's private staging tree (pid 999999999 cannot be live).
+    const deadDir = join(stagingRoot(), `${SLUG}@${hub.sha}.999999999.11111111-1111-1111-1111-111111111111`);
+    mkdirSync(deadDir, { recursive: true });
+    writeFileSync(join(deadDir, 'model.safetensors'), Buffer.alloc(10, 0x1));
+
+    // finalDir is an UNOWNED real dir (a manual / `mlx download` copy, no marker), so
+    // the ownership preflight refuses this job (overwrite:false).
+    mkdirSync(finalDir(), { recursive: true });
+    writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(finalDir(), 'model.safetensors'), Buffer.alloc(300, 0xab));
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
+
+    // The job was refused up front (unowned finalDir) — never listed, never done.
+    expect(events.some((event) => event.type === 'start')).toBe(false);
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+    const err = events.find((event) => event.type === 'error');
+    expect(err?.type).toBe('error');
+    if (err?.type === 'error') {
+      expect(err.message).toMatch(/not created by the dashboard/i);
+    }
+
+    // …yet the crashed dead-owner staging tree WAS reaped despite the refusal.
+    expect(existsSync(deadDir)).toBe(false);
+
+    // The unowned finalDir is byte-for-byte intact — never overwritten, no marker.
+    expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+    expect(readFileSync(join(finalDir(), 'model.safetensors'))).toEqual(Buffer.alloc(300, 0xab));
+    expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(false);
+  });
+
+  // Finding 1: a rollback backup can be a FOREIGN SYMLINK (a prior `overwrite`
+  // publish renamed a symlinked finalDir to its backup, then crashed before
+  // installing staging). With finalDir ABSENT, pre-fix recovery renamed that symlink
+  // onto finalDir AFTER the only ownership check, then skip-detection FOLLOWED the
+  // link and emitted `done` through the foreign target. Recovery must restore only an
+  // OWNED REAL-DIR backup, and a re-run preflight must refuse any foreign link at
+  // finalDir before skip-detection can follow it.
+  it('does NOT restore a foreign-symlink backup onto an absent finalDir, and never reports done through it', async () => {
+    const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
+    writeFileSync(join(external, 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(external, 'model.safetensors'), Buffer.alloc(300, 0xab));
+    writeFileSync(
+      join(external, DOWNLOAD_COMPLETE_MARKER),
+      // repo + revision MATCH the resolved snapshot so pre-fix skip-detection would
+      // read the foreign marker as already-installed and emit `done` through the link.
+      JSON.stringify({ repo: REPO, revision: hub.sha, files: ['config.json', 'model.safetensors'], completedAt: 'x' }),
+    );
+    // A dead-owner (pid 999999999) rollback backup that is a SYMLINK into `external`.
+    mkdirSync(stagingRoot(), { recursive: true });
+    const backup = join(stagingRoot(), `${SLUG}.backup-999999999.44444444-4444-4444-4444-444444444444`);
+    symlinkSync(external, backup);
+    expect(existsSync(finalDir())).toBe(false);
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
+
+    // The foreign-symlink backup was NEVER promoted onto finalDir as a live install:
+    // finalDir is either absent (refused) or a REAL dir with our freshly downloaded
+    // (zero-byte) content — never the foreign symlink, never the foreign 0xAB bytes.
+    if (existsSync(finalDir())) {
+      expect(lstatSync(finalDir()).isSymbolicLink()).toBe(false);
+    }
+    const done = events.find((event) => event.type === 'done');
+    if (done?.type === 'done') {
+      expect(lstatSync(finalDir()).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12));
+    }
+
+    // The external symlink target is byte-for-byte intact — nothing was written or
+    // published through the foreign link.
+    expect(readFileSync(join(external, 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+    expect(readFileSync(join(external, 'model.safetensors'))).toEqual(Buffer.alloc(300, 0xab));
+
+    rmSync(external, { recursive: true, force: true });
   });
 
   it('rejects a repo that is not in the catalog', () => {

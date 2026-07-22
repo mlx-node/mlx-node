@@ -541,39 +541,59 @@ export class DownloadManager {
 
     let stagingDir: string | undefined;
     try {
-      // Preflight ownership BEFORE any recovery/staging work — and specifically
-      // before `sweepStaging`: a final dir the downloader does not own (a manual
-      // copy or an `mlx download` install with no completion marker, OR any
-      // symlink, which `isDownloaderOwned` rejects no-follow) is refused up front,
-      // so an unowned local checkpoint never triggers a full multi-GB
-      // download+hash only to be refused at publish. Hoisting it above the sweep
-      // is load-bearing: the sweep's dead-owner backup reap classifies finalDir
-      // with `isModelInstalled`, which FOLLOWS symlinks — so a foreign `finalDir`
-      // link must be refused BEFORE the sweep could follow it and reap a
-      // recoverable rollback backup. This block reads only `finalDir` (no
-      // dependency on the staging root or the resolved revision), so it is safe to
-      // run first. The publish-time checks below still guard the narrow
-      // check-then-swap race for a dir that races in after this point.
-      if (occupied(finalDir) && !isDownloaderOwned(finalDir) && !job.overwrite) {
-        throw new Error(
-          `Refusing to install over "${finalDir}": it was not created by the dashboard downloader. ` +
-            `Remove it manually to reinstall.`,
-        );
-      }
+      // The no-follow ownership preflight, factored so it reads identically at both
+      // its call sites: a final dir the downloader does not own (a manual copy or an
+      // `mlx download` install with no completion marker, OR any symlink, which
+      // `isDownloaderOwned` rejects no-follow) is refused — so an unowned local
+      // checkpoint never triggers a full multi-GB download+hash only to be refused at
+      // publish. It reads ONLY `finalDir`, so it is order-independent of the staging
+      // root and the resolved revision. Run it (a) before backup recovery — the
+      // recovery reap classifies finalDir with `isModelInstalled`, which FOLLOWS
+      // symlinks, so a foreign `finalDir` link must be refused BEFORE recovery could
+      // follow it and reap a recoverable rollback backup — and (b) again after
+      // recovery, so a `finalDir` that recovery (or a race) restored to a foreign
+      // symlink is refused BEFORE skip-detection follows it. The publish-time checks
+      // below still guard the narrow check-then-swap race for a dir that races in
+      // after this point.
+      const refuseIfUnownedFinal = (): void => {
+        if (occupied(finalDir) && !isDownloaderOwned(finalDir) && !job.overwrite) {
+          throw new Error(
+            `Refusing to install over "${finalDir}": it was not created by the dashboard downloader. ` +
+              `Remove it manually to reinstall.`,
+          );
+        }
+      };
 
       // Refuse a symlinked (or non-directory) `.staging` root BEFORE creating it:
       // otherwise `mkdir(..., { recursive })` follows the link and every staged
       // write, the sweep, the publish backup, and the `finally` cleanup all land
       // on the external target. Rejecting a symlinked root closes the escape at the
-      // source — every downstream path is built under this root.
+      // source — every downstream path is built under this root. Done first (it only
+      // touches the staging root, not finalDir) so the dead-tree reap below can run.
       assertRealDirOrAbsent(stagingRoot);
       await mkdir(stagingRoot, { recursive: true });
 
-      // Reap a crashed job's private staging tree and recover/reap an orphaned
-      // publish backup for THIS model. Both are gated by pid-liveness, so a live
-      // peer's private staging tree and active publish backup are never reclaimed
-      // out from under it.
-      await this.sweepStaging(slug);
+      // Reap a crashed job's private staging tree BEFORE the ownership preflight, so
+      // even a job the preflight REFUSES (an unowned/foreign finalDir, no overwrite)
+      // still frees a crashed multi-GB staging tree instead of leaking it until some
+      // other eligible download for the slug runs. This touches only `.staging`
+      // trees (never finalDir), so it is safe to run before the finalDir preflight.
+      await this.reapDeadStagingTrees();
+
+      // Ownership preflight: refuse an unowned/foreign finalDir up front (no bytes
+      // move for a doomed job).
+      refuseIfUnownedFinal();
+
+      // Recover/reap an orphaned publish backup for THIS model — AFTER the preflight,
+      // so a foreign finalDir link was already refused and can't be followed here.
+      // Pid-gated: a live peer's active publish backup is never reclaimed.
+      await this.recoverBackup(slug, finalDir);
+
+      // Re-run the preflight after recovery: recovery restores only an owned real-dir
+      // backup, but this refuses any foreign symlink a race put at finalDir before
+      // skip-detection (`readCompletion`/`isModelInstalled`, which FOLLOW symlinks)
+      // could read the foreign marker and report a false `done` through the link.
+      refuseIfUnownedFinal();
 
       const revision = await this.resolveRevision(job.repo);
       // Job-private staging: keyed by the IMMUTABLE revision (a different
@@ -735,24 +755,54 @@ export class DownloadManager {
   }
 
   /**
-   * Startup recovery sweep of `.staging`, gated entirely by pid-liveness — no
-   * interprocess lock. The owner pid encoded in each dir name is the sole proof of
-   * whether it is safe to reclaim:
-   *
-   *   - Process-wide, pid-proven: a crashed/SIGKILLed job's private staging tree
-   *     (`<slug>@<sha>.<pid>.<uuid>`) is reaped when its owner pid is gone (it is
-   *     cleaned only in the live process's `finally`, so a kill leaks it forever
-   *     otherwise). A live — or reused — pid is kept; pid-reuse only preserves a
-   *     leak, it can never reap a live job.
-   *
-   *   - Slug-scoped (this model only): a publish backup whose owner pid is DEAD
-   *     (`<slug>.backup-<pid>.<uuid>`) is orphaned — renamed back into place when
-   *     the swap died mid-rename (final dir absent), else the leaked copy is
-   *     removed. A backup whose owner pid is still ALIVE belongs to a peer that is
-   *     mid-publish and is never touched, so its active backup is never reclaimed.
-   *     Never throws.
+   * PROCESS-WIDE reap of crashed jobs' private staging trees
+   * (`<slug>@<sha>.<pid>.<uuid>`, every slug), gated entirely by pid-liveness — no
+   * interprocess lock. Such a tree is cleaned only in its live owner's `finally`, so
+   * a crash/SIGKILL leaks it forever otherwise; it is reaped when its owner pid is
+   * gone. A live — or reused — pid is kept; pid-reuse only preserves a leak, it can
+   * never reap a live job. This touches ONLY `.staging` trees (never a final dir),
+   * so it carries no finalDir ownership dependency and runs BEFORE the ownership
+   * preflight, ensuring a preflight-refused job still frees a crashed tree. Never
+   * throws.
    */
-  private async sweepStaging(slug: string): Promise<void> {
+  private async reapDeadStagingTrees(): Promise<void> {
+    const stagingRoot = join(this.modelsDir, '.staging');
+    let entries: string[];
+    try {
+      entries = await readdir(stagingRoot);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      const staleMatch = STAGING_DIR_RE.exec(name);
+      if (staleMatch !== null && !pidAlive(Number(staleMatch[1]))) {
+        await rm(join(stagingRoot, name), { recursive: true, force: true }).catch(() => {});
+      }
+    }
+  }
+
+  /**
+   * SLUG-SCOPED recover/reap of an orphaned publish backup for THIS model
+   * (`<slug>.backup-<pid>.<uuid>`), gated by pid-liveness. Runs AFTER the ownership
+   * preflight (which already refused a foreign `finalDir` symlink), so nothing here
+   * follows such a link. A backup whose owner pid is still ALIVE belongs to a peer
+   * mid-publish and is never touched. For a dead-owner backup, classify finalDir
+   * NO-FOLLOW first — `isModelInstalled` alone FOLLOWS symlinks, so a live `finalDir`
+   * link into an external marked model would read as a complete install and REAP a
+   * recoverable rollback backup:
+   *
+   *   - finalDir is a proven owned-complete REAL dir → the backup is redundant → rm;
+   *   - finalDir is ABSENT (a crashed swap) AND the backup is itself an OWNED REAL
+   *     directory (no-follow: `lstat().isDirectory()` + our marker) → restore it by
+   *     renaming it back into place. A FOREIGN-SYMLINK backup is NEVER restored: a
+   *     prior `overwrite` publish could have renamed a symlinked finalDir to its
+   *     backup, and restoring that link at finalDir would let skip-detection follow
+   *     it and report a false `done` through the foreign target;
+   *   - otherwise (foreign symlink / unowned dir / incomplete-owned dir, OR — with
+   *     finalDir absent — a non-owned/symlink backup) → RETAIN the backup untouched
+   *     and never clobber whatever occupies finalDir. Never throws.
+   */
+  private async recoverBackup(slug: string, finalDir: string): Promise<void> {
     const stagingRoot = join(this.modelsDir, '.staging');
     let entries: string[];
     try {
@@ -761,49 +811,37 @@ export class DownloadManager {
       return;
     }
     const backupPrefix = `${slug}.backup-`;
-    const finalDir = join(this.modelsDir, slug);
     for (const name of entries) {
-      const staleMatch = STAGING_DIR_RE.exec(name);
-      if (staleMatch !== null && !pidAlive(Number(staleMatch[1]))) {
-        await rm(join(stagingRoot, name), { recursive: true, force: true }).catch(() => {});
-        continue;
+      if (!name.startsWith(backupPrefix)) continue;
+      const backupMatch = BACKUP_DIR_RE.exec(name);
+      // Fail closed on an unparseable owner: a name that carries the backup prefix
+      // but no readable pid is left untouched (never promoted onto finalDir, never
+      // reaped), mirroring `pidAlive`'s unknown-owner→alive stance. Without this,
+      // the null match would short-circuit the live-PID guard below and treat the
+      // dir as owner-dead.
+      if (backupMatch === null) continue;
+      // A backup whose owner pid is still alive is a peer mid-publish: never touch it.
+      if (pidAlive(Number(backupMatch[1]))) continue;
+      const backupPath = join(stagingRoot, name);
+      let finalOwnedComplete = false;
+      let finalAbsent = false;
+      try {
+        const st = lstatSync(finalDir);
+        finalOwnedComplete = st.isDirectory() && isDownloaderOwned(finalDir) && isModelInstalled(finalDir);
+      } catch {
+        finalAbsent = true;
       }
-      if (name.startsWith(backupPrefix)) {
-        const backupMatch = BACKUP_DIR_RE.exec(name);
-        // Fail closed on an unparseable owner: a name that carries the backup prefix
-        // but no readable pid is left untouched (never promoted onto finalDir, never
-        // reaped), mirroring `pidAlive`'s unknown-owner→alive stance. Without this,
-        // the null match would short-circuit the live-PID guard below and treat the
-        // dir as owner-dead.
-        if (backupMatch === null) continue;
-        // A backup whose owner pid is still alive is a peer mid-publish: never touch it.
-        if (pidAlive(Number(backupMatch[1]))) continue;
-        const backupPath = join(stagingRoot, name);
-        // Classify finalDir NO-FOLLOW before reaping/restoring. `isModelInstalled`
-        // alone FOLLOWS symlinks, so a live `finalDir` link into an external marked
-        // model would read as a complete install and REAP a recoverable rollback
-        // backup. Reap ONLY a proven owned-complete REAL directory; restore ONLY
-        // when finalDir is absent (a crashed swap); otherwise — a foreign symlink,
-        // an unowned dir, or an incomplete-owned dir — RETAIN the backup untouched
-        // and never clobber whatever occupies finalDir.
-        let finalOwnedComplete = false;
-        let finalAbsent = false;
-        try {
-          const st = lstatSync(finalDir);
-          finalOwnedComplete = st.isDirectory() && isDownloaderOwned(finalDir) && isModelInstalled(finalDir);
-        } catch {
-          finalAbsent = true;
+      try {
+        if (finalOwnedComplete) {
+          await rm(backupPath, { recursive: true, force: true }); // redundant backup
+        } else if (finalAbsent && lstatSync(backupPath).isDirectory() && isDownloaderOwned(backupPath)) {
+          // Restore a crashed swap — but ONLY an owned REAL-directory backup, so a
+          // foreign-symlink backup is never promoted onto finalDir.
+          await rename(backupPath, finalDir);
         }
-        try {
-          if (finalOwnedComplete) {
-            await rm(backupPath, { recursive: true, force: true }); // redundant backup
-          } else if (finalAbsent) {
-            await rename(backupPath, finalDir); // restore a crashed swap
-          }
-          // else foreign symlink / unowned dir / incomplete-owned → retain untouched
-        } catch {
-          // A single un-recoverable backup must not block the job.
-        }
+        // else foreign symlink / unowned dir / incomplete-owned → retain untouched
+      } catch {
+        // A single un-recoverable backup must not block the job.
       }
     }
   }

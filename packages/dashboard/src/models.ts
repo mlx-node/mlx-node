@@ -316,6 +316,18 @@ export function walkDirStats(
       // is no-follow — a symlink's `lstat` is never a directory — so reject any
       // non-directory here BEFORE `opendirSync`, closing the escape across the whole
       // enqueue→pop window (discovery already filters symlink roots, so real roots stay).
+      //
+      // ACCEPTED RESIDUAL: this no-follows only the FINAL component. Because the walk
+      // traverses lexical paths, a concurrent adversary who swaps an ANCESTOR directory
+      // (or the final component in the gap between this `lstat` and `opendirSync`) to a
+      // symlink DURING the walk can still redirect sizing onto an external tree. This is
+      // accepted, not defended: the output (`sizeBytes`/`fileCount`) is a best-effort
+      // DISPLAY-ONLY estimate — it never drives a destructive or security decision
+      // (`deleteLocalModel` deletes by the path-safe NAME, never by this size), so the
+      // worst case under adversarial FS mutation of the user's OWN local store is a
+      // wrong size NUMBER in the UI. A fully robust defense would need descriptor-
+      // relative (`openat`/`O_NOFOLLOW`) traversal, which `node:fs`'s sync API does not
+      // expose; the lexical walk is the deliberate trade-off.
       if (!self.isDirectory()) continue;
     } catch {
       continue;
