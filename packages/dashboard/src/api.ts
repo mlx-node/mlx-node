@@ -735,12 +735,20 @@ function handleSessionMetrics({ res, params, deps }: RouteCtx): void {
   // the token columns and points back here via `root_session_id`. Without the union
   // the child's tokens/count are dropped from the totals even though the SPA already
   // shows its model badge + folds its throughput in (from the `traces` array below),
-  // and it disagrees with the global overview. The dedup admits ONLY traces with no
-  // correlated `turns` row for THIS session (the inner `AND trace_id IS NOT NULL`
-  // keeps `NOT IN` from going NULL and dropping the whole set), and — mirroring the
-  // global fix in handleMetricsOverview — the trace side stores GROSS `prompt_tokens`
-  // so its `inputTokens` is clamped to the producer's net value `MAX(prompt-cached,0)`
-  // to avoid a gross-vs-net double-count against the turns side's already-net input.
+  // and it disagrees with the global overview. The union admits ONLY GENUINE children:
+  // a child stamps `session_id = <child in-memory id>` (≠ root) and
+  // `root_session_id = <root id>` (stream-adapter.ts: `sessionId` from the per-request
+  // options, `rootSessionId` from the submit-time cache-owner root), so keying on
+  // `root_session_id = ? AND session_id != ?` selects them. Keying on `session_id = ?`
+  // too would resurrect an ABANDONED root turn — when a root branches, ingestion drops
+  // its assistant turn from `turns` but the trace lingers with `session_id = root`
+  // (== root_session_id); it would then pass the trace-only dedup and be miscounted as
+  // a delegated turn. The dedup admits ONLY traces with no correlated `turns` row for
+  // THIS session (the inner `AND trace_id IS NOT NULL` keeps `NOT IN` from going NULL
+  // and dropping the whole set), and — mirroring the global fix in
+  // handleMetricsOverview — the trace side stores GROSS `prompt_tokens` so its
+  // `inputTokens` is clamped to the producer's net value `MAX(prompt-cached,0)` to
+  // avoid a gross-vs-net double-count against the turns side's already-net input.
   const turnRows = deps.dash.sqlite
     .prepare(
       `SELECT * FROM (
@@ -766,7 +774,7 @@ function handleSessionMetrics({ res, params, deps }: RouteCtx): void {
                 tr.cold_hits AS coldHits, tr.cold_misses AS coldMisses,
                 tr.cold_bytes_written AS coldBytesWritten, tr.cold_bytes_restored AS coldBytesRestored
          FROM traces tr
-         WHERE (tr.session_id = ? OR tr.root_session_id = ?)
+         WHERE tr.root_session_id = ? AND tr.session_id != ?
            AND tr.trace_id NOT IN (SELECT trace_id FROM turns WHERE session_id = ? AND trace_id IS NOT NULL)
        )
        ORDER BY ts`,

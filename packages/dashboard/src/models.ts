@@ -8,7 +8,7 @@
  * the same trade-off already made in `packages/agent/src/provider/models.ts`.
  */
 
-import { type Dirent, existsSync, lstatSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { type Dir, type Dirent, existsSync, lstatSync, opendirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
@@ -264,7 +264,10 @@ const MAX_WALK_ENTRIES = 100_000;
  * the total work. Unreadable entries are skipped. `truncated` is set when the
  * budget was hit (the returned size is then a lower bound).
  */
-function walkDirStats(dir: string): { sizeBytes: number; fileCount: number; truncated: boolean } {
+export function walkDirStats(
+  dir: string,
+  maxEntries: number = MAX_WALK_ENTRIES,
+): { sizeBytes: number; fileCount: number; truncated: boolean } {
   let sizeBytes = 0;
   let fileCount = 0;
   let entriesSeen = 0;
@@ -285,36 +288,62 @@ function walkDirStats(dir: string): { sizeBytes: number; fileCount: number; trun
       return;
     }
 
-    let entries: Dirent[];
+    // Enumerate INCREMENTALLY: `opendirSync` + `readSync` reads one `Dirent` at a
+    // time, so the entry budget bounds BOTH memory and time even on a pathological
+    // high-fan-out directory. `readdirSync({ withFileTypes: true })` would instead
+    // first materialize the ENTIRE `Dirent[]` (millions of entries) and block the
+    // synchronous `/api/models` handler before the per-entry budget could apply.
+    let handle: Dir;
     try {
-      entries = readdirSync(current, { withFileTypes: true });
+      handle = opendirSync(current);
     } catch {
       return;
     }
-    for (const entry of entries) {
-      if (entriesSeen >= MAX_WALK_ENTRIES) {
-        truncated = true;
-        return;
-      }
-      entriesSeen++;
-      const full = join(current, entry.name);
-      // Descend ONLY into a real directory; a symlink-to-directory is never entered.
-      if (entry.isDirectory()) {
-        walk(full);
-        if (truncated) return;
-        continue;
-      }
-      try {
-        // `statSync` follows symlinks so HF-cache-symlinked blobs count at their
-        // real byte size rather than the ~100-byte link. A symlink whose target is
-        // a directory contributes neither bytes nor a recursion (never followed).
-        const stat = statSync(full);
-        if (!stat.isDirectory()) {
-          sizeBytes += stat.size;
-          fileCount += 1;
+    try {
+      for (;;) {
+        let entry: Dirent | null;
+        try {
+          entry = handle.readSync();
+        } catch {
+          return;
         }
+        // Genuine end-of-directory: not a truncation.
+        if (entry === null) break;
+        // Budget check BEFORE processing this entry: a directory with more than
+        // `maxEntries` entries stops here (with `truncated`) rather than draining
+        // every remaining `Dirent`. Placed after the read so a directory holding
+        // EXACTLY `maxEntries` entries reaches end-of-stream above and is NOT
+        // falsely reported as truncated (matches the prior eager semantics).
+        if (entriesSeen >= maxEntries) {
+          truncated = true;
+          return;
+        }
+        entriesSeen++;
+        const full = join(current, entry.name);
+        // Descend ONLY into a real directory; a symlink-to-directory is never entered.
+        if (entry.isDirectory()) {
+          walk(full);
+          if (truncated) return;
+          continue;
+        }
+        try {
+          // `statSync` follows symlinks so HF-cache-symlinked blobs count at their
+          // real byte size rather than the ~100-byte link. A symlink whose target is
+          // a directory contributes neither bytes nor a recursion (never followed).
+          const stat = statSync(full);
+          if (!stat.isDirectory()) {
+            sizeBytes += stat.size;
+            fileCount += 1;
+          }
+        } catch {
+          // Broken symlink / unreadable file: skip.
+        }
+      }
+    } finally {
+      try {
+        handle.closeSync();
       } catch {
-        // Broken symlink / unreadable file: skip.
+        // Best-effort close; a failed close must never surface into `/api/models`.
       }
     }
   };

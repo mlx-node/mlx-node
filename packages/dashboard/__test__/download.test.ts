@@ -405,9 +405,12 @@ describe('DownloadManager', () => {
     // config.json got fetched before the failure — the job was genuinely mid-way.
     expect(hub.downloaded).toContain('config.json');
     // No half-populated FINAL dir; job-private staging is cleaned on failure (resume
-    // is HF-cache-backed, not staging-backed, so nothing is left to reuse).
+    // is HF-cache-backed, not staging-backed, so nothing is left to reuse). The
+    // cleanup runs in the job's `finally`, which completes AFTER the `error` event
+    // that `waitFor` above unblocked on, so wait for the private staging dir to be
+    // reclaimed (a genuine leak times out here) rather than racing that teardown.
     expect(existsSync(finalDir())).toBe(false);
-    expect(jobStagingDirs()).toEqual([]);
+    await waitFor(() => jobStagingDirs().length === 0);
     // Catalog must NOT report the aborted download as installed.
     const item = catalogWithState(modelsDir).find((entry) => entry.slug === SLUG)!;
     expect(item.installed).toBe(false);
@@ -736,6 +739,39 @@ describe('DownloadManager', () => {
     // The manual files are byte-for-byte intact; no marker written.
     expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(false);
+  });
+
+  it('fails fast on a DANGLING final symlink — before listing or downloading any bytes', async () => {
+    // `<modelsDir>/<slug>` is a DANGLING symlink (its target does not exist — e.g. it
+    // points at an unmounted volume). `existsSync` FOLLOWS the link and reports the
+    // path ABSENT, which used to skip the ownership preflight and trigger a full
+    // wasted download that only failed at publish. A no-follow occupancy check
+    // (`lstatSync`) sees the link itself and refuses UP FRONT — the link is never
+    // downloader-owned, so it is treated exactly like a foreign dir.
+    symlinkSync(join(modelsDir, 'nonexistent-target'), finalDir());
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
+
+    // Refused BEFORE the manifest was listed (no `start`) and BEFORE any file was
+    // fetched (no bytes copied, no staging tree created).
+    expect(events.some((event) => event.type === 'start')).toBe(false);
+    expect(hub.downloaded).toEqual([]);
+    expect(jobStagingDirs()).toEqual([]);
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+
+    const err = events.find((event) => event.type === 'error');
+    expect(err?.type).toBe('error');
+    if (err?.type === 'error') {
+      expect(err.message).toMatch(/not created by the dashboard/i);
+    }
   });
 
   it('refuses to overwrite an unowned existing dir and leaves it intact', async () => {

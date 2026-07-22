@@ -570,6 +570,75 @@ describe('dashboard server — sessions', () => {
     // dedup excludes only trace-only rows, never a correlated turn.
     expect(body.turns.filter((t) => t.traceId === 'trace-aaa')).toHaveLength(1);
   });
+
+  // #3 (R15): the trace-only UNION must admit ONLY genuine delegated children, never
+  // resurrect an ABANDONED root turn. When a root session branches, ingestion drops
+  // its abandoned assistant turn from `turns`, yet the trace lingers with
+  // session_id == root_session_id == the root id. The old `session_id = ? OR
+  // root_session_id = ?` predicate re-admitted it (it passes the trace-only dedup —
+  // no longer in `turns`) and counted it as a fake delegated turn, inflating the
+  // turn count and token totals. A genuine child runs on its own in-memory session,
+  // so its trace has session_id = <child id> != root; the fixed predicate keys on
+  // `root_session_id = ? AND session_id != ?`.
+  it('excludes an abandoned root trace (session_id = root) but keeps genuine children', async () => {
+    writeFileSync(
+      join(tracesDir, '2026-07-04-branch.jsonl'),
+      `${[
+        // (b) ABANDONED root turn: no surviving `turns` row; trace lingers with
+        // session_id == root_session_id == fix-1. Must NOT be counted.
+        {
+          v: 1,
+          traceId: 'trace-abandoned-root',
+          ts: 1782036502000,
+          sessionId: 'fix-1',
+          rootSessionId: 'fix-1',
+          model: 'ghost-model',
+          durationMs: 30,
+          finishReason: 'stop',
+          promptTokens: 9999,
+          cachedTokens: 0,
+          outputTokens: 8888,
+          reasoningTokens: 0,
+        },
+        // (c) GENUINE delegated child: own in-memory session id != root.
+        {
+          v: 1,
+          traceId: 'trace-real-child',
+          ts: 1782036503000,
+          sessionId: 'child-of-fix-1',
+          rootSessionId: 'fix-1',
+          model: 'child-model',
+          durationMs: 20,
+          finishReason: 'stop',
+          promptTokens: 100,
+          cachedTokens: 0,
+          outputTokens: 40,
+          reasoningTokens: 0,
+        },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join('\n')}\n`,
+    );
+    await ingest();
+    const res = await fetch(`${server.url}/api/sessions/fix-1/metrics`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      turns: Array<{ traceId: string | null; inputTokens: number | null; outputTokens: number | null }>;
+    };
+    const ids = body.turns.map((t) => t.traceId);
+
+    // The active root turn (trace-aaa) stays present, the genuine child is merged
+    // exactly once.
+    expect(body.turns.filter((t) => t.traceId === 'trace-aaa')).toHaveLength(1);
+    expect(body.turns.filter((t) => t.traceId === 'trace-real-child')).toHaveLength(1);
+    // The abandoned root trace is NEVER resurrected as a delegated turn.
+    expect(ids).not.toContain('trace-abandoned-root');
+    // Its inflated tokens never reach the session totals.
+    const totalOut = body.turns.reduce((sum, t) => sum + (t.outputTokens ?? 0), 0);
+    const totalIn = body.turns.reduce((sum, t) => sum + (t.inputTokens ?? 0), 0);
+    expect(totalOut).toBeLessThan(8888);
+    expect(totalIn).toBeLessThan(9999);
+  });
 });
 
 // Finding 4: session-file symlink containment. Primary — a symlinked transcript

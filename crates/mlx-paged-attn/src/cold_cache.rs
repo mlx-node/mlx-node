@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use safetensors::tensor::{Dtype, TensorView};
 use safetensors::{SafeTensors, serialize};
@@ -607,10 +607,11 @@ impl Shared {
 /// the property [`ColdCacheManager::drain`] relies on for a shutdown flush.
 enum WriteJob {
     Block(ColdCacheBlock),
-    /// Drain marker: the writer acks it (unblocking `drain`) after every
-    /// earlier `Block` has been persisted. A dropped `rx` makes the ack a
-    /// harmless no-op.
-    Barrier(SyncSender<()>),
+    /// Drain marker: after every earlier `Block` has been persisted the writer
+    /// acks it (unblocking `drain`) with whether all of those blocks since the
+    /// previous barrier persisted successfully — `true` only when none failed.
+    /// A dropped `rx` makes the ack a harmless no-op.
+    Barrier(SyncSender<bool>),
 }
 
 /// Bounded background SSD cache. Clones share one queue/index.
@@ -693,19 +694,30 @@ impl ColdCacheManager {
         std::thread::Builder::new()
             .name("mlx-paged-ssd-writer".to_string())
             .spawn(move || {
+                // Whether any block since the last barrier failed to persist.
+                // Inference is still fail-open (the hot block is valid), but the
+                // flag lets a covering drain barrier report durability honestly
+                // instead of acking success unconditionally. Reset after each
+                // barrier so every drain reports only on its own window.
+                let mut failed = false;
                 while let Ok(job) = receiver.recv() {
                     match job {
                         // Fail-open: inference already has a valid hot block. A
                         // persistence error only means the next process
-                        // recomputes.
+                        // recomputes — but a pending drain barrier must learn
+                        // that this covered block did not become durable.
                         WriteJob::Block(block) => {
-                            let _ = persist_block(&worker_shared, &block);
+                            if persist_block(&worker_shared, &block).is_err() {
+                                failed = true;
+                            }
                         }
                         // Every earlier `Block` has already been persisted (FIFO,
                         // single consumer), so acking here signals the drain is
-                        // complete. A gone receiver (drain timed out) is fine.
+                        // complete; the ack now reports whether all of them
+                        // succeeded. A gone receiver (drain timed out) is fine.
                         WriteJob::Barrier(ack) => {
-                            let _ = ack.send(());
+                            let _ = ack.send(!failed);
+                            failed = false;
                         }
                     }
                 }
@@ -809,22 +821,51 @@ impl ColdCacheManager {
     /// Block until every write accepted before this call is fully durable
     /// (payload fsync + rename + directory fsync), or `timeout` elapses.
     ///
-    /// A `Barrier` is pushed with a BLOCKING `send` — during shutdown, waiting
-    /// for a queue slot is fine, and unlike the non-blocking block enqueue the
-    /// barrier must never be dropped. FIFO ordering on the single-consumer
-    /// writer guarantees the ack lands only after every earlier `Block`'s
-    /// `persist_block` has returned, so on `true` every `enqueue` that returned
-    /// `Ok(true)` before this call is on disk. Returns `false` on timeout so a
-    /// stuck fsync cannot hang process exit, and `true` immediately when the
-    /// writer is already gone (tier disabled/torn down: nothing left to flush).
+    /// The WHOLE drain is bounded by `timeout`: a deadline is computed up front
+    /// and bounds BOTH barrier admission and the ack wait. `std::sync::mpsc`'s
+    /// `SyncSender` has no timed `send`, so a blocking `send` onto a full queue
+    /// behind a stuck fsync could exceed the timeout or hang process exit;
+    /// instead the barrier is admitted with `try_send` retried until a slot
+    /// frees or the deadline passes, then the ack is awaited for the remaining
+    /// time. FIFO ordering on the single-consumer writer guarantees the ack
+    /// lands only after every earlier `Block`'s `persist_block` has returned,
+    /// and the ack is `true` only when all of those blocks persisted — so
+    /// `drain` returns `true` iff every `enqueue` that returned `Ok(true)`
+    /// before this call is on disk. Returns `false` when the barrier cannot be
+    /// admitted or acked within the deadline (a stuck fsync cannot hang exit)
+    /// or when a covered block failed to persist, and `true` immediately when
+    /// the writer is already gone (tier disabled/torn down: nothing to flush).
     pub fn drain(&self, timeout: Duration) -> bool {
-        let (tx, rx) = mpsc::sync_channel::<()>(1);
-        if self.sender.send(WriteJob::Barrier(tx)).is_err() {
-            // Writer thread absent/stopped: no queued block can still be in
-            // flight, so the drain is trivially satisfied.
-            return true;
+        let deadline = Instant::now() + timeout;
+        let (tx, rx) = mpsc::sync_channel::<bool>(1);
+        // Deadline-bounded admission: retry `try_send` (recovering the barrier
+        // job on each `Full`) until a queue slot frees or the deadline passes.
+        let mut job = WriteJob::Barrier(tx);
+        loop {
+            match self.sender.try_send(job) {
+                Ok(()) => break,
+                // Writer thread absent/stopped: no queued block can still be in
+                // flight, so the drain is trivially satisfied.
+                Err(TrySendError::Disconnected(_)) => return true,
+                Err(TrySendError::Full(returned)) => {
+                    if Instant::now() >= deadline {
+                        // Could not even admit the barrier within the timeout.
+                        return false;
+                    }
+                    job = returned;
+                    std::thread::sleep(
+                        Duration::from_millis(5)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+            }
         }
-        rx.recv_timeout(timeout).is_ok()
+        // Success only on an honest `true` ack within the remaining time; a
+        // timeout or a persist-failure ack (`false`) is a failed drain.
+        matches!(
+            rx.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+            Ok(true)
+        )
     }
 
     /// Load and validate a block, bounding the restore read by the manager's
@@ -1742,6 +1783,111 @@ mod tests {
             manager.drain(Duration::from_secs(5)),
             "an empty tier drains immediately"
         );
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // A drain must report durability HONESTLY: if any block it covers failed
+    // to persist, the barrier ack is `false`, so `drain` returns `false`
+    // rather than falsely reporting the write as durable. The dir-fsync
+    // override forces `persist_block` to return `Err` after the rename, the
+    // same failure seam the post-rename test uses.
+    #[test]
+    fn drain_reports_false_when_a_covered_block_fails_to_persist() {
+        let root = temp_root("drain-persist-fail");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        *manager.shared.dir_sync_override.lock().unwrap() =
+            Some(Box::new(|| Err("injected dir fsync failure".to_string())));
+
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        assert!(
+            manager.enqueue(block(key)).unwrap(),
+            "the block must be accepted so the barrier covers it"
+        );
+
+        assert!(
+            !manager.drain(Duration::from_secs(5)),
+            "a covered block that failed to persist must make drain report false"
+        );
+
+        *manager.shared.dir_sync_override.lock().unwrap() = None;
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // The WHOLE drain must stay bounded by `timeout` even when the bounded
+    // queue is full and the writer is stuck mid-persist: barrier admission is
+    // deadline-aware `try_send`, not a blocking `send` that could outlast the
+    // timeout or hang exit. A safety timer releases the writer well after the
+    // short timeout so a regression (blocking admission) terminates instead of
+    // hanging the suite.
+    #[test]
+    fn drain_is_bounded_by_timeout_under_a_saturated_queue() {
+        use std::sync::atomic::AtomicBool;
+
+        let root = temp_root("drain-bounded");
+        let depth = 2usize;
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, depth).unwrap();
+
+        // Park the writer inside `persist_block`'s dir fsync so it consumes
+        // exactly one block and then stops draining the queue.
+        let release = Arc::new(AtomicBool::new(false));
+        let release_writer = Arc::clone(&release);
+        *manager.shared.dir_sync_override.lock().unwrap() = Some(Box::new(move || {
+            while !release_writer.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        }));
+
+        let make_block = |i: u32| {
+            let toks = vec![i, i + 100, i + 200, i + 300];
+            let key = ColdCacheKey::chain(fingerprint(), None, &toks, &[], 0, 0);
+            let mut candidate = block(key);
+            candidate.tokens = toks;
+            candidate
+        };
+
+        // First block is dequeued by the writer, which then parks in the
+        // fsync override; give it a moment to get there.
+        assert!(manager.enqueue(make_block(0)).unwrap());
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Fill the bounded buffer until enqueue starts dropping — a drop proves
+        // the queue is saturated behind the parked writer.
+        let mut saturated = false;
+        for i in 1..(depth as u32 + 6) {
+            if !manager.enqueue(make_block(i)).unwrap() {
+                saturated = true;
+                break;
+            }
+        }
+        assert!(saturated, "the bounded queue must be full before draining");
+
+        // Safety net: releases the writer long after the short drain timeout,
+        // so even a regressed blocking drain unblocks rather than hanging.
+        let release_timer = Arc::clone(&release);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            release_timer.store(true, Ordering::Relaxed);
+        });
+
+        let timeout = Duration::from_millis(200);
+        let start = Instant::now();
+        let drained = manager.drain(timeout);
+        let elapsed = start.elapsed();
+
+        assert!(
+            !drained,
+            "a saturated queue behind a stuck writer cannot drain within the timeout"
+        );
+        assert!(
+            elapsed < timeout + Duration::from_millis(500),
+            "drain must stay bounded by the timeout, took {elapsed:?}"
+        );
+
+        // Release the writer so teardown drains cleanly.
+        release.store(true, Ordering::Relaxed);
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }

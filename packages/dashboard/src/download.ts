@@ -224,6 +224,24 @@ function assertRealDirOrAbsent(path: string): void {
   }
 }
 
+/**
+ * No-follow occupancy: is ANYTHING present at this path — including a dangling or
+ * foreign symlink? `existsSync` FOLLOWS symlinks, so a `<modelsDir>/<slug>` that is
+ * a dangling link (target on an unmounted volume, say) reads as ABSENT and slips
+ * past the ownership preflight, triggering a full wasted download that only fails at
+ * publish. `lstatSync` stats the LINK itself, so such a path reads as occupied and
+ * is refused up front (a symlink is never downloader-owned → `isDownloaderOwned`
+ * returns false → the preflight/publish guards refuse it).
+ */
+function occupied(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export type DownloadEvent =
   | { type: 'start'; id: string; repo: string; totalBytes: number; fileCount: number }
   | {
@@ -539,7 +557,7 @@ export class DownloadManager {
       // checkpoint never triggers a full multi-GB download+hash only to be refused
       // at publish. The publish-time checks below still guard the narrow
       // check-then-swap race for a dir that races in after this point.
-      if (existsSync(finalDir) && !isDownloaderOwned(finalDir) && !job.overwrite) {
+      if (occupied(finalDir) && !isDownloaderOwned(finalDir) && !job.overwrite) {
         throw new Error(
           `Refusing to install over "${finalDir}": it was not created by the dashboard downloader. ` +
             `Remove it manually to reinstall.`,
@@ -876,7 +894,7 @@ export class DownloadManager {
   ): Promise<void> {
     await mkdir(dirname(finalDir), { recursive: true });
 
-    if (existsSync(finalDir) && !isDownloaderOwned(finalDir) && !overwrite) {
+    if (occupied(finalDir) && !isDownloaderOwned(finalDir) && !overwrite) {
       throw new Error(
         `Refusing to overwrite "${finalDir}": it was not created by the dashboard downloader. ` +
           `Remove it manually to reinstall.`,
@@ -891,7 +909,7 @@ export class DownloadManager {
     };
     await writeFile(join(stagingDir, DOWNLOAD_COMPLETE_MARKER), `${JSON.stringify(marker, null, 2)}\n`);
 
-    if (!existsSync(finalDir)) {
+    if (!occupied(finalDir)) {
       await rename(stagingDir, finalDir);
       await fsyncDir(dirname(finalDir));
       return;
