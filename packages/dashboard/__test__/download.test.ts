@@ -774,6 +774,53 @@ describe('DownloadManager', () => {
     }
   });
 
+  it('fails fast on a LIVE final symlink → external marked dir — before any bytes (no-follow ownership)', async () => {
+    // `<modelsDir>/<slug>` is a LIVE symlink whose target is an EXTERNAL directory
+    // that itself carries a valid completion marker. `existsSync`/`readFileSync`
+    // FOLLOW the link, so a laxer ownership check reads the foreign marker and thinks
+    // the dir is downloader-owned — proceeding to overwrite/report-done through a path
+    // the runner never wrote. The occupancy check is no-follow (`lstatSync` sees the
+    // link) and `isDownloaderOwned` is no-follow (it `lstat`-gates on a real directory
+    // before reading the marker), so the preflight refuses UP FRONT.
+    const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
+    writeFileSync(join(external, 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(external, 'model.safetensors'), Buffer.alloc(300, 0xab));
+    writeFileSync(
+      join(external, DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: REPO, revision: SHA_OLD, files: ['config.json', 'model.safetensors'], completedAt: 'x' }),
+    );
+    symlinkSync(external, finalDir());
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
+
+    // Refused BEFORE the manifest was listed (no `start`) and BEFORE any file was
+    // fetched (no bytes copied, no staging tree created); never reported done.
+    expect(events.some((event) => event.type === 'start')).toBe(false);
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+    expect(hub.downloaded).toEqual([]);
+    expect(jobStagingDirs()).toEqual([]);
+
+    const err = events.find((event) => event.type === 'error');
+    expect(err?.type).toBe('error');
+    if (err?.type === 'error') {
+      expect(err.message).toMatch(/not created by the dashboard/i);
+    }
+
+    // The external target is byte-for-byte intact — nothing was written through the link.
+    expect(readFileSync(join(external, 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+    expect(readFileSync(join(external, 'model.safetensors'))).toEqual(Buffer.alloc(300, 0xab));
+
+    rmSync(external, { recursive: true, force: true });
+  });
+
   it('refuses to overwrite an unowned existing dir and leaves it intact', async () => {
     // A valid checkpoint placed manually / by `mlx download` — no completion
     // marker, so the downloader does not own it.

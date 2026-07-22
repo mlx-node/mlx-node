@@ -9,6 +9,7 @@ import {
   defaultModelsDir,
   deleteLocalModel,
   discoverLocalModels,
+  isDownloaderOwned,
   isModelInstalled,
 } from '../src/models.js';
 
@@ -221,6 +222,50 @@ describe('isModelInstalled', () => {
     writeFileSync(join(bare, 'config.json'), Buffer.alloc(4));
     writeFileSync(join(bare, 'model.safetensors'), Buffer.alloc(8));
     expect(isModelInstalled(bare)).toBe(false);
+  });
+});
+
+describe('isDownloaderOwned', () => {
+  /** Write a valid completion marker into `dir` (an owned-looking install). */
+  function writeOwnedMarker(dir: string): void {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: 'owner/repo', revision: 'a'.repeat(40), files: ['config.json'], completedAt: 'x' }),
+    );
+  }
+
+  it('is true for a real directory carrying our marker', () => {
+    const owned = join(modelsDir, 'owned');
+    writeOwnedMarker(owned);
+    expect(isDownloaderOwned(owned)).toBe(true);
+  });
+
+  // A LIVE symlink whose target is an EXTERNAL directory carrying a valid marker must
+  // NOT read as owned: `readFileSync` follows the link and would otherwise report the
+  // foreign install as ours, letting the download runner overwrite/report-done through
+  // a path we never wrote. The no-follow `lstat` gate refuses any non-directory.
+  it('is false for a live symlink to an external marked dir (no-follow ownership)', () => {
+    const external = mkdtempSync(join(tmpdir(), 'dash-ext-owned-'));
+    writeFileSync(
+      join(external, DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: 'owner/repo', revision: 'b'.repeat(40), files: ['config.json'], completedAt: 'x' }),
+    );
+    const link = join(modelsDir, 'linked-final');
+    symlinkSync(external, link);
+
+    // The link resolves to a valid foreign marker, yet ownership is refused.
+    expect(existsSync(join(link, DOWNLOAD_COMPLETE_MARKER))).toBe(true);
+    expect(isDownloaderOwned(link)).toBe(false);
+
+    rmSync(external, { recursive: true, force: true });
+  });
+
+  it('is false for a dangling symlink and for an absent path', () => {
+    const dangling = join(modelsDir, 'dangling');
+    symlinkSync(join(modelsDir, 'no-such-target'), dangling);
+    expect(isDownloaderOwned(dangling)).toBe(false);
+    expect(isDownloaderOwned(join(modelsDir, 'absent'))).toBe(false);
   });
 });
 

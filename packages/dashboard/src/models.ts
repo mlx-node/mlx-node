@@ -142,8 +142,20 @@ export function readCompletion(finalDir: string): DownloadCompletion | undefined
  * mid-upgrade owned dir is still ours). The downloader uses this to decide
  * whether it may overwrite a final dir: a dir WITHOUT our marker was placed by a
  * human or by `mlx download` and must never be destroyed.
+ *
+ * NO-FOLLOW: a symlink (or any non-directory) at this path was never written by us
+ * as a managed model dir, so the check `lstat`-gates on a REAL directory BEFORE
+ * reading the marker. Without this gate `readFileSync` would FOLLOW a live final
+ * symlink into an external directory and read its foreign marker, reporting that
+ * link as downloader-owned — which would slip a foreign install past the ownership
+ * preflight/publish guards (a wasted overwrite, or a false "done" through the link).
  */
 export function isDownloaderOwned(modelDir: string): boolean {
+  try {
+    if (!lstatSync(modelDir).isDirectory()) return false;
+  } catch {
+    return false;
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(join(modelDir, DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as unknown;
@@ -252,17 +264,23 @@ function detectContextWindow(config: Record<string, unknown>): number | null {
 const MAX_WALK_ENTRIES = 100_000;
 
 /**
- * Recursive size + file count of a directory, bounded so it can never hang the
- * event loop. Recursion descends ONLY into REAL directories (`Dirent` carries
- * lstat semantics, so a symlink whose target is a directory reports
- * `isDirectory() === false` and is never entered) — this is what breaks a symlink
- * cycle (`self -> .`, or two `-> .` links whose exponential fan-out used to freeze
- * the handler) and keeps an external symlinked tree's bytes out of the total. A
- * symlink is still `statSync`'d for its real byte size (preserving the HF-cache
- * blob-link intent) but never recursed into. A `dev:ino` visited-set guards
- * against a real-directory hardlink/mount loop, and {@link MAX_WALK_ENTRIES} caps
- * the total work. Unreadable entries are skipped. `truncated` is set when the
- * budget was hit (the returned size is then a lower bound).
+ * Iterative size + file count of a directory, bounded so it can never hang the
+ * event loop. Traversal is an explicit worklist of directory PATHS, not recursion:
+ * each directory's `Dir` handle is CLOSED before any child is opened, so at most
+ * ONE handle is ever open — a deep tree can never hold one fd per level and hit
+ * `EMFILE` on a child `opendirSync` (which a recursive descent, whose parent handle
+ * stays open across the child call, does). Only REAL directories are descended into
+ * (`Dirent` carries lstat semantics, so a symlink whose target is a directory
+ * reports `isDirectory() === false` and is never pushed) — this is what breaks a
+ * symlink cycle (`self -> .`, or two `-> .` links whose exponential fan-out used to
+ * freeze the handler) and keeps an external symlinked tree's bytes out of the total.
+ * A symlink is still `statSync`'d for its real byte size (preserving the HF-cache
+ * blob-link intent) but never descended into. A `dev:ino` visited-set guards against
+ * a real-directory hardlink/mount loop, and {@link MAX_WALK_ENTRIES} caps the total
+ * work. A broken-symlink / unreadable FILE is a genuine per-file skip (silent).
+ * `truncated` is set — the returned size is then a LOWER BOUND — when the budget was
+ * hit OR when a resource failure (`opendirSync`/`readSync`) left a subtree unsized;
+ * such a failure is never swallowed into an exact-looking undercount.
  */
 export function walkDirStats(
   dir: string,
@@ -272,20 +290,28 @@ export function walkDirStats(
   let fileCount = 0;
   let entriesSeen = 0;
   let truncated = false;
+  // Hitting the entry budget must stop ALL further work (the budget bounds total
+  // time so the synchronous `/api/models` handler can't wedge); a per-directory
+  // resource failure only marks the result incomplete and skips that one dir.
+  let budgetHit = false;
   const visited = new Set<string>();
+  // Explicit worklist of directory PATHS. Bounded by the entry budget: every pushed
+  // subdirectory was itself a counted entry, so the stack can never outgrow it.
+  const stack: string[] = [dir];
 
-  const walk = (current: string): void => {
-    if (truncated) return;
-    // Break any real-directory cycle (hardlink/bind loop) by identity. The
-    // no-follow recursion below already excludes symlinked dirs, so this is
-    // defense-in-depth for the rare non-symlink loop.
+  while (stack.length > 0 && !budgetHit) {
+    const current = stack.pop()!;
+    // Break any real-directory cycle (hardlink/bind loop) by identity. The no-follow
+    // descent below already excludes symlinked dirs, so this is defense-in-depth for
+    // the rare non-symlink loop. A vanished/unreadable dir here is a TOCTOU skip
+    // (like the per-file skip), not a resource-exhaustion truncation.
     try {
       const self = lstatSync(current);
       const key = `${self.dev}:${self.ino}`;
-      if (visited.has(key)) return;
+      if (visited.has(key)) continue;
       visited.add(key);
     } catch {
-      return;
+      continue;
     }
 
     // Enumerate INCREMENTALLY: `opendirSync` + `readSync` reads one `Dirent` at a
@@ -297,7 +323,11 @@ export function walkDirStats(
     try {
       handle = opendirSync(current);
     } catch {
-      return;
+      // Permission / fd-exhaustion (EMFILE): the dir's contents are unknown. Flag the
+      // whole result incomplete (a lower bound) rather than silently dropping the
+      // subtree, then keep sizing the rest of the worklist.
+      truncated = true;
+      continue;
     }
     try {
       for (;;) {
@@ -305,7 +335,10 @@ export function walkDirStats(
         try {
           entry = handle.readSync();
         } catch {
-          return;
+          // A read fault mid-directory leaves the remainder of THIS dir unsized:
+          // mark incomplete and move on rather than returning a silent undercount.
+          truncated = true;
+          break;
         }
         // Genuine end-of-directory: not a truncation.
         if (entry === null) break;
@@ -316,27 +349,30 @@ export function walkDirStats(
         // falsely reported as truncated (matches the prior eager semantics).
         if (entriesSeen >= maxEntries) {
           truncated = true;
-          return;
+          budgetHit = true;
+          break;
         }
         entriesSeen++;
         const full = join(current, entry.name);
         // Descend ONLY into a real directory; a symlink-to-directory is never entered.
+        // PUSH the child path (processed after this handle is closed) — never recurse
+        // while this handle is still open — so at most one `Dir` handle is ever live.
         if (entry.isDirectory()) {
-          walk(full);
-          if (truncated) return;
+          stack.push(full);
           continue;
         }
         try {
           // `statSync` follows symlinks so HF-cache-symlinked blobs count at their
           // real byte size rather than the ~100-byte link. A symlink whose target is
-          // a directory contributes neither bytes nor a recursion (never followed).
+          // a directory contributes neither bytes nor a descent (never followed).
           const stat = statSync(full);
           if (!stat.isDirectory()) {
             sizeBytes += stat.size;
             fileCount += 1;
           }
         } catch {
-          // Broken symlink / unreadable file: skip.
+          // Broken symlink / unreadable file: a genuine per-file skip (not a
+          // resource exhaustion), so it never flags the result incomplete.
         }
       }
     } finally {
@@ -346,9 +382,8 @@ export function walkDirStats(
         // Best-effort close; a failed close must never surface into `/api/models`.
       }
     }
-  };
+  }
 
-  walk(dir);
   return { sizeBytes, fileCount, truncated };
 }
 

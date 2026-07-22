@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -8,8 +8,23 @@ import { afterEach, beforeEach, expect, it, vi } from 'vite-plus/test';
 // module to delegating wrappers that COUNT the enumeration primitives instead, so a
 // test can prove `walkDirStats` enumerates INCREMENTALLY (`opendirSync` +
 // `Dir.readSync`, bounded by the entry budget) and never materializes the whole
-// directory up front via `readdirSync(withFileTypes)`.
-const fsCounters = vi.hoisted(() => ({ readdir: 0, opendir: 0, readSync: 0 }));
+// directory up front via `readdirSync(withFileTypes)`. The wrappers additionally
+// track CONCURRENT open `Dir` handles (increment on `opendirSync`, decrement on
+// `closeSync`) so a test can prove the walk holds at most ONE handle at a time —
+// never one fd per tree level — and can inject `opendirSync`/`readSync` faults on a
+// chosen path to prove a resource failure surfaces as `truncated` (incomplete),
+// never a silent undercount.
+const fsCounters = vi.hoisted(() => ({
+  readdir: 0,
+  opendir: 0,
+  readSync: 0,
+  openHandles: 0,
+  maxOpenHandles: 0,
+}));
+
+// When set, `opendirSync`/`Dir.readSync` on EXACTLY this path throws a resource
+// error (EMFILE / EIO), simulating fd exhaustion or a mid-directory read fault.
+const fsFail = vi.hoisted(() => ({ opendirThrowOn: null as string | null, readThrowOn: null as string | null }));
 
 vi.mock('node:fs', async (importOriginal) => {
   const real = await importOriginal<typeof import('node:fs')>();
@@ -21,11 +36,33 @@ vi.mock('node:fs', async (importOriginal) => {
     },
     opendirSync: (...args: Parameters<typeof real.opendirSync>) => {
       fsCounters.opendir++;
+      const path = String(args[0]);
+      if (fsFail.opendirThrowOn !== null && path === fsFail.opendirThrowOn) {
+        const err = new Error(`EMFILE: too many open files, opendir '${path}'`) as NodeJS.ErrnoException;
+        err.code = 'EMFILE';
+        throw err;
+      }
       const dir = real.opendirSync(...(args as Parameters<typeof real.opendirSync>));
+      fsCounters.openHandles++;
+      if (fsCounters.openHandles > fsCounters.maxOpenHandles) fsCounters.maxOpenHandles = fsCounters.openHandles;
       const read = dir.readSync.bind(dir);
       dir.readSync = () => {
         fsCounters.readSync++;
+        if (fsFail.readThrowOn !== null && path === fsFail.readThrowOn) {
+          const err = new Error(`EIO: i/o error, read '${path}'`) as NodeJS.ErrnoException;
+          err.code = 'EIO';
+          throw err;
+        }
         return read();
+      };
+      const close = dir.closeSync.bind(dir);
+      let closed = false;
+      dir.closeSync = () => {
+        if (!closed) {
+          closed = true;
+          fsCounters.openHandles--;
+        }
+        return close();
       };
       return dir;
     },
@@ -42,6 +79,10 @@ beforeEach(() => {
   fsCounters.readdir = 0;
   fsCounters.opendir = 0;
   fsCounters.readSync = 0;
+  fsCounters.openHandles = 0;
+  fsCounters.maxOpenHandles = 0;
+  fsFail.opendirThrowOn = null;
+  fsFail.readThrowOn = null;
 });
 
 afterEach(() => {
@@ -85,4 +126,77 @@ it('counts every file and does not truncate when the dir fits the budget', () =>
   expect(stats.truncated).toBe(false);
   expect(stats.fileCount).toBe(files);
   expect(stats.sizeBytes).toBe(files * 2);
+});
+
+// FD discipline: recursion that descends while the parent `Dir` handle is still open
+// holds ONE fd per tree level, so a deep real-directory tree under a low
+// `RLIMIT_NOFILE` makes a child `opendirSync` hit EMFILE (silently dropping the
+// subtree). An ITERATIVE bounded worklist must instead close each dir BEFORE opening
+// any child, so at most ONE `Dir` handle is ever open — no matter how deep the tree.
+it('holds at most one Dir handle at a time across a deep nested tree (no fd-per-level)', () => {
+  // A linear chain several levels deep, each level a REAL directory with a file, so
+  // the walk must descend level by level. Recursion would keep every level's handle
+  // open at the leaf (concurrency == depth+1); the worklist keeps it at 1.
+  let cursor = dir;
+  const depth = 6;
+  let expectedFiles = 0;
+  for (let level = 0; level < depth; level++) {
+    writeFileSync(join(cursor, `file${level}.bin`), Buffer.alloc(3));
+    expectedFiles++;
+    cursor = join(cursor, `level${level}`);
+    mkdirSync(cursor, { recursive: true });
+  }
+  writeFileSync(join(cursor, 'leaf.bin'), Buffer.alloc(3));
+  expectedFiles++;
+
+  const stats = walkDirStats(dir, 100_000);
+
+  // Every level was visited (all files counted) …
+  expect(stats.truncated).toBe(false);
+  expect(stats.fileCount).toBe(expectedFiles);
+  expect(stats.sizeBytes).toBe(expectedFiles * 3);
+  // … yet the walk never held more than a single open `Dir` handle at once.
+  expect(fsCounters.maxOpenHandles).toBe(1);
+  // Sanity: it really did open one handle per directory (root + `depth` subdirs).
+  expect(fsCounters.opendir).toBe(depth + 1);
+});
+
+// Resource failure = INCOMPLETE, never a silent false-complete. A nested
+// `opendirSync` that throws EMFILE (fd exhaustion) must set `truncated` so the
+// caller warns the reported size is a lower bound — not swallow the subtree and
+// return an exact-looking undercount.
+it('marks truncated when a nested opendirSync throws (EMFILE), not a silent undercount', () => {
+  writeFileSync(join(dir, 'top.bin'), Buffer.alloc(4));
+  const sub = join(dir, 'sub');
+  mkdirSync(sub, { recursive: true });
+  writeFileSync(join(sub, 'inner.bin'), Buffer.alloc(8));
+
+  // The child dir cannot be opened (simulated fd exhaustion).
+  fsFail.opendirThrowOn = sub;
+  const stats = walkDirStats(dir, 100_000);
+
+  // The subtree was dropped but the result is flagged INCOMPLETE (a lower bound),
+  // not reported as an exact, complete size.
+  expect(stats.truncated).toBe(true);
+  // The root's own file was still counted (the walk did not crash or bail entirely).
+  expect(stats.fileCount).toBe(1);
+  expect(stats.sizeBytes).toBe(4);
+});
+
+// A `readSync` fault mid-directory likewise must mark the result incomplete rather
+// than `return` silently with `truncated` still false.
+it('marks truncated when a nested Dir.readSync throws mid-directory', () => {
+  writeFileSync(join(dir, 'top.bin'), Buffer.alloc(4));
+  const sub = join(dir, 'sub');
+  mkdirSync(sub, { recursive: true });
+  writeFileSync(join(sub, 'inner.bin'), Buffer.alloc(8));
+
+  // Reading the child directory faults partway.
+  fsFail.readThrowOn = sub;
+  const stats = walkDirStats(dir, 100_000);
+
+  expect(stats.truncated).toBe(true);
+  // The root file still counted; the faulted child contributed nothing.
+  expect(stats.fileCount).toBe(1);
+  expect(stats.sizeBytes).toBe(4);
 });

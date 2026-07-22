@@ -230,8 +230,12 @@ function assertRealDirOrAbsent(path: string): void {
  * a dangling link (target on an unmounted volume, say) reads as ABSENT and slips
  * past the ownership preflight, triggering a full wasted download that only fails at
  * publish. `lstatSync` stats the LINK itself, so such a path reads as occupied and
- * is refused up front (a symlink is never downloader-owned → `isDownloaderOwned`
- * returns false → the preflight/publish guards refuse it).
+ * is refused up front. `isDownloaderOwned` is likewise no-follow (it `lstat`-gates on
+ * a real directory before reading the marker), so ANY symlink here — a DANGLING link
+ * OR a LIVE link into an external marked dir — returns false and the preflight/publish
+ * guards refuse it. Without that, `readFileSync` would follow a live link and mistake
+ * the foreign marker for our own install, letting the runner overwrite or report done
+ * through a path it never wrote.
  */
 function occupied(path: string): boolean {
   try {
