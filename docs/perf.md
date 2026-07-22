@@ -55,6 +55,7 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_PAGED_PREFILL_CHUNK_SIZE`          | Prefill chunk size                         |
 | `MLX_PAGED_GROUPED_QWEN35=0`            | Disable the default-on BF16 D256/BS16 grouped decode kernel (24Q/4KV above 16K q1 / 8K q2; 16Q/2KV above 32K q1 / 16K q2) for same-binary A/B or driver rollback |
 | `MLX_TEST_PAGED`                        | Test-only paged-path toggle                |
+| `MLX_PERSIST_PAGED_CACHE`               | Override the per-model `persistPagedCache` config for the SSD-backed cold KV tier. Precedence: env > config alias > off. Parsed leniently (`1`/`true`/`on`/`yes` → on, `0`/`false`/`off`/`no` → off; unset/other falls through to config). Off by default at library level |
 
 ### Memory pool
 

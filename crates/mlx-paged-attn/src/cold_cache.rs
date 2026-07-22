@@ -177,7 +177,7 @@ impl ColdCacheBlock {
             .map(|layer| (layer.keys.len() + layer.values.len()) as u64)
             .sum::<u64>()
             + (self.tokens.len() * size_of::<u32>()) as u64
-            + 4096
+            + header_overhead(self.layers.len() as u64)
     }
 }
 
@@ -980,14 +980,50 @@ impl ColdCacheManager {
     }
 }
 
+/// Per-tensor safetensors descriptor allowance. `encode_block`'s longest
+/// descriptor is
+/// `"layer.<i>.value":{"dtype":"U8","shape":[N],"data_offsets":[A,B]}` plus a
+/// separating comma: 60 bytes of fixed punctuation/keywords, at most
+/// `digits(i)` index digits, and three integer fields (one shape, two offsets),
+/// each a payload offset and so at most 20 decimal digits (`u64`). That caps
+/// any real descriptor at 60 + 20 + 3*20 = 140 bytes; 256 leaves generous
+/// headroom for every layer count.
+const HEADER_BYTES_PER_DESCRIPTOR: u64 = 256;
+
+/// Fixed allowance for the `__metadata__` object: `abi` +
+/// `key`/`fingerprint`/`checksum` (three 64-char hex strings) + the numeric
+/// layout fields + JSON syntax (~450 bytes worst case).
+const HEADER_METADATA_BYTES: u64 = 1024;
+
+/// safetensors framing: the 8-byte little-endian header-length prefix plus up
+/// to 7 bytes of padding that 8-byte-aligns the JSON header.
+const HEADER_FRAMING_BYTES: u64 = 8 + 7;
+
+/// Upper bound on the safetensors header + framing `encode_block` wraps around
+/// the raw K/V/token payload. The container is `[8-byte header length][JSON
+/// header, 8-byte aligned][payload]`, and the JSON header carries
+/// `1 + 2*num_layers` tensor descriptors (`tokens` plus each layer's
+/// key/value) and one `__metadata__` object, so the overhead grows with layer
+/// count — a flat constant cannot cover deep models. Shared by
+/// [`ColdCacheBlock::encoded_len`] and [`max_encoded_len_for_pool`] so the two
+/// bounds can never drift.
+fn header_overhead(num_layers: u64) -> u64 {
+    let descriptors = num_layers.saturating_mul(2).saturating_add(1);
+    descriptors
+        .saturating_mul(HEADER_BYTES_PER_DESCRIPTOR)
+        .saturating_add(HEADER_METADATA_BYTES)
+        .saturating_add(HEADER_FRAMING_BYTES)
+}
+
 /// Upper bound on a legitimately-encoded block for `pool`, mirroring
 /// [`ColdCacheBlock::encoded_len`]: all layers' K+V bytes (via
 /// [`crate::profile::bytes_per_block`], which is exactly
 /// `num_layers * (key_bytes_per_layer + value_bytes_per_layer)`), the block's
-/// per-token `u32` ids, and the encoder's fixed header/JSON slop (`+4096`).
-/// A degenerate (zero-factor) geometry yields the slop-only floor, which fails
-/// closed by rejecting every real block — the pool would fail
-/// [`layout_matches_pool`] anyway.
+/// per-token `u32` ids, and the encoder's header/framing overhead
+/// ([`header_overhead`], which scales with the `1 + 2*num_layers` safetensors
+/// descriptor count). A degenerate (zero-factor) geometry yields the
+/// overhead-only floor, which fails closed by rejecting every real block — the
+/// pool would fail [`layout_matches_pool`] anyway.
 fn max_encoded_len_for_pool(pool: &LayerKVPool) -> u64 {
     let kv_bytes = crate::profile::bytes_per_block(
         pool.num_layers() as u32,
@@ -998,7 +1034,9 @@ fn max_encoded_len_for_pool(pool: &LayerKVPool) -> u64 {
     )
     .unwrap_or(0);
     let token_bytes = pool.block_size() as u64 * size_of::<u32>() as u64;
-    kv_bytes.saturating_add(token_bytes).saturating_add(4096)
+    kv_bytes
+        .saturating_add(token_bytes)
+        .saturating_add(header_overhead(pool.num_layers() as u64))
 }
 
 fn layout_matches_pool(layout: &ColdCacheLayout, pool: &LayerKVPool) -> bool {
@@ -1319,6 +1357,18 @@ fn decode_block(
         .chunks_exact(4)
         .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
         .collect();
+    // `num_layers` comes from untrusted metadata; a valid block has exactly
+    // `1 + 2*num_layers` tensors (`tokens` plus each layer's key/value).
+    // Checking it against the actually-deserialized tensor count (itself
+    // bounded by the byte-capped read) keeps the `Vec::with_capacity` below
+    // from being sized by a forged huge value.
+    if (layout.num_layers as usize)
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(1))
+        != Some(tensors.len())
+    {
+        return Err("cold-cache tensor count does not match num_layers".to_string());
+    }
     let mut layers = Vec::with_capacity(layout.num_layers as usize);
     for i in 0..layout.num_layers as usize {
         layers.push(ColdLayerBlock {
@@ -2842,6 +2892,161 @@ mod tests {
             }
         }
         drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Production Qwen3 KV geometry (block_size=16, num_kv_heads=8,
+    /// head_size=128, bf16) at an arbitrary layer count, so the fixture
+    /// exercises the O(num_layers) safetensors header the flat `+4096` bound
+    /// underestimated.
+    fn deep_block(key: ColdCacheKey, num_layers: u32) -> ColdCacheBlock {
+        let block_size = 16u32;
+        let num_kv_heads = 8u32;
+        let head_size = 128u32;
+        let dtype_bytes = 2usize; // bf16
+        let side_bytes =
+            num_kv_heads as usize * head_size as usize * block_size as usize * dtype_bytes;
+        let tokens: Vec<u32> = (0..block_size).collect();
+        let layers = (0..num_layers as usize)
+            .map(|i| ColdLayerBlock {
+                keys: (0..side_bytes).map(|b| ((b + i) % 251) as u8).collect(),
+                values: (0..side_bytes)
+                    .map(|b| ((b * 3 + i * 7) % 251) as u8)
+                    .collect(),
+            })
+            .collect();
+        ColdCacheBlock {
+            key,
+            fingerprint: fingerprint(),
+            tokens,
+            layout: ColdCacheLayout {
+                block_size,
+                num_layers,
+                num_kv_heads,
+                head_size,
+                cache_dtype: "BFloat16".to_string(),
+                key_bytes_per_layer: side_bytes,
+                value_bytes_per_layer: side_bytes,
+            },
+            layers,
+        }
+    }
+
+    #[test]
+    fn deep_blocks_persist_and_load_within_geometry_bound() {
+        // Regression: the O(num_layers) safetensors header overruns a flat
+        // +4096 allowance at real Qwen3 depths, so every persisted block was
+        // rejected as corruption on restart. Each depth must round-trip within
+        // its own encoded bound (numerically the max_encoded_len_for_pool the
+        // matching pool would derive — both use header_overhead with equal
+        // payload terms).
+        for &num_layers in &[28u32, 32, 64] {
+            let root = temp_root(&format!("deep-roundtrip-{num_layers}"));
+            let manager = ColdCacheManager::open_at(root.clone(), 8 * GIB, 0, 2).unwrap();
+            let key = ColdCacheKey::chain(
+                fingerprint(),
+                None,
+                &[1, 2, 3, 4],
+                &[num_layers as u64],
+                0,
+                0,
+            );
+            let original = deep_block(key, num_layers);
+            let bound = original.encoded_len();
+            assert!(
+                encode_block(&original).unwrap().len() as u64 <= bound,
+                "L={num_layers}: encoded block must fit within its own geometry bound"
+            );
+            persist_block(&manager.shared, &original).unwrap();
+            assert_eq!(
+                manager.load_bounded(key, fingerprint(), bound),
+                Some(original),
+                "L={num_layers}: a legitimate deep block must load within the bound, not miss"
+            );
+            drop(manager);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn encoded_len_mirrors_pool_bound_and_upper_bounds_encoder() {
+        for &num_layers in &[1u32, 28, 32, 64, 80] {
+            let key = ColdCacheKey::chain(
+                fingerprint(),
+                None,
+                &[1, 2, 3, 4],
+                &[num_layers as u64],
+                0,
+                0,
+            );
+            let block = deep_block(key, num_layers);
+            // encoded_len must equal the geometry-only max_encoded_len_for_pool
+            // arithmetic (kv payload + tokens + header_overhead), proving the
+            // two bounds stay mirrored without constructing a GPU pool.
+            let kv_bytes = crate::profile::bytes_per_block(
+                num_layers,
+                8,
+                128,
+                16,
+                crate::metal::MetalDtype::BFloat16,
+            )
+            .unwrap();
+            let token_bytes = 16u64 * size_of::<u32>() as u64;
+            let pool_bound = kv_bytes + token_bytes + header_overhead(num_layers as u64);
+            assert_eq!(
+                block.encoded_len(),
+                pool_bound,
+                "L={num_layers}: encoded_len must mirror max_encoded_len_for_pool arithmetic"
+            );
+            assert!(
+                encode_block(&block).unwrap().len() as u64 <= block.encoded_len(),
+                "L={num_layers}: the bound must be a true upper bound on the encoder output"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_rejects_forged_huge_num_layers() {
+        // A tiny file with correct abi/key/fingerprint but a forged
+        // num_layers=u32::MAX and only a `tokens` tensor. Before the guard the
+        // decoder ran `Vec::with_capacity(u32::MAX)` (~206 GB) and aborted; the
+        // tensor-count check now rejects it. The test returning at all proves
+        // no multi-GB allocation happened.
+        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let fp = fingerprint();
+        let token_bytes: Vec<u8> = vec![1, 0, 0, 0]; // one u32
+        let view = TensorView::new(Dtype::U8, vec![token_bytes.len()], &token_bytes).unwrap();
+        let mut metadata = HashMap::new();
+        metadata.insert("abi".to_string(), CACHE_ABI.to_string());
+        metadata.insert("key".to_string(), key.to_hex());
+        metadata.insert("fingerprint".to_string(), fp.to_hex());
+        metadata.insert("checksum".to_string(), "unused".to_string());
+        metadata.insert("block_size".to_string(), "1".to_string());
+        metadata.insert("num_layers".to_string(), u32::MAX.to_string());
+        metadata.insert("num_kv_heads".to_string(), "1".to_string());
+        metadata.insert("head_size".to_string(), "1".to_string());
+        metadata.insert("cache_dtype".to_string(), "BFloat16".to_string());
+        metadata.insert("key_bytes".to_string(), "0".to_string());
+        metadata.insert("value_bytes".to_string(), "0".to_string());
+        let bytes = serialize(vec![("tokens", view)], Some(metadata)).unwrap();
+
+        assert!(
+            decode_block(&bytes, key, fp).is_err(),
+            "a forged num_layers must be rejected before allocating layer storage"
+        );
+
+        // Delivered through the public load path, the same file must miss and
+        // count as a corruption — never abort.
+        let root = temp_root("forged-num-layers");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let path = root.join(format!("{}.safetensors", key.to_hex()));
+        fs::write(&path, &bytes).unwrap();
+        assert!(
+            manager.load(key, fp).is_none(),
+            "the forged entry must miss, not abort"
+        );
+        assert_eq!(manager.stats().corruptions, 1);
+        drop(manager);
         let _ = fs::remove_dir_all(root);
     }
 }

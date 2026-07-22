@@ -554,9 +554,18 @@ fn snapshot_shard_identities(dir: &Path) -> Option<HashMap<String, ShardIdentity
 /// cold-tier fingerprint has read the shards. Any `None` (a shard/directory
 /// that could not be stat'd at some checkpoint) or any difference means the
 /// mmap'd bytes might not be the bytes the fingerprint described, so the caller
-/// must leave cold persistence off (fail-safe). Requiring equality across the
-/// full bracket closes both the swap-straddles-mmap and the
-/// swap-during-fingerprint-read windows.
+/// must leave cold persistence off (fail-safe).
+///
+/// Requiring equality across the full bracket rejects the atomic-rename swap
+/// (a reinstall changes dev/ino, and an in-place rewrite changes len/mtime, so
+/// at least one snapshot differs). It does NOT prove *continuous* identity: a
+/// coordinated local ABA swap — shard A present for the before/at snapshots,
+/// replaced by B only while the fingerprint reads it, then A restored before
+/// the final snapshot — makes all three snapshots compare equal yet binds A's
+/// stat identity to B's fingerprinted bytes. That residual is accepted and out
+/// of scope; closing it soundly would require the fingerprint to hash the same
+/// held fd that backs the loaded arrays (an fd-coupled loader restructure), not
+/// point-in-time stat snapshots.
 fn shard_identities_stable(
     before_mmap: &Option<HashMap<String, ShardIdentity>>,
     at_mmap: &Option<HashMap<String, ShardIdentity>>,
@@ -566,6 +575,34 @@ fn shard_identities_stable(
         (Some(before), Some(at), Some(after)) => before == at && at == after,
         _ => false,
     }
+}
+
+/// Lenient boolean parse for the `MLX_PERSIST_PAGED_CACHE` override.
+/// `1/true/on/yes` → `Some(true)`, `0/false/off/no` → `Some(false)`
+/// (case-insensitive, surrounding whitespace ignored); anything else →
+/// `None` so the caller falls through to the config alias.
+fn parse_bool_env(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Resolve whether cold KV persistence is on, with precedence
+/// **env > config alias > off**. The `MLX_PERSIST_PAGED_CACHE` environment
+/// variable overrides the per-model config (`persist_paged_cache` /
+/// `persistPagedCache`) so a direct library caller — which has no config
+/// plumbing — can still enable or disable persistence, matching the Phase-A
+/// "per-model config + env override, off by default at library level"
+/// contract. An unset or unrecognized env value falls through to the config
+/// alias, then to off. `env_value` is passed in (rather than read here) so the
+/// precedence logic is unit-testable without mutating process-global env.
+fn resolve_persist_cold(env_value: Option<&str>, config_flag: Option<bool>) -> bool {
+    if let Some(from_env) = env_value.and_then(parse_bool_env) {
+        return from_env;
+    }
+    config_flag.unwrap_or(false)
 }
 
 /// Spawn a dedicated model thread, load all weights inside init_fn.
@@ -630,8 +667,11 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                     // bytes mapped under a NEW inode. Paired with the
                     // after-fingerprint snapshot below it brackets the ENTIRE
                     // load-to-fingerprint span. Only needed when persistence is
-                    // on.
-                    let persist_cold = config.persist_paged_cache.unwrap_or(false);
+                    // on. Precedence: MLX_PERSIST_PAGED_CACHE env override >
+                    // per-model config alias > off (Phase-A library contract).
+                    let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
+                    let persist_cold =
+                        resolve_persist_cold(persist_env.as_deref(), config.persist_paged_cache);
                     let shard_snapshot_before_mmap = if persist_cold {
                         snapshot_shard_identities(path)
                     } else {
@@ -1123,5 +1163,53 @@ mod cold_tier_shard_identity_tests {
             "an unreadable after-fingerprint snapshot must fail safe"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod persist_cold_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn env_override_wins_over_config() {
+        // Env true beats a config that says false, and env false beats a
+        // config that says true — the override is authoritative in both
+        // directions.
+        assert!(resolve_persist_cold(Some("1"), Some(false)));
+        assert!(!resolve_persist_cold(Some("0"), Some(true)));
+        assert!(resolve_persist_cold(Some("true"), None));
+        assert!(!resolve_persist_cold(Some("off"), Some(true)));
+    }
+
+    #[test]
+    fn env_parsing_is_lenient_and_case_insensitive() {
+        for on in ["1", "true", "TRUE", "on", "On", "yes", "  yes  "] {
+            assert_eq!(parse_bool_env(on), Some(true), "{on:?} must parse as true");
+        }
+        for off in ["0", "false", "FALSE", "off", "Off", "no", "  no  "] {
+            assert_eq!(
+                parse_bool_env(off),
+                Some(false),
+                "{off:?} must parse as false"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_or_unset_env_falls_through_to_config() {
+        // An unrecognized value is ignored (falls through), and no env leaves
+        // the config alias authoritative.
+        assert_eq!(parse_bool_env("maybe"), None);
+        assert!(resolve_persist_cold(Some("maybe"), Some(true)));
+        assert!(!resolve_persist_cold(Some("garbage"), Some(false)));
+        assert!(!resolve_persist_cold(Some("garbage"), None));
+        assert!(resolve_persist_cold(None, Some(true)));
+        assert!(!resolve_persist_cold(None, Some(false)));
+    }
+
+    #[test]
+    fn default_is_off_at_library_level() {
+        // No env, no config alias → persistence off by default.
+        assert!(!resolve_persist_cold(None, None));
     }
 }
