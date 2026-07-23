@@ -179,7 +179,10 @@ export default function Models() {
             catalog.loading ? (
               <Skeleton className="h-4 w-28" />
             ) : (
-              `${formatCount(catalogItems.filter((i) => i.installed).length)} installed`
+              // Count `present` (loadable on disk, incl. fingerprint-matched /
+              // CLI-installed), matching what each card labels "Installed" — not
+              // the dashboard-owned `installed` marker, which misses those.
+              `${formatCount(catalogItems.filter((i) => i.present).length)} installed`
             )
           }
         />
