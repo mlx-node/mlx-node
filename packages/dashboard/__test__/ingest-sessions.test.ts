@@ -20,7 +20,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import { openDashboardDb, type DashboardDb } from '../src/db/open.js';
 import { sessions, turns } from '../src/db/schema.js';
-import { ingestSessions, readSessionEntries, verifySessionFileId } from '../src/ingest/sessions.js';
+import {
+  ingestSessions,
+  isValidSessionTopology,
+  readSessionEntries,
+  verifySessionFileId,
+} from '../src/ingest/sessions.js';
 
 /** Write JSONL lines (objects) to a fresh `--w--` session dir; returns the file path. */
 function writeSessionFile(base: string, fileName: string, lines: object[]): string {
@@ -320,6 +325,55 @@ describe('ingestSessions', () => {
     const row = dash.db.select().from(sessions).where(eq(sessions.id, 'br-1')).all()[0];
     // Active branch is [u1, a2]; abandoned a1 is excluded from the count.
     expect(row.messageCount).toBe(2);
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
+
+  it('rejects a message entry whose payload is not an object (would throw downstream)', () => {
+    const header = { type: 'session', version: 3, id: 's1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' };
+    const good = { type: 'message', id: 'm1', parentId: null, message: { role: 'user', content: 'q' } };
+    expect(isValidSessionTopology([header, good] as never)).toBe(true);
+    // `message: null` (or a scalar) passes the entry-object check but throws on the
+    // downstream `msg.role` deref — reject it so ingest quarantines the file.
+    expect(isValidSessionTopology([header, { ...good, message: null }] as never)).toBe(false);
+    expect(isValidSessionTopology([header, { ...good, message: 42 }] as never)).toBe(false);
+  });
+
+  it('quarantines a session corrupted to a non-object message after it was indexed', async () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-nullmsg-'));
+    const root = join(soloBase, 'sessions');
+    const good = [
+      { type: 'session', version: 3, id: 'nm-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
+      { type: 'message', id: 'u1', parentId: null, message: { role: 'user', content: 'q' } },
+      {
+        type: 'message',
+        id: 'a1',
+        parentId: 'u1',
+        timestamp: '2026-07-01T10:00:02.000Z',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'a' }],
+          model: 'm',
+          usage: { input: 1, output: 2 },
+        },
+      },
+    ];
+    const file = writeSessionFile(soloBase, 'nm.jsonl', good);
+    await ingestSessions(dash, root);
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'nm-1')).all()).toHaveLength(1);
+    expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'nm-1')).all()).toHaveLength(1);
+
+    // Corrupt the assistant message's payload to `null`; a bytewise-different file
+    // re-ingests. The old code threw in deriveSession → generic outer catch → stale
+    // rows lingered. Now it is quarantined like any other unprojectable file.
+    const corrupt = good.map((l) => (l.id === 'a1' ? { ...l, message: null } : l));
+    writeFileSync(file, `${corrupt.map((l) => JSON.stringify(l)).join('\n')}\n`);
+    const result = await ingestSessions(dash, root);
+
+    expect(dash.db.select().from(sessions).where(eq(sessions.id, 'nm-1')).all()).toHaveLength(0);
+    expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'nm-1')).all()).toHaveLength(0);
+    expect(result.removed).toBeGreaterThanOrEqual(1);
+    expect(result.warnings.some((w) => w.includes('non-object message'))).toBe(true);
 
     rmSync(soloBase, { recursive: true, force: true });
   });

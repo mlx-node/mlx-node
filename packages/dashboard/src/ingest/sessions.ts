@@ -129,6 +129,17 @@ export function isValidSessionTopology(entries: FileEntry[]): boolean {
   // — which would throw the same way — are never reached.
   for (const entry of entries) {
     if (entry === null || typeof entry !== 'object') return false;
+    // A message entry whose `message` payload is itself a non-object (`null`, a
+    // scalar) passes the object check above but throws on the downstream
+    // `msg.role`/`msg.content` deref in `deriveSession`/`mapTranscriptEntry`. That
+    // TypeError escapes ingest's per-file quarantine (so a file corrupted after
+    // indexing keeps its stale session/turn rows) and 500s the detail handler.
+    // Reject it here so the caller routes the file into the same topology
+    // quarantine, and the projections that would throw are never reached.
+    if ((entry as { type?: unknown }).type === 'message') {
+      const message = (entry as { message?: unknown }).message;
+      if (message === null || typeof message !== 'object') return false;
+    }
   }
   const sessionEntries = entries.filter((e): e is SessionEntry => e.type !== 'session');
   const byId = new Map<string, SessionEntry>();
@@ -423,7 +434,7 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
       // Quarantine a topologically broken tree (cycle / duplicate ids) BEFORE any
       // branch projection: the walker would otherwise loop unbounded and OOM.
       if (!isValidSessionTopology(entries)) {
-        warnings.push(`${filePath}: invalid session tree (cycle or duplicate entry id); skipped`);
+        warnings.push(`${filePath}: invalid session tree (cycle, duplicate id, or non-object message); skipped`);
         if (quarantinePath(filePath)) removed++;
         continue;
       }

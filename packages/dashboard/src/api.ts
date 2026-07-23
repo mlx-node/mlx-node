@@ -588,7 +588,7 @@ async function handleSessionDetail({ res, params, deps }: RouteCtx): Promise<voi
     // Gate the projection on the same topology guard ingest uses, surfacing the
     // failure through `transcriptError` like every other detail error here.
     if (!isValidSessionTopology(entries)) {
-      transcriptError = 'Session tree is invalid (cycle or duplicate entry id); transcript unavailable';
+      transcriptError = 'Session tree is invalid (cycle, duplicate id, or non-object message); transcript unavailable';
     } else {
       const isMessage = (entry: TranscriptEntry | null): entry is TranscriptEntry => entry !== null;
       // Project the SAME active, message-bearing branch the index derives its turns
