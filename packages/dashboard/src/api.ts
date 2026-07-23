@@ -267,7 +267,9 @@ function handleHealth({ res, deps }: RouteCtx): void {
 
 function handleModels({ res, deps }: RouteCtx): void {
   const { models, warnings } = discoverLocalModels(deps.modelsDir);
-  sendJson(res, 200, { models, warnings });
+  // `dir` lets the UI show WHERE these checkpoints live — the directory is
+  // configurable (`--models-dir`), so the count alone is ambiguous.
+  sendJson(res, 200, { models, warnings, dir: deps.modelsDir });
 }
 
 function handleDeleteModel({ res, params, deps }: RouteCtx): void {

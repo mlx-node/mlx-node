@@ -3,6 +3,7 @@ import { StatTile } from '@/components/stat-tile';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import {
   Dialog,
   DialogClose,
@@ -27,7 +28,18 @@ import type {
   ModelsResponse,
 } from '@/lib/types';
 import { useJson } from '@/lib/use-api';
-import { AlertCircle, Check, Download, FileWarning, Inbox, Loader2, Package, Trash2, X } from 'lucide-react';
+import {
+  AlertCircle,
+  Check,
+  ChevronRight,
+  Download,
+  FileWarning,
+  Inbox,
+  Loader2,
+  Package,
+  Trash2,
+  X,
+} from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { toast } from 'sonner';
 
@@ -154,6 +166,7 @@ export default function Models() {
 
   const localModels = models.data?.models ?? [];
   const warnings = models.data?.warnings ?? [];
+  const modelsDir = models.data?.dir ?? '';
   const totalBytes = localModels.reduce((sum, m) => sum + m.sizeBytes, 0);
   const catalogItems = (catalog.data?.items ?? []).filter((item) => !item.hidden);
 
@@ -169,7 +182,22 @@ export default function Models() {
           label="Installed"
           icon={Package}
           value={models.loading ? <Skeleton className="h-8 w-12" /> : formatCount(localModels.length)}
-          sub={models.loading ? <Skeleton className="h-4 w-24" /> : `${formatBytes(totalBytes)} on disk`}
+          sub={
+            models.loading ? (
+              <Skeleton className="h-4 w-24" />
+            ) : (
+              <>
+                <span className="block">{formatBytes(totalBytes)} on disk</span>
+                {modelsDir !== '' && (
+                  // The models directory is configurable (`--models-dir`), so name
+                  // it — a bare count doesn't say where these checkpoints live.
+                  <span className="mt-0.5 block truncate font-mono text-[11px]" title={modelsDir}>
+                    {modelsDir}
+                  </span>
+                )}
+              </>
+            )
+          }
         />
         <StatTile
           label="Recommended"
@@ -195,14 +223,28 @@ export default function Models() {
         </CardHeader>
         <CardContent>
           {warnings.length > 0 && (
-            <div className="text-muted-foreground bg-muted/50 mb-4 flex items-start gap-2 rounded-md border p-3 text-xs">
-              <FileWarning className="mt-0.5 size-4 shrink-0" aria-hidden />
-              <ul className="space-y-0.5">
-                {warnings.map((warning) => (
-                  <li key={warning}>{warning}</li>
-                ))}
-              </ul>
-            </div>
+            // Skipped directories are routine noise (GGUF folders, source trees)
+            // and can run to dozens of lines, so keep the list folded behind a
+            // count and let anyone who cares expand it.
+            <Collapsible className="text-muted-foreground bg-muted/50 mb-4 rounded-md border">
+              <CollapsibleTrigger className="hover:bg-muted/70 group flex w-full items-center gap-2 rounded-md p-3 text-xs transition-colors data-[state=open]:rounded-b-none">
+                <FileWarning className="size-4 shrink-0" aria-hidden />
+                <span className="font-medium">
+                  {formatCount(warnings.length)} {warnings.length === 1 ? 'directory' : 'directories'} skipped
+                </span>
+                <ChevronRight
+                  className="ml-auto size-3.5 shrink-0 transition-transform group-data-[state=open]:rotate-90"
+                  aria-hidden
+                />
+              </CollapsibleTrigger>
+              <CollapsibleContent className="px-3 pb-3 text-xs">
+                <ul className="space-y-0.5 pl-6">
+                  {warnings.map((warning) => (
+                    <li key={warning}>{warning}</li>
+                  ))}
+                </ul>
+              </CollapsibleContent>
+            </Collapsible>
           )}
 
           {models.error ? (

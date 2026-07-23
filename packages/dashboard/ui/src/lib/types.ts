@@ -18,6 +18,8 @@ export interface LocalModel {
 export interface ModelsResponse {
   models: LocalModel[];
   warnings: string[];
+  /** Absolute path of the models directory these checkpoints were discovered in. */
+  dir: string;
 }
 
 export interface CatalogItem {

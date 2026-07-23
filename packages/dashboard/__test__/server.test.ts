@@ -107,9 +107,11 @@ describe('dashboard server — models & catalog', () => {
   it('lists local models', async () => {
     const res = await fetch(`${server.url}/api/models`);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { models: Array<{ name: string; modelType: string }> };
+    const body = (await res.json()) as { models: Array<{ name: string; modelType: string }>; dir: string };
     expect(body.models.map((m) => m.name)).toContain('model-a');
     expect(body.models.find((m) => m.name === 'model-a')?.modelType).toBe('qwen3');
+    // The directory is configurable, so the response names where it looked.
+    expect(body.dir).toBe(modelsDir);
   });
 
   it('serves the catalog with install state', async () => {
