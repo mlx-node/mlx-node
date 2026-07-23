@@ -348,6 +348,24 @@ fn main() {
             .define("CMAKE_CXX_COMPILER_RANLIB", &ranlib)
             .cflag(format!("-isysroot {sdk_path}"))
             .cxxflag(format!("-isysroot {sdk_path}"));
+
+        // `-Werror=switch` cannot be reached with `.cxxflag(...)`: the `cmake`
+        // crate composes `CMAKE_CXX_FLAGS` as our flags followed by the ones
+        // `cc` produces, and `cc` ends that list with `-w`, which clang honors
+        // over every `-W`/`-Werror=` flag no matter where it sits on the
+        // command line. The include below runs inside MLX's configure step,
+        // where it can rewrite the composed string instead of appending to it.
+        // Clang-only, hence macOS-only: `-Wno-everything` is not a GCC flag.
+        let switch_diagnostic = manifest_dir
+            .join("cmake")
+            .join("switch-exhaustiveness.cmake");
+        println!("cargo:rerun-if-changed={}", switch_diagnostic.display());
+        cfg.define(
+            "CMAKE_PROJECT_TOP_LEVEL_INCLUDES",
+            switch_diagnostic
+                .to_str()
+                .expect("switch-exhaustiveness.cmake path is not valid UTF-8"),
+        );
     } else if target_os == "linux" {
         // Linux/CUDA build. The MLX submodule's CMake auto-detects the GPU
         // architecture, but on a GPU-less / headless configure host the
