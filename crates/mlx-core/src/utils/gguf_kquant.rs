@@ -335,7 +335,10 @@ pub fn repack_kquant(
                 KQuantFormat::Q6K => {
                     // .biases[G] = ggml d, raw f16 bits — no float math, so
                     // exactness is free.
-                    biases.push(u16::from_le_bytes([blk[Q6K_D_OFFSET], blk[Q6K_D_OFFSET + 1]]));
+                    biases.push(u16::from_le_bytes([
+                        blk[Q6K_D_OFFSET],
+                        blk[Q6K_D_OFFSET + 1],
+                    ]));
                     // .scales[16G + j] = ggml sc[j], verbatim int8.
                     for j in 0..QK_K / 16 {
                         scales_i8.push(blk[Q6K_SCALES_OFFSET + j] as i8);

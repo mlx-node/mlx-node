@@ -273,6 +273,7 @@ fn quantized_matmul(
     finish(handle)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gather_qmm(
     x: &MxArray,
     w: &MxArray,
@@ -337,14 +338,7 @@ fn cpu_runs_dequantize_matmul_and_gather_for_every_kquant_mode() {
         expect_shape(
             &format!("dequantize {} cpu", kq.mode),
             &[N, K],
-            dequantize(
-                &w,
-                &scales,
-                Some(&biases),
-                kq.group_size,
-                kq.bits,
-                kq.mode,
-            ),
+            dequantize(&w, &scales, Some(&biases), kq.group_size, kq.bits, kq.mode),
         );
         for m in [1i64, 8] {
             let x = zeros(&[m, K], DType::BFloat16);
@@ -403,14 +397,7 @@ fn gpu_rejects_every_kquant_op() {
         let (w, scales, biases) = kquant_weights(kq);
         expect_rejected(
             &format!("dequantize {} gpu", kq.mode),
-            dequantize(
-                &w,
-                &scales,
-                Some(&biases),
-                kq.group_size,
-                kq.bits,
-                kq.mode,
-            ),
+            dequantize(&w, &scales, Some(&biases), kq.group_size, kq.bits, kq.mode),
         );
         for m in [1i64, 8] {
             let x = zeros(&[m, K], DType::BFloat16);

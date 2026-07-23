@@ -35,6 +35,11 @@
 //! asserts that every tolerated pair is zero on BOTH sides, so a real numeric
 //! divergence cannot hide inside the exemption. Q4_K and Q5_K have no such
 //! reassociation and are compared strictly bitwise.
+//!
+//! The sweep above is over FINITE super-scales. The one non-finite super-scale
+//! the fold also parts on, `d = inf`, is pinned separately by
+//! `q6k_non_finite_super_scale_diverges_from_ggml` and is unreachable from a
+//! real file.
 
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -364,7 +369,9 @@ fn profile_q45k_subscales(
         let (s, m) = match p {
             Profile::Zero => (0, 0),
             // SubscaleNeg has no signed counterpart here; reuse the extremes
-            Profile::SubscaleExtreme | Profile::SubscaleNeg => (EXTREMES[j % 8], EXTREMES[(j + 4) % 8]),
+            Profile::SubscaleExtreme | Profile::SubscaleNeg => {
+                (EXTREMES[j % 8], EXTREMES[(j + 4) % 8])
+            }
             // 8 pairs per block x 8 consecutive blocks = all 64 values, for both
             Profile::SubscaleSweep => (
                 ((block_seq * 8 + j) % 64) as u8,
@@ -406,7 +413,11 @@ fn gen_block(format: KQuantFormat, blk: &mut [u8], p: Profile, rng: &mut Lcg, bl
                 q6k_set_code(blk, v, code);
             }
             for (v, &code) in codes.iter().enumerate() {
-                assert_eq!(q6k_code(blk, v), code, "q6k writer/reader disagree at v={v}");
+                assert_eq!(
+                    q6k_code(blk, v),
+                    code,
+                    "q6k writer/reader disagree at v={v}"
+                );
             }
         }
         KQuantFormat::Q4K | KQuantFormat::Q5K => {
@@ -463,27 +474,72 @@ fn case_specs(format: KQuantFormat) -> Vec<CaseSpec> {
         COMMON_PROFILES
     };
     let mut out = vec![
-        CaseSpec { name: "typical_n1_k256", rows: 1, k: 256, rotation: &[Profile::Typical] },
-        CaseSpec { name: "typical_n8_k512", rows: 8, k: 512, rotation: &[Profile::Typical] },
-        CaseSpec { name: "typical_n128_k256", rows: 128, k: 256, rotation: &[Profile::Typical] },
-        CaseSpec { name: "random_n8_k1024", rows: 8, k: 1024, rotation: &[Profile::RandomAll] },
-        CaseSpec { name: "random_n128_k512", rows: 128, k: 512, rotation: &[Profile::RandomAll] },
-        CaseSpec { name: "zero_n8_k256", rows: 8, k: 256, rotation: &[Profile::Zero] },
-        CaseSpec { name: "denormal_d_n8_k512", rows: 8, k: 512, rotation: &[Profile::DenormalD] },
+        CaseSpec {
+            name: "typical_n1_k256",
+            rows: 1,
+            k: 256,
+            rotation: &[Profile::Typical],
+        },
+        CaseSpec {
+            name: "typical_n8_k512",
+            rows: 8,
+            k: 512,
+            rotation: &[Profile::Typical],
+        },
+        CaseSpec {
+            name: "typical_n128_k256",
+            rows: 128,
+            k: 256,
+            rotation: &[Profile::Typical],
+        },
+        CaseSpec {
+            name: "random_n8_k1024",
+            rows: 8,
+            k: 1024,
+            rotation: &[Profile::RandomAll],
+        },
+        CaseSpec {
+            name: "random_n128_k512",
+            rows: 128,
+            k: 512,
+            rotation: &[Profile::RandomAll],
+        },
+        CaseSpec {
+            name: "zero_n8_k256",
+            rows: 8,
+            k: 256,
+            rotation: &[Profile::Zero],
+        },
+        CaseSpec {
+            name: "denormal_d_n8_k512",
+            rows: 8,
+            k: 512,
+            rotation: &[Profile::DenormalD],
+        },
         CaseSpec {
             name: "tiny_and_max_d_n8_k512",
             rows: 8,
             k: 512,
             rotation: &[Profile::TinyD, Profile::MaxD],
         },
-        CaseSpec { name: "negative_d_n8_k256", rows: 8, k: 256, rotation: &[Profile::NegD] },
+        CaseSpec {
+            name: "negative_d_n8_k256",
+            rows: 8,
+            k: 256,
+            rotation: &[Profile::NegD],
+        },
         CaseSpec {
             name: "code_saturation_n8_k512",
             rows: 8,
             k: 512,
             rotation: &[Profile::CodeMin, Profile::CodeMax],
         },
-        CaseSpec { name: "code_sweep_n8_k256", rows: 8, k: 256, rotation: &[Profile::CodeSweep] },
+        CaseSpec {
+            name: "code_sweep_n8_k256",
+            rows: 8,
+            k: 256,
+            rotation: &[Profile::CodeSweep],
+        },
         // 16 super-blocks per row walks every sub-scale value exactly once
         CaseSpec {
             name: "subscale_sweep_n2_k4096",
@@ -497,12 +553,32 @@ fn case_specs(format: KQuantFormat) -> Vec<CaseSpec> {
             k: 256,
             rotation: &[Profile::SubscaleExtreme],
         },
-        CaseSpec { name: "alternating_n8_k256", rows: 8, k: 256, rotation: &[Profile::Alternating] },
+        CaseSpec {
+            name: "alternating_n8_k256",
+            rows: 8,
+            k: 256,
+            rotation: &[Profile::Alternating],
+        },
         // Every profile inside one row: exercises the G = g>>4 / g>>3
         // super-block indexing and the per-row bit cursor across 4 super-blocks.
-        CaseSpec { name: "edge_rotation_n1_k1024", rows: 1, k: 1024, rotation: all },
-        CaseSpec { name: "edge_rotation_n8_k1024", rows: 8, k: 1024, rotation: all },
-        CaseSpec { name: "edge_rotation_n128_k1024", rows: 128, k: 1024, rotation: all },
+        CaseSpec {
+            name: "edge_rotation_n1_k1024",
+            rows: 1,
+            k: 1024,
+            rotation: all,
+        },
+        CaseSpec {
+            name: "edge_rotation_n8_k1024",
+            rows: 8,
+            k: 1024,
+            rotation: all,
+        },
+        CaseSpec {
+            name: "edge_rotation_n128_k1024",
+            rows: 128,
+            k: 1024,
+            rotation: all,
+        },
     ];
     if format == KQuantFormat::Q6K {
         out.push(CaseSpec {
@@ -562,21 +638,17 @@ fn read_f32_exact(handle: *mut mlx_sys::mlx_array, len: usize) -> Vec<f32> {
 /// Drive MLX's own K-quant decode over the repacked arrays.
 fn mlx_decode(format: KQuantFormat, arrays: &KQuantArrays, rows: usize, k: usize) -> Vec<f32> {
     let rows_i = rows as i64;
-    let weight = MxArray::from_uint32(
-        &arrays.weight,
-        &[rows_i, format.weight_cols(k) as i64],
-    )
-    .expect("weight array");
+    let weight = MxArray::from_uint32(&arrays.weight, &[rows_i, format.weight_cols(k) as i64])
+        .expect("weight array");
     let scales = match &arrays.scales {
         KQuantScales::Signed(v) => MxArray::from_int8(v, &[rows_i, format.scales_cols(k) as i64]),
-        KQuantScales::Unsigned(v) => MxArray::from_uint8(v, &[rows_i, format.scales_cols(k) as i64]),
+        KQuantScales::Unsigned(v) => {
+            MxArray::from_uint8(v, &[rows_i, format.scales_cols(k) as i64])
+        }
     }
     .expect("scales array");
-    let biases = MxArray::from_float16(
-        &arrays.biases,
-        &[rows_i, format.biases_cols(k) as i64],
-    )
-    .expect("biases array");
+    let biases = MxArray::from_float16(&arrays.biases, &[rows_i, format.biases_cols(k) as i64])
+        .expect("biases array");
 
     let mode = CString::new(format.mlx_mode()).expect("mode");
     // SAFETY: the three handles outlive the call; out_dtype 0 is float32.
@@ -598,7 +670,12 @@ fn mlx_decode(format: KQuantFormat, arrays: &KQuantArrays, rows: usize, k: usize
     );
     // SAFETY: non-null handle from mlx_dequantize.
     let len = unsafe { mlx_sys::mlx_array_size(handle) };
-    assert_eq!(len, rows * k, "{} decode produced {len} values", format.mlx_mode());
+    assert_eq!(
+        len,
+        rows * k,
+        "{} decode produced {len} values",
+        format.mlx_mode()
+    );
     let out = read_f32_exact(handle, len);
     // SAFETY: the handle is owned here and not referenced afterwards.
     unsafe { mlx_sys::mlx_array_delete(handle) };
@@ -693,9 +770,8 @@ fn run_format(format: KQuantFormat) -> FormatRun {
     let bits = format.bits();
     let block_bytes = format.block_bytes();
     // One fixed seed per format. No time(), no rand().
-    let mut rng = Lcg::new(
-        0x5EED_0000u64.wrapping_add((bits as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
-    );
+    let mut rng =
+        Lcg::new(0x5EED_0000u64.wrapping_add((bits as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)));
     let mut cov = Coverage::default();
     let mut samples = Vec::new();
     let mut hard = 0u64;
@@ -713,7 +789,13 @@ fn run_format(format: KQuantFormat) -> FormatRun {
             let p = spec.rotation[b % spec.rotation.len()];
             let start = b * block_bytes;
             let bytes = buf.bytes_mut();
-            gen_block(format, &mut bytes[start..start + block_bytes], p, &mut rng, b);
+            gen_block(
+                format,
+                &mut bytes[start..start + block_bytes],
+                p,
+                &mut rng,
+                b,
+            );
         }
 
         // 2. ggml reference decode
@@ -728,8 +810,7 @@ fn run_format(format: KQuantFormat) -> FormatRun {
         }
 
         // 3. repack through the production repacker
-        let arrays =
-            repack_kquant(format, buf.bytes(), spec.rows, spec.k).expect("repack");
+        let arrays = repack_kquant(format, buf.bytes(), spec.rows, spec.k).expect("repack");
         assert_eq!(
             arrays.weight.len(),
             spec.rows * format.weight_cols(spec.k),
@@ -759,7 +840,13 @@ fn run_format(format: KQuantFormat) -> FormatRun {
                 match format {
                     KQuantFormat::Q6K => {
                         let want_d = u16::from_le_bytes([blk[208], blk[209]]);
-                        assert_eq!(b[sb], want_d, "{} {}: .biases lost d", format.mlx_mode(), spec.name);
+                        assert_eq!(
+                            b[sb],
+                            want_d,
+                            "{} {}: .biases lost d",
+                            format.mlx_mode(),
+                            spec.name
+                        );
                         note_super_scale(&mut cov, want_d);
                         let KQuantScales::Signed(all) = &arrays.scales else {
                             panic!("q6k must produce signed scales");
@@ -872,12 +959,24 @@ fn run_format(format: KQuantFormat) -> FormatRun {
                 }
                 hard += 1;
                 if samples.len() < 16 {
-                    samples.push(Mismatch { case: spec.name, row, v, code, want, got: mine });
+                    samples.push(Mismatch {
+                        case: spec.name,
+                        row,
+                        v,
+                        code,
+                        want,
+                        got: mine,
+                    });
                 }
             }
         }
     }
-    FormatRun { coverage: cov, samples, hard, signed_zero_only }
+    FormatRun {
+        coverage: cov,
+        samples,
+        hard,
+        signed_zero_only,
+    }
 }
 
 fn note_super_scale(cov: &mut Coverage, d: u16) {
@@ -937,7 +1036,10 @@ fn assert_coverage(format: KQuantFormat, cov: &Coverage) {
                 );
             }
             assert!(cov.branch_lo > 0, "get_scale_min_k4 j<4 branch never taken");
-            assert!(cov.branch_hi > 0, "get_scale_min_k4 j>=4 branch never taken");
+            assert!(
+                cov.branch_hi > 0,
+                "get_scale_min_k4 j>=4 branch never taken"
+            );
             assert!(
                 cov.branch_hi_spliced > 0,
                 "get_scale_min_k4 j>=4 branch never produced a value needing the \
@@ -1084,14 +1186,28 @@ fn q6k_interleave_positions_and_half_block_boundary() {
             blk[192 + j] = (j as i8 + 1) as u8;
         }
         // one distinct code per interleave position, then the half boundary
-        for (v, code) in [(0usize, 63u32), (32, 1), (64, 62), (96, 2), (127, 33), (128, 31)] {
+        for (v, code) in [
+            (0usize, 63u32),
+            (32, 1),
+            (64, 62),
+            (96, 2),
+            (127, 33),
+            (128, 31),
+        ] {
             q6k_set_code(blk, v, code);
         }
     }
     let reference = ggml_decode_row(format, buf.bytes(), QK_K);
     // The generator must actually have put six distinguishable values in place;
     // otherwise "MLX agrees" would be vacuous.
-    for (v, code) in [(0usize, 63u32), (32, 1), (64, 62), (96, 2), (127, 33), (128, 31)] {
+    for (v, code) in [
+        (0usize, 63u32),
+        (32, 1),
+        (64, 62),
+        (96, 2),
+        (127, 33),
+        (128, 31),
+    ] {
         // sub-scale j owns [16j, 16j+16) and was written as j + 1
         let sub_scale = (v / 16) as f32 + 1.0;
         let want = sub_scale * (code as f32 - 32.0);
@@ -1113,6 +1229,111 @@ fn q6k_interleave_positions_and_half_block_boundary() {
             "v={v}: ggml {} != mlx {}",
             reference[v],
             got[v]
+        );
+    }
+}
+
+/// A DIVERGENCE, not an equivalence: Q6_K with a non-finite super-scale.
+///
+/// The folded bias is `-32 * scale`, so at `d = inf` every value in the
+/// super-block is `inf * code + -inf` and reads NaN. ggml computes
+/// `(d * sub_scale) * (code - 32)` and keeps a signed infinity for every code
+/// but 32, where its own `inf * 0` is NaN too.
+///
+/// No GGUF can carry this: the quantizer derives `d` from finite weights. It is
+/// pinned so it stays a known divergence rather than being rediscovered as a
+/// mystery. A NaN `d` is asserted equal on both sides, which together with the
+/// exhaustive finite sweep covers every `d` a binary16 can hold.
+///
+/// If this test fails the fold changed, and the note in
+/// `crates/mlx-sys/mlx/mlx/backend/cpu/quantized.cpp` must change with it.
+#[test]
+fn q6k_non_finite_super_scale_diverges_from_ggml() {
+    pin_cpu_stream();
+    let format = KQuantFormat::Q6K;
+
+    // d = +inf, every sub-scale non-zero and both signs represented, codes
+    // sweeping 0..64 so 32 (ggml's own NaN) and both rails are in every run.
+    let mut buf = BlockBuf::zeroed(format.block_bytes());
+    {
+        let blk = buf.bytes_mut();
+        blk[208..210].copy_from_slice(&0x7c00u16.to_le_bytes());
+        for j in 0..16 {
+            let mag = j as i8 + 1;
+            let sc = if j % 2 == 0 { mag } else { -mag };
+            blk[192 + j] = sc as u8;
+        }
+        for v in 0..QK_K {
+            q6k_set_code(blk, v, (v % 64) as u32);
+        }
+    }
+    let reference = ggml_decode_row(format, buf.bytes(), QK_K);
+    let arrays = repack_kquant(format, buf.bytes(), 1, QK_K).expect("repack");
+    let got = mlx_decode(format, &arrays, 1, QK_K);
+
+    let mut ref_pos_inf = 0u32;
+    let mut ref_neg_inf = 0u32;
+    for v in 0..QK_K {
+        let code = (v % 64) as i32;
+        let sub_scale = v / 16 + 1;
+        let sub_sign = if (v / 16) % 2 == 0 { 1i32 } else { -1 };
+        assert_eq!(
+            q6k_code(buf.bytes(), v),
+            code as u32,
+            "generator failed to place code {code} at v={v}"
+        );
+        assert!(
+            got[v].is_nan(),
+            "v={v} code={code} sub_scale={}: the folded bias no longer collapses \
+             an infinite d to NaN, mlx gave {}",
+            sub_sign * sub_scale as i32,
+            got[v]
+        );
+        if code == 32 {
+            assert!(reference[v].is_nan(), "v={v}: ggml inf * 0 is not NaN");
+            continue;
+        }
+        let want_positive = sub_sign * (code - 32) > 0;
+        assert!(
+            reference[v].is_infinite() && reference[v].is_sign_positive() == want_positive,
+            "v={v} code={code}: ggml gave {} where an infinity of sign {} was \
+             expected — the reference decoder changed",
+            reference[v],
+            if want_positive { '+' } else { '-' }
+        );
+        if want_positive {
+            ref_pos_inf += 1;
+        } else {
+            ref_neg_inf += 1;
+        }
+    }
+    assert!(
+        ref_pos_inf > 0 && ref_neg_inf > 0,
+        "the case never produced both infinity signs: +{ref_pos_inf} -{ref_neg_inf}"
+    );
+    println!("q6k d=+inf: mlx NaN everywhere, ggml +inf x{ref_pos_inf} -inf x{ref_neg_inf}");
+
+    // A NaN d is the other non-finite super-scale, and there the two agree.
+    let mut nan_buf = BlockBuf::zeroed(format.block_bytes());
+    {
+        let blk = nan_buf.bytes_mut();
+        blk[208..210].copy_from_slice(&0x7e00u16.to_le_bytes());
+        for j in 0..16 {
+            blk[192 + j] = (j as i8 + 1) as u8;
+        }
+        for v in 0..QK_K {
+            q6k_set_code(blk, v, (v % 64) as u32);
+        }
+    }
+    let nan_reference = ggml_decode_row(format, nan_buf.bytes(), QK_K);
+    let nan_arrays = repack_kquant(format, nan_buf.bytes(), 1, QK_K).expect("repack");
+    let nan_got = mlx_decode(format, &nan_arrays, 1, QK_K);
+    for v in 0..QK_K {
+        assert!(
+            nan_reference[v].is_nan() && nan_got[v].is_nan(),
+            "v={v}: a NaN d must give NaN on both sides, got ggml {} mlx {}",
+            nan_reference[v],
+            nan_got[v]
         );
     }
 }
@@ -1159,7 +1380,10 @@ fn q45k_scale_min_k4_branches_and_word_straddling_code() {
                 format
             );
             if j >= 4 {
-                assert!(ls[j] > 0x0f || lm[j] > 0x0f, "j={j} does not exercise the splice");
+                assert!(
+                    ls[j] > 0x0f || lm[j] > 0x0f,
+                    "j={j} does not exercise the splice"
+                );
             }
         }
 
@@ -1177,7 +1401,11 @@ fn q45k_scale_min_k4_branches_and_word_straddling_code() {
         } else {
             for v in 0..QK_K {
                 let bit0 = v * 4;
-                assert_eq!(bit0 / 32, (bit0 + 3) / 32, "a 4-bit code straddled at v={v}");
+                assert_eq!(
+                    bit0 / 32,
+                    (bit0 + 3) / 32,
+                    "a 4-bit code straddled at v={v}"
+                );
             }
         }
 
@@ -1297,8 +1525,8 @@ fn upstream_span(name: &str, first: usize, last: usize) -> Vec<String> {
         return lines[first - 1..last].iter().map(|l| canon(l)).collect();
     }
     let anchor = vendor_dir().join("ggml_quants_upstream.inc");
-    let text = std::fs::read_to_string(&anchor)
-        .unwrap_or_else(|e| panic!("{}: {e}", anchor.display()));
+    let text =
+        std::fs::read_to_string(&anchor).unwrap_or_else(|e| panic!("{}: {e}", anchor.display()));
     let marker = format!("// @@ {name} ggml-quants.c:{first}-{last}");
     let mut out = Vec::new();
     let mut inside = false;
@@ -1345,7 +1573,10 @@ fn vendored_ggml_reference_is_verbatim() {
             .iter()
             .position(|l| *l == upstream[0])
             .unwrap_or_else(|| {
-                panic!("{} does not contain {name} (ggml-quants.c:{first})", mine_path.display())
+                panic!(
+                    "{} does not contain {name} (ggml-quants.c:{first})",
+                    mine_path.display()
+                )
             });
         let got = &mine[start..(start + upstream.len()).min(mine.len())];
         if got == upstream.as_slice() {
