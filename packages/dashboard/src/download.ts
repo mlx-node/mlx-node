@@ -323,7 +323,10 @@ export class DownloadManager {
   // coarse file-index progress. Retain it separately from `lastEvent` (which
   // `progress` overwrites) to replay on attach.
   private readonly startEvent = new Map<string, DownloadEvent>();
-  private draining = false;
+  // The in-flight drain loop, retained (not fire-and-forget) so `shutdown` can
+  // await every queued/running job's `finally` cleanup before the process exits;
+  // `null` whenever no loop is running.
+  private drainPromise: Promise<void> | null = null;
 
   private currentJob: JobState | null = null;
   private currentFile: FileContext | null = null;
@@ -422,6 +425,29 @@ export class DownloadManager {
     return true;
   }
 
+  /**
+   * Abort every in-flight and queued job, then wait for their staging dirs to be
+   * removed before returning. The server's `close()` awaits this on
+   * SIGINT/SIGTERM so the process can never `process.exit` while a `processJob`
+   * is mid-write — which would orphan a partial, potentially multi-GB `.staging`
+   * tree (its `finally` never runs) — and so a background job can never publish a
+   * model AFTER the server is considered closed. Reuses the per-job {@link cancel}
+   * (its AbortController + `cancelled` boundary) rather than duplicating abort
+   * logic: a queued job is dropped and settled `cancelled`, the in-flight job is
+   * aborted, and a job already in its non-cancellable `committing` window is left
+   * to finish its atomic swap and simply awaited to completion. Never throws.
+   */
+  async shutdown(): Promise<void> {
+    // Snapshot the queue first: `cancel` splices each settled id out of it.
+    for (const id of this.queue.slice()) this.cancel(id);
+    // Abort the in-flight job (if any); its `processJob` unwinds via the aborted
+    // fetch + boundary check and its `finally` removes the job-private staging dir.
+    if (this.currentJob !== null) this.cancel(this.currentJob.id);
+    // Await the retained drain loop so every unwinding `finally` (staging `rm`)
+    // has completed before we resolve; `null` when nothing is in flight.
+    await (this.drainPromise ?? Promise.resolve()).catch(() => {});
+  }
+
   jobs(): Array<{
     id: string;
     repo: string;
@@ -511,18 +537,27 @@ export class DownloadManager {
     };
   }
 
-  private async drain(): Promise<void> {
-    if (this.draining) return;
-    this.draining = true;
-    try {
-      while (this.queue.length > 0) {
-        const id = this.queue.shift()!;
-        const job = this.jobsById.get(id);
-        if (job !== undefined) await this.processJob(job);
+  /**
+   * Process queued jobs one at a time. The running loop is retained on
+   * `drainPromise` (not fire-and-forget) so {@link shutdown} can await every
+   * queued/running job's `finally` cleanup before the process exits; a `start`
+   * that arrives while a loop is already running joins that same promise instead
+   * of spawning a second, concurrent drain.
+   */
+  private drain(): Promise<void> {
+    if (this.drainPromise !== null) return this.drainPromise;
+    this.drainPromise = (async () => {
+      try {
+        while (this.queue.length > 0) {
+          const id = this.queue.shift()!;
+          const job = this.jobsById.get(id);
+          if (job !== undefined) await this.processJob(job);
+        }
+      } finally {
+        this.drainPromise = null;
       }
-    } finally {
-      this.draining = false;
-    }
+    })();
+    return this.drainPromise;
   }
 
   /**

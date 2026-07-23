@@ -329,6 +329,11 @@ export async function startDashboardServer(opts: DashboardServerOptions = {}): P
     port: boundPort,
     async close() {
       clearInterval(ingestTimer);
+      // Abort and drain in-flight downloads BEFORE anything else so a shutdown
+      // (SIGINT/SIGTERM → `process.exit`) can't kill the process mid-write and
+      // orphan a partial, potentially multi-GB `.staging` tree, nor let a
+      // background job publish a model after the server is considered closed.
+      await downloads.shutdown();
       for (const client of sseClients) {
         try {
           client.cleanup();

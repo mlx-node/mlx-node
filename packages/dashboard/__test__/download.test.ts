@@ -1709,6 +1709,73 @@ describe('DownloadManager', () => {
 
     rmSync(external, { recursive: true, force: true });
   });
+
+  // Regression: the server's `close()` must abort in-flight downloads and AWAIT
+  // their staging cleanup. Without it, a SIGINT during a multi-GB download lets
+  // the CLI `process.exit(0)` before `processJob`'s `finally` removes the
+  // job-private `.staging` tree — orphaning a partial, potentially multi-GB
+  // directory — and a background job could publish AFTER the server is "closed".
+  // `shutdown()` aborts the in-flight job and RESOLVES only once every staging dir
+  // is reclaimed (it must not hang).
+  it('shutdown aborts an in-flight job, cleans its staging dir, and resolves', async () => {
+    let blocked = false;
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeCancelFetch({ 'config.json': 12, 'model.safetensors': 300 }, 'model.safetensors', () => {
+        blocked = true;
+      }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+
+    // config.json caches; the weight fetch blocks (in flight) with a staging dir on disk.
+    await waitFor(() => blocked);
+    expect(jobStagingDirs().length).toBe(1);
+
+    // Resolves (does not hang) only once the aborted job's `finally` has run.
+    await manager.shutdown();
+
+    // Job settled cancelled, nothing published, and the staging tree is reclaimed
+    // synchronously by the time shutdown resolves (no post-await waitFor needed).
+    expect(manager.jobs().find((j) => j.id === id)!.state).toBe('cancelled');
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(jobStagingDirs()).toEqual([]);
+    expect(existsSync(finalDir())).toBe(false);
+  });
+
+  // Regression: `shutdown` must also DROP a still-queued job so it never starts,
+  // then resolve — the queued job is settled `cancelled` without ever fetching.
+  it('shutdown drops a still-queued job without ever fetching it', async () => {
+    let blocked = false;
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeCancelFetch({ 'config.json': 12, 'model.safetensors': 300 }, 'model.safetensors', () => {
+        blocked = true;
+      }),
+    });
+    // Job 1 occupies the single-threaded drain (its weight fetch blocks in flight).
+    const id1 = manager.start(REPO);
+    await waitFor(() => blocked);
+
+    // Job 2 queues behind it (drain is busy) and has not started.
+    const id2 = manager.start(REPO);
+    const events2: DownloadEvent[] = [];
+    manager.subscribe(id2, (event) => events2.push(event));
+
+    await manager.shutdown();
+
+    // The queued job was dropped + settled without ever running (no `start`); the
+    // in-flight job was aborted; both are terminal and shutdown resolved cleanly.
+    expect(manager.jobs().find((j) => j.id === id2)!.state).toBe('cancelled');
+    expect(events2.some((event) => event.type === 'start')).toBe(false);
+    expect(manager.jobs().find((j) => j.id === id1)!.state).toBe('cancelled');
+    expect(jobStagingDirs()).toEqual([]);
+    expect(existsSync(finalDir())).toBe(false);
+  });
 });
 
 describe('pidAlive (download.ts)', () => {
