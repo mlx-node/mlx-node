@@ -39,6 +39,7 @@ features = ["skip_collect_on_exit", "v3"]
 criterion = { workspace = true }
 
 [build-dependencies]
+cc = { workspace = true }
 napi-build = { workspace = true }
 
 [[bench]]
