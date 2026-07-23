@@ -301,6 +301,48 @@ function detectQuantLabel(config: Record<string, unknown>): string | null {
   return null;
 }
 
+/** A checkpoint's content identity for catalog matching: family label + quant triple. */
+export interface CheckpointFingerprint {
+  modelType: string;
+  quant: { bits: number; mode: string; group: number } | null;
+}
+
+/**
+ * Read `<modelDir>/config.json` into the identity the catalog matches on — the
+ * family label ({@link detectModelTypeLabel}) plus the quant block's
+ * bits/mode/group. `undefined` when the config is missing or unparseable;
+ * `quant: null` for a full-precision checkpoint. Lets the dashboard recognize a
+ * recommended model that lives under a non-canonical folder name.
+ */
+export function readCheckpointFingerprint(modelDir: string): CheckpointFingerprint | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(join(modelDir, 'config.json'), 'utf-8')) as unknown;
+  } catch {
+    return undefined;
+  }
+  const config = asObject(parsed);
+  if (config === undefined) return undefined;
+  return { modelType: detectModelTypeLabel(config), quant: parseQuantTriple(config) };
+}
+
+/** The `{bits, mode, group}` quant triple, or `null` for a full-precision config. */
+function parseQuantTriple(config: Record<string, unknown>): { bits: number; mode: string; group: number } | null {
+  const quant = asObject(config.quantization) ?? asObject(config.quantization_config);
+  if (quant === undefined) return null;
+  const bits = typeof quant.bits === 'number' && Number.isFinite(quant.bits) ? quant.bits : undefined;
+  const mode =
+    typeof quant.mode === 'string'
+      ? quant.mode
+      : typeof quant.quant_method === 'string'
+        ? quant.quant_method
+        : undefined;
+  const group =
+    typeof quant.group_size === 'number' && Number.isFinite(quant.group_size) ? quant.group_size : undefined;
+  if (bits === undefined || mode === undefined || group === undefined) return null;
+  return { bits, mode, group };
+}
+
 function positiveInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
 }

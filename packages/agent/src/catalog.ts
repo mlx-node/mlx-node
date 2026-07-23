@@ -7,8 +7,25 @@
  * use them verbatim.
  */
 
+/**
+ * Content identity of a published checkpoint — its `config.json` `model_type`
+ * plus quant block (`bits`/`mode`/`group_size`). The dashboard matches this
+ * against local checkpoints so a recommended model is recognized as installed
+ * even under a DIFFERENT folder name (e.g. an upload whose HF repo was renamed,
+ * or a re-quantized copy). Matching also requires the local folder name to start
+ * with the entry {@link CatalogEntry.label}, so two same-architecture, same-quant
+ * models (AgentWorld-35B-A3B vs Qwen3.6-35B-A3B — both `qwen3_5_moe` nvfp4) never
+ * cross-match on fingerprint alone.
+ */
+export interface ModelFingerprint {
+  /** Canonical `model_type` family label (`qwen3_5`, `qwen3_5_moe`, `gemma4`). */
+  modelType: string;
+  /** Quantization block: bit width, mode (`nvfp4`, `mxfp4`, `affine`), group size. */
+  quant: { bits: number; mode: string; group: number };
+}
+
 export interface CatalogEntry {
-  /** Wizard display name. */
+  /** Wizard display name. Also the base-model folder-name prefix used for matching. */
   label: string;
   /** HF slug for `mlx download model`. */
   hfRepo: string;
@@ -20,6 +37,12 @@ export interface CatalogEntry {
   isDefault?: boolean;
   /** Not offered by the wizard (repo not yet published). */
   hidden?: boolean;
+  /**
+   * Published checkpoint identity, for recognizing this model on disk under a
+   * non-canonical folder name. Absent for a hidden/unpublished entry whose
+   * `config.json` is unknown offline (such an entry matches by exact slug only).
+   */
+  fingerprint?: ModelFingerprint;
 }
 
 export const MODEL_CATALOG: readonly CatalogEntry[] = [
@@ -29,18 +52,21 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     sizeGb: 22.2,
     description: 'Best tool use — recommended default',
     isDefault: true,
+    fingerprint: { modelType: 'qwen3_5', quant: { bits: 4, mode: 'nvfp4', group: 16 } },
   },
   {
     label: 'Qwen-AgentWorld-35B',
     hfRepo: 'Brooooooklyn/Qwen-AgentWorld-35B-A3B-nvfp4-mlx',
     sizeGb: 22.7,
     description: 'Agent-tuned MoE, fast decode',
+    fingerprint: { modelType: 'qwen3_5_moe', quant: { bits: 4, mode: 'nvfp4', group: 16 } },
   },
   {
     label: 'Gemma-4-26B-A4B',
     hfRepo: 'Brooooooklyn/Gemma-4-26B-A4B-NVFP4-mlx',
     sizeGb: 18.8,
     description: 'MoE, fast decode',
+    fingerprint: { modelType: 'gemma4', quant: { bits: 4, mode: 'nvfp4', group: 16 } },
   },
   {
     // Produced + validated locally as mxfp4 (MLP) + mxfp8 (attention) via

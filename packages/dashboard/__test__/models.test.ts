@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
+import { catalogWithState } from '../src/catalog.js';
 import {
   DOWNLOAD_COMPLETE_MARKER,
   defaultModelsDir,
@@ -12,6 +13,7 @@ import {
   isDownloaderOwned,
   isModelInstalled,
   isModelPresent,
+  readCheckpointFingerprint,
 } from '../src/models.js';
 
 let modelsDir: string;
@@ -350,5 +352,67 @@ describe('defaultModelsDir', () => {
   it('honors MLX_MODELS_DIR when set', () => {
     process.env.MLX_MODELS_DIR = modelsDir;
     expect(defaultModelsDir()).toBe(modelsDir);
+  });
+});
+
+describe('readCheckpointFingerprint', () => {
+  it('reads model_type + quant triple from config.json', () => {
+    writeModel(
+      modelsDir,
+      'fp-nvfp4',
+      JSON.stringify({ model_type: 'qwen3_5', quantization: { bits: 4, mode: 'nvfp4', group_size: 16 } }),
+      2048,
+    );
+    expect(readCheckpointFingerprint(join(modelsDir, 'fp-nvfp4'))).toEqual({
+      modelType: 'qwen3_5',
+      quant: { bits: 4, mode: 'nvfp4', group: 16 },
+    });
+  });
+
+  it('returns quant null for a full-precision checkpoint', () => {
+    writeModel(modelsDir, 'fp-bf16', JSON.stringify({ model_type: 'gemma4' }), 2048);
+    expect(readCheckpointFingerprint(join(modelsDir, 'fp-bf16'))).toEqual({ modelType: 'gemma4', quant: null });
+  });
+
+  it('returns undefined when config.json is missing', () => {
+    mkdirSync(join(modelsDir, 'no-config'), { recursive: true });
+    expect(readCheckpointFingerprint(join(modelsDir, 'no-config'))).toBeUndefined();
+  });
+});
+
+describe('catalogWithState — recognizes a recommended model under a renamed folder', () => {
+  // The Qwen3.6-27B recommendation is nvfp4/4/16 qwen3_5; an upload can live under a
+  // non-canonical folder name (only the quant suffix differs from the HF repo).
+  const QWEN_27B_NVFP4 = JSON.stringify({
+    model_type: 'qwen3_5',
+    quantization: { bits: 4, mode: 'nvfp4', group_size: 16 },
+  });
+
+  it('marks present when a same-base, same-quant checkpoint exists under a different name', () => {
+    writeModel(modelsDir, 'qwen3.6-27b-unsloth-nvfp4-fp8-dgx-mlx-fresh', QWEN_27B_NVFP4, 2048);
+    const item = catalogWithState(modelsDir).find((e) => e.label === 'Qwen3.6-27B')!;
+    expect(item.present).toBe(true);
+  });
+
+  it('does NOT mark present for a same-base checkpoint of a different quant', () => {
+    // bf16 (no quant) of the same base is not the NVFP4 recommendation.
+    writeModel(modelsDir, 'qwen3.6-27b-mlx', JSON.stringify({ model_type: 'qwen3_5' }), 2048);
+    const item = catalogWithState(modelsDir).find((e) => e.label === 'Qwen3.6-27B')!;
+    expect(item.present).toBe(false);
+  });
+
+  it('does NOT cross-match two same-arch, same-quant models (AgentWorld vs Qwen3.6-35B-A3B)', () => {
+    // A Qwen3.6-35B-A3B nvfp4 checkpoint has the SAME fingerprint as the AgentWorld
+    // recommendation (qwen3_5_moe nvfp4/4/16) but is a DIFFERENT model — the label
+    // prefix guard must keep it from lighting up the AgentWorld card.
+    const MOE_NVFP4 = JSON.stringify({
+      model_type: 'qwen3_5_moe',
+      quantization: { bits: 4, mode: 'nvfp4', group_size: 16 },
+    });
+    writeModel(modelsDir, 'qwen3.6-35b-a3b-nvfp4-mlx', MOE_NVFP4, 2048);
+    expect(catalogWithState(modelsDir).find((e) => e.label === 'Qwen-AgentWorld-35B')!.present).toBe(false);
+    // The real AgentWorld folder (same fingerprint, matching prefix) DOES match.
+    writeModel(modelsDir, 'qwen-agentworld-35b-a3b-unsloth-nvfp4-mlx', MOE_NVFP4, 2048);
+    expect(catalogWithState(modelsDir).find((e) => e.label === 'Qwen-AgentWorld-35B')!.present).toBe(true);
   });
 });
