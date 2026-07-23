@@ -103,12 +103,19 @@ function splitHostPort(authority: string): { hostname: string; port: string } {
   return { hostname: authority.slice(0, colon), port: authority.slice(colon + 1) };
 }
 
-/** Whether an authority names an allowed host, optionally carrying the server port. */
+/**
+ * Whether an authority names an allowed host on the server's own port. An
+ * omitted port is `http`'s default 80, so it only matches when the server binds
+ * 80 — otherwise an `Origin: http://127.0.0.1` (a page on loopback port 80) would
+ * be treated as same-origin with a dashboard on 6590 and could drive-by a
+ * mutating POST. `new URL(...).host` already strips a redundant `:80`, so a
+ * port-80 bind still sees the omitted-port form here.
+ */
 function isAllowedAuthority(authority: string | undefined, port: number, allowedHosts: Set<string>): boolean {
   if (authority === undefined || authority === '') return false;
   const { hostname, port: hostPort } = splitHostPort(authority);
   if (!allowedHosts.has(hostname)) return false;
-  return hostPort === '' || hostPort === String(port);
+  return hostPort === String(port) || (hostPort === '' && port === 80);
 }
 
 type HostVerdict = 'allowed' | 'foreign' | 'malformed';

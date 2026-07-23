@@ -1241,6 +1241,22 @@ describe('dashboard server — local-origin guard', () => {
     expect(res.status).toBe(403);
   });
 
+  it('rejects a mutating Origin that omits the port (a port-80 loopback page is cross-origin)', async () => {
+    // Server binds an ephemeral (non-80) port, so `http://127.0.0.1` (port 80
+    // omitted) is a different origin and must not be treated as same-origin.
+    const res = await rawRequest(server.port, 'POST', '/api/ingest', {
+      Origin: 'http://127.0.0.1',
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('allows a mutating Origin that carries the matching server port', async () => {
+    const res = await rawRequest(server.port, 'POST', '/api/ingest', {
+      Origin: `http://127.0.0.1:${server.port}`,
+    });
+    expect(res.status).toBe(200);
+  });
+
   it('does not guard GET reads', async () => {
     const res = await rawRequest(server.port, 'GET', '/api/models', {
       Origin: 'https://evil.example',
