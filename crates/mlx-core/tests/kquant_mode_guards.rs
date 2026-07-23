@@ -7,8 +7,8 @@
 //!
 //! * `quantize` throws for every K-quant mode on every device — these formats
 //!   are consumed, never produced;
-//! * `dequantize` / `quantized_matmul` / `gather_qmm` work on the CPU and throw
-//!   on the GPU, because Metal and CUDA have no K-quant kernels yet;
+//! * `dequantize` / `quantized_matmul` / `gather_qmm` work on the CPU, and on
+//!   Metal they run and agree with the CPU reference;
 //! * the validators reject malformed K-quant tensors, so the throws above prove
 //!   something about the backends rather than about a missing argument check;
 //! * the pre-existing affine / mxfp4 modes still work through the widened
@@ -177,6 +177,28 @@ fn expect_shape(what: &str, want: &[i64], attempt: Attempt) {
     }
 }
 
+/// Evaluate an op result and read it back element by element as float32.
+///
+/// Element-wise rather than `mlx_array_to_float32`, which materialises through
+/// `add(arr, zeros)` — the same reason `kquant_ggml_parity.rs` reads this way.
+fn expect_f32(what: &str, handle: *mut mlx_sys::mlx_array) -> Vec<f32> {
+    assert!(!handle.is_null(), "{what} was rejected at construction");
+    if let Err(why) = eval(handle) {
+        drop_array(handle);
+        panic!("{what} was rejected: {why}");
+    }
+    // SAFETY: `handle` is a live, evaluated array.
+    let len = unsafe { mlx_sys::mlx_array_size(handle) };
+    let mut out = vec![0f32; len];
+    for (i, slot) in out.iter_mut().enumerate() {
+        // SAFETY: i < len == array size.
+        let ok = unsafe { mlx_sys::mlx_array_item_at_float32(handle, i, slot) };
+        assert!(ok, "{what}: mlx_array_item_at_float32 failed at index {i}");
+    }
+    drop_array(handle);
+    out
+}
+
 // ---------------------------------------------------------------------------
 // op wrappers
 // ---------------------------------------------------------------------------
@@ -192,6 +214,120 @@ fn kquant_weights(kq: &KQuant) -> (MxArray, MxArray, MxArray) {
         zeros(&[N, kq.scales_cols], scales_dtype),
         zeros(&[N, kq.biases_cols], DType::Float16),
     )
+}
+
+/// Deterministic pseudo-random fill. A plain LCG so both devices see the same
+/// bytes and a failure reproduces.
+fn lcg(state: &mut u32) -> u32 {
+    *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    *state
+}
+
+/// float16 bit patterns for the super-block scale `d` (and `dmin`): small
+/// powers of two plus two odd mantissas, so `d * sc` is not trivially exact.
+const HALF_SCALES: [u16; 6] = [0x3000, 0x2C00, 0x3400, 0x2E66, 0x3155, 0x2800];
+
+/// K-quant tensors with non-trivial codes and both scale levels populated.
+/// `leading` is everything before the packed dimension, so `&[N]` builds a
+/// matmul weight and `&[4, N]` an expert stack.
+///
+/// All three arrays hold a fixed number of entries per 256-value super-block,
+/// so the `KQUANTS` column counts — which are stated for `K` — scale linearly.
+fn filled_kquant_weights(kq: &KQuant, leading: &[i64], k: i64) -> (MxArray, MxArray, MxArray) {
+    assert_eq!(k % K, 0, "k must be a whole number of super-blocks");
+    let rows: i64 = leading.iter().product();
+    let supers = k / K;
+    let (weight_cols, scales_cols, biases_cols) = (
+        kq.weight_cols * supers,
+        kq.scales_cols * supers,
+        kq.biases_cols * supers,
+    );
+    let shape = |cols: i64| {
+        let mut s = leading.to_vec();
+        s.push(cols);
+        s
+    };
+
+    let mut st = 0x5eed_1234u32;
+    let weight: Vec<u32> = (0..rows * weight_cols).map(|_| lcg(&mut st)).collect();
+    let scales_len = (rows * scales_cols) as usize;
+    let scales = if kq.scales_signed {
+        // q6k sub-scales are signed.
+        let v: Vec<i8> = (0..scales_len)
+            .map(|_| (lcg(&mut st) % 17) as i8 - 8)
+            .collect();
+        MxArray::from_int8(&v, &shape(scales_cols))
+    } else {
+        // q4k/q5k interleave (sc, m), both 6-bit unsigned.
+        let v: Vec<u8> = (0..scales_len).map(|_| (lcg(&mut st) % 64) as u8).collect();
+        MxArray::from_uint8(&v, &shape(scales_cols))
+    }
+    .expect("scales array");
+    let biases: Vec<u16> = (0..(rows * biases_cols) as usize)
+        .map(|i| HALF_SCALES[i % HALF_SCALES.len()])
+        .collect();
+    (
+        MxArray::from_uint32(&weight, &shape(weight_cols)).expect("weight array"),
+        scales,
+        MxArray::from_float16(&biases, &shape(biases_cols)).expect("biases array"),
+    )
+}
+
+/// A deterministic float32 activation in [-1, 1).
+fn ramp(shape: &[i64], seed: u32) -> MxArray {
+    let n: i64 = shape.iter().product();
+    let mut st = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let v: Vec<f32> = (0..n)
+        .map(|_| (lcg(&mut st) >> 8) as f32 / 8_388_608.0 - 1.0)
+        .collect();
+    MxArray::from_float32(&v, shape).expect("activation array")
+}
+
+/// The same activation as `ramp`, stored as bfloat16 — the top 16 bits of the
+/// float32 pattern. Both devices then see identical bytes.
+fn ramp_bf16(shape: &[i64], seed: u32) -> MxArray {
+    let n: i64 = shape.iter().product();
+    let mut st = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let v: Vec<u16> = (0..n)
+        .map(|_| {
+            let f = (lcg(&mut st) >> 8) as f32 / 8_388_608.0 - 1.0;
+            (f.to_bits() >> 16) as u16
+        })
+        .collect();
+    MxArray::from_bfloat16(&v, shape).expect("activation array")
+}
+
+/// Build the same op on the CPU and on the GPU and compare the results.
+/// `tol` is relative to the largest CPU magnitude; 0 demands bit equality.
+fn compare_devices<F>(what: &str, tol: f32, build: F)
+where
+    F: Fn() -> *mut mlx_sys::mlx_array,
+{
+    assert!(select(Device::Cpu), "CPU device is always available");
+    let cpu = expect_f32(&format!("{what} cpu"), build());
+    assert!(select(Device::Gpu), "the GPU device went away mid-test");
+    let gpu = expect_f32(&format!("{what} gpu"), build());
+
+    assert_eq!(cpu.len(), gpu.len(), "{what}: output lengths differ");
+    let scale = cpu.iter().fold(1f32, |m, v| m.max(v.abs()));
+    let limit = tol * scale;
+    let mut worst = 0f32;
+    let mut worst_at = 0usize;
+    for (i, (a, b)) in cpu.iter().zip(gpu.iter()).enumerate() {
+        let d = (a - b).abs();
+        if d.is_nan() || d > worst {
+            worst = d;
+            worst_at = i;
+        }
+    }
+    assert!(
+        worst <= limit,
+        "{what}: Metal and the CPU differ by {worst} at index {worst_at} \
+         (cpu {}, gpu {}, limit {limit})",
+        cpu[worst_at],
+        gpu[worst_at],
+    );
+    println!("  matches  {what}  (max |cpu - gpu| {worst} <= {limit})");
 }
 
 fn quantize(x: &MxArray, group_size: i32, bits: i32, mode: &str) -> Attempt {
@@ -221,18 +357,18 @@ fn quantize(x: &MxArray, group_size: i32, bits: i32, mode: &str) -> Attempt {
     out
 }
 
-fn dequantize(
+fn dequantize_handle(
     w: &MxArray,
     scales: &MxArray,
     biases: Option<&MxArray>,
     group_size: i32,
     bits: i32,
     mode: &str,
-) -> Attempt {
+) -> *mut mlx_sys::mlx_array {
     let mode = CString::new(mode).expect("mode");
     // SAFETY: every handle outlives the call; a null `biases` is the documented
     // "no biases" encoding.
-    let handle = unsafe {
+    unsafe {
         mlx_sys::mlx_dequantize(
             w.as_raw_ptr(),
             scales.as_raw_ptr(),
@@ -242,8 +378,44 @@ fn dequantize(
             0,
             mode.as_ptr(),
         )
-    };
-    finish(handle)
+    }
+}
+
+fn dequantize(
+    w: &MxArray,
+    scales: &MxArray,
+    biases: Option<&MxArray>,
+    group_size: i32,
+    bits: i32,
+    mode: &str,
+) -> Attempt {
+    finish(dequantize_handle(w, scales, biases, group_size, bits, mode))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quantized_matmul_handle(
+    x: &MxArray,
+    w: &MxArray,
+    scales: &MxArray,
+    biases: Option<&MxArray>,
+    group_size: i32,
+    bits: i32,
+    mode: &str,
+) -> *mut mlx_sys::mlx_array {
+    let mode = CString::new(mode).expect("mode");
+    // SAFETY: every handle outlives the call.
+    unsafe {
+        mlx_sys::mlx_quantized_matmul(
+            x.as_raw_ptr(),
+            w.as_raw_ptr(),
+            scales.as_raw_ptr(),
+            biases.map_or(std::ptr::null_mut(), |b| b.as_raw_ptr()),
+            true,
+            group_size,
+            bits,
+            mode.as_ptr(),
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -256,21 +428,40 @@ fn quantized_matmul(
     bits: i32,
     mode: &str,
 ) -> Attempt {
+    finish(quantized_matmul_handle(
+        x, w, scales, biases, group_size, bits, mode,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gather_qmm_handle(
+    x: &MxArray,
+    w: &MxArray,
+    scales: &MxArray,
+    biases: Option<&MxArray>,
+    lhs: &MxArray,
+    rhs: &MxArray,
+    group_size: i32,
+    bits: i32,
+    mode: &str,
+) -> *mut mlx_sys::mlx_array {
     let mode = CString::new(mode).expect("mode");
     // SAFETY: every handle outlives the call.
-    let handle = unsafe {
-        mlx_sys::mlx_quantized_matmul(
+    unsafe {
+        mlx_sys::mlx_gather_qmm(
             x.as_raw_ptr(),
             w.as_raw_ptr(),
             scales.as_raw_ptr(),
             biases.map_or(std::ptr::null_mut(), |b| b.as_raw_ptr()),
+            lhs.as_raw_ptr(),
+            rhs.as_raw_ptr(),
             true,
             group_size,
             bits,
             mode.as_ptr(),
+            false,
         )
-    };
-    finish(handle)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -285,24 +476,9 @@ fn gather_qmm(
     bits: i32,
     mode: &str,
 ) -> Attempt {
-    let mode = CString::new(mode).expect("mode");
-    // SAFETY: every handle outlives the call.
-    let handle = unsafe {
-        mlx_sys::mlx_gather_qmm(
-            x.as_raw_ptr(),
-            w.as_raw_ptr(),
-            scales.as_raw_ptr(),
-            biases.map_or(std::ptr::null_mut(), |b| b.as_raw_ptr()),
-            lhs.as_raw_ptr(),
-            rhs.as_raw_ptr(),
-            true,
-            group_size,
-            bits,
-            mode.as_ptr(),
-            false,
-        )
-    };
-    finish(handle)
+    finish(gather_qmm_handle(
+        x, w, scales, biases, lhs, rhs, group_size, bits, mode,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -385,25 +561,32 @@ fn cpu_runs_dequantize_matmul_and_gather_for_every_kquant_mode() {
     }
 }
 
-/// Metal and CUDA have no K-quant kernels. They must say so out loud rather
-/// than fall through to some other mode's kernel and return wrong numbers.
+/// Metal decodes the two scale levels itself, so the K-quant ops must run
+/// there and land on the CPU reference. Zero-filled tensors would only prove a
+/// pipeline was found, so the weights, sub-scales and super-scales below are
+/// all non-trivial and the outputs are compared value by value.
+///
+/// The shapes pick six kernels: `qmv` (M = 1), `qmv_fast` (M = 1, K % 512 == 0),
+/// `qmv_wide` (M = 8 on gen 15+), `qmm_t_splitk` (M = 64), `qmm_t` (batched)
+/// and `gather_qmv`, plus `dequantize`.
 #[test]
-fn gpu_rejects_every_kquant_op() {
+fn gpu_runs_every_kquant_op_and_matches_cpu() {
     if !select(Device::Gpu) {
-        eprintln!("skipping gpu_rejects_every_kquant_op: no GPU device");
+        eprintln!("skipping gpu_runs_every_kquant_op_and_matches_cpu: no GPU device");
         return;
     }
     for kq in &KQUANTS {
-        let (w, scales, biases) = kquant_weights(kq);
-        expect_rejected(
-            &format!("dequantize {} gpu", kq.mode),
-            dequantize(&w, &scales, Some(&biases), kq.group_size, kq.bits, kq.mode),
-        );
-        for m in [1i64, 8] {
-            let x = zeros(&[m, K], DType::BFloat16);
-            expect_rejected(
-                &format!("quantized_matmul M={m} {} gpu", kq.mode),
-                quantized_matmul(
+        let (w, scales, biases) = filled_kquant_weights(kq, &[N], K);
+        // dequantize is a pure per-element decode: no accumulation can reorder,
+        // so Metal has to reproduce the CPU bits exactly.
+        compare_devices(&format!("dequantize {}", kq.mode), 0.0, || {
+            dequantize_handle(&w, &scales, Some(&biases), kq.group_size, kq.bits, kq.mode)
+        });
+
+        for m in [1i64, 8, 64] {
+            let x = ramp(&[m, K], 7 + m as u32);
+            compare_devices(&format!("quantized_matmul M={m} {}", kq.mode), 1e-5, || {
+                quantized_matmul_handle(
                     &x,
                     &w,
                     &scales,
@@ -411,23 +594,38 @@ fn gpu_rejects_every_kquant_op() {
                     kq.group_size,
                     kq.bits,
                     kq.mode,
-                ),
-            );
+                )
+            });
         }
-        let scales_dtype = if kq.scales_signed {
-            DType::Int8
-        } else {
-            DType::Uint8
-        };
-        let we = zeros(&[4, N, kq.weight_cols], DType::Uint32);
-        let se = zeros(&[4, N, kq.scales_cols], scales_dtype);
-        let be = zeros(&[4, N, kq.biases_cols], DType::Float16);
-        let x = zeros(&[2, 8, K], DType::BFloat16);
-        let lhs = zeros(&[2], DType::Uint32);
-        let rhs = zeros(&[2], DType::Uint32);
-        expect_rejected(
-            &format!("gather_qmm {} gpu", kq.mode),
-            gather_qmm(
+
+        // N % 8 == 0 and K % 512 == 0 pick qmv_fast, the kernel a real decode
+        // step runs; the K = 256 case above picks the tail-handling qmv.
+        let (wf, sf, bf) = filled_kquant_weights(kq, &[N], 2 * K);
+        let xf = ramp(&[1, 2 * K], 23);
+        compare_devices(
+            &format!("quantized_matmul qmv_fast {}", kq.mode),
+            1e-5,
+            || quantized_matmul_handle(&xf, &wf, &sf, Some(&bf), kq.group_size, kq.bits, kq.mode),
+        );
+
+        // Batched (B > 1) skips qmm_splitk and lands on qmm, which is where the
+        // NAX gate lives. bfloat16 and K % 64 == 0 satisfy the rest of that
+        // gate, so without the mode allowlist this asks for a
+        // `<mode>_qmm_t_nax_...` kernel that kquant.metal never instantiates.
+        let (wb, sb, bb) = filled_kquant_weights(kq, &[3, N], K);
+        let xb = ramp_bf16(&[3, 64, K], 3);
+        compare_devices(
+            &format!("batched quantized_matmul bf16 {}", kq.mode),
+            0.02,
+            || quantized_matmul_handle(&xb, &wb, &sb, Some(&bb), kq.group_size, kq.bits, kq.mode),
+        );
+
+        let (we, se, be) = filled_kquant_weights(kq, &[4, N], K);
+        let x = ramp(&[2, 8, K], 11);
+        let lhs = MxArray::from_uint32(&[0, 1], &[2]).expect("lhs indices");
+        let rhs = MxArray::from_uint32(&[3, 1], &[2]).expect("rhs indices");
+        compare_devices(&format!("gather_qmm {}", kq.mode), 1e-5, || {
+            gather_qmm_handle(
                 &x,
                 &we,
                 &se,
@@ -437,8 +635,8 @@ fn gpu_rejects_every_kquant_op() {
                 kq.group_size,
                 kq.bits,
                 kq.mode,
-            ),
-        );
+            )
+        });
     }
     // leave the process on the CPU for whatever runs next
     select(Device::Cpu);
