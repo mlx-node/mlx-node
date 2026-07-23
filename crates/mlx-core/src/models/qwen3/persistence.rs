@@ -601,19 +601,25 @@ fn parse_bool_env(value: &str) -> Option<bool> {
 }
 
 /// Resolve whether cold KV persistence is on, with precedence
-/// **env > config alias > off**. The `MLX_PERSIST_PAGED_CACHE` environment
-/// variable overrides the per-model config (`persist_paged_cache` /
-/// `persistPagedCache`) so a direct library caller — which has no config
-/// plumbing — can still enable or disable persistence, matching the Phase-A
-/// "per-model config + env override, off by default at library level"
-/// contract. An unset or unrecognized env value falls through to the config
-/// alias, then to off. `env_value` is passed in (rather than read here) so the
-/// precedence logic is unit-testable without mutating process-global env.
+/// **explicit config > env > off**. An *explicit* per-model config decision
+/// (`persist_paged_cache` / `persistPagedCache` present as a bool, i.e.
+/// `Some`) is authoritative and wins over the environment — this is how an
+/// explicit CLI decision reaches the loader: `mlx agent --no-persist-cache`
+/// writes `persist_paged_cache: false` into the model's config overlay, and
+/// that per-invocation intent must beat an ambient `MLX_PERSIST_PAGED_CACHE`
+/// default. The `MLX_PERSIST_PAGED_CACHE` environment variable only supplies a
+/// default when the config is unset (`None`), so a direct library caller —
+/// which has no config plumbing — can still enable or disable persistence,
+/// matching the Phase-A "per-model config + env override, off by default at
+/// library level" contract. With neither an explicit config nor a recognized
+/// env value, persistence is off. `env_value` is passed in (rather than read
+/// here) so the precedence logic is unit-testable without mutating
+/// process-global env.
 fn resolve_persist_cold(env_value: Option<&str>, config_flag: Option<bool>) -> bool {
-    if let Some(from_env) = env_value.and_then(parse_bool_env) {
-        return from_env;
+    if let Some(explicit) = config_flag {
+        return explicit;
     }
-    config_flag.unwrap_or(false)
+    env_value.and_then(parse_bool_env).unwrap_or(false)
 }
 
 /// Spawn a dedicated model thread, load all weights inside init_fn.
@@ -678,8 +684,10 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                     // bytes mapped under a NEW inode. Paired with the
                     // after-fingerprint snapshot below it brackets the ENTIRE
                     // load-to-fingerprint span. Only needed when persistence is
-                    // on. Precedence: MLX_PERSIST_PAGED_CACHE env override >
-                    // per-model config alias > off (Phase-A library contract).
+                    // on. Precedence: explicit per-model config decision >
+                    // MLX_PERSIST_PAGED_CACHE env default > off (Phase-A library
+                    // contract; an explicit CLI `--no-persist-cache` writes the
+                    // config `false` and must beat an ambient env override).
                     let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
                     let persist_cold =
                         resolve_persist_cold(persist_env.as_deref(), config.persist_paged_cache);
@@ -1182,14 +1190,28 @@ mod persist_cold_resolution_tests {
     use super::*;
 
     #[test]
-    fn env_override_wins_over_config() {
-        // Env true beats a config that says false, and env false beats a
-        // config that says true — the override is authoritative in both
-        // directions.
-        assert!(resolve_persist_cold(Some("1"), Some(false)));
-        assert!(!resolve_persist_cold(Some("0"), Some(true)));
+    fn explicit_config_wins_over_env() {
+        // An explicit per-model config decision is authoritative in both
+        // directions and beats the env: a per-invocation CLI
+        // `--no-persist-cache` (config `false`) stays disabled even under an
+        // ambient `MLX_PERSIST_PAGED_CACHE=1`, and a config `true` stays
+        // enabled even under env `0`.
+        assert!(
+            !resolve_persist_cold(Some("1"), Some(false)),
+            "explicit config disable must win over env=1"
+        );
+        assert!(
+            resolve_persist_cold(Some("0"), Some(true)),
+            "explicit config enable must win over env=0"
+        );
+        assert!(resolve_persist_cold(Some("off"), Some(true)));
+        // The env only supplies the default when the config is unset.
+        assert!(
+            resolve_persist_cold(Some("1"), None),
+            "env fills the default when config is unset"
+        );
         assert!(resolve_persist_cold(Some("true"), None));
-        assert!(!resolve_persist_cold(Some("off"), Some(true)));
+        assert!(!resolve_persist_cold(Some("0"), None));
     }
 
     #[test]

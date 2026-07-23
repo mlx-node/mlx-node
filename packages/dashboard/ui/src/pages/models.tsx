@@ -83,6 +83,20 @@ export default function Models() {
 
   const onDownloadDone = (repo: string): void => {
     toast.success('Download complete', { description: repo });
+    const id = active[repo];
+    setActive((prev) => {
+      const next = { ...prev };
+      delete next[repo];
+      return next;
+    });
+    // The job has settled terminally on the server; drop it from `active` and
+    // dismiss it via DELETE (mirroring onDownloadError/cancel). Otherwise the
+    // completed job id lingers, and a later delete of this model would remount
+    // DownloadProgress on that stale job — replaying `done` → a spurious "complete"
+    // toast + a Complete/Cancel card instead of an Install button.
+    if (id !== undefined) {
+      void mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(id)}`).catch(() => {});
+    }
     models.reload();
     catalog.reload();
   };
@@ -321,7 +335,10 @@ interface CatalogCardProps {
 }
 
 function CatalogCard({ item, jobId, onInstall, onDone, onError, onCancel }: CatalogCardProps) {
-  const downloading = jobId !== undefined && !item.installed;
+  // Gate on `present` (loadable checkpoint on disk), not `installed` (dashboard
+  // marker): a model installed via the `mlx download` CLI / wizard is present but
+  // unowned, so offering Install would refuse to overwrite it and fail.
+  const downloading = jobId !== undefined && !item.present;
 
   return (
     <Card className="gap-4">
@@ -356,7 +373,7 @@ function CatalogCard({ item, jobId, onInstall, onDone, onError, onCancel }: Cata
               Cancel
             </Button>
           </div>
-        ) : item.installed ? (
+        ) : item.present ? (
           <Button variant="outline" className="w-full" disabled>
             <Check className="size-4" />
             Installed

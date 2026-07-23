@@ -131,6 +131,32 @@ describe('dashboard server — sessions', () => {
     expect(ids).toContain('fix-2');
   });
 
+  it('reports the true total and honors limit/offset paging', async () => {
+    await ingest();
+    const all = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+      sessions: Array<{ id: string }>;
+      total: number;
+    };
+    expect(all.total).toBe(2);
+    expect(all.sessions).toHaveLength(2);
+
+    // A capped page still reports the full match total (so the Overview tile is
+    // accurate past the page size), and offset walks to the next row.
+    const page = (await (await fetch(`${server.url}/api/sessions?limit=1`)).json()) as {
+      sessions: Array<{ id: string }>;
+      total: number;
+    };
+    expect(page.total).toBe(2);
+    expect(page.sessions).toHaveLength(1);
+
+    const next = (await (await fetch(`${server.url}/api/sessions?limit=1&offset=1`)).json()) as {
+      sessions: Array<{ id: string }>;
+      total: number;
+    };
+    expect(next.sessions).toHaveLength(1);
+    expect(next.sessions[0].id).not.toBe(page.sessions[0].id);
+  });
+
   it('returns a session detail with transcript text', async () => {
     await ingest();
     const res = await fetch(`${server.url}/api/sessions/fix-1`);
@@ -624,6 +650,7 @@ describe('dashboard server — sessions', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       turns: Array<{ traceId: string | null; inputTokens: number | null; outputTokens: number | null }>;
+      traces: Array<{ traceId: string }>;
     };
     const ids = body.turns.map((t) => t.traceId);
 
@@ -638,6 +665,15 @@ describe('dashboard server — sessions', () => {
     const totalIn = body.turns.reduce((sum, t) => sum + (t.inputTokens ?? 0), 0);
     expect(totalOut).toBeLessThan(8888);
     expect(totalIn).toBeLessThan(9999);
+
+    // A12: the SAME abandoned trace must also be excluded from the `traces` array
+    // the SPA derives model badges + avg TTFT/decode chips from — mirroring the
+    // turns filter — so those chips agree with the transcript / turn charts. The
+    // active root trace and the genuine delegated child remain.
+    const traceIds = body.traces.map((t) => t.traceId);
+    expect(traceIds).toContain('trace-aaa');
+    expect(traceIds).toContain('trace-real-child');
+    expect(traceIds).not.toContain('trace-abandoned-root');
   });
 });
 

@@ -386,6 +386,10 @@ function handleSessionsList({ res, url, deps }: RouteCtx): void {
   const model = url.searchParams.get('model');
   const from = queryInt(url, 'from');
   const to = queryInt(url, 'to');
+  // Page the (possibly large) list. `limit` defaults to 500 and is clamped to
+  // [1, 500] so an unbounded/absurd value can't be forced; `offset` clamps to >= 0.
+  const limit = Math.min(Math.max(queryInt(url, 'limit') ?? 500, 1), 500);
+  const offset = Math.max(queryInt(url, 'offset') ?? 0, 0);
 
   const where: string[] = [];
   const args: Array<string | number> = [];
@@ -421,9 +425,14 @@ function handleSessionsList({ res, url, deps }: RouteCtx): void {
     FROM sessions s
     ${whereSql}
     ORDER BY s.modified DESC
-    LIMIT 500`;
+    LIMIT ? OFFSET ?`;
 
-  const rows = deps.dash.sqlite.prepare(sql).all(...args);
+  // A separate COUNT over the SAME filter so the client (e.g. the Overview tile)
+  // reports the true match total rather than the capped page length.
+  const total = toInt(
+    (deps.dash.sqlite.prepare(`SELECT COUNT(*) AS n FROM sessions s ${whereSql}`).get(...args) as { n: unknown }).n,
+  );
+  const rows = deps.dash.sqlite.prepare(sql).all(...args, limit, offset);
   const list = rows.map((row) => ({
     id: String(row.id),
     path: String(row.path),
@@ -437,7 +446,7 @@ function handleSessionsList({ res, url, deps }: RouteCtx): void {
     inputTokens: toInt(row.inputTokens),
     outputTokens: toInt(row.outputTokens),
   }));
-  sendJson(res, 200, { sessions: list });
+  sendJson(res, 200, { sessions: list, total });
 }
 
 function lookupSession(deps: ApiDeps, id: string): { path: string; row: typeof sessions.$inferSelect } | null {
@@ -780,9 +789,17 @@ function handleSessionMetrics({ res, params, deps }: RouteCtx): void {
        ORDER BY ts`,
     )
     .all(params.id, params.id, params.id, params.id);
-  // Include this session's own turns AND any subagent turns delegated under it:
-  // a child (subagent) trace carries no persisted session JSONL, but its
-  // root_session_id points back here (Finding 11b).
+  // Include this session's own ACTIVE-branch turns AND any subagent turns delegated
+  // under it — but NOT an abandoned root turn's lingering trace. The SPA derives its
+  // model badges and avg TTFT/decode chips from this `traces` array while the per-turn
+  // charts use `turns` (above), so keying on `session_id = ?` alone would readmit the
+  // abandoned root trace `turnRows` deliberately excludes (a branched root drops its
+  // assistant turn from `turns` but the trace lingers with `session_id = root`), making
+  // the chips disagree with the transcript. Mirror `turnRows`: select a root trace only
+  // when it correlates to an ACTIVE `turns` row (via `trace_id`), plus genuine delegated
+  // children (`root_session_id = ? AND session_id != ?`) not already correlated here. A
+  // child (subagent) trace carries no persisted session JSONL, but its `root_session_id`
+  // points back here (Finding 11b).
   const traceRows = deps.dash.sqlite
     .prepare(
       `SELECT trace_id AS traceId, session_id AS sessionId, root_session_id AS rootSessionId,
@@ -791,9 +808,13 @@ function handleSessionMetrics({ res, params, deps }: RouteCtx): void {
               duration_ms AS durationMs, finish_reason AS finishReason,
               cold_hits AS coldHits, cold_misses AS coldMisses,
               cold_bytes_written AS coldBytesWritten, cold_bytes_restored AS coldBytesRestored
-       FROM traces WHERE session_id = ? OR root_session_id = ? ORDER BY ts`,
+       FROM traces tr
+       WHERE tr.trace_id IN (SELECT trace_id FROM turns WHERE session_id = ? AND trace_id IS NOT NULL)
+          OR (tr.root_session_id = ? AND tr.session_id != ?
+              AND tr.trace_id NOT IN (SELECT trace_id FROM turns WHERE session_id = ? AND trace_id IS NOT NULL))
+       ORDER BY ts`,
     )
-    .all(params.id, params.id);
+    .all(params.id, params.id, params.id, params.id);
   sendJson(res, 200, { sessionId: params.id, turns: turnRows, traces: traceRows });
 }
 

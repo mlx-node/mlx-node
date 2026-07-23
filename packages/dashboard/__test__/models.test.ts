@@ -11,6 +11,7 @@ import {
   discoverLocalModels,
   isDownloaderOwned,
   isModelInstalled,
+  isModelPresent,
 } from '../src/models.js';
 
 let modelsDir: string;
@@ -222,6 +223,35 @@ describe('isModelInstalled', () => {
     writeFileSync(join(bare, 'config.json'), Buffer.alloc(4));
     writeFileSync(join(bare, 'model.safetensors'), Buffer.alloc(8));
     expect(isModelInstalled(bare)).toBe(false);
+  });
+});
+
+describe('isModelPresent', () => {
+  it('is present for a markerless config + weight dir (CLI/wizard install)', () => {
+    // Exactly what `mlx download model` leaves on disk: a loadable checkpoint with
+    // NO dashboard completion marker. `isModelInstalled` rejects it (unowned), but
+    // it must read as PRESENT so the UI does not offer an Install that would then
+    // refuse to overwrite the unowned directory.
+    const dir = join(modelsDir, 'cli-installed');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'config.json'), Buffer.alloc(4));
+    writeFileSync(join(dir, 'model.safetensors'), Buffer.alloc(8));
+    expect(isModelInstalled(dir)).toBe(false);
+    expect(isModelPresent(dir)).toBe(true);
+  });
+
+  it('is NOT present without a config.json, without a weight, or for a missing dir', () => {
+    const weightOnly = join(modelsDir, 'weight-only');
+    mkdirSync(weightOnly, { recursive: true });
+    writeFileSync(join(weightOnly, 'model.safetensors'), Buffer.alloc(8));
+    expect(isModelPresent(weightOnly)).toBe(false);
+
+    const configOnly = join(modelsDir, 'config-only-present');
+    mkdirSync(configOnly, { recursive: true });
+    writeFileSync(join(configOnly, 'config.json'), Buffer.alloc(4));
+    expect(isModelPresent(configOnly)).toBe(false);
+
+    expect(isModelPresent(join(modelsDir, 'does-not-exist'))).toBe(false);
   });
 });
 

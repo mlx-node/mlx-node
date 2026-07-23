@@ -250,8 +250,7 @@ export function openDashboardDb(path: string): DashboardDb {
   try {
     sqlite = openWithSchema(path);
   } catch (err) {
-    const rebuildable =
-      err instanceof RebuildRequiredError || isCorruptionError(err) || isSchemaMismatchError(err);
+    const rebuildable = err instanceof RebuildRequiredError || isCorruptionError(err) || isSchemaMismatchError(err);
     if (path === ':memory:' || !rebuildable) throw err;
     quarantineDbFiles(path);
     sqlite = openWithSchema(path);

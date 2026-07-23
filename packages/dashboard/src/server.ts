@@ -76,7 +76,11 @@ export function bracketHost(host: string): string {
  */
 function bindAllowedHosts(host: string): Set<string> {
   const wildcard = host === '0.0.0.0' || host === '::' || host === '';
-  if (!wildcard) return new Set([...LOCAL_HOSTNAMES, host]);
+  // Hostnames are ASCII case-insensitive, and request classification normalizes the
+  // authority through `new URL(...)` (which ASCII-lowercases the host). Lowercase the
+  // configured host too so a mixed-case `--host MyMac.local` isn't rejected 403 on
+  // every request even though the server bound to it successfully.
+  if (!wildcard) return new Set([...LOCAL_HOSTNAMES, host.toLowerCase()]);
   const hosts = new Set<string>(LOCAL_HOSTNAMES);
   for (const addrs of Object.values(networkInterfaces())) {
     for (const a of addrs ?? []) hosts.add(a.address);

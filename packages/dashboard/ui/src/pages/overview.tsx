@@ -39,7 +39,9 @@ export default function Overview() {
   const modelCount = models.data?.models.length ?? 0;
   const modelBytes = models.data?.models.reduce((sum, m) => sum + m.sizeBytes, 0) ?? 0;
 
-  const sessionCount = sessions.data?.sessions.length ?? 0;
+  // The true match total (not the capped page length) so this tile is accurate
+  // past the server's default 500-row page.
+  const sessionCount = sessions.data?.total ?? 0;
   const tokens7d = metrics.data ? metrics.data.totals.inputTokens + metrics.data.totals.outputTokens : 0;
 
   const disk = cache.data?.disk;

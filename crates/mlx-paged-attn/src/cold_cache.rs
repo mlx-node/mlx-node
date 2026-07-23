@@ -879,7 +879,16 @@ impl ColdCacheManager {
         key: ColdCacheKey,
         fingerprint: ColdCacheFingerprint,
     ) -> Option<ColdCacheBlock> {
-        self.load_bounded(key, fingerprint, self.shared.quota_bytes)
+        let block = self.load_bounded(key, fingerprint, self.shared.quota_bytes)?;
+        // Decode-level hit: this API hands back the decoded block directly, so a
+        // successful load IS the realized outcome here (unlike `restore_block`,
+        // which counts only after its transactional publish commits).
+        self.shared.stats.hits.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .stats
+            .bytes_restored
+            .fetch_add(block.encoded_len(), Ordering::Relaxed);
+        Some(block)
     }
 
     /// Load and validate a block, reading at most `max_encoded` bytes so a
@@ -983,11 +992,15 @@ impl ColdCacheManager {
         };
         match result {
             Ok(block) => {
-                self.shared.stats.hits.fetch_add(1, Ordering::Relaxed);
-                self.shared
-                    .stats
-                    .bytes_restored
-                    .fetch_add(block.encoded_len(), Ordering::Relaxed);
+                // NOTE: the `hits` / `bytes_restored` reuse counters are NOT
+                // bumped here. A successful decode is not yet realized reuse —
+                // `restore_block` still has to validate layout, allocate a
+                // physical block, upload to the GPU, and publish the prefix,
+                // any of which can fail and fall back to prefill. The counters
+                // are incremented at each caller's true success boundary: the
+                // public `load` (decode-level API) below, and `restore_block`
+                // only after `publish_restored_prefix` commits.
+                //
                 // Startup rebuild derives recency from file mtime. Persist
                 // every validated hit (on the descriptor that was read, so a
                 // swapped pathname is never touched) so a process restart
@@ -1083,7 +1096,19 @@ impl ColdCacheManager {
                 identity.block_index,
             );
         match published {
-            Ok(true) => Some(block),
+            Ok(true) => {
+                // Realized reuse: the decoded prefix is now allocated, uploaded,
+                // and published into the pool. Count the hit and restored bytes
+                // only here so the dashboard/trace never report reuse for a
+                // block that decoded but fell back to prefill (layout mismatch,
+                // allocation exhaustion, upload error, or a lost publish race).
+                self.shared.stats.hits.fetch_add(1, Ordering::Relaxed);
+                self.shared
+                    .stats
+                    .bytes_restored
+                    .fetch_add(cold.encoded_len(), Ordering::Relaxed);
+                Some(block)
+            }
             _ => {
                 allocator
                     .lock()

@@ -1255,7 +1255,7 @@ describe('DownloadManager', () => {
     expect(existsSync(join(legacyStagingDir(SHA_OLD), 'model.safetensors'))).toBe(true);
   });
 
-  it('replays the last event to a late subscriber', async () => {
+  it('replays the start frame then the last event to a late subscriber', async () => {
     const manager = new DownloadManager({
       modelsDir,
       cacheDir,
@@ -1266,8 +1266,12 @@ describe('DownloadManager', () => {
 
     const replayed: DownloadEvent[] = [];
     manager.subscribe(id, (event) => replayed.push(event));
-    expect(replayed).toHaveLength(1);
-    expect(replayed[0]).toMatchObject({ type: 'done' });
+    // A late subscriber first gets the one-shot `start` frame (job totalBytes /
+    // fileCount) so the UI renders an aggregate bar rather than coarse file-index
+    // progress, then the terminal event — no duplicate when `start` IS the latest.
+    expect(replayed).toHaveLength(2);
+    expect(replayed[0]).toMatchObject({ type: 'start', totalBytes: 312, fileCount: 2 });
+    expect(replayed[1]).toMatchObject({ type: 'done' });
   });
 
   it('unlinks the snapshot pointer but never deletes a blob resolving OUTSIDE the cache dir', async () => {

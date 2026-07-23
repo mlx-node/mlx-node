@@ -28,7 +28,15 @@ export interface CatalogItem {
   isDefault?: boolean;
   hidden?: boolean;
   slug: string;
+  /** A dashboard-owned (completion-marker) install of this model is present. */
   installed: boolean;
+  /**
+   * A loadable checkpoint is present on disk regardless of the dashboard marker —
+   * true for {@link installed}, and also for a model installed via the `mlx
+   * download` CLI / wizard. Gate the Install action on this (an unowned present
+   * model can't be overwritten).
+   */
+  present: boolean;
 }
 
 export interface CatalogResponse {
@@ -79,6 +87,8 @@ export interface SessionRow {
 
 export interface SessionsResponse {
   sessions: SessionRow[];
+  /** Total sessions matching the filter, before `limit`/`offset` paging. */
+  total: number;
 }
 
 /** One day's token totals from `GET /api/metrics/overview` `tokensByDay` (UTC day). */

@@ -220,6 +220,12 @@ export default function Sessions() {
               </TableBody>
             </Table>
           )}
+          {sessions.data && sessions.data.total > rows.length && (
+            <p className="text-muted-foreground px-6 pt-3 text-xs">
+              Showing the newest {rows.length.toLocaleString()} of {sessions.data.total.toLocaleString()} matching
+              sessions. Narrow with search or the directory / date filters to reach older ones.
+            </p>
+          )}
         </CardContent>
       </Card>
 

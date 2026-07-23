@@ -318,6 +318,11 @@ export class DownloadManager {
   private readonly order: string[] = [];
   private readonly queue: string[] = [];
   private readonly lastEvent = new Map<string, DownloadEvent>();
+  // The `start` frame (job `totalBytes` + `fileCount`) is emitted once, so a
+  // subscriber that attaches mid-download would otherwise miss it and be stuck on
+  // coarse file-index progress. Retain it separately from `lastEvent` (which
+  // `progress` overwrites) to replay on attach.
+  private readonly startEvent = new Map<string, DownloadEvent>();
   private draining = false;
 
   private currentJob: JobState | null = null;
@@ -393,6 +398,7 @@ export class DownloadManager {
       const at = this.order.indexOf(id);
       if (at !== -1) this.order.splice(at, 1);
       this.lastEvent.delete(id);
+      this.startEvent.delete(id);
       return true;
     }
 
@@ -435,10 +441,17 @@ export class DownloadManager {
     });
   }
 
-  /** Subscribe to a job's events; the most recent event is replayed on attach. */
+  /**
+   * Subscribe to a job's events. On attach, replay the `start` frame first (so a
+   * mid-download subscriber learns the job `totalBytes`/`fileCount` and renders an
+   * aggregate byte bar instead of coarse file-index progress), then the most recent
+   * event — skipping the duplicate when `start` IS the most recent.
+   */
   subscribe(id: string, fn: (event: DownloadEvent) => void): () => void {
+    const start = this.startEvent.get(id);
     const last = this.lastEvent.get(id);
-    if (last !== undefined) fn(last);
+    if (start !== undefined) fn(start);
+    if (last !== undefined && last !== start) fn(last);
     this.emitter.on(id, fn);
     return () => {
       this.emitter.off(id, fn);
@@ -446,6 +459,7 @@ export class DownloadManager {
   }
 
   private emit(event: DownloadEvent): void {
+    if (event.type === 'start') this.startEvent.set(event.id, event);
     this.lastEvent.set(event.id, event);
     this.emitter.emit(event.id, event);
   }

@@ -8,7 +8,17 @@
  * the same trade-off already made in `packages/agent/src/provider/models.ts`.
  */
 
-import { type Dir, type Dirent, existsSync, lstatSync, opendirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import {
+  type Dir,
+  type Dirent,
+  existsSync,
+  lstatSync,
+  opendirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
@@ -103,6 +113,26 @@ export function isModelInstalled(modelDir: string): boolean {
   const hasWeight = files.some((file) => typeof file === 'string' && isWeightFile(file));
   if (!hasConfig || !hasWeight) return false;
   return files.every((file) => typeof file === 'string' && existsSync(join(modelDir, file)));
+}
+
+/**
+ * Whether `modelDir` holds a loadable checkpoint ON DISK — a `config.json` plus at
+ * least one weight file — regardless of the dashboard completion marker. Unlike
+ * {@link isModelInstalled} (downloader-OWNED, marker-gated) this also recognizes a
+ * checkpoint installed by the `mlx download` CLI or the agent wizard, neither of
+ * which writes the marker. Callers use it to show such a model as PRESENT without
+ * offering a dashboard install, which would refuse to overwrite the unowned
+ * directory (`DownloadManager.refuseIfUnownedFinal`) and fail deterministically.
+ */
+export function isModelPresent(modelDir: string): boolean {
+  if (!existsSync(join(modelDir, 'config.json'))) return false;
+  let entries: string[];
+  try {
+    entries = readdirSync(modelDir);
+  } catch {
+    return false;
+  }
+  return entries.some((file) => isWeightFile(file));
 }
 
 /**

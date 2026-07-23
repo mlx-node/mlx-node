@@ -8,7 +8,7 @@
  * addon.
  */
 
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { resolve, sep } from 'node:path';
 
@@ -39,9 +39,22 @@ function contentTypeFor(path: string): string {
   return CONTENT_TYPES[path.slice(dot).toLowerCase()] ?? 'application/octet-stream';
 }
 
-/** Resolve a request path to a real file inside `webRoot`, or `null` to fall back. */
-function resolveFile(webRoot: string, pathname: string): string | null {
-  const root = resolve(webRoot);
+/** The canonical (symlink-resolved) web root, or `null` if it does not exist. */
+function canonicalRoot(webRoot: string): string | null {
+  try {
+    return realpathSync(resolve(webRoot));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve a request path to a real file inside the (already canonical) web
+ * `root`, or `null` to fall back. Lexical `resolve` blocks `..` traversal; the
+ * canonical re-check in {@link tryFile} additionally blocks a symlink *under* the
+ * root that points outside it.
+ */
+function resolveFile(root: string, pathname: string): string | null {
   let rel: string;
   try {
     rel = decodeURIComponent(pathname);
@@ -49,17 +62,26 @@ function resolveFile(webRoot: string, pathname: string): string | null {
     rel = pathname;
   }
   rel = rel.replace(/^\/+/, '');
-  if (rel === '') return existsSync(root) ? tryFile(resolve(root, 'index.html')) : null;
+  if (rel === '') return tryFile(resolve(root, 'index.html'), root);
 
   const target = resolve(root, rel);
-  // Reject traversal outside the web root; the SPA fallback handles it.
+  // Reject lexical traversal outside the web root; the SPA fallback handles it.
   if (target !== root && !target.startsWith(root + sep)) return null;
-  return tryFile(target);
+  return tryFile(target, root);
 }
 
-function tryFile(candidate: string): string | null {
+/**
+ * Return `candidate` resolved to its real path only if it is a regular file whose
+ * canonical location is contained in `canonRoot`. Canonicalizing both sides means
+ * a legitimately symlinked root (e.g. macOS `/tmp`→`/private/tmp`) still serves,
+ * while a symlink under the root escaping it is rejected before `readFileSync`
+ * follows the link.
+ */
+function tryFile(candidate: string, canonRoot: string): string | null {
   try {
-    return statSync(candidate).isFile() ? candidate : null;
+    const real = realpathSync(candidate);
+    if (real !== canonRoot && !real.startsWith(canonRoot + sep)) return null;
+    return statSync(real).isFile() ? real : null;
   } catch {
     return null;
   }
@@ -87,15 +109,21 @@ export function serveStatic(req: IncomingMessage, res: ServerResponse, webRoot: 
   }
 
   const head = method === 'HEAD';
-  const file = resolveFile(webRoot, pathname);
+  const root = canonicalRoot(webRoot);
+  if (root === null) {
+    res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' });
+    res.end(JSON.stringify({ error: 'Not found' }));
+    return;
+  }
+
+  const file = resolveFile(root, pathname);
   if (file !== null) {
     send(res, 200, readFileSync(file), contentTypeFor(file), head);
     return;
   }
 
   // SPA fallback: serve index.html for any unmatched path.
-  const indexPath = resolve(webRoot, 'index.html');
-  const index = tryFile(indexPath);
+  const index = tryFile(resolve(root, 'index.html'), root);
   if (index !== null) {
     send(res, 200, readFileSync(index), 'text/html; charset=utf-8', head);
     return;

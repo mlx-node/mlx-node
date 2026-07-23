@@ -315,7 +315,17 @@ function listSessionFiles(root: string): string[] {
     if (entry.isDirectory()) {
       if (!entry.name.startsWith('--') || !entry.name.endsWith('--')) continue;
       const dirPath = join(root, entry.name);
-      for (const name of readdirSync(dirPath)) pushIfRegularJsonl(join(dirPath, name));
+      // Isolate a single unreadable / vanished project subdir (chmod, or a TOCTOU
+      // race after the root listing) like the per-item guards around it: skip it
+      // rather than throw out of the whole scan, which would abort ingestion for
+      // every sibling session AND skip the subsequent trace ingest / metrics pass.
+      let names: string[];
+      try {
+        names = readdirSync(dirPath);
+      } catch {
+        continue;
+      }
+      for (const name of names) pushIfRegularJsonl(join(dirPath, name));
       continue;
     }
     // Flat explicit-session-dir layout: a `.jsonl` directly under the root. The

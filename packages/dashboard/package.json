@@ -19,7 +19,7 @@
   "scripts": {
     "build": "tsc -b && yarn build:ui",
     "build:ui": "cd ui && vp build",
-    "prepack": "yarn build:ui"
+    "prepack": "yarn build"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.81.1",

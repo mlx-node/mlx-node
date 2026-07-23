@@ -1,5 +1,6 @@
 import {
   appendFileSync,
+  chmodSync,
   cpSync,
   mkdirSync,
   mkdtempSync,
@@ -77,6 +78,28 @@ describe('ingestSessions', () => {
     expect(traced[0].cachedTokens).toBe(10);
     expect(traced[0].reasoningTokens).toBe(5);
   });
+
+  // chmod 000 is a no-op for root, so the unreadable dir would still list — skip.
+  const canTestUnreadable = (process.getuid?.() ?? 0) !== 0;
+  (canTestUnreadable ? it : it.skip)(
+    'isolates an unreadable project subdir so sibling sessions still ingest',
+    async () => {
+      // A sibling `--bad--/` whose inner `readdir` throws (chmod 000, or a TOCTOU
+      // vanish between the root listing and the call) must NOT abort the whole
+      // scan — the valid `--w--` fixture sessions must still be reconciled.
+      const bad = join(workRoot, '--bad--');
+      mkdirSync(bad, { recursive: true });
+      writeFileSync(join(bad, 'x.jsonl'), '{"type":"session","id":"unreadable"}\n');
+      chmodSync(bad, 0o000);
+      try {
+        const res = await ingestSessions(dash, workRoot);
+        expect(res.updated).toBe(2);
+        expect(dash.db.select().from(sessions).all()).toHaveLength(2);
+      } finally {
+        chmodSync(bad, 0o755); // restore so afterEach cleanup can remove it
+      }
+    },
+  );
 
   it('skips unchanged files on re-ingest', async () => {
     await ingestSessions(dash, workRoot);
