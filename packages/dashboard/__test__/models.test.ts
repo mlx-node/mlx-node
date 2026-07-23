@@ -178,6 +178,16 @@ describe('deleteLocalModel', () => {
 
     rmSync(outside, { recursive: true, force: true });
   });
+
+  it('refuses to delete a non-checkpoint directory (no config.json) and a stray file', () => {
+    // `junk/` (a dir without config.json) and `README.md` (a regular file) both
+    // sit directly under modelsDir with safe names, but neither is a checkpoint
+    // discovery would list — a typo/hand-crafted DELETE must not rmSync them.
+    expect(() => deleteLocalModel(modelsDir, 'junk')).toThrow(/not a model checkpoint/i);
+    expect(existsSync(join(modelsDir, 'junk'))).toBe(true);
+    expect(() => deleteLocalModel(modelsDir, 'README.md')).toThrow(/not a model checkpoint/i);
+    expect(existsSync(join(modelsDir, 'README.md'))).toBe(true);
+  });
 });
 
 describe('isModelInstalled', () => {
@@ -252,6 +262,36 @@ describe('isModelPresent', () => {
     expect(isModelPresent(configOnly)).toBe(false);
 
     expect(isModelPresent(join(modelsDir, 'does-not-exist'))).toBe(false);
+  });
+
+  it('requires every shard of a sharded checkpoint, not just the first', () => {
+    // config.json + index.json + ALL shards → present.
+    const full = join(modelsDir, 'sharded-full');
+    mkdirSync(full, { recursive: true });
+    writeFileSync(join(full, 'config.json'), Buffer.alloc(4));
+    writeFileSync(
+      join(full, 'model.safetensors.index.json'),
+      JSON.stringify({
+        weight_map: { 'a.weight': 'model-00001-of-00002.safetensors', 'b.weight': 'model-00002-of-00002.safetensors' },
+      }),
+    );
+    writeFileSync(join(full, 'model-00001-of-00002.safetensors'), Buffer.alloc(8));
+    writeFileSync(join(full, 'model-00002-of-00002.safetensors'), Buffer.alloc(8));
+    expect(isModelPresent(full)).toBe(true);
+
+    // Interrupted: index + only the first shard → NOT present (a partial download
+    // must not read as installed).
+    const partial = join(modelsDir, 'sharded-partial');
+    mkdirSync(partial, { recursive: true });
+    writeFileSync(join(partial, 'config.json'), Buffer.alloc(4));
+    writeFileSync(
+      join(partial, 'model.safetensors.index.json'),
+      JSON.stringify({
+        weight_map: { 'a.weight': 'model-00001-of-00002.safetensors', 'b.weight': 'model-00002-of-00002.safetensors' },
+      }),
+    );
+    writeFileSync(join(partial, 'model-00001-of-00002.safetensors'), Buffer.alloc(8));
+    expect(isModelPresent(partial)).toBe(false);
   });
 });
 

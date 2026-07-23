@@ -132,7 +132,40 @@ export function isModelPresent(modelDir: string): boolean {
   } catch {
     return false;
   }
-  return entries.some((file) => isWeightFile(file));
+  const fileSet = new Set(entries);
+  // A single-file weight is a complete checkpoint on its own.
+  if (fileSet.has('model.safetensors') || fileSet.has('inference.pdiparams')) return true;
+  if (entries.some((file) => file.endsWith('.gguf'))) return true;
+  // Sharded safetensors: every shard the index references must exist on disk —
+  // otherwise an interrupted download that landed the index + only the first
+  // shard would falsely read as present (matches the CLI's completeness check,
+  // `isModelAlreadyDownloaded`). A lone shard without its index is not complete.
+  if (fileSet.has('model.safetensors.index.json')) return shardsComplete(modelDir);
+  return false;
+}
+
+/** Every shard referenced by `model.safetensors.index.json`'s `weight_map` exists. */
+function shardsComplete(modelDir: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(join(modelDir, 'model.safetensors.index.json'), 'utf-8')) as unknown;
+  } catch {
+    return false;
+  }
+  const weightMap =
+    parsed !== null && typeof parsed === 'object' && 'weight_map' in parsed
+      ? (parsed as { weight_map?: unknown }).weight_map
+      : undefined;
+  if (weightMap === null || typeof weightMap !== 'object') return false;
+  const shards = new Set<string>();
+  for (const value of Object.values(weightMap as Record<string, unknown>)) {
+    if (typeof value === 'string') shards.add(value);
+  }
+  if (shards.size === 0) return false;
+  for (const shard of shards) {
+    if (!existsSync(join(modelDir, shard))) return false;
+  }
+  return true;
 }
 
 /**
@@ -533,6 +566,13 @@ export function deleteLocalModel(modelsDir: string, name: string): void {
   }
   if (stat.isSymbolicLink()) {
     throw new Error(`Refusing to delete "${name}": target is a symlink, not a model directory`);
+  }
+  // Only delete a real checkpoint directory — one discovery would list (a dir
+  // carrying a `config.json`). The route takes an arbitrary name, so without
+  // this a typo or hand-crafted request could `rmSync` an unrelated regular file
+  // or non-model directory that merely happens to sit under `modelsDir`.
+  if (!stat.isDirectory() || !existsSync(join(target, 'config.json'))) {
+    throw new Error(`Refusing to delete "${name}": not a model checkpoint directory`);
   }
   rmSync(target, { recursive: true, force: true });
 }

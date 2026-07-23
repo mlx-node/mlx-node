@@ -1057,13 +1057,26 @@ impl ColdCacheManager {
         // is validated against just below, so a tampered oversized entry at the
         // canonical name is a bounded miss, never a gigabyte allocation.
         let cold = self.load_bounded(key, fingerprint, max_encoded_len_for_pool(pool))?;
+        // Each post-decode failure below is a real fall-back to ordinary prefill,
+        // so it must count exactly one miss. The decode itself counted neither
+        // hit nor miss (`load_bounded` bumps `misses` only for a failed decode in
+        // its `Err` arm), and each path here is reached only after `load_bounded`
+        // returned `Some`, so there is no double-count with that decode-level miss.
         if cold.tokens != identity.tokens || !layout_matches_pool(&cold.layout, pool) {
+            self.shared.stats.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let block = allocator
+        let block = match allocator
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .allocate()?;
+            .allocate()
+        {
+            Some(block) => block,
+            None => {
+                self.shared.stats.misses.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
 
         for (layer_idx, layer) in cold.layers.iter().enumerate() {
             if pool
@@ -1079,6 +1092,7 @@ impl ColdCacheManager {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .free(Arc::clone(&block));
+                self.shared.stats.misses.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         }
@@ -1114,6 +1128,7 @@ impl ColdCacheManager {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .free(block);
+                self.shared.stats.misses.fetch_add(1, Ordering::Relaxed);
                 None
             }
         }
@@ -3100,6 +3115,100 @@ mod tests {
                 allocator.free(hit);
             }
         }
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A block that decodes cleanly but then fails a post-decode restore step is
+    /// a real fall-back to ordinary prefill, so it must count exactly one miss
+    /// and zero hits — the hit/bytes_restored accounting is reserved for a fully
+    /// published prefix. The token-mismatch guard is the deterministic
+    /// post-decode failure: the stored block decodes against its own
+    /// key/fingerprint, but the caller's `identity.tokens` differ, so
+    /// `restore_block` bails before allocating a physical block.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn post_decode_restore_failure_counts_one_miss() {
+        use crate::metal::MetalDtype;
+        use crate::{PagedAttentionConfig, hash_tokens};
+
+        let config = PagedAttentionConfig {
+            block_size: 8,
+            gpu_memory_mb: 256,
+            head_size: 64,
+            num_kv_heads: 1,
+            num_layers: 1,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(32),
+            max_batch_size: Some(1),
+        };
+        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping post_decode_restore_failure_counts_one_miss: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let allocator = Mutex::new(BlockAllocator::new(2, 8));
+        let source = allocator.lock().unwrap().allocate().unwrap();
+        let bytes_per_side = 64 * 8 * 2;
+        let keys: Vec<u8> = (0..bytes_per_side).map(|i| (i % 251) as u8).collect();
+        let values: Vec<u8> = (0..bytes_per_side)
+            .map(|i| (250 - (i % 251)) as u8)
+            .collect();
+        pool.write_blocks_from_host(0, &[source.block_id], &keys, &values)
+            .unwrap();
+
+        let root = temp_root("restore-miss");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let key = ColdCacheKey::chain(fingerprint(), None, &tokens, &[], 0, 0);
+        assert!(
+            manager
+                .capture_and_enqueue(&pool, &source, key, fingerprint(), &tokens)
+                .unwrap()
+        );
+        let path = root.join(format!("{}.safetensors", key.to_hex()));
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        allocator.lock().unwrap().free(source);
+
+        // Same key + fingerprint, so `load_bounded` decodes the stored block
+        // successfully (the decode itself counts neither hit nor miss). But the
+        // caller's prefix tokens differ from the stored block's, so the
+        // token-mismatch guard rejects the restore — the deterministic
+        // post-decode failure this test targets.
+        let mismatched_tokens = vec![9, 10, 11, 12, 13, 14, 15, 16];
+        let identity = RestorePrefixIdentity {
+            hot_hash: hash_tokens(&mismatched_tokens, 0, &[]),
+            tokens: mismatched_tokens,
+            parent_hot_hash: 0,
+            extra_keys: vec![],
+            cache_salt: 0,
+            block_index: 0,
+        };
+        let restored = manager.restore_block(&pool, &allocator, key, fingerprint(), &identity);
+        assert!(
+            restored.is_none(),
+            "a token mismatch must abort the restore (fall back to prefill)"
+        );
+
+        let stats = manager.stats();
+        assert_eq!(
+            stats.misses, 1,
+            "a decoded-then-rejected block must count exactly one miss"
+        );
+        assert_eq!(stats.hits, 0, "no prefix was published, so no hit");
+        assert_eq!(
+            stats.bytes_restored, 0,
+            "nothing was restored into the pool"
+        );
+
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }
