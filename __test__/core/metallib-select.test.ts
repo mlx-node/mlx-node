@@ -552,7 +552,14 @@ describe('selectPagedMetallib / assertPagedMetallibIntegrity', () => {
 function mtlbHeader(
   major: number,
   minor: number,
-  opts?: { magic?: string; platform?: number; containerVersion?: number; libraryType?: number; osTag?: number },
+  opts?: {
+    magic?: string;
+    platform?: number;
+    containerVersion?: number;
+    libraryType?: number;
+    osTag?: number;
+    update?: number;
+  },
 ): Buffer {
   const header = Buffer.alloc(24);
   header.write(opts?.magic ?? 'MTLB', 0, 'latin1');
@@ -562,7 +569,9 @@ function mtlbHeader(
   header[10] = opts?.libraryType ?? 0x00;
   header[11] = opts?.osTag ?? 0x81;
   header.writeUInt16LE(major, 12);
-  header.writeUInt16LE(minor, 14);
+  // minor and update are two separate bytes, not a u16 minor.
+  header[14] = minor;
+  header[15] = opts?.update ?? 0;
   return header;
 }
 
@@ -574,6 +583,28 @@ describe('parseMetallibMinOs / assertMetallibFloor', () => {
     // The exact header bytes of the shipped 26.0-floor artifacts.
     const real = Buffer.from('4d544c420180020009000081' + '1a000000', 'hex');
     expect(parseMetallibMinOs(real)).toBe('26.0');
+  });
+
+  it('reads minor and update as separate bytes, not one u16 minor', () => {
+    // A non-zero update byte is where the two readings diverge: a u16 read of
+    // `0502` yields 517. Bytes below are a real local build on macOS 26.5.2,
+    // confirmed with `xcrun air-vtool -show` (Major 26, Minor 5, Update 2).
+    const real2652 = Buffer.from('4d544c420180020009000081' + '1a000502', 'hex');
+    expect(parseMetallibMinOs(real2652)).toBe('26.5.2');
+    expect(parseMetallibMinOs(mtlbHeader(26, 5, { update: 2 }))).toBe('26.5.2');
+    // update === 0 keeps the two-component form the shipped artifacts use.
+    expect(parseMetallibMinOs(mtlbHeader(26, 5))).toBe('26.5');
+  });
+
+  it('accepts a metallib built at the host floor when that floor has a patch component', () => {
+    // Regression: building on macOS 26.5.2 stamps 26.5.2 and the deployment
+    // floor defaults to the host version, so the gate must compare equal. The
+    // u16 misread reported 26.517 and failed a correct build.
+    const stamped = mtlbHeader(26, 5, { update: 2 });
+    expect(() => assertMetallibFloor(stamped, { path: 'x', deploymentFloor: '26.5.2' })).not.toThrow();
+    expect(() => assertMetallibFloor(stamped, { path: 'x', deploymentFloor: '26.5.1' })).toThrow(
+      /stamps min-OS 26\.5\.2, above the intended deployment floor 26\.5\.1/,
+    );
   });
 
   it('returns undefined on unknown layouts instead of guessing', () => {
