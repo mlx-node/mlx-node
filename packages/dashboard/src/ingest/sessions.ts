@@ -270,26 +270,53 @@ export function readSessionEntries(path: string): FileEntry[] {
 }
 
 /**
- * Whether the session file at `path` currently parses to `expectedId`. Used as a
- * last-defense guard before deleting a session file: a stale index row for id A
- * must not `rmSync` a file whose path was reused by a newer session B. A
- * missing/unreadable/headerless file returns `false` — never delete on doubt.
+ * How the on-disk session file at `path` relates to `expectedId`. The delete guard
+ * must tell three "not this session" cases apart, which a plain boolean cannot:
+ *   - `'missing'`      — no file on disk; there is nothing to unlink, so dropping the
+ *                        stale index row is safe.
+ *   - `'different'`    — a readable file whose header names ANOTHER session: the path
+ *                        was reused by a newer session B. B's file must be left
+ *                        untouched, but the stale row for id A can be dropped.
+ *   - `'unverifiable'` — the file exists but cannot be read, cannot be parsed, or
+ *                        carries no header, so we cannot prove whose it is. Deleting
+ *                        the row while leaving the file desyncs the DB from disk — the
+ *                        transcript can re-index on a later successful ingest (so it
+ *                        reappears after we reported it deleted) or linger as an
+ *                        orphan — so the caller treats this as a conflict, not a
+ *                        delete. Never delete on doubt.
+ *   - `'matches'`      — the header still names THIS session; safe to unlink.
  */
-export function verifySessionFileId(path: string, expectedId: string): boolean {
+export function classifySessionFile(
+  path: string,
+  expectedId: string,
+): 'missing' | 'matches' | 'different' | 'unverifiable' {
+  if (!existsSync(path)) return 'missing';
   let raw: string;
   try {
     raw = readFileSync(path, 'utf8');
   } catch {
-    return false;
+    return 'unverifiable';
   }
   let entries: FileEntry[];
   try {
     entries = parseSessionEntries(raw);
   } catch {
-    return false;
+    return 'unverifiable';
   }
   const header = entries.find((e) => e.type === 'session') as SessionHeader | undefined;
-  return header !== undefined && header.id === expectedId;
+  if (header === undefined) return 'unverifiable';
+  return header.id === expectedId ? 'matches' : 'different';
+}
+
+/**
+ * Whether the session file at `path` currently parses to `expectedId`. A thin
+ * exact-match wrapper over `classifySessionFile` (one source of truth) for callers
+ * that only proceed when the file provably belongs to this session — the rename
+ * handler, which must refuse to mutate any file it cannot verify. A
+ * missing/unreadable/headerless/foreign file returns `false`.
+ */
+export function verifySessionFileId(path: string, expectedId: string): boolean {
+  return classifySessionFile(path, expectedId) === 'matches';
 }
 
 /**

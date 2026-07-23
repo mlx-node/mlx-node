@@ -21,6 +21,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 import { openDashboardDb, type DashboardDb } from '../src/db/open.js';
 import { sessions, turns } from '../src/db/schema.js';
 import {
+  classifySessionFile,
   ingestSessions,
   isValidSessionTopology,
   readSessionEntries,
@@ -686,6 +687,49 @@ describe('ingestSessions', () => {
     expect(verifySessionFileId(file, 'sess-B')).toBe(true);
     expect(verifySessionFileId(file, 'sess-A')).toBe(false);
     expect(verifySessionFileId(join(soloBase, 'missing.jsonl'), 'sess-B')).toBe(false);
+    rmSync(soloBase, { recursive: true, force: true });
+  });
+
+  // The four-way verdict the delete handler branches on: `verifySessionFileId`'s
+  // single `false` cannot tell a file that PROVABLY belongs to another session
+  // (`different` — row-only cleanup is safe) from one we simply cannot verify
+  // (`unverifiable` — deleting the row while the file lingers would desync the DB
+  // from disk), so the delete guard needs the reason, not just a boolean.
+  it('classifySessionFile distinguishes missing / matches / different / unverifiable', () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-classify-'));
+
+    const match = writeSessionFile(soloBase, 'match.jsonl', [
+      { type: 'session', version: 3, id: 'sess-B', timestamp: '2026-07-02T10:00:00.000Z', cwd: '/w' },
+    ]);
+    expect(classifySessionFile(match, 'sess-B')).toBe('matches');
+    // Same readable file, header names a DIFFERENT session (path reused).
+    expect(classifySessionFile(match, 'sess-A')).toBe('different');
+
+    // No file on disk → nothing to orphan.
+    expect(classifySessionFile(join(soloBase, 'gone.jsonl'), 'sess-B')).toBe('missing');
+
+    // Exists + parseable, but carries no `type:'session'` header → unverifiable.
+    const headerless = writeSessionFile(soloBase, 'headerless.jsonl', [
+      {
+        type: 'message',
+        id: 'm1',
+        parentId: null,
+        timestamp: '2026-07-02T10:00:01.000Z',
+        message: { role: 'user', content: 'orphaned, no header' },
+      },
+    ]);
+    expect(classifySessionFile(headerless, 'sess-B')).toBe('unverifiable');
+
+    // Exists but unreadable → unverifiable (skip as root, where chmod 000 is a no-op).
+    if ((process.getuid?.() ?? 0) !== 0) {
+      chmodSync(headerless, 0o000);
+      try {
+        expect(classifySessionFile(headerless, 'sess-B')).toBe('unverifiable');
+      } finally {
+        chmodSync(headerless, 0o644);
+      }
+    }
+
     rmSync(soloBase, { recursive: true, force: true });
   });
 

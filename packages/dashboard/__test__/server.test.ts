@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   cpSync,
   existsSync,
   mkdirSync,
@@ -488,6 +489,95 @@ describe('dashboard server — sessions', () => {
 
     const after = (await (await fetch(`${server.url}/api/sessions`)).json()) as { sessions: Array<{ id: string }> };
     expect(after.sessions.map((s) => s.id)).not.toContain('fix-2');
+    expect((await fetch(`${server.url}/api/sessions/fix-2`)).status).toBe(404);
+  });
+
+  // A file that exists on disk but cannot be verified (unreadable / corrupt) must
+  // NOT be half-deleted. The old code skipped the `rmSync` yet still dropped the
+  // rows and replied `deleted`, so the transcript stayed on disk out of sync with
+  // the DB: it could re-index on a later successful ingest (reappearing after we
+  // said `deleted`) or linger as an orphan. Delete now refuses with 409, reconciles
+  // the index, and leaves BOTH the row and the file intact. Reading is unrestricted
+  // for root, so chmod 000 there is a no-op — skip.
+  const canTestUnreadable = (process.getuid?.() ?? 0) !== 0;
+  (canTestUnreadable ? it : it.skip)(
+    'refuses to delete an unreadable session file, keeping the row and the file',
+    async () => {
+      await ingest();
+      const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+        sessions: Array<{ id: string; path: string }>;
+      };
+      const filePath = before.sessions.find((s) => s.id === 'fix-2')!.path;
+
+      // Unreadable in place: chmod touches ctime only, so mtime/size are unchanged
+      // and the reconcile the handler runs cannot re-read it — its watermark keeps
+      // the existing row rather than quarantining it.
+      chmodSync(filePath, 0o000);
+      try {
+        const del = await fetch(`${server.url}/api/sessions/fix-2`, { method: 'DELETE' });
+        expect(del.status).toBe(409);
+      } finally {
+        chmodSync(filePath, 0o644); // restore so the assertions below (and cleanup) can read it
+      }
+
+      // Neither the file nor the row was removed.
+      expect(existsSync(filePath)).toBe(true);
+      expect((await fetch(`${server.url}/api/sessions/fix-2`)).status).toBe(200);
+    },
+  );
+
+  // The stale-row guard's legitimate case: a row whose PATH was reused by a NEWER
+  // session must drop ONLY its own rows on delete — never `rmSync` the newer
+  // session's file. This is `different`, not `unverifiable`, so it still succeeds.
+  it('deletes only the stale rows when the path was reused by a newer session', async () => {
+    await ingest();
+    const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+      sessions: Array<{ id: string; path: string }>;
+    };
+    const filePath = before.sessions.find((s) => s.id === 'fix-2')!.path;
+
+    // Overwrite fix-2's path with a brand-new VALID session (a different id), as if
+    // pi reused the path — WITHOUT re-ingesting, so the stale fix-2 row still points
+    // here and the delete must classify the file as `different`.
+    const reused = [
+      JSON.stringify({ type: 'session', version: 3, id: 'reused-B', timestamp: '2026-07-20T10:00:00.000Z', cwd: '/w' }),
+      JSON.stringify({
+        type: 'message',
+        id: 'm1',
+        parentId: null,
+        timestamp: '2026-07-20T10:00:01.000Z',
+        message: { role: 'user', content: 'I am the newer session' },
+      }),
+    ].join('\n');
+    writeFileSync(filePath, `${reused}\n`);
+
+    const del = await fetch(`${server.url}/api/sessions/fix-2`, { method: 'DELETE' });
+    expect(del.status).toBe(200);
+    expect((await del.json()) as { deleted: boolean; id: string }).toMatchObject({ deleted: true, id: 'fix-2' });
+
+    // The newer session's file was left untouched (content intact), and the stale
+    // fix-2 row is gone; a fresh ingest then surfaces the newer session.
+    expect(existsSync(filePath)).toBe(true);
+    expect(readFileSync(filePath, 'utf-8')).toContain('reused-B');
+    expect((await fetch(`${server.url}/api/sessions/fix-2`)).status).toBe(404);
+    await ingest();
+    const after = (await (await fetch(`${server.url}/api/sessions`)).json()) as { sessions: Array<{ id: string }> };
+    expect(after.sessions.map((s) => s.id)).toContain('reused-B');
+  });
+
+  // A row whose file has already vanished must still be cleaned up — there is
+  // nothing on disk left to orphan, so this is a plain success, not a conflict.
+  it('deletes the rows when the session file is already gone', async () => {
+    await ingest();
+    const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+      sessions: Array<{ id: string; path: string }>;
+    };
+    const filePath = before.sessions.find((s) => s.id === 'fix-2')!.path;
+    unlinkSync(filePath);
+
+    const del = await fetch(`${server.url}/api/sessions/fix-2`, { method: 'DELETE' });
+    expect(del.status).toBe(200);
+    expect((await del.json()) as { deleted: boolean; id: string }).toMatchObject({ deleted: true, id: 'fix-2' });
     expect((await fetch(`${server.url}/api/sessions/fix-2`)).status).toBe(404);
   });
 

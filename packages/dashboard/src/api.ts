@@ -7,7 +7,7 @@
  * and pi's `SessionManager` for transcripts/rename — never the native addon.
  */
 
-import { existsSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { basename, dirname, join, sep } from 'node:path';
 
@@ -26,6 +26,7 @@ import { sessions, turns } from './db/schema.js';
 import type { DownloadManager, DownloadEvent } from './download.js';
 import {
   activeBranchEntries,
+  classifySessionFile,
   countJsonlLines,
   isValidSessionTopology,
   lastLineParses,
@@ -701,7 +702,7 @@ async function handleSessionRename({ req, res, params, deps }: RouteCtx): Promis
   sendJson(res, 200, { id: params.id, name });
 }
 
-function handleSessionDelete({ res, params, deps }: RouteCtx): void {
+async function handleSessionDelete({ res, params, deps }: RouteCtx): Promise<void> {
   const found = lookupSession(deps, params.id);
   if (found === null) {
     sendError(res, 404, `Session "${params.id}" not found`);
@@ -711,10 +712,30 @@ function handleSessionDelete({ res, params, deps }: RouteCtx): void {
     sendError(res, 403, 'Session file resolves outside the managed sessions root');
     return;
   }
-  // Last-defense guard: only unlink the file if it still belongs to this id. A
-  // stale index row (path since reused by a newer session) must not delete the
-  // newer session's file — drop our rows and let re-ingest reconcile instead.
-  if (existsSync(found.path) && verifySessionFileId(found.path, params.id)) {
+  // Decide what to do with the on-disk transcript BEFORE touching any rows. A bare
+  // "does it still belong to this id" boolean cannot tell a file that provably
+  // belongs to a DIFFERENT session (its path reused by a newer one) apart from one we
+  // simply cannot verify (unreadable / corrupt / headerless):
+  //   - 'matches'      → unlink the file, then drop the rows.
+  //   - 'different'    → a newer session's file; must NOT unlink it. Drop our stale
+  //                      rows only and let re-ingest reconcile.
+  //   - 'missing'      → nothing to unlink; drop the rows.
+  //   - 'unverifiable' → deleting the rows while leaving the file on disk desyncs the
+  //                      DB from disk: the transcript could re-index on a later
+  //                      successful ingest (reappearing after we said `deleted`), or
+  //                      linger as an orphan. Reconcile the index and refuse, mirroring
+  //                      the rename handler, rather than half-delete.
+  const verdict = classifySessionFile(found.path, params.id);
+  if (verdict === 'unverifiable') {
+    await deps.runIngest();
+    sendError(
+      res,
+      409,
+      `Session "${params.id}" file exists but could not be verified (unreadable or corrupt); delete refused to avoid orphaning it`,
+    );
+    return;
+  }
+  if (verdict === 'matches') {
     rmSync(found.path, { force: true });
   }
   const { db, sqlite } = deps.dash;
