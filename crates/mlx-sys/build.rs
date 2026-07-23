@@ -373,6 +373,13 @@ fn main() {
         // determinism (`121a` is what MLX auto-detected on the GB10 host;
         // override via MLX_CUDA_ARCHITECTURES). Release build type so the
         // benchmark numbers are not skewed by an unoptimized default.
+        //
+        // `switch-exhaustiveness.cmake` is deliberately not applied here: it
+        // rewrites the composed flags with `-Wno-everything`, which only
+        // clang understands, and nvcc drives host compilation through GCC.
+        // A `switch` over QuantizationMode that misses an enumerator is
+        // therefore a build error on macOS only. CUDA sources are compiled
+        // nowhere else in CI, so any such switch has to be walked by hand.
         let cuda_archs = env::var("MLX_CUDA_ARCHITECTURES").unwrap_or_else(|_| "121a".into());
         cfg.define("MLX_BUILD_CUDA", "ON")
             .define("MLX_BUILD_METAL", "OFF")
