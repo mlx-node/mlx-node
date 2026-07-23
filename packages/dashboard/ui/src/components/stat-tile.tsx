@@ -24,15 +24,15 @@ export interface StatTileProps {
  */
 export function StatTile({ label, value, sub, icon: Icon, footer, className }: StatTileProps) {
   return (
-    <Card className={cn('gap-0 py-5', className)}>
+    <Card className={cn('hover:shadow-soft-lg gap-0 py-5 transition-shadow', className)}>
       <div className="flex items-start justify-between gap-3 px-5">
         <div className="min-w-0 space-y-1.5">
           <p className="text-muted-foreground text-sm font-medium">{label}</p>
-          <p className="text-3xl leading-none font-semibold tracking-tight">{value}</p>
+          <div className="text-3xl leading-none font-semibold tracking-tight">{value}</div>
           {sub !== undefined && <div className="text-muted-foreground text-sm">{sub}</div>}
         </div>
         {Icon !== undefined && (
-          <span className="bg-muted text-muted-foreground flex size-9 shrink-0 items-center justify-center rounded-lg">
+          <span className="bg-brand-gradient text-primary-foreground shadow-soft flex size-9 shrink-0 items-center justify-center rounded-lg">
             <Icon className="size-5" aria-hidden />
           </span>
         )}
