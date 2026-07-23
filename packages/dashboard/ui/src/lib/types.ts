@@ -193,6 +193,8 @@ export interface TranscriptToolCall {
   id: string;
   name: string;
   arguments: unknown;
+  /** One-line digest of the arguments (path / command / …), shown on the header. */
+  summary: string;
 }
 
 /** One flattened transcript message from `GET /api/sessions/:id` (server: `TranscriptEntry`). */
@@ -204,6 +206,16 @@ export interface TranscriptEntry {
   /** Present on `toolResult` messages. */
   toolName?: string;
   isError?: boolean;
+  /** The model id that produced an `assistant` message; drives its logo + name. */
+  model?: string;
+  /** Base64 image blocks, rendered inline as thumbnails. */
+  images?: Array<{ mimeType: string; data: string }>;
+  /** Chip labels (e.g. `HEIC · 32 KB`) for binary blobs shown in place of raw bytes. */
+  binaryNotes?: string[];
+  /** Coordinate-mapping image-read notes split out of `text`; hidden by default. */
+  imageNotes?: string[];
+  /** One-line digest of the originating call's args (path / command); on `toolResult` rows. */
+  title?: string;
 }
 
 export interface SessionSummary {

@@ -581,6 +581,137 @@ describe('dashboard server — sessions', () => {
     expect((await fetch(`${server.url}/api/sessions/fix-2`)).status).toBe(404);
   });
 
+  it('renders image reads as thumbnails and raw-binary reads as chips (not garbage)', async () => {
+    // A 1x1 PNG (base64) — the backend passes it through verbatim for the UI to inline.
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    // Raw HEIC bytes a `read` returned verbatim in a text block: leading NUL control
+    // bytes (→ classified binary) and the `ftypheic` magic (→ labelled HEIC).
+    const nul = String.fromCharCode(0);
+    const heicBytes = nul.repeat(3) + 'ftypheic' + nul.repeat(2) + 'mif1garbagebytes';
+    const dir = join(sessionsRoot, '--imgproj--');
+    mkdirSync(dir, { recursive: true });
+    const lines = [
+      { type: 'session', version: 3, id: 'img-1', timestamp: '2026-07-20T10:00:00.000Z', cwd: '/imgproj' },
+      {
+        type: 'message',
+        id: 'u1',
+        parentId: null,
+        timestamp: '2026-07-20T10:00:01.000Z',
+        message: { role: 'user', content: 'read the files' },
+      },
+      {
+        type: 'message',
+        id: 'r1',
+        parentId: 'u1',
+        timestamp: '2026-07-20T10:00:02.000Z',
+        message: {
+          role: 'toolResult',
+          toolName: 'read',
+          content: [
+            { type: 'text', text: 'Read image file [image/png]' },
+            {
+              type: 'text',
+              text: '[Image: original 6720x4480, displayed at 2000x1333. Multiply coordinates by 3.36 to map to original image.]',
+            },
+            { type: 'image', data: png, mimeType: 'image/png' },
+          ],
+        },
+      },
+      {
+        type: 'message',
+        id: 'r2',
+        parentId: 'r1',
+        timestamp: '2026-07-20T10:00:03.000Z',
+        message: { role: 'toolResult', toolName: 'read', content: [{ type: 'text', text: heicBytes }] },
+      },
+    ];
+    writeFileSync(join(dir, 'img.jsonl'), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
+    await ingest();
+
+    const detail = (await (await fetch(`${server.url}/api/sessions/img-1`)).json()) as {
+      transcript: Array<{
+        role: string;
+        text: string;
+        images?: Array<{ mimeType: string; data: string }>;
+        binaryNotes?: string[];
+        imageNotes?: string[];
+      }>;
+    };
+
+    const imageEntry = detail.transcript.find((e) => e.images !== undefined);
+    expect(imageEntry?.images).toEqual([{ mimeType: 'image/png', data: png }]);
+    // The coordinate-mapping note is split out of the rendered prose into imageNotes,
+    // leaving only the plain action label — and never left inline in the text.
+    expect(imageEntry?.text).toBe('Read image file [image/png]');
+    expect(imageEntry?.imageNotes?.[0]).toMatch(/Multiply coordinates by 3\.36/);
+    expect(imageEntry?.text ?? '').not.toContain('Multiply coordinates');
+
+    const binaryEntry = detail.transcript.find((e) => e.binaryNotes !== undefined);
+    expect(binaryEntry?.binaryNotes?.[0]).toMatch(/^HEIC · /);
+    // The raw bytes are NOT dumped into rendered text.
+    expect(binaryEntry?.text ?? '').toBe('');
+    expect(JSON.stringify(detail.transcript)).not.toContain('garbagebytes');
+  });
+
+  it('summarizes tool-call args and joins them onto the result row title', async () => {
+    const dir = join(sessionsRoot, '--callproj--');
+    mkdirSync(dir, { recursive: true });
+    const lines = [
+      { type: 'session', version: 3, id: 'call-1', timestamp: '2026-07-20T10:00:00.000Z', cwd: '/callproj' },
+      {
+        type: 'message',
+        id: 'u1',
+        parentId: null,
+        timestamp: '2026-07-20T10:00:01.000Z',
+        message: { role: 'user', content: 'read it' },
+      },
+      {
+        type: 'message',
+        id: 'a1',
+        parentId: 'u1',
+        timestamp: '2026-07-20T10:00:02.000Z',
+        message: {
+          role: 'assistant',
+          model: 'qwen3.6-27b-unsloth-mxfp4-mlx',
+          content: [{ type: 'toolCall', id: 'call_abc', name: 'read', arguments: { path: '/callproj/src/lib.rs' } }],
+        },
+      },
+      {
+        type: 'message',
+        id: 'r1',
+        parentId: 'a1',
+        timestamp: '2026-07-20T10:00:03.000Z',
+        message: {
+          role: 'toolResult',
+          toolCallId: 'call_abc',
+          toolName: 'read',
+          content: [{ type: 'text', text: 'fn main() {}' }],
+        },
+      },
+    ];
+    writeFileSync(join(dir, 'call.jsonl'), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
+    await ingest();
+
+    const detail = (await (await fetch(`${server.url}/api/sessions/call-1`)).json()) as {
+      transcript: Array<{
+        role: string;
+        title?: string;
+        toolName?: string;
+        model?: string;
+        toolCalls: Array<{ name: string; summary: string }>;
+      }>;
+    };
+
+    // The assistant's tool call carries a one-line arg digest, and the entry
+    // surfaces the model that produced it (for its per-model logo)…
+    const callEntry = detail.transcript.find((e) => e.toolCalls.length > 0);
+    expect(callEntry?.toolCalls[0]).toMatchObject({ name: 'read', summary: '/callproj/src/lib.rs' });
+    expect(callEntry?.model).toBe('qwen3.6-27b-unsloth-mxfp4-mlx');
+    // …and the result row recovers the same digest by joining on toolCallId.
+    const resultEntry = detail.transcript.find((e) => e.role === 'toolResult' && e.toolName === 'read');
+    expect(resultEntry?.title).toBe('/callproj/src/lib.rs');
+  });
+
   it('joins turns and traces for session metrics', async () => {
     await ingest();
     const res = await fetch(`${server.url}/api/sessions/fix-1/metrics`);
@@ -1306,6 +1437,12 @@ describe('dashboard server — static SPA', () => {
 
   it('reports health', async () => {
     const res = await fetch(`${server.url}/health`);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { status: string }).status).toBe('ok');
+  });
+
+  it('also serves health under /api/health (reachable through the UI /api proxy)', async () => {
+    const res = await fetch(`${server.url}/api/health`);
     expect(res.status).toBe(200);
     expect(((await res.json()) as { status: string }).status).toBe('ok');
   });
