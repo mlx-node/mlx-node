@@ -40,6 +40,10 @@
 //!    rather than `word |= code << (i * bits)`. 4-bit does not straddle, but one
 //!    cursor covers all three widths.
 //!
+//! Rows repack independently, so [`KQuantRepacker`] takes a tensor a chunk of
+//! rows at a time and a loader never has to hold a whole multi-hundred-megabyte
+//! GGUF payload resident. [`repack_kquant`] is the whole-tensor wrapper.
+//!
 //! Correctness is gated by `crates/mlx-core/tests/kquant_ggml_parity.rs`, which
 //! drives this repacker and MLX's CPU decode against ggml's own decoders.
 
@@ -128,10 +132,16 @@ impl KQuantFormat {
             Self::Q4K | Self::Q5K => 2 * (k / QK_K),
         }
     }
+
+    /// Bytes one row of `k` values occupies in the GGUF payload. `k` is assumed
+    /// to be a multiple of `QK_K`, which `KQuantRepacker::new` enforces.
+    pub fn row_bytes(self, k: usize) -> usize {
+        (k / QK_K) * self.block_bytes()
+    }
 }
 
 /// `.scales` for one tensor, in the dtype MLX expects for the format.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KQuantScales {
     /// q6k: ggml's signed int8 sub-scales, verbatim.
     Signed(Vec<i8>),
@@ -140,7 +150,7 @@ pub enum KQuantScales {
 }
 
 /// The three MLX arrays for one repacked tensor, flattened row-major.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KQuantArrays {
     /// `uint32[rows, format.weight_cols(k)]`
     pub weight: Vec<u32>,
@@ -286,108 +296,192 @@ pub fn q5k_code(blk: &[u8], v: usize) -> u32 {
     u32::from(nibble | (high << 4))
 }
 
+/// Reserve room for `rows * cols` more elements, reporting a failed allocation
+/// as an error rather than aborting the process — a K-quant destination for a
+/// large tensor runs to hundreds of megabytes.
+fn reserve_rows<T>(dst: &mut Vec<T>, rows: usize, cols: usize, what: &str) -> Result<()> {
+    let extra = rows
+        .checked_mul(cols)
+        .ok_or_else(|| Error::from_reason(format!("K-quant repack: .{what} length overflow")))?;
+    dst.try_reserve(extra).map_err(|e| {
+        Error::from_reason(format!(
+            "K-quant repack: cannot reserve .{what} for {rows} rows: {e}"
+        ))
+    })
+}
+
+/// Repacks a tensor row by row, so a caller can walk a multi-gigabyte GGUF a
+/// chunk at a time instead of holding the whole payload resident.
+///
+/// Appending in chunks produces exactly the arrays a single whole-tensor call
+/// would: every row is a whole number of super-blocks and `256 * bits` is a
+/// multiple of 32 for all three widths, so each row's code stream starts and
+/// ends on a `uint32` boundary. `chunked_repack_equals_whole_tensor_repack`
+/// pins that.
+///
+/// The destination still grows to the full repacked tensor — only the *source*
+/// is streamed. Nothing here dequantizes; the output is the same bits at ggml's
+/// byte size.
+pub struct KQuantRepacker {
+    format: KQuantFormat,
+    k: usize,
+    rows: usize,
+    weight: Vec<u32>,
+    /// q6k `.scales`; empty for q4k/q5k.
+    scales_i8: Vec<i8>,
+    /// q4k/q5k `.scales`; empty for q6k.
+    scales_u8: Vec<u8>,
+    biases: Vec<u16>,
+}
+
+impl KQuantRepacker {
+    /// `rows_hint` sizes the destination up front. `push_rows` accepts any
+    /// number of rows regardless, but passing the tensor's true row count keeps
+    /// the destination to a single allocation.
+    pub fn new(format: KQuantFormat, k: usize, rows_hint: usize) -> Result<Self> {
+        if k == 0 || !k.is_multiple_of(QK_K) {
+            return Err(Error::from_reason(format!(
+                "{} repack: K must be a positive multiple of {QK_K}, got {k}",
+                format.mlx_mode()
+            )));
+        }
+        let mut repacker = Self {
+            format,
+            k,
+            rows: 0,
+            weight: Vec::new(),
+            scales_i8: Vec::new(),
+            scales_u8: Vec::new(),
+            biases: Vec::new(),
+        };
+        repacker.reserve(rows_hint)?;
+        Ok(repacker)
+    }
+
+    fn reserve(&mut self, rows: usize) -> Result<()> {
+        let (format, k) = (self.format, self.k);
+        reserve_rows(&mut self.weight, rows, format.weight_cols(k), "weight")?;
+        reserve_rows(&mut self.biases, rows, format.biases_cols(k), "biases")?;
+        if format.scales_are_signed() {
+            reserve_rows(&mut self.scales_i8, rows, format.scales_cols(k), "scales")
+        } else {
+            reserve_rows(&mut self.scales_u8, rows, format.scales_cols(k), "scales")
+        }
+    }
+
+    /// Rows appended so far.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Append `rows` consecutive rows. `blocks` must hold exactly
+    /// `rows * format.row_bytes(k)` bytes of ggml super-blocks, row-major, and
+    /// must continue where the previous call left off.
+    pub fn push_rows(&mut self, blocks: &[u8], rows: usize) -> Result<()> {
+        let (format, k) = (self.format, self.k);
+        let block_bytes = format.block_bytes();
+        let sb_per_row = k / QK_K;
+        let want_bytes = rows
+            .checked_mul(sb_per_row)
+            .and_then(|n| n.checked_mul(block_bytes))
+            .ok_or_else(|| Error::from_reason("K-quant repack: tensor size overflow"))?;
+        if blocks.len() != want_bytes {
+            return Err(Error::from_reason(format!(
+                "{} repack: expected {want_bytes} bytes for {rows}x{k}, got {}",
+                format.mlx_mode(),
+                blocks.len()
+            )));
+        }
+        self.reserve(rows)?;
+
+        let bits = format.bits();
+        for row in 0..rows {
+            let mut packer = BitPacker::new(&mut self.weight);
+            for sb in 0..sb_per_row {
+                let start = (row * sb_per_row + sb) * block_bytes;
+                let blk = &blocks[start..start + block_bytes];
+
+                match format {
+                    KQuantFormat::Q6K => {
+                        // .biases[G] = ggml d, raw f16 bits — no float math, so
+                        // exactness is free.
+                        self.biases.push(u16::from_le_bytes([
+                            blk[Q6K_D_OFFSET],
+                            blk[Q6K_D_OFFSET + 1],
+                        ]));
+                        // .scales[16G + j] = ggml sc[j], verbatim int8.
+                        for j in 0..QK_K / 16 {
+                            self.scales_i8.push(blk[Q6K_SCALES_OFFSET + j] as i8);
+                        }
+                        for v in 0..QK_K {
+                            packer.push(q6k_code(blk, v), bits);
+                        }
+                    }
+                    KQuantFormat::Q4K | KQuantFormat::Q5K => {
+                        let (d_off, dmin_off, sc_off) = match format {
+                            KQuantFormat::Q4K => (Q4K_D_OFFSET, Q4K_DMIN_OFFSET, Q4K_SCALES_OFFSET),
+                            _ => (Q5K_D_OFFSET, Q5K_DMIN_OFFSET, Q5K_SCALES_OFFSET),
+                        };
+                        // .biases[2G] = d, .biases[2G+1] = dmin — raw f16 bits.
+                        self.biases
+                            .push(u16::from_le_bytes([blk[d_off], blk[d_off + 1]]));
+                        self.biases
+                            .push(u16::from_le_bytes([blk[dmin_off], blk[dmin_off + 1]]));
+                        // .scales[2g] = sc[j], .scales[2g+1] = m[j]. ggml packs
+                        // the eight pairs as 6-bit fields across 12 bytes;
+                        // storing them unpacked costs 0.125 bpw and keeps the
+                        // affine kernel's per-group pointer walk intact.
+                        let packed = &blk[sc_off..sc_off + 12];
+                        for j in 0..QK_K / 32 {
+                            let (sc, m) = get_scale_min_k4(j, packed);
+                            self.scales_u8.push(sc);
+                            self.scales_u8.push(m);
+                        }
+                        for v in 0..QK_K {
+                            let code = if format == KQuantFormat::Q4K {
+                                q4k_code(blk, v)
+                            } else {
+                                q5k_code(blk, v)
+                            };
+                            packer.push(code, bits);
+                        }
+                    }
+                }
+            }
+            packer.finish()?;
+        }
+        self.rows += rows;
+        Ok(())
+    }
+
+    /// The three MLX arrays for the rows appended so far.
+    pub fn finish(self) -> KQuantArrays {
+        KQuantArrays {
+            weight: self.weight,
+            scales: if self.format.scales_are_signed() {
+                KQuantScales::Signed(self.scales_i8)
+            } else {
+                KQuantScales::Unsigned(self.scales_u8)
+            },
+            biases: self.biases,
+        }
+    }
+}
+
 /// Repack `rows * (k / 256)` contiguous ggml super-blocks into the MLX K-quant
 /// array contract. `blocks` is the tensor's GGUF payload, row-major.
+///
+/// Whole-tensor convenience over [`KQuantRepacker`]; a loader that does not want
+/// the entire payload resident should drive the repacker directly.
 pub fn repack_kquant(
     format: KQuantFormat,
     blocks: &[u8],
     rows: usize,
     k: usize,
 ) -> Result<KQuantArrays> {
-    if k == 0 || !k.is_multiple_of(QK_K) {
-        return Err(Error::from_reason(format!(
-            "{} repack: K must be a positive multiple of {QK_K}, got {k}",
-            format.mlx_mode()
-        )));
-    }
-    let block_bytes = format.block_bytes();
-    let sb_per_row = k / QK_K;
-    let want_bytes = rows
-        .checked_mul(sb_per_row)
-        .and_then(|n| n.checked_mul(block_bytes))
-        .ok_or_else(|| Error::from_reason("K-quant repack: tensor size overflow"))?;
-    if blocks.len() != want_bytes {
-        return Err(Error::from_reason(format!(
-            "{} repack: expected {want_bytes} bytes for {rows}x{k}, got {}",
-            format.mlx_mode(),
-            blocks.len()
-        )));
-    }
-
-    let bits = format.bits();
-    let mut weight = Vec::with_capacity(rows * format.weight_cols(k));
-    let mut biases = Vec::with_capacity(rows * format.biases_cols(k));
-    let mut scales_i8 = Vec::new();
-    let mut scales_u8 = Vec::new();
-    if format.scales_are_signed() {
-        scales_i8.reserve(rows * format.scales_cols(k));
-    } else {
-        scales_u8.reserve(rows * format.scales_cols(k));
-    }
-
-    for row in 0..rows {
-        let mut packer = BitPacker::new(&mut weight);
-        for sb in 0..sb_per_row {
-            let start = (row * sb_per_row + sb) * block_bytes;
-            let blk = &blocks[start..start + block_bytes];
-
-            match format {
-                KQuantFormat::Q6K => {
-                    // .biases[G] = ggml d, raw f16 bits — no float math, so
-                    // exactness is free.
-                    biases.push(u16::from_le_bytes([
-                        blk[Q6K_D_OFFSET],
-                        blk[Q6K_D_OFFSET + 1],
-                    ]));
-                    // .scales[16G + j] = ggml sc[j], verbatim int8.
-                    for j in 0..QK_K / 16 {
-                        scales_i8.push(blk[Q6K_SCALES_OFFSET + j] as i8);
-                    }
-                    for v in 0..QK_K {
-                        packer.push(q6k_code(blk, v), bits);
-                    }
-                }
-                KQuantFormat::Q4K | KQuantFormat::Q5K => {
-                    let (d_off, dmin_off, sc_off) = match format {
-                        KQuantFormat::Q4K => (Q4K_D_OFFSET, Q4K_DMIN_OFFSET, Q4K_SCALES_OFFSET),
-                        _ => (Q5K_D_OFFSET, Q5K_DMIN_OFFSET, Q5K_SCALES_OFFSET),
-                    };
-                    // .biases[2G] = d, .biases[2G+1] = dmin — raw f16 bits.
-                    biases.push(u16::from_le_bytes([blk[d_off], blk[d_off + 1]]));
-                    biases.push(u16::from_le_bytes([blk[dmin_off], blk[dmin_off + 1]]));
-                    // .scales[2g] = sc[j], .scales[2g+1] = m[j]. ggml packs the
-                    // eight pairs as 6-bit fields across 12 bytes; storing them
-                    // unpacked costs 0.125 bpw and keeps the affine kernel's
-                    // per-group pointer walk intact.
-                    let packed = &blk[sc_off..sc_off + 12];
-                    for j in 0..QK_K / 32 {
-                        let (sc, m) = get_scale_min_k4(j, packed);
-                        scales_u8.push(sc);
-                        scales_u8.push(m);
-                    }
-                    for v in 0..QK_K {
-                        let code = if format == KQuantFormat::Q4K {
-                            q4k_code(blk, v)
-                        } else {
-                            q5k_code(blk, v)
-                        };
-                        packer.push(code, bits);
-                    }
-                }
-            }
-        }
-        packer.finish()?;
-    }
-
-    Ok(KQuantArrays {
-        weight,
-        scales: if format.scales_are_signed() {
-            KQuantScales::Signed(scales_i8)
-        } else {
-            KQuantScales::Unsigned(scales_u8)
-        },
-        biases,
-    })
+    let mut repacker = KQuantRepacker::new(format, k, rows)?;
+    repacker.push_rows(blocks, rows)?;
+    Ok(repacker.finish())
 }
 
 #[cfg(test)]
@@ -426,5 +520,72 @@ mod tests {
         let blocks = vec![0u8; 210];
         let err = repack_kquant(KQuantFormat::Q6K, &blocks, 1, 128).expect_err("bad K");
         assert!(err.reason.contains("multiple of 256"), "{}", err.reason);
+    }
+
+    /// Deterministic block bytes: fixed-seed LCG, no wall clock and no `rand`.
+    fn lcg_bytes(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chunked_repack_equals_whole_tensor_repack() {
+        for (format, k) in [
+            (KQuantFormat::Q4K, 512),
+            (KQuantFormat::Q5K, 256),
+            (KQuantFormat::Q6K, 768),
+        ] {
+            let rows = 5;
+            let row_bytes = format.row_bytes(k);
+            let blocks = lcg_bytes(u64::from(format.gguf_type()), rows * row_bytes);
+            let whole = repack_kquant(format, &blocks, rows, k).expect("whole-tensor repack");
+
+            for chunk_rows in [1, 2, 5] {
+                let mut repacker = KQuantRepacker::new(format, k, rows).expect("repacker");
+                let mut done = 0;
+                while done < rows {
+                    let n = chunk_rows.min(rows - done);
+                    let at = done * row_bytes;
+                    repacker
+                        .push_rows(&blocks[at..at + n * row_bytes], n)
+                        .expect("push chunk");
+                    done += n;
+                }
+                assert_eq!(repacker.rows(), rows);
+                assert_eq!(
+                    repacker.finish(),
+                    whole,
+                    "{} chunked {chunk_rows} rows at a time",
+                    format.mlx_mode()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repacker_grows_past_its_row_hint() {
+        let (format, k) = (KQuantFormat::Q5K, 256);
+        let blocks = lcg_bytes(7, 4 * format.row_bytes(k));
+        let mut repacker = KQuantRepacker::new(format, k, 0).expect("repacker");
+        repacker.push_rows(&blocks, 4).expect("push rows");
+        assert_eq!(repacker.rows(), 4);
+        assert_eq!(
+            repacker.finish(),
+            repack_kquant(format, &blocks, 4, k).expect("whole-tensor repack")
+        );
+    }
+
+    #[test]
+    fn push_rows_rejects_a_chunk_that_is_not_whole_rows() {
+        let mut repacker = KQuantRepacker::new(KQuantFormat::Q4K, 256, 2).expect("repacker");
+        let err = repacker.push_rows(&[0u8; 143], 1).expect_err("partial row");
+        assert!(err.reason.contains("expected 144 bytes"), "{}", err.reason);
     }
 }

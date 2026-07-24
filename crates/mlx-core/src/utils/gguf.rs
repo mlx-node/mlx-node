@@ -16,6 +16,7 @@ use napi_derive::napi;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
+use crate::utils::gguf_kquant::{KQuantArrays, KQuantFormat, KQuantRepacker, KQuantScales, QK_K};
 use crate::utils::safetensors::save_safetensors;
 
 // ── GGUF Constants ──────────────────────────────────────────────────────────
@@ -34,6 +35,8 @@ pub enum GgufTensorType {
     Q4_0 = 2,
     Q4_1 = 3,
     Q8_0 = 8,
+    Q4K = 12,
+    Q5K = 13,
     Q6K = 14,
     BF16 = 30,
 }
@@ -46,13 +49,18 @@ impl GgufTensorType {
             2 => Some(Self::Q4_0),
             3 => Some(Self::Q4_1),
             8 => Some(Self::Q8_0),
+            12 => Some(Self::Q4K),
+            13 => Some(Self::Q5K),
             14 => Some(Self::Q6K),
             30 => Some(Self::BF16),
             _ => None,
         }
     }
 
-    /// Bytes per element for non-quantized types. Quantized types return block size info.
+    /// Bytes per element for non-quantized types, bytes per block for quantized
+    /// ones. The K-quant sizes are `block_q4_K` / `block_q5_K` / `block_q6_K`
+    /// from `crates/mlx-core/vendor/ggml/ggml_kquant_ref.h:41-73`, which the
+    /// vendored C static-asserts against ggml's own structs.
     fn type_size(&self) -> usize {
         match self {
             Self::F32 => 4,
@@ -60,27 +68,59 @@ impl GgufTensorType {
             Self::Q4_0 => 18, // block size: 2 byte scale + 16 bytes (32 x 4-bit)
             Self::Q4_1 => 20, // 2 byte scale + 2 byte bias + 16 bytes
             Self::Q8_0 => 34, // 2 byte scale + 32 bytes
+            // f16 d + f16 dmin + 12 packed 6-bit (sub-scale, min) pairs +
+            // 128 nibble bytes for 256 values.
+            Self::Q4K => 144,
+            // Q4_K plus a 32-byte plane holding each value's fifth bit.
+            Self::Q5K => 176,
             // 128 low-nibble bytes + 64 high-two-bit bytes + 16 signed
             // sub-scales + one f16 super-scale for 256 values.
             Self::Q6K => 210,
         }
     }
 
-    /// Number of elements per block for quantized types
+    /// Number of elements per block; 1 for the scalar types.
+    ///
+    /// Deliberately exhaustive — no `_` arm. `data_size()` divides the element
+    /// count by this before multiplying by `type_size()`, so a type that fell
+    /// through to 1 would take the non-quantized branch, oversize its tensor by
+    /// a factor of `block_size`, and shift every later tensor offset in the file
+    /// with no error raised anywhere.
     fn block_size(&self) -> usize {
         match self {
+            Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => 32,
-            Self::Q6K => 256,
-            _ => 1,
+            Self::Q4K | Self::Q5K | Self::Q6K => 256,
         }
     }
 
+    /// Whether the payload is stored as fixed-size blocks. Derived from
+    /// `block_size()` so a type cannot answer this and its byte count
+    /// inconsistently.
     fn is_quantized(&self) -> bool {
-        matches!(self, Self::Q4_0 | Self::Q4_1 | Self::Q8_0 | Self::Q6K)
+        self.block_size() > 1
     }
 
+    /// Whether `load_quantized_tensor` can repack the blocks into MLX's affine
+    /// `(weight, scales, biases)` triplet. False for the K-quants: their
+    /// per-16/32-value sub-scales need the K-quant array contract in
+    /// `crate::utils::gguf_kquant`, not affine's one f16 scale per block.
     fn is_mlx_affine_quantized(&self) -> bool {
         matches!(self, Self::Q4_0 | Self::Q4_1 | Self::Q8_0)
+    }
+
+    /// The repacker format for the ggml K-quants, `None` for everything else.
+    ///
+    /// Deliberately exhaustive for the same reason as `block_size()`: a K-quant
+    /// added here but forgotten in `load_gguf_tensors` would be handed to the
+    /// affine or the dense reader and decode to garbage.
+    fn k_quant_format(&self) -> Option<KQuantFormat> {
+        match self {
+            Self::Q4K => Some(KQuantFormat::Q4K),
+            Self::Q5K => Some(KQuantFormat::Q5K),
+            Self::Q6K => Some(KQuantFormat::Q6K),
+            Self::F32 | Self::F16 | Self::BF16 | Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => None,
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -90,6 +130,8 @@ impl GgufTensorType {
             Self::Q4_0 => "Q4_0",
             Self::Q4_1 => "Q4_1",
             Self::Q8_0 => "Q8_0",
+            Self::Q4K => "Q4_K",
+            Self::Q5K => "Q5_K",
             Self::Q6K => "Q6_K",
             Self::BF16 => "BF16",
         }
@@ -479,8 +521,8 @@ pub fn parse_gguf<P: AsRef<Path>>(path: P) -> Result<GgufFile> {
             Some(t) => t,
             None => {
                 return Err(Error::from_reason(format!(
-                    "Tensor '{}' has unsupported GGUF type {} — only F32(0), F16(1), Q4_0(2), Q4_1(3), Q8_0(8), Q6_K(14), BF16(30) are supported. \
-                     Q6_K is supported only for the Gemma4 token embedding; other K-quant formats require dequantization before conversion.",
+                    "Tensor '{}' has unsupported GGUF type {} — only F32(0), F16(1), Q4_0(2), Q4_1(3), Q8_0(8), Q4_K(12), Q5_K(13), Q6_K(14), BF16(30) are recognized. \
+                     Other K-quant and IQ formats require dequantization before conversion.",
                     name, type_u32
                 )));
             }
@@ -802,11 +844,168 @@ fn load_quantized_tensor(
     ])
 }
 
+/// Source bytes a single K-quant read pulls in before repacking them. Large
+/// enough to amortize the read syscall across many rows, small enough that the
+/// source side never rivals the tensor being built.
+const KQUANT_CHUNK_TARGET_BYTES: usize = 4 << 20;
+
+/// Read `rows` rows of `format` super-blocks from the reader's current position
+/// and repack them.
+///
+/// Rows repack independently, so the source is consumed in chunks of at most
+/// `chunk_target_bytes` (rounded down to whole rows, never below one) instead of
+/// as one buffer. `label` names the tensor for read errors.
+fn repack_rows_from_reader(
+    reader: &mut impl Read,
+    format: KQuantFormat,
+    k: usize,
+    rows: usize,
+    chunk_target_bytes: usize,
+    label: &str,
+) -> Result<KQuantArrays> {
+    let row_bytes = format.row_bytes(k);
+    let chunk_rows = (chunk_target_bytes / row_bytes).clamp(1, rows.max(1));
+    let mut buf = vec![0u8; chunk_rows * row_bytes];
+
+    let mut repacker = KQuantRepacker::new(format, k, rows)?;
+    let mut done = 0usize;
+    while done < rows {
+        let n = chunk_rows.min(rows - done);
+        let chunk = &mut buf[..n * row_bytes];
+        reader.read_exact(chunk).map_err(|e| {
+            Error::from_reason(format!(
+                "Failed to read rows {done}..{} of {label}: {e}",
+                done + n
+            ))
+        })?;
+        repacker.push_rows(chunk, n)?;
+        done += n;
+    }
+    Ok(repacker.finish())
+}
+
+/// The three output keys one imported K-quant tensor occupies: the packed
+/// `.weight` under the source tensor's own name, plus the `.scales` / `.biases`
+/// sidecars sharing its prefix.
+///
+/// `load_kquant_repack` names its arrays with this, and the converter's
+/// do-not-dtype-cast set spells out the same three names, so the producer and
+/// the consumer cannot drift into disagreeing about the suffixes.
+fn k_quant_output_keys(weight_key: &str) -> [String; 3] {
+    let prefix = weight_key.strip_suffix(".weight").unwrap_or(weight_key);
+    [
+        weight_key.to_string(),
+        format!("{prefix}.scales"),
+        format!("{prefix}.biases"),
+    ]
+}
+
+/// Import a ggml K-quant tensor as MLX K-quant arrays, without dequantizing.
+///
+/// Emits the same `(weight, scales, biases)` triplet shape as the affine path,
+/// because ~25 sites elsewhere in the loader use a `.scales` / `.biases` pair as
+/// the "this tensor is quantized" sentinel. The contents differ: `.weight` is an
+/// LSB-first `bits`-wide code stream, `.scales` holds ggml's per-16/32-value
+/// sub-scales (signed for Q6_K, `(sc, m)` pairs for Q4_K / Q5_K), and `.biases`
+/// holds ggml's `d` — and `dmin` for Q4_K / Q5_K — which are SCALES, not biases.
+/// `crate::utils::gguf_kquant` documents the full contract and owns the packing.
+///
+/// The GGUF payload is read a few megabytes at a time rather than whole, so a
+/// multi-hundred-megabyte tensor never has its source bytes and its repacked
+/// copy resident together. The destination arrays are still built in full —
+/// they are the tensor.
+fn load_kquant_repack(
+    reader: &mut (impl Read + Seek),
+    gguf: &GgufFile,
+    tensor: &GgufTensorInfo,
+    format: KQuantFormat,
+) -> Result<Vec<(String, MxArray)>> {
+    let shape = tensor.mlx_shape();
+    let last_dim = shape.last().copied().unwrap_or(0);
+    if last_dim <= 0 || !(last_dim as usize).is_multiple_of(QK_K) {
+        return Err(Error::from_reason(format!(
+            "{} tensor '{}' has last dimension {last_dim}; expected a positive multiple of {QK_K}",
+            tensor.tensor_type.name(),
+            tensor.name
+        )));
+    }
+    let k = last_dim as usize;
+    // `num_elements()` is the product of the dims, so dividing by the last one
+    // is exact.
+    let rows = tensor.num_elements() as usize / k;
+
+    let abs_offset = gguf.data_offset + tensor.offset;
+    reader.seek(SeekFrom::Start(abs_offset)).map_err(|e| {
+        Error::from_reason(format!(
+            "Failed to seek to {} tensor '{}': {e}",
+            tensor.tensor_type.name(),
+            tensor.name
+        ))
+    })?;
+
+    let arrays = repack_rows_from_reader(
+        reader,
+        format,
+        k,
+        rows,
+        KQUANT_CHUNK_TARGET_BYTES,
+        &format!("{} tensor '{}'", tensor.tensor_type.name(), tensor.name),
+    )?;
+
+    let row_shape = |cols: usize| -> Vec<i64> {
+        let mut s = shape.clone();
+        if let Some(last) = s.last_mut() {
+            *last = cols as i64;
+        }
+        s
+    };
+
+    // Destructured so each staging buffer is freed as soon as MLX has copied
+    // it, instead of all three outliving the last copy.
+    let KQuantArrays {
+        weight,
+        scales,
+        biases,
+    } = arrays;
+    let weight_arr = MxArray::from_uint32(&weight, &row_shape(format.weight_cols(k)))?;
+    drop(weight);
+    let scales_shape = row_shape(format.scales_cols(k));
+    let scales_arr = match &scales {
+        // Q6_K sub-scales are signed; reinterpreting them through uint8 would
+        // turn -1 into 255.
+        KQuantScales::Signed(v) => MxArray::from_int8(v, &scales_shape)?,
+        KQuantScales::Unsigned(v) => MxArray::from_uint8(v, &scales_shape)?,
+    };
+    drop(scales);
+    let biases_arr = MxArray::from_float16(&biases, &row_shape(format.biases_cols(k)))?;
+    drop(biases);
+
+    let [weight_key, scales_key, biases_key] = k_quant_output_keys(&tensor.name);
+    Ok(vec![
+        (weight_key, weight_arr),
+        (scales_key, scales_arr),
+        (biases_key, biases_arr),
+    ])
+}
+
+/// What `load_gguf_tensors` does beyond a dtype-preserving read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GgufLoadOptions {
+    /// Log progress every 50 tensors.
+    pub verbose: bool,
+    /// Repack ggml Q4_K / Q5_K / Q6_K blocks into MLX K-quant arrays.
+    ///
+    /// Off by default, which is the pre-K-quant behaviour: Q6_K is accepted
+    /// only as the Gemma4 token embedding and dequantized to BF16, and Q4_K /
+    /// Q5_K are rejected.
+    pub import_k_quants: bool,
+}
+
 /// Load all tensors from a GGUF file
 pub fn load_gguf_tensors<P: AsRef<Path>>(
     path: P,
     gguf: &GgufFile,
-    verbose: bool,
+    options: GgufLoadOptions,
 ) -> Result<HashMap<String, MxArray>> {
     let file = fs::File::open(path.as_ref())
         .map_err(|e| Error::from_reason(format!("Failed to open GGUF file: {e}")))?;
@@ -814,7 +1013,7 @@ pub fn load_gguf_tensors<P: AsRef<Path>>(
     let mut weights = HashMap::new();
 
     for (i, tensor) in gguf.tensors.iter().enumerate() {
-        if verbose && (i % 50 == 0 || i == gguf.tensors.len() - 1) {
+        if options.verbose && (i % 50 == 0 || i == gguf.tensors.len() - 1) {
             info!(
                 "Loading tensor {}/{}: {} ({}, shape {:?})",
                 i + 1,
@@ -825,20 +1024,35 @@ pub fn load_gguf_tensors<P: AsRef<Path>>(
             );
         }
 
-        if tensor.tensor_type == GgufTensorType::Q6K {
-            let is_gemma4 = gguf
-                .metadata
-                .get("general.architecture")
-                .and_then(GgufMetaValue::as_str)
-                == Some("gemma4");
-            if !is_gemma4 || tensor.name != "token_embd.weight" {
+        if let Some(format) = tensor.tensor_type.k_quant_format() {
+            if options.import_k_quants {
+                for (name, arr) in load_kquant_repack(&mut reader, gguf, tensor, format)? {
+                    weights.insert(name, arr);
+                }
+            } else if tensor.tensor_type == GgufTensorType::Q6K {
+                // The pre-K-quant fallback: one dequantized tensor, in one
+                // position, for one architecture.
+                let is_gemma4 = gguf
+                    .metadata
+                    .get("general.architecture")
+                    .and_then(GgufMetaValue::as_str)
+                    == Some("gemma4");
+                if !is_gemma4 || tensor.name != "token_embd.weight" {
+                    return Err(Error::from_reason(format!(
+                        "Q6_K tensor '{}' is unsupported in this position. mlx-node currently supports Q6_K only for Gemma4 token_embd.weight, dequantized to BF16.",
+                        tensor.name
+                    )));
+                }
+                let arr = load_q6k_tensor_bf16(&mut reader, gguf, tensor)?;
+                weights.insert(tensor.name.clone(), arr);
+            } else {
                 return Err(Error::from_reason(format!(
-                    "Q6_K tensor '{}' is unsupported in this position. mlx-node currently supports Q6_K only for Gemma4 token_embd.weight, dequantized to BF16.",
-                    tensor.name
+                    "{} tensor '{}' needs the K-quant import, which is not enabled. mlx-node reads {} only when K-quant import is requested.",
+                    tensor.tensor_type.name(),
+                    tensor.name,
+                    tensor.tensor_type.name(),
                 )));
             }
-            let arr = load_q6k_tensor_bf16(&mut reader, gguf, tensor)?;
-            weights.insert(tensor.name.clone(), arr);
         } else if tensor.tensor_type.is_mlx_affine_quantized() {
             let triplet = load_quantized_tensor(&mut reader, gguf, tensor)?;
             for (name, arr) in triplet {
@@ -877,6 +1091,33 @@ fn is_gemma4_mmproj_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
                 == Some("gemma4ua"))
 }
 
+/// The three names a quantized tensor group ships under. Both GGUF quant
+/// importers emit the same trio: `load_quantized_tensor` (affine Q4_0/Q4_1/Q8_0)
+/// and `load_kquant_repack` (Q4_K/Q5_K/Q6_K) each write `{base}.weight` plus a
+/// `{base}.scales` / `{base}.biases` sidecar pair. Loaders probe the sidecar by
+/// name to decide a tensor is quantized (e.g. `embed_tokens.scales`), so a
+/// rename that moves only `.weight` strands the sidecars under their old names
+/// and the group silently degrades to a bare packed weight.
+const QUANT_GROUP_SUFFIXES: [&str; 3] = [".weight", ".scales", ".biases"];
+
+/// Rename `{from_base}` to `{to_base}` for a global tensor, carrying whichever
+/// of the canonical quant-group suffixes the key uses.
+///
+/// The per-layer rules are infix `replace()`s (`.ffn_down.` →
+/// `.mlp.down_proj.`), so they already ride along on any suffix. The global
+/// tensors (`token_embd`, `output`) are renamed by whole-string match instead,
+/// which is why they need this: matching the suffix explicitly keeps a
+/// quantized global tensor's `.scales`/`.biases` attached to its renamed
+/// `.weight`. Requiring the remainder to be exactly one of the three suffixes
+/// (rather than a bare prefix test) keeps neighbours like `output_norm.weight`
+/// and `token_embd_extra.weight` untouched.
+fn rename_global_quant_group(name: &str, from_base: &str, to_base: &str) -> Option<String> {
+    let suffix = name.strip_prefix(from_base)?;
+    QUANT_GROUP_SUFFIXES
+        .contains(&suffix)
+        .then(|| format!("{to_base}{suffix}"))
+}
+
 /// Gemma4's GGUF naming has four distinct residual norms. The generic mapper
 /// predates that architecture and maps `ffn_norm` and `post_attention_norm` to
 /// the same destination, silently losing one tensor when collected into a
@@ -908,12 +1149,16 @@ fn gemma4_name_to_hf(name: &str) -> Option<String> {
     result = result.replace(".post_ffw_norm.", ".post_feedforward_layernorm.");
     result = result.replace(".layer_output_scale.weight", ".layer_scalar");
 
-    if result == "token_embd.weight" {
-        result = "model.embed_tokens.weight".to_string();
+    // Global tensors rename whole-string, so they carry the quant-group suffix
+    // explicitly (a quantized `token_embd`/`output` ships `.scales`/`.biases`
+    // beside `.weight`). `output_norm` stays an exact `.weight` match — norms
+    // are never quantized, so it has no group to carry.
+    if let Some(renamed) = rename_global_quant_group(&result, "token_embd", "model.embed_tokens") {
+        result = renamed;
     } else if result == "output_norm.weight" {
         result = "model.norm.weight".to_string();
-    } else if result == "output.weight" {
-        result = "lm_head.weight".to_string();
+    } else if let Some(renamed) = rename_global_quant_group(&result, "output", "lm_head") {
+        result = renamed;
     }
     Some(result)
 }
@@ -1031,12 +1276,16 @@ pub fn gguf_name_to_hf(name: &str) -> String {
 
     // ── Global layers ───────────────────────────────────────────────────
 
-    if result == "token_embd.weight" {
-        result = "model.embed_tokens.weight".to_string();
+    // Whole-string renames, so they carry the quant-group suffix explicitly:
+    // a quantized `token_embd` / untied `output` ships `.scales`/`.biases`
+    // beside `.weight`. `output_norm` stays an exact `.weight` match — norms
+    // are never quantized, so it has no group to carry.
+    if let Some(renamed) = rename_global_quant_group(&result, "token_embd", "model.embed_tokens") {
+        result = renamed;
     } else if result == "output_norm.weight" {
         result = "model.norm.weight".to_string();
-    } else if result == "output.weight" {
-        result = "lm_head.weight".to_string();
+    } else if let Some(renamed) = rename_global_quant_group(&result, "output", "lm_head") {
+        result = renamed;
     }
 
     result
@@ -1521,64 +1770,154 @@ pub fn extract_config(metadata: &HashMap<String, GgufMetaValue>) -> serde_json::
     serde_json::Value::Object(config)
 }
 
-/// Describe affine tensors that were already quantized in the GGUF source.
+/// The `(bits, group_size, mode)` triple a `quantization` config entry names.
 ///
-/// Q4_0/Q4_1/Q8_0 are repacked by `load_quantized_tensor` without changing
-/// their 32-value block geometry. That remains true even when the caller did
-/// not request an additional `--quantize` pass, so the output config must not
-/// fall back to the runtime's generic group-size default (64 for Gemma4).
-fn preserved_source_quantization(gguf: &GgufFile) -> Result<Option<serde_json::Value>> {
-    let mut profiles = std::collections::BTreeMap::<String, i32>::new();
-    let mut bit_counts = HashMap::<i32, usize>::new();
+/// All three fields participate in every comparison. Bits alone cannot tell a
+/// Q4_0 tensor from a Q4_K one — both are 4-bit — yet they decode through
+/// different kernels with different group sizes, so a bits-only equality test
+/// reports an Unsloth Dynamic GGUF as uniformly affine and mislabels every
+/// K-quant tensor in it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+struct SourceQuantProfile {
+    bits: i32,
+    group_size: i32,
+    mode: &'static str,
+}
+
+impl SourceQuantProfile {
+    /// How the converter writes a tensor of this GGUF type, or `None` when the
+    /// tensor lands as a dense float array.
+    ///
+    /// Deliberately exhaustive — no `_` arm — for the same reason
+    /// `GgufTensorType::block_size` is: a quantized type that fell through to
+    /// `None` here would be written with no `quantization` entry describing it
+    /// and decoded with whatever geometry the runtime happens to default to.
+    fn for_gguf_type(ty: GgufTensorType) -> Option<Self> {
+        match ty {
+            GgufTensorType::F32 | GgufTensorType::F16 | GgufTensorType::BF16 => None,
+            // `load_quantized_tensor` repacks these into MLX affine groups of
+            // 32 without changing their block geometry.
+            GgufTensorType::Q4_0 | GgufTensorType::Q4_1 => Some(Self::affine(4)),
+            GgufTensorType::Q8_0 => Some(Self::affine(8)),
+            // `load_kquant_repack` keeps ggml's geometry verbatim, so the
+            // triple is read off the repacker format rather than restated
+            // here; `k_quant_format` stays the only type -> format mapping.
+            GgufTensorType::Q4K | GgufTensorType::Q5K | GgufTensorType::Q6K => {
+                ty.k_quant_format().map(Self::k_quant)
+            }
+        }
+    }
+
+    const fn affine(bits: i32) -> Self {
+        Self {
+            bits,
+            group_size: 32,
+            mode: "affine",
+        }
+    }
+
+    fn k_quant(format: KQuantFormat) -> Self {
+        Self {
+            bits: format.bits() as i32,
+            group_size: format.group_size() as i32,
+            mode: format.mlx_mode(),
+        }
+    }
+
+    /// Whether a tensor with this profile has to be named explicitly in the
+    /// config instead of relying on the top-level triple. Affine at group 32 is
+    /// the only shape a generic default can reproduce; the K-quant modes carry
+    /// ggml geometry no default supplies.
+    fn requires_explicit_entry(self) -> bool {
+        self.mode != "affine"
+    }
+
+    fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "bits": self.bits,
+            "group_size": self.group_size,
+            "mode": self.mode,
+        })
+    }
+
+    fn describe(self) -> String {
+        format!(
+            "{}-bit {} (group_size {})",
+            self.bits, self.mode, self.group_size
+        )
+    }
+}
+
+/// Describe tensors that were already quantized in the GGUF source.
+///
+/// Q4_0/Q4_1/Q8_0 go through `load_quantized_tensor` and — when the K-quant
+/// import is on — Q4_K/Q5_K/Q6_K go through `load_kquant_repack`. Neither path
+/// changes the source block geometry, so that geometry has to reach the output
+/// config even when the caller never asked for a `--quantize` pass; otherwise
+/// Gemma4 falls back to the runtime's generic group-size default (64) and
+/// decodes exact packed bytes with the wrong shape.
+///
+/// `import_k_quants` mirrors `GgufLoadOptions`: with it off the loader rejected
+/// Q4_K/Q5_K outright and dequantized the Gemma4 Q6_K embedding to BF16, so no
+/// K-quant tensor reaches the output for this to describe.
+fn preserved_source_quantization(
+    gguf: &GgufFile,
+    import_k_quants: bool,
+) -> Result<Option<serde_json::Value>> {
+    let mut profiles = std::collections::BTreeMap::<String, SourceQuantProfile>::new();
+    let mut profile_counts = HashMap::<SourceQuantProfile, usize>::new();
 
     for tensor in &gguf.tensors {
-        let bits = match tensor.tensor_type {
-            GgufTensorType::Q4_0 | GgufTensorType::Q4_1 => 4,
-            GgufTensorType::Q8_0 => 8,
-            _ => continue,
+        if !import_k_quants && tensor.tensor_type.k_quant_format().is_some() {
+            continue;
+        }
+        let Some(profile) = SourceQuantProfile::for_gguf_type(tensor.tensor_type) else {
+            continue;
         };
         let Some(mapped) = gguf_name_to_hf_for_metadata(&tensor.name, &gguf.metadata) else {
             continue;
         };
         let prefix = mapped.strip_suffix(".weight").unwrap_or(&mapped);
         let prefix = super::normalize_override_key(prefix);
-        if let Some(previous) = profiles.insert(prefix.clone(), bits)
-            && previous != bits
+        if let Some(previous) = profiles.insert(prefix.clone(), profile)
+            && previous != profile
         {
             return Err(Error::from_reason(format!(
-                "GGUF source quantization collision: '{prefix}' resolves to both {previous}-bit and {bits}-bit tensors"
+                "GGUF source quantization collision: '{prefix}' resolves to both {} and {} tensors",
+                previous.describe(),
+                profile.describe()
             )));
         }
-        *bit_counts.entry(bits).or_default() += 1;
+        *profile_counts.entry(profile).or_default() += 1;
     }
 
     if profiles.is_empty() {
         return Ok(None);
     }
 
-    let default_bits = bit_counts
+    let default_profile = profile_counts
         .into_iter()
-        .max_by_key(|&(bits, count)| (count, bits))
-        .map(|(bits, _)| bits)
-        .expect("non-empty profiles imply a bit count");
-    let mixed_bits = profiles.values().any(|&bits| bits != default_bits);
+        .max_by_key(|&(profile, count)| (count, profile))
+        .map(|(profile, _)| profile)
+        .expect("non-empty profiles imply a profile count");
+    let mixed = profiles.values().any(|&profile| profile != default_profile);
+
     let mut quant = serde_json::Map::new();
-    quant.insert("bits".to_string(), serde_json::json!(default_bits));
-    quant.insert("group_size".to_string(), serde_json::json!(32));
-    quant.insert("mode".to_string(), serde_json::json!("affine"));
-    if mixed_bits {
-        // Every source-quantized tensor receives an explicit override, so the
-        // top-level modal bit-width is only a fallback and cannot misdecode a
-        // mixed Q4/Q8 GGUF.
-        for (prefix, bits) in profiles {
-            quant.insert(
-                prefix,
-                serde_json::json!({
-                    "bits": bits,
-                    "group_size": 32,
-                    "mode": "affine",
-                }),
-            );
+    quant.insert("bits".to_string(), serde_json::json!(default_profile.bits));
+    quant.insert(
+        "group_size".to_string(),
+        serde_json::json!(default_profile.group_size),
+    );
+    quant.insert("mode".to_string(), serde_json::json!(default_profile.mode));
+    for (prefix, profile) in profiles {
+        // In a mixed file every source-quantized tensor gets an entry, so the
+        // top-level triple is only a fallback and cannot misdecode the odd ones
+        // out. K-quant tensors are named even in a file that looks uniform:
+        // Unsloth Dynamic GGUFs mix formats by construction, and a reader that
+        // consulted only the top-level triple would decode the tensors it does
+        // not cover with the wrong kernel and group size.
+        if mixed || profile.requires_explicit_entry() {
+            quant.insert(prefix, profile.to_json());
         }
     }
     Ok(Some(serde_json::Value::Object(quant)))
@@ -1654,6 +1993,13 @@ pub struct GgufConversionOptions {
     /// in_proj_a / in_proj_b, 8-bit affine). Requires `quant_mode = "affine"`.
     /// Forces `group_size = 32` for upgraded layers.
     pub quant_mxfp: Option<bool>,
+
+    /// Import ggml Q4_K / Q5_K / Q6_K tensors as MLX K-quant arrays instead of
+    /// rejecting them (default: false). The blocks are repacked, never
+    /// dequantized, so the output keeps the source file's weights and byte size.
+    /// With this off, Q6_K remains the Gemma4 token-embedding BF16 fallback and
+    /// Q4_K / Q5_K are an error.
+    pub import_k_quants: Option<bool>,
 }
 
 #[napi(object)]
@@ -1779,19 +2125,76 @@ pub async fn convert_gguf_to_safetensors(
         info!("  {ttype}: {count} tensors");
     }
 
-    // Q6_K is deliberately a BF16-only dense fallback. Remember its remapped
-    // key so an optional global dtype request cannot accidentally turn this
-    // one tensor into F32/F16 while all no-request source tensors remain exact.
-    let q6k_bf16_keys: std::collections::HashSet<String> = gguf
+    let import_k_quants = options.import_k_quants.unwrap_or(false);
+
+    // K-quant import repacks ggml's Q4_K/Q5_K/Q6_K blocks bit-for-bit and never
+    // dequantizes them, so any path that would re-quantize the model — an
+    // explicit `--quantize`, a `--q-recipe`, the `--q-mxfp` upgrade, or
+    // `--imatrix-path` AWQ pre-scaling — both contradicts the import and forces
+    // whole-model float residency. Reject the combination upfront, before
+    // loading gigabytes of weights, when the source actually carries K-quant
+    // tensors. (With the import off, Q6_K stays the Gemma4 embedding BF16
+    // fallback and re-quantizing it is still supported, so the guard is scoped
+    // to the import path.)
+    if import_k_quants
+        && gguf
+            .tensors
+            .iter()
+            .any(|t| t.tensor_type.k_quant_format().is_some())
+    {
+        let requantizing = options.quantize.unwrap_or(false)
+            || options.quant_recipe.is_some()
+            || options.quant_mxfp.unwrap_or(false)
+            || options.imatrix_path.is_some();
+        if requantizing {
+            return Err(Error::from_reason(
+                "K-quant GGUF import cannot be combined with re-quantization \
+                 (--quantize / --q-recipe / --q-mxfp / --imatrix-path): ggml \
+                 Q4_K/Q5_K/Q6_K blocks are imported bit-for-bit and never \
+                 dequantized. Import them as-is, or drop --gguf-kquant to convert \
+                 a dequantized copy.",
+            ));
+        }
+    }
+
+    // Output keys an optional global `--dtype` request must leave alone,
+    // spelled out rather than inferred from a suffix or a dtype.
+    //
+    // Without the K-quant import, Q6_K is a BF16-only dense fallback: it is a
+    // genuine float array, so nothing else in the cast loop would spare it.
+    // With the import on, the same tensors arrive as a packed uint32 `.weight`
+    // plus `.scales` / `.biases` sidecars whose exact integer and f16 bit
+    // patterns *are* the weights. The loop's generic `.scales` / `.biases` and
+    // uint32 skips happen to cover those three today, which makes them a trap
+    // keyed on suffix spelling; naming the keys here through the same helper
+    // the importer names them with means changing either the suffixes or the
+    // array dtypes cannot quietly start casting them.
+    let preserve_dtype_keys: std::collections::HashSet<String> = gguf
         .tensors
         .iter()
-        .filter(|t| t.tensor_type == GgufTensorType::Q6K)
+        .filter(|t| t.tensor_type.k_quant_format().is_some())
         .filter_map(|t| gguf_name_to_hf_for_metadata(&t.name, &gguf.metadata))
+        .flat_map(|key| -> Vec<String> {
+            if import_k_quants {
+                k_quant_output_keys(&key).to_vec()
+            } else {
+                // The pre-import fallback dequantizes the Gemma4 Q6_K embedding
+                // to BF16 and rejects the other two, so there is one key.
+                vec![key]
+            }
+        })
         .collect();
 
     // Load tensors
     info!("Loading tensors...");
-    let mut weights = load_gguf_tensors(&input_path, &gguf, verbose)?;
+    let mut weights = load_gguf_tensors(
+        &input_path,
+        &gguf,
+        GgufLoadOptions {
+            verbose,
+            import_k_quants,
+        },
+    )?;
     info!("Loaded {} tensors", weights.len());
 
     // Remap keys from GGUF to HF naming
@@ -1824,7 +2227,7 @@ pub async fn convert_gguf_to_safetensors(
         info!("Converting to {dtype_str}...");
         let keys: Vec<String> = weights.keys().cloned().collect();
         for key in keys {
-            if q6k_bf16_keys.contains(&key) {
+            if preserve_dtype_keys.contains(&key) {
                 continue;
             }
             // Skip quantized weight triplets
@@ -2149,11 +2552,12 @@ pub async fn convert_gguf_to_safetensors(
             );
             config_json["quantization"] = quant_obj.clone();
             config_json["quantization_config"] = quant_obj;
-        } else if let Some(quant_obj) = preserved_source_quantization(&gguf)? {
+        } else if let Some(quant_obj) = preserved_source_quantization(&gguf, import_k_quants)? {
             // Source Q4_0/Q4_1/Q8_0 tensors were losslessly repacked into MLX
-            // affine groups of 32. Record that even without an extra quantize
-            // request; otherwise Gemma4 defaults to group_size 64 and decodes
-            // the exact packed bytes with the wrong geometry.
+            // affine groups of 32, and imported K-quants keep ggml's own
+            // geometry. Record that even without an extra quantize request;
+            // otherwise Gemma4 defaults to group_size 64 and decodes the exact
+            // packed bytes with the wrong geometry.
             config_json["quantization"] = quant_obj.clone();
             config_json["quantization_config"] = quant_obj;
         }
@@ -2164,8 +2568,8 @@ pub async fn convert_gguf_to_safetensors(
             .map_err(|e| Error::from_reason(format!("Failed to write config.json: {e}")))?;
         if do_quantize {
             info!("Wrote config.json with quantization metadata");
-        } else if preserved_source_quantization(&gguf)?.is_some() {
-            info!("Wrote config.json with preserved GGUF affine quantization metadata");
+        } else if preserved_source_quantization(&gguf, import_k_quants)?.is_some() {
+            info!("Wrote config.json with preserved GGUF source quantization metadata");
         } else if src_config.exists() {
             info!("Copied config.json from source directory");
         } else {
@@ -2240,6 +2644,7 @@ pub async fn convert_gguf_to_safetensors(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::gguf_kquant::repack_kquant;
 
     fn build_minimal_gguf(
         metadata: &[(&str, GgufMetaValue)],
@@ -2394,7 +2799,7 @@ mod tests {
         // MLX shape should be reversed
         assert_eq!(gguf.tensors[0].mlx_shape(), vec![2, 3]);
 
-        let weights = load_gguf_tensors(&tmp, &gguf, false).unwrap();
+        let weights = load_gguf_tensors(&tmp, &gguf, GgufLoadOptions::default()).unwrap();
         assert_eq!(weights.len(), 1);
 
         let arr = weights.get("test.weight").unwrap();
@@ -2433,6 +2838,246 @@ mod tests {
         block
     }
 
+    /// Inverse of `gguf_kquant::get_scale_min_k4` (:173): pack eight 6-bit
+    /// `(sc, m)` pairs into the 12 bytes ggml stores them in. `j < 4` lands the
+    /// whole 6-bit value in the low six bits of one byte; `j >= 4` splits it into
+    /// a low nibble and a two-bit field stolen from the top of an earlier byte.
+    fn pack_scales_min_k4(sc: &[u8; 8], m: &[u8; 8]) -> [u8; 12] {
+        let mut q = [0u8; 12];
+        for j in 0..4 {
+            q[j] |= sc[j] & 63;
+            q[j + 4] |= m[j] & 63;
+        }
+        for j in 4..8 {
+            q[j + 4] |= (sc[j] & 0x0f) | ((m[j] & 0x0f) << 4);
+            q[j - 4] |= ((sc[j] >> 4) & 0x03) << 6;
+            q[j] |= ((m[j] >> 4) & 0x03) << 6;
+        }
+        q
+    }
+
+    /// Inverse of `gguf_kquant::q4k_code` (:276): lay 256 four-bit codes into a
+    /// Q4_K super-block. Byte `bi` of `qs` holds the low nibble of value
+    /// `64*(bi/32)+(bi%32)` and the high nibble of that value plus 32.
+    fn pack_q4k_block(
+        codes: &[u8; 256],
+        sc: &[u8; 8],
+        m: &[u8; 8],
+        d: f32,
+        dmin: f32,
+    ) -> [u8; 144] {
+        let mut block = [0u8; 144];
+        block[0..2].copy_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+        block[2..4].copy_from_slice(&half::f16::from_f32(dmin).to_bits().to_le_bytes());
+        block[4..16].copy_from_slice(&pack_scales_min_k4(sc, m));
+        for bi in 0..128 {
+            let half = bi / 32;
+            let lane = bi % 32;
+            let lo = codes[64 * half + lane] & 0x0f;
+            let hi = codes[64 * half + 32 + lane] & 0x0f;
+            block[16 + bi] = lo | (hi << 4);
+        }
+        block
+    }
+
+    /// Inverse of `gguf_kquant::q5k_code` (:288): Q4_K's low-nibble layout plus a
+    /// fifth bit plane in `qh`, indexed by lane with bit `2*(v/64) + (v%64>=32)`.
+    fn pack_q5k_block(
+        codes: &[u8; 256],
+        sc: &[u8; 8],
+        m: &[u8; 8],
+        d: f32,
+        dmin: f32,
+    ) -> [u8; 176] {
+        let mut block = [0u8; 176];
+        block[0..2].copy_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+        block[2..4].copy_from_slice(&half::f16::from_f32(dmin).to_bits().to_le_bytes());
+        block[4..16].copy_from_slice(&pack_scales_min_k4(sc, m));
+        for (v, &code) in codes.iter().enumerate() {
+            let lane = v % 32;
+            let bit = 2 * (v / 64) + usize::from(v % 64 >= 32);
+            block[16 + lane] |= ((code >> 4) & 1) << bit;
+        }
+        for bi in 0..128 {
+            let half = bi / 32;
+            let lane = bi % 32;
+            let lo = codes[64 * half + lane] & 0x0f;
+            let hi = codes[64 * half + 32 + lane] & 0x0f;
+            block[48 + bi] = lo | (hi << 4);
+        }
+        block
+    }
+
+    /// Recover `count` codes from MLX's LSB-first `bits`-wide `.weight` stream —
+    /// the inverse of `gguf_kquant::BitPacker`. Codes straddle uint32 words for
+    /// bits 5 and 6, so a bit cursor is required; `packed |= code << (i*bits)`
+    /// would only unpack the 4-bit case.
+    fn unpack_lsb_codes(weight: &[u32], bits: usize, count: usize) -> Vec<u32> {
+        let mask = (1u64 << bits) - 1;
+        let mut codes = Vec::with_capacity(count);
+        let mut acc = 0u64;
+        let mut nbits = 0u32;
+        let mut wi = 0usize;
+        for _ in 0..count {
+            while nbits < bits as u32 {
+                acc |= u64::from(weight[wi]) << nbits;
+                wi += 1;
+                nbits += 32;
+            }
+            codes.push((acc & mask) as u32);
+            acc >>= bits;
+            nbits -= bits as u32;
+        }
+        codes
+    }
+
+    /// Import a single hand-built K-quant super-block through the production
+    /// loader with the K-quant import on, returning its `.weight`/`.scales`/
+    /// `.biases` triple.
+    fn load_single_kquant_block(ty: GgufTensorType, block: &[u8]) -> HashMap<String, MxArray> {
+        let data = build_minimal_gguf(&[], &[("blk.0.ffn_down.weight", &[256, 1], ty, block)]);
+        let tmp = std::env::temp_dir().join(format!(
+            "mlx-node-kquant-roundtrip-{}-{}.gguf",
+            ty.name(),
+            std::process::id()
+        ));
+        fs::write(&tmp, data).unwrap();
+        let gguf = parse_gguf(&tmp).unwrap();
+        let weights = load_gguf_tensors(
+            &tmp,
+            &gguf,
+            GgufLoadOptions {
+                verbose: false,
+                import_k_quants: true,
+            },
+        )
+        .unwrap();
+        fs::remove_file(&tmp).ok();
+        weights
+    }
+
+    #[test]
+    fn q4k_import_round_trips_known_codes_scales_and_biases_bit_exact() {
+        // Known-answer round-trip: hand-build a super-block, then assert the
+        // repacked arrays reproduce the exact codes and scale bit patterns fed
+        // in — independent of the repacker that produced them. Codes vary with
+        // the super-block half so a low/high nibble swap cannot pass.
+        let mut codes = [0u8; 256];
+        for (v, c) in codes.iter_mut().enumerate() {
+            *c = ((v + 3 * (v / 32)) % 16) as u8;
+        }
+        let mut sc = [0u8; 8];
+        let mut m = [0u8; 8];
+        for j in 0..8 {
+            sc[j] = ((3 * j + 7) & 63) as u8; // exercises the j>=4 split field
+            m[j] = ((61 - 5 * j) & 63) as u8;
+        }
+        let block = pack_q4k_block(&codes, &sc, &m, 0.5, -0.25);
+        let weights = load_single_kquant_block(GgufTensorType::Q4K, &block);
+
+        let weight = weights.get("blk.0.ffn_down.weight").unwrap();
+        assert_eq!(weight.dtype().unwrap(), DType::Uint32);
+        let packed: Vec<u32> = weight.to_uint32().unwrap().iter().copied().collect();
+        assert_eq!(
+            unpack_lsb_codes(&packed, 4, 256),
+            codes.iter().map(|&c| u32::from(c)).collect::<Vec<_>>()
+        );
+
+        let scales = weights.get("blk.0.ffn_down.scales").unwrap();
+        assert_eq!(scales.dtype().unwrap(), DType::Uint8);
+        let want_scales: Vec<u8> = (0..8).flat_map(|j| [sc[j], m[j]]).collect();
+        assert_eq!(scales.to_uint8().unwrap(), want_scales);
+
+        let biases = weights.get("blk.0.ffn_down.biases").unwrap();
+        assert_eq!(biases.dtype().unwrap(), DType::Float16);
+        assert_eq!(
+            biases.to_uint16_native().unwrap(),
+            vec![
+                half::f16::from_f32(0.5).to_bits(),
+                half::f16::from_f32(-0.25).to_bits(),
+            ]
+        );
+    }
+
+    #[test]
+    fn q5k_import_round_trips_known_codes_scales_and_biases_bit_exact() {
+        // Same known-answer round-trip for Q5_K. Codes span the full 5-bit range
+        // so the `qh` fifth-bit plane is exercised, not just the `qs` nibbles.
+        let mut codes = [0u8; 256];
+        for (v, c) in codes.iter_mut().enumerate() {
+            *c = ((v + 3 * (v / 32)) % 32) as u8;
+        }
+        let mut sc = [0u8; 8];
+        let mut m = [0u8; 8];
+        for j in 0..8 {
+            sc[j] = ((5 * j + 9) & 63) as u8;
+            m[j] = ((58 - 4 * j) & 63) as u8;
+        }
+        let block = pack_q5k_block(&codes, &sc, &m, 0.125, -0.75);
+        let weights = load_single_kquant_block(GgufTensorType::Q5K, &block);
+
+        let weight = weights.get("blk.0.ffn_down.weight").unwrap();
+        assert_eq!(weight.dtype().unwrap(), DType::Uint32);
+        let packed: Vec<u32> = weight.to_uint32().unwrap().iter().copied().collect();
+        assert_eq!(
+            unpack_lsb_codes(&packed, 5, 256),
+            codes.iter().map(|&c| u32::from(c)).collect::<Vec<_>>()
+        );
+
+        let scales = weights.get("blk.0.ffn_down.scales").unwrap();
+        assert_eq!(scales.dtype().unwrap(), DType::Uint8);
+        let want_scales: Vec<u8> = (0..8).flat_map(|j| [sc[j], m[j]]).collect();
+        assert_eq!(scales.to_uint8().unwrap(), want_scales);
+
+        let biases = weights.get("blk.0.ffn_down.biases").unwrap();
+        assert_eq!(biases.dtype().unwrap(), DType::Float16);
+        assert_eq!(
+            biases.to_uint16_native().unwrap(),
+            vec![
+                half::f16::from_f32(0.125).to_bits(),
+                half::f16::from_f32(-0.75).to_bits(),
+            ]
+        );
+    }
+
+    #[test]
+    fn q6k_import_round_trips_known_codes_scales_and_biases_bit_exact() {
+        // Q6_K keeps ggml's signed sub-scales, so `.scales` stays int8 and the
+        // packed code is the ggml value plus 32. Assert the codes survive the
+        // ql/qh de-swizzle and the signed scales keep their sign.
+        let mut q = [0i8; 256];
+        for (v, val) in q.iter_mut().enumerate() {
+            *val = (((v + 3 * (v / 16)) % 64) as i32 - 32) as i8;
+        }
+        let mut scales = [0i8; 16];
+        for (j, s) in scales.iter_mut().enumerate() {
+            *s = (j as i32 * 4 - 30) as i8;
+        }
+        let block = pack_q6k_block(&q, &scales, 0.375);
+        let weights = load_single_kquant_block(GgufTensorType::Q6K, &block);
+
+        let weight = weights.get("blk.0.ffn_down.weight").unwrap();
+        assert_eq!(weight.dtype().unwrap(), DType::Uint32);
+        let packed: Vec<u32> = weight.to_uint32().unwrap().iter().copied().collect();
+        assert_eq!(
+            unpack_lsb_codes(&packed, 6, 256),
+            q.iter()
+                .map(|&c| (i32::from(c) + 32) as u32)
+                .collect::<Vec<_>>()
+        );
+
+        let got_scales = weights.get("blk.0.ffn_down.scales").unwrap();
+        assert_eq!(got_scales.dtype().unwrap(), DType::Int8);
+        assert_eq!(got_scales.to_int8().unwrap(), scales.to_vec());
+
+        let biases = weights.get("blk.0.ffn_down.biases").unwrap();
+        assert_eq!(biases.dtype().unwrap(), DType::Float16);
+        assert_eq!(
+            biases.to_uint16_native().unwrap(),
+            vec![half::f16::from_f32(0.375).to_bits()]
+        );
+    }
+
     #[test]
     fn gemma4_q6k_token_embedding_dequantizes_to_bf16() {
         let mut q = [0i8; 256];
@@ -2461,7 +3106,7 @@ mod tests {
         let gguf = parse_gguf(&tmp).unwrap();
         assert_eq!(gguf.tensors[0].tensor_type, GgufTensorType::Q6K);
         assert_eq!(gguf.tensors[0].data_size(), 210);
-        let weights = load_gguf_tensors(&tmp, &gguf, false).unwrap();
+        let weights = load_gguf_tensors(&tmp, &gguf, GgufLoadOptions::default()).unwrap();
         let embedding = weights.get("token_embd.weight").unwrap();
         assert_eq!(embedding.dtype().unwrap(), DType::BFloat16);
         assert_eq!(embedding.shape().unwrap().as_ref(), &[1, 256]);
@@ -2494,12 +3139,523 @@ mod tests {
             std::env::temp_dir().join(format!("mlx-node-invalid-q6k-{}.gguf", std::process::id()));
         fs::write(&tmp, data).unwrap();
         let gguf = parse_gguf(&tmp).unwrap();
-        let err = match load_gguf_tensors(&tmp, &gguf, false) {
+        let err = match load_gguf_tensors(&tmp, &gguf, GgufLoadOptions::default()) {
             Ok(_) => panic!("unsupported Q6_K placement unexpectedly loaded"),
             Err(err) => err,
         };
         assert!(format!("{err}").contains("only for Gemma4 token_embd.weight"));
         fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn k_quant_geometry_agrees_with_the_repacker() {
+        // The tensor-type table and the repacker each carry their own copy of
+        // the ggml block geometry. Cross-check them so the two cannot drift.
+        for (format, ty) in [
+            (KQuantFormat::Q4K, GgufTensorType::Q4K),
+            (KQuantFormat::Q5K, GgufTensorType::Q5K),
+            (KQuantFormat::Q6K, GgufTensorType::Q6K),
+        ] {
+            assert_eq!(GgufTensorType::from_u32(format.gguf_type()), Some(ty));
+            assert_eq!(ty.type_size(), format.block_bytes(), "{}", ty.name());
+            assert_eq!(ty.block_size(), QK_K, "{}", ty.name());
+            assert!(ty.is_quantized(), "{}", ty.name());
+            // K-quants carry per-16/32-value sub-scales, so they must never be
+            // handed to the affine `(weight, scales, biases)` repacker.
+            assert!(!ty.is_mlx_affine_quantized(), "{}", ty.name());
+        }
+    }
+
+    #[test]
+    fn data_size_counts_k_quant_super_blocks() {
+        // 8 rows of 4096 values = 128 super-blocks. Were `block_size()` to fall
+        // through to 1, `data_size()` would take the non-quantized branch and
+        // return 32768 * type_size, putting every later tensor in the file at
+        // the wrong offset with no error.
+        for (ty, block_bytes) in [
+            (GgufTensorType::Q4K, 144),
+            (GgufTensorType::Q5K, 176),
+            (GgufTensorType::Q6K, 210),
+        ] {
+            let tensor = GgufTensorInfo {
+                name: "blk.0.ffn_down.weight".to_string(),
+                n_dims: 2,
+                dims: vec![4096, 8],
+                tensor_type: ty,
+                offset: 0,
+            };
+            assert_eq!(tensor.num_elements(), 32768);
+            assert_eq!(tensor.data_size(), 128 * block_bytes, "{}", ty.name());
+        }
+    }
+
+    /// Deterministic block bytes: fixed-seed LCG, no wall clock and no `rand`.
+    /// Every byte pattern is a legal K-quant block, so no packer is needed here
+    /// — the repacker is what these tests compare against, and it is itself
+    /// gated bitwise against ggml by `tests/kquant_ggml_parity.rs`.
+    fn lcg_bytes(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect()
+    }
+
+    fn k_quant_cases() -> [(KQuantFormat, GgufTensorType); 3] {
+        [
+            (KQuantFormat::Q4K, GgufTensorType::Q4K),
+            (KQuantFormat::Q5K, GgufTensorType::Q5K),
+            (KQuantFormat::Q6K, GgufTensorType::Q6K),
+        ]
+    }
+
+    #[test]
+    fn k_quant_import_emits_the_mlx_array_contract() {
+        let (rows, k) = (3usize, 512usize);
+        for (format, ty) in k_quant_cases() {
+            let payload = lcg_bytes(u64::from(format.gguf_type()), rows * format.row_bytes(k));
+            // GGUF dims are reversed, so an MLX [rows, k] tensor is stored [k, rows].
+            let data = build_minimal_gguf(
+                &[],
+                &[(
+                    "blk.0.ffn_down.weight",
+                    &[k as u64, rows as u64],
+                    ty,
+                    &payload,
+                )],
+            );
+            let tmp = std::env::temp_dir().join(format!(
+                "mlx-node-kquant-import-{}-{}.gguf",
+                ty.name(),
+                std::process::id()
+            ));
+            fs::write(&tmp, data).unwrap();
+            let gguf = parse_gguf(&tmp).unwrap();
+            let weights = load_gguf_tensors(
+                &tmp,
+                &gguf,
+                GgufLoadOptions {
+                    verbose: false,
+                    import_k_quants: true,
+                },
+            )
+            .unwrap();
+            fs::remove_file(&tmp).ok();
+
+            assert_eq!(weights.len(), 3, "{}", ty.name());
+            let expected = repack_kquant(format, &payload, rows, k).unwrap();
+
+            let weight = weights.get("blk.0.ffn_down.weight").unwrap();
+            assert_eq!(weight.dtype().unwrap(), DType::Uint32, "{}", ty.name());
+            assert_eq!(
+                weight.shape().unwrap().as_ref(),
+                &[rows as i64, format.weight_cols(k) as i64],
+                "{}",
+                ty.name()
+            );
+            assert_eq!(
+                weight
+                    .to_uint32()
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                expected.weight,
+                "{} .weight",
+                ty.name()
+            );
+
+            let scales = weights.get("blk.0.ffn_down.scales").unwrap();
+            assert_eq!(
+                scales.shape().unwrap().as_ref(),
+                &[rows as i64, format.scales_cols(k) as i64],
+                "{}",
+                ty.name()
+            );
+            match &expected.scales {
+                // Q6_K sub-scales are signed. Landing them in a uint8 array
+                // would read -1 back as 255 and every negative-scaled group
+                // would decode with the wrong sign.
+                KQuantScales::Signed(want) => {
+                    assert_eq!(scales.dtype().unwrap(), DType::Int8, "{}", ty.name());
+                    assert_eq!(&scales.to_int8().unwrap(), want, "{} .scales", ty.name());
+                }
+                KQuantScales::Unsigned(want) => {
+                    assert_eq!(scales.dtype().unwrap(), DType::Uint8, "{}", ty.name());
+                    assert_eq!(&scales.to_uint8().unwrap(), want, "{} .scales", ty.name());
+                }
+            }
+
+            // `.biases` carries ggml's `d` (and `dmin`), which are SCALES. The
+            // f16 bit patterns must survive verbatim — no float round-trip.
+            let biases = weights.get("blk.0.ffn_down.biases").unwrap();
+            assert_eq!(biases.dtype().unwrap(), DType::Float16, "{}", ty.name());
+            assert_eq!(
+                biases.shape().unwrap().as_ref(),
+                &[rows as i64, format.biases_cols(k) as i64],
+                "{}",
+                ty.name()
+            );
+            assert_eq!(
+                biases.to_uint16_native().unwrap(),
+                expected.biases,
+                "{} .biases",
+                ty.name()
+            );
+        }
+    }
+
+    #[test]
+    fn k_quant_import_is_chunk_size_invariant() {
+        // A 4 MiB chunk target needs a multi-megabyte tensor to split, so drive
+        // the read loop directly at chunk sizes that do split: an off-by-one in
+        // the loop would otherwise only ever show up on a real model.
+        let (rows, k) = (7usize, 256usize);
+        for (format, _) in k_quant_cases() {
+            let row_bytes = format.row_bytes(k);
+            let payload = lcg_bytes(u64::from(format.gguf_type()) + 99, rows * row_bytes);
+            let whole = repack_kquant(format, &payload, rows, k).unwrap();
+            for chunk_target in [0, 1, row_bytes, 3 * row_bytes, usize::MAX] {
+                let mut cursor = std::io::Cursor::new(&payload);
+                let got = repack_rows_from_reader(
+                    &mut cursor,
+                    format,
+                    k,
+                    rows,
+                    chunk_target,
+                    "test tensor",
+                )
+                .unwrap();
+                assert_eq!(
+                    got,
+                    whole,
+                    "{} at chunk target {chunk_target}",
+                    format.mlx_mode()
+                );
+                // Every byte of the payload was consumed, and no more.
+                assert_eq!(cursor.position() as usize, payload.len());
+            }
+        }
+    }
+
+    #[test]
+    fn k_quant_import_off_rejects_q4k_and_q5k() {
+        for (format, ty) in [
+            (KQuantFormat::Q4K, GgufTensorType::Q4K),
+            (KQuantFormat::Q5K, GgufTensorType::Q5K),
+        ] {
+            let payload = vec![0u8; format.block_bytes()];
+            let data =
+                build_minimal_gguf(&[], &[("blk.0.ffn_down.weight", &[256, 1], ty, &payload)]);
+            let tmp = std::env::temp_dir().join(format!(
+                "mlx-node-kquant-off-{}-{}.gguf",
+                ty.name(),
+                std::process::id()
+            ));
+            fs::write(&tmp, data).unwrap();
+            let gguf = parse_gguf(&tmp).unwrap();
+            let err = match load_gguf_tensors(&tmp, &gguf, GgufLoadOptions::default()) {
+                Ok(_) => panic!("{} loaded with the K-quant import off", ty.name()),
+                Err(err) => err,
+            };
+            fs::remove_file(&tmp).ok();
+            let text = format!("{err}");
+            assert!(text.contains(ty.name()), "{text}");
+            assert!(text.contains("K-quant import"), "{text}");
+        }
+    }
+
+    #[test]
+    fn q6k_import_repacks_the_gemma4_embedding_instead_of_dequantizing_it() {
+        // Same fixture as `gemma4_q6k_token_embedding_dequantizes_to_bf16`,
+        // which pins the flag-off BF16 fallback. With the import on the tensor
+        // stays quantized and gains its `.scales` / `.biases`.
+        let block = pack_q6k_block(&[0; 256], &[1; 16], 1.0);
+        let data = build_minimal_gguf(
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("gemma4".to_string()),
+            )],
+            &[("token_embd.weight", &[256, 1], GgufTensorType::Q6K, &block)],
+        );
+        let tmp =
+            std::env::temp_dir().join(format!("mlx-node-q6k-import-{}.gguf", std::process::id()));
+        fs::write(&tmp, data).unwrap();
+        let gguf = parse_gguf(&tmp).unwrap();
+        let weights = load_gguf_tensors(
+            &tmp,
+            &gguf,
+            GgufLoadOptions {
+                verbose: false,
+                import_k_quants: true,
+            },
+        )
+        .unwrap();
+        fs::remove_file(&tmp).ok();
+
+        let weight = weights.get("token_embd.weight").unwrap();
+        assert_eq!(weight.dtype().unwrap(), DType::Uint32);
+        assert_eq!(weight.shape().unwrap().as_ref(), &[1, 48]);
+        assert_eq!(
+            weights.get("token_embd.scales").unwrap().dtype().unwrap(),
+            DType::Int8
+        );
+        assert_eq!(
+            weights.get("token_embd.biases").unwrap().dtype().unwrap(),
+            DType::Float16
+        );
+    }
+
+    /// The user-visible bug: a K-quant `token_embd` must survive the key remap as
+    /// a complete group so the loader's `embed_tokens.scales` probe fires and the
+    /// embedding takes the PACKED quantized branch. Previously only `.weight` was
+    /// renamed, so the probe missed, the dense fallback received a uint32
+    /// `embed_tokens.weight`, and the load died in `ensure_dense_weight_floating`.
+    ///
+    /// Asserts at the remap + probe boundary (a full model load needs a real
+    /// checkpoint): post-remap the trio is `model.embed_tokens.*`, and after the
+    /// `model.` strip the loader applies (`gemma4/persistence.rs`) the probe key
+    /// `embed_tokens.scales` is present with its K-quant dtypes intact.
+    #[test]
+    fn kquant_token_embd_survives_the_remap_as_a_packed_group() {
+        let block = pack_q6k_block(&[0; 256], &[1; 16], 1.0);
+        let data = build_minimal_gguf(
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("gemma4".to_string()),
+            )],
+            &[("token_embd.weight", &[256, 1], GgufTensorType::Q6K, &block)],
+        );
+        let tmp =
+            std::env::temp_dir().join(format!("mlx-node-q6k-remap-{}.gguf", std::process::id()));
+        fs::write(&tmp, data).unwrap();
+        let gguf = parse_gguf(&tmp).unwrap();
+        let weights = load_gguf_tensors(
+            &tmp,
+            &gguf,
+            GgufLoadOptions {
+                verbose: false,
+                import_k_quants: true,
+            },
+        )
+        .unwrap();
+        fs::remove_file(&tmp).ok();
+
+        let remapped = remap_keys(weights, &gguf.metadata).expect("remap must not collide");
+
+        // The whole group lands under the HF embedding name.
+        assert_eq!(
+            remapped
+                .get("model.embed_tokens.weight")
+                .expect("packed weight must remap")
+                .dtype()
+                .unwrap(),
+            DType::Uint32
+        );
+        assert_eq!(
+            remapped
+                .get("model.embed_tokens.scales")
+                .expect("`.scales` sidecar must remap alongside `.weight`")
+                .dtype()
+                .unwrap(),
+            DType::Int8
+        );
+        assert_eq!(
+            remapped
+                .get("model.embed_tokens.biases")
+                .expect("`.biases` sidecar must remap alongside `.weight`")
+                .dtype()
+                .unwrap(),
+            DType::Float16
+        );
+        // No sidecar was left stranded under its GGUF name.
+        assert!(
+            !remapped.contains_key("token_embd.scales")
+                && !remapped.contains_key("token_embd.biases"),
+            "sidecars must not survive under their GGUF names"
+        );
+
+        // The loader strips `model.` and probes `{base}.scales` to choose the
+        // packed quantized branch over the dense fallback.
+        let probed: HashMap<String, ()> = remapped
+            .keys()
+            .map(|k| (k.strip_prefix("model.").unwrap_or(k).to_string(), ()))
+            .collect();
+        assert!(
+            probed.contains_key("embed_tokens.scales"),
+            "the packed-embedding probe key must exist after the `model.` strip"
+        );
+    }
+
+    #[test]
+    fn k_quant_import_rejects_a_last_dim_that_is_not_a_super_block_multiple() {
+        // A K-quant row is a whole number of 256-value super-blocks. Reject a
+        // tensor that is not, rather than repacking a truncated final block.
+        let tensor = GgufTensorInfo {
+            name: "blk.0.ffn_down.weight".to_string(),
+            n_dims: 2,
+            dims: vec![128, 4],
+            tensor_type: GgufTensorType::Q4K,
+            offset: 0,
+        };
+        let gguf = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: 1,
+            metadata: HashMap::new(),
+            tensors: vec![tensor.clone()],
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let mut cursor = std::io::Cursor::new(vec![0u8; 4 * 144]);
+        let err = match load_kquant_repack(&mut cursor, &gguf, &tensor, KQuantFormat::Q4K) {
+            Ok(_) => panic!("a 128-wide Q4_K row unexpectedly imported"),
+            Err(err) => err,
+        };
+        let text = format!("{err}");
+        assert!(text.contains("last dimension 128"), "{text}");
+        assert!(text.contains("multiple of 256"), "{text}");
+    }
+
+    #[test]
+    fn k_quant_import_names_its_arrays_through_the_shared_helper() {
+        // The converter's do-not-dtype-cast set spells out the same three keys
+        // via `k_quant_output_keys`. If the importer ever names its arrays by
+        // hand again the two drift apart and a `--dtype` request starts casting
+        // packed weights; this fails first.
+        let (rows, k) = (2usize, 256usize);
+        for (format, ty) in k_quant_cases() {
+            let payload = lcg_bytes(
+                u64::from(format.gguf_type()) + 7,
+                rows * format.row_bytes(k),
+            );
+            let data = build_minimal_gguf(
+                &[],
+                &[(
+                    "blk.0.ffn_down.weight",
+                    &[k as u64, rows as u64],
+                    ty,
+                    &payload,
+                )],
+            );
+            let tmp = std::env::temp_dir().join(format!(
+                "mlx-node-kquant-keys-{}-{}.gguf",
+                ty.name(),
+                std::process::id()
+            ));
+            fs::write(&tmp, data).unwrap();
+            let gguf = parse_gguf(&tmp).unwrap();
+            let weights = load_gguf_tensors(
+                &tmp,
+                &gguf,
+                GgufLoadOptions {
+                    verbose: false,
+                    import_k_quants: true,
+                },
+            )
+            .unwrap();
+            fs::remove_file(&tmp).ok();
+
+            let mut got: Vec<String> = weights.into_keys().collect();
+            got.sort();
+            let mut want = k_quant_output_keys("blk.0.ffn_down.weight").to_vec();
+            want.sort();
+            assert_eq!(got, want, "{}", ty.name());
+        }
+    }
+
+    #[tokio::test]
+    async fn k_quant_import_survives_a_global_dtype_request() {
+        // `--dtype` must not touch an imported K-quant triplet: the packed
+        // uint32 codes and the int8 / f16 bit patterns beside them are the
+        // weights. A float cast would silently rewrite all three.
+        let (rows, k) = (2usize, 256usize);
+        let format = KQuantFormat::Q6K;
+        let payload = lcg_bytes(0xC0FFEE, rows * format.row_bytes(k));
+        let norm = 3.25f32.to_le_bytes();
+        let data = build_minimal_gguf(
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("qwen3".to_string()),
+            )],
+            &[
+                (
+                    "blk.0.ffn_down.weight",
+                    &[k as u64, rows as u64],
+                    GgufTensorType::Q6K,
+                    &payload,
+                ),
+                ("output_norm.weight", &[1], GgufTensorType::F32, &norm),
+            ],
+        );
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-kquant-dtype-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("model.gguf");
+        fs::write(&input, data).unwrap();
+        let output = root.join("output");
+
+        convert_gguf_to_safetensors(GgufConversionOptions {
+            input_path: input.to_string_lossy().into_owned(),
+            output_dir: output.to_string_lossy().into_owned(),
+            config_source_dir: None,
+            dtype: Some("float32".to_string()),
+            verbose: Some(false),
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            output_filename: None,
+            vlm_key_prefix: Some(false),
+            quant_mxfp: Some(false),
+            import_k_quants: Some(true),
+        })
+        .await
+        .unwrap();
+
+        let safetensors =
+            crate::utils::safetensors::SafeTensorsFile::load(output.join("model.safetensors"))
+                .unwrap();
+        use crate::utils::safetensors::SafeTensorDType;
+        let dtype_of = |key: &str| safetensors.tensors[key].dtype.clone();
+        assert!(matches!(
+            dtype_of("model.layers.0.mlp.down_proj.weight"),
+            SafeTensorDType::U32
+        ));
+        assert!(matches!(
+            dtype_of("model.layers.0.mlp.down_proj.scales"),
+            SafeTensorDType::I8
+        ));
+        assert!(matches!(
+            dtype_of("model.layers.0.mlp.down_proj.biases"),
+            SafeTensorDType::F16
+        ));
+        // The dense tensor did take the requested cast, so the skip above is
+        // targeted rather than the dtype pass having been a no-op.
+        assert!(matches!(
+            dtype_of("model.norm.weight"),
+            SafeTensorDType::F32
+        ));
+
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            config["quantization"]["language_model.model.layers.0.mlp.down_proj"],
+            serde_json::json!({ "bits": 6, "group_size": 16, "mode": "q6k" })
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2518,7 +3674,7 @@ mod tests {
             std::env::temp_dir().join(format!("mlx-node-q4-repack-{}.gguf", std::process::id()));
         fs::write(&tmp, data).unwrap();
         let gguf = parse_gguf(&tmp).unwrap();
-        let weights = load_gguf_tensors(&tmp, &gguf, false).unwrap();
+        let weights = load_gguf_tensors(&tmp, &gguf, GgufLoadOptions::default()).unwrap();
 
         let packed = weights.get("test.weight").unwrap().to_uint32().unwrap();
         let mut unpacked = [0u8; 32];
@@ -2784,10 +3940,131 @@ mod tests {
             alignment: GGUF_DEFAULT_ALIGNMENT,
             data_offset: 0,
         };
-        let quant = preserved_source_quantization(&gguf).unwrap().unwrap();
+        let quant = preserved_source_quantization(&gguf, false)
+            .unwrap()
+            .unwrap();
         assert_eq!(quant["bits"], 4);
         assert_eq!(quant["group_size"], 32);
         assert_eq!(quant["mode"], "affine");
+        // A file of one profile still needs no per-tensor entries.
+        assert_eq!(quant.as_object().unwrap().len(), 3);
+    }
+
+    /// Tensor descriptors only — `preserved_source_quantization` reads names
+    /// and types, never payload bytes.
+    fn source_quant_fixture(tensors: &[(&str, GgufTensorType)]) -> GgufFile {
+        GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: tensors.len() as u64,
+            metadata: HashMap::new(),
+            tensors: tensors
+                .iter()
+                .enumerate()
+                .map(|(i, (name, tensor_type))| GgufTensorInfo {
+                    name: (*name).to_string(),
+                    n_dims: 2,
+                    dims: vec![256, 1],
+                    tensor_type: *tensor_type,
+                    offset: i as u64 * 256,
+                })
+                .collect(),
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        }
+    }
+
+    #[test]
+    fn mixed_q4_0_and_q4_k_source_metadata_names_every_tensor() {
+        // Q4_0 and Q4_K are both 4-bit and decode completely differently.
+        // Comparing bit-widths alone reports this file as uniform, emits no
+        // per-tensor entries, and leaves the Q4_K tensor labelled 4-bit affine
+        // group 32 — wrong kernel, wrong group size, no error anywhere.
+        let gguf = source_quant_fixture(&[
+            ("blk.0.attn_q.weight", GgufTensorType::Q4_0),
+            ("blk.0.attn_k.weight", GgufTensorType::Q4_0),
+            ("blk.0.ffn_down.weight", GgufTensorType::Q4K),
+        ]);
+        let quant = preserved_source_quantization(&gguf, true).unwrap().unwrap();
+
+        // The modal profile stays the top-level fallback.
+        assert_eq!(quant["bits"], 4);
+        assert_eq!(quant["group_size"], 32);
+        assert_eq!(quant["mode"], "affine");
+
+        assert_eq!(
+            quant["language_model.model.layers.0.mlp.down_proj"],
+            serde_json::json!({ "bits": 4, "group_size": 32, "mode": "q4k" })
+        );
+        assert_eq!(
+            quant["language_model.model.layers.0.self_attn.q_proj"],
+            serde_json::json!({ "bits": 4, "group_size": 32, "mode": "affine" })
+        );
+        assert_eq!(
+            quant["language_model.model.layers.0.self_attn.k_proj"],
+            serde_json::json!({ "bits": 4, "group_size": 32, "mode": "affine" })
+        );
+    }
+
+    #[test]
+    fn k_quant_source_metadata_is_named_even_in_a_uniform_file() {
+        // Unsloth Dynamic GGUFs are mixed by construction, so a K-quant tensor
+        // is named whether or not this particular file happens to look uniform.
+        for (format, tensor_type) in k_quant_cases() {
+            let gguf = source_quant_fixture(&[("blk.0.ffn_down.weight", tensor_type)]);
+            let quant = preserved_source_quantization(&gguf, true).unwrap().unwrap();
+            let expected = serde_json::json!({
+                "bits": format.bits(),
+                "group_size": format.group_size(),
+                "mode": format.mlx_mode(),
+            });
+            assert_eq!(quant["bits"], expected["bits"], "{}", tensor_type.name());
+            assert_eq!(
+                quant["group_size"],
+                expected["group_size"],
+                "{}",
+                tensor_type.name()
+            );
+            assert_eq!(quant["mode"], expected["mode"], "{}", tensor_type.name());
+            assert_eq!(
+                quant["language_model.model.layers.0.mlp.down_proj"],
+                expected,
+                "{}",
+                tensor_type.name()
+            );
+        }
+    }
+
+    #[test]
+    fn k_quant_source_metadata_is_absent_without_the_import() {
+        // With the import off the loader rejected Q4_K / Q5_K and dequantized
+        // the Gemma4 Q6_K embedding to BF16, so no K-quant tensor survives to
+        // be described.
+        for (_, tensor_type) in k_quant_cases() {
+            let gguf = source_quant_fixture(&[("blk.0.ffn_down.weight", tensor_type)]);
+            assert!(
+                preserved_source_quantization(&gguf, false)
+                    .unwrap()
+                    .is_none(),
+                "{}",
+                tensor_type.name()
+            );
+        }
+    }
+
+    #[test]
+    fn source_quantization_collision_names_the_full_triple() {
+        let gguf = source_quant_fixture(&[
+            ("blk.0.ffn_down.weight", GgufTensorType::Q4_0),
+            ("blk.0.ffn_down.weight", GgufTensorType::Q4K),
+        ]);
+        let message = preserved_source_quantization(&gguf, true)
+            .unwrap_err()
+            .reason;
+        assert!(
+            message.contains("4-bit affine (group_size 32)"),
+            "{message}"
+        );
+        assert!(message.contains("4-bit q4k (group_size 32)"), "{message}");
     }
 
     #[tokio::test]
@@ -2861,6 +4138,7 @@ mod tests {
             output_filename: None,
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
+            import_k_quants: Some(false),
         })
         .await
         .unwrap();
@@ -2940,6 +4218,77 @@ mod tests {
         );
         assert_eq!(gguf_name_to_hf("output_norm.weight"), "model.norm.weight");
         assert_eq!(gguf_name_to_hf("output.weight"), "lm_head.weight");
+    }
+
+    /// A quantized global tensor ships as a `.weight`/`.scales`/`.biases` trio
+    /// (both the affine `load_quantized_tensor` repack and the K-quant
+    /// `load_kquant_repack` emit all three). The global renames are whole-string
+    /// matches, so before this they moved only `.weight` and stranded the
+    /// sidecars under their GGUF names — the loaders probe `embed_tokens.scales`
+    /// / `lm_head.scales` to decide a tensor is quantized, so the group silently
+    /// degraded to a bare packed weight that then failed the dense dtype guard.
+    #[test]
+    fn global_renames_carry_the_whole_quant_group() {
+        for (gguf, hf) in [("token_embd", "model.embed_tokens"), ("output", "lm_head")] {
+            for suffix in [".weight", ".scales", ".biases"] {
+                assert_eq!(
+                    gguf_name_to_hf(&format!("{gguf}{suffix}")),
+                    format!("{hf}{suffix}"),
+                    "generic mapper must carry {suffix} for {gguf}"
+                );
+                assert_eq!(
+                    gemma4_name_to_hf(&format!("{gguf}{suffix}")).unwrap(),
+                    format!("{hf}{suffix}"),
+                    "gemma4 mapper must carry {suffix} for {gguf}"
+                );
+            }
+        }
+    }
+
+    /// The quant-group carry must not over-generalize: `output_norm` is a norm
+    /// (never quantized) and only its `.weight` is renamed, and a neighbour that
+    /// merely shares the `token_embd` / `output` prefix is left alone.
+    #[test]
+    fn global_renames_do_not_over_generalize() {
+        // output_norm.weight keeps its own destination, NOT lm_head.*.
+        assert_eq!(gguf_name_to_hf("output_norm.weight"), "model.norm.weight");
+        assert_eq!(
+            gemma4_name_to_hf("output_norm.weight").unwrap(),
+            "model.norm.weight"
+        );
+        // A non-canonical suffix on a global tensor is not a quant-group member
+        // and must pass through unrenamed.
+        assert_eq!(gguf_name_to_hf("token_embd.bias"), "token_embd.bias");
+        assert_eq!(gguf_name_to_hf("output.bias"), "output.bias");
+        // A longer base that merely starts with the same prefix is untouched.
+        assert_eq!(
+            gguf_name_to_hf("token_embd_extra.weight"),
+            "token_embd_extra.weight"
+        );
+        assert_eq!(
+            rename_global_quant_group("output_norm.weight", "output", "lm_head"),
+            None,
+            "prefix-only match must not rename"
+        );
+    }
+
+    /// A tied model (only `token_embd.*`) and an untied one (`token_embd.*` plus
+    /// `output.*`) must both remap unambiguously now that three keys map where
+    /// one did before: the six destinations are pairwise distinct, so
+    /// `remap_keys`' injectivity check has nothing to trip on.
+    #[test]
+    fn tied_and_untied_quant_groups_remap_without_collision() {
+        let mut seen = std::collections::HashSet::new();
+        for base in ["token_embd", "output"] {
+            for suffix in [".weight", ".scales", ".biases"] {
+                let dest = gguf_name_to_hf(&format!("{base}{suffix}"));
+                assert!(
+                    seen.insert(dest.clone()),
+                    "duplicate remap destination '{dest}' would collide in remap_keys"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 6);
     }
 
     #[test]
