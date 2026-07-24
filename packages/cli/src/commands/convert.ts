@@ -133,6 +133,11 @@ Quantization Arguments:
                         Required for legacy affine "unsloth". Optional for its
                         fixed --q-mxfp / --q-mode nvfp4 maps, but preferred
                         when matching calibration data is available.
+  --gguf-kquant         Import ggml Q4_K / Q5_K / Q6_K tensors as MLX K-quant
+                        arrays instead of rejecting them. Blocks are repacked
+                        bit-for-bit, never dequantized, so the output keeps the
+                        source weights and byte size. Cannot be combined with
+                        --quantize / --q-recipe / --q-mxfp / --imatrix-path.
 
 Model Types:
   (default)             SafeTensors dtype conversion (HuggingFace models)
@@ -184,6 +189,7 @@ export async function run(argv: string[]) {
       'imatrix-path': { type: 'string' },
       'config-dir': { type: 'string' },
       mmproj: { type: 'string' },
+      'gguf-kquant': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
   });
@@ -481,6 +487,19 @@ export async function run(argv: string[]) {
       );
       process.exit(1);
     }
+    // K-quant import (--gguf-kquant) repacks ggml Q4_K/Q5_K/Q6_K bit-for-bit and
+    // never dequantizes, so any re-quantization flag both contradicts it and
+    // forces whole-model float residency. Reject upfront (mirrors the native
+    // guard in crates/mlx-core/src/utils/gguf.rs::convert_gguf_to_safetensors).
+    if (
+      args['gguf-kquant'] &&
+      (args.quantize || quantRecipe !== undefined || args['q-mxfp'] || imatrixPath !== undefined)
+    ) {
+      console.error(
+        'Error: --gguf-kquant cannot be combined with re-quantization (--quantize / --q-recipe / --q-mxfp / --imatrix-path); ggml K-quant blocks are imported bit-for-bit and never dequantized',
+      );
+      process.exit(1);
+    }
 
     const dtype = args.dtype || 'bfloat16';
     console.log(`Converting GGUF to SafeTensors`);
@@ -518,6 +537,7 @@ export async function run(argv: string[]) {
         quantMxfp: args['q-mxfp'],
         quantRecipe,
         imatrixPath,
+        importKQuants: args['gguf-kquant'],
         configSourceDir,
         vlmKeyPrefix: !!mmprojPath,
       });
@@ -544,6 +564,11 @@ export async function run(argv: string[]) {
           dtype: 'bfloat16',
           verbose,
           quantize: false,
+          // Import K-quants for the vision encoder too, so a UD mmproj carrying
+          // Q4_K/Q5_K/Q6_K tensors repacks bit-for-bit instead of tripping the
+          // K-quant rejection — matching the main model conversion above rather
+          // than splitting behaviour silently between text and vision.
+          importKQuants: args['gguf-kquant'],
           configSourceDir,
           outputFilename: 'vision.safetensors',
         });

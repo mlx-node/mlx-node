@@ -18,6 +18,7 @@ use tracing::{info, warn};
 use crate::array::{DType, MxArray};
 use crate::models::paddleocr_vl::persistence::load_paddleocr_vl_weights;
 use crate::models::qianfan_ocr::persistence::load_qianfan_ocr_weights;
+use crate::utils::gguf_kquant::{KQuantFormat, QK_K};
 use crate::utils::safetensors::load_safetensors_lazy;
 
 /// RAII guard that pins the MLX default device + stream to CPU for one
@@ -366,7 +367,11 @@ pub(crate) mod recipe {
                 bits: top_level_bits,
                 group_size: top_level_group_size,
             },
-            PerLayerMode::Fp8E4m3 | PerLayerMode::Sym8 => {
+            PerLayerMode::Fp8E4m3
+            | PerLayerMode::Sym8
+            | PerLayerMode::Q6K
+            | PerLayerMode::Q4K
+            | PerLayerMode::Q5K => {
                 return Err(Error::from_reason(format!(
                     "Qwen vision source mode {mode:?} is not a uniform packed mode supported by the dense vision sanitizer; dequantize the vision tower before conversion"
                 )));
@@ -5606,6 +5611,21 @@ fn validate_existing_quantized_entry(
                 )));
             }
         }
+        // K-quant sidecars carry ggml's own geometry: a uint32 code stream, an
+        // int8 (q6k) / uint8 (q4k, q5k) sub-scale array, and an f16 `.biases`
+        // holding `d` (a scale, not a bias). The last dims are set by the format,
+        // including the interleave factor of 2 the q4k/q5k `(sc, m)` / `(d, dmin)`
+        // pairs carry, so the generic affine shape check below cannot describe
+        // them — this arm validates in full and returns.
+        "q4k" | "q5k" | "q6k" => {
+            let format = match entry.mode.as_str() {
+                "q4k" => KQuantFormat::Q4K,
+                "q5k" => KQuantFormat::Q5K,
+                _ => KQuantFormat::Q6K,
+            };
+            validate_existing_kquant_entry(weight, scales, weights, prefix, entry, format)?;
+            return Ok(());
+        }
         other => {
             return Err(Error::from_reason(format!(
                 "cannot preserve already-quantized group '{prefix}': unsupported resolved mode '{other}'"
@@ -5658,6 +5678,125 @@ fn validate_existing_quantized_entry(
     Ok(())
 }
 
+/// Validate an already-quantized K-quant group against the geometry its mode
+/// mandates. Called only from `validate_existing_quantized_entry`'s K-quant arm,
+/// which has already fetched `.weight` / `.scales`.
+///
+/// K is derived from the `.weight` packing (`cols * 32 / bits`), NOT from
+/// `32 / bits`: integer-dividing 32 by 5 or 6 loses the remainder and yields a
+/// bogus K for exactly the two widths Q5_K / Q6_K need, which would then reject
+/// a valid checkpoint or accept a malformed one. `.scales` / `.biases` last dims
+/// are read straight off the format so the q4k/q5k interleave factor of 2 is
+/// applied without restating it here.
+fn validate_existing_kquant_entry(
+    weight: &MxArray,
+    scales: &MxArray,
+    weights: &HashMap<String, MxArray>,
+    prefix: &str,
+    entry: &QuantEntry,
+    format: KQuantFormat,
+) -> Result<()> {
+    let mode = format.mlx_mode();
+    // Guard against a config whose recorded bits/group_size disagree with the
+    // mode string that drives the geometry — the mode is the source of truth.
+    if entry.bits != format.bits() as i32 || entry.group_size != format.group_size() as i32 {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' has inconsistent metadata \
+             bits={}/group_size={}; {mode} requires bits={}/group_size={}",
+            entry.bits,
+            entry.group_size,
+            format.bits(),
+            format.group_size()
+        )));
+    }
+
+    if weight.dtype()? != DType::Uint32 {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' does not match {mode} storage: \
+             weight={:?} (expected uint32)",
+            weight.dtype()?
+        )));
+    }
+    let expected_scales_dtype = if format.scales_are_signed() {
+        DType::Int8
+    } else {
+        DType::Uint8
+    };
+    if scales.dtype()? != expected_scales_dtype {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' does not match {mode} storage: \
+             scales={:?} (expected {expected_scales_dtype:?})",
+            scales.dtype()?
+        )));
+    }
+    let biases = weights.get(&format!("{prefix}.biases")).ok_or_else(|| {
+        Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' is missing mandatory .biases"
+        ))
+    })?;
+    if biases.dtype()? != DType::Float16 {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' has non-float16 .biases {:?} \
+             (the array holds ggml's f16 `d`, a raw bit pattern)",
+            biases.dtype()?
+        )));
+    }
+
+    let weight_shape = weight.shape()?.to_vec();
+    let scale_shape = scales.shape()?.to_vec();
+    let bias_shape = biases.shape()?.to_vec();
+    let ndim = weight_shape.len();
+    if ndim < 2 || scale_shape.len() != ndim || bias_shape.len() != ndim {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' has mismatched ranks: \
+             weight {weight_shape:?}, scales {scale_shape:?}, biases {bias_shape:?}"
+        )));
+    }
+    if weight_shape[..ndim - 1] != scale_shape[..ndim - 1]
+        || weight_shape[..ndim - 1] != bias_shape[..ndim - 1]
+    {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' has mismatched leading dims: \
+             weight {weight_shape:?}, scales {scale_shape:?}, biases {bias_shape:?}"
+        )));
+    }
+
+    let weight_cols = weight_shape[ndim - 1];
+    let bits = format.bits() as i64;
+    if weight_cols <= 0 || (weight_cols * 32) % bits != 0 {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' .weight last dim {weight_cols} is not a \
+             whole {bits}-bit code packing"
+        )));
+    }
+    let k = weight_cols * 32 / bits;
+    if k % QK_K as i64 != 0 {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' decodes to K={k}, not a multiple of the \
+             {QK_K}-value ggml super-block"
+        )));
+    }
+    let k = k as usize;
+
+    let expected_scale_cols = format.scales_cols(k) as i64;
+    if scale_shape[ndim - 1] != expected_scale_cols {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' .scales last dim {} does not match {mode} \
+             K={k} expectation {expected_scale_cols}",
+            scale_shape[ndim - 1]
+        )));
+    }
+    let expected_bias_cols = format.biases_cols(k) as i64;
+    if bias_shape[ndim - 1] != expected_bias_cols {
+        return Err(Error::from_reason(format!(
+            "already-quantized {mode} group '{prefix}' .biases last dim {} does not match {mode} \
+             K={k} expectation {expected_bias_cols}",
+            bias_shape[ndim - 1]
+        )));
+    }
+    Ok(())
+}
+
 /// The emission-loop quantizability gates, hoisted into ONE place so the sym8
 /// group-coherence pass (`enforce_sym8_group_coherence`) and the emission loop
 /// in `quantize_weights_inner` can never diverge: a `QuantEntry` actually
@@ -5677,6 +5816,11 @@ fn quant_entry_emits(array: &MxArray, mode: &str, group_size: i32) -> Result<boo
         ndim == 2 || ndim == 3
     } else if mode == "sym8" {
         last_dim % 16 == 0
+    } else if matches!(mode, "q4k" | "q5k" | "q6k") {
+        // K-quants are packed in 256-value ggml super-blocks; the sub-scale
+        // group_size (16 or 32) is a within-block subdivision, so the emission
+        // gate is the super-block, not the group.
+        last_dim % (QK_K as i32) == 0
     } else {
         last_dim % group_size == 0
     })
@@ -9560,6 +9704,110 @@ mod tests {
             )
             .unwrap()
             .is_some()
+        );
+    }
+
+    /// Build a valid already-quantized K-quant group into `weights`, matching
+    /// the array contract for `format` at `rows` rows of `k` values.
+    fn insert_valid_kquant_group(
+        weights: &mut HashMap<String, MxArray>,
+        prefix: &str,
+        format: KQuantFormat,
+        rows: usize,
+        k: usize,
+    ) {
+        let (wc, sc, bc) = (
+            format.weight_cols(k),
+            format.scales_cols(k),
+            format.biases_cols(k),
+        );
+        weights.insert(
+            format!("{prefix}.weight"),
+            MxArray::from_uint32(&vec![0u32; rows * wc], &[rows as i64, wc as i64]).unwrap(),
+        );
+        let scales = if format.scales_are_signed() {
+            MxArray::from_int8(&vec![1i8; rows * sc], &[rows as i64, sc as i64]).unwrap()
+        } else {
+            MxArray::from_uint8(&vec![1u8; rows * sc], &[rows as i64, sc as i64]).unwrap()
+        };
+        weights.insert(format!("{prefix}.scales"), scales);
+        weights.insert(
+            format!("{prefix}.biases"),
+            MxArray::from_float16(&vec![0u16; rows * bc], &[rows as i64, bc as i64]).unwrap(),
+        );
+    }
+
+    fn kquant_entry(prefix: &str, format: KQuantFormat) -> QuantEntry {
+        QuantEntry {
+            key: format!("{prefix}.weight"),
+            bits: format.bits() as i32,
+            group_size: format.group_size() as i32,
+            mode: format.mlx_mode().to_string(),
+        }
+    }
+
+    #[test]
+    fn validate_existing_kquant_entry_accepts_every_width() {
+        // W4 gate. The old `weight_cols * (32 / bits)` derivation integer-divides
+        // 32 by the width: 32/5 = 6, 32/6 = 5. For q5k (weight_cols 80 at K=512)
+        // that gives 480, for q6k (weight_cols 96) it gives 480 — neither a
+        // super-block multiple — so the buggy path would REJECT these valid
+        // groups. The correct `weight_cols * 32 / bits` recovers K=512. Covering
+        // 4-, 5- and 6-bit proves the fix across every width the feature adds.
+        for format in [KQuantFormat::Q4K, KQuantFormat::Q5K, KQuantFormat::Q6K] {
+            let prefix = "model.layers.0.mlp.gate_proj";
+            let mut weights: HashMap<String, MxArray> = HashMap::new();
+            insert_valid_kquant_group(&mut weights, prefix, format, 4, 512);
+            let entry = kquant_entry(prefix, format);
+            validate_existing_quantized_entry(&weights, prefix, &entry).unwrap_or_else(|e| {
+                panic!(
+                    "{} valid group must validate: {}",
+                    format.mlx_mode(),
+                    e.reason
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn validate_existing_kquant_entry_rejects_wrong_scales_dtype() {
+        // q6k sub-scales are SIGNED int8; the q4k/q5k uint8 dtype is a format
+        // mismatch, not an alias.
+        let prefix = "model.layers.0.mlp.gate_proj";
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        insert_valid_kquant_group(&mut weights, prefix, KQuantFormat::Q6K, 2, 256);
+        let sc = KQuantFormat::Q6K.scales_cols(256);
+        weights.insert(
+            format!("{prefix}.scales"),
+            MxArray::from_uint8(&vec![1u8; 2 * sc], &[2, sc as i64]).unwrap(),
+        );
+        let entry = kquant_entry(prefix, KQuantFormat::Q6K);
+        let err = validate_existing_quantized_entry(&weights, prefix, &entry)
+            .expect_err("q6k with uint8 scales must be rejected");
+        assert!(err.reason.contains("expected Int8"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn validate_existing_kquant_entry_rejects_missing_scale_interleave() {
+        // A q5k `.scales` that drops the `(sc, m)` interleave factor of 2 (K/32
+        // instead of 2*K/32) is malformed and must be rejected; the format's own
+        // `scales_cols` carries the factor so the check cannot forget it.
+        let prefix = "model.layers.0.mlp.gate_proj";
+        let format = KQuantFormat::Q5K;
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        insert_valid_kquant_group(&mut weights, prefix, format, 2, 256);
+        let wrong = 256 / 32; // 8 — half of the required 16
+        weights.insert(
+            format!("{prefix}.scales"),
+            MxArray::from_uint8(&vec![1u8; 2 * wrong], &[2, wrong as i64]).unwrap(),
+        );
+        let entry = kquant_entry(prefix, format);
+        let err = validate_existing_quantized_entry(&weights, prefix, &entry)
+            .expect_err("q5k missing the scale interleave must be rejected");
+        assert!(
+            err.reason.contains(".scales last dim"),
+            "got: {}",
+            err.reason
         );
     }
 

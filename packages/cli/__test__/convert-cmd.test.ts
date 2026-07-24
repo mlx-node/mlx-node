@@ -66,6 +66,62 @@ describe('mlx convert GGUF validation', () => {
     expect(convertGgufToSafetensors).not.toHaveBeenCalled();
   });
 
+  it('rejects --gguf-kquant combined with re-quantization for .gguf input upfront', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    await expect(
+      runConvert(['--input', ggufPath, '--output', join(tmp, 'out'), '--gguf-kquant', '--quantize']),
+    ).rejects.toThrow('process.exit(1)');
+
+    const errors = errSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(errors).toContain('--gguf-kquant cannot be combined with re-quantization');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(convertGgufToSafetensors).not.toHaveBeenCalled();
+  });
+
+  it('rejects --gguf-kquant combined with --imatrix-path for .gguf input upfront', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    // ggufPath is an existing .gguf file, so it clears the imatrix
+    // existence/extension checks and reaches the K-quant import guard — proving
+    // the guard fires on --imatrix-path, a trigger distinct from --quantize.
+    await expect(
+      runConvert([
+        '--input',
+        ggufPath,
+        '--output',
+        join(tmp, 'out'),
+        '--gguf-kquant',
+        '--imatrix-path',
+        ggufPath,
+      ]),
+    ).rejects.toThrow('process.exit(1)');
+
+    const errors = errSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(errors).toContain('--gguf-kquant cannot be combined with re-quantization');
+    expect(convertGgufToSafetensors).not.toHaveBeenCalled();
+  });
+
+  it('forwards importKQuants when --gguf-kquant is used without re-quantization', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    await runConvert(['--input', ggufPath, '--output', join(tmp, 'out'), '--gguf-kquant']);
+
+    expect(convertGgufToSafetensors).toHaveBeenCalledTimes(1);
+    expect(convertGgufToSafetensors).toHaveBeenCalledWith(
+      expect.objectContaining({ importKQuants: true, quantize: false }),
+    );
+  });
+
   it('rejects --config-dir when the path is not a directory', async () => {
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     vi.spyOn(console, 'log').mockImplementation(() => {});
