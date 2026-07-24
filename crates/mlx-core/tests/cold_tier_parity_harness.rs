@@ -131,6 +131,24 @@ pub struct ColdTierParitySpec {
     pub thinking_token_budget: Option<i32>,
     /// Minimum `cached_tokens` instance 2 must report. `None` => `block_size * 2`.
     pub min_restored_tokens: Option<u32>,
+    /// Extra persist-enabled turns run BEFORE instance 1, purely to deepen the
+    /// persisted chain. Default 0 — qwen3 is bit-for-bit unaffected.
+    ///
+    /// This is a fixture dial, not an assertion knob: the cold writer's queue
+    /// is bounded (`DEFAULT_QUEUE_DEPTH`) and
+    /// `ColdTierWalk::capture_chain` STOPS at the first block the queue
+    /// refuses, so a single turn only ever persists the first handful of
+    /// blocks no matter how long the prompt is. Blocks already on disk are
+    /// `contains`-skipped without re-enqueueing, so each further turn advances
+    /// the frontier by another queue's worth. A family whose auxiliary state
+    /// is only representable at a deep boundary (gemma4's sliding sidecar
+    /// needs a whole `sliding_window`) therefore cannot reach that boundary in
+    /// one turn, and would fail the gate for a reason that has nothing to do
+    /// with its restore path.
+    ///
+    /// Warm-up turns are neither compared nor asserted on — the three measured
+    /// instances below are unchanged.
+    pub capture_warmup_turns: usize,
 }
 
 impl ColdTierParitySpec {
@@ -146,6 +164,7 @@ impl ColdTierParitySpec {
             max_new_tokens: 32,
             thinking_token_budget: Some(32),
             min_restored_tokens: None,
+            capture_warmup_turns: 0,
         }
     }
 
@@ -177,6 +196,12 @@ impl ColdTierParitySpec {
 
     pub fn with_min_restored_tokens(mut self, tokens: u32) -> Self {
         self.min_restored_tokens = Some(tokens);
+        self
+    }
+
+    /// See [`Self::capture_warmup_turns`].
+    pub fn with_capture_warmup_turns(mut self, turns: usize) -> Self {
+        self.capture_warmup_turns = turns;
         self
     }
 
@@ -459,6 +484,30 @@ where
             parity_chat_config(&spec),
         )
     };
+
+    // Chain warm-up (opt-in; see `capture_warmup_turns`). Each turn advances
+    // the persisted chain's frontier by another writer-queue's worth of
+    // blocks, because blocks already on disk are skipped without re-enqueueing.
+    // Nothing here is asserted on — this only deepens what instance 2 can find.
+    for turn_index in 0..spec.capture_warmup_turns {
+        let result = turn(&persist_dir).await.unwrap_or_else(|e| {
+            panic!(
+                "[{}] capture warm-up turn {} failed: {e}",
+                spec.family,
+                turn_index + 1
+            )
+        });
+        // Drain per turn: leaving the writer queue full would starve the next
+        // turn's capture of the very slots it needs to advance the frontier.
+        wait_for_cold_writes_drained().await;
+        eprintln!(
+            "[{}] warm-up turn {}/{}: cached={} (chain deepening; not asserted)",
+            spec.family,
+            turn_index + 1,
+            spec.capture_warmup_turns,
+            result.cached_tokens
+        );
+    }
 
     // Instance 1: persistence on. Fresh prefill; captures full blocks to the
     // cold tier on turn finalize. Dropped by `run_turn` before the restart.

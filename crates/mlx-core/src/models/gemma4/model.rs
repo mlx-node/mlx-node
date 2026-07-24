@@ -118,6 +118,7 @@ use super::config::Gemma4Config;
 use super::decoder_layer::{Gemma4DecoderLayer, Gemma4LayerKind};
 use super::dspark::DsparkTap;
 use super::layer_cache::Gemma4LayerCache;
+use super::sliding_sidecar;
 use crate::engine;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use tracing::info;
@@ -2303,6 +2304,29 @@ impl Gemma4Inner {
             });
         }
 
+        // Every in-memory source has missed. Before paying a full decoder
+        // replay over the reused prefix, install the sliding state the SSD
+        // cold tier restored alongside this turn's paged K/V — if it restored
+        // any. Media turns never install (see
+        // `capture_gemma4_sliding_cold_sidecar`: they also never capture, and
+        // `require_exact_checkpoint` marks exactly the image-lineage turns).
+        if !require_exact_checkpoint
+            && let Some(preparation) =
+                self.install_gemma4_sliding_cold_sidecar(cached_prefix_len)?
+        {
+            if trace_enabled {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] gemma4 sliding_prefix_prepare_done state={} cached_prefix_tokens={} primed_prefix_tokens={} replay_delta_tokens={} elapsed_ms={:.1}",
+                    preparation.state,
+                    cached_prefix_len,
+                    preparation.primed_prefix_len,
+                    cached_prefix_len.saturating_sub(preparation.primed_prefix_len),
+                    prepare_start.map(elapsed_ms).unwrap_or(0.0)
+                ));
+            }
+            return Ok(preparation);
+        }
+
         self.caches = Some(init_caches_for_config(&self.config));
         if trace_enabled {
             write_inference_trace(format_args!(
@@ -2317,6 +2341,345 @@ impl Gemma4Inner {
             state: "replay",
             primed_prefix_len: 0,
         })
+    }
+
+    /// Install auxiliary sliding-window state the SSD cold tier restored
+    /// alongside this turn's paged K/V prefix.
+    ///
+    /// This is the cold-tier twin of the in-memory checkpoint lookups above:
+    /// same destination (`self.caches` at a known offset), different source
+    /// (an on-disk [`mlx_paged_attn::ColdSidecar`] instead of a live
+    /// `RotatingKVCacheSnapshot`). It is consulted only after every in-memory
+    /// source has missed, because those are already materialized and cost no
+    /// decode.
+    ///
+    /// `ColdTierWalk::restore_extend` guarantees the sidecar backs EXACTLY the
+    /// prefix the adapter reported, so no boundary re-derivation is needed —
+    /// but every structural precondition is re-checked here anyway (group,
+    /// layout equality against this config's geometry, boundary within the
+    /// reported prefix). A contract slip must degrade to a MISS, i.e. a return
+    /// of `None` that falls through to the caller's full replay, never to
+    /// state installed at the wrong offset.
+    ///
+    /// Returns `None` when there is no sidecar, or when anything about it
+    /// fails to line up. Taking the sidecar is unconditional so a rejected one
+    /// cannot be reconsidered later in the same turn.
+    fn install_gemma4_sliding_cold_sidecar(
+        &mut self,
+        cached_prefix_len: u32,
+    ) -> Result<Option<Gemma4SlidingPrefixPreparation>> {
+        let Some(adapter) = self.paged_adapter.as_mut() else {
+            return Ok(None);
+        };
+        let Some(sidecar) = adapter.take_restored_sidecar() else {
+            return Ok(None);
+        };
+        if sidecar.layout.group != mlx_paged_attn::ColdGroup::SlidingWindow {
+            return Ok(None);
+        }
+        let boundary = sidecar.layout.boundary_tokens;
+        // The walk reconciles the prefix and the state together, so a sidecar
+        // reaching PAST the prefix it was handed back with is a broken
+        // contract, not a deeper opportunity: refuse it.
+        if boundary == 0 || boundary > cached_prefix_len {
+            return Ok(None);
+        }
+        let Some(geometry) = sliding_sidecar::geometry(&self.config) else {
+            return Ok(None);
+        };
+        // `load_sidecar` already compared the layout to the policy's template;
+        // comparing again against the geometry derived from the LOADED config
+        // makes the install independent of that earlier check.
+        if sliding_sidecar::layout_at(&geometry, boundary) != sidecar.layout {
+            return Ok(None);
+        }
+        let Some(snapshots) =
+            sliding_sidecar::decode_snapshots(&self.config, &geometry, &sidecar.tensors, boundary)?
+        else {
+            return Ok(None);
+        };
+        let Some(caches) = restore_gemma4_sliding_caches(&self.config, &snapshots, boundary)?
+        else {
+            return Ok(None);
+        };
+        self.caches = Some(caches);
+        Ok(Some(Gemma4SlidingPrefixPreparation {
+            state: "cold_sidecar",
+            primed_prefix_len: boundary,
+        }))
+    }
+
+    /// Persist this turn's sliding-window state to the SSD cold tier, so a
+    /// later process can resume from the paged prefix WITHOUT replaying the
+    /// decoder over it (`run_sliding_only_prefill`).
+    ///
+    /// Best-effort and infallible by construction — every failure path is a
+    /// silent skip. A missing sidecar is never a correctness problem: the
+    /// restore walk simply reconciles the candidate prefix down past that
+    /// boundary and the state is recomputed exactly as it is today.
+    ///
+    /// The boundary is the DEEPEST `B` that satisfies all of:
+    ///
+    ///  * `B` is a positive multiple of the paged block size, and at least one
+    ///    whole `sliding_window` (see `sliding_sidecar`: the layout's payload
+    ///    length is fixed, so shallower boundaries are unrepresentable);
+    ///  * the persisted K/V chain reaches `B` (`cold_captured_blocks`) — a
+    ///    sidecar past the chain's break can never be selected, so writing one
+    ///    would only burn quota;
+    ///  * an already-materialized in-memory checkpoint sits exactly at `B` and
+    ///    matches this request's tokens AND its per-block cache identity, so
+    ///    the payload costs no extra forward and no extra `eval`.
+    ///
+    /// At most ONE sidecar per turn: the payload is `physical sliding layers ×
+    /// 2 × window × kv_heads × head_dim` elements — hundreds of MiB on a real
+    /// checkpoint — and the writer queue is bounded.
+    ///
+    /// Media turns are skipped outright in v1. Their per-block keys are
+    /// image-aware (so a text prompt could never select an image-derived
+    /// sidecar), but `gemma4_vlm_prefix_policy` additionally forbids resuming
+    /// INSIDE an expanded image run, and this capture does not model that
+    /// rule; refusing is the fail-closed answer.
+    fn capture_gemma4_sliding_cold_sidecar(&self) {
+        let Some(adapter) = self.paged_adapter.as_ref() else {
+            return;
+        };
+        let Some(cold) = adapter.cold_tier() else {
+            return;
+        };
+        let Some(policy) = cold.sidecar_policy.as_ref() else {
+            return;
+        };
+        if policy.group() != mlx_paged_attn::ColdGroup::SlidingWindow {
+            return;
+        }
+        // v1: text-only. See the doc comment.
+        if !self.cached_paged_image_token_positions.is_empty() {
+            return;
+        }
+        let Some(geometry) = sliding_sidecar::geometry(&self.config) else {
+            return;
+        };
+        let block_size = adapter.block_size();
+        if block_size == 0 {
+            return;
+        }
+        let request_tokens = adapter.request_tokens();
+        // Ceiling: whole blocks of this request that the persisted K/V chain
+        // actually covers.
+        let full_blocks = request_tokens.len() / block_size as usize;
+        let chain_blocks = (adapter.cold_captured_blocks() as usize).min(full_blocks);
+        if chain_blocks == 0 {
+            return;
+        }
+        let extra_keys_per_block = engine::build_paged_extra_keys(
+            request_tokens.len(),
+            block_size,
+            &self.cached_paged_image_token_positions,
+        );
+
+        // Descend to the deepest representable boundary an in-memory
+        // checkpoint already backs.
+        let Some((boundary, snapshots)) = self.find_gemma4_sliding_capture_checkpoint(
+            &geometry,
+            request_tokens,
+            block_size,
+            chain_blocks,
+            &extra_keys_per_block,
+        ) else {
+            return;
+        };
+        // The sidecar chain is the KV chain recomputed under the
+        // `SlidingWindow` domain tag: identical per-block arguments, different
+        // group (vLLM's `BlockHashWithGroupId`). `ColdTierWalk::
+        // deepest_backed_boundary` derives the identical chain on restore.
+        //
+        // Derived BEFORE the payload is built so the dedup below can skip the
+        // whole encode: reading this state back off the GPU is hundreds of MiB
+        // on a real checkpoint, and every later turn on the same prompt would
+        // otherwise redo it and rewrite an object already on disk.
+        let blocks = boundary as usize / block_size as usize;
+        let mut parent: Option<mlx_paged_attn::ColdCacheKey> = None;
+        for index in 0..blocks {
+            let (Some(extra_keys), Some(tokens)) = (
+                extra_keys_per_block.get(index),
+                request_tokens.get(index * block_size as usize..(index + 1) * block_size as usize),
+            ) else {
+                return;
+            };
+            parent = Some(mlx_paged_attn::ColdCacheKey::chain(
+                mlx_paged_attn::ColdGroup::SlidingWindow,
+                cold.fingerprint,
+                parent,
+                tokens,
+                extra_keys,
+                0,
+                index,
+            ));
+        }
+        let Some(key) = parent else {
+            return;
+        };
+        // Already persisted for this exact chain: nothing to do. Mirrors
+        // `ColdTierWalk::capture_chain`'s `contains` dedup, and `contains_in`
+        // is explicitly side-effect free (no hit/miss accounting).
+        if cold
+            .manager
+            .contains_in(&key, mlx_paged_attn::ColdGroup::SlidingWindow)
+        {
+            return;
+        }
+
+        let Ok(Some(tensors)) =
+            sliding_sidecar::encode_tensors(&self.config, &geometry, snapshots, boundary)
+        else {
+            return;
+        };
+        let sidecar = mlx_paged_attn::ColdSidecar {
+            key,
+            fingerprint: cold.fingerprint,
+            layout: sliding_sidecar::layout_at(&geometry, boundary),
+            tensors,
+        };
+        if let Err(error) = cold.manager.enqueue_sidecar(sidecar) {
+            tracing::debug!(
+                target: "mlx_core::gemma4::paged",
+                "Gemma4 sliding sidecar enqueue failed at boundary {boundary}: {error}"
+            );
+        }
+    }
+
+    /// Deepest already-materialized sliding checkpoint that can anchor a cold
+    /// sidecar for `request_tokens`, with its snapshots.
+    ///
+    /// Candidates must sit at a boundary this layout can express
+    /// (`boundary_is_representable`), be covered by the persisted K/V chain
+    /// (`<= chain_blocks * block_size`), and carry BOTH the exact token prefix
+    /// and the exact per-block cache identity — the same `final_block_hash`
+    /// the in-memory lookup path checks, so a checkpoint recorded under
+    /// different image keys can never anchor a text sidecar.
+    fn find_gemma4_sliding_capture_checkpoint<'a>(
+        &'a self,
+        geometry: &sliding_sidecar::SlidingSidecarGeometry,
+        request_tokens: &[u32],
+        block_size: u32,
+        chain_blocks: usize,
+        extra_keys_per_block: &[Vec<u64>],
+    ) -> Option<(u32, &'a [Option<RotatingKVCacheSnapshot>])> {
+        let ceiling = (chain_blocks as u64).saturating_mul(block_size as u64);
+        let ceiling = u32::try_from(ceiling).unwrap_or(u32::MAX);
+        let mut best: Option<(u32, &[Option<RotatingKVCacheSnapshot>])> = None;
+        let candidates = self
+            .sliding_prompt_boundary_checkpoint
+            .iter()
+            .chain(self.sliding_prefix_checkpoints.iter());
+        for checkpoint in candidates {
+            let boundary = checkpoint.prefix_len;
+            if boundary > ceiling
+                || checkpoint.block_size != block_size
+                || !sliding_sidecar::boundary_is_representable(geometry, boundary, block_size)
+                || best.is_some_and(|(best_boundary, _)| best_boundary >= boundary)
+            {
+                continue;
+            }
+            if request_tokens.get(..boundary as usize) != Some(checkpoint.tokens.as_slice()) {
+                continue;
+            }
+            let Some(final_block_hash) = compute_gemma4_paged_prefix_block_hash_with_keys(
+                request_tokens,
+                boundary,
+                block_size,
+                extra_keys_per_block,
+                0,
+            ) else {
+                continue;
+            };
+            if checkpoint.final_block_hash != final_block_hash {
+                continue;
+            }
+            if !gemma4_sliding_snapshots_ready_at(&self.config, &checkpoint.snapshots, boundary) {
+                continue;
+            }
+            best = Some((boundary, checkpoint.snapshots.as_slice()));
+        }
+        best
+    }
+
+    /// Build the process-global SSD cold-tier context (manager + COMPLETE
+    /// content fingerprint) for `model_path` WITHOUT attaching it, mirroring
+    /// `Qwen3Inner::build_cold_tier_context` — see its doc for how the weight
+    /// identity is established and why the caller brackets the load around it.
+    ///
+    /// The gemma4 difference is the [`mlx_paged_attn::ColdSidecarPolicy`]:
+    /// gemma4's pool covers the FULL-ATTENTION layers only, so a K/V-only
+    /// restore would resume from sliding-window state the pool never held. The
+    /// policy turns the restore walk into vLLM's reconcile-down — the candidate
+    /// prefix is reduced to the deepest boundary a validated sidecar backs, and
+    /// a boundary nothing backs restores nothing.
+    ///
+    /// The sliding geometry is folded into the fingerprint explicitly:
+    /// [`crate::cold_tier::ColdTierGeometry`] describes the POOL, which here
+    /// covers only the global layers, so two configs differing ONLY in window
+    /// size or sliding/global split would otherwise share a pool geometry.
+    ///
+    /// Returns `None` (fail-open) when the paged adapter is absent, the tier
+    /// cannot be opened, this checkpoint has no sliding layers to persist, or a
+    /// complete content fingerprint cannot be established.
+    pub(crate) fn build_cold_tier_context(
+        &self,
+        model_path: &str,
+    ) -> Option<crate::transformer::paged_kv_cache_adapter::ColdTierContext> {
+        let adapter = self.paged_adapter.as_ref()?;
+        let manager = crate::cold_tier::global_cold_cache()?;
+        // No sliding layers means no out-of-pool state — but it also means this
+        // is not the hybrid gemma4 the sidecar work validated, so stay off
+        // rather than silently behaving like a dense family.
+        let geometry = sliding_sidecar::geometry(&self.config)?;
+        let sidecar_policy = sliding_sidecar::policy(&self.config)?;
+        let mut config_json = serde_json::to_vec(&self.config).ok()?;
+        config_json.extend_from_slice(&geometry.fingerprint_component());
+        let pool = adapter.layer_kv_pool();
+        let pool_geometry = crate::cold_tier::ColdTierGeometry {
+            block_size: pool.block_size() as u64,
+            num_layers: pool.num_layers() as u64,
+            num_kv_heads: pool.config().num_kv_heads as u64,
+            head_size: pool.config().head_size as u64,
+            cache_dtype: format!("{:?}", pool.cache_dtype()),
+        };
+        match crate::cold_tier::build_model_fingerprint(
+            "gemma4",
+            model_path,
+            Some(&config_json),
+            &pool_geometry,
+        ) {
+            Some(fingerprint) => Some(
+                crate::transformer::paged_kv_cache_adapter::ColdTierContext {
+                    manager,
+                    fingerprint,
+                    sidecar_policy: Some(sidecar_policy),
+                },
+            ),
+            None => {
+                tracing::warn!(
+                    "cold-tier persistence disabled for {model_path}: could not establish a \
+                     content fingerprint (unreadable or missing weight shard)"
+                );
+                None
+            }
+        }
+    }
+
+    /// Attach a previously-built cold-tier context to the paged adapter. A
+    /// no-op (fail-open) when the paged adapter is absent. Split from
+    /// [`Self::build_cold_tier_context`] so the caller can verify shard
+    /// identity is still stable AFTER the fingerprint read and BEFORE the cold
+    /// tier is committed.
+    pub(crate) fn attach_cold_tier(
+        &mut self,
+        ctx: crate::transformer::paged_kv_cache_adapter::ColdTierContext,
+    ) {
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            adapter.set_cold_tier(ctx);
+        }
     }
 
     pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
@@ -3999,6 +4362,15 @@ impl Gemma4Inner {
                 cached_prefix_len, sliding_primed_prefix_len
             ));
         }
+        // Sliding-window state now covers the whole cached prefix (either it
+        // already did, or the replay above just extended it to
+        // `cached_prefix_len`). Discharge the adapter's auxiliary-state
+        // obligation before the first `record_tokens` of the turn.
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            adapter
+                .confirm_aux_prefix_primed(cached_prefix_len)
+                .map_err(Error::from_reason)?;
+        }
 
         crate::models::gemma4::diagnostic::set_path("paged");
         crate::models::gemma4::diagnostic::set_step(-1);
@@ -4912,6 +5284,18 @@ impl Gemma4Inner {
                 "run_paged_vlm_prefill suffix embedding length {} does not match suffix token length {suffix_len}",
                 suffix_embeds.shape_at(1)?
             )));
+        }
+
+        // Sliding-window state covers the whole cached prefix by construction
+        // on this path: `resolve_vlm_paged_prefix` either kept a candidate
+        // whose `sliding_prefix_exact` was true, or restarted the turn cold
+        // (`cached_prefix_len == 0`). Discharge the adapter's auxiliary-state
+        // obligation before the first `record_tokens` of the turn — the same
+        // ack `run_paged_prefill_chunk` makes for the text path.
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            adapter
+                .confirm_aux_prefix_primed(cached_prefix_len)
+                .map_err(Error::from_reason)?;
         }
 
         crate::models::gemma4::diagnostic::set_path("paged");
@@ -5962,7 +6346,11 @@ impl PagedBackend for Gemma4Inner {
         // for reuse + release. Infallible (`let _ =` every call — a teardown
         // failure must not mask the turn result).
         self.paged_finalize_failed = false;
-        let finalize_error = match self.paged_adapter.as_mut() {
+        // The non-reuse branch defers its `release_request` past the sidecar
+        // capture below: releasing clears `request_tokens` and the cold-chain
+        // capture depth, and the sidecar is keyed off exactly those.
+        let mut release_pending = false;
+        let mut finalize_error = match self.paged_adapter.as_mut() {
             Some(adapter) => {
                 let total_tokens = adapter.request_tokens().len();
                 let block_size = adapter.block_size();
@@ -5976,15 +6364,25 @@ impl PagedBackend for Gemma4Inner {
                         .finalize_turn_keep_live_per_block(&extra_keys, 0)
                         .err()
                 } else {
-                    let register_error = adapter
+                    release_pending = true;
+                    adapter
                         .register_full_blocks_for_reuse_per_block(&extra_keys, 0)
-                        .err();
-                    let release_error = adapter.release_request().err();
-                    register_error.or(release_error)
+                        .err()
                 }
             }
             None => Some("Gemma4 paged adapter missing during finalize".to_string()),
         };
+        // Persist the out-of-pool sliding state for the SAME chain the adapter
+        // just captured, so a later process can resume from the restored K/V
+        // prefix instead of replaying the decoder over it. Skipped when the
+        // finalize failed: the K/V chain the sidecar would anchor on was not
+        // published, so nothing could ever select it.
+        if finalize_error.is_none() {
+            self.capture_gemma4_sliding_cold_sidecar();
+        }
+        if release_pending && let Some(adapter) = self.paged_adapter.as_mut() {
+            finalize_error = finalize_error.or(adapter.release_request().err());
+        }
         if let Some(error) = finalize_error {
             tracing::warn!(
                 target: "mlx_core::gemma4::paged",
@@ -9464,6 +9862,7 @@ mod tests {
     #[cfg(test)]
     fn paged_tiny_config(use_block_paged: Option<bool>) -> super::Gemma4Config {
         super::Gemma4Config {
+            persist_paged_cache: None,
             vocab_size: 100,
             hidden_size: 64,
             num_hidden_layers: 2,

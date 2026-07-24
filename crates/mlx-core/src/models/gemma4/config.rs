@@ -5,7 +5,7 @@ use napi_derive::napi;
 /// Supports E2B (2.3B), E4B (4.5B), and 31B dense models.
 /// For MoE models (26B-A4B), use `Gemma4MoeConfig` from `gemma4_moe`.
 #[napi(object)]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Gemma4Config {
     // Standard transformer fields
     pub vocab_size: i32,
@@ -185,6 +185,16 @@ pub struct Gemma4Config {
     #[serde(default)]
     #[napi(ts_type = "boolean | undefined")]
     pub use_block_paged_cache: Option<bool>,
+
+    /// Persist full paged KV blocks — and gemma4's out-of-pool sliding-window
+    /// state, as a cold-tier sidecar — to the SSD cold tier so warm prefixes
+    /// survive process restarts. Off unless explicitly enabled.
+    ///
+    /// An EXPLICIT value here is authoritative and beats the ambient
+    /// `MLX_PERSIST_PAGED_CACHE` default (`cold_tier::resolve_persist_cold`).
+    #[serde(default)]
+    #[napi(ts_type = "boolean | undefined")]
+    pub persist_paged_cache: Option<bool>,
 }
 
 fn default_sliding_window() -> i32 {

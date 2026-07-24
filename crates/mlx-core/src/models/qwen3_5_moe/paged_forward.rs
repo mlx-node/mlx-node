@@ -291,7 +291,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_paged_prefill_chunk_with_size_and_checkpoint(
+pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
     full_tokens: &[u32],
     suffix_tokens: &[u32],
     cached_prefix_len: u32,
@@ -380,6 +380,12 @@ fn run_paged_prefill_chunk_with_size_and_checkpoint(
             ));
         }
     }
+    // The recurrent half of the cached prefix is now in hand (either it already
+    // was, or the pre-pass above just replayed it from token ids). Clear the
+    // adapter's auxiliary-state obligation before the first `record_tokens`.
+    paged_adapter
+        .confirm_aux_prefix_primed(cached_prefix_len)
+        .map_err(Error::from_reason)?;
 
     let checkpoint_suffix_offset = checkpoint_target
         .and_then(|target| target.checked_sub(cached_prefix_len))
@@ -538,8 +544,8 @@ fn run_paged_prefill_chunk_with_size_and_checkpoint(
 /// Thin wrapper over `run_paged_prefill_one_chunk_moe` +
 /// `project_last_token_logits_moe`. Kept as a named helper because
 /// callers (and the chunked driver's fast-path branch) reference it
-/// by name and the GDN pre-pass / `record_tokens` ordering matches
-/// the single-shot semantics we want to preserve byte-for-byte.
+/// by name and it runs the same GDN pre-pass the chunked driver does
+/// before forwarding the suffix.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_paged_prefill_single_shot(
     full_tokens: &[u32],
@@ -556,14 +562,24 @@ pub(crate) fn run_paged_prefill_single_shot(
     paged_adapter: &mut PagedKVCacheAdapter,
     cached_rope_deltas: i32,
 ) -> Result<MxArray> {
-    paged_adapter
-        .record_tokens(suffix_tokens)
-        .map_err(Error::from_reason)?;
-
+    // The GDN pre-pass runs BEFORE `record_tokens` so the auxiliary-state
+    // acknowledgement below precedes the first token recorded against the
+    // cached prefix (the chunked driver already has this order). The swap is
+    // observationally inert: `run_gdn_only_prefill` takes no paged adapter and
+    // so cannot touch the block table, pool or cursor, while `record_tokens` is
+    // host-side bookkeeping plus block allocation and never reads the GDN
+    // caches. Neither one's result depends on the other.
     if cached_prefix_len > 0 && !gdn_prefix_already_primed {
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
         run_gdn_only_prefill(prefix, embed, layers, caches)?;
     }
+    paged_adapter
+        .confirm_aux_prefix_primed(cached_prefix_len)
+        .map_err(Error::from_reason)?;
+
+    paged_adapter
+        .record_tokens(suffix_tokens)
+        .map_err(Error::from_reason)?;
 
     let hidden_states = run_paged_prefill_one_chunk_moe(
         suffix_tokens,
@@ -649,6 +665,12 @@ pub(crate) fn run_paged_vlm_prefill_moe(
             "run_paged_vlm_prefill_moe received a K/V prefix without an exact GDN sidecar; caller must restart cold",
         ));
     }
+    // Past the guard the recurrent half is exact by construction (an image
+    // prefix is never replayed from token ids — the caller restarts cold
+    // instead), so the adapter's obligation is discharged here.
+    paged_adapter
+        .confirm_aux_prefix_primed(cached_prefix_len)
+        .map_err(Error::from_reason)?;
 
     let suffix_tokens = &expanded_tokens[cached_prefix_len_us..];
     let configured_chunk_size = crate::array::paged_prefill_chunk_size();
@@ -1044,6 +1066,7 @@ mod tests {
             paged_cache_memory_mb: Some(256),
             paged_block_size: Some(16),
             use_block_paged_cache: Some(true),
+            persist_paged_cache: None,
             n_mtp_layers: 0,
         }
     }

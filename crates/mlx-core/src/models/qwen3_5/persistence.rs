@@ -10,6 +10,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
+use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
 use crate::models::quant_dispatch::{
     default_per_layer_quant, effective_plq_for, ensure_affine_biases_present,
     ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
@@ -1768,12 +1769,38 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     config.num_layers, config.hidden_size, config.num_heads, config.num_kv_heads,
                 );
 
+                // Cold-tier persistence decision, resolved BEFORE the mmap so the
+                // shard-identity bracket that guards it can straddle the load.
+                // Precedence: explicit per-model config > MLX_PERSIST_PAGED_CACHE
+                // env default > off (see `resolve_persist_cold`).
+                let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
+                let persist_cold = resolve_persist_cold(
+                    "qwen3_5",
+                    persist_env.as_deref(),
+                    config.persist_paged_cache,
+                );
+                let shard_snapshot_before_mmap = if persist_cold {
+                    snapshot_shard_identities(path)
+                } else {
+                    None
+                };
+
                 // Load all weights. MTPLX-compatible artifacts can store the MTP
                 // module in an external sidecar (usually `mtp.safetensors`) instead
                 // of embedding it in the main model shards. When present, prefer
                 // the sidecar and drop embedded MTP tensors so key normalization
                 // cannot leave duplicate `mtp.*` entries racing during sanitize.
                 let mut raw_params = load_all_safetensors(path, true)?;
+
+                // Second snapshot, against the same inodes the mmap pinned; paired
+                // with the after-fingerprint snapshot below it brackets the WHOLE
+                // load-to-fingerprint span so a mid-load model-directory swap can
+                // never bind the OLD weights to a NEW revision's fingerprint.
+                let shard_snapshot_at_mmap = if persist_cold {
+                    snapshot_shard_identities(path)
+                } else {
+                    None
+                };
 
                 // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval
                 // of any mmap-backed weight (FP8 dequant in `sanitize_weights`,
@@ -2010,6 +2037,33 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     crate::array::memory::materialize_weights(&arrays)?;
                 }
                 inner.initialize_paged_adapter()?;
+
+                // Fail-closed revalidation bracketing the WHOLE
+                // load-to-fingerprint span, then attach the SSD cold tier. The
+                // fingerprint (built from the paged pool geometry + GDN sidecar
+                // geometry, so it needs the adapter that `initialize_paged_adapter`
+                // just built) reads the shards; only if shard identity is provably
+                // unchanged across [before-mmap .. at-mmap .. after-fingerprint] is
+                // the tier committed, so a mid-load directory swap can never bind
+                // OLD weights to a NEW revision's fingerprint. A hybrid family's
+                // context carries a `ColdSidecarPolicy`, so the restore walk
+                // refuses any boundary a validated GDN sidecar does not back.
+                if persist_cold && let Some(ctx) = inner.build_cold_tier_context(&model_path) {
+                    let after_fingerprint = snapshot_shard_identities(path);
+                    if shard_identities_stable(
+                        &shard_snapshot_before_mmap,
+                        &shard_snapshot_at_mmap,
+                        &after_fingerprint,
+                    ) {
+                        inner.attach_cold_tier(ctx);
+                    } else {
+                        warn!(
+                            "cold-tier persistence disabled for {model_path}: model \
+                             directory changed during load (shard identity mismatch); \
+                             KV persistence stays off for safety"
+                        );
+                    }
+                }
 
                 // Deterministic weight-byte total for the cache-limit
                 // coordinator. Includes both text `params` and the
@@ -2249,6 +2303,11 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
                 None => None,
             }
         },
+        // Persist the out-of-pool GDN recurrent state to the SSD cold tier. Off
+        // unless explicitly present as a bool (the agent overlay / a config
+        // override). `MLX_PERSIST_PAGED_CACHE` supplies the env default at load
+        // (`resolve_persist_cold`), so this stays a strict tri-state read.
+        persist_paged_cache: raw.get("persist_paged_cache").and_then(|v| v.as_bool()),
         n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),
     })
 }
@@ -2922,6 +2981,7 @@ mod tests {
             paged_cache_memory_mb: None,
             paged_block_size: None,
             use_block_paged_cache: None,
+            persist_paged_cache: None,
             n_mtp_layers: 0,
         }
     }

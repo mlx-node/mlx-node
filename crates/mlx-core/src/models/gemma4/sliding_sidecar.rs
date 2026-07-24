@@ -1,0 +1,641 @@
+//! Gemma4's sliding-window state as a cold-tier [`ColdSidecar`].
+//!
+//! # Why gemma4 needs one at all
+//!
+//! Gemma4 is a HYBRID: `Gemma4Inner` sizes its paged pool over the PHYSICAL
+//! FULL-ATTENTION layers only (`physical_full_attention_layer_count`, and the
+//! `num_layers` it feeds into `PagedAttentionConfig`). The interleaved sliding
+//! layers keep their K/V in a per-layer [`RotatingKVCache`] that the pool never
+//! sees. A restored paged prefix therefore reconstructs only part of the model
+//! state, and the missing half has to come from somewhere: today it is
+//! RECOMPUTED by `run_sliding_only_prefill`, which re-runs the decoder over the
+//! whole reused prefix. This sidecar persists it instead.
+//!
+//! # The payload
+//!
+//! One [`RotatingKVCacheSnapshot`] per PHYSICAL sliding layer — `keys` in slot
+//! 0, `values` in slot 1, layer-major in decoder order. "Physical" is
+//! load-bearing: a `SharedOnSliding` KV-shared alias consumes its anchor's
+//! stash and never advances a slot of its own (see
+//! `gemma4_sliding_caches_ready_at`), so it holds no state. Counting aliases in
+//! `num_layers` would shift every later layer's tensors by the alias count and
+//! restore plausible-looking garbage rather than fail.
+//!
+//! # Why every boundary is at least one whole window
+//!
+//! [`ColdSidecarPolicy`] is a geometry TEMPLATE: `expected_at` varies ONLY
+//! `boundary_tokens`, and `load_sidecar` compares layouts for equality. So
+//! `dims` and `bytes_per_tensor` must be boundary-invariant. A rotating cache
+//! holds `min(offset, window)` tokens, which is constant only once
+//! `offset >= window`. Shallower boundaries are simply not representable, and
+//! padding is not an escape hatch — `RotatingKVCache::restore_snapshot` hard-
+//! checks `cached_tokens == expected_cached_tokens(offset, max_size)` and would
+//! reject the pad. Both sides therefore SKIP below the window: capture writes
+//! nothing, and the restore walk reconciles down to zero and recomputes. That
+//! is the fail-closed direction.
+//!
+//! # Why the chain key, not a window-local key
+//!
+//! A sliding layer's K/V at position `i` is projected from a hidden state that
+//! has already passed through the interleaved FULL-attention layers, which
+//! attend to the ENTIRE prefix. The state at a boundary is therefore NOT a
+//! function of the last `window` tokens, and two prompts agreeing only on their
+//! last `window` tokens must never share a sidecar. The parent-linked chain
+//! from block 0 that `ColdTierWalk::deepest_backed_boundary` builds is exactly
+//! the right identity — the same per-block `extra_keys` (image-aware) and
+//! `cache_salt` as the K/V chain, under the `SlidingWindow` domain tag.
+
+use mlx_paged_attn::{ColdGroup, ColdSidecarLayout, ColdSidecarPolicy};
+use napi::bindgen_prelude::*;
+
+use crate::array::{DType, MxArray};
+use crate::transformer::rotating_kv_cache::RotatingKVCacheSnapshot;
+
+use super::config::Gemma4Config;
+
+/// `keys` then `values`. Sliding layers never share K with V —
+/// `attention.rs` gates `k_is_v` on `is_global`, so the count is fixed at 2.
+pub(crate) const TENSORS_PER_LAYER: u32 = 2;
+
+/// The one element type this sidecar is written and read in. The snapshot type
+/// promises no dtype (see `gemma4_sliding_checkpoint_estimated_bytes`, which
+/// budgets 4 bytes/elem for exactly that reason), so an f32 sliding cache must
+/// SKIP capture rather than write f32 bytes under a bf16 label. `load_sidecar`
+/// compares the whole layout, so a mismatch on the read side is already a miss.
+const SIDECAR_DTYPE: &str = "BFloat16";
+
+/// Geometry of gemma4's out-of-pool sliding state, derived once from the
+/// config. Every field is boundary-invariant, which is what lets it back a
+/// [`ColdSidecarPolicy`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SlidingSidecarGeometry {
+    /// `config.sliding_window` — the rotating cache's `max_size`, and the
+    /// token count every payload carries.
+    pub window: u32,
+    /// Count of PHYSICAL sliding layers: `is_sliding_layer && !is_kv_shared_layer`.
+    pub physical_layers: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+}
+
+impl SlidingSidecarGeometry {
+    /// `[batch, kv_heads, window, head_dim]` — the shape
+    /// `RotatingKVCache::restore_snapshot` validates against, with `batch`
+    /// pinned to 1 (the adapter is scoped to one request at a time).
+    fn dims(&self) -> Vec<u32> {
+        vec![1, self.kv_heads, self.window, self.head_dim]
+    }
+
+    fn bytes_per_tensor(&self) -> Option<usize> {
+        (self.kv_heads as usize)
+            .checked_mul(self.window as usize)?
+            .checked_mul(self.head_dim as usize)?
+            .checked_mul(std::mem::size_of::<u16>())
+    }
+
+    /// Elements per state tensor, i.e. the `to_uint16_native` length a capture
+    /// must produce and a restore must consume.
+    fn elements_per_tensor(&self) -> Option<usize> {
+        (self.kv_heads as usize)
+            .checked_mul(self.window as usize)?
+            .checked_mul(self.head_dim as usize)
+    }
+
+    /// Geometry bytes folded into the cold-tier fingerprint.
+    ///
+    /// [`crate::cold_tier::ColdTierGeometry`] describes the POOL, which for
+    /// gemma4 covers only the full-attention layers — two configs with the same
+    /// full-attention pool but a different `sliding_window` or a different
+    /// `layer_types` split would produce the same pool geometry. The serialized
+    /// `Gemma4Config` blob already carries those fields, but binding them
+    /// explicitly makes the sidecar's identity independent of that blob's
+    /// serde surface ever changing.
+    pub fn fingerprint_component(&self) -> Vec<u8> {
+        format!(
+            "gemma4-sliding-sidecar:v1:window={}:layers={}:kv_heads={}:head_dim={}:dtype={}:tensors={}",
+            self.window,
+            self.physical_layers,
+            self.kv_heads,
+            self.head_dim,
+            SIDECAR_DTYPE,
+            TENSORS_PER_LAYER,
+        )
+        .into_bytes()
+    }
+}
+
+/// Decoder indices of the layers that OWN sliding state, in order. The
+/// `layer * TENSORS_PER_LAYER + slot` ordering of the payload is stated in
+/// terms of this vector's positions.
+pub(crate) fn physical_sliding_layers(config: &Gemma4Config) -> Vec<usize> {
+    (0..config.num_hidden_layers.max(0) as usize)
+        .filter(|&i| config.is_sliding_layer(i) && !config.is_kv_shared_layer(i))
+        .collect()
+}
+
+/// Derive the sidecar geometry, or `None` when this checkpoint has no
+/// out-of-pool sliding state to persist (an all-global `layer_types`, or a
+/// nonsensical window/head geometry). `None` means "install no policy": the
+/// family then behaves exactly as it did before sidecars existed.
+pub(crate) fn geometry(config: &Gemma4Config) -> Option<SlidingSidecarGeometry> {
+    let physical_layers = u32::try_from(physical_sliding_layers(config).len()).ok()?;
+    if physical_layers == 0 {
+        return None;
+    }
+    let window = u32::try_from(config.sliding_window).ok()?;
+    let kv_heads = u32::try_from(config.effective_kv_heads(false)).ok()?;
+    let head_dim = u32::try_from(config.effective_head_dim(false)).ok()?;
+    if window == 0 || kv_heads == 0 || head_dim == 0 {
+        return None;
+    }
+    let geo = SlidingSidecarGeometry {
+        window,
+        physical_layers,
+        kv_heads,
+        head_dim,
+    };
+    // A geometry whose payload cannot be sized is not persistable at all.
+    geo.bytes_per_tensor()?;
+    Some(geo)
+}
+
+/// The layout a sidecar anchored at `boundary_tokens` must have. `boundary` is
+/// stamped by [`ColdSidecarPolicy::expected_at`] on the read side; the capture
+/// side builds the same value here so the two compare equal.
+pub(crate) fn layout_at(geo: &SlidingSidecarGeometry, boundary_tokens: u32) -> ColdSidecarLayout {
+    ColdSidecarLayout {
+        group: ColdGroup::SlidingWindow,
+        boundary_tokens,
+        num_layers: geo.physical_layers,
+        tensors_per_layer: TENSORS_PER_LAYER,
+        dtype: SIDECAR_DTYPE.to_string(),
+        dims: geo.dims(),
+        // `bytes_per_tensor` is checked non-`None` by `geometry`.
+        bytes_per_tensor: geo.bytes_per_tensor().unwrap_or(0),
+    }
+}
+
+/// Build the reconcile-down policy for this config, or `None` when there is no
+/// sliding state to back (see [`geometry`]).
+pub(crate) fn policy(config: &Gemma4Config) -> Option<ColdSidecarPolicy> {
+    let geo = geometry(config)?;
+    ColdSidecarPolicy::new(layout_at(&geo, 0)).ok()
+}
+
+/// Whether `boundary_tokens` is representable by this policy: a positive
+/// multiple of `block_size` that is at least one whole window. See the module
+/// doc — below the window the payload length would vary, so there is no legal
+/// layout and BOTH sides must skip rather than pad or truncate.
+pub(crate) fn boundary_is_representable(
+    geo: &SlidingSidecarGeometry,
+    boundary_tokens: u32,
+    block_size: u32,
+) -> bool {
+    boundary_tokens > 0
+        && block_size > 0
+        && boundary_tokens.is_multiple_of(block_size)
+        && boundary_tokens >= geo.window
+}
+
+/// Serialize the in-memory snapshots for one boundary into the layer-major
+/// tensor payload.
+///
+/// `snapshots` is indexed by DECODER layer (length `num_hidden_layers`, `None`
+/// at global and KV-shared slots), exactly as `snapshot_gemma4_sliding_caches`
+/// produces it.
+///
+/// Returns `Ok(None)` — a graceful skip, never an error — when the state does
+/// not match the sidecar's fixed geometry: a missing physical layer, a wrong
+/// offset, a non-bf16 element type, or a shape that is not
+/// `[1, kv_heads, window, head_dim]`. Skipping is the fail-closed direction:
+/// writing bytes that do not match the label would produce a sidecar that
+/// restores wrong state instead of missing.
+///
+/// The caller must have materialized the snapshots first
+/// (`materialize_gemma4_sliding_snapshots` = `copy()` + `eval_arrays`); the
+/// `copy` is mandatory because `temporal_order` can hand back a clone that
+/// ALIASES live storage which the single-token update path rewrites in place.
+pub(crate) fn encode_tensors(
+    config: &Gemma4Config,
+    geo: &SlidingSidecarGeometry,
+    snapshots: &[Option<RotatingKVCacheSnapshot>],
+    boundary_tokens: u32,
+) -> Result<Option<Vec<Vec<u8>>>> {
+    let layers = physical_sliding_layers(config);
+    if layers.len() != geo.physical_layers as usize
+        || snapshots.len() != config.num_hidden_layers.max(0) as usize
+    {
+        return Ok(None);
+    }
+    let Some(elements) = geo.elements_per_tensor() else {
+        return Ok(None);
+    };
+    let expected_shape = [
+        1i64,
+        geo.kv_heads as i64,
+        geo.window as i64,
+        geo.head_dim as i64,
+    ];
+
+    let mut tensors = Vec::with_capacity(layers.len() * TENSORS_PER_LAYER as usize);
+    for &layer_idx in &layers {
+        let Some(Some(snapshot)) = snapshots.get(layer_idx) else {
+            return Ok(None);
+        };
+        // The rotating cache's own invariants, restated against the FIXED
+        // geometry the layout promises. `restore_snapshot` re-derives
+        // `cached_tokens` from `offset`/`max_size`, so these must agree here or
+        // the restored cache would be rejected later — after 100s of MiB were
+        // written.
+        if snapshot.offset != boundary_tokens as i32
+            || snapshot.max_size != geo.window as i32
+            || snapshot.keep != 0
+            || snapshot.cached_tokens != geo.window as i32
+        {
+            return Ok(None);
+        }
+        for array in [&snapshot.keys, &snapshot.values] {
+            // FAIL CLOSED on dtype: reinterpreting f32 storage as bf16 would
+            // be silent corruption, so refuse to capture at all.
+            if array.dtype()? != DType::BFloat16 {
+                return Ok(None);
+            }
+            if array.shape()?.as_ref() != expected_shape.as_slice() {
+                return Ok(None);
+            }
+            let raw = array.to_uint16_native()?;
+            if raw.len() != elements {
+                return Ok(None);
+            }
+            let mut bytes = Vec::with_capacity(elements * std::mem::size_of::<u16>());
+            for value in raw {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            tensors.push(bytes);
+        }
+    }
+    Ok(Some(tensors))
+}
+
+/// Rebuild the per-decoder-layer snapshot vector from a validated sidecar
+/// payload, ready for `restore_gemma4_sliding_caches`.
+///
+/// `tensors` must already have passed [`mlx_paged_attn::ColdSidecar`]
+/// validation (tensor count and per-tensor byte length pinned by the layout);
+/// this re-checks anyway so a contract slip is a graceful `None` rather than a
+/// panic or a wrong-shaped array. Alias (KV-shared) and global slots are left
+/// `None`, matching what `restore_gemma4_sliding_caches` expects.
+pub(crate) fn decode_snapshots(
+    config: &Gemma4Config,
+    geo: &SlidingSidecarGeometry,
+    tensors: &[Vec<u8>],
+    boundary_tokens: u32,
+) -> Result<Option<Vec<Option<RotatingKVCacheSnapshot>>>> {
+    let layers = physical_sliding_layers(config);
+    if layers.len() != geo.physical_layers as usize
+        || tensors.len() != layers.len() * TENSORS_PER_LAYER as usize
+    {
+        return Ok(None);
+    }
+    let Some(elements) = geo.elements_per_tensor() else {
+        return Ok(None);
+    };
+    // The sidecar can only be installed at a boundary whose `min(offset,
+    // window)` equals the payload's token count; anything else would be
+    // rejected by `restore_snapshot` after the arrays were built.
+    if boundary_tokens < geo.window {
+        return Ok(None);
+    }
+    let shape = [
+        1i64,
+        geo.kv_heads as i64,
+        geo.window as i64,
+        geo.head_dim as i64,
+    ];
+
+    let mut snapshots: Vec<Option<RotatingKVCacheSnapshot>> = (0..config.num_hidden_layers.max(0)
+        as usize)
+        .map(|_| None)
+        .collect();
+    for (ordinal, &layer_idx) in layers.iter().enumerate() {
+        let mut arrays = Vec::with_capacity(TENSORS_PER_LAYER as usize);
+        for slot in 0..TENSORS_PER_LAYER as usize {
+            let Some(bytes) = tensors.get(ordinal * TENSORS_PER_LAYER as usize + slot) else {
+                return Ok(None);
+            };
+            if bytes.len() != elements * std::mem::size_of::<u16>() {
+                return Ok(None);
+            }
+            let raw: Vec<u16> = bytes
+                .chunks_exact(std::mem::size_of::<u16>())
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect();
+            arrays.push(MxArray::from_bfloat16(&raw, &shape)?);
+        }
+        let values = arrays.pop().expect("values tensor");
+        let keys = arrays.pop().expect("keys tensor");
+        let Some(slot) = snapshots.get_mut(layer_idx) else {
+            return Ok(None);
+        };
+        *slot = Some(RotatingKVCacheSnapshot {
+            keys,
+            values,
+            offset: boundary_tokens as i32,
+            max_size: geo.window as i32,
+            // `Gemma4LayerCache::new_sliding` always builds
+            // `RotatingKVCache::new(window, None)`, so `keep` is 0 and
+            // `restore_snapshot` rejects any other value.
+            keep: 0,
+            cached_tokens: geo.window as i32,
+        });
+    }
+    Ok(Some(snapshots))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 6 layers: sliding at 0,1,3,4 and global at 2,5, with the last layer
+    /// KV-shared — so index 5 is an alias and the PHYSICAL sliding set is
+    /// {0,1,3,4}.
+    fn config() -> Gemma4Config {
+        let mut cfg = Gemma4Config {
+            num_hidden_layers: 6,
+            sliding_window: 32,
+            num_key_value_heads: 2,
+            head_dim: 4,
+            ..Default::default()
+        };
+        cfg.layer_types = vec![
+            "sliding_attention".to_string(),
+            "sliding_attention".to_string(),
+            "full_attention".to_string(),
+            "sliding_attention".to_string(),
+            "sliding_attention".to_string(),
+            "full_attention".to_string(),
+        ];
+        cfg
+    }
+
+    fn geo_of(cfg: &Gemma4Config) -> SlidingSidecarGeometry {
+        geometry(cfg).expect("geometry")
+    }
+
+    #[test]
+    fn physical_sliding_layers_excludes_global_and_shared_aliases() {
+        let mut cfg = config();
+        assert_eq!(physical_sliding_layers(&cfg), vec![0, 1, 3, 4]);
+
+        // Two KV-shared trailing layers: index 4 becomes an alias even though
+        // `layer_types` still calls it sliding. Counting it would shift every
+        // later layer's tensors and restore garbage rather than fail.
+        cfg.num_kv_shared_layers = Some(2);
+        assert_eq!(physical_sliding_layers(&cfg), vec![0, 1, 3]);
+        assert_eq!(geo_of(&cfg).physical_layers, 3);
+    }
+
+    #[test]
+    fn all_global_config_installs_no_policy() {
+        let mut cfg = config();
+        cfg.layer_types = vec!["full_attention".to_string(); 6];
+        assert!(geometry(&cfg).is_none());
+        assert!(policy(&cfg).is_none());
+    }
+
+    #[test]
+    fn layout_is_boundary_invariant_except_the_boundary() {
+        let cfg = config();
+        let geo = geo_of(&cfg);
+        let a = layout_at(&geo, 32);
+        let b = layout_at(&geo, 64);
+        assert_eq!(a.boundary_tokens, 32);
+        assert_eq!(b.boundary_tokens, 64);
+        assert_eq!(a.dims, b.dims);
+        assert_eq!(a.bytes_per_tensor, b.bytes_per_tensor);
+        assert_eq!(a.num_layers, 4);
+        assert_eq!(a.tensors_per_layer, 2);
+        assert_eq!(a.dims, vec![1, 2, 32, 4]);
+        assert_eq!(a.bytes_per_tensor, 2 * 32 * 4 * 2);
+
+        // And the policy stamps exactly that.
+        let policy = policy(&cfg).expect("policy");
+        assert_eq!(policy.group(), ColdGroup::SlidingWindow);
+        assert_eq!(policy.expected_at(32), a);
+        assert_eq!(policy.expected_at(64), b);
+    }
+
+    #[test]
+    fn boundaries_below_one_window_are_not_representable() {
+        let geo = geo_of(&config());
+        // window = 32, block_size = 16.
+        assert!(!boundary_is_representable(&geo, 0, 16));
+        assert!(!boundary_is_representable(&geo, 16, 16));
+        assert!(boundary_is_representable(&geo, 32, 16));
+        assert!(boundary_is_representable(&geo, 48, 16));
+        // Not block aligned.
+        assert!(!boundary_is_representable(&geo, 40, 16));
+        // Degenerate block size never yields a boundary.
+        assert!(!boundary_is_representable(&geo, 32, 0));
+    }
+
+    /// Build a materialized snapshot vector for `boundary`, filling the
+    /// physical sliding slots with distinct bf16 patterns so a mis-ordered
+    /// round trip is visible rather than plausible.
+    fn snapshots_for(
+        cfg: &Gemma4Config,
+        geo: &SlidingSidecarGeometry,
+        boundary: u32,
+        dtype_is_bf16: bool,
+    ) -> Vec<Option<RotatingKVCacheSnapshot>> {
+        let elements = geo.elements_per_tensor().unwrap();
+        let shape = [
+            1i64,
+            geo.kv_heads as i64,
+            geo.window as i64,
+            geo.head_dim as i64,
+        ];
+        let mut out: Vec<Option<RotatingKVCacheSnapshot>> =
+            (0..cfg.num_hidden_layers as usize).map(|_| None).collect();
+        for (ordinal, &layer) in physical_sliding_layers(cfg).iter().enumerate() {
+            let make = |tag: u16| -> MxArray {
+                let raw: Vec<u16> = (0..elements)
+                    .map(|i| (i as u16).wrapping_mul(31).wrapping_add(tag))
+                    .collect();
+                if dtype_is_bf16 {
+                    MxArray::from_bfloat16(&raw, &shape).unwrap()
+                } else {
+                    MxArray::from_float16(&raw, &shape).unwrap()
+                }
+            };
+            out[layer] = Some(RotatingKVCacheSnapshot {
+                keys: make(ordinal as u16 * 2),
+                values: make(ordinal as u16 * 2 + 1),
+                offset: boundary as i32,
+                max_size: geo.window as i32,
+                keep: 0,
+                cached_tokens: geo.window as i32,
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn payload_round_trips_layer_major_and_bit_exact() {
+        let cfg = config();
+        let geo = geo_of(&cfg);
+        let boundary = geo.window; // smallest representable boundary
+        let snapshots = snapshots_for(&cfg, &geo, boundary, true);
+
+        let tensors = encode_tensors(&cfg, &geo, &snapshots, boundary)
+            .unwrap()
+            .expect("bf16 snapshots must encode");
+        let layout = layout_at(&geo, boundary);
+        assert_eq!(tensors.len(), layout.tensor_count().unwrap());
+        assert!(tensors.iter().all(|t| t.len() == layout.bytes_per_tensor));
+
+        let decoded = decode_snapshots(&cfg, &geo, &tensors, boundary)
+            .unwrap()
+            .expect("payload must decode");
+        assert_eq!(decoded.len(), snapshots.len());
+        for (layer, (before, after)) in snapshots.iter().zip(decoded.iter()).enumerate() {
+            match (before, after) {
+                (None, None) => {}
+                (Some(before), Some(after)) => {
+                    assert_eq!(after.offset, boundary as i32);
+                    assert_eq!(after.max_size, geo.window as i32);
+                    assert_eq!(after.keep, 0);
+                    assert_eq!(after.cached_tokens, geo.window as i32);
+                    // Bit-exact, not approximately equal: the whole point of
+                    // the u16 path is that no f32 round trip happens.
+                    assert_eq!(
+                        before.keys.to_uint16_native().unwrap(),
+                        after.keys.to_uint16_native().unwrap(),
+                        "keys diverged on layer {layer}"
+                    );
+                    assert_eq!(
+                        before.values.to_uint16_native().unwrap(),
+                        after.values.to_uint16_native().unwrap(),
+                        "values diverged on layer {layer}"
+                    );
+                }
+                _ => panic!("layer {layer} slot occupancy changed across the round trip"),
+            }
+        }
+    }
+
+    #[test]
+    fn capture_skips_rather_than_mislabels_non_bf16_state() {
+        let cfg = config();
+        let geo = geo_of(&cfg);
+        let boundary = geo.window;
+        // f16 has the same byte width as bf16, so a length check alone would
+        // let it through and the label would lie about the element type.
+        let snapshots = snapshots_for(&cfg, &geo, boundary, false);
+        assert!(
+            encode_tensors(&cfg, &geo, &snapshots, boundary)
+                .unwrap()
+                .is_none(),
+            "a non-bf16 sliding cache must skip capture, not reinterpret its bytes"
+        );
+    }
+
+    #[test]
+    fn capture_skips_on_offset_mismatch_or_missing_physical_layer() {
+        let cfg = config();
+        let geo = geo_of(&cfg);
+        let boundary = geo.window;
+
+        // Snapshot offsets describing a DIFFERENT boundary than the one the
+        // layout would be stamped with.
+        let stale = snapshots_for(&cfg, &geo, boundary, true);
+        assert!(
+            encode_tensors(&cfg, &geo, &stale, boundary * 2)
+                .unwrap()
+                .is_none()
+        );
+
+        // A physical sliding layer with no snapshot at all.
+        let mut holed = snapshots_for(&cfg, &geo, boundary, true);
+        holed[3] = None;
+        assert!(
+            encode_tensors(&cfg, &geo, &holed, boundary)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn decode_refuses_short_payloads_and_sub_window_boundaries() {
+        let cfg = config();
+        let geo = geo_of(&cfg);
+        let boundary = geo.window;
+        let tensors = encode_tensors(
+            &cfg,
+            &geo,
+            &snapshots_for(&cfg, &geo, boundary, true),
+            boundary,
+        )
+        .unwrap()
+        .unwrap();
+
+        // One tensor short of the layout's count.
+        let mut truncated = tensors.clone();
+        truncated.pop();
+        assert!(
+            decode_snapshots(&cfg, &geo, &truncated, boundary)
+                .unwrap()
+                .is_none()
+        );
+
+        // One tensor short of the layout's byte length.
+        let mut clipped = tensors.clone();
+        clipped[0].pop();
+        assert!(
+            decode_snapshots(&cfg, &geo, &clipped, boundary)
+                .unwrap()
+                .is_none()
+        );
+
+        // A boundary shallower than one window has no valid `cached_tokens`.
+        assert!(
+            decode_snapshots(&cfg, &geo, &tensors, boundary - 16)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fingerprint_component_separates_window_and_layer_split() {
+        let cfg = config();
+        let base = geo_of(&cfg).fingerprint_component();
+
+        let mut wider = cfg.clone();
+        wider.sliding_window = 64;
+        assert_ne!(geo_of(&wider).fingerprint_component(), base);
+
+        // Same full-attention pool (2 global layers), different sliding split:
+        // the POOL geometry is identical, so only this component separates them.
+        let mut resplit = cfg.clone();
+        resplit.layer_types = vec![
+            "sliding_attention".to_string(),
+            "full_attention".to_string(),
+            "sliding_attention".to_string(),
+            "sliding_attention".to_string(),
+            "full_attention".to_string(),
+            "sliding_attention".to_string(),
+        ];
+        assert_eq!(
+            physical_sliding_layers(&resplit).len(),
+            physical_sliding_layers(&cfg).len(),
+            "this fixture keeps the layer COUNT equal on purpose"
+        );
+        // Counts agree, so the component agrees — the differing ORDER is
+        // carried by the serialized config blob the fingerprint also folds in.
+        assert_eq!(geo_of(&resplit).fingerprint_component(), base);
+
+        let mut heads = cfg.clone();
+        heads.num_key_value_heads = 4;
+        assert_ne!(geo_of(&heads).fingerprint_component(), base);
+    }
+}

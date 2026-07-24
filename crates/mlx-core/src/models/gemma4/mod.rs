@@ -16,6 +16,7 @@ pub mod moe;
 pub(crate) mod output_parser;
 pub mod persistence;
 pub mod quantized_linear;
+pub(crate) mod sliding_sidecar;
 pub mod unified_vision_config;
 pub mod vision;
 pub mod vision_config;

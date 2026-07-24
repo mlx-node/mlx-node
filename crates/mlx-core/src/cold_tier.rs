@@ -5,6 +5,8 @@
 //! cannot be opened (no HOME, unwritable disk, ...) inference proceeds
 //! without persistence and `coldCacheStats()` reports `enabled: false`.
 
+use std::collections::HashMap;
+use std::fs;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -66,21 +68,39 @@ pub fn cold_cache_stats_snapshot() -> Option<ColdCacheStats> {
 /// decision from opposite ends, so a test asserts they never drift.
 ///
 /// A family belongs here only when EVERY piece of per-token state its forward
-/// pass carries between turns lives inside the paged pool, so a restored block
-/// reconstructs the whole prefix:
+/// pass carries between turns is reconstructible from the tier — either because
+/// it all lives inside the paged pool, or because the part that does not is
+/// persisted alongside as a `ColdSidecar` and the restore reconciles down to a
+/// boundary that sidecar actually backs:
 ///
 ///  * `qwen3` (dense) sizes its pool over all layers, so the pool holds the
-///    complete KV for the prefix.
-///  * `qwen3_5` / `qwen3_5_moe` keep GDN recurrent state, and `gemma4` keeps
-///    sliding-window `RotatingKVCache` state, outside the pool.
+///    complete KV for the prefix and needs no sidecar
+///    (`ColdTierContext::sidecar_policy` is `None`).
+///  * `gemma4` sizes its pool over the full-attention layers only, but persists
+///    its out-of-pool sliding-window `RotatingKVCache` state as a
+///    `ColdGroup::SlidingWindow` sidecar
+///    (`crate::models::gemma4::sliding_sidecar`). Its `ColdSidecarPolicy` makes
+///    the restore walk refuse any boundary a validated sidecar does not back.
+///  * `qwen3_5` (dense) sizes its pool over the full-attention layers only, but
+///    persists its out-of-pool GDN recurrent state (conv + recurrent) as a
+///    `ColdGroup::GdnState` sidecar (`crate::models::qwen3_5::gdn_sidecar`). A
+///    GDN recurrent state is a running summary of every preceding token, so it
+///    is valid ONLY at its exact block-aligned prefix length (vLLM `MambaSpec`);
+///    its `ColdSidecarPolicy` reconciles the restore down to the deepest such
+///    boundary a validated sidecar backs, or to zero.
+///  * `qwen3_5_moe` keeps the SAME GDN recurrent state outside the pool, but has
+///    no cold-tier attach wired yet — its own restart-parity gate (on a real
+///    MoE checkpoint) has not been run, so it stays off.
 ///  * `lfm2` / `lfm2_moe` keep short-conv state outside the pool with no
 ///    serialization path for it at all, AND drive the uniform adapter API
 ///    whose restore branch is already wired to the tier — attaching a context
 ///    to them would restore an incomplete prefix silently.
 ///
-/// Widening this list is a correctness decision, never a perf one: a family
-/// may only join once the state it keeps outside the pool is persisted too.
-const COLD_RESTORE_FAMILIES: &[&str] = &["qwen3"];
+/// Widening this list is a correctness decision, never a perf one, and it is
+/// authorized by exactly one thing: the family's restart-parity gate
+/// (`crates/mlx-core/tests/cold_tier_parity_harness.rs`) passing on real
+/// weights with `hits > 0` and `corruptions == 0`.
+const COLD_RESTORE_FAMILIES: &[&str] = &["gemma4", "qwen3", "qwen3_5", "qwen3_5_moe"];
 
 /// Whether the cold tier may restore persisted paged blocks for `model_type`
 /// (see [`COLD_RESTORE_FAMILIES`]). Fails closed: an unknown or misspelled
@@ -97,6 +117,171 @@ pub fn cold_restore_families() -> Vec<String> {
         .iter()
         .map(|family| (*family).to_string())
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Load-time guard shared by every family that attaches a cold tier
+// ---------------------------------------------------------------------------
+//
+// The fingerprint above describes the bytes it READ; these helpers are what
+// let a loader prove those are the same bytes its mmap actually took. They
+// live here rather than in one family's persistence module because every
+// family attaching a `ColdTierContext` owes the identical bracket, and two
+// copies of a fail-safe check drift into one copy of a fail-open one.
+
+/// Filesystem identity of one weight shard, used to detect a mid-load
+/// model-directory swap. `dev`/`ino` change when a separate process
+/// reinstalls a shard as a new file (the common reinstall pattern), and
+/// `len`/`mtime` catch an in-place rewrite. Equality across a snapshot pair
+/// means the mmap'd inode is still the file the cold-tier fingerprint will
+/// read.
+#[derive(PartialEq)]
+pub(crate) struct ShardIdentity {
+    len: u64,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    mtime: i64,
+    #[cfg(unix)]
+    mtime_nsec: i64,
+    #[cfg(not(unix))]
+    mtime: Option<std::time::SystemTime>,
+}
+
+impl ShardIdentity {
+    fn from_metadata(meta: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            ShardIdentity {
+                len: meta.len(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+                mtime: meta.mtime(),
+                mtime_nsec: meta.mtime_nsec(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            ShardIdentity {
+                len: meta.len(),
+                mtime: meta.modified().ok(),
+            }
+        }
+    }
+}
+
+/// Snapshot the on-disk identity of every top-level `.safetensors` shard in
+/// `dir` — the SAME shard set the cold-tier fingerprint
+/// (`cold_tier::build_model_fingerprint` → `shard_file_names`) covers.
+///
+/// Returns `None` if the directory or any shard's metadata cannot be read;
+/// the caller treats `None` as "changed" and leaves cold persistence off
+/// (fail-safe). Keyed by file name so an added/removed shard between two
+/// snapshots also compares unequal.
+pub(crate) fn snapshot_shard_identities(dir: &Path) -> Option<HashMap<String, ShardIdentity>> {
+    let mut identities = HashMap::new();
+    for entry in fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".safetensors") {
+            continue;
+        }
+        // `metadata` follows symlinks, matching the fingerprint's shard reads.
+        let meta = fs::metadata(entry.path()).ok()?;
+        identities.insert(name, ShardIdentity::from_metadata(&meta));
+    }
+    Some(identities)
+}
+
+/// True only if the shard identity is provably unchanged across all three
+/// bracketing snapshots: before the mmap, right after the mmap, and after the
+/// cold-tier fingerprint has read the shards. Any `None` (a shard/directory
+/// that could not be stat'd at some checkpoint) or any difference means the
+/// mmap'd bytes might not be the bytes the fingerprint described, so the caller
+/// must leave cold persistence off (fail-safe).
+///
+/// Requiring equality across the full bracket rejects the atomic-rename swap
+/// (a reinstall changes dev/ino, and an in-place rewrite changes len/mtime, so
+/// at least one snapshot differs). It does NOT prove *continuous* identity: a
+/// coordinated local ABA swap — shard A present for the before/at snapshots,
+/// replaced by B only while the fingerprint reads it, then A restored before
+/// the final snapshot — makes all three snapshots compare equal yet binds A's
+/// stat identity to B's fingerprinted bytes. That residual is accepted and out
+/// of scope; closing it soundly would require the fingerprint to hash the same
+/// held fd that backs the loaded arrays (an fd-coupled loader restructure), not
+/// point-in-time stat snapshots.
+///
+/// A second residual is temporal, not spatial: this bracket closes BEFORE the
+/// weights are materialized. MLX reads shard bytes lazily, at
+/// `array::memory::materialize_weights`, well after `attach_cold_tier` — so a
+/// same-inode in-place shard rewrite in the resulting fingerprint→materialize
+/// window materializes new bytes under the already-attached fingerprint. Unlike
+/// the ABA swap above it need not preserve mtime or be restored, since no
+/// snapshot follows it before materialization. These snapshots bracket the mmap,
+/// not the materialize; only the same fd-coupled fingerprint (hashing the held
+/// fd that backs the loaded arrays) would close this window too, and it stays
+/// out of scope.
+pub(crate) fn shard_identities_stable(
+    before_mmap: &Option<HashMap<String, ShardIdentity>>,
+    at_mmap: &Option<HashMap<String, ShardIdentity>>,
+    after_fingerprint: &Option<HashMap<String, ShardIdentity>>,
+) -> bool {
+    match (before_mmap, at_mmap, after_fingerprint) {
+        (Some(before), Some(at), Some(after)) => before == at && at == after,
+        _ => false,
+    }
+}
+
+/// Lenient boolean parse for the `MLX_PERSIST_PAGED_CACHE` override.
+/// `1/true/on/yes` → `Some(true)`, `0/false/off/no` → `Some(false)`
+/// (case-insensitive, surrounding whitespace ignored); anything else →
+/// `None` so the caller falls through to the config alias.
+pub(crate) fn parse_bool_env(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Resolve whether cold KV persistence is on, with precedence
+/// **explicit config > env > off**. An *explicit* per-model config decision
+/// (`persist_paged_cache` / `persistPagedCache` present as a bool, i.e.
+/// `Some`) is authoritative and wins over the environment — this is how an
+/// explicit CLI decision reaches the loader: `mlx agent --no-persist-cache`
+/// writes `persist_paged_cache: false` into the model's config overlay, and
+/// that per-invocation intent must beat an ambient `MLX_PERSIST_PAGED_CACHE`
+/// default. The `MLX_PERSIST_PAGED_CACHE` environment variable only supplies a
+/// default when the config is unset (`None`), so a direct library caller —
+/// which has no config plumbing — can still enable or disable persistence,
+/// matching the Phase-A "per-model config + env override, off by default at
+/// library level" contract. With neither an explicit config nor a recognized
+/// env value, persistence is off. `env_value` is passed in (rather than read
+/// here) so the precedence logic is unit-testable without mutating
+/// process-global env.
+pub(crate) fn resolve_persist_cold(
+    model_type: &str,
+    env_value: Option<&str>,
+    config_flag: Option<bool>,
+) -> bool {
+    // The family allowlist is the single source of truth for whether the cold
+    // tier may engage, enforced HERE at the native choke point rather than only
+    // in the agent. A family that is off the list never persists or restores a
+    // cold tier — not via an explicit `persist_paged_cache` config, not via
+    // `MLX_PERSIST_PAGED_CACHE`, not via any direct library caller that bypasses
+    // the agent entirely. A family's loader may wire a full cold bracket ahead
+    // of proving it; this gate keeps that bracket dormant until the family is
+    // admitted, so an unproven path can never be exercised in the field.
+    if !cold_restore_supported(model_type) {
+        return false;
+    }
+    if let Some(explicit) = config_flag {
+        return explicit;
+    }
+    env_value.and_then(parse_bool_env).unwrap_or(false)
 }
 
 /// Filename the dashboard downloader writes as the last step of an atomic
@@ -497,22 +682,41 @@ mod tests {
     }
 
     #[test]
-    fn cold_restore_allowlist_covers_qwen3_dense_only() {
+    fn cold_restore_allowlist_covers_gated_families_only() {
+        // Dense: the pool holds the whole prefix.
         assert!(cold_restore_supported("qwen3"));
-        // Every other family keeps per-token state outside the paged pool.
-        // lfm2 / lfm2_moe matter most: they drive the uniform adapter API
-        // whose restore branch is already wired to the tier, so admitting
-        // them here would corrupt output rather than merely slow it down.
+        // Hybrid, admitted only because its out-of-pool sliding-window state is
+        // persisted as a `ColdGroup::SlidingWindow` sidecar AND its
+        // restart-parity gate passes on real weights
+        // (`crates/mlx-core/tests/gemma4_cold_tier_parity.rs`).
+        assert!(cold_restore_supported("gemma4"));
+        // Hybrid, admitted only because its out-of-pool GDN recurrent state is
+        // persisted as a `ColdGroup::GdnState` sidecar AND its restart-parity
+        // gate passes on real weights
+        // (`crates/mlx-core/tests/qwen3_5_cold_tier_parity.rs`).
+        assert!(cold_restore_supported("qwen3_5"));
+        // Shares qwen3_5's GDN state type and sidecar codec, driven through
+        // `Qwen3_5MoeConfig::to_dense_config()`, and admitted on its OWN
+        // restart-parity gate against a real MoE checkpoint
+        // (`crates/mlx-core/tests/qwen3_5_moe_cold_tier_parity.rs`) — sharing a
+        // codec with a passing family is not evidence, so the MoE ran its own.
+        assert!(cold_restore_supported("qwen3_5_moe"));
+        // Every remaining family still keeps per-token state outside the paged
+        // pool with no cold-tier attach wired. lfm2 / lfm2_moe matter most:
+        // they drive the uniform adapter API whose restore branch is already
+        // wired to the tier, so admitting them would corrupt output rather
+        // than merely slow it down.
         for family in [
-            "qwen3_5",
-            "qwen3_5_moe",
-            "gemma4",
             "lfm2",
             "lfm2_moe",
             // Fails closed on anything unrecognized, including near-misses.
             "Qwen3",
             "qwen3 ",
             "qwen3_dense",
+            "Qwen3_5",
+            "qwen3_5 ",
+            "Gemma4",
+            "gemma4_text",
             "",
         ] {
             assert!(
@@ -522,7 +726,15 @@ mod tests {
         }
         // The napi surface a TypeScript test compares against must expose the
         // same list, not a superset.
-        assert_eq!(cold_restore_families(), vec!["qwen3".to_string()]);
+        assert_eq!(
+            cold_restore_families(),
+            vec![
+                "gemma4".to_string(),
+                "qwen3".to_string(),
+                "qwen3_5".to_string(),
+                "qwen3_5_moe".to_string()
+            ]
+        );
     }
 
     #[test]

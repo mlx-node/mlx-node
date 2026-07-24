@@ -3136,6 +3136,15 @@ export interface Gemma4Config {
    * real Gemma-4-E2B weights.
    */
   useBlockPagedCache?: boolean | undefined;
+  /**
+   * Persist full paged KV blocks — and gemma4's out-of-pool sliding-window
+   * state, as a cold-tier sidecar — to the SSD cold tier so warm prefixes
+   * survive process restarts. Off unless explicitly enabled.
+   *
+   * An EXPLICIT value here is authoritative and beats the ambient
+   * `MLX_PERSIST_PAGED_CACHE` default (`cold_tier::resolve_persist_cold`).
+   */
+  persistPagedCache?: boolean | undefined;
 }
 
 /** Optional load-time settings for [`Gemma4Model::load`]. */
@@ -4187,6 +4196,13 @@ export interface Qwen35Config {
    */
   useBlockPagedCache?: boolean | undefined;
   /**
+   * Persist the out-of-pool GDN recurrent state (and the paged KV blocks it
+   * gates) to the SSD cold tier so warm prefixes survive process restarts.
+   * Off unless explicitly enabled. See `crate::models::qwen3_5::gdn_sidecar`
+   * and `crate::cold_tier::resolve_persist_cold`.
+   */
+  persistPagedCache?: boolean | undefined;
+  /**
    * Number of MTP (Multi-Token Prediction) head layers shipped with the
    * checkpoint. Populated from `mtp_num_hidden_layers` /
    * `num_nextn_predict_layers` in `config.json`. `0` means the
@@ -4293,6 +4309,14 @@ export interface Qwen35MoeConfig {
    * Default: `None` / `false`.
    */
   useBlockPagedCache?: boolean | undefined;
+  /**
+   * Persist the out-of-pool GDN recurrent state (and the paged KV blocks it
+   * gates) to the SSD cold tier so warm prefixes survive process restarts.
+   * Off unless explicitly enabled. Shares the dense qwen3_5 GDN sidecar codec
+   * (`crate::models::qwen3_5::gdn_sidecar`) via `to_dense_config`; the
+   * precedence rules live in `crate::cold_tier::resolve_persist_cold`.
+   */
+  persistPagedCache?: boolean | undefined;
   /**
    * Number of MTP (Multi-Token Prediction) head layers shipped with
    * the checkpoint. Populated from `mtp_num_hidden_layers` /

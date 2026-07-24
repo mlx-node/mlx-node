@@ -757,17 +757,17 @@ impl ColdTierWalk<'_> {
     /// it, so it never claims to have reduced a prefix the in-memory cache
     /// already served.
     ///
-    /// That leaves one thing this gate deliberately does NOT cover, and the
-    /// family-enable step has to: a HOT hit is not gated here. A block that a
-    /// backed restore published (or that phase 4 released — `free` decrefs it
-    /// to a cache-only entry, it is not erased) stays in the allocator's prefix
-    /// cache and a later lookup in the same process can serve it as a hot hit
-    /// with no sidecar attached. The KV is valid; what is missing is the
-    /// auxiliary half. So a hybrid family must still establish its own state
-    /// for a hot prefix, or restart the turn cold via
-    /// [`PagedKVCacheAdapter::restart_prepared_turn_cold_per_block`] — exactly
-    /// as it must today. This walk changes only what the SSD tier is allowed to
-    /// hand back.
+    /// That leaves one thing this gate deliberately does NOT cover: a HOT hit
+    /// is not gated here. A block that a backed restore published (or that
+    /// phase 4 released — `free` decrefs it to a cache-only entry, it is not
+    /// erased) stays in the allocator's prefix cache and a later lookup in the
+    /// same process can serve it as a hot hit with no sidecar attached. The KV
+    /// is valid; what is missing is the auxiliary half. So a hybrid family must
+    /// still establish its own state for a hot prefix, or restart the turn cold
+    /// via [`PagedKVCacheAdapter::restart_prepared_turn_cold_per_block`]. This
+    /// walk changes only what the SSD tier is allowed to hand back; the hot
+    /// half is covered by the `aux_prefix_unbacked` latch, which turns that
+    /// obligation into a checked one (see its field doc).
     ///
     /// With `sidecar_policy: None` every phase above is skipped and the body is
     /// the pre-sidecar walk verbatim.
@@ -1067,17 +1067,26 @@ impl ColdTierWalk<'_> {
     /// — so [`Self::restore_extend`] recomputes the identical chain.
     /// `contains` dedups re-publishes of a chain already on disk without
     /// touching Metal.
+    ///
+    /// Returns how many leading blocks the persisted chain now covers — every
+    /// block that was already on disk or was accepted by the writer queue, up
+    /// to the first one that was not. A family capturing an auxiliary sidecar
+    /// alongside the chain must not anchor it deeper than this: a sidecar past
+    /// the chain's break can never be selected on restore
+    /// ([`Self::kv_chain_upper_bound`] caps the descent at the chain's reach),
+    /// so writing it would only burn quota.
     fn capture_chain<'k>(
         &self,
         request_tokens: &[u32],
         blocks_slice: &[Arc<PhysicalBlock>],
         cache_salt: u64,
         extra_keys_for: impl Fn(usize) -> Option<&'k [u64]>,
-    ) {
+    ) -> usize {
         let bs = self.block_size as usize;
         if bs == 0 {
-            return;
+            return 0;
         }
+        let mut captured = 0usize;
         let mut parent: Option<mlx_paged_attn::ColdCacheKey> = None;
         for (i, block) in blocks_slice.iter().enumerate() {
             // Both lookups are infallible under the callers' own
@@ -1117,7 +1126,9 @@ impl ColdTierWalk<'_> {
                 }
             }
             parent = Some(key);
+            captured = i + 1;
         }
+        captured
     }
 }
 
@@ -1183,6 +1194,63 @@ pub struct PagedKVCacheAdapter {
     /// restore walk reconciles the two together. Cleared at the start of every
     /// request so a stale turn's state can never be installed on a later one.
     restored_sidecar: Option<mlx_paged_attn::ColdSidecar>,
+
+    /// Latch: the last prefix lookup handed this request a cached K/V prefix
+    /// whose AUXILIARY (out-of-pool) half the adapter cannot vouch for.
+    ///
+    /// ## Why a latch and not a walk-side gate
+    ///
+    /// [`ColdTierWalk::restore_extend`] reconciles the SSD tier down to a
+    /// sidecar-backed boundary, but it runs only on what the HOT prefix cache
+    /// did NOT already cover — `find_longest_cache_hit*` is consulted first and
+    /// its result is the walk's floor. So a pure hot hit takes the walk's
+    /// `idx >= full_blocks` exit and no sidecar is ever produced. And the hot
+    /// cache is guaranteed to contain such blocks: `restore_block` publishes
+    /// every restored block through `BlockAllocator::publish_restored_prefix`
+    /// (leaving it at refcount 2), phase 4's `free` on the reconciled-away tail
+    /// only decrefs it to 1 so the cache-only entry SURVIVES, and ordinary
+    /// end-of-turn `finalize_turn_keep_live*` /
+    /// `register_full_blocks_for_reuse*` republishes the same blocks anyway.
+    /// The very boundary the reconcile-down gate refused is therefore servable
+    /// as a hot hit on the next lookup, with no state attached.
+    ///
+    /// Making a hot hit impossible would mean disabling the in-process prefix
+    /// cache for every hybrid family — a large, permanent perf loss for a
+    /// hazard the family can handle itself (GDN / sliding replay from token
+    /// ids). So the gate is instead an explicit per-turn obligation: when the
+    /// adapter cannot vouch for the auxiliary half, the family MUST call
+    /// [`PagedKVCacheAdapter::confirm_aux_prefix_primed`] before it records a
+    /// single token against that prefix. This field is that obligation, made
+    /// machine-checked instead of conventional.
+    ///
+    /// SET by `find_cached_prefix{,_per_block}_inner`, and only when the cold
+    /// tier carries a [`ColdSidecarPolicy`]. With `sidecar_policy: None` (dense
+    /// `qwen3`, and every adapter with no cold tier at all) it is never set, so
+    /// those families are bit-for-bit unaffected: every enforcement point below
+    /// short-circuits on `false`.
+    ///
+    /// CLEARED by `reset_for_new_request`, `release_request`, `continue_turn`
+    /// (a live continuation never dropped the auxiliary half in the first
+    /// place) and by a successful `confirm_aux_prefix_primed`.
+    ///
+    /// ENFORCED (`Err` while latched) by `record_tokens`,
+    /// `finalize_turn_keep_live{,_per_block}` and
+    /// `register_full_blocks_for_reuse{,_per_block}` — i.e. before any new K/V
+    /// is written on top of the prefix, and before the resulting blocks are
+    /// published for anyone else to reuse.
+    aux_prefix_unbacked: bool,
+
+    /// How many leading K/V blocks of the CURRENT request the cold tier's
+    /// persisted chain covers after this turn's capture — the return of
+    /// [`ColdTierWalk::capture_chain`], or 0 while no capture has run.
+    ///
+    /// A hybrid family captures its auxiliary sidecar right after finalize,
+    /// and the sidecar is only ever selectable at a boundary the KV chain also
+    /// reaches ([`ColdTierWalk::kv_chain_upper_bound`] is the descent's
+    /// ceiling). Publishing this lets the family cap its sidecar boundary at
+    /// the chain's real reach instead of writing a payload that can never be
+    /// chosen. Cleared by `reset_for_new_request` / `release_request`.
+    cold_captured_blocks: u32,
 
     /// Optional FP8 K/V scale manager. When `Some`, the adapter
     /// reads per-layer K/V scales from the manager and threads them into
@@ -1395,6 +1463,8 @@ impl PagedKVCacheAdapter {
             cold_tier: None,
             suppress_cold_restore_once: false,
             restored_sidecar: None,
+            aux_prefix_unbacked: false,
+            cold_captured_blocks: 0,
             #[cfg(target_os = "macos")]
             scale_manager: None,
             #[cfg(target_os = "macos")]
@@ -1420,6 +1490,10 @@ impl PagedKVCacheAdapter {
         self.cold_tier = Some(ctx);
     }
 
+    /// The cold-tier context this adapter persists through, if any. Exposed so
+    /// a hybrid family can write its own auxiliary sidecar under the SAME
+    /// manager and fingerprint the K/V chain uses — a sidecar keyed off a
+    /// different identity could never be selected.
     pub fn cold_tier(&self) -> Option<&ColdTierContext> {
         self.cold_tier.as_ref()
     }
@@ -1434,6 +1508,99 @@ impl PagedKVCacheAdapter {
     /// that installs state once cannot accidentally install it twice.
     pub fn take_restored_sidecar(&mut self) -> Option<mlx_paged_attn::ColdSidecar> {
         self.restored_sidecar.take()
+    }
+
+    /// How many leading K/V blocks of this request the persisted cold chain
+    /// covers after the last capture. See the `cold_captured_blocks` field
+    /// doc; `0` when nothing was captured (no tier, no finalize yet, or the
+    /// chain broke on its very first block).
+    pub fn cold_captured_blocks(&self) -> u32 {
+        self.cold_captured_blocks
+    }
+
+    /// Whether the prefix this request is resuming from has an auxiliary
+    /// (out-of-pool) half the adapter cannot vouch for. See
+    /// [`Self::confirm_aux_prefix_primed`] and the `aux_prefix_unbacked` field
+    /// doc. Always `false` for a family with no [`ColdSidecarPolicy`].
+    pub fn aux_prefix_unbacked(&self) -> bool {
+        self.aux_prefix_unbacked
+    }
+
+    /// Decide whether the prefix just handed back leaves an unmet auxiliary
+    /// obligation.
+    ///
+    /// `false` — the only possible answer without a [`ColdSidecarPolicy`] —
+    /// means either the family keeps ALL of its cross-token state inside the
+    /// paged pool, or the restore walk handed back state that backs exactly the
+    /// prefix it returned.
+    fn aux_prefix_state_missing(&self) -> bool {
+        let Some(cold) = self.cold_tier.as_ref() else {
+            return false;
+        };
+        if cold.sidecar_policy.is_none() {
+            return false;
+        }
+        if self.cached_token_count == 0 {
+            return false;
+        }
+        match self.restored_sidecar.as_ref() {
+            // `restore_extend` reconciles the prefix and the state together, so
+            // this normally holds; re-checking keeps a future contract slip
+            // fail-closed instead of silently resuming on the wrong boundary.
+            Some(sidecar) => sidecar.layout.boundary_tokens != self.cached_token_count,
+            None => true,
+        }
+    }
+
+    /// The family acknowledges that it has established the auxiliary
+    /// (out-of-pool) state for exactly `primed_tokens` of cached prefix — GDN
+    /// recurrent state for `qwen3_5*`, sliding-window `RotatingKVCache` state
+    /// for `gemma4` — and clears the obligation the prefix lookup latched.
+    ///
+    /// Call this at the ONE point per family where the auxiliary half is
+    /// provably in hand: immediately after the "already primed, or replay the
+    /// prefix now" decision, and BEFORE the first `record_tokens` of the turn.
+    ///
+    /// No-op unless the obligation is actually outstanding, so a family with no
+    /// [`ColdSidecarPolicy`] (dense `qwen3` today) is unaffected, and so is a
+    /// live continuation — `continue_turn` never dropped the auxiliary half and
+    /// leaves `cached_token_count` describing the PREVIOUS lookup, which the
+    /// caller's live prefix length is not required to match.
+    ///
+    /// When the obligation IS outstanding, `primed_tokens` must equal the
+    /// prefix the adapter reported (`cached_token_count`). A mismatch means the
+    /// family primed a different boundary than the one it is about to resume
+    /// from, which is exactly the corruption this gate exists to prevent, so it
+    /// returns `Err` and leaves the latch set.
+    pub fn confirm_aux_prefix_primed(&mut self, primed_tokens: u32) -> Result<(), String> {
+        if !self.aux_prefix_unbacked {
+            return Ok(());
+        }
+        if primed_tokens != self.cached_token_count {
+            return Err(format!(
+                "confirm_aux_prefix_primed: family primed {primed_tokens} tokens of auxiliary \
+                 state but the request resumes from a {} token cached prefix. The out-of-pool \
+                 state must cover exactly the reused prefix.",
+                self.cached_token_count
+            ));
+        }
+        self.aux_prefix_unbacked = false;
+        Ok(())
+    }
+
+    /// Fail closed on any operation that would build on — or publish — a
+    /// cached prefix whose auxiliary half nobody has established.
+    fn ensure_aux_prefix_primed(&self, op: &str) -> Result<(), String> {
+        if !self.aux_prefix_unbacked {
+            return Ok(());
+        }
+        Err(format!(
+            "{op}: this request resumed from a {} token cached K/V prefix whose out-of-pool \
+             state (GDN recurrent / sliding-window) was not restored with it, and the model \
+             never called confirm_aux_prefix_primed. Continuing would attend over K/V that no \
+             recurrent state matches. Prime the prefix (or restart the turn cold) first.",
+            self.cached_token_count
+        ))
     }
 
     /// Shared per-layer K/V pool. Exposed so callers can fold the pool's
@@ -1458,6 +1625,11 @@ impl PagedKVCacheAdapter {
         // Auxiliary state belongs to the prefix the previous lookup restored,
         // never to the next request.
         self.restored_sidecar = None;
+        // No prefix is being resumed yet, so there is no auxiliary obligation.
+        self.aux_prefix_unbacked = false;
+        // The previous turn's capture depth describes the previous turn's
+        // tokens; a family must never anchor this turn's sidecar on it.
+        self.cold_captured_blocks = 0;
         #[cfg(target_os = "macos")]
         {
             self.prefill_attention_inputs_cache = None;
@@ -1978,6 +2150,10 @@ impl PagedKVCacheAdapter {
         block_table.set_num_tokens(self.request_tokens.len() as u32);
 
         self.prefix_lookup_done = true;
+        // The prefix above may include blocks the HOT cache served, which the
+        // cold walk's reconcile-down never sees. Latch the outstanding
+        // auxiliary-state obligation; see the `aux_prefix_unbacked` field doc.
+        self.aux_prefix_unbacked = self.aux_prefix_state_missing();
         Ok(CachedPrefix {
             blocks,
             cached_token_count,
@@ -2178,6 +2354,9 @@ impl PagedKVCacheAdapter {
         block_table.set_num_tokens(self.request_tokens.len() as u32);
 
         self.prefix_lookup_done = true;
+        // Same obligation as the uniform entry point — and this is the path
+        // `qwen3_5` / `qwen3_5_moe` / `gemma4` use exclusively.
+        self.aux_prefix_unbacked = self.aux_prefix_state_missing();
         Ok(CachedPrefix {
             blocks,
             cached_token_count,
@@ -2345,6 +2524,9 @@ impl PagedKVCacheAdapter {
         if self.block_table.is_none() {
             return Err("record_tokens called before reset_for_new_request".to_string());
         }
+        // Nothing may be written on top of a cached prefix whose out-of-pool
+        // half is unaccounted for.
+        self.ensure_aux_prefix_primed("record_tokens")?;
         // Compute the new total BEFORE mutating state so we can grow the
         // block table first and leave caller-visible state unchanged on
         // allocator exhaustion.
@@ -4390,6 +4572,10 @@ impl PagedKVCacheAdapter {
         extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<u32, String> {
+        // Never publish blocks computed on top of a prefix whose out-of-pool
+        // half nobody established — that would hand the same unsound resume
+        // point to every later request.
+        self.ensure_aux_prefix_primed("register_full_blocks_for_reuse")?;
         // Idempotent: subsequent calls within the same request are no-ops.
         if self.already_registered {
             return Ok(0);
@@ -4468,7 +4654,7 @@ impl PagedKVCacheAdapter {
         // Persist the same chain to the SSD cold tier (see
         // [`ColdTierWalk::capture_chain`]).
         if let Some(cold) = self.cold_tier.as_ref() {
-            ColdTierWalk {
+            let captured = ColdTierWalk {
                 cold,
                 pool: &self.layer_kv_pool,
                 allocator: &self.allocator,
@@ -4477,6 +4663,7 @@ impl PagedKVCacheAdapter {
             .capture_chain(&self.request_tokens, blocks_slice, cache_salt, |_| {
                 Some(extra_keys)
             });
+            self.cold_captured_blocks = captured.try_into().unwrap_or(u32::MAX);
         }
 
         // Mark registered ONLY on the success path so an Err leaves
@@ -4525,6 +4712,7 @@ impl PagedKVCacheAdapter {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Result<u32, String> {
+        self.ensure_aux_prefix_primed("register_full_blocks_for_reuse_per_block")?;
         if self.already_registered {
             return Ok(0);
         }
@@ -4601,7 +4789,7 @@ impl PagedKVCacheAdapter {
         // check above already guarantees a per-block entry for every block
         // handed to the walk.
         if let Some(cold) = self.cold_tier.as_ref() {
-            ColdTierWalk {
+            let captured = ColdTierWalk {
                 cold,
                 pool: &self.layer_kv_pool,
                 allocator: &self.allocator,
@@ -4610,6 +4798,7 @@ impl PagedKVCacheAdapter {
             .capture_chain(&self.request_tokens, blocks_slice, cache_salt, |i| {
                 extra_keys_per_block.get(i).map(Vec::as_slice)
             });
+            self.cold_captured_blocks = captured.try_into().unwrap_or(u32::MAX);
         }
 
         self.already_registered = true;
@@ -4648,6 +4837,9 @@ impl PagedKVCacheAdapter {
         self.cached_token_count = 0;
         self.request_tokens.clear();
         self.restored_sidecar = None;
+        // The request that carried the obligation is gone.
+        self.aux_prefix_unbacked = false;
+        self.cold_captured_blocks = 0;
         #[cfg(target_os = "macos")]
         {
             self.prefill_attention_inputs_cache = None;
@@ -4763,6 +4955,7 @@ impl PagedKVCacheAdapter {
         extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<u32, String> {
+        self.ensure_aux_prefix_primed("finalize_turn_keep_live")?;
         // Idempotent like `register_full_blocks_for_reuse`: subsequent
         // calls within the same turn return Ok(0) without side effects.
         // This intentionally mirrors the registration-half's idempotency
@@ -4810,6 +5003,7 @@ impl PagedKVCacheAdapter {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Result<u32, String> {
+        self.ensure_aux_prefix_primed("finalize_turn_keep_live_per_block")?;
         if self.already_registered {
             #[cfg(target_os = "macos")]
             self.clear_attention_inputs_caches();
@@ -4948,6 +5142,10 @@ impl PagedKVCacheAdapter {
         // future caller that mixes patterns isn't tripped by stale state.
         self.already_registered = false;
         self.prefix_lookup_done = true; // already implicitly "done" — no fresh lookup is allowed
+        // A live continuation never dropped the auxiliary (out-of-pool) half:
+        // the model's own caches carried it across the turn boundary, exactly
+        // as the partial trailing block carried the K/V. Nothing to prime.
+        self.aux_prefix_unbacked = false;
         #[cfg(target_os = "macos")]
         {
             self.clear_attention_inputs_caches();
@@ -7071,6 +7269,237 @@ mod tests {
             );
         }
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE hot-hit half of the fail-closed gate, and the prerequisite for
+    /// allowlisting any hybrid family.
+    ///
+    /// `ColdTierWalk::restore_extend` reconciles the SSD tier down to a
+    /// sidecar-backed boundary, but it only ever runs on what the in-process
+    /// prefix cache did NOT already serve — `find_longest_cache_hit*` runs
+    /// first and its result is the walk's floor. Blocks whose auxiliary state
+    /// was never persisted therefore stay servable as a pure HOT hit: an
+    /// ordinary end-of-turn `register_full_blocks_for_reuse` publishes them,
+    /// and phase 4's `free` on a reconciled-away tail only decrefs a restored
+    /// block to a surviving cache-only entry. So the boundary the reconcile
+    /// refused comes straight back through the hot path with no state attached.
+    ///
+    /// This pins both halves of the fix:
+    ///   * a hot hit for a family WITH a `ColdSidecarPolicy` is refused — for
+    ///     recording, for registering and for finalizing — until the family
+    ///     confirms it holds the out-of-pool state for exactly that prefix, and
+    ///     a confirmation for a DIFFERENT boundary is refused too;
+    ///   * the `sidecar_policy: None` control (dense `qwen3`) is untouched: it
+    ///     is never latched and the confirmation is inert at any value.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hot_prefix_hit_is_refused_until_the_family_confirms_its_auxiliary_state() {
+        let tokens: Vec<u32> = (0..32u32).map(|i| 4_000 + i).collect();
+        let root = std::env::temp_dir().join(format!(
+            "mlx-adapter-hot-hit-gate-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let fingerprint =
+            mlx_paged_attn::ColdCacheFingerprint::from_components([b"hot-hit-gate".as_slice()]);
+
+        // One shared allocator holds the hot prefix cache, so the later
+        // requests see the first request's registered blocks.
+        let allocator = new_allocator(16, 8);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 8) else {
+            return;
+        };
+
+        // Turn 1 publishes four full blocks into the HOT prefix cache with no
+        // cold tier attached, so nothing about the auxiliary half exists
+        // anywhere — exactly what a never-captured (or reconciled-away)
+        // boundary leaves behind.
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(32).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        assert_eq!(adapter.register_full_blocks_for_reuse(&[], 0).unwrap(), 4);
+        adapter.release_request().unwrap();
+
+        let manager = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                .expect("temp-dir cold cache must open"),
+        );
+        let policy = mlx_paged_attn::ColdSidecarPolicy::new(reconcile_sidecar_layout(32))
+            .expect("policy geometry must validate");
+
+        // --- CONTROL: `sidecar_policy: None`. Must not move at all. ---
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager),
+            fingerprint,
+            sidecar_policy: None,
+        });
+        adapter.reset_for_new_request(1).unwrap();
+        let control = adapter.find_cached_prefix(&tokens, &[], 0, false).unwrap();
+        assert_eq!(control.cached_token_count, 32, "the hot hit must stand");
+        assert!(
+            !adapter.aux_prefix_unbacked(),
+            "a family whose every piece of state is inside the paged pool must never be latched"
+        );
+        adapter.allocate_suffix_blocks(33).unwrap();
+        adapter
+            .record_tokens(&[9_001])
+            .expect("policy-None families build on a hot hit exactly as before");
+        // The acknowledgement is inert for them, at any value.
+        adapter.confirm_aux_prefix_primed(7).unwrap();
+        adapter.release_request().unwrap();
+
+        // --- GATED: same allocator, same hot hit, but the family's state
+        //     lives outside the pool. ---
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager),
+            fingerprint,
+            sidecar_policy: Some(policy),
+        });
+        adapter.reset_for_new_request(2).unwrap();
+        let gated = adapter.find_cached_prefix(&tokens, &[], 0, false).unwrap();
+        assert_eq!(
+            gated.cached_token_count, 32,
+            "the K/V half is genuinely cached; the gate is about the other half"
+        );
+        assert!(
+            adapter.aux_prefix_unbacked(),
+            "a hot hit with no state behind it must latch the obligation"
+        );
+        assert_eq!(
+            manager.stats().hits,
+            0,
+            "a full hot hit never reaches the SSD tier, which is precisely why \
+             the reconcile-down gate cannot see it"
+        );
+        adapter.allocate_suffix_blocks(33).unwrap();
+
+        // Every way of building on — or republishing — the prefix is refused.
+        for err in [
+            adapter.record_tokens(&[9_002]).unwrap_err(),
+            adapter.register_full_blocks_for_reuse(&[], 0).unwrap_err(),
+            adapter.finalize_turn_keep_live(&[], 0).unwrap_err(),
+        ] {
+            assert!(
+                err.contains("confirm_aux_prefix_primed"),
+                "the refusal must name the obligation, got: {err}"
+            );
+        }
+        assert_eq!(
+            adapter.current_token_count(),
+            32,
+            "a refused record_tokens must not advance the cursor"
+        );
+
+        // A confirmation for the WRONG boundary is refused and leaves the latch
+        // set — priming 16 tokens of state under a 32-token resume point is the
+        // corruption this gate exists to stop.
+        let mismatch = adapter.confirm_aux_prefix_primed(16).unwrap_err();
+        assert!(
+            mismatch.contains("16") && mismatch.contains("32"),
+            "the mismatch must report both boundaries, got: {mismatch}"
+        );
+        assert!(adapter.aux_prefix_unbacked());
+        assert!(adapter.record_tokens(&[9_003]).is_err());
+
+        // The family primes the out-of-pool half for exactly the reused prefix;
+        // the turn proceeds normally from there.
+        adapter.confirm_aux_prefix_primed(32).unwrap();
+        assert!(!adapter.aux_prefix_unbacked());
+        adapter.record_tokens(&[9_004]).unwrap();
+        adapter.finalize_turn_keep_live(&[], 0).unwrap();
+        adapter.release_request().unwrap();
+
+        // A turn that reuses NO prefix has nothing to prime, policy or not.
+        let other: Vec<u32> = (0..32u32).map(|i| 8_800 + i).collect();
+        adapter.reset_for_new_request(3).unwrap();
+        let fresh = adapter.find_cached_prefix(&other, &[], 0, false).unwrap();
+        assert_eq!(fresh.cached_token_count, 0);
+        assert!(
+            !adapter.aux_prefix_unbacked(),
+            "no reused prefix means no obligation"
+        );
+        adapter.allocate_suffix_blocks(32).unwrap();
+        adapter.record_tokens(&other).unwrap();
+        adapter.release_request().unwrap();
+
+        drop(adapter);
+        drop(manager);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The per-block entry point — the one `qwen3_5` / `qwen3_5_moe` /
+    /// `gemma4` use exclusively — must latch the same obligation, and
+    /// `release_request` / `reset_for_new_request` must clear it so a refused
+    /// turn does not poison the adapter.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn per_block_hot_prefix_hit_latches_and_the_latch_is_request_scoped() {
+        let tokens: Vec<u32> = (0..32u32).map(|i| 5_500 + i).collect();
+        let per_block: Vec<Vec<u64>> = vec![Vec::new(); 4];
+        let root = std::env::temp_dir().join(format!(
+            "mlx-adapter-hot-hit-gate-pb-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let fingerprint =
+            mlx_paged_attn::ColdCacheFingerprint::from_components([b"hot-hit-gate-pb".as_slice()]);
+
+        let Some(mut adapter) = maybe_adapter(new_allocator(16, 8), 8) else {
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(32).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        assert_eq!(
+            adapter
+                .register_full_blocks_for_reuse_per_block(&per_block, 0)
+                .unwrap(),
+            4
+        );
+        adapter.release_request().unwrap();
+
+        let manager = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                .expect("temp-dir cold cache must open"),
+        );
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager),
+            fingerprint,
+            sidecar_policy: Some(
+                mlx_paged_attn::ColdSidecarPolicy::new(reconcile_sidecar_layout(32))
+                    .expect("policy geometry must validate"),
+            ),
+        });
+
+        adapter.reset_for_new_request(1).unwrap();
+        let gated = adapter
+            .find_cached_prefix_per_block(&tokens, &per_block, 0, false)
+            .unwrap();
+        assert_eq!(gated.cached_token_count, 32);
+        assert!(
+            adapter.aux_prefix_unbacked(),
+            "the per-block lookup must latch exactly like the uniform one"
+        );
+        let err = adapter
+            .register_full_blocks_for_reuse_per_block(&per_block, 0)
+            .unwrap_err();
+        assert!(err.contains("confirm_aux_prefix_primed"), "got: {err}");
+        let err = adapter
+            .finalize_turn_keep_live_per_block(&per_block, 0)
+            .unwrap_err();
+        assert!(err.contains("confirm_aux_prefix_primed"), "got: {err}");
+
+        // Abandoning the turn drops the obligation with the request.
+        adapter.release_request().unwrap();
+        assert!(!adapter.aux_prefix_unbacked());
+        adapter.reset_for_new_request(2).unwrap();
+        assert!(!adapter.aux_prefix_unbacked());
+
+        drop(adapter);
+        drop(manager);
         let _ = std::fs::remove_dir_all(&root);
     }
 

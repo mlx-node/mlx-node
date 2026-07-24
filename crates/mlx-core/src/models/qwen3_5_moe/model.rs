@@ -749,6 +749,87 @@ impl Qwen35MoeInner {
         Ok(())
     }
 
+    /// Build the process-global SSD cold-tier context (manager + COMPLETE
+    /// content fingerprint) for `model_path` WITHOUT attaching it. MoE mirror of
+    /// `Qwen35Inner::build_cold_tier_context` — see its doc for the full
+    /// rationale; the ONLY differences are the `qwen3_5_moe` fingerprint family
+    /// and that the GDN sidecar geometry/policy is derived from the shared dense
+    /// codec via `to_dense_config` (dense and MoE keep byte-identical GDN
+    /// recurrent state — same shapes, same dtype, same layer mapping).
+    ///
+    /// The pool covers the FULL-ATTENTION layers only, so a K/V-only restore
+    /// would resume from GDN recurrent state the pool never held. The
+    /// [`mlx_paged_attn::ColdSidecarPolicy`] turns the restore walk into vLLM's
+    /// reconcile-down — the candidate prefix is reduced to the deepest boundary a
+    /// validated GDN sidecar backs, and a boundary nothing backs restores
+    /// nothing.
+    ///
+    /// Returns `None` (fail-open) when the paged adapter is absent, the tier
+    /// cannot be opened, this checkpoint has no GDN state to persist, or a
+    /// complete content fingerprint cannot be established.
+    pub(crate) fn build_cold_tier_context(
+        &self,
+        model_path: &str,
+    ) -> Option<crate::transformer::paged_kv_cache_adapter::ColdTierContext> {
+        let adapter = self.paged_adapter.as_ref()?;
+        let manager = crate::cold_tier::global_cold_cache()?;
+        let pool = adapter.layer_kv_pool();
+        let cache_dtype = format!("{:?}", pool.cache_dtype());
+        // The GDN state is shared with dense qwen3_5, so derive its geometry and
+        // policy from the dense projection of this MoE config. No GDN layers
+        // means no out-of-pool state — but it also means this is not the hybrid
+        // qwen3_5 MoE the sidecar work validated, so stay off rather than
+        // silently behaving like a dense family.
+        let dense_config = self.config.to_dense_config();
+        let geometry = crate::models::qwen3_5::gdn_sidecar::geometry(&dense_config, &cache_dtype)?;
+        let sidecar_policy =
+            crate::models::qwen3_5::gdn_sidecar::policy(&dense_config, &cache_dtype)?;
+        let mut config_json = serde_json::to_vec(&self.config).ok()?;
+        config_json.extend_from_slice(&geometry.fingerprint_component());
+        let pool_geometry = crate::cold_tier::ColdTierGeometry {
+            block_size: pool.block_size() as u64,
+            num_layers: pool.num_layers() as u64,
+            num_kv_heads: pool.config().num_kv_heads as u64,
+            head_size: pool.config().head_size as u64,
+            cache_dtype,
+        };
+        match crate::cold_tier::build_model_fingerprint(
+            "qwen3_5_moe",
+            model_path,
+            Some(&config_json),
+            &pool_geometry,
+        ) {
+            Some(fingerprint) => Some(
+                crate::transformer::paged_kv_cache_adapter::ColdTierContext {
+                    manager,
+                    fingerprint,
+                    sidecar_policy: Some(sidecar_policy),
+                },
+            ),
+            None => {
+                tracing::warn!(
+                    "cold-tier persistence disabled for {model_path}: could not establish a \
+                     content fingerprint (unreadable or missing weight shard)"
+                );
+                None
+            }
+        }
+    }
+
+    /// Attach a previously-built cold-tier context to the paged adapter. A
+    /// no-op (fail-open) when the paged adapter is absent. Split from
+    /// [`Self::build_cold_tier_context`] so the caller can verify shard identity
+    /// is still stable AFTER the fingerprint read and BEFORE the cold tier is
+    /// committed.
+    pub(crate) fn attach_cold_tier(
+        &mut self,
+        ctx: crate::transformer::paged_kv_cache_adapter::ColdTierContext,
+    ) {
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            adapter.set_cold_tier(ctx);
+        }
+    }
+
     pub(crate) fn paged_context_limits(&self) -> (u32, u32, u32, u32) {
         let trained = self.config.max_position_embeddings.max(0) as u32;
         let Some(adapter) = self.paged_adapter.as_ref() else {
@@ -1166,6 +1247,265 @@ impl Qwen35MoeInner {
         );
     }
 
+    /// Install GDN recurrent state the SSD cold tier restored alongside this
+    /// turn's paged K/V prefix. MoE mirror of
+    /// `Qwen35Inner::install_dense_gdn_cold_sidecar` — same source (an on-disk
+    /// [`mlx_paged_attn::ColdSidecar`]), same destination (`self.caches`), same
+    /// fail-closed re-checks (group, layout equality against this config's
+    /// geometry, boundary == the reported prefix). Consulted ONLY after every
+    /// in-memory source missed.
+    ///
+    /// The GDN codec is shared with dense qwen3_5 (`to_dense_config` projects the
+    /// linear geometry), so a boundary the walk reconciled to is decoded with the
+    /// identical layout the dense family writes. A contract slip degrades to a
+    /// MISS (`Ok(false)`) that falls through to replay, never state installed at
+    /// the wrong offset. Taking the sidecar is unconditional so a rejected one
+    /// cannot be reconsidered later in the same turn; on success the decoded
+    /// state is fed into the in-memory prefix store so later same-process turns
+    /// hit RAM.
+    fn install_moe_gdn_cold_sidecar(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+    ) -> Result<bool> {
+        let sidecar = {
+            let Some(adapter) = self.paged_adapter.as_mut() else {
+                return Ok(false);
+            };
+            match adapter.take_restored_sidecar() {
+                Some(sidecar) => sidecar,
+                None => return Ok(false),
+            }
+        };
+        if sidecar.layout.group != mlx_paged_attn::ColdGroup::GdnState {
+            return Ok(false);
+        }
+        let boundary = sidecar.layout.boundary_tokens;
+        // The walk reconciles the prefix and the state together, so a sidecar
+        // that does not describe EXACTLY the reported prefix is a broken
+        // contract, not a deeper opportunity: refuse it.
+        if boundary == 0 || boundary != cached_prefix_len {
+            return Ok(false);
+        }
+        let cache_dtype = {
+            let Some(adapter) = self.paged_adapter.as_ref() else {
+                return Ok(false);
+            };
+            format!("{:?}", adapter.layer_kv_pool().cache_dtype())
+        };
+        let dense_config = self.config.to_dense_config();
+        let Some(geometry) =
+            crate::models::qwen3_5::gdn_sidecar::geometry(&dense_config, &cache_dtype)
+        else {
+            return Ok(false);
+        };
+        // `load_sidecar` already compared the layout to the policy's template;
+        // comparing again against the geometry derived from the LOADED config
+        // makes the install independent of that earlier check.
+        if crate::models::qwen3_5::gdn_sidecar::layout_at(&geometry, boundary) != sidecar.layout {
+            return Ok(false);
+        }
+        let Some(caches) = crate::models::qwen3_5::gdn_sidecar::decode_caches(
+            &dense_config,
+            &geometry,
+            &sidecar.tensors,
+            boundary,
+        )?
+        else {
+            return Ok(false);
+        };
+        self.caches = Some(caches);
+        // Feed the in-memory store so later turns in this process hit RAM
+        // instead of decoding the sidecar again. Best-effort: a failure to
+        // clone/store never invalidates the freshly installed live caches.
+        if let Some(snapshot) = self
+            .caches
+            .as_ref()
+            .and_then(|caches| clone_moe_linear_layer_caches(&self.config, caches))
+        {
+            let checkpoint =
+                crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint {
+                    prefix_len: boundary,
+                    caches: snapshot,
+                };
+            self.remember_moe_gdn_materialized_prefix_checkpoint(
+                tokens,
+                block_size,
+                extra_keys_per_block,
+                cache_salt,
+                checkpoint,
+            );
+        }
+        Ok(true)
+    }
+
+    /// Effective paged-prefill chunk size for the engine-driven path. MoE mirror
+    /// of `Qwen35Inner::cold_gdn_prefill_chunk_size`: when the SSD cold tier
+    /// carries a GDN sidecar policy (persistence on), force a single checkpoint
+    /// split so the recurrent state is materialized at `gdn_checkpoint_target`
+    /// (the ONLY boundary the sidecar can persist). An explicit
+    /// `MLX_PAGED_PREFILL_CHUNK_SIZE` still wins; with no cold GDN policy this is
+    /// the unchanged single-shot default, so non-persist turns are byte-for-bit
+    /// unaffected.
+    fn cold_gdn_prefill_chunk_size(&self) -> i32 {
+        let env_chunk = crate::array::paged_prefill_chunk_size();
+        if env_chunk > 0 {
+            return env_chunk;
+        }
+        let has_gdn_policy = self
+            .paged_adapter
+            .as_ref()
+            .and_then(|adapter| adapter.cold_tier())
+            .and_then(|cold| cold.sidecar_policy.as_ref())
+            .is_some_and(|policy| policy.group() == mlx_paged_attn::ColdGroup::GdnState);
+        if has_gdn_policy { i32::MAX } else { 0 }
+    }
+
+    /// Persist this turn's GDN recurrent state to the SSD cold tier. MoE mirror
+    /// of `Qwen35Inner::capture_dense_gdn_cold_sidecar`.
+    ///
+    /// Best-effort and infallible by construction — every failure path is a
+    /// silent skip. A missing sidecar is never a correctness problem: the restore
+    /// walk reconciles the candidate prefix down past that boundary and the state
+    /// is recomputed exactly as it is today.
+    ///
+    /// A GDN recurrent state is valid ONLY at the exact prefix length it was
+    /// produced at (vLLM `MambaSpec`), so the boundary is the DEEPEST
+    /// already-materialized in-memory GDN checkpoint (a `gdn_checkpoint_target` a
+    /// prior prefill published) whose block-aligned prefix the persisted K/V
+    /// chain ALSO reaches (`cold_captured_blocks`). At most ONE sidecar per turn
+    /// (~31 MiB on the 35B-A3B); the writer queue is bounded. Media turns are
+    /// skipped in v1 (the GDN VLM exactness gate is not modeled on disk, so
+    /// refusing is the fail-closed answer).
+    fn capture_moe_gdn_cold_sidecar(&self) {
+        let Some(adapter) = self.paged_adapter.as_ref() else {
+            return;
+        };
+        let Some(cold) = adapter.cold_tier() else {
+            return;
+        };
+        let Some(policy) = cold.sidecar_policy.as_ref() else {
+            return;
+        };
+        if policy.group() != mlx_paged_attn::ColdGroup::GdnState {
+            return;
+        }
+        // v1: text-only. See the doc comment.
+        if !self.cached_paged_image_token_positions.is_empty() {
+            return;
+        }
+        let cache_dtype = format!("{:?}", adapter.layer_kv_pool().cache_dtype());
+        let dense_config = self.config.to_dense_config();
+        let Some(geometry) =
+            crate::models::qwen3_5::gdn_sidecar::geometry(&dense_config, &cache_dtype)
+        else {
+            return;
+        };
+        let block_size = adapter.block_size();
+        if block_size == 0 {
+            return;
+        }
+        let request_tokens = adapter.request_tokens();
+        // Whole blocks of this request the persisted K/V chain actually covers.
+        let full_blocks = request_tokens.len() / block_size as usize;
+        let chain_blocks = (adapter.cold_captured_blocks() as usize).min(full_blocks);
+        if chain_blocks == 0 {
+            return;
+        }
+        let ceiling_tokens = u32::try_from((chain_blocks as u64).saturating_mul(block_size as u64))
+            .unwrap_or(u32::MAX);
+        let extra_keys_per_block = engine::build_paged_extra_keys(
+            request_tokens.len(),
+            block_size,
+            &self.cached_paged_image_token_positions,
+        );
+
+        // Deepest same-owner in-memory GDN checkpoint whose block-hash chain
+        // matches this request and whose prefix the KV chain reaches. `cache_salt`
+        // is 0 here to match the KV-chain finalize
+        // (`finalize_turn_keep_live_per_block(.., 0)`) and the in-memory publish,
+        // so the restore walk — which chains the sidecar under the SAME salt as
+        // the KV blocks — can select it.
+        let Some(idx) = find_longest_valid_gdn_checkpoint_index(
+            &self.gdn_prefix_checkpoints,
+            &self.active_cache_owner_id,
+            request_tokens,
+            ceiling_tokens,
+            block_size,
+            &extra_keys_per_block,
+            0,
+            |checkpoint| moe_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)),
+        ) else {
+            return;
+        };
+        let checkpoint = &self.gdn_prefix_checkpoints[idx];
+        let boundary = checkpoint.prefix_len;
+        if boundary == 0 || boundary > ceiling_tokens {
+            return;
+        }
+
+        // Derive the GdnState chain key for blocks `0..boundary/block_size` — the
+        // KV chain recomputed under the `GdnState` domain tag (vLLM's
+        // `BlockHashWithGroupId`). `ColdTierWalk::deepest_backed_boundary`
+        // derives the identical chain on restore. Built BEFORE the payload so the
+        // `contains_in` dedup below can skip the whole encode (a device->host
+        // readback of tens of MiB) when the chain is already on disk.
+        let blocks = boundary as usize / block_size as usize;
+        let mut parent: Option<mlx_paged_attn::ColdCacheKey> = None;
+        for index in 0..blocks {
+            let (Some(extra_keys), Some(tokens)) = (
+                extra_keys_per_block.get(index),
+                request_tokens.get(index * block_size as usize..(index + 1) * block_size as usize),
+            ) else {
+                return;
+            };
+            parent = Some(mlx_paged_attn::ColdCacheKey::chain(
+                mlx_paged_attn::ColdGroup::GdnState,
+                cold.fingerprint,
+                parent,
+                tokens,
+                extra_keys,
+                0,
+                index,
+            ));
+        }
+        let Some(key) = parent else {
+            return;
+        };
+        // Already persisted for this exact chain: nothing to do. `contains_in` is
+        // explicitly side-effect free (no hit/miss accounting).
+        if cold
+            .manager
+            .contains_in(&key, mlx_paged_attn::ColdGroup::GdnState)
+        {
+            return;
+        }
+
+        let Ok(Some(tensors)) = crate::models::qwen3_5::gdn_sidecar::encode_tensors(
+            &dense_config,
+            &geometry,
+            &checkpoint.caches,
+            boundary,
+        ) else {
+            return;
+        };
+        let sidecar = mlx_paged_attn::ColdSidecar {
+            key,
+            fingerprint: cold.fingerprint,
+            layout: crate::models::qwen3_5::gdn_sidecar::layout_at(&geometry, boundary),
+            tensors,
+        };
+        if let Err(error) = cold.manager.enqueue_sidecar(sidecar) {
+            tracing::debug!(
+                target: "mlx_core::qwen3_5_moe::paged",
+                "qwen3.5 MoE GDN sidecar enqueue failed at boundary {boundary}: {error}"
+            );
+        }
+    }
+
     pub(super) fn prepare_moe_gdn_prefix_state(
         &mut self,
         tokens: &[u32],
@@ -1306,6 +1646,24 @@ impl Qwen35MoeInner {
                 restored_prefix_len,
                 replayed_prefix_len,
             ));
+        }
+
+        // Cold-tier GDN sidecar: on-SSD recurrent state the restore walk brought
+        // back for EXACTLY this cached prefix (reconcile-down guarantees the
+        // boundary). Consulted only after every in-memory source above missed —
+        // i.e. the common process-restart case. v1 is text-only: an image-aware
+        // prefix still goes through the exactness gates below.
+        if cached_prefix_len > 0
+            && !image_aware_prefix
+            && self.install_moe_gdn_cold_sidecar(
+                tokens,
+                cached_prefix_len,
+                block_size,
+                extra_keys_per_block,
+                cache_salt,
+            )?
+        {
+            return Ok(finish("cold_sidecar", cached_prefix_len, 0));
         }
 
         let fresh_caches = fresh_moe_layer_caches(&self.config);
@@ -2845,6 +3203,19 @@ impl Qwen35MoeInner {
             }
         };
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
+        // Discharge the adapter's auxiliary (GDN) prefix obligation before the
+        // turn's first `record_tokens`. See `prime_prefix_state` for the full
+        // rationale; a no-op unless a HOT K/V hit handed back a prefix the cold
+        // tier's `ColdSidecarPolicy` was not gated against.
+        let confirm_result = self
+            .paged_adapter
+            .as_mut()
+            .map(|adapter| adapter.confirm_aux_prefix_primed(cached_prefix_len))
+            .unwrap_or(Ok(()));
+        if let Err(error) = confirm_result {
+            self.invalidate_moe_paged_session("planned-MTP GDN auxiliary-prefix confirmation");
+            return Err(Error::from_reason(error));
+        }
         let preserves_image_lineage = carries_image_lineage && cached_prefix_len > 0;
         self.cached_token_history.clear();
         if !preserves_image_lineage {
@@ -3258,6 +3629,21 @@ impl Qwen35MoeInner {
             }
         };
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
+        // Discharge the adapter's auxiliary (GDN) prefix obligation before the
+        // turn's first `record_tokens`. See `prime_prefix_state` for the full
+        // rationale; a no-op unless a HOT K/V hit handed back a prefix the cold
+        // tier's `ColdSidecarPolicy` was not gated against.
+        let confirm_result = self
+            .paged_adapter
+            .as_mut()
+            .map(|adapter| adapter.confirm_aux_prefix_primed(cached_prefix_len))
+            .unwrap_or(Ok(()));
+        if let Err(error) = confirm_result {
+            self.invalidate_moe_paged_session(
+                "planned-MTP stream GDN auxiliary-prefix confirmation",
+            );
+            return Err(Error::from_reason(error));
+        }
         let gdn_prefix_state = gdn_prefix_preparation.state;
         let preserves_image_lineage = carries_image_lineage && cached_prefix_len > 0;
         self.cached_token_history.clear();
@@ -7009,6 +7395,17 @@ impl PagedBackend for Qwen35MoeInner {
             continued_live_prefix,
         )?;
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
+        // GDN recurrent state now covers exactly the cached prefix (installed
+        // live, restored from a cold sidecar, or replayed just above). Discharge
+        // the adapter's auxiliary-state obligation — set when the cold tier
+        // carries a `ColdSidecarPolicy` and a HOT K/V hit handed back a prefix no
+        // sidecar was gated against — before the turn's first `record_tokens`. A
+        // no-op for a live continuation or a sidecar-backed restore.
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            adapter
+                .confirm_aux_prefix_primed(cached_prefix_len)
+                .map_err(Error::from_reason)?;
+        }
         let preserves_image_lineage = carries_image_lineage && cached_prefix_len > 0;
         // Clear the per-turn session state here (history is re-set in
         // `save_paged_history`; image key is reset because the paged path does
@@ -7064,6 +7461,12 @@ impl PagedBackend for Qwen35MoeInner {
         // continues an image prefill); aligns the suffix keys with the
         // compressed-position image keys.
         let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
+        // Force a single checkpoint split when persistence is on so the GDN
+        // recurrent state is materialized at `gdn_checkpoint_target` (the ONLY
+        // boundary the cold sidecar can persist). Byte-inert with no cold GDN
+        // policy — the unchanged single-shot default. See
+        // `cold_gdn_prefill_chunk_size`.
+        let chunk_size = self.cold_gdn_prefill_chunk_size();
         let (logits, gdn_checkpoint) = {
             let caches_ref = self
                 .caches
@@ -7073,7 +7476,7 @@ impl PagedBackend for Qwen35MoeInner {
                 .paged_adapter
                 .as_mut()
                 .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?;
-            super::paged_forward::run_paged_prefill_chunk_with_checkpoint(
+            super::paged_forward::run_paged_prefill_chunk_with_size_and_checkpoint(
                 &prefix.full_tokens,
                 suffix_tokens,
                 prefix.effective_cached_prefix_len as u32,
@@ -7086,6 +7489,7 @@ impl PagedBackend for Qwen35MoeInner {
                 &embedding_weight,
                 &layer_kinds,
                 adapter,
+                chunk_size,
                 rope_deltas,
             )?
         };
@@ -7114,7 +7518,8 @@ impl PagedBackend for Qwen35MoeInner {
         // error must downgrade the session before the engine's unconditional
         // history save can publish image-placeholder history.
         self.paged_finalize_failed = false;
-        let finalize_error = match self.paged_adapter.as_mut() {
+        let mut release_pending = false;
+        let mut finalize_error = match self.paged_adapter.as_mut() {
             Some(adapter) if reuse_cache => {
                 let total_for_finalize = adapter.request_tokens().len();
                 let block_size = adapter.block_size();
@@ -7135,15 +7540,31 @@ impl PagedBackend for Qwen35MoeInner {
                     block_size,
                     &self.cached_paged_image_token_positions,
                 );
-                let register_error = adapter
+                // The release is attempted below (even when registration fails),
+                // but only AFTER the GDN sidecar capture — releasing resets the
+                // adapter's cold-chain frontier to 0.
+                release_pending = true;
+                adapter
                     .register_full_blocks_for_reuse_per_block(&finalize_extra_keys, 0)
-                    .err();
-                // Always attempt the release, even when registration fails.
-                let release_error = adapter.release_request().err();
-                register_error.or(release_error)
+                    .err()
             }
             None => Some("paged_adapter is None during MoE finalization".to_owned()),
         };
+        // Persist the out-of-pool GDN recurrent state for the SAME chain the
+        // adapter just captured (its `cold_captured_blocks` is now set), so a
+        // later process can resume from the restored K/V prefix instead of
+        // replaying GDN over it. Runs BEFORE the release below, which resets the
+        // captured-chain frontier to 0. Skipped when the finalize failed: the
+        // K/V chain the sidecar would anchor on was not published, so nothing
+        // could ever select it.
+        if finalize_error.is_none() {
+            self.capture_moe_gdn_cold_sidecar();
+        }
+        // Always attempt the release for the non-reuse path, even when
+        // registration failed (mirrors the prior `register_error.or(release)`).
+        if release_pending && let Some(adapter) = self.paged_adapter.as_mut() {
+            finalize_error = finalize_error.or(adapter.release_request().err());
+        }
         if let Some(error) = finalize_error {
             self.downgrade_failed_paged_finalize(&error);
         }
@@ -8826,6 +9247,7 @@ mod paged_construction_tests {
             paged_cache_memory_mb: Some(64),
             paged_block_size: Some(16),
             use_block_paged_cache: if use_block_paged { Some(true) } else { None },
+            persist_paged_cache: None,
             n_mtp_layers: 0,
         }
     }
@@ -9259,6 +9681,7 @@ mod mask_free_full_attention_parity_tests {
             paged_cache_memory_mb: Some(64),
             paged_block_size: Some(16),
             use_block_paged_cache: None,
+            persist_paged_cache: None,
             n_mtp_layers: 0,
         }
     }

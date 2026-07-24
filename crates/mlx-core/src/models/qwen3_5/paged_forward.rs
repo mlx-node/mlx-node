@@ -439,6 +439,12 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             );
         }
     }
+    // The recurrent half of the cached prefix is now in hand (either it already
+    // was, or the pass above just replayed it from token ids). Clear the
+    // adapter's auxiliary-state obligation before the first `record_tokens`.
+    paged_adapter
+        .confirm_aux_prefix_primed(cached_prefix_len)
+        .map_err(Error::from_reason)?;
 
     let total_chunks = chunk_ranges.len();
     let mut last_logits: Option<MxArray> = None;
@@ -618,10 +624,14 @@ fn run_paged_prefill_single_shot(
     let inference_info_enabled =
         tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
     let single_shot_start = inference_info_enabled.then(Instant::now);
-    paged_adapter
-        .record_tokens(suffix_tokens)
-        .map_err(Error::from_reason)?;
 
+    // The GDN pre-pass runs BEFORE `record_tokens` so the auxiliary-state
+    // acknowledgement below precedes the first token recorded against the
+    // cached prefix (the chunked driver already has this order). The swap is
+    // observationally inert: `run_gdn_only_prefill` takes no paged adapter and
+    // so cannot touch the block table, pool or cursor, while `record_tokens` is
+    // host-side bookkeeping plus block allocation and never reads the GDN
+    // caches. Neither one's result depends on the other.
     if cached_prefix_len > 0 && !gdn_prefix_already_primed {
         let gdn_info_start = inference_info_enabled.then(Instant::now);
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
@@ -641,6 +651,13 @@ fn run_paged_prefill_single_shot(
             );
         }
     }
+    paged_adapter
+        .confirm_aux_prefix_primed(cached_prefix_len)
+        .map_err(Error::from_reason)?;
+
+    paged_adapter
+        .record_tokens(suffix_tokens)
+        .map_err(Error::from_reason)?;
 
     let hidden_states = run_paged_prefill_one_chunk(
         suffix_tokens,
@@ -749,6 +766,12 @@ pub(crate) fn run_paged_vlm_prefill(
             "run_paged_vlm_prefill received a K/V prefix without an exact GDN sidecar; caller must restart cold",
         ));
     }
+    // Past the guard the recurrent half is exact by construction (an image
+    // prefix is never replayed from token ids — the caller restarts cold
+    // instead), so the adapter's obligation is discharged here.
+    paged_adapter
+        .confirm_aux_prefix_primed(cached_prefix_len)
+        .map_err(Error::from_reason)?;
 
     let suffix_tokens = &expanded_tokens[cached_prefix_len_us..];
     let configured_chunk_size = crate::array::paged_prefill_chunk_size();
@@ -990,6 +1013,11 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
             );
         }
     }
+    // See the non-MTP chunked driver: discharge the auxiliary-state obligation
+    // before the first `record_tokens` of the turn.
+    paged_adapter
+        .confirm_aux_prefix_primed(cached_prefix_len)
+        .map_err(Error::from_reason)?;
 
     let total_chunks = chunk_ranges.len();
     let mut last_logits: Option<MxArray> = None;
@@ -1173,14 +1201,19 @@ fn run_paged_prefill_single_shot_with_hidden(
     keep_last_hidden: Option<usize>,
     cached_rope_deltas: i32,
 ) -> Result<(MxArray, MxArray)> {
-    paged_adapter
-        .record_tokens(suffix_tokens)
-        .map_err(Error::from_reason)?;
-
+    // GDN pre-pass before `record_tokens`; see `run_paged_prefill_single_shot`
+    // for why the two are order-independent.
     if cached_prefix_len > 0 && !gdn_prefix_already_primed {
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
         run_gdn_only_prefill(prefix, embed, layers, caches)?;
     }
+    paged_adapter
+        .confirm_aux_prefix_primed(cached_prefix_len)
+        .map_err(Error::from_reason)?;
+
+    paged_adapter
+        .record_tokens(suffix_tokens)
+        .map_err(Error::from_reason)?;
 
     let hidden_states = run_paged_prefill_one_chunk(
         suffix_tokens,

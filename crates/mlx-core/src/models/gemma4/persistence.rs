@@ -8,6 +8,7 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::{DType, MxArray};
+use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
 use crate::engine::persistence::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
     prewarm_checkpoint_pages,
@@ -370,6 +371,7 @@ fn parse_config_with_load_metadata(model_path: &Path) -> Result<ParsedGemma4Conf
             .and_then(|v| v.as_u64())
             .map(|v| v as u32),
         use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
+        persist_paged_cache: raw.get("persist_paged_cache").and_then(|v| v.as_bool()),
     };
 
     Ok(ParsedGemma4Config {
@@ -2407,7 +2409,25 @@ impl Gemma4Inner {
         // Converted unified checkpoints keep the encoder-free vision/audio
         // tensors from GGUF mmproj in `vision.safetensors`. Plain Gemma and
         // text-only unified configs continue loading only the main checkpoint.
+        // Cold-tier persistence intent, resolved BEFORE the mmap so the
+        // shard-identity bracket can open on the pre-mmap snapshot.
+        // Precedence: explicit config > `MLX_PERSIST_PAGED_CACHE` > off.
+        let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
+        let persist_cold =
+            resolve_persist_cold("gemma4", persist_env.as_deref(), config.persist_paged_cache);
+        let shard_snapshot_before_mmap = if persist_cold {
+            snapshot_shard_identities(path)
+        } else {
+            None
+        };
+
         let mut params = load_all_safetensors(path, should_load_media_sidecar(&config))?;
+
+        let shard_snapshot_at_mmap = if persist_cold {
+            snapshot_shard_identities(path)
+        } else {
+            None
+        };
 
         // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval
         // of any mmap-backed weight (FP8 dequant in `dequant_fp8_weights`,
@@ -2499,6 +2519,37 @@ impl Gemma4Inner {
 
         // Create inner model
         let mut inner = Gemma4Inner::new(config.clone())?;
+
+        if persist_cold {
+            // Fail-closed revalidation bracketing the WHOLE load-to-fingerprint
+            // span, identical in shape to the qwen3 loader's: compute the
+            // content fingerprint FIRST (it reads the shards), then re-stat and
+            // require shard identity to be unchanged across [before-mmap ..
+            // at-mmap .. after the fingerprint read]. Only then attach. Any
+            // change at any checkpoint — or an unreadable shard — means the
+            // fingerprint could describe a different revision than the weights
+            // the mmap actually loaded, so leave persistence off.
+            //
+            // The gemma4 context additionally carries a `ColdSidecarPolicy`, so
+            // attaching it also arms the reconcile-down restore and the
+            // auxiliary-state obligation the sliding prefill discharges.
+            if let Some(ctx) = inner.build_cold_tier_context(model_path) {
+                let after_fingerprint = snapshot_shard_identities(path);
+                if shard_identities_stable(
+                    &shard_snapshot_before_mmap,
+                    &shard_snapshot_at_mmap,
+                    &after_fingerprint,
+                ) {
+                    inner.attach_cold_tier(ctx);
+                } else {
+                    tracing::warn!(
+                        "cold-tier persistence disabled for {model_path}: model directory \
+                         changed during load (shard identity mismatch); KV persistence stays \
+                         off for safety"
+                    );
+                }
+            }
+        }
 
         // Resolve quantization parameters from config.json so the apply path
         // picks the right packing for this checkpoint. This is required for

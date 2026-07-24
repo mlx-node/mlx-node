@@ -26,22 +26,40 @@ import type { DiscoveredModelLike } from '../types.js';
  * drift.
  *
  * A family belongs here only when EVERY piece of per-token state its forward
- * pass carries between turns lives inside the paged pool, so a restored block
- * reconstructs the whole prefix:
+ * pass carries between turns is reconstructible from the tier — either because
+ * it all lives inside the paged pool, or because the part that does not is
+ * persisted alongside as a cold-tier sidecar and the restore reconciles down to
+ * a boundary that sidecar actually backs:
  *
  *  - `qwen3` (dense) sizes its pool over all layers, so the pool holds the
- *    complete KV for the prefix.
- *  - `qwen3_5` / `qwen3_5_moe` keep GDN recurrent state, and `gemma4` keeps
- *    sliding-window `RotatingKVCache` state, outside the pool.
+ *    complete KV for the prefix and needs no sidecar.
+ *  - `gemma4` sizes its pool over the full-attention layers only, but persists
+ *    its out-of-pool sliding-window `RotatingKVCache` state as a
+ *    `ColdGroup::SlidingWindow` sidecar, and its `ColdSidecarPolicy` makes the
+ *    native restore walk refuse any boundary a validated sidecar does not back.
+ *  - `qwen3_5` (dense) sizes its pool over the full-attention layers only, but
+ *    persists its out-of-pool GDN recurrent state (conv + recurrent) as a
+ *    `ColdGroup::GdnState` sidecar, and its `ColdSidecarPolicy` reconciles the
+ *    native restore down to the deepest block-aligned boundary a validated
+ *    sidecar backs (a recurrent state is valid only at its exact prefix length).
+ *  - `qwen3_5_moe` keeps the SAME GDN recurrent state outside the pool but has
+ *    no cold-tier attach wired on the native side yet (its own restart-parity
+ *    gate has not been run), so persistence is not requested for it.
  *  - `lfm2` / `lfm2_moe` keep short-conv state outside the pool with no
  *    serialization path for it at all, AND drive the uniform native adapter
  *    API whose restore branch is already wired to the tier — asking for
  *    persistence on their behalf would restore an incomplete prefix silently.
  *
- * Widening this set is a correctness decision, never a perf one: a family may
- * only join once the state it keeps outside the pool is persisted too.
+ * Widening this set is a correctness decision, never a perf one, and it is
+ * authorized by exactly one thing: the family's native restart-parity gate
+ * passing on real weights with `hits > 0` and `corruptions == 0`.
  */
-export const COLD_TIER_RESTORE_FAMILIES: ReadonlySet<string> = new Set<ModelType>(['qwen3']);
+export const COLD_TIER_RESTORE_FAMILIES: ReadonlySet<string> = new Set<ModelType>([
+  'gemma4',
+  'qwen3',
+  'qwen3_5',
+  'qwen3_5_moe',
+]);
 
 /** Per-load policy handed to {@link MlxModelHostOptions.resolveModelPathFn}. */
 export interface ModelLoadPolicy {

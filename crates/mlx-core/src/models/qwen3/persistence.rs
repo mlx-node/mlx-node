@@ -14,6 +14,11 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::MxArray;
+// The cold-tier load guard (shard-identity bracket + persistence precedence)
+// is shared with every other family that attaches a `ColdTierContext`.
+#[cfg(test)]
+use crate::cold_tier::parse_bool_env;
+use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
 use crate::engine::persistence::prewarm_checkpoint_pages;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::load_safetensors_lazy;
@@ -482,146 +487,6 @@ fn load_safetensors_mapped(path: &Path) -> Result<HashMap<String, MxArray>> {
     Ok(mapped_params)
 }
 
-/// Filesystem identity of one weight shard, used to detect a mid-load
-/// model-directory swap. `dev`/`ino` change when a separate process
-/// reinstalls a shard as a new file (the common reinstall pattern), and
-/// `len`/`mtime` catch an in-place rewrite. Equality across a snapshot pair
-/// means the mmap'd inode is still the file the cold-tier fingerprint will
-/// read.
-#[derive(PartialEq)]
-struct ShardIdentity {
-    len: u64,
-    #[cfg(unix)]
-    dev: u64,
-    #[cfg(unix)]
-    ino: u64,
-    #[cfg(unix)]
-    mtime: i64,
-    #[cfg(unix)]
-    mtime_nsec: i64,
-    #[cfg(not(unix))]
-    mtime: Option<std::time::SystemTime>,
-}
-
-impl ShardIdentity {
-    fn from_metadata(meta: &fs::Metadata) -> Self {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            ShardIdentity {
-                len: meta.len(),
-                dev: meta.dev(),
-                ino: meta.ino(),
-                mtime: meta.mtime(),
-                mtime_nsec: meta.mtime_nsec(),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            ShardIdentity {
-                len: meta.len(),
-                mtime: meta.modified().ok(),
-            }
-        }
-    }
-}
-
-/// Snapshot the on-disk identity of every top-level `.safetensors` shard in
-/// `dir` — the SAME shard set the cold-tier fingerprint
-/// (`cold_tier::build_model_fingerprint` → `shard_file_names`) covers.
-///
-/// Returns `None` if the directory or any shard's metadata cannot be read;
-/// the caller treats `None` as "changed" and leaves cold persistence off
-/// (fail-safe). Keyed by file name so an added/removed shard between two
-/// snapshots also compares unequal.
-fn snapshot_shard_identities(dir: &Path) -> Option<HashMap<String, ShardIdentity>> {
-    let mut identities = HashMap::new();
-    for entry in fs::read_dir(dir).ok()? {
-        let entry = entry.ok()?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with(".safetensors") {
-            continue;
-        }
-        // `metadata` follows symlinks, matching the fingerprint's shard reads.
-        let meta = fs::metadata(entry.path()).ok()?;
-        identities.insert(name, ShardIdentity::from_metadata(&meta));
-    }
-    Some(identities)
-}
-
-/// True only if the shard identity is provably unchanged across all three
-/// bracketing snapshots: before the mmap, right after the mmap, and after the
-/// cold-tier fingerprint has read the shards. Any `None` (a shard/directory
-/// that could not be stat'd at some checkpoint) or any difference means the
-/// mmap'd bytes might not be the bytes the fingerprint described, so the caller
-/// must leave cold persistence off (fail-safe).
-///
-/// Requiring equality across the full bracket rejects the atomic-rename swap
-/// (a reinstall changes dev/ino, and an in-place rewrite changes len/mtime, so
-/// at least one snapshot differs). It does NOT prove *continuous* identity: a
-/// coordinated local ABA swap — shard A present for the before/at snapshots,
-/// replaced by B only while the fingerprint reads it, then A restored before
-/// the final snapshot — makes all three snapshots compare equal yet binds A's
-/// stat identity to B's fingerprinted bytes. That residual is accepted and out
-/// of scope; closing it soundly would require the fingerprint to hash the same
-/// held fd that backs the loaded arrays (an fd-coupled loader restructure), not
-/// point-in-time stat snapshots.
-///
-/// A second residual is temporal, not spatial: this bracket closes BEFORE the
-/// weights are materialized. MLX reads shard bytes lazily, at
-/// `array::memory::materialize_weights`, well after `attach_cold_tier` — so a
-/// same-inode in-place shard rewrite in the resulting fingerprint→materialize
-/// window materializes new bytes under the already-attached fingerprint. Unlike
-/// the ABA swap above it need not preserve mtime or be restored, since no
-/// snapshot follows it before materialization. These snapshots bracket the mmap,
-/// not the materialize; only the same fd-coupled fingerprint (hashing the held
-/// fd that backs the loaded arrays) would close this window too, and it stays
-/// out of scope.
-fn shard_identities_stable(
-    before_mmap: &Option<HashMap<String, ShardIdentity>>,
-    at_mmap: &Option<HashMap<String, ShardIdentity>>,
-    after_fingerprint: &Option<HashMap<String, ShardIdentity>>,
-) -> bool {
-    match (before_mmap, at_mmap, after_fingerprint) {
-        (Some(before), Some(at), Some(after)) => before == at && at == after,
-        _ => false,
-    }
-}
-
-/// Lenient boolean parse for the `MLX_PERSIST_PAGED_CACHE` override.
-/// `1/true/on/yes` → `Some(true)`, `0/false/off/no` → `Some(false)`
-/// (case-insensitive, surrounding whitespace ignored); anything else →
-/// `None` so the caller falls through to the config alias.
-fn parse_bool_env(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "on" | "yes" => Some(true),
-        "0" | "false" | "off" | "no" => Some(false),
-        _ => None,
-    }
-}
-
-/// Resolve whether cold KV persistence is on, with precedence
-/// **explicit config > env > off**. An *explicit* per-model config decision
-/// (`persist_paged_cache` / `persistPagedCache` present as a bool, i.e.
-/// `Some`) is authoritative and wins over the environment — this is how an
-/// explicit CLI decision reaches the loader: `mlx agent --no-persist-cache`
-/// writes `persist_paged_cache: false` into the model's config overlay, and
-/// that per-invocation intent must beat an ambient `MLX_PERSIST_PAGED_CACHE`
-/// default. The `MLX_PERSIST_PAGED_CACHE` environment variable only supplies a
-/// default when the config is unset (`None`), so a direct library caller —
-/// which has no config plumbing — can still enable or disable persistence,
-/// matching the Phase-A "per-model config + env override, off by default at
-/// library level" contract. With neither an explicit config nor a recognized
-/// env value, persistence is off. `env_value` is passed in (rather than read
-/// here) so the precedence logic is unit-testable without mutating
-/// process-global env.
-fn resolve_persist_cold(env_value: Option<&str>, config_flag: Option<bool>) -> bool {
-    if let Some(explicit) = config_flag {
-        return explicit;
-    }
-    env_value.and_then(parse_bool_env).unwrap_or(false)
-}
-
 /// Spawn a dedicated model thread, load all weights inside init_fn.
 ///
 /// Returns a thin `Qwen3Model` NAPI shell with the thread handle.
@@ -689,8 +554,11 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                     // contract; an explicit CLI `--no-persist-cache` writes the
                     // config `false` and must beat an ambient env override).
                     let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
-                    let persist_cold =
-                        resolve_persist_cold(persist_env.as_deref(), config.persist_paged_cache);
+                    let persist_cold = resolve_persist_cold(
+                        "qwen3",
+                        persist_env.as_deref(),
+                        config.persist_paged_cache,
+                    );
                     let shard_snapshot_before_mmap = if persist_cold {
                         snapshot_shard_identities(path)
                     } else {
@@ -1197,21 +1065,43 @@ mod persist_cold_resolution_tests {
         // ambient `MLX_PERSIST_PAGED_CACHE=1`, and a config `true` stays
         // enabled even under env `0`.
         assert!(
-            !resolve_persist_cold(Some("1"), Some(false)),
+            !resolve_persist_cold("qwen3", Some("1"), Some(false)),
             "explicit config disable must win over env=1"
         );
         assert!(
-            resolve_persist_cold(Some("0"), Some(true)),
+            resolve_persist_cold("qwen3", Some("0"), Some(true)),
             "explicit config enable must win over env=0"
         );
-        assert!(resolve_persist_cold(Some("off"), Some(true)));
+        assert!(resolve_persist_cold("qwen3", Some("off"), Some(true)));
         // The env only supplies the default when the config is unset.
         assert!(
-            resolve_persist_cold(Some("1"), None),
+            resolve_persist_cold("qwen3", Some("1"), None),
             "env fills the default when config is unset"
         );
-        assert!(resolve_persist_cold(Some("true"), None));
-        assert!(!resolve_persist_cold(Some("0"), None));
+        assert!(resolve_persist_cold("qwen3", Some("true"), None));
+        assert!(!resolve_persist_cold("qwen3", Some("0"), None));
+    }
+
+    #[test]
+    fn allowlist_gate_beats_every_persist_signal() {
+        // The family allowlist is enforced inside `resolve_persist_cold`, so a
+        // family that is off the list can never engage the cold tier however
+        // loudly persistence is requested — not via an explicit config `true`,
+        // not via `MLX_PERSIST_PAGED_CACHE=1`. This is what keeps a loader's
+        // cold bracket dormant until its family is admitted, so an unproven
+        // path (e.g. qwen3_5_moe before its parity gate passes) cannot be
+        // exercised by a direct library caller that bypasses the agent.
+        for family in ["lfm2", "lfm2_moe", "harrier", "not-a-family"] {
+            assert!(
+                !resolve_persist_cold(family, Some("1"), Some(true)),
+                "{family} is off the allowlist and must never persist a cold tier"
+            );
+        }
+        // A family on the list still honours the config/env precedence above.
+        assert!(resolve_persist_cold("qwen3", Some("0"), Some(true)));
+        assert!(resolve_persist_cold("gemma4", Some("1"), None));
+        assert!(resolve_persist_cold("qwen3_5", None, Some(true)));
+        assert!(resolve_persist_cold("qwen3_5_moe", Some("1"), None));
     }
 
     #[test]
@@ -1233,16 +1123,16 @@ mod persist_cold_resolution_tests {
         // An unrecognized value is ignored (falls through), and no env leaves
         // the config alias authoritative.
         assert_eq!(parse_bool_env("maybe"), None);
-        assert!(resolve_persist_cold(Some("maybe"), Some(true)));
-        assert!(!resolve_persist_cold(Some("garbage"), Some(false)));
-        assert!(!resolve_persist_cold(Some("garbage"), None));
-        assert!(resolve_persist_cold(None, Some(true)));
-        assert!(!resolve_persist_cold(None, Some(false)));
+        assert!(resolve_persist_cold("qwen3", Some("maybe"), Some(true)));
+        assert!(!resolve_persist_cold("qwen3", Some("garbage"), Some(false)));
+        assert!(!resolve_persist_cold("qwen3", Some("garbage"), None));
+        assert!(resolve_persist_cold("qwen3", None, Some(true)));
+        assert!(!resolve_persist_cold("qwen3", None, Some(false)));
     }
 
     #[test]
     fn default_is_off_at_library_level() {
         // No env, no config alias → persistence off by default.
-        assert!(!resolve_persist_cold(None, None));
+        assert!(!resolve_persist_cold("qwen3", None, None));
     }
 }
