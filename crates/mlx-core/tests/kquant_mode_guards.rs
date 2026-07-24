@@ -1,9 +1,8 @@
 //! K-quant dispatch guards: what must throw, what must work, what must not
 //! regress.
 //!
-//! In-tree port of the fail-loud smoke that shipped with the Phase 2 work. The
-//! numeric gate against ggml lives in `kquant_ggml_parity.rs`; this file guards
-//! the shape of the support matrix around it:
+//! The numeric gate against ggml lives in `kquant_ggml_parity.rs`; this file
+//! guards the shape of the support matrix around it:
 //!
 //! * `quantize` throws for every K-quant mode on every device — these formats
 //!   are consumed, never produced;
@@ -97,8 +96,10 @@ const KQUANTS: [KQuant; 3] = [
 //   activations that rounding is a no-op.
 //
 // So float32 is the numeric gate, and it is held to a float32 summation-order
-// tolerance. Worst case measured across all 33 float kernels `kquant.metal`
-// instantiates: 7.5e-7 relative (`qmv_fast batch_1 q5k`). 1e-5 leaves 13x.
+// tolerance. Worst case over the shapes below: 7.5e-7 relative (`qmv_fast
+// batch_1 q5k`). That bound is per-shape, not per-kernel — the same `qmv`
+// kernel measures 7.7e-7 at K = 768 — so the constant carries headroom for
+// shapes the gate does not drive rather than sitting just above the maximum.
 //
 // The whole `qmm` / `gather_qmm` family in fact comes out bit for bit equal.
 // That is not a degenerate comparison — `compare_devices` refuses a reference
@@ -1035,10 +1036,20 @@ fn gpu_matches_cpu_for_every_activation_dtype() {
 /// versions in `quantized.h`, so the bfloat16 rounding of `Sum(x_i)` that
 /// widens the K-quant vector kernels is a property of MLX's affine kernel
 /// shape, not of the K-quant decode. This runs the same `qmv` comparison on
-/// affine 4-bit weights arranged the way q6k's are — `bias = -7.5 * scale`
-/// against 4-bit codes centred on 7.5, the affine analogue of q6k's
-/// `bias = -32 * scale` against 6-bit codes centred on 32 — and asserts affine
-/// shows the same order of gap.
+/// affine 4-bit weights biased the way q6k's are — `bias = -7.5 * scale`
+/// against 4-bit codes centred on 7.5, the analogue of q6k's
+/// `bias = -32 * scale` against 6-bit codes centred on 32 — and asserts the
+/// same order of gap appears without any K-quant code in the path.
+///
+/// Read this as presence-of-mechanism, not as a magnitude comparison. A single
+/// constant `(scale, bias)` makes the whole row cancel, so this control peaks
+/// ~10x lower than the q6k case and its *relative* gap is inflated by the
+/// smaller denominator; on absolute error it is the smaller of the two. A
+/// shape-matched control (affine 6-bit / group 32, per-group scales,
+/// `bias = -32 * scale`) peaks alongside q6k and still measures ~2.4x wider,
+/// which is what actually rules out a K-quant-specific defect. It is not in
+/// the suite because affine instantiates no group-16 variant, so the closest
+/// match still differs in group size.
 ///
 /// If MLX ever makes that partial sum exact, this fails and the two
 /// `*_STORE_TOL` constants want re-measuring rather than keeping.

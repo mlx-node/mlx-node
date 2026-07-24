@@ -601,9 +601,10 @@ fn case_specs(format: KQuantFormat) -> Vec<CaseSpec> {
 // MLX driver
 // ---------------------------------------------------------------------------
 
-/// Pin MLX's process-wide default device and stream to the CPU. The K-quant
-/// decode is a CPU-only path in Phase 2; Metal and CUDA reject the modes on
-/// purpose (see `kquant_mode_guards.rs`). `.cargo/config.toml` pins
+/// Pin MLX's process-wide default device and stream to the CPU. This file is
+/// the reference the Metal gate is measured against, so it has to compare the
+/// CPU decode against ggml and nothing else; `kquant_mode_guards.rs` is what
+/// holds Metal to this reference. `.cargo/config.toml` pins
 /// `RUST_TEST_THREADS=1`, so mutating the global is safe here.
 fn pin_cpu_stream() {
     // SAFETY: plain global setters in the MLX FFI; both catch internally.
