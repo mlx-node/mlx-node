@@ -1800,14 +1800,29 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
             shared.quota_bytes
         ));
     }
-    // Everything currently indexed is the most this eviction can ever reclaim.
-    if available.saturating_add(index.total_bytes) < shared.reserve_bytes.saturating_add(incoming) {
-        return Err("insufficient disk space for cold-cache write".to_string());
-    }
+    // Everything still indexed and not yet ruled out is the most this eviction
+    // can reclaim — an UPPER bound, not a promise. An entry whose file another
+    // process already deleted counts its size here and frees nothing when
+    // cleared, so a single estimate taken up front can clear the bar while the
+    // real reclaim falls short. Re-tested at the top of every iteration
+    // instead, against what actually remains: the bound drops by the entry's
+    // own size whether that entry was cleared or found unclearable, so it
+    // converges on the truth as stale entries are discovered.
+    let mut reclaimable = index.total_bytes;
     let mut unclearable: Vec<ColdCacheKey> = Vec::new();
     while index.total_bytes.saturating_add(incoming) > shared.quota_bytes
         || available < shared.reserve_bytes.saturating_add(incoming)
     {
+        // Refuse before destroying one more live entry for a write the
+        // survivors can no longer make room for. Past this point every
+        // eviction is pure loss: the write fails either way, and what it
+        // takes with it is warm cache someone was about to reuse. Guards the
+        // free-space axis only — under quota pressure alone `available`
+        // already clears `reserve + incoming`, so this cannot fire and
+        // mislabel a quota eviction as a disk-space failure.
+        if available.saturating_add(reclaimable) < shared.reserve_bytes.saturating_add(incoming) {
+            return Err("insufficient disk space for cold-cache write".to_string());
+        }
         let Some((&key, entry)) = index
             .entries
             .iter()
@@ -1817,6 +1832,7 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
             return Err("insufficient disk space for cold-cache write".to_string());
         };
         let name = entry.file_name.clone();
+        let candidate_size = entry.size;
         let cleared = match shared.root.stat_identity(&name) {
             Some((_, kind)) => clear_entry(&shared.root, &name, kind),
             // Either the entry already vanished (the unlink then observes
@@ -1826,10 +1842,12 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
         };
         if !cleared {
             unclearable.push(key);
+            reclaimable = reclaimable.saturating_sub(candidate_size);
             continue;
         }
         if let Some(entry) = index.entries.remove(&key) {
             index.total_bytes = index.total_bytes.saturating_sub(entry.size);
+            reclaimable = reclaimable.saturating_sub(entry.size);
             shared.stats.evictions.fetch_add(1, Ordering::Relaxed);
         }
         let (_, resampled) = shared.space()?;
@@ -4063,6 +4081,75 @@ mod tests {
         persist_block(&manager.shared, &block(key_b))
             .expect("restored headroom must admit the write again");
         assert_eq!(manager.load(key_b, fp), Some(block(key_b)));
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A stale index entry must not cost a LIVE one its place.
+    ///
+    /// The up-front feasibility estimate counts every indexed byte as
+    /// reclaimable, which an entry another process already deleted is not: it
+    /// frees zero. With that entry at the LRU head the estimate clears the bar,
+    /// the pass prunes it, and the real reclaim then falls short — so a
+    /// single-shot check would keep going and evict the valid entry behind it,
+    /// destroying warm cache for a write that fails anyway.
+    ///
+    /// Sized so the distinction is the whole test: `available + A + B` exactly
+    /// meets `reserve + incoming`, and `available + B` alone is one block
+    /// short.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_entry_does_not_drag_a_valid_one_down_with_it() {
+        let root = temp_root("evict-stale-spares-valid");
+        let fp = fingerprint();
+        let key_a = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[1], 0, 0);
+        let key_b = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[2], 0, 0);
+        let key_c = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[3], 0, 0);
+        let one = encode_block(&block(key_a)).unwrap().len() as u64;
+        let reserve = 5 * one;
+
+        // Quota is roomy, so only the free-space axis is under test.
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, reserve, 2).unwrap();
+        let base = Arc::new(AtomicU64::new(GIB));
+        install_space_override(&manager, &root, &base);
+
+        // A first, so it is the LRU head; B is the valid entry behind it.
+        persist_block(&manager.shared, &block(key_a)).unwrap();
+        persist_block(&manager.shared, &block(key_b)).unwrap();
+        assert!(manager.contains(&key_a) && manager.contains(&key_b));
+
+        // Another process removed A's payload; the index still carries it.
+        fs::remove_file(root.join(format!("{}.safetensors", key_a.to_hex()))).unwrap();
+
+        // Only B's bytes remain on disk, so `available` settles at 4 blocks:
+        //   4 + (A 1 + B 1) == reserve 5 + incoming 1   -> first check passes
+        //   4 +        (B 1) <  reserve 5 + incoming 1   -> second must refuse
+        base.store(5 * one, Ordering::Relaxed);
+        assert!(
+            persist_block(&manager.shared, &block(key_c)).is_err(),
+            "a write the survivors cannot make room for must be refused"
+        );
+
+        assert!(
+            manager.contains(&key_b),
+            "the valid entry must survive: clearing it could never have admitted the write"
+        );
+        assert_eq!(
+            manager.load(key_b, fp),
+            Some(block(key_b)),
+            "and it must still be readable, not merely indexed"
+        );
+        assert!(
+            !manager.contains(&key_a),
+            "the dead index entry is still pruned by the pass"
+        );
+        assert!(!manager.contains(&key_c));
+        assert_eq!(
+            manager.stats().evictions,
+            1,
+            "exactly one eviction: the stale entry, and nothing beyond it"
+        );
+
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }
