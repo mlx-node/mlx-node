@@ -68,13 +68,21 @@ restored on a hot-cache miss before falling back to a normal prefill.
 - Library default is **off** (`persistPagedCache` per-model config field, TS
   `persistPagedCache`). `mlx agent` turns it **on by default** for qwen3 models
   (disable with `mlx agent --no-persist-cache`) via a temporary config overlay.
-- **Restore is gated to qwen3 dense only.** Other families (gemma4, lfm2,
-  qwen3.5/3.6) keep per-layer state outside the paged pool — sliding-window
-  `RotatingKVCache`, LFM2 conv state, GDN recurrent/conv state — so paged blocks do
-  not fully determine their layer state, and they are **not** restore-eligible.
-  Capture/persist wiring is family-generic so hybrids can be added later by
-  persisting their extra state. This mirrors vLLM defaulting prefix caching off for
-  hybrid models.
+- **Restore is gated to an allowlist: `qwen3`, `qwen3_5`, `qwen3_5_moe`, `gemma4`.**
+  Dense qwen3 sizes its pool over every layer, so paged blocks fully determine its
+  layer state. The other three are hybrid — their pools cover the full-attention
+  layers only — but each now persists its out-of-pool state as a cold-tier
+  **sidecar**: sliding-window `RotatingKVCache` state for gemma4, GDN recurrent
+  state for qwen3.5/3.6 dense and MoE. A `ColdSidecarPolicy` makes the restore
+  reconcile DOWN to a boundary a validated sidecar actually backs (vLLM's per-group
+  rule), and the `aux_prefix_unbacked` latch fails closed if an in-process hot hit
+  would resume a K/V prefix whose out-of-pool half is missing. `lfm2` / `lfm2_moe`
+  keep short-conv state outside the pool with no serialization path, so they are
+  **not** restore-eligible. A family joins the allowlist only after its restart-parity
+  gate passes on real weights with `hits > 0` and `corruptions == 0` — see
+  `docs/paged-cache.md`. The allowlist is enforced natively in
+  `cold_tier::resolve_persist_cold`, so a family that is off it never persists or
+  restores even under an explicit `persistPagedCache` or `MLX_PERSIST_PAGED_CACHE=1`.
 - The tier is fail-open: any validation or I/O failure falls through silently to a
   fresh prefill. Quota is 10 % of FS capacity capped at 100 GiB, LRU by rebuilt
   mtime recency. All destructive I/O is descriptor-relative and no-follow, contained
