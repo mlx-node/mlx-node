@@ -2697,6 +2697,12 @@ export interface ColdCacheStats {
 }
 
 /**
+ * The native cold-restore allowlist, exposed so a test can assert it agrees
+ * exactly with the TypeScript `COLD_TIER_RESTORE_FAMILIES` set.
+ */
+export declare function coldRestoreFamilies(): Array<string>;
+
+/**
  * Structured completion information aligned with ChatResult.
  * Contains pre-parsed tool calls, thinking, and clean text.
  */

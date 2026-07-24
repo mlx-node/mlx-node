@@ -59,6 +59,46 @@ pub fn cold_cache_stats_snapshot() -> Option<ColdCacheStats> {
     GLOBAL.get()?.as_ref().map(|manager| manager.stats())
 }
 
+/// Model families whose paged prefix blocks can be restored from the SSD
+/// cold tier soundly. The single source of truth on the native side, and the
+/// exact mirror of `COLD_TIER_RESTORE_FAMILIES` in
+/// `packages/agent/src/provider/model-host.ts`; the two gate the same
+/// decision from opposite ends, so a test asserts they never drift.
+///
+/// A family belongs here only when EVERY piece of per-token state its forward
+/// pass carries between turns lives inside the paged pool, so a restored block
+/// reconstructs the whole prefix:
+///
+///  * `qwen3` (dense) sizes its pool over all layers, so the pool holds the
+///    complete KV for the prefix.
+///  * `qwen3_5` / `qwen3_5_moe` keep GDN recurrent state, and `gemma4` keeps
+///    sliding-window `RotatingKVCache` state, outside the pool.
+///  * `lfm2` / `lfm2_moe` keep short-conv state outside the pool with no
+///    serialization path for it at all, AND drive the uniform adapter API
+///    whose restore branch is already wired to the tier — attaching a context
+///    to them would restore an incomplete prefix silently.
+///
+/// Widening this list is a correctness decision, never a perf one: a family
+/// may only join once the state it keeps outside the pool is persisted too.
+const COLD_RESTORE_FAMILIES: &[&str] = &["qwen3"];
+
+/// Whether the cold tier may restore persisted paged blocks for `model_type`
+/// (see [`COLD_RESTORE_FAMILIES`]). Fails closed: an unknown or misspelled
+/// family is unsupported, so the tier stays off and the prefix is recomputed.
+pub fn cold_restore_supported(model_type: &str) -> bool {
+    COLD_RESTORE_FAMILIES.contains(&model_type)
+}
+
+/// The native cold-restore allowlist, exposed so a test can assert it agrees
+/// exactly with the TypeScript `COLD_TIER_RESTORE_FAMILIES` set.
+#[napi]
+pub fn cold_restore_families() -> Vec<String> {
+    COLD_RESTORE_FAMILIES
+        .iter()
+        .map(|family| (*family).to_string())
+        .collect()
+}
+
 /// Filename the dashboard downloader writes as the last step of an atomic
 /// publish (see `packages/dashboard/src/download.ts`). Carries the pinned
 /// HuggingFace commit `revision` — an immutable content identity for the
@@ -454,6 +494,35 @@ mod tests {
             .unwrap()
             .set_modified(time)
             .unwrap();
+    }
+
+    #[test]
+    fn cold_restore_allowlist_covers_qwen3_dense_only() {
+        assert!(cold_restore_supported("qwen3"));
+        // Every other family keeps per-token state outside the paged pool.
+        // lfm2 / lfm2_moe matter most: they drive the uniform adapter API
+        // whose restore branch is already wired to the tier, so admitting
+        // them here would corrupt output rather than merely slow it down.
+        for family in [
+            "qwen3_5",
+            "qwen3_5_moe",
+            "gemma4",
+            "lfm2",
+            "lfm2_moe",
+            // Fails closed on anything unrecognized, including near-misses.
+            "Qwen3",
+            "qwen3 ",
+            "qwen3_dense",
+            "",
+        ] {
+            assert!(
+                !cold_restore_supported(family),
+                "{family:?} must not be cold-restorable"
+            );
+        }
+        // The napi surface a TypeScript test compares against must expose the
+        // same list, not a superset.
+        assert_eq!(cold_restore_families(), vec!["qwen3".to_string()]);
     }
 
     #[test]

@@ -13,21 +13,48 @@
  * overlapping native activity on the compiled-path globals).
  */
 
-import { ChatSession, loadModel, type SessionCapableModel } from '@mlx-node/lm';
+import { ChatSession, loadModel, type ModelType, type SessionCapableModel } from '@mlx-node/lm';
 
 import type { DiscoveredModelLike } from '../types.js';
+
+/**
+ * Model families whose paged prefix blocks can be restored from the SSD cold
+ * tier soundly. The single source of truth on the TypeScript side, mirroring
+ * `COLD_RESTORE_FAMILIES` in `crates/mlx-core/src/cold_tier.rs`; the two gate
+ * the same decision from opposite ends, and
+ * `packages/agent/__test__/cold-tier-families.test.ts` asserts they never
+ * drift.
+ *
+ * A family belongs here only when EVERY piece of per-token state its forward
+ * pass carries between turns lives inside the paged pool, so a restored block
+ * reconstructs the whole prefix:
+ *
+ *  - `qwen3` (dense) sizes its pool over all layers, so the pool holds the
+ *    complete KV for the prefix.
+ *  - `qwen3_5` / `qwen3_5_moe` keep GDN recurrent state, and `gemma4` keeps
+ *    sliding-window `RotatingKVCache` state, outside the pool.
+ *  - `lfm2` / `lfm2_moe` keep short-conv state outside the pool with no
+ *    serialization path for it at all, AND drive the uniform native adapter
+ *    API whose restore branch is already wired to the tier — asking for
+ *    persistence on their behalf would restore an incomplete prefix silently.
+ *
+ * Widening this set is a correctness decision, never a perf one: a family may
+ * only join once the state it keeps outside the pool is persisted too.
+ */
+export const COLD_TIER_RESTORE_FAMILIES: ReadonlySet<string> = new Set<ModelType>(['qwen3']);
 
 /** Per-load policy handed to {@link MlxModelHostOptions.resolveModelPathFn}. */
 export interface ModelLoadPolicy {
   /**
    * Authoritative cold-tier directive for the config overlay
-   * (`persist_paged_cache` in the cloned config.json). Present ONLY for
-   * qwen3-family loads, carrying the resolved {@link MlxModelHostOptions.persistPagedCache}
-   * value as an EXPLICIT boolean: `true` enables the SSD cold tier, `false`
-   * authoritatively disables it — overriding any `persist_paged_cache` the
-   * checkpoint's own config.json hard-codes, so `mlx agent --no-persist-cache`
-   * truly wins. Non-qwen3 families receive no policy at all, so the overlay
-   * never touches the field for them.
+   * (`persist_paged_cache` in the cloned config.json). Present ONLY for loads
+   * of a {@link COLD_TIER_RESTORE_FAMILIES} family, carrying the resolved
+   * {@link MlxModelHostOptions.persistPagedCache} value as an EXPLICIT
+   * boolean: `true` enables the SSD cold tier, `false` authoritatively
+   * disables it — overriding any `persist_paged_cache` the checkpoint's own
+   * config.json hard-codes, so `mlx agent --no-persist-cache` truly wins.
+   * Every other family receives no policy at all, so the overlay never touches
+   * the field for them.
    */
   persistPagedCache: boolean;
 }
@@ -52,11 +79,11 @@ export interface MlxModelHostOptions {
    */
   requirePagedCache?: boolean;
   /**
-   * Enable the qwen3 dense cold tier (persisted paged prefix blocks) by
-   * default. `mlx agent` turns this on; `mlx agent --no-persist-cache` sets it
-   * false. Applied to qwen3-family loads only — qwen3 dense is the sole family
-   * with a sound paged cold restore (gemma4/lfm2/qwen3.5 keep per-layer state
-   * outside the paged pool). Defaults true.
+   * Enable the cold tier (persisted paged prefix blocks) by default. `mlx
+   * agent` turns this on; `mlx agent --no-persist-cache` sets it false.
+   * Applied only to loads of a {@link COLD_TIER_RESTORE_FAMILIES} family —
+   * every other family keeps per-layer state outside the paged pool, so its
+   * prefix cannot be restored soundly. Defaults true.
    */
   persistPagedCache?: boolean;
 }
@@ -146,15 +173,15 @@ export class MlxModelHost {
       } else {
         resident = false;
         this.resident = null;
-        // Only qwen3 dense has a sound paged cold restore. Hand it an EXPLICIT
-        // tri-state directive so the overlay can authoritatively set the flag
-        // either way (default-on, or `--no-persist-cache` off — overriding any
-        // value in the checkpoint's config.json). Every other family gets no
-        // policy at all, so the overlay never touches the field for them.
-        const resolvedPath =
-          entry.modelType === 'qwen3'
-            ? await this.resolveModelPathFn(entry, { persistPagedCache: this.persistPagedCache })
-            : await this.resolveModelPathFn(entry);
+        // Only a COLD_TIER_RESTORE_FAMILIES family has a sound paged cold
+        // restore. Hand it an EXPLICIT tri-state directive so the overlay can
+        // authoritatively set the flag either way (default-on, or
+        // `--no-persist-cache` off — overriding any value in the checkpoint's
+        // config.json). Every other family gets no policy at all, so the
+        // overlay never touches the field for them.
+        const resolvedPath = COLD_TIER_RESTORE_FAMILIES.has(entry.modelType)
+          ? await this.resolveModelPathFn(entry, { persistPagedCache: this.persistPagedCache })
+          : await this.resolveModelPathFn(entry);
         const model = await this.loadModelFn(resolvedPath);
         const sessionModel = model as unknown as SessionCapableModel;
         const gemmaDraftActive = entry.modelType === 'gemma4' && sessionModel.hasMtpWeights?.() === true;

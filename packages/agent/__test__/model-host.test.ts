@@ -2,7 +2,7 @@ import type { LoadableModel } from '@mlx-node/lm';
 import { ChatSession } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
-import { MlxModelHost } from '../src/provider/model-host.js';
+import { COLD_TIER_RESTORE_FAMILIES, MlxModelHost } from '../src/provider/model-host.js';
 import type { DiscoveredModelLike } from '../src/types.js';
 
 const MODELS: DiscoveredModelLike[] = [
@@ -17,6 +17,17 @@ const MODELS: DiscoveredModelLike[] = [
  */
 function makeLoader() {
   return vi.fn(async (path: string) => ({ fakeModelFor: path }) as unknown as LoadableModel);
+}
+
+/**
+ * The exact argument list the host must hand `resolveModelPathFn` for
+ * `model`: a cold-restorable family carries the explicit persistence policy,
+ * every other family carries nothing at all. Derived from
+ * {@link COLD_TIER_RESTORE_FAMILIES} rather than a hard-coded family string,
+ * so admitting a new family flips these expectations with it.
+ */
+function expectedResolveArgs(model: DiscoveredModelLike, persistPagedCache = true): unknown[] {
+  return COLD_TIER_RESTORE_FAMILIES.has(model.modelType) ? [model, { persistPagedCache }] : [model];
 }
 
 /** Acquire the resident session without doing any work in the callback. */
@@ -68,7 +79,7 @@ describe('MlxModelHost', () => {
     await getSession(host, 'qwen-small');
 
     expect(events).toEqual(['resolve:/models/qwen-small', 'load:/paged/models/qwen-small']);
-    expect(resolveModelPathFn).toHaveBeenCalledWith(MODELS[0]);
+    expect(resolveModelPathFn.mock.calls[0]).toEqual(expectedResolveArgs(MODELS[0]));
     expect(loader).toHaveBeenCalledWith('/paged/models/qwen-small');
   });
 
@@ -354,13 +365,15 @@ describe('MlxModelHost', () => {
       expect(resolveModelPathFn.mock.calls[0]).toEqual([QWEN3, { persistPagedCache: false }]);
     });
 
-    it('never requests persistence for a non-qwen3 family', async () => {
+    it('matches the cold-restore allowlist for a hybrid family', async () => {
       const resolveModelPathFn = trackingResolver();
       const host = new MlxModelHost(HOST_MODELS, { loadModelFn: makeLoader(), resolveModelPathFn });
 
       await getSession(host, 'gemma-mid');
 
-      expect(resolveModelPathFn.mock.calls[0]).toEqual([HOST_MODELS[1]]);
+      // gemma4 keeps sliding-window state outside the paged pool, so today it
+      // is outside the set and must receive no policy at all.
+      expect(resolveModelPathFn.mock.calls[0]).toEqual(expectedResolveArgs(HOST_MODELS[1]));
     });
   });
 

@@ -783,6 +783,7 @@ module.exports.calibrateActivationAmaxRaw = nativeBinding.calibrateActivationAma
 module.exports.ChatRole = nativeBinding.ChatRole;
 module.exports.coldCacheDrain = nativeBinding.coldCacheDrain;
 module.exports.coldCacheStats = nativeBinding.coldCacheStats;
+module.exports.coldRestoreFamilies = nativeBinding.coldRestoreFamilies;
 module.exports.convertForeignWeights = nativeBinding.convertForeignWeights;
 module.exports.convertGgufToSafetensors = nativeBinding.convertGgufToSafetensors;
 module.exports.convertModel = nativeBinding.convertModel;
