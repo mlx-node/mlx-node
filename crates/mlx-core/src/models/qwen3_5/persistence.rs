@@ -14,8 +14,8 @@ use crate::models::quant_dispatch::{
     default_per_layer_quant, effective_plq_for, ensure_dense_weight_floating,
     ensure_int8_storage_resolves_sym8, ensure_kquant_storage_resolves_kquant,
     ensure_plain_fp8_storage_resolves_fp8_e4m3, has_kquant_mode, has_sym8_mode, merge_per_layer,
-    normalize_per_layer_key, parse_mode_str, parse_quant_settings, resolve_default_mode,
-    select_quantization_block,
+    mode_to_str, normalize_per_layer_key, parse_mode_str, parse_quant_settings,
+    resolve_default_mode, select_quantization_block,
 };
 use crate::nn::LayerNorm;
 use crate::tokenizer::Qwen3Tokenizer;
@@ -868,27 +868,6 @@ fn draft_lm_head_spec_from_runtime(model_dir: &Path) -> Result<Option<PerLayerQu
         return Ok(None);
     };
     parse_draft_lm_head_spec(value, "mtplx_runtime.recommended_draft_lm_head")
-}
-
-fn mode_to_str(mode: PerLayerMode) -> &'static str {
-    match mode {
-        PerLayerMode::Affine => "affine",
-        PerLayerMode::Mxfp8 => "mxfp8",
-        PerLayerMode::Mxfp4 => "mxfp4",
-        PerLayerMode::Nvfp4 => "nvfp4",
-        PerLayerMode::Fp8E4m3 => crate::quant::fp8_weight::FP8_E4M3_MODE,
-        // Only reachable from the MTPLX draft-lm-head quantize/dequantize
-        // helpers, which thread the string into `mlx_quantize`/
-        // `mlx_dequantize` — C++ rejects "sym8" there, so a (nonsensical)
-        // sym8 draft-head spec fails loud instead of mis-packing.
-        PerLayerMode::Sym8 => "sym8",
-        // Same as sym8: an MTPLX draft head is never K-quant (K-quants are
-        // consume-only GGUF imports and `mlx_quantize` rejects these strings),
-        // so returning the string makes a nonsensical spec fail loud in C++.
-        PerLayerMode::Q6K => "q6k",
-        PerLayerMode::Q4K => "q4k",
-        PerLayerMode::Q5K => "q5k",
-    }
 }
 
 fn quantize_array(

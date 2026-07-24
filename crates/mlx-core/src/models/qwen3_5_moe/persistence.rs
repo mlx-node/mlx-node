@@ -17,7 +17,7 @@ use crate::models::mtp_drafter::{DrafterBodyVariant, MTP_MOE_LAYER_LINEAR_SUFFIX
 use crate::models::quant_dispatch::{
     default_per_layer_quant, effective_plq_for, ensure_dense_weight_floating,
     ensure_int8_storage_resolves_sym8, ensure_kquant_storage_resolves_kquant,
-    ensure_plain_fp8_storage_resolves_fp8_e4m3, has_kquant_mode, has_sym8_mode,
+    ensure_plain_fp8_storage_resolves_fp8_e4m3, has_kquant_mode, has_sym8_mode, mode_to_str,
     normalize_per_layer_key, parse_quant_settings, resolve_default_mode, select_quantization_block,
 };
 use crate::models::qwen3_5::persistence::{
@@ -43,25 +43,6 @@ use super::quantized_linear::{
     try_build_sym8_quantized_linear,
 };
 use super::switch_glu::SwitchGLU;
-
-/// The `mlx_dequantize`/`mlx_quantized_matmul` mode string for a resolved
-/// per-layer quant mode. Mirrors the dense `qwen3_5::persistence::mode_to_str`
-/// (private there); used to thread the embedding/tied-lm_head packing mode into
-/// the mode-aware `Embedding` ops so a K-quant `token_embd` decodes as K-quant
-/// rather than being misread as affine.
-fn mode_to_str(mode: PerLayerMode) -> &'static str {
-    match mode {
-        PerLayerMode::Affine => "affine",
-        PerLayerMode::Mxfp8 => "mxfp8",
-        PerLayerMode::Mxfp4 => "mxfp4",
-        PerLayerMode::Nvfp4 => "nvfp4",
-        PerLayerMode::Fp8E4m3 => crate::quant::fp8_weight::FP8_E4M3_MODE,
-        PerLayerMode::Sym8 => "sym8",
-        PerLayerMode::Q6K => "q6k",
-        PerLayerMode::Q4K => "q4k",
-        PerLayerMode::Q5K => "q5k",
-    }
-}
 
 /// Sanitize weights from HuggingFace format.
 fn sanitize_weights(

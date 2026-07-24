@@ -9,14 +9,14 @@
 //!     .weight uint32[N, K*6/32]  LSB-first 6-bit stream, code in [0, 63]
 //!     .scales int8  [N, K/16]    ggml sc, verbatim, SIGNED
 //!     .biases f16   [N, K/256]   ggml d, verbatim
-//!     decode  scale = d[g >> 4] * sc[g];  bias = -32 * scale
+//!     decode  scale = .biases[g >> 4] * .scales[g];  bias = -32 * scale
 //!
 //!   q4k  bits=4 group_size=32   (q5k is the same with bits=5)
 //!     .weight uint32[N, K*4/32]  LSB-first 4-bit stream, code in [0, 15]
 //!     .scales uint8 [N, 2*K/32]  (sc, m)   interleaved at 2g, 2g+1
 //!     .biases f16   [N, 2*K/256] (d, dmin) interleaved at 2G, 2G+1
-//!     decode  scale = d[2*(g >> 3)] * sc[2g]
-//!             bias  = -dmin[2*(g >> 3) + 1] * m[2g + 1]
+//!     decode  scale = .biases[2*(g >> 3)]       * .scales[2g]       (d    * sc)
+//!             bias  = -(.biases[2*(g >> 3) + 1] * .scales[2g + 1])  (dmin * m)
 //! ```
 //!
 //! with `g` the logical group index `v / group_size` and `G` the super-block

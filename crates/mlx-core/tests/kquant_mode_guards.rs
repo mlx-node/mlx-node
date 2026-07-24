@@ -89,7 +89,7 @@ const KQUANTS: [KQuant; 3] = [
 //
 // * `qmv`, `qmv_fast`, `qmv_wide`, `qvm`, `qvm_split_k` and the gather vector
 //   kernels decode straight into a float accumulator (`typedef float U`,
-//   kquant.h:804);
+//   kquant.h:807);
 // * the `qmm` family rounds each decoded weight to the activation type on the
 //   way into the threadgroup tile (`dequantize_to`, kquant.h:579-589) while the
 //   CPU keeps it in float (`kq_qmm_t`, cpu/quantized.cpp:1212) — with float32
@@ -585,7 +585,7 @@ fn gather_qmm_handle(
     let mode = CString::new(mode).expect("mode");
     // SAFETY: every handle outlives the call. A null `lhs` is the documented
     // "derive the left indices from x" encoding, and it is also what turns
-    // `sorted` into `right_sorted_` (mlx/ops.cpp:5699).
+    // `sorted` into `right_sorted_` (mlx/ops.cpp:5715).
     unsafe {
         mlx_sys::mlx_gather_qmm(
             x.as_raw_ptr(),
@@ -919,7 +919,7 @@ fn gpu_matches_cpu_on_every_quantized_matmul_kernel() {
 ///   otherwise                                       -> gather_qvm    (:1849)
 /// ```
 ///
-/// `right_sorted_` is `sorted_indices && !lhs_indices` (`mlx/ops.cpp:5699`), so
+/// `right_sorted_` is `sorted_indices && !lhs_indices` (`mlx/ops.cpp:5715`), so
 /// the two `gather_qmm_rhs` cases pass a null left index and let MLX derive it.
 #[test]
 fn gpu_matches_cpu_on_every_gather_kernel() {
@@ -1011,7 +1011,7 @@ fn gpu_matches_cpu_for_every_activation_dtype() {
             (DType::BFloat16, "bf16", BF16_STORE_TOL, BF16_TILE_TOL),
         ] {
             // qmv accumulates in float and rounds once on the store
-            // (kquant.h:804, :840).
+            // (kquant.h:807, :843).
             let x1 = activation(&[1, K], 131, dtype);
             compare_devices(&format!("qmv {name} {m}"), store_tol, || {
                 qmm_of(kq, &x1, &w, true)

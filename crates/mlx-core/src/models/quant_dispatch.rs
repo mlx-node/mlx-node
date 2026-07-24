@@ -116,6 +116,35 @@ pub fn parse_mode_str(s: Option<&str>) -> Option<PerLayerMode> {
     }
 }
 
+/// Encode a `PerLayerMode` back into its `quantization.mode` string — the exact
+/// inverse of [`parse_mode_str`], and the string every mode-aware MLX entry
+/// point is handed.
+///
+/// Three consumers:
+///  - `mlx_quantize` (the MTPLX draft-lm-head quantize helper). C++ has no
+///    `sym8` mode at all, and rejects the K-quant strings outright ("can be read
+///    but not produced", `ops.cpp:5233`), so a nonsensical draft-head spec in
+///    either mode fails loud there instead of mis-packing.
+///  - `mlx_dequantize` (the MTPLX source-head dequantize helper). `sym8` still
+///    fails loud, but the K-quant strings are IMPLEMENTED (`kq_dequantize`,
+///    `ops.cpp:5494`), so a K-quant source head dequantizes rather than throwing.
+///  - the mode-aware `Embedding` load in the dense and MoE loaders, which threads
+///    the on-disk packing mode of `token_embd` / the tied lm_head through to
+///    `mlx_quantized_matmul` so a K-quant embedding is not misread as affine.
+pub(crate) fn mode_to_str(mode: PerLayerMode) -> &'static str {
+    match mode {
+        PerLayerMode::Affine => "affine",
+        PerLayerMode::Mxfp8 => "mxfp8",
+        PerLayerMode::Mxfp4 => "mxfp4",
+        PerLayerMode::Nvfp4 => "nvfp4",
+        PerLayerMode::Fp8E4m3 => crate::quant::fp8_weight::FP8_E4M3_MODE,
+        PerLayerMode::Sym8 => "sym8",
+        PerLayerMode::Q6K => "q6k",
+        PerLayerMode::Q4K => "q4k",
+        PerLayerMode::Q5K => "q5k",
+    }
+}
+
 /// True when `mode` is one of the ggml K-quant families (Q6_K / Q4_K / Q5_K).
 pub fn is_kquant_mode(mode: PerLayerMode) -> bool {
     matches!(
@@ -302,7 +331,7 @@ pub struct KQuantGroup {
 /// demands. Mirrors the MLX FFI's `quantization_params_from_mode` +
 /// `validate_mode_with_type` (`ops.cpp`) so the Rust load-time validation and
 /// the C++ kernel contract cannot drift. Returns `None` for non-K-quant modes.
-fn kquant_mode_params(mode: PerLayerMode) -> Option<(&'static str, i32, i32, DType)> {
+pub(crate) fn kquant_mode_params(mode: PerLayerMode) -> Option<(&'static str, i32, i32, DType)> {
     match mode {
         PerLayerMode::Q6K => Some(("q6k", 6, 16, DType::Int8)),
         PerLayerMode::Q4K => Some(("q4k", 4, 32, DType::Uint8)),
@@ -950,6 +979,74 @@ mod tests {
         assert_eq!(parse_mode_str(Some("sym8")), Some(PerLayerMode::Sym8));
         assert_eq!(parse_mode_str(Some("bogus")), None);
         assert_eq!(parse_mode_str(None), None);
+    }
+
+    /// `mode_to_str` is the exact inverse of `parse_mode_str`. Nothing else
+    /// pins the two tables together, so a mode added to one and not the other
+    /// (or spelled differently) would only surface as a checkpoint that writes
+    /// a string it cannot read back. Enumerating every variant also makes a new
+    /// `PerLayerMode` a compile error here rather than a silent gap.
+    #[test]
+    fn mode_to_str_round_trips_through_parse_mode_str() {
+        for mode in [
+            PerLayerMode::Affine,
+            PerLayerMode::Mxfp8,
+            PerLayerMode::Mxfp4,
+            PerLayerMode::Nvfp4,
+            PerLayerMode::Fp8E4m3,
+            PerLayerMode::Sym8,
+            PerLayerMode::Q6K,
+            PerLayerMode::Q4K,
+            PerLayerMode::Q5K,
+        ] {
+            let encoded = mode_to_str(mode);
+            assert_eq!(
+                parse_mode_str(Some(encoded)),
+                Some(mode),
+                "mode {mode:?} encodes to '{encoded}' which parse_mode_str does not decode back"
+            );
+        }
+    }
+
+    /// The K-quant `(mode_str, bits, group_size, scales_dtype)` table is the
+    /// single mirror of the MLX FFI contract, consumed by `resolve_kquant_group`
+    /// and by gemma4's packed-embedding arm. Pin it, including that it returns
+    /// `None` for every non-K-quant mode, and that its mode string agrees with
+    /// `mode_to_str`.
+    #[test]
+    fn kquant_mode_params_pins_the_ffi_contract() {
+        assert_eq!(
+            kquant_mode_params(PerLayerMode::Q6K),
+            Some(("q6k", 6, 16, DType::Int8))
+        );
+        assert_eq!(
+            kquant_mode_params(PerLayerMode::Q4K),
+            Some(("q4k", 4, 32, DType::Uint8))
+        );
+        assert_eq!(
+            kquant_mode_params(PerLayerMode::Q5K),
+            Some(("q5k", 5, 32, DType::Uint8))
+        );
+        for mode in [
+            PerLayerMode::Affine,
+            PerLayerMode::Mxfp8,
+            PerLayerMode::Mxfp4,
+            PerLayerMode::Nvfp4,
+            PerLayerMode::Fp8E4m3,
+            PerLayerMode::Sym8,
+        ] {
+            assert!(
+                kquant_mode_params(mode).is_none(),
+                "non-K-quant mode {mode:?} must have no K-quant FFI parameters"
+            );
+        }
+        for mode in [PerLayerMode::Q6K, PerLayerMode::Q4K, PerLayerMode::Q5K] {
+            assert_eq!(
+                kquant_mode_params(mode).map(|(s, ..)| s),
+                Some(mode_to_str(mode)),
+                "K-quant FFI mode string must agree with mode_to_str for {mode:?}"
+            );
+        }
     }
 
     #[test]

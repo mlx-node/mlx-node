@@ -15,7 +15,7 @@ use crate::engine::persistence::{
 use crate::models::quant_dispatch::{
     default_per_layer_quant, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
     ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
-    load_quant_settings_from_disk, merge_per_layer, resolve_default_mode,
+    kquant_mode_params, load_quant_settings_from_disk, merge_per_layer, resolve_default_mode,
 };
 use crate::tokenizer::Qwen3Tokenizer;
 
@@ -1284,19 +1284,36 @@ fn resolve_packed_embed_params<'a>(
             // The packed backend hands all three arrays to the mode-aware K-quant
             // `mlx_dequantize`/`mlx_quantized_matmul`, so nothing is dequantized
             // to bf16 here and the tied lm_head stays a true K-quant matmul.
-            let (mode_str, want_scales) = match plq.mode {
-                PerLayerMode::Q6K => ("q6k", DType::Int8),
-                PerLayerMode::Q4K => ("q4k", DType::Uint8),
-                _ => ("q5k", DType::Uint8),
+            // `kquant_mode_params` is the single mirror of the MLX FFI's
+            // mode/dtype contract, so the mode string and expected `.scales`
+            // dtype cannot drift from the kernel. It returns `None` for every
+            // non-K-quant mode, which this arm has already excluded — the `else`
+            // keeps that unreachable-today branch fail-closed instead of
+            // defaulting a future K-quant family to the wrong bit width.
+            let Some((mode_str, _, _, want_scales)) = kquant_mode_params(plq.mode) else {
+                return Err(Error::from_reason(format!(
+                    "gemma4 {key} load: quant mode {:?} reached the K-quant embedding arm but has \
+                     no K-quant FFI parameters — refusing to load",
+                    plq.mode
+                )));
             };
             // Fail closed on any storage that contradicts the resolved K-quant
             // mode, mirroring the affine/mxfp8 arms: the `.biases` super-block
-            // scale is required, and the sub-block `.scales` dtype must match.
+            // scale is required and holds a raw ggml f16 `d` bit pattern, and
+            // the sub-block `.scales` dtype must match.
             if biases.is_none() {
                 return Err(Error::from_reason(format!(
                     "gemma4 {key} load: quant mode resolves to {mode_str} but '{key}.biases' \
                      (the ggml `d` super-block scale) is missing — K-quants require it, \
                      refusing to load"
+                )));
+            }
+            let biases_dtype = biases.and_then(|b| b.dtype().ok());
+            if biases_dtype != Some(DType::Float16) {
+                return Err(Error::from_reason(format!(
+                    "gemma4 {key} load: quant mode resolves to {mode_str} but '{key}.biases' is \
+                     {biases_dtype:?}, expected Float16 (the ggml `d` super-block scale) — \
+                     config/tensor disagreement, refusing to load"
                 )));
             }
             let scales_dtype = scales.dtype().ok();
@@ -5045,6 +5062,48 @@ mod tests {
             "error names the q6k/uint8 scale mismatch: {}",
             err.reason
         );
+    }
+
+    /// `.biases` on a K-quant embedding is a raw ggml f16 `d` bit pattern that
+    /// the kernel reads as float16; any other dtype means it is not that array.
+    /// Presence alone is not enough — an upcast/recast sidecar must be rejected
+    /// loud, the same way `resolve_kquant_group` and convert's
+    /// `validate_existing_kquant_entry` reject it on the linear/switch paths.
+    #[test]
+    fn resolve_packed_embed_kquant_with_non_f16_biases_fails_loud() {
+        for (mode, bits, group_size, scales_dtype, weight_cols, scale_cols) in [
+            (PerLayerMode::Q6K, 6, 16, DType::Int8, 48, 16),
+            (PerLayerMode::Q4K, 4, 32, DType::Uint8, 32, 16),
+            (PerLayerMode::Q5K, 5, 32, DType::Uint8, 40, 16),
+        ] {
+            for wrong in [DType::BFloat16, DType::Float32, DType::Uint8] {
+                let weight =
+                    MxArray::zeros(&[4, weight_cols], Some(DType::Uint32)).expect("packed weight");
+                let scales =
+                    MxArray::zeros(&[4, scale_cols], Some(scales_dtype)).expect("sub-scales");
+                let biases = MxArray::zeros(&[4, 2], Some(wrong)).expect("wrong-dtype biases");
+                let plq = PerLayerQuant {
+                    bits,
+                    group_size,
+                    mode,
+                    input_amax: None,
+                };
+                let err = resolve_packed_embed_params(
+                    "embed_tokens",
+                    plq,
+                    &weight,
+                    &scales,
+                    Some(&biases),
+                )
+                .err()
+                .unwrap_or_else(|| panic!("{mode:?} with {wrong:?} biases must fail loud"));
+                assert!(
+                    err.reason.contains("biases") && err.reason.contains("Float16"),
+                    "error names the biases dtype contract for {mode:?}/{wrong:?}: {}",
+                    err.reason
+                );
+            }
+        }
     }
 
     #[test]

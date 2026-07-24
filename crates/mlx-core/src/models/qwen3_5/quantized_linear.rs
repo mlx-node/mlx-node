@@ -446,19 +446,6 @@ pub fn try_build_sym8_quantized_linear(
     )))
 }
 
-/// ggml K-quant packing parameters. `.biases` holds the ggml `d` super-block
-/// SCALE (float16), NOT an additive bias — the two-level decode
-/// `scale = d[..]*sc[..]` happens in the MLX kernel (see `PerLayerMode::Q6K`).
-pub const Q6K_BITS: i32 = 6;
-pub const Q6K_GROUP_SIZE: i32 = 16;
-pub const Q6K_MODE: &str = "q6k";
-pub const Q4K_BITS: i32 = 4;
-pub const Q4K_GROUP_SIZE: i32 = 32;
-pub const Q4K_MODE: &str = "q4k";
-pub const Q5K_BITS: i32 = 5;
-pub const Q5K_GROUP_SIZE: i32 = 32;
-pub const Q5K_MODE: &str = "q5k";
-
 /// Try to build a ggml K-quant `QuantizedLinear` from `{prefix}.weight` (uint32
 /// packed), `{prefix}.scales` (int8 for Q6_K / uint8 for Q4_K/Q5_K), and the
 /// MANDATORY `{prefix}.biases` (float16 ggml `d` super-block scale).
