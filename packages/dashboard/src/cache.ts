@@ -9,10 +9,18 @@
  * with `MLX_COLD_CACHE_DIR` set the tier lives in that directory's
  * `mlx-paged-v1` managed child (crates/mlx-core/src/cold_tier.rs).
  *
- * Only canonical `<64-hex-sha256>.safetensors` block files are ever counted or
- * removed. The hardened tier also leaves writer temp files
+ * Two canonical object shapes are counted and removed, matching
+ * `object_file_name` in cold_cache.rs: KV blocks
+ * (`<64-hex-sha256>.safetensors`) and state sidecars
+ * (`<64-hex-sha256>.<group>.safetensors`, group ∈ `gdn_state`,
+ * `sliding_window`). Both consume the same quota, so both are counted in
+ * `totalBytes` and both are removed by clear/evict — a sidecar left behind
+ * would sit outside every quota view forever. They are reported separately so
+ * "N blocks" stays a block count.
+ *
+ * The hardened tier also leaves writer temp files
  * (`.{64-hex}.{pid}.{tick}.tmp`) and quarantined obstructions
- * (`.blocked.<name>.{pid}.{tick}`) beside the blocks; those, and any other
+ * (`.blocked.<name>.{pid}.{tick}`) beside the objects; those, and any other
  * foreign file, are never touched.
  */
 
@@ -20,8 +28,16 @@ import { type Stats, lstatSync, readdirSync, statSync, statfsSync, unlinkSync } 
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-/** Canonical persisted block filename (`ColdCacheKey::to_hex` + suffix). */
+/** Canonical persisted KV-block filename (`ColdCacheKey::to_hex` + suffix). */
 const BLOCK_FILE = /^[0-9a-f]{64}\.safetensors$/;
+
+/**
+ * Canonical sidecar filename: the same 64-hex key with its `ColdGroup` label
+ * as an infix. The label alternatives mirror `ColdGroup::SIDECAR_GROUPS`
+ * exactly — `kv` is deliberately absent, since a KV object is only ever the
+ * bare `BLOCK_FILE` form.
+ */
+const SIDECAR_FILE = /^[0-9a-f]{64}\.(?:gdn_state|sliding_window)\.safetensors$/;
 
 const GIB = 1024 ** 3;
 /** `MAX_DEFAULT_QUOTA` in cold_cache.rs. */
@@ -36,17 +52,24 @@ export interface ColdCacheDiskInfo {
   root: string;
   /** Whether `root` exists and is a directory. */
   exists: boolean;
-  /** Number of canonical `<64-hex>.safetensors` blocks. */
+  /** Number of canonical `<64-hex>.safetensors` KV blocks. */
   entryCount: number;
-  /** Sum of block sizes in bytes. */
+  /** Number of canonical `<64-hex>.<group>.safetensors` state sidecars. */
+  sidecarCount: number;
+  /** Sum of ALL cold-object sizes (blocks + sidecars) — what the quota sees. */
   totalBytes: number;
+  /** Sidecar share of `totalBytes`; block bytes are `totalBytes - sidecarBytes`. */
+  sidecarBytes: number;
   /** `min(0.10 * fsCapacity, 100 GiB)` from `statfsSync(root)`; 0 when missing. */
   quotaBytes: number;
-  /** Oldest block mtime (ms since epoch), or `null` when there are no blocks. */
+  /** Oldest object mtime (ms since epoch), or `null` when there are none. */
   oldestMtime: number | null;
-  /** Newest block mtime (ms since epoch), or `null` when there are no blocks. */
+  /** Newest object mtime (ms since epoch), or `null` when there are none. */
   newestMtime: number | null;
-  /** Fixed-order age buckets over block mtime. */
+  /**
+   * Fixed-order age buckets over every object's mtime, blocks and sidecars
+   * alike — `evictOlderThan` removes both, so the preview must count both.
+   */
   ageHistogram: Array<{ label: string; count: number; bytes: number }>;
 }
 
@@ -67,17 +90,19 @@ interface BlockEntry {
   path: string;
   size: number;
   mtimeMs: number;
+  /** Which canonical shape matched — sidecars are accounted separately. */
+  kind: 'block' | 'sidecar';
 }
 
 /**
- * Canonical block files under `root`. The root itself is typed with `lstatSync`
- * first: a symlinked or non-directory root is refused (empty list), mirroring
- * the native manager's opener (cold_cache.rs `symlink_metadata` root check),
- * so clear/evict can never unlink through a symlinked root into foreign files.
- * Entries are likewise typed with `lstatSync`, so a symlink at a block name is
- * never followed or counted — mirroring the manager's no-follow `stat_file`,
- * which indexes regular files only. A missing or unreadable directory yields an
- * empty list.
+ * Canonical cold objects under `root`, blocks and sidecars alike. The root
+ * itself is typed with `lstatSync` first: a symlinked or non-directory root is
+ * refused (empty list), mirroring the native manager's opener (cold_cache.rs
+ * `symlink_metadata` root check), so clear/evict can never unlink through a
+ * symlinked root into foreign files. Entries are likewise typed with
+ * `lstatSync`, so a symlink at an object name is never followed or counted —
+ * mirroring the manager's no-follow `stat_file`, which indexes regular files
+ * only. A missing or unreadable directory yields an empty list.
  */
 function listBlocks(root: string): BlockEntry[] {
   let rootStat: Stats;
@@ -95,7 +120,12 @@ function listBlocks(root: string): BlockEntry[] {
   }
   const blocks: BlockEntry[] = [];
   for (const name of names) {
-    if (!BLOCK_FILE.test(name)) continue;
+    const kind: BlockEntry['kind'] | null = BLOCK_FILE.test(name)
+      ? 'block'
+      : SIDECAR_FILE.test(name)
+        ? 'sidecar'
+        : null;
+    if (kind === null) continue;
     const path = join(root, name);
     let stat: Stats;
     try {
@@ -104,7 +134,7 @@ function listBlocks(root: string): BlockEntry[] {
       continue;
     }
     if (!stat.isFile()) continue;
-    blocks.push({ path, size: stat.size, mtimeMs: stat.mtimeMs });
+    blocks.push({ path, size: stat.size, mtimeMs: stat.mtimeMs, kind });
   }
   return blocks;
 }
@@ -147,7 +177,9 @@ export function scanColdCache(root: string = defaultColdCacheDir()): ColdCacheDi
       root,
       exists: false,
       entryCount: 0,
+      sidecarCount: 0,
       totalBytes: 0,
+      sidecarBytes: 0,
       quotaBytes: 0,
       oldestMtime: null,
       newestMtime: null,
@@ -158,10 +190,16 @@ export function scanColdCache(root: string = defaultColdCacheDir()): ColdCacheDi
   const blocks = listBlocks(root);
   const now = Date.now();
   let totalBytes = 0;
+  let sidecarCount = 0;
+  let sidecarBytes = 0;
   let oldestMtime: number | null = null;
   let newestMtime: number | null = null;
   for (const block of blocks) {
     totalBytes += block.size;
+    if (block.kind === 'sidecar') {
+      sidecarCount += 1;
+      sidecarBytes += block.size;
+    }
     if (oldestMtime === null || block.mtimeMs < oldestMtime) oldestMtime = block.mtimeMs;
     if (newestMtime === null || block.mtimeMs > newestMtime) newestMtime = block.mtimeMs;
     const bucket = histogram[bucketIndex(now - block.mtimeMs)];
@@ -172,8 +210,10 @@ export function scanColdCache(root: string = defaultColdCacheDir()): ColdCacheDi
   return {
     root,
     exists: true,
-    entryCount: blocks.length,
+    entryCount: blocks.length - sidecarCount,
+    sidecarCount,
     totalBytes,
+    sidecarBytes,
     quotaBytes: quotaBytesFor(root),
     oldestMtime,
     newestMtime,
@@ -182,9 +222,11 @@ export function scanColdCache(root: string = defaultColdCacheDir()): ColdCacheDi
 }
 
 /**
- * Remove every canonical block under `root`, leaving quarantine, writer-temp,
- * and any foreign file untouched. Only files actually unlinked are counted, so
- * a concurrent removal never inflates the totals. A missing root is a no-op.
+ * Remove every canonical cold object under `root` — blocks and sidecars alike,
+ * since a sidecar whose blocks are gone is unusable and would only occupy
+ * quota — leaving quarantine, writer-temp, and any foreign file untouched.
+ * Only files actually unlinked are counted, so a concurrent removal never
+ * inflates the totals. A missing root is a no-op.
  */
 export function clearColdCache(root: string = defaultColdCacheDir()): { removed: number; freedBytes: number } {
   let removed = 0;
@@ -202,9 +244,11 @@ export function clearColdCache(root: string = defaultColdCacheDir()): { removed:
 }
 
 /**
- * Remove canonical blocks whose mtime is strictly older than `days` ago,
- * leaving newer blocks and every foreign file in place. A missing root is a
- * no-op.
+ * Remove canonical cold objects (blocks and sidecars) whose mtime is strictly
+ * older than `days` ago, leaving newer objects and every foreign file in
+ * place. A sidecar evicted ahead of its blocks is safe: the restore path
+ * reconciles the candidate prefix down to the last boundary a sidecar still
+ * backs. A missing root is a no-op.
  */
 export function evictOlderThan(
   days: number,

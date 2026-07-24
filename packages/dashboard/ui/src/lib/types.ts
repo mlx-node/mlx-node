@@ -164,8 +164,12 @@ export interface MetricsOverviewResponse {
 export interface ColdCacheDiskInfo {
   root: string;
   exists: boolean;
+  /** KV blocks only; state sidecars are counted by `sidecarCount`. */
   entryCount: number;
+  sidecarCount: number;
+  /** Blocks + sidecars, i.e. everything the cold-tier quota covers. */
   totalBytes: number;
+  sidecarBytes: number;
   quotaBytes: number;
   oldestMtime: number | null;
   newestMtime: number | null;

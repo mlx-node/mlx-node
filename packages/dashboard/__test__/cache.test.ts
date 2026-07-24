@@ -14,6 +14,11 @@ function hexName(index: number): string {
   return `${index.toString(16).padStart(64, '0')}.safetensors`;
 }
 
+/** Canonical sidecar filename: same key, `ColdGroup` label as an infix. */
+function sidecarName(index: number, group: 'gdn_state' | 'sliding_window'): string {
+  return `${index.toString(16).padStart(64, '0')}.${group}.safetensors`;
+}
+
 interface StagedBlock {
   name: string;
   bytes: number;
@@ -87,12 +92,75 @@ describe('scanColdCache', () => {
     expect(Math.abs((info.newestMtime as number) - (now - 0.5 * DAY_MS))).toBeLessThan(2000);
   });
 
+  it('accounts sidecars separately but inside the quota total', () => {
+    const now = Date.now();
+    stage(now);
+    // Two sidecars, aged into distinct buckets, plus near-miss names that must
+    // be ignored: an unknown group label and the `kv` label (a KV object is
+    // only ever the bare 64-hex form).
+    const gdn = join(root, sidecarName(5, 'gdn_state'));
+    writeFileSync(gdn, Buffer.alloc(7));
+    const gdnWhen = new Date(now - 0.5 * DAY_MS);
+    utimesSync(gdn, gdnWhen, gdnWhen);
+
+    const win = join(root, sidecarName(6, 'sliding_window'));
+    writeFileSync(win, Buffer.alloc(3));
+    const winWhen = new Date(now - 10 * DAY_MS);
+    utimesSync(win, winWhen, winWhen);
+
+    writeFileSync(join(root, `${'0'.repeat(63)}7.mamba_state.safetensors`), 'unknown-group');
+    writeFileSync(join(root, `${'0'.repeat(63)}8.kv.safetensors`), 'kv-is-never-an-infix');
+
+    const info = scanColdCache(root);
+    expect(info.entryCount).toBe(4); // blocks only
+    expect(info.sidecarCount).toBe(2);
+    expect(info.sidecarBytes).toBe(10);
+    expect(info.totalBytes).toBe(110); // 100 block bytes + 10 sidecar bytes
+    // Sidecars are evictable by mtime, so the preview histogram counts them.
+    expect(info.ageHistogram).toEqual([
+      { label: '<1d', count: 2, bytes: 17 },
+      { label: '1-7d', count: 1, bytes: 20 },
+      { label: '7-30d', count: 2, bytes: 33 },
+      { label: '>30d', count: 1, bytes: 40 },
+    ]);
+  });
+
+  it('clear and evict remove sidecars too, so none can outlive the quota view', () => {
+    const now = Date.now();
+    stage(now);
+    const fresh = join(root, sidecarName(5, 'gdn_state'));
+    writeFileSync(fresh, Buffer.alloc(7));
+    const freshWhen = new Date(now - 0.5 * DAY_MS);
+    utimesSync(fresh, freshWhen, freshWhen);
+
+    const stale = join(root, sidecarName(6, 'sliding_window'));
+    writeFileSync(stale, Buffer.alloc(3));
+    const staleWhen = new Date(now - 40 * DAY_MS);
+    utimesSync(stale, staleWhen, staleWhen);
+
+    expect(evictOlderThan(7, root)).toEqual({ removed: 3, freedBytes: 73 }); // 30 + 40 + 3
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+
+    expect(clearColdCache(root)).toEqual({ removed: 3, freedBytes: 37 }); // 10 + 20 + 7
+    expect(existsSync(fresh)).toBe(false);
+    for (const stranger of STRANGERS) expect(existsSync(join(root, stranger))).toBe(true);
+
+    const after = scanColdCache(root);
+    expect(after.entryCount).toBe(0);
+    expect(after.sidecarCount).toBe(0);
+    expect(after.totalBytes).toBe(0);
+    expect(after.sidecarBytes).toBe(0);
+  });
+
   it('reports exists:false and zero counts for a missing root', () => {
     const missing = join(root, 'does', 'not', 'exist');
     const info = scanColdCache(missing);
     expect(info.exists).toBe(false);
     expect(info.entryCount).toBe(0);
+    expect(info.sidecarCount).toBe(0);
     expect(info.totalBytes).toBe(0);
+    expect(info.sidecarBytes).toBe(0);
     expect(info.quotaBytes).toBe(0);
     expect(info.oldestMtime).toBeNull();
     expect(info.newestMtime).toBeNull();
