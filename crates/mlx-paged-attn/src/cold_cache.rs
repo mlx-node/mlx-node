@@ -1705,6 +1705,25 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
         .index
         .lock()
         .map_err(|_| "cold-cache index mutex poisoned".to_string())?;
+    // Refuse an impossible write BEFORE evicting anything. Both loop
+    // conditions below are insensitive to how much has already been reclaimed
+    // once `incoming` alone cannot fit: `total_bytes + incoming > quota` stays
+    // true at `total_bytes == 0`, and the free-space branch stays true even
+    // after every entry is gone. The loop would then evict the ENTIRE cache
+    // one LRU entry at a time and still return the same error, so a single
+    // oversized object (a gemma4 sliding sidecar runs to hundreds of MiB)
+    // against a small quota — or any write on a nearly-full disk — silently
+    // wipes a cache it was never able to join.
+    if incoming > shared.quota_bytes {
+        return Err(format!(
+            "cold-cache write of {incoming} bytes exceeds the {} byte quota",
+            shared.quota_bytes
+        ));
+    }
+    // Everything currently indexed is the most this eviction can ever reclaim.
+    if available.saturating_add(index.total_bytes) < shared.reserve_bytes.saturating_add(incoming) {
+        return Err("insufficient disk space for cold-cache write".to_string());
+    }
     let mut unclearable: Vec<ColdCacheKey> = Vec::new();
     while index.total_bytes.saturating_add(incoming) > shared.quota_bytes
         || available < shared.reserve_bytes.saturating_add(incoming)
@@ -3923,6 +3942,56 @@ mod tests {
         assert_eq!(manager.shared.index.lock().unwrap().total_bytes, one);
         assert_eq!(manager.load(key_b, fp), Some(block(key_b)));
         drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// An object that cannot fit the quota at all must be refused BEFORE the
+    /// LRU loop runs. Otherwise both loop conditions stay true no matter how
+    /// much is reclaimed, so the write evicts every entry in turn and then
+    /// fails anyway — destroying a warm cache on behalf of a write that could
+    /// never have joined it.
+    #[test]
+    fn oversized_write_is_refused_without_evicting_anything() {
+        let root = temp_root("evict-oversized-refused");
+        let fp = fingerprint();
+        let key_a = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[1], 0, 0);
+        let one = encode_block(&block(key_a)).unwrap().len() as u64;
+
+        // Quota admits the resident entry but is smaller than a second object,
+        // so `incoming` alone can never fit.
+        let manager = ColdCacheManager::open_at(root.clone(), one + one / 2, 0, 2).unwrap();
+        let base = Arc::new(AtomicU64::new(GIB));
+        install_space_override(&manager, &root, &base);
+
+        persist_block(&manager.shared, &block(key_a)).unwrap();
+        assert!(manager.contains(&key_a));
+
+        assert!(
+            evict_for_write(&manager.shared, one * 4).is_err(),
+            "a write larger than the whole quota must be refused"
+        );
+        assert!(
+            manager.contains(&key_a),
+            "the resident entry must survive a write that could never fit"
+        );
+        assert_eq!(manager.stats().evictions, 0);
+        assert_eq!(manager.shared.index.lock().unwrap().total_bytes, one);
+
+        // Same guarantee on the disk-space axis: reclaiming everything indexed
+        // still cannot clear the reserve floor, so nothing is evicted.
+        let space_root = temp_root("evict-oversized-space");
+        let roomy = ColdCacheManager::open_at(space_root.clone(), GIB, GIB, 2).unwrap();
+        let space = Arc::new(AtomicU64::new(0));
+        install_space_override(&roomy, &space_root, &space);
+        assert!(
+            evict_for_write(&roomy.shared, one).is_err(),
+            "a hopeless free-space request must be refused up front"
+        );
+        assert_eq!(roomy.stats().evictions, 0);
+
+        drop(roomy);
+        drop(manager);
+        let _ = fs::remove_dir_all(space_root);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -5146,6 +5146,18 @@ impl PagedKVCacheAdapter {
         // the model's own caches carried it across the turn boundary, exactly
         // as the partial trailing block carried the K/V. Nothing to prime.
         self.aux_prefix_unbacked = false;
+        // By the same argument the restore walk's sidecar is spent: a live
+        // continuation needs no install, so anything still here belongs to the
+        // turn that just ended. A family whose install runs AFTER its in-memory
+        // sources (gemma4 checks live / last_history / checkpoint first) can
+        // leave one untaken, and gemma4's install accepts a strictly shallower
+        // `boundary <= cached_prefix_len` — so without this clear, a stale
+        // boundary from the previous turn is installable on the next one. That
+        // is currently harmless only because `starts_with` above makes the old
+        // boundary a genuine token prefix and the caller replays the delta;
+        // honour the field's own "cleared at the start of every request"
+        // contract rather than leaning on two unrelated invariants.
+        self.restored_sidecar = None;
         #[cfg(target_os = "macos")]
         {
             self.clear_attention_inputs_caches();

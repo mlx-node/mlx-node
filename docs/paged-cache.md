@@ -124,11 +124,22 @@ is the `gdn_checkpoint_target` (the largest full block strictly before the end o
 prompt), and the recurrent state is only materialized there when the prefill **splits**
 at that offset. So when a GDN cold policy is attached, `paged_prefill` forces that one
 split even under the default single-shot chunk size
-(`Qwen35Inner::cold_gdn_prefill_chunk_size`); the split is numerically transparent
-(each attention query still attends over the whole cumulative range), which the
-restart-parity gate confirms by matching the persist-on output to the persist-off
-baseline byte-for-byte. Capture is text-only in v1 and never anchors deeper than the
-K/V chain actually reached (`cold_captured_blocks`).
+(`Qwen35Inner::cold_gdn_prefill_chunk_size`).
+
+Be precise about what that split costs. It is **mathematically equivalent, not
+bit-identical**: every attention query still attends over the whole cumulative range,
+but the GDN scan runs as two launches instead of one, so the running state takes an
+extra bf16 round trip at the boundary and the reduction order changes. That is the
+same tradeoff vLLM mandates for `mamba_cache_mode == "align"`, which hard-requires
+chunked prefill (`model_executor/models/config.py`) and is the regime Qwen3-Next runs
+in — so it is the reference design rather than an invention. It does mean the split is
+taken as soon as a policy is attached, i.e. on the FIRST persist-enabled run, before
+anything has ever been restored. The restart-parity gate matched persist-on against
+the persist-off baseline byte-for-byte on the gated checkpoints, which **bounds** the
+divergence rather than proving it is absent at every prompt length.
+
+Capture is text-only in v1 and never anchors deeper than the K/V chain actually
+reached (`cold_captured_blocks`).
 
 `qwen3_5_moe` shares the identical GDN state type, sidecar module, and capture/replay
 helpers, driven through `Qwen3_5MoeConfig::to_dense_config()`. That projection is safe
