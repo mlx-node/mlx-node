@@ -698,6 +698,23 @@ mod tests {
         (keys, values)
     }
 
+    /// K/V for tokens `start ..= start + len - 1`, one value per token, so a
+    /// readback names the tokens it contains. Values are `10x` the keys, which
+    /// catches a K/V swap.
+    fn ramp_kv(start: i64, len: i64) -> (MxArray, MxArray) {
+        let keys: Vec<f32> = (start..start + len).map(|token| token as f32).collect();
+        let values: Vec<f32> = keys.iter().map(|key| key * 10.0).collect();
+        (
+            MxArray::from_float32(&keys, &[1, 1, len, 1]).unwrap(),
+            MxArray::from_float32(&values, &[1, 1, len, 1]).unwrap(),
+        )
+    }
+
+    fn read_f32(arr: &MxArray) -> Vec<f32> {
+        arr.eval();
+        arr.to_float32().unwrap().to_vec()
+    }
+
     fn assert_shape(arr: &MxArray, expected: &[i64]) {
         let shape = arr.shape().unwrap();
         assert_eq!(shape.len(), expected.len(), "Shape dimension mismatch");
@@ -1077,5 +1094,230 @@ mod tests {
         let (restored_tail, _) = restored.fetch_current_kv().unwrap();
         assert_float_data(&source_tail, &[5.0, 6.0, 7.0, 8.0]);
         assert_float_data(&restored_tail, &[5.0, 6.0, 7.0, 8.0]);
+    }
+
+    /// A boundary SHORTER than the window restores a PRE-WRAP cache:
+    /// `idx == cached_tokens < max_size`. That is the state a natural prefill
+    /// of the same length leaves behind, not a truncated one — the two must be
+    /// indistinguishable, including the write index the next append uses.
+    ///
+    /// This is the shape the gemma4 cold sidecar installs for a sub-window
+    /// chat prompt, which is the common case.
+    #[test]
+    fn test_sub_window_snapshot_restores_pre_wrap_state() {
+        const WINDOW: i32 = 1024;
+        const BOUNDARY: i64 = 512;
+
+        let mut natural = RotatingKVCache::new(WINDOW, None);
+        let (prompt_keys, prompt_values) = ramp_kv(1, BOUNDARY);
+        natural
+            .update_and_fetch(&prompt_keys, &prompt_values)
+            .unwrap();
+
+        let snapshot = natural.snapshot().unwrap().unwrap();
+        assert_eq!(snapshot.offset, BOUNDARY as i32);
+        assert_eq!(snapshot.max_size, WINDOW);
+        assert_eq!(snapshot.keep, 0);
+        assert_eq!(
+            snapshot.cached_tokens, BOUNDARY as i32,
+            "a sub-window boundary carries min(offset, window) == offset rows"
+        );
+        assert!(
+            snapshot.cached_tokens < WINDOW,
+            "this test is only meaningful for a PRE-WRAP snapshot"
+        );
+
+        let mut restored = RotatingKVCache::new(WINDOW, None);
+        restored.restore_snapshot(&snapshot).unwrap();
+
+        assert_eq!(
+            restored.state().unwrap(),
+            natural.state().unwrap(),
+            "restored logical state must match the natural prefill"
+        );
+        assert_eq!(restored.get_idx(), BOUNDARY as i32);
+        assert_eq!(
+            restored.get_idx(),
+            restored.get_cached_token_count().unwrap(),
+            "pre-wrap: the write index sits at the end of the cached run"
+        );
+
+        let (natural_tail, natural_tail_values) = natural.fetch_current_kv().unwrap();
+        let (restored_tail, restored_tail_values) = restored.fetch_current_kv().unwrap();
+        let expected_prompt: Vec<f32> = (1..=BOUNDARY).map(|token| token as f32).collect();
+        assert_eq!(read_f32(&natural_tail), expected_prompt);
+        assert_eq!(read_f32(&restored_tail), expected_prompt);
+        assert_eq!(
+            read_f32(&restored_tail_values),
+            read_f32(&natural_tail_values)
+        );
+
+        // One decode step on each. The restored cache must grow its backing
+        // store and write at the same slot the natural one does.
+        let (next_keys, next_values) = ramp_kv(BOUNDARY + 1, 1);
+        let natural_view = natural.update_and_fetch(&next_keys, &next_values).unwrap();
+        let restored_view = restored.update_and_fetch(&next_keys, &next_values).unwrap();
+
+        let expected_view: Vec<f32> = (1..=BOUNDARY + 1).map(|token| token as f32).collect();
+        assert_eq!(read_f32(&natural_view[0]), expected_view);
+        assert_eq!(read_f32(&restored_view[0]), expected_view);
+        assert_eq!(
+            read_f32(&restored_view[1]),
+            read_f32(&natural_view[1]),
+            "value view must match too"
+        );
+
+        assert_eq!(natural.state().unwrap(), restored.state().unwrap());
+        assert_eq!(restored.get_offset(), BOUNDARY as i32 + 1);
+        assert_eq!(restored.get_idx(), BOUNDARY as i32 + 1);
+    }
+
+    /// THE pre-wrap restore hazard.
+    ///
+    /// `idx == cached_tokens < max_size` is a shape the cold-install path never
+    /// produced before sub-window boundaries became representable. A wrong
+    /// `idx` decodes correctly for hundreds of tokens and only then rotates at
+    /// the wrong offset, so a short end-to-end run cannot catch it. Drive a
+    /// restored-at-512 cache PAST the 1024 window and require, at every step:
+    ///
+    ///  * identical logical state to a cache that never stopped;
+    ///  * an identical raw attention view (which after the wrap is the ROTATED
+    ///    buffer, so the wrap slot itself is compared);
+    ///  * a temporal window equal to an independent oracle — the last
+    ///    `min(offset, window)` tokens — so both caches being wrong the same
+    ///    way still fails.
+    ///
+    /// The restored cache is driven through the SAME two stages the sidecar
+    /// install leads to, in order:
+    ///
+    ///  1. a MULTI-token append covering the rest of the prompt. This is the
+    ///     only stage that reads the restored `idx` — `temporal_order` orders
+    ///     the stored rows by it. The single-token path cannot stand in: its
+    ///     `needs_grow` branch overwrites `idx` with `offset` before the first
+    ///     write, which would mask a wrong restored index.
+    ///  2. single-token decode across the window edge.
+    ///
+    /// The reference cache reaches the same point by a genuinely different
+    /// history — one unbroken prompt prefill — so agreement is a real claim,
+    /// not a replay of the same calls.
+    #[test]
+    fn test_sub_window_restore_wraps_like_an_uninterrupted_cache() {
+        const WINDOW: i64 = 1024;
+        const BOUNDARY: i64 = 512;
+        const PROMPT: i64 = 600;
+        const TOTAL: i64 = 1100;
+
+        // Reference: the whole prompt in one prefill, no restore anywhere.
+        let mut natural = RotatingKVCache::new(WINDOW as i32, None);
+        let (prompt_keys, prompt_values) = ramp_kv(1, PROMPT);
+        let natural_prefill = natural
+            .update_and_fetch(&prompt_keys, &prompt_values)
+            .unwrap();
+
+        // Under test: a sidecar-shaped restore at a sub-window boundary, then
+        // the remaining prompt tokens as a continuation chunk.
+        let mut source = RotatingKVCache::new(WINDOW as i32, None);
+        let (cached_keys, cached_values) = ramp_kv(1, BOUNDARY);
+        source
+            .update_and_fetch(&cached_keys, &cached_values)
+            .unwrap();
+        let snapshot = source.snapshot().unwrap().unwrap();
+        assert!(snapshot.cached_tokens < WINDOW as i32);
+
+        let mut restored = RotatingKVCache::new(WINDOW as i32, None);
+        restored.restore_snapshot(&snapshot).unwrap();
+
+        let (rest_keys, rest_values) = ramp_kv(BOUNDARY + 1, PROMPT - BOUNDARY);
+        let restored_prefill = restored.update_and_fetch(&rest_keys, &rest_values).unwrap();
+
+        let expected_prompt: Vec<f32> = (1..=PROMPT).map(|token| token as f32).collect();
+        assert_eq!(
+            read_f32(&natural_prefill[0]),
+            expected_prompt,
+            "reference prefill view"
+        );
+        assert_eq!(
+            read_f32(&restored_prefill[0]),
+            expected_prompt,
+            "continuation over a restored sub-window prefix must expose the WHOLE prompt"
+        );
+        assert_eq!(
+            read_f32(&restored_prefill[1]),
+            read_f32(&natural_prefill[1]),
+            "continuation value view must match the reference"
+        );
+        assert_eq!(
+            natural.state().unwrap(),
+            restored.state().unwrap(),
+            "restore + continuation must land on the reference state"
+        );
+
+        for token in (PROMPT + 1)..=TOTAL {
+            let (keys, values) = ramp_kv(token, 1);
+            let natural_view = natural.update_and_fetch(&keys, &values).unwrap();
+            let restored_view = restored.update_and_fetch(&keys, &values).unwrap();
+
+            assert_eq!(
+                natural.state().unwrap(),
+                restored.state().unwrap(),
+                "logical state diverged at token {token}"
+            );
+            assert_eq!(
+                read_f32(&restored_view[0]),
+                read_f32(&natural_view[0]),
+                "raw key view diverged at token {token}"
+            );
+            assert_eq!(
+                read_f32(&restored_view[1]),
+                read_f32(&natural_view[1]),
+                "raw value view diverged at token {token}"
+            );
+
+            // Independent oracle, not a cross-check: at offset `token` the
+            // window holds exactly the last min(token, WINDOW) tokens.
+            let cached = token.min(WINDOW);
+            let expected_keys: Vec<f32> = ((token - cached + 1)..=token)
+                .map(|token| token as f32)
+                .collect();
+            let expected_values: Vec<f32> = expected_keys.iter().map(|key| key * 10.0).collect();
+            let (restored_tail, restored_tail_values) = restored.fetch_current_kv().unwrap();
+            assert_eq!(
+                read_f32(&restored_tail),
+                expected_keys,
+                "temporal key window wrong at token {token}"
+            );
+            assert_eq!(
+                read_f32(&restored_tail_values),
+                expected_values,
+                "temporal value window wrong at token {token}"
+            );
+
+            // The wrap itself: the WINDOW-th token still fills the last slot,
+            // and only the next one rotates back to slot 0 (keep == 0).
+            if token == WINDOW {
+                assert_eq!(
+                    restored.get_idx(),
+                    WINDOW as i32,
+                    "cache must not rotate before it is full"
+                );
+            }
+            if token == WINDOW + 1 {
+                assert_eq!(
+                    restored.get_idx(),
+                    1,
+                    "first post-window token must land in slot 0"
+                );
+            }
+        }
+
+        assert_eq!(restored.get_offset(), TOTAL as i32);
+        assert_eq!(natural.get_offset(), TOTAL as i32);
+        assert_eq!(
+            restored.get_idx(),
+            (TOTAL - WINDOW) as i32,
+            "write index must be exactly the post-wrap distance"
+        );
+        assert_eq!(restored.get_idx(), natural.get_idx());
+        assert_eq!(restored.get_cached_token_count().unwrap(), WINDOW as i32);
     }
 }

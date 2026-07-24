@@ -104,6 +104,36 @@ pub const DEFAULT_PROMPT: &str = "Please explain, in a few clear sentences, how 
     process restart, and what tradeoffs an engineer should weigh when choosing the \
     block size for such a cache.";
 
+/// What the RESTORE instance (instance 2) did, handed to a family's
+/// [`ColdTierParitySpec::with_restore_inspector`] callback.
+///
+/// The shared gate can only see `ChatResult`, which says *how much* prefix came
+/// back but nothing about *what backed it*. A hybrid family's interesting claim
+/// lives one level down — which auxiliary source primed the sliding/recurrent
+/// half, and whether any replay was still paid — and the only place that is
+/// observable from outside the crate is the inference-trace channel. So the
+/// harness slices the trace to exactly instance 2's turn and hands it over; the
+/// family decides what the lines have to say.
+pub struct RestoreObservation<'a> {
+    pub family: &'a str,
+    /// Instance 2's result. `cached_tokens` is the adapter's
+    /// `cached_token_count` verbatim.
+    pub result: &'a ChatResult,
+    /// Everything appended to `MLX_INFERENCE_TRACE_FILE` while instance 2 ran.
+    ///
+    /// EMPTY when the trace channel is not configured (`MLX_INFERENCE_TRACE` /
+    /// `MLX_INFERENCE_TRACE_FILE` unset, or latched off earlier in this
+    /// process). An inspector that needs the channel must say so itself — the
+    /// harness deliberately does not turn tracing on for families that did not
+    /// ask, because every other family's gate would then run instrumented.
+    pub trace: &'a str,
+}
+
+/// See [`ColdTierParitySpec::with_restore_inspector`]. Boxed rather than a
+/// generic parameter so adding one does not change `run_restart_parity`'s
+/// signature for the families that pass none.
+pub type RestoreInspector = Box<dyn Fn(&RestoreObservation<'_>) + Send + Sync>;
+
 /// Per-family knobs for [`run_restart_parity`].
 ///
 /// Everything here is a *fixture* dial. The gate's assertions themselves are
@@ -140,15 +170,22 @@ pub struct ColdTierParitySpec {
     /// refuses, so a single turn only ever persists the first handful of
     /// blocks no matter how long the prompt is. Blocks already on disk are
     /// `contains`-skipped without re-enqueueing, so each further turn advances
-    /// the frontier by another queue's worth. A family whose auxiliary state
-    /// is only representable at a deep boundary (gemma4's sliding sidecar
-    /// needs a whole `sliding_window`) therefore cannot reach that boundary in
-    /// one turn, and would fail the gate for a reason that has nothing to do
-    /// with its restore path.
+    /// the frontier by another queue's worth. A family whose auxiliary state is
+    /// only anchored at a deep boundary (gemma4's long-prompt gate targets the
+    /// decode-cadence checkpoint at one whole `sliding_window`) therefore
+    /// cannot reach that boundary in one turn, and would fail the gate for a
+    /// reason that has nothing to do with its restore path.
     ///
     /// Warm-up turns are neither compared nor asserted on — the three measured
     /// instances below are unchanged.
     pub capture_warmup_turns: usize,
+    /// Optional family-specific assertion over the RESTORE instance, run after
+    /// the shared engagement/soundness checks and before the parity checks.
+    ///
+    /// `None` for every family that ships one — they are fully covered by the
+    /// fixed assertions — so this is inert by default and no existing gate's
+    /// behaviour changes.
+    pub inspect_restore: Option<RestoreInspector>,
 }
 
 impl ColdTierParitySpec {
@@ -165,6 +202,7 @@ impl ColdTierParitySpec {
             thinking_token_budget: Some(32),
             min_restored_tokens: None,
             capture_warmup_turns: 0,
+            inspect_restore: None,
         }
     }
 
@@ -202,6 +240,17 @@ impl ColdTierParitySpec {
     /// See [`Self::capture_warmup_turns`].
     pub fn with_capture_warmup_turns(mut self, turns: usize) -> Self {
         self.capture_warmup_turns = turns;
+        self
+    }
+
+    /// Add a family-specific assertion over the restore instance. See
+    /// [`RestoreObservation`]; the callback is expected to panic on failure,
+    /// like every other assertion in this gate.
+    pub fn with_restore_inspector<F>(mut self, inspect: F) -> Self
+    where
+        F: Fn(&RestoreObservation<'_>) + Send + Sync + 'static,
+    {
+        self.inspect_restore = Some(Box::new(inspect));
         self
     }
 
@@ -402,6 +451,47 @@ fn assert_text_eq(label_a: &str, a: &str, label_b: &str, b: &str) {
     }
 }
 
+/// The inference-trace sink, when the caller configured one.
+///
+/// `mlx_core::inference_trace` appends every `[MLX_TRACE]` line to this file,
+/// so byte offsets into it delimit turns: snapshot the length before an
+/// instance runs and everything after that offset belongs to it. Only read
+/// when a family passed a [`RestoreInspector`]; otherwise the harness never
+/// touches tracing at all.
+fn inference_trace_path() -> Option<PathBuf> {
+    let raw = std::env::var("MLX_INFERENCE_TRACE_FILE").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+/// Current length of the trace file, or 0 when there is no file yet.
+fn inference_trace_len(path: Option<&Path>) -> u64 {
+    path.and_then(|p| fs::metadata(p).ok())
+        .map(|meta| meta.len())
+        .unwrap_or(0)
+}
+
+/// Everything appended to the trace file since `offset`.
+///
+/// Lossy UTF-8 rather than a hard error: this feeds an assertion message, and
+/// a torn multi-byte tail must never turn a real restore result into an
+/// unrelated panic.
+fn inference_trace_since(path: Option<&Path>, offset: u64) -> String {
+    let Some(path) = path else {
+        return String::new();
+    };
+    let Ok(bytes) = fs::read(path) else {
+        return String::new();
+    };
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
+}
+
 /// Where the tier root came from, so cleanup only removes what we created.
 enum ColdRoot {
     /// `MLX_COLD_CACHE_DIR` was already set; caller owns the directory.
@@ -525,12 +615,21 @@ where
 
     let stats_before = cold_cache_stats_snapshot();
 
+    // Only families that asked for an inspector pay any attention to tracing;
+    // for everyone else these stay `None`/0 and nothing is read.
+    let trace_path = spec
+        .inspect_restore
+        .as_ref()
+        .and_then(|_| inference_trace_path());
+    let trace_offset = inference_trace_len(trace_path.as_deref());
+
     // Instance 2: fresh model (empty in-memory hot cache) standing in for a
     // process restart. Its `find_cached_prefix*` must miss the hot cache and
     // restore the persisted prefix from the cold tier.
     let result_b = turn(&persist_dir)
         .await
         .unwrap_or_else(|e| panic!("[{}] instance 2 (restore) failed: {e}", spec.family));
+    let restore_trace = inference_trace_since(trace_path.as_deref(), trace_offset);
     eprintln!(
         "[{}] instance 2 (restart, restore): num_tokens={} cached={} finish={}",
         spec.family, result_b.num_tokens, result_b.cached_tokens, result_b.finish_reason
@@ -601,6 +700,19 @@ where
         after.evictions,
         after.corruptions
     );
+
+    // ---- 2b. Family-specific view of the restore -------------------------
+    // Runs after the shared checks (so a plain "nothing restored" failure
+    // reports itself first, in the words every family shares) and before
+    // parity (so a family that can name *why* the restore is wrong gets to
+    // say it before a text diff does).
+    if let Some(inspect) = spec.inspect_restore.as_ref() {
+        inspect(&RestoreObservation {
+            family: spec.family,
+            result: &result_b,
+            trace: &restore_trace,
+        });
+    }
 
     // ---- 3. Byte-for-byte greedy parity ----------------------------------
     assert_text_eq(

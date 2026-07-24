@@ -89,19 +89,55 @@ latches that case, and `record_tokens` / `register_full_blocks_for_reuse*` /
 `values`, layer-major, bf16, via `to_uint16_native` / `from_bfloat16` so no f32 round
 trip happens.
 
-Because `ColdSidecarPolicy` fixes every layout field except `boundary_tokens`, the
-payload length must be boundary-invariant — and a rotating cache holds
-`min(offset, window)` tokens. So a boundary is only representable when it is a
-positive multiple of the block size **and at least one whole `sliding_window`**.
-Shallower boundaries are skipped on both sides rather than padded;
-`RotatingKVCache::restore_snapshot` would reject a pad anyway. Capture additionally
-refuses any non-bf16 cache (the snapshot type promises no dtype) and any media turn
-(v1), and never anchors deeper than the K/V chain actually reached
-(`PagedKVCacheAdapter::cold_captured_blocks`).
+A rotating cache holds `min(offset, window)` tokens, so the payload length varies
+below the window. That is a payload-format fact, **not** a hit rule, and the policy
+keeps the two apart: gemma4 builds its policy with
+`ColdSidecarPolicy::new_boundary_scaled(layout, 2)`, declaring the token axis of
+`[1, kv_heads, window, head_dim]` as the one that follows the boundary. So
+`expected_at(b)` stamps `dims[2] = min(b, window)` with `bytes_per_tensor` scaled to
+match, and `sliding_sidecar::layout_at` derives the identical value on the capture
+side. **Any** positive block-aligned boundary is representable — there is no window
+floor, and no sub-window boundary is skipped. What the layout pins down is a shape
+_rule_, not a byte count: group, dtype, tensor count and every non-declared dimension
+are still frozen by the policy, and only the one declared axis (with
+`bytes_per_tensor` following it) is a function of the boundary. Padding is still not
+an escape hatch: `RotatingKVCache::restore_snapshot` hard-checks
+`cached_tokens == min(offset, max_size)`, which is exactly what a sub-window payload
+carries, so it is a first-class pre-wrap state rather than a pad or a truncation.
 
-For gemma4 the sidecar is an **optimization, not a correctness prerequisite**: when
-it is absent, `run_sliding_only_prefill` recomputes the missing sliding state from
-token ids. The sidecar removes that replay cost.
+At and above the window the scaling rule is the identity (`min(b, window) == window`),
+so sidecars written before the axis existed still compare equal — **no fingerprint or
+on-disk format change**. The window floor previously made the sidecar inert: gemma4's
+real window is 1024 and typical chat prompts are shorter, so nothing was ever backed
+while capture still wrote K/V blocks no restore could read back.
+
+Capture additionally refuses any non-bf16 cache (the snapshot type promises no dtype)
+and any media turn (v1), and never anchors deeper than the K/V chain actually reached
+(`PagedKVCacheAdapter::cold_captured_blocks`). It also only anchors where an
+in-memory checkpoint already sits, and below one window the sole such anchor is the
+prompt-boundary checkpoint (above a window the decode cadence supplies its own).
+Where that one *lands* decides whether anything can use it. A prefill over `N`
+tokens stores exactly one, and restore asks for at most `N - 1` tokens:
+
+| prompt length          | checkpoint lands at            | usable |
+| ---------------------- | ------------------------------ | ------ |
+| `N % block_size != 0`  | `floor(N / block_size) * bs`   | yes    |
+| `N % block_size == 0`  | `N` — one block out of reach   | no     |
+
+So with `block_size = 16` a 500-token prompt anchors at 496 while a 512-token one
+anchors at 512 and gets nothing. A capture that finds no usable anchor traces
+`sliding_cold_sidecar_capture_skipped` rather than looking like a working cache.
+
+For gemma4 the sidecar is an **optimization, not a correctness prerequisite**, and
+that is precisely what licenses scaling the boundary: a sliding window is a
+_windowed_ state, so when the sidecar is absent — or is only representable shallower
+than the K/V prefix — `run_sliding_only_prefill` reconstructs the missing rows from
+token ids exactly, and the sidecar only buys back that replay. Contrast qwen3_5:
+a GDN recurrent state is a running summary of every preceding token, valid ONLY at
+the exact boundary it was produced at, and recomputing it is mathematically
+equivalent but not bit-identical (see below). That asymmetry is the whole reason the
+scaled axis is gemma4's alone — `ColdSidecarPolicy::new` stays unscaled and qwen3_5 /
+qwen3_5_moe are untouched.
 
 ### qwen3_5's GDN recurrent-state sidecar
 
@@ -176,17 +212,39 @@ MLX_COLD_CACHE_DIR=$(mktemp -d) \
   cargo test -p mlx-core --test qwen3_5_moe_cold_tier_parity -- --ignored --test-threads=1 --nocapture
 ```
 
-A gate on a large checkpoint is slow — the 26B gemma4 run takes ~66 min and the 35B
-MoE ~26 min, because a checkpoint with no `.mlx-download-complete.json` marker
-full-shard-hashes its weights on every one of the harness's fresh loads.
+A gate on a large checkpoint is slow — the 26B gemma4 run takes ~66 min for the
+long-prompt gate alone and the 35B MoE ~26 min, because a checkpoint with no
+`.mlx-download-complete.json` marker full-shard-hashes its weights on every one of
+the harness's fresh loads.
 
-The gemma4 gate deliberately uses a prompt several thousand tokens long. The shared
-`DEFAULT_PROMPT` is below the 1024-token sliding window, so under the
-`boundary >= window` rule it would restore zero sidecar-backed prefix and still pass
-on the K/V path alone — flipping an allowlist entry on evidence that never touched
-the sliding code. With a policy installed, a non-zero `cached_tokens` in a _freshly
-loaded_ instance (empty hot cache) can only come from a validated sidecar, so the
-gate's restore floor is raised to one whole window.
+The structural fact both gemma4 gates rest on: with a `ColdSidecarPolicy` installed, a
+non-zero `cached_tokens` in a _freshly loaded_ instance (empty hot cache) can only
+have come from a validated sidecar. `gemma4_cold_tier_parity.rs` therefore runs **two**
+gates, one per side of `min(boundary, window)`:
+
+| gate                                            | prompt        | restored rotating state                        |
+| ----------------------------------------------- | ------------- | ---------------------------------------------- |
+| `gemma4_cold_tier_restart_parity`               | ~1.2k tokens  | post-wrap: a full window, `idx` inside the ring |
+| `gemma4_cold_tier_restart_parity_sub_window`    | ~350 tokens   | pre-wrap: `boundary` rows                       |
+
+The long-prompt one keeps a `min_restored_tokens` floor of one whole window so it
+stays in the `>= window` regime rather than quietly duplicating its sibling; that
+floor is a statement about its fixture, not about what the layout can express. The
+sub-window one adds the assertions `ChatResult` cannot carry — that the restored
+sidecar backs exactly `cached_token_count` (so `aux_prefix_unbacked` never latches)
+and that zero tokens were replayed — read off the `[MLX_TRACE]`
+`sliding_prefix_prepare_done` / `paged_prefill_sliding_prefix_skipped` lines, which
+is the only place that decision is observable from outside the crate. It reads that
+channel rather than turning it on, so run it with `MLX_INFERENCE_TRACE=1` and
+`MLX_INFERENCE_TRACE_FILE=...` supplied by the invocation — the module doc carries
+the full command.
+
+Witnessed on `Gemma-4-26B-A4B-IT-UD-Q3_K_XL-mlx`: `boundary=320` (well under the
+1024 window), `replay_delta=0`, sliding prefill skipped as `already_primed`, restart
+`cached=320` against `cached=0` on the persist-off baseline, `hits=120 misses=0
+corruptions=0`, text and `num_tokens` identical across all three instances. The
+~69 MB written against a ~200 MB full-window payload is the scaled axis doing its
+job.
 
 The tier manager is a process-global `OnceLock`, so every family gate is `#[ignore]`d
 and must run with `--test-threads=1`.

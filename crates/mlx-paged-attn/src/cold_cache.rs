@@ -350,9 +350,29 @@ impl ColdSidecarLayout {
 /// `boundary_tokens` is deliberately NOT part of a policy — it is the one
 /// layout field that varies per candidate — so [`Self::new`] normalizes it to
 /// zero and [`Self::expected_at`] stamps the candidate boundary in.
+///
+/// A boundary may ALSO scale exactly one declared `dims` axis
+/// ([`Self::new_boundary_scaled`]), for a family whose payload carries
+/// `min(boundary, extent)` rows rather than a fixed count — gemma4's rotating
+/// sliding window, which holds `min(offset, window)` tokens. A scaled axis is
+/// a PAYLOAD-FORMAT property and NEVER a hit rule: it says how many bytes a
+/// sidecar at a given boundary carries, and says nothing about which
+/// boundaries are eligible. Eligibility stays entirely with the caller's own
+/// representability check and with the restore walk's reconcile-down. That is
+/// the separation vLLM keeps in `vllm/v1/core/single_type_kv_cache_manager.py`
+/// between `SlidingWindowManager::find_longest_cache_hit` (hit discipline,
+/// which explicitly accepts a prefix-anchored sub-window run) and
+/// `reachable_block_mask` (retention discipline): neither dictates the other,
+/// and neither is inferred from the payload's shape.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColdSidecarPolicy {
     layout: ColdSidecarLayout,
+    /// Index into `layout.dims` whose extent tracks the candidate boundary,
+    /// or `None` when the payload is boundary-invariant (every family but
+    /// gemma4 today). `Some(axis)` is only ever produced by
+    /// [`Self::new_boundary_scaled`], which pre-validates it so
+    /// [`Self::expected_at`] cannot fail.
+    boundary_scaled_axis: Option<usize>,
 }
 
 impl ColdSidecarPolicy {
@@ -360,6 +380,9 @@ impl ColdSidecarPolicy {
     /// any geometry a sidecar could never legally be written with, so an
     /// impossible policy cannot be installed and then silently suppress every
     /// restore forever.
+    ///
+    /// The resulting policy is boundary-INVARIANT: [`Self::expected_at`]
+    /// varies `boundary_tokens` and nothing else.
     pub fn new(layout: ColdSidecarLayout) -> Result<Self, String> {
         layout.validate_geometry()?;
         Ok(Self {
@@ -367,6 +390,42 @@ impl ColdSidecarPolicy {
                 boundary_tokens: 0,
                 ..layout
             },
+            boundary_scaled_axis: None,
+        })
+    }
+
+    /// Build a policy whose `dims[axis]` — and, proportionally,
+    /// `bytes_per_tensor` — follow the candidate boundary, clamped at the
+    /// template's own extent.
+    ///
+    /// Everything [`Self::new`] rejects is rejected here too, plus the three
+    /// facts that make [`Self::expected_at`] INFALLIBLE: the axis is in range,
+    /// its extent is non-zero, and it divides `bytes_per_tensor` evenly (so
+    /// the per-row byte cost is exact and the scaled length can never be a
+    /// rounded approximation of the payload a capture would write).
+    pub fn new_boundary_scaled(layout: ColdSidecarLayout, axis: usize) -> Result<Self, String> {
+        layout.validate_geometry()?;
+        let Some(&extent) = layout.dims.get(axis) else {
+            return Err(
+                "cold-cache sidecar boundary-scaled axis is outside the layout dims".to_string(),
+            );
+        };
+        // `validate_geometry` already refuses a zero dim; restated so the
+        // division below stays obviously safe if that ever loosens.
+        if extent == 0 {
+            return Err("cold-cache sidecar boundary-scaled axis must be positive".to_string());
+        }
+        if !layout.bytes_per_tensor.is_multiple_of(extent as usize) {
+            return Err(
+                "cold-cache sidecar boundary-scaled axis must divide bytes_per_tensor".to_string(),
+            );
+        }
+        Ok(Self {
+            layout: ColdSidecarLayout {
+                boundary_tokens: 0,
+                ..layout
+            },
+            boundary_scaled_axis: Some(axis),
         })
     }
 
@@ -380,11 +439,32 @@ impl ColdSidecarPolicy {
     /// [`ColdCacheManager::load_sidecar`] compares layouts for equality, so a
     /// sidecar recorded at a different boundary, dtype, or tensor shape is a
     /// miss rather than a reinterpretation of its bytes.
+    ///
+    /// With a boundary-scaled axis the shallow end also shrinks the payload:
+    /// `dims[axis] = min(boundary_tokens, template_extent)` and
+    /// `bytes_per_tensor` scales with it. At and above the template extent the
+    /// rule is the IDENTITY, so a policy that gains a scaled axis keeps
+    /// describing every sidecar written before it existed — no fingerprint or
+    /// on-disk format change. At `boundary_tokens == 0` it yields a zero-length
+    /// payload, which [`ColdSidecar::validate`] already refuses to write and no
+    /// stored sidecar can match: the fail-closed direction.
     pub fn expected_at(&self, boundary_tokens: u32) -> ColdSidecarLayout {
-        ColdSidecarLayout {
+        let mut layout = ColdSidecarLayout {
             boundary_tokens,
             ..self.layout.clone()
+        };
+        if let Some(axis) = self.boundary_scaled_axis {
+            // `new_boundary_scaled` pinned the axis in range with a non-zero
+            // extent that divides `bytes_per_tensor`, so both operations below
+            // are total. `scaled <= extent` keeps the product bounded by
+            // `bytes_per_tensor`, so it cannot overflow either.
+            let extent = self.layout.dims[axis];
+            let scaled = boundary_tokens.min(extent);
+            layout.dims[axis] = scaled;
+            layout.bytes_per_tensor =
+                self.layout.bytes_per_tensor / extent as usize * scaled as usize;
         }
+        layout
     }
 }
 
@@ -2635,6 +2715,141 @@ mod tests {
                 num_layers: 0,
                 ..sidecar_layout(ColdGroup::GdnState)
             })
+            .is_err()
+        );
+    }
+
+    /// CONTROL for the boundary-scaled axis, and the `qwen3_5` /
+    /// `qwen3_5_moe` no-change proof: those families build their policy with
+    /// [`ColdSidecarPolicy::new`], whose `expected_at` stamps the candidate
+    /// boundary and NOTHING else. `dims` and `bytes_per_tensor` stay frozen at
+    /// the template's values at every boundary, shallow or deep, so their
+    /// restore walk keeps probing exactly the layouts it probes today.
+    ///
+    /// This test must be green both BEFORE and AFTER a scaled axis exists.
+    #[test]
+    fn unscaled_policy_stamps_the_boundary_and_nothing_else() {
+        let template = sidecar_layout(ColdGroup::GdnState);
+        let policy =
+            ColdSidecarPolicy::new(template.clone()).expect("a legal geometry must build a policy");
+        for boundary in [1u32, 16, 17, 32, 512, 4096, u32::MAX] {
+            let expected = policy.expected_at(boundary);
+            assert_eq!(
+                expected,
+                ColdSidecarLayout {
+                    boundary_tokens: boundary,
+                    ..template.clone()
+                },
+                "an unscaled policy must vary only `boundary_tokens` (at {boundary})"
+            );
+            assert_eq!(expected.dims, template.dims);
+            assert_eq!(expected.bytes_per_tensor, template.bytes_per_tensor);
+        }
+    }
+
+    /// A rotating-window-shaped template: `[batch, kv_heads, window, head_dim]`
+    /// with the token axis at index 2, sized so `bytes_per_tensor` is the exact
+    /// bf16 byte count.
+    fn scaled_sidecar_layout() -> ColdSidecarLayout {
+        ColdSidecarLayout {
+            group: ColdGroup::SlidingWindow,
+            boundary_tokens: 0,
+            num_layers: 4,
+            tensors_per_layer: 2,
+            dtype: "BFloat16".to_string(),
+            dims: vec![1, 2, 1024, 4],
+            bytes_per_tensor: 2 * 1024 * 4 * 2,
+        }
+    }
+
+    /// BACKWARD-COMPAT PROOF, and the reason a scaled axis needs no
+    /// fingerprint or on-disk format bump: at and above the template extent
+    /// `min(b, extent) == extent`, so a scaled policy stamps byte-for-byte
+    /// what the unscaled one stamps, and every sidecar already on disk still
+    /// compares equal. Only BELOW the extent does anything move — and there,
+    /// nothing was ever written.
+    #[test]
+    fn boundary_scaled_policy_is_the_identity_at_and_above_the_template_extent() {
+        let template = scaled_sidecar_layout();
+        let scaled = ColdSidecarPolicy::new_boundary_scaled(template.clone(), 2)
+            .expect("a legal geometry with an in-range axis must build a policy");
+        let unscaled =
+            ColdSidecarPolicy::new(template.clone()).expect("the same geometry, unscaled");
+
+        for boundary in [1024u32, 1040, 2048, 65536, u32::MAX] {
+            assert_eq!(
+                scaled.expected_at(boundary),
+                unscaled.expected_at(boundary),
+                "scaling must be the identity at boundary {boundary}"
+            );
+            assert_eq!(scaled.expected_at(boundary).dims, template.dims);
+            assert_eq!(
+                scaled.expected_at(boundary).bytes_per_tensor,
+                template.bytes_per_tensor
+            );
+        }
+
+        // Below the extent exactly one axis moves, and the byte length moves
+        // with it — proportionally, never rounded.
+        let half = scaled.expected_at(512);
+        assert_eq!(half.boundary_tokens, 512);
+        assert_eq!(half.dims, vec![1, 2, 512, 4]);
+        assert_eq!(half.bytes_per_tensor, template.bytes_per_tensor / 2);
+        let quarter = scaled.expected_at(256);
+        assert_eq!(quarter.dims, vec![1, 2, 256, 4]);
+        assert_eq!(quarter.bytes_per_tensor, template.bytes_per_tensor / 4);
+        // Everything that is not the scaled axis stays geometry.
+        assert_eq!(half.group, template.group);
+        assert_eq!(half.num_layers, template.num_layers);
+        assert_eq!(half.tensors_per_layer, template.tensors_per_layer);
+        assert_eq!(half.dtype, template.dtype);
+
+        // A zero boundary yields an empty payload — refused by
+        // `ColdSidecar::validate`, and matched by no stored sidecar.
+        assert_eq!(scaled.expected_at(0).bytes_per_tensor, 0);
+    }
+
+    /// The three facts that make `expected_at` infallible are checked up
+    /// front, so an unusable scaled policy can never be installed and then
+    /// silently mis-size every probe.
+    #[test]
+    fn boundary_scaled_policy_refuses_an_unusable_axis() {
+        // Out of range: `dims` has 4 entries.
+        assert!(ColdSidecarPolicy::new_boundary_scaled(scaled_sidecar_layout(), 4).is_err());
+        assert!(
+            ColdSidecarPolicy::new_boundary_scaled(scaled_sidecar_layout(), usize::MAX).is_err()
+        );
+        // The extent must divide `bytes_per_tensor`, or the per-row cost —
+        // and so every scaled length — would be a rounded lie.
+        assert!(
+            ColdSidecarPolicy::new_boundary_scaled(
+                ColdSidecarLayout {
+                    bytes_per_tensor: 2 * 1024 * 4 * 2 + 1,
+                    ..scaled_sidecar_layout()
+                },
+                2,
+            )
+            .is_err()
+        );
+        // Every geometry bound `new` enforces still applies.
+        assert!(
+            ColdSidecarPolicy::new_boundary_scaled(
+                ColdSidecarLayout {
+                    group: ColdGroup::Kv,
+                    ..scaled_sidecar_layout()
+                },
+                2,
+            )
+            .is_err()
+        );
+        assert!(
+            ColdSidecarPolicy::new_boundary_scaled(
+                ColdSidecarLayout {
+                    dims: vec![1, 2, 0, 4],
+                    ..scaled_sidecar_layout()
+                },
+                2,
+            )
             .is_err()
         );
     }

@@ -2420,9 +2420,10 @@ impl Gemma4Inner {
     ///
     /// The boundary is the DEEPEST `B` that satisfies all of:
     ///
-    ///  * `B` is a positive multiple of the paged block size, and at least one
-    ///    whole `sliding_window` (see `sliding_sidecar`: the layout's payload
-    ///    length is fixed, so shallower boundaries are unrepresentable);
+    ///  * `B` is a positive multiple of the paged block size (see
+    ///    `sliding_sidecar::boundary_is_representable` — there is no window
+    ///    floor: the payload carries `min(B, window)` rows, exactly what a live
+    ///    rotating cache holds at that offset);
     ///  * the persisted K/V chain reaches `B` (`cold_captured_blocks`) — a
     ///    sidecar past the chain's break can never be selected, so writing one
     ///    would only burn quota;
@@ -2431,8 +2432,8 @@ impl Gemma4Inner {
     ///    the payload costs no extra forward and no extra `eval`.
     ///
     /// At most ONE sidecar per turn: the payload is `physical sliding layers ×
-    /// 2 × window × kv_heads × head_dim` elements — hundreds of MiB on a real
-    /// checkpoint — and the writer queue is bounded.
+    /// 2 × min(B, window) × kv_heads × head_dim` elements — hundreds of MiB on
+    /// a real checkpoint — and the writer queue is bounded.
     ///
     /// Media turns are skipped outright in v1. Their per-block keys are
     /// image-aware (so a text prompt could never select an image-derived
@@ -2486,6 +2487,41 @@ impl Gemma4Inner {
             chain_blocks,
             &extra_keys_per_block,
         ) else {
+            // The one silent way this whole feature stays inert. Removing the
+            // window floor made SUB-window boundaries representable, but a
+            // capture still needs an already-materialized checkpoint sitting
+            // exactly on a block boundary at or below the chain's reach. Below
+            // one window the only anchor is the prompt-boundary checkpoint,
+            // and where it LANDS decides whether anything can use it. A prefill
+            // over N tokens stores exactly one: the mid-body site puts it at
+            // `floor(N / block_size) * block_size` when that position is
+            // reachable, otherwise the post-final-loop site puts it at N (both
+            // go through the `is_multiple_of(block_size)` guard, so only one
+            // ever passes). Restore asks for at most `N - 1` tokens, so:
+            //
+            //   N % block_size != 0  ->  checkpoint below N, usable
+            //   N % block_size == 0  ->  checkpoint AT N, one block out of
+            //                            reach, and this branch is taken
+            //
+            // With `block_size = 16` a 500-token prompt anchors at 496 while a
+            // 512-token one anchors at 512 and gets nothing. Above a window the
+            // decode-cadence checkpoints cover for this. Trace the miss so the
+            // gap is visible under MLX_TRACE instead of looking like a working
+            // cache.
+            if inference_trace_enabled() {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_skipped reason=no_representable_checkpoint_at_or_below_chain_reach chain_reach_tokens={} chain_blocks={} block_size={} window={} request_tokens={} prompt_boundary={} prefix_checkpoints={}",
+                    chain_blocks as u64 * block_size as u64,
+                    chain_blocks,
+                    block_size,
+                    geometry.window,
+                    request_tokens.len(),
+                    self.sliding_prompt_boundary_checkpoint
+                        .as_ref()
+                        .map_or(0, |checkpoint| checkpoint.prefix_len),
+                    self.sliding_prefix_checkpoints.len()
+                ));
+            }
             return;
         };
         // The sidecar chain is the KV chain recomputed under the
@@ -10816,6 +10852,180 @@ mod tests {
         if let Some(adapter) = inner.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
+    }
+
+    /// Hybrid sliding/global config whose sidecar geometry is well defined:
+    /// two PHYSICAL sliding layers, two global layers to carry the paged pool.
+    #[cfg(test)]
+    fn sliding_capture_config() -> super::Gemma4Config {
+        super::Gemma4Config {
+            num_hidden_layers: 4,
+            layer_types: vec![
+                "sliding_attention".to_string(),
+                "full_attention".to_string(),
+                "sliding_attention".to_string(),
+                "full_attention".to_string(),
+            ],
+            ..paged_tiny_config(Some(true))
+        }
+    }
+
+    /// Snapshots a live rotating cache would hold at `boundary`: one per
+    /// PHYSICAL sliding layer, `None` everywhere else, with
+    /// `cached_tokens = min(boundary, window)` rows — a genuine PRE-WRAP state
+    /// when `boundary < window`, not a padded full-window one.
+    #[cfg(test)]
+    fn sliding_capture_snapshots(
+        config: &super::Gemma4Config,
+        boundary: u32,
+    ) -> Vec<Option<RotatingKVCacheSnapshot>> {
+        let geometry = sliding_sidecar::geometry(config).expect("geometry");
+        let cached = boundary.min(geometry.window);
+        let shape = [
+            1i64,
+            geometry.kv_heads as i64,
+            cached as i64,
+            geometry.head_dim as i64,
+        ];
+        let elements =
+            (geometry.kv_heads as usize) * (cached as usize) * (geometry.head_dim as usize);
+        let mut snapshots: Vec<Option<RotatingKVCacheSnapshot>> = (0..config.num_hidden_layers
+            as usize)
+            .map(|_| None)
+            .collect();
+        for (ordinal, &layer) in sliding_sidecar::physical_sliding_layers(config)
+            .iter()
+            .enumerate()
+        {
+            let make = |tag: u16| -> MxArray {
+                let raw: Vec<u16> = (0..elements)
+                    .map(|i| (i as u16).wrapping_mul(31).wrapping_add(tag))
+                    .collect();
+                MxArray::from_bfloat16(&raw, &shape).expect("bf16 snapshot array")
+            };
+            snapshots[layer] = Some(RotatingKVCacheSnapshot {
+                keys: make(ordinal as u16 * 2),
+                values: make(ordinal as u16 * 2 + 1),
+                offset: boundary as i32,
+                max_size: config.sliding_window,
+                keep: 0,
+                cached_tokens: cached as i32,
+            });
+        }
+        snapshots
+    }
+
+    /// A checkpoint BELOW one sliding window is a legal capture anchor.
+    ///
+    /// This is the capture half of Track A. The payload carries
+    /// `min(boundary, window)` rows, so a 32-token boundary under a 128-token
+    /// window describes exactly what a live `RotatingKVCache` holds there. The
+    /// old `boundary >= window` rule made `boundary_is_representable` refuse
+    /// it, `find_gemma4_sliding_capture_checkpoint` return `None`, and gemma4's
+    /// sidecar inert for every typical chat prompt.
+    ///
+    /// Drives the REAL selector rather than `boundary_is_representable` alone,
+    /// so the token-prefix, block-hash and snapshot-readiness gates in front of
+    /// it are all exercised at a sub-window boundary too.
+    #[test]
+    fn test_gemma4_capture_checkpoint_selects_sub_window_boundary() {
+        let cfg = sliding_capture_config();
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(inner) => inner,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        let geometry = sliding_sidecar::geometry(&inner.config).expect("hybrid config geometry");
+        let block_size = 16u32;
+        let boundary = 32u32;
+        assert!(
+            boundary < geometry.window,
+            "fixture must be SUB-window: boundary={boundary} window={}",
+            geometry.window
+        );
+
+        // 4 full blocks of prompt; the persisted K/V chain reaches all of them.
+        let request_tokens: Vec<u32> = (7000..7064).collect();
+        let extra_keys_per_block =
+            engine::build_paged_extra_keys(request_tokens.len(), block_size, &[]);
+        let final_block_hash = super::compute_gemma4_paged_prefix_block_hash_with_keys(
+            &request_tokens,
+            boundary,
+            block_size,
+            &extra_keys_per_block,
+            0,
+        )
+        .expect("sub-window prefix hash");
+
+        inner.sliding_prompt_boundary_checkpoint = Some(super::Gemma4SlidingPrefixCheckpoint {
+            prefix_len: boundary,
+            block_size,
+            final_block_hash,
+            protected_image_prompt_boundary: false,
+            tokens: request_tokens[..boundary as usize].to_vec(),
+            snapshots: sliding_capture_snapshots(&inner.config, boundary),
+        });
+
+        let selected = inner.find_gemma4_sliding_capture_checkpoint(
+            &geometry,
+            &request_tokens,
+            block_size,
+            4,
+            &extra_keys_per_block,
+        );
+        let (selected_boundary, snapshots) =
+            selected.expect("a sub-window checkpoint must now anchor a capture");
+        assert_eq!(selected_boundary, boundary);
+        assert_eq!(snapshots.len(), inner.config.num_hidden_layers as usize);
+        for (layer, snapshot) in snapshots.iter().enumerate() {
+            if inner.config.is_sliding_layer(layer) && !inner.config.is_kv_shared_layer(layer) {
+                let snapshot = snapshot.as_ref().expect("physical sliding layer snapshot");
+                assert_eq!(snapshot.offset, boundary as i32);
+                assert_eq!(snapshot.cached_tokens, boundary as i32);
+                assert_eq!(snapshot.max_size, inner.config.sliding_window);
+            } else {
+                assert!(snapshot.is_none(), "layer {layer} must carry no snapshot");
+            }
+        }
+
+        // And the payload the capture would write is well formed at this
+        // sub-window boundary — the format follows the boundary, it does not
+        // dictate it.
+        let layout = sliding_sidecar::layout_at(&geometry, boundary);
+        assert_eq!(layout.boundary_tokens, boundary);
+        assert_eq!(
+            layout.dims,
+            vec![1u32, geometry.kv_heads, boundary, geometry.head_dim]
+        );
+        let tensors =
+            sliding_sidecar::encode_tensors(&inner.config, &geometry, snapshots, boundary)
+                .expect("encode must not error")
+                .expect("sub-window snapshots must encode");
+        assert_eq!(tensors.len(), layout.tensor_count().expect("tensor count"));
+        assert!(tensors.iter().all(|t| t.len() == layout.bytes_per_tensor));
+
+        // Fail-closed the other way: a checkpoint DEEPER than the persisted
+        // K/V chain is still refused. A sidecar past the chain's break could
+        // never be selected on restore, so writing one would only burn quota.
+        assert!(
+            inner
+                .find_gemma4_sliding_capture_checkpoint(
+                    &geometry,
+                    &request_tokens,
+                    block_size,
+                    1,
+                    &extra_keys_per_block,
+                )
+                .is_none(),
+            "boundary 32 must not be selected when the chain reaches only 16 tokens"
+        );
     }
 
     #[test]
