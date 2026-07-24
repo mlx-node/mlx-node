@@ -294,6 +294,37 @@ fn encode_array(
     Ok(true)
 }
 
+/// Fires at most once per process: a GDN cold sidecar that can never be written
+/// because the state's dtype does not match the geometry the pool fixed.
+static DTYPE_MISMATCH_WARNED: std::sync::Once = std::sync::Once::new();
+
+/// Report a permanently-unwritable sidecar exactly once.
+///
+/// [`encode_array`] fails closed on a dtype mismatch, which is right — it must
+/// never reinterpret f32 storage as bf16. But the resulting `Ok(None)` is
+/// indistinguishable from the benign structural skips around it, so a
+/// misconfigured tier degrades into silence. A `dtype()` probe that itself
+/// errors is left to the encode path to surface.
+fn warn_once_on_dtype_mismatch(conv: &MxArray, rec: &MxArray, expected: DType) {
+    let (Ok(conv_dtype), Ok(rec_dtype)) = (conv.dtype(), rec.dtype()) else {
+        return;
+    };
+    if conv_dtype == expected && rec_dtype == expected {
+        return;
+    }
+    DTYPE_MISMATCH_WARNED.call_once(|| {
+        tracing::warn!(
+            expected = ?expected,
+            conv_state = ?conv_dtype,
+            recurrent_state = ?rec_dtype,
+            "qwen3_5 GDN cold sidecar can never be captured: the paged pool's cache dtype fixes \
+             the sidecar element type, but the GDN state carries a different dtype. The cold tier \
+             will keep persisting K/V blocks it can never restore from (hits stay at 0). Align the \
+             paged pool cache dtype with the GDN activation dtype, or disable persistPagedCache."
+        );
+    });
+}
+
 /// Serialize the materialized GDN caches for one boundary into the layer-major
 /// single-blob-per-layer payload.
 ///
@@ -337,6 +368,14 @@ pub(crate) fn encode_tensors(
         let (Some(conv), Some(rec)) = (arrays.get(0), arrays.get(1)) else {
             return Ok(None);
         };
+        // A dtype mismatch here is not a transient skip, it is a permanent
+        // misconfiguration: the sidecar geometry fixes its element type from
+        // the POOL's cache dtype at load, while these arrays carry the GDN
+        // ACTIVATION dtype. If those disagree the skip below repeats on every
+        // turn forever, so the tier keeps writing K/V blocks it can never
+        // restore from — quota and I/O burned, hits pinned at zero, outwardly
+        // indistinguishable from a cold cache. Say it once, loudly.
+        warn_once_on_dtype_mismatch(conv, rec, dtype);
         let mut blob = Vec::with_capacity(bytes_per_tensor);
         if !encode_array(conv, dtype, &conv_shape, conv_elements, &mut blob)? {
             return Ok(None);

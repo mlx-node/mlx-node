@@ -4713,6 +4713,29 @@ impl PagedKVCacheAdapter {
         cache_salt: u64,
     ) -> Result<u32, String> {
         self.ensure_aux_prefix_primed("register_full_blocks_for_reuse_per_block")?;
+        // A family that captures an auxiliary sidecar derives that sidecar's
+        // chain with a salt of ZERO (see `capture_dense_gdn_cold_sidecar` /
+        // `capture_gemma4_sliding_cold_sidecar`), while the restore walk chains
+        // under whatever salt the LOOKUP carried. Both are zero today, so they
+        // agree. Should a salt ever be introduced (tenant isolation is the
+        // obvious reason) the K/V chain would move and the sidecar chain would
+        // not, so `deepest_backed_boundary` would find nothing — every hybrid
+        // restore silently and permanently pinned at zero, indistinguishable
+        // from a cold cache. Fail loudly at the seam instead: the fix is to
+        // thread the salt into sidecar capture, not to quietly lose the tier.
+        if cache_salt != 0
+            && self
+                .cold_tier
+                .as_ref()
+                .is_some_and(|cold| cold.sidecar_policy.is_some())
+        {
+            return Err(format!(
+                "register_full_blocks_for_reuse_per_block: cache_salt={cache_salt} with an \
+                 auxiliary sidecar policy installed, but sidecar capture derives its chain \
+                 with salt 0 — the two chains would disagree and every restore would miss. \
+                 Thread the salt through sidecar capture before using a non-zero salt."
+            ));
+        }
         if self.already_registered {
             return Ok(0);
         }
@@ -7281,6 +7304,81 @@ mod tests {
             );
         }
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Sidecar capture hardcodes salt 0 while the restore walk chains under the
+    /// lookup's salt. They agree only because every caller passes 0, so a
+    /// non-zero salt would move the K/V chain, leave the sidecar chain behind,
+    /// and pin every hybrid restore at zero for good. That must be an error at
+    /// the seam, not a silently dead tier — while a family with no sidecar
+    /// policy keeps salting freely, since it has no second chain to desync.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_nonzero_salt_is_refused_while_a_sidecar_policy_is_installed() {
+        let tokens: Vec<u32> = (0..32u32).map(|i| 7_100 + i).collect();
+        let root = std::env::temp_dir().join(format!(
+            "mlx-adapter-salt-guard-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let fingerprint =
+            mlx_paged_attn::ColdCacheFingerprint::from_components([b"salt-guard".as_slice()]);
+        let allocator = new_allocator(16, 8);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 8) else {
+            return;
+        };
+        let manager = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+                .expect("temp-dir cold cache must open"),
+        );
+        let per_block: Vec<Vec<u64>> = vec![Vec::new(); 4];
+
+        // No policy: a salt is none of the cold tier's business.
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager),
+            fingerprint,
+            sidecar_policy: None,
+        });
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(32).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        assert!(
+            adapter
+                .register_full_blocks_for_reuse_per_block(&per_block, 42)
+                .is_ok(),
+            "a family with no auxiliary chain may salt however it likes"
+        );
+        adapter.release_request().unwrap();
+
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager),
+            fingerprint,
+            sidecar_policy: Some(
+                mlx_paged_attn::ColdSidecarPolicy::new(reconcile_sidecar_layout(32))
+                    .expect("policy geometry must validate"),
+            ),
+        });
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.allocate_suffix_blocks(32).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        let err = adapter
+            .register_full_blocks_for_reuse_per_block(&per_block, 42)
+            .expect_err("a non-zero salt desyncs the sidecar chain and must be refused");
+        assert!(
+            err.contains("cache_salt"),
+            "the error must name the offending knob, got: {err}"
+        );
+        // Salt 0 is the contract capture actually honours, so it still works.
+        assert!(
+            adapter
+                .register_full_blocks_for_reuse_per_block(&per_block, 0)
+                .is_ok(),
+            "the supported salt must remain usable after the refusal"
+        );
+        adapter.release_request().unwrap();
+        drop(adapter);
         let _ = std::fs::remove_dir_all(&root);
     }
 
