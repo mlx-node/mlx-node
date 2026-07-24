@@ -33,6 +33,8 @@ use sha2::{Digest, Sha256};
 use crate::{BlockAllocator, LayerKVPool, PhysicalBlock};
 
 const CACHE_ABI: &str = "mlx-paged-v1";
+/// Filename suffix shared by every cold object (KV blocks and sidecars).
+const OBJECT_SUFFIX: &str = ".safetensors";
 const DEFAULT_QUEUE_DEPTH: usize = 8;
 const GIB: u64 = 1024 * 1024 * 1024;
 const MAX_DEFAULT_QUOTA: u64 = 100 * GIB;
@@ -72,15 +74,91 @@ impl fmt::Debug for ColdCacheFingerprint {
     }
 }
 
+/// Cache group a cold object belongs to — the cold-tier analogue of vLLM's
+/// `BlockHashWithGroupId` (`vllm/v1/core/kv_cache_utils.py`), which folds a
+/// group id into the hash key so blocks of one KV-cache group can never be
+/// mistaken for another's. vLLM concatenates a 4-byte group id onto the
+/// block hash; a fixed-width 32-byte key cannot grow, so the group is folded
+/// in as the hashed domain-separation prefix instead — strictly stronger,
+/// since the discriminant is inside the SHA-256 message rather than beside
+/// it.
+///
+/// [`ColdGroup::Kv`] deliberately carries the pre-group domain tag verbatim,
+/// so KV keys are byte-identical to the derivation that shipped before groups
+/// existed (pinned by `kv_group_key_is_byte_identical_to_pre_group_derivation`).
+///
+/// Groups are also the on-disk namespace: [`object_file_name`] gives each
+/// non-KV group its own filename suffix, so a sidecar can never be opened,
+/// decoded, or restored as a KV block even if a key somehow repeated.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ColdGroup {
+    /// Paged KV blocks: `1 + 2*num_layers` tensors per 16-token block.
+    Kv,
+    /// GDN recurrent state at a block boundary (qwen3_5 / qwen3_5_moe), which
+    /// lives outside the paged pool and is therefore not covered by any KV
+    /// block.
+    GdnState,
+    /// Sliding-window (`RotatingKVCache`) state at a block boundary (gemma4),
+    /// likewise outside the paged pool.
+    SlidingWindow,
+}
+
+impl ColdGroup {
+    /// Every non-KV group, in a stable order. Used by name parsing and by the
+    /// dashboard-facing filename contract.
+    pub const SIDECAR_GROUPS: [Self; 2] = [Self::GdnState, Self::SlidingWindow];
+
+    /// Domain-separation tag hashed as the first component of every key.
+    ///
+    /// Tags are NUL-terminated and NUL-free, and differ from one another
+    /// before their first NUL, so no two groups can produce the same hasher
+    /// input for any argument list — group separation does not rely on the
+    /// (fixed-width) components that follow.
+    const fn domain_tag(self) -> &'static [u8] {
+        match self {
+            // Byte-identical to the pre-group constant: DO NOT EDIT.
+            Self::Kv => b"mlx-node:cold-prefix-block:v1\0",
+            Self::GdnState => b"mlx-node:cold-sidecar-gdn-state:v1\0",
+            Self::SlidingWindow => b"mlx-node:cold-sidecar-sliding-window:v1\0",
+        }
+    }
+
+    /// Stable on-disk label: the filename infix for sidecars and the `group`
+    /// metadata value. KV keeps the empty label so its canonical filename
+    /// stays `<64-hex>.safetensors`.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Kv => "kv",
+            Self::GdnState => "gdn_state",
+            Self::SlidingWindow => "sliding_window",
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "kv" => Some(Self::Kv),
+            "gdn_state" => Some(Self::GdnState),
+            "sliding_window" => Some(Self::SlidingWindow),
+            _ => None,
+        }
+    }
+}
+
 /// Stable, collision-resistant chained key for one logical prefix block.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct ColdCacheKey([u8; 32]);
 
 impl ColdCacheKey {
-    /// Build a block key. `parent` is `None` for the first block and the
-    /// preceding block key thereafter. Integer encoding is explicitly LE so
-    /// the key is stable across processes and Rust versions.
+    /// Build a cold-object key within `group`. `parent` is `None` for the
+    /// first block and the preceding block key thereafter. Integer encoding
+    /// is explicitly LE so the key is stable across processes and Rust
+    /// versions.
+    ///
+    /// `group` is hashed first (as its domain tag), so the same prefix in two
+    /// groups yields two unrelated keys; [`ColdGroup::Kv`] reproduces the
+    /// pre-group derivation exactly.
     pub fn chain(
+        group: ColdGroup,
         fingerprint: ColdCacheFingerprint,
         parent: Option<Self>,
         tokens: &[u32],
@@ -89,7 +167,7 @@ impl ColdCacheKey {
         block_index: usize,
     ) -> Self {
         let mut hasher = Sha256::new();
-        hasher.update(b"mlx-node:cold-prefix-block:v1\0");
+        hasher.update(group.domain_tag());
         hasher.update(fingerprint.as_bytes());
         hasher.update(parent.map_or([0u8; 32], |key| key.0));
         hasher.update((block_index as u64).to_le_bytes());
@@ -181,6 +259,169 @@ impl ColdCacheBlock {
     }
 }
 
+/// Upper bound on [`ColdSidecarLayout::tensors_per_layer`]. Sidecar payloads
+/// are a handful of state tensors per layer (e.g. GDN conv + recurrent
+/// state); the cap keeps the descriptor count — and so the header bound in
+/// [`header_overhead_for_descriptors`] — provably tied to `num_layers`.
+const MAX_SIDECAR_TENSORS_PER_LAYER: u32 = 16;
+
+/// Upper bound on [`ColdSidecarLayout::dims`]. `dims` is serialized into the
+/// safetensors `__metadata__` object, so it must stay well inside
+/// [`HEADER_METADATA_BYTES`]: 8 dims is at most 8*10 digits + 7 separators =
+/// 87 bytes on top of the ~450-byte block metadata worst case.
+const MAX_SIDECAR_DIMS: usize = 8;
+
+/// Geometry of one persisted sidecar: the non-paged state a hybrid family
+/// carries alongside its KV blocks.
+///
+/// A sidecar is anchored at a BOUNDARY — `boundary_tokens` prefix tokens have
+/// been consumed — because recurrent/rotating state is only meaningful at an
+/// exact token count. Restore reconciles DOWN to a boundary a sidecar
+/// actually backs (vLLM `kv_cache_coordinator.py`: each group may only reduce
+/// the candidate length), never up.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdSidecarLayout {
+    /// Which non-KV group this payload belongs to. Never [`ColdGroup::Kv`].
+    pub group: ColdGroup,
+    /// Prefix length (in tokens) the state is valid at. Must be a positive
+    /// multiple of the KV block size so it names a real block boundary.
+    pub boundary_tokens: u32,
+    pub num_layers: u32,
+    /// Tensors persisted per layer; group-specific (e.g. conv + recurrent).
+    pub tensors_per_layer: u32,
+    /// Element dtype label of the state tensors, e.g. `"BFloat16"`.
+    pub dtype: String,
+    /// Group-specific per-tensor geometry (e.g. `[num_heads, head_dim]`).
+    pub dims: Vec<u32>,
+    /// Byte length of every individual state tensor.
+    pub bytes_per_tensor: usize,
+}
+
+impl ColdSidecarLayout {
+    /// Total tensor count, `None` on overflow.
+    pub fn tensor_count(&self) -> Option<usize> {
+        (self.num_layers as usize).checked_mul(self.tensors_per_layer as usize)
+    }
+
+    /// The invariants that describe GEOMETRY alone — group, layer/tensor
+    /// counts, dims, per-tensor byte length — with no reference to a boundary
+    /// or to payload bytes.
+    ///
+    /// [`ColdSidecar::validate`] layers the boundary and payload checks on top,
+    /// so a value accepted here still cannot be persisted in a shape the
+    /// decoder would reject. [`ColdSidecarPolicy::new`] needs exactly this
+    /// half: a policy is a geometry TEMPLATE whose boundary is only known once
+    /// a candidate prefix is in hand.
+    pub fn validate_geometry(&self) -> Result<(), String> {
+        if self.group == ColdGroup::Kv {
+            return Err("cold-cache sidecars must not use the KV group".to_string());
+        }
+        if self.num_layers == 0 || self.tensors_per_layer == 0 {
+            return Err("cold-cache sidecar must carry at least one state tensor".to_string());
+        }
+        if self.tensors_per_layer > MAX_SIDECAR_TENSORS_PER_LAYER {
+            return Err("cold-cache sidecar tensors-per-layer exceeds the bound".to_string());
+        }
+        if self.dims.is_empty() || self.dims.len() > MAX_SIDECAR_DIMS {
+            return Err("cold-cache sidecar dims count out of range".to_string());
+        }
+        if self.dims.contains(&0) {
+            return Err("cold-cache sidecar dims must be positive".to_string());
+        }
+        if self.bytes_per_tensor == 0 {
+            return Err("cold-cache sidecar tensors must be non-empty".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// What a model family REQUIRES at every prefix boundary it resumes from: one
+/// auxiliary (non-KV) group plus the exact geometry a sidecar of that group
+/// must have. A family whose whole per-token state lives inside the paged pool
+/// (dense `qwen3`) has NO policy; a hybrid family that keeps GDN recurrent or
+/// sliding-window state outside the pool has one, and the cold-tier restore
+/// walk refuses to hand back any prefix a matching sidecar does not back.
+///
+/// This is the cold-tier form of vLLM's per-group reconcile-down
+/// (`vllm/v1/core/sched/scheduler.py`, `vllm/v1/core/kv_cache_coordinator.py`):
+/// every group may only REDUCE the candidate prefix length, never extend it,
+/// and the reused prefix is the boundary every group agrees on.
+///
+/// `boundary_tokens` is deliberately NOT part of a policy — it is the one
+/// layout field that varies per candidate — so [`Self::new`] normalizes it to
+/// zero and [`Self::expected_at`] stamps the candidate boundary in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdSidecarPolicy {
+    layout: ColdSidecarLayout,
+}
+
+impl ColdSidecarPolicy {
+    /// Build a policy from a geometry template. Rejects [`ColdGroup::Kv`] and
+    /// any geometry a sidecar could never legally be written with, so an
+    /// impossible policy cannot be installed and then silently suppress every
+    /// restore forever.
+    pub fn new(layout: ColdSidecarLayout) -> Result<Self, String> {
+        layout.validate_geometry()?;
+        Ok(Self {
+            layout: ColdSidecarLayout {
+                boundary_tokens: 0,
+                ..layout
+            },
+        })
+    }
+
+    /// The auxiliary group whose keys this policy probes. Never
+    /// [`ColdGroup::Kv`].
+    pub fn group(&self) -> ColdGroup {
+        self.layout.group
+    }
+
+    /// The exact layout a sidecar anchored at `boundary_tokens` must have.
+    /// [`ColdCacheManager::load_sidecar`] compares layouts for equality, so a
+    /// sidecar recorded at a different boundary, dtype, or tensor shape is a
+    /// miss rather than a reinterpretation of its bytes.
+    pub fn expected_at(&self, boundary_tokens: u32) -> ColdSidecarLayout {
+        ColdSidecarLayout {
+            boundary_tokens,
+            ..self.layout.clone()
+        }
+    }
+}
+
+/// Owned host representation of one sidecar object. Stored as its own file
+/// under its own group-tagged key, so it is never reachable through the KV
+/// block namespace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColdSidecar {
+    pub key: ColdCacheKey,
+    pub fingerprint: ColdCacheFingerprint,
+    pub layout: ColdSidecarLayout,
+    /// Layer-major: `tensors[layer * tensors_per_layer + slot]`.
+    pub tensors: Vec<Vec<u8>>,
+}
+
+impl ColdSidecar {
+    /// Every structural invariant the decoder also enforces, so a sidecar can
+    /// never be written in a shape that would later fail to decode.
+    fn validate(&self) -> Result<(), String> {
+        self.layout.validate_geometry()?;
+        if self.layout.boundary_tokens == 0 {
+            return Err("cold-cache sidecar boundary must be a positive token count".to_string());
+        }
+        if self.layout.tensor_count() != Some(self.tensors.len()) {
+            return Err("cold-cache sidecar tensor count does not match layout".to_string());
+        }
+        if self
+            .tensors
+            .iter()
+            .any(|tensor| tensor.len() != self.layout.bytes_per_tensor)
+        {
+            return Err("cold-cache sidecar tensor byte length does not match layout".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RestorePrefixIdentity {
     pub hot_hash: u64,
@@ -236,6 +477,10 @@ impl AtomicStats {
 
 #[derive(Clone, Debug)]
 struct IndexEntry {
+    /// Group the on-disk object belongs to. Kept alongside `file_name` so
+    /// eviction and quota accounting cover sidecars as well as KV blocks —
+    /// an unaccounted sidecar would sit outside the quota forever.
+    group: ColdGroup,
     file_name: String,
     size: u64,
     last_access: u128,
@@ -607,6 +852,9 @@ impl Shared {
 /// the property [`ColdCacheManager::drain`] relies on for a shutdown flush.
 enum WriteJob {
     Block(ColdCacheBlock),
+    /// A non-KV state sidecar. Persisted through the same durable path and
+    /// covered by the same barrier semantics as `Block`.
+    Sidecar(Box<ColdSidecar>),
     /// Drain marker: after every earlier `Block` has been persisted the writer
     /// acks it (unblocking `drain`) with whether all of those blocks since the
     /// previous barrier persisted successfully — `true` only when none failed.
@@ -711,6 +959,11 @@ impl ColdCacheManager {
                                 failed = true;
                             }
                         }
+                        WriteJob::Sidecar(sidecar) => {
+                            if persist_sidecar(&worker_shared, &sidecar).is_err() {
+                                failed = true;
+                            }
+                        }
                         // Every earlier `Block` has already been persisted (FIFO,
                         // single consumer), so acking here signals the drain is
                         // complete; the ack now reports whether all of them
@@ -744,10 +997,24 @@ impl ColdCacheManager {
     /// A file deleted externally leaves a stale `true` only until the next
     /// `load` for that key misses and prunes the entry.
     pub fn contains(&self, key: &ColdCacheKey) -> bool {
+        self.contains_in(key, ColdGroup::Kv)
+    }
+
+    /// [`Self::contains`] restricted to one group: true only when the indexed
+    /// object for `key` was written in `group`. Keys are already
+    /// group-derived, so this can only differ from `contains` if a key ever
+    /// repeated across groups — in which case the group-specific answer is
+    /// the safe one, since it matches the file the loader would open.
+    pub fn contains_in(&self, key: &ColdCacheKey, group: ColdGroup) -> bool {
         self.shared
             .index
             .lock()
-            .map(|index| index.entries.contains_key(key))
+            .map(|index| {
+                index
+                    .entries
+                    .get(key)
+                    .is_some_and(|entry| entry.group == group)
+            })
             .unwrap_or(false)
     }
 
@@ -803,6 +1070,28 @@ impl ColdCacheManager {
     pub fn enqueue(&self, block: ColdCacheBlock) -> Result<bool, String> {
         block.validate()?;
         match self.sender.try_send(WriteJob::Block(block)) {
+            Ok(()) => {
+                self.shared.stats.enqueued.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            }
+            Err(TrySendError::Full(_)) => {
+                self.shared
+                    .stats
+                    .queue_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(false)
+            }
+            Err(TrySendError::Disconnected(_)) => Err("cold-cache writer stopped".to_string()),
+        }
+    }
+
+    /// Non-blocking enqueue of a state sidecar, with the same bounded-queue
+    /// drop policy as [`Self::enqueue`]. A dropped sidecar is not a
+    /// correctness problem: without it the next restore simply reconciles the
+    /// candidate prefix down past that boundary and recomputes.
+    pub fn enqueue_sidecar(&self, sidecar: ColdSidecar) -> Result<bool, String> {
+        sidecar.validate()?;
+        match self.sender.try_send(WriteJob::Sidecar(Box::new(sidecar))) {
             Ok(()) => {
                 self.shared.stats.enqueued.fetch_add(1, Ordering::Relaxed);
                 Ok(true)
@@ -891,6 +1180,44 @@ impl ColdCacheManager {
         Some(block)
     }
 
+    /// Load and validate the sidecar for `key`, which must be a key derived
+    /// in `expected.group`. The read is bounded by `expected`'s own geometry,
+    /// and the decoded layout must equal `expected` exactly — a sidecar
+    /// recorded under a different dtype, layer count, tensor count, or
+    /// boundary is a miss, never a reinterpretation of its bytes.
+    ///
+    /// `None` covers absent, unreadable, malformed, over-sized, and
+    /// mismatched sidecars alike. Callers reconcile DOWN on `None`: drop the
+    /// candidate prefix back to the last boundary a sidecar does back
+    /// (vLLM `kv_cache_coordinator.py`), never restore an attention-only
+    /// prefix whose recurrent state is missing.
+    ///
+    /// No `hits`/`bytes_restored` bump: a sidecar is a precondition for reuse,
+    /// not reuse itself, and realized reuse is counted once by
+    /// [`Self::restore_block`] per KV block actually published.
+    pub fn load_sidecar(
+        &self,
+        key: ColdCacheKey,
+        fingerprint: ColdCacheFingerprint,
+        expected: &ColdSidecarLayout,
+    ) -> Option<ColdSidecar> {
+        if expected.group == ColdGroup::Kv {
+            return None;
+        }
+        let max_encoded = max_encoded_len_for_sidecar(expected)?;
+        let sidecar = self.load_object_bounded(key, expected.group, max_encoded, |bytes| {
+            decode_sidecar(bytes, key, fingerprint, expected.group)
+        })?;
+        if &sidecar.layout != expected {
+            // A structurally valid sidecar for a different geometry is a
+            // fall-back to recompute, exactly like a layout-mismatched block
+            // in `restore_block`, and is counted the same way.
+            self.shared.stats.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(sidecar)
+    }
+
     /// Load and validate a block, reading at most `max_encoded` bytes so a
     /// corrupt/tampered oversized entry (possibly a sparse regular file whose
     /// `st_size` reports gigabytes) can never drive an unbounded allocation:
@@ -931,7 +1258,25 @@ impl ColdCacheManager {
         fingerprint: ColdCacheFingerprint,
         max_encoded: u64,
     ) -> Option<ColdCacheBlock> {
-        let name = block_file_name(&key);
+        self.load_object_bounded(key, ColdGroup::Kv, max_encoded, |bytes| {
+            decode_block(bytes, key, fingerprint)
+        })
+    }
+
+    /// Group-generic body of [`Self::load_bounded`]: open the canonical name
+    /// for `(key, group)`, slurp at most `max_encoded` bytes, and hand them to
+    /// `decode`. The open/prune/touch/statistics contract documented on
+    /// [`Self::load_bounded`] applies verbatim to every group — only the
+    /// decoder differs, so a sidecar can never be decoded by the block
+    /// decoder (or vice versa) and every malformed payload is a graceful miss.
+    fn load_object_bounded<T>(
+        &self,
+        key: ColdCacheKey,
+        group: ColdGroup,
+        max_encoded: u64,
+        decode: impl FnOnce(&[u8]) -> Result<T, String>,
+    ) -> Option<T> {
+        let name = object_file_name(&key, group);
         let mut observed_identity = None;
         let mut opened_file = None;
         // The index lock spans [open → failed-open identity snapshot]: the
@@ -982,7 +1327,7 @@ impl ColdCacheManager {
                         if bytes.len() as u64 > max_encoded {
                             Err("cold-cache entry exceeds geometry bound".to_string())
                         } else {
-                            decode_block(&bytes, key, fingerprint)
+                            decode(&bytes)
                         }
                     });
                 opened_file = Some(file);
@@ -991,7 +1336,7 @@ impl ColdCacheManager {
             Err(e) => Err(e.to_string()),
         };
         match result {
-            Ok(block) => {
+            Ok(decoded) => {
                 // NOTE: the `hits` / `bytes_restored` reuse counters are NOT
                 // bumped here. A successful decode is not yet realized reuse —
                 // `restore_block` still has to validate layout, allocate a
@@ -1021,7 +1366,7 @@ impl ColdCacheManager {
                 {
                     entry.last_access = touched_tick;
                 }
-                Some(block)
+                Some(decoded)
             }
             Err(_) => {
                 self.shared.stats.misses.fetch_add(1, Ordering::Relaxed);
@@ -1163,7 +1508,16 @@ const HEADER_FRAMING_BYTES: u64 = 8 + 7;
 /// [`ColdCacheBlock::encoded_len`] and [`max_encoded_len_for_pool`] so the two
 /// bounds can never drift.
 fn header_overhead(num_layers: u64) -> u64 {
-    let descriptors = num_layers.saturating_mul(2).saturating_add(1);
+    header_overhead_for_descriptors(num_layers.saturating_mul(2).saturating_add(1))
+}
+
+/// [`header_overhead`] for an arbitrary descriptor count — the sidecar
+/// encoder writes `num_layers * tensors_per_layer` descriptors and no
+/// `tokens` tensor, so it cannot use the block formula. The per-descriptor
+/// and metadata allowances are shared, and a sidecar's longest descriptor
+/// name (`layer.<i>.state.<j>`, at most 25 chars for `u32` indices) stays
+/// well inside [`HEADER_BYTES_PER_DESCRIPTOR`].
+fn header_overhead_for_descriptors(descriptors: u64) -> u64 {
     descriptors
         .saturating_mul(HEADER_BYTES_PER_DESCRIPTOR)
         .saturating_add(HEADER_METADATA_BYTES)
@@ -1194,29 +1548,96 @@ fn max_encoded_len_for_pool(pool: &LayerKVPool) -> u64 {
         .saturating_add(header_overhead(pool.num_layers() as u64))
 }
 
+/// Upper bound on a legitimately-encoded sidecar with `layout`: every state
+/// tensor's bytes (`num_layers * tensors_per_layer * bytes_per_tensor`, all
+/// pinned by [`ColdSidecar::validate`]) plus the encoder's header/framing
+/// overhead for that many descriptors. `None` when the layout's own counts
+/// overflow or exceed the structural caps, which fails the read closed (no
+/// bound, no load).
+fn max_encoded_len_for_sidecar(layout: &ColdSidecarLayout) -> Option<u64> {
+    if layout.tensors_per_layer > MAX_SIDECAR_TENSORS_PER_LAYER {
+        return None;
+    }
+    let tensors = layout.tensor_count()? as u64;
+    let payload = tensors.checked_mul(layout.bytes_per_tensor as u64)?;
+    payload.checked_add(header_overhead_for_descriptors(tensors))
+}
+
+/// Per-layer K/V byte lengths one block occupies in `pool`, mirroring
+/// `LayerKVPool::read_blocks_to_host` / `write_blocks_from_host` exactly
+/// (including the `head_size / x` integer division on the K side). `None`
+/// for a pool whose dtype/FP8 combination has no kernel layout, which makes
+/// [`layout_matches_pool`] fail closed.
+fn pool_layer_bytes(pool: &LayerKVPool) -> Option<(usize, usize)> {
+    let x = pool.cache_pack_factor().ok()? as u64;
+    if x == 0 {
+        return None;
+    }
+    let element = crate::profile::dtype_size_for(pool.cache_dtype()) as u64;
+    let heads = pool.config().num_kv_heads as u64;
+    let head_size = pool.config().head_size as u64;
+    let block_size = pool.block_size() as u64;
+    let key = heads * (head_size / x) * x * block_size * element;
+    let value = heads * head_size * block_size * element;
+    Some((usize::try_from(key).ok()?, usize::try_from(value).ok()?))
+}
+
+/// Whether a decoded block's layout is exactly this pool's geometry.
+///
+/// The per-layer byte lengths are compared here, not left to
+/// `write_blocks_from_host`: a block that agrees on
+/// `(block_size, num_layers, num_kv_heads, head_size, cache_dtype)` but not
+/// on the packed K/V byte lengths — a different kernel pack factor `x`, or a
+/// `head_size` not divisible by `x` — would otherwise pass validation and be
+/// caught only mid-upload, after a physical block had been allocated and
+/// earlier layers already written into the pool.
 fn layout_matches_pool(layout: &ColdCacheLayout, pool: &LayerKVPool) -> bool {
+    let Some((key_bytes, value_bytes)) = pool_layer_bytes(pool) else {
+        return false;
+    };
     layout.block_size == pool.block_size()
         && layout.num_layers as usize == pool.num_layers()
         && layout.num_kv_heads == pool.config().num_kv_heads
         && layout.head_size == pool.config().head_size
         && layout.cache_dtype == format!("{:?}", pool.cache_dtype())
+        && layout.key_bytes_per_layer == key_bytes
+        && layout.value_bytes_per_layer == value_bytes
 }
 
 fn persist_block(shared: &Shared, block: &ColdCacheBlock) -> Result<(), String> {
     block.validate()?;
     let bytes = encode_block(block)?;
+    persist_encoded(shared, block.key, ColdGroup::Kv, &bytes)
+}
+
+/// Sidecars go through the identical durable path as blocks — evict to
+/// quota, write to a writer temp, `fsync`, `renameat`, publish under the
+/// index lock, `fsync` the directory — only the encoder and the canonical
+/// name differ.
+fn persist_sidecar(shared: &Shared, sidecar: &ColdSidecar) -> Result<(), String> {
+    sidecar.validate()?;
+    let bytes = encode_sidecar(sidecar)?;
+    persist_encoded(shared, sidecar.key, sidecar.layout.group, &bytes)
+}
+
+fn persist_encoded(
+    shared: &Shared,
+    key: ColdCacheKey,
+    group: ColdGroup,
+    bytes: &[u8],
+) -> Result<(), String> {
     evict_for_write(shared, bytes.len() as u64)?;
-    let destination = block_file_name(&block.key);
+    let destination = object_file_name(&key, group);
     let temp = format!(
         ".{}.{}.{}.tmp",
-        block.key.to_hex(),
+        key.to_hex(),
         std::process::id(),
         now_tick()
     );
     let mut file = shared.root.create_exclusive(&temp)?;
     let size = bytes.len() as u64;
     if let Err(error) = (|| -> Result<(), String> {
-        file.write_all(&bytes)
+        file.write_all(bytes)
             .map_err(|e| format!("write cold-cache file: {e}"))?;
         file.sync_all()
             .map_err(|e| format!("sync cold-cache file: {e}"))?;
@@ -1235,8 +1656,9 @@ fn persist_block(shared: &Shared, block: &ColdCacheBlock) -> Result<(), String> 
             shared.stats.queue_drops.fetch_add(1, Ordering::Relaxed);
         })?;
         if let Some(old) = index.entries.insert(
-            block.key,
+            key,
             IndexEntry {
+                group,
                 file_name: destination.clone(),
                 size,
                 last_access: now_tick(),
@@ -1350,7 +1772,17 @@ fn prune_failed_load(
         Some((_, kind)) => clear_entry(&shared.root, name, kind),
         None => true,
     };
-    if cleared && let Some(entry) = index.entries.remove(&key) {
+    // De-index only the entry that actually names the file just cleared. The
+    // group is part of the key derivation, so a sidecar and a block can never
+    // share a key in the first place; checking the name keeps that a local,
+    // checkable property instead of a cross-module assumption.
+    if cleared
+        && index
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.file_name == name)
+        && let Some(entry) = index.entries.remove(&key)
+    {
         index.total_bytes = index.total_bytes.saturating_sub(entry.size);
     }
 }
@@ -1419,8 +1851,33 @@ fn open_identity(_file: &File) -> Option<FileIdentity> {
     None
 }
 
-fn block_file_name(key: &ColdCacheKey) -> String {
-    format!("{}.safetensors", key.to_hex())
+/// Canonical filename for a cold object. KV keeps the historical
+/// `<64-hex>.safetensors`; every other group gets its label as an infix
+/// (`<64-hex>.gdn_state.safetensors`), so the two namespaces are disjoint on
+/// disk as well as in the key derivation, and the dashboard can account them
+/// separately (packages/dashboard/src/cache.ts).
+fn object_file_name(key: &ColdCacheKey, group: ColdGroup) -> String {
+    match group {
+        ColdGroup::Kv => format!("{}{OBJECT_SUFFIX}", key.to_hex()),
+        other => format!("{}.{}{OBJECT_SUFFIX}", key.to_hex(), other.label()),
+    }
+}
+
+/// Inverse of [`object_file_name`]. `None` for anything that is not a
+/// canonical cold object (writer temps, quarantined obstructions, foreign
+/// files), so the index scanner never adopts a name it could not later
+/// resolve back to the same file.
+fn parse_object_name(name: &str) -> Option<(ColdCacheKey, ColdGroup)> {
+    let stem = name.strip_suffix(OBJECT_SUFFIX)?;
+    if let Some(key) = ColdCacheKey::from_hex(stem) {
+        return Some((key, ColdGroup::Kv));
+    }
+    let (hex, label) = stem.split_once('.')?;
+    let key = ColdCacheKey::from_hex(hex)?;
+    let group = ColdGroup::from_label(label)?;
+    // `kv` as an infix would name a second file for a KV key; only the bare
+    // hex form is canonical for that group.
+    (group != ColdGroup::Kv).then_some((key, group))
 }
 
 fn encode_block(block: &ColdCacheBlock) -> Result<Vec<u8>, String> {
@@ -1570,6 +2027,178 @@ fn decode_block(
     Ok(block)
 }
 
+fn sidecar_tensor_name(layer: usize, slot: usize) -> String {
+    format!("layer.{layer}.state.{slot}")
+}
+
+/// Serialize a sidecar into its own safetensors object. The container shape
+/// is deliberately NOT the block shape — no `tokens` tensor, `state`-named
+/// descriptors, and a `group` metadata field — so the two object types can
+/// never be confused even before their disjoint keys and filenames are
+/// considered.
+fn encode_sidecar(sidecar: &ColdSidecar) -> Result<Vec<u8>, String> {
+    sidecar.validate()?;
+    let per_layer = sidecar.layout.tensors_per_layer as usize;
+    let mut owned: Vec<(String, Vec<u8>)> = Vec::with_capacity(sidecar.tensors.len());
+    for (index, tensor) in sidecar.tensors.iter().enumerate() {
+        owned.push((
+            sidecar_tensor_name(index / per_layer, index % per_layer),
+            tensor.clone(),
+        ));
+    }
+    let checksum = payload_checksum(&owned);
+    let views: Result<Vec<_>, _> = owned
+        .iter()
+        .map(|(name, data)| {
+            TensorView::new(Dtype::U8, vec![data.len()], data).map(|view| (name.as_str(), view))
+        })
+        .collect();
+    let mut metadata = HashMap::new();
+    metadata.insert("abi".to_string(), CACHE_ABI.to_string());
+    metadata.insert(
+        "group".to_string(),
+        sidecar.layout.group.label().to_string(),
+    );
+    metadata.insert("key".to_string(), sidecar.key.to_hex());
+    metadata.insert("fingerprint".to_string(), sidecar.fingerprint.to_hex());
+    metadata.insert("checksum".to_string(), checksum);
+    metadata.insert(
+        "boundary_tokens".to_string(),
+        sidecar.layout.boundary_tokens.to_string(),
+    );
+    metadata.insert(
+        "num_layers".to_string(),
+        sidecar.layout.num_layers.to_string(),
+    );
+    metadata.insert(
+        "tensors_per_layer".to_string(),
+        sidecar.layout.tensors_per_layer.to_string(),
+    );
+    metadata.insert("dtype".to_string(), sidecar.layout.dtype.clone());
+    metadata.insert(
+        "dims".to_string(),
+        sidecar
+            .layout
+            .dims
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    metadata.insert(
+        "bytes_per_tensor".to_string(),
+        sidecar.layout.bytes_per_tensor.to_string(),
+    );
+    serialize(views.map_err(|e| e.to_string())?, Some(metadata)).map_err(|e| e.to_string())
+}
+
+/// Inverse of [`encode_sidecar`], fail-closed at every step: a missing or
+/// unparsable field, a `group`/`key`/`fingerprint`/`abi` that does not match
+/// what the caller asked for, a tensor count that disagrees with
+/// `num_layers * tensors_per_layer`, a tensor of the wrong byte length, or a
+/// payload checksum mismatch all return `Err` — which the loader turns into a
+/// miss plus a corruption bump plus a prune. Nothing here can panic or
+/// allocate from an untrusted count: the `Vec` is reserved only after the
+/// metadata counts have been checked against the deserialized tensor count,
+/// which is itself bounded by the byte-capped read.
+fn decode_sidecar(
+    bytes: &[u8],
+    expected_key: ColdCacheKey,
+    expected_fingerprint: ColdCacheFingerprint,
+    expected_group: ColdGroup,
+) -> Result<ColdSidecar, String> {
+    if expected_group == ColdGroup::Kv {
+        return Err("cold-cache sidecars must not use the KV group".to_string());
+    }
+    let (_, header) = SafeTensors::read_metadata(bytes).map_err(|e| e.to_string())?;
+    let metadata = header
+        .metadata()
+        .as_ref()
+        .ok_or_else(|| "cold-cache sidecar metadata missing".to_string())?;
+    let tensors = SafeTensors::deserialize(bytes).map_err(|e| e.to_string())?;
+    let get = |name: &str| {
+        metadata
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("cold-cache sidecar metadata `{name}` missing"))
+    };
+    if get("abi")? != CACHE_ABI
+        || get("group")? != expected_group.label()
+        || get("key")? != expected_key.to_hex()
+        || get("fingerprint")? != expected_fingerprint.to_hex()
+    {
+        return Err("cold-cache sidecar identity/ABI mismatch".to_string());
+    }
+    let parse = |name: &str| -> Result<u32, String> {
+        get(name)?
+            .parse::<u32>()
+            .map_err(|_| format!("invalid cold-cache sidecar metadata `{name}`"))
+    };
+    let dims_field = get("dims")?;
+    let mut dims = Vec::new();
+    for part in dims_field.split(',') {
+        if dims.len() == MAX_SIDECAR_DIMS {
+            return Err("cold-cache sidecar dims count out of range".to_string());
+        }
+        dims.push(
+            part.parse::<u32>()
+                .map_err(|_| "invalid cold-cache sidecar metadata `dims`".to_string())?,
+        );
+    }
+    let layout = ColdSidecarLayout {
+        group: expected_group,
+        boundary_tokens: parse("boundary_tokens")?,
+        num_layers: parse("num_layers")?,
+        tensors_per_layer: parse("tensors_per_layer")?,
+        dtype: get("dtype")?,
+        dims,
+        bytes_per_tensor: get("bytes_per_tensor")?
+            .parse::<usize>()
+            .map_err(|_| "invalid cold-cache sidecar metadata `bytes_per_tensor`".to_string())?,
+    };
+    // `num_layers`/`tensors_per_layer` are untrusted metadata; a valid
+    // sidecar has exactly their product of tensors. Checking that against the
+    // actually-deserialized tensor count (bounded by the byte-capped read)
+    // keeps the reservation below from being sized by a forged value.
+    if layout.tensors_per_layer > MAX_SIDECAR_TENSORS_PER_LAYER
+        || layout.tensor_count() != Some(tensors.len())
+    {
+        return Err("cold-cache sidecar tensor count does not match layout".to_string());
+    }
+    let per_layer = layout.tensors_per_layer as usize;
+    let mut state = Vec::with_capacity(tensors.len());
+    for index in 0..tensors.len() {
+        state.push(
+            tensors
+                .tensor(&sidecar_tensor_name(index / per_layer, index % per_layer))
+                .map_err(|e| e.to_string())?
+                .data()
+                .to_vec(),
+        );
+    }
+    let sidecar = ColdSidecar {
+        key: expected_key,
+        fingerprint: expected_fingerprint,
+        layout,
+        tensors: state,
+    };
+    // Structural validation (including per-tensor byte lengths) before the
+    // checksum, so a forged header can never make the checksum the only gate.
+    sidecar.validate()?;
+
+    let mut owned = Vec::with_capacity(sidecar.tensors.len());
+    for (index, tensor) in sidecar.tensors.iter().enumerate() {
+        owned.push((
+            sidecar_tensor_name(index / per_layer, index % per_layer),
+            tensor.clone(),
+        ));
+    }
+    if payload_checksum(&owned) != get("checksum")? {
+        return Err("cold-cache sidecar payload checksum mismatch".to_string());
+    }
+    Ok(sidecar)
+}
+
 fn payload_checksum(tensors: &[(String, Vec<u8>)]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"mlx-node:cold-cache-payload:v1\0");
@@ -1585,13 +2214,10 @@ fn payload_checksum(tensors: &[(String, Vec<u8>)]) -> String {
 fn rebuild_index(root: &RootDir) -> Result<CacheIndex, String> {
     let mut index = CacheIndex::default();
     for name in root.entry_names()? {
-        let Some(stem) = name.strip_suffix(".safetensors") else {
+        let Some((key, group)) = parse_object_name(&name) else {
             if is_cold_cache_temp_file(&name) {
                 let _ = root.unlink(&name);
             }
-            continue;
-        };
-        let Some(key) = ColdCacheKey::from_hex(stem) else {
             continue;
         };
         let Some((size, last_access)) = root.stat_file(&name) else {
@@ -1600,6 +2226,7 @@ fn rebuild_index(root: &RootDir) -> Result<CacheIndex, String> {
         index.entries.insert(
             key,
             IndexEntry {
+                group,
                 file_name: name,
                 size,
                 last_access,
@@ -1709,27 +2336,551 @@ mod tests {
         ))
     }
 
+    fn sidecar_layout(group: ColdGroup) -> ColdSidecarLayout {
+        ColdSidecarLayout {
+            group,
+            boundary_tokens: 16,
+            num_layers: 2,
+            tensors_per_layer: 2,
+            dtype: "BFloat16".to_string(),
+            dims: vec![4, 8, 2],
+            bytes_per_tensor: 6,
+        }
+    }
+
+    fn sidecar(key: ColdCacheKey, group: ColdGroup) -> ColdSidecar {
+        let layout = sidecar_layout(group);
+        let count = layout.tensor_count().unwrap();
+        ColdSidecar {
+            key,
+            fingerprint: fingerprint(),
+            layout,
+            // Distinct per-tensor content so a decoder that reorders or
+            // aliases tensors cannot round-trip.
+            tensors: (0..count)
+                .map(|i| (0..6u8).map(|b| i as u8 * 16 + b).collect())
+                .collect(),
+        }
+    }
+
+    /// Byte-for-byte reimplementation of the key derivation as it existed
+    /// before [`ColdGroup`] — the reference the KV group must still match.
+    fn pre_group_chain(
+        fingerprint: ColdCacheFingerprint,
+        parent: Option<ColdCacheKey>,
+        tokens: &[u32],
+        extra_keys: &[u64],
+        cache_salt: u64,
+        block_index: usize,
+    ) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"mlx-node:cold-prefix-block:v1\0");
+        hasher.update(fingerprint.as_bytes());
+        hasher.update(parent.map_or([0u8; 32], |key| *key.as_bytes()));
+        hasher.update((block_index as u64).to_le_bytes());
+        hasher.update((tokens.len() as u64).to_le_bytes());
+        for token in tokens {
+            hasher.update(token.to_le_bytes());
+        }
+        hasher.update((extra_keys.len() as u64).to_le_bytes());
+        for key in extra_keys {
+            hasher.update(key.to_le_bytes());
+        }
+        hasher.update(if block_index == 0 { cache_salt } else { 0 }.to_le_bytes());
+        hasher.finalize().into()
+    }
+
+    /// Adding the group discriminant must not move a single KV key: an
+    /// existing chain on disk (and the hot-chain contract the adapter mirrors)
+    /// still derives to exactly the same bytes.
+    #[test]
+    fn kv_group_key_is_byte_identical_to_pre_group_derivation() {
+        let fp = fingerprint();
+        // Frozen golden value for the canonical first block, so a future edit
+        // to the hashed component order fails here even if the reference
+        // implementation below were edited alongside it.
+        assert_eq!(
+            ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[], 0, 0).to_hex(),
+            "150ac769fca99a77c26a4b3776143c1912d837c90fad2889719e83ef7896a6d7",
+            "the KV key derivation is a persisted on-disk contract"
+        );
+
+        let parent = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[], 7, 0);
+        for (parent, tokens, extra, salt, index) in [
+            (None, vec![1u32, 2, 3, 4], vec![], 0u64, 0usize),
+            (None, vec![1, 2, 3, 4], vec![9u64], 7, 0),
+            (Some(parent), vec![5, 6, 7, 8], vec![9, 10], 7, 1),
+            (Some(parent), vec![], vec![], u64::MAX, 3),
+        ] {
+            assert_eq!(
+                ColdCacheKey::chain(ColdGroup::Kv, fp, parent, &tokens, &extra, salt, index)
+                    .as_bytes(),
+                &pre_group_chain(fp, parent, &tokens, &extra, salt, index),
+                "ColdGroup::Kv must reproduce the pre-group derivation exactly"
+            );
+        }
+    }
+
+    /// vLLM folds the cache-group id into the block hash key
+    /// (`BlockHashWithGroupId`) precisely so one group's entry can never be
+    /// served for another's. Same inputs, different group ⇒ different key.
+    #[test]
+    fn groups_never_collide_for_identical_inputs() {
+        let fp = fingerprint();
+        let groups = [ColdGroup::Kv, ColdGroup::GdnState, ColdGroup::SlidingWindow];
+        let parent = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[], 0, 0);
+        for (parent, tokens, extra, salt, index) in [
+            (None, vec![1u32, 2, 3, 4], vec![], 0u64, 0usize),
+            (Some(parent), vec![5, 6, 7, 8], vec![11u64], 3, 1),
+        ] {
+            let keys: Vec<ColdCacheKey> = groups
+                .iter()
+                .map(|&group| ColdCacheKey::chain(group, fp, parent, &tokens, &extra, salt, index))
+                .collect();
+            for i in 0..keys.len() {
+                for j in (i + 1)..keys.len() {
+                    assert_ne!(
+                        keys[i], keys[j],
+                        "{:?} and {:?} must not share a key",
+                        groups[i], groups[j]
+                    );
+                }
+            }
+        }
+        // Domain tags must also stay pairwise distinct as literals, since key
+        // separation rests entirely on them.
+        let tags: Vec<&[u8]> = groups.iter().map(|g| g.domain_tag()).collect();
+        for i in 0..tags.len() {
+            for j in (i + 1)..tags.len() {
+                assert_ne!(tags[i], tags[j]);
+            }
+        }
+    }
+
+    /// A sidecar lives in its own filename namespace, so it can never be
+    /// opened — let alone decoded — through the KV block path.
+    #[test]
+    fn sidecar_names_are_disjoint_from_block_names() {
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let kv_name = object_file_name(&key, ColdGroup::Kv);
+        assert_eq!(kv_name, format!("{}.safetensors", key.to_hex()));
+        assert_eq!(parse_object_name(&kv_name), Some((key, ColdGroup::Kv)));
+
+        for group in ColdGroup::SIDECAR_GROUPS {
+            let name = object_file_name(&key, group);
+            assert_ne!(name, kv_name);
+            assert_eq!(
+                name,
+                format!("{}.{}.safetensors", key.to_hex(), group.label())
+            );
+            assert_eq!(parse_object_name(&name), Some((key, group)));
+        }
+
+        // Non-canonical shapes are never adopted by the index scanner.
+        assert_eq!(
+            parse_object_name(&format!("{}.kv.safetensors", key.to_hex())),
+            None
+        );
+        assert_eq!(
+            parse_object_name(&format!("{}.bogus.safetensors", key.to_hex())),
+            None
+        );
+        assert_eq!(
+            parse_object_name(&format!("{}.safetensors.tmp", key.to_hex())),
+            None
+        );
+        assert_eq!(parse_object_name("not-a-key.gdn_state.safetensors"), None);
+    }
+
+    #[test]
+    fn sidecar_roundtrip_preserves_dtype_and_dims() {
+        let fp = fingerprint();
+        let key = ColdCacheKey::chain(ColdGroup::GdnState, fp, None, &[1, 2, 3, 4], &[], 0, 0);
+        let original = sidecar(key, ColdGroup::GdnState);
+        let encoded = encode_sidecar(&original).unwrap();
+        assert!(
+            encoded.len() as u64 <= max_encoded_len_for_sidecar(&original.layout).unwrap(),
+            "the read bound must be a true upper bound on the encoder output"
+        );
+
+        let decoded = decode_sidecar(&encoded, key, fp, ColdGroup::GdnState).unwrap();
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.layout.dtype, "BFloat16");
+        assert_eq!(decoded.layout.dims, vec![4, 8, 2]);
+        assert_eq!(decoded.layout.boundary_tokens, 16);
+        assert_eq!(decoded.layout.tensors_per_layer, 2);
+
+        // Wrong group, wrong key, wrong fingerprint: all refused.
+        assert!(decode_sidecar(&encoded, key, fp, ColdGroup::SlidingWindow).is_err());
+        assert!(decode_sidecar(&encoded, key, fp, ColdGroup::Kv).is_err());
+        let other = ColdCacheKey::chain(ColdGroup::GdnState, fp, None, &[9, 9, 9, 9], &[], 0, 0);
+        assert!(decode_sidecar(&encoded, other, fp, ColdGroup::GdnState).is_err());
+        let other_fp = ColdCacheFingerprint::from_components([b"other".as_slice()]);
+        assert!(decode_sidecar(&encoded, key, other_fp, ColdGroup::GdnState).is_err());
+
+        // A corrupt payload byte fails the checksum.
+        let mut corrupt = encoded.clone();
+        *corrupt.last_mut().unwrap() ^= 0xff;
+        assert!(decode_sidecar(&corrupt, key, fp, ColdGroup::GdnState).is_err());
+
+        // The two object types are mutually undecodable even with matching
+        // identity metadata: neither decoder can be fed the other's bytes.
+        assert!(decode_block(&encoded, key, fp).is_err());
+        let kv_key = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[], 0, 0);
+        let block_bytes = encode_block(&block(kv_key)).unwrap();
+        assert!(decode_sidecar(&block_bytes, kv_key, fp, ColdGroup::GdnState).is_err());
+    }
+
+    #[test]
+    fn sidecar_rejects_out_of_range_geometry() {
+        let key = ColdCacheKey::chain(ColdGroup::GdnState, fingerprint(), None, &[1], &[], 0, 0);
+        let mut kv_group = sidecar(key, ColdGroup::GdnState);
+        kv_group.layout.group = ColdGroup::Kv;
+        assert!(
+            kv_group.validate().is_err(),
+            "sidecars must not use the KV group"
+        );
+
+        let mut zero_boundary = sidecar(key, ColdGroup::GdnState);
+        zero_boundary.layout.boundary_tokens = 0;
+        assert!(zero_boundary.validate().is_err());
+
+        let mut too_many = sidecar(key, ColdGroup::GdnState);
+        too_many.layout.tensors_per_layer = MAX_SIDECAR_TENSORS_PER_LAYER + 1;
+        assert!(too_many.validate().is_err());
+        assert_eq!(max_encoded_len_for_sidecar(&too_many.layout), None);
+
+        let mut too_many_dims = sidecar(key, ColdGroup::GdnState);
+        too_many_dims.layout.dims = vec![1; MAX_SIDECAR_DIMS + 1];
+        assert!(too_many_dims.validate().is_err());
+
+        let mut short_tensor = sidecar(key, ColdGroup::GdnState);
+        short_tensor.tensors[1].pop();
+        assert!(short_tensor.validate().is_err());
+
+        let mut missing_tensor = sidecar(key, ColdGroup::GdnState);
+        missing_tensor.tensors.pop();
+        assert!(missing_tensor.validate().is_err());
+    }
+
+    /// A policy is a geometry TEMPLATE, not a boundary: the boundary is the one
+    /// layout field that varies per candidate prefix, so the constructor drops
+    /// whatever was passed and `expected_at` stamps in the candidate's own. Any
+    /// geometry a sidecar could never legally be written with is refused up
+    /// front, so an impossible policy cannot be installed and then silently
+    /// suppress every restore forever.
+    #[test]
+    fn sidecar_policy_is_a_boundary_free_geometry_template() {
+        let policy = ColdSidecarPolicy::new(ColdSidecarLayout {
+            boundary_tokens: 4096,
+            ..sidecar_layout(ColdGroup::GdnState)
+        })
+        .expect("a legal geometry must build a policy");
+        assert_eq!(policy.group(), ColdGroup::GdnState);
+        assert_eq!(
+            policy.expected_at(32),
+            ColdSidecarLayout {
+                boundary_tokens: 32,
+                ..sidecar_layout(ColdGroup::GdnState)
+            },
+            "the constructor's boundary must be dropped and the candidate's used"
+        );
+
+        // KV is not an auxiliary group: a policy in it would mint keys that
+        // collide with the block namespace.
+        assert!(ColdSidecarPolicy::new(sidecar_layout(ColdGroup::Kv)).is_err());
+        // Every geometry bound `ColdSidecar::validate` enforces applies here.
+        assert!(
+            ColdSidecarPolicy::new(ColdSidecarLayout {
+                tensors_per_layer: MAX_SIDECAR_TENSORS_PER_LAYER + 1,
+                ..sidecar_layout(ColdGroup::GdnState)
+            })
+            .is_err()
+        );
+        assert!(
+            ColdSidecarPolicy::new(ColdSidecarLayout {
+                dims: Vec::new(),
+                ..sidecar_layout(ColdGroup::GdnState)
+            })
+            .is_err()
+        );
+        assert!(
+            ColdSidecarPolicy::new(ColdSidecarLayout {
+                bytes_per_tensor: 0,
+                ..sidecar_layout(ColdGroup::GdnState)
+            })
+            .is_err()
+        );
+        assert!(
+            ColdSidecarPolicy::new(ColdSidecarLayout {
+                num_layers: 0,
+                ..sidecar_layout(ColdGroup::GdnState)
+            })
+            .is_err()
+        );
+    }
+
+    /// A forged sidecar header must never size an allocation: the tensor
+    /// count is checked against what actually deserialized, exactly as the
+    /// block decoder checks `1 + 2*num_layers`. The test returning at all
+    /// proves no multi-GB reservation happened.
+    #[test]
+    fn sidecar_decode_rejects_forged_counts() {
+        let key = ColdCacheKey::chain(ColdGroup::GdnState, fingerprint(), None, &[1], &[], 0, 0);
+        let payload: Vec<u8> = vec![7; 6];
+        let view = TensorView::new(Dtype::U8, vec![payload.len()], &payload).unwrap();
+        let forged = |num_layers: &str, per_layer: &str| {
+            let mut metadata = HashMap::new();
+            metadata.insert("abi".to_string(), CACHE_ABI.to_string());
+            metadata.insert("group".to_string(), ColdGroup::GdnState.label().to_string());
+            metadata.insert("key".to_string(), key.to_hex());
+            metadata.insert("fingerprint".to_string(), fingerprint().to_hex());
+            metadata.insert("checksum".to_string(), "unused".to_string());
+            metadata.insert("boundary_tokens".to_string(), "16".to_string());
+            metadata.insert("num_layers".to_string(), num_layers.to_string());
+            metadata.insert("tensors_per_layer".to_string(), per_layer.to_string());
+            metadata.insert("dtype".to_string(), "BFloat16".to_string());
+            metadata.insert("dims".to_string(), "4,8,2".to_string());
+            metadata.insert("bytes_per_tensor".to_string(), "6".to_string());
+            serialize(
+                vec![(sidecar_tensor_name(0, 0).as_str(), view.clone())],
+                Some(metadata),
+            )
+            .unwrap()
+        };
+
+        for (layers, per_layer) in [
+            (u32::MAX.to_string(), "16".to_string()),
+            (u32::MAX.to_string(), u32::MAX.to_string()),
+            ("1".to_string(), "0".to_string()),
+            ("2".to_string(), "1".to_string()),
+        ] {
+            assert!(
+                decode_sidecar(
+                    &forged(&layers, &per_layer),
+                    key,
+                    fingerprint(),
+                    ColdGroup::GdnState
+                )
+                .is_err(),
+                "forged counts ({layers}, {per_layer}) must be rejected before allocating"
+            );
+        }
+    }
+
+    /// End-to-end fail-closed contract: a sidecar that lands on disk and is
+    /// then truncated must MISS, count exactly one corruption, and have its
+    /// file pruned — never panic, and never hand back partial state.
+    #[test]
+    fn truncated_sidecar_is_a_graceful_miss_that_prunes_and_counts_corruption() {
+        let root = temp_root("sidecar-truncated");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let fp = fingerprint();
+        let key = ColdCacheKey::chain(ColdGroup::GdnState, fp, None, &[1, 2, 3, 4], &[], 0, 0);
+        let expected = sidecar(key, ColdGroup::GdnState);
+
+        assert!(manager.enqueue_sidecar(expected.clone()).unwrap());
+        assert!(manager.drain(Duration::from_secs(5)));
+
+        let path = root.join(object_file_name(&key, ColdGroup::GdnState));
+        assert!(path.exists(), "the sidecar must land under its own name");
+        assert!(
+            !root.join(format!("{}.safetensors", key.to_hex())).exists(),
+            "a sidecar must never occupy the KV block name"
+        );
+        assert!(manager.contains_in(&key, ColdGroup::GdnState));
+        assert!(!manager.contains(&key), "a sidecar is not a KV block");
+        assert_eq!(
+            manager.load_sidecar(key, fp, &sidecar_layout(ColdGroup::GdnState)),
+            Some(expected.clone())
+        );
+
+        // Truncate in place (same inode), so pruning sees the very entry that
+        // failed and is allowed to clear it.
+        let bytes = fs::read(&path).unwrap();
+        fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+
+        let before = manager.stats();
+        assert_eq!(
+            manager.load_sidecar(key, fp, &sidecar_layout(ColdGroup::GdnState)),
+            None,
+            "a truncated sidecar must miss, not panic or return partial state"
+        );
+        let after = manager.stats();
+        assert_eq!(after.corruptions, before.corruptions + 1);
+        assert_eq!(after.misses, before.misses + 1);
+        assert!(!path.exists(), "the corrupt sidecar file must be pruned");
+        assert!(!manager.contains_in(&key, ColdGroup::GdnState));
+
+        // A sidecar asked for under the wrong group, or with a layout that
+        // does not match what was written, is likewise a miss.
+        assert_eq!(
+            manager.load_sidecar(key, fp, &sidecar_layout(ColdGroup::Kv)),
+            None
+        );
+
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A sidecar whose on-disk geometry differs from what the caller expects
+    /// is a miss, not a reinterpretation — the sidecar analogue of
+    /// `layout_matches_pool`.
+    #[test]
+    fn sidecar_layout_mismatch_is_a_miss() {
+        let root = temp_root("sidecar-layout-mismatch");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let fp = fingerprint();
+        let key = ColdCacheKey::chain(ColdGroup::GdnState, fp, None, &[1, 2, 3, 4], &[], 0, 0);
+        assert!(
+            manager
+                .enqueue_sidecar(sidecar(key, ColdGroup::GdnState))
+                .unwrap()
+        );
+        assert!(manager.drain(Duration::from_secs(5)));
+
+        let mut wrong_dtype = sidecar_layout(ColdGroup::GdnState);
+        wrong_dtype.dtype = "Float16".to_string();
+        assert_eq!(manager.load_sidecar(key, fp, &wrong_dtype), None);
+
+        let mut wrong_dims = sidecar_layout(ColdGroup::GdnState);
+        wrong_dims.dims = vec![4, 8, 3];
+        assert_eq!(manager.load_sidecar(key, fp, &wrong_dims), None);
+
+        let mut wrong_boundary = sidecar_layout(ColdGroup::GdnState);
+        wrong_boundary.boundary_tokens = 32;
+        assert_eq!(manager.load_sidecar(key, fp, &wrong_boundary), None);
+
+        // The file survives every mismatch: it is valid, just not what this
+        // caller asked for.
+        assert!(
+            root.join(object_file_name(&key, ColdGroup::GdnState))
+                .exists()
+        );
+        assert_eq!(
+            manager.load_sidecar(key, fp, &sidecar_layout(ColdGroup::GdnState)),
+            Some(sidecar(key, ColdGroup::GdnState))
+        );
+
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// `layout_matches_pool` must reject a block whose per-layer K/V byte
+    /// lengths disagree with the pool, instead of leaving it to
+    /// `write_blocks_from_host` — by then a physical block is allocated and
+    /// earlier layers are already uploaded.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn layout_mismatch_on_layer_bytes_is_rejected_at_validation() {
+        use crate::PagedAttentionConfig;
+        use crate::metal::MetalDtype;
+
+        let config = PagedAttentionConfig {
+            block_size: 8,
+            gpu_memory_mb: 256,
+            head_size: 64,
+            num_kv_heads: 1,
+            num_layers: 1,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(32),
+            max_batch_size: Some(1),
+        };
+        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping layout_mismatch_on_layer_bytes_is_rejected_at_validation: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+
+        // The pool's own per-layer byte lengths, cross-checked against what
+        // `read_blocks_to_host` actually produces.
+        let (key_bytes, value_bytes) = pool_layer_bytes(&pool).unwrap();
+        let (keys, values) = pool.read_blocks_to_host(0, &[0]).unwrap();
+        assert_eq!((keys.len(), values.len()), (key_bytes, value_bytes));
+
+        let matching = ColdCacheLayout {
+            block_size: pool.block_size(),
+            num_layers: pool.num_layers() as u32,
+            num_kv_heads: pool.config().num_kv_heads,
+            head_size: pool.config().head_size,
+            cache_dtype: format!("{:?}", pool.cache_dtype()),
+            key_bytes_per_layer: key_bytes,
+            value_bytes_per_layer: value_bytes,
+        };
+        assert!(layout_matches_pool(&matching, &pool));
+
+        let mut wrong_keys = matching.clone();
+        wrong_keys.key_bytes_per_layer = key_bytes / 2;
+        assert!(
+            !layout_matches_pool(&wrong_keys, &pool),
+            "a key_bytes mismatch must fail validation, not the upload"
+        );
+
+        let mut wrong_values = matching.clone();
+        wrong_values.value_bytes_per_layer = value_bytes + 2;
+        assert!(
+            !layout_matches_pool(&wrong_values, &pool),
+            "a value_bytes mismatch must fail validation, not the upload"
+        );
+    }
+
+    /// Sidecars occupy quota like any other object, so the startup scan must
+    /// index them — an unaccounted file would sit outside eviction forever.
+    #[test]
+    fn sidecars_are_indexed_and_accounted_across_restart() {
+        let root = temp_root("sidecar-accounting");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let fp = fingerprint();
+        let kv_key = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[], 0, 0);
+        let side_key = ColdCacheKey::chain(ColdGroup::GdnState, fp, None, &[1, 2, 3, 4], &[], 0, 0);
+        assert!(manager.enqueue(block(kv_key)).unwrap());
+        assert!(
+            manager
+                .enqueue_sidecar(sidecar(side_key, ColdGroup::GdnState))
+                .unwrap()
+        );
+        assert!(manager.drain(Duration::from_secs(5)));
+        drop(manager);
+
+        let reopened = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let index = reopened.shared.index.lock().unwrap();
+        assert_eq!(index.entries.len(), 2, "both objects must be indexed");
+        assert_eq!(index.entries[&kv_key].group, ColdGroup::Kv);
+        assert_eq!(index.entries[&side_key].group, ColdGroup::GdnState);
+        let on_disk: u64 = [kv_key, side_key]
+            .iter()
+            .map(|key| index.entries[key].size)
+            .sum();
+        assert_eq!(index.total_bytes, on_disk);
+        drop(index);
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn stable_chain_is_parent_and_fingerprint_sensitive() {
         let fp = fingerprint();
-        let first = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[], 0, 0);
+        let first = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[], 0, 0);
         assert_eq!(
             first,
-            ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[], 0, 0)
+            ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[], 0, 0)
         );
         assert_ne!(
             first,
-            ColdCacheKey::chain(fp, None, &[1, 2, 3, 5], &[], 0, 0)
+            ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 5], &[], 0, 0)
         );
         assert_ne!(
-            ColdCacheKey::chain(fp, Some(first), &[5, 6, 7, 8], &[], 0, 1),
-            ColdCacheKey::chain(fp, None, &[5, 6, 7, 8], &[], 0, 1)
+            ColdCacheKey::chain(ColdGroup::Kv, fp, Some(first), &[5, 6, 7, 8], &[], 0, 1),
+            ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[5, 6, 7, 8], &[], 0, 1)
         );
     }
 
     #[test]
     fn safetensors_roundtrip_and_checksum() {
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         let original = block(key);
         let encoded = encode_block(&original).unwrap();
         let decoded = decode_block(&encoded, key, fingerprint()).unwrap();
@@ -1742,7 +2893,7 @@ mod tests {
 
     #[test]
     fn full_blocks_only() {
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         let mut partial = block(key);
         partial.tokens.pop();
         assert!(partial.validate().is_err());
@@ -1752,7 +2903,7 @@ mod tests {
     fn writer_is_atomic_and_index_rebuilds() {
         let root = temp_root("roundtrip");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         let expected = block(key);
         assert!(manager.enqueue(expected.clone()).unwrap());
 
@@ -1787,7 +2938,7 @@ mod tests {
         let mut accepted = Vec::new();
         for i in 0..8u32 {
             let toks = vec![i, i + 100, i + 200, i + 300];
-            let key = ColdCacheKey::chain(fingerprint(), None, &toks, &[], 0, 0);
+            let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &toks, &[], 0, 0);
             let mut candidate = block(key);
             candidate.tokens = toks;
             // Non-blocking enqueue may drop under a momentarily full queue; only
@@ -1839,7 +2990,7 @@ mod tests {
         *manager.shared.dir_sync_override.lock().unwrap() =
             Some(Box::new(|| Err("injected dir fsync failure".to_string())));
 
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         assert!(
             manager.enqueue(block(key)).unwrap(),
             "the block must be accepted so the barrier covers it"
@@ -1882,7 +3033,7 @@ mod tests {
 
         let make_block = |i: u32| {
             let toks = vec![i, i + 100, i + 200, i + 300];
-            let key = ColdCacheKey::chain(fingerprint(), None, &toks, &[], 0, 0);
+            let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &toks, &[], 0, 0);
             let mut candidate = block(key);
             candidate.tokens = toks;
             candidate
@@ -1942,7 +3093,7 @@ mod tests {
     fn post_rename_dir_sync_failure_keeps_index_consistent() {
         let root = temp_root("dir-sync-fail");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         let expected = block(key);
         // The index credits the actual encoded byte length, matching
         // `persist_block`'s `size = bytes.len()` (not the `encoded_len`
@@ -1994,9 +3145,9 @@ mod tests {
 
         let root = temp_root("restart-lru");
         let fp = fingerprint();
-        let key_a = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[1], 0, 0);
-        let key_b = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[2], 0, 0);
-        let key_c = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[3], 0, 0);
+        let key_a = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[1], 0, 0);
+        let key_b = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[2], 0, 0);
+        let key_c = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[3], 0, 0);
         let path_a = root.join(format!("{}.safetensors", key_a.to_hex()));
         let path_b = root.join(format!("{}.safetensors", key_b.to_hex()));
         let path_c = root.join(format!("{}.safetensors", key_c.to_hex()));
@@ -2044,7 +3195,7 @@ mod tests {
     fn contains_checks_index_without_stats_side_effects() {
         let root = temp_root("contains");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         assert!(!manager.contains(&key));
         assert!(manager.enqueue(block(key)).unwrap());
         for _ in 0..200 {
@@ -2065,7 +3216,7 @@ mod tests {
     fn load_miss_after_external_delete_prunes_index() {
         let root = temp_root("external-delete");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         assert!(manager.enqueue(block(key)).unwrap());
         for _ in 0..200 {
             if manager.contains(&key) {
@@ -2100,7 +3251,7 @@ mod tests {
         fs::write(&victim, b"victim payload").unwrap();
 
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         assert!(manager.enqueue(block(key)).unwrap());
         for _ in 0..200 {
             if manager.contains(&key) {
@@ -2155,7 +3306,7 @@ mod tests {
 
         let root = temp_root("fifo-swap");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         assert!(manager.enqueue(block(key)).unwrap());
         for _ in 0..200 {
             if manager.contains(&key) {
@@ -2217,7 +3368,7 @@ mod tests {
     fn load_miss_after_empty_dir_swap_removes_dir_and_unblocks_key() {
         let root = temp_root("empty-dir-swap");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         assert!(manager.enqueue(block(key)).unwrap());
         for _ in 0..200 {
             if manager.contains(&key) {
@@ -2265,7 +3416,7 @@ mod tests {
     fn load_miss_after_nonempty_dir_swap_quarantines_without_deleting_content() {
         let root = temp_root("nonempty-dir-swap");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         assert!(manager.enqueue(block(key)).unwrap());
         for _ in 0..200 {
             if manager.contains(&key) {
@@ -2334,7 +3485,7 @@ mod tests {
 
         let root = temp_root("unreadable-entry");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         persist_block(&manager.shared, &block(key)).unwrap();
         assert!(manager.contains(&key));
 
@@ -2367,7 +3518,7 @@ mod tests {
     fn load_bounded_rejects_oversized_entry_without_unbounded_alloc() {
         let root = temp_root("bounded-oversized");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         let good = block(key);
         // Tight, geometry-derived cap: the legit entry's encoded upper bound.
         let max_encoded = good.encoded_len();
@@ -2431,8 +3582,8 @@ mod tests {
     fn eviction_quarantines_directory_swapped_onto_lru_entry() {
         let root = temp_root("evict-dir-swap");
         let fp = fingerprint();
-        let key_a = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[1], 0, 0);
-        let key_b = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[2], 0, 0);
+        let key_a = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[1], 0, 0);
+        let key_b = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[2], 0, 0);
         let one = encode_block(&block(key_a)).unwrap().len() as u64;
         let manager = ColdCacheManager::open_at(root.clone(), one + one / 2, 0, 2).unwrap();
 
@@ -2502,8 +3653,8 @@ mod tests {
 
         let root = temp_root("evict-unclearable");
         let fp = fingerprint();
-        let key_a = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[1], 0, 0);
-        let key_b = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[2], 0, 0);
+        let key_a = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[1], 0, 0);
+        let key_b = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[2], 0, 0);
         let one = encode_block(&block(key_a)).unwrap().len() as u64;
         let manager = ColdCacheManager::open_at(root.clone(), one + one / 2, 0, 2).unwrap();
 
@@ -2543,7 +3694,7 @@ mod tests {
 
         let root = temp_root("failed-open-writer-race");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         persist_block(&manager.shared, &block(key)).unwrap();
         let size = encode_block(&block(key)).unwrap().len() as u64;
 
@@ -2640,8 +3791,8 @@ mod tests {
     fn eviction_of_missing_entry_frees_nothing_and_keeps_reserve() {
         let root = temp_root("evict-missing-reserve");
         let fp = fingerprint();
-        let key_a = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[1], 0, 0);
-        let key_b = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[2], 0, 0);
+        let key_a = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[1], 0, 0);
+        let key_b = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[2], 0, 0);
         let one = encode_block(&block(key_a)).unwrap().len() as u64;
         let reserve = 5 * one;
         let manager = ColdCacheManager::open_at(root.clone(), GIB, reserve, 2).unwrap();
@@ -2687,8 +3838,8 @@ mod tests {
     fn eviction_quarantine_frees_nothing_and_keeps_reserve() {
         let root = temp_root("evict-quarantine-reserve");
         let fp = fingerprint();
-        let key_a = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[1], 0, 0);
-        let key_b = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[2], 0, 0);
+        let key_a = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[1], 0, 0);
+        let key_b = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[2], 0, 0);
         let one = encode_block(&block(key_a)).unwrap().len() as u64;
         let reserve = 5 * one;
         let marker = b"marker";
@@ -2751,8 +3902,8 @@ mod tests {
     fn eviction_of_regular_file_frees_space_and_admits_write() {
         let root = temp_root("evict-regular-reserve");
         let fp = fingerprint();
-        let key_a = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[1], 0, 0);
-        let key_b = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[2], 0, 0);
+        let key_a = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[1], 0, 0);
+        let key_b = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[2], 0, 0);
         let one = encode_block(&block(key_a)).unwrap().len() as u64;
         let reserve = 5 * one;
         let manager = ColdCacheManager::open_at(root.clone(), GIB, reserve, 2).unwrap();
@@ -2778,7 +3929,7 @@ mod tests {
     #[test]
     fn startup_rebuild_ignores_quarantined_directories() {
         let root = temp_root("quarantine-rebuild");
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         let quarantined = root.join(format!(".blocked.{}.safetensors.4242.7", key.to_hex()));
         fs::create_dir_all(&quarantined).unwrap();
         let marker = quarantined.join("marker.txt");
@@ -2806,7 +3957,7 @@ mod tests {
     fn writer_commit_rename_failure_counts_drop_and_removes_temp() {
         let root = temp_root("commit-rename-failure");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         let path = root.join(format!("{}.safetensors", key.to_hex()));
         fs::create_dir(&path).unwrap();
         fs::write(path.join("marker.txt"), b"marker").unwrap();
@@ -2844,7 +3995,7 @@ mod tests {
     fn failed_load_cleanup_spares_concurrent_writer_replacement() {
         let root = temp_root("replace-race");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         let path = root.join(format!("{}.safetensors", key.to_hex()));
         fs::write(&path, b"corrupt generation").unwrap();
 
@@ -2878,7 +4029,7 @@ mod tests {
     fn startup_cleanup_removes_only_writer_temp_files() {
         let root = temp_root("tmp-cleanup");
         fs::create_dir_all(&root).unwrap();
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         let stale_writer_tmp = root.join(format!(".{}.{}.{}.tmp", key.to_hex(), 4242, 7));
         let foreign_tmp = root.join("foo.tmp");
         let foreign_data = root.join("data.txt");
@@ -2906,7 +4057,7 @@ mod tests {
         fs::create_dir_all(&victim).unwrap();
         let marker = victim.join("marker.txt");
         fs::write(&marker, b"marker").unwrap();
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         let victim_tmp = victim.join(format!(".{}.{}.{}.tmp", key.to_hex(), 4242, 7));
         fs::write(&victim_tmp, b"stale").unwrap();
         let victim_mode = fs::metadata(&victim).unwrap().permissions().mode() & 0o7777;
@@ -2951,8 +4102,8 @@ mod tests {
         let victim_mode = fs::metadata(&victim).unwrap().permissions().mode() & 0o7777;
 
         let fp = fingerprint();
-        let key_a = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[1], 0, 0);
-        let key_b = ColdCacheKey::chain(fp, None, &[1, 2, 3, 4], &[2], 0, 0);
+        let key_a = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[1], 0, 0);
+        let key_b = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[2], 0, 0);
         let one = encode_block(&block(key_a)).unwrap().len() as u64;
         let manager = ColdCacheManager::open_at(root.clone(), one + one / 2, 0, 2).unwrap();
 
@@ -3023,7 +4174,7 @@ mod tests {
     fn corrupt_file_fails_open_and_is_removed() {
         let root = temp_root("corrupt");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 1).unwrap();
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         let path = root.join(format!("{}.safetensors", key.to_hex()));
         fs::write(&path, b"not a safetensors file").unwrap();
         assert!(manager.load(key, fingerprint()).is_none());
@@ -3070,7 +4221,7 @@ mod tests {
         let root = temp_root("restore");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
         let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let key = ColdCacheKey::chain(fingerprint(), None, &tokens, &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &tokens, &[], 0, 0);
         assert!(
             manager
                 .capture_and_enqueue(&pool, &source, key, fingerprint(), &tokens)
@@ -3163,7 +4314,7 @@ mod tests {
         let root = temp_root("restore-miss");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
         let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let key = ColdCacheKey::chain(fingerprint(), None, &tokens, &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &tokens, &[], 0, 0);
         assert!(
             manager
                 .capture_and_enqueue(&pool, &source, key, fingerprint(), &tokens)
@@ -3276,8 +4427,24 @@ mod tests {
         let extra_keys: &[u64] = &[];
         let cache_salt = 0u64;
         let fp = fingerprint();
-        let key0 = ColdCacheKey::chain(fp, None, &tokens[0..8], extra_keys, cache_salt, 0);
-        let key1 = ColdCacheKey::chain(fp, Some(key0), &tokens[8..16], extra_keys, cache_salt, 1);
+        let key0 = ColdCacheKey::chain(
+            ColdGroup::Kv,
+            fp,
+            None,
+            &tokens[0..8],
+            extra_keys,
+            cache_salt,
+            0,
+        );
+        let key1 = ColdCacheKey::chain(
+            ColdGroup::Kv,
+            fp,
+            Some(key0),
+            &tokens[8..16],
+            extra_keys,
+            cache_salt,
+            1,
+        );
 
         let root = temp_root("multi-restore");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 4).unwrap();
@@ -3317,7 +4484,15 @@ mod tests {
         let mut restored = Vec::new();
         for idx in 0..2usize {
             let toks = &tokens[idx * 8..(idx + 1) * 8];
-            let key = ColdCacheKey::chain(fp, parent_key, toks, extra_keys, cache_salt, idx);
+            let key = ColdCacheKey::chain(
+                ColdGroup::Kv,
+                fp,
+                parent_key,
+                toks,
+                extra_keys,
+                cache_salt,
+                idx,
+            );
             let identity = RestorePrefixIdentity {
                 hot_hash: hot[idx],
                 tokens: toks.to_vec(),
@@ -3407,6 +4582,7 @@ mod tests {
             let root = temp_root(&format!("deep-roundtrip-{num_layers}"));
             let manager = ColdCacheManager::open_at(root.clone(), 8 * GIB, 0, 2).unwrap();
             let key = ColdCacheKey::chain(
+                ColdGroup::Kv,
                 fingerprint(),
                 None,
                 &[1, 2, 3, 4],
@@ -3435,6 +4611,7 @@ mod tests {
     fn encoded_len_mirrors_pool_bound_and_upper_bounds_encoder() {
         for &num_layers in &[1u32, 28, 32, 64, 80] {
             let key = ColdCacheKey::chain(
+                ColdGroup::Kv,
                 fingerprint(),
                 None,
                 &[1, 2, 3, 4],
@@ -3475,7 +4652,7 @@ mod tests {
         // decoder ran `Vec::with_capacity(u32::MAX)` (~206 GB) and aborted; the
         // tensor-count check now rejects it. The test returning at all proves
         // no multi-GB allocation happened.
-        let key = ColdCacheKey::chain(fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         let fp = fingerprint();
         let token_bytes: Vec<u8> = vec![1, 0, 0, 0]; // one u32
         let view = TensorView::new(Dtype::U8, vec![token_bytes.len()], &token_bytes).unwrap();

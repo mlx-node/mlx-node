@@ -458,6 +458,11 @@ impl Qwen3Inner {
                 crate::transformer::paged_kv_cache_adapter::ColdTierContext {
                     manager,
                     fingerprint,
+                    // Dense qwen3 sizes its paged pool over ALL layers, so the
+                    // pool already holds every piece of per-token state the
+                    // forward pass carries between turns. Nothing lives outside
+                    // it, so there is no auxiliary state to reconcile against.
+                    sidecar_policy: None,
                 },
             ),
             None => {
