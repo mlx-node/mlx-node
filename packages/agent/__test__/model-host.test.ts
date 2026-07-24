@@ -365,15 +365,35 @@ describe('MlxModelHost', () => {
       expect(resolveModelPathFn.mock.calls[0]).toEqual([QWEN3, { persistPagedCache: false }]);
     });
 
-    it('matches the cold-restore allowlist for a hybrid family', async () => {
+    it('requests cold-tier persistence by default for a hybrid family too', async () => {
       const resolveModelPathFn = trackingResolver();
       const host = new MlxModelHost(HOST_MODELS, { loadModelFn: makeLoader(), resolveModelPathFn });
 
       await getSession(host, 'gemma-mid');
 
-      // gemma4 keeps sliding-window state outside the paged pool, so today it
-      // is outside the set and must receive no policy at all.
-      expect(resolveModelPathFn.mock.calls[0]).toEqual(expectedResolveArgs(HOST_MODELS[1]));
+      // gemma4 keeps sliding-window state outside the paged pool, but persists
+      // it as a cold-tier sidecar and passed its restart-parity gate, so it is
+      // on the allowlist and gets the same default-on policy as dense qwen3.
+      // Asserted literally rather than through `expectedResolveArgs`, so this
+      // still fails if the allowlist and the default ever drift apart.
+      expect(resolveModelPathFn.mock.calls[0]).toEqual([HOST_MODELS[1], { persistPagedCache: true }]);
+    });
+
+    it('hands no policy at all to a family off the allowlist', async () => {
+      const resolveModelPathFn = trackingResolver();
+      const lfm2: DiscoveredModelLike = { name: 'lfm2-small', path: '/models/lfm2-small', modelType: 'lfm2' };
+      const host = new MlxModelHost([...HOST_MODELS, lfm2], {
+        loadModelFn: makeLoader(),
+        resolveModelPathFn,
+      });
+
+      await getSession(host, 'lfm2-small');
+
+      // lfm2 keeps short-conv state outside the pool with no serialization
+      // path, so it is off the allowlist. It must receive NO policy — not
+      // `{ persistPagedCache: false }` — so the overlay never touches the
+      // field and a checkpoint's own config.json keeps whatever it set.
+      expect(resolveModelPathFn.mock.calls[0]).toEqual([lfm2]);
     });
   });
 

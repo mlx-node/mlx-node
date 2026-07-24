@@ -66,8 +66,12 @@ When enabled, full paged prefix blocks are captured to the cold tier on publish 
 restored on a hot-cache miss before falling back to a normal prefill.
 
 - Library default is **off** (`persistPagedCache` per-model config field, TS
-  `persistPagedCache`). `mlx agent` turns it **on by default** for qwen3 models
-  (disable with `mlx agent --no-persist-cache`) via a temporary config overlay.
+  `persistPagedCache`). `mlx agent` turns it **on by default for every allowlisted
+  family** — `qwen3`, `qwen3_5`, `qwen3_5_moe`, `gemma4` — via a temporary config
+  overlay, so a warm prefix survives a restart without opting in. Disable with
+  `mlx agent --no-persist-cache`. The overlay writes an EXPLICIT value, so the
+  flag beats whatever the checkpoint's `config.json` hard-codes; a family off the
+  allowlist is handed no policy at all and the overlay never touches its field.
 - **Restore is gated to an allowlist: `qwen3`, `qwen3_5`, `qwen3_5_moe`, `gemma4`.**
   Dense qwen3 sizes its pool over every layer, so paged blocks fully determine its
   layer state. The other three are hybrid — their pools cover the full-attention
