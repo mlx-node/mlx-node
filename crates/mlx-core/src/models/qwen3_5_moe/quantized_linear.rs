@@ -12,11 +12,11 @@ pub use crate::models::qwen3_5::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, DEFAULT_QUANT_MODE, FP8_E4M3_BITS,
     FP8_E4M3_GROUP_SIZE, FP8_E4M3_MODE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE, LinearProj,
     MLPVariant, MXFP4_BITS, MXFP4_GROUP_SIZE, MXFP4_MODE, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
-    NVFP4_BITS, NVFP4_GROUP_SIZE, NVFP4_MODE, PerLayerMode, PerLayerQuant, SYM8_BITS,
-    SYM8_GROUP_SIZE, SYM8_MODE, is_mxfp8_checkpoint, is_quantized_checkpoint,
-    try_build_fp8_e4m3_quantized_linear, try_build_mxfp4_quantized_linear,
-    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear, try_build_quantized_linear,
-    try_build_sym8_quantized_linear,
+    NVFP4_BITS, NVFP4_GROUP_SIZE, NVFP4_MODE, PerLayerMode, PerLayerQuant, Q4K_MODE, Q5K_MODE,
+    Q6K_MODE, SYM8_BITS, SYM8_GROUP_SIZE, SYM8_MODE, is_mxfp8_checkpoint, is_quantized_checkpoint,
+    try_build_fp8_e4m3_quantized_linear, try_build_kquant_quantized_linear,
+    try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
+    try_build_nvfp4_quantized_linear, try_build_quantized_linear, try_build_sym8_quantized_linear,
 };
 
 /// Expert-indexed linear backed by a serialized quantized weight format.
@@ -236,6 +236,37 @@ pub fn try_build_fp8_e4m3_quantized_switch_linear(
         weight.clone(),
         scales.clone(),
         dequant_weight_t,
+    )))
+}
+
+/// Try to build a ggml K-quant expert `QuantizedSwitchLinear` from the stacked
+/// `{prefix}.weight` (uint32 `[E,out,in_packed]`), `{prefix}.scales` (int8 for
+/// Q6_K / uint8 for Q4_K/Q5_K), and MANDATORY `{prefix}.biases` (float16 ggml
+/// `d`). The three stacked companions are assembled by the MoE expert stacker
+/// in `persistence.rs` using the SAME `.weight`/`.scales`/`.biases` suffixes as
+/// every other quantized mode, so no stacker change is needed.
+///
+/// Fail-loud contract mirrors [`try_build_kquant_quantized_linear`]: `Ok(None)`
+/// only when `.scales` is absent; every partial/malformed group is `Err`.
+/// `forward` threads the resolved mode string into `mlx_gather_qmm`.
+pub fn try_build_kquant_quantized_switch_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+    mode: PerLayerMode,
+    family: &str,
+) -> Result<Option<QuantizedSwitchLinear>> {
+    let Some(group) =
+        crate::models::quant_dispatch::resolve_kquant_group(params, key_prefix, mode, 3, family)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(QuantizedSwitchLinear::new(
+        group.weight,
+        group.scales,
+        Some(group.biases),
+        group.group_size,
+        group.bits,
+        group.mode_str.to_string(),
     )))
 }
 

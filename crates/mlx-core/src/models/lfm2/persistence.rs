@@ -14,14 +14,15 @@ use crate::engine::persistence::{
 use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, default_per_layer_quant, effective_plq_for,
     ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
-    ensure_plain_fp8_storage_resolves_fp8_e4m3, has_sym8_mode, load_quant_settings_from_disk,
-    resolve_default_mode,
+    ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
+    has_sym8_mode, load_quant_settings_from_disk, resolve_default_mode,
 };
 use crate::models::qwen3_5_moe::persistence::try_build_quantized_switch_linear;
 use crate::models::qwen3_5_moe::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
     LinearProj, MLPVariant, MXFP4_BITS, MXFP4_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, NVFP4_BITS,
     NVFP4_GROUP_SIZE, QuantizedLinear, QuantizedSwitchLinear, is_mxfp8_checkpoint,
+    try_build_kquant_quantized_linear, try_build_kquant_quantized_switch_linear,
     try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
     try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
     try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
@@ -53,6 +54,7 @@ fn build_lfm2_qsl(
     // the int8 stack can flow into the affine/mxfp QSL builders.
     ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "lfm2_moe")?;
     ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "lfm2_moe")?;
+    ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "lfm2_moe")?;
     Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
@@ -65,6 +67,9 @@ fn build_lfm2_qsl(
         }
         PerLayerMode::Affine => {
             try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
+        }
+        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+            try_build_kquant_quantized_switch_linear(params, prefix, plq.mode, "lfm2_moe")?
         }
         // FAIL-LOUD: the 3-D stacked experts have no sym8 dispatch
         // (`gather_qmm` has no sym8 pack). Convert force-emits affine-8
@@ -101,6 +106,7 @@ fn build_lfm2_gate_ql(
     // the int8 tensor can flow into the affine/mxfp builders.
     ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "lfm2_moe")?;
     ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "lfm2_moe")?;
+    ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "lfm2_moe")?;
     Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
@@ -113,6 +119,9 @@ fn build_lfm2_gate_ql(
         }
         PerLayerMode::Affine => {
             try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
+        }
+        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+            try_build_kquant_quantized_linear(params, prefix, plq.mode, "lfm2_moe")?
         }
         // FAIL-LOUD: the router gate is deliberately kept affine-8 by convert
         // (it force-emits a per-layer override for `*.feed_forward.gate` under
@@ -156,6 +165,7 @@ fn build_lfm2_non_moe_ql(
     // registration (the compiled gate keys on config metadata only).
     ensure_int8_storage_resolves_sym8(params, base, plq.mode, "lfm2")?;
     ensure_plain_fp8_storage_resolves_fp8_e4m3(params, base, plq.mode, "lfm2")?;
+    ensure_kquant_storage_resolves_kquant(params, base, plq.mode, "lfm2")?;
     Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, base),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, base),
@@ -168,6 +178,9 @@ fn build_lfm2_non_moe_ql(
         }
         PerLayerMode::Affine => try_build_quantized_linear(params, base, plq.group_size, plq.bits),
         PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, base)?,
+        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+            try_build_kquant_quantized_linear(params, base, plq.mode, "lfm2")?
+        }
     })
 }
 
@@ -338,6 +351,14 @@ fn plq_to_packed_params(plq: PerLayerQuant, ctx: &str) -> Result<(i32, i32, &'st
                  (embedding / packed quant-info) has no sym8 dispatch — convert never emits \
                  sym8 for these tensors (the lfm2 embedding stays dense bf16 under a sym8 \
                  default), so this checkpoint is malformed; refusing to load"
+            )));
+        }
+        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+            return Err(Error::from_reason(format!(
+                "lfm2: '{ctx}' resolved to K-quant ({:?}), but the packed embedding / \
+                 quant-info path does not support ggml K-quants — a K-quant GGUF import keeps \
+                 the lfm2 embedding dense bf16, so this checkpoint is malformed; refusing to load",
+                plq.mode
             )));
         }
     })

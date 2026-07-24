@@ -16,7 +16,8 @@ use crate::engine::persistence::{
 use crate::models::mtp_drafter::{DrafterBodyVariant, MTP_MOE_LAYER_LINEAR_SUFFIXES};
 use crate::models::quant_dispatch::{
     default_per_layer_quant, effective_plq_for, ensure_dense_weight_floating,
-    ensure_int8_storage_resolves_sym8, ensure_plain_fp8_storage_resolves_fp8_e4m3, has_sym8_mode,
+    ensure_int8_storage_resolves_sym8, ensure_kquant_storage_resolves_kquant,
+    ensure_plain_fp8_storage_resolves_fp8_e4m3, has_kquant_mode, has_sym8_mode,
     normalize_per_layer_key, parse_quant_settings, resolve_default_mode, select_quantization_block,
 };
 use crate::models::qwen3_5::persistence::{
@@ -34,13 +35,33 @@ use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
     MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, QuantizedSwitchLinear,
     is_mxfp8_checkpoint, is_quantized_checkpoint, try_build_fp8_e4m3_quantized_linear,
-    try_build_fp8_e4m3_quantized_switch_linear, try_build_mxfp4_quantized_linear,
+    try_build_fp8_e4m3_quantized_switch_linear, try_build_kquant_quantized_linear,
+    try_build_kquant_quantized_switch_linear, try_build_mxfp4_quantized_linear,
     try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
     try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
     try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
     try_build_sym8_quantized_linear,
 };
 use super::switch_glu::SwitchGLU;
+
+/// The `mlx_dequantize`/`mlx_quantized_matmul` mode string for a resolved
+/// per-layer quant mode. Mirrors the dense `qwen3_5::persistence::mode_to_str`
+/// (private there); used to thread the embedding/tied-lm_head packing mode into
+/// the mode-aware `Embedding` ops so a K-quant `token_embd` decodes as K-quant
+/// rather than being misread as affine.
+fn mode_to_str(mode: PerLayerMode) -> &'static str {
+    match mode {
+        PerLayerMode::Affine => "affine",
+        PerLayerMode::Mxfp8 => "mxfp8",
+        PerLayerMode::Mxfp4 => "mxfp4",
+        PerLayerMode::Nvfp4 => "nvfp4",
+        PerLayerMode::Fp8E4m3 => crate::quant::fp8_weight::FP8_E4M3_MODE,
+        PerLayerMode::Sym8 => "sym8",
+        PerLayerMode::Q6K => "q6k",
+        PerLayerMode::Q4K => "q4k",
+        PerLayerMode::Q5K => "q5k",
+    }
+}
 
 /// Sanitize weights from HuggingFace format.
 fn sanitize_weights(
@@ -500,6 +521,7 @@ fn apply_weights_moe_inner(
     // loud if a sym8 override ever reaches it. The speculative MTP head is
     // disabled under sym8 (see the MTP branch below), mirroring dense.
     let checkpoint_has_sym8 = has_sym8_mode(top_level_mode, per_layer_quant);
+    let checkpoint_has_kquant = has_kquant_mode(top_level_mode, per_layer_quant);
     let is_quantized = is_quantized_checkpoint(params);
     let (default_plq, default_gate_plq) =
         compute_moe_defaults(params, top_level_mode, quant_bits, quant_group_size);
@@ -525,9 +547,10 @@ fn apply_weights_moe_inner(
         // before the int8 tensor can flow into the affine/mxfp builders.
         ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "qwen3_5_moe")?;
         ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "qwen3_5_moe")?;
+        ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "qwen3_5_moe")?;
         // Result<Option<..>>: `Ok(None)` = "prefix not quantized, fall back
-        // to the dense-weight branch"; `Err` = fail-loud (a malformed sym8
-        // layer must never silently fall back, see
+        // to the dense-weight branch"; `Err` = fail-loud (a malformed sym8 /
+        // K-quant group must never silently fall back, see
         // `try_build_sym8_quantized_linear`).
         let built = match plq.mode {
             PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
@@ -538,6 +561,9 @@ fn apply_weights_moe_inner(
                 try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
             }
             PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
+            PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+                try_build_kquant_quantized_linear(params, prefix, plq.mode, "qwen3_5_moe")?
+            }
         };
         // Thread the per-tensor FP8 activation scale from the resolved
         // per-layer quant record onto the built projection — mirrors the dense
@@ -571,6 +597,7 @@ fn apply_weights_moe_inner(
         let plq = effective_plq_for(prefix, per_layer_quant, default_plq, Some(default_gate_plq));
         ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "qwen3_5_moe")?;
         ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "qwen3_5_moe")?;
+        ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "qwen3_5_moe")?;
         Ok(match plq.mode {
             PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
             PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
@@ -578,6 +605,9 @@ fn apply_weights_moe_inner(
             PerLayerMode::Fp8E4m3 => try_build_fp8_e4m3_quantized_switch_linear(params, prefix)?,
             PerLayerMode::Affine => {
                 try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
+            }
+            PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+                try_build_kquant_quantized_switch_linear(params, prefix, plq.mode, "qwen3_5_moe")?
             }
             // Per-expert 3-D stacked projections route through gather_qmm,
             // which has no sym8 pack. Sym8 reaches a switch prefix two ways
@@ -622,6 +652,11 @@ fn apply_weights_moe_inner(
             .get("embed_tokens")
             .copied()
             .unwrap_or(default_plq);
+        // K-quant STORAGE with non-K metadata (or vice versa) = config drift —
+        // fail loud before the embedding/tied-lm_head sidecars reach a mode that
+        // would misdecode them (a repacked `token_embd` is q6k/q4k/q5k, not
+        // affine). Mirrors the linear/switch builders' guard.
+        ensure_kquant_storage_resolves_kquant(params, "embedding", plq.mode, "qwen3_5_moe")?;
         // Gate the packed-resident load exactly like the dense loader
         // (`qwen3_5/persistence.rs`): packed is a WIN only on the paged,
         // non-MTP, non-VLM turn path, where the tied lm_head routes through
@@ -640,27 +675,36 @@ fn apply_weights_moe_inner(
             && crate::engine::persistence::compiled_forward_backend_available()
             && config.n_mtp_layers == 0
             && !has_vision;
+        // Resolve the packing mode from the checkpoint rather than assuming
+        // affine: a GGUF `token_embd` repacked to q6k/q4k/q5k must decode as
+        // K-quant, and mxfp embeddings as mxfp. The `ensure_kquant_*` guard
+        // above already rejected any storage/mode mismatch, so this string
+        // matches the on-disk packing handed to `mlx_dequantize`/
+        // `mlx_quantized_matmul`.
+        let embed_mode = mode_to_str(plq.mode);
         if prefer_packed {
-            // Mode hardcoded "affine": embed_tokens/lm_head sidecars are always
-            // affine-quantized, matching what `Embedding::load_quantized`
-            // already hardcodes.
             inner.embedding.load_quantized_packed(
                 weight,
                 scales,
                 biases,
                 plq.group_size,
                 plq.bits,
-                "affine",
+                embed_mode,
             )?;
             info!(
-                "Loaded packed-quantized embedding ({}-bit, quantized_matmul on forward + tied lm_head)",
+                "Loaded packed-quantized embedding ({}-bit {embed_mode}, quantized_matmul on forward + tied lm_head)",
                 plq.bits
             );
         } else {
-            inner
-                .embedding
-                .load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
-            info!("Loaded quantized embedding ({}-bit)", plq.bits);
+            inner.embedding.load_quantized(
+                weight,
+                scales,
+                biases,
+                plq.group_size,
+                plq.bits,
+                embed_mode,
+            )?;
+            info!("Loaded quantized embedding ({}-bit {embed_mode})", plq.bits);
         }
     } else if let Some(w) = params.get("embedding.weight") {
         // Dense fallback (no `.scales`): a stripped quant group must never
@@ -1170,16 +1214,17 @@ fn apply_weights_moe_inner(
     // decode. On an incomplete set, warn + disable MTP (leave
     // `mtp_weights_loaded = false`) rather than feeding garbage to the head.
     if inner.mtp.is_some() {
-        if checkpoint_has_sym8 {
-            // sym8 scope: MTP is OUT, mirroring the dense loader. mtp.rs's
-            // own `try_build_ql`/`try_build_qsl` closures have unwired
-            // `Sym8 => None` arms, so a sym8 MTP head cannot build — loading
-            // it would silently install nothing. Fail soft into plain AR
-            // decode, mirroring the missing-weights branch below.
+        if checkpoint_has_sym8 || checkpoint_has_kquant {
+            // sym8/K-quant scope: MTP is OUT, mirroring the dense loader.
+            // mtp.rs's own `try_build_ql`/`try_build_qsl` closures map both
+            // `Sym8` and every K-quant mode to `None`, so the head cannot build
+            // — loading it would silently install nothing, and an imported GGUF
+            // never ships an MTP head. Fail soft into plain AR decode,
+            // mirroring the missing-weights branch below.
             inner.mtp_weights_loaded = false;
             warn!(
-                "Qwen3.5-MoE: sym8 checkpoint with config.n_mtp_layers={} — MTP is not \
-                 supported on the sym8 (eager int8) path; disabling speculative MTP.",
+                "Qwen3.5-MoE: sym8/K-quant checkpoint with config.n_mtp_layers={} — MTP is not \
+                 supported on the imported-quant path; disabling speculative MTP.",
                 config.n_mtp_layers
             );
         } else {
@@ -1949,6 +1994,7 @@ mod tests {
         AttentionType, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, DType, MLPType, MxArray,
         PerLayerMode, PerLayerQuant, Qwen3_5MoeConfig, Qwen35MoeInner, apply_weights_moe_inner,
         default_per_layer_quant, load_vision_encoder_moe, pin_sym8_to_flat_kv_cache,
+        sanitize_weights,
     };
     use std::collections::HashMap;
 
@@ -2249,6 +2295,62 @@ mod tests {
                 assert_eq!(weight.shape().unwrap().to_vec(), vec![4, 64, 64]);
             }
             _ => panic!("layer 0 must be MoE (decoder_sparse_step = 1)"),
+        }
+    }
+
+    /// T13: the MoE expert stacker keys per-expert companions on the three
+    /// canonical suffixes (.weight / .scales / .biases), so a K-quant expert
+    /// set stacks into THREE separate `switch_mlp.{proj}` companions with dtypes
+    /// preserved — the reused suffixes mean no stacker change is needed for
+    /// K-quants. This pins that invariant: if the stacker ever folded an unknown
+    /// suffix into the `.weight` group, `.scales`/`.biases` would go missing.
+    #[test]
+    fn kquant_expert_set_stacks_three_companions_separately() {
+        let config = tiny_sym8_moe_cfg(); // num_experts = 4
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        // Q6_K-shaped companions: uint32 packed .weight, int8 .scales, float16
+        // .biases (ggml `d`). Shapes are nominal — the stacker only concatenates
+        // the per-expert arrays over a new leading axis.
+        for e in 0..4 {
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                let base = format!("layers.0.mlp.experts.{e}.{proj}");
+                params.insert(
+                    format!("{base}.weight"),
+                    MxArray::from_uint32(&[0u32; 8 * 3], &[8, 3]).expect("weight"),
+                );
+                params.insert(
+                    format!("{base}.scales"),
+                    MxArray::from_float32(&[1.0f32; 8 * 2], &[8, 2])
+                        .expect("scales")
+                        .astype(DType::Int8)
+                        .expect("int8 scales"),
+                );
+                params.insert(
+                    format!("{base}.biases"),
+                    MxArray::from_float16(&[half::f16::from_f32(0.5).to_bits(); 8], &[8, 1])
+                        .expect("biases"),
+                );
+            }
+        }
+
+        let out = sanitize_weights(params, &config).expect("K-quant expert stacking must succeed");
+
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            let w = out
+                .get(&format!("layers.0.mlp.switch_mlp.{proj}.weight"))
+                .unwrap_or_else(|| panic!("{proj}.weight stacked companion missing"));
+            let s = out
+                .get(&format!("layers.0.mlp.switch_mlp.{proj}.scales"))
+                .unwrap_or_else(|| panic!("{proj}.scales missing — folded into weight group?"));
+            let b = out
+                .get(&format!("layers.0.mlp.switch_mlp.{proj}.biases"))
+                .unwrap_or_else(|| panic!("{proj}.biases missing — folded into weight group?"));
+            assert_eq!(w.shape().unwrap().to_vec(), vec![4, 8, 3]);
+            assert_eq!(w.dtype().unwrap(), DType::Uint32);
+            assert_eq!(s.shape().unwrap().to_vec(), vec![4, 8, 2]);
+            assert_eq!(s.dtype().unwrap(), DType::Int8);
+            assert_eq!(b.shape().unwrap().to_vec(), vec![4, 8, 1]);
+            assert_eq!(b.dtype().unwrap(), DType::Float16);
         }
     }
 

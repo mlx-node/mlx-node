@@ -326,6 +326,10 @@ impl Qwen3_5MTPModule {
                 // disables speculative MTP under sym8). `None` here keeps the
                 // exhaustive match honest without silently mis-packing.
                 PerLayerMode::Sym8 => None,
+                // Unreachable: the dense loader disables MTP for K-quant
+                // checkpoints (`has_kquant_mode` gate), and an imported GGUF
+                // never ships an MTP head. `None` fails soft into AR decode.
+                PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => None,
             }
         };
 

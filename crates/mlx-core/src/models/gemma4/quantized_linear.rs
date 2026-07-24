@@ -155,6 +155,33 @@ pub fn try_build_nvfp4_quantized_switch_linear(
     ))
 }
 
+/// Try to build a ggml K-quant expert `QuantizedSwitchLinear` (gemma4-local
+/// type) from the stacked uint32 `.weight`, int8/uint8 `.scales`, and mandatory
+/// float16 `.biases`. Validation is delegated to the family-neutral
+/// [`resolve_kquant_group`](crate::models::quant_dispatch::resolve_kquant_group)
+/// so the gemma4 copy cannot drift from the qwen3_5 reference. `.biases` holds
+/// the ggml `d` super-block scale, not an additive bias.
+pub fn try_build_kquant_quantized_switch_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+    mode: PerLayerMode,
+    family: &str,
+) -> Result<Option<QuantizedSwitchLinear>> {
+    let Some(group) =
+        crate::models::quant_dispatch::resolve_kquant_group(params, key_prefix, mode, 3, family)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(QuantizedSwitchLinear::new(
+        group.weight,
+        group.scales,
+        Some(group.biases),
+        group.group_size,
+        group.bits,
+        group.mode_str.to_string(),
+    )))
+}
+
 /// Default quantization parameters for 4-bit models.
 pub const DEFAULT_QUANT_BITS: i32 = 4;
 pub const DEFAULT_QUANT_GROUP_SIZE: i32 = 64;
@@ -481,6 +508,36 @@ pub fn try_build_sym8_quantized_linear(
         w_kn,
         scales.clone(),
         None,
+    )))
+}
+
+/// Try to build a ggml K-quant `QuantizedLinear` (gemma4-local type) from
+/// `{prefix}.weight` (uint32), `{prefix}.scales` (int8 for Q6_K / uint8 for
+/// Q4_K/Q5_K), and the MANDATORY `{prefix}.biases` (float16 ggml `d`).
+///
+/// Fail-loud contract mirrors [`try_build_sym8_quantized_linear`] and the
+/// qwen3_5 reference: `Ok(None)` only when `.scales` is absent; every partial
+/// group is `Err`. Validation is delegated to the family-neutral
+/// [`resolve_kquant_group`](crate::models::quant_dispatch::resolve_kquant_group).
+pub fn try_build_kquant_quantized_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+    mode: PerLayerMode,
+    family: &str,
+) -> Result<Option<QuantizedLinear>> {
+    let Some(group) =
+        crate::models::quant_dispatch::resolve_kquant_group(params, key_prefix, mode, 2, family)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(QuantizedLinear::new(
+        group.weight,
+        group.scales,
+        Some(group.biases),
+        None,
+        group.group_size,
+        group.bits,
+        group.mode_str.to_string(),
     )))
 }
 

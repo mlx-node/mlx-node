@@ -3241,6 +3241,14 @@ export interface GgufConversionOptions {
    * Forces `group_size = 32` for upgraded layers.
    */
   quantMxfp?: boolean;
+  /**
+   * Import ggml Q4_K / Q5_K / Q6_K tensors as MLX K-quant arrays instead of
+   * rejecting them (default: false). The blocks are repacked, never
+   * dequantized, so the output keeps the source file's weights and byte size.
+   * With this off, Q6_K remains the Gemma4 token-embedding BF16 fallback and
+   * Q4_K / Q5_K are an error.
+   */
+  importKQuants?: boolean;
 }
 
 export interface GgufConversionResult {

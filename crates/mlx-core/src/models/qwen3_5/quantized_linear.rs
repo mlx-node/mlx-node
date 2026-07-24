@@ -446,6 +446,52 @@ pub fn try_build_sym8_quantized_linear(
     )))
 }
 
+/// ggml K-quant packing parameters. `.biases` holds the ggml `d` super-block
+/// SCALE (float16), NOT an additive bias — the two-level decode
+/// `scale = d[..]*sc[..]` happens in the MLX kernel (see `PerLayerMode::Q6K`).
+pub const Q6K_BITS: i32 = 6;
+pub const Q6K_GROUP_SIZE: i32 = 16;
+pub const Q6K_MODE: &str = "q6k";
+pub const Q4K_BITS: i32 = 4;
+pub const Q4K_GROUP_SIZE: i32 = 32;
+pub const Q4K_MODE: &str = "q4k";
+pub const Q5K_BITS: i32 = 5;
+pub const Q5K_GROUP_SIZE: i32 = 32;
+pub const Q5K_MODE: &str = "q5k";
+
+/// Try to build a ggml K-quant `QuantizedLinear` from `{prefix}.weight` (uint32
+/// packed), `{prefix}.scales` (int8 for Q6_K / uint8 for Q4_K/Q5_K), and the
+/// MANDATORY `{prefix}.biases` (float16 ggml `d` super-block scale).
+///
+/// Fail-loud template shared with sym8: `Ok(None)` ONLY when `.scales` is
+/// absent (an unquantized bf16 tensor in a mixed-precision UD GGUF); every
+/// malformed/partial group is `Err`. Validation is delegated to
+/// [`resolve_kquant_group`](crate::models::quant_dispatch::resolve_kquant_group)
+/// so the dense, expert, and gemma4 K-quant builders cannot drift. `forward`
+/// threads the resolved mode string into `mlx_quantized_matmul`, which does the
+/// two-level scale decode from `scales`/`biases`.
+pub fn try_build_kquant_quantized_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+    mode: PerLayerMode,
+    family: &str,
+) -> Result<Option<QuantizedLinear>> {
+    let Some(group) =
+        crate::models::quant_dispatch::resolve_kquant_group(params, key_prefix, mode, 2, family)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(QuantizedLinear::new(
+        group.weight,
+        group.scales,
+        Some(group.biases),
+        None,
+        group.group_size,
+        group.bits,
+        group.mode_str.to_string(),
+    )))
+}
+
 /// Linear layer backed by a serialized quantized weight format.
 ///
 /// Affine/MX/NVFP modes use packed Uint32 weights and MLX quantized_matmul;
@@ -1531,5 +1577,84 @@ mod fp8_activation_tests {
         );
 
         ActivationAmaxCollector::disarm_current_thread();
+    }
+}
+
+#[cfg(test)]
+mod kquant_builder_tests {
+    use super::*;
+    use crate::array::DType;
+
+    /// A minimal well-typed K-quant group under `{prefix}.*`: uint32 packed
+    /// `.weight`, int8 (Q6_K) / uint8 (Q4_K/Q5_K) `.scales`, float16 `.biases`.
+    fn kquant_params(prefix: &str, mode: PerLayerMode) -> HashMap<String, MxArray> {
+        let scales = match mode {
+            PerLayerMode::Q6K => MxArray::from_float32(&[1.0, -1.0, 2.0, -2.0], &[2, 2])
+                .unwrap()
+                .astype(DType::Int8)
+                .unwrap(),
+            _ => MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[2, 2])
+                .unwrap()
+                .astype(DType::Uint8)
+                .unwrap(),
+        };
+        let biases = MxArray::from_float16(
+            &[
+                half::f16::from_f32(0.5).to_bits(),
+                half::f16::from_f32(0.25).to_bits(),
+            ],
+            &[2, 1],
+        )
+        .unwrap();
+        let weight = MxArray::from_uint32(&[0u32; 2 * 4], &[2, 4]).unwrap();
+        HashMap::from([
+            (format!("{prefix}.weight"), weight),
+            (format!("{prefix}.scales"), scales),
+            (format!("{prefix}.biases"), biases),
+        ])
+    }
+
+    /// The builder installs the mode's fixed (mode string, bits, group_size)
+    /// onto the QuantizedLinear — the FFI reads these to drive the two-level
+    /// K-quant decode.
+    #[test]
+    fn kquant_builder_installs_mode_bits_group() {
+        for (mode, want_mode, want_bits, want_gs) in [
+            (PerLayerMode::Q6K, "q6k", 6, 16),
+            (PerLayerMode::Q4K, "q4k", 4, 32),
+            (PerLayerMode::Q5K, "q5k", 5, 32),
+        ] {
+            let p = kquant_params("proj", mode);
+            let ql = try_build_kquant_quantized_linear(&p, "proj", mode, "test")
+                .expect("well-formed K-quant group builds")
+                .expect("scales present => Some");
+            assert_eq!(ql.mode(), want_mode);
+            assert_eq!(ql.bits, want_bits);
+            assert_eq!(ql.group_size, want_gs);
+            assert!(
+                ql.get_biases().is_some(),
+                "K-quant carries mandatory .biases"
+            );
+        }
+    }
+
+    /// Fail-loud contract: absent `.scales` => Ok(None) (a bf16 fallback tensor);
+    /// a missing `.weight` or the mandatory `.biases` => Err.
+    #[test]
+    fn kquant_builder_fail_loud_contract() {
+        let mut p = kquant_params("l", PerLayerMode::Q6K);
+        p.remove("l.scales");
+        assert!(matches!(
+            try_build_kquant_quantized_linear(&p, "l", PerLayerMode::Q6K, "test"),
+            Ok(None)
+        ));
+
+        let mut p = kquant_params("l", PerLayerMode::Q4K);
+        p.remove("l.weight");
+        assert!(try_build_kquant_quantized_linear(&p, "l", PerLayerMode::Q4K, "test").is_err());
+
+        let mut p = kquant_params("l", PerLayerMode::Q4K);
+        p.remove("l.biases");
+        assert!(try_build_kquant_quantized_linear(&p, "l", PerLayerMode::Q4K, "test").is_err());
     }
 }

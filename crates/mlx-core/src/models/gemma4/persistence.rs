@@ -14,8 +14,8 @@ use crate::engine::persistence::{
 };
 use crate::models::quant_dispatch::{
     default_per_layer_quant, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
-    ensure_plain_fp8_storage_resolves_fp8_e4m3, load_quant_settings_from_disk, merge_per_layer,
-    resolve_default_mode,
+    ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
+    load_quant_settings_from_disk, merge_per_layer, resolve_default_mode,
 };
 use crate::tokenizer::Qwen3Tokenizer;
 
@@ -24,6 +24,7 @@ use super::model::{Gemma4Draft, Gemma4Inner, Gemma4Model, warmup_forward};
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
     PerLayerMode, PerLayerQuant, is_mxfp8_checkpoint, is_quantized_checkpoint,
+    try_build_kquant_quantized_linear, try_build_kquant_quantized_switch_linear,
     try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
     try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
     try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
@@ -1273,9 +1274,49 @@ fn resolve_packed_embed_params<'a>(
                 biases,
             })
         }
+        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+            // Real gemma4 UD GGUFs ship `token_embd` as a K-quant (e.g. Q6_K).
+            // A K-quant group is a uint32 `.weight`, integer sub-block `.scales`
+            // (int8 for Q6_K, uint8 for Q4_K/Q5_K), and a MANDATORY float16
+            // `.biases` holding ggml's `d` super-block SCALE (not an additive
+            // bias). `plq.group_size`/`plq.bits` were resolved by the fail-closed
+            // parse tables (q6k=16/6, q4k=32/4, q5k=32/5) — pass them through.
+            // The packed backend hands all three arrays to the mode-aware K-quant
+            // `mlx_dequantize`/`mlx_quantized_matmul`, so nothing is dequantized
+            // to bf16 here and the tied lm_head stays a true K-quant matmul.
+            let (mode_str, want_scales) = match plq.mode {
+                PerLayerMode::Q6K => ("q6k", DType::Int8),
+                PerLayerMode::Q4K => ("q4k", DType::Uint8),
+                _ => ("q5k", DType::Uint8),
+            };
+            // Fail closed on any storage that contradicts the resolved K-quant
+            // mode, mirroring the affine/mxfp8 arms: the `.biases` super-block
+            // scale is required, and the sub-block `.scales` dtype must match.
+            if biases.is_none() {
+                return Err(Error::from_reason(format!(
+                    "gemma4 {key} load: quant mode resolves to {mode_str} but '{key}.biases' \
+                     (the ggml `d` super-block scale) is missing — K-quants require it, \
+                     refusing to load"
+                )));
+            }
+            let scales_dtype = scales.dtype().ok();
+            if scales_dtype != Some(want_scales) {
+                return Err(Error::from_reason(format!(
+                    "gemma4 {key} load: quant mode resolves to {mode_str} but '{key}.scales' is \
+                     {scales_dtype:?}, expected {want_scales:?} — config/tensor disagreement, \
+                     refusing to load"
+                )));
+            }
+            Ok(PackedEmbedParams {
+                group_size: plq.group_size,
+                bits: plq.bits,
+                mode_str,
+                biases,
+            })
+        }
         other => Err(Error::from_reason(format!(
             "gemma4 {key} load: quant mode {other:?} is not supported for the embedding/tied \
-             lm_head; only affine and mxfp8 are supported"
+             lm_head; only affine, mxfp8, and K-quant (q6k/q4k/q5k) are supported"
         ))),
     }
 }
@@ -1287,6 +1328,7 @@ fn build_gemma_ql(
 ) -> Result<Option<super::quantized_linear::QuantizedLinear>> {
     ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
     ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "gemma4")?;
+    ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "gemma4")?;
     Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
@@ -1301,6 +1343,9 @@ fn build_gemma_ql(
             try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
         }
         PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
+        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+            try_build_kquant_quantized_linear(params, prefix, plq.mode, "gemma4")?
+        }
     })
 }
 
@@ -1311,6 +1356,7 @@ fn build_gemma_qsl(
 ) -> Result<Option<super::quantized_linear::QuantizedSwitchLinear>> {
     ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
     ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "gemma4")?;
+    ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "gemma4")?;
     Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
@@ -1323,6 +1369,9 @@ fn build_gemma_qsl(
         }
         PerLayerMode::Affine => {
             try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
+        }
+        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+            try_build_kquant_quantized_switch_linear(params, prefix, plq.mode, "gemma4")?
         }
         PerLayerMode::Sym8 => {
             return Err(Error::from_reason(format!(
@@ -4901,6 +4950,99 @@ mod tests {
         assert!(
             err.reason.contains("affine"),
             "error mentions affine: {}",
+            err.reason
+        );
+    }
+
+    /// Q6_K mode (int8 sub-block scales + mandatory f16 `d` super-block scale)
+    /// threads the PLQ's resolved 6-bit / group_size-16 params through, tags the
+    /// static "q6k" mode string, and passes the `.biases` tensor. Real gemma4 UD
+    /// GGUFs ship `token_embd` as Q6_K, so this is the load that previously hit
+    /// the `other => Err` arm and could not resolve.
+    #[test]
+    fn resolve_packed_embed_q6k_passes_kquant_params_and_biases() {
+        let weight = MxArray::zeros(&[4, 48], Some(DType::Uint32)).expect("q6k packed weight");
+        let scales = MxArray::zeros(&[4, 16], Some(DType::Int8)).expect("int8 sub-scales");
+        let biases = MxArray::zeros(&[4, 1], Some(DType::Float16)).expect("f16 d");
+        let plq = PerLayerQuant {
+            bits: 6,
+            group_size: 16,
+            mode: PerLayerMode::Q6K,
+            input_amax: None,
+        };
+        let packed =
+            resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, Some(&biases))
+                .expect("q6k embedding must resolve");
+        assert_eq!(packed.bits, 6);
+        assert_eq!(packed.group_size, 16);
+        assert_eq!(packed.mode_str, "q6k");
+        assert!(packed.biases.is_some(), "q6k `d` biases must pass through");
+    }
+
+    /// Q4_K mode (uint8 (sc, m) sub-scales + f16 (d, dmin) biases) threads the
+    /// resolved 4-bit / group_size-32 params through and tags "q4k".
+    #[test]
+    fn resolve_packed_embed_q4k_passes_kquant_params_and_biases() {
+        let weight = MxArray::zeros(&[4, 32], Some(DType::Uint32)).expect("q4k packed weight");
+        let scales = MxArray::zeros(&[4, 16], Some(DType::Uint8)).expect("uint8 (sc,m) scales");
+        let biases = MxArray::zeros(&[4, 2], Some(DType::Float16)).expect("f16 (d,dmin)");
+        let plq = PerLayerQuant {
+            bits: 4,
+            group_size: 32,
+            mode: PerLayerMode::Q4K,
+            input_amax: None,
+        };
+        let packed =
+            resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, Some(&biases))
+                .expect("q4k embedding must resolve");
+        assert_eq!(packed.bits, 4);
+        assert_eq!(packed.group_size, 32);
+        assert_eq!(packed.mode_str, "q4k");
+        assert!(packed.biases.is_some(), "q4k biases must pass through");
+    }
+
+    /// A K-quant embedding with no `.biases` is malformed — the ggml `d`
+    /// super-block scale is mandatory — so it is rejected loud rather than fed to
+    /// the K-quant kernel with a null biases pointer.
+    #[test]
+    fn resolve_packed_embed_q6k_without_biases_fails_loud() {
+        let weight = MxArray::zeros(&[4, 48], Some(DType::Uint32)).expect("q6k packed weight");
+        let scales = MxArray::zeros(&[4, 16], Some(DType::Int8)).expect("int8 sub-scales");
+        let plq = PerLayerQuant {
+            bits: 6,
+            group_size: 16,
+            mode: PerLayerMode::Q6K,
+            input_amax: None,
+        };
+        let err = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, None)
+            .err()
+            .expect("q6k without biases must fail loud");
+        assert!(
+            err.reason.contains("q6k") && err.reason.contains("biases"),
+            "error names the missing q6k biases: {}",
+            err.reason
+        );
+    }
+
+    /// Q6_K storage requires int8 sub-scales; a uint8-scale table under a Q6_K
+    /// mode is a config/tensor contradiction and is rejected loud.
+    #[test]
+    fn resolve_packed_embed_q6k_with_uint8_scales_fails_loud() {
+        let weight = MxArray::zeros(&[4, 48], Some(DType::Uint32)).expect("q6k packed weight");
+        let scales = MxArray::zeros(&[4, 16], Some(DType::Uint8)).expect("wrong uint8 scales");
+        let biases = MxArray::zeros(&[4, 1], Some(DType::Float16)).expect("f16 d");
+        let plq = PerLayerQuant {
+            bits: 6,
+            group_size: 16,
+            mode: PerLayerMode::Q6K,
+            input_amax: None,
+        };
+        let err = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, Some(&biases))
+            .err()
+            .expect("q6k + uint8 scales must fail loud");
+        assert!(
+            err.reason.contains("q6k") && err.reason.contains("Uint8"),
+            "error names the q6k/uint8 scale mismatch: {}",
             err.reason
         );
     }
