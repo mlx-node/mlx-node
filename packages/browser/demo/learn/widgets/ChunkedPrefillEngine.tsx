@@ -391,13 +391,16 @@ export function ChunkedPrefillEngine() {
                 </g>
               );
             })}
-            {/* the two halves, named */}
+            {/* The two halves, named — one label per line. Both run ~126px at
+                8px, so a shared baseline overflowed the 200px bar and the two
+                strings interleaved. Stacking clears it in both locales; the
+                band down to the forward pass (y 138–186) is otherwise empty. */}
             <text x={budX(0)} y={BUD_Y + BUD_H + 11} style={{ fill: 'var(--muted-foreground)' }} className="text-[8px]">
               {copy.budgetDecodes}
             </text>
             <text
               x={budX(BUDGET - 1) + BUD_CELL}
-              y={BUD_Y + BUD_H + 11}
+              y={BUD_Y + BUD_H + 22}
               textAnchor="end"
               style={{ fill: RED }}
               className="text-[8px] font-medium"
