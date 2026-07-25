@@ -25,6 +25,13 @@
 //!
 //! Run with:
 //!   cargo test -p mlx-core --release --test kquant_nax_bench -- --nocapture
+//!
+//! On a host without the NAX kernels this declines instead of measuring, and
+//! libtest hides the reason unless `--nocapture` is passed — so in a plain
+//! `cargo test` log the line is just `kquant_vs_affine_prefill ... ok`, which
+//! is what CI's macos-26 runners produce today. `KQ_NAX_REQUIRE=1` turns that
+//! into a failure; `kquant_mode_guards.rs` reads the same variable, so one
+//! setting pins both gates on a box that is supposed to have the kernels.
 
 use std::ffi::CString;
 use std::time::Instant;
@@ -69,6 +76,10 @@ const WARMUP: usize = 6;
 /// kernels into one bool. `mlx_gpu_architecture_gen() >= 17` is not a
 /// substitute: that is a separate parse in `mlx_gated_delta.cpp:407-428` which
 /// knows nothing about macOS 26.2, the `'p' -> 18` rule, or `MLX_METAL_NO_NAX`.
+///
+/// `MLX_METAL_GPU_ARCH` feeds the generation this ultimately reads
+/// (`metal/device.cpp:589-601`), so an override left in the environment turns
+/// the bench off exactly the way older hardware would.
 fn nax_available() -> bool {
     // SAFETY: a nullary FFI predicate that catches internally and reports false
     // when the Metal device is unavailable (`mlx-sys/src/mlx_stream.cpp:140`).

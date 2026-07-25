@@ -9,10 +9,10 @@
 //! * `dequantize` / `quantized_matmul` / `gather_qmm` work on the CPU, and on
 //!   Metal every kernel the dispatcher can reach agrees with the CPU
 //!   reference — all 33 `float` kernels `kquant.metal` instantiates per mode,
-//!   plus the float16 and bfloat16 variants of `qmv` and `qmm_t`. On a device
-//!   with the NAX tensor-op kernels the `qmm_t` shapes reach
-//!   `kquant_qmm_t_nax` (`kquant_nax.metal`) instead of the simdgroup
-//!   `kquant_qmm_t`, covering all four of its instantiations plus its
+//!   plus the float16 and bfloat16 variants of `qmv`, `qmm_t` and
+//!   `qmm_t_splitk`. On a device with the NAX tensor-op kernels the `qmm_t`
+//!   shapes reach `kquant_qmm_t_nax` (`kquant_nax.metal`) instead of the
+//!   simdgroup `kquant_qmm_t`, covering all four of its instantiations plus its
 //!   unaligned-M branch and a row spanning several super-blocks;
 //! * the validators reject malformed K-quant tensors, so the throws above prove
 //!   something about the backends rather than about a missing argument check;
@@ -24,6 +24,28 @@
 //!
 //! Run:
 //!   cargo test -p mlx-core --release --test kquant_mode_guards
+//!
+//! That run reaches whichever kernels the host dispatches to, which is not the
+//! whole matrix on any single machine, so two more spellings are worth knowing:
+//!
+//!   MLX_METAL_GPU_ARCH=applegpu_g16s cargo test ...    # simdgroup fallback
+//!
+//! `Device::Device` parses the GPU generation out of that string rather than
+//! off the hardware (`metal/device.cpp:589-601`), so a generation below 17
+//! fails the check at :956 and every NAX branch turns off. No rebuild, and
+//! nothing else moves with it: of the four places the Metal backend reads the
+//! generation, the other three test `== 13 || == 14`, `>= 15` and `< 15`
+//! (`quantized.cpp:209`, `:429`, `matmul.cpp:1265`) and so read 16 and 17
+//! alike. This is the only way to exercise the float16/bfloat16 simdgroup
+//! `qmm_t` on a NAX box, since `MLX_ENABLE_TF32=0` reroutes float32 only.
+//! `applegpu_g14s` goes further and also turns off `use_qmv_wide`
+//! (`quantized.cpp:429`), matching an M1/M2 host. Keep the trailing size
+//! letter: it feeds `max_ops_per_buffer` and friends (`device.cpp:602`).
+//!
+//!   KQ_NAX_REQUIRE=1 cargo test ...                   # fail if NAX is absent
+//!
+//! turns a missing-NAX host from a silent skip into a failure, for a box that
+//! is supposed to have the kernels. See `nax_required`.
 
 use std::ffi::CString;
 
@@ -206,6 +228,22 @@ const BF16_STORE_TOL: f32 = 3e-2;
 const F16_TILE_TOL: f32 = 4e-3;
 const BF16_TILE_TOL: f32 = 3e-2;
 
+// `qmm_t_splitk` adds a second rounding on top of that tile rounding: it writes
+// each K-partition's partial sum into an intermediate array built with the
+// *activation* dtype (`array intermediate(temp_shape, x.dtype(), ...)`,
+// metal/quantized.cpp:1101) and only then reduces across partitions, so a
+// bfloat16 activation costs 8 bits of mantissa per partial where the CPU keeps
+// one float accumulator over the whole of K. This is the float16/bfloat16
+// analogue of what F32_DEEP_TOL covers for `qvm_split_k`.
+//
+// Measured over the six shapes (three modes x two alignments) at split_k = 8:
+// worst 1.1e-3 on float16 and 6.0e-3 on bfloat16, against 6.4e-4 and 5.1e-3 for
+// the same modes without split-K. Separate constants rather than reusing the
+// tile ones because folding the wider number in would quietly cut float16's
+// headroom from 6.2x to 3.6x and hide a regression in the partial store.
+const F16_SPLITK_TOL: f32 = 6e-3;
+const BF16_SPLITK_TOL: f32 = 4e-2;
+
 // The affine control below must keep showing a bfloat16 gap of its own,
 // otherwise the two constants above are over-generous and want re-measuring.
 // It is a measurement, not a gate, so its ceiling is only there to catch a
@@ -253,16 +291,40 @@ fn select(device: Device) -> bool {
     true
 }
 
+/// Whether this host has the NAX tensor-op kernels at all.
+///
+/// `metal::is_nax_available()` folds the GPU generation (>= 17, or >= 18 when
+/// the architecture string ends in 'p'), the macOS 26.2 requirement and the
+/// `MLX_METAL_NO_NAX` compile-out into one cached bool
+/// (`metal/device.cpp:944-962`), and is the first thing the dispatcher's own
+/// gate reads (`metal/quantized.cpp:968`). `mlx_gpu_architecture_gen()` is *not*
+/// a substitute: it is a separate parse in `mlx_gated_delta.cpp:407-428` that
+/// knows none of the last three.
+fn nax_available() -> bool {
+    // SAFETY: a nullary FFI predicate that catches internally and reports false
+    // when the Metal device is unavailable (`mlx-sys/src/mlx_stream.cpp:140`).
+    unsafe { mlx_sys::mlx_metal_is_nax_available() }
+}
+
+/// Whether the caller has declared that this host is supposed to have the NAX
+/// kernels, so their absence is a failure rather than a skip.
+///
+/// Every NAX-specific assertion in this file is conditioned on the host having
+/// them, which is the right default — the simdgroup fallback is a supported
+/// configuration that CI's runners exercise on every push, not a failure. The
+/// cost is that a host which silently stops being a NAX host still reports ok,
+/// with the whole band quietly skipped. Setting this on a box that is meant to
+/// have the kernels closes that gap. `kquant_nax_bench.rs` reads the same
+/// variable for the same reason, so one setting covers both gates.
+fn nax_required() -> bool {
+    std::env::var("KQ_NAX_REQUIRE").as_deref() == Ok("1")
+}
+
 /// Whether a float32 `qmm_t` on this host actually reaches the NAX tensor op.
 ///
 /// Both halves of the dispatcher's gate (`metal/quantized.cpp:968-970`):
 ///
-/// * `metal::is_nax_available()` — folds the GPU generation (>= 17, or >= 18
-///   when the architecture string ends in 'p'), the macOS 26.2 requirement and
-///   the `MLX_METAL_NO_NAX` compile-out into one cached bool
-///   (`metal/device.cpp:944-962`). `mlx_gpu_architecture_gen()` is *not* a
-///   substitute: it is a separate parse in `mlx_gated_delta.cpp:407-428` that
-///   knows none of the last three.
+/// * `nax_available()`, above;
 /// * `env::enable_tf32()` — `get_var("MLX_ENABLE_TF32", 1)` (`mlx/utils.h:196`),
 ///   which reads the variable with `atoi` (`mlx/utils.cpp:288`): unset is on,
 ///   "0" is off. Anything that is not a clean nonzero integer is read as off
@@ -272,14 +334,11 @@ fn select(device: Device) -> bool {
 /// float16 and bfloat16 satisfy the gate's `dtype != float32` arm whatever tf32
 /// says; this is only about the float32 comparisons.
 fn nax_tf32_active() -> bool {
-    // SAFETY: a nullary FFI predicate that catches internally and reports false
-    // when the Metal device is unavailable (`mlx-sys/src/mlx_stream.cpp:140`).
-    let nax = unsafe { mlx_sys::mlx_metal_is_nax_available() };
     let tf32 = match std::env::var("MLX_ENABLE_TF32") {
         Ok(v) => v.trim().parse::<i32>().is_ok_and(|n| n != 0),
         Err(_) => true,
     };
-    nax && tf32
+    nax_available() && tf32
 }
 
 /// The tolerance for the float32 `qmm_t` shapes, which is a property of the
@@ -912,11 +971,17 @@ fn gpu_matches_cpu_on_every_quantized_matmul_kernel() {
         eprintln!("skipping gpu_matches_cpu_on_every_quantized_matmul_kernel: no GPU device");
         return;
     }
-    println!(
-        "  nax={} tf32_gate={}",
-        // SAFETY: see `nax_tf32_active`.
-        unsafe { mlx_sys::mlx_metal_is_nax_available() },
-        nax_tf32_active()
+    println!("  nax={} tf32_gate={}", nax_available(), nax_tf32_active());
+    assert!(
+        nax_available() || !nax_required(),
+        "KQ_NAX_REQUIRE=1 but metal::is_nax_available() is false, so every NAX \
+         assertion in this file would be skipped and the run would still report \
+         ok. Per metal/device.cpp:944-962 that means the GPU generation is below \
+         17 (below 18 when the architecture string ends in 'p'), macOS is older \
+         than 26.2, or the metallib was built without the NAX kernels \
+         (MLX_METAL_NO_NAX). Note that MLX_METAL_GPU_ARCH overrides the \
+         generation this check parses (metal/device.cpp:589-601), so an override \
+         left in the environment reaches here."
     );
 
     // Worst tf32 gap per mode over the six NAX `qmm_t` shapes, asserted against
@@ -1266,6 +1331,29 @@ fn gpu_matches_cpu_on_every_gather_kernel() {
 ///
 /// The unaligned widths are unaligned under the simdgroup `N % 32` rule as well
 /// as the NAX `N % 64` one, so the same shapes cover both kernel families.
+///
+/// Which family those four actually run is a property of the host, and nothing
+/// in the process can change it: the gate's other float32-only escape,
+/// `env::enable_tf32()`, does not apply to these dtypes, and its `K % 64 == 0`
+/// arm is free — a K-quant's packed dimension must already be a whole number of
+/// 256-element super-blocks or the validator rejects it. So on a NAX host these
+/// are `kquant_qmm_t_nax` and on every other host they are the simdgroup
+/// `kquant_qmm_t`, and the only way to see the other family is to run the suite
+/// somewhere else. `MLX_METAL_GPU_ARCH=applegpu_g16s` does that without a
+/// rebuild: `Device::Device` parses the generation straight out of that string
+/// (`metal/device.cpp:589-601`), so 16 fails the `gen >= 17` check at :956 and
+/// every NAX branch turns off. Measured, the two families agree exactly here —
+/// same peak and same worst gap on all 24 comparisons — which is expected,
+/// since neither truncates float16 or bfloat16 and both accumulate in float.
+///
+/// The two `qmm_t_splitk` shapes are the exception that needs no such trick.
+/// `qmm_splitk` has no NAX branch at all (`metal/quantized.cpp:1057`), so they
+/// run the simdgroup kernel on every host including this one, and they are the
+/// only float16/bfloat16 `qmm_t` numbers in the suite that a NAX box actually
+/// exercises against the fallback code. They also cover a rounding step none of
+/// the shapes above reach — see `F16_SPLITK_TOL`. Production hits this path on
+/// an ordinary single-sequence bfloat16 prefill, where B == 1 and M clears
+/// `vector_limit`.
 #[test]
 fn gpu_matches_cpu_for_every_activation_dtype() {
     if !select(Device::Gpu) {
@@ -1275,14 +1363,27 @@ fn gpu_matches_cpu_for_every_activation_dtype() {
     for kq in &KQUANTS {
         let m = kq.mode;
         let w = filled_kquant_weights(kq, &[N], K);
+        let wu = filled_kquant_weights(kq, &[N_UNALIGNED], K);
         let wb = filled_kquant_weights(kq, &[3, N], K);
         let wbu = filled_kquant_weights(kq, &[3, N_UNALIGNED], K);
         let wbig = filled_kquant_weights(kq, &[1024], K);
         let wbigu = filled_kquant_weights(kq, &[548], K);
 
-        for (dtype, name, store_tol, tile_tol) in [
-            (DType::Float16, "f16", F16_STORE_TOL, F16_TILE_TOL),
-            (DType::BFloat16, "bf16", BF16_STORE_TOL, BF16_TILE_TOL),
+        for (dtype, name, store_tol, tile_tol, splitk_tol) in [
+            (
+                DType::Float16,
+                "f16",
+                F16_STORE_TOL,
+                F16_TILE_TOL,
+                F16_SPLITK_TOL,
+            ),
+            (
+                DType::BFloat16,
+                "bf16",
+                BF16_STORE_TOL,
+                BF16_TILE_TOL,
+                BF16_SPLITK_TOL,
+            ),
         ] {
             // qmv accumulates in float and rounds once on the store
             // (kquant.h:807, :843).
@@ -1319,6 +1420,24 @@ fn gpu_matches_cpu_for_every_activation_dtype() {
                 &format!("qmm_t alN_false batch_0 {name} {m}"),
                 tile_tol,
                 || qmm_of(kq, &xbig, &wbigu, true),
+            );
+
+            // M = 64 clears vector_limit and B == 1, so this is the split-K
+            // path: split_k lands on 8 and each partition's partial sum is
+            // stored in the *activation* dtype (`intermediate` is built with
+            // `x.dtype()`, metal/quantized.cpp:1101) before a separate reduce
+            // adds them. `qmm_splitk` has no NAX branch at all, so these two
+            // run the simdgroup kernel on every host.
+            let xsk = activation(&[64, K], 149, dtype);
+            compare_devices(
+                &format!("qmm_t_splitk alN_true {name} {m}"),
+                splitk_tol,
+                || qmm_of(kq, &xsk, &w, true),
+            );
+            compare_devices(
+                &format!("qmm_t_splitk alN_false {name} {m}"),
+                splitk_tol,
+                || qmm_of(kq, &xsk, &wu, true),
             );
         }
     }
