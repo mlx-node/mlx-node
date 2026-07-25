@@ -307,6 +307,47 @@ pub fn create_random_qwen3_checkpoint<'env>(
     })
 }
 
+/// Reject a quantized checkpoint for the dense Qwen3 family.
+///
+/// The dense Qwen3 model (model_type `"qwen3"`) is the shared-autograd training
+/// model (GRPO/SFT); its `Embedding` / `Linear` / `Attention` / `MLP` are
+/// dense-only and it has no quantized-weight kernels — it never even parses the
+/// `quantization` block. Without this guard a converted quantized GGUF (ggml
+/// K-quant q4k/q5k/q6k OR affine Q4_0/Q8_0) is read as dense and surfaces as one
+/// opaque shape mismatch per packed tensor — 198 of them for Qwen3-0.6B, led by
+/// `embedding.weight: expected [151936, 1024], got [151936, 128]`, i.e.
+/// `[V, H]` against `[V, H*bits/32]`. A `quantization` config that resolves to
+/// no runtime kernel
+/// must be a loud, actionable error rather than a silently-ignored shrug —
+/// exactly the fail-open hole that let a mislabeled quantization config go
+/// unnoticed. Quantized Qwen3.5 / Gemma4 route to their own quant-capable
+/// loaders; a quantized plain-Qwen3 checkpoint has no runtime home today.
+///
+/// Fires only when a non-empty `quantization` / `quantization_config` block is
+/// present, so ordinary dense checkpoints (and the training path) are
+/// untouched. `select_quantization_block` is the same helper the quant-capable
+/// families use, so alias validation (empty/non-object/divergent pair) stays in
+/// lockstep with them.
+fn reject_quantized_checkpoint(raw_config: &Value, model_path: &str) -> Result<()> {
+    let Some(block) = crate::models::quant_dispatch::select_quantization_block(raw_config)? else {
+        return Ok(());
+    };
+    if !block.as_object().is_some_and(|o| !o.is_empty()) {
+        return Ok(());
+    }
+    let mode = block
+        .get("mode")
+        .and_then(|m| m.as_str())
+        .unwrap_or("affine");
+    Err(Error::from_reason(format!(
+        "Model at '{model_path}' carries a '{mode}' quantization config, but the dense Qwen3 \
+         loader (model_type \"qwen3\") has no quantized-weight support — it can only load dense \
+         (bf16/f16/f32) checkpoints. Re-convert without quantization, or use a quant-capable \
+         family (qwen3_5 / gemma4). This includes ggml K-quant (q4k/q5k/q6k) and affine \
+         (Q4_0/Q8_0) GGUF imports, which currently have no plain-Qwen3 runtime path."
+    )))
+}
+
 /// Parse Qwen3Config from a serde_json::Value (shared between load paths).
 fn parse_config(raw_config: &Value) -> Result<Qwen3Config> {
     let bos_token_id = raw_config["bos_token_id"]
@@ -479,6 +520,10 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                     })?;
 
                     let config = parse_config(&raw_config)?;
+
+                    // Fail CLOSED on a quantized checkpoint before the loader
+                    // misreads packed weights as dense.
+                    reject_quantized_checkpoint(&raw_config, &model_path)?;
 
                     info!(
                         "Qwen3 config: {} layers, hidden={}, heads={}, kv_heads={}",
@@ -690,4 +735,57 @@ fn parse_head_dim(raw_config: &Value) -> Result<i32> {
     }
 
     Ok(hs / nh)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A K-quant config that the dense loader cannot honor must fail CLOSED
+    /// with a mode-named, actionable error — never be silently ignored and
+    /// then decoded as dense (the 198 shape-mismatch wall). This is the
+    /// regression guarding "a quantization config resolving to nothing".
+    #[test]
+    fn reject_quantized_checkpoint_fails_closed_on_kquant() {
+        let cfg = json!({
+            "model_type": "qwen3",
+            "quantization": { "bits": 4, "group_size": 32, "mode": "q4k" },
+            "quantization_config": { "bits": 4, "group_size": 32, "mode": "q4k" },
+        });
+        let err = reject_quantized_checkpoint(&cfg, "/tmp/model")
+            .expect_err("q4k checkpoint must be rejected by the dense loader");
+        let msg = err.reason;
+        assert!(msg.contains("q4k"), "error names the mode: {msg}");
+        assert!(
+            msg.contains("no quantized-weight support"),
+            "error is actionable: {msg}"
+        );
+    }
+
+    /// Affine GGUF imports (Q4_0 / Q8_0) hit the same dense-only wall and must
+    /// also fail closed. `mode` may be absent on legacy affine blocks, so the
+    /// message defaults to "affine" rather than panicking.
+    #[test]
+    fn reject_quantized_checkpoint_fails_closed_on_affine_without_mode() {
+        let cfg = json!({
+            "model_type": "qwen3",
+            "quantization": { "bits": 8, "group_size": 32 },
+        });
+        let err = reject_quantized_checkpoint(&cfg, "/tmp/model")
+            .expect_err("affine 8-bit checkpoint must be rejected");
+        assert!(err.reason.contains("affine"), "defaults mode to affine");
+    }
+
+    /// A dense checkpoint (no quantization block) and a config carrying only an
+    /// empty `quantization: {}` stub must both load unimpeded — the guard fires
+    /// only on real quant metadata, leaving the training path untouched.
+    #[test]
+    fn reject_quantized_checkpoint_allows_dense_and_empty_block() {
+        let dense = json!({ "model_type": "qwen3", "hidden_size": 1024 });
+        assert!(reject_quantized_checkpoint(&dense, "/tmp/model").is_ok());
+
+        let empty_block = json!({ "model_type": "qwen3", "quantization": {} });
+        assert!(reject_quantized_checkpoint(&empty_block, "/tmp/model").is_ok());
+    }
 }
