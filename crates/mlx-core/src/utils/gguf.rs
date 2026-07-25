@@ -1754,13 +1754,44 @@ pub fn extract_config(metadata: &HashMap<String, GgufMetaValue>) -> serde_json::
         );
     }
 
-    // Head dimension (may be derived)
-    if let (Some(hidden), Some(heads)) = (
+    // Head dimension. The Qwen3 family decouples head_dim from
+    // hidden_size / num_attention_heads: Qwen3-0.6B has 16 query heads yet a
+    // head_dim of 128 (q_proj is [2048, 1024], not [1024, 1024]). GGUF records
+    // this as `{arch}.attention.key_length`, so for the Qwen3 family honor it
+    // as authoritative — deriving `hidden / heads` = 64 made every Qwen3 GGUF
+    // fail to load with `q_norm expected [64], got [128]`.
+    //
+    // This preference is scoped to the Qwen3 family (matching
+    // `is_qwen35_hybrid_gguf`'s arch set) precisely because a single top-level
+    // head_dim is only meaningful when every attention layer shares it. Gemma4
+    // does NOT: its sliding-window layers use head_dim 256 and its global
+    // layers 512, so its GGUF reports `key_length=512` (global) alongside
+    // `key_length_swa=256`. Gemma4's native loader derives per-layer-type head
+    // dims itself and ignores this top-level field, so it must stay on the
+    // legacy `hidden / heads` derivation — both to keep the field byte-identical
+    // with existing Gemma4 K-quant conversions and because neither GGUF value is
+    // the whole story there.
+    let is_qwen_family = matches!(arch.as_str(), "qwen3" | "qwen35" | "qwen35moe");
+    // A key_length of 0 is not a head dim; fall through to the derivation
+    // rather than writing a config that divides by it downstream. Same guard
+    // the `heads > 0` arm below applies to the derived value.
+    let key_length = if is_qwen_family {
+        metadata
+            .get(&format!("{arch}.attention.key_length"))
+            .and_then(|v| v.as_u32())
+            .filter(|&k| k > 0)
+            .map(u64::from)
+    } else {
+        None
+    };
+    let derived_head_dim = match (
         config.get("hidden_size").and_then(|v| v.as_u64()),
         config.get("num_attention_heads").and_then(|v| v.as_u64()),
-    ) && heads > 0
-    {
-        let head_dim = hidden / heads;
+    ) {
+        (Some(hidden), Some(heads)) if heads > 0 => Some(hidden / heads),
+        _ => None,
+    };
+    if let Some(head_dim) = key_length.or(derived_head_dim) {
         config.insert(
             "head_dim".to_string(),
             serde_json::Value::Number(head_dim.into()),
@@ -4454,7 +4485,72 @@ mod tests {
         assert_eq!(config["intermediate_size"], 3072);
         assert_eq!(config["num_attention_heads"], 16);
         assert_eq!(config["num_key_value_heads"], 8);
-        assert_eq!(config["head_dim"], 64); // 1024/16
+        assert_eq!(config["head_dim"], 64); // 1024/16 — no key_length present
+    }
+
+    /// Qwen3 decouples head_dim from hidden_size / num_attention_heads:
+    /// Qwen3-0.6B has 16 query heads but head_dim 128 (q_proj is [2048, 1024]).
+    /// GGUF records this as `attention.key_length`, which must win over the
+    /// `hidden / heads` derivation — otherwise every Qwen3 GGUF fails to load
+    /// with `q_norm expected [64], got [128]`.
+    #[test]
+    fn test_config_extraction_honors_key_length_head_dim() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "general.architecture".to_string(),
+            GgufMetaValue::String("qwen3".to_string()),
+        );
+        metadata.insert(
+            "qwen3.embedding_length".to_string(),
+            GgufMetaValue::Uint32(1024),
+        );
+        metadata.insert(
+            "qwen3.attention.head_count".to_string(),
+            GgufMetaValue::Uint32(16),
+        );
+        metadata.insert(
+            "qwen3.attention.head_count_kv".to_string(),
+            GgufMetaValue::Uint32(8),
+        );
+        // The decoupled head_dim: 128, not 1024/16 = 64.
+        metadata.insert(
+            "qwen3.attention.key_length".to_string(),
+            GgufMetaValue::Uint32(128),
+        );
+
+        let config = extract_config(&metadata);
+        assert_eq!(config["head_dim"], 128);
+    }
+
+    /// Gemma4 must NOT adopt `attention.key_length` as its top-level head_dim:
+    /// its sliding-window layers use head_dim 256 and its global layers 512, so
+    /// the GGUF reports key_length=512 alongside key_length_swa=256 and neither
+    /// is the single answer. The native Gemma4 loader derives per-layer-type
+    /// dims itself and ignores this field, which stays `hidden / heads` = 240
+    /// for 12B. This locks in byte-identity with existing Gemma4 K-quant
+    /// conversions (the reference artifact carries head_dim 240, not 512).
+    #[test]
+    fn test_config_extraction_gemma4_ignores_key_length() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "general.architecture".to_string(),
+            GgufMetaValue::String("gemma4".to_string()),
+        );
+        metadata.insert(
+            "gemma4.embedding_length".to_string(),
+            GgufMetaValue::Uint32(3840),
+        );
+        metadata.insert(
+            "gemma4.attention.head_count".to_string(),
+            GgufMetaValue::Uint32(16),
+        );
+        metadata.insert(
+            "gemma4.attention.key_length".to_string(),
+            GgufMetaValue::Uint32(512),
+        );
+
+        let config = extract_config(&metadata);
+        assert_eq!(config["head_dim"], 240); // 3840/16 — key_length ignored
     }
 
     #[test]
