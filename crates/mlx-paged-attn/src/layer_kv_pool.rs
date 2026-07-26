@@ -120,6 +120,16 @@ fn bridge_dtype_code(dtype: MetalDtype) -> Result<i32, String> {
 /// `[num_kv_heads, head_size, block_size]`).
 pub type BlockLayerBytes = (Vec<u8>, Vec<u8>);
 
+/// Ceiling on what one `LayerKVPool::new_for_test` pool may allocate.
+///
+/// That constructor skips `config.validate()`, so nothing bounds the geometry
+/// a test hands it. The largest pool any caller in this workspace builds is
+/// 1 MiB (256 blocks x block_size 16 x 2 layers); this leaves three orders of
+/// magnitude of headroom while still turning a typo'd `block_size` into an
+/// `Err` instead of a silent multi-gigabyte allocation.
+#[cfg(target_os = "macos")]
+const TEST_POOL_MAX_BYTES: u64 = 256 << 20;
+
 /// Shared per-layer Metal KV-cache buffer pool.
 ///
 /// On non-macOS targets this compiles to a no-op stub so the rest of the
@@ -206,20 +216,146 @@ impl LayerKVPool {
     /// the per-layer and whole-block entry points cannot drift apart — a drift
     /// would let one path accept bytes the other rejects, or worse, blit a
     /// wrong-sized window. It is *not* the only copy of this product in the
-    /// tree: [`Self::new`]'s buffer sizing, `cold_cache::pool_layer_bytes`,
-    /// and the mlx-core paged adapter's block-gather each re-derive it, so a
-    /// layout change has to be made in all four places.
+    /// tree: `cold_cache::pool_layer_bytes` and the mlx-core paged adapter's
+    /// block-gather each re-derive it, so a layout change has to be made in
+    /// all three places. [`Self::new`] and [`Self::new_for_test`] used to be a
+    /// fourth and fifth; they now size their buffers from
+    /// [`Self::block_bytes_for`], which is this function's own body, so a pool
+    /// cannot be allocated to one geometry and blitted at another.
     #[cfg(target_os = "macos")]
     fn block_bytes_per_layer(&self) -> Result<(u64, u64), String> {
-        let (element_size, x) = Self::cache_dtype_layout(self.config.use_fp8(), self.cache_dtype)?;
+        Self::block_bytes_for(&self.config, self.cache_dtype)
+    }
+
+    /// [`Self::block_bytes_per_layer`] for a config that is not a pool yet, so
+    /// buffer *allocation* and blit *addressing* read their sizes off one
+    /// expression.
+    ///
+    /// Every product is checked. A `PagedAttentionConfig` reaching here has
+    /// not necessarily been through `validate()` — [`Self::new_for_test`]
+    /// skips it deliberately — so `num_kv_heads * head_size * block_size *
+    /// element_size` is free to overflow `u64` on a geometry no allocator
+    /// would ever satisfy. Unchecked, that wraps to a small size in release
+    /// and panics in debug; checked, it is an ordinary `Err`.
+    #[cfg(target_os = "macos")]
+    fn block_bytes_for(
+        config: &PagedAttentionConfig,
+        cache_dtype: MetalDtype,
+    ) -> Result<(u64, u64), String> {
+        let (element_size, x) = Self::cache_dtype_layout(config.use_fp8(), cache_dtype)?;
         let x = x as u64;
-        let block_size = self.config.block_size as u64;
-        let num_kv_heads = self.config.num_kv_heads as u64;
-        let head_size = self.config.head_size as u64;
-        Ok((
-            num_kv_heads * (head_size / x) * block_size * x * element_size,
-            num_kv_heads * head_size * block_size * element_size,
-        ))
+        let block_size = config.block_size as u64;
+        let num_kv_heads = config.num_kv_heads as u64;
+        let head_size = config.head_size as u64;
+        let overflow = || {
+            format!(
+                "LayerKVPool: block geometry overflows u64 (num_kv_heads {num_kv_heads}, \
+                 head_size {head_size}, block_size {block_size}, x {x}, element_size \
+                 {element_size})"
+            )
+        };
+        let key = num_kv_heads
+            .checked_mul(head_size / x)
+            .and_then(|v| v.checked_mul(block_size))
+            .and_then(|v| v.checked_mul(x))
+            .and_then(|v| v.checked_mul(element_size))
+            .ok_or_else(overflow)?;
+        let value = num_kv_heads
+            .checked_mul(head_size)
+            .and_then(|v| v.checked_mul(block_size))
+            .and_then(|v| v.checked_mul(element_size))
+            .ok_or_else(overflow)?;
+        Ok((key, value))
+    }
+
+    /// The end offset (exclusive) of physical block `block_id`'s slot in a
+    /// per-layer buffer laid out as `num_blocks` consecutive `block_bytes`
+    /// slots. `None` on overflow.
+    #[cfg(target_os = "macos")]
+    fn block_slot_end(block_id: u32, block_bytes: u64) -> Option<u64> {
+        (block_id as u64)
+            .checked_mul(block_bytes)?
+            .checked_add(block_bytes)
+    }
+
+    /// Reject a transfer whose block slot does not fit inside a layer's real
+    /// `MTLBuffer`, before any blit is encoded.
+    ///
+    /// `block_id < num_blocks` is not this check. That one says the id is a
+    /// legal *index*; this one says the *buffer* is actually big enough to
+    /// hold the slot that index names. [`Self::new`] sizes every buffer for
+    /// `num_blocks` slots so the two agree and this never fires — but a
+    /// `Buffer` is only a retained handle, and a pool can hold buffers `new`
+    /// did not size.
+    ///
+    /// Metal will not report the mistake. An out-of-range blit was measured on
+    /// this machine finishing with status `Completed` and a nil error, so
+    /// `command_buffer::observe` is structurally blind to it (that module's
+    /// own docs say so). Under `MTL_DEBUG_LAYER=1` the same blit instead
+    /// aborts the process from
+    /// `-[MTLDebugBlitCommandEncoder copyFromBuffer:…]`. Silent corruption on
+    /// one machine and a crash on another is the worst pair of outcomes to
+    /// choose between, so the range is checked here in ordinary Rust.
+    #[cfg(target_os = "macos")]
+    fn check_slot_fits(
+        &self,
+        context: &str,
+        layer_idx: usize,
+        block_id: u32,
+        key_block_size: u64,
+        value_block_size: u64,
+    ) -> Result<(), String> {
+        let (key_cache, value_cache) = self.layers.get(layer_idx).ok_or_else(|| {
+            format!(
+                "{context}: layer_idx {layer_idx} out of range (num_layers = {})",
+                self.layers.len()
+            )
+        })?;
+        for (side, buffer, block_bytes) in [
+            ("key", key_cache, key_block_size),
+            ("value", value_cache, value_block_size),
+        ] {
+            let slot_end = Self::block_slot_end(block_id, block_bytes).ok_or_else(|| {
+                format!(
+                    "{context}: layer {layer_idx} {side} slot for block {block_id} overflows u64 \
+                     ({block_bytes} bytes per block)"
+                )
+            })?;
+            let allocated = buffer.length();
+            if slot_end > allocated {
+                return Err(format!(
+                    "{context}: layer {layer_idx} {side} buffer is {allocated} bytes but block \
+                     {block_id} occupies bytes {}..{slot_end} ({block_bytes} bytes per block). \
+                     The pool's buffers were not allocated for this geometry; blitting anyway \
+                     reads or writes past the end of the buffer.",
+                    slot_end - block_bytes
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::check_slot_fits`] for every layer, for the whole-block entry
+    /// points. Checks all of them, not just layer 0 — the layers are separate
+    /// allocations and only one of them has to be short.
+    #[cfg(target_os = "macos")]
+    fn check_slot_fits_all_layers(
+        &self,
+        context: &str,
+        block_id: u32,
+        key_block_size: u64,
+        value_block_size: u64,
+    ) -> Result<(), String> {
+        for layer_idx in 0..self.layers.len() {
+            self.check_slot_fits(
+                context,
+                layer_idx,
+                block_id,
+                key_block_size,
+                value_block_size,
+            )?;
+        }
+        Ok(())
     }
 
     /// Allocate one (K, V) `metal::Buffer` pair per layer.
@@ -259,8 +395,11 @@ impl LayerKVPool {
             return Err("LayerKVPool::new: config.num_layers must be > 0".to_string());
         }
 
+        // Run the dtype consistency check on every platform so its rejection
+        // path is covered by CPU-only test runs. On macOS the byte sizes come
+        // from `block_bytes_for` below, which re-derives the same pair.
         let use_fp8 = config.use_fp8();
-        let (element_size, x) = Self::cache_dtype_layout(use_fp8, cache_dtype)?;
+        let (_element_size, x) = Self::cache_dtype_layout(use_fp8, cache_dtype)?;
 
         #[cfg(target_os = "macos")]
         {
@@ -281,18 +420,22 @@ impl LayerKVPool {
                 ));
             }
 
-            let key_cache_size = num_blocks as u64
-                * config.num_kv_heads as u64
-                * (config.head_size as u64 / x as u64)
-                * config.block_size as u64
-                * x as u64
-                * element_size;
-
-            let value_cache_size = num_blocks as u64
-                * config.num_kv_heads as u64
-                * config.head_size as u64
-                * config.block_size as u64
-                * element_size;
+            // Same expression the blit ranges are addressed from, so a pool
+            // can never be allocated to one geometry and transferred at
+            // another.
+            let (key_block_size, value_block_size) = Self::block_bytes_for(&config, cache_dtype)?;
+            let overflow = |side: &str, per_block: u64| {
+                format!(
+                    "LayerKVPool::new: {side} cache size overflows u64 ({per_block} bytes per \
+                     block x {num_blocks} blocks)"
+                )
+            };
+            let key_cache_size = key_block_size
+                .checked_mul(num_blocks as u64)
+                .ok_or_else(|| overflow("key", key_block_size))?;
+            let value_cache_size = value_block_size
+                .checked_mul(num_blocks as u64)
+                .ok_or_else(|| overflow("value", value_block_size))?;
 
             let mut layers = Vec::with_capacity(config.num_layers as usize);
             for _ in 0..config.num_layers {
@@ -318,7 +461,7 @@ impl LayerKVPool {
             // Suppress dead-code warnings on non-macOS — we still validated
             // the layout above so the dtype error path is exercised on every
             // platform, but the actual sizes only matter for Metal.
-            let _ = (element_size, x);
+            let _ = (_element_size, x);
             Ok(Self {
                 num_layers: config.num_layers,
                 config,
@@ -328,18 +471,34 @@ impl LayerKVPool {
         }
     }
 
-    /// **Test-only.** Construct a pool with 1-byte placeholder GPU
-    /// buffers, intended for unit tests of consumers (e.g.
-    /// `PagedKVCacheAdapter`) that exercise lifecycle / metadata
-    /// semantics WITHOUT dispatching kernels.
+    /// **Test-only.** Construct a pool for unit tests of consumers (e.g.
+    /// `PagedKVCacheAdapter`) that exercise lifecycle / metadata semantics
+    /// WITHOUT dispatching kernels.
     ///
-    /// Skips `config.validate()` so callers may use arbitrary
-    /// `block_size` values for test convenience. On macOS this still
-    /// allocates one (tiny) `metal::Buffer` pair per layer so
-    /// `key_cache` / `value_cache` return `Some`; the buffers are
-    /// 1-byte placeholders and **using them with `write_kv` is
-    /// undefined behaviour** (will read/write past the buffer end on
-    /// the GPU, corrupt memory, or silently produce garbage).
+    /// Skips `config.validate()` so callers may use arbitrary `block_size`
+    /// values for test convenience. That skip is the only thing separating
+    /// this from [`Self::new`] now: `block_size` / `head_size` may sit outside
+    /// the kernel instantiation list, so a pool from here is still **not for
+    /// kernel dispatch**.
+    ///
+    /// The buffers themselves are real. They are sized from
+    /// `block_bytes_for` — the same expression the blit ranges are addressed
+    /// from — so the block-transfer entry points
+    /// ([`Self::read_block_all_layers`] and friends) operate entirely
+    /// in-bounds. They used to be 1-byte placeholders, which every one of
+    /// those entry points would happily blit a full block out of: silently on
+    /// this hardware, as a process abort under `MTL_DEBUG_LAYER=1`. The GDN
+    /// sidecar tests in `mlx-core` genuinely capture and restore blocks
+    /// through a pool from here, so "make GPU I/O return `Err` instead" would
+    /// have deleted their coverage rather than fixed anything.
+    ///
+    /// Total allocation is capped at `TEST_POOL_MAX_BYTES`: with
+    /// `config.validate()` skipped there is no bound on `block_size`, and a
+    /// silent multi-gigabyte allocation is a worse outcome than an `Err`.
+    ///
+    /// Buffers are `StorageModePrivate` and **not zeroed**. Reading a block
+    /// that was never written returns whatever the driver handed out. Assert
+    /// on bytes you wrote, never on bytes you did not.
     ///
     /// `cache_dtype` is recorded on the pool so the gather dispatch path
     /// routes through the correct `(io_t, cache_t)` kernel name. Tests that
@@ -377,17 +536,42 @@ impl LayerKVPool {
             use crate::metal::MetalState;
             use metal::MTLResourceOptions;
 
+            let (key_block_size, value_block_size) = Self::block_bytes_for(&cfg, cache_dtype)?;
+            let overflow = || {
+                format!(
+                    "LayerKVPool::new_for_test: pool size overflows u64 ({key_block_size} key + \
+                     {value_block_size} value bytes per block x {num_blocks} blocks x \
+                     {num_layers} layers)"
+                )
+            };
+            let key_cache_size = key_block_size
+                .checked_mul(num_blocks as u64)
+                .ok_or_else(overflow)?;
+            let value_cache_size = value_block_size
+                .checked_mul(num_blocks as u64)
+                .ok_or_else(overflow)?;
+            let total = key_cache_size
+                .checked_add(value_cache_size)
+                .and_then(|per_layer| per_layer.checked_mul(num_layers as u64))
+                .ok_or_else(overflow)?;
+            if total > TEST_POOL_MAX_BYTES {
+                return Err(format!(
+                    "LayerKVPool::new_for_test: {total} bytes exceeds the {TEST_POOL_MAX_BYTES} \
+                     byte test-pool cap ({num_blocks} blocks x {num_layers} layers x \
+                     {key_block_size}+{value_block_size} bytes). `config.validate()` is skipped \
+                     here, so nothing else bounds this geometry."
+                ));
+            }
+
             let state = MetalState::get()?;
             let mut layers = Vec::with_capacity(num_layers as usize);
             for _ in 0..num_layers {
-                // 1-byte placeholders — just enough to satisfy the
-                // existence checks. Not for kernel dispatch.
                 let k = state
                     .device
-                    .new_buffer(1, MTLResourceOptions::StorageModePrivate);
+                    .new_buffer(key_cache_size, MTLResourceOptions::StorageModePrivate);
                 let v = state
                     .device
-                    .new_buffer(1, MTLResourceOptions::StorageModePrivate);
+                    .new_buffer(value_cache_size, MTLResourceOptions::StorageModePrivate);
                 layers.push((k, v));
             }
 
@@ -1140,6 +1324,17 @@ impl LayerKVPool {
 
         let (key_cache, value_cache) = &self.layers[layer_idx as usize];
         let (key_block_size, value_block_size) = self.block_bytes_per_layer()?;
+        // The largest id owns the highest slot, so checking it alone bounds
+        // every blit this call encodes.
+        if let Some(&max_block_id) = block_ids.iter().max() {
+            self.check_slot_fits(
+                "LayerKVPool::read_blocks_to_host",
+                layer_idx as usize,
+                max_block_id,
+                key_block_size,
+                value_block_size,
+            )?;
+        }
 
         let total_keys = key_block_size as usize * block_ids.len();
         let total_values = value_block_size as usize * block_ids.len();
@@ -1231,7 +1426,8 @@ impl LayerKVPool {
     /// the whole block is copied by one blit encoder under a single commit +
     /// `wait_until_completed`.
     ///
-    /// Validation (non-empty pool, block-id range, dtype geometry) runs
+    /// Validation (non-empty pool, block-id range, dtype geometry, and that
+    /// every layer's buffer is actually long enough to hold the slot) runs
     /// before any Metal command is submitted, so a rejected call issues no
     /// GPU work at all.
     #[cfg(target_os = "macos")]
@@ -1255,18 +1451,41 @@ impl LayerKVPool {
         }
         let (key_block_size, value_block_size) = self.block_bytes_per_layer()?;
         let num_layers = self.layers.len();
+        self.check_slot_fits_all_layers(
+            "LayerKVPool::read_block_all_layers",
+            block_id,
+            key_block_size,
+            value_block_size,
+        )?;
 
         // Exactly two staging buffers for the whole block; layer `i` owns the
         // window at `i * block_bytes` in each.
+        //
+        // The products are checked rather than bare `*`. Under `Self::new`
+        // they cannot overflow — the pool's own buffers are already allocated
+        // at `num_blocks` times this — but that is a property of the caller,
+        // and this is the only arithmetic in the function that feeds raw
+        // pointer math below.
+        let staging_overflow = |side: &str, per_layer: u64| {
+            format!(
+                "LayerKVPool::read_block_all_layers: {side} staging size overflows u64 \
+                 ({per_layer} bytes x {num_layers} layers)"
+            )
+        };
+        let key_staging_size = key_block_size
+            .checked_mul(num_layers as u64)
+            .ok_or_else(|| staging_overflow("key", key_block_size))?;
+        let value_staging_size = value_block_size
+            .checked_mul(num_layers as u64)
+            .ok_or_else(|| staging_overflow("value", value_block_size))?;
+
         let state = MetalState::get()?;
-        let key_staging = state.device.new_buffer(
-            key_block_size * num_layers as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let value_staging = state.device.new_buffer(
-            value_block_size * num_layers as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let key_staging = state
+            .device
+            .new_buffer(key_staging_size, MTLResourceOptions::StorageModeShared);
+        let value_staging = state
+            .device
+            .new_buffer(value_staging_size, MTLResourceOptions::StorageModeShared);
 
         let command_buffer = state.command_queue.new_command_buffer();
         let blit = command_buffer.new_blit_command_encoder();
@@ -1300,23 +1519,22 @@ impl LayerKVPool {
         let mut layers = Vec::with_capacity(num_layers);
         // SAFETY: the shared staging buffers are CPU-accessible now that the
         // blit has completed, they stay alive for this whole loop, and each
-        // layer reads its own disjoint in-bounds window.
+        // layer reads its own disjoint window. The cursors walk exactly the
+        // `num_layers * block_bytes` the buffers were allocated at, so every
+        // read is in bounds and the final advance lands one past the end,
+        // which `add` permits. Walking a cursor rather than indexing by
+        // `layer_idx * block_bytes` keeps multiplication out of the pointer
+        // arithmetic entirely.
         unsafe {
-            let key_base = key_staging.contents() as *const u8;
-            let value_base = value_staging.contents() as *const u8;
-            for layer_idx in 0..num_layers {
+            let mut key_cursor = key_staging.contents() as *const u8;
+            let mut value_cursor = value_staging.contents() as *const u8;
+            for _ in 0..num_layers {
                 let mut keys = vec![0u8; key_bytes];
                 let mut values = vec![0u8; value_bytes];
-                std::ptr::copy_nonoverlapping(
-                    key_base.add(layer_idx * key_bytes),
-                    keys.as_mut_ptr(),
-                    key_bytes,
-                );
-                std::ptr::copy_nonoverlapping(
-                    value_base.add(layer_idx * value_bytes),
-                    values.as_mut_ptr(),
-                    value_bytes,
-                );
+                std::ptr::copy_nonoverlapping(key_cursor, keys.as_mut_ptr(), key_bytes);
+                std::ptr::copy_nonoverlapping(value_cursor, values.as_mut_ptr(), value_bytes);
+                key_cursor = key_cursor.add(key_bytes);
+                value_cursor = value_cursor.add(value_bytes);
                 layers.push((keys, values));
             }
         }
@@ -1383,6 +1601,19 @@ impl LayerKVPool {
         if block_ids.is_empty() {
             return Ok(());
         }
+        // The largest id owns the highest slot, so checking it alone bounds
+        // every blit this call encodes. Placed before the first blit is
+        // encoded, like every other rejection here, so a pool too small for
+        // the transfer is left bit-for-bit unmodified.
+        if let Some(&max_block_id) = block_ids.iter().max() {
+            self.check_slot_fits(
+                "LayerKVPool::write_blocks_from_host",
+                layer_idx as usize,
+                max_block_id,
+                key_block_size,
+                value_block_size,
+            )?;
+        }
 
         let state = MetalState::get()?;
         let key_staging = state
@@ -1444,8 +1675,9 @@ impl LayerKVPool {
     ///
     /// # Partial-overwrite invariant
     ///
-    /// Every check — layer count, block-id range, and *each* layer's key and
-    /// value byte length — completes before the first blit is encoded. A call
+    /// Every check — layer count, block-id range, *each* layer's key and
+    /// value byte length, and *each* layer's buffer being long enough to hold
+    /// the slot — completes before the first blit is encoded. A call
     /// rejected by *validation* therefore leaves the pool bit-for-bit
     /// unmodified rather than half-written. This is the whole safety story for
     /// corrupt cold-cache data: a pool holding the first `k` layers of one
@@ -1503,35 +1735,53 @@ impl LayerKVPool {
             }
         }
 
+        self.check_slot_fits_all_layers(
+            "LayerKVPool::write_block_all_layers",
+            block_id,
+            key_block_size,
+            value_block_size,
+        )?;
+
         // Past this point every input is known-good and no blit has been
         // encoded yet, so the invariant above holds for all the early returns.
+        //
+        // The staging products are checked rather than bare `*`: this is the
+        // only arithmetic here that feeds raw pointer math below.
+        let staging_overflow = |side: &str, per_layer: u64| {
+            format!(
+                "LayerKVPool::write_block_all_layers: {side} staging size overflows u64 \
+                 ({per_layer} bytes x {} layers)",
+                layers.len()
+            )
+        };
+        let key_staging_size = key_block_size
+            .checked_mul(layers.len() as u64)
+            .ok_or_else(|| staging_overflow("key", key_block_size))?;
+        let value_staging_size = value_block_size
+            .checked_mul(layers.len() as u64)
+            .ok_or_else(|| staging_overflow("value", value_block_size))?;
+
         let state = MetalState::get()?;
-        let key_staging = state.device.new_buffer(
-            key_block_size * layers.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let value_staging = state.device.new_buffer(
-            value_block_size * layers.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let key_staging = state
+            .device
+            .new_buffer(key_staging_size, MTLResourceOptions::StorageModeShared);
+        let value_staging = state
+            .device
+            .new_buffer(value_staging_size, MTLResourceOptions::StorageModeShared);
         // SAFETY: freshly created StorageModeShared buffers are CPU-visible
-        // and exclusively owned here. Each layer fills its own disjoint
-        // in-bounds window (lengths were checked above), and every write
-        // happens before the blit is committed below.
+        // and exclusively owned here. Every layer's slice was checked above to
+        // be exactly `block_bytes` long, so the cursors walk precisely the
+        // `layers.len() * block_bytes` the buffers were allocated at; the
+        // final advance lands one past the end, which `add` permits. Every
+        // write happens before the blit is committed below.
         unsafe {
-            let key_base = key_staging.contents() as *mut u8;
-            let value_base = value_staging.contents() as *mut u8;
-            for (layer_idx, (keys, values)) in layers.iter().enumerate() {
-                std::ptr::copy_nonoverlapping(
-                    keys.as_ptr(),
-                    key_base.add(layer_idx * key_block_size as usize),
-                    keys.len(),
-                );
-                std::ptr::copy_nonoverlapping(
-                    values.as_ptr(),
-                    value_base.add(layer_idx * value_block_size as usize),
-                    values.len(),
-                );
+            let mut key_cursor = key_staging.contents() as *mut u8;
+            let mut value_cursor = value_staging.contents() as *mut u8;
+            for (keys, values) in layers.iter() {
+                std::ptr::copy_nonoverlapping(keys.as_ptr(), key_cursor, keys.len());
+                std::ptr::copy_nonoverlapping(values.as_ptr(), value_cursor, values.len());
+                key_cursor = key_cursor.add(keys.len());
+                value_cursor = value_cursor.add(values.len());
             }
         }
 
@@ -2084,6 +2334,252 @@ mod tests {
 
         // The read side rejects an out-of-range block id too.
         assert!(pool.read_block_all_layers(pool.num_blocks()).is_err());
+    }
+
+    /// Swap one layer's key buffer for a 1-byte one — exactly the placeholder
+    /// `new_for_test` used to hand every caller — and return the pair that was
+    /// there so the caller can put it back.
+    ///
+    /// The LAST layer is the victim on purpose: a check that inspects only
+    /// layer 0 passes with this in place.
+    #[cfg(target_os = "macos")]
+    fn shrink_layer_key_buffer(pool: &mut LayerKVPool, layer_idx: usize) -> (Buffer, Buffer) {
+        use crate::metal::MetalState;
+        use metal::MTLResourceOptions;
+        let state = MetalState::get().expect("metal state for the shrink");
+        let saved = pool.layers[layer_idx].clone();
+        pool.layers[layer_idx].0 = state
+            .device
+            .new_buffer(1, MTLResourceOptions::StorageModePrivate);
+        saved
+    }
+
+    /// `block_id < num_blocks` says the id is a legal index. It does NOT say
+    /// the layer's buffer is big enough to hold that slot, and the two came
+    /// apart for real: `new_for_test` allocated 1-byte buffers while reporting
+    /// `num_blocks = 8`, so the whole-block entry points blitted 1024 bytes a
+    /// side out of a 1-byte buffer on every `mlx-core` GDN sidecar test.
+    ///
+    /// Metal does not catch it. The oversized blit was measured on this
+    /// machine finishing `Completed` with a nil error, so `observe` cannot
+    /// see it; under `MTL_DEBUG_LAYER=1` the same blit aborts the process.
+    /// The only thing that can reject it is a length check in Rust.
+    ///
+    /// Dies if `check_slot_fits_all_layers` is dropped from either entry
+    /// point, and dies if it is narrowed to layer 0.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn batched_block_io_rejects_a_layer_buffer_too_small_for_the_slot() {
+        const LAYERS: usize = 4;
+        let mut pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping batched_block_io_rejects_a_layer_buffer_too_small: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let per_side = 2 * 64 * 8 * 2;
+        let payload = distinct_layer_bytes(LAYERS, per_side);
+        let borrowed: Vec<(&[u8], &[u8])> = payload
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        pool.write_block_all_layers(2, &borrowed).expect("seed");
+        let before = snapshot_pool(&pool);
+
+        let victim = LAYERS - 1;
+        let saved = shrink_layer_key_buffer(&mut pool, victim);
+
+        let read_err = pool.read_block_all_layers(2).expect_err(
+            "reading a block out of a 1-byte layer buffer must be rejected, not blitted",
+        );
+        let write_err = pool
+            .write_block_all_layers(2, &borrowed)
+            .expect_err("writing a block into a 1-byte layer buffer must be rejected, not blitted");
+        for (label, err) in [("read", &read_err), ("write", &write_err)] {
+            assert!(
+                err.contains(&format!("layer {victim}")),
+                "{label} error must name the offending layer: {err}"
+            );
+            assert!(
+                err.contains("is 1 bytes"),
+                "{label} error must report the buffer's real length: {err}"
+            );
+            assert!(
+                err.contains(&format!("{per_side} bytes per block")),
+                "{label} error must report the slot size it needed: {err}"
+            );
+        }
+
+        // Restore the real buffer, then prove neither rejection touched the
+        // pool: both must return before the first blit is encoded, which is
+        // the partial-overwrite invariant `write_block_all_layers` documents.
+        pool.layers[victim] = saved;
+        assert_eq!(
+            snapshot_pool(&pool),
+            before,
+            "a transfer rejected for a short buffer must not modify any byte of the pool"
+        );
+    }
+
+    /// The per-layer pair carries the same defect and is the one that runs in
+    /// production — `PagedKVCacheAdapter::read_kv_range` calls
+    /// `read_blocks_to_host` on every cache-hit prefill.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn per_layer_block_io_rejects_a_layer_buffer_too_small_for_the_slot() {
+        const LAYERS: usize = 4;
+        let mut pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping per_layer_block_io_rejects_a_layer_buffer_too_small: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let per_side = 2 * 64 * 8 * 2;
+        let payload = distinct_layer_bytes(LAYERS, per_side);
+        let borrowed: Vec<(&[u8], &[u8])> = payload
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        pool.write_block_all_layers(2, &borrowed).expect("seed");
+        let before = snapshot_pool(&pool);
+
+        let victim = LAYERS - 1;
+        let saved = shrink_layer_key_buffer(&mut pool, victim);
+
+        let read_err = pool
+            .read_blocks_to_host(victim as u32, &[2])
+            .expect_err("per-layer read out of a 1-byte buffer must be rejected");
+        let (keys, values) = &payload[victim];
+        let write_err = pool
+            .write_blocks_from_host(victim as u32, &[2], keys, values)
+            .expect_err("per-layer write into a 1-byte buffer must be rejected");
+        for (label, err) in [("read", &read_err), ("write", &write_err)] {
+            assert!(
+                err.contains(&format!("layer {victim}")),
+                "{label} error must name the offending layer: {err}"
+            );
+            assert!(
+                err.contains("is 1 bytes"),
+                "{label} error must report the buffer's real length: {err}"
+            );
+        }
+
+        // An untouched layer of the same pool still works, so the check
+        // rejects the short buffer rather than the call.
+        pool.read_blocks_to_host(0, &[2])
+            .expect("a correctly sized layer must still transfer");
+
+        pool.layers[victim] = saved;
+        assert_eq!(
+            snapshot_pool(&pool),
+            before,
+            "a per-layer transfer rejected for a short buffer must not modify the pool"
+        );
+    }
+
+    /// `new_for_test` pools must be able to do the block I/O the `mlx-core`
+    /// GDN sidecar tests drive through them. With 1-byte buffers the transfer
+    /// was encoded anyway and "succeeded" against uninitialized staging bytes;
+    /// the round trip below is what tells those two states apart.
+    ///
+    /// Dies if `new_for_test` goes back to 1-byte buffers — with the length
+    /// check present both calls return `Err`, and without it the readback
+    /// returns allocation garbage instead of the payload.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn new_for_test_pools_round_trip_a_whole_block() {
+        const LAYERS: u32 = 2;
+        const NUM_BLOCKS: u32 = 4;
+        let pool = match LayerKVPool::new_for_test(
+            base_config(LAYERS),
+            NUM_BLOCKS,
+            LAYERS,
+            MetalDtype::Float16,
+        ) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping new_for_test_pools_round_trip_a_whole_block: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new_for_test failure: {e}"),
+        };
+        let (key_block_size, value_block_size) =
+            pool.block_bytes_per_layer().expect("pool geometry");
+        for layer in 0..LAYERS as usize {
+            assert_eq!(
+                pool.layers[layer].0.length(),
+                key_block_size * NUM_BLOCKS as u64,
+                "layer {layer} key buffer must hold every block slot"
+            );
+            assert_eq!(
+                pool.layers[layer].1.length(),
+                value_block_size * NUM_BLOCKS as u64,
+                "layer {layer} value buffer must hold every block slot"
+            );
+        }
+
+        let per_side = key_block_size as usize;
+        let sentinel = seed_sentinel_block(&pool, 0, per_side);
+        let payload = distinct_layer_bytes(LAYERS as usize, per_side);
+        let borrowed: Vec<(&[u8], &[u8])> = payload
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        pool.write_block_all_layers(2, &borrowed)
+            .expect("batched write into a test pool");
+        let read_back = pool
+            .read_block_all_layers(2)
+            .expect("batched read from a test pool");
+        assert_eq!(
+            read_back, payload,
+            "a test pool must return the bytes that were written to it"
+        );
+        assert_eq!(
+            pool.read_block_all_layers(0)
+                .expect("batched read of the sentinel block"),
+            sentinel,
+            "the write must land in block 2's slot only"
+        );
+    }
+
+    /// `new_for_test` skips `config.validate()`, so nothing upstream bounds
+    /// the geometry it is handed. The byte count must therefore be computed
+    /// with checked arithmetic and capped, not multiplied out and allocated.
+    ///
+    /// Needs no GPU: both rejections happen before `MetalState::get`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn new_for_test_rejects_a_geometry_it_cannot_allocate() {
+        // 1. The product overflows u64 outright.
+        let overflowing = PagedAttentionConfig {
+            block_size: u32::MAX,
+            num_kv_heads: u32::MAX,
+            head_size: u32::MAX,
+            num_layers: 1,
+            use_fp8_cache: Some(false),
+            ..PagedAttentionConfig::default()
+        };
+        let err = LayerKVPool::new_for_test(overflowing, u32::MAX, 1, MetalDtype::Float16)
+            .map(|_| ())
+            .expect_err("a geometry whose byte count overflows u64 must be rejected");
+        assert!(
+            err.contains("overflow"),
+            "expected an overflow rejection, got: {err}"
+        );
+
+        // 2. The product fits, but the pool would be far larger than any test
+        //    needs. Silently allocating it is worse than an `Err`.
+        let huge = LayerKVPool::new_for_test(base_config(2), 100_000, 2, MetalDtype::Float16)
+            .map(|_| ())
+            .expect_err("a pool over the test cap must be rejected");
+        assert!(
+            huge.contains("test-pool cap"),
+            "expected a cap rejection, got: {huge}"
+        );
     }
 
     /// A command buffer that aborts must turn into an `Err`, not a silent

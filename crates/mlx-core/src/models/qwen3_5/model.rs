@@ -14697,6 +14697,22 @@ mod paged_construction_tests {
             before.capture_reached + 1,
             "the manual finalize must enter the GDN sidecar capture exactly once"
         );
+        // The chain really carried both blocks off the GPU. Asserted here
+        // because everything below depends on it and nothing below can see it:
+        // a pool whose buffers are too small makes `read_block_all_layers`
+        // return `Err`, the chain capture stops at its first block, and the
+        // boundary assertion after this one becomes unreachable rather than
+        // false. Without this line that failure reads as "the capture did not
+        // reach its boundary selection", three layers from the real cause.
+        assert_eq!(
+            inner
+                .paged_adapter
+                .as_ref()
+                .expect("paged_adapter")
+                .cold_captured_blocks(),
+            2,
+            "both whole blocks must have been captured off the pool"
+        );
         // The finalize published two whole blocks to the cold chain, so the
         // capture ran all the way to the boundary selection and found no
         // in-memory checkpoint to anchor on. Reaching THAT arm proves it got
