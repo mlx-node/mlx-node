@@ -109,6 +109,17 @@ pub struct ColdSidecarTelemetry {
     pub enqueued: u64,
     /// Sidecars the bounded writer queue refused because it was full.
     pub queue_drops: u64,
+    /// Restored sidecars a family actually INSTALLED as its live per-turn state.
+    ///
+    /// The only counter on the read side, and it exists because every other
+    /// signal a restore emits is satisfiable with the sidecar thrown away.
+    /// `install_*_gdn_cold_sidecar` has eight `Ok(false)` arms and each one falls
+    /// through to a full O(prefix) recurrent replay that produces CORRECT state
+    /// — so `cached_tokens`, `hits`, `corruptions`, and text/`num_tokens` parity
+    /// all stay exactly as they were. Without this counter a regression from
+    /// "restored and used" to "restored and re-derived from scratch" is
+    /// invisible, and that regression is the whole feature.
+    pub installed: u64,
 }
 
 /// The counters behind [`ColdSidecarTelemetry`].
@@ -124,6 +135,7 @@ pub struct ColdSidecarCounters {
     already_persisted: AtomicU64,
     enqueued: AtomicU64,
     queue_drops: AtomicU64,
+    installed: AtomicU64,
 }
 
 impl ColdSidecarCounters {
@@ -135,6 +147,7 @@ impl ColdSidecarCounters {
             already_persisted: AtomicU64::new(0),
             enqueued: AtomicU64::new(0),
             queue_drops: AtomicU64::new(0),
+            installed: AtomicU64::new(0),
         }
     }
 
@@ -170,6 +183,15 @@ impl ColdSidecarCounters {
         self.queue_drops.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a restored sidecar a family installed as its live per-turn state.
+    ///
+    /// Recorded at the point of no return — after the decoded caches have
+    /// replaced `self.caches`, so no later `Ok(false)` arm can undo it and a
+    /// decode failure (which returns `Err` and fails the turn) never reaches it.
+    pub fn record_install(&self) {
+        self.installed.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> ColdSidecarTelemetry {
         let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
         ColdSidecarTelemetry {
@@ -179,6 +201,7 @@ impl ColdSidecarCounters {
             already_persisted: load(&self.already_persisted),
             enqueued: load(&self.enqueued),
             queue_drops: load(&self.queue_drops),
+            installed: load(&self.installed),
         }
     }
 }
@@ -1474,6 +1497,21 @@ mod tests {
                 already_persisted: 1,
                 enqueued: 1,
                 queue_drops: 1,
+                ..Default::default()
+            }
+        );
+
+        counters.record_install();
+        assert_eq!(
+            counters.snapshot(),
+            ColdSidecarTelemetry {
+                capture_reached: 1,
+                chain_empty: 1,
+                boundary_skips: 1,
+                already_persisted: 1,
+                enqueued: 1,
+                queue_drops: 1,
+                installed: 1,
             }
         );
     }

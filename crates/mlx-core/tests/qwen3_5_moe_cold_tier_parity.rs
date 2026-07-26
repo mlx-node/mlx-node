@@ -18,8 +18,15 @@
 //! a freshly loaded model, so its in-process prefix cache is empty and a hot hit
 //! is impossible. Any non-zero `cached_tokens` it reports can therefore only have
 //! come through the reconcile-down walk — a GDN state sidecar was found on disk,
-//! decoded, and validated against this checkpoint's geometry. That is what turns
-//! "the tier restored something" into "the tier restored the recurrent half too".
+//! decoded, and validated against this checkpoint's geometry.
+//!
+//! Found + read + checksummed + layout-validated is NOT the same as INSTALLED:
+//! `install_moe_gdn_cold_sidecar`'s `Ok(false)` arms all fall through to a full
+//! O(prefix) GDN replay whose output, `cached_tokens`, `hits` and `corruptions`
+//! are indistinguishable from a healthy run. `expecting_sidecar_install()`
+//! asserts the `installed` counter advanced during instance 2 alone, and only
+//! with it set does a pass here mean "the tier restored the recurrent half too".
+//! See the dense sibling for the long version.
 //!
 //! # Why warm-up turns
 //!
@@ -107,7 +114,10 @@ async fn qwen3_5_moe_cold_tier_restart_parity() {
             // Two turns put the persisted chain past a mid ladder rung. Fewer
             // than the three the short prompt needed, because the chain no
             // longer has to reach the prompt's own end — only a shallow rung.
-            .with_capture_warmup_turns(2),
+            .with_capture_warmup_turns(2)
+            // See the dense sibling: without this the gate cannot tell an
+            // installed GDN sidecar from one read, validated and thrown away.
+            .expecting_sidecar_install(),
         |model_dir, messages, config| async move {
             // Loaded fresh per instance and dropped when this future
             // completes, so instance 2 really starts from an empty hot cache.

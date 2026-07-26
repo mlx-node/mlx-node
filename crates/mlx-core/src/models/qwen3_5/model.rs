@@ -1755,6 +1755,11 @@ impl Qwen35Inner {
             return Ok(false);
         };
         self.caches = Some(caches);
+        // The one observable that separates "the tier restored the recurrent
+        // half" from "the tier read it and every arm above declined". Both
+        // produce identical text, identical `num_tokens` and identical
+        // `cached_tokens`; only the second re-forwards the whole prefix.
+        crate::cold_tier::cold_sidecar_counters().record_install();
         // Feed the in-memory store so later turns in this process hit RAM
         // instead of decoding the sidecar again. Best-effort: a failure to
         // clone/store never invalidates the freshly installed live caches.

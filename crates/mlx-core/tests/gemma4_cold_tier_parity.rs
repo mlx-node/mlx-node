@@ -231,7 +231,12 @@ async fn gemma4_cold_tier_restart_parity() {
             // restore this deep in a fresh instance is only reachable through a
             // validated sliding-window sidecar, and this fixture's shallowest
             // checkpoint sits at exactly one window.
-            .with_min_restored_tokens(SLIDING_WINDOW_TOKENS),
+            .with_min_restored_tokens(SLIDING_WINDOW_TOKENS)
+            // `install_gemma4_sliding_cold_sidecar` has six `Ok(None)` arms and
+            // each falls through to a full `run_sliding_only_prefill` replay
+            // whose output is identical, so nothing else here can see the
+            // difference.
+            .expecting_sidecar_install(),
         |model_dir, messages, config| async move {
             // Loaded fresh per instance and dropped when this future
             // completes, so instance 2 really starts from an empty hot cache.
@@ -303,6 +308,11 @@ async fn gemma4_cold_tier_restart_parity_sub_window() {
             // ~21 blocks to cover. The chain advanced ~24 blocks/turn when this
             // was measured on qwen3, so this is several times over.
             .with_capture_warmup_turns(6)
+            // The inspector below reads a trace line that names the state, so
+            // this gate was already the one family gate that could see an
+            // install. Assert it structurally too, so it does not depend on
+            // whether the stream path happens to emit that line.
+            .expecting_sidecar_install()
             .with_restore_inspector(move |observation| {
                 assert_sub_window_sidecar_restore(observation, &trace_path);
             }),

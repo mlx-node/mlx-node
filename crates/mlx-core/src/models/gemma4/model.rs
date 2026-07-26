@@ -2403,6 +2403,11 @@ impl Gemma4Inner {
             return Ok(None);
         };
         self.caches = Some(caches);
+        // The one observable that separates "the tier restored the sliding half"
+        // from "the tier read it and every arm above declined". Both produce
+        // identical text, identical `num_tokens` and identical `cached_tokens`;
+        // only the second re-forwards the whole prefix.
+        crate::cold_tier::cold_sidecar_counters().record_install();
         Ok(Some(Gemma4SlidingPrefixPreparation {
             state: "cold_sidecar",
             primed_prefix_len: boundary,

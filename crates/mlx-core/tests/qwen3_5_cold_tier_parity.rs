@@ -18,8 +18,19 @@
 //! empty and a hot hit is impossible. Any non-zero `cached_tokens` it reports
 //! can therefore only have come through the reconcile-down walk — which means a
 //! GDN state sidecar was found on disk, decoded, and validated against this
-//! checkpoint's geometry. That is what turns "the tier restored something" into
-//! "the tier restored the recurrent half too".
+//! checkpoint's geometry.
+//!
+//! Be precise about the last step, because for a long time this file was not.
+//! Found + read + checksummed + layout-validated is NOT the same as INSTALLED.
+//! `install_dense_gdn_cold_sidecar` has eight `Ok(false)` arms and every one of
+//! them falls through to `replay_materialized` — a full O(prefix) GDN replay
+//! that reconstructs CORRECT recurrent state. Under that fall-through
+//! `cached_tokens`, `hits`, `corruptions` and the text/`num_tokens` parity are
+//! all exactly what a healthy run reports, so nothing else in the harness moves.
+//! `expecting_sidecar_install()` is what closes that: it asserts the
+//! `installed` sidecar counter advanced during instance 2 alone. Only with it
+//! set does a pass here mean "the tier restored the recurrent half too" rather
+//! than "the tier could have".
 //!
 //! # Why warm-up turns
 //!
@@ -119,7 +130,12 @@ async fn qwen3_5_cold_tier_restart_parity() {
             // Two turns put the persisted chain past a mid ladder rung. Fewer
             // than the three the short prompt needed, because the chain no
             // longer has to reach the prompt's own end — only a shallow rung.
-            .with_capture_warmup_turns(2),
+            .with_capture_warmup_turns(2)
+            // Without this the module doc above overclaims: every other
+            // assertion here is satisfied by a restart that reads and validates
+            // the GDN sidecar and then discards it, falling through to a full
+            // O(prefix) recurrent replay whose output is identical.
+            .expecting_sidecar_install(),
         |model_dir, messages, config| async move {
             // Loaded fresh per instance and dropped when this future
             // completes, so instance 2 really starts from an empty hot cache.

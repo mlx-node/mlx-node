@@ -342,6 +342,19 @@ pub struct ColdTierParitySpec {
     /// fixed assertions — so this is inert by default and no existing gate's
     /// behaviour changes.
     pub inspect_restore: Option<RestoreInspector>,
+    /// Require the restart instance to INSTALL the sidecar it restored, not
+    /// merely find, read, checksum and layout-validate it.
+    ///
+    /// Off by default so families with no auxiliary state are bit-for-bit
+    /// unchanged. Every family whose `ColdTierContext` carries a
+    /// `ColdSidecarPolicy` should set it, because without it their gate's whole
+    /// claim is unbacked: `install_*_cold_sidecar` has a long tail of
+    /// `Ok(false)` / `Ok(None)` arms, each falling through to a full O(prefix)
+    /// replay that reconstructs CORRECT state. Assertions 1, 1b, 2 and 3 are all
+    /// satisfied by that fall-through — the restore walk already counted the
+    /// hits and set `cached_tokens` before the install ran, and the replay's
+    /// text matches. The counter is the only thing that moves.
+    pub expect_sidecar_install: bool,
 }
 
 impl ColdTierParitySpec {
@@ -360,7 +373,14 @@ impl ColdTierParitySpec {
             min_restored_tokens: None,
             capture_warmup_turns: 0,
             inspect_restore: None,
+            expect_sidecar_install: false,
         }
+    }
+
+    /// See [`Self::expect_sidecar_install`].
+    pub fn expecting_sidecar_install(mut self) -> Self {
+        self.expect_sidecar_install = true;
+        self
     }
 
     /// Add one `config.json` override applied to both clones.
@@ -732,6 +752,7 @@ fn sidecar_telemetry_delta(
             .saturating_sub(before.already_persisted),
         enqueued: after.enqueued.saturating_sub(before.enqueued),
         queue_drops: after.queue_drops.saturating_sub(before.queue_drops),
+        installed: after.installed.saturating_sub(before.installed),
     }
 }
 
@@ -873,6 +894,12 @@ where
     wait_for_cold_writes_drained().await;
 
     let stats_before = cold_cache_stats_snapshot();
+    // A SECOND sidecar window, narrower than `sidecar_before` on purpose: it
+    // opens after instance 1 has finished, so its delta is instance 2's alone.
+    // The install assertion needs that. Instance 1 is itself a fresh model load
+    // and can install a warm-up's sidecar, so the 1+2 window would stay green
+    // with the restart instance installing nothing.
+    let restore_sidecar_before = cold_sidecar_telemetry();
 
     // Only families that asked for an inspector pay any attention to tracing;
     // for everyone else these stay `None`/0 and nothing is read.
@@ -896,6 +923,9 @@ where
 
     let stats_after = cold_cache_stats_snapshot();
     let sidecar_after = cold_sidecar_telemetry();
+    let restore_installs = sidecar_after
+        .installed
+        .saturating_sub(restore_sidecar_before.installed);
 
     // Instance 3: persistence off — a clean fresh-prefill baseline that never
     // touches the tier (no `ColdTierContext`).
@@ -927,14 +957,15 @@ where
     let sidecar_delta = sidecar_telemetry_delta(&sidecar_before, &sidecar_after);
     eprintln!(
         "[{}] sidecar telemetry over instances 1+2: capture_reached={} chain_empty={} \
-         boundary_skips={} already_persisted={} enqueued={} queue_drops={}",
+         boundary_skips={} already_persisted={} enqueued={} queue_drops={} installed={}",
         spec.family,
         sidecar_delta.capture_reached,
         sidecar_delta.chain_empty,
         sidecar_delta.boundary_skips,
         sidecar_delta.already_persisted,
         sidecar_delta.enqueued,
-        sidecar_delta.queue_drops
+        sidecar_delta.queue_drops,
+        sidecar_delta.installed
     );
 
     // ---- 1b-diagnostic. The ladder, printed BEFORE any assertion ----------
@@ -1074,6 +1105,38 @@ where
         after.bytes_restored,
         after.evictions,
         after.corruptions
+    );
+
+    // ---- 2a. The restored sidecar was INSTALLED, not just read -----------
+    //
+    // Everything above this line is satisfied by a restart that finds the
+    // sidecar on disk, checksums it, layout-validates it, and then throws it
+    // away: `cached_tokens` and `hits` are set by the restore walk BEFORE the
+    // install runs, and the fall-through replay reconstructs correct state, so
+    // the text and `num_tokens` parity below match too. Only this counter
+    // separates "restored and used" from "restored and re-derived from
+    // scratch" — which is an O(prefix) GDN / sliding replay on every restart,
+    // i.e. the entire point of the feature, silently gone.
+    //
+    // Division of labour, deliberately: the counter proves the decoded state
+    // reached `self.caches`. It does NOT prove the state is CORRECT — that is
+    // assertion 3's job, since stale or absent recurrent state changes the text.
+    if spec.expect_sidecar_install {
+        assert!(
+            restore_installs >= 1,
+            "[{}] the restart instance restored {} token(s) from the tier but installed NO \
+             sidecar: every `install_*_cold_sidecar` arm declined and the turn fell through to \
+             a full O(prefix) replay. Output is still correct, which is why nothing else here \
+             fires — but the recurrent/sliding half of the restore did no work. Check the \
+             group, boundary == cached_prefix_len, layout-vs-geometry and decode arms of that \
+             function.",
+            spec.family,
+            result_b.cached_tokens
+        );
+    }
+    eprintln!(
+        "[{}] sidecar installs by the restart instance alone: {} (expected >= 1: {})",
+        spec.family, restore_installs, spec.expect_sidecar_install
     );
 
     // ---- 2b. Family-specific view of the restore -------------------------
