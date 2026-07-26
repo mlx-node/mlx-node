@@ -55,6 +55,19 @@ use std::collections::VecDeque;
 /// plus the root, which is five. A `/new` rotation mints a sixth owner id, but
 /// the retired root is the one `last_resort_victim` takes first — pinned by
 /// `rotating_root_evicts_old_root_and_preserves_new_root_with_four_children`.
+///
+/// What the cap DOES cost at the sized fleet is SSD writes a restart would read,
+/// not restore depth: at five owners the store cannot hold every owner's whole
+/// ladder, so a shallow rung an owner just published can be evicted before it is
+/// written. That shortfall is a bounded miss window, not a permanent loss —
+/// the persisted chain gains on the prompt (+`QUEUE_BLOCKS_PER_TURN` blocks a
+/// turn against the fixture's per-turn prompt growth), so the deepest retained
+/// rung comes under the chain's reach within a few turns and every owner ends
+/// up with the same deepest sidecar on disk. That bound holds ONLY because the
+/// writer is fast enough for the chain to gain; at the pre-`fsync(2)` rate the
+/// chain LOST ground per turn and the shortfall was permanent. So a writer
+/// regression reads here as a capacity regression — `retention_sim` sweeps
+/// `PRE_FSYNC_BLOCKS_PER_TURN` for exactly that reason.
 pub(crate) const GDN_PREFIX_CHECKPOINT_LIMIT: usize = 5;
 
 /// One prefill publishes a ladder of block-aligned prefix checkpoints rather

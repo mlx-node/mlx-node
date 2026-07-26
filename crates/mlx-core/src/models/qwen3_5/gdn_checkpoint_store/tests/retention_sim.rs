@@ -498,6 +498,18 @@ fn run(
 }
 
 const SWEEP_TURNS: usize = 40;
+
+/// Concurrent owners the product actually produces: the root Pi session plus
+/// the four child loops the subagent extension caps concurrency at.
+///
+/// A LITERAL, deliberately — NOT `GDN_PREFIX_CHECKPOINT_LIMIT`. The blind-turn
+/// cliff sits exactly one owner past the cap, so a loop bounded by the cap moves
+/// with any shrink of it and can never reach the cliff: swept at
+/// `1..=GDN_PREFIX_CHECKPOINT_LIMIT`, the mutation `cap 5 -> 4` (with per-owner
+/// 4 -> 3, which the `const _` assert below the cap forces) leaves this test
+/// GREEN. Measured, not reasoned. This constant is the demand; the cap is the
+/// supply, and only a fixed demand can catch the supply falling.
+const SIZED_FLEET_OWNERS: usize = 5;
 const SWEEP_OWNERS: [usize; 6] = [1, 2, 3, 4, 5, 6];
 
 /// Capacity variants. `limit 24` is the upper bound for this sweep: six owners
@@ -808,7 +820,7 @@ fn multi_owner_sweep_measures_both_consumers() {
         agent_1.cold_selectable()
     );
 
-    for owners in 1..=3 {
+    for owners in 1..=SIZED_FLEET_OWNERS {
         let small_fleet = run(
             &Fixture::AGENT,
             owners,
@@ -877,8 +889,18 @@ const AGENT_SELECTABLE_FLOOR: usize = 30;
 /// five owners; at SIX it is 28 of 40, under either arm — that cliff is the
 /// count bound, not the victim search.
 ///
+/// The loop that reads this sweeps `1..=SIZED_FLEET_OWNERS` — a fixed 5, the
+/// fleet the product produces — so this assertion is what pins the CAP at the
+/// count that justifies its value. Bounding the loop by
+/// `GDN_PREFIX_CHECKPOINT_LIMIT` instead does not work and was measured not to:
+/// the cliff sits one owner past the cap, so the loop moves with the mutation
+/// and never reaches it.
+///
 /// Catches, verified by mutation: replacing the global-cap victim search with
 /// plain FIFO (`checkpoints.remove(0)`) blinds a turn at three owners.
+/// `GDN_PREFIX_CHECKPOINT_LIMIT` 5 -> 4 (with `GDN_PREFIX_CHECKPOINTS_PER_OWNER`
+/// 4 -> 3, which the `const _` assert beside the cap forces) blinds 28 of 40 at
+/// five owners, `cold_captures` 23 and `warm_store_partial` 7.
 const SMALL_FLEET_BLIND_TURNS: usize = 0;
 
 /// Share of every cached prefix token those same runs re-forward. Measured 0.0%,
