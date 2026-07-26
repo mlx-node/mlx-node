@@ -13,9 +13,10 @@ use crate::engine::persistence::{
     prewarm_checkpoint_pages,
 };
 use crate::models::quant_dispatch::{
-    default_per_layer_quant, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
-    ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
-    kquant_mode_params, load_quant_settings_from_disk, merge_per_layer, resolve_default_mode,
+    default_per_layer_quant, ensure_affine_biases_present, ensure_dense_weight_floating,
+    ensure_int8_storage_resolves_sym8, ensure_kquant_storage_resolves_kquant,
+    ensure_plain_fp8_storage_resolves_fp8_e4m3, kquant_mode_params, load_quant_settings_from_disk,
+    merge_per_layer, resolve_default_mode,
 };
 use crate::tokenizer::Qwen3Tokenizer;
 
@@ -1346,6 +1347,7 @@ fn build_gemma_ql(
     ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
     ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "gemma4")?;
     ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "gemma4")?;
+    ensure_affine_biases_present(params, prefix, plq.mode, "gemma4")?;
     Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
@@ -1374,6 +1376,7 @@ fn build_gemma_qsl(
     ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
     ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "gemma4")?;
     ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "gemma4")?;
+    ensure_affine_biases_present(params, prefix, plq.mode, "gemma4")?;
     Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
@@ -3781,9 +3784,11 @@ mod tests {
                 .astype(DType::BFloat16)
                 .expect("bf16")
         };
-        // Affine-SHAPED quant group (packed Uint32 weight + scales). The
-        // affine builder stores tensors as-is, so dummies are sufficient for
-        // this loader-seam test.
+        // Affine-SHAPED quant group (packed Uint32 weight + both companions).
+        // The affine builder stores tensors as-is, so dummies are sufficient
+        // for this loader-seam test — but the group must be complete, or the
+        // missing-bias guard fires first and this stops testing partial
+        // quantization at all.
         let quant_group = |p: &mut HashMap<String, MxArray>, base: &str| {
             let w = MxArray::from_float32(&[0.0f32; 4 * 2], &[4, 2])
                 .expect("from_float32")
@@ -3791,6 +3796,7 @@ mod tests {
                 .expect("uint32");
             p.insert(format!("{base}.weight"), w);
             p.insert(format!("{base}.scales"), bf16_w(&[4, 1]));
+            p.insert(format!("{base}.biases"), bf16_w(&[4, 1]));
         };
         let run = |params: &HashMap<String, MxArray>| {
             // lm_head.weight is required for untied configs; inject a valid bf16

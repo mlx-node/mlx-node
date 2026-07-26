@@ -16,8 +16,10 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
+use crate::engine::persistence::expand_symmetric_affine_biases;
 use crate::models::paddleocr_vl::persistence::load_paddleocr_vl_weights;
 use crate::models::qianfan_ocr::persistence::load_qianfan_ocr_weights;
+use crate::models::quant_dispatch::SYMMETRIC_ZERO_POINT_KEY;
 use crate::utils::gguf_kquant::{KQuantFormat, QK_K};
 use crate::utils::safetensors::load_safetensors_lazy;
 
@@ -1912,6 +1914,36 @@ pub async fn convert_model(options: ConversionOptions) -> Result<ConversionResul
     result
 }
 
+/// Drop every `symmetric_zero_point` claim from a config carried over from the
+/// source checkpoint.
+///
+/// The field means "this checkpoint stores no `.biases`; derive them from the
+/// scales". Only the GGUF importer can honour that, because only it knows the
+/// source block format; this converter rebuilds the companions at its input
+/// boundary and the writer then stores them. Copying the claim through would
+/// emit a checkpoint whose config says derived while its payload says stored —
+/// which the loader rejects outright, so a plain re-convert of a symmetric
+/// import would produce an unloadable model.
+///
+/// Applies to both aliases and to every per-tensor entry, since a mixed source
+/// names each symmetric tensor individually.
+fn strip_symmetric_zero_point(config: &mut serde_json::Value) {
+    for alias in ["quantization", "quantization_config"] {
+        let Some(block) = config
+            .get_mut(alias)
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        block.remove(SYMMETRIC_ZERO_POINT_KEY);
+        for entry in block.values_mut() {
+            if let Some(entry) = entry.as_object_mut() {
+                entry.remove(SYMMETRIC_ZERO_POINT_KEY);
+            }
+        }
+    }
+}
+
 async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionResult> {
     let input_dir = PathBuf::from(&options.input_dir);
     let output_dir = PathBuf::from(&options.output_dir);
@@ -2411,6 +2443,22 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             input_dir.display()
         )));
     }
+
+    // A source checkpoint whose config.json declares symmetric affine groups
+    // stores no `.biases` companions. Rebuilding them here, at the boundary,
+    // means the whole conversion pipeline downstream — including the guards that
+    // reject an affine group missing its mandatory `.biases` — keeps seeing the
+    // one tensor shape it has always seen. The rebuilt arrays carry no source
+    // provenance, so the passthrough snapshot below simply skips them and they
+    // take the ordinary MLX writer path.
+    //
+    // Paired with `strip_symmetric_zero_point` on the emitted config: once the
+    // companions are rebuilt here they are also written out, so the output is a
+    // stored-bias checkpoint and must not repeat the source's derived-bias
+    // claim.
+    let mut tensors = tensors;
+    expand_symmetric_affine_biases(&input_dir, &mut tensors)?;
+    let tensors = tensors;
 
     // Snapshot source-file provenance for every loaded bf16/f16 tensor, keyed by
     // the loaded MLX array's raw handle pointer. A dest tensor that still carries
@@ -3061,6 +3109,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // Write config.json — clean and sort keys to match mlx-lm/mlx-vlm save_config
     let output_config_path = output_dir.join("config.json");
     let mut output_config = config.clone();
+    strip_symmetric_zero_point(&mut output_config);
 
     // Inject quantization metadata if quantized
     if do_quantize || is_gemma_e2b_import {
@@ -3611,6 +3660,7 @@ fn write_mtp_drafter_dir(
             obj.insert("quantization".to_string(), quant.clone());
             obj.insert("quantization_config".to_string(), quant.clone());
         }
+        strip_symmetric_zero_point(&mut draft_config);
     }
 
     // Sort keys + indent 2 to match split.py's json.dump(sorted(...), indent=2).
@@ -7055,6 +7105,67 @@ pub(crate) fn infer_num_layers_from_weights(weights: &HashMap<String, MxArray>) 
 mod tests {
     use super::*;
     use crate::convert::recipe::{self, ConversionRecipe};
+
+    /// Re-converting a symmetric GGUF import must not emit a config that still
+    /// claims the `.biases` are derived. The input boundary rebuilds them and
+    /// the writer stores them, so an output that kept the claim would describe
+    /// a checkpoint that does not exist and the loader would refuse it — a
+    /// plain `mlx convert` of an imported model producing an unloadable model.
+    #[test]
+    fn carried_over_config_drops_the_symmetric_zero_point() {
+        let mut config = serde_json::json!({
+            "model_type": "gemma4_unified",
+            "quantization": {
+                "bits": 4,
+                "group_size": 32,
+                "mode": "affine",
+                SYMMETRIC_ZERO_POINT_KEY: 8,
+                "language_model.model.layers.0.mlp.down_proj": {
+                    "bits": 4, "group_size": 32, "mode": "affine",
+                    SYMMETRIC_ZERO_POINT_KEY: 8,
+                },
+                "language_model.model.embed_tokens": {
+                    "bits": 6, "group_size": 16, "mode": "q6k",
+                },
+            },
+            "quantization_config": {
+                "bits": 8, "group_size": 32, "mode": "affine",
+                SYMMETRIC_ZERO_POINT_KEY: 128,
+            },
+        });
+        strip_symmetric_zero_point(&mut config);
+
+        assert_eq!(
+            config["quantization"],
+            serde_json::json!({
+                "bits": 4,
+                "group_size": 32,
+                "mode": "affine",
+                "language_model.model.layers.0.mlp.down_proj": {
+                    "bits": 4, "group_size": 32, "mode": "affine",
+                },
+                "language_model.model.embed_tokens": {
+                    "bits": 6, "group_size": 16, "mode": "q6k",
+                },
+            }),
+            "the geometry must survive; only the derived-bias claim goes"
+        );
+        assert_eq!(
+            config["quantization_config"],
+            serde_json::json!({ "bits": 8, "group_size": 32, "mode": "affine" }),
+            "the legacy alias is carried over too and must be stripped alike"
+        );
+        assert_eq!(config["model_type"], "gemma4_unified");
+
+        // A config that never carried the field is returned untouched.
+        let plain = serde_json::json!({
+            "model_type": "qwen3_5",
+            "quantization": { "bits": 4, "group_size": 64, "mode": "affine" },
+        });
+        let mut untouched = plain.clone();
+        strip_symmetric_zero_point(&mut untouched);
+        assert_eq!(untouched, plain);
+    }
 
     #[test]
     fn imatrix_rejects_prequantized_body_before_mutating_packed_weight_or_norm() {

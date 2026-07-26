@@ -51,6 +51,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use mlx_core::array::MxArray;
 use mlx_core::utils::gguf::{gguf_name_to_hf, parse_gguf};
 use mlx_core::utils::safetensors::SafeTensorsFile;
 
@@ -112,6 +113,36 @@ const CASES: &[Case] = &[
         source_gguf: "gguf/qwen3-0.6b-pure-Q8_0.gguf",
         reference_gguf: "deq/q8_0-deq-f32.gguf",
         mlx_dir: "qwen3-q8-mlx2",
+        expect: Expect::F16RoundedDecode,
+    },
+    // The symmetric affine import: ggml Q4_0 is `d * (q - 8)` and Q8_0 is
+    // `d * (q - 128)`, so neither writes a `.biases` companion any more and the
+    // loader rebuilds it from the scale. They are held to the SAME expectation
+    // as the stored-bias control above — if the reconstruction moved a value,
+    // it stops equalling llama.cpp's f32 rounded to float16 and the case fails.
+    Case {
+        label: "Q4_0-symmetric",
+        source_gguf: "gguf/qwen3-0.6b-pure-Q4_0.gguf",
+        reference_gguf: "deq/q4_0-deq-f32.gguf",
+        mlx_dir: "qwen3-q40-sym",
+        expect: Expect::BitExactModuloSignedZero,
+    },
+    Case {
+        label: "Q8_0-symmetric",
+        source_gguf: "gguf/qwen3-0.6b-pure-Q8_0.gguf",
+        reference_gguf: "deq/q8_0-deq-f32.gguf",
+        mlx_dir: "qwen3-q80-sym",
+        expect: Expect::F16RoundedDecode,
+    },
+    // Q4_1 is the asymmetric sibling: its second f16 field is a per-block
+    // minimum, not a function of the scale, so its `.biases` must still be
+    // stored. This case decodes it with no zero point declared anywhere, which
+    // is only possible if the import left that path alone.
+    Case {
+        label: "Q4_1-asymmetric",
+        source_gguf: "gguf/qwen3-0.6b-pure-Q4_1.gguf",
+        reference_gguf: "deq/q4_1-deq-f32.gguf",
+        mlx_dir: "qwen3-q41-sym",
         expect: Expect::F16RoundedDecode,
     },
 ];
@@ -216,6 +247,15 @@ fn run_case(root: &Path, case: &Case) -> Totals {
     let group_size = qblock["group_size"].as_i64().expect("group_size") as i32;
     let mode = qblock["mode"].as_str().expect("mode").to_string();
     let mode_c = CString::new(mode.clone()).expect("mode cstring");
+    // Set exactly when the source block format is symmetric and the converter
+    // therefore left the derived `.biases` off disk.
+    let zero_point = qblock["symmetric_zero_point"].as_i64().map(|z| z as i32);
+    assert_eq!(
+        zero_point.is_some(),
+        case.label.ends_with("-symmetric"),
+        "{}: config.json symmetry marker disagrees with the case",
+        case.label
+    );
 
     let st_path = mlx_dir.join("model.safetensors");
     let st = SafeTensorsFile::load(&st_path).expect("load safetensors header");
@@ -242,9 +282,23 @@ fn run_case(root: &Path, case: &Case) -> Totals {
         let s = tensors
             .get(&format!("{base}.scales"))
             .unwrap_or_else(|| panic!("{}: no {base}.scales in our checkpoint", case.label));
-        let b = tensors
-            .get(&format!("{base}.biases"))
-            .unwrap_or_else(|| panic!("{}: no {base}.biases in our checkpoint", case.label));
+        // A symmetric group stores no bias; the loader rebuilds it as
+        // `scales * -Z` and this does the same thing, so the decode below is
+        // the decode the runtime performs.
+        let rebuilt = zero_point.map(|z| {
+            assert!(
+                !tensors.contains_key(&format!("{base}.biases")),
+                "{}: {base} declares a symmetric zero point but still stores a .biases",
+                case.label
+            );
+            s.mul_scalar(-f64::from(z)).expect("rebuild derived bias")
+        });
+        let b = match &rebuilt {
+            Some(b) => b,
+            None => tensors
+                .get(&format!("{base}.biases"))
+                .unwrap_or_else(|| panic!("{}: no {base}.biases in our checkpoint", case.label)),
+        };
 
         // SAFETY: the three handles outlive the call; out_dtype 0 is float32.
         let handle = unsafe {
@@ -367,4 +421,144 @@ fn imported_kquant_weights_match_llamacpp_dequantization() {
         assert!(t.elements > 0, "{}: compared nothing", case.label);
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Two conversions of the SAME source GGUF — one written before the symmetric
+/// import (a real `.biases` array on disk) and one written after it (no array,
+/// rebuilt from the scale) — decoded and compared element for element.
+///
+/// The `Expect::F16RoundedDecode` cases above pin each conversion against
+/// llama.cpp independently. This pins them against EACH OTHER, on the real
+/// bytes of a real model, with no reference in between and no expectation to
+/// hide behind: the packed weights and the scales must be byte-identical, and
+/// the two decodes must agree bit for bit over every element.
+#[test]
+fn the_symmetric_import_decodes_identically_to_the_stored_bias_import() {
+    let Some(root) = root() else {
+        eprintln!("KQ_PARITY_ROOT unset or not a directory — skipping real-data A/B");
+        return;
+    };
+    let stored_dir = root.join("qwen3-q8-mlx2");
+    let derived_dir = root.join("qwen3-q80-sym");
+    if !stored_dir.is_dir() || !derived_dir.is_dir() {
+        eprintln!("pre-symmetric and symmetric Q8_0 conversions not both present — skipping A/B");
+        return;
+    }
+
+    let read = |dir: &Path| {
+        let cfg: serde_json::Value =
+            serde_json::from_reader(File::open(dir.join("config.json")).expect("open config.json"))
+                .expect("parse config.json");
+        let st = dir.join("model.safetensors");
+        let file = SafeTensorsFile::load(&st).expect("load safetensors header");
+        let tensors = file.load_tensors(&st).expect("load safetensors tensors");
+        (cfg, tensors)
+    };
+    let (stored_cfg, stored) = read(&stored_dir);
+    let (derived_cfg, derived) = read(&derived_dir);
+
+    assert!(
+        stored_cfg["quantization"]["symmetric_zero_point"].is_null(),
+        "the pre-symmetric conversion must carry no marker"
+    );
+    let zero_point = derived_cfg["quantization"]["symmetric_zero_point"]
+        .as_i64()
+        .expect("the symmetric conversion must carry a marker") as i32;
+    assert_eq!(zero_point, 128, "Q8_0 blocks are `d * (q - 128)`");
+    let bits = derived_cfg["quantization"]["bits"].as_i64().expect("bits") as i32;
+    let group_size = derived_cfg["quantization"]["group_size"]
+        .as_i64()
+        .expect("group_size") as i32;
+    let mode = CString::new("affine").expect("mode cstring");
+
+    let bases: Vec<String> = stored
+        .keys()
+        .filter_map(|k| k.strip_suffix(".biases").map(str::to_string))
+        .collect();
+    assert!(
+        !bases.is_empty(),
+        "the stored-bias conversion has no groups"
+    );
+
+    let mut compared = 0u64;
+    let mut diffs = 0u64;
+    let mut first: Option<String> = None;
+    for base in &bases {
+        let sw = stored
+            .get(&format!("{base}.weight"))
+            .expect("stored weight");
+        let dw = derived
+            .get(&format!("{base}.weight"))
+            .expect("derived weight");
+        let ss = stored
+            .get(&format!("{base}.scales"))
+            .expect("stored scales");
+        let ds = derived
+            .get(&format!("{base}.scales"))
+            .expect("derived scales");
+        assert!(
+            !derived.contains_key(&format!("{base}.biases")),
+            "{base}: the symmetric conversion must store no .biases"
+        );
+
+        let sb = stored
+            .get(&format!("{base}.biases"))
+            .expect("stored biases");
+        let db = ds.mul_scalar(-f64::from(zero_point)).expect("derived bias");
+
+        let dequantize = |w: &MxArray, s: &MxArray, b: &MxArray| {
+            // SAFETY: the three handles outlive the call; out_dtype 0 is float32.
+            let handle = unsafe {
+                mlx_sys::mlx_dequantize(
+                    w.as_raw_ptr(),
+                    s.as_raw_ptr(),
+                    b.as_raw_ptr(),
+                    group_size,
+                    bits,
+                    0,
+                    mode.as_ptr(),
+                )
+            };
+            assert!(
+                !handle.is_null(),
+                "{base}: mlx_dequantize rejected the group"
+            );
+            // SAFETY: non-null handle from mlx_dequantize.
+            let len = unsafe { mlx_sys::mlx_array_size(handle) };
+            let out = read_f32_exact(handle, len);
+            // SAFETY: the handle is owned here and not used afterwards.
+            unsafe { mlx_sys::mlx_array_delete(handle) };
+            out
+        };
+
+        let a = dequantize(sw, ss, sb);
+        let b = dequantize(dw, ds, &db);
+        assert_eq!(a.len(), b.len(), "{base}: element counts differ");
+        for i in 0..a.len() {
+            if a[i].to_bits() != b[i].to_bits() {
+                diffs += 1;
+                if first.is_none() {
+                    first = Some(format!(
+                        "{base} idx {i}: stored-bias {:?} (0x{:08x}) vs derived-bias {:?} \
+                         (0x{:08x})",
+                        a[i],
+                        a[i].to_bits(),
+                        b[i],
+                        b[i].to_bits()
+                    ));
+                }
+            }
+        }
+        compared += a.len() as u64;
+    }
+
+    println!(
+        "[Q8_0 stored-vs-derived] groups={} elements={compared} differing={diffs}",
+        bases.len()
+    );
+    if let Some(f) = &first {
+        println!("[Q8_0 stored-vs-derived] first divergence: {f}");
+    }
+    assert_eq!(diffs, 0, "first divergence: {}", first.unwrap_or_default());
+    assert!(compared > 0, "compared nothing");
 }

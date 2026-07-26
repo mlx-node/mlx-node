@@ -16,6 +16,7 @@ use napi_derive::napi;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
+use crate::models::quant_dispatch::SYMMETRIC_ZERO_POINT_KEY;
 use crate::utils::gguf_kquant::{KQuantArrays, KQuantFormat, KQuantRepacker, KQuantScales, QK_K};
 use crate::utils::safetensors::save_safetensors;
 
@@ -702,7 +703,50 @@ fn load_q6k_tensor_bf16(
     MxArray::from_bfloat16(&values, &shape)
 }
 
-/// Load a quantized tensor (Q4_0, Q4_1, Q8_0) and produce (weight, scales, biases) triplet
+/// The zero point a symmetric ggml block format subtracts from every code.
+///
+/// ggml stores Q4_0 as `w = d * (q - 8)` and Q8_0 as `w = d * (q - 128)` after
+/// the sign-bit flip this importer applies: one f16 scale per 32 weights and no
+/// stored offset at all. MLX's affine format is `w = scale * q + bias`, so the
+/// repack used to materialize `bias = -Z * scale` — an array whose every entry
+/// is a function of the scale beside it, costing 0.5 bpw (681 MB on
+/// Gemma-4-12B-QAT) and pushing the import above the GGUF it came from.
+///
+/// Returning `Some(Z)` here means the tensor's `.biases` companion is left off
+/// disk and reconstructed at load by
+/// [`expand_symmetric_affine_biases`](crate::engine::persistence::expand_symmetric_affine_biases).
+/// `None` means the format stores a real, independently chosen offset (Q4_1's
+/// per-block minimum) that no scale can reproduce.
+pub fn symmetric_zero_point(ty: GgufTensorType) -> Option<i32> {
+    match ty {
+        GgufTensorType::Q4_0 => Some(8),
+        GgufTensorType::Q8_0 => Some(128),
+        GgufTensorType::Q4_1
+        | GgufTensorType::F32
+        | GgufTensorType::F16
+        | GgufTensorType::BF16
+        | GgufTensorType::Q4K
+        | GgufTensorType::Q5K
+        | GgufTensorType::Q6K => None,
+    }
+}
+
+/// The `.biases` entry the pre-symmetric importer wrote for a symmetric block.
+///
+/// Kept as the reference the parity gate compares the load-time reconstruction
+/// against, so the historical bytes stay reproducible after the writer stopped
+/// emitting them.
+pub fn derived_symmetric_bias_bits(scale_bits: u16, zero_point: i32) -> u16 {
+    let scale = half::f16::from_bits(scale_bits).to_f32();
+    half::f16::from_f32(-(zero_point as f32) * scale).to_bits()
+}
+
+/// Load a quantized tensor (Q4_0, Q4_1, Q8_0) into its MLX affine companions.
+///
+/// Q4_1 yields the `(weight, scales, biases)` triplet its stored per-block
+/// minimum requires. Q4_0 and Q8_0 yield `(weight, scales)` only: their offset
+/// is the constant `-Z * scale`, so it is reconstructed at load instead of
+/// stored (see [`symmetric_zero_point`]).
 fn load_quantized_tensor(
     reader: &mut (impl Read + Seek),
     gguf: &GgufFile,
@@ -745,7 +789,9 @@ fn load_quantized_tensor(
 
     let mut weights_packed = vec![0u32; w_elements];
     let mut scales = vec![0u16; sb_elements]; // f16
-    let mut biases = vec![0u16; sb_elements]; // f16
+    // Only the asymmetric format fills this; the symmetric ones reconstruct
+    // their offset from the scale at load and never allocate the array.
+    let mut biases: Vec<u16> = Vec::new(); // f16
 
     let type_size = tensor.tensor_type.type_size();
 
@@ -754,11 +800,7 @@ fn load_quantized_tensor(
             // Block: 2 bytes f16 scale, 16 bytes (32 x 4-bit weights)
             for i in 0..n_blocks {
                 let block = &raw[i * type_size..(i + 1) * type_size];
-                let scale_bytes = u16::from_le_bytes([block[0], block[1]]);
-                scales[i] = scale_bytes;
-                // bias = -8 * scale
-                let scale_f32 = half::f16::from_bits(scale_bytes).to_f32();
-                biases[i] = half::f16::from_f32(-8.0 * scale_f32).to_bits();
+                scales[i] = u16::from_le_bytes([block[0], block[1]]);
 
                 // Unpack 4-bit weights into int8, then repack into uint32
                 let mut unpacked = [0i8; 32];
@@ -779,6 +821,7 @@ fn load_quantized_tensor(
         }
         GgufTensorType::Q4_1 => {
             // Block: 2 bytes f16 scale, 2 bytes f16 bias, 16 bytes (32 x 4-bit weights)
+            biases = vec![0u16; sb_elements];
             for i in 0..n_blocks {
                 let block = &raw[i * type_size..(i + 1) * type_size];
                 scales[i] = u16::from_le_bytes([block[0], block[1]]);
@@ -803,11 +846,7 @@ fn load_quantized_tensor(
             // Block: 2 bytes f16 scale, 32 bytes (32 x 8-bit signed weights)
             for i in 0..n_blocks {
                 let block = &raw[i * type_size..(i + 1) * type_size];
-                let scale_bytes = u16::from_le_bytes([block[0], block[1]]);
-                scales[i] = scale_bytes;
-                // bias = -128 * scale
-                let scale_f32 = half::f16::from_bits(scale_bytes).to_f32();
-                biases[i] = half::f16::from_f32(-128.0 * scale_f32).to_bits();
+                scales[i] = u16::from_le_bytes([block[0], block[1]]);
 
                 // Convert signed int8 to unsigned (add 128 / flip sign bit) then pack into u32
                 let base = i * (block_size / 4); // 8 bits per weight, 4 per u32
@@ -831,17 +870,22 @@ fn load_quantized_tensor(
 
     let weight_arr = MxArray::from_uint32(&weights_packed, &w_i64_shape)?;
     let scales_arr = MxArray::from_float16(&scales, &sb_i64_shape)?;
-    let biases_arr = MxArray::from_float16(&biases, &sb_i64_shape)?;
 
     // Strip .weight suffix for prefix, then add .scales/.biases
     let name = &tensor.name;
     let prefix = name.strip_suffix(".weight").unwrap_or(name);
 
-    Ok(vec![
+    let mut out = vec![
         (name.clone(), weight_arr),
         (format!("{prefix}.scales"), scales_arr),
-        (format!("{prefix}.biases"), biases_arr),
-    ])
+    ];
+    if symmetric_zero_point(tensor.tensor_type).is_none() {
+        out.push((
+            format!("{prefix}.biases"),
+            MxArray::from_float16(&biases, &sb_i64_shape)?,
+        ));
+    }
+    Ok(out)
 }
 
 /// Source bytes a single K-quant read pulls in before repacking them. Large
@@ -1801,18 +1845,26 @@ pub fn extract_config(metadata: &HashMap<String, GgufMetaValue>) -> serde_json::
     serde_json::Value::Object(config)
 }
 
-/// The `(bits, group_size, mode)` triple a `quantization` config entry names.
+/// What a `quantization` config entry says about one tensor: the
+/// `(bits, group_size, mode)` triple plus the symmetric zero point, if any.
 ///
-/// All three fields participate in every comparison. Bits alone cannot tell a
+/// Every field participates in every comparison. Bits alone cannot tell a
 /// Q4_0 tensor from a Q4_K one — both are 4-bit — yet they decode through
 /// different kernels with different group sizes, so a bits-only equality test
 /// reports an Unsloth Dynamic GGUF as uniformly affine and mislabels every
-/// K-quant tensor in it.
+/// K-quant tensor in it. The zero point is in the identity for the same reason
+/// one step down: Q4_0 and Q4_1 are both 4-bit affine at group 32 and differ
+/// only in whether the offset is derived or stored.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 struct SourceQuantProfile {
     bits: i32,
     group_size: i32,
     mode: &'static str,
+    /// Set when the source block format is symmetric and the converter left the
+    /// derived `.biases` companion off disk. Part of the identity, so a
+    /// symmetric Q4_0 tensor and an asymmetric Q4_1 tensor no longer collapse
+    /// onto one profile and a file holding both is described per tensor.
+    symmetric_zero_point: Option<i32>,
 }
 
 impl SourceQuantProfile {
@@ -1827,9 +1879,12 @@ impl SourceQuantProfile {
         match ty {
             GgufTensorType::F32 | GgufTensorType::F16 | GgufTensorType::BF16 => None,
             // `load_quantized_tensor` repacks these into MLX affine groups of
-            // 32 without changing their block geometry.
-            GgufTensorType::Q4_0 | GgufTensorType::Q4_1 => Some(Self::affine(4)),
-            GgufTensorType::Q8_0 => Some(Self::affine(8)),
+            // 32 without changing their block geometry. Q4_0 and Q8_0 are
+            // symmetric, so their profile also records the zero point the
+            // loader needs to rebuild the omitted `.biases`.
+            GgufTensorType::Q4_0 => Some(Self::affine(4).symmetric(ty)),
+            GgufTensorType::Q4_1 => Some(Self::affine(4)),
+            GgufTensorType::Q8_0 => Some(Self::affine(8).symmetric(ty)),
             // `load_kquant_repack` keeps ggml's geometry verbatim, so the
             // triple is read off the repacker format rather than restated
             // here; `k_quant_format` stays the only type -> format mapping.
@@ -1844,6 +1899,15 @@ impl SourceQuantProfile {
             bits,
             group_size: 32,
             mode: "affine",
+            symmetric_zero_point: None,
+        }
+    }
+
+    /// Record the zero point `ty`'s blocks subtract, if it has one.
+    fn symmetric(self, ty: GgufTensorType) -> Self {
+        Self {
+            symmetric_zero_point: symmetric_zero_point(ty),
+            ..self
         }
     }
 
@@ -1852,6 +1916,7 @@ impl SourceQuantProfile {
             bits: format.bits() as i32,
             group_size: format.group_size() as i32,
             mode: format.mlx_mode(),
+            symmetric_zero_point: None,
         }
     }
 
@@ -1864,18 +1929,30 @@ impl SourceQuantProfile {
     }
 
     fn to_json(self) -> serde_json::Value {
-        serde_json::json!({
-            "bits": self.bits,
-            "group_size": self.group_size,
-            "mode": self.mode,
-        })
+        let mut obj = serde_json::Map::new();
+        obj.insert("bits".to_string(), serde_json::json!(self.bits));
+        obj.insert("group_size".to_string(), serde_json::json!(self.group_size));
+        obj.insert("mode".to_string(), serde_json::json!(self.mode));
+        if let Some(zero_point) = self.symmetric_zero_point {
+            obj.insert(
+                SYMMETRIC_ZERO_POINT_KEY.to_string(),
+                serde_json::json!(zero_point),
+            );
+        }
+        serde_json::Value::Object(obj)
     }
 
     fn describe(self) -> String {
-        format!(
-            "{}-bit {} (group_size {})",
-            self.bits, self.mode, self.group_size
-        )
+        match self.symmetric_zero_point {
+            Some(zero_point) => format!(
+                "{}-bit {} (group_size {}, symmetric zero point {zero_point})",
+                self.bits, self.mode, self.group_size
+            ),
+            None => format!(
+                "{}-bit {} (group_size {})",
+                self.bits, self.mode, self.group_size
+            ),
+        }
     }
 }
 
@@ -2071,6 +2148,12 @@ fn preserved_source_quantization(
         serde_json::json!(default_profile.group_size),
     );
     quant.insert("mode".to_string(), serde_json::json!(default_profile.mode));
+    if let Some(zero_point) = default_profile.symmetric_zero_point {
+        quant.insert(
+            SYMMETRIC_ZERO_POINT_KEY.to_string(),
+            serde_json::json!(zero_point),
+        );
+    }
     for (prefix, profile) in profiles {
         // In a mixed file every source-quantized tensor gets an entry, so the
         // top-level triple is only a fallback and cannot misdecode the odd ones
@@ -3883,20 +3966,145 @@ mod tests {
                 .unwrap(),
             vec![scale_bits]
         );
-        let expected_bias_bits = half::f16::from_f32(-2.0).to_bits();
+        // Q4_0 is symmetric: its offset is the constant -8 * scale, so the
+        // import writes no `.biases` companion and the loader rebuilds it.
+        assert!(
+            !weights.contains_key("test.biases"),
+            "Q4_0 must not write a derived .biases companion"
+        );
+        assert_eq!(
+            derived_symmetric_bias_bits(scale_bits, 8),
+            half::f16::from_f32(-2.0).to_bits()
+        );
+        fs::remove_file(&tmp).ok();
+    }
+
+    /// Load one 32-weight block of `ty` through the production import path.
+    fn load_single_affine_block(
+        ty: GgufTensorType,
+        block: &[u8],
+        label: &str,
+    ) -> HashMap<String, MxArray> {
+        let data = build_minimal_gguf(&[], &[("test.weight", &[32, 1], ty, block)]);
+        let tmp = std::env::temp_dir().join(format!(
+            "mlx-node-affine-{label}-{}.gguf",
+            std::process::id()
+        ));
+        fs::write(&tmp, data).unwrap();
+        let gguf = parse_gguf(&tmp).unwrap();
+        let weights = load_gguf_tensors(&tmp, &gguf, GgufLoadOptions::default()).unwrap();
+        fs::remove_file(&tmp).ok();
+        weights
+    }
+
+    #[test]
+    fn q8_0_import_omits_the_derived_bias() {
+        let scale_bits = half::f16::from_f32(0.5).to_bits();
+        let mut block = [0u8; 34];
+        block[..2].copy_from_slice(&scale_bits.to_le_bytes());
+        for (i, byte) in block[2..].iter_mut().enumerate() {
+            *byte = (i as i8).wrapping_sub(16) as u8;
+        }
+        let weights = load_single_affine_block(GgufTensorType::Q8_0, &block, "q8");
+
         assert_eq!(
             weights
-                .get("test.biases")
+                .get("test.scales")
                 .unwrap()
                 .to_uint16_native()
                 .unwrap(),
-            vec![expected_bias_bits]
+            vec![scale_bits]
+        );
+        assert!(
+            !weights.contains_key("test.biases"),
+            "Q8_0 is `d * (q - 128)` — its offset is derived, not stored"
         );
         assert_eq!(
-            weights.get("test.biases").unwrap().to_float32().unwrap()[0],
-            -2.0
+            derived_symmetric_bias_bits(scale_bits, 128),
+            half::f16::from_f32(-64.0).to_bits()
         );
-        fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn q4_1_import_keeps_its_own_stored_minimum() {
+        // Q4_1 is the asymmetric sibling: its second f16 field is a minimum
+        // chosen per block, unrelated to the scale. Deriving it would destroy
+        // every weight in the tensor, so the import must keep storing it.
+        let scale_bits = half::f16::from_f32(0.25).to_bits();
+        let min_bits = half::f16::from_f32(-1.75).to_bits();
+        let mut block = [0u8; 20];
+        block[..2].copy_from_slice(&scale_bits.to_le_bytes());
+        block[2..4].copy_from_slice(&min_bits.to_le_bytes());
+        for (i, byte) in block[4..].iter_mut().enumerate() {
+            *byte = ((15 - i) as u8) << 4 | i as u8;
+        }
+        let weights = load_single_affine_block(GgufTensorType::Q4_1, &block, "q41");
+
+        let biases = weights
+            .get("test.biases")
+            .expect("Q4_1 stores a real minimum and must keep its .biases")
+            .to_uint16_native()
+            .unwrap();
+        assert_eq!(biases, vec![min_bits]);
+        assert_ne!(
+            biases[0],
+            derived_symmetric_bias_bits(scale_bits, 8),
+            "the stored minimum must not coincide with the symmetric derivation, \
+             or this fixture cannot tell the two apart"
+        );
+    }
+
+    #[test]
+    fn symmetric_zero_point_is_pinned_per_gguf_type() {
+        assert_eq!(symmetric_zero_point(GgufTensorType::Q4_0), Some(8));
+        assert_eq!(symmetric_zero_point(GgufTensorType::Q8_0), Some(128));
+        assert_eq!(symmetric_zero_point(GgufTensorType::Q4_1), None);
+        for ty in [
+            GgufTensorType::Q4K,
+            GgufTensorType::Q5K,
+            GgufTensorType::Q6K,
+            GgufTensorType::F32,
+            GgufTensorType::F16,
+            GgufTensorType::BF16,
+        ] {
+            assert_eq!(symmetric_zero_point(ty), None, "{}", ty.name());
+        }
+
+        let profile = |ty| SourceQuantProfile::for_gguf_type(ty).unwrap();
+        assert_eq!(profile(GgufTensorType::Q4_0).symmetric_zero_point, Some(8));
+        assert_eq!(
+            profile(GgufTensorType::Q8_0).symmetric_zero_point,
+            Some(128)
+        );
+        assert_eq!(profile(GgufTensorType::Q4_1).symmetric_zero_point, None);
+        // The split is what lets a file holding both name them separately.
+        assert_ne!(profile(GgufTensorType::Q4_0), profile(GgufTensorType::Q4_1));
+    }
+
+    #[test]
+    fn mixed_q4_0_and_q4_1_source_metadata_separates_them() {
+        let gguf = source_quant_fixture(&[
+            ("blk.0.attn_q.weight", GgufTensorType::Q4_0),
+            ("blk.0.attn_k.weight", GgufTensorType::Q4_0),
+            ("blk.0.ffn_down.weight", GgufTensorType::Q4_1),
+        ]);
+        let quant = preserved_source_quantization(&gguf, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(quant[SYMMETRIC_ZERO_POINT_KEY], 8);
+        assert_eq!(
+            quant["language_model.model.layers.0.self_attn.q_proj"],
+            serde_json::json!({
+                "bits": 4, "group_size": 32, "mode": "affine",
+                SYMMETRIC_ZERO_POINT_KEY: 8,
+            })
+        );
+        assert_eq!(
+            quant["language_model.model.layers.0.mlp.down_proj"],
+            serde_json::json!({ "bits": 4, "group_size": 32, "mode": "affine" }),
+            "the Q4_1 tensor must be named and must carry no zero point"
+        );
     }
 
     #[test]
@@ -4132,8 +4340,11 @@ mod tests {
         assert_eq!(quant["bits"], 4);
         assert_eq!(quant["group_size"], 32);
         assert_eq!(quant["mode"], "affine");
+        // Q4_0 blocks are `d * (q - 8)`, so the config carries the zero point
+        // the loader needs to rebuild the omitted `.biases`.
+        assert_eq!(quant[SYMMETRIC_ZERO_POINT_KEY], 8);
         // A file of one profile still needs no per-tensor entries.
-        assert_eq!(quant.as_object().unwrap().len(), 3);
+        assert_eq!(quant.as_object().unwrap().len(), 4);
     }
 
     /// Tensor descriptors only — `preserved_source_quantization` reads names
@@ -4253,11 +4464,17 @@ mod tests {
         );
         assert_eq!(
             quant["language_model.model.layers.0.self_attn.q_proj"],
-            serde_json::json!({ "bits": 4, "group_size": 32, "mode": "affine" })
+            serde_json::json!({
+                "bits": 4, "group_size": 32, "mode": "affine",
+                SYMMETRIC_ZERO_POINT_KEY: 8,
+            })
         );
         assert_eq!(
             quant["language_model.model.layers.0.self_attn.k_proj"],
-            serde_json::json!({ "bits": 4, "group_size": 32, "mode": "affine" })
+            serde_json::json!({
+                "bits": 4, "group_size": 32, "mode": "affine",
+                SYMMETRIC_ZERO_POINT_KEY: 8,
+            })
         );
     }
 
@@ -4317,7 +4534,7 @@ mod tests {
             .unwrap_err()
             .reason;
         assert!(
-            message.contains("4-bit affine (group_size 32)"),
+            message.contains("4-bit affine (group_size 32, symmetric zero point 8)"),
             "{message}"
         );
         assert!(message.contains("4-bit q4k (group_size 32)"), "{message}");
@@ -4400,10 +4617,14 @@ mod tests {
         .unwrap();
 
         let mut expected_config = source_config;
+        // The source tensors are ggml Q4_0 (`d * (q - 8)`), so the block carries
+        // the zero point that stands in for the `.biases` array the import no
+        // longer writes.
         let expected_quant = serde_json::json!({
             "bits": 4,
             "group_size": 32,
-            "mode": "affine"
+            "mode": "affine",
+            SYMMETRIC_ZERO_POINT_KEY: 8,
         });
         expected_config["quantization"] = expected_quant.clone();
         expected_config["quantization_config"] = expected_quant;

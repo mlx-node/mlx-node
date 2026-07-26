@@ -13,6 +13,10 @@ use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::engine::params::ModelGenerationDefaults;
+use crate::models::quant_dispatch::{
+    SYMMETRIC_ZERO_POINT_KEY, normalize_per_layer_key, parse_symmetric_zero_points,
+    select_quantization_block,
+};
 use crate::utils::safetensors::load_safetensors_lazy;
 
 /// Whether the Metal-only native paths can run on this host.
@@ -106,6 +110,7 @@ pub(crate) fn load_all_safetensors(
     if let Some(path) = single_path {
         info!("Loading weights from: {} (mmap)", path.display());
         let mut params = load_safetensors_lazy(&path)?;
+        expand_symmetric_affine_biases(dir, &mut params)?;
         append_vision_safetensors(dir, load_vision, &mut params)?;
         return Ok(params);
     }
@@ -146,6 +151,7 @@ pub(crate) fn load_all_safetensors(
         all_params.extend(shard_params);
     }
 
+    expand_symmetric_affine_biases(dir, &mut all_params)?;
     append_vision_safetensors(dir, load_vision, &mut all_params)?;
 
     Ok(all_params)
@@ -179,6 +185,98 @@ fn append_vision_safetensors(
     info!("Loaded {} vision tensors", vision_params.len());
     params.extend(vision_params);
     Ok(())
+}
+
+/// Rebuild the `.biases` companions a symmetric affine checkpoint leaves off
+/// disk, so everything downstream sees the historical
+/// `(weight, scales, biases)` shape.
+///
+/// A ggml Q4_0 block is `w = d * (q - 8)` and a Q8_0 block is `w = d * (q - 128)`.
+/// MLX affine is `w = scale * q + bias`, so the GGUF import used to write out an
+/// array whose every entry was `-Z * scale` — 0.5 bpw of pure redundancy, 681 MB
+/// on Gemma-4-12B-QAT, enough to push the import above the GGUF it came from.
+/// The converter now records `Z` in `config.json` (see
+/// [`SYMMETRIC_ZERO_POINT_KEY`](crate::models::quant_dispatch::SYMMETRIC_ZERO_POINT_KEY))
+/// and this rebuilds the array here.
+///
+/// `scales * -Z` is a `mul_scalar`, which builds the scalar in the array's own
+/// dtype and returns an unevaluated node, so a float16 scales array yields a
+/// float16 bias array and nothing is materialized until the weight is first
+/// used. The reconstruction is bitwise equal to what the converter used to
+/// write: `Z` is a power of two, so the product is exact in float16 for every
+/// scale short of overflow, and an overflowing scale reaches infinity on both
+/// sides alike.
+///
+/// A checkpoint whose config declares no zero point is untouched — the map comes
+/// back with zero insertions and behaves exactly as it did before the field
+/// existed. Returns how many companions were rebuilt.
+pub(crate) fn expand_symmetric_affine_biases(
+    dir: &Path,
+    params: &mut HashMap<String, MxArray>,
+) -> Result<usize> {
+    let Ok(raw_str) = fs::read_to_string(dir.join("config.json")) else {
+        return Ok(0);
+    };
+    // Every checkpoint written before the field existed must take exactly the
+    // path it always took, so the strict block parse below — which can reject a
+    // malformed `quantization` block that a given family never read — only runs
+    // for a file that literally spells the field out.
+    if !raw_str.contains(SYMMETRIC_ZERO_POINT_KEY) {
+        return Ok(0);
+    }
+    let Ok(raw) = serde_json::from_str::<Value>(&raw_str) else {
+        return Ok(0);
+    };
+    let quant_cfg = select_quantization_block(&raw)?;
+    // The fallback group size only matters for overrides that omit their own,
+    // and an affine override that omits it inherits a value this function never
+    // reads; 32 is the group every symmetric ggml block format uses.
+    let zero_points = parse_symmetric_zero_points(quant_cfg, 32)?;
+    if zero_points.is_empty() {
+        return Ok(0);
+    }
+
+    let mut pending: Vec<(String, i32)> = Vec::new();
+    for key in params.keys() {
+        let Some(base) = key.strip_suffix(".scales") else {
+            continue;
+        };
+        let Some(zero_point) = zero_points.for_key(&normalize_per_layer_key(base)) else {
+            continue;
+        };
+        if params.contains_key(&format!("{base}.biases")) {
+            return Err(Error::from_reason(format!(
+                "'{base}' declares a symmetric zero point but the checkpoint also stores \
+                 '{base}.biases' — the companion is either derived or stored, never both; \
+                 refusing to load contradictory quantization metadata"
+            )));
+        }
+        pending.push((base.to_string(), zero_point));
+    }
+
+    for (base, zero_point) in &pending {
+        let scales = params
+            .get(&format!("{base}.scales"))
+            .expect("scales key was just observed");
+        let dtype = scales.dtype()?;
+        if !matches!(dtype, DType::Float32 | DType::Float16 | DType::BFloat16) {
+            return Err(Error::from_reason(format!(
+                "'{base}' declares a symmetric zero point but '{base}.scales' is {dtype:?}; an \
+                 affine scale must be floating for the derived bias to be its exact negative \
+                 multiple"
+            )));
+        }
+        let biases = scales.mul_scalar(-f64::from(*zero_point))?;
+        params.insert(format!("{base}.biases"), biases);
+    }
+
+    if !pending.is_empty() {
+        info!(
+            "Rebuilt {} symmetric affine .biases companions from their scales",
+            pending.len()
+        );
+    }
+    Ok(pending.len())
 }
 
 #[cfg(test)]
@@ -250,6 +348,300 @@ mod safetensors_loading_tests {
         assert!(with_vision.contains_key("vision.weight"));
 
         fs::remove_dir_all(dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod symmetric_bias_expansion_tests {
+    use super::*;
+    use crate::models::quant_dispatch::SYMMETRIC_ZERO_POINT_KEY;
+    use crate::utils::gguf::derived_symmetric_bias_bits;
+    use crate::utils::safetensors::save_safetensors;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// f16 scales spanning subnormal, normal and the largest magnitude whose
+    /// `-8 *` product is still finite, so a reconstruction that only works in
+    /// the easy middle of the range cannot pass.
+    const SCALE_BITS: [u16; 6] = [0x0001, 0x0200, 0x0400, 0x25c0, 0x3c00, 0x6fff];
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "symmetric_bias_{label}_{}_{}",
+            std::process::id(),
+            id
+        ));
+        fs::create_dir_all(&dir).expect("create temp model dir");
+        dir
+    }
+
+    /// A checkpoint holding one affine group at `key`, plus whatever extra
+    /// tensors the caller wants, and the given `quantization` config block.
+    fn write_checkpoint(dir: &Path, key: &str, extra: &[(String, MxArray)], quant: Value) {
+        let n = SCALE_BITS.len() as i64;
+        let mut tensors: HashMap<String, MxArray> = HashMap::from([
+            (
+                format!("{key}.weight"),
+                MxArray::from_uint32(&vec![0x1234_5678u32; SCALE_BITS.len() * 4], &[n, 4])
+                    .expect("weight"),
+            ),
+            (
+                format!("{key}.scales"),
+                MxArray::from_float16(&SCALE_BITS, &[n, 1]).expect("scales"),
+            ),
+        ]);
+        for (k, v) in extra {
+            tensors.insert(k.clone(), v.clone());
+        }
+        save_safetensors(dir.join("model.safetensors"), &mut tensors, None).expect("save");
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_string(&serde_json::json!({ "quantization": quant })).unwrap(),
+        )
+        .expect("write config.json");
+    }
+
+    fn q4_0_block() -> Value {
+        serde_json::json!({
+            "bits": 4,
+            "group_size": 32,
+            "mode": "affine",
+            SYMMETRIC_ZERO_POINT_KEY: 8,
+        })
+    }
+
+    /// The `.biases` companion the pre-symmetric converter would have written.
+    fn historical_bias_bits(zero_point: i32) -> Vec<u16> {
+        SCALE_BITS
+            .iter()
+            .map(|&s| derived_symmetric_bias_bits(s, zero_point))
+            .collect()
+    }
+
+    /// `MxArray` has no `Debug`, so `expect_err` cannot be used directly.
+    fn expect_load_error(dir: &Path, label: &str) -> Error {
+        match load_all_safetensors(dir, false) {
+            Ok(params) => panic!("{label}: loaded {} tensors instead", params.len()),
+            Err(e) => e,
+        }
+    }
+
+    fn bias_bits(params: &HashMap<String, MxArray>, key: &str) -> Vec<u16> {
+        params
+            .get(&format!("{key}.biases"))
+            .unwrap_or_else(|| panic!("{key}.biases was not rebuilt"))
+            .to_uint16_native()
+            .expect("read f16 bits")
+    }
+
+    #[test]
+    fn top_level_marker_rebuilds_the_historical_bias_bitwise() {
+        let dir = temp_dir("top_level");
+        let key = "model.layers.0.mlp.down_proj";
+        write_checkpoint(&dir, key, &[], q4_0_block());
+
+        let params = load_all_safetensors(&dir, false).expect("load");
+        assert_eq!(bias_bits(&params, key), historical_bias_bits(8));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn config_names_survive_the_wrapper_prefix_mismatch() {
+        // config.json writes `language_model.model.layers.N...` while the
+        // safetensors key is `model.layers.N...`; both normalize to the same
+        // prefix, and a per-tensor entry has to be found across that gap.
+        let dir = temp_dir("prefix");
+        let key = "model.layers.3.self_attn.q_proj";
+        write_checkpoint(
+            &dir,
+            key,
+            &[],
+            serde_json::json!({
+                "bits": 4,
+                "group_size": 32,
+                "mode": "affine",
+                "language_model.model.layers.3.self_attn.q_proj": q4_0_block(),
+            }),
+        );
+
+        let params = load_all_safetensors(&dir, false).expect("load");
+        assert_eq!(bias_bits(&params, key), historical_bias_bits(8));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn q8_0_marker_uses_its_own_zero_point() {
+        let dir = temp_dir("q8");
+        let key = "model.layers.0.mlp.up_proj";
+        write_checkpoint(
+            &dir,
+            key,
+            &[],
+            serde_json::json!({
+                "bits": 8,
+                "group_size": 32,
+                "mode": "affine",
+                SYMMETRIC_ZERO_POINT_KEY: 128,
+            }),
+        );
+
+        let params = load_all_safetensors(&dir, false).expect("load");
+        assert_eq!(bias_bits(&params, key), historical_bias_bits(128));
+        assert_ne!(
+            historical_bias_bits(128),
+            historical_bias_bits(8),
+            "the two zero points must produce different arrays or this proves nothing"
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_unmarked_checkpoint_is_untouched() {
+        // Two shapes an unmarked file legitimately has, both of which a
+        // "rebuild whenever a bias is missing" rule would corrupt: an affine
+        // group that stores its own bias, and an mxfp4 group that has uint8
+        // scales and no bias at all.
+        let dir = temp_dir("unmarked");
+        let key = "model.layers.0.mlp.down_proj";
+        let stored = MxArray::from_float16(&[0x1234u16; 6], &[6, 1]).expect("biases");
+        let mxfp_scales = MxArray::from_uint8(&[0x7fu8; 6], &[6, 1]).expect("mxfp scales");
+        write_checkpoint(
+            &dir,
+            key,
+            &[
+                (format!("{key}.biases"), stored),
+                (
+                    "model.layers.1.mlp.down_proj.scales".to_string(),
+                    mxfp_scales,
+                ),
+            ],
+            serde_json::json!({
+                "bits": 4,
+                "group_size": 32,
+                "mode": "affine",
+                "language_model.model.layers.1.mlp.down_proj": {
+                    "bits": 4, "group_size": 32, "mode": "mxfp4",
+                },
+            }),
+        );
+
+        let mut params = load_all_safetensors(&dir, false).expect("load");
+        assert_eq!(
+            expand_symmetric_affine_biases(&dir, &mut params).expect("expand"),
+            0,
+            "a checkpoint with no zero point must have nothing rebuilt"
+        );
+        assert_eq!(bias_bits(&params, key), vec![0x1234u16; 6]);
+        assert!(
+            !params.contains_key("model.layers.1.mlp.down_proj.biases"),
+            "an mxfp4 group must never be handed a synthesised bias"
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_marked_group_that_also_stores_its_bias_is_rejected() {
+        let dir = temp_dir("contradictory");
+        let key = "model.layers.0.mlp.down_proj";
+        let stored = MxArray::from_float16(&[0x1234u16; 6], &[6, 1]).expect("biases");
+        write_checkpoint(
+            &dir,
+            key,
+            &[(format!("{key}.biases"), stored)],
+            q4_0_block(),
+        );
+
+        let err = expect_load_error(&dir, "must reject a contradictory checkpoint");
+        assert!(
+            err.reason.contains(key) && err.reason.contains("derived or stored"),
+            "unexpected message: {}",
+            err.reason
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_non_symmetric_override_shadows_the_top_level_marker() {
+        // A K-quant tensor in an otherwise-symmetric file stores its float16
+        // super-block scale in `.biases`. Inheriting the top-level zero point
+        // would both collide with that companion and misdescribe the tensor.
+        let dir = temp_dir("shadow");
+        let key = "model.layers.0.mlp.down_proj";
+        let kq_scales = MxArray::from_float16(&SCALE_BITS, &[6, 1]).expect("scales");
+        let mxfp_scales = MxArray::from_uint8(&[0x7fu8; 6], &[6, 1]).expect("mxfp scales");
+        write_checkpoint(
+            &dir,
+            key,
+            &[
+                ("model.embed_tokens.scales".to_string(), kq_scales),
+                (
+                    "model.layers.1.mlp.down_proj.scales".to_string(),
+                    mxfp_scales,
+                ),
+            ],
+            serde_json::json!({
+                "bits": 4,
+                "group_size": 32,
+                "mode": "affine",
+                SYMMETRIC_ZERO_POINT_KEY: 8,
+                "language_model.model.embed_tokens": {
+                    "bits": 6, "group_size": 16, "mode": "q6k",
+                },
+                "language_model.model.layers.1.mlp.down_proj": {
+                    "bits": 4, "group_size": 32, "mode": "mxfp4",
+                },
+            }),
+        );
+
+        let params = load_all_safetensors(&dir, false).expect("load");
+        assert_eq!(bias_bits(&params, key), historical_bias_bits(8));
+        assert!(
+            !params.contains_key("model.embed_tokens.biases"),
+            "a q6k override must not inherit the top-level zero point"
+        );
+        assert!(
+            !params.contains_key("model.layers.1.mlp.down_proj.biases"),
+            "an mxfp4 override must not inherit the top-level zero point"
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_illegal_zero_point_is_rejected() {
+        for (label, quant) in [
+            (
+                "wrong value for the bit width",
+                serde_json::json!({
+                    "bits": 4, "group_size": 32, "mode": "affine",
+                    SYMMETRIC_ZERO_POINT_KEY: 128,
+                }),
+            ),
+            (
+                "declared on a non-affine mode",
+                serde_json::json!({
+                    "bits": 6, "group_size": 16, "mode": "q6k",
+                    SYMMETRIC_ZERO_POINT_KEY: 32,
+                }),
+            ),
+        ] {
+            let dir = temp_dir("illegal");
+            write_checkpoint(&dir, "model.layers.0.mlp.down_proj", &[], quant);
+            let err = expect_load_error(&dir, label);
+            assert!(
+                err.reason.contains(SYMMETRIC_ZERO_POINT_KEY),
+                "{label}: unexpected message: {}",
+                err.reason
+            );
+            fs::remove_dir_all(dir).ok();
+        }
     }
 }
 

@@ -24,6 +24,25 @@ use crate::array::{DType, MxArray};
 
 const SYM8_GROUP_SIZE_SENTINEL: i32 = -1;
 
+/// `config.json` field naming the zero point a symmetric affine group subtracts
+/// from every code.
+///
+/// A ggml Q4_0 block is `w = d * (q - 8)` and a Q8_0 block is `w = d * (q - 128)`:
+/// one f16 scale per 32 weights and no stored offset. MLX affine is
+/// `w = scale * q + bias`, so the GGUF importer used to write a `.biases` array
+/// whose every entry was `-Z * scale` — 0.5 bpw of pure redundancy. It now omits
+/// that array and records `Z` here instead;
+/// [`expand_symmetric_affine_biases`](crate::engine::persistence::expand_symmetric_affine_biases)
+/// rebuilds the companion at load, before any builder runs, so everything
+/// downstream sees the historical `(weight, scales, biases)` shape.
+///
+/// Deliberately a field on `mode: "affine"` rather than a new mode string: an
+/// unrecognised mode makes [`parse_mode_str`] return `None`, which sends an
+/// older build into a checkpoint-content heuristic that would GUESS a decoder.
+/// Keeping the mode string stable instead routes an older build onto MLX's
+/// deterministic "Biases must be provided for affine quantization" throw.
+pub const SYMMETRIC_ZERO_POINT_KEY: &str = "symmetric_zero_point";
+
 /// Per-layer quantization mode discriminator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PerLayerMode {
@@ -312,6 +331,50 @@ pub fn ensure_kquant_storage_resolves_kquant(
         )));
     }
     Ok(())
+}
+
+/// Fail-loud guard for an affine group whose `.biases` companion is missing.
+///
+/// MLX affine decode is `scale * q + bias` and its `validate_mode_with_type`
+/// throws "Biases must be provided for affine quantization" on a null bias, so
+/// an affine `.scales` with no `.biases` is never loadable — but the builders
+/// take the companion as an `Option` and would carry the `None` all the way to
+/// that generic C++ throw, long after the model appeared to load.
+///
+/// The reachable cause is a checkpoint written by a build that omits the derived
+/// companion for symmetric groups (see [`SYMMETRIC_ZERO_POINT_KEY`]) being read
+/// through a path that never ran
+/// [`expand_symmetric_affine_biases`](crate::engine::persistence::expand_symmetric_affine_biases).
+/// Naming the tensor at load beats decoding garbage or throwing anonymously
+/// later. Call BEFORE dispatching on `plq.mode`, beside the storage guards.
+///
+/// Scoped to a group that has both a `.weight` and a `.scales`, which is exactly
+/// the shape a symmetric checkpoint has on disk. A `.scales` with no `.weight`
+/// is an orphaned sidecar, not a truncated group, and the families already
+/// report those by name — this must not preempt that with a vaguer message.
+pub fn ensure_affine_biases_present(
+    params: &HashMap<String, MxArray>,
+    base: &str,
+    mode: PerLayerMode,
+    family: &str,
+) -> Result<()> {
+    if mode != PerLayerMode::Affine {
+        return Ok(());
+    }
+    if !params.contains_key(&format!("{base}.weight"))
+        || !params.contains_key(&format!("{base}.scales"))
+    {
+        return Ok(());
+    }
+    if params.contains_key(&format!("{base}.biases")) {
+        return Ok(());
+    }
+    Err(Error::from_reason(format!(
+        "{family}: affine group '{base}' has '{base}.scales' but no '{base}.biases' — affine \
+         decode is `scale * q + bias` and cannot run without it. A checkpoint whose \
+         config.json declares '{SYMMETRIC_ZERO_POINT_KEY}' stores the companion implicitly and \
+         needs a build that rebuilds it at load; otherwise the checkpoint is truncated"
+    )))
 }
 
 /// A validated ggml K-quant sidecar group ready to hand to `QuantizedLinear` /
@@ -611,13 +674,130 @@ fn parse_input_amax(
     Ok(Some(cast))
 }
 
+/// Validate a `symmetric_zero_point` field and return the zero point it names.
+///
+/// Legal only on `mode: "affine"`, and only at the one value the algebra
+/// permits: a `bits`-wide unsigned code centred at `1 << (bits - 1)`, which is 8
+/// for ggml Q4_0 and 128 for Q8_0. Any other value would rebuild every bias in
+/// the tensor at the wrong offset — silently, since the shapes still match — so
+/// it is rejected rather than clamped.
+fn parse_symmetric_zero_point(
+    value: Option<&Value>,
+    mode: PerLayerMode,
+    bits: i32,
+    context: &str,
+) -> Result<Option<i32>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if mode != PerLayerMode::Affine {
+        return Err(Error::from_reason(format!(
+            "Invalid {context}: {SYMMETRIC_ZERO_POINT_KEY} describes an affine group whose \
+             derived .biases companion was omitted, got mode {mode:?}"
+        )));
+    }
+    let zero_point = parse_i32(value, context)?;
+    let expected = 1i32 << (bits - 1);
+    if zero_point != expected {
+        return Err(Error::from_reason(format!(
+            "Invalid {context}={zero_point} for {bits}-bit affine; a symmetric group subtracts \
+             {expected}"
+        )));
+    }
+    Ok(Some(zero_point))
+}
+
+/// The zero points a checkpoint's `quantization` block declares, resolved the
+/// way the loaders resolve any other per-layer setting.
+///
+/// `per_layer` maps a [`normalize_per_layer_key`]-normalized tensor prefix to
+/// its declared zero point; an entry present with value `None` means that
+/// tensor has an override which is NOT symmetric, and must therefore shadow the
+/// top-level `default` rather than inherit it.
+#[derive(Debug, Default, Clone)]
+pub struct SymmetricZeroPoints {
+    pub default: Option<i32>,
+    pub per_layer: HashMap<String, Option<i32>>,
+}
+
+impl SymmetricZeroPoints {
+    /// The zero point in force for an already-normalized tensor prefix.
+    pub fn for_key(&self, normalized_prefix: &str) -> Option<i32> {
+        match self.per_layer.get(normalized_prefix) {
+            Some(entry) => *entry,
+            None => self.default,
+        }
+    }
+
+    /// True when nothing in the block declares symmetry, so no companion needs
+    /// rebuilding and the checkpoint behaves exactly as it did before the field
+    /// existed.
+    pub fn is_empty(&self) -> bool {
+        self.default.is_none() && self.per_layer.values().all(Option::is_none)
+    }
+}
+
+/// Read the `symmetric_zero_point` declarations out of a `quantization` block.
+///
+/// Shares [`parse_per_layer_entries`] with the ordinary settings parse, so the
+/// two readers cannot disagree about which children are quantization entries or
+/// which zero points are legal.
+pub fn parse_symmetric_zero_points(
+    quant_cfg: Option<&Value>,
+    fallback_group_size: i32,
+) -> Result<SymmetricZeroPoints> {
+    let obj = quant_object(quant_cfg)?;
+    let top_level_mode = parse_explicit_mode(
+        obj.and_then(|q| q.get("mode")),
+        "top-level quantization.mode",
+    )?;
+    let default = top_level_symmetric_zero_point(obj, top_level_mode)?;
+    let (_, per_layer) = parse_per_layer_entries(obj, fallback_group_size)?;
+    Ok(SymmetricZeroPoints { default, per_layer })
+}
+
+/// Validate the block-level `symmetric_zero_point`, which every tensor without
+/// its own override inherits.
+fn top_level_symmetric_zero_point(
+    obj: Option<&serde_json::Map<String, Value>>,
+    top_level_mode: Option<PerLayerMode>,
+) -> Result<Option<i32>> {
+    let Some(value) = obj.and_then(|q| q.get(SYMMETRIC_ZERO_POINT_KEY)) else {
+        return Ok(None);
+    };
+    let bits_value = obj.and_then(|q| q.get("bits")).ok_or_else(|| {
+        Error::from_reason(format!(
+            "Invalid top-level quantization.{SYMMETRIC_ZERO_POINT_KEY}: a symmetric group must \
+             also declare integer bits"
+        ))
+    })?;
+    let bits = parse_bits(bits_value, top_level_mode, "top-level quantization.bits")?;
+    parse_symmetric_zero_point(
+        Some(value),
+        top_level_mode.unwrap_or(PerLayerMode::Affine),
+        bits,
+        &format!("top-level quantization.{SYMMETRIC_ZERO_POINT_KEY}"),
+    )
+}
+
 fn parse_per_layer_overrides(
     obj: Option<&serde_json::Map<String, Value>>,
     fallback_group_size: i32,
 ) -> Result<HashMap<String, PerLayerQuant>> {
+    Ok(parse_per_layer_entries(obj, fallback_group_size)?.0)
+}
+
+/// Walk the per-tensor children of a `quantization` block once, yielding both
+/// the `PerLayerQuant` overrides and the `symmetric_zero_point` declarations.
+#[allow(clippy::type_complexity)]
+fn parse_per_layer_entries(
+    obj: Option<&serde_json::Map<String, Value>>,
+    fallback_group_size: i32,
+) -> Result<(HashMap<String, PerLayerQuant>, HashMap<String, Option<i32>>)> {
     let mut per_layer = HashMap::new();
+    let mut zero_points = HashMap::new();
     let Some(obj) = obj else {
-        return Ok(per_layer);
+        return Ok((per_layer, zero_points));
     };
 
     for (key, value) in obj {
@@ -639,7 +819,8 @@ fn parse_per_layer_overrides(
         let looks_quantized = child.contains_key("bits")
             || child.contains_key("group_size")
             || child.contains_key("mode")
-            || child.contains_key("input_amax");
+            || child.contains_key("input_amax")
+            || child.contains_key(SYMMETRIC_ZERO_POINT_KEY);
         if !looks_quantized {
             // Compatibility: unrelated nested metadata objects with no quant
             // schema fields remain outside the per-layer override map.
@@ -678,8 +859,16 @@ fn parse_per_layer_overrides(
             mode,
             &format!("{context}.input_amax"),
         )?;
+        let zero_point = parse_symmetric_zero_point(
+            child.get(SYMMETRIC_ZERO_POINT_KEY),
+            mode,
+            bits,
+            &format!("{context}.{SYMMETRIC_ZERO_POINT_KEY}"),
+        )?;
+        let normalized = normalize_per_layer_key(key);
+        zero_points.insert(normalized.clone(), zero_point);
         per_layer.insert(
-            normalize_per_layer_key(key),
+            normalized,
             PerLayerQuant {
                 bits,
                 group_size,
@@ -688,7 +877,7 @@ fn parse_per_layer_overrides(
             },
         );
     }
-    Ok(per_layer)
+    Ok((per_layer, zero_points))
 }
 
 /// Parse the `quantization` (or legacy `quantization_config`) block from a
@@ -722,6 +911,7 @@ pub fn parse_quant_block(
                 .to_string(),
         ));
     }
+    top_level_symmetric_zero_point(obj, top_level_mode)?;
     let per_layer = parse_per_layer_overrides(obj, fallback_group_size)?;
     Ok((top_level_mode, per_layer))
 }
@@ -761,6 +951,7 @@ pub fn parse_quant_settings(
                 .to_string(),
         ));
     }
+    top_level_symmetric_zero_point(obj, top_level_mode)?;
     let per_layer = parse_per_layer_overrides(obj, group_size)?;
     Ok((bits, group_size, top_level_mode, per_layer))
 }
@@ -1625,6 +1816,169 @@ mod tests {
         let mut mx = kquant_group_params("proj", PerLayerMode::Q4K);
         mx.remove("proj.biases");
         ensure_kquant_storage_resolves_kquant(&mx, "proj", PerLayerMode::Mxfp8, "t").unwrap();
+    }
+
+    /// An affine group in the shape a symmetric checkpoint has on disk:
+    /// float16 scales, no `.biases`.
+    fn affine_group_without_bias(prefix: &str) -> HashMap<String, MxArray> {
+        let scales =
+            MxArray::from_float16(&[half::f16::from_f32(0.125).to_bits(); 2], &[1, 2]).unwrap();
+        HashMap::from([
+            (
+                format!("{prefix}.weight"),
+                MxArray::from_uint32(&[0u32; 4], &[1, 4]).unwrap(),
+            ),
+            (format!("{prefix}.scales"), scales),
+        ])
+    }
+
+    #[test]
+    fn ensure_affine_biases_present_names_the_truncated_tensor() {
+        // The reachable cause: a checkpoint whose config declares a symmetric
+        // zero point, read through a path that never rebuilt the companion.
+        // Without this the `None` rides all the way to MLX's anonymous
+        // "Biases must be provided for affine quantization" throw.
+        let p = affine_group_without_bias("layers.0.mlp.down_proj");
+        let err =
+            ensure_affine_biases_present(&p, "layers.0.mlp.down_proj", PerLayerMode::Affine, "t")
+                .expect_err("an affine group with no .biases must not load");
+        assert!(
+            err.reason.contains("layers.0.mlp.down_proj")
+                && err.reason.contains(SYMMETRIC_ZERO_POINT_KEY),
+            "the error must name the tensor and the field: {}",
+            err.reason
+        );
+
+        // The same group once the companion is present → Ok.
+        let mut ok = affine_group_without_bias("layers.0.mlp.down_proj");
+        ok.insert(
+            "layers.0.mlp.down_proj.biases".to_string(),
+            MxArray::from_float16(&[half::f16::from_f32(-1.0).to_bits(); 2], &[1, 2]).unwrap(),
+        );
+        ensure_affine_biases_present(&ok, "layers.0.mlp.down_proj", PerLayerMode::Affine, "t")
+            .unwrap();
+    }
+
+    #[test]
+    fn ensure_affine_biases_present_leaves_the_biasless_modes_alone() {
+        // Weakening this guard into "a missing bias means synthesise one" would
+        // hand a fabricated companion to every one-companion mode, so it must
+        // stay silent for all of them and for an unquantized prefix.
+        let p = affine_group_without_bias("proj");
+        for mode in [
+            PerLayerMode::Mxfp4,
+            PerLayerMode::Mxfp8,
+            PerLayerMode::Nvfp4,
+            PerLayerMode::Fp8E4m3,
+            PerLayerMode::Sym8,
+            PerLayerMode::Q4K,
+            PerLayerMode::Q5K,
+            PerLayerMode::Q6K,
+        ] {
+            ensure_affine_biases_present(&p, "proj", mode, "t")
+                .unwrap_or_else(|e| panic!("{mode:?} must not be judged by the affine rule: {e}"));
+        }
+        // No `.scales` at all is a dense tensor, not a truncated affine group.
+        let dense = HashMap::from([(
+            "proj.weight".to_string(),
+            MxArray::from_uint32(&[0u32; 4], &[1, 4]).unwrap(),
+        )]);
+        ensure_affine_biases_present(&dense, "proj", PerLayerMode::Affine, "t").unwrap();
+
+        // A `.scales` with no `.weight` is an orphaned sidecar. The families
+        // name those precisely (gemma4's MLP orphan scan, qwen3_5_moe's dense
+        // fallback dtype guard); this guard must stay out of the way so the
+        // better message is the one the user sees.
+        let mut orphan = affine_group_without_bias("proj");
+        orphan.remove("proj.weight");
+        ensure_affine_biases_present(&orphan, "proj", PerLayerMode::Affine, "t").unwrap();
+    }
+
+    #[test]
+    fn symmetric_zero_point_is_rejected_outside_its_one_legal_shape() {
+        let block = |v: Value| -> Result<()> { parse_quant_settings(Some(&v), 4, 32).map(|_| ()) };
+        // The legal pair for each width.
+        block(serde_json::json!({
+            "bits": 4, "group_size": 32, "mode": "affine", SYMMETRIC_ZERO_POINT_KEY: 8,
+        }))
+        .expect("4-bit affine subtracts 8");
+        block(serde_json::json!({
+            "bits": 8, "group_size": 32, "mode": "affine", SYMMETRIC_ZERO_POINT_KEY: 128,
+        }))
+        .expect("8-bit affine subtracts 128");
+
+        // Off-by-one, cross-width, and a non-affine mode all fail.
+        for bad in [
+            serde_json::json!({
+                "bits": 4, "group_size": 32, "mode": "affine", SYMMETRIC_ZERO_POINT_KEY: 7,
+            }),
+            serde_json::json!({
+                "bits": 4, "group_size": 32, "mode": "affine", SYMMETRIC_ZERO_POINT_KEY: 128,
+            }),
+            serde_json::json!({
+                "bits": 8, "group_size": 32, "mode": "affine", SYMMETRIC_ZERO_POINT_KEY: 8,
+            }),
+            serde_json::json!({
+                "bits": 4, "group_size": 32, "mode": "mxfp4", SYMMETRIC_ZERO_POINT_KEY: 8,
+            }),
+            serde_json::json!({
+                "bits": 6, "group_size": 16, "mode": "q6k", SYMMETRIC_ZERO_POINT_KEY: 32,
+            }),
+            serde_json::json!({ "group_size": 32, "mode": "affine", SYMMETRIC_ZERO_POINT_KEY: 8 }),
+        ] {
+            let err = block(bad.clone()).expect_err(&format!("{bad} must be rejected"));
+            assert!(
+                err.reason.contains(SYMMETRIC_ZERO_POINT_KEY),
+                "{bad}: unexpected message {}",
+                err.reason
+            );
+        }
+
+        // A per-tensor override is held to the same rule.
+        let err = block(serde_json::json!({
+            "bits": 4,
+            "group_size": 32,
+            "mode": "affine",
+            "model.layers.0.mlp.down_proj": {
+                "bits": 4, "group_size": 32, "mode": "affine", SYMMETRIC_ZERO_POINT_KEY: 4,
+            },
+        }))
+        .expect_err("an override may not declare its own wrong zero point");
+        assert!(
+            err.reason.contains(SYMMETRIC_ZERO_POINT_KEY),
+            "{}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn symmetric_zero_points_shadow_the_default_per_tensor() {
+        let quant = serde_json::json!({
+            "bits": 4,
+            "group_size": 32,
+            "mode": "affine",
+            SYMMETRIC_ZERO_POINT_KEY: 8,
+            "language_model.model.embed_tokens": { "bits": 6, "group_size": 16, "mode": "q6k" },
+            "language_model.model.layers.1.mlp.down_proj": {
+                "bits": 4, "group_size": 32, "mode": "affine",
+            },
+        });
+        let z = parse_symmetric_zero_points(Some(&quant), 32).expect("parse");
+        assert!(!z.is_empty());
+        // Unlisted tensors inherit the block default.
+        assert_eq!(z.for_key("layers.0.self_attn.q_proj"), Some(8));
+        // A listed tensor takes its own answer, symmetric or not — inheriting
+        // here would collide with the q6k super-block `d` stored in `.biases`.
+        assert_eq!(z.for_key("embed_tokens"), None);
+        assert_eq!(z.for_key("layers.1.mlp.down_proj"), None);
+
+        // No marker anywhere → nothing to rebuild.
+        let plain = serde_json::json!({ "bits": 4, "group_size": 32, "mode": "affine" });
+        assert!(
+            parse_symmetric_zero_points(Some(&plain), 32)
+                .expect("parse")
+                .is_empty()
+        );
     }
 
     #[test]

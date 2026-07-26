@@ -11,11 +11,11 @@ use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::models::quant_dispatch::{
-    default_per_layer_quant, effective_plq_for, ensure_dense_weight_floating,
-    ensure_int8_storage_resolves_sym8, ensure_kquant_storage_resolves_kquant,
-    ensure_plain_fp8_storage_resolves_fp8_e4m3, has_kquant_mode, has_sym8_mode, merge_per_layer,
-    mode_to_str, normalize_per_layer_key, parse_mode_str, parse_quant_settings,
-    resolve_default_mode, select_quantization_block,
+    default_per_layer_quant, effective_plq_for, ensure_affine_biases_present,
+    ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
+    ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
+    has_kquant_mode, has_sym8_mode, merge_per_layer, mode_to_str, normalize_per_layer_key,
+    parse_mode_str, parse_quant_settings, resolve_default_mode, select_quantization_block,
 };
 use crate::nn::LayerNorm;
 use crate::tokenizer::Qwen3Tokenizer;
@@ -1151,6 +1151,7 @@ fn apply_weights_inner(
         ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "qwen3_5")?;
         ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "qwen3_5")?;
         ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "qwen3_5")?;
+        ensure_affine_biases_present(params, prefix, plq.mode, "qwen3_5")?;
         // Result<Option<..>>: `Ok(None)` = "prefix not quantized, fall back
         // to the dense-weight branch"; `Err` = fail-loud (a malformed sym8 /
         // K-quant group must never silently fall back, see
@@ -1207,6 +1208,7 @@ fn apply_weights_inner(
         // would misdecode them (a repacked `token_embd` is q6k/q4k/q5k, not
         // affine). Mirrors the linear builders' guard on `try_build_ql`.
         ensure_kquant_storage_resolves_kquant(params, "embedding", plq.mode, "qwen3_5")?;
+        ensure_affine_biases_present(params, "embedding", plq.mode, "qwen3_5")?;
         // Packed-resident load (`quantized_matmul` on the tied lm_head via
         // `Embedding::as_linear` on the paged path) is a WIN only where every
         // per-turn `get_weight()` consumer is packed-aware. That holds for the

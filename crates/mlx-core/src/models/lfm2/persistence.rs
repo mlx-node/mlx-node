@@ -13,7 +13,7 @@ use crate::engine::persistence::{
 };
 use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, default_per_layer_quant, effective_plq_for,
-    ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
+    ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
     ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
     has_sym8_mode, load_quant_settings_from_disk, resolve_default_mode,
 };
@@ -55,6 +55,7 @@ fn build_lfm2_qsl(
     ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "lfm2_moe")?;
     ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "lfm2_moe")?;
     ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "lfm2_moe")?;
+    ensure_affine_biases_present(params, prefix, plq.mode, "lfm2_moe")?;
     Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
@@ -107,6 +108,7 @@ fn build_lfm2_gate_ql(
     ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "lfm2_moe")?;
     ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "lfm2_moe")?;
     ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "lfm2_moe")?;
+    ensure_affine_biases_present(params, prefix, plq.mode, "lfm2_moe")?;
     Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
@@ -166,6 +168,7 @@ fn build_lfm2_non_moe_ql(
     ensure_int8_storage_resolves_sym8(params, base, plq.mode, "lfm2")?;
     ensure_plain_fp8_storage_resolves_fp8_e4m3(params, base, plq.mode, "lfm2")?;
     ensure_kquant_storage_resolves_kquant(params, base, plq.mode, "lfm2")?;
+    ensure_affine_biases_present(params, base, plq.mode, "lfm2")?;
     Ok(match plq.mode {
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, base),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, base),

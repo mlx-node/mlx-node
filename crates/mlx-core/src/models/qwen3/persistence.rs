@@ -777,6 +777,32 @@ mod tests {
         assert!(err.reason.contains("affine"), "defaults mode to affine");
     }
 
+    /// A symmetric affine GGUF import — the shape whose `.biases` companions
+    /// live in `config.json` as a zero point instead of on disk — is rejected
+    /// here, before any weight is read. That is why `load_safetensors_mapped`
+    /// carries no companion-rebuilding step: this loader never reaches a
+    /// checkpoint that needs one, and it says so by name rather than failing
+    /// later on a missing tensor.
+    #[test]
+    fn reject_quantized_checkpoint_fails_closed_on_symmetric_affine() {
+        let cfg = json!({
+            "model_type": "qwen3",
+            "quantization": {
+                "bits": 4,
+                "group_size": 32,
+                "mode": "affine",
+                "symmetric_zero_point": 8,
+            },
+        });
+        let err = reject_quantized_checkpoint(&cfg, "/tmp/model")
+            .expect_err("a symmetric Q4_0 import must be rejected by the dense loader");
+        assert!(
+            err.reason.contains("affine") && err.reason.contains("Q4_0"),
+            "error names the mode and the source format: {}",
+            err.reason
+        );
+    }
+
     /// A dense checkpoint (no quantization block) and a config carrying only an
     /// empty `quantization: {}` stub must both load unimpeded — the guard fires
     /// only on real quant metadata, leaving the training path untouched.

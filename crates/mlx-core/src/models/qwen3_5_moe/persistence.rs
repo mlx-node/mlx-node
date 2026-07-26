@@ -15,10 +15,11 @@ use crate::engine::persistence::{
 };
 use crate::models::mtp_drafter::{DrafterBodyVariant, MTP_MOE_LAYER_LINEAR_SUFFIXES};
 use crate::models::quant_dispatch::{
-    default_per_layer_quant, effective_plq_for, ensure_dense_weight_floating,
-    ensure_int8_storage_resolves_sym8, ensure_kquant_storage_resolves_kquant,
-    ensure_plain_fp8_storage_resolves_fp8_e4m3, has_kquant_mode, has_sym8_mode, mode_to_str,
-    normalize_per_layer_key, parse_quant_settings, resolve_default_mode, select_quantization_block,
+    default_per_layer_quant, effective_plq_for, ensure_affine_biases_present,
+    ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
+    ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
+    has_kquant_mode, has_sym8_mode, mode_to_str, normalize_per_layer_key, parse_quant_settings,
+    resolve_default_mode, select_quantization_block,
 };
 use crate::models::qwen3_5::persistence::{
     MTP_LAYER_LINEAR_SUFFIXES, augment_mtplx_mtp_quantization_with_suffixes, load_vision_weights,
@@ -529,6 +530,7 @@ fn apply_weights_moe_inner(
         ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "qwen3_5_moe")?;
         ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "qwen3_5_moe")?;
         ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "qwen3_5_moe")?;
+        ensure_affine_biases_present(params, prefix, plq.mode, "qwen3_5_moe")?;
         // Result<Option<..>>: `Ok(None)` = "prefix not quantized, fall back
         // to the dense-weight branch"; `Err` = fail-loud (a malformed sym8 /
         // K-quant group must never silently fall back, see
@@ -579,6 +581,7 @@ fn apply_weights_moe_inner(
         ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "qwen3_5_moe")?;
         ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "qwen3_5_moe")?;
         ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "qwen3_5_moe")?;
+        ensure_affine_biases_present(params, prefix, plq.mode, "qwen3_5_moe")?;
         Ok(match plq.mode {
             PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
             PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
@@ -638,6 +641,7 @@ fn apply_weights_moe_inner(
         // would misdecode them (a repacked `token_embd` is q6k/q4k/q5k, not
         // affine). Mirrors the linear/switch builders' guard.
         ensure_kquant_storage_resolves_kquant(params, "embedding", plq.mode, "qwen3_5_moe")?;
+        ensure_affine_biases_present(params, "embedding", plq.mode, "qwen3_5_moe")?;
         // Gate the packed-resident load exactly like the dense loader
         // (`qwen3_5/persistence.rs`): packed is a WIN only on the paged,
         // non-MTP, non-VLM turn path, where the tied lm_head routes through
