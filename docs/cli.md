@@ -156,6 +156,30 @@ mlx convert --input ./model.gguf --output ./model-mlx
 
 Auto-detected by the `.gguf` extension. Supports BF16, F16, F32, Q4_0, Q4_1, Q8_0 source quantization types.
 
+#### Symmetric formats (Q4_0, Q8_0)
+
+ggml stores these as `w = d * (q - Z)` — one f16 scale per 32 weights, with the
+offset derived rather than stored. MLX's affine format is `w = scale * q + bias`,
+so the import used to write a `.biases` array whose every entry was `-Z * scale`:
+0.5 bpw of pure redundancy, 681 MB on Gemma-4-12B-QAT.
+
+The converter now records `symmetric_zero_point` in `config.json` and leaves the
+companion off disk; the loader rebuilds it before any layer is constructed. The
+reconstruction is bitwise equal to what was stored — `Z` is a power of two, so
+the f16 product is exact — and the output lands at ggml's own density:
+
+| source | before | after | ggml |
+| ------ | ------ | ----- | ---- |
+| Q4_0   | 5.0000 bpw | 4.5000 bpw | 4.5000 |
+| Q8_0   | 9.0000 bpw | 8.5000 bpw | 8.5000 |
+| Q4_1   | 5.0000 bpw | unchanged  | — (stores a real per-block minimum) |
+
+These outputs are **not mlx-lm-loadable**, since mlx-lm requires a stored
+`.biases` for affine groups — the same trade-off `--q-mode sym8` already makes.
+Q4_1 imports keep their biases and stay portable. Reading a symmetric checkpoint
+on an mlx-node build that predates the field fails loudly on first forward
+("Biases must be provided for affine quantization"), not silently.
+
 ### Model-type auto-detection
 
 The converter auto-detects model families and applies family-specific sanitization passes:

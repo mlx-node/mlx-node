@@ -30,11 +30,13 @@
 //!   $SYM_QAT_ROOT/gemma4-qat-mlx/   conversion from before the change
 //!   $SYM_QAT_ROOT/gemma4-qat-sym/   conversion from after it
 //!
-//! and the test runs; leave it unset and it skips.
+//! These are `#[ignore]`d so an unattended run reports them as ignored rather
+//! than passing on a comparison it never made — an acceptance gate that goes
+//! green because its fixture is absent is worse than no gate.
 //!
 //! Run:
 //!   SYM_QAT_ROOT=... cargo test -p mlx-core --release \
-//!     --test symmetric_import_gemma4_qat -- --nocapture
+//!     --test symmetric_import_gemma4_qat -- --ignored --nocapture
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
@@ -196,6 +198,7 @@ fn affine_prefixes(f: &Fixtures) -> Vec<(String, String)> {
 }
 
 #[test]
+#[ignore = "needs SYM_QAT_ROOT pointing at both gemma4 QAT conversions"]
 fn only_the_derived_bias_arrays_left_the_file() {
     let Some(f) = fixtures() else {
         eprintln!("SYM_QAT_ROOT unset — skipping gemma4 QAT acceptance");
@@ -252,6 +255,7 @@ fn only_the_derived_bias_arrays_left_the_file() {
 }
 
 #[test]
+#[ignore = "needs SYM_QAT_ROOT pointing at both gemma4 QAT conversions"]
 fn weights_and_scales_are_byte_identical_and_the_bias_is_derivable() {
     let Some(f) = fixtures() else {
         eprintln!("SYM_QAT_ROOT unset — skipping gemma4 QAT acceptance");
@@ -314,6 +318,7 @@ fn weights_and_scales_are_byte_identical_and_the_bias_is_derivable() {
 }
 
 #[test]
+#[ignore = "needs SYM_QAT_ROOT pointing at both gemma4 QAT conversions"]
 fn the_decode_is_unchanged_with_the_rebuilt_bias() {
     let Some(f) = fixtures() else {
         eprintln!("SYM_QAT_ROOT unset — skipping gemma4 QAT acceptance");
@@ -410,6 +415,7 @@ fn the_decode_is_unchanged_with_the_rebuilt_bias() {
 }
 
 #[test]
+#[ignore = "needs SYM_QAT_ROOT pointing at both gemma4 QAT conversions"]
 fn the_kquant_embedding_is_untouched() {
     let Some(f) = fixtures() else {
         eprintln!("SYM_QAT_ROOT unset — skipping gemma4 QAT acceptance");
@@ -445,6 +451,7 @@ fn the_kquant_embedding_is_untouched() {
 }
 
 #[test]
+#[ignore = "needs SYM_QAT_ROOT pointing at both gemma4 QAT conversions"]
 fn the_affine_portion_reaches_ggml_q4_0_density() {
     let Some(f) = fixtures() else {
         eprintln!("SYM_QAT_ROOT unset — skipping gemma4 QAT acceptance");

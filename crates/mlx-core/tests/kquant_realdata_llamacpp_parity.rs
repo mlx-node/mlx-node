@@ -40,11 +40,13 @@
 //!   $KQ_PARITY_ROOT/deq/q4k-deq-f32.gguf                  (llama-quantize F32)
 //!   $KQ_PARITY_ROOT/qwen3-q4k-mlx2/                       (mlx convert output)
 //!
-//! and the test runs; leave it unset and it skips.
+//! These are `#[ignore]`d so an unattended run reports them as ignored rather
+//! than passing on a comparison it never made — a parity gate that goes green
+//! because its fixture is absent is worse than no gate.
 //!
 //! Run:
 //!   KQ_PARITY_ROOT=... cargo test -p mlx-core --release \
-//!     --test kquant_realdata_llamacpp_parity -- --nocapture
+//!     --test kquant_realdata_llamacpp_parity -- --ignored --nocapture
 
 use std::ffi::CString;
 use std::fs::File;
@@ -382,6 +384,7 @@ fn run_case(root: &Path, case: &Case) -> Totals {
 }
 
 #[test]
+#[ignore = "needs KQ_PARITY_ROOT pointing at the GGUF + llama.cpp F32 fixtures"]
 fn imported_kquant_weights_match_llamacpp_dequantization() {
     let Some(root) = root() else {
         eprintln!("KQ_PARITY_ROOT unset or not a directory — skipping real-data parity");
@@ -433,6 +436,7 @@ fn imported_kquant_weights_match_llamacpp_dequantization() {
 /// hide behind: the packed weights and the scales must be byte-identical, and
 /// the two decodes must agree bit for bit over every element.
 #[test]
+#[ignore = "needs KQ_PARITY_ROOT pointing at the GGUF + llama.cpp F32 fixtures"]
 fn the_symmetric_import_decodes_identically_to_the_stored_bias_import() {
     let Some(root) = root() else {
         eprintln!("KQ_PARITY_ROOT unset or not a directory — skipping real-data A/B");
