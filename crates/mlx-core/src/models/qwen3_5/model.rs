@@ -13395,6 +13395,53 @@ mod paged_construction_tests {
         )
     }
 
+    /// The planned-MTP twin of [`run_dense_paged_prefill_with_size_and_checkpoint`].
+    ///
+    /// `run_dense_core_paged_prefill` forks on `keep_prompt_hidden_tokens`: an
+    /// AR turn lands in `run_paged_prefill_chunk_with_size`, a planned-MTP turn
+    /// in `run_paged_prefill_chunk_with_hidden_with_size`. Those are two
+    /// separate bodies that each decide their own checkpoint break set, so a
+    /// helper that only reaches the first cannot see the second regress.
+    fn run_dense_paged_prefill_with_hidden_and_checkpoint(
+        inner: &mut Qwen35Inner,
+        full_tokens: &[u32],
+        suffix_tokens: &[u32],
+        cached_prefix_len: u32,
+        chunk_size: i32,
+    ) -> Result<(
+        MxArray,
+        MxArray,
+        Vec<super::super::paged_forward::MaterializedGdnPrefixCheckpoint>,
+    )> {
+        let layer_kinds =
+            decoder_layer::compute_layer_kinds(inner.config.num_layers as usize, |i| {
+                inner.config.is_linear_layer(i)
+            });
+        let embed = inner.embedding.clone();
+        let embedding_weight = embed.get_weight();
+        let keep_tokens = full_tokens.len();
+        let caches = inner.caches.as_mut().expect("qwen35 caches initialized");
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+
+        super::super::paged_forward::run_paged_prefill_chunk_with_hidden_with_size(
+            full_tokens,
+            suffix_tokens,
+            cached_prefix_len,
+            false,
+            &embed,
+            &mut inner.layers,
+            caches,
+            &inner.final_norm,
+            &inner.lm_head,
+            &embedding_weight,
+            &layer_kinds,
+            adapter,
+            chunk_size,
+            Some(keep_tokens),
+            /* cached_rope_deltas */ 0,
+        )
+    }
+
     fn logits_to_f32_vec(logits: &MxArray) -> Vec<f32> {
         let f32_arr = logits.astype(DType::Float32).expect("astype f32");
         f32_arr.eval();
@@ -14735,6 +14782,40 @@ mod paged_construction_tests {
              boundary, not the ladder — the extra breaks change the prefill GEMM's M and so the \
              sampled tokens of a persistence-off request"
         );
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("paged_adapter")
+            .release_request()
+            .expect("release_request");
+
+        // The SAME claim on the planned-MTP body. `run_dense_core_paged_prefill`
+        // forks on `keep_prompt_hidden_tokens` into two separate prefill
+        // functions that each pick their own break set, and every arm above
+        // takes the AR fork only. Measured: hardcoding `want_ladder = true` at
+        // the MTP call site alone (`run_paged_prefill_chunk_with_hidden_with_size`)
+        // left this whole gate and its MoE twin GREEN before this arm existed.
+        // `ChatSession::mergeConfig` auto-defaults `enableMtp` to true on any
+        // checkpoint carrying an MTP head, so on those checkpoints the MTP fork
+        // is the one an `mlx agent` turn actually takes.
+        reset_paged_request(&mut inner, &long_prompt);
+        let (_, _, no_policy_mtp_rungs) = run_dense_paged_prefill_with_hidden_and_checkpoint(
+            &mut inner,
+            &long_prompt,
+            &long_prompt,
+            0,
+            2048,
+        )
+        .expect("explicit-chunk MTP prefill with no cold tier");
+        assert_eq!(
+            no_policy_mtp_rungs
+                .iter()
+                .map(|c| c.prefix_len)
+                .collect::<Vec<_>>(),
+            vec![192],
+            "the planned-MTP prefill body must take the same single pre-ladder boundary with no \
+             cold GDN policy as the AR body does"
+        );
         // Release WITHOUT registering: publishing this prompt's blocks would
         // give the next arm's shared 64-token prefix a cache hit, and every arm
         // here has to start cold.
@@ -14786,6 +14867,34 @@ mod paged_construction_tests {
             cold_rungs.iter().map(|c| c.prefix_len).collect::<Vec<_>>(),
             vec![48, 192],
             "an explicit chunk size under a GDN cold policy still publishes the whole ladder"
+        );
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("paged_adapter")
+            .release_request()
+            .expect("release_request");
+
+        // And the MTP fork under the policy: the ladder is what the sidecar
+        // anchors on, so an MTP turn that publishes only the deep rung is the
+        // silent-zero-reuse defect `29be89e0` set out to fix, on the fork it
+        // did not cover.
+        reset_paged_request(&mut inner, &long_prompt);
+        let (_, _, cold_mtp_rungs) = run_dense_paged_prefill_with_hidden_and_checkpoint(
+            &mut inner,
+            &long_prompt,
+            &long_prompt,
+            0,
+            2048,
+        )
+        .expect("explicit-chunk MTP prefill under a cold GDN policy");
+        assert_eq!(
+            cold_mtp_rungs
+                .iter()
+                .map(|c| c.prefix_len)
+                .collect::<Vec<_>>(),
+            vec![48, 192],
+            "the planned-MTP prefill body must publish the whole ladder under a cold GDN policy"
         );
 
         let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
