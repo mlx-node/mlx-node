@@ -3,6 +3,7 @@
 //! This kernel computes attention using the paged KV cache.
 //! Supports both V1 (no partitioning) and V2 (with partitioning) modes.
 
+use super::command_buffer::observe;
 use super::reshape_and_cache::RawBufferInfo;
 use super::state::{MetalDtype, MetalState};
 use metal::foreign_types::ForeignTypeRef;
@@ -621,6 +622,9 @@ impl PagedAttentionOutput {
 
         command_buffer.commit();
         command_buffer.wait_until_completed();
+        // Checked before the shared buffer is read, so an aborted copy is
+        // never decoded as attention output.
+        observe(&command_buffer, "PagedAttentionOutput::to_host_f32")?;
 
         // Read data from shared buffer
         let num_elements = self.num_elements();
@@ -898,6 +902,7 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
 
     command_buffer.commit();
     command_buffer.wait_until_completed();
+    observe(&command_buffer, "dispatch_paged_attention_v1_raw")?;
 
     // Output dtype is the io_dtype the kernel was templated on (not the
     // cache dtype). For FP8 (cache=uchar) the kernel dequantizes internally
@@ -1114,6 +1119,10 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
 
         command_buffer.commit();
         command_buffer.wait_until_completed();
+        observe(
+            &command_buffer,
+            "dispatch_paged_attention_v2_raw (partition)",
+        )?;
     }
 
     // Phase 2: Reduce partitions
@@ -1158,6 +1167,7 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
 
         command_buffer.commit();
         command_buffer.wait_until_completed();
+        observe(&command_buffer, "dispatch_paged_attention_v2_raw (reduce)")?;
     }
 
     // Output dtype is io_dtype (kernel writes io-typed elements). FP8
@@ -1446,6 +1456,7 @@ pub unsafe fn dispatch_paged_attention_varlen_v1_raw(
 
     command_buffer.commit();
     command_buffer.wait_until_completed();
+    observe(&command_buffer, "dispatch_paged_attention_varlen_v1_raw")?;
 
     Ok(PagedAttentionVarlenOutput {
         buffer: output,
@@ -1658,6 +1669,10 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
 
         command_buffer.commit();
         command_buffer.wait_until_completed();
+        observe(
+            &command_buffer,
+            "dispatch_paged_attention_varlen_v2_raw (partition)",
+        )?;
     }
 
     // Phase 2: reduce partitions. The varlen reduce kernel walks the
@@ -1708,6 +1723,10 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
 
         command_buffer.commit();
         command_buffer.wait_until_completed();
+        observe(
+            &command_buffer,
+            "dispatch_paged_attention_varlen_v2_raw (reduce)",
+        )?;
     }
 
     Ok(PagedAttentionVarlenOutput {

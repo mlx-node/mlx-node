@@ -17,8 +17,9 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLFunction, MTLLibrary,
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+    MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLFunction,
+    MTLLibrary,
 };
 
 pub use objc2_metal::MTLResourceOptions;
@@ -344,6 +345,78 @@ impl CommandBuffer {
     pub fn wait_until_completed(&self) {
         self.0.waitUntilCompleted();
     }
+
+    /// Lifecycle stage this buffer is in. After `commit` + `wait_until_completed`
+    /// Metal leaves it at either [`CommandBufferStatus::Completed`] or
+    /// [`CommandBufferStatus::Error`]; anything else means the buffer never ran
+    /// the work the caller submitted.
+    #[inline]
+    pub fn status(&self) -> CommandBufferStatus {
+        CommandBufferStatus::from_raw(self.0.status())
+    }
+
+    /// The `NSError` Metal attached when execution aborted, if any. Metal
+    /// leaves this nil for a buffer that completed, and may also leave it nil
+    /// for an aborted one, so absence of an error is not evidence of success —
+    /// read [`Self::status`] for that.
+    #[inline]
+    pub fn error(&self) -> Option<String> {
+        self.0.error().map(error_string)
+    }
+}
+
+/// Owned mirror of `MTLCommandBufferStatus`.
+///
+/// `Unknown` carries the raw value so a future Metal release that adds a stage
+/// is reported rather than silently mapped onto an existing one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandBufferStatus {
+    NotEnqueued,
+    Enqueued,
+    Committed,
+    Scheduled,
+    Completed,
+    Error,
+    Unknown(u64),
+}
+
+impl CommandBufferStatus {
+    #[inline]
+    fn from_raw(status: MTLCommandBufferStatus) -> Self {
+        match status {
+            MTLCommandBufferStatus::NotEnqueued => Self::NotEnqueued,
+            MTLCommandBufferStatus::Enqueued => Self::Enqueued,
+            MTLCommandBufferStatus::Committed => Self::Committed,
+            MTLCommandBufferStatus::Scheduled => Self::Scheduled,
+            MTLCommandBufferStatus::Completed => Self::Completed,
+            MTLCommandBufferStatus::Error => Self::Error,
+            other => Self::Unknown(other.0 as u64),
+        }
+    }
+}
+
+/// Decide whether a submitted command buffer actually ran its work.
+///
+/// Only [`CommandBufferStatus::Completed`] counts as success. Every other
+/// stage — including an `Error` for which Metal attached no `NSError` — is a
+/// failure, because the GPU work either aborted or never reached the device.
+/// Callers that skip this check cannot tell an aborted blit from a successful
+/// one: the destination simply keeps whatever bytes it already held.
+///
+/// `context` names the submitting operation so the message identifies which
+/// transfer failed.
+pub fn command_buffer_outcome(
+    status: CommandBufferStatus,
+    error: Option<String>,
+    context: &str,
+) -> Result<(), String> {
+    if status == CommandBufferStatus::Completed {
+        return Ok(());
+    }
+    Err(format!(
+        "{context}: Metal command buffer did not complete (status {status:?}): {}",
+        error.as_deref().unwrap_or("no NSError reported")
+    ))
 }
 
 pub struct ComputeCommandEncoder(Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>);
@@ -461,5 +534,98 @@ mod tests {
         // SAFETY: same StorageModeShared and initialized-length guarantees as
         // above, for one `i32`.
         assert_eq!(unsafe { *value_buffer.contents().cast::<i32>() }, value);
+    }
+
+    /// The success predicate must be "status is Completed", not "no NSError"
+    /// and not "status is Error". Metal can abort a buffer without attaching
+    /// an `NSError`, and a buffer stuck at `Scheduled` or at an
+    /// unrecognized future stage never ran the submitted work either. Both of
+    /// those would be read as success by the looser predicates.
+    #[test]
+    fn only_a_completed_command_buffer_is_success() {
+        assert!(command_buffer_outcome(CommandBufferStatus::Completed, None, "ctx").is_ok());
+        assert!(
+            command_buffer_outcome(
+                CommandBufferStatus::Error,
+                Some("Ignored (for causing prior/excessive GPU errors)".to_string()),
+                "ctx",
+            )
+            .is_err()
+        );
+        // An aborted buffer with a nil `error` is the case a `error.is_some()`
+        // predicate would wave through.
+        assert!(command_buffer_outcome(CommandBufferStatus::Error, None, "ctx").is_err());
+        for status in [
+            CommandBufferStatus::NotEnqueued,
+            CommandBufferStatus::Enqueued,
+            CommandBufferStatus::Committed,
+            CommandBufferStatus::Scheduled,
+            CommandBufferStatus::Unknown(9),
+        ] {
+            assert!(
+                command_buffer_outcome(status, None, "ctx").is_err(),
+                "{status:?} must not be reported as success"
+            );
+        }
+    }
+
+    /// A failure has to say which submission failed and what Metal reported,
+    /// otherwise an operator sees an unattributed error from a process that
+    /// submits command buffers from a dozen places.
+    #[test]
+    fn failure_message_names_the_context_and_the_metal_error() {
+        let message = command_buffer_outcome(
+            CommandBufferStatus::Error,
+            Some("device removed".to_string()),
+            "LayerKVPool::write_block_all_layers",
+        )
+        .expect_err("an errored buffer must not be Ok");
+        assert!(
+            message.contains("LayerKVPool::write_block_all_layers"),
+            "message must name the caller: {message}"
+        );
+        assert!(
+            message.contains("device removed"),
+            "message must carry the NSError text: {message}"
+        );
+
+        let message = command_buffer_outcome(CommandBufferStatus::Scheduled, None, "ctx")
+            .expect_err("a non-completed buffer must not be Ok");
+        assert!(
+            message.contains("Scheduled"),
+            "message must name the observed status: {message}"
+        );
+        assert!(
+            message.contains("no NSError"),
+            "message must say the error was absent rather than omit it: {message}"
+        );
+    }
+
+    /// `status()` on a healthy submission must be `Completed`, so the check
+    /// added at every commit/wait site cannot reject working GPU transfers.
+    #[test]
+    fn healthy_submission_reports_completed() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("skipping healthy submission status test: no Metal device");
+            return;
+        };
+        let queue = device.new_command_queue();
+        let source =
+            device.new_buffer_with_slice(&[1u32, 2, 3, 4], MTLResourceOptions::StorageModeShared);
+        let destination = device.new_buffer(16, MTLResourceOptions::StorageModeShared);
+
+        let command_buffer = queue.new_command_buffer();
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_buffer(&source, 0, &destination, 0, 16);
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        assert_eq!(command_buffer.status(), CommandBufferStatus::Completed);
+        assert_eq!(command_buffer.error(), None);
+        assert!(
+            command_buffer_outcome(command_buffer.status(), command_buffer.error(), "healthy")
+                .is_ok()
+        );
     }
 }

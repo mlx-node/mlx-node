@@ -18,6 +18,7 @@
 //! - `reshape_and_cache_kv_{type}_cache_{type}[_fp8]`
 //! - `paged_attention_{type}_cache_{type}_hs{head}_bs{block}_nt256_nsl32_ps{partition}[_alibi]`
 
+pub(crate) mod command_buffer;
 mod copy_blocks;
 mod kv_scale;
 mod mlx_integration;

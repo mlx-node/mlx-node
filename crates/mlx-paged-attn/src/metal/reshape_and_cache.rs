@@ -2,6 +2,7 @@
 //!
 //! This kernel writes new KV pairs into the paged KV cache.
 
+use super::command_buffer::observe;
 use super::state::{MetalDtype, MetalState};
 use metal::foreign_types::ForeignTypeRef;
 use metal::{Buffer, BufferRef, MTLSize};
@@ -162,8 +163,7 @@ pub unsafe fn dispatch_reshape_and_cache_raw(
 
     command_buffer.commit();
     command_buffer.wait_until_completed();
-
-    Ok(())
+    observe(&command_buffer, "dispatch_reshape_and_cache_raw")
 }
 
 #[cfg(test)]

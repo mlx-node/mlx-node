@@ -426,8 +426,7 @@ fn blit_attention_output(
     blit_encoder.end_encoding();
     command_buffer.commit();
     command_buffer.wait_until_completed();
-
-    Ok(())
+    crate::metal::command_buffer::observe(&command_buffer, "blit_attention_output")
 }
 
 /// `extern "C"` wrapper around `dispatch_paged_attention_varlen_auto`

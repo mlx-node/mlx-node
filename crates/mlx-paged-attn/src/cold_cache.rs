@@ -1509,10 +1509,19 @@ impl ColdCacheManager {
         };
 
         // One command buffer for the whole block instead of one per layer.
-        // `write_block_all_layers` finishes validating every layer before it
-        // encodes its first blit, so this failing means nothing was written:
-        // freeing the block restores the exact pre-call state, with no risk of
-        // the pool retaining a partially applied prefix.
+        // Two different failures land here. Validation (layout, block id, per
+        // layer byte lengths) rejects before the first blit is encoded, so
+        // nothing was written. A command-buffer abort is reported after the
+        // blits were submitted, so some layers of this block may have been
+        // applied and others not.
+        //
+        // Both are safe for the same reason, and it is not "nothing was
+        // written": `BlockAllocator::allocate` never zeroes, so every freshly
+        // handed-out block already holds a previous owner's bytes. The
+        // invariant restore depends on is that the block is never PUBLISHED —
+        // freeing it here without reaching `publish_restored_prefix` leaves it
+        // unreachable through the prefix cache, and its slots are only ever
+        // read again after `reshape_and_cache` rewrites them.
         let layer_bytes: Vec<(&[u8], &[u8])> = cold
             .layers
             .iter()
@@ -5824,6 +5833,324 @@ mod tests {
             "nothing was restored into the pool"
         );
 
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A capture whose GPU read aborts must not enqueue anything and must
+    /// still release the pin it took, otherwise the block is leaked as
+    /// permanently referenced and a half-read block reaches disk as valid
+    /// cold data for a later process to restore.
+    ///
+    /// Scope: the armed seam substitutes for reading the command buffer's
+    /// status. A real device fault is NOT covered — see
+    /// `crate::metal::command_buffer::arm_failure`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_command_buffer_failure_enqueues_nothing_and_unpins() {
+        use crate::PagedAttentionConfig;
+        use crate::metal::MetalDtype;
+        use crate::metal::command_buffer::arm_failure;
+
+        let config = PagedAttentionConfig {
+            block_size: 8,
+            gpu_memory_mb: 256,
+            head_size: 64,
+            num_kv_heads: 1,
+            num_layers: 1,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(32),
+            max_batch_size: Some(1),
+        };
+        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!(
+                    "skipping capture_command_buffer_failure_enqueues_nothing_and_unpins: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let allocator = Mutex::new(BlockAllocator::new(2, 8));
+        let source = allocator.lock().unwrap().allocate().unwrap();
+
+        let root = temp_root("capture-cb-fail");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &tokens, &[], 0, 0);
+
+        let refs_before = source.get_ref_count();
+        let armed = arm_failure("LayerKVPool::read_block_all_layers");
+        let captured = manager.capture_and_enqueue(&pool, &source, key, fingerprint(), &tokens);
+        drop(armed);
+
+        // Checked before the error is unwrapped, so a regression that lets the
+        // capture succeed on an aborted read is caught here rather than
+        // hidden behind an earlier `expect_err` panic.
+        let stats = manager.stats();
+        assert_eq!(
+            stats.enqueued, 0,
+            "a half-read block must never reach the writer queue"
+        );
+        assert_eq!(stats.queue_drops, 0, "the queue was never offered anything");
+        assert_eq!(
+            source.get_ref_count(),
+            refs_before,
+            "the capture pin must be released on the failure path too"
+        );
+
+        let err = captured.expect_err("an aborted GPU read must fail the capture");
+        assert!(
+            err.contains("LayerKVPool::read_block_all_layers"),
+            "the capture must surface which submission failed: {err}"
+        );
+        assert!(
+            manager.drain(Duration::from_secs(5)),
+            "the writer queue must drain within the timeout"
+        );
+        assert!(
+            !manager.contains(&key),
+            "nothing must be persisted for a failed capture"
+        );
+
+        allocator.lock().unwrap().free(source);
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A restore whose GPU upload aborts must free the block it allocated,
+    /// count exactly one miss, and never publish the prefix. Publishing would
+    /// make a block the GPU may have written only partially reachable through
+    /// the prefix cache, which decodes to wrong tokens with no error anywhere.
+    ///
+    /// Scope: the armed seam substitutes for reading the command buffer's
+    /// status. A real device fault is NOT covered — see
+    /// `crate::metal::command_buffer::arm_failure`. The sibling test
+    /// `restore_post_allocate_upload_error_frees_block_and_counts_one_miss`
+    /// drives the same arm through a real, unseamed `Err`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restore_command_buffer_failure_frees_block_and_counts_one_miss() {
+        use crate::metal::MetalDtype;
+        use crate::metal::command_buffer::arm_failure;
+        use crate::{PagedAttentionConfig, hash_tokens};
+
+        let config = PagedAttentionConfig {
+            block_size: 8,
+            gpu_memory_mb: 256,
+            head_size: 64,
+            num_kv_heads: 1,
+            num_layers: 1,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(32),
+            max_batch_size: Some(1),
+        };
+        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!(
+                    "skipping restore_command_buffer_failure_frees_block_and_counts_one_miss: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let allocator = Mutex::new(BlockAllocator::new(2, 8));
+        let source = allocator.lock().unwrap().allocate().unwrap();
+        let bytes_per_side = 64 * 8 * 2;
+        let keys: Vec<u8> = (0..bytes_per_side).map(|i| (i % 251) as u8).collect();
+        let values: Vec<u8> = (0..bytes_per_side)
+            .map(|i| (250 - (i % 251)) as u8)
+            .collect();
+        pool.write_blocks_from_host(0, &[source.block_id], &keys, &values)
+            .unwrap();
+
+        let root = temp_root("restore-cb-fail");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &tokens, &[], 0, 0);
+        assert!(
+            manager
+                .capture_and_enqueue(&pool, &source, key, fingerprint(), &tokens)
+                .unwrap()
+        );
+        assert!(
+            manager.drain(Duration::from_secs(5)),
+            "the captured block must be durable before the restore"
+        );
+        allocator.lock().unwrap().free(source);
+
+        let identity = RestorePrefixIdentity {
+            hot_hash: hash_tokens(&tokens, 0, &[]),
+            tokens: tokens.clone(),
+            parent_hot_hash: 0,
+            extra_keys: vec![],
+            cache_salt: 0,
+            block_index: 0,
+        };
+        let free_before = allocator.lock().unwrap().num_free_blocks();
+        let misses_before = manager.stats().misses;
+
+        let armed = arm_failure("LayerKVPool::write_block_all_layers");
+        let restored = manager.restore_block(&pool, &allocator, key, fingerprint(), &identity);
+        drop(armed);
+
+        assert!(
+            restored.is_none(),
+            "an aborted upload must fall back to prefill"
+        );
+        let stats = manager.stats();
+        assert_eq!(
+            stats.misses - misses_before,
+            1,
+            "a failed upload is exactly one fall-back to prefill, counted once"
+        );
+        assert_eq!(stats.hits, 0, "no prefix was published, so no hit");
+        assert_eq!(stats.bytes_restored, 0, "nothing landed in the pool");
+        // Checked before the free-block count: "never published" is the
+        // invariant the restore actually depends on, and a failure arm that
+        // published would still be caught here even if the block were also
+        // handed back to the free pool.
+        let (hits, hit_tokens) =
+            allocator
+                .lock()
+                .unwrap()
+                .find_longest_cache_hit(&tokens, 8, &[], 0);
+        assert_eq!(
+            hit_tokens, 0,
+            "a block whose upload aborted must never become reachable through the prefix cache"
+        );
+        assert!(hits.is_empty());
+
+        assert_eq!(
+            allocator.lock().unwrap().num_free_blocks(),
+            free_before,
+            "the block allocated for the restore must be freed again"
+        );
+
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The same cleanup arm as the test above, reached by a REAL `Err` from
+    /// `write_block_all_layers` with no seam involved: the allocator owns one
+    /// more block than the pool, so the block handed to the restore is out of
+    /// the pool's range and the upload is rejected AFTER the allocation.
+    ///
+    /// Every earlier guard (`layout_matches_pool`, the token comparison) runs
+    /// before `allocate`, so this is the only way to reach the free-the-block
+    /// branch without a test hook — which makes it the evidence that the
+    /// branch is not seam-dependent.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restore_post_allocate_upload_error_frees_block_and_counts_one_miss() {
+        use crate::metal::MetalDtype;
+        use crate::{PagedAttentionConfig, hash_tokens};
+
+        let config = PagedAttentionConfig {
+            block_size: 8,
+            gpu_memory_mb: 256,
+            head_size: 64,
+            num_kv_heads: 1,
+            num_layers: 1,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(32),
+            max_batch_size: Some(1),
+        };
+        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!(
+                    "skipping restore_post_allocate_upload_error_frees_block_and_counts_one_miss: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        // Three allocator blocks against a two-block pool: ids 0 and 1 are
+        // valid pool blocks, id 2 is not.
+        let allocator = Mutex::new(BlockAllocator::new(3, 8));
+        let source = allocator.lock().unwrap().allocate().unwrap();
+        let held = allocator.lock().unwrap().allocate().unwrap();
+        assert_eq!(source.block_id, 0);
+        assert_eq!(held.block_id, 1);
+
+        let bytes_per_side = 64 * 8 * 2;
+        let keys: Vec<u8> = (0..bytes_per_side).map(|i| (i % 251) as u8).collect();
+        let values: Vec<u8> = (0..bytes_per_side)
+            .map(|i| (250 - (i % 251)) as u8)
+            .collect();
+        pool.write_blocks_from_host(0, &[source.block_id], &keys, &values)
+            .unwrap();
+
+        let root = temp_root("restore-oob-upload");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &tokens, &[], 0, 0);
+        assert!(
+            manager
+                .capture_and_enqueue(&pool, &source, key, fingerprint(), &tokens)
+                .unwrap()
+        );
+        assert!(
+            manager.drain(Duration::from_secs(5)),
+            "the captured block must be durable before the restore"
+        );
+
+        // `source` and `held` stay alive, so the restore's `allocate` draws
+        // block id 2 — past the end of the pool.
+        let identity = RestorePrefixIdentity {
+            hot_hash: hash_tokens(&tokens, 0, &[]),
+            tokens: tokens.clone(),
+            parent_hot_hash: 0,
+            extra_keys: vec![],
+            cache_salt: 0,
+            block_index: 0,
+        };
+        let free_before = allocator.lock().unwrap().num_free_blocks();
+        assert_eq!(free_before, 1, "only block 2 is left for the restore");
+        let misses_before = manager.stats().misses;
+
+        let restored = manager.restore_block(&pool, &allocator, key, fingerprint(), &identity);
+        assert!(
+            restored.is_none(),
+            "an upload the pool rejects must fall back to prefill"
+        );
+        let stats = manager.stats();
+        assert_eq!(
+            stats.misses - misses_before,
+            1,
+            "a rejected upload is exactly one fall-back to prefill, counted once"
+        );
+        assert_eq!(stats.hits, 0, "no prefix was published, so no hit");
+        assert_eq!(stats.bytes_restored, 0, "nothing landed in the pool");
+        // Checked before the free-block count: "never published" is the
+        // invariant the restore actually depends on, and a failure arm that
+        // published would still be caught here even if the block were also
+        // handed back to the free pool.
+        let (hits, hit_tokens) =
+            allocator
+                .lock()
+                .unwrap()
+                .find_longest_cache_hit(&tokens, 8, &[], 0);
+        assert_eq!(
+            hit_tokens, 0,
+            "a block whose upload failed must never become reachable through the prefix cache"
+        );
+        assert!(hits.is_empty());
+
+        assert_eq!(
+            allocator.lock().unwrap().num_free_blocks(),
+            free_before,
+            "the block allocated for the restore must be freed again"
+        );
+
+        {
+            let mut allocator = allocator.lock().unwrap();
+            allocator.free(source);
+            allocator.free(held);
+        }
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }

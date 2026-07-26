@@ -1110,6 +1110,7 @@ impl LayerKVPool {
         layer_idx: u32,
         block_ids: &[u32],
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        use crate::metal::command_buffer::observe;
         use crate::metal::is_metal_extraction_supported;
 
         if !is_metal_extraction_supported() {
@@ -1182,6 +1183,10 @@ impl LayerKVPool {
         blit_encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
+        // Before the staging buffers are read: an aborted blit leaves them
+        // holding uninitialized allocation bytes, which would otherwise be
+        // returned as if they were cache contents.
+        observe(&command_buffer, "LayerKVPool::read_blocks_to_host")?;
 
         let mut keys_bytes = vec![0u8; total_keys];
         let mut values_bytes = vec![0u8; total_values];
@@ -1231,6 +1236,7 @@ impl LayerKVPool {
     /// GPU work at all.
     #[cfg(target_os = "macos")]
     pub fn read_block_all_layers(&self, block_id: u32) -> Result<Vec<BlockLayerBytes>, String> {
+        use crate::metal::command_buffer::observe;
         use crate::metal::{MetalState, is_metal_extraction_supported};
         use metal::MTLResourceOptions;
 
@@ -1283,6 +1289,11 @@ impl LayerKVPool {
         blit.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
+        // Checked before the staging buffers are copied out, so an aborted
+        // read builds no `BlockLayerBytes` at all. The cold tier persists what
+        // this returns, and a half-read block written to disk as valid would
+        // be restored as corruption by some later process.
+        observe(&command_buffer, "LayerKVPool::read_block_all_layers")?;
 
         let key_bytes = key_block_size as usize;
         let value_bytes = value_block_size as usize;
@@ -1334,6 +1345,7 @@ impl LayerKVPool {
         keys_bytes: &[u8],
         values_bytes: &[u8],
     ) -> Result<(), String> {
+        use crate::metal::command_buffer::observe;
         use crate::metal::{MetalState, is_metal_extraction_supported};
         use metal::MTLResourceOptions;
 
@@ -1401,7 +1413,7 @@ impl LayerKVPool {
         blit.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
-        Ok(())
+        observe(&command_buffer, "LayerKVPool::write_blocks_from_host")
     }
 
     /// Non-macOS stub.
@@ -1433,18 +1445,27 @@ impl LayerKVPool {
     /// # Partial-overwrite invariant
     ///
     /// Every check — layer count, block-id range, and *each* layer's key and
-    /// value byte length — completes before the first blit is encoded. A
-    /// rejected call therefore leaves the pool bit-for-bit unmodified rather
-    /// than half-written. This is the whole safety story for corrupt
-    /// cold-cache data: a pool holding the first `k` layers of one prefix and
-    /// the remaining layers of another decodes to wrong tokens with no error
-    /// anywhere, so callers rely on failure meaning "nothing happened".
+    /// value byte length — completes before the first blit is encoded. A call
+    /// rejected by *validation* therefore leaves the pool bit-for-bit
+    /// unmodified rather than half-written. This is the whole safety story for
+    /// corrupt cold-cache data: a pool holding the first `k` layers of one
+    /// prefix and the remaining layers of another decodes to wrong tokens with
+    /// no error anywhere.
+    ///
+    /// A command-buffer failure carries no such guarantee — the blits were
+    /// already submitted, and an aborted buffer may have applied some layers
+    /// and not others. What every `Err` from this function does guarantee is
+    /// that the caller was told, so the caller must treat the target block as
+    /// holding undefined bytes and must not publish it. `ColdCacheManager::
+    /// restore_block` does exactly that: it frees the block without ever
+    /// reaching `publish_restored_prefix`.
     #[cfg(target_os = "macos")]
     pub fn write_block_all_layers(
         &self,
         block_id: u32,
         layers: &[(&[u8], &[u8])],
     ) -> Result<(), String> {
+        use crate::metal::command_buffer::observe;
         use crate::metal::{MetalState, is_metal_extraction_supported};
         use metal::MTLResourceOptions;
 
@@ -1535,7 +1556,7 @@ impl LayerKVPool {
         blit.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
-        Ok(())
+        observe(&command_buffer, "LayerKVPool::write_block_all_layers")
     }
 
     /// Non-macOS stub.
@@ -2063,6 +2084,104 @@ mod tests {
 
         // The read side rejects an out-of-range block id too.
         assert!(pool.read_block_all_layers(pool.num_blocks()).is_err());
+    }
+
+    /// A command buffer that aborts must turn into an `Err`, not a silent
+    /// success. The input here is FULLY valid, so every validation path
+    /// returns `Ok` and the only thing that can produce an error is reading
+    /// the submitted buffer's status back.
+    ///
+    /// Scope: the armed seam substitutes for the observation only. A real
+    /// device fault reaching `cb.status()` is NOT covered — see
+    /// `crate::metal::command_buffer::arm_failure`. This also deliberately
+    /// does NOT assert the pool is unmodified: the blits genuinely ran, and
+    /// asserting bit-equality would only pass because the seam is a lie.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_batched_write_reports_a_failed_command_buffer() {
+        use crate::metal::command_buffer::arm_failure;
+
+        const LAYERS: usize = 4;
+        let pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_batched_write_reports_a_failed_command_buffer: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let per_side = 2 * 64 * 8 * 2;
+        let good = distinct_layer_bytes(LAYERS, per_side);
+        let borrowed: Vec<(&[u8], &[u8])> = good
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+
+        let armed = arm_failure("LayerKVPool::write_block_all_layers");
+        let err = pool
+            .write_block_all_layers(2, &borrowed)
+            .expect_err("an aborted command buffer must not report success");
+        assert!(
+            err.contains("LayerKVPool::write_block_all_layers"),
+            "error must name the failed submission: {err}"
+        );
+        assert!(
+            err.contains("did not complete"),
+            "error must say the buffer never completed: {err}"
+        );
+
+        // Deliberately still armed: the arm is consumed by the call it fired
+        // on, so this identical call must succeed. A sticky arm would fail
+        // here and would otherwise silently poison every later submission on
+        // this thread.
+        pool.write_block_all_layers(2, &borrowed)
+            .expect("the arm must fire exactly once");
+        drop(armed);
+    }
+
+    /// The read side must reject an aborted command buffer BEFORE it copies
+    /// the staging buffers out, so no `BlockLayerBytes` is ever built from
+    /// bytes the GPU never wrote. That ordering is what stops the cold tier
+    /// persisting a half-read block as if it were valid.
+    ///
+    /// Scope caveat: this test passes with the check on either side of the
+    /// copy-out loop; it pins that the check exists and propagates, not where
+    /// it sits. The placement is a review item.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_batched_read_reports_a_failed_command_buffer() {
+        use crate::metal::command_buffer::arm_failure;
+
+        const LAYERS: usize = 4;
+        let pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_batched_read_reports_a_failed_command_buffer: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+
+        let armed = arm_failure("LayerKVPool::read_block_all_layers");
+        // `map` to the layer count first, so a failing assertion prints that
+        // count rather than dumping every block byte.
+        let err = pool
+            .read_block_all_layers(1)
+            .map(|layers| layers.len())
+            .expect_err("an aborted command buffer must not yield block bytes");
+        assert!(
+            err.contains("LayerKVPool::read_block_all_layers"),
+            "error must name the failed submission: {err}"
+        );
+
+        // Still armed, for the same one-shot reason as the write-side test.
+        assert_eq!(
+            pool.read_block_all_layers(1)
+                .map(|layers| layers.len())
+                .expect("the arm must fire exactly once"),
+            LAYERS
+        );
+        drop(armed);
     }
 
     /// FP8 variant of [`base_config`]: `use_fp8_cache = Some(true)` forces
