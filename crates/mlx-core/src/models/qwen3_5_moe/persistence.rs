@@ -1678,10 +1678,10 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     )?;
 
                     // Materialize mmap-backed weights
-                    {
+                    let weights_resident = {
                         let arrays: Vec<&MxArray> = params.values().collect();
-                        crate::array::memory::materialize_weights(&arrays)?;
-                    }
+                        crate::array::memory::materialize_weights(&arrays)?
+                    };
 
                     // Set tokenizer
                     if let Some(tok) = tokenizer {
@@ -1702,32 +1702,45 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
 
                     // Delay physical paged-pool allocation until all text and
                     // vision weights are resident so the live-memory cap sees
-                    // the actual model footprint.
-                    if let Some(ref vparams) = vision_params {
-                        let arrays: Vec<&MxArray> = vparams.values().collect();
-                        crate::array::memory::materialize_weights(&arrays)?;
-                    }
+                    // the actual model footprint. Shadowing the witness (rather
+                    // than reassigning) keeps the cold-tier gate below the LAST
+                    // materialize pass, not merely the first.
+                    let weights_resident = match vision_params.as_ref() {
+                        Some(vparams) => {
+                            let arrays: Vec<&MxArray> = vparams.values().collect();
+                            crate::array::memory::materialize_weights(&arrays)?
+                        }
+                        None => weights_resident,
+                    };
                     inner.initialize_paged_adapter()?;
 
                     // Fail-closed revalidation bracketing the WHOLE
-                    // load-to-fingerprint span, then attach the SSD cold tier.
-                    // The fingerprint (built from the paged pool geometry + GDN
-                    // sidecar geometry, so it needs the adapter that
-                    // `initialize_paged_adapter` just built) reads the shards;
-                    // only if shard identity is provably unchanged across
+                    // load-to-materialize-to-fingerprint span, then attach the
+                    // SSD cold tier. The fingerprint (built from the paged pool
+                    // geometry + GDN sidecar geometry, so it needs the adapter
+                    // that `initialize_paged_adapter` just built) reads the
+                    // shards; only if shard identity is provably unchanged across
                     // [before-mmap .. at-mmap .. after-fingerprint] is the tier
                     // committed, so a mid-load directory swap can never bind OLD
                     // weights to a NEW revision's fingerprint. The MoE context
                     // carries a `ColdSidecarPolicy`, so the restore walk refuses
                     // any boundary a validated GDN sidecar does not back.
-                    if persist_cold && let Some(ctx) = inner.build_cold_tier_context(&model_path) {
+                    //
+                    // Both steps take the `materialize_weights` witness, so the
+                    // ordering that keeps a lazy `pread` from landing after the
+                    // identity read is enforced by the compiler rather than by
+                    // this call order.
+                    if persist_cold
+                        && let Some(ctx) =
+                            inner.build_cold_tier_context(&model_path, &weights_resident)
+                    {
                         let after_fingerprint = snapshot_shard_identities(path);
                         if shard_identities_stable(
                             &shard_snapshot_before_mmap,
                             &shard_snapshot_at_mmap,
                             &after_fingerprint,
                         ) {
-                            inner.attach_cold_tier(ctx);
+                            inner.attach_cold_tier(ctx, &weights_resident);
                         } else {
                             warn!(
                                 "cold-tier persistence disabled for {model_path}: model \

@@ -17,6 +17,8 @@ use mlx_paged_attn::{ColdCacheFingerprint, ColdCacheManager, ColdCacheStats};
 use napi_derive::napi;
 use sha2::{Digest, Sha256};
 
+use crate::array::memory::WeightsResident;
+
 static GLOBAL: OnceLock<Option<Arc<ColdCacheManager>>> = OnceLock::new();
 
 /// Overrides the cold-tier parent directory (primarily for tests). Read
@@ -390,16 +392,17 @@ pub(crate) fn snapshot_shard_identities(dir: &Path) -> Option<HashMap<String, Sh
 /// held fd that backs the loaded arrays (an fd-coupled loader restructure), not
 /// point-in-time stat snapshots.
 ///
-/// A second residual is temporal, not spatial: this bracket closes BEFORE the
-/// weights are materialized. MLX reads shard bytes lazily, at
-/// `array::memory::materialize_weights`, well after `attach_cold_tier` — so a
-/// same-inode in-place shard rewrite in the resulting fingerprint→materialize
-/// window materializes new bytes under the already-attached fingerprint. Unlike
-/// the ABA swap above it need not preserve mtime or be restored, since no
-/// snapshot follows it before materialization. These snapshots bracket the mmap,
-/// not the materialize; only the same fd-coupled fingerprint (hashing the held
-/// fd that backs the loaded arrays) would close this window too, and it stays
-/// out of scope.
+/// The bracket also covers materialization, not just the mmap. MLX reads shard
+/// bytes lazily through a held `O_RDONLY` fd, so a same-inode in-place rewrite
+/// after the identity read used to bind persisted KV to bytes the model never
+/// ran. Every loader now materializes its weights BEFORE building the
+/// fingerprint — enforced by the `WeightsResident` witness
+/// `build_model_fingerprint` demands — so the third snapshot lands after the
+/// bulk `pread`, and a rewrite anywhere in `[before-mmap .. after-fingerprint]`
+/// changes a shard's len or mtime and fails this check closed. The residuals
+/// that remain are the coordinated ABA swap above and the mtime-preserving
+/// same-size swap; both would need the same fd-coupled fingerprint to close and
+/// stay out of scope.
 pub(crate) fn shard_identities_stable(
     before_mmap: &Option<HashMap<String, ShardIdentity>>,
     at_mmap: &Option<HashMap<String, ShardIdentity>>,
@@ -517,23 +520,39 @@ pub(crate) struct ColdTierGeometry {
 /// persistence OFF (fail-safe) rather than persisting under a partial identity
 /// that could collide with another model.
 ///
-/// **Temporal residual (lazy materialization).** This fingerprint is computed —
-/// and the cold tier attached — BEFORE the weights are materialized: MLX reads
-/// shard bytes lazily, at `array::memory::materialize_weights`, after this
-/// returns. A same-inode in-place shard rewrite in that fingerprint→materialize
-/// window therefore materializes NEW bytes under the OLD fingerprint, and —
-/// unlike the mtime-preserving swap guarded above — it need not preserve mtime,
-/// since no identity snapshot follows it before materialization. The loader's
-/// `shard_identities_stable` snapshots bracket the mmap but do NOT prove
-/// continuous identity through materialization. Closing this soundly requires an
-/// fd-coupled fingerprint derived from the same held mapping/fd that backs the
-/// loaded arrays; that is out of scope for v1.
+/// **Ordering contract (lazy materialization).** MLX reads shard bytes lazily:
+/// the loader holds one `O_RDONLY` fd per shard and the bulk bytes arrive at
+/// `array::memory::materialize_weights`. An identity read before that pass
+/// describes bytes a same-inode in-place rewrite can still replace, and — unlike
+/// the mtime-preserving swap guarded above — such a rewrite need not preserve
+/// mtime, because no identity snapshot would follow it. Nothing corrects a wrong
+/// identity later: `cold_cache` compares a stored object's fingerprint against
+/// the ATTACH-TIME value, never a re-derived one.
+///
+/// So this function requires a [`WeightsResident`] witness, which only
+/// `materialize_weights` can mint. Every loader must materialize first, and the
+/// compiler enforces it. A witness that materialized nothing is refused, so an
+/// empty `materialize_weights(&[])` cannot launder the ordering.
 pub(crate) fn build_model_fingerprint(
     model_type: &str,
     model_path: &str,
     config_json: Option<&[u8]>,
     geometry: &ColdTierGeometry,
+    weights: &WeightsResident,
 ) -> Option<ColdCacheFingerprint> {
+    // A zero-coverage witness proves nothing about the shards this identity is
+    // about to read, so fail safe rather than bind KV to unread weights.
+    if weights.bytes() == 0 {
+        tracing::warn!(
+            "cold-tier persistence disabled for {model_path}: the weight-materialization \
+             witness covers {} arrays / {} bytes, so the shard bytes this identity reads \
+             are not provably the bytes the model runs",
+            weights.arrays(),
+            weights.bytes(),
+        );
+        return None;
+    }
+
     let dir = Path::new(model_path);
 
     // Deterministic (sorted) shard enumeration. A missing/unreadable directory
@@ -845,9 +864,27 @@ mod tests {
     /// sizes match — only the weight bytes differ.
     const SHARED_HEADER: &str = r#"{"w":{"dtype":"U8","shape":[4096],"data_offsets":[0,4096]}}"#;
 
+    /// A witness standing in for a real `materialize_weights` pass. Its counts
+    /// only have to be non-zero: `build_model_fingerprint` refuses a witness
+    /// that materialized nothing, and every identity test here is about the
+    /// shard bytes, not the pass size.
+    fn materialized() -> WeightsResident {
+        WeightsResident::for_test(1, 4096)
+    }
+
     fn build(dir: &Path) -> Option<ColdCacheFingerprint> {
+        build_with_witness(dir, &materialized())
+    }
+
+    fn build_with_witness(dir: &Path, weights: &WeightsResident) -> Option<ColdCacheFingerprint> {
         let config = br#"{"model_type":"qwen3","hidden_size":1024}"#;
-        build_model_fingerprint("qwen3", dir.to_str().unwrap(), Some(config), &geometry())
+        build_model_fingerprint(
+            "qwen3",
+            dir.to_str().unwrap(),
+            Some(config),
+            &geometry(),
+            weights,
+        )
     }
 
     /// Pin a shard file's modification time. The cheap manifest path now folds
@@ -1009,6 +1046,29 @@ mod tests {
         assert!(
             build(&dir).is_none(),
             "an unreadable shard must disable persistence, not weaken the fingerprint"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fingerprint_refuses_a_witness_that_materialized_nothing() {
+        // The `WeightsResident` parameter is a compile-time ordering gate: the
+        // identity read must run AFTER the loader's lazy `pread` of the shards.
+        // A bare ZST gate would be launderable — `materialize_weights(&[])?`
+        // above the attach mints a witness while reading nothing — so the
+        // witness carries counts and a zero-coverage one is refused here.
+        let dir = unique_tmp("cold-fp-empty-witness");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_safetensors(&dir.join("model.safetensors"), SHARED_HEADER, &[7u8; 4096]);
+
+        assert!(
+            build_with_witness(&dir, &materialized()).is_some(),
+            "a real materialize pass over this shard must yield a fingerprint"
+        );
+        assert!(
+            build_with_witness(&dir, &WeightsResident::for_test(0, 0)).is_none(),
+            "a witness that materialized nothing proves nothing about these shard \
+             bytes, so persistence must stay off"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

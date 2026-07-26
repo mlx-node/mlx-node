@@ -499,17 +499,69 @@ fn eval_weight_materialize_chunk(
     Ok(())
 }
 
+/// Proof that a [`materialize_weights`] pass has run, carrying what that pass
+/// covered.
+///
+/// The fields are private to this module and there is no public constructor, so
+/// only `materialize_weights` can mint one. A function that takes
+/// `&WeightsResident` therefore cannot be called before the weights have been
+/// read off disk — the compiler rejects it, no source-order convention needed.
+///
+/// The cold tier depends on that ordering. MLX loads safetensors lazily: the
+/// loader opens one `O_RDONLY` fd per shard and the bulk bytes arrive later, at
+/// the `pread` inside this materialize pass. A weight identity computed before
+/// that pass describes bytes an in-place, same-inode shard rewrite can still
+/// replace, and the identity is never re-derived at read time — so persisted KV
+/// would be filed under weights the process never ran.
+///
+/// The counters are part of the proof rather than telemetry: an empty
+/// `materialize_weights(&[])` also mints a witness, so
+/// `cold_tier::build_model_fingerprint` refuses a witness that materialized
+/// nothing. Without that, the ordering gate would be launderable by an empty
+/// call placed above the attach.
+pub struct WeightsResident {
+    arrays: usize,
+    bytes: u64,
+}
+
+impl WeightsResident {
+    /// Number of arrays the materialize pass evaluated.
+    pub fn arrays(&self) -> usize {
+        self.arrays
+    }
+
+    /// Total bytes those arrays occupy.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Forge a witness with chosen counts so tests can drive the callers that
+    /// require one — including the zero-coverage case the fingerprint refuses.
+    #[cfg(test)]
+    pub(crate) fn for_test(arrays: usize, bytes: u64) -> Self {
+        Self { arrays, bytes }
+    }
+}
+
 /// Materialize mmap-backed weight arrays in byte-budgeted chunks.
 ///
 /// A single eval on all weights can cause Metal command buffer timeouts
 /// on large models (e.g. 65GB bf16). This function queries GPU memory
 /// via `max_recommended_working_set_size` and chunks eval calls so each
 /// batch stays within a fraction of available GPU memory.
-pub fn materialize_weights(arrays: &[&super::MxArray]) -> napi::Result<()> {
+///
+/// Returns a [`WeightsResident`] witness describing what was materialized.
+/// Callers that only need the side effect discard it; callers whose
+/// correctness depends on running AFTER the shard bytes are resident take it as
+/// an argument (see [`WeightsResident`]).
+pub fn materialize_weights(arrays: &[&super::MxArray]) -> napi::Result<WeightsResident> {
     use tracing::info;
 
     if arrays.is_empty() {
-        return Ok(());
+        return Ok(WeightsResident {
+            arrays: 0,
+            bytes: 0,
+        });
     }
 
     let start = std::time::Instant::now();
@@ -573,7 +625,10 @@ pub fn materialize_weights(arrays: &[&super::MxArray]) -> napi::Result<()> {
         total_bytes as f64 / (1u64 << 30) as f64,
         elapsed_ms(start),
     ));
-    Ok(())
+    Ok(WeightsResident {
+        arrays: total,
+        bytes: total_bytes as u64,
+    })
 }
 
 /// Check if memory is safe for autograd graph construction
@@ -614,6 +669,52 @@ pub fn check_memory_safety(required_mb: f64) -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The empty pass still mints a witness — nothing was read off disk, so its
+    /// counts must be zero. `cold_tier::build_model_fingerprint` keys its
+    /// fail-safe on exactly this value: without it, an
+    /// `materialize_weights(&[])?` placed above a cold-tier attach would satisfy
+    /// the compile-time ordering gate while materializing nothing.
+    #[test]
+    fn empty_materialize_yields_a_zero_witness() {
+        let witness = materialize_weights(&[]).expect("empty materialize cannot fail");
+        assert_eq!(
+            (witness.arrays(), witness.bytes()),
+            (0, 0),
+            "an empty pass read no shard bytes, so its witness must not claim coverage"
+        );
+    }
+
+    /// The witness has to describe the pass truthfully: a witness that
+    /// under-reports (or reports zero for a real pass) would make the
+    /// fingerprint's fail-safe fire on a healthy load, and one that over-reports
+    /// would let the empty pass through.
+    #[test]
+    fn witness_counts_every_array_and_byte() {
+        use crate::array::{DType, MxArray};
+
+        let arrays = [
+            MxArray::zeros(&[8], Some(DType::Float32)).expect("zeros f32[8]"),
+            MxArray::zeros(&[4, 4], Some(DType::BFloat16)).expect("zeros bf16[4,4]"),
+            MxArray::zeros(&[3], Some(DType::Float32)).expect("zeros f32[3]"),
+        ];
+        let expected_bytes: u64 = arrays.iter().map(|a| a.nbytes() as u64).sum();
+        assert!(expected_bytes > 0, "fixture must hold real bytes");
+
+        let refs: Vec<&MxArray> = arrays.iter().collect();
+        let witness = materialize_weights(&refs).expect("materialize of tiny arrays");
+
+        assert_eq!(
+            witness.arrays(),
+            arrays.len(),
+            "witness must count every array"
+        );
+        assert_eq!(
+            witness.bytes(),
+            expected_bytes,
+            "witness must count every materialized byte"
+        );
+    }
 
     #[test]
     fn parse_chunk_size_returns_default_when_env_unset() {

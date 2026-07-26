@@ -613,34 +613,6 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                         path,
                     ));
                     inner.set_tokenizer(Arc::new(tokenizer.clone()));
-                    if persist_cold {
-                        // Fail-closed revalidation bracketing the WHOLE
-                        // load-to-fingerprint span. Compute the content
-                        // fingerprint FIRST (this reads the shards from disk),
-                        // then re-stat and require shard identity to be
-                        // unchanged across [before-mmap .. at-mmap .. after the
-                        // fingerprint read]. Only then attach the cold tier: any
-                        // change at any checkpoint — or an unreadable shard —
-                        // means the fingerprint could describe a different
-                        // revision than the weights the mmap actually loaded, so
-                        // leave persistence off.
-                        if let Some(ctx) = inner.build_cold_tier_context(&model_path) {
-                            let after_fingerprint = snapshot_shard_identities(path);
-                            if shard_identities_stable(
-                                &shard_snapshot_before_mmap,
-                                &shard_snapshot_at_mmap,
-                                &after_fingerprint,
-                            ) {
-                                inner.attach_cold_tier(ctx);
-                            } else {
-                                tracing::warn!(
-                                    "cold-tier persistence disabled for {model_path}: model \
-                                     directory changed during load (shard identity mismatch); \
-                                     KV persistence stays off for safety"
-                                );
-                            }
-                        }
-                    }
 
                     // Load parameters into inner
                     let num_layers = config.num_layers as usize;
@@ -727,9 +699,48 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                     }
 
                     // Materialize all mmap-backed weight arrays
-                    {
+                    let weights_resident = {
                         let arrays: Vec<&MxArray> = mapped_params.values().collect();
-                        crate::array::memory::materialize_weights(&arrays)?;
+                        crate::array::memory::materialize_weights(&arrays)?
+                    };
+
+                    if persist_cold {
+                        // Fail-closed revalidation bracketing the WHOLE
+                        // load-to-materialize-to-fingerprint span. Compute the
+                        // content fingerprint FIRST (this reads the shards from
+                        // disk), then re-stat and require shard identity to be
+                        // unchanged across [before-mmap .. at-mmap .. after the
+                        // fingerprint read]. Only then attach the cold tier: any
+                        // change at any checkpoint — or an unreadable shard —
+                        // means the fingerprint could describe a different
+                        // revision than the weights the mmap actually loaded, so
+                        // leave persistence off.
+                        //
+                        // Both steps sit BELOW `materialize_weights` and take its
+                        // `WeightsResident` witness. MLX preads shard bytes
+                        // lazily through a held fd, so an identity read above
+                        // that pass would leave a window in which a same-inode
+                        // in-place rewrite binds persisted KV to bytes this
+                        // process never ran — and nothing re-derives the identity
+                        // at read time.
+                        if let Some(ctx) =
+                            inner.build_cold_tier_context(&model_path, &weights_resident)
+                        {
+                            let after_fingerprint = snapshot_shard_identities(path);
+                            if shard_identities_stable(
+                                &shard_snapshot_before_mmap,
+                                &shard_snapshot_at_mmap,
+                                &after_fingerprint,
+                            ) {
+                                inner.attach_cold_tier(ctx, &weights_resident);
+                            } else {
+                                tracing::warn!(
+                                    "cold-tier persistence disabled for {model_path}: model \
+                                     directory changed during load (shard identity mismatch); \
+                                     KV persistence stays off for safety"
+                                );
+                            }
+                        }
                     }
 
                     // Deterministic weight-byte total for the cache-limit

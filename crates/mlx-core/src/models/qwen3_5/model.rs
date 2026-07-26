@@ -1384,9 +1384,14 @@ impl Qwen35Inner {
     /// Returns `None` (fail-open) when the paged adapter is absent, the tier
     /// cannot be opened, this checkpoint has no GDN state to persist, or a
     /// complete content fingerprint cannot be established.
+    ///
+    /// The `weights` witness pins this call after the loader's
+    /// `materialize_weights` pass: MLX preads shard bytes lazily, so an identity
+    /// read before that pass can describe bytes the model never runs.
     pub(crate) fn build_cold_tier_context(
         &self,
         model_path: &str,
+        weights: &crate::array::memory::WeightsResident,
     ) -> Option<crate::transformer::paged_kv_cache_adapter::ColdTierContext> {
         let adapter = self.paged_adapter.as_ref()?;
         let manager = crate::cold_tier::global_cold_cache()?;
@@ -1411,6 +1416,7 @@ impl Qwen35Inner {
             model_path,
             Some(&config_json),
             &pool_geometry,
+            weights,
         ) {
             Some(fingerprint) => Some(
                 crate::transformer::paged_kv_cache_adapter::ColdTierContext {
@@ -1434,9 +1440,14 @@ impl Qwen35Inner {
     /// [`Self::build_cold_tier_context`] so the caller can verify shard
     /// identity is still stable AFTER the fingerprint read and BEFORE the cold
     /// tier is committed.
+    ///
+    /// Takes the same `materialize_weights` witness as the build step so the
+    /// COMMIT point, not just the identity read, is compiler-pinned below
+    /// materialization.
     pub(crate) fn attach_cold_tier(
         &mut self,
         ctx: crate::transformer::paged_kv_cache_adapter::ColdTierContext,
+        _weights: &crate::array::memory::WeightsResident,
     ) {
         if let Some(adapter) = self.paged_adapter.as_mut() {
             adapter.set_cold_tier(ctx);
