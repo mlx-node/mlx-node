@@ -336,7 +336,7 @@ export function GradientDescent() {
   const ariaLabel = copy.ariaLabel(w, steps, lVal, gVal, lr, outOfBowl);
 
   return (
-    <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
+    <div className="@container not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.title}</div>
         <div className="text-[11px] text-muted-foreground">
@@ -344,7 +344,17 @@ export function GradientDescent() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+      {/*
+        `@2xl`, not `md:` — and the `@container` that answers it is on the shell
+        div above. This widget renders in chapters that have a live right-hand
+        pane, so its column is 425px wide even at a 1280px viewport: a VIEWPORT
+        breakpoint says "wide" while the CONTAINER is not. With `md:` the
+        220px-min controls took 232px and squeezed the plot to 181px — viewBox
+        540 at scale 0.335, every axis label at 3.0 CSS px. `@2xl` (42rem) is
+        measured against the shell, so the two columns split only when the
+        column itself has room for them.
+      */}
+      <div className="grid grid-cols-1 gap-3 @2xl:grid-cols-[minmax(0,1fr)_auto]">
         {/* ---- The loss bowl ---- */}
         <svg
           role="img"

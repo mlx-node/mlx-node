@@ -26,24 +26,40 @@ import type { StepPlayer } from './use-step-player';
  *   #4  less card chrome      — `DiagramFrame` drops the shell's border/fill/
  *                               radius (CPE:249) in ONE place, not 79.
  *
- * CANVAS WIDTH (#3, unenforceable so it lives in prose). MEASURE FIRST — this
- * is the rule the first pilot got wrong and only a live measurement caught:
+ * CANVAS WIDTH (#3, unenforceable so it lives in prose). MEASURE FIRST — the
+ * first pilot got this wrong twice, and only a live measurement caught either:
  *
- *   a viewBox unit is NOT a CSS pixel. Every diagram is `className="w-full"`, so
- *   the on-screen size of `text-[10px]` is 10 x (columnWidth / VB_W). The
- *   chapter reading column measures 451px at a 1280px viewport (three-column
- *   LessonLayout, `lg:grid-cols-[220px_minmax(0,1fr)_minmax(0,1fr)]`).
+ *   A viewBox unit is NOT a CSS pixel. Every diagram is `className="w-full"`, so
+ *   the on-screen size of `text-[10px]` is 10 x (columnWidth / VB_W). Set VB_W
+ *   so that ratio lands near 1 and the type sizes in this module mean what they
+ *   say. At scale 0.64 a `CHIP_FONT = 10` chip renders at 6.4 CSS px, which is
+ *   not a small label — it is an unreadable one.
  *
- *   So: KEEP VB_W NEAR 460. At 460 the scale is ~0.98 and the type sizes in this
- *   module mean what they say. At VB_W = 700 the same `CHIP_FONT = 10` renders
- *   at 6.4 CSS px, which is not a small label — it is an unreadable one.
+ *   THERE IS NO SINGLE COURSE-WIDE COLUMN WIDTH. Measured live at a 1280px
+ *   viewport, `document.querySelector('svg').getBoundingClientRect().width`:
  *
- * "Airier" is therefore bought with LAYOUT, never with canvas width: wider
- * gutters and gaps inside a ~460-wide box, and the vertical space that #2 frees
- * by lifting titles out of the boxes. A tall diagram is fine — the column is
- * narrow, so a vertical stack SHOULD come out taller than 16:9. There is no
- * `CANVAS` export because the height is the widget's own business and a wrong
- * shared default is worse than none.
+ *     chapter WITH a live right-hand pane   451px   /chapters/training
+ *     chapter WITHOUT one                   742px   /chapters/kv-cache/batching
+ *
+ *   The pane is what halves it (`LessonLayout`'s
+ *   `lg:grid-cols-[220px_minmax(0,1fr)_minmax(0,1fr)]`), so the number depends
+ *   on which chapter mounts the widget, not on the viewport. Look up where the
+ *   widget is actually rendered, measure that page, then pick VB_W. 460 is
+ *   right for a paned chapter and 1.6x too small for an unpaned one.
+ *
+ *   The same arithmetic is worth running on any widget you touch, not just the
+ *   one you are restyling: `GradientDescent.tsx:347` breaks its controls out at
+ *   `md:` (a VIEWPORT query) inside a 425px CONTAINER, so on /chapters/training
+ *   the plot is squeezed to 181px — scale 0.335, axis labels at 3.0 CSS px.
+ *   Viewport breakpoints cannot express "how wide is my column"; use Tailwind
+ *   v4's `@container` for that.
+ *
+ * "Airier" is therefore bought with LAYOUT, never by inflating VB_W past the
+ * column: wider gutters and gaps, plus the vertical space that #2 frees by
+ * lifting titles out of the boxes. A tall diagram is fine — in a paned chapter
+ * the column is narrow, so a vertical stack SHOULD come out taller than 16:9.
+ * There is no `CANVAS` export because the height is the widget's own business
+ * and a wrong shared default is worse than none.
  *
  * WHAT IS NOT HERE, ON PURPOSE:
  *   - Geometry. `P_*`, `F_*`, `K_*` and friends encode ONE diagram's layout.
