@@ -710,4 +710,96 @@ mod tests {
             base
         );
     }
+
+    /// GDN geometry of `Qwen3.6-27B` verbatim from its `config.json`
+    /// (`~/.mlx-node/models/qwen3.6-27b`). Only the fields the sidecar sizes
+    /// itself from are real; the rest are placeholders.
+    fn qwen3_6_27b_config() -> Qwen3_5Config {
+        Qwen3_5Config {
+            num_layers: 64,
+            full_attention_interval: 4,
+            linear_conv_kernel_dim: 4,
+            linear_num_key_heads: 16,
+            linear_key_head_dim: 128,
+            linear_num_value_heads: 48,
+            linear_value_head_dim: 128,
+            ..config()
+        }
+    }
+
+    /// Bytes one resident GDN checkpoint costs, sized by the same code that
+    /// sizes the on-disk sidecar. `GDN_PREFIX_CHECKPOINT_LIMIT` and the
+    /// checkpoint ladder are both bounded against this number, so it is pinned
+    /// here rather than quoted from a comment.
+    #[test]
+    fn one_gdn_checkpoint_of_the_27b_costs_a_known_number_of_bytes() {
+        let geo = geometry(&qwen3_6_27b_config(), "BFloat16").expect("geometry");
+        assert_eq!(geo.gdn_layers, 48);
+        // conv `[1, 3, 10240]` + recurrent `[1, 48, 128, 128]`, bf16.
+        assert_eq!(geo.conv_elements(), Some(30_720));
+        assert_eq!(geo.recurrent_elements(), Some(786_432));
+        assert_eq!(geo.bytes_per_tensor(), Some(1_634_304));
+
+        let layout = layout_at(&geo, 4096);
+        let per_checkpoint = layout.bytes_per_tensor * layout.num_layers as usize;
+        assert_eq!(per_checkpoint, 78_446_592);
+    }
+
+    /// The figure above is a shape calculation. This checks it against what the
+    /// MLX allocator actually reserves for the same arrays. Ignored by default:
+    /// it allocates ~75 MiB on the GPU and needs a Metal device.
+    #[test]
+    #[ignore = "allocates ~75 MiB of Metal buffers; run with --ignored"]
+    fn a_27b_gdn_checkpoint_allocates_the_bytes_its_layout_claims() {
+        use crate::array::{DType, MxArray, get_active_memory};
+
+        let geo = geometry(&qwen3_6_27b_config(), "BFloat16").expect("geometry");
+        let layout = layout_at(&geo, 4096);
+        let claimed = layout.bytes_per_tensor * layout.num_layers as usize;
+
+        // Warm the allocator so the delta measures the checkpoint only.
+        let warmup = MxArray::zeros(&[1024], Some(DType::BFloat16)).expect("warmup");
+        warmup.eval();
+        drop(warmup);
+        let before = get_active_memory();
+
+        let mut checkpoint = Vec::new();
+        for _ in 0..geo.gdn_layers {
+            let conv = MxArray::zeros(
+                &[1, i64::from(geo.conv_rows), i64::from(geo.conv_dim)],
+                Some(DType::BFloat16),
+            )
+            .expect("conv state");
+            let recurrent = MxArray::zeros(
+                &[
+                    1,
+                    i64::from(geo.num_v_heads),
+                    i64::from(geo.v_head_dim),
+                    i64::from(geo.k_head_dim),
+                ],
+                Some(DType::BFloat16),
+            )
+            .expect("recurrent state");
+            conv.eval();
+            recurrent.eval();
+            checkpoint.push((conv, recurrent));
+        }
+        let resident = get_active_memory() - before;
+        drop(checkpoint);
+
+        // The allocator rounds up, so it may reserve more than the shapes ask
+        // for, but never less.
+        assert!(
+            resident >= claimed as f64,
+            "resident {resident} < claimed {claimed}"
+        );
+        assert!(
+            resident < claimed as f64 * 1.25,
+            "resident {resident} is more than 25% above claimed {claimed}"
+        );
+        println!(
+            "one 27B GDN checkpoint: claimed {claimed} B, resident {resident} B ({:.2} MiB)",
+            resident / 1024.0 / 1024.0
+        );
+    }
 }

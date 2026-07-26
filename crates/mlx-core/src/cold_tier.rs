@@ -10,6 +10,7 @@ use std::fs;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use mlx_paged_attn::{ColdCacheFingerprint, ColdCacheManager, ColdCacheStats};
@@ -59,6 +60,153 @@ fn open_managed_cold_cache(parent: &Path) -> Option<Arc<ColdCacheManager>> {
 /// never forces the tier open.
 pub fn cold_cache_stats_snapshot() -> Option<ColdCacheStats> {
     GLOBAL.get()?.as_ref().map(|manager| manager.stats())
+}
+
+/// Sidecar-write accounting for the recurrent/sliding state that lives
+/// OUTSIDE the paged K/V pool.
+///
+/// `ColdCacheStats` counts block writes and cannot distinguish them from
+/// sidecar writes, and a turn that returns before `enqueue_sidecar` is
+/// invisible there entirely. Without these a family whose sidecar is never
+/// written looks exactly like a family that needs no sidecar: both report clean
+/// block traffic and a restore that quietly reuses nothing.
+///
+/// These belong in `ColdCacheStats` alongside the block counters the dashboard
+/// and the parity harness already read — a manager is in hand at every record
+/// site, so nothing here needs to outlive it. They live in this crate only
+/// because `ColdCacheStats` is defined in `mlx-paged-attn`, which this change
+/// may not touch. The cost of that split is real and unfixed here: the counts
+/// are per-process, so a host running several sessions cannot attribute a skip
+/// to one of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ColdSidecarTelemetry {
+    /// Turns that reached a family's sidecar capture at all. Every other counter
+    /// here is a sub-count of this one, so it is what separates "the capture ran
+    /// and declined" from "the turn's finalize path never calls the capture" —
+    /// the exact confusion a planned-MTP turn produced while its manual finalize
+    /// had no capture hook.
+    pub capture_reached: u64,
+    /// Turns whose persisted K/V chain covered no whole block of the request,
+    /// so there was no prefix to anchor recurrent state under at all.
+    pub chain_empty: u64,
+    /// Turns whose chain did cover blocks, but where no retained in-memory
+    /// checkpoint sat at or below its reach.
+    pub boundary_skips: u64,
+    /// Turns that selected a boundary but found that exact chain already on
+    /// disk, so nothing was written and nothing needed to be.
+    ///
+    /// Its own counter rather than silence, because silence made a HEALTHY run
+    /// wear the signature of a broken one. The steady state of a repeated
+    /// prompt is: the first turn that can reach a rung enqueues it, and every
+    /// later turn re-selects the SAME rung and dedups here. A window that
+    /// starts after that first turn therefore sees `enqueued == 0` while the
+    /// per-turn shallow boundaries it could not reach still count as
+    /// `boundary_skips`, which is bit-for-bit the "the ladder collapsed to its
+    /// deepest rung" signature the parity harness triages on. Only this
+    /// counter tells the two apart.
+    pub already_persisted: u64,
+    /// Sidecars handed to the bounded writer queue.
+    pub enqueued: u64,
+    /// Sidecars the bounded writer queue refused because it was full.
+    pub queue_drops: u64,
+}
+
+/// The counters behind [`ColdSidecarTelemetry`].
+///
+/// A type rather than loose statics so a test can exercise a fresh, isolated
+/// instance and assert exact deltas — the only assertion that catches a
+/// recorder wired to the wrong field.
+#[derive(Debug, Default)]
+pub struct ColdSidecarCounters {
+    capture_reached: AtomicU64,
+    chain_empty: AtomicU64,
+    boundary_skips: AtomicU64,
+    already_persisted: AtomicU64,
+    enqueued: AtomicU64,
+    queue_drops: AtomicU64,
+}
+
+impl ColdSidecarCounters {
+    const fn new() -> Self {
+        Self {
+            capture_reached: AtomicU64::new(0),
+            chain_empty: AtomicU64::new(0),
+            boundary_skips: AtomicU64::new(0),
+            already_persisted: AtomicU64::new(0),
+            enqueued: AtomicU64::new(0),
+            queue_drops: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a turn that entered a family's sidecar capture. Recorded first
+    /// thing in the capture, before any of its skip arms.
+    pub fn record_capture_reached(&self) {
+        self.capture_reached.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a turn whose persisted K/V chain covered no whole block.
+    pub fn record_chain_empty(&self) {
+        self.chain_empty.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a turn whose sidecar capture found no usable boundary under the
+    /// chain's reach.
+    pub fn record_boundary_skip(&self) {
+        self.boundary_skips.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a turn whose selected chain was already on disk.
+    pub fn record_already_persisted(&self) {
+        self.already_persisted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a sidecar the writer queue accepted.
+    pub fn record_enqueued(&self) {
+        self.enqueued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a sidecar the writer queue refused because it was full.
+    pub fn record_queue_drop(&self) {
+        self.queue_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> ColdSidecarTelemetry {
+        let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
+        ColdSidecarTelemetry {
+            capture_reached: load(&self.capture_reached),
+            chain_empty: load(&self.chain_empty),
+            boundary_skips: load(&self.boundary_skips),
+            already_persisted: load(&self.already_persisted),
+            enqueued: load(&self.enqueued),
+            queue_drops: load(&self.queue_drops),
+        }
+    }
+}
+
+static SIDECAR_COUNTERS: ColdSidecarCounters = ColdSidecarCounters::new();
+
+/// The counters the capture paths record into.
+pub fn cold_sidecar_counters() -> &'static ColdSidecarCounters {
+    &SIDECAR_COUNTERS
+}
+
+/// Process-wide sidecar counters. Unlike `cold_cache_stats_snapshot` these read
+/// without forcing the tier open.
+pub fn cold_sidecar_telemetry() -> ColdSidecarTelemetry {
+    SIDECAR_COUNTERS.snapshot()
+}
+
+/// Serializes tests that assert on a DELTA of the process-wide counters.
+///
+/// `SIDECAR_COUNTERS` is one static shared by every test thread, and cargo runs
+/// tests in parallel. Two tests that each assert "my call moved this counter by
+/// exactly one" can both be correct and still fail, or worse pass while a bug
+/// hides in the other's increment. Every test that reads a global delta holds
+/// this for the whole read-act-read window.
+#[cfg(test)]
+pub(crate) fn sidecar_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Model families whose paged prefix blocks can be restored from the SSD
@@ -1240,5 +1388,96 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Each recorder must move its own counter and ONLY its own. Run against a
+    /// fresh instance, so every count starts at zero and the whole snapshot can
+    /// be compared exactly — a recorder wired to the wrong field, or bumping
+    /// two at once, changes a field this asserts on.
+    #[test]
+    fn each_sidecar_recorder_moves_only_its_own_counter() {
+        let counters = ColdSidecarCounters::default();
+        assert_eq!(counters.snapshot(), ColdSidecarTelemetry::default());
+
+        counters.record_capture_reached();
+        assert_eq!(
+            counters.snapshot(),
+            ColdSidecarTelemetry {
+                capture_reached: 1,
+                ..Default::default()
+            }
+        );
+
+        counters.record_chain_empty();
+        assert_eq!(
+            counters.snapshot(),
+            ColdSidecarTelemetry {
+                capture_reached: 1,
+                chain_empty: 1,
+                ..Default::default()
+            }
+        );
+
+        counters.record_boundary_skip();
+        assert_eq!(
+            counters.snapshot(),
+            ColdSidecarTelemetry {
+                capture_reached: 1,
+                chain_empty: 1,
+                boundary_skips: 1,
+                ..Default::default()
+            }
+        );
+
+        counters.record_already_persisted();
+        assert_eq!(
+            counters.snapshot(),
+            ColdSidecarTelemetry {
+                capture_reached: 1,
+                chain_empty: 1,
+                boundary_skips: 1,
+                already_persisted: 1,
+                ..Default::default()
+            }
+        );
+
+        counters.record_enqueued();
+        assert_eq!(
+            counters.snapshot(),
+            ColdSidecarTelemetry {
+                capture_reached: 1,
+                chain_empty: 1,
+                boundary_skips: 1,
+                already_persisted: 1,
+                enqueued: 1,
+                ..Default::default()
+            }
+        );
+
+        counters.record_queue_drop();
+        assert_eq!(
+            counters.snapshot(),
+            ColdSidecarTelemetry {
+                capture_reached: 1,
+                chain_empty: 1,
+                boundary_skips: 1,
+                already_persisted: 1,
+                enqueued: 1,
+                queue_drops: 1,
+            }
+        );
+    }
+
+    /// The process-wide instance the capture paths actually record into is the
+    /// same type, so a call through the free function lands in the same field.
+    #[test]
+    fn the_process_wide_counters_are_the_ones_the_capture_paths_record_into() {
+        let _serialized = sidecar_counter_test_lock();
+        let before = cold_sidecar_telemetry();
+        cold_sidecar_counters().record_boundary_skip();
+        cold_sidecar_counters().record_capture_reached();
+        let after = cold_sidecar_telemetry();
+        assert_eq!(after.boundary_skips, before.boundary_skips + 1);
+        assert_eq!(after.capture_reached, before.capture_reached + 1);
     }
 }

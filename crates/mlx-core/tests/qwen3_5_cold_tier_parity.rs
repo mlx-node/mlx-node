@@ -24,14 +24,69 @@
 //! # Why warm-up turns
 //!
 //! Unlike gemma4's sliding sidecar (representable only at a whole 1024-token
-//! window), the GDN sidecar sits at a SINGLE `gdn_checkpoint_target` boundary —
-//! the largest full block strictly before the end of the prompt, a handful of
-//! blocks for `DEFAULT_PROMPT`. But `ColdTierWalk::capture_chain` still stops at
-//! the first block the bounded writer queue refuses, so one turn persists only
-//! the first handful of K/V blocks. The GDN sidecar is only WRITTEN once the
-//! persisted K/V chain reaches its boundary (`cold_captured_blocks`), so a few
-//! warm-up turns deepen the chain past it. Blocks already on disk are skipped
-//! without re-enqueueing, so the frontier advances every turn.
+//! window), the GDN sidecar may sit at any rung of the prefill's checkpoint
+//! ladder (`gdn_prefill_checkpoint_boundaries`): the deepest rung is
+//! `gdn_checkpoint_target` — the largest full block strictly before the end of
+//! the prompt — and each shallower rung is a block-aligned quarter of the one
+//! above it. But `ColdTierWalk::capture_chain` still stops at the first block
+//! the bounded writer queue refuses, so one turn persists only the first
+//! handful of K/V blocks. A sidecar is only WRITTEN at the deepest rung the
+//! persisted K/V chain already covers (`cold_captured_blocks`), so a few
+//! warm-up turns deepen the chain until a rung qualifies. Blocks already on
+//! disk are skipped without re-enqueueing, so the frontier advances every turn.
+//!
+//! # Why the capture and restore prompts differ
+//!
+//! Everything above is about a LADDER, but a gate whose three instances all run
+//! a ~90-token prompt cannot see one. At 90 tokens the ladder is `[16, 80]` and
+//! one warm-up turn's chain reach (~8 blocks = 128 tokens) already covers the
+//! deepest rung, so the restore always anchors at the prompt's end — the
+//! shallow rungs are never exercised and collapsing the ladder to a single
+//! endpoint boundary leaves such a gate green.
+//!
+//! So this fixture uses `harness::ladder_capture_prompt` / `ladder_restore_prompt`:
+//! a long shared body and then a diverging tail. Two things follow.
+//! The capture prompt's deepest rung sits far past what a bounded writer queue
+//! drains in a few turns. And the divergence caps `kv_chain_upper_bound` —
+//! which walks the block chain and breaks at the first key not on disk — well
+//! below that rung, whatever the machine's I/O did. The restore therefore MUST
+//! land on a shallower rung, which is what `harness`'s assertion 1b checks.
+//!
+//! Observed on `qwen3.5-0.8b-mlx-bf16`:
+//!
+//! ```text
+//! capture prompt 1259 tok -> ladder [16, 64, 304, 1248]   (deepest = 78 blocks)
+//! warm-up 1 cached=0     warm-up 2 cached=64     instance 1 cached=64
+//! instance 2 (restart)   cached=304   <-- rung 3 of 4, strictly below 1248
+//! sidecar telemetry      boundary_skips=0 already_persisted=1 enqueued=1
+//! ```
+//!
+//! `already_persisted=1` alongside `enqueued=1` is the healthy steady state,
+//! not a miss: one turn wrote rung 304 and the next re-selected the same chain
+//! and deduped. It has its own counter precisely so that `enqueued=0` in a
+//! later window cannot be misread as a collapsed ladder.
+//!
+//! Honest limit: this kills a ladder collapsed to ONE rung. It does not kill a
+//! collapse to two (`[304, 1248]` still restores at 304), and it does not kill
+//! a RATIO change either: 4 = 2^2, so halving the spacing produces a ladder
+//! that still contains the rung a ~24-block chain would have anchored on
+//! anyway. The claim being gated is "a rung strictly below the prompt end
+//! exists and is used", not "there are exactly four, spaced by four".
+//!
+//! Neither gap is left open. Both are pinned by exact rung VALUES in
+//! `qwen3_5::paged_forward::gdn_checkpoint_tests::ladder_rungs_are_quarters_of_the_one_above`
+//! — model-free, milliseconds, and it fails on every ratio and rung-count
+//! mutation. That is the right division of labour: a multi-minute
+//! three-model-load gate should prove the thing only real weights can prove
+//! (that a shallow rung is genuinely WRITTEN, found, decoded and restored
+//! across a process boundary), and arithmetic should be pinned by arithmetic.
+//!
+//! One consequence worth stating plainly: when the ladder collapses to one
+//! rung, the failure here is NOT "the restore picked the wrong rung". Nothing
+//! is written at all, so instance 2 restores zero and the harness's assertion 1
+//! fires — a message about the restore path, for a defect in the prefill. The
+//! harness prints the computed ladder and the sidecar telemetry BEFORE that
+//! assertion for exactly this reason.
 //!
 //! Gated on `MLX_TEST_MODEL_PATH`. The tier manager is a process-global
 //! `OnceLock`, so this must be the only thing in the process touching it —
@@ -55,12 +110,16 @@ async fn qwen3_5_cold_tier_restart_parity() {
     harness::run_restart_parity(
         harness::ColdTierParitySpec::new("qwen3_5")
             // The pool covers only the full-attention layers, so this is ample
-            // for `DEFAULT_PROMPT` plus a short decode tail.
-            .with_pool_memory_mb(512)
-            // Deepen the persisted K/V chain past the GDN sidecar's
-            // `gdn_checkpoint_target` boundary (a few blocks for this prompt)
-            // before the measured restore. See the module doc.
-            .with_capture_warmup_turns(3),
+            // for two ~1260-token prompts plus a short decode tail. Raised from
+            // 512 with the prompt: a pool-pressure eviction of the shallow
+            // sidecar this gate depends on would read as a restore failure.
+            .with_pool_memory_mb(1024)
+            .with_prompt(harness::ladder_capture_prompt())
+            .with_restore_prompt(harness::ladder_restore_prompt())
+            // Two turns put the persisted chain past a mid ladder rung. Fewer
+            // than the three the short prompt needed, because the chain no
+            // longer has to reach the prompt's own end — only a shallow rung.
+            .with_capture_warmup_turns(2),
         |model_dir, messages, config| async move {
             // Loaded fresh per instance and dropped when this future
             // completes, so instance 2 really starts from an empty hot cache.

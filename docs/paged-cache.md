@@ -155,27 +155,86 @@ and skips rather than mislabel.
 Unlike a sliding window, a GDN recurrent state is a running summary of **every**
 preceding token (vLLM `MambaSpec`), so it is valid ONLY at the exact block-aligned
 prefix length it was produced at — the `ColdSidecarPolicy` reconciles the restore
-down to the deepest such boundary a validated sidecar backs, or to zero. The boundary
-is the `gdn_checkpoint_target` (the largest full block strictly before the end of the
-prompt), and the recurrent state is only materialized there when the prefill **splits**
-at that offset. So when a GDN cold policy is attached, `paged_prefill` forces that one
-split even under the default single-shot chunk size
-(`Qwen35Inner::cold_gdn_prefill_chunk_size`).
+down to the deepest such boundary a validated sidecar backs, or to zero.
 
-Be precise about what that split costs. It is **mathematically equivalent, not
+A prefill publishes a **ladder** of such boundaries, not one
+(`gdn_prefill_checkpoint_boundaries`, `GDN_CHECKPOINT_LADDER_RUNGS = 4`,
+`GDN_CHECKPOINT_LADDER_RATIO = 4`). The deepest rung is the `gdn_checkpoint_target`
+(the largest full block strictly before the end of the prompt); each shallower rung is
+a block-aligned quarter of the one above, and the ladder stops after four rungs or
+when the next would fall to zero or below what is already cached. A 1400-token prompt
+at `block_size` 16 therefore publishes `[16, 80, 336, 1392]`. The recurrent state is
+only materialized at a rung when the prefill **splits** there, so when a GDN cold
+policy is attached `paged_prefill` forces a split at **every** rung it crosses, even
+under the default single-shot chunk size (`Qwen35Inner::cold_gdn_prefill_chunk_size`).
+
+Why a ladder rather than the single endpoint boundary: capture may only anchor a
+sidecar where the persisted K/V chain already reaches, and that chain advances by one
+bounded writer queue's worth of blocks per turn (~8 blocks). A single endpoint rung
+needs the chain to reach the prompt's own end, which on a long prompt takes tens of
+turns; the ladder needs it to reach only a quarter of the deepest rung.
+
+Be precise about what those splits cost. They are **mathematically equivalent, not
 bit-identical**: every attention query still attends over the whole cumulative range,
-but the GDN scan runs as two launches instead of one, so the running state takes an
-extra bf16 round trip at the boundary and the reduction order changes. That is the
-same tradeoff vLLM mandates for `mamba_cache_mode == "align"`, which hard-requires
+but the GDN scan runs as one launch per rung crossed plus one, so the running state
+takes an extra bf16 round trip at each boundary and the reduction order changes. The
+chunk length is also the GEMM's `M`, so kernel selection can change with it. That is
+the same tradeoff vLLM mandates for `mamba_cache_mode == "align"`, which hard-requires
 chunked prefill (`model_executor/models/config.py`) and is the regime Qwen3-Next runs
-in — so it is the reference design rather than an invention. It does mean the split is
-taken as soon as a policy is attached, i.e. on the FIRST persist-enabled run, before
-anything has ever been restored. The restart-parity gate matched persist-on against
-the persist-off baseline byte-for-byte on the gated checkpoints, which **bounds** the
-divergence rather than proving it is absent at every prompt length.
+in — so it is the reference design rather than an invention. It does mean the splits
+are taken as soon as a policy is attached, i.e. on the FIRST persist-enabled run,
+before anything has ever been restored. The restart-parity gate matched persist-on
+against the persist-off baseline byte-for-byte on the gated checkpoints, which
+**bounds** the divergence rather than proving it is absent at every prompt length —
+and that remains exactly as true of the longer, up-to-four-split fixture the gate now
+runs.
 
 Capture is text-only in v1 and never anchors deeper than the K/V chain actually
-reached (`cold_captured_blocks`).
+reached (`cold_captured_blocks`). Within that reach it anchors at the **deepest ladder
+rung**, so an early turn anchors shallow and later turns move the anchor down the
+ladder as the chain's frontier advances. One sidecar per turn.
+
+Only turn 1 publishes a full ladder. `gdn_prefill_checkpoint_boundaries` drops every
+rung at or below `cached_prefix_len`, because this prefill never crosses those token
+positions — `(4096, cached = 1008, block 16)` yields `[4080]` alone. So the shallow
+rungs a later capture anchors on exist **only as residue from an earlier turn**, and
+retention decides whether a warm conversation can still write a sidecar at all.
+
+`gdn_checkpoint_store::prune_gdn_checkpoints` enforces two caps against that:
+`GDN_PREFIX_CHECKPOINTS_PER_OWNER = 4` (the ladder width) per owner, and
+`GDN_PREFIX_CHECKPOINT_LIMIT = 5` overall (one root session plus four concurrent pi
+subagents). Prune runs after **every** rung push, not once per ladder, so a store
+already at the global cap sees a ladder arrive one rung at a time. Judged on
+redundancy alone the newest rung's own predecessor is always the most redundant entry
+present, so the global loop searches for a victim among every owner **except the one
+publishing** first — otherwise the ladder eats itself down to the single endpoint rung
+it exists to replace. The global cap is `GDN_PREFIX_CHECKPOINT_LIMIT` only when the
+root owner was named explicitly, which today means `mlx agent`; every other caller
+leaves the root implicit and gets the tighter `GDN_PREFIX_CHECKPOINTS_PER_OWNER = 4`,
+which is one publisher's whole ladder — on that path `set_cache_owner_id` re-points the
+root at the active owner every turn, so there is normally only one owner anyway.
+
+Be exact about who survives that, because the guarantee is narrower than "the
+publisher is protected". Preferring a foreign victim is a *preference*, not a floor:
+the search only ever considers entries whose owner keeps something afterwards, so when
+no other owner holds a spare rung — four siblings with one checkpoint each, exactly the
+shape five slots was sized for — it finds nothing and the publisher's own ladder
+collapses to its endpoint rung anyway, and that turn's cold capture misses.
+`four_single_entry_siblings_outlive_the_publishers_ladder` pins that. The root, in
+turn, keeps only its **last** checkpoint: the redundancy search carries no root guard,
+so while the root holds more than one rung its ladder is the *preferred* victim
+(`one_subagent_turn_strips_the_root_to_its_deepest_rung`).
+
+What the ordering cannot do is take an owner's warm reuse away. The only arm that
+empties an owner runs after the redundancy search over *every* owner comes back empty,
+which means one entry per owner and still over cap — strictly more live owners than
+slots. Below that point nobody goes blind under either order
+(`one_subagent_turn_leaves_every_sibling_a_checkpoint`), and the measured hot-path cost
+of the preference is zero: identical replayed prefix tokens and identical blind turns
+in all 108 cells of `retention_sim::the_publisher_arm_never_costs_hot_path_replay`.
+Past that point — six live owners in five slots — 28 of 40 agent turns re-forward their
+whole cached prefix, under either order. That cliff is the count bound, not the victim
+search, and moving it is a memory decision at ~75 MiB per slot.
 
 `qwen3_5_moe` shares the identical GDN state type, sidecar module, and capture/replay
 helpers, driven through `Qwen3_5MoeConfig::to_dense_config()`. That projection is safe
@@ -193,6 +252,40 @@ passes on a real checkpoint. The harness runs three instances — persist/captur
 fresh-instance restore, persist-off baseline — and asserts byte-identical `text`,
 equal `num_tokens`, `hits > 0`, and `corruptions == 0` (so a fail-open restore cannot
 masquerade as a pass).
+
+Skipping is now only legal when no path was given. `MLX_TEST_MODEL_PATH` **unset**, or
+set to an empty/whitespace value (a command substitution that produced nothing, a CI
+`env:` fed by an empty expression), means the caller has no checkpoint and the gate
+returns quietly. `MLX_TEST_MODEL_PATH` set to a non-empty path that is not a directory
+**panics**: nobody sets a checkpoint path they do not mean, so that is a typo in an
+invocation that believed it was gating the cold tier, and a green run there would
+assert nothing at all.
+
+The two qwen3_5 gates additionally set a `restore_prompt` — instances 2 and 3 run a
+long prompt (1259 tokens on `qwen3.5-0.8b-mlx-bf16`, ladder `[16, 64, 304, 1248]`)
+that shares a long body with the capture prompt and then diverges.
+That makes the gate able to see the ladder at all: with one ~90-token prompt shared by
+all three instances the ladder is `[16, 80]` and one turn's chain reach already covers
+the deepest rung, so the restore always anchors at the prompt's end and a ladder
+collapsed to a single endpoint boundary passes. With the divergent pair, the point
+where the two prompts part caps `kv_chain_upper_bound` far below the capture prompt's
+deepest rung, so the restore MUST reconcile onto a shallower one — which the harness
+asserts (`cached_tokens` is a member of the capture prompt's ladder, and is strictly
+below its deepest rung). This kills a one-rung ladder unconditionally; it does not pin
+the rung count at four, and it does not pin the **ratio** either — 4 = 2², so halving
+the spacing yields a ladder that still contains the rung a ~24-block chain would have
+anchored on. Both gaps are closed by exact rung values in
+`gdn_checkpoint_tests::ladder_rungs_are_quarters_of_the_one_above`, which is model-free
+and runs in milliseconds. Arithmetic is pinned by arithmetic; the three-model-load gate
+is reserved for the part only real weights can show — that a shallow rung is genuinely
+written, found, decoded, and restored across a process boundary.
+
+Note what the failure looks like when the ladder *does* collapse: nothing is written at
+all (the single endpoint rung is tens of blocks past what the writer queue drains), so
+instance 2 restores zero and the harness's **assertion 1** fires with a message about
+the restore path — not assertion 1b. The harness therefore prints the computed ladder
+and the sidecar telemetry *before* any assertion, and assertion 1's own message names
+the prefill as the place to look.
 
 ```bash
 MLX_COLD_CACHE_DIR=$(mktemp -d) \
@@ -216,6 +309,13 @@ A gate on a large checkpoint is slow — the 26B gemma4 run takes ~66 min for th
 long-prompt gate alone and the 35B MoE ~26 min, because a checkpoint with no
 `.mlx-download-complete.json` marker full-shard-hashes its weights on every one of
 the harness's fresh loads.
+
+The two small-checkpoint gates run in CI, on the existing `model-test` matrix legs
+that already download and convert the checkpoint they need (`.github/workflows/ci.yml`):
+`qwen3_cold_tier_parity` on the `qwen3` leg, `qwen3_5_cold_tier_parity` plus the
+Metal-gated unit test `dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy`
+on the `qwen3_5-dense` leg. The MoE (35B checkpoint) and gemma4 (66 min) gates stay
+local-only.
 
 The structural fact both gemma4 gates rest on: with a `ColdSidecarPolicy` installed, a
 non-zero `cached_tokens` in a _freshly loaded_ instance (empty hot cache) can only

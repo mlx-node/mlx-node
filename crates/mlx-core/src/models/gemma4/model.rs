@@ -2441,6 +2441,7 @@ impl Gemma4Inner {
     /// INSIDE an expanded image run, and this capture does not model that
     /// rule; refusing is the fail-closed answer.
     fn capture_gemma4_sliding_cold_sidecar(&self) {
+        crate::cold_tier::cold_sidecar_counters().record_capture_reached();
         let Some(adapter) = self.paged_adapter.as_ref() else {
             return;
         };
@@ -2470,6 +2471,21 @@ impl Gemma4Inner {
         let full_blocks = request_tokens.len() / block_size as usize;
         let chain_blocks = (adapter.cold_captured_blocks() as usize).min(full_blocks);
         if chain_blocks == 0 {
+            // A different diagnosis from the checkpoint miss below: the
+            // persisted chain covers no whole block of this request, so no
+            // checkpoint at any depth could have been used. This is the arm a
+            // genuinely cold process hits on its first turns, while the bounded
+            // writer queue is still ratcheting the chain forward.
+            crate::cold_tier::cold_sidecar_counters().record_chain_empty();
+            if inference_trace_enabled() {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_skipped reason=persisted_chain_covers_no_whole_block cold_captured_blocks={} full_blocks={} block_size={} request_tokens={}",
+                    adapter.cold_captured_blocks(),
+                    full_blocks,
+                    block_size,
+                    request_tokens.len()
+                ));
+            }
             return;
         }
         let extra_keys_per_block = engine::build_paged_extra_keys(
@@ -2508,6 +2524,7 @@ impl Gemma4Inner {
             // decode-cadence checkpoints cover for this. Trace the miss so the
             // gap is visible under MLX_TRACE instead of looking like a working
             // cache.
+            crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
             if inference_trace_enabled() {
                 write_inference_trace(format_args!(
                     "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_skipped reason=no_representable_checkpoint_at_or_below_chain_reach chain_reach_tokens={} chain_blocks={} block_size={} window={} request_tokens={} prompt_boundary={} prefix_checkpoints={}",
@@ -2557,11 +2574,14 @@ impl Gemma4Inner {
         };
         // Already persisted for this exact chain: nothing to do. Mirrors
         // `ColdTierWalk::capture_chain`'s `contains` dedup, and `contains_in`
-        // is explicitly side-effect free (no hit/miss accounting).
+        // is explicitly side-effect free (no hit/miss accounting), so this arm
+        // must do its own — an unrecorded exit here reads downstream as
+        // `enqueued=0`, which is also what a collapsed rung ladder produces.
         if cold
             .manager
             .contains_in(&key, mlx_paged_attn::ColdGroup::SlidingWindow)
         {
+            crate::cold_tier::cold_sidecar_counters().record_already_persisted();
             return;
         }
 
@@ -2576,11 +2596,22 @@ impl Gemma4Inner {
             layout: sliding_sidecar::layout_at(&geometry, boundary),
             tensors,
         };
-        if let Err(error) = cold.manager.enqueue_sidecar(sidecar) {
-            tracing::debug!(
+        match cold.manager.enqueue_sidecar(sidecar) {
+            Ok(true) => crate::cold_tier::cold_sidecar_counters().record_enqueued(),
+            // The bounded writer queue refused the sidecar. Nothing is written
+            // and nothing failed, so this turn is otherwise indistinguishable
+            // from a successful capture.
+            Ok(false) => {
+                crate::cold_tier::cold_sidecar_counters().record_queue_drop();
+                tracing::debug!(
+                    target: "mlx_core::gemma4::paged",
+                    "Gemma4 sliding sidecar dropped at boundary {boundary}: cold-cache writer queue full"
+                );
+            }
+            Err(error) => tracing::debug!(
                 target: "mlx_core::gemma4::paged",
                 "Gemma4 sliding sidecar enqueue failed at boundary {boundary}: {error}"
-            );
+            ),
         }
     }
 

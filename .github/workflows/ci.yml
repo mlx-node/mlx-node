@@ -256,7 +256,9 @@ jobs:
             mtype: ''
             kind: cargo
             env: MLX_TEST_MODEL_PATH
-            tests: --test qwen3_paged_vs_flat_parity
+            tests: >-
+              --test qwen3_paged_vs_flat_parity
+              --test qwen3_cold_tier_parity
           - name: qwen3_5-dense
             model: Qwen/Qwen3.5-0.8B
             slug: qwen3.5-0.8b
@@ -268,6 +270,21 @@ jobs:
               --test qwen3_5_session
               --test qwen3_5_delta_chat
               --test p2_paged_thinking_honors_enable
+              --test qwen3_5_cold_tier_parity
+            # Name filter for a SECOND `cargo test --lib` invocation. `--lib`
+            # cannot be folded into `tests:` above: `-- --ignored` would then run
+            # all ~55 of mlx-core's ignored unit tests, and the privacy-filter
+            # ones `.expect()` a checkpoint at `.cache/models/privacy-filter`
+            # with no skip guard, so they would hard-fail on a runner that has
+            # no such directory. A filter after `--` would instead deselect the
+            # integration tests. Hence a separate run with its own filter.
+            #
+            # FULLY QUALIFIED and run under `--exact`, because libtest exits 0
+            # when a filter matches nothing: a rename would turn this step into
+            # a silent no-op that still reports green. The run step additionally
+            # asserts the run actually executed a test, which is the part a
+            # filter can never guarantee on its own.
+            lib_tests: models::qwen3_5::model::paged_construction_tests::dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy
           - name: lfm2
             model: LiquidAI/LFM2.5-1.2B-Thinking
             slug: lfm2.5-1.2b-thinking
@@ -362,14 +379,43 @@ jobs:
           else
             # cargo leg: point this family's gating env var(s) at the converted
             # checkpoint so the #[ignore]'d tests un-skip; `-- --ignored` runs only those.
-            # `--test-threads=1` serializes them: each ignored test loads 2-4 full
+            # `--test-threads=1` serializes them: each ignored test loads 2-6 full
             # models, and libtest's default per-test thread pool would otherwise run
             # several at once, oversubscribing the single shared Metal GPU until a
             # command buffer trips the GPU watchdog (kIOGPUCommandBufferCallbackErrorTimeout
             # -> SIGABRT) on the shared CI runner. One shared GPU means parallelism
             # never sped these up anyway, so serializing costs ~nothing.
+            # The `*_cold_tier_parity` gates additionally require being the ONLY
+            # thing in their process touching the cold tier (its manager is a
+            # process-global OnceLock seeded from MLX_COLD_CACHE_DIR on first
+            # use). Cargo runs each `--test <name>` target as its own binary, so
+            # listing them here already satisfies that; the harness creates its
+            # own per-process temp root when MLX_COLD_CACHE_DIR is unset.
             for v in ${{ matrix.env }}; do export "$v=$ckpt"; done
             cargo test -p mlx-core ${{ matrix.tests }} -- --ignored --test-threads=1 --nocapture
+            # Ignored UNIT tests, selected by name. Empty for legs that set no
+            # `lib_tests:`, in which case nothing extra runs. See the comment on
+            # that matrix key for why this is not folded into the line above.
+            #
+            # The `1 passed` check is the point of the tee: `cargo test` exits 0
+            # on "0 passed; 55 filtered out", so a filter that stopped matching
+            # — a rename, a moved module — would delete this coverage while the
+            # leg stayed green. That is the failure mode this repo keeps hitting,
+            # so the run count is asserted rather than assumed. A genuine test
+            # FAILURE is already fatal via `set -o pipefail`. `paged_inner_or_skip`
+            # inside the test can still self-skip on a Metal init failure; that
+            # one prints `skipping` and is visible in the log.
+            if [ -n "${{ matrix.lib_tests }}" ]; then
+              cargo test -p mlx-core --lib -- --ignored --exact --test-threads=1 --nocapture \
+                ${{ matrix.lib_tests }} 2>&1 | tee /tmp/lib_tests.log
+              if ! grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/lib_tests.log; then
+                echo "::error::lib_tests filter '${{ matrix.lib_tests }}' matched no test."
+                echo "::error::libtest exits 0 on an empty selection, so this would have been a"
+                echo "::error::silent green. Re-qualify the name against 'cargo test -p mlx-core"
+                echo "::error::--lib -- --ignored --list'."
+                exit 1
+              fi
+            fi
           fi
 
   lint:
