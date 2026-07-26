@@ -248,6 +248,61 @@ pub(crate) fn gdn_prefill_checkpoint_boundaries(
     boundaries
 }
 
+/// Whether this adapter's cold tier will actually consume a checkpoint ladder.
+///
+/// The ladder's shallow rungs exist for ONE consumer: a GDN sidecar anchored
+/// where the SSD block chain already reaches. With no such policy installed
+/// nothing can ever read them, so paying for them is pure cost — extra forced
+/// chunk breaks (each one a different GEMM `M`, so a different kernel class and
+/// accumulation order), extra `synchronize_and_clear_cache` barriers, and extra
+/// full GDN snapshots held resident.
+///
+/// This is the single source of truth for "persistence is on for the recurrent
+/// half": both `cold_gdn_prefill_chunk_size` (dense and MoE) and the boundary
+/// selection below read it, so the chunk size and the break set cannot disagree
+/// about whether this turn is a persist turn.
+pub(crate) fn gdn_cold_sidecar_ladder_wanted(adapter: &PagedKVCacheAdapter) -> bool {
+    adapter
+        .cold_tier()
+        .and_then(|cold| cold.sidecar_policy.as_ref())
+        .is_some_and(|policy| policy.group() == mlx_paged_attn::ColdGroup::GdnState)
+}
+
+/// Boundaries a prefill forces a chunk break at, ascending.
+///
+/// `want_ladder` is [`gdn_cold_sidecar_ladder_wanted`] for the turn's adapter:
+///
+/// ```text
+///   want_ladder = true   -> gdn_prefill_checkpoint_boundaries   (up to 4 rungs)
+///   want_ladder = false  -> gdn_checkpoint_target               (0 or 1 rung)
+/// ```
+///
+/// The `false` arm is not an optimization, it is a compatibility contract. A
+/// prefill split at N points is algebraically transparent but NOT numerically
+/// bit-identical, so a turn with no cold tier must take exactly the break set it
+/// took before the ladder existed — a single deep boundary — or the sampled
+/// tokens of a persistence-off request can change. That matters because
+/// `MLX_PAGED_PREFILL_CHUNK_SIZE` is not exotic: `packages/agent/src/run-agent.ts`
+/// and `packages/cli/src/commands/launch-claude/index.ts` both default it to
+/// 2048 unconditionally, so `mlx agent --no-persist-cache` reaches a positive
+/// chunk size with no policy installed. Keeping the deep boundary on that arm
+/// also preserves the warm in-process continuation, which
+/// `find_dense_gdn_prefix_checkpoint` serves from exactly that rung.
+pub(crate) fn prefill_checkpoint_boundaries(
+    full_tokens_len: usize,
+    cached_prefix_len: u32,
+    block_size: u32,
+    want_ladder: bool,
+) -> Vec<u32> {
+    if want_ladder {
+        gdn_prefill_checkpoint_boundaries(full_tokens_len, cached_prefix_len, block_size)
+    } else {
+        gdn_checkpoint_target(full_tokens_len, cached_prefix_len, block_size)
+            .into_iter()
+            .collect()
+    }
+}
+
 /// Rebase absolute checkpoint boundaries onto the uncached suffix the prefill
 /// actually forwards. Boundaries at or below the cached prefix are dropped —
 /// this prefill never crosses them, so it cannot snapshot there.
@@ -428,10 +483,11 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         .map(|logits| (logits, Vec::new()));
     }
 
-    let checkpoint_boundaries = gdn_prefill_checkpoint_boundaries(
+    let checkpoint_boundaries = prefill_checkpoint_boundaries(
         full_tokens.len(),
         cached_prefix_len,
         paged_adapter.block_size(),
+        gdn_cold_sidecar_ladder_wanted(paged_adapter),
     );
 
     if checkpoint_boundaries.is_empty() && suffix_tokens.len() <= chunk_size as usize {
@@ -980,10 +1036,11 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
         .map(|(logits, hidden)| (logits, hidden, Vec::new()));
     }
 
-    let checkpoint_boundaries = gdn_prefill_checkpoint_boundaries(
+    let checkpoint_boundaries = prefill_checkpoint_boundaries(
         full_tokens.len(),
         cached_prefix_len,
         paged_adapter.block_size(),
+        gdn_cold_sidecar_ladder_wanted(paged_adapter),
     );
 
     if checkpoint_boundaries.is_empty() && suffix_tokens.len() <= chunk_size as usize {
@@ -1686,7 +1743,74 @@ pub(crate) fn run_paged_verify_step(
 
 #[cfg(test)]
 mod gdn_checkpoint_tests {
-    use super::{gdn_checkpoint_target, gdn_prefill_checkpoint_boundaries, paged_prefill_ranges};
+    use super::{
+        gdn_checkpoint_target, gdn_prefill_checkpoint_boundaries, paged_prefill_ranges,
+        prefill_checkpoint_boundaries,
+    };
+
+    /// A turn with no GDN cold policy must take the break set it took before the
+    /// ladder existed: the single deep `gdn_checkpoint_target`, never the rungs.
+    ///
+    /// This is a numerical-output contract, not a tidiness one. Chunk length is
+    /// the prefill GEMM's `M`, so a different break set selects a different
+    /// kernel class and accumulation order and can flip an argmax. And a
+    /// persist-off turn DOES reach a positive chunk size without anyone typing
+    /// an env var: `packages/agent/src/run-agent.ts` and
+    /// `packages/cli/src/commands/launch-claude/index.ts` both default
+    /// `MLX_PAGED_PREFILL_CHUNK_SIZE` to 2048 unconditionally, before any
+    /// persistence decision, and `mlx agent --no-persist-cache` forces paged on
+    /// with no flat fallback.
+    ///
+    /// Catches, verified by mutation: calling `gdn_prefill_checkpoint_boundaries`
+    /// unconditionally at the three prefill bodies, i.e. dropping the
+    /// `want_ladder` arm. The `false` rows then return four rungs and the range
+    /// row becomes `[0..16, 16..80, 80..336, 336..1392, 1392..1400]`.
+    ///
+    /// 1400 is load-bearing. At the 64-token prompt the model-layer ladder gates
+    /// use, the ladder is already a single rung, so that length cannot tell the
+    /// two arms apart.
+    #[test]
+    fn no_cold_policy_keeps_the_single_deep_boundary_the_ladder_replaced() {
+        assert_eq!(
+            prefill_checkpoint_boundaries(1400, 0, 16, false),
+            vec![1392],
+            "with no GDN cold policy the break set is the pre-ladder single boundary"
+        );
+        assert_eq!(
+            prefill_checkpoint_boundaries(1400, 0, 16, true),
+            vec![16, 80, 336, 1392],
+            "with a GDN cold policy every rung is a real break the sidecar can anchor on"
+        );
+        assert_eq!(
+            paged_prefill_ranges(1400, 2048, &[1392]),
+            vec![0..1392, 1392..1400],
+            "two chunks, M = 1392 then 8 — what a persist-off turn forwarded before the ladder"
+        );
+
+        // The two arms agree exactly where the ladder degenerates, so a fixture
+        // that only ever exercises a short prompt proves nothing about either.
+        for (len, cached) in [(200usize, 0u32), (64, 0), (4096, 1008)] {
+            assert_eq!(
+                prefill_checkpoint_boundaries(len, cached, 16, false),
+                gdn_checkpoint_target(len, cached, 16)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "the false arm IS gdn_checkpoint_target at {len}/{cached}"
+            );
+        }
+        assert_eq!(
+            prefill_checkpoint_boundaries(4096, 1008, 16, true),
+            prefill_checkpoint_boundaries(4096, 1008, 16, false),
+            "a deep cached prefix collapses the ladder to one rung, so both arms agree"
+        );
+
+        // And where they differ, they differ in the direction that matters: the
+        // ladder is a strict superset ending at the same deepest rung.
+        let ladder = prefill_checkpoint_boundaries(1400, 0, 16, true);
+        let plain = prefill_checkpoint_boundaries(1400, 0, 16, false);
+        assert_eq!(ladder.last(), plain.last());
+        assert!(ladder.len() > plain.len());
+    }
 
     /// Pin the ladder's exact rung VALUES, not just its shape.
     ///

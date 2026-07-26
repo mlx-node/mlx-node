@@ -1365,10 +1365,15 @@ impl Qwen35MoeInner {
     /// return a chunk size large enough that the only breaks the prefill takes
     /// are the `gdn_prefill_checkpoint_boundaries` ladder's rungs, which are the
     /// only prefix lengths the sidecar can be anchored at. An explicit
-    /// `MLX_PAGED_PREFILL_CHUNK_SIZE` still wins; with no cold GDN policy this is
-    /// the unchanged single-shot default, so non-persist turns are byte-for-bit
-    /// unaffected. Splitting is algebraically transparent but not numerically
-    /// bit-identical — see the dense doc for the accepted drift.
+    /// `MLX_PAGED_PREFILL_CHUNK_SIZE` still wins.
+    ///
+    /// With no cold GDN policy and no env override this is the unchanged
+    /// single-shot default (0). With no cold GDN policy but the env var SET, the
+    /// break set is the single deep `gdn_checkpoint_target` — what a persist-off
+    /// turn split at before the ladder existed — because both this and the
+    /// prefill body read `paged_forward::gdn_cold_sidecar_ladder_wanted`.
+    /// Splitting is algebraically transparent but not numerically bit-identical
+    /// — see the dense doc for the accepted drift.
     ///
     /// A caller must read this BEFORE it takes the `&mut self` borrows the
     /// prefill needs (`&mut self.layers` + `&mut self.paged_adapter`); an inline
@@ -1378,13 +1383,19 @@ impl Qwen35MoeInner {
         if env_chunk > 0 {
             return env_chunk;
         }
-        let has_gdn_policy = self
-            .paged_adapter
+        if self.wants_gdn_checkpoint_ladder() {
+            i32::MAX
+        } else {
+            0
+        }
+    }
+
+    /// Whether this turn's prefill should publish the whole checkpoint ladder.
+    /// MoE mirror of `Qwen35Inner::wants_gdn_checkpoint_ladder`.
+    fn wants_gdn_checkpoint_ladder(&self) -> bool {
+        self.paged_adapter
             .as_ref()
-            .and_then(|adapter| adapter.cold_tier())
-            .and_then(|cold| cold.sidecar_policy.as_ref())
-            .is_some_and(|policy| policy.group() == mlx_paged_attn::ColdGroup::GdnState);
-        if has_gdn_policy { i32::MAX } else { 0 }
+            .is_some_and(crate::models::qwen3_5::paged_forward::gdn_cold_sidecar_ladder_wanted)
     }
 
     /// Prefill for the hand-written MoE paged cores (sync + stream, text).
@@ -10164,6 +10175,46 @@ mod paged_construction_tests {
             .expect("allocate suffix blocks");
     }
 
+    /// Drive the MoE prefill worker with an EXPLICIT chunk size, bypassing
+    /// `cold_gdn_prefill_chunk_size`. That is the only way to reach the break-set
+    /// decision with no policy installed — the shape a persist-off `mlx agent`
+    /// turn has, since `run-agent.ts` seeds `MLX_PAGED_PREFILL_CHUNK_SIZE=2048`
+    /// before any persistence decision.
+    fn run_moe_paged_prefill_with_size_and_checkpoint(
+        inner: &mut Qwen35MoeInner,
+        full_tokens: &[u32],
+        suffix_tokens: &[u32],
+        chunk_size: i32,
+    ) -> Result<(
+        MxArray,
+        Vec<crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint>,
+    )> {
+        let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
+            inner.config.num_layers as usize,
+            |i| inner.config.is_linear_layer(i),
+        );
+        let embed = inner.embedding.clone();
+        let embedding_weight = embed.get_weight();
+        let caches = inner.caches.as_mut().expect("moe caches initialized");
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        crate::models::qwen3_5_moe::paged_forward::run_paged_prefill_chunk_with_size_and_checkpoint(
+            full_tokens,
+            suffix_tokens,
+            0,
+            false,
+            &embed,
+            &mut inner.layers,
+            caches,
+            &inner.final_norm,
+            &inner.lm_head,
+            &embedding_weight,
+            &layer_kinds,
+            adapter,
+            chunk_size,
+            /* cached_rope_deltas */ 0,
+        )
+    }
+
     /// Both hand-written MoE cores prefill through `run_moe_core_paged_prefill`,
     /// so this drives that shared body directly: under a GdnState policy it must
     /// publish checkpoint ladder rungs, and with no cold tier it must stay
@@ -10183,6 +10234,12 @@ mod paged_construction_tests {
     /// cannot see it: that one reads the accessor, never the call site. The
     /// no-cold-tier leg is load-bearing in the other direction — a hardcoded
     /// `i32::MAX` would chunk prefills that ship today as single-shot.
+    ///
+    /// The two EXPLICIT-chunk-size arms reach the break-set decision with no
+    /// policy installed, which `cold_gdn_prefill_chunk_size`'s own 0 can never
+    /// do. They catch hardcoding `gdn_cold_sidecar_ladder_wanted`'s result at
+    /// the prefill body in either direction; the 64-token arms cannot, because
+    /// at that length the ladder is already one rung and both arms agree.
     ///
     /// Runs in CI on the `qwen3_5-dense` `model-test` leg's `lib_tests` filter,
     /// which needs no checkpoint for this one; there is no MoE leg, and
@@ -10211,6 +10268,38 @@ mod paged_construction_tests {
             "with no cold GDN policy the MoE cores must stay single-shot"
         );
 
+        // A prompt long enough that the two break sets DIFFER: ladder
+        // [48, 192] against the single pre-ladder boundary [192]. Run BEFORE
+        // the cold tier is installed — the adapter has no way to drop one.
+        let long_prompt: Vec<u32> = (0u32..200).map(|i| (i * 5 + 7) % 257).collect();
+        reset_moe_paged_request(&mut inner, &long_prompt);
+        let (_, no_policy_rungs) = run_moe_paged_prefill_with_size_and_checkpoint(
+            &mut inner,
+            &long_prompt,
+            &long_prompt,
+            2048,
+        )
+        .expect("explicit-chunk MoE prefill with no cold tier");
+        assert_eq!(
+            no_policy_rungs
+                .iter()
+                .map(|c| c.prefix_len)
+                .collect::<Vec<_>>(),
+            vec![192],
+            "with no cold GDN policy an explicit chunk size must take the single pre-ladder \
+             boundary, not the ladder — the extra breaks change the prefill GEMM's M and so the \
+             sampled tokens of a persistence-off request"
+        );
+        // Release WITHOUT registering: publishing this prompt's blocks would
+        // give the next arm's shared 64-token prefix a cache hit, and every arm
+        // here has to start cold.
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("paged_adapter")
+            .release_request()
+            .expect("release_request");
+
         let root = moe_temp_cold_root("moe-core-ladder");
         install_moe_gdn_cold_tier(&mut inner, &root);
         reset_moe_paged_request(&mut inner, &prompt);
@@ -10229,6 +10318,22 @@ mod paged_construction_tests {
                 checkpoint.prefix_len
             );
         }
+
+        // Same long prompt, same explicit chunk size, policy now installed:
+        // every rung of the ladder is a real break.
+        reset_moe_paged_request(&mut inner, &long_prompt);
+        let (_, cold_rungs) = run_moe_paged_prefill_with_size_and_checkpoint(
+            &mut inner,
+            &long_prompt,
+            &long_prompt,
+            2048,
+        )
+        .expect("explicit-chunk MoE prefill under a cold GDN policy");
+        assert_eq!(
+            cold_rungs.iter().map(|c| c.prefix_len).collect::<Vec<_>>(),
+            vec![48, 192],
+            "an explicit chunk size under a GDN cold policy still publishes the whole ladder"
+        );
 
         let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
         let _ = adapter.register_full_blocks_for_reuse(&[], 0);

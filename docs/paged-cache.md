@@ -289,7 +289,24 @@ the same tradeoff vLLM mandates for `mamba_cache_mode == "align"`, which hard-re
 chunked prefill (`model_executor/models/config.py`) and is the regime Qwen3-Next runs
 in — so it is the reference design rather than an invention. It does mean the splits
 are taken as soon as a policy is attached, i.e. on the FIRST persist-enabled run,
-before anything has ever been restored. The restart-parity gate matched persist-on
+before anything has ever been restored.
+
+The converse also has to hold, and it is enforced rather than assumed. A turn with
+**no** GDN cold policy takes the break set it took before the ladder existed: the
+single deep `gdn_checkpoint_target`, never the rungs. That is not cosmetic. Chunking
+is on for a persist-off turn whenever `MLX_PAGED_PREFILL_CHUNK_SIZE` is positive, and
+`packages/agent/src/run-agent.ts` plus `packages/cli/src/commands/launch-claude/index.ts`
+both default it to 2048 unconditionally, before any persistence decision — so
+`mlx agent --no-persist-cache` reaches a positive chunk size with no policy installed.
+Without the guard a 1400-token prompt there would forward as 5 chunks
+(`M` = 16, 64, 256, 1056, 8) where it used to forward as 2 (`M` = 1392, 8), which by
+the paragraph above can change its sampled tokens. `paged_forward::prefill_checkpoint_boundaries`
+takes the arm, `gdn_cold_sidecar_ladder_wanted` is the single predicate both it and
+`cold_gdn_prefill_chunk_size` read, and
+`gdn_checkpoint_tests::no_cold_policy_keeps_the_single_deep_boundary_the_ladder_replaced`
+pins the values.
+
+The restart-parity gate matched persist-on
 against the persist-off baseline byte-for-byte on the gated checkpoints, which
 **bounds** the divergence rather than proving it is absent at every prompt length —
 and that remains exactly as true of the longer, up-to-four-split fixture the gate now

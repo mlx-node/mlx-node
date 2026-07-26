@@ -1930,9 +1930,16 @@ impl Qwen35Inner {
     ///
     /// So when the SSD cold tier carries a GDN sidecar policy (persistence on),
     /// return a chunk size large enough that the ONLY breaks are the ladder's.
-    /// An explicit `MLX_PAGED_PREFILL_CHUNK_SIZE` still wins. With no cold GDN
-    /// policy this is the unchanged single-shot default, so non-persist turns
-    /// are byte-for-bit unaffected.
+    /// An explicit `MLX_PAGED_PREFILL_CHUNK_SIZE` still wins.
+    ///
+    /// With no cold GDN policy and no env override this is the unchanged
+    /// single-shot default (0), which crosses no boundary at all. With no cold
+    /// GDN policy but the env var SET, chunking is on and the break set is
+    /// `prefill_checkpoint_boundaries(.., want_ladder = false)` — the single
+    /// deep `gdn_checkpoint_target`, exactly what a persist-off turn split at
+    /// before the ladder existed. Both arms read
+    /// `paged_forward::gdn_cold_sidecar_ladder_wanted` so the chunk size and the
+    /// break set cannot disagree about whether this is a persist turn.
     ///
     /// Splitting is algebraically transparent — every attention query still
     /// attends over the whole cumulative range, and a break only marks where
@@ -1961,13 +1968,21 @@ impl Qwen35Inner {
         if env_chunk > 0 {
             return env_chunk;
         }
-        let has_gdn_policy = self
-            .paged_adapter
+        if self.wants_gdn_checkpoint_ladder() {
+            i32::MAX
+        } else {
+            0
+        }
+    }
+
+    /// Whether this turn's prefill should publish the whole checkpoint ladder.
+    ///
+    /// Thin wrapper over [`super::paged_forward::gdn_cold_sidecar_ladder_wanted`]
+    /// so the model layer and the prefill body probe the SAME predicate.
+    fn wants_gdn_checkpoint_ladder(&self) -> bool {
+        self.paged_adapter
             .as_ref()
-            .and_then(|adapter| adapter.cold_tier())
-            .and_then(|cold| cold.sidecar_policy.as_ref())
-            .is_some_and(|policy| policy.group() == mlx_paged_attn::ColdGroup::GdnState);
-        if has_gdn_policy { i32::MAX } else { 0 }
+            .is_some_and(super::paged_forward::gdn_cold_sidecar_ladder_wanted)
     }
 
     /// Prefill for the hand-written paged cores (sync + stream, text).
@@ -14651,6 +14666,14 @@ mod paged_construction_tests {
     /// instead of `self.cold_gdn_prefill_chunk_size()` inside
     /// `run_dense_core_paged_prefill` — the cold arm then returns no rungs, which
     /// is exactly the MTP-turn defect.
+    ///
+    /// The last two arms use an EXPLICIT positive chunk size, which is the only
+    /// way to reach the break-set decision with no policy installed — the shape
+    /// a persist-off `mlx agent` turn has, since `run-agent.ts` seeds
+    /// `MLX_PAGED_PREFILL_CHUNK_SIZE=2048` before any persistence decision. They
+    /// catch hardcoding `gdn_cold_sidecar_ladder_wanted`'s result at the prefill
+    /// body in either direction, which the arms above cannot: at 64 tokens the
+    /// ladder is already a single rung, so both arms agree there.
     #[test]
     #[ignore = "requires Metal GPU; run with --ignored"]
     fn dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy() {
@@ -14684,6 +14707,39 @@ mod paged_construction_tests {
             "with no cold GDN policy the cores must stay single-shot"
         );
 
+        // A prompt long enough that the two break sets DIFFER: ladder
+        // [48, 192] against the single pre-ladder boundary [192]. Run BEFORE
+        // the cold tier is installed — the adapter has no way to drop one.
+        let long_prompt: Vec<u32> = (0u32..200).map(|i| (i * 5 + 7) % 257).collect();
+        reset_paged_request(&mut inner, &long_prompt);
+        let (_, no_policy_rungs) = run_dense_paged_prefill_with_size_and_checkpoint(
+            &mut inner,
+            &long_prompt,
+            &long_prompt,
+            0,
+            2048,
+        )
+        .expect("explicit-chunk prefill with no cold tier");
+        assert_eq!(
+            no_policy_rungs
+                .iter()
+                .map(|c| c.prefix_len)
+                .collect::<Vec<_>>(),
+            vec![192],
+            "with no cold GDN policy an explicit chunk size must take the single pre-ladder \
+             boundary, not the ladder — the extra breaks change the prefill GEMM's M and so the \
+             sampled tokens of a persistence-off request"
+        );
+        // Release WITHOUT registering: publishing this prompt's blocks would
+        // give the next arm's shared 64-token prefix a cache hit, and every arm
+        // here has to start cold.
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("paged_adapter")
+            .release_request()
+            .expect("release_request");
+
         let root = temp_cold_root("dense-core-ladder");
         install_gdn_cold_tier(&mut inner, &root);
         reset_paged_request(&mut inner, &prompt);
@@ -14709,6 +14765,23 @@ mod paged_construction_tests {
                 checkpoint.prefix_len
             );
         }
+
+        // Same long prompt, same explicit chunk size, policy now installed:
+        // every rung of the ladder is a real break.
+        reset_paged_request(&mut inner, &long_prompt);
+        let (_, cold_rungs) = run_dense_paged_prefill_with_size_and_checkpoint(
+            &mut inner,
+            &long_prompt,
+            &long_prompt,
+            0,
+            2048,
+        )
+        .expect("explicit-chunk prefill under a cold GDN policy");
+        assert_eq!(
+            cold_rungs.iter().map(|c| c.prefix_len).collect::<Vec<_>>(),
+            vec![48, 192],
+            "an explicit chunk size under a GDN cold policy still publishes the whole ladder"
+        );
 
         let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
         let _ = adapter.register_full_blocks_for_reuse(&[], 0);

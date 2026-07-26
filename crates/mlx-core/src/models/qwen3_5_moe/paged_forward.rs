@@ -15,8 +15,8 @@ use crate::inference_trace::{
 };
 use crate::models::qwen3_5::paged_forward::{
     MaterializedGdnPrefixCheckpoint, checkpoint_suffix_offsets, gdn_checkpoint_target,
-    gdn_prefill_checkpoint_boundaries, materialize_linear_layer_caches, paged_prefill_ranges,
-    snapshot_materialized_linear_layer_caches,
+    gdn_cold_sidecar_ladder_wanted, materialize_linear_layer_caches, paged_prefill_ranges,
+    prefill_checkpoint_boundaries, snapshot_materialized_linear_layer_caches,
 };
 use crate::nn::{Embedding, RMSNorm};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
@@ -308,10 +308,11 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
     }
 
     let chunk_size_usize = chunk_size as usize;
-    let checkpoint_boundaries = gdn_prefill_checkpoint_boundaries(
+    let checkpoint_boundaries = prefill_checkpoint_boundaries(
         full_tokens.len(),
         cached_prefix_len,
         paged_adapter.block_size(),
+        gdn_cold_sidecar_ladder_wanted(paged_adapter),
     );
 
     if checkpoint_boundaries.is_empty() && suffix_tokens.len() <= chunk_size_usize {
