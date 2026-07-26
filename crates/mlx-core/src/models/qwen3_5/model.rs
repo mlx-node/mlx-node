@@ -13181,16 +13181,17 @@ mod paged_construction_tests {
     }
 
     fn paged_inner_or_skip(test_name: &str) -> Option<(Qwen35Inner, Qwen3_5Config)> {
+        // Only a device-less host licenses a skip. A `LayerKVPool::new: ...
+        // must be > 0` means the test config stopped producing a usable pool,
+        // and skipping on that is a silent green — see `metal_device_absent`.
+        let unavailable = crate::test_support::metal_device_absent;
         let cfg = tiny_paged_forward_cfg();
         match Qwen35Inner::new(cfg.clone()) {
             Ok(mut inner) => match inner.initialize_paged_adapter() {
                 Ok(()) => Some((inner, cfg)),
                 Err(err) => {
                     let msg = err.reason.to_string();
-                    if msg.contains("Metal")
-                        || msg.contains("device")
-                        || msg.contains("LayerKVPool")
-                    {
+                    if unavailable(&msg) {
                         eprintln!("skipping {test_name} (paged adapter unavailable): {msg}");
                         None
                     } else {
@@ -13200,7 +13201,7 @@ mod paged_construction_tests {
             },
             Err(err) => {
                 let msg = err.reason.to_string();
-                if msg.contains("Metal") || msg.contains("device") || msg.contains("LayerKVPool") {
+                if unavailable(&msg) {
                     eprintln!("skipping {test_name} (paged adapter unavailable): {msg}");
                     None
                 } else {

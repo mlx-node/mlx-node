@@ -10021,9 +10021,10 @@ mod paged_construction_tests {
     /// This one goes through `initialize_paged_adapter`, so the pool geometry is
     /// the one the config really implies and a prefill can run against it.
     fn moe_paged_inner_or_skip(test_name: &str) -> Option<Qwen35MoeInner> {
-        let unavailable = |msg: &str| {
-            msg.contains("Metal") || msg.contains("device") || msg.contains("LayerKVPool")
-        };
+        // Only a device-less host licenses a skip. A `LayerKVPool::new: ...
+        // must be > 0` means the test config stopped producing a usable pool,
+        // and skipping on that is a silent green — see `metal_device_absent`.
+        let unavailable = crate::test_support::metal_device_absent;
         let mut inner = match Qwen35MoeInner::new(tiny_paged_forward_moe_cfg()) {
             Ok(inner) => inner,
             Err(err) => {

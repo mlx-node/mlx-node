@@ -411,9 +411,14 @@ jobs:
             # — a rename, a moved module — would delete this coverage while the
             # leg stayed green. That is the failure mode this repo keeps hitting,
             # so the run count is asserted rather than assumed. A genuine test
-            # FAILURE is already fatal via `set -o pipefail`. `paged_inner_or_skip`
-            # inside the test can still self-skip on a Metal init failure; that
-            # one prints `skipping` and is visible in the log.
+            # FAILURE is already fatal via `set -o pipefail`.
+            #
+            # The count alone does NOT close the other silent-green door:
+            # `paged_inner_or_skip` returns early on a device-less host, and
+            # libtest counts that as passed, so a Metal init failure here would
+            # report the full count having exercised nothing. These legs run on
+            # a Metal runner where that must never happen, so any `skipping`
+            # line fails the leg too.
             #
             # EXACT count, not `[1-9][0-9]*`: with more than one name in
             # `lib_tests` a loose check stays green when only some of them still
@@ -428,6 +433,12 @@ jobs:
                 echo "::error::libtest exits 0 on an empty selection, so this would have been a"
                 echo "::error::silent green. Re-qualify each name against 'cargo test -p mlx-core"
                 echo "::error::--lib -- --ignored --list'."
+                exit 1
+              fi
+              if grep -q '^skipping ' /tmp/lib_tests.log; then
+                echo "::error::a lib_test self-skipped on this Metal runner, so it passed"
+                echo "::error::without exercising anything. Offending line(s):"
+                grep '^skipping ' /tmp/lib_tests.log
                 exit 1
               fi
             fi

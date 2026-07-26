@@ -4741,10 +4741,25 @@ mod tests {
     /// 5e-3; `test_support::bf16_scaled_tolerance` documents why the anchor
     /// is the vector scale and not the element's own magnitude.
     ///
-    /// The budget is a rounding allowance, not a licence to predict a
-    /// different token: whenever the reference's top-2 gap is wider than
-    /// twice the budget — so no perturbation the budget permits can reorder
-    /// them — both paths must pick the same argmax.
+    /// **That element-wise budget is the only detector here, and its floor is
+    /// worth stating plainly**: a single-element divergence goes unnoticed
+    /// until it exceeds `3/128` = 2.34% of the largest reference logit (or
+    /// 5e-3 absolute, while every logit sits under ~0.21). The real
+    /// off-by-one this guards against — `cached_prefix_len` short by one —
+    /// lands at 3.0-3.4% of scale (`abs_diff` 0.078 at scale 2.3125, 0.086 at
+    /// 2.90625), i.e. only 1.26-1.44x over the floor. A milder structural
+    /// divergence would pass.
+    ///
+    /// An argmax cross-check cannot raise that floor, which is why there is
+    /// not one. Once the loop above has accepted every element, `|ref[i] -
+    /// cand[i]| <= tol` holds everywhere, so for any reference top-2 gap
+    /// wider than `2 * tol` the candidate's argmax is *forced* to match:
+    /// `cand[top] >= ref_top1 - tol > ref_top2 + tol >= cand[j]`. An argmax
+    /// assertion guarded on that gap is a restatement of the loop, not a
+    /// second detector. Narrowing the guard does not help either — these
+    /// three fixtures' reference gaps measure 11.1, 19.9 and 66.1 grid steps
+    /// against a 3-step budget, so no in-budget perturbation reorders them at
+    /// any guard width. The gap is printed below so its slack stays visible.
     #[cfg(test)]
     fn assert_logits_parity(label: &str, reference: &[f32], candidate: &[f32]) {
         assert_eq!(
@@ -4768,26 +4783,15 @@ mod tests {
                  reference scale {scale})"
             );
         }
+        let steps = |v: f32| if scale > 0.0 { v * 128.0 / scale } else { 0.0 };
         let (ref_top_idx, ref_top1, ref_top2) = top_two(reference);
-        let decidable_gap = 2.0 * tol;
-        if ref_top1 - ref_top2 > decidable_gap {
-            let (cand_top_idx, _, _) = top_two(candidate);
-            assert_eq!(
-                ref_top_idx, cand_top_idx,
-                "{label} changed the predicted token: reference argmax \
-                 {ref_top_idx} (top1={ref_top1}, top2={ref_top2}, gap exceeds \
-                 {decidable_gap}) but candidate argmax is {cand_top_idx}"
-            );
-        }
-        let grid_steps = if scale > 0.0 {
-            max_abs_diff * 128.0 / scale
-        } else {
-            0.0
-        };
         eprintln!(
-            "{label} parity max_abs_diff={max_abs_diff} ({grid_steps} bf16 grid \
-             steps of scale={scale}), tol={tol} over {} elements",
-            reference.len()
+            "{label} parity max_abs_diff={max_abs_diff} ({} bf16 grid steps of \
+             scale={scale}), tol={tol} over {} elements; reference argmax \
+             {ref_top_idx} leads by {} grid steps",
+            steps(max_abs_diff),
+            reference.len(),
+            steps(ref_top1 - ref_top2)
         );
     }
 
@@ -4802,9 +4806,9 @@ mod tests {
     /// chunks for a 96-token prompt). The post-prefill `[vocab]` logits
     /// vectors are compared element-wise.
     ///
-    /// Comparison is `assert_logits_parity` (3 bf16 grid steps of the
-    /// reference vector's scale, plus argmax agreement whenever the top-2
-    /// gap makes the ordering decidable). Weights come from a pinned MLX
+    /// Comparison is `assert_logits_parity` — 3 bf16 grid steps of the
+    /// reference vector's scale, which is the whole detector; see its doc
+    /// for the resulting detection floor. Weights come from a pinned MLX
     /// seed so the draw — and therefore whether any logit lands on a
     /// different bf16 grid point — is the same on every run.
     ///

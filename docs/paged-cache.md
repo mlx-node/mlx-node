@@ -118,7 +118,7 @@ producer interval and counts the accepted prefix directly rather than deriving i
 
 Blocks accepted per turn at queue depth 8, two runs:
 
-| producer `Tc`      | dense, `sync_all` | dense, `fsync(2)` | MoE, `sync_all` | MoE, `fsync(2)` |
+| dialled producer `Tc` | dense, `sync_all` | dense, `fsync(2)` | MoE, `sync_all` | MoE, `fsync(2)` |
 | ------------------ | ----------------- | ----------------- | --------------- | --------------- |
 | 0.10 ms            | 9                 | 11, 13            | 9               | 11, 10          |
 | **0.20 ms (real)** | 9                 | **28, 25**        | 9               | **17, 18**      |
@@ -171,6 +171,18 @@ here. `N` cannot run far past `Q + 1` until `Tw` falls under `Tc`, and at the me
 cutting `Tw` ~10x is what makes it affordable — the backlog a larger queue admits now
 drains an order of magnitude faster, and `drain()` at agent exit is bounded by the same
 `Tw`.
+
+**What happens if `Tw` does fall under `Tc`**, on a `MLX_COLD_CACHE_DIR` pointed at a
+RAM disk or a drive faster than the one measured: the queue stops refusing, `N` has no
+frontier, and `capture_chain` walks **every** full block of the request in one turn.
+That is the intent of the walk — the whole prompt persists on its first turn — but the
+cost lands on the inference thread as one blocking `read_block_all_layers` per new
+block, after the turn's last token. It is bounded by prompt length, not by anything
+tunable: a first turn on a 64 K-token prompt is 4096 blocks x ~0.2 ms = **~0.9 s of
+added turn tail**, and nothing counts or caps it. The margin against that today is
+`Tw/Tc` ~ 2x on the measured pair, and the `fsync(2)` `Tw` above is an over-estimate,
+so the real margin is smaller than 2x. Whoever raises `Q` should put a cap and a
+counter on the walk in the same change.
 
 ### gemma4's sliding-window sidecar
 
@@ -408,12 +420,22 @@ with the checkpoint already resident in the page cache:
 | `gemma4_cold_tier_restart_parity`              | 175 s    | 15                |
 | `gemma4_cold_tier_restart_parity_sub_window`   | 84 s     | 9                 |
 
-Earlier notes here said ~66 min and ~26 min. Those predate the batched cold-tier
-command buffer and the writer's `fsync(2)` change, which together cut the per-block
-restore and capture costs the warm-up turns are dominated by. Budget more on a COLD
-page cache: neither checkpoint carries a `.mlx-download-complete.json` marker, so
-every persist-enabled load full-shard-hashes ~14 GB of weights, and the harness makes
-one such load per warm-up turn plus one per measured instance.
+Earlier notes here said ~66 min and ~26 min. **Do not read the drop as something the
+cold-tier commits bought** — the arithmetic does not support it. The long gemma4 gate
+restores 739 blocks; at the batched command buffer's own measured saving that is
+`739 x (5.271 - 1.158) ms` = **3.0 s**, and the capture side is smaller again. A few
+seconds, against a 62-minute difference.
+
+What the two numbers really differ in is model-load I/O. Neither checkpoint carries a
+`.mlx-download-complete.json` marker, so every persist-enabled load full-shard-hashes
+~14 GB of weights, and the long gate makes 15 such loads. 175 s over 15 loads is
+11.7 s per load, with the weights already in the page cache. 66 min over the same 15
+loads is 264 s per load — about what ~14 GB reads like when it has to come off the
+disk each time. Both runs keep their checkpoints on the same volume, so page-cache
+state is the variable, not the storage. So: **budget the table above only for a warm
+page cache, and expect minutes per load otherwise.** The 264 s/load figure is what the
+arithmetic implies, not a re-measured number — the cold case was not re-run. What is
+certain is the direction: the cold-tier commits moved seconds, not the headline.
 
 The two small-checkpoint gates run in CI, on the existing `model-test` matrix legs
 that already download and convert the checkpoint they need (`.github/workflows/ci.yml`):

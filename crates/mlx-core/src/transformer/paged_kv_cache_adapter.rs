@@ -1114,6 +1114,15 @@ impl ColdTierWalk<'_> {
                 // persisted under a missing parent (a chain hole that is
                 // unrestorable after restart). Breaking keeps the enqueued set
                 // a contiguous prefix.
+                //
+                // That break is also the ONLY bound on this loop. Each
+                // iteration past it costs one blocking `read_block_all_layers`
+                // round trip (~0.2 ms) on the inference thread, and the queue
+                // only refuses while the writer is slower than the capture. On
+                // a cold-tier directory fast enough to invert that — a RAM
+                // disk — nothing refuses and the walk covers the whole prompt
+                // in one turn: ~0.9 s of turn tail at 64 K tokens. See
+                // `docs/paged-cache.md`.
                 match self.cold.manager.capture_and_enqueue(
                     self.pool,
                     block,

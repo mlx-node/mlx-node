@@ -42,21 +42,27 @@
 //! ```text
 //!   owners                     1     2     3     4     5     6
 //!   round-robin
-//!     sidecars   Excluding     3     2     3     4     4     4
-//!                Any           3     3     2     2     2     2
+//!     sidecars   Excluding    38    38    35    32    24    20
+//!                Any          38    35    32    27    22    18
 //!     replay %   BOTH        0.0   5.9   7.8   9.3  10.5  84.0
 //!     blind      BOTH          0     0     0     0     0    28
 //!   burst x4
-//!     sidecars   Excluding     3     4     6     7     7     7
-//!                Any           3     3     3     3     3     3
+//!     sidecars   Excluding    38    36    33    30    26    22
+//!                Any          38    35    31    27    23    19
 //!     replay %   BOTH        0.0   1.2   1.5   1.5   1.5   9.6
 //!     blind      BOTH          0     0     0     0     0     3
 //!                                                          ^^^^
 //!                                              capacity, both arms
 //! ```
 //!
+//! The sidecar rows are at the shipped chain speed, [`QUEUE_BLOCKS_PER_TURN`].
+//! They read 2-7 instead of 20-38 under the pre-`fsync(2)` writer, which
+//! persisted 8-9 blocks a turn against this fixture's 16 — a chain that never
+//! advanced past the first few boundaries. The replay and blind rows are the
+//! same at both speeds.
+//!
 //! The metric-B rows are not rounded to look alike: `gdn_replay_tokens` and the
-//! blind-turn count are EQUAL between the arms, in all 108 cells of
+//! blind-turn count are EQUAL between the arms, in all 324 cells of
 //! `the_publisher_arm_never_costs_hot_path_replay`'s sweep, for the structural
 //! reason set out in `prune_gdn_checkpoints`'s doc. The victim ORDER moves metric
 //! A only. What moves metric B is capacity: six owners in five slots collapses
@@ -78,15 +84,31 @@ use crate::models::qwen3_5::paged_forward::gdn_prefill_checkpoint_boundaries;
 /// every block `contains` already reports on disk at no cost, and BREAKS at the
 /// first block `capture_and_enqueue` does not accept. The writer queue is a
 /// bounded `sync_channel` (`mlx_paged_attn::cold_cache`'s private
-/// `DEFAULT_QUEUE_DEPTH`, 8) drained by a background thread, so one turn lands
-/// about one queue's worth of NEW blocks and the next turn starts its free skip
-/// where the last one stopped. The frontier therefore ratchets by roughly this
-/// many blocks per turn regardless of how long the prompt is.
+/// `DEFAULT_QUEUE_DEPTH`, 8) drained by a background thread, so the frontier
+/// ratchets by `N = (Q + 1) / (1 - Tc/Tw)` blocks per turn — the accepted
+/// prefix before one refusal — regardless of how long the prompt is.
+///
+/// The value is what `cold_cache::bench_chain_advance_per_turn` counts off the
+/// real writer at the real per-block capture cost: 25-28 for a dense block,
+/// 17-18 for MoE. It was 8-9 while the writer still called `F_FULLFSYNC` per
+/// object, which made `Tw` so much larger than `Tc` that `N` collapsed onto
+/// `Q + 1` and the queue depth was the whole answer; `docs/paged-cache.md`
+/// carries both columns.
 ///
 /// This is the one number here that is a dial rather than a call, so
-/// `chain_speed_changes_the_level_not_the_ranking` re-runs the sweep at half and
-/// double this value.
-const QUEUE_BLOCKS_PER_TURN: u32 = 8;
+/// `chain_speed_changes_the_level_not_the_ranking` re-runs the sweep at half
+/// and double this value, 13 and 52. 13 sits under the MoE rate, 52 is past
+/// the point where every fixture saturates, and the old `F_FULLFSYNC` rate is
+/// swept as a third point — [`PRE_FSYNC_BLOCKS_PER_TURN`].
+const QUEUE_BLOCKS_PER_TURN: u32 = 26;
+
+/// The ratchet before the writer stopped calling `F_FULLFSYNC` per object.
+///
+/// Kept as a sweep point because a cold tier on a filesystem where `fsync(2)`
+/// is as expensive as `F_FULLFSYNC` — or a host whose SSD is that much slower
+/// than its GPU — still lands here, and the retention ranking has to hold at
+/// both ends.
+const PRE_FSYNC_BLOCKS_PER_TURN: u32 = 8;
 
 /// Owner ids the sweep hands out, in the order it hands them out. `OWNERS[0]` is
 /// the root — the interactive session that `mlx agent` names explicitly and that
@@ -153,9 +175,14 @@ struct Fixture {
 
 impl Fixture {
     /// An agentic session: a large seeded context and turns that carry tool
-    /// output, so the conversation grows far faster than
-    /// [`QUEUE_BLOCKS_PER_TURN`] can persist. The chain never catches up, which
-    /// is the regime the checkpoint ladder was added for.
+    /// output. It opens 64 blocks (1024 tokens) behind and each of an owner's
+    /// own turns adds 16 blocks against a chain that ratchets
+    /// [`QUEUE_BLOCKS_PER_TURN`], so the chain closes the gap by ~10 blocks per
+    /// own-turn and needs ~7 of them to catch up. Spread over the owner sweep
+    /// that is most of the 40 turns spent behind — the regime the checkpoint
+    /// ladder was added for. Under the pre-`fsync(2)` writer
+    /// ([`PRE_FSYNC_BLOCKS_PER_TURN`]) the chain LOST 8 blocks per own-turn and
+    /// never caught up at all.
     const AGENT: Self = Self {
         label: "agent   1024+256/turn",
         block_size: 16,
@@ -164,9 +191,11 @@ impl Fixture {
         assistant_tokens: 192,
     };
 
-    /// Short back-and-forth chat: turns add less than one queue's worth of
-    /// tokens, so the persisted chain overtakes the prompt after a few turns and
-    /// every later turn can anchor at its own deepest rung.
+    /// Short back-and-forth chat: turns add 6 blocks against a chain that
+    /// ratchets [`QUEUE_BLOCKS_PER_TURN`], so the persisted chain overtakes the
+    /// prompt within two turns and every later turn can anchor at its own
+    /// deepest rung. At the shipped chain speed that saturates — see
+    /// `the_publisher_arm_buys_cold_sidecars`.
     const CHAT: Self = Self {
         label: "chat     256+96/turn",
         block_size: 16,
@@ -1164,8 +1193,19 @@ fn the_publisher_arm_never_costs_hot_path_replay() {
 ///
 /// Burst order is the shape pi actually produces — four task loops interleaved
 /// by the host, not a tidy rotation — and it is where the gap is widest.
+///
+/// Only the AGENT fixture can still show a gap at the shipped chain speed. CHAT
+/// adds 96 tokens (6 blocks) per turn against a chain that ratchets
+/// [`QUEUE_BLOCKS_PER_TURN`], so the persisted chain overtakes the prompt within
+/// two turns and BOTH arms write a sidecar on every single turn — the ceiling,
+/// `SWEEP_TURNS * SWEEP_OWNERS.len()`. A tie there is saturation, not the policy
+/// failing to buy anything, so the assertion splits: at the ceiling the applied
+/// arm must match it, below the ceiling it must strictly beat the control. That
+/// split is what makes the CHAT arm still able to fail — it goes red if the
+/// reordering ever drops a sidecar the unrestricted search kept.
 #[test]
 fn the_publisher_arm_buys_cold_sidecars() {
+    let ceiling = SWEEP_TURNS * SWEEP_OWNERS.len();
     for order in [Order::RoundRobin, Order::Burst(4)] {
         for fixture in [Fixture::AGENT, Fixture::CHAT] {
             let total = |policy| -> usize {
@@ -1183,18 +1223,30 @@ fn the_publisher_arm_buys_cold_sidecars() {
             let applied = total(Policy::ProtectsPublisher);
             let control = total(Policy::Unrestricted);
             println!(
-                "{} {}: {applied} sidecars vs {control}",
+                "{} {}: {applied} sidecars vs {control} (ceiling {ceiling})",
                 fixture.label,
                 order.label()
             );
-            assert!(
-                applied > control,
-                "{} {}: preferring a foreign victim wrote {applied} sidecars over \
-                 the owner sweep and the unrestricted search wrote {control}, so \
-                 it is buying nothing and should be reverted",
-                fixture.label,
-                order.label(),
-            );
+            if control == ceiling {
+                assert_eq!(
+                    applied,
+                    ceiling,
+                    "{} {}: the unrestricted search already wrote a sidecar on \
+                     every turn, so preferring a foreign victim must not lose \
+                     one — it wrote {applied}",
+                    fixture.label,
+                    order.label(),
+                );
+            } else {
+                assert!(
+                    applied > control,
+                    "{} {}: preferring a foreign victim wrote {applied} sidecars \
+                     over the owner sweep and the unrestricted search wrote \
+                     {control}, so it is buying nothing and should be reverted",
+                    fixture.label,
+                    order.label(),
+                );
+            }
         }
     }
 }
@@ -1245,7 +1297,11 @@ fn one_owner_is_the_same_policy_either_way() {
 /// ranking does not hang off its exact value.
 #[test]
 fn chain_speed_changes_the_level_not_the_ranking() {
-    for queue in [QUEUE_BLOCKS_PER_TURN / 2, QUEUE_BLOCKS_PER_TURN * 2] {
+    for queue in [
+        PRE_FSYNC_BLOCKS_PER_TURN,
+        QUEUE_BLOCKS_PER_TURN / 2,
+        QUEUE_BLOCKS_PER_TURN * 2,
+    ] {
         let mut line = Vec::new();
         let mut applied_total = 0usize;
         let mut control_total = 0usize;

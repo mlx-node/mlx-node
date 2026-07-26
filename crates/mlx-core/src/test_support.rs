@@ -331,3 +331,53 @@ pub(crate) fn sorted_gather_mm_untrustworthy() -> bool {
         }
     })
 }
+
+/// True when `msg` says this host has no usable Metal device, so a paged test
+/// that needs one may print `skipping` and return instead of failing.
+///
+/// Matched against the message from `Qwen35Inner::new` /
+/// `Qwen35MoeInner::new` / `initialize_paged_adapter`, which wrap whatever
+/// `LayerKVPool` returned.
+///
+/// It matches the two device-absence strings and nothing else — deliberately
+/// NOT the substring `LayerKVPool`, which also appears in
+/// `LayerKVPool::new: num_blocks must be > 0` and
+/// `LayerKVPool::new: config.num_layers must be > 0`. Those two mean the test
+/// config no longer produces a usable pool, i.e. the test lost its coverage.
+/// A self-skip on them is invisible: libtest counts a skipped-and-returned
+/// test as passed, and the CI leg that owns these tests asserts a pass COUNT,
+/// so a config drift would read green with nothing exercised.
+pub(crate) fn metal_device_absent(msg: &str) -> bool {
+    msg.contains("Metal GPU not available") || msg.contains("No Metal device found")
+}
+
+#[cfg(test)]
+mod skip_predicate_tests {
+    use super::metal_device_absent;
+
+    #[test]
+    fn only_device_absence_licenses_a_paged_test_to_skip() {
+        for absent in [
+            "Metal GPU not available",
+            "No Metal device found",
+            "paged init failed: Metal GPU not available",
+        ] {
+            assert!(
+                metal_device_absent(absent),
+                "a genuinely device-less host must still be able to skip: {absent}"
+            );
+        }
+        for real_failure in [
+            "LayerKVPool::new: num_blocks must be > 0",
+            "LayerKVPool::new: config.num_layers must be > 0",
+            "LayerKVPool allocation failed",
+            "block_size must be > 0",
+        ] {
+            assert!(
+                !metal_device_absent(real_failure),
+                "a config/caller failure must fail the test, not silently skip it: \
+                 {real_failure}"
+            );
+        }
+    }
+}
