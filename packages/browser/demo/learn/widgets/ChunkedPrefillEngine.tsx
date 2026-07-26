@@ -1,7 +1,7 @@
 import * as React from 'react';
 
 import { useLocale } from '../../lib/i18n-react';
-import { FlowDots, HatchDefs, StepControls, hatchFill, useStepPlayer } from '../motion';
+import { FlowDots, HatchDefs, StepControls, elbow, hatchFill, useStepPlayer } from '../motion';
 
 /**
  * ChunkedPrefillEngine — one engine step at a time: a long prompt is prefilled
@@ -208,11 +208,6 @@ const COPY = {
     svgAria: `一张动画引擎示意图。${PROMPT_TOKENS} 个 tokens 的 prompt 被拆成 ${CHUNKS.length} 个 chunk，每个最多 ${CHUNK} 个 tokens。每个 chunk 进入一次与其他请求共享的 LLM forward pass，然后它的 keys 和 values 填进 paged KV cache 的固定大小 block。第一个输出 token 只在最后一个 chunk 之后才被采样。示意图下方的说明文字会跟着当前步骤走。`,
   },
 } as const;
-
-/** Elbow path: down from `from`, across, then into `to`. */
-function elbow(x1: number, y1: number, x2: number, y2: number, midY: number): string {
-  return `M ${x1} ${y1} L ${x1} ${midY} L ${x2} ${midY} L ${x2} ${y2}`;
-}
 
 export function ChunkedPrefillEngine() {
   const locale = useLocale();

@@ -92,9 +92,8 @@ const COPY = {
     ),
     captionDone: (
       <>
-        Done. Every block got its answer — its <strong>gradient</strong> — and that block-by-block hand-off down the
-        stack is the whole of backprop. Note what has <em>not</em> happened yet: no weight changed. The optimizer
-        (AdamW, below) now uses those ~800M gradients to take one small step — then the next batch.
+        Done — every block has its <strong>gradient</strong>, and that hand-off <em>is</em> backprop. No weight changed
+        yet: the optimizer (AdamW, below) turns those ~800M gradients into one step.
       </>
     ),
     captionActive: (label: string) => (
@@ -133,9 +132,8 @@ const COPY = {
     ),
     captionDone: (
       <>
-        完成。每个块都拿到了自己的答案——它的<strong>梯度</strong>
-        ——这种沿堆叠逐块向下的接力，就是反向传播的全部。注意有什么<em>还没</em>
-        发生：没有任何权重被改动。接下来由优化器（AdamW，见下文）用这约 800M 个梯度迈出一小步——然后处理下一个 batch。
+        完成——每个块都拿到了自己的<strong>梯度</strong>，这种沿堆叠向下的接力就是反向传播的全部。但<em>还没</em>
+        有任何权重被改动：优化器（AdamW，见下文）用这约 800M 个梯度迈出一小步。
       </>
     ),
     captionActive: (label: string) => (
@@ -202,8 +200,14 @@ const FWD_X = CX - 100;
 const GRAD_X = CX + 100;
 const ARROW_PAD = 5;
 
-/** Baseline for the two lane captions — below the loss box, above block 0. */
-const COL_LABEL_Y = 78;
+/**
+ * Centre line for the two lane captions. Both sit ON their own lane, so each is
+ * a FrameLabel (a `--background` plate that erases the stroke under the text),
+ * not a bare `<text>` — see the note where they are rendered.
+ */
+const COL_LABEL_Y = 75;
+/** Lane captions are a size down from the box titles. */
+const COL_LABEL_FONT = 9;
 
 function blockY(i: number): number {
   const extra = i >= 2 ? DOTS_GAP : 0;
@@ -258,10 +262,23 @@ export function BackpropFlowDiagram() {
     caption = copy.captionActive(copy.blocks[activeIdx]!);
   }
 
+  // Every caption this sweep can reach, so DiagramFrame can reserve the tallest
+  // and the chapter body cannot hop when the beat changes. One entry per block
+  // because the active caption is a builder and each block label wraps
+  // differently — `LM head` and `embedding` are not the same width.
+  const captions = [copy.captionStart, copy.captionDone, ...copy.blocks.map(copy.captionActive)];
+
   const ease = player.reducedMotion ? undefined : 'stroke 300ms ease, opacity 300ms ease';
 
   return (
-    <DiagramFrame title={copy.title} player={player} locale={locale} caption={caption} note={copy.footer}>
+    <DiagramFrame
+      title={copy.title}
+      player={player}
+      locale={locale}
+      caption={caption}
+      captions={captions}
+      note={copy.footer}
+    >
       <svg viewBox={`0 0 ${VB_W} ${VB_H}`} className="w-full" role="img" aria-label={copy.svgAria}>
         <HatchDefs />
         <defs>
@@ -284,30 +301,6 @@ export function BackpropFlowDiagram() {
           className="text-[10px] font-semibold uppercase tracking-wider"
         >
           {copy.oneNumber}
-        </text>
-
-        {/* ── Lane captions, centred over the lane each one names. They sit in
-            the band between the loss box (ends y=56) and block 0 (starts y=94),
-            so they cannot collide with either. Centring rather than pushing
-            them outward is what keeps the widest string ("FORWARD ↑ (DONE)",
-            ~105 units) inside a 460-wide canvas in both locales. ── */}
-        <text
-          x={FWD_X}
-          y={COL_LABEL_Y}
-          textAnchor="middle"
-          style={{ fill: 'var(--muted-foreground)' }}
-          className="text-[9px] uppercase tracking-wider"
-        >
-          {copy.forwardCol}
-        </text>
-        <text
-          x={GRAD_X}
-          y={COL_LABEL_Y}
-          textAnchor="middle"
-          style={{ fill: frame > 0 ? EMERALD : 'var(--muted-foreground)' }}
-          className="text-[9px] font-medium uppercase tracking-wider"
-        >
-          {copy.gradientCol}
         </text>
 
         {/* ── Ellipsis between layer 24 and layer 1 ── */}
@@ -365,6 +358,34 @@ export function BackpropFlowDiagram() {
             </g>
           );
         })}
+
+        {/* ── Lane captions, centred over the lane each one names.
+            AFTER the arrows on purpose. SVG paints in document order, so while
+            these were bare `<text>` drawn first, the gap-0 elbow — which runs
+            x=FWD_X / x=GRAD_X from y=36 down to y=89 — was stroked straight
+            through the letters (measured: "GRAD|ENT", "FORWARD | ↑"). The
+            band between the loss box and block 0 is clear, but the LANE ISN'T,
+            and the lane is exactly what a centred caption sits on.
+
+            FrameLabel puts a `--background` plate under each one, so the arrow
+            reads as passing behind the label rather than through it. Centring
+            rather than pushing them outward is what keeps the widest string
+            ("FORWARD ↑ (DONE)", ~129 units) inside a 460-wide canvas. ── */}
+        <FrameLabel
+          x={FWD_X}
+          y={COL_LABEL_Y}
+          align="middle"
+          font={COL_LABEL_FONT}
+          label={copy.forwardCol}
+        />
+        <FrameLabel
+          x={GRAD_X}
+          y={COL_LABEL_Y}
+          align="middle"
+          font={COL_LABEL_FONT}
+          fill={frame > 0 ? EMERALD : 'var(--muted-foreground)'}
+          label={copy.gradientCol}
+        />
 
         {/* ── The stacked blocks ── */}
         {BLOCKS.map((b, i) => {

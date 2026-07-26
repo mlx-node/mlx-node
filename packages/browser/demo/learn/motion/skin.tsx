@@ -24,7 +24,7 @@ import type { StepPlayer } from './use-step-player';
  *   #3  airier canvas         — guidance only, see CANVAS WIDTH below. Geometry
  *                               stays widget-owned; there is nothing to export.
  *   #4  less card chrome      — `DiagramFrame` drops the shell's border/fill/
- *                               radius (CPE:249) in ONE place, not 79.
+ *                               radius (CPE:249) in ONE place, not 51.
  *
  * CANVAS WIDTH (#3, unenforceable so it lives in prose). MEASURE FIRST — the
  * first pilot got this wrong twice, and only a live measurement caught either:
@@ -107,7 +107,7 @@ export const RX = 0;
  *   OUTER — a real, owned container. CPE:266, 421, 467, 599.
  *   INNER — anything drawn inside a container: inner borders, cells, slots,
  *           connectors. CPE:276, 306, 380, 548.
- * Already the house default: 82 files use 1.5, 95 use 1.
+ * Already the house default: 81 uses of 1.5 across 37 files, 95 of 1 across 38.
  */
 export const SW = { OUTER: 1.5, INNER: 1 } as const;
 
@@ -266,30 +266,81 @@ export function PanelFrame({
  * `tracking-wider` is 0.05em, so 0.5px of extra advance per glyph at that size.
  */
 const CHIP_FONT = 10;
-const CHIP_H = 14; // clears a 10px face and covers a 1.5 stroke on both sides
 const CHIP_PAD_X = 6;
 const CHIP_TRACK = 0.5;
-/** Vertical centring on the border line: centre + ~0.36em, the same hand-tune CPE uses. */
-const CHIP_BASELINE = 3.5;
+/** Plate height: face + 4, which clears the face and covers a 1.5 stroke both sides. */
+const chipH = (font: number) => font + 4;
+/** Vertical centring on the line: centre + 0.35em, the same hand-tune CPE uses. */
+const chipBaseline = (font: number) => font * 0.35;
 
-/** CJK / fullwidth block — these advance a full em where Latin advances ~0.68. */
-const FULLWIDTH = /[\u3000-\u9FFF\uFF01-\uFF60]/u;
+/**
+ * Everything that advances a FULL em. CJK and fullwidth ASCII, plus — the part
+ * the first draft got wrong — U+2000-U+2BFF, where the zh copy's punctuation
+ * actually lives. Measured in Inter 600 (fontTools v4.000): em dash 1.000em,
+ * ellipsis 0.956, arrows 0.881-0.954, check mark 0.883, and U+22EF is not in
+ * Inter at all, so it falls back to a system face. The old range scored every
+ * one of those at 0.68 — NARROW, the direction that puts the stroke through the
+ * glyphs; four em dashes alone ate the whole CHIP_PAD_X reserve. Hangul and the
+ * CJK compat / vertical-form blocks are in for the same reason. Astral CJK needs
+ * the second alternative: a BMP class can never match U+20000+, so Ext-B was
+ * scoring 0.68 too.
+ *
+ * Thin spaces and curly quotes in U+2000-U+2BFF are now over-counted. That is
+ * deliberate — over is the safe direction, and they are rare in a box title.
+ */
+const FULLWIDTH =
+  /[\u2000-\u2BFF\u3000-\u9FFF\uAC00-\uD7A3\uF900-\uFAFF\uFE10-\uFE4F\uFF01-\uFF60]|[\u{20000}-\u{3FFFF}]/u;
+
+/**
+ * The glyphs whose advance runs past the 0.79em the estimator assumes below.
+ * Measured on the RENDERED page, not read out of the font file: a `<text>`
+ * carrying these exact classes, differenced over repeats —
+ * `(len(ch x 41) - len(ch x 31)) / 10`, which cancels the side bearings — then
+ * less the 0.05em tracking, leaving the bare advance.
+ *
+ *   W 1.043em   %  1.004   M 0.923    <- past 0.79
+ *   Q 0.773     O  0.769   N 0.759    <- the widest that are not
+ *
+ * 1.06 clears all three. fontTools agrees on M/Q/O/N to three places but puts W
+ * at 1.020, and an earlier reading of this same page came out ~0.99 — both low
+ * enough to under-size a ten-W label, so measure a WARM page
+ * (`document.fonts.ready`) and trust it over the file.
+ *
+ * `%` is not a capital and belongs here anyway: `uppercase` does not shrink it
+ * and a caption can plausibly carry one ("30% faster"). Three families are
+ * knowingly NOT covered, because no label in this course can contain them — the
+ * per-mille signs (U+2030/31, 1.42em), the Latin digraphs (U+01C4-01CC,
+ * 1.34-1.42em), and U+00DF, which `uppercase` expands to "SS" (1.35em).
+ */
+const WIDE_GLYPH = /[MWmw%]/;
+const WIDE_ADVANCE = 1.06;
 
 /**
  * Estimated chip width. SVG cannot measure text without a DOM, and this has to
  * be identical on the prerender server and in the browser, so it is an estimate
- * by construction. Deliberately biased LARGE: an over-wide chip notches a little
+ * by construction. It MUST be biased large: an over-wide chip notches a little
  * more border than it needs, which is invisible; an under-wide one lets the
  * stroke run through the letters, which is not.
+ *
+ * The first draft said exactly that and then used 0.68em per capital, which is
+ * below 15 of Inter 600's 26 (W 1.020, M 0.922, Q 0.773, O 0.769, N 0.759,
+ * G 0.749, H 0.746, C 0.737, U 0.736, A 0.728, V 0.728, D 0.722, X 0.720,
+ * Y 0.713, K 0.703). The sign stayed positive only because CHIP_PAD_X is added
+ * unconditionally — a fixed reserve, not a bias, and one a four-W label eats
+ * outright. 0.79 is an upper bound for the other 24 in Inter AND in the system
+ * stack the page paints with before the webfont swaps in.
  */
-function chipWidth(label: string): number {
+function chipWidth(label: string, font: number): number {
   const chars = Array.from(label);
   let advance = 0;
   for (const ch of chars) {
-    if (FULLWIDTH.test(ch)) advance += CHIP_FONT;
-    else if (ch === ' ') advance += CHIP_FONT * 0.3;
-    // The class applies `uppercase`, so every Latin glyph renders as a capital.
-    else advance += CHIP_FONT * 0.68;
+    if (FULLWIDTH.test(ch)) advance += font;
+    else if (ch === ' ') advance += font * 0.3;
+    // The class applies `uppercase`, so every Latin glyph renders as a capital
+    // — which is exactly why M and W need a step of their own, and why `%`
+    // rides along: uppercasing does not shrink it either.
+    else if (WIDE_GLYPH.test(ch)) advance += font * WIDE_ADVANCE;
+    else advance += font * 0.79;
   }
   return advance + CHIP_TRACK * chars.length + CHIP_PAD_X * 2;
 }
@@ -298,10 +349,14 @@ function chipWidth(label: string): number {
  * TARGET LOOK #2 — FrameLabel: a title chip straddling the top border.
  *
  *        +--[ PAGED KV CACHE ]----------+
- *        |                              |
+ *        | +- -                - - - -+ |
+ *        | :                          : |
  *
  * A `var(--background)`-filled rect notched into the stroke, with the label
- * sitting on it. This replaces the course's current rule — title INSIDE the box,
+ * sitting on it. On a short PanelFrame the plate reaches the INNER dashed
+ * border too, as drawn — inset is 5 there and the plate half-height is 7. That
+ * is correct, not a bug: the 10px face itself crosses both strokes, so erasing
+ * only the outer one would leave the dashes running through the descenders. This replaces the course's current rule — title INSIDE the box,
  * baseline at roughly `top + 17 + height/12` (CPE:281, 425, 615) — which costs
  * ~20px of vertical space per box and is the main reason CPE reads as 1.376:1
  * rather than 16:9. Moving the title onto the border gives that space back, so
@@ -310,36 +365,47 @@ function chipWidth(label: string): number {
  * This is the ONE export with no prior art in the repo; everything else was
  * extracted. Treat the geometry as the first draft it is.
  *
- * `x` is the anchor ON the border line, `y` is the border line itself — pass the
- * panel's own `y`, not `y + something`. `align` says which end of the chip the
- * anchor pins: `start` (default) sits it in from the left corner, which is the
- * reference look; `middle` re-centres it for a symmetric diagram.
+ * `x` is the anchor ON the line, `y` is the line itself — pass the panel's own
+ * `y`, not `y + something`. `align` says which end of the chip the anchor pins:
+ * `start` (default) sits it in from the left corner, which is the reference
+ * look; `middle` re-centres it for a symmetric diagram.
+ *
+ * The line does not have to be a panel border. Any label sitting ON a stroke
+ * needs this — a lane caption centred on its own arrow is the same problem, and
+ * BackpropFlowDiagram shipped one frame with the elbow drawn straight through
+ * the letters because a bare `<text>` looked fine in the frame that was checked.
+ * `font` and `fill` exist for that case; the defaults are the panel-title look.
  */
 export function FrameLabel({
   x,
   y,
   label,
   align = 'start',
+  font = CHIP_FONT,
+  fill = 'var(--foreground)',
 }: {
   x: number;
   y: number;
   label: string;
   align?: 'start' | 'middle' | 'end';
+  font?: number;
+  fill?: string;
 }) {
-  const w = chipWidth(label);
+  const w = chipWidth(label, font);
+  const h = chipH(font);
   const chipX = align === 'start' ? x : align === 'middle' ? x - w / 2 : x - w;
   const textX = align === 'start' ? x + CHIP_PAD_X : align === 'middle' ? x : x - CHIP_PAD_X;
 
   return (
     <g>
-      {/* No stroke: this rect's whole job is to ERASE the border under the text. */}
-      <rect x={chipX} y={y - CHIP_H / 2} width={w} height={CHIP_H} rx={RX} style={{ fill: 'var(--background)' }} />
+      {/* No stroke: this rect's whole job is to ERASE the stroke under the text. */}
+      <rect x={chipX} y={y - h / 2} width={w} height={h} rx={RX} style={{ fill: 'var(--background)' }} />
       <text
         x={textX}
-        y={y + CHIP_BASELINE}
+        y={y + chipBaseline(font)}
         textAnchor={align}
-        style={{ fill: 'var(--foreground)' }}
-        className="text-[10px] font-semibold uppercase tracking-wider"
+        style={{ fill, fontSize: font }}
+        className="font-semibold uppercase tracking-wider"
       >
         {label}
       </text>
@@ -350,13 +416,20 @@ export function FrameLabel({
 // ── DiagramFrame ─────────────────────────────────────────────────────────────
 
 /**
+ * Caption typography. Shared so the invisible sizers and the visible caption
+ * cannot drift apart — if they did, the slot would be sized for a different
+ * font than the one it holds. 12px at `leading-relaxed` is 19.5px a line.
+ */
+const CAPTION_CLS = 'text-[12px] leading-relaxed text-muted-foreground';
+
+/**
  * DiagramFrame — the shell every animated diagram repeats: header row, the svg,
  * the caption, the footnote. Pass the `<svg>` as children; this owns everything
  * around it.
  *
  * TARGET LOOK #4 — LESS CARD CHROME. CPE's shell is
  *   `not-prose my-5 space-y-3 rounded-md border border-border bg-background p-3`
- * (CPE:249), copied verbatim into 93 files. A rounded, bordered, filled card
+ * (CPE:249), copied verbatim into 51 files. A rounded, bordered, filled card
  * around a square-cornered wireframe diagram fights it twice — the radius
  * contradicts RX = 0 and the border draws a fifth box nobody asked for. So the
  * card is gone and the breathing room is dialled up instead (`my-6 space-y-4`).
@@ -380,12 +453,35 @@ export function FrameLabel({
  *    polite in the same DOM mutation that changes the text — and a region that
  *    was not already live when its content changed is not reliably announced.
  *    Two nodes sidesteps the race: the span's `aria-live` never changes.
+ *
+ *  - `announcing`, not `!player.playing`, gates BOTH nodes. Two reasons, both
+ *    measured rather than reasoned:
+ *
+ *    1. `playing` starts TRUE (use-step-player.ts:60), so the first draft's
+ *       `aria-hidden="true"` + empty span put the caption in NO accessible node
+ *       at all — confirmed by running this component through the prerender's own
+ *       esbuild config: the server emits `<span …aria-live="polite"></span>`,
+ *       empty, next to an aria-hidden paragraph. A sighted reader saw a caption
+ *       a screen-reader user could not reach, on every page, by default.
+ *    2. `useStepPlayer` pauses ITSELF twice — for reduced motion after mount
+ *       (:63-67) and when a `loop:false` sweep parks (:83-86). Gating on
+ *       `playing` alone turned both into an unsolicited announcement during
+ *       load. A MutationObserver caught the reduced-motion one as two commits
+ *       21ms apart: span `'' -> caption`, with nothing touched.
+ *
+ *    So: the paragraph is exposed until the reader presses something, and after
+ *    that the two nodes hand the sentence back and forth. Exactly one
+ *    accessible copy exists at every instant, which is also why this cannot
+ *    double-announce.
  *  - `aria-atomic` so the whole sentence reads, not the character diff.
- *  - `min-h-[3.75rem]` reserves THREE lines at `text-[12px] leading-relaxed`
- *    (12 x 1.625 = 19.5px each) so the page does not jump as the caption
- *    changes length. Two lines was not enough for the first caller and made the
- *    chapter body hop 38px on every loop. A caption that runs to four lines in
- *    the 451px reading column will still shift the page — shorten the caption.
+ *  - The caption slot holds still as the caption changes length, because
+ *    `captions` stacks the whole sweep in ONE grid cell and the cell takes the
+ *    tallest. A fixed `min-h` cannot do that job: it is one number facing two
+ *    locales and a 335px-to-742px column, and it was wrong twice. Two lines
+ *    hopped the chapter body 38px per loop; three lines still hopped it 18px at
+ *    451px, 38px at 375px and 57px at 335px, because the same caption wraps to
+ *    4, 5 and 6 lines there. Callers that omit `captions` keep the three-line
+ *    guess, and keep that risk.
  *
  * The third part of the contract — a REAL pause control — is `StepControls`,
  * rendered here. The fourth — reduced-motion seeding — is `useStepPlayer`, which
@@ -400,6 +496,7 @@ export function DiagramFrame({
   player,
   locale,
   caption,
+  captions,
   note,
   showReset = false,
   children,
@@ -418,26 +515,82 @@ export function DiagramFrame({
    * plain string is still the common case and still valid.
    */
   caption: React.ReactNode;
+  /**
+   * Every caption this sweep can show. Optional, and used ONLY to size the
+   * slot — the frame stacks them all in one grid cell, so the cell is as tall
+   * as the tallest AT THE CURRENT WIDTH and the page cannot hop when the beat
+   * changes. Pass the same list the caller indexes into; order is irrelevant.
+   *
+   * Cheap to get wrong in the safe direction: a caption missing from the list
+   * only costs the hop it would have caused anyway, and a stale extra one only
+   * reserves a few px. Omitting it entirely falls back to a three-line guess.
+   */
+  captions?: React.ReactNode[];
   /** Optional standing footnote — "these numbers are illustrative", etc. */
   note?: React.ReactNode;
   /** Worth it for long sweeps; noise for short loops. See StepControls.tsx:44. */
   showReset?: boolean;
   children: React.ReactNode;
 }) {
+  // A pause the READER asked for. `player.playing` alone cannot tell the two
+  // apart — see the `announcing` note above.
+  const [asked, setAsked] = React.useState(false);
+  const ask = <T,>(fn: T) => ((...args: unknown[]) => {
+    setAsked(true);
+    (fn as (...a: unknown[]) => void)(...args);
+  }) as T;
+  const intent: StepPlayer = {
+    ...player,
+    toggle: ask(player.toggle),
+    step: ask(player.step),
+    reset: ask(player.reset),
+    goTo: ask(player.goTo),
+  };
+  /** Is the live region holding the caption right now? */
+  const announcing = asked && !player.playing;
+
   return (
     <div className="not-prose my-6 space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">{title}</div>
-        <StepControls player={player} locale={locale} showReset={showReset} />
+        <StepControls player={intent} locale={locale} showReset={showReset} />
       </div>
 
       {children}
 
-      <p className="min-h-[3.75rem] text-[12px] leading-relaxed text-muted-foreground" aria-hidden="true">
-        {caption}
-      </p>
+      {/* The caption slot. Every caption of the sweep sits in the SAME grid
+          cell, so the cell is as tall as the tallest one at whatever width the
+          column happens to be — no magic number, no per-locale tuning, and
+          nothing to keep in sync when a caption is reworded. The sizers are
+          `invisible` rather than hidden so they still take up space, and they
+          are out of the a11y tree, so only the real one below is readable.
+
+          The cell sizes to the tallest MARGIN box, so it measures ~24px taller
+          than any caption in it: the chapter body puts `my-3` on every `p`
+          through an `[&_p]` variant, and `.not-prose` does not stop it — this
+          course has no typography plugin, so that class is inert here. That is
+          the body's own paragraph rhythm, and the same margin the single
+          caption carried before this slot existed. Measured, not assumed. Do
+          NOT add `m-0` to make the number tidy: it would quietly retune caption
+          spacing in every widget that uses this frame. */}
+      <div className="grid">
+        {(captions ?? []).map((sizer, i) => (
+          <p key={i} aria-hidden="true" className={`invisible col-start-1 row-start-1 ${CAPTION_CLS}`}>
+            {sizer}
+          </p>
+        ))}
+        {/* Exactly ONE accessible copy, always. Not announcing -> the plain
+            paragraph carries it (no live ancestor, so a sweep says nothing).
+            Announcing -> the paragraph steps out and the region speaks, once. */}
+        <p
+          className={`col-start-1 row-start-1 ${captions ? '' : 'min-h-[3.75rem] '}${CAPTION_CLS}`}
+          aria-hidden={announcing ? 'true' : undefined}
+        >
+          {caption}
+        </p>
+      </div>
       <span className="sr-only" aria-live="polite" aria-atomic="true">
-        {player.playing ? '' : caption}
+        {announcing ? caption : ''}
       </span>
 
       {note ? (
