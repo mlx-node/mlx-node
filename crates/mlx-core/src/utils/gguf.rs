@@ -1891,6 +1891,137 @@ impl SourceQuantProfile {
 /// `import_k_quants` mirrors `GgufLoadOptions`: with it off the loader rejected
 /// Q4_K/Q5_K outright and dequantized the Gemma4 Q6_K embedding to BF16, so no
 /// K-quant tensor reaches the output for this to describe.
+/// Whether this Gemma4 checkpoint takes V from the key projection on its
+/// global layers.
+///
+/// Gemma4 interleaves sliding-window and global (full-attention) layers, and on
+/// the global ones V is not a projection at all: the layer reuses the key
+/// projection output, so no `attn_v` tensor is ever written. llama.cpp encodes
+/// this by marking `wv` as `TENSOR_NOT_REQUIRED` and falling back to
+/// `V := Kcur` when it is absent; `Gemma4Attention` spells the same thing as
+/// `attention_k_eq_v`, which drops `v_proj` and takes V from the raw key
+/// projection before K's norm and RoPE.
+///
+/// No GGUF metadata key records it, so the only witness is the tensor list
+/// itself. Without this the loader asks for a `v_proj` the publisher never
+/// wrote and the conversion dies on `layers.5.self_attn.v_proj` — which is what
+/// blocks Google's QAT GGUFs, the only form those checkpoints ship in.
+///
+/// The signal is deliberately a *mix*: some decoder layers carrying `attn_v`
+/// and others not. A checkpoint where every layer has V is an ordinary one, and
+/// a checkpoint where none does is not the interleaved pattern this describes —
+/// neither should silently flip the flag.
+///
+/// The return value is the full `layer_types` array rather than a bare bool,
+/// because the flag alone is not enough. `attention_k_eq_v` only takes effect
+/// on layers the config calls `full_attention`, and when `layer_types` is
+/// absent the loader synthesizes one from `sliding_window_pattern`, which
+/// defaults to 5 and puts the global layers at indices 4, 9, 14 … The GGUF
+/// carries `sliding_window_pattern` as a *bool*, so the cycle length cannot be
+/// read from metadata at all — but the tensors give it exactly: on a checkpoint
+/// with this layout the layers missing `attn_v` are precisely the global ones.
+/// Emitting the array measured off the tensors avoids guessing a period that is
+/// 6 here and would silently mistype every layer if guessed as 5.
+fn gemma4_layer_types_from_missing_v(gguf: &GgufFile) -> Option<Vec<String>> {
+    let mut layers = std::collections::BTreeSet::new();
+    for tensor in &gguf.tensors {
+        if let Some(rest) = tensor.name.strip_prefix("blk.")
+            && let Some((idx, _)) = rest.split_once('.')
+            && let Ok(n) = idx.parse::<u32>()
+        {
+            layers.insert(n);
+        }
+    }
+
+    let mut types = Vec::with_capacity(layers.len());
+    let mut with_v = false;
+    let mut without_v = false;
+    for layer in layers {
+        let prefix = format!("blk.{layer}.attn_v");
+        if gguf.tensors.iter().any(|t| t.name.starts_with(&prefix)) {
+            with_v = true;
+            types.push("sliding_attention".to_string());
+        } else {
+            without_v = true;
+            types.push("full_attention".to_string());
+        }
+    }
+
+    (with_v && without_v).then_some(types)
+}
+
+/// Fill in the Gemma4 attention geometry that the generic metadata mapping
+/// cannot express.
+///
+/// Gemma4 decouples the head dimension from `hidden_size / num_attention_heads`
+/// and uses a different one per layer type — 512 on global layers and 256 on
+/// sliding ones for the 12B, against a derived value of 240 that matches
+/// neither. It also varies the KV head count per layer, so `head_count_kv` is
+/// an *array* in the GGUF rather than a scalar, and the generic mapping (which
+/// handles scalars only) drops it entirely, leaving the loader on its default
+/// of 2.
+///
+/// `layer_types` says which entry of that array is which: the sliding count
+/// becomes `num_key_value_heads` and the global one
+/// `num_global_key_value_heads`, mirroring how `Gemma4Config::effective_*`
+/// reads them back.
+fn apply_gemma4_attention_geometry(
+    config: &mut serde_json::Map<String, serde_json::Value>,
+    metadata: &HashMap<String, GgufMetaValue>,
+    layer_types: Option<&[String]>,
+) {
+    let mut put = |key: &str, value: u32| {
+        config.insert(key.to_string(), serde_json::Value::Number(value.into()));
+    };
+
+    let global_head_dim = metadata
+        .get("gemma4.attention.key_length")
+        .and_then(|v| v.as_u32());
+    let sliding_head_dim = metadata
+        .get("gemma4.attention.key_length_swa")
+        .and_then(|v| v.as_u32())
+        .or(global_head_dim);
+
+    // `head_dim` is the sliding one; global layers read `global_head_dim`.
+    if let Some(hd) = sliding_head_dim {
+        put("head_dim", hd);
+    }
+    if let Some(hd) = global_head_dim {
+        put("global_head_dim", hd);
+    }
+    if let Some(w) = metadata
+        .get("gemma4.attention.sliding_window")
+        .and_then(|v| v.as_u32())
+    {
+        put("sliding_window", w);
+    }
+
+    let kv_per_layer = match metadata.get("gemma4.attention.head_count_kv") {
+        Some(GgufMetaValue::ArrayI32(v)) => v.iter().map(|&n| n as u32).collect::<Vec<_>>(),
+        Some(GgufMetaValue::ArrayU32(v)) => v.clone(),
+        Some(scalar) => scalar.as_u32().into_iter().collect(),
+        None => Vec::new(),
+    };
+    if kv_per_layer.is_empty() {
+        return;
+    }
+
+    let pick = |global: bool| -> Option<u32> {
+        let types = layer_types?;
+        let idx = types
+            .iter()
+            .position(|t| (t == "full_attention") == global)?;
+        kv_per_layer.get(idx).copied()
+    };
+
+    if let Some(kv) = pick(false).or_else(|| kv_per_layer.first().copied()) {
+        put("num_key_value_heads", kv);
+    }
+    if let Some(kv) = pick(true) {
+        put("num_global_key_value_heads", kv);
+    }
+}
+
 fn preserved_source_quantization(
     gguf: &GgufFile,
     import_k_quants: bool,
@@ -2563,6 +2694,7 @@ pub async fn convert_gguf_to_safetensors(
         }
 
         // Load or extract config, then inject quantization metadata if needed
+        let synthesized_config = !src_config.exists();
         let mut config_json: serde_json::Value = if src_config.exists() {
             let data = fs::read_to_string(&src_config)
                 .map_err(|e| Error::from_reason(format!("Failed to read config.json: {e}")))?;
@@ -2571,6 +2703,29 @@ pub async fn convert_gguf_to_safetensors(
         } else {
             extract_config(&gguf.metadata)
         };
+
+        // Read off the tensor list, not the metadata, and applied to both config
+        // sources: a hand-supplied config.json for a GGUF whose global layers
+        // carry no `attn_v` is describing weights that do not exist, and the
+        // weights are the artifact.
+        if is_gemma4_main_gguf(&gguf.metadata) {
+            let layer_types = gemma4_layer_types_from_missing_v(&gguf);
+            if let Some(ref types) = layer_types {
+                config_json["attention_k_eq_v"] = serde_json::Value::Bool(true);
+                config_json["layer_types"] = serde_json::Value::Array(
+                    types
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                );
+            }
+            // Only when we synthesized the config: an authoritative config.json
+            // already states this geometry, and the GGUF is the weaker source.
+            if synthesized_config && let Some(obj) = config_json.as_object_mut() {
+                apply_gemma4_attention_geometry(obj, &gguf.metadata, layer_types.as_deref());
+            }
+        }
 
         if do_quantize {
             let quant_obj = crate::convert::build_quantization_object(
@@ -4002,6 +4157,76 @@ mod tests {
             alignment: GGUF_DEFAULT_ALIGNMENT,
             data_offset: 0,
         }
+    }
+
+    /// Layer names for `n` decoder layers, where every layer listed in
+    /// `global` is written without an `attn_v` tensor.
+    fn kv_layout_fixture(n: u32, global: &[u32]) -> GgufFile {
+        let mut names = Vec::new();
+        for layer in 0..n {
+            names.push(format!("blk.{layer}.attn_q.weight"));
+            names.push(format!("blk.{layer}.attn_k.weight"));
+            if !global.contains(&layer) {
+                names.push(format!("blk.{layer}.attn_v.weight"));
+            }
+            names.push(format!("blk.{layer}.attn_output.weight"));
+        }
+        let refs: Vec<(&str, GgufTensorType)> = names
+            .iter()
+            .map(|n| (n.as_str(), GgufTensorType::Q4_0))
+            .collect();
+        source_quant_fixture(&refs)
+    }
+
+    /// The shape of Google's `gemma-4-12b-it-qat-q4_0-gguf`: 48 layers, every
+    /// sixth one written without `attn_v` because it takes V from the key
+    /// projection.
+    ///
+    /// The positions are the point, not just the count. `attention_k_eq_v` only
+    /// applies to layers the config calls `full_attention`, and the loader's
+    /// fallback period of 5 puts those at 4, 9, 14 … — so with the flag set but
+    /// the array missing, layer 5 reads as sliding, V is demanded anyway, and
+    /// the load dies on `layers.5.self_attn.v_proj`. That is the exact failure
+    /// this fixture reproduces.
+    #[test]
+    fn gemma4_missing_attn_v_yields_layer_types_at_the_real_period() {
+        let global: Vec<u32> = (0..48).filter(|l| (l + 1) % 6 == 0).collect();
+        assert_eq!(global.len(), 8, "gemma4 publishes 8 global layers of 48");
+
+        let types = gemma4_layer_types_from_missing_v(&kv_layout_fixture(48, &global))
+            .expect("a mixed checkpoint yields layer_types");
+        assert_eq!(types.len(), 48);
+
+        let full: Vec<usize> = types
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| *t == "full_attention")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            full,
+            vec![5, 11, 17, 23, 29, 35, 41, 47],
+            "period 6, not the loader's default of 5"
+        );
+    }
+
+    /// The mutation that matters in the other direction: a detector that always
+    /// fires would drop `v_proj` on an ordinary checkpoint and feed attention
+    /// the keys as values — silent corruption rather than a load failure. A
+    /// checkpoint whose layers all carry `attn_v` must yield nothing, and so
+    /// must the degenerate all-missing case, which is not the interleave this
+    /// describes.
+    #[test]
+    fn gemma4_kv_detection_needs_a_genuine_mix() {
+        assert!(
+            gemma4_layer_types_from_missing_v(&kv_layout_fixture(48, &[])).is_none(),
+            "every layer has attn_v: this is an ordinary checkpoint"
+        );
+        let all: Vec<u32> = (0..48).collect();
+        assert!(
+            gemma4_layer_types_from_missing_v(&kv_layout_fixture(48, &all)).is_none(),
+            "no layer has attn_v: not the sliding/global interleave"
+        );
     }
 
     #[test]
