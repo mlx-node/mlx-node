@@ -42,9 +42,12 @@ import type { DiscoveredModelLike } from '../types.js';
  *    `ColdGroup::GdnState` sidecar, and its `ColdSidecarPolicy` reconciles the
  *    native restore down to the deepest block-aligned boundary a validated
  *    sidecar backs (a recurrent state is valid only at its exact prefix length).
- *  - `qwen3_5_moe` keeps the SAME GDN recurrent state outside the pool but has
- *    no cold-tier attach wired on the native side yet (its own restart-parity
- *    gate has not been run), so persistence is not requested for it.
+ *  - `qwen3_5_moe` keeps the SAME GDN recurrent state outside the pool — same
+ *    shapes, same dtype, same layer mapping — so it shares the dense family's
+ *    sidecar codec and `ColdSidecarPolicy` verbatim. Its restart-parity gate has
+ *    since been run on `Qwen3.6-35b-a3b-UD-Q2_K_XL-mlx`: the restore reconciled
+ *    onto ladder rung 304 of `[16, 64, 304, 1248]` with `hits=42` and
+ *    `corruptions=0`, and the text matched a no-persist baseline.
  *  - `lfm2` / `lfm2_moe` keep short-conv state outside the pool with no
  *    serialization path for it at all, AND drive the uniform native adapter
  *    API whose restore branch is already wired to the tier — asking for

@@ -282,9 +282,18 @@ jobs:
             # FULLY QUALIFIED and run under `--exact`, because libtest exits 0
             # when a filter matches nothing: a rename would turn this step into
             # a silent no-op that still reports green. The run step additionally
-            # asserts the run actually executed a test, which is the part a
-            # filter can never guarantee on its own.
-            lib_tests: models::qwen3_5::model::paged_construction_tests::dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy
+            # asserts the run executed exactly as many tests as there are names
+            # here, which is the part a filter can never guarantee on its own.
+            #
+            # Whitespace-separated; libtest ORs multiple `--exact` filters. The
+            # MoE entry is not a qwen3_5-dense test — it builds a tiny synthetic
+            # MoE plus a real paged pool and needs NO checkpoint, so it rides
+            # this leg because there is no MoE `model-test` leg and (see
+            # docs/paged-cache.md) there cannot be one: the smallest published
+            # qwen3_5_moe is 35B-A3B.
+            lib_tests: >-
+              models::qwen3_5::model::paged_construction_tests::dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy
+              models::qwen3_5_moe::model::paged_construction_tests::moe_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy
           - name: lfm2
             model: LiquidAI/LFM2.5-1.2B-Thinking
             slug: lfm2.5-1.2b-thinking
@@ -397,7 +406,7 @@ jobs:
             # `lib_tests:`, in which case nothing extra runs. See the comment on
             # that matrix key for why this is not folded into the line above.
             #
-            # The `1 passed` check is the point of the tee: `cargo test` exits 0
+            # The passed-count check is the point of the tee: `cargo test` exits 0
             # on "0 passed; 55 filtered out", so a filter that stopped matching
             # — a rename, a moved module — would delete this coverage while the
             # leg stayed green. That is the failure mode this repo keeps hitting,
@@ -405,13 +414,19 @@ jobs:
             # FAILURE is already fatal via `set -o pipefail`. `paged_inner_or_skip`
             # inside the test can still self-skip on a Metal init failure; that
             # one prints `skipping` and is visible in the log.
+            #
+            # EXACT count, not `[1-9][0-9]*`: with more than one name in
+            # `lib_tests` a loose check stays green when only some of them still
+            # resolve, which is the same silent-green hole one filter down.
             if [ -n "${{ matrix.lib_tests }}" ]; then
+              want=$(echo "${{ matrix.lib_tests }}" | wc -w | tr -d ' ')
               cargo test -p mlx-core --lib -- --ignored --exact --test-threads=1 --nocapture \
                 ${{ matrix.lib_tests }} 2>&1 | tee /tmp/lib_tests.log
-              if ! grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/lib_tests.log; then
-                echo "::error::lib_tests filter '${{ matrix.lib_tests }}' matched no test."
+              if ! grep -qE "test result: ok\. $want passed" /tmp/lib_tests.log; then
+                echo "::error::lib_tests expected $want test(s) to run; the filter matched a"
+                echo "::error::different number. Names: ${{ matrix.lib_tests }}"
                 echo "::error::libtest exits 0 on an empty selection, so this would have been a"
-                echo "::error::silent green. Re-qualify the name against 'cargo test -p mlx-core"
+                echo "::error::silent green. Re-qualify each name against 'cargo test -p mlx-core"
                 echo "::error::--lib -- --ignored --list'."
                 exit 1
               fi

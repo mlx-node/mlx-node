@@ -236,9 +236,14 @@ pub(crate) fn sidecar_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
 ///    is valid ONLY at its exact block-aligned prefix length (vLLM `MambaSpec`);
 ///    its `ColdSidecarPolicy` reconciles the restore down to the deepest such
 ///    boundary a validated sidecar backs, or to zero.
-///  * `qwen3_5_moe` keeps the SAME GDN recurrent state outside the pool, but has
-///    no cold-tier attach wired yet — its own restart-parity gate (on a real
-///    MoE checkpoint) has not been run, so it stays off.
+///  * `qwen3_5_moe` keeps the SAME GDN recurrent state outside the pool — same
+///    shapes, same dtype, same layer mapping, projected by
+///    `Qwen3_5MoeConfig::to_dense_config` — so it shares the dense family's
+///    sidecar codec and `ColdSidecarPolicy` verbatim. Witnessed on
+///    `Qwen3.6-35b-a3b-UD-Q2_K_XL-mlx`: the restore reconciled onto rung 304 of
+///    the ladder `[16, 64, 304, 1248]` with `hits=42`, `corruptions=0`, and text
+///    matching a no-persist baseline
+///    (`crates/mlx-core/tests/qwen3_5_moe_cold_tier_parity.rs`).
 ///  * `lfm2` / `lfm2_moe` keep short-conv state outside the pool with no
 ///    serialization path for it at all, AND drive the uniform adapter API
 ///    whose restore branch is already wired to the tier — attaching a context

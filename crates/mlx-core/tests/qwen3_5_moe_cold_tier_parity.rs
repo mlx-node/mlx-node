@@ -43,17 +43,37 @@
 //! the ladder there is `[16, 80]` and one turn's chain reach (~8 blocks = 128
 //! tokens) already covers the deepest rung, so the restore always anchors at
 //! the prompt's end and a ladder collapsed to one endpoint boundary leaves the
-//! gate green. With the ladder fixture the deepest rung is tens of blocks in
-//! (1259 tokens / 78 blocks on the dense 0.8B; the MoE tokenizer will differ,
-//! and every assertion reads the runtime `prompt_tokens` rather than a
-//! constant), and the point where the two prompts diverge caps
-//! `kv_chain_upper_bound` far below it — so
-//! the restore MUST reconcile onto a shallower rung, which is what the
-//! harness's assertion 1b checks. It kills a one-rung ladder; it does not pin
-//! the rung count at four, nor the ratio — both of those are pinned by exact
-//! rung values in
+//! gate green. With the ladder fixture the deepest rung is tens of blocks in,
+//! and the point where the two prompts diverge caps `kv_chain_upper_bound` far
+//! below it — so the restore MUST reconcile onto a shallower rung, which is
+//! what the harness's assertion 1b checks. It kills a one-rung ladder; it does
+//! not pin the rung count at four, nor the ratio — both of those are pinned by
+//! exact rung values in
 //! `qwen3_5::paged_forward::gdn_checkpoint_tests::ladder_rungs_are_quarters_of_the_one_above`,
 //! model-free and in milliseconds. See the dense gate's module doc.
+//!
+//! Observed on `Qwen3.6-35b-a3b-UD-Q2_K_XL-mlx` (40 layers, `full_attention_interval`
+//! 4, `head_dim` 256, no MTP head), 105 s wall over 5 fresh loads:
+//!
+//! ```text
+//! capture prompt 1259 tok -> ladder [16, 64, 304, 1248]   (deepest = 78 blocks)
+//! warm-up 1 cached=0     warm-up 2 cached=64     instance 1 cached=304
+//! instance 2 (restart)   cached=304   <-- rung 3 of 4, strictly below 1248
+//! sidecar telemetry      boundary_skips=0 already_persisted=2 enqueued=0
+//! cold stats             hits=42 misses=0 corruptions=0
+//! ```
+//!
+//! Rung for rung the same shape the dense 0.8B gate reports, because both
+//! families tokenize this fixture to the same 1259 tokens — this file used to
+//! hedge that "the MoE tokenizer will differ", and it does not. Nothing here is
+//! a constant either way: every assertion reads the runtime `prompt_tokens`.
+//!
+//! `already_persisted=2` with `enqueued=0` is the healthy steady state, not a
+//! miss — a warm-up turn wrote rung 304 and both measured turns re-selected the
+//! same chain and deduped. Under a ladder collapsed to one rung the same three
+//! lines instead read `cached=0` everywhere, `boundary_skips=2
+//! already_persisted=0`, and `restore anchored at 0`, and the harness's
+//! assertion 1 fires.
 //!
 //! Gated on `MLX_TEST_MODEL_PATH`. The tier manager is a process-global
 //! `OnceLock`, so this must be the only thing in the process touching it —

@@ -399,17 +399,42 @@ MLX_COLD_CACHE_DIR=$(mktemp -d) \
   cargo test -p mlx-core --test qwen3_5_moe_cold_tier_parity -- --ignored --test-threads=1 --nocapture
 ```
 
-A gate on a large checkpoint is slow — the 26B gemma4 run takes ~66 min for the
-long-prompt gate alone and the 35B MoE ~26 min, because a checkpoint with no
-`.mlx-download-complete.json` marker full-shard-hashes its weights on every one of
-the harness's fresh loads.
+The large-checkpoint gates are minutes, not hours. Measured on an M5 Max, `--release`,
+with the checkpoint already resident in the page cache:
+
+| gate                                          | wall     | fresh model loads |
+| --------------------------------------------- | -------- | ----------------- |
+| `qwen3_5_moe_cold_tier_restart_parity`         | 105 s    | 5                 |
+| `gemma4_cold_tier_restart_parity`              | 175 s    | 15                |
+| `gemma4_cold_tier_restart_parity_sub_window`   | 84 s     | 9                 |
+
+Earlier notes here said ~66 min and ~26 min. Those predate the batched cold-tier
+command buffer and the writer's `fsync(2)` change, which together cut the per-block
+restore and capture costs the warm-up turns are dominated by. Budget more on a COLD
+page cache: neither checkpoint carries a `.mlx-download-complete.json` marker, so
+every persist-enabled load full-shard-hashes ~14 GB of weights, and the harness makes
+one such load per warm-up turn plus one per measured instance.
 
 The two small-checkpoint gates run in CI, on the existing `model-test` matrix legs
 that already download and convert the checkpoint they need (`.github/workflows/ci.yml`):
 `qwen3_cold_tier_parity` on the `qwen3` leg, `qwen3_5_cold_tier_parity` plus the
-Metal-gated unit test `dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy`
-on the `qwen3_5-dense` leg. The MoE (35B checkpoint) and gemma4 (66 min) gates stay
-local-only.
+Metal-gated unit tests `dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy`
+and `moe_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy` on the
+`qwen3_5-dense` leg. The MoE unit test rides that leg because it needs no checkpoint
+at all — it builds a tiny synthetic MoE and a real paged pool — and there is no MoE
+leg for it to ride instead.
+
+The two real-weights gates that stay local-only stay that way because of their
+CHECKPOINTS, not their runtime:
+
+- **MoE** — the smallest published `qwen3_5_moe` is 35B-A3B. Even the UD-Q2_K_XL quant
+  peaks at 14.2 GB resident, past a standard macOS runner.
+- **gemma4** — the only CI-reachable gemma4 is the gated
+  `google/gemma-4-E2B-it-qat-mobile-transformers`, whose `sliding_window` is **512**.
+  `gemma4_cold_tier_parity.rs` pins `SLIDING_WINDOW_TOKENS = 1024` and uses it as both
+  the long gate's `min_restored_tokens` floor and the sub-window gate's ceiling
+  assertion, so on a 512-window checkpoint those two assertions stop meaning what
+  their messages say. Wiring it needs the window read from the loaded config first.
 
 The structural fact both gemma4 gates rest on: with a `ColdSidecarPolicy` installed, a
 non-zero `cached_tokens` in a _freshly loaded_ instance (empty hot cache) can only

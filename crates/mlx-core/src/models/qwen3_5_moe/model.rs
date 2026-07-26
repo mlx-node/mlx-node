@@ -9309,7 +9309,7 @@ mod paged_construction_tests {
     use super::*;
     use crate::array::DType;
     use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
-    use crate::models::qwen3_5_moe::decoder_layer::MLPType;
+    use crate::models::qwen3_5_moe::decoder_layer::{AttentionType, MLPType};
     use crate::models::qwen3_5_moe::quantized_linear::{
         MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE, QuantizedSwitchLinear,
     };
@@ -9984,6 +9984,254 @@ mod paged_construction_tests {
             "an installed GdnState policy must make the prefill split at the ladder"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Tiny MoE config shaped for a REAL paged prefill, unlike [`tiny_moe_cfg`].
+    ///
+    /// Two departures, both forced by what the paged path demands:
+    ///
+    /// * `head_dim` 32. Paged attention's Metal kernels reject anything
+    ///   smaller, so `tiny_moe_cfg`'s 16 never reaches a prefill. Same reason
+    ///   the dense `tiny_paged_forward_cfg` bumps it.
+    /// * every layer forced onto the DENSE MLP arm through `mlp_only_layers`.
+    ///   `update_keys_values` accepts only 2-byte K/V, so a randomly
+    ///   initialized model has to be cast to bf16 end to end, and
+    ///   `SparseMoeBlock` publishes no weight accessors to cast through.
+    ///   Nothing under test reads the MLP: the chunk size, the ladder and the
+    ///   checkpoint materialization all live in `run_moe_core_paged_prefill`
+    ///   and `qwen3_5_moe::paged_forward`.
+    fn tiny_paged_forward_moe_cfg() -> Qwen3_5MoeConfig {
+        let mut cfg = tiny_moe_cfg(true);
+        cfg.hidden_size = 128;
+        cfg.intermediate_size = 256;
+        cfg.head_dim = 32;
+        cfg.linear_key_head_dim = 32;
+        cfg.linear_value_head_dim = 32;
+        cfg.paged_cache_memory_mb = Some(256);
+        cfg.mlp_only_layers = Some((0..cfg.num_layers).collect());
+        cfg
+    }
+
+    /// MoE inner over a production-shaped paged adapter, or `None` on a host
+    /// with no usable Metal device.
+    ///
+    /// Distinct from [`moe_inner_with_test_adapter_or_skip`], which hands back a
+    /// hand-built 8-block pool for lifecycle tests that dispatch no kernel.
+    /// This one goes through `initialize_paged_adapter`, so the pool geometry is
+    /// the one the config really implies and a prefill can run against it.
+    fn moe_paged_inner_or_skip(test_name: &str) -> Option<Qwen35MoeInner> {
+        let unavailable = |msg: &str| {
+            msg.contains("Metal") || msg.contains("device") || msg.contains("LayerKVPool")
+        };
+        let mut inner = match Qwen35MoeInner::new(tiny_paged_forward_moe_cfg()) {
+            Ok(inner) => inner,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if unavailable(&msg) {
+                    eprintln!("skipping {test_name} (paged adapter unavailable): {msg}");
+                    return None;
+                }
+                panic!("unexpected Qwen35MoeInner::new failure in {test_name}: {msg}");
+            }
+        };
+        if let Err(err) = inner.initialize_paged_adapter() {
+            let msg = err.reason.to_string();
+            if unavailable(&msg) {
+                eprintln!("skipping {test_name} (paged adapter unavailable): {msg}");
+                return None;
+            }
+            panic!("unexpected paged init failure in {test_name}: {msg}");
+        }
+        if inner.paged_adapter.is_none() {
+            // `initialize_paged_adapter` returns `Ok` and installs nothing when
+            // the compiled forward backend is missing.
+            eprintln!("skipping {test_name}: no paged adapter was installed");
+            return None;
+        }
+        Some(inner)
+    }
+
+    /// Cast every weight a paged forward touches to bf16.
+    ///
+    /// `update_keys_values` refuses anything but Float16/BFloat16 K/V (the pool
+    /// allocates 2-byte elements) and a randomly initialized model is f32. A
+    /// PARTIAL cast is worse than none: one f32 weight promotes the hidden state
+    /// back to f32 and the failure surfaces at the K/V write, several frames
+    /// from its cause. So this walks everything, and the sparse-MLP arm panics
+    /// rather than skipping.
+    fn cast_moe_inner_weights_bf16(inner: &mut Qwen35MoeInner) {
+        let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype bf16") };
+
+        let w = inner.embedding.get_weight();
+        inner.embedding.set_weight(&cast(&w)).expect("set embed");
+
+        let w = inner.final_norm.get_weight();
+        inner
+            .final_norm
+            .set_weight(&cast(&w))
+            .expect("set final_norm");
+
+        if let Some(head) = inner.lm_head.as_mut() {
+            let w = head.get_weight();
+            head.set_weight(&cast(&w), "lm_head").expect("set lm_head");
+        }
+
+        for layer in inner.layers.iter_mut() {
+            let w = layer.get_input_layernorm_weight();
+            layer
+                .set_input_layernorm_weight(&cast(&w))
+                .expect("set input_layernorm");
+            let w = layer.get_post_attention_layernorm_weight();
+            layer
+                .set_post_attention_layernorm_weight(&cast(&w))
+                .expect("set post_attention_layernorm");
+
+            match &mut layer.attn {
+                AttentionType::Linear(gdn) => {
+                    let w = gdn.get_dt_bias();
+                    gdn.set_dt_bias(&cast(&w));
+                    let w = gdn.get_a_log();
+                    gdn.set_a_log(&cast(&w)).expect("set a_log");
+                    let w = gdn.get_in_proj_qkvz_weight();
+                    gdn.set_in_proj_qkvz_weight(&cast(&w))
+                        .expect("set in_proj_qkvz");
+                    let w = gdn.get_in_proj_ba_weight();
+                    gdn.set_in_proj_ba_weight(&cast(&w))
+                        .expect("set in_proj_ba");
+                    let w = gdn.get_conv1d_weight();
+                    gdn.set_conv1d_weight(&cast(&w)).expect("set conv1d");
+                    let w = gdn.get_norm_weight();
+                    gdn.set_norm_weight(&cast(&w)).expect("set gdn norm");
+                    let w = gdn.get_out_proj_weight();
+                    gdn.set_out_proj_weight(&cast(&w)).expect("set out_proj");
+                }
+                AttentionType::Full(attn) => {
+                    let w = attn.get_q_proj_weight();
+                    attn.set_q_proj_weight(&cast(&w)).expect("set q_proj");
+                    let w = attn.get_k_proj_weight();
+                    attn.set_k_proj_weight(&cast(&w)).expect("set k_proj");
+                    let w = attn.get_v_proj_weight();
+                    attn.set_v_proj_weight(&cast(&w)).expect("set v_proj");
+                    let w = attn.get_o_proj_weight();
+                    attn.set_o_proj_weight(&cast(&w)).expect("set o_proj");
+                    let w = attn.get_q_norm_weight();
+                    attn.set_q_norm_weight(&cast(&w)).expect("set q_norm");
+                    let w = attn.get_k_norm_weight();
+                    attn.set_k_norm_weight(&cast(&w)).expect("set k_norm");
+                }
+            }
+
+            match &mut layer.mlp {
+                MLPType::Dense(mlp) => {
+                    let w = mlp.get_gate_proj_weight();
+                    mlp.set_gate_proj_weight(&cast(&w)).expect("set gate_proj");
+                    let w = mlp.get_up_proj_weight();
+                    mlp.set_up_proj_weight(&cast(&w)).expect("set up_proj");
+                    let w = mlp.get_down_proj_weight();
+                    mlp.set_down_proj_weight(&cast(&w)).expect("set down_proj");
+                }
+                MLPType::MoE(_) => panic!(
+                    "tiny_paged_forward_moe_cfg lists every layer in mlp_only_layers so each MLP \
+                     can be cast; a sparse block here means that drifted, and the f32 experts \
+                     would trip the K/V dtype gate far from the cause"
+                ),
+            }
+        }
+    }
+
+    /// Put the adapter where a fresh turn's prefill starts: empty caches, no
+    /// cached prefix, suffix blocks allocated for the whole prompt.
+    fn reset_moe_paged_request(inner: &mut Qwen35MoeInner, prompt: &[u32]) {
+        let caches = fresh_moe_layer_caches(&inner.config);
+        inner.caches = Some(caches);
+
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        if adapter.block_table().is_some() {
+            adapter.release_request().expect("release_request");
+        }
+        adapter.reset_for_new_request(0).expect("reset request");
+        let prefix = adapter
+            .find_cached_prefix(prompt, &[], 0, false)
+            .expect("find_cached_prefix");
+        assert_eq!(
+            prefix.cached_token_count, 0,
+            "MoE chunking tests must start from a cold adapter prefix"
+        );
+        adapter
+            .allocate_suffix_blocks(prompt.len() as u32)
+            .expect("allocate suffix blocks");
+    }
+
+    /// Both hand-written MoE cores prefill through `run_moe_core_paged_prefill`,
+    /// so this drives that shared body directly: under a GdnState policy it must
+    /// publish checkpoint ladder rungs, and with no cold tier it must stay
+    /// single-shot. MoE mirror of the dense
+    /// `dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy`.
+    ///
+    /// Catches: passing a literal `0`, or `crate::array::paged_prefill_chunk_size()`
+    /// (which is 0 unless the env var is set), where
+    /// `self.cold_gdn_prefill_chunk_size()` belongs inside
+    /// `run_moe_core_paged_prefill`. Either takes
+    /// `run_paged_prefill_chunk_with_size_and_checkpoint`'s `chunk_size <= 0`
+    /// arm, which hands back `Vec::new()` for the ladder — no rung is
+    /// materialized, so every MoE cold capture anchors nothing. That is the
+    /// MTP-turn defect, on the MoE side.
+    ///
+    /// The sibling `moe_cold_gdn_prefill_chunk_size_follows_the_installed_sidecar_policy`
+    /// cannot see it: that one reads the accessor, never the call site. The
+    /// no-cold-tier leg is load-bearing in the other direction — a hardcoded
+    /// `i32::MAX` would chunk prefills that ship today as single-shot.
+    ///
+    /// Runs in CI on the `qwen3_5-dense` `model-test` leg's `lib_tests` filter,
+    /// which needs no checkpoint for this one; there is no MoE leg, and
+    /// `docs/paged-cache.md` records why there cannot be.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn moe_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy() {
+        let Some(mut inner) = moe_paged_inner_or_skip(
+            "moe_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy",
+        ) else {
+            return;
+        };
+        cast_moe_inner_weights_bf16(&mut inner);
+        let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
+            inner.config.num_layers as usize,
+            |i| inner.config.is_linear_layer(i),
+        );
+        let prompt: Vec<u32> = (0u32..64).map(|i| (i * 5 + 7) % 257).collect();
+
+        reset_moe_paged_request(&mut inner, &prompt);
+        let (_, no_cold_ladder) = inner
+            .run_moe_core_paged_prefill(&prompt, &prompt, 0, false, &layer_kinds, "ladder prefill")
+            .expect("prefill with no cold tier");
+        assert!(
+            no_cold_ladder.is_empty(),
+            "with no cold GDN policy the MoE cores must stay single-shot"
+        );
+
+        let root = moe_temp_cold_root("moe-core-ladder");
+        install_moe_gdn_cold_tier(&mut inner, &root);
+        reset_moe_paged_request(&mut inner, &prompt);
+        let (_, ladder) = inner
+            .run_moe_core_paged_prefill(&prompt, &prompt, 0, false, &layer_kinds, "ladder prefill")
+            .expect("prefill under a cold GDN policy");
+        assert!(
+            !ladder.is_empty(),
+            "a persist-cold MoE turn must materialize the GDN checkpoint ladder its sidecar \
+             anchors on"
+        );
+        for checkpoint in &ladder {
+            assert!(
+                checkpoint.prefix_len > 0 && (checkpoint.prefix_len as usize) < prompt.len(),
+                "a rung must sit strictly inside the prompt, got {}",
+                checkpoint.prefix_len
+            );
+        }
+
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+        adapter.release_request().expect("release_request");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
