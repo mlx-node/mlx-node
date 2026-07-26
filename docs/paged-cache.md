@@ -81,6 +81,97 @@ latches that case, and `record_tokens` / `register_full_blocks_for_reuse*` /
 `finalize_turn_keep_live*` all fail closed until the family calls
 `confirm_aux_prefix_primed`. Families with no policy (dense `qwen3`) never latch.
 
+### Writer durability: `fsync(2)`, not `F_FULLFSYNC`
+
+The single writer thread commits every object with
+`create_exclusive → write_all → sync_payload → renameat → directory fsync`.
+`sync_payload` is deliberately **not** `File::sync_all`, which on Apple targets is
+`fcntl(F_FULLFSYNC)` — a device-wide flush of the drive's own write cache. Because the
+writer is one thread, every queued block waited behind that drive round trip.
+
+Measured by `write_decomposition_bench::bench_write_path_phase_decomposition`
+(`#[ignore]`d; release build, 128 rounds, round-robin over the sync variants, one cache
+root per variant), per-object writer service time `Tw`:
+
+| block                | `sync_all` `Tw` | `fsync(2)` `Tw` | speedup | of which device flush |
+| -------------------- | --------------- | --------------- | ------- | --------------------- |
+| qwen3_5 dense 198 KB | 4.267 ms        | 0.432 ms        | 9.88x   | 3.876 → 0.089 ms      |
+| qwen3_5 MoE 330 KB   | 4.432 ms        | 0.446 ms        | 9.94x   | 4.007 → 0.098 ms      |
+| qwen3-0.6b 1.84 MB   | 5.788 ms        | 1.273 ms        | 4.55x   | 4.773 → 0.236 ms      |
+
+The flush is a fixed cost, so the smaller the block the more of `Tw` it was — which is
+why the two blocks that actually ship gain roughly twice what the 1.84 MB bench block
+does.
+
+It also dominates the frontier `N = (Q+1)/(1 - Tc/Tw)`: the blocks
+`ColdTierWalk::capture_chain` gets to persist before the bounded queue refuses one and
+the walk breaks. `bench_chain_advance_per_turn` drives the real writer at a fixed
+producer interval and counts the accepted prefix directly rather than deriving it, and
+`bench_capture_cost_per_geometry` measures the producer cost `Tc` — one
+`read_block_all_layers` round trip — at each geometry:
+
+| block         | measured `Tc` |
+| ------------- | ------------- |
+| qwen3_5 dense | 0.215 ms      |
+| qwen3_5 MoE   | 0.201 ms      |
+| qwen3-0.6b    | 0.394 ms      |
+
+Blocks accepted per turn at queue depth 8, two runs:
+
+| producer `Tc`      | dense, `sync_all` | dense, `fsync(2)` | MoE, `sync_all` | MoE, `fsync(2)` |
+| ------------------ | ----------------- | ----------------- | --------------- | --------------- |
+| 0.10 ms            | 9                 | 11, 13            | 9               | 11, 10          |
+| **0.20 ms (real)** | 9                 | **28, 25**        | 9               | **17, 18**      |
+| 0.32 ms            | 9                 | 600+, 403         | 9               | 72, 45          |
+
+Under `sync_all` the answer is 9 at every producer rate — the writer was so much slower
+than the producer that `N` collapsed onto `Q + 1` and nothing else mattered. That is
+the ~8-9 blocks (~130 tokens) per turn seen in practice.
+
+At the measured `Tc` the honest reading is the middle row: **9 → ~26 blocks per turn
+(dense) and 9 → ~18 (MoE)**, i.e. 144 → ~410 and ~285 tokens. Reaching an 8192-token
+boundary (512 blocks) drops from ~57 turns to ~20 (dense) and ~29 (MoE). `N` is steep
+in `Tc`, so do not read the 0.32 ms row as the result — it is 50% past what capture
+actually costs.
+
+The two benches cross-check. Fed each geometry's measured `Tc`, the frontier formula
+predicts `N` = 16.4 for MoE (observed 17-18) and 17.0 for dense (observed 25-28). MoE
+lands on it; dense beats it, in the direction the setup predicts — the decomposition
+bench interleaves all four sync variants round-robin on one device and `F_FULLFSYNC` is
+device-wide, so a baseline write drags on the `fsync(2)` sample that follows it. Its
+`fsync(2)` column is an over-estimate, which makes every speedup above the conservative
+one.
+
+**What is given up.** `fsync(2)` hands the bytes to the drive but does not ask it to
+flush its volatile write cache, and drops the implicit device ordering barrier between
+the payload extents and the journalled rename.
+
+|                    | process kill | kernel panic | sudden power loss / hard reset |
+| ------------------ | ------------ | ------------ | ------------------------------ |
+| `F_FULLFSYNC` (was) | safe         | safe         | safe                           |
+| `fsync(2)` (now)    | safe         | safe         | **at risk**                    |
+
+This is affordable **only** because every read re-derives the SHA-256 payload checksum
+recorded at write time (`decode_block`, `decode_sidecar`) and `load_object_bounded`
+turns any decode error into a miss + prune + one `corruptions` count. After a hard
+power cut a user can therefore see a slower-than-expected first turn, a non-zero
+`corruptions` count on the dashboard, and a cold-tier directory that shrank — never
+wrong KV handed to inference. `a_bit_flipped_block_is_a_miss_that_prunes_and_counts_corruption`
+and `a_block_without_a_payload_checksum_is_refused` pin both halves of that.
+
+The checksum stays SHA-256. Swapping it for a non-cryptographic hash would break the
+on-disk format, and the bench says it is not worth it at the sizes that ship: on the
+dense block `payload_checksum` is 0.061 ms of a 0.432 ms `Tw`, so making it *free*
+(the harness prints that projection) would reach only 0.366 ms — worth ~3 more blocks
+per turn, against invalidating every cache on disk.
+
+`Q` — `DEFAULT_QUEUE_DEPTH`, 8 — is now the binding term again, and it is untouched
+here. `N` cannot run far past `Q + 1` until `Tw` falls under `Tc`, and at the measured
+`Tc` (~0.21 ms) it has not: `Tw` is ~0.31-0.43 ms. Raising `Q` is the next lever, and
+cutting `Tw` ~10x is what makes it affordable — the backlog a larger queue admits now
+drains an order of magnitude faster, and `drain()` at agent exit is bounded by the same
+`Tw`.
+
 ### gemma4's sliding-window sidecar
 
 `crates/mlx-core/src/models/gemma4/sliding_sidecar.rs` persists one
@@ -170,9 +261,12 @@ under the default single-shot chunk size (`Qwen35Inner::cold_gdn_prefill_chunk_s
 
 Why a ladder rather than the single endpoint boundary: capture may only anchor a
 sidecar where the persisted K/V chain already reaches, and that chain advances by one
-bounded writer queue's worth of blocks per turn (~8 blocks). A single endpoint rung
-needs the chain to reach the prompt's own end, which on a long prompt takes tens of
-turns; the ladder needs it to reach only a quarter of the deepest rung.
+bounded writer queue's worth of blocks per turn. A single endpoint rung needs the
+chain to reach the prompt's own end, which on a long prompt takes tens of turns; the
+ladder needs it to reach only a quarter of the deepest rung. The ladder was designed
+when that advance was pinned at 9 blocks per turn by `F_FULLFSYNC`; see
+[Writer durability](#writer-durability-fsync2-not-f_fullfsync), which raised it but
+did not remove the bound.
 
 Be precise about what those splits cost. They are **mathematically equivalent, not
 bit-identical**: every attention query still attends over the whole cumulative range,

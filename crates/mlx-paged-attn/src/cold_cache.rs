@@ -1192,8 +1192,15 @@ impl ColdCacheManager {
         }
     }
 
-    /// Block until every write accepted before this call is fully durable
-    /// (payload fsync + rename + directory fsync), or `timeout` elapses.
+    /// Block until every write accepted before this call has been committed
+    /// (payload [`sync_payload`] + rename + directory fsync), or `timeout`
+    /// elapses.
+    ///
+    /// "Committed" is exactly what [`sync_payload`] provides: the object
+    /// survives process death and kernel panic, but NOT a sudden power loss,
+    /// which can leave a renamed object whose payload extents never reached
+    /// the drive. Such an object fails its payload checksum on the next read
+    /// and is pruned as a miss.
     ///
     /// The WHOLE drain is bounded by `timeout`: a deadline is computed up front
     /// and bounds BOTH barrier admission and the ack wait. `std::sync::mpsc`'s
@@ -1736,8 +1743,7 @@ fn persist_encoded(
     if let Err(error) = (|| -> Result<(), String> {
         file.write_all(bytes)
             .map_err(|e| format!("write cold-cache file: {e}"))?;
-        file.sync_all()
-            .map_err(|e| format!("sync cold-cache file: {e}"))?;
+        sync_payload(&file)?;
         // The index lock spans [rename + index publish] so a concurrent
         // failed-load cleanup can never observe the renamed file without
         // its index entry (or delete it in between).
@@ -1764,8 +1770,8 @@ fn persist_encoded(
             index.total_bytes = index.total_bytes.saturating_sub(old.size);
         }
         index.total_bytes = index.total_bytes.saturating_add(size);
-        // The rename is the true commit point (the payload was already
-        // `sync_all`'d), so the index publish above is bound to rename
+        // The rename is the true commit point (the payload already went
+        // through `sync_payload`), so the index publish above is bound to rename
         // success, not to this directory fsync. A dir-fsync failure here
         // therefore leaves in-process accounting consistent with the
         // renamed canonical file — the cleanup `unlink(&temp)` stays a
@@ -1983,6 +1989,45 @@ fn open_identity(file: &File) -> Option<FileIdentity> {
 #[cfg(not(unix))]
 fn open_identity(_file: &File) -> Option<FileIdentity> {
     None
+}
+
+/// Push one cold object's bytes toward the storage device before the rename
+/// that commits it.
+///
+/// Deliberately NOT [`File::sync_all`]: on Apple targets that is
+/// `fcntl(F_FULLFSYNC)`, which flushes the drive's own volatile write cache
+/// and is device-wide. Measured by `bench_write_path_phase_decomposition` on
+/// a qwen3_5 dense block, the flush was 3.876 ms of a 4.267 ms per-object
+/// service time; `fsync(2)` costs 0.089 ms of 0.432 ms in the same harness.
+/// Because the writer is a single thread, every queued block waited behind
+/// that drive round trip — which is what pinned the persisted chain at
+/// exactly 9 blocks per turn no matter how fast the producer ran
+/// (`bench_chain_advance_per_turn`).
+///
+/// The guarantee that is dropped is power-loss durability, and only that:
+/// `fsync(2)` still hands the bytes to the kernel's device queue, so process
+/// death and kernel panic are unaffected. It also drops the implicit device
+/// ordering barrier, so after a hard power cut the (journalled) rename may be
+/// present while the payload extents are not.
+///
+/// That is affordable here because this is a cache whose every read
+/// re-derives [`payload_checksum`] over the tensor payload and compares it
+/// against the value recorded at write time ([`decode_block`],
+/// [`decode_sidecar`]). A mismatch is an `Err`, and `load_object_bounded`
+/// turns `Err` into a miss plus a prune, so a torn object costs one
+/// recomputed prefix and can never be handed to inference as data.
+#[cfg(unix)]
+fn sync_payload(file: &File) -> Result<(), String> {
+    rustix::fs::fsync(file).map_err(|e| format!("sync cold-cache file: {e}"))
+}
+
+/// Non-unix keeps `sync_all`. The measurement above is a macOS/APFS result,
+/// and this platform's [`RootDir::sync`] is already a no-op, so it is not the
+/// platform this trade-off was made for.
+#[cfg(not(unix))]
+fn sync_payload(file: &File) -> Result<(), String> {
+    file.sync_all()
+        .map_err(|e| format!("sync cold-cache file: {e}"))
 }
 
 /// Canonical filename for a cold object. KV keeps the historical
@@ -2895,25 +2940,95 @@ mod write_decomposition_bench {
     //!
     //! The variants exist to separate three different costs that
     //! `File::sync_all` conflates on macOS:
-    //! - `sync_all` — what production does today.
+    //! - `sync_all` — what production did before [`sync_payload`], kept as the
+    //!   speedup baseline.
     //! - plain `fsync(2)` — the POSIX flush, which on APFS does NOT push the
     //!   drive's own write cache. Comparing it against `sync_all` is the
     //!   direct in-process test of whether `sync_all` really issues
-    //!   `F_FULLFSYNC` on this platform.
+    //!   `F_FULLFSYNC` on this platform. This is what production calls now.
     //! - `F_BARRIERFSYNC` — an I/O ordering barrier with no device flush.
     //! - nothing at all — the floor.
     use super::tests::{fingerprint, temp_root};
     use super::*;
+    use crate::PagedAttentionConfig;
+    use crate::metal::MetalDtype;
     use std::os::fd::AsRawFd;
 
-    const BENCH_LAYERS: usize = 28;
-    const BENCH_KV_HEADS: usize = 8;
-    const BENCH_HEAD_SIZE: usize = 128;
     const BENCH_BLOCK_SIZE: usize = 16;
     /// bf16.
     const BENCH_ELEMENT: usize = 2;
-    /// K (and, identically, V) bytes for one layer of one block.
-    const PER_SIDE: usize = BENCH_KV_HEADS * BENCH_HEAD_SIZE * BENCH_BLOCK_SIZE * BENCH_ELEMENT;
+
+    /// One family's paged-KV block shape. Only full-attention layers hold
+    /// paged KV, so `layers` is the full-attention layer count, not the
+    /// model's depth.
+    #[derive(Clone, Copy)]
+    struct Geometry {
+        label: &'static str,
+        layers: usize,
+        kv_heads: usize,
+        head_size: usize,
+        /// Object size this shape is chosen to stand in for. Checked (to 1%)
+        /// against what the production encoder actually emits before any
+        /// timing runs, so a later edit to the numbers above cannot silently
+        /// move the bench onto a payload no family writes.
+        object_bytes: usize,
+        /// Producer cost `Tc` for this shape, from
+        /// [`bench_capture_cost_per_geometry`] on an M5 Max. The frontier `N`
+        /// is steep in it, so it is per-geometry rather than one constant:
+        /// a smaller block moves less data over the same GPU round trip.
+        capture_ms: f64,
+    }
+
+    impl Geometry {
+        /// K (and, identically, V) bytes for one layer of one block.
+        const fn per_side(&self) -> usize {
+            self.kv_heads * self.head_size * BENCH_BLOCK_SIZE * BENCH_ELEMENT
+        }
+
+        const fn payload_bytes(&self) -> usize {
+            self.per_side() * 2 * self.layers
+        }
+    }
+
+    /// The bench originally measured only the first of these. It is ~9x
+    /// larger than the block the hybrid families actually persist, which
+    /// inflates every payload-proportional phase (host clone, checksum,
+    /// `write_all`) against the fixed per-object syscall costs — so `Tw`, and
+    /// with it the frontier `N`, does not transfer between them.
+    ///
+    /// The two hybrid entries are shapes CHOSEN to land on the measured
+    /// per-block object sizes (198,072 B dense, 329,760 B MoE); only
+    /// full-attention layers hold paged KV, which is why their layer counts
+    /// are far below model depth. They are not claimed to be those models'
+    /// exact `(layers, kv_heads, head_size)` — what the writer's cost depends
+    /// on is bytes per object and descriptor count, and both are matched to
+    /// well under 1%.
+    const GEOMETRIES: [Geometry; 3] = [
+        Geometry {
+            label: "qwen3-0.6b block  28 attn layers x 8 kv x 128",
+            layers: 28,
+            kv_heads: 8,
+            head_size: 128,
+            object_bytes: 1_839_952,
+            capture_ms: 0.394,
+        },
+        Geometry {
+            label: "qwen3_5 dense block  12 attn layers x 2 kv x 128",
+            layers: 12,
+            kv_heads: 2,
+            head_size: 128,
+            object_bytes: 198_072,
+            capture_ms: 0.215,
+        },
+        Geometry {
+            label: "qwen3_5 MoE block  20 attn layers x 2 kv x 128",
+            layers: 20,
+            kv_heads: 2,
+            head_size: 128,
+            object_bytes: 329_760,
+            capture_ms: 0.201,
+        },
+    ];
 
     /// Measured rounds. One round writes one object per variant.
     const ROUNDS: usize = 128;
@@ -2921,17 +3036,19 @@ mod write_decomposition_bench {
     /// allocator warm-up).
     const WARMUP_ROUNDS: usize = 8;
 
-    /// Producer cost per block after the capture-batching change, from
-    /// `bench_restore_block_phase_decomposition`'s `[G2]` phase.
-    const TC_MS: f64 = 0.32;
     /// [`DEFAULT_QUEUE_DEPTH`].
     const QUEUE_DEPTH: f64 = 8.0;
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum SyncMode {
-        /// Production: `File::sync_all`.
+        /// `File::sync_all` — what production did before [`sync_payload`],
+        /// kept as the speedup baseline.
         SyncAll,
-        /// POSIX `fsync(2)`, no `F_FULLFSYNC`.
+        /// Production: POSIX `fsync(2)` via [`sync_payload`], no
+        /// `F_FULLFSYNC`. Calling the production helper rather than
+        /// re-implementing it makes the `(PRODUCTION)` label below a
+        /// compile-time fact: reverting `sync_payload` to `sync_all` collapses
+        /// this variant onto the baseline and the speedup column reads 1.00x.
         PlainFsync,
         /// `fcntl(F_BARRIERFSYNC)`: ordering barrier, no device flush.
         Barrier,
@@ -2949,8 +3066,8 @@ mod write_decomposition_bench {
 
         fn label(self) -> &'static str {
             match self {
-                SyncMode::SyncAll => "sync_all (PRODUCTION)",
-                SyncMode::PlainFsync => "fsync(2)",
+                SyncMode::SyncAll => "sync_all (was production)",
+                SyncMode::PlainFsync => "fsync(2) (PRODUCTION)",
                 SyncMode::Barrier => "F_BARRIERFSYNC",
                 SyncMode::NoSync => "none",
             }
@@ -2970,9 +3087,7 @@ mod write_decomposition_bench {
                 SyncMode::SyncAll => file
                     .sync_all()
                     .map_err(|e| format!("sync cold-cache file: {e}")),
-                SyncMode::PlainFsync => {
-                    rustix::fs::fsync(file).map_err(|e| format!("fsync cold-cache file: {e}"))
-                }
+                SyncMode::PlainFsync => sync_payload(file),
                 SyncMode::Barrier => {
                     // SAFETY: `F_BARRIERFSYNC` takes no third argument and the
                     // descriptor is an open, writable regular file owned by
@@ -3083,13 +3198,14 @@ mod write_decomposition_bench {
         })
     }
 
-    /// A block at the real qwen3-0.6b geometry. Layer bytes differ per layer
+    /// A block at one family's real geometry. Layer bytes differ per layer
     /// so no encoder or checksum can collapse them.
-    fn bench_block(key: ColdCacheKey, tokens: Vec<u32>) -> ColdCacheBlock {
-        let layers = (0..BENCH_LAYERS)
+    fn bench_block(geometry: &Geometry, key: ColdCacheKey, tokens: Vec<u32>) -> ColdCacheBlock {
+        let per_side = geometry.per_side();
+        let layers = (0..geometry.layers)
             .map(|layer| ColdLayerBlock {
-                keys: (0..PER_SIDE).map(|i| ((i + layer) % 251) as u8).collect(),
-                values: (0..PER_SIDE)
+                keys: (0..per_side).map(|i| ((i + layer) % 251) as u8).collect(),
+                values: (0..per_side)
                     .map(|i| (250 - ((i + layer) % 251)) as u8)
                     .collect(),
             })
@@ -3100,12 +3216,12 @@ mod write_decomposition_bench {
             tokens,
             layout: ColdCacheLayout {
                 block_size: BENCH_BLOCK_SIZE as u32,
-                num_layers: BENCH_LAYERS as u32,
-                num_kv_heads: BENCH_KV_HEADS as u32,
-                head_size: BENCH_HEAD_SIZE as u32,
+                num_layers: geometry.layers as u32,
+                num_kv_heads: geometry.kv_heads as u32,
+                head_size: geometry.head_size as u32,
                 cache_dtype: "BFloat16".to_string(),
-                key_bytes_per_layer: PER_SIDE,
-                value_bytes_per_layer: PER_SIDE,
+                key_bytes_per_layer: per_side,
+                value_bytes_per_layer: per_side,
             },
             layers,
         }
@@ -3311,17 +3427,25 @@ mod write_decomposition_bench {
     #[test]
     #[ignore = "measurement harness; run explicitly with --ignored"]
     fn bench_write_path_phase_decomposition() {
-        let payload_bytes = PER_SIDE * 2 * BENCH_LAYERS;
         eprintln!(
-            "geometry: {BENCH_LAYERS} layers x {BENCH_KV_HEADS} kv-heads x {BENCH_HEAD_SIZE} dim \
-             x {BENCH_BLOCK_SIZE} tok bf16 = {payload_bytes} B/block ({:.2} MB)",
-            payload_bytes as f64 / 1e6
-        );
-        eprintln!(
-            "sampling: {ROUNDS} measured rounds (+{WARMUP_ROUNDS} warmup), round-robin over {} \
-             variants, order rotated one position per round; one dedicated cache root per variant \
-             so directory size and index size stay identical across them",
+            "sampling: {ROUNDS} measured rounds (+{WARMUP_ROUNDS} warmup) per geometry, \
+             round-robin over {} variants, order rotated one position per round; one dedicated \
+             cache root per variant so directory size and index size stay identical across them",
             SyncMode::ALL.len()
+        );
+        for geometry in &GEOMETRIES {
+            measure_geometry(geometry);
+        }
+    }
+
+    fn measure_geometry(geometry: &Geometry) {
+        let payload_bytes = geometry.payload_bytes();
+        eprintln!(
+            "\n\n############ geometry: {} x {BENCH_BLOCK_SIZE} tok bf16 = {payload_bytes} B \
+             payload/block ({:.3} MB), {} B encoded ############",
+            geometry.label,
+            payload_bytes as f64 / 1e6,
+            geometry.object_bytes
         );
 
         // Fidelity gate: if the instrumented encoder does not produce the
@@ -3333,7 +3457,7 @@ mod write_decomposition_bench {
             let probe_tokens: Vec<u32> = (0..BENCH_BLOCK_SIZE as u32).collect();
             let probe_key =
                 ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &probe_tokens, &[], 0, 0);
-            let probe = bench_block(probe_key, probe_tokens);
+            let probe = bench_block(geometry, probe_key, probe_tokens);
             let mut scratch = Phases::default();
             let instrumented = encode_block_instrumented(&probe, &mut scratch).unwrap();
             let production = encode_block(&probe).unwrap();
@@ -3341,6 +3465,16 @@ mod write_decomposition_bench {
                 instrumented.len(),
                 production.len(),
                 "instrumented encoder must match encode_block's byte length"
+            );
+            let drift = (production.len() as f64 - geometry.object_bytes as f64).abs()
+                / geometry.object_bytes as f64;
+            assert!(
+                drift < 0.01,
+                "{} encodes to {} B but stands in for a {} B object ({:.2}% off)",
+                geometry.label,
+                production.len(),
+                geometry.object_bytes,
+                drift * 100.0
             );
             assert_eq!(
                 decode_block(&instrumented, probe_key, fingerprint()).unwrap(),
@@ -3355,7 +3489,7 @@ mod write_decomposition_bench {
         // eviction pressure land on another's measurement.
         let roots: Vec<PathBuf> = SyncMode::ALL
             .iter()
-            .map(|mode| temp_root(&format!("bench-write-{}", mode.slug())))
+            .map(|mode| temp_root(&format!("bench-write-{}-{}", geometry.layers, mode.slug())))
             .collect();
         // 8 GiB quota against ~235 MB written per root: eviction never fires,
         // so `evict_for_write` here is its steady-state no-evict cost
@@ -3392,7 +3526,7 @@ mod write_decomposition_bench {
                     serial,
                 );
                 serial += 1;
-                let block = bench_block(key, tokens);
+                let block = bench_block(geometry, key, tokens);
                 let phases = persist_instrumented(&managers[slot].shared, &block, mode)
                     .expect("bench write must persist");
                 if measured {
@@ -3426,7 +3560,10 @@ mod write_decomposition_bench {
             if set.iter().all(|s| s.is_empty()) {
                 continue;
             }
-            eprintln!("\n=== Tw summary + frontier N, {set_label} (Tc = {TC_MS} ms) ===");
+            eprintln!(
+                "\n=== Tw summary + frontier N, {set_label} (Tc = {} ms) ===",
+                geometry.capture_ms
+            );
             eprintln!(
                 "  variant                  Tw med   Tw p90   speedup   N@Q=8   N@Q=8 (p90)   \
                  Q for N=128   Q for N=512"
@@ -3451,10 +3588,10 @@ mod write_decomposition_bench {
                     median,
                     p90,
                     baseline / median,
-                    render(frontier(TC_MS, median, QUEUE_DEPTH)),
-                    render(frontier(TC_MS, p90, QUEUE_DEPTH)),
-                    render(required_depth(TC_MS, median, 128.0)),
-                    render(required_depth(TC_MS, median, 512.0)),
+                    render(frontier(geometry.capture_ms, median, QUEUE_DEPTH)),
+                    render(frontier(geometry.capture_ms, p90, QUEUE_DEPTH)),
+                    render(required_depth(geometry.capture_ms, median, 128.0)),
+                    render(required_depth(geometry.capture_ms, median, 512.0)),
                 );
             }
             eprintln!(
@@ -3493,10 +3630,10 @@ mod write_decomposition_bench {
                     mode.label(),
                     median,
                     p90,
-                    render(frontier(TC_MS, median, QUEUE_DEPTH)),
-                    render(frontier(TC_MS, p90, QUEUE_DEPTH)),
-                    render(required_depth(TC_MS, median, 128.0)),
-                    render(required_depth(TC_MS, median, 512.0)),
+                    render(frontier(geometry.capture_ms, median, QUEUE_DEPTH)),
+                    render(frontier(geometry.capture_ms, p90, QUEUE_DEPTH)),
+                    render(required_depth(geometry.capture_ms, median, 128.0)),
+                    render(required_depth(geometry.capture_ms, median, 512.0)),
                 );
             }
             eprintln!(
@@ -3509,6 +3646,208 @@ mod write_decomposition_bench {
         for root in &roots {
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    /// Producer intervals to sweep in [`bench_chain_advance_per_turn`].
+    /// Brackets every geometry's measured `Geometry::capture_ms`, because the
+    /// frontier `N` is steep in `Tc` and a single point would hide that.
+    const PRODUCER_INTERVALS_MS: [f64; 5] = [0.10, 0.20, 0.32, 0.50, 1.00];
+
+    /// Cap on host bytes held as pre-built blocks in one trial.
+    const CHAIN_TRIAL_BYTES: usize = 256 * 1024 * 1024;
+
+    /// OBSERVED per-turn chain advance: how many consecutive blocks
+    /// `ColdTierWalk::capture_chain` gets to persist before the bounded queue
+    /// refuses one and the walk breaks.
+    ///
+    /// Everything reported about the chain so far has been arithmetic on the
+    /// frontier `N = (Q+1)/(1 - Tc/Tw)`. This drives the real
+    /// [`ColdCacheManager::enqueue`] against the real writer thread at a fixed
+    /// producer interval and counts the accepted prefix directly, so the model
+    /// can be checked rather than assumed. No Metal and no weights: the writer
+    /// only ever sees owned host bytes, and the capture cost it is racing is
+    /// reproduced by the interval.
+    ///
+    /// This is a measurement, NOT a gate. The separation between `sync_all`
+    /// and `fsync(2)` here is a wall-clock effect of a few blocks on a shared
+    /// machine, and asserting on it would be a flaky test dressed up as a
+    /// guarantee. The defence against someone quietly restoring `sync_all` is
+    /// [`sync_payload`]'s doc, the note in `docs/paged-cache.md`, and
+    /// `SyncMode::PlainFsync` calling the production helper — not an
+    /// assertion here.
+    #[test]
+    #[ignore = "measurement harness; run explicitly with --ignored"]
+    fn bench_chain_advance_per_turn() {
+        eprintln!(
+            "observed chain advance: blocks accepted by enqueue() before the first Ok(false), \
+             driving the real writer thread at queue depth {DEFAULT_QUEUE_DEPTH}"
+        );
+        for geometry in &GEOMETRIES {
+            let cap = (CHAIN_TRIAL_BYTES / geometry.object_bytes).min(600);
+            eprintln!(
+                "\n=== {} ({} B/object, cap {cap} blocks/trial) ===",
+                geometry.label, geometry.object_bytes
+            );
+            eprintln!(
+                "  producer Tc     accepted   elapsed   implied Tw   tokens/turn   \
+                 turns to 8192 tok"
+            );
+            for interval_ms in PRODUCER_INTERVALS_MS {
+                let (accepted, elapsed_ms, hit_cap) =
+                    chain_advance_trial(geometry, interval_ms, cap);
+                // From the frontier relation, the Tw that would produce this
+                // observed N: Tw = Tc / (1 - (Q+1)/N).
+                let implied_tw = {
+                    let slack = 1.0 - (QUEUE_DEPTH + 1.0) / accepted as f64;
+                    if slack > 0.0 {
+                        format!("{:8.3}", interval_ms / slack)
+                    } else {
+                        "       -".to_string()
+                    }
+                };
+                let tokens = accepted * BENCH_BLOCK_SIZE;
+                eprintln!(
+                    "  {interval_ms:8.2} ms {:10}{}{elapsed_ms:9.1} ms {implied_tw}   \
+                     {tokens:11}   {:16.1}",
+                    accepted,
+                    if hit_cap { "+" } else { " " },
+                    512.0 / accepted as f64,
+                );
+            }
+        }
+        eprintln!(
+            "\n  `+` marks a trial that hit the block cap without ever being refused. \
+             8192 tokens at block_size {BENCH_BLOCK_SIZE} is 512 blocks."
+        );
+    }
+
+    /// The producer cost `Tc` that [`bench_chain_advance_per_turn`] can only
+    /// sweep: one `read_block_all_layers` round trip, which is exactly what
+    /// [`ColdCacheManager::capture_and_enqueue`] pays on the inference thread
+    /// per block. Source of every `Geometry::capture_ms`.
+    ///
+    /// `Tc` had only ever been measured at the qwen3-0.6b geometry, and the
+    /// frontier `N` is steep in it, so the two shipping block sizes were the
+    /// biggest unknown in every chain-advance number. Needs Metal; skips
+    /// itself when a pool cannot be built.
+    #[test]
+    #[ignore = "measurement harness; run explicitly with --ignored"]
+    fn bench_capture_cost_per_geometry() {
+        eprintln!(
+            "Tc: one read_block_all_layers round trip per block ({ROUNDS} rounds, \
+             +{WARMUP_ROUNDS} warmup)"
+        );
+        for geometry in &GEOMETRIES {
+            let total_blocks = 32u32;
+            let config = PagedAttentionConfig {
+                block_size: BENCH_BLOCK_SIZE as u32,
+                gpu_memory_mb: 4096,
+                head_size: geometry.head_size as u32,
+                num_kv_heads: geometry.kv_heads as u32,
+                num_layers: geometry.layers as u32,
+                use_fp8_cache: Some(false),
+                max_seq_len: Some(4096),
+                max_batch_size: Some(1),
+            };
+            let pool = match LayerKVPool::new(config, total_blocks, MetalDtype::BFloat16) {
+                Ok(pool) => pool,
+                Err(e) => {
+                    eprintln!("  {}: skipped ({e})", geometry.label);
+                    continue;
+                }
+            };
+            let allocator = Mutex::new(BlockAllocator::new(total_blocks, BENCH_BLOCK_SIZE as u32));
+            let Some(block) = allocator.lock().unwrap().allocate() else {
+                eprintln!("  {}: skipped (no free block)", geometry.label);
+                continue;
+            };
+
+            // Seed every layer so the readback moves real bytes rather than
+            // whatever an untouched buffer holds.
+            let per_side = geometry.per_side();
+            let keys: Vec<u8> = (0..per_side).map(|i| (i % 251) as u8).collect();
+            let values: Vec<u8> = (0..per_side).map(|i| (250 - (i % 251)) as u8).collect();
+            for layer in 0..geometry.layers as u32 {
+                pool.write_blocks_from_host(layer, &[block.block_id], &keys, &values)
+                    .unwrap();
+            }
+
+            let mut samples = Vec::with_capacity(ROUNDS);
+            for round in 0..(WARMUP_ROUNDS + ROUNDS) {
+                let started = Instant::now();
+                let read = pool.read_block_all_layers(block.block_id).unwrap();
+                let elapsed = ms(started.elapsed());
+                assert_eq!(
+                    read.len(),
+                    geometry.layers,
+                    "readback must cover every layer"
+                );
+                if round >= WARMUP_ROUNDS {
+                    samples.push(elapsed);
+                }
+            }
+            let (median, p90, mean) = summarize(&samples);
+            eprintln!(
+                "  {:<52} Tc median {median:.3} ms  p90 {p90:.3} ms  mean {mean:.3} ms",
+                geometry.label
+            );
+        }
+    }
+
+    /// One trial: feed pre-built blocks to `enqueue` exactly `interval_ms`
+    /// apart and return `(accepted, elapsed_ms, hit_cap)`.
+    ///
+    /// Blocks are built up front so allocation never counts against the
+    /// producer interval, and the pacing is a spin rather than a sleep
+    /// because `thread::sleep` cannot resolve 0.1 ms on macOS.
+    fn chain_advance_trial(
+        geometry: &Geometry,
+        interval_ms: f64,
+        cap: usize,
+    ) -> (usize, f64, bool) {
+        let mut blocks: Vec<ColdCacheBlock> = Vec::with_capacity(cap);
+        for serial in 0..cap {
+            let tokens: Vec<u32> = (0..BENCH_BLOCK_SIZE)
+                .map(|t| (serial as u32) * 1000 + t as u32)
+                .collect();
+            let key =
+                ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &tokens, &[], 0, serial);
+            blocks.push(bench_block(geometry, key, tokens));
+        }
+
+        let root = temp_root(&format!(
+            "bench-chain-{}-{}",
+            geometry.layers,
+            (interval_ms * 100.0) as u64
+        ));
+        let manager = ColdCacheManager::open_at(root.clone(), 8 * GIB, 0, DEFAULT_QUEUE_DEPTH)
+            .expect("open bench cache");
+
+        let interval = Duration::from_secs_f64(interval_ms / 1000.0);
+        let started = Instant::now();
+        let mut accepted = 0usize;
+        let mut hit_cap = true;
+        for (index, block) in blocks.into_iter().enumerate() {
+            let due = started + interval.saturating_mul(index as u32);
+            while Instant::now() < due {
+                std::hint::spin_loop();
+            }
+            match manager.enqueue(block).expect("writer must stay alive") {
+                true => accepted += 1,
+                false => {
+                    hit_cap = false;
+                    break;
+                }
+            }
+        }
+        let elapsed_ms = ms(started.elapsed());
+
+        // Let the writer finish so the next trial starts from an idle drive
+        // rather than inheriting this one's backlog.
+        manager.drain(Duration::from_secs(60));
+        drop(manager);
+        let _ = fs::remove_dir_all(&root);
+        (accepted, elapsed_ms, hit_cap)
     }
 }
 
@@ -4072,6 +4411,139 @@ mod tests {
             manager.load_sidecar(key, fp, &sidecar_layout(ColdGroup::Kv)),
             None
         );
+
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The failure mode [`sync_payload`] deliberately admits: a KV block whose
+    /// bytes on disk are not the bytes we wrote, while its length, its
+    /// safetensors framing and every metadata field are still intact. Only
+    /// the payload checksum can tell, so this is the end-to-end proof that a
+    /// torn object is a MISS that prunes — never partial KV handed to
+    /// inference.
+    ///
+    /// Blocks had no such test. `corrupt_file_fails_open_and_is_removed`
+    /// writes non-safetensors bytes (rejected by the parser) and
+    /// `decode_rejects_forged_huge_num_layers` trips the tensor-count guard;
+    /// neither reaches the checksum comparison.
+    #[test]
+    fn a_bit_flipped_block_is_a_miss_that_prunes_and_counts_corruption() {
+        let root = temp_root("block-bitflip");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let expected = block(key);
+
+        assert!(manager.enqueue(expected.clone()).unwrap());
+        assert!(manager.drain(Duration::from_secs(5)));
+        let path = root.join(format!("{}.safetensors", key.to_hex()));
+        assert_eq!(
+            manager.load(key, fingerprint()),
+            Some(expected),
+            "the fixture must be live before it is damaged"
+        );
+
+        // Flip one payload byte in place: same inode (so pruning may clear the
+        // very entry that failed) and same length, so the safetensors header,
+        // the `1 + 2*num_layers` tensor-count check and `validate()` all still
+        // pass. The checksum is the only gate this flip can trip, which is
+        // what stops the test going green for some other reason.
+        let mut bytes = fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        let before = manager.stats();
+        assert_eq!(
+            manager.load(key, fingerprint()),
+            None,
+            "a torn block must miss, not hand back the wrong KV bytes"
+        );
+        let after = manager.stats();
+        assert_eq!(after.corruptions, before.corruptions + 1);
+        assert_eq!(after.misses, before.misses + 1);
+        assert!(!path.exists(), "the torn block must be pruned");
+        assert!(!manager.contains(&key));
+
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// An object that predates the payload checksum must be refused, not
+    /// trusted. The whole reason `sync_payload` is affordable is that every
+    /// read re-derives the checksum, so a decoder that verified only when the
+    /// field happened to be present would silently reopen the hole for every
+    /// object written before it existed.
+    #[test]
+    fn a_block_without_a_payload_checksum_is_refused() {
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let source = block(key);
+
+        // Everything `encode_block` writes except the `checksum` entry, so the
+        // object is well-formed on every other axis and the missing field is
+        // the only thing that can reject it.
+        let token_bytes: Vec<u8> = source.tokens.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut owned: Vec<(String, Vec<u8>)> = vec![("tokens".to_string(), token_bytes)];
+        for (i, layer) in source.layers.iter().enumerate() {
+            owned.push((format!("layer.{i}.key"), layer.keys.clone()));
+            owned.push((format!("layer.{i}.value"), layer.values.clone()));
+        }
+        let views: Vec<_> = owned
+            .iter()
+            .map(|(name, data)| {
+                (
+                    name.as_str(),
+                    TensorView::new(Dtype::U8, vec![data.len()], data).unwrap(),
+                )
+            })
+            .collect();
+        let mut metadata = HashMap::new();
+        metadata.insert("abi".to_string(), CACHE_ABI.to_string());
+        metadata.insert("key".to_string(), key.to_hex());
+        metadata.insert("fingerprint".to_string(), fingerprint().to_hex());
+        metadata.insert(
+            "block_size".to_string(),
+            source.layout.block_size.to_string(),
+        );
+        metadata.insert(
+            "num_layers".to_string(),
+            source.layout.num_layers.to_string(),
+        );
+        metadata.insert(
+            "num_kv_heads".to_string(),
+            source.layout.num_kv_heads.to_string(),
+        );
+        metadata.insert("head_size".to_string(), source.layout.head_size.to_string());
+        metadata.insert("cache_dtype".to_string(), source.layout.cache_dtype.clone());
+        metadata.insert(
+            "key_bytes".to_string(),
+            source.layout.key_bytes_per_layer.to_string(),
+        );
+        metadata.insert(
+            "value_bytes".to_string(),
+            source.layout.value_bytes_per_layer.to_string(),
+        );
+        let bytes = serialize(views, Some(metadata)).unwrap();
+
+        assert!(
+            decode_block(&bytes, key, fingerprint()).is_err(),
+            "a block carrying no payload checksum must not decode"
+        );
+
+        // And through the public loader: a miss that is counted and pruned,
+        // exactly like a damaged object, so an unverifiable generation cannot
+        // linger in the cache.
+        let root = temp_root("block-no-checksum");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let path = root.join(format!("{}.safetensors", key.to_hex()));
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            manager.load(key, fingerprint()),
+            None,
+            "an unchecksummed object must never be read as if it had one"
+        );
+        assert_eq!(manager.stats().corruptions, 1);
+        assert!(!path.exists(), "the unverifiable object must be pruned");
 
         drop(manager);
         let _ = fs::remove_dir_all(root);
