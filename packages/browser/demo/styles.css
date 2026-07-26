@@ -1345,6 +1345,14 @@
   [data-slot='button'][data-size='icon'] {
     min-width: 44px;
   }
+  /* SegmentedToggle's chips are hand-rolled <button>s, not the shared
+     primitive, so the rule above never reached them and they stayed 24px on
+     touch — the gap this comment already claimed to close. Same floor, its own
+     hook. `inline-flex` on the chip keeps the label centred once min-height
+     exceeds the line box. */
+  [data-slot='segmented-option'] {
+    min-height: 44px;
+  }
   /* 16px is the exact iOS Safari auto-zoom threshold: focusing an input below
      it zooms the whole page in and never zooms back. Keep the field at 16px on
      touch so the chat UI never jerks larger on send. */

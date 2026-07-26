@@ -70,12 +70,19 @@ export function SegmentedToggle<T extends string | number | boolean>({
           <button
             key={String(opt.value)}
             type="button"
+            // Tap-target hook. The chip is 24px tall — well under the 44px
+            // floor. `max-sm:` covers narrow screens; the coarse-pointer rule
+            // in styles.css keyed off this attribute covers touch at any width
+            // (a tablet is wide AND coarse). The shared <Button> primitive gets
+            // the same treatment via `data-slot="button"`, but this control is
+            // hand-rolled, so it needs its own hook.
+            data-slot="segmented-option"
             aria-pressed={active}
             aria-label={opt.ariaLabel}
             disabled={isDisabled}
             onClick={() => onChange(opt.value)}
             className={cn(
-              'rounded-sm px-2.5 py-1 text-xs font-medium transition-colors',
+              'inline-flex items-center rounded-sm px-2.5 py-1 max-sm:min-h-[44px] max-sm:px-3 text-xs font-medium transition-colors',
               'disabled:pointer-events-none disabled:opacity-50',
               active
                 ? 'bg-primary/15 text-primary shadow-sm'
