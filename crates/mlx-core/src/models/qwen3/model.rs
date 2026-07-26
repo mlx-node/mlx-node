@@ -4710,6 +4710,87 @@ mod tests {
             .collect()
     }
 
+    /// `(index of largest, largest, second largest)` of `values`.
+    #[cfg(test)]
+    fn top_two(values: &[f32]) -> (usize, f32, f32) {
+        let mut best_idx = 0usize;
+        let mut best = f32::NEG_INFINITY;
+        let mut second = f32::NEG_INFINITY;
+        for (i, &v) in values.iter().enumerate() {
+            if v > best {
+                second = best;
+                best = v;
+                best_idx = i;
+            } else if v > second {
+                second = v;
+            }
+        }
+        (best_idx, best, second)
+    }
+
+    /// Assert that two `[vocab]` logit vectors, produced by two prefill
+    /// paths from the same tokens and the same weights, agree.
+    ///
+    /// Both vectors are bf16 values read back as f32. The paths reduce the
+    /// same dot products in a different order — the chunked driver's 1-token
+    /// tail chunk dispatches an M=1 GEMV where the single-shot rows go
+    /// through a GEMM, and per-chunk context lengths change the score/out
+    /// matmul shapes — so an element can land one bf16 grid step away
+    /// whenever the exact result sits near a rounding boundary. The budget
+    /// is 3 bf16 grid steps of the reference vector's own scale, floored at
+    /// 5e-3; `test_support::bf16_scaled_tolerance` documents why the anchor
+    /// is the vector scale and not the element's own magnitude.
+    ///
+    /// The budget is a rounding allowance, not a licence to predict a
+    /// different token: whenever the reference's top-2 gap is wider than
+    /// twice the budget — so no perturbation the budget permits can reorder
+    /// them — both paths must pick the same argmax.
+    #[cfg(test)]
+    fn assert_logits_parity(label: &str, reference: &[f32], candidate: &[f32]) {
+        assert_eq!(
+            reference.len(),
+            candidate.len(),
+            "{label}: logit vector length mismatch"
+        );
+        let scale = crate::test_support::max_abs(reference);
+        let tol = crate::test_support::bf16_scaled_tolerance(scale, 3.0, 5e-3);
+        let mut max_abs_diff = 0.0f32;
+        for (i, (a, b)) in reference.iter().zip(candidate.iter()).enumerate() {
+            assert!(b.is_finite(), "{label} logits[{i}] not finite: {b}");
+            let abs_diff = (a - b).abs();
+            if abs_diff > max_abs_diff {
+                max_abs_diff = abs_diff;
+            }
+            assert!(
+                abs_diff <= tol,
+                "{label} logits diverge at index {i}: single={a}, chunked={b}, \
+                 abs_diff={abs_diff} > tol={tol} (3 bf16 grid steps of the \
+                 reference scale {scale})"
+            );
+        }
+        let (ref_top_idx, ref_top1, ref_top2) = top_two(reference);
+        let decidable_gap = 2.0 * tol;
+        if ref_top1 - ref_top2 > decidable_gap {
+            let (cand_top_idx, _, _) = top_two(candidate);
+            assert_eq!(
+                ref_top_idx, cand_top_idx,
+                "{label} changed the predicted token: reference argmax \
+                 {ref_top_idx} (top1={ref_top1}, top2={ref_top2}, gap exceeds \
+                 {decidable_gap}) but candidate argmax is {cand_top_idx}"
+            );
+        }
+        let grid_steps = if scale > 0.0 {
+            max_abs_diff * 128.0 / scale
+        } else {
+            0.0
+        };
+        eprintln!(
+            "{label} parity max_abs_diff={max_abs_diff} ({grid_steps} bf16 grid \
+             steps of scale={scale}), tol={tol} over {} elements",
+            reference.len()
+        );
+    }
+
     /// Chunked-prefill parity test: chunked prefill with the same weights and
     /// the same suffix tokens MUST produce the same final logits as the
     /// single-shot prefill, modulo small bf16 rounding noise.
@@ -4721,13 +4802,11 @@ mod tests {
     /// chunks for a 96-token prompt). The post-prefill `[vocab]` logits
     /// vectors are compared element-wise.
     ///
-    /// Tolerance: `atol=5e-3, rtol=5e-3`. bf16 has only ~3 decimal digits
-    /// of precision, and chunked prefill changes the order of GPU
-    /// operations (split causal mask reshapes, intermediate evals); empty
-    /// reductions / different fma orderings on a vocab-sized matmul push
-    /// element-wise differences into the 1e-3 range easily. We're
-    /// validating "same answer up to floating-point noise", not bitwise
-    /// equality.
+    /// Comparison is `assert_logits_parity` (3 bf16 grid steps of the
+    /// reference vector's scale, plus argmax agreement whenever the top-2
+    /// gap makes the ordering decidable). Weights come from a pinned MLX
+    /// seed so the draw — and therefore whether any logit lands on a
+    /// different bf16 grid point — is the same on every run.
     ///
     /// Skips on no-Metal hosts.
     #[test]
@@ -4738,6 +4817,13 @@ mod tests {
             eprintln!("skipping (paged backend unavailable without Metal)");
             return;
         }
+        // `Qwen3Inner::new` draws every weight from MLX's default PRNG, whose
+        // key is seeded once from wall-clock milliseconds and never reset, so
+        // an unseeded run builds different weights in every process. Which
+        // logits (if any) land on a different bf16 grid point across the
+        // GEMM-vs-GEMV split below is a function of those weights, so leaving
+        // the draw free turns this assertion into a per-process lottery.
+        unsafe { mlx_sys::mlx_seed(0x9E37_0001) };
         let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
             Ok(i) => i,
@@ -4823,35 +4909,7 @@ mod tests {
         let chunked_vec = logits_to_f32_vec(&logits_chunked);
         assert_eq!(chunked_vec.len(), cfg.vocab_size as usize);
 
-        // Element-wise close-comparison. bf16 + chunk-boundary fma reorderings
-        // give ~3 decimals; the assertion is generous to rule out structural
-        // bugs without flaking on hardware-numerics jitter.
-        let atol = 5e-3f32;
-        let rtol = 5e-3f32;
-        let mut max_abs_diff = 0.0f32;
-        let mut max_rel_diff = 0.0f32;
-        for (i, (a, b)) in single_vec.iter().zip(chunked_vec.iter()).enumerate() {
-            assert!(b.is_finite(), "chunked logits[{i}] not finite: {b}");
-            let abs_diff = (a - b).abs();
-            let rel_diff = abs_diff / (a.abs().max(b.abs()).max(1e-6));
-            if abs_diff > max_abs_diff {
-                max_abs_diff = abs_diff;
-            }
-            if rel_diff > max_rel_diff {
-                max_rel_diff = rel_diff;
-            }
-            assert!(
-                abs_diff <= atol || rel_diff <= rtol,
-                "logits diverge at index {i}: single={a}, chunked={b}, \
-                 abs_diff={abs_diff}, rel_diff={rel_diff} (max allowed: \
-                 atol={atol} or rtol={rtol})"
-            );
-        }
-        eprintln!(
-            "chunked-prefill parity max_abs_diff={max_abs_diff}, max_rel_diff={max_rel_diff} \
-             (atol={atol}, rtol={rtol}) over {} elements",
-            single_vec.len()
-        );
+        assert_logits_parity("chunked-prefill", &single_vec, &chunked_vec);
 
         // Cleanup.
         {
@@ -5045,8 +5103,8 @@ mod tests {
     ///
     /// Compares the post-prefill `[vocab]` logits between chunked
     /// (chunk_size=16) and single-shot (chunk_size=0) runs over the same
-    /// 97-token prompt. Tolerance budget mirrors the multi-chunk parity
-    /// test (atol=rtol=5e-3 for bf16 + chunk-boundary fma reorderings).
+    /// 97-token prompt, through `assert_logits_parity` and from a pinned
+    /// MLX seed.
     ///
     /// Skips on no-Metal hosts, and on hosts whose half-precision GEMM
     /// fails the `test_support::half_gemm_untrustworthy` canary: this
@@ -5076,6 +5134,9 @@ mod tests {
             );
             return;
         }
+        // Pin the weight draw — see the seed comment in
+        // `test_chunked_prefill_matches_single_shot_logits`.
+        unsafe { mlx_sys::mlx_seed(0x9E37_0002) };
         let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
             Ok(i) => i,
@@ -5170,35 +5231,7 @@ mod tests {
             );
         }
 
-        let atol = 5e-3f32;
-        let rtol = 5e-3f32;
-        let mut max_abs_diff = 0.0f32;
-        let mut max_rel_diff = 0.0f32;
-        for (i, (a, b)) in single_vec.iter().zip(chunked_vec.iter()).enumerate() {
-            assert!(
-                b.is_finite(),
-                "uneven-tail chunked logits[{i}] not finite: {b}"
-            );
-            let abs_diff = (a - b).abs();
-            let rel_diff = abs_diff / (a.abs().max(b.abs()).max(1e-6));
-            if abs_diff > max_abs_diff {
-                max_abs_diff = abs_diff;
-            }
-            if rel_diff > max_rel_diff {
-                max_rel_diff = rel_diff;
-            }
-            assert!(
-                abs_diff <= atol || rel_diff <= rtol,
-                "uneven-tail logits diverge at index {i}: single={a}, chunked={b}, \
-                 abs_diff={abs_diff}, rel_diff={rel_diff} (max allowed: \
-                 atol={atol} or rtol={rtol})"
-            );
-        }
-        eprintln!(
-            "uneven-tail chunked-prefill parity max_abs_diff={max_abs_diff}, \
-             max_rel_diff={max_rel_diff} (atol={atol}, rtol={rtol}) over {} elements",
-            single_vec.len()
-        );
+        assert_logits_parity("uneven-tail chunked-prefill", &single_vec, &chunked_vec);
 
         {
             let adapter = inner.paged_adapter.as_mut().unwrap();
@@ -5226,7 +5259,8 @@ mod tests {
     /// 64-token suffix) and once single-shot (chunk_size=0). Both must
     /// produce the same final-token logits.
     ///
-    /// Tolerance: same atol=rtol=5e-3 budget as the other parity tests.
+    /// Same `assert_logits_parity` budget and pinned MLX seed as the other
+    /// two parity tests.
     #[test]
     fn test_chunked_prefill_with_cached_prefix_matches_single_shot() {
         // Block-paged needs the Metal backend; on a non-Metal build the
@@ -5235,6 +5269,9 @@ mod tests {
             eprintln!("skipping (paged backend unavailable without Metal)");
             return;
         }
+        // Pin the weight draw — see the seed comment in
+        // `test_chunked_prefill_matches_single_shot_logits`.
+        unsafe { mlx_sys::mlx_seed(0x9E37_0003) };
         let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
             Ok(i) => i,
@@ -5404,36 +5441,7 @@ mod tests {
             );
         }
 
-        // Compare logits.
-        let atol = 5e-3f32;
-        let rtol = 5e-3f32;
-        let mut max_abs_diff = 0.0f32;
-        let mut max_rel_diff = 0.0f32;
-        for (i, (a, b)) in single_vec.iter().zip(chunked_vec.iter()).enumerate() {
-            assert!(
-                b.is_finite(),
-                "cached-prefix chunked logits[{i}] not finite: {b}"
-            );
-            let abs_diff = (a - b).abs();
-            let rel_diff = abs_diff / (a.abs().max(b.abs()).max(1e-6));
-            if abs_diff > max_abs_diff {
-                max_abs_diff = abs_diff;
-            }
-            if rel_diff > max_rel_diff {
-                max_rel_diff = rel_diff;
-            }
-            assert!(
-                abs_diff <= atol || rel_diff <= rtol,
-                "cached-prefix logits diverge at index {i}: single={a}, chunked={b}, \
-                 abs_diff={abs_diff}, rel_diff={rel_diff} (max allowed: \
-                 atol={atol} or rtol={rtol})"
-            );
-        }
-        eprintln!(
-            "cached-prefix chunked-prefill parity max_abs_diff={max_abs_diff}, \
-             max_rel_diff={max_rel_diff} (atol={atol}, rtol={rtol}) over {} elements",
-            single_vec.len()
-        );
+        assert_logits_parity("cached-prefix chunked-prefill", &single_vec, &chunked_vec);
 
         // Cleanup.
         {

@@ -1,11 +1,46 @@
 //! Test-only helpers for detecting host-level numeric-environment issues
-//! that make certain assertions meaningless.
+//! that make certain assertions meaningless, plus the tolerance arithmetic
+//! that keeps half-precision parity assertions honest.
 
 use std::sync::OnceLock;
 
 use mlx_sys as sys;
 
 use crate::array::{DType, MxArray};
+
+/// Largest absolute value in `values`; `0.0` for an empty slice. This is the
+/// scale to anchor [`bf16_scaled_tolerance`] on.
+pub(crate) fn max_abs(values: &[f32]) -> f32 {
+    values.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+}
+
+/// Element-wise budget for comparing two bf16 tensors that two different
+/// execution paths computed from the same inputs.
+///
+/// bf16 keeps 8 significand bits, so neighbouring bf16 values are a relative
+/// `2^-8`..`2^-7` apart. Two paths that reduce the same dot products in a
+/// different order land on different sides of a rounding boundary whenever
+/// the exact result happens to sit near one — which, for operands drawn from
+/// an unseeded PRNG, is a per-process coin flip. A fixed absolute tolerance
+/// smaller than that grid spacing is therefore not a tolerance at all: it
+/// asserts bit-equality and fails on the draws that lose the flip.
+///
+/// The budget is anchored to `scale` — the largest magnitude in the
+/// **reference** tensor — and NOT to the element being compared. The absolute
+/// error of a dot product is set by its partial sums, so an element that is
+/// small only because its terms cancelled carries the same absolute error as
+/// the largest element; a per-element relative bound would demand far more of
+/// the cancelled elements than the arithmetic can deliver. Anchoring on the
+/// reference (rather than on either side) also stops a blown-up value on the
+/// candidate side from inflating its own budget.
+///
+/// `ulps / 128.0` is `ulps * 2^-7`, i.e. `ulps` bf16 grid steps at `scale`.
+/// `floor` keeps the budget usable when every value sits near zero. Mirrors
+/// the `5e-3.max(max_abs * (3.0 / 128.0))` rule already used by the
+/// `banded_attention` bf16 parity test.
+pub(crate) fn bf16_scaled_tolerance(scale: f32, ulps: f32, floor: f32) -> f32 {
+    floor.max(scale.abs() * ulps / 128.0)
+}
 
 /// Returns `true` when this host's half-precision GEMM produces results
 /// that deviate from an f32 host reference by more than `0.1` on a small
