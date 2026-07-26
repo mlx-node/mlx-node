@@ -10061,7 +10061,15 @@ mod paged_construction_tests {
         }
         if inner.paged_adapter.is_none() {
             // `initialize_paged_adapter` returns `Ok` and installs nothing when
-            // the compiled forward backend is missing.
+            // the compiled forward backend is missing. That never reaches
+            // `metal_device_absent`, so it needs the require-Metal gate of its
+            // own or it stays a silent green on the very runner that gate exists
+            // to protect.
+            assert!(
+                !crate::test_support::metal_required(),
+                "MLX_TEST_REQUIRE_METAL=1 but {test_name} got no paged adapter: \
+                 initialize_paged_adapter returned Ok and installed nothing"
+            );
             eprintln!("skipping {test_name}: no paged adapter was installed");
             return None;
         }

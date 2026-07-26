@@ -347,13 +347,74 @@ pub(crate) fn sorted_gather_mm_untrustworthy() -> bool {
 /// A self-skip on them is invisible: libtest counts a skipped-and-returned
 /// test as passed, and the CI leg that owns these tests asserts a pass COUNT,
 /// so a config drift would read green with nothing exercised.
+///
+/// `MLX_TEST_REQUIRE_METAL=1` removes the licence entirely. A leg that runs on a
+/// Metal runner sets it, so a Metal init failure there takes the caller's
+/// `panic!` arm and the leg goes RED instead of reporting a full pass count with
+/// nothing exercised. Scraping the log for the `skipping` line cannot do that
+/// job: libtest writes `test <name> ... ` and flushes BEFORE running the body,
+/// so under `--nocapture` the skip line lands mid-line and never at column 0.
 pub(crate) fn metal_device_absent(msg: &str) -> bool {
+    metal_device_absent_when(metal_required(), msg)
+}
+
+/// Whether this run forbids a Metal self-skip. Read once — a test that flipped
+/// the var mid-run would otherwise race every other test thread.
+///
+/// Public within the crate for skip arms that do not go through
+/// [`metal_device_absent`] because they have no error message to match against.
+pub(crate) fn metal_required() -> bool {
+    static REQUIRED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUIRED.get_or_init(|| {
+        std::env::var("MLX_TEST_REQUIRE_METAL")
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// The decision itself, with the environment lifted out.
+///
+/// Split from [`metal_device_absent`] so the require-Metal contract is testable
+/// as a pure function — asserting it through the env var would need
+/// `set_var`, which is `unsafe` and racy against every other test thread.
+pub(crate) fn metal_device_absent_when(require_metal: bool, msg: &str) -> bool {
+    if require_metal {
+        return false;
+    }
     msg.contains("Metal GPU not available") || msg.contains("No Metal device found")
 }
 
 #[cfg(test)]
 mod skip_predicate_tests {
-    use super::metal_device_absent;
+    use super::{metal_device_absent, metal_device_absent_when};
+
+    /// `MLX_TEST_REQUIRE_METAL=1` must remove the skip licence for the device-
+    /// absence strings too, not just for config failures.
+    ///
+    /// Catches, verified by mutation: reverting the wrapper to an unconditional
+    /// `msg.contains(...)`, i.e. deleting the `require_metal` term. The sibling
+    /// below survives that mutation, which is why this case exists separately.
+    ///
+    /// It is the whole reason the env var exists: on a Metal runner a device
+    /// init failure has to fail the leg, and the log-scraping guard that used to
+    /// carry that job structurally could not — see `metal_device_absent`.
+    #[test]
+    fn require_metal_forbids_a_skip() {
+        for absent in [
+            "Metal GPU not available",
+            "No Metal device found",
+            "paged init failed: Metal GPU not available",
+        ] {
+            assert!(
+                !metal_device_absent_when(true, absent),
+                "with MLX_TEST_REQUIRE_METAL=1 even a device-less host must fail loudly: {absent}"
+            );
+            assert!(
+                metal_device_absent_when(false, absent),
+                "without it the licence is unchanged: {absent}"
+            );
+        }
+    }
 
     #[test]
     fn only_device_absence_licenses_a_paged_test_to_skip() {

@@ -417,15 +417,27 @@ jobs:
             # `paged_inner_or_skip` returns early on a device-less host, and
             # libtest counts that as passed, so a Metal init failure here would
             # report the full count having exercised nothing. These legs run on
-            # a Metal runner where that must never happen, so any `skipping`
-            # line fails the leg too.
+            # a Metal runner where that must never happen.
+            #
+            # MLX_TEST_REQUIRE_METAL=1 is what actually closes it: it makes
+            # `test_support::metal_device_absent` return false for the device-
+            # absence strings, so the caller takes its `panic!` arm and the test
+            # FAILS. The grep below is belt-and-braces only — no Rust test can
+            # catch someone deleting this export from the YAML.
+            #
+            # The grep is deliberately UNANCHORED. libtest writes
+            # `test <name> ... ` and flushes it BEFORE running the body, so under
+            # `--nocapture` a skip line printed by the test lands mid-line, never
+            # at column 0; `grep '^skipping '` matched nothing and the guard was
+            # dead code. Verified against a captured log.
             #
             # EXACT count, not `[1-9][0-9]*`: with more than one name in
             # `lib_tests` a loose check stays green when only some of them still
             # resolve, which is the same silent-green hole one filter down.
             if [ -n "${{ matrix.lib_tests }}" ]; then
               want=$(echo "${{ matrix.lib_tests }}" | wc -w | tr -d ' ')
-              cargo test -p mlx-core --lib -- --ignored --exact --test-threads=1 --nocapture \
+              MLX_TEST_REQUIRE_METAL=1 \
+                cargo test -p mlx-core --lib -- --ignored --exact --test-threads=1 --nocapture \
                 ${{ matrix.lib_tests }} 2>&1 | tee /tmp/lib_tests.log
               if ! grep -qE "test result: ok\. $want passed" /tmp/lib_tests.log; then
                 echo "::error::lib_tests expected $want test(s) to run; the filter matched a"
@@ -435,10 +447,10 @@ jobs:
                 echo "::error::--lib -- --ignored --list'."
                 exit 1
               fi
-              if grep -q '^skipping ' /tmp/lib_tests.log; then
+              if grep -q 'skipping ' /tmp/lib_tests.log; then
                 echo "::error::a lib_test self-skipped on this Metal runner, so it passed"
                 echo "::error::without exercising anything. Offending line(s):"
-                grep '^skipping ' /tmp/lib_tests.log
+                grep 'skipping ' /tmp/lib_tests.log
                 exit 1
               fi
             fi
