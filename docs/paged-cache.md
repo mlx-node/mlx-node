@@ -326,7 +326,13 @@ retention decides whether a warm conversation can still write a sidecar at all.
 `gdn_checkpoint_store::prune_gdn_checkpoints` enforces two caps against that:
 `GDN_PREFIX_CHECKPOINTS_PER_OWNER = 4` (the ladder width) per owner, and
 `GDN_PREFIX_CHECKPOINT_LIMIT = 5` overall (one root session plus four concurrent pi
-subagents). Prune runs after **every** rung push, not once per ladder, so a store
+subagents). That second pairing crosses a language boundary — the fleet size is
+`MAX_CONCURRENCY` in `packages/agent/src/extensions/subagent.ts` — so it is held by
+a gate rather than by this sentence: `cold_tier::gdn_prefix_checkpoint_limit`
+publishes the cap and `packages/agent/__test__/gdn-checkpoint-capacity.test.ts`
+asserts `MAX_CONCURRENCY + 1` still fits under it.
+
+Prune runs after **every** rung push, not once per ladder, so a store
 already at the global cap sees a ladder arrive one rung at a time. Judged on
 redundancy alone the newest rung's own predecessor is always the most redundant entry
 present, so the global loop searches for a victim among every owner **except the one

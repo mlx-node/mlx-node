@@ -27,8 +27,16 @@ import { Type } from 'typebox';
 import { sanitizeApprovalDetail } from './approval-detail.js';
 
 const MAX_PARALLEL_TASKS = 8;
-/** Tool loops can overlap; the shared `MlxModelHost` serializes model calls. */
-const MAX_CONCURRENCY = 4;
+/**
+ * Tool loops can overlap; the shared `MlxModelHost` serializes model calls.
+ *
+ * Exported because it is one half of a cross-language invariant. Every live
+ * loop is a distinct native GDN cache owner, so this fleet demands
+ * `MAX_CONCURRENCY + 1` checkpoint slots (root session plus one per loop), and
+ * the native store supplies `gdnPrefixCheckpointLimit()` of them.
+ * `__test__/gdn-checkpoint-capacity.test.ts` holds the two together.
+ */
+export const MAX_CONCURRENCY = 4;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
 type AgentScope = 'user' | 'project' | 'both';

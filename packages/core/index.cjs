@@ -797,6 +797,7 @@ module.exports.documentToXlsx = nativeBinding.documentToXlsx;
 module.exports.DType = nativeBinding.DType;
 module.exports.ElementType = nativeBinding.ElementType;
 module.exports.formatDocument = nativeBinding.formatDocument;
+module.exports.gdnPrefixCheckpointLimit = nativeBinding.gdnPrefixCheckpointLimit;
 module.exports.getMemorySnapshot = nativeBinding.getMemorySnapshot;
 module.exports.getProfilingData = nativeBinding.getProfilingData;
 module.exports.isProfilingEnabled = nativeBinding.isProfilingEnabled;

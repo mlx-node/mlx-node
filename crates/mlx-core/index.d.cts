@@ -2932,6 +2932,26 @@ export interface FunctionParameters {
 }
 
 /**
+ * How many GDN prefix checkpoints the native store holds across all owners
+ * ([`GDN_PREFIX_CHECKPOINT_LIMIT`]), exposed for the same reason
+ * [`cold_restore_families`] is: it is one half of a cross-language invariant
+ * and nothing else carries it over the boundary.
+ *
+ * The other half is `MAX_CONCURRENCY` in
+ * `packages/agent/src/extensions/subagent.ts`. The store's demand is
+ * `MAX_CONCURRENCY + 1` — one owner per concurrent child loop plus the root
+ * session — and the cliff sits exactly one owner past the cap, where every
+ * owner holds a single entry and the store is still over it, so each publish
+ * takes somebody's last checkpoint. `retention_sim` measures that as 0 blind
+ * turns at five owners and 28 of 40 at six.
+ *
+ * No Rust gate can see a TypeScript-only edit, so raising the fleet alone
+ * would land in that regime with every Rust gate still green.
+ * `packages/agent/__test__/gdn-checkpoint-capacity.test.ts` is what stops it.
+ */
+export declare function gdnPrefixCheckpointLimit(): number;
+
+/**
  * Gemma 4 model configuration (dense variant).
  *
  * Supports E2B (2.3B), E4B (4.5B), and 31B dense models.

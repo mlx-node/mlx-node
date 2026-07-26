@@ -18,6 +18,7 @@ use napi_derive::napi;
 use sha2::{Digest, Sha256};
 
 use crate::array::memory::WeightsResident;
+use crate::models::qwen3_5::gdn_checkpoint_store::GDN_PREFIX_CHECKPOINT_LIMIT;
 
 static GLOBAL: OnceLock<Option<Arc<ColdCacheManager>>> = OnceLock::new();
 
@@ -295,6 +296,27 @@ pub fn cold_restore_families() -> Vec<String> {
         .iter()
         .map(|family| (*family).to_string())
         .collect()
+}
+
+/// How many GDN prefix checkpoints the native store holds across all owners
+/// ([`GDN_PREFIX_CHECKPOINT_LIMIT`]), exposed for the same reason
+/// [`cold_restore_families`] is: it is one half of a cross-language invariant
+/// and nothing else carries it over the boundary.
+///
+/// The other half is `MAX_CONCURRENCY` in
+/// `packages/agent/src/extensions/subagent.ts`. The store's demand is
+/// `MAX_CONCURRENCY + 1` — one owner per concurrent child loop plus the root
+/// session — and the cliff sits exactly one owner past the cap, where every
+/// owner holds a single entry and the store is still over it, so each publish
+/// takes somebody's last checkpoint. `retention_sim` measures that as 0 blind
+/// turns at five owners and 28 of 40 at six.
+///
+/// No Rust gate can see a TypeScript-only edit, so raising the fleet alone
+/// would land in that regime with every Rust gate still green.
+/// `packages/agent/__test__/gdn-checkpoint-capacity.test.ts` is what stops it.
+#[napi]
+pub fn gdn_prefix_checkpoint_limit() -> u32 {
+    GDN_PREFIX_CHECKPOINT_LIMIT as u32
 }
 
 // ---------------------------------------------------------------------------

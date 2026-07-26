@@ -2651,8 +2651,13 @@ export interface CleanupStats {
  * the tier was never opened (nothing to flush) — and `false` on timeout.
  *
  * Called from the agent's one-shot (`mlx agent -p`) shutdown so a prompt's
- * just-persisted prefix blocks are durable before the process exits, rather
- * than being abandoned in the write queue.
+ * just-persisted prefix blocks reach the drive before the process exits,
+ * rather than being abandoned in the write queue.
+ *
+ * The payload flush is `fsync(2)`, not `F_FULLFSYNC`: a drained block
+ * survives process death and kernel panic, but a sudden power loss can leave
+ * it torn. Torn objects fail the payload checksum on the next read and are
+ * pruned as a miss, so the cost is a recomputed prefix, never wrong state.
  */
 export declare function coldCacheDrain(timeoutMs: number): boolean;
 
@@ -3002,6 +3007,26 @@ export interface FunctionParameters {
   /** List of required parameter names */
   required?: Array<string>;
 }
+
+/**
+ * How many GDN prefix checkpoints the native store holds across all owners
+ * ([`GDN_PREFIX_CHECKPOINT_LIMIT`]), exposed for the same reason
+ * [`cold_restore_families`] is: it is one half of a cross-language invariant
+ * and nothing else carries it over the boundary.
+ *
+ * The other half is `MAX_CONCURRENCY` in
+ * `packages/agent/src/extensions/subagent.ts`. The store's demand is
+ * `MAX_CONCURRENCY + 1` — one owner per concurrent child loop plus the root
+ * session — and the cliff sits exactly one owner past the cap, where every
+ * owner holds a single entry and the store is still over it, so each publish
+ * takes somebody's last checkpoint. `retention_sim` measures that as 0 blind
+ * turns at five owners and 28 of 40 at six.
+ *
+ * No Rust gate can see a TypeScript-only edit, so raising the fleet alone
+ * would land in that regime with every Rust gate still green.
+ * `packages/agent/__test__/gdn-checkpoint-capacity.test.ts` is what stops it.
+ */
+export declare function gdnPrefixCheckpointLimit(): number;
 
 /**
  * Gemma 4 model configuration (dense variant).
