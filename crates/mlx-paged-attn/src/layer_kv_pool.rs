@@ -114,6 +114,12 @@ fn bridge_dtype_code(dtype: MetalDtype) -> Result<i32, String> {
     })
 }
 
+/// One physical block's host-side bytes for a single layer, as
+/// `(keys, values)` in the pool's native packed K/V layouts (vLLM K
+/// `[num_kv_heads, head_size/x, block_size, x]`, V
+/// `[num_kv_heads, head_size, block_size]`).
+pub type BlockLayerBytes = (Vec<u8>, Vec<u8>);
+
 /// Shared per-layer Metal KV-cache buffer pool.
 ///
 /// On non-macOS targets this compiles to a no-op stub so the rest of the
@@ -182,6 +188,38 @@ impl LayerKVPool {
                     .to_string(),
             ),
         }
+    }
+
+    /// Bytes one physical block occupies in one layer, as `(key, value)`.
+    ///
+    /// - K block: `[num_kv_heads, head_size/x, block_size, x]` elements.
+    /// - V block: `[num_kv_heads, head_size, block_size]` elements.
+    ///
+    /// `head_size / x` then `* x` is spelled out rather than folded away so
+    /// the expression reads term for term like the K buffer's declared shape.
+    /// It never actually truncates: [`Self::new`] refuses to build a pool
+    /// whose `head_size` is not a multiple of `x`, so `(head_size / x) * x`
+    /// always equals `head_size` here and the K and V block sizes always come
+    /// out equal.
+    ///
+    /// Every host<->pool size check inside this type routes through here, so
+    /// the per-layer and whole-block entry points cannot drift apart — a drift
+    /// would let one path accept bytes the other rejects, or worse, blit a
+    /// wrong-sized window. It is *not* the only copy of this product in the
+    /// tree: [`Self::new`]'s buffer sizing, `cold_cache::pool_layer_bytes`,
+    /// and the mlx-core paged adapter's block-gather each re-derive it, so a
+    /// layout change has to be made in all four places.
+    #[cfg(target_os = "macos")]
+    fn block_bytes_per_layer(&self) -> Result<(u64, u64), String> {
+        let (element_size, x) = Self::cache_dtype_layout(self.config.use_fp8(), self.cache_dtype)?;
+        let x = x as u64;
+        let block_size = self.config.block_size as u64;
+        let num_kv_heads = self.config.num_kv_heads as u64;
+        let head_size = self.config.head_size as u64;
+        Ok((
+            num_kv_heads * (head_size / x) * block_size * x * element_size,
+            num_kv_heads * head_size * block_size * element_size,
+        ))
     }
 
     /// Allocate one (K, V) `metal::Buffer` pair per layer.
@@ -1100,17 +1138,7 @@ impl LayerKVPool {
         }
 
         let (key_cache, value_cache) = &self.layers[layer_idx as usize];
-        let (element_size, x_u32) =
-            Self::cache_dtype_layout(self.config.use_fp8(), self.cache_dtype)?;
-        let x = x_u32 as u64;
-        let block_size = self.config.block_size as u64;
-        let num_kv_heads = self.config.num_kv_heads as u64;
-        let head_size = self.config.head_size as u64;
-
-        // K block: [num_kv_heads, head_size/x, block_size, x] elements.
-        let key_block_size = num_kv_heads * (head_size / x) * block_size * x * element_size;
-        // V block: [num_kv_heads, head_size, block_size] elements.
-        let value_block_size = num_kv_heads * head_size * block_size * element_size;
+        let (key_block_size, value_block_size) = self.block_bytes_per_layer()?;
 
         let total_keys = key_block_size as usize * block_ids.len();
         let total_values = value_block_size as usize * block_ids.len();
@@ -1184,6 +1212,112 @@ impl LayerKVPool {
         Err("read_blocks_to_host is only supported on macOS (Metal backend)".to_string())
     }
 
+    /// Read one physical block back to host for **every** layer in a single
+    /// Metal submission. Returns `(keys, values)` per layer, indexed by
+    /// `layer_idx`, in the same native packed layouts
+    /// [`Self::read_blocks_to_host`] returns.
+    ///
+    /// Byte for byte this equals calling `read_blocks_to_host(l, &[block_id])`
+    /// for `l in 0..num_layers()`. Only the dispatch differs: the per-layer
+    /// entry point allocates a staging pair and then commits and *blocks* on
+    /// its own command buffer each time, so capturing one block of a 28-layer
+    /// model cost 28 serialized GPU round-trips — paid on the inference
+    /// thread, on every turn that captures, while the block is pinned. Here
+    /// the whole block is copied by one blit encoder under a single commit +
+    /// `wait_until_completed`.
+    ///
+    /// Validation (non-empty pool, block-id range, dtype geometry) runs
+    /// before any Metal command is submitted, so a rejected call issues no
+    /// GPU work at all.
+    #[cfg(target_os = "macos")]
+    pub fn read_block_all_layers(&self, block_id: u32) -> Result<Vec<BlockLayerBytes>, String> {
+        use crate::metal::{MetalState, is_metal_extraction_supported};
+        use metal::MTLResourceOptions;
+
+        if !is_metal_extraction_supported() {
+            return Err("Metal GPU not available".to_string());
+        }
+        if self.layers.is_empty() {
+            return Err("LayerKVPool::read_block_all_layers: pool has zero layers".to_string());
+        }
+        if block_id >= self.num_blocks {
+            return Err(format!(
+                "LayerKVPool::read_block_all_layers: block_id {} >= num_blocks {} \
+                 (out-of-range physical block)",
+                block_id, self.num_blocks
+            ));
+        }
+        let (key_block_size, value_block_size) = self.block_bytes_per_layer()?;
+        let num_layers = self.layers.len();
+
+        // Exactly two staging buffers for the whole block; layer `i` owns the
+        // window at `i * block_bytes` in each.
+        let state = MetalState::get()?;
+        let key_staging = state.device.new_buffer(
+            key_block_size * num_layers as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let value_staging = state.device.new_buffer(
+            value_block_size * num_layers as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let command_buffer = state.command_queue.new_command_buffer();
+        let blit = command_buffer.new_blit_command_encoder();
+        for (layer_idx, (key_cache, value_cache)) in self.layers.iter().enumerate() {
+            blit.copy_from_buffer(
+                key_cache,
+                block_id as u64 * key_block_size,
+                &key_staging,
+                layer_idx as u64 * key_block_size,
+                key_block_size,
+            );
+            blit.copy_from_buffer(
+                value_cache,
+                block_id as u64 * value_block_size,
+                &value_staging,
+                layer_idx as u64 * value_block_size,
+                value_block_size,
+            );
+        }
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        let key_bytes = key_block_size as usize;
+        let value_bytes = value_block_size as usize;
+        let mut layers = Vec::with_capacity(num_layers);
+        // SAFETY: the shared staging buffers are CPU-accessible now that the
+        // blit has completed, they stay alive for this whole loop, and each
+        // layer reads its own disjoint in-bounds window.
+        unsafe {
+            let key_base = key_staging.contents() as *const u8;
+            let value_base = value_staging.contents() as *const u8;
+            for layer_idx in 0..num_layers {
+                let mut keys = vec![0u8; key_bytes];
+                let mut values = vec![0u8; value_bytes];
+                std::ptr::copy_nonoverlapping(
+                    key_base.add(layer_idx * key_bytes),
+                    keys.as_mut_ptr(),
+                    key_bytes,
+                );
+                std::ptr::copy_nonoverlapping(
+                    value_base.add(layer_idx * value_bytes),
+                    values.as_mut_ptr(),
+                    value_bytes,
+                );
+                layers.push((keys, values));
+            }
+        }
+        Ok(layers)
+    }
+
+    /// Non-macOS stub.
+    #[cfg(not(target_os = "macos"))]
+    pub fn read_block_all_layers(&self, _block_id: u32) -> Result<Vec<BlockLayerBytes>, String> {
+        Err("read_block_all_layers is only supported on macOS (Metal backend)".to_string())
+    }
+
     /// Restore raw cache-layout bytes for physical blocks in one layer.
     ///
     /// This is the exact inverse of [`Self::read_blocks_to_host`]. The input
@@ -1222,13 +1356,7 @@ impl LayerKVPool {
             }
         }
 
-        let (element_size, x) = Self::cache_dtype_layout(self.config.use_fp8(), self.cache_dtype)?;
-        let block_size = self.config.block_size as u64;
-        let num_kv_heads = self.config.num_kv_heads as u64;
-        let head_size = self.config.head_size as u64;
-        let key_block_size =
-            num_kv_heads * (head_size / x as u64) * block_size * x as u64 * element_size;
-        let value_block_size = num_kv_heads * head_size * block_size * element_size;
+        let (key_block_size, value_block_size) = self.block_bytes_per_layer()?;
         let expected_keys = key_block_size as usize * block_ids.len();
         let expected_values = value_block_size as usize * block_ids.len();
         if keys_bytes.len() != expected_keys || values_bytes.len() != expected_values {
@@ -1286,6 +1414,138 @@ impl LayerKVPool {
         _values_bytes: &[u8],
     ) -> Result<(), String> {
         Err("write_blocks_from_host is only supported on macOS (Metal backend)".to_string())
+    }
+
+    /// Restore one physical block's raw cache-layout bytes for **every** layer
+    /// in a single Metal submission. `layers[i]` supplies `(keys, values)` for
+    /// layer `i` and must have exactly `num_layers()` entries, each in the
+    /// native packed layouts [`Self::read_block_all_layers`] produces.
+    ///
+    /// Byte for byte this equals calling
+    /// `write_blocks_from_host(l, &[block_id], keys, values)` for
+    /// `l in 0..num_layers()`. Only the dispatch differs: the per-layer entry
+    /// point allocates two staging buffers and commits and *blocks* on its own
+    /// command buffer each time, so restoring one block of a 28-layer model
+    /// cost 56 allocations and 28 serialized GPU round-trips. Here the block
+    /// is staged into one buffer pair and copied by one blit encoder under a
+    /// single commit + `wait_until_completed`.
+    ///
+    /// # Partial-overwrite invariant
+    ///
+    /// Every check — layer count, block-id range, and *each* layer's key and
+    /// value byte length — completes before the first blit is encoded. A
+    /// rejected call therefore leaves the pool bit-for-bit unmodified rather
+    /// than half-written. This is the whole safety story for corrupt
+    /// cold-cache data: a pool holding the first `k` layers of one prefix and
+    /// the remaining layers of another decodes to wrong tokens with no error
+    /// anywhere, so callers rely on failure meaning "nothing happened".
+    #[cfg(target_os = "macos")]
+    pub fn write_block_all_layers(
+        &self,
+        block_id: u32,
+        layers: &[(&[u8], &[u8])],
+    ) -> Result<(), String> {
+        use crate::metal::{MetalState, is_metal_extraction_supported};
+        use metal::MTLResourceOptions;
+
+        if !is_metal_extraction_supported() {
+            return Err("Metal GPU not available".to_string());
+        }
+        if self.layers.is_empty() {
+            return Err("LayerKVPool::write_block_all_layers: pool has zero layers".to_string());
+        }
+        if layers.len() != self.layers.len() {
+            return Err(format!(
+                "LayerKVPool::write_block_all_layers: layer count {} != pool num_layers {}",
+                layers.len(),
+                self.layers.len()
+            ));
+        }
+        if block_id >= self.num_blocks {
+            return Err(format!(
+                "LayerKVPool::write_block_all_layers: block_id {} >= num_blocks {}",
+                block_id, self.num_blocks
+            ));
+        }
+        let (key_block_size, value_block_size) = self.block_bytes_per_layer()?;
+        for (layer_idx, (keys, values)) in layers.iter().enumerate() {
+            if keys.len() as u64 != key_block_size || values.len() as u64 != value_block_size {
+                return Err(format!(
+                    "LayerKVPool::write_block_all_layers: layer {} byte length mismatch \
+                     (keys {} != {}, values {} != {})",
+                    layer_idx,
+                    keys.len(),
+                    key_block_size,
+                    values.len(),
+                    value_block_size
+                ));
+            }
+        }
+
+        // Past this point every input is known-good and no blit has been
+        // encoded yet, so the invariant above holds for all the early returns.
+        let state = MetalState::get()?;
+        let key_staging = state.device.new_buffer(
+            key_block_size * layers.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let value_staging = state.device.new_buffer(
+            value_block_size * layers.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        // SAFETY: freshly created StorageModeShared buffers are CPU-visible
+        // and exclusively owned here. Each layer fills its own disjoint
+        // in-bounds window (lengths were checked above), and every write
+        // happens before the blit is committed below.
+        unsafe {
+            let key_base = key_staging.contents() as *mut u8;
+            let value_base = value_staging.contents() as *mut u8;
+            for (layer_idx, (keys, values)) in layers.iter().enumerate() {
+                std::ptr::copy_nonoverlapping(
+                    keys.as_ptr(),
+                    key_base.add(layer_idx * key_block_size as usize),
+                    keys.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    values.as_ptr(),
+                    value_base.add(layer_idx * value_block_size as usize),
+                    values.len(),
+                );
+            }
+        }
+
+        let command_buffer = state.command_queue.new_command_buffer();
+        let blit = command_buffer.new_blit_command_encoder();
+        for (layer_idx, (key_cache, value_cache)) in self.layers.iter().enumerate() {
+            blit.copy_from_buffer(
+                &key_staging,
+                layer_idx as u64 * key_block_size,
+                key_cache,
+                block_id as u64 * key_block_size,
+                key_block_size,
+            );
+            blit.copy_from_buffer(
+                &value_staging,
+                layer_idx as u64 * value_block_size,
+                value_cache,
+                block_id as u64 * value_block_size,
+                value_block_size,
+            );
+        }
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        Ok(())
+    }
+
+    /// Non-macOS stub.
+    #[cfg(not(target_os = "macos"))]
+    pub fn write_block_all_layers(
+        &self,
+        _block_id: u32,
+        _layers: &[(&[u8], &[u8])],
+    ) -> Result<(), String> {
+        Err("write_block_all_layers is only supported on macOS (Metal backend)".to_string())
     }
 }
 
@@ -1552,11 +1812,981 @@ mod tests {
         );
     }
 
+    /// Per-layer bytes for a batched-path test: every layer gets a distinct
+    /// pattern, so a wrong staging offset (layer `i` written at layer `j`'s
+    /// window) cannot pass by looking the same everywhere.
+    #[cfg(target_os = "macos")]
+    fn distinct_layer_bytes(num_layers: usize, per_side: usize) -> Vec<BlockLayerBytes> {
+        (0..num_layers)
+            .map(|layer| {
+                let keys = (0..per_side)
+                    .map(|i| ((layer * 37 + i * 7 + 1) % 251) as u8)
+                    .collect();
+                let values = (0..per_side)
+                    .map(|i| ((layer * 91 + i * 13 + 5) % 251) as u8)
+                    .collect();
+                (keys, values)
+            })
+            .collect()
+    }
+
+    /// Seed `block_id` with a per-layer sentinel through the trusted per-layer
+    /// path and return the bytes written, so a neighbouring block can be shown
+    /// untouched afterwards.
+    ///
+    /// Reading a never-written block and asserting zeros does not work here on
+    /// two counts. Metal makes no guarantee that a fresh `StorageModePrivate`
+    /// allocation reads back zeroed, and these are exactly the small size class
+    /// a process-owned heap suballocates, so a test binary that has already
+    /// churned Metal buffers can see another allocation's bytes. A zero
+    /// assertion is also weaker than it looks: it cannot tell "this block was
+    /// already garbage" apart from "the batched write spilled into it". The
+    /// sentinel pattern differs from [`distinct_layer_bytes`] in both
+    /// coefficients, so a spill of the payload is always visible.
+    #[cfg(target_os = "macos")]
+    fn seed_sentinel_block(
+        pool: &LayerKVPool,
+        block_id: u32,
+        per_side: usize,
+    ) -> Vec<BlockLayerBytes> {
+        let sentinel: Vec<BlockLayerBytes> = (0..pool.num_layers())
+            .map(|layer| {
+                let keys = (0..per_side)
+                    .map(|i| ((layer * 53 + i * 3 + 199) % 251) as u8)
+                    .collect();
+                let values = (0..per_side)
+                    .map(|i| ((layer * 17 + i * 29 + 227) % 251) as u8)
+                    .collect();
+                (keys, values)
+            })
+            .collect();
+        for (layer, (keys, values)) in sentinel.iter().enumerate() {
+            pool.write_blocks_from_host(layer as u32, &[block_id], keys, values)
+                .expect("sentinel seed");
+        }
+        sentinel
+    }
+
+    /// Read every block of every layer through the trusted per-layer path.
+    /// Used to assert the pool is untouched after a rejected batched write.
+    #[cfg(target_os = "macos")]
+    fn snapshot_pool(pool: &LayerKVPool) -> Vec<BlockLayerBytes> {
+        let mut out = Vec::new();
+        for block in 0..pool.num_blocks() {
+            for layer in 0..pool.num_layers() as u32 {
+                out.push(pool.read_blocks_to_host(layer, &[block]).expect("readback"));
+            }
+        }
+        out
+    }
+
+    /// The batched whole-block write must land byte-identical bytes to the
+    /// per-layer write it replaces, and the batched whole-block read must
+    /// return byte-identical bytes to the per-layer read it replaces. Uses a
+    /// non-zero block id and distinct per-layer contents so a block-offset or
+    /// layer-offset bug cannot coincidentally agree.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_batched_block_io_matches_per_layer_path() {
+        const LAYERS: usize = 4;
+        let pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_batched_block_io_matches_per_layer_path: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        // heads=2 * head_size=64 * block_size=8 * sizeof(bf16)=2.
+        let per_side = 2 * 64 * 8 * 2;
+        let payload = distinct_layer_bytes(LAYERS, per_side);
+        let sentinel = seed_sentinel_block(&pool, 0, per_side);
+
+        // Same payload, two different non-zero blocks: one uploaded the old
+        // way, one the batched way.
+        let per_layer_block = 1u32;
+        let batched_block = 3u32;
+        for (layer, (keys, values)) in payload.iter().enumerate() {
+            pool.write_blocks_from_host(layer as u32, &[per_layer_block], keys, values)
+                .expect("per-layer upload");
+        }
+        let borrowed: Vec<(&[u8], &[u8])> = payload
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        pool.write_block_all_layers(batched_block, &borrowed)
+            .expect("batched upload");
+
+        for (layer, (keys, values)) in payload.iter().enumerate() {
+            let (old_k, old_v) = pool
+                .read_blocks_to_host(layer as u32, &[per_layer_block])
+                .expect("per-layer readback");
+            let (new_k, new_v) = pool
+                .read_blocks_to_host(layer as u32, &[batched_block])
+                .expect("per-layer readback of batched block");
+            assert_eq!(&new_k, &old_k, "layer {layer} keys differ between paths");
+            assert_eq!(&new_v, &old_v, "layer {layer} values differ between paths");
+            assert_eq!(&new_k, keys, "layer {layer} keys differ from input");
+            assert_eq!(&new_v, values, "layer {layer} values differ from input");
+        }
+
+        // Read side: batched readback == per-layer readback, per layer.
+        let batched_read = pool
+            .read_block_all_layers(batched_block)
+            .expect("batched readback");
+        assert_eq!(batched_read.len(), LAYERS);
+        for (layer, (keys, values)) in batched_read.iter().enumerate() {
+            let (old_k, old_v) = pool
+                .read_blocks_to_host(layer as u32, &[batched_block])
+                .expect("per-layer readback");
+            assert_eq!(keys, &old_k, "layer {layer} batched-read keys differ");
+            assert_eq!(values, &old_v, "layer {layer} batched-read values differ");
+            assert_eq!(
+                keys, &payload[layer].0,
+                "layer {layer} keys differ from input"
+            );
+            assert_eq!(
+                values, &payload[layer].1,
+                "layer {layer} values differ from input"
+            );
+        }
+
+        // The neighbouring block still holds its sentinel — proves the batched
+        // write did not spill across block slots.
+        let untouched = pool
+            .read_block_all_layers(0)
+            .expect("batched readback of untouched block");
+        assert_eq!(
+            untouched, sentinel,
+            "batched write must not touch other block slots"
+        );
+    }
+
+    /// The partial-overwrite invariant: every rejection path must leave the
+    /// pool bit-for-bit unmodified. The byte-length cases deliberately corrupt
+    /// the LAST layer, which is exactly what a lazily validating
+    /// implementation would only notice after blitting all the earlier layers.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_batched_write_rejections_leave_pool_unmodified() {
+        const LAYERS: usize = 4;
+        let pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_batched_write_rejections_leave_pool_unmodified: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let per_side = 2 * 64 * 8 * 2;
+        let good = distinct_layer_bytes(LAYERS, per_side);
+        let borrowed: Vec<(&[u8], &[u8])> = good
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        pool.write_block_all_layers(2, &borrowed).expect("seed");
+        let before = snapshot_pool(&pool);
+
+        // A wholly different payload, so any byte that does land is visible.
+        let poison = distinct_layer_bytes(LAYERS, per_side)
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.iter().map(|b| b ^ 0xff).collect::<Vec<u8>>(),
+                    v.iter().map(|b| b ^ 0xff).collect::<Vec<u8>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // 1. Too few layers.
+        let short_count: Vec<(&[u8], &[u8])> = poison[..LAYERS - 1]
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        let err = pool
+            .write_block_all_layers(2, &short_count)
+            .expect_err("wrong layer count must be rejected");
+        assert!(err.contains("layer count"), "unexpected error: {err}");
+
+        // 2. Too many layers.
+        let mut long = poison.clone();
+        long.push(poison[0].clone());
+        let long_count: Vec<(&[u8], &[u8])> = long
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        assert!(
+            pool.write_block_all_layers(2, &long_count).is_err(),
+            "extra layer must be rejected"
+        );
+
+        // 3. Last layer's keys are one byte short.
+        let mut bad_keys: Vec<(&[u8], &[u8])> = poison
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        bad_keys[LAYERS - 1].0 = &poison[LAYERS - 1].0[..per_side - 1];
+        let err = pool
+            .write_block_all_layers(2, &bad_keys)
+            .expect_err("short keys must be rejected");
+        assert!(
+            err.contains(&format!("layer {}", LAYERS - 1)),
+            "error must name the offending layer: {err}"
+        );
+
+        // 4. Last layer's values are one byte short.
+        let mut bad_values: Vec<(&[u8], &[u8])> = poison
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        bad_values[LAYERS - 1].1 = &poison[LAYERS - 1].1[..per_side - 1];
+        assert!(
+            pool.write_block_all_layers(2, &bad_values).is_err(),
+            "short values must be rejected"
+        );
+
+        // 5. Out-of-range block id.
+        let all_good: Vec<(&[u8], &[u8])> = poison
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        let err = pool
+            .write_block_all_layers(pool.num_blocks(), &all_good)
+            .expect_err("out-of-range block id must be rejected");
+        assert!(err.contains("num_blocks"), "unexpected error: {err}");
+
+        assert_eq!(
+            snapshot_pool(&pool),
+            before,
+            "a rejected batched write must not modify any byte of the pool"
+        );
+
+        // The read side rejects an out-of-range block id too.
+        assert!(pool.read_block_all_layers(pool.num_blocks()).is_err());
+    }
+
+    /// FP8 variant of [`base_config`]: `use_fp8_cache = Some(true)` forces
+    /// `block_size` off 8 (`PagedAttentionConfig::validate` rejects that pair),
+    /// and the pool must then be built with `MetalDtype::UChar` — the
+    /// `(element_size = 1, x = 16)` arm of `cache_dtype_layout`.
+    #[cfg(target_os = "macos")]
+    fn fp8_config(num_layers: u32) -> PagedAttentionConfig {
+        PagedAttentionConfig {
+            block_size: 16,
+            use_fp8_cache: Some(true),
+            ..base_config(num_layers)
+        }
+    }
+
+    /// Same contract as [`test_batched_block_io_matches_per_layer_path`] —
+    /// batched and per-layer dispatch must land byte-identical pool contents —
+    /// but on the FP8 arm, which had no byte-level coverage at all: every other
+    /// I/O test drives BF16, so a stale 2-byte element size or an 8-wide pack
+    /// factor would double every offset and length here and go unnoticed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_fp8_batched_block_io_matches_per_layer_path() {
+        const LAYERS: usize = 4;
+        // K: heads=2 * (head_size=64 / x=16) * block_size=16 * x=16, one byte
+        //    per FP8 element = 2048.
+        // V: heads=2 * head_size=64 * block_size=16, one byte = 2048.
+        const PER_SIDE: usize = 2 * (64 / 16) * 16 * 16;
+        let pool = match LayerKVPool::new(fp8_config(LAYERS as u32), 4, MetalDtype::UChar) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_fp8_batched_block_io_matches_per_layer_path: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        assert_eq!(pool.cache_pack_factor().expect("pack factor"), 16);
+        let payload = distinct_layer_bytes(LAYERS, PER_SIDE);
+        let sentinel = seed_sentinel_block(&pool, 0, PER_SIDE);
+
+        // Same payload, two different non-zero blocks: one uploaded the old
+        // way, one the batched way.
+        let per_layer_block = 1u32;
+        let batched_block = 3u32;
+        for (layer, (keys, values)) in payload.iter().enumerate() {
+            pool.write_blocks_from_host(layer as u32, &[per_layer_block], keys, values)
+                .expect("per-layer FP8 upload");
+        }
+        let borrowed: Vec<(&[u8], &[u8])> = payload
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        pool.write_block_all_layers(batched_block, &borrowed)
+            .expect("batched FP8 upload");
+
+        let batched_read = pool
+            .read_block_all_layers(batched_block)
+            .expect("batched FP8 readback");
+        assert_eq!(batched_read.len(), LAYERS);
+        for (layer, (keys, values)) in batched_read.iter().enumerate() {
+            // Pins the FP8 arm's byte arithmetic: a 2-byte element size or an
+            // x=8 pack factor lands 4096 here, not 2048.
+            assert_eq!(keys.len(), PER_SIDE, "layer {layer} FP8 K block bytes");
+            assert_eq!(values.len(), PER_SIDE, "layer {layer} FP8 V block bytes");
+
+            let (old_k, old_v) = pool
+                .read_blocks_to_host(layer as u32, &[per_layer_block])
+                .expect("per-layer FP8 readback");
+            assert_eq!(keys, &old_k, "layer {layer} keys differ between paths");
+            assert_eq!(values, &old_v, "layer {layer} values differ between paths");
+            assert_eq!(
+                keys, &payload[layer].0,
+                "layer {layer} keys differ from input"
+            );
+            assert_eq!(
+                values, &payload[layer].1,
+                "layer {layer} values differ from input"
+            );
+        }
+
+        // The neighbouring block still holds its sentinel — proves neither FP8
+        // upload spilled across block slots.
+        let untouched = pool
+            .read_block_all_layers(0)
+            .expect("batched FP8 readback of untouched block");
+        assert_eq!(
+            untouched, sentinel,
+            "FP8 writes must not touch other block slots"
+        );
+    }
+
+    /// Every other byte-level test in this module uses `head_size = 64`, so the
+    /// suite never observed a second head size and could not tell
+    /// `head_size`-proportional sizing from a constant. This drives
+    /// `head_size = 80` — legal per `PagedAttentionConfig::validate`, and
+    /// `80 % 8 == 0` so `LayerKVPool::new` accepts it on the BF16 `x = 8` arm —
+    /// through both the per-layer and the batched path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_bf16_block_io_at_head_size_80() {
+        const LAYERS: usize = 3;
+        // K: heads=2 * (head_size=80 / x=8) * block_size=8 * x=8 * 2 B = 2560.
+        // V: heads=2 * head_size=80 * block_size=8 * 2 B = 2560.
+        const PER_SIDE: usize = 2 * (80 / 8) * 8 * 8 * 2;
+        let cfg = PagedAttentionConfig {
+            head_size: 80,
+            ..base_config(LAYERS as u32)
+        };
+        let pool = match LayerKVPool::new(cfg, 4, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_bf16_block_io_at_head_size_80: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let payload = distinct_layer_bytes(LAYERS, PER_SIDE);
+        let sentinel = seed_sentinel_block(&pool, 0, PER_SIDE);
+
+        let per_layer_block = 1u32;
+        let batched_block = 3u32;
+        for (layer, (keys, values)) in payload.iter().enumerate() {
+            pool.write_blocks_from_host(layer as u32, &[per_layer_block], keys, values)
+                .expect("per-layer upload at head_size 80");
+        }
+        let borrowed: Vec<(&[u8], &[u8])> = payload
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        pool.write_block_all_layers(batched_block, &borrowed)
+            .expect("batched upload at head_size 80");
+
+        let batched_read = pool
+            .read_block_all_layers(batched_block)
+            .expect("batched readback at head_size 80");
+        assert_eq!(batched_read.len(), LAYERS);
+        for (layer, (keys, values)) in batched_read.iter().enumerate() {
+            // Sizing must track head_size 80, not the 64 the rest of the
+            // module hard-codes (that would be 2048 per side).
+            assert_eq!(keys.len(), PER_SIDE, "layer {layer} K block bytes");
+            assert_eq!(values.len(), PER_SIDE, "layer {layer} V block bytes");
+
+            let (old_k, old_v) = pool
+                .read_blocks_to_host(layer as u32, &[per_layer_block])
+                .expect("per-layer readback at head_size 80");
+            assert_eq!(keys, &old_k, "layer {layer} keys differ between paths");
+            assert_eq!(values, &old_v, "layer {layer} values differ between paths");
+            assert_eq!(
+                keys, &payload[layer].0,
+                "layer {layer} keys differ from input"
+            );
+            assert_eq!(
+                values, &payload[layer].1,
+                "layer {layer} values differ from input"
+            );
+        }
+
+        let untouched = pool
+            .read_block_all_layers(0)
+            .expect("batched readback of untouched block");
+        assert_eq!(
+            untouched, sentinel,
+            "writes at head_size 80 must not touch other block slots"
+        );
+    }
+
+    /// `PagedAttentionConfig::validate` accepts `head_size = 120`, but the FP8
+    /// pack factor is 16 and `120 / 16 = 7.5` — the packed K layout has no
+    /// integral shape. `LayerKVPool::new` must refuse instead of allocating a
+    /// buffer sized from the truncated quotient, which would be 8 heads-worth
+    /// of lanes short of what the kernel addresses.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_new_rejects_fp8_head_size_not_divisible_by_pack_factor() {
+        let cfg = PagedAttentionConfig {
+            head_size: 120,
+            ..fp8_config(2)
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "head_size 120 must be config-legal, or this test proves nothing"
+        );
+        let msg = match LayerKVPool::new(cfg, 4, MetalDtype::UChar) {
+            Ok(_) => panic!("expected head_size/pack-factor rejection, got Ok"),
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!(
+                    "skipping test_new_rejects_fp8_head_size_not_divisible_by_pack_factor: {e}"
+                );
+                return;
+            }
+            Err(e) => e,
+        };
+        assert_eq!(
+            msg,
+            "head_size (120) must be divisible by x (16). Cache layout would be broken."
+        );
+
+        // The same head size is fine on the BF16 arm (`x = 8`, `120 % 8 == 0`),
+        // so the rejection is about the FP8 geometry and not about 120 itself.
+        let bf16 = PagedAttentionConfig {
+            head_size: 120,
+            ..base_config(2)
+        };
+        assert!(
+            LayerKVPool::new(bf16, 4, MetalDtype::BFloat16).is_ok(),
+            "head_size 120 is a multiple of the BF16 pack factor and must be accepted"
+        );
+    }
+
     #[test]
     fn test_bridge_dtype_code_table() {
         assert_eq!(bridge_dtype_code(MetalDtype::Float16).unwrap(), 2);
         assert_eq!(bridge_dtype_code(MetalDtype::BFloat16).unwrap(), 3);
         assert_eq!(bridge_dtype_code(MetalDtype::UChar).unwrap(), 5);
         assert!(bridge_dtype_code(MetalDtype::Float32).is_err());
+    }
+}
+
+/// Measurement-only harness (temporary, `#[ignore]`d, not part of any gate).
+/// Counterfactual for the cold-tier restore upload: production issues one
+/// `write_blocks_from_host` per layer, each of which commits its own Metal
+/// command buffer and blocks in `wait_until_completed`. This measures that
+/// shape against encoding every layer into a single command buffer with one
+/// commit+wait, which is the only difference between the two arms.
+#[cfg(all(test, target_os = "macos"))]
+mod upload_batching_bench {
+    use super::*;
+    use crate::metal::{MetalDtype, MetalState, is_metal_extraction_supported};
+    use metal::MTLResourceOptions;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::time::Instant;
+
+    const L: u32 = 28;
+    const KVH: u32 = 8;
+    const HS: u32 = 128;
+    const BS: u32 = 16;
+    const REPS: usize = 64;
+
+    fn cfg() -> PagedAttentionConfig {
+        PagedAttentionConfig {
+            block_size: BS,
+            gpu_memory_mb: 2048,
+            head_size: HS,
+            num_kv_heads: KVH,
+            num_layers: L,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(4096),
+            max_batch_size: Some(1),
+        }
+    }
+
+    /// Per-family cost of BOTH directions, at each model's real KV geometry:
+    /// the old per-layer shape (one command buffer + commit + wait per layer)
+    /// against the batched whole-block entry points that replaced it
+    /// (`write_block_all_layers` on restore, `read_block_all_layers` on
+    /// capture). Both arms call the real production APIs.
+    #[test]
+    #[ignore = "measurement harness; run explicitly with --ignored"]
+    fn bench_block_io_cost_by_model_family() {
+        if !is_metal_extraction_supported() {
+            eprintln!("skipping: no Metal");
+            return;
+        }
+        // (label, layers, kv_heads, head_size)
+        let families = [
+            ("qwen3-0.6b-mlx-bf16", 28u32, 8u32, 128u32),
+            ("gemma-4-e2b-it-mlx", 35, 1, 256),
+            ("Qwen3.5-0.8B (24L/2H/256)", 24, 2, 256),
+        ];
+        let f = |d: std::time::Duration| d.as_secs_f64() * 1e3 / REPS as f64;
+        eprintln!(
+            "\n=== per-block cost, per-layer vs batched (block_size {BS}, bf16, {REPS} reps) ==="
+        );
+        for (label, l, kvh, hs) in families {
+            let c = PagedAttentionConfig {
+                block_size: BS,
+                gpu_memory_mb: 2048,
+                head_size: hs,
+                num_kv_heads: kvh,
+                num_layers: l,
+                use_fp8_cache: Some(false),
+                max_seq_len: Some(4096),
+                max_batch_size: Some(1),
+            };
+            let pool = match LayerKVPool::new(c, 8, MetalDtype::BFloat16) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("  {label}: skipped ({e})");
+                    continue;
+                }
+            };
+            let per_side = (kvh * hs * BS * 2) as usize;
+            let owned: Vec<(Vec<u8>, Vec<u8>)> = (0..l as usize)
+                .map(|layer| {
+                    (
+                        (0..per_side)
+                            .map(|i| ((layer * 37 + i) % 251) as u8)
+                            .collect(),
+                        (0..per_side)
+                            .map(|i| ((layer * 91 + i * 3) % 251) as u8)
+                            .collect(),
+                    )
+                })
+                .collect();
+            let borrowed: Vec<(&[u8], &[u8])> = owned
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect();
+            let bid = 3u32;
+
+            let write_per_layer = |pool: &LayerKVPool| {
+                for (layer, (k, v)) in owned.iter().enumerate() {
+                    pool.write_blocks_from_host(layer as u32, &[bid], k, v)
+                        .unwrap();
+                }
+            };
+            let read_per_layer = |pool: &LayerKVPool| {
+                let mut out = Vec::with_capacity(l as usize);
+                for layer in 0..l {
+                    out.push(pool.read_blocks_to_host(layer, &[bid]).unwrap());
+                }
+                std::hint::black_box(&out);
+            };
+            for _ in 0..4 {
+                write_per_layer(&pool);
+                pool.write_block_all_layers(bid, &borrowed).unwrap();
+                read_per_layer(&pool);
+                std::hint::black_box(pool.read_block_all_layers(bid).unwrap());
+            }
+
+            let t = Instant::now();
+            for _ in 0..REPS {
+                write_per_layer(&pool);
+            }
+            let w_old = t.elapsed();
+            let t = Instant::now();
+            for _ in 0..REPS {
+                pool.write_block_all_layers(bid, &borrowed).unwrap();
+            }
+            let w_new = t.elapsed();
+            let t = Instant::now();
+            for _ in 0..REPS {
+                read_per_layer(&pool);
+            }
+            let r_old = t.elapsed();
+            let t = Instant::now();
+            for _ in 0..REPS {
+                std::hint::black_box(pool.read_block_all_layers(bid).unwrap());
+            }
+            let r_new = t.elapsed();
+
+            eprintln!(
+                "\n  {label} — {l} layers, {} B/block ({} B/token)",
+                per_side * 2 * l as usize,
+                per_side * 2 * l as usize / BS as usize
+            );
+            eprintln!(
+                "    restore upload  per-layer {:7.3} ms -> batched {:6.3} ms   {:5.1}x",
+                f(w_old),
+                f(w_new),
+                f(w_old) / f(w_new)
+            );
+            eprintln!(
+                "    capture readback per-layer {:6.3} ms -> batched {:6.3} ms   {:5.1}x",
+                f(r_old),
+                f(r_new),
+                f(r_old) / f(r_new)
+            );
+        }
+    }
+
+    /// Per-family upload cost: production per-layer shape vs one batched
+    /// command buffer, for each model's real KV geometry.
+    #[test]
+    #[ignore = "measurement harness; run explicitly with --ignored"]
+    fn bench_upload_cost_by_model_family() {
+        if !is_metal_extraction_supported() {
+            eprintln!("skipping: no Metal");
+            return;
+        }
+        // (label, layers, kv_heads, head_size)
+        let families = [
+            ("qwen3-0.6b-mlx-bf16", 28u32, 8u32, 128u32),
+            ("gemma-4-e2b-it-mlx", 35, 1, 256),
+            ("Qwen3.5-0.8B (24L/2H/256)", 24, 2, 256),
+        ];
+        eprintln!("\n=== per-block upload cost by family (block_size {BS}, bf16) ===");
+        for (label, l, kvh, hs) in families {
+            let c = PagedAttentionConfig {
+                block_size: BS,
+                gpu_memory_mb: 2048,
+                head_size: hs,
+                num_kv_heads: kvh,
+                num_layers: l,
+                use_fp8_cache: Some(false),
+                max_seq_len: Some(4096),
+                max_batch_size: Some(1),
+            };
+            let pool = match LayerKVPool::new(c, 8, MetalDtype::BFloat16) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("  {label}: skipped ({e})");
+                    continue;
+                }
+            };
+            let per_side = (kvh * hs * BS * 2) as usize;
+            let keys: Vec<u8> = (0..per_side).map(|i| (i % 251) as u8).collect();
+            let values: Vec<u8> = (0..per_side).map(|i| (250 - (i % 251)) as u8).collect();
+            let bid = 3u32;
+            let st = MetalState::get().unwrap();
+            for _ in 0..4 {
+                for x in 0..l {
+                    pool.write_blocks_from_host(x, &[bid], &keys, &values)
+                        .unwrap();
+                }
+            }
+            let t = Instant::now();
+            for _ in 0..REPS {
+                for x in 0..l {
+                    pool.write_blocks_from_host(x, &[bid], &keys, &values)
+                        .unwrap();
+                }
+            }
+            let pl = t.elapsed();
+            let t = Instant::now();
+            for _ in 0..REPS {
+                let ks = st
+                    .device
+                    .new_buffer_with_slice(&keys, MTLResourceOptions::StorageModeShared);
+                let vs = st
+                    .device
+                    .new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared);
+                let cb = st.command_queue.new_command_buffer();
+                let bl = cb.new_blit_command_encoder();
+                for x in 0..l as usize {
+                    let (kc, vc) = &pool.layers[x];
+                    bl.copy_from_buffer(&ks, 0, kc, bid as u64 * per_side as u64, per_side as u64);
+                    bl.copy_from_buffer(&vs, 0, vc, bid as u64 * per_side as u64, per_side as u64);
+                }
+                bl.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+            }
+            let ba = t.elapsed();
+            let f = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            eprintln!(
+                "  {label:26} {l:2}L  {:7} B/blk  {:5} B/token | per-layer {:7.3} ms  batched \
+                 {:6.3} ms  {:5.1}x",
+                per_side * 2 * l as usize,
+                per_side * 2 * l as usize / BS as usize,
+                f(pl) / REPS as f64,
+                f(ba) / REPS as f64,
+                f(pl) / f(ba)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement harness; run explicitly with --ignored"]
+    fn bench_per_layer_commit_vs_single_command_buffer() {
+        if !is_metal_extraction_supported() {
+            eprintln!("skipping: no Metal");
+            return;
+        }
+        let pool = match LayerKVPool::new(cfg(), 8, MetalDtype::BFloat16) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skipping: {e}");
+                return;
+            }
+        };
+        let per_side = (KVH * HS * BS * 2) as usize;
+        let keys: Vec<u8> = (0..per_side).map(|i| (i % 251) as u8).collect();
+        let values: Vec<u8> = (0..per_side).map(|i| (250 - (i % 251)) as u8).collect();
+        let block_id = 3u32;
+
+        // Arm 1: production shape — one write_blocks_from_host per layer.
+        for _ in 0..4 {
+            for l in 0..L {
+                pool.write_blocks_from_host(l, &[block_id], &keys, &values)
+                    .unwrap();
+            }
+        }
+        let t = Instant::now();
+        for _ in 0..REPS {
+            for l in 0..L {
+                pool.write_blocks_from_host(l, &[block_id], &keys, &values)
+                    .unwrap();
+            }
+        }
+        let per_layer = t.elapsed();
+
+        // Arm 2: identical blits, one command buffer, one commit+wait.
+        let state = MetalState::get().unwrap();
+        let key_block_size = per_side as u64;
+        let value_block_size = per_side as u64;
+        let batched_once = |pool: &LayerKVPool| {
+            let ks = state
+                .device
+                .new_buffer_with_slice(&keys, MTLResourceOptions::StorageModeShared);
+            let vs = state
+                .device
+                .new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared);
+            let cb = state.command_queue.new_command_buffer();
+            let blit = cb.new_blit_command_encoder();
+            for l in 0..L as usize {
+                let (kc, vc) = &pool.layers[l];
+                blit.copy_from_buffer(&ks, 0, kc, block_id as u64 * key_block_size, key_block_size);
+                blit.copy_from_buffer(
+                    &vs,
+                    0,
+                    vc,
+                    block_id as u64 * value_block_size,
+                    value_block_size,
+                );
+            }
+            blit.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        };
+        for _ in 0..4 {
+            batched_once(&pool);
+        }
+        let t = Instant::now();
+        for _ in 0..REPS {
+            batched_once(&pool);
+        }
+        let batched = t.elapsed();
+
+        // Arm 3: bare command-buffer round-trip cost (no blits at all).
+        let t = Instant::now();
+        for _ in 0..REPS * L as usize {
+            let cb = state.command_queue.new_command_buffer();
+            let blit = cb.new_blit_command_encoder();
+            blit.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        }
+        let empty = t.elapsed();
+
+        // Arm 4: per-layer commit+wait, but staging buffers allocated ONCE.
+        // Isolates command-buffer round-trip cost from staging allocation.
+        let ks_reuse = state
+            .device
+            .new_buffer_with_slice(&keys, MTLResourceOptions::StorageModeShared);
+        let vs_reuse = state
+            .device
+            .new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared);
+        let t = Instant::now();
+        for _ in 0..REPS {
+            for l in 0..L as usize {
+                let (kc, vc) = &pool.layers[l];
+                let cb = state.command_queue.new_command_buffer();
+                let blit = cb.new_blit_command_encoder();
+                blit.copy_from_buffer(
+                    &ks_reuse,
+                    0,
+                    kc,
+                    block_id as u64 * key_block_size,
+                    key_block_size,
+                );
+                blit.copy_from_buffer(
+                    &vs_reuse,
+                    0,
+                    vc,
+                    block_id as u64 * value_block_size,
+                    value_block_size,
+                );
+                blit.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+            }
+        }
+        let per_layer_reused_staging = t.elapsed();
+
+        // Arm 5: single command buffer, but a fresh staging pair per layer.
+        // Isolates staging allocation cost from command-buffer round-trips.
+        let t = Instant::now();
+        for _ in 0..REPS {
+            let cb = state.command_queue.new_command_buffer();
+            let blit = cb.new_blit_command_encoder();
+            let mut hold = Vec::with_capacity(L as usize * 2);
+            for l in 0..L as usize {
+                let ks = state
+                    .device
+                    .new_buffer_with_slice(&keys, MTLResourceOptions::StorageModeShared);
+                let vs = state
+                    .device
+                    .new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared);
+                let (kc, vc) = &pool.layers[l];
+                blit.copy_from_buffer(&ks, 0, kc, block_id as u64 * key_block_size, key_block_size);
+                blit.copy_from_buffer(
+                    &vs,
+                    0,
+                    vc,
+                    block_id as u64 * value_block_size,
+                    value_block_size,
+                );
+                hold.push((ks, vs));
+            }
+            blit.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        }
+        let one_cb_fresh_staging = t.elapsed();
+
+        // Arm 6: staging allocation alone (no GPU work at all).
+        let t = Instant::now();
+        for _ in 0..REPS {
+            let mut hold = Vec::with_capacity(L as usize * 2);
+            for _ in 0..L as usize {
+                hold.push((
+                    state
+                        .device
+                        .new_buffer_with_slice(&keys, MTLResourceOptions::StorageModeShared),
+                    state
+                        .device
+                        .new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared),
+                ));
+            }
+            std::hint::black_box(&hold);
+        }
+        let staging_alloc_only = t.elapsed();
+
+        let f = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        eprintln!(
+            "\n=== upload of one {L}-layer block ({} B), {REPS} reps ===",
+            per_side * 2 * L as usize
+        );
+        eprintln!(
+            "  per-layer  ({L} commit+wait): {:8.4} ms/block",
+            f(per_layer) / REPS as f64
+        );
+        eprintln!(
+            "  batched    (1 commit+wait):  {:8.4} ms/block",
+            f(batched) / REPS as f64
+        );
+        eprintln!(
+            "  speedup from batching:       {:8.2}x",
+            f(per_layer) / f(batched)
+        );
+        eprintln!(
+            "  bare empty command buffer:   {:8.4} ms each  ({:.4} ms x {L} = {:.4} ms/block of pure round-trip)",
+            f(empty) / (REPS * L as usize) as f64,
+            f(empty) / (REPS * L as usize) as f64,
+            f(empty) / REPS as f64
+        );
+        eprintln!("  --- isolating the two changes that differ between the arms ---");
+        eprintln!(
+            "  {L} commit+wait, staging reused ONCE: {:8.4} ms/block  (cost of command buffers alone)",
+            f(per_layer_reused_staging) / REPS as f64
+        );
+        eprintln!(
+            "  1 commit+wait, {} fresh staging bufs: {:8.4} ms/block  (cost of allocations alone)",
+            L * 2,
+            f(one_cb_fresh_staging) / REPS as f64
+        );
+        eprintln!(
+            "  {} staging allocations, no GPU work:  {:8.4} ms/block",
+            L * 2,
+            f(staging_alloc_only) / REPS as f64
+        );
+
+        // Arms 7/8: the same two shapes, but with unrelated GPU work in flight on
+        // the SAME process-wide command queue (metal/state.rs:33) — the real
+        // condition during a turn, where inference owns the queue. Each
+        // `wait_until_completed` then also waits out whatever is queued ahead.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+        let big: Vec<u8> = vec![7u8; 4 << 20];
+        let bg = std::thread::spawn(move || {
+            let st = MetalState::get().unwrap();
+            let a = st
+                .device
+                .new_buffer_with_slice(&big, MTLResourceOptions::StorageModeShared);
+            let b = st
+                .device
+                .new_buffer(big.len() as u64, MTLResourceOptions::StorageModePrivate);
+            let mut n = 0u64;
+            while !stop_bg.load(AtomicOrdering::Relaxed) {
+                let cb = st.command_queue.new_command_buffer();
+                let bl = cb.new_blit_command_encoder();
+                for _ in 0..8 {
+                    bl.copy_from_buffer(&a, 0, &b, 0, big.len() as u64);
+                }
+                bl.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                n += 1;
+            }
+            n
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let t = Instant::now();
+        for _ in 0..REPS {
+            for l in 0..L {
+                pool.write_blocks_from_host(l, &[block_id], &keys, &values)
+                    .unwrap();
+            }
+        }
+        let per_layer_busy = t.elapsed();
+        let t = Instant::now();
+        for _ in 0..REPS {
+            batched_once(&pool);
+        }
+        let batched_busy = t.elapsed();
+        stop.store(true, AtomicOrdering::Relaxed);
+        let bg_iters = bg.join().unwrap();
+
+        eprintln!("  --- same two shapes with the GPU queue busy ({bg_iters} bg submissions) ---");
+        eprintln!(
+            "  per-layer, GPU busy:         {:8.4} ms/block  ({:.2}x its own idle number)",
+            f(per_layer_busy) / REPS as f64,
+            f(per_layer_busy) / f(per_layer)
+        );
+        eprintln!(
+            "  batched,   GPU busy:         {:8.4} ms/block  ({:.2}x its own idle number)",
+            f(batched_busy) / REPS as f64,
+            f(batched_busy) / f(batched)
+        );
+        eprintln!(
+            "  batching speedup when busy:  {:8.2}x",
+            f(per_layer_busy) / f(batched_busy)
+        );
     }
 }

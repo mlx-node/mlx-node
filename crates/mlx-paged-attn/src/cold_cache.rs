@@ -1116,11 +1116,16 @@ impl ColdCacheManager {
         // Logical pin prevents allocator eviction/reuse while Metal blits run.
         block.incref();
         let captured: Result<ColdCacheBlock, String> = (|| {
-            let mut layers = Vec::with_capacity(pool.num_layers());
-            for layer in 0..pool.num_layers() as u32 {
-                let (keys, values) = pool.read_blocks_to_host(layer, &[block.block_id])?;
-                layers.push(ColdLayerBlock { keys, values });
-            }
+            // One command buffer for the whole block. Reading layer by layer
+            // cost one blocking GPU round-trip per layer, all of them on the
+            // inference thread and all of them inside the pin above. A failure
+            // still returns here with `layers` dropped, so the `decref` below
+            // runs and no half-populated block can reach `enqueue`.
+            let layers: Vec<ColdLayerBlock> = pool
+                .read_block_all_layers(block.block_id)?
+                .into_iter()
+                .map(|(keys, values)| ColdLayerBlock { keys, values })
+                .collect();
             let first = layers
                 .first()
                 .ok_or_else(|| "cannot persist a pool with zero layers".to_string())?;
@@ -1503,23 +1508,26 @@ impl ColdCacheManager {
             }
         };
 
-        for (layer_idx, layer) in cold.layers.iter().enumerate() {
-            if pool
-                .write_blocks_from_host(
-                    layer_idx as u32,
-                    &[block.block_id],
-                    &layer.keys,
-                    &layer.values,
-                )
-                .is_err()
-            {
-                allocator
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .free(Arc::clone(&block));
-                self.shared.stats.misses.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
+        // One command buffer for the whole block instead of one per layer.
+        // `write_block_all_layers` finishes validating every layer before it
+        // encodes its first blit, so this failing means nothing was written:
+        // freeing the block restores the exact pre-call state, with no risk of
+        // the pool retaining a partially applied prefix.
+        let layer_bytes: Vec<(&[u8], &[u8])> = cold
+            .layers
+            .iter()
+            .map(|layer| (layer.keys.as_slice(), layer.values.as_slice()))
+            .collect();
+        if pool
+            .write_block_all_layers(block.block_id, &layer_bytes)
+            .is_err()
+        {
+            allocator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .free(Arc::clone(&block));
+            self.shared.stats.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
         }
 
         let published = allocator
@@ -2410,11 +2418,1096 @@ fn hex_decode_32(value: &str) -> Option<[u8; 32]> {
     Some(output)
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod restore_decomposition_bench {
+    //! Measurement-only harness (temporary, `#[ignore]`d, not part of any gate).
+    //! Decomposes the per-block cold-tier restore cost into named phases using
+    //! the real `qwen3-0.6b-mlx-bf16` pool geometry.
+    use super::tests::{fingerprint, temp_root};
+    use super::*;
+    use crate::metal::MetalDtype;
+    use crate::{PagedAttentionConfig, hash_tokens};
+
+    const BENCH_LAYERS: u32 = 28;
+    const BENCH_KV_HEADS: u32 = 8;
+    const BENCH_HEAD_SIZE: u32 = 128;
+    const BENCH_BLOCK_SIZE: u32 = 16;
+    const BENCH_BLOCKS: usize = 64;
+
+    fn ms(d: Duration) -> f64 {
+        d.as_secs_f64() * 1e3
+    }
+
+    fn pct(part: f64, whole: f64) -> f64 {
+        if whole <= 0.0 {
+            0.0
+        } else {
+            part / whole * 100.0
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "measurement harness; run explicitly with --ignored"]
+    fn bench_restore_block_phase_decomposition() {
+        let config = PagedAttentionConfig {
+            block_size: BENCH_BLOCK_SIZE,
+            gpu_memory_mb: 4096,
+            head_size: BENCH_HEAD_SIZE,
+            num_kv_heads: BENCH_KV_HEADS,
+            num_layers: BENCH_LAYERS,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(4096),
+            max_batch_size: Some(1),
+        };
+        let total_blocks = (BENCH_BLOCKS * 2 + 4) as u32;
+        let pool = match LayerKVPool::new(config, total_blocks, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("skipping bench: {e}");
+                return;
+            }
+        };
+        let per_side = (BENCH_KV_HEADS * BENCH_HEAD_SIZE * BENCH_BLOCK_SIZE * 2) as usize;
+        let payload_bytes = per_side * 2 * BENCH_LAYERS as usize;
+        eprintln!(
+            "geometry: {BENCH_LAYERS} layers x {BENCH_KV_HEADS} kv-heads x {BENCH_HEAD_SIZE} dim \
+             x {BENCH_BLOCK_SIZE} tok bf16 = {payload_bytes} B/block ({:.2} MB)",
+            payload_bytes as f64 / 1e6
+        );
+
+        let allocator = Mutex::new(BlockAllocator::new(total_blocks, BENCH_BLOCK_SIZE));
+        let root = temp_root("bench-restore");
+        let manager = ColdCacheManager::open_at(root.clone(), 8 * GIB, 0, 32).unwrap();
+
+        // ---- populate: capture BENCH_BLOCKS real objects through the real writer.
+        let source = allocator.lock().unwrap().allocate().unwrap();
+        let keys: Vec<u8> = (0..per_side).map(|i| (i % 251) as u8).collect();
+        let values: Vec<u8> = (0..per_side).map(|i| (250 - (i % 251)) as u8).collect();
+        let mut capture_perlayer = Duration::ZERO;
+        let t = Instant::now();
+        for layer in 0..BENCH_LAYERS {
+            pool.write_blocks_from_host(layer, &[source.block_id], &keys, &values)
+                .unwrap();
+        }
+        capture_perlayer += t.elapsed();
+        eprintln!(
+            "seed upload of 1 block ({BENCH_LAYERS} write_blocks_from_host calls): {:.3} ms",
+            ms(capture_perlayer)
+        );
+
+        let mut all_keys = Vec::new();
+        let mut parent = None;
+        // Capture is ~20x faster now that a block is one command buffer, so the
+        // producer readily outruns the writer and `capture_and_enqueue` starts
+        // returning `Ok(false)` (bounded-queue drop). The measurement needs all
+        // BENCH_BLOCKS objects on disk, so back off and retry; `queue_full`
+        // counts how often the frontier was hit.
+        let mut queue_full = 0usize;
+        for i in 0..BENCH_BLOCKS {
+            let toks: Vec<u32> = (0..BENCH_BLOCK_SIZE)
+                .map(|t| (i as u32) * 1000 + t)
+                .collect();
+            let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), parent, &toks, &[], 0, i);
+            while !manager
+                .capture_and_enqueue(&pool, &source, key, fingerprint(), &toks)
+                .unwrap()
+            {
+                queue_full += 1;
+                assert!(
+                    manager.drain(Duration::from_secs(120)),
+                    "writer must drain when the queue is full"
+                );
+            }
+            parent = Some(key);
+            all_keys.push((key, toks));
+        }
+        eprintln!(
+            "populate: {BENCH_BLOCKS} blocks captured, write queue hit its bound {queue_full} \
+             time(s)"
+        );
+        assert!(
+            manager.drain(Duration::from_secs(120)),
+            "writer must drain before measuring reads"
+        );
+        allocator.lock().unwrap().free(source);
+
+        // ---- phase A: raw file read only (open + read syscalls, no decode).
+        let mut raw_read = Duration::ZERO;
+        let mut raw_bytes = 0usize;
+        for (key, _) in &all_keys {
+            let path = root.join(object_file_name(key, ColdGroup::Kv));
+            let t = Instant::now();
+            let bytes = fs::read(&path).unwrap();
+            raw_read += t.elapsed();
+            raw_bytes += bytes.len();
+        }
+        eprintln!(
+            "[A] raw fs::read x{BENCH_BLOCKS} ({} B total): {:.3} ms total, {:.4} ms/block",
+            raw_bytes,
+            ms(raw_read),
+            ms(raw_read) / BENCH_BLOCKS as f64
+        );
+
+        // ---- phase A2: same read again (page cache now warm) for cold-vs-warm split.
+        let mut raw_read_warm = Duration::ZERO;
+        for (key, _) in &all_keys {
+            let path = root.join(object_file_name(key, ColdGroup::Kv));
+            let t = Instant::now();
+            let _ = fs::read(&path).unwrap();
+            raw_read_warm += t.elapsed();
+        }
+        eprintln!(
+            "[A2] raw fs::read again (warm page cache): {:.3} ms total, {:.4} ms/block",
+            ms(raw_read_warm),
+            ms(raw_read_warm) / BENCH_BLOCKS as f64
+        );
+
+        // ---- phase A3: TRUE cold read. `sudo purge` needs a password, so instead
+        //      bypass the unified buffer cache per-descriptor with F_NOCACHE, which
+        //      forces every read to reach the device.
+        let mut nocache_read = Duration::ZERO;
+        for (key, _) in &all_keys {
+            let path = root.join(object_file_name(key, ColdGroup::Kv));
+            let t = Instant::now();
+            let f = File::open(&path).unwrap();
+            unsafe {
+                use std::os::fd::AsRawFd;
+                assert_eq!(libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1), 0);
+            }
+            let mut buf = Vec::new();
+            let mut f = f;
+            f.read_to_end(&mut buf).unwrap();
+            nocache_read += t.elapsed();
+            assert_eq!(buf.len(), raw_bytes / BENCH_BLOCKS);
+        }
+        eprintln!(
+            "[A3] fs read with F_NOCACHE (page cache bypassed, true device read): {:.3} ms total, \
+             {:.4} ms/block",
+            ms(nocache_read),
+            ms(nocache_read) / BENCH_BLOCKS as f64
+        );
+
+        // ---- phase B: decode + checksum (load_bounded minus the raw read).
+        let max_encoded = max_encoded_len_for_pool(&pool);
+        let mut load_total = Duration::ZERO;
+        for (key, _) in &all_keys {
+            let t = Instant::now();
+            let got = manager.load_bounded(*key, fingerprint(), max_encoded);
+            load_total += t.elapsed();
+            assert!(got.is_some(), "bench object must decode");
+        }
+        eprintln!(
+            "[B] load_bounded (open+read+decode+sha256+touch) x{BENCH_BLOCKS}: {:.3} ms total, \
+             {:.4} ms/block",
+            ms(load_total),
+            ms(load_total) / BENCH_BLOCKS as f64
+        );
+
+        // ---- phase C: sha256 alone over one payload, to size the checksum term.
+        let sample = manager
+            .load_bounded(all_keys[0].0, fingerprint(), max_encoded)
+            .unwrap();
+        let mut owned = Vec::with_capacity(1 + sample.layers.len() * 2);
+        owned.push((
+            "tokens".to_string(),
+            sample.tokens.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        ));
+        for (i, layer) in sample.layers.iter().enumerate() {
+            owned.push((format!("layer.{i}.key"), layer.keys.clone()));
+            owned.push((format!("layer.{i}.value"), layer.values.clone()));
+        }
+        let t = Instant::now();
+        for _ in 0..BENCH_BLOCKS {
+            let _ = payload_checksum(&owned);
+        }
+        let sha_total = t.elapsed();
+        eprintln!(
+            "[C] payload_checksum (sha256 over {} B) x{BENCH_BLOCKS}: {:.4} ms/block",
+            payload_bytes,
+            ms(sha_total) / BENCH_BLOCKS as f64
+        );
+
+        // ---- phase C2: the extra clone decode_block makes just to feed the checksum.
+        let t = Instant::now();
+        for _ in 0..BENCH_BLOCKS {
+            let mut o = Vec::with_capacity(1 + sample.layers.len() * 2);
+            o.push((
+                "tokens".to_string(),
+                sample.tokens.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            ));
+            for (i, layer) in sample.layers.iter().enumerate() {
+                o.push((format!("layer.{i}.key"), layer.keys.clone()));
+                o.push((format!("layer.{i}.value"), layer.values.clone()));
+            }
+            std::hint::black_box(&o);
+        }
+        let clone_total = t.elapsed();
+        eprintln!(
+            "[C2] decode_block's checksum-only payload clone x{BENCH_BLOCKS}: {:.4} ms/block",
+            ms(clone_total) / BENCH_BLOCKS as f64
+        );
+
+        // ---- phase D: device upload, exactly as restore_block issues it
+        //      (one write_blocks_from_host per layer => per-layer commit+wait).
+        let scratch = allocator.lock().unwrap().allocate().unwrap();
+        let mut upload_total = Duration::ZERO;
+        for _ in 0..BENCH_BLOCKS {
+            let t = Instant::now();
+            for (layer_idx, layer) in sample.layers.iter().enumerate() {
+                pool.write_blocks_from_host(
+                    layer_idx as u32,
+                    &[scratch.block_id],
+                    &layer.keys,
+                    &layer.values,
+                )
+                .unwrap();
+            }
+            upload_total += t.elapsed();
+        }
+        eprintln!(
+            "[D] device upload, {BENCH_LAYERS} x write_blocks_from_host (per-layer commit+wait) \
+             x{BENCH_BLOCKS}: {:.3} ms total, {:.4} ms/block",
+            ms(upload_total),
+            ms(upload_total) / BENCH_BLOCKS as f64
+        );
+
+        // ---- phase D2: the same upload as restore_block issues it TODAY —
+        //      one write_block_all_layers => a single commit+wait per block.
+        let borrowed: Vec<(&[u8], &[u8])> = sample
+            .layers
+            .iter()
+            .map(|layer| (layer.keys.as_slice(), layer.values.as_slice()))
+            .collect();
+        let mut upload_batched = Duration::ZERO;
+        for _ in 0..BENCH_BLOCKS {
+            let t = Instant::now();
+            pool.write_block_all_layers(scratch.block_id, &borrowed)
+                .unwrap();
+            upload_batched += t.elapsed();
+        }
+        eprintln!(
+            "[D2] device upload, 1 x write_block_all_layers (single commit+wait) x{BENCH_BLOCKS}: \
+             {:.3} ms total, {:.4} ms/block  ({:.2}x faster than [D])",
+            ms(upload_batched),
+            ms(upload_batched) / BENCH_BLOCKS as f64,
+            ms(upload_total) / ms(upload_batched)
+        );
+
+        // ---- phase G: the CAPTURE direction, which runs on the inference
+        //      thread on every turn that captures — not just on restore turns.
+        //      G is the old per-layer readback shape, G2 the batched one that
+        //      capture_and_enqueue uses now.
+        let mut capture_per_layer = Duration::ZERO;
+        for _ in 0..BENCH_BLOCKS {
+            let t = Instant::now();
+            let mut layers = Vec::with_capacity(BENCH_LAYERS as usize);
+            for layer in 0..BENCH_LAYERS {
+                layers.push(
+                    pool.read_blocks_to_host(layer, &[scratch.block_id])
+                        .unwrap(),
+                );
+            }
+            capture_per_layer += t.elapsed();
+            std::hint::black_box(&layers);
+        }
+        let mut capture_batched = Duration::ZERO;
+        for _ in 0..BENCH_BLOCKS {
+            let t = Instant::now();
+            let layers = pool.read_block_all_layers(scratch.block_id).unwrap();
+            capture_batched += t.elapsed();
+            std::hint::black_box(&layers);
+        }
+        eprintln!(
+            "[G] capture readback, {BENCH_LAYERS} x read_blocks_to_host (per-layer commit+wait) \
+             x{BENCH_BLOCKS}: {:.3} ms total, {:.4} ms/block",
+            ms(capture_per_layer),
+            ms(capture_per_layer) / BENCH_BLOCKS as f64
+        );
+        eprintln!(
+            "[G2] capture readback, 1 x read_block_all_layers (single commit+wait) \
+             x{BENCH_BLOCKS}: {:.3} ms total, {:.4} ms/block  ({:.2}x faster than [G])",
+            ms(capture_batched),
+            ms(capture_batched) / BENCH_BLOCKS as f64,
+            ms(capture_per_layer) / ms(capture_batched)
+        );
+        allocator.lock().unwrap().free(scratch);
+
+        // ---- phase E: full restore_block, production path, as ground truth.
+        let mut restore_total = Duration::ZERO;
+        let mut restored_blocks = Vec::new();
+        let mut parent_ok = 0usize;
+        for (i, (key, toks)) in all_keys.iter().enumerate() {
+            let identity = RestorePrefixIdentity {
+                hot_hash: hash_tokens(toks, if i == 0 { 0 } else { parent_ok as u64 }, &[]),
+                tokens: toks.clone(),
+                parent_hot_hash: 0,
+                extra_keys: vec![],
+                cache_salt: 0,
+                block_index: i,
+            };
+            let t = Instant::now();
+            let got = manager.restore_block(&pool, &allocator, *key, fingerprint(), &identity);
+            restore_total += t.elapsed();
+            if let Some(b) = got {
+                restored_blocks.push(b);
+                parent_ok += 1;
+            }
+        }
+        eprintln!(
+            "[E] restore_block end-to-end x{BENCH_BLOCKS} ({} succeeded): {:.3} ms total, {:.4} \
+             ms/block",
+            restored_blocks.len(),
+            ms(restore_total),
+            ms(restore_total) / BENCH_BLOCKS as f64
+        );
+
+        let n = BENCH_BLOCKS as f64;
+        let e2e = ms(restore_total) / n;
+        let a = ms(raw_read_warm) / n;
+        let b = ms(load_total) / n;
+        // `restore_block` uploads through the batched path now, so the
+        // decomposition of the measured [E] must use [D2], not [D].
+        let d = ms(upload_batched) / n;
+        eprintln!("\n=== per-block decomposition (ms, % of restore_block e2e) ===");
+        eprintln!("  open+read (warm)        {:8.3}  {:5.1}%", a, pct(a, e2e));
+        eprintln!(
+            "  decode+sha256 (B - A)   {:8.3}  {:5.1}%",
+            b - a,
+            pct(b - a, e2e)
+        );
+        eprintln!(
+            "    of which sha256       {:8.3}  {:5.1}%",
+            ms(sha_total) / n,
+            pct(ms(sha_total) / n, e2e)
+        );
+        eprintln!(
+            "    of which extra clone  {:8.3}  {:5.1}%",
+            ms(clone_total) / n,
+            pct(ms(clone_total) / n, e2e)
+        );
+        eprintln!("  device upload (batched) {:8.3}  {:5.1}%", d, pct(d, e2e));
+        eprintln!(
+            "  bookkeeping (E-B-D2)    {:8.3}  {:5.1}%",
+            e2e - b - d,
+            pct(e2e - b - d, e2e)
+        );
+        eprintln!("  ------------------------------------------");
+        eprintln!("  restore_block e2e       {:8.3}  100.0%", e2e);
+        eprintln!(
+            "  (upload before batching was {:.3} ms/block; the old e2e would be {:.3} ms)",
+            ms(upload_total) / n,
+            e2e - d + ms(upload_total) / n
+        );
+
+        {
+            let mut g = allocator.lock().unwrap();
+            for blk in restored_blocks {
+                g.free(blk);
+            }
+        }
+
+        // ---- phase F: CONTENDED load. The reader's `openat` sits inside the same
+        //      index mutex the writer holds across `renameat` + directory fsync
+        //      (cold_cache.rs:1727-1758), and nothing drains the write queue before
+        //      a restore. Reproduce that overlap: keep the writer committing while
+        //      the same objects are loaded.
+        // A CPU-only clone of one captured block; `enqueue` needs no GPU, so the
+        // writer thread can drive real commits (encode + fsync + rename + dir
+        // fsync) without touching the pool.
+        let template = sample.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_w = Arc::clone(&stop);
+        let mgr2 = Arc::new(ColdCacheManager::open_at(root.clone(), 8 * GIB, 0, 8).unwrap());
+        let mgr2_w = Arc::clone(&mgr2);
+        let writer = std::thread::spawn(move || {
+            let mut accepted = 0usize;
+            let mut i = 1_000_000usize;
+            while !stop_w.load(Ordering::Relaxed) {
+                let toks: Vec<u32> = (0..BENCH_BLOCK_SIZE).map(|t| i as u32 * 31 + t).collect();
+                let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &toks, &[], 0, 0);
+                let mut b = template.clone();
+                b.key = key;
+                b.tokens = toks;
+                if matches!(mgr2_w.enqueue(b), Ok(true)) {
+                    accepted += 1;
+                }
+                i += 1;
+            }
+            accepted
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        let mut load_contended = Duration::ZERO;
+        for (key, _) in &all_keys {
+            let t = Instant::now();
+            let _ = manager.load_bounded(*key, fingerprint(), max_encoded);
+            load_contended += t.elapsed();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let writes = writer.join().unwrap();
+        eprintln!(
+            "\n[F] load_bounded while a writer commits concurrently ({writes} writes accepted): \
+             {:.3} ms total, {:.4} ms/block  ({:.2}x the quiet {:.4} ms/block)",
+            ms(load_contended),
+            ms(load_contended) / n,
+            (ms(load_contended) / n) / (ms(load_total) / n),
+            ms(load_total) / n
+        );
+
+        drop(mgr2);
+        drop(manager);
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod write_decomposition_bench {
+    //! Measurement-only harness (temporary, `#[ignore]`d, not part of any
+    //! gate). Decomposes the writer thread's per-object service time `Tw` —
+    //! which is exactly [`persist_block`]: `validate` + [`encode_block`] +
+    //! [`persist_encoded`] — into named phases, then re-measures the same
+    //! phases with the payload `fsync` swapped for cheaper barriers.
+    //!
+    //! Nothing here touches Metal. The writer thread only ever sees owned host
+    //! bytes, so the payload is synthesised on the host at the real
+    //! `qwen3-0.6b-mlx-bf16` geometry (28 layers x 8 KV heads x 128 head dim x
+    //! 16 tokens, bf16 = 1,835,008 payload bytes per block).
+    //!
+    //! Sampling is ROUND-ROBIN across the sync variants, rotated one position
+    //! per round, because this machine is not guaranteed quiet. Block
+    //! structured sampling ("run 128 of variant A, then 128 of variant B")
+    //! attributes any drift in background load to whichever variant happened
+    //! to be running during it; round-robin spreads that drift across all
+    //! variants, and the rotation stops any variant from permanently owning
+    //! the first (cache-cold) or last position within a round. Each round is
+    //! labelled with whether a `rustc`/`cargo` was running immediately before
+    //! AND immediately after it, so a quiet-only subset can be reported
+    //! alongside the full set.
+    //!
+    //! The variants exist to separate three different costs that
+    //! `File::sync_all` conflates on macOS:
+    //! - `sync_all` — what production does today.
+    //! - plain `fsync(2)` — the POSIX flush, which on APFS does NOT push the
+    //!   drive's own write cache. Comparing it against `sync_all` is the
+    //!   direct in-process test of whether `sync_all` really issues
+    //!   `F_FULLFSYNC` on this platform.
+    //! - `F_BARRIERFSYNC` — an I/O ordering barrier with no device flush.
+    //! - nothing at all — the floor.
+    use super::tests::{fingerprint, temp_root};
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    const BENCH_LAYERS: usize = 28;
+    const BENCH_KV_HEADS: usize = 8;
+    const BENCH_HEAD_SIZE: usize = 128;
+    const BENCH_BLOCK_SIZE: usize = 16;
+    /// bf16.
+    const BENCH_ELEMENT: usize = 2;
+    /// K (and, identically, V) bytes for one layer of one block.
+    const PER_SIDE: usize = BENCH_KV_HEADS * BENCH_HEAD_SIZE * BENCH_BLOCK_SIZE * BENCH_ELEMENT;
+
+    /// Measured rounds. One round writes one object per variant.
+    const ROUNDS: usize = 128;
+    /// Discarded rounds up front (first-touch page faults, directory growth,
+    /// allocator warm-up).
+    const WARMUP_ROUNDS: usize = 8;
+
+    /// Producer cost per block after the capture-batching change, from
+    /// `bench_restore_block_phase_decomposition`'s `[G2]` phase.
+    const TC_MS: f64 = 0.32;
+    /// [`DEFAULT_QUEUE_DEPTH`].
+    const QUEUE_DEPTH: f64 = 8.0;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SyncMode {
+        /// Production: `File::sync_all`.
+        SyncAll,
+        /// POSIX `fsync(2)`, no `F_FULLFSYNC`.
+        PlainFsync,
+        /// `fcntl(F_BARRIERFSYNC)`: ordering barrier, no device flush.
+        Barrier,
+        /// No durability call at all.
+        NoSync,
+    }
+
+    impl SyncMode {
+        const ALL: [SyncMode; 4] = [
+            SyncMode::SyncAll,
+            SyncMode::PlainFsync,
+            SyncMode::Barrier,
+            SyncMode::NoSync,
+        ];
+
+        fn label(self) -> &'static str {
+            match self {
+                SyncMode::SyncAll => "sync_all (PRODUCTION)",
+                SyncMode::PlainFsync => "fsync(2)",
+                SyncMode::Barrier => "F_BARRIERFSYNC",
+                SyncMode::NoSync => "none",
+            }
+        }
+
+        fn slug(self) -> &'static str {
+            match self {
+                SyncMode::SyncAll => "syncall",
+                SyncMode::PlainFsync => "fsync",
+                SyncMode::Barrier => "barrier",
+                SyncMode::NoSync => "nosync",
+            }
+        }
+
+        fn apply(self, file: &File) -> Result<(), String> {
+            match self {
+                SyncMode::SyncAll => file
+                    .sync_all()
+                    .map_err(|e| format!("sync cold-cache file: {e}")),
+                SyncMode::PlainFsync => {
+                    rustix::fs::fsync(file).map_err(|e| format!("fsync cold-cache file: {e}"))
+                }
+                SyncMode::Barrier => {
+                    // SAFETY: `F_BARRIERFSYNC` takes no third argument and the
+                    // descriptor is an open, writable regular file owned by
+                    // `file` for the whole call.
+                    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) };
+                    if rc == -1 {
+                        return Err(format!(
+                            "F_BARRIERFSYNC cold-cache file: {}",
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    Ok(())
+                }
+                SyncMode::NoSync => Ok(()),
+            }
+        }
+    }
+
+    /// Display order. The three `of which` rows sit INSIDE `encode_block`, so
+    /// the percentage column deliberately sums to more than 100%.
+    const PHASE_NAMES: [&str; 10] = [
+        "encode_block+checksum",
+        "  of which host clone",
+        "  of which payload_checksum",
+        "  of which serialize",
+        "evict_for_write",
+        "create_exclusive",
+        "write_all",
+        "file sync",
+        "renameat+index publish",
+        "directory fsync",
+    ];
+
+    #[derive(Clone, Copy, Default)]
+    struct Phases {
+        encode: f64,
+        encode_clone: f64,
+        encode_checksum: f64,
+        encode_serialize: f64,
+        evict: f64,
+        create: f64,
+        write: f64,
+        sync: f64,
+        commit: f64,
+        dir_fsync: f64,
+        total: f64,
+    }
+
+    impl Phases {
+        fn phase(&self, index: usize) -> f64 {
+            match index {
+                0 => self.encode,
+                1 => self.encode_clone,
+                2 => self.encode_checksum,
+                3 => self.encode_serialize,
+                4 => self.evict,
+                5 => self.create,
+                6 => self.write,
+                7 => self.sync,
+                8 => self.commit,
+                9 => self.dir_fsync,
+                _ => unreachable!("phase index out of range"),
+            }
+        }
+    }
+
+    fn ms(d: Duration) -> f64 {
+        d.as_secs_f64() * 1e3
+    }
+
+    fn pct(part: f64, whole: f64) -> f64 {
+        if whole <= 0.0 {
+            0.0
+        } else {
+            part / whole * 100.0
+        }
+    }
+
+    /// Nearest-rank percentile over an already-sorted slice.
+    fn percentile(sorted: &[f64], p: f64) -> f64 {
+        if sorted.is_empty() {
+            return f64::NAN;
+        }
+        let rank = (p * sorted.len() as f64).ceil().max(1.0) as usize;
+        sorted[rank.min(sorted.len()) - 1]
+    }
+
+    fn summarize(values: &[f64]) -> (f64, f64, f64) {
+        if values.is_empty() {
+            return (f64::NAN, f64::NAN, f64::NAN);
+        }
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("durations are never NaN"));
+        let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+        (percentile(&sorted, 0.5), percentile(&sorted, 0.9), mean)
+    }
+
+    /// Whether a compile is running right now. Recorded as a per-round LABEL,
+    /// not used as a gate: the background build belongs to another worktree
+    /// and may outlive this run.
+    fn compiler_running() -> bool {
+        ["rustc", "cargo"].iter().any(|name| {
+            std::process::Command::new("/usr/bin/pgrep")
+                .args(["-x", name])
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        })
+    }
+
+    /// A block at the real qwen3-0.6b geometry. Layer bytes differ per layer
+    /// so no encoder or checksum can collapse them.
+    fn bench_block(key: ColdCacheKey, tokens: Vec<u32>) -> ColdCacheBlock {
+        let layers = (0..BENCH_LAYERS)
+            .map(|layer| ColdLayerBlock {
+                keys: (0..PER_SIDE).map(|i| ((i + layer) % 251) as u8).collect(),
+                values: (0..PER_SIDE)
+                    .map(|i| (250 - ((i + layer) % 251)) as u8)
+                    .collect(),
+            })
+            .collect();
+        ColdCacheBlock {
+            key,
+            fingerprint: fingerprint(),
+            tokens,
+            layout: ColdCacheLayout {
+                block_size: BENCH_BLOCK_SIZE as u32,
+                num_layers: BENCH_LAYERS as u32,
+                num_kv_heads: BENCH_KV_HEADS as u32,
+                head_size: BENCH_HEAD_SIZE as u32,
+                cache_dtype: "BFloat16".to_string(),
+                key_bytes_per_layer: PER_SIDE,
+                value_bytes_per_layer: PER_SIDE,
+            },
+            layers,
+        }
+    }
+
+    /// Instrumented clone of [`encode_block`] (cold_cache.rs:2008-2051),
+    /// split into the three costs it hides: the host clone that materialises
+    /// every layer's K/V bytes into an owned `Vec` per tensor, the SHA-256
+    /// over that payload, and the safetensors `serialize` that concatenates
+    /// it all into the final buffer. Byte-for-byte identical output.
+    fn encode_block_instrumented(
+        block: &ColdCacheBlock,
+        phases: &mut Phases,
+    ) -> Result<Vec<u8>, String> {
+        let t = Instant::now();
+        let token_bytes: Vec<u8> = block.tokens.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut owned: Vec<(String, Vec<u8>)> = Vec::with_capacity(1 + block.layers.len() * 2);
+        owned.push(("tokens".to_string(), token_bytes));
+        for (i, layer) in block.layers.iter().enumerate() {
+            owned.push((format!("layer.{i}.key"), layer.keys.clone()));
+            owned.push((format!("layer.{i}.value"), layer.values.clone()));
+        }
+        phases.encode_clone = ms(t.elapsed());
+
+        let t = Instant::now();
+        let checksum = payload_checksum(&owned);
+        phases.encode_checksum = ms(t.elapsed());
+
+        let t = Instant::now();
+        let views: Result<Vec<_>, _> = owned
+            .iter()
+            .map(|(name, data)| {
+                TensorView::new(Dtype::U8, vec![data.len()], data).map(|view| (name.as_str(), view))
+            })
+            .collect();
+        let mut metadata = HashMap::new();
+        metadata.insert("abi".to_string(), CACHE_ABI.to_string());
+        metadata.insert("key".to_string(), block.key.to_hex());
+        metadata.insert("fingerprint".to_string(), block.fingerprint.to_hex());
+        metadata.insert("checksum".to_string(), checksum);
+        metadata.insert(
+            "block_size".to_string(),
+            block.layout.block_size.to_string(),
+        );
+        metadata.insert(
+            "num_layers".to_string(),
+            block.layout.num_layers.to_string(),
+        );
+        metadata.insert(
+            "num_kv_heads".to_string(),
+            block.layout.num_kv_heads.to_string(),
+        );
+        metadata.insert("head_size".to_string(), block.layout.head_size.to_string());
+        metadata.insert("cache_dtype".to_string(), block.layout.cache_dtype.clone());
+        metadata.insert(
+            "key_bytes".to_string(),
+            block.layout.key_bytes_per_layer.to_string(),
+        );
+        metadata.insert(
+            "value_bytes".to_string(),
+            block.layout.value_bytes_per_layer.to_string(),
+        );
+        let bytes =
+            serialize(views.map_err(|e| e.to_string())?, Some(metadata)).map_err(|e| e.to_string());
+        phases.encode_serialize = ms(t.elapsed());
+        bytes
+    }
+
+    /// Instrumented clone of [`persist_block`] + [`persist_encoded`]
+    /// (cold_cache.rs:1695-1776). Phase boundaries and lock scopes match the
+    /// production body exactly — in particular the index guard spans
+    /// `renameat`, the index publish AND the directory fsync — with only the
+    /// payload-durability call parameterised. Production is untouched.
+    fn persist_instrumented(
+        shared: &Shared,
+        block: &ColdCacheBlock,
+        mode: SyncMode,
+    ) -> Result<Phases, String> {
+        let mut phases = Phases::default();
+        let started = Instant::now();
+
+        let t = Instant::now();
+        block.validate()?;
+        let bytes = encode_block_instrumented(block, &mut phases)?;
+        phases.encode = ms(t.elapsed());
+
+        let key = block.key;
+        let group = ColdGroup::Kv;
+        let size = bytes.len() as u64;
+
+        let t = Instant::now();
+        evict_for_write(shared, size)?;
+        phases.evict = ms(t.elapsed());
+
+        let destination = object_file_name(&key, group);
+        let temp = format!(
+            ".{}.{}.{}.tmp",
+            key.to_hex(),
+            std::process::id(),
+            now_tick()
+        );
+
+        let t = Instant::now();
+        let mut file = shared.root.create_exclusive(&temp)?;
+        phases.create = ms(t.elapsed());
+
+        let outcome = (|| -> Result<(), String> {
+            let t = Instant::now();
+            file.write_all(&bytes)
+                .map_err(|e| format!("write cold-cache file: {e}"))?;
+            phases.write = ms(t.elapsed());
+
+            let t = Instant::now();
+            mode.apply(&file)?;
+            phases.sync = ms(t.elapsed());
+
+            let t = Instant::now();
+            let mut index = shared
+                .index
+                .lock()
+                .map_err(|_| "cold-cache index mutex poisoned".to_string())?;
+            shared.root.rename(&temp, &destination).inspect_err(|_| {
+                shared.stats.queue_drops.fetch_add(1, Ordering::Relaxed);
+            })?;
+            if let Some(old) = index.entries.insert(
+                key,
+                IndexEntry {
+                    group,
+                    file_name: destination.clone(),
+                    size,
+                    last_access: now_tick(),
+                },
+            ) {
+                index.total_bytes = index.total_bytes.saturating_sub(old.size);
+            }
+            index.total_bytes = index.total_bytes.saturating_add(size);
+            phases.commit = ms(t.elapsed());
+
+            let t = Instant::now();
+            shared.sync()?;
+            phases.dir_fsync = ms(t.elapsed());
+            Ok(())
+        })();
+        if let Err(error) = outcome {
+            let _ = shared.root.unlink(&temp);
+            return Err(error);
+        }
+        shared
+            .stats
+            .bytes_written
+            .fetch_add(size, Ordering::Relaxed);
+        phases.total = ms(started.elapsed());
+        Ok(phases)
+    }
+
+    fn report_variant(mode: SyncMode, samples: &[Phases], label: &str) {
+        if samples.is_empty() {
+            eprintln!("\n=== {} [{label}] === no samples", mode.label());
+            return;
+        }
+        let totals: Vec<f64> = samples.iter().map(|s| s.total).collect();
+        let (median_total, p90_total, mean_total) = summarize(&totals);
+        eprintln!(
+            "\n=== {} [{label}] === n={}   Tw median {:.3} ms  p90 {:.3} ms  mean {:.3} ms",
+            mode.label(),
+            samples.len(),
+            median_total,
+            p90_total,
+            mean_total
+        );
+        eprintln!("  phase                     median      p90     mean   %of median Tw");
+        for (index, name) in PHASE_NAMES.iter().enumerate() {
+            let values: Vec<f64> = samples.iter().map(|s| s.phase(index)).collect();
+            let (median, p90, mean) = summarize(&values);
+            eprintln!(
+                "  {name:<24}{median:8.3} {p90:8.3} {mean:8.3}   {:5.1}%",
+                pct(median, median_total)
+            );
+        }
+        eprintln!("  ---------------------------------------------------------------");
+        eprintln!(
+            "  {:<24}{:8.3} {:8.3} {:8.3}   100.0%",
+            "Tw (total)", median_total, p90_total, mean_total
+        );
+    }
+
+    /// Frontier fixed point `N = (Q+1)/(1 - Tc/Tw)`: how many blocks a
+    /// back-to-back producer can enqueue before the bounded queue drops one.
+    /// `None` once the writer is at least as fast as the producer, where the
+    /// backlog never grows and no drop is reachable.
+    fn frontier(tc: f64, tw: f64, q: f64) -> Option<f64> {
+        let slack = 1.0 - tc / tw;
+        (slack > 0.0).then(|| (q + 1.0) / slack)
+    }
+
+    /// Inverse of [`frontier`]: the queue depth that pushes the first drop out
+    /// past `n` blocks. `None` when no depth is needed.
+    fn required_depth(tc: f64, tw: f64, n: f64) -> Option<f64> {
+        let slack = 1.0 - tc / tw;
+        (slack > 0.0).then(|| (n * slack - 1.0).max(0.0))
+    }
+
+    #[test]
+    #[ignore = "measurement harness; run explicitly with --ignored"]
+    fn bench_write_path_phase_decomposition() {
+        let payload_bytes = PER_SIDE * 2 * BENCH_LAYERS;
+        eprintln!(
+            "geometry: {BENCH_LAYERS} layers x {BENCH_KV_HEADS} kv-heads x {BENCH_HEAD_SIZE} dim \
+             x {BENCH_BLOCK_SIZE} tok bf16 = {payload_bytes} B/block ({:.2} MB)",
+            payload_bytes as f64 / 1e6
+        );
+        eprintln!(
+            "sampling: {ROUNDS} measured rounds (+{WARMUP_ROUNDS} warmup), round-robin over {} \
+             variants, order rotated one position per round; one dedicated cache root per variant \
+             so directory size and index size stay identical across them",
+            SyncMode::ALL.len()
+        );
+
+        // Fidelity gate: if the instrumented encoder does not produce the
+        // object the production encoder produces, every number below is
+        // measuring the wrong work. Compared through `decode_block` rather
+        // than byte-wise because safetensors emits `__metadata__` in
+        // `HashMap` iteration order, which differs between two calls.
+        {
+            let probe_tokens: Vec<u32> = (0..BENCH_BLOCK_SIZE as u32).collect();
+            let probe_key =
+                ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &probe_tokens, &[], 0, 0);
+            let probe = bench_block(probe_key, probe_tokens);
+            let mut scratch = Phases::default();
+            let instrumented = encode_block_instrumented(&probe, &mut scratch).unwrap();
+            let production = encode_block(&probe).unwrap();
+            assert_eq!(
+                instrumented.len(),
+                production.len(),
+                "instrumented encoder must match encode_block's byte length"
+            );
+            assert_eq!(
+                decode_block(&instrumented, probe_key, fingerprint()).unwrap(),
+                decode_block(&production, probe_key, fingerprint()).unwrap(),
+                "instrumented encoder must round-trip identically to encode_block"
+            );
+        }
+
+        // One root per variant. Sharing a root would make the directory (and
+        // so the directory fsync, and the index) 4x larger than production for
+        // the same per-variant sample count, and would let one variant's
+        // eviction pressure land on another's measurement.
+        let roots: Vec<PathBuf> = SyncMode::ALL
+            .iter()
+            .map(|mode| temp_root(&format!("bench-write-{}", mode.slug())))
+            .collect();
+        // 8 GiB quota against ~235 MB written per root: eviction never fires,
+        // so `evict_for_write` here is its steady-state no-evict cost
+        // (fstatvfs + index mutex), which is what the writer pays on every
+        // object until the cache is actually full.
+        let managers: Vec<ColdCacheManager> = roots
+            .iter()
+            .map(|root| ColdCacheManager::open_at(root.clone(), 8 * GIB, 0, 8).unwrap())
+            .collect();
+
+        let mut samples: Vec<Vec<Phases>> = vec![Vec::new(); SyncMode::ALL.len()];
+        let mut quiet_samples: Vec<Vec<Phases>> = vec![Vec::new(); SyncMode::ALL.len()];
+        let mut quiet_rounds = 0usize;
+        let mut serial = 0usize;
+
+        for round in 0..(WARMUP_ROUNDS + ROUNDS) {
+            let measured = round >= WARMUP_ROUNDS;
+            let busy_before = compiler_running();
+            for step in 0..SyncMode::ALL.len() {
+                // Rotate so every variant occupies every position in the round
+                // an equal number of times.
+                let slot = (round + step) % SyncMode::ALL.len();
+                let mode = SyncMode::ALL[slot];
+                let tokens: Vec<u32> = (0..BENCH_BLOCK_SIZE)
+                    .map(|t| (serial as u32) * 1000 + t as u32)
+                    .collect();
+                let key = ColdCacheKey::chain(
+                    ColdGroup::Kv,
+                    fingerprint(),
+                    None,
+                    &tokens,
+                    &[],
+                    0,
+                    serial,
+                );
+                serial += 1;
+                let block = bench_block(key, tokens);
+                let phases = persist_instrumented(&managers[slot].shared, &block, mode)
+                    .expect("bench write must persist");
+                if measured {
+                    samples[slot].push(phases);
+                }
+            }
+            let quiet = !busy_before && !compiler_running();
+            if measured && quiet {
+                quiet_rounds += 1;
+                for (slot, per_mode) in quiet_samples.iter_mut().enumerate() {
+                    per_mode.push(*samples[slot].last().expect("round pushed a sample"));
+                }
+            }
+        }
+
+        eprintln!(
+            "\nbackground load: {quiet_rounds}/{ROUNDS} measured rounds had NO rustc/cargo running \
+             both immediately before and immediately after the round"
+        );
+
+        for (slot, mode) in SyncMode::ALL.iter().enumerate() {
+            report_variant(*mode, &samples[slot], "all samples");
+        }
+        if quiet_rounds > 0 && quiet_rounds < ROUNDS {
+            for (slot, mode) in SyncMode::ALL.iter().enumerate() {
+                report_variant(*mode, &quiet_samples[slot], "quiet subset");
+            }
+        }
+
+        for (set_label, set) in [("all samples", &samples), ("quiet subset", &quiet_samples)] {
+            if set.iter().all(|s| s.is_empty()) {
+                continue;
+            }
+            eprintln!("\n=== Tw summary + frontier N, {set_label} (Tc = {TC_MS} ms) ===");
+            eprintln!(
+                "  variant                  Tw med   Tw p90   speedup   N@Q=8   N@Q=8 (p90)   \
+                 Q for N=128   Q for N=512"
+            );
+            let baseline = {
+                let totals: Vec<f64> = set[0].iter().map(|s| s.total).collect();
+                summarize(&totals).0
+            };
+            for (slot, mode) in SyncMode::ALL.iter().enumerate() {
+                let totals: Vec<f64> = set[slot].iter().map(|s| s.total).collect();
+                if totals.is_empty() {
+                    continue;
+                }
+                let (median, p90, _) = summarize(&totals);
+                let render = |value: Option<f64>| match value {
+                    Some(v) => format!("{v:.1}"),
+                    None => "never".to_string(),
+                };
+                eprintln!(
+                    "  {:<22}{:8.3} {:8.3}   {:6.2}x  {:>7} {:>13} {:>13} {:>13}",
+                    mode.label(),
+                    median,
+                    p90,
+                    baseline / median,
+                    render(frontier(TC_MS, median, QUEUE_DEPTH)),
+                    render(frontier(TC_MS, p90, QUEUE_DEPTH)),
+                    render(required_depth(TC_MS, median, 128.0)),
+                    render(required_depth(TC_MS, median, 512.0)),
+                );
+            }
+            eprintln!(
+                "  N is the number of consecutive captured blocks before the bounded queue drops \
+                 one. A 2048-token prompt at block_size 16 is 128 blocks, 8192 tokens is 512."
+            );
+
+            // Every variant above is still dominated by SHA-256 once the
+            // device flush is gone. Subtracting the MEASURED per-sample
+            // checksum time bounds what any checksum change could ever buy:
+            // no cheaper hash can beat a free one. This is a bound derived
+            // from measured data, not a measurement of a real implementation.
+            eprintln!(
+                "\n  projection: same samples with the measured payload_checksum time subtracted \
+                 (upper bound on any checksum optimisation, e.g. a non-cryptographic hash)"
+            );
+            eprintln!(
+                "  variant                 Tw' med  Tw' p90             N@Q=8   N@Q=8 (p90)   \
+                 Q for N=128   Q for N=512"
+            );
+            for (slot, mode) in SyncMode::ALL.iter().enumerate() {
+                let totals: Vec<f64> = set[slot]
+                    .iter()
+                    .map(|s| (s.total - s.encode_checksum).max(1e-6))
+                    .collect();
+                if totals.is_empty() {
+                    continue;
+                }
+                let (median, p90, _) = summarize(&totals);
+                let render = |value: Option<f64>| match value {
+                    Some(v) => format!("{v:.1}"),
+                    None => "never".to_string(),
+                };
+                eprintln!(
+                    "  {:<22}{:8.3} {:8.3}            {:>7} {:>13} {:>13} {:>13}",
+                    mode.label(),
+                    median,
+                    p90,
+                    render(frontier(TC_MS, median, QUEUE_DEPTH)),
+                    render(frontier(TC_MS, p90, QUEUE_DEPTH)),
+                    render(required_depth(TC_MS, median, 128.0)),
+                    render(required_depth(TC_MS, median, 512.0)),
+                );
+            }
+            eprintln!(
+                "  \"never\" means Tw <= Tc: the writer keeps up with the producer, the backlog \
+                 never grows, and no queue depth is needed at all."
+            );
+        }
+
+        drop(managers);
+        for root in &roots {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fingerprint() -> ColdCacheFingerprint {
+    pub(super) fn fingerprint() -> ColdCacheFingerprint {
         ColdCacheFingerprint::from_components([b"model".as_slice(), b"tokenizer".as_slice()])
     }
 
@@ -2445,7 +3538,7 @@ mod tests {
         }
     }
 
-    fn temp_root(name: &str) -> PathBuf {
+    pub(super) fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "mlx-paged-cold-cache-{name}-{}-{}",
             std::process::id(),
