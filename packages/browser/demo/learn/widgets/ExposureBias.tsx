@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import { useLocale } from '../../lib/i18n-react';
+import { DiagramFrame, useStepPlayer } from '../motion';
 
 /**
  * Chapter 13 (Training) supplement — exposure bias, the reason inference drifts.
@@ -22,6 +23,18 @@ import { useLocale } from '../../lib/i18n-react';
  * The point is exposure bias: training never lets the model consume its own
  * mistakes, so at inference small errors compound. Synthetic / scripted — no
  * model, no worker, no WASM.
+ *
+ * Animation model: `useStepPlayer` + `DiagramFrame` from `learn/motion`, in
+ * place of this file's former hand-rolled `setInterval` + its own play button,
+ * header, footnotes and divergence-note box. There is no `<svg>` here, so this
+ * is a kit-only adoption: the two lane rows keep their existing markup.
+ *
+ * The divergence note IS this widget's caption — it is the one thing that
+ * rewrites itself as the sweep advances — so it moves onto `DiagramFrame`'s
+ * caption slot, where all three of its arms are stacked as invisible sizers and
+ * the chapter body can no longer hop when the lanes split. What it loses in the
+ * move is its own tinted box; the rose emphasis on the label at the moment of
+ * divergence survives, because that emphasis is inline in the caption itself.
  */
 
 // The shared gold reference both lanes are scored against.
@@ -37,6 +50,11 @@ const DIVERGE_STEP = 5;
 
 const TOTAL_STEPS = FREE_RUN.length;
 const STEP_MS = 1500;
+
+// The sweep runs 0..TOTAL_STEPS inclusive: frame 0 is the empty "(start)" state
+// before any token is revealed, so there is one more frame than there are
+// tokens. Same count the old `(s + 1) % (TOTAL_STEPS + 1)` interval walked.
+const TOTAL_FRAMES = TOTAL_STEPS + 1;
 
 function renderToken(t: string): string {
   return t.startsWith(' ') ? '·' + t.slice(1) : t;
@@ -58,11 +76,14 @@ function freeRunCells(count: number): Cell[] {
 
 // Per-locale copy — every user-visible English string moved here verbatim.
 // Model tokens (' mat', ' couch') stay English in both locales.
+//
+// Play / Pause are NOT here any more: those verbs belong to the shared
+// `StepControls`, which carries its own en/zh pair so every animated widget in
+// the course says the same word. The step counter stays — it is content, not a
+// control, and the shared controls do not render one.
 const COPY = {
   en: {
     title: 'Exposure bias — why inference drifts',
-    pause: '❚❚ Pause',
-    play: '▶ Play',
     stepCounter: (s: number, total: number) => `step ${s}/${total}`,
     laneATitle: 'Teacher forcing (training)',
     laneANote: 'next input = true token',
@@ -95,8 +116,6 @@ const COPY = {
   },
   zh: {
     title: '曝光偏差（exposure bias）——推理为什么会跑偏',
-    pause: '❚❚ 暂停',
-    play: '▶ 播放',
     stepCounter: (s: number, total: number) => `第 ${s}/${total} 步`,
     laneATitle: 'Teacher forcing（训练）',
     laneANote: '下一个输入 = 真实 token',
@@ -129,118 +148,116 @@ const COPY = {
 } as const;
 
 export function ExposureBias() {
-  const copy = COPY[useLocale()];
-  const [step, setStep] = React.useState(0);
-  const [playing, setPlaying] = React.useState(() =>
-    typeof window !== 'undefined' ? !window.matchMedia('(prefers-reduced-motion: reduce)').matches : true,
-  );
+  const locale = useLocale();
+  const copy = COPY[locale];
+  const player = useStepPlayer(TOTAL_FRAMES, { frameMs: STEP_MS });
 
-  React.useEffect(() => {
-    if (!playing) return;
-    const t = window.setInterval(() => setStep((s) => (s + 1) % (TOTAL_STEPS + 1)), STEP_MS);
-    return () => window.clearInterval(t);
-  }, [playing]);
-
-  // `step` runs 0..TOTAL_STEPS; the number of revealed tokens is `step`, so the
-  // final frame (step === TOTAL_STEPS) shows the whole sequence before looping.
-  const revealed = step;
+  // `player.frame` runs 0..TOTAL_STEPS; the number of revealed tokens is the
+  // frame index, so the final frame shows the whole sequence before looping.
+  const revealed = player.frame;
   const goldCells = REFERENCE.slice(0, revealed);
   const freeCells = freeRunCells(revealed);
   const diverged = revealed > DIVERGE_STEP;
   const atDivergence = revealed === DIVERGE_STEP + 1;
 
+  // The caption has exactly three arms, and this builder is two of them: the
+  // label is highlighted on the single frame the lanes actually split, plain on
+  // every frame after (the sentence itself is identical in both).
+  const divergenceCaption = (highlight: boolean) => (
+    <>
+      <span className={highlight ? 'font-semibold text-rose-700 dark:text-rose-300' : 'text-foreground/90'}>
+        {copy.divergenceLabel}
+      </span>{' '}
+      {copy.divergence}
+    </>
+  );
+
+  const caption: React.ReactNode = diverged ? divergenceCaption(atDivergence) : copy.notYet;
+
+  // Every caption this sweep can reach, so the slot reserves the tallest and the
+  // chapter body cannot hop when the lanes split. Three entries for the three
+  // arms above: not-yet-diverged, diverged-this-frame, diverged-earlier.
+  const captions = [copy.notYet, divergenceCaption(true), divergenceCaption(false)];
+
   return (
-    <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.title}</div>
-        <div className="inline-flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setPlaying((p) => !p)}
-            aria-pressed={playing}
-            className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
-          >
-            {playing ? copy.pause : copy.play}
-          </button>
-          <span className="font-mono text-[11px] text-muted-foreground">
-            {copy.stepCounter(Math.min(revealed, TOTAL_STEPS), TOTAL_STEPS)}
-          </span>
-        </div>
-      </div>
-
-      {/* Lane A — teacher forcing: always force-fed the gold token. */}
-      <div className="space-y-1">
-        <div className="flex items-baseline justify-between">
-          <span className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.laneATitle}</span>
-          <span className="text-[10px] text-muted-foreground">{copy.laneANote}</span>
-        </div>
-        <div className="flex min-h-9 flex-wrap items-center gap-1 rounded-md border border-border/60 bg-muted/30 p-2">
-          {goldCells.map((t, i) => (
-            <span
-              key={`gold-${i}`}
-              className="rounded bg-emerald-500/70 px-1.5 py-0.5 font-mono text-[11px] text-white outline outline-1 outline-emerald-400"
-            >
-              {renderToken(t)}
-            </span>
-          ))}
-          {revealed === 0 ? <span className="font-mono text-[11px] text-muted-foreground/60">{copy.start}</span> : null}
-          <span className="ml-0.5 font-mono text-[11px] text-muted-foreground" aria-hidden>
-            ▮
-          </span>
-        </div>
-      </div>
-
-      {/* Lane B — free-running inference: feeds its own predictions back in. */}
-      <div className="space-y-1">
-        <div className="flex items-baseline justify-between">
-          <span className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.laneBTitle}</span>
-          <span className="text-[10px] text-muted-foreground">{copy.laneBNote}</span>
-        </div>
-        <div className="flex min-h-9 flex-wrap items-center gap-1 rounded-md border border-border/60 bg-muted/30 p-2">
-          {freeCells.map((c, i) => (
-            <span
-              key={`free-${i}`}
-              className={[
-                'rounded px-1.5 py-0.5 font-mono text-[11px] transition-colors',
-                c.kind === 'gold'
-                  ? 'bg-emerald-500/70 text-white outline outline-1 outline-emerald-400'
-                  : 'bg-rose-500/70 text-white outline outline-1 outline-rose-400',
-              ].join(' ')}
-            >
-              {renderToken(c.text)}
-            </span>
-          ))}
-          {revealed === 0 ? <span className="font-mono text-[11px] text-muted-foreground/60">{copy.start}</span> : null}
-          <span className="ml-0.5 font-mono text-[11px] text-muted-foreground" aria-hidden>
-            ▮
-          </span>
-        </div>
-      </div>
-
-      {/* Divergence note — appears the moment the lanes split, then persists. */}
-      <div
-        className={[
-          'rounded-md border px-3 py-2 text-[12px] transition-colors duration-300',
-          diverged
-            ? 'border-rose-500/40 bg-rose-500/5 text-foreground/90'
-            : 'border-border/40 bg-muted/20 text-muted-foreground/70',
-        ].join(' ')}
+    <>
+      <DiagramFrame
+        title={copy.title}
+        player={player}
+        locale={locale}
+        caption={caption}
+        captions={captions}
+        note={copy.scripted}
       >
-        {diverged ? (
-          <>
-            <span className={atDivergence ? 'font-semibold text-rose-700 dark:text-rose-300' : 'text-foreground/90'}>
-              {copy.divergenceLabel}
-            </span>{' '}
-            {copy.divergence}
-          </>
-        ) : (
-          copy.notYet
-        )}
-      </div>
+        <div className="space-y-3">
+          {/* Not a control, so `StepControls` does not own it: it says which of the
+              8 tokens the lanes are on. Right-aligned to sit under the controls,
+              where it used to live. */}
+          <div className="flex justify-end">
+            <span className="font-mono text-[11px] text-muted-foreground">
+              {copy.stepCounter(Math.min(revealed, TOTAL_STEPS), TOTAL_STEPS)}
+            </span>
+          </div>
 
-      <p className="text-[10px] text-muted-foreground">{copy.scripted}</p>
+          {/* Lane A — teacher forcing: always force-fed the gold token. */}
+          <div className="space-y-1">
+            <div className="flex items-baseline justify-between">
+              <span className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.laneATitle}</span>
+              <span className="text-[10px] text-muted-foreground">{copy.laneANote}</span>
+            </div>
+            <div className="flex min-h-9 flex-wrap items-center gap-1 rounded-md border border-border/60 bg-muted/30 p-2">
+              {goldCells.map((t, i) => (
+                <span
+                  key={`gold-${i}`}
+                  className="rounded bg-emerald-500/70 px-1.5 py-0.5 font-mono text-[11px] text-white outline outline-1 outline-emerald-400"
+                >
+                  {renderToken(t)}
+                </span>
+              ))}
+              {revealed === 0 ? (
+                <span className="font-mono text-[11px] text-muted-foreground/60">{copy.start}</span>
+              ) : null}
+              <span className="ml-0.5 font-mono text-[11px] text-muted-foreground" aria-hidden>
+                ▮
+              </span>
+            </div>
+          </div>
 
+          {/* Lane B — free-running inference: feeds its own predictions back in. */}
+          <div className="space-y-1">
+            <div className="flex items-baseline justify-between">
+              <span className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.laneBTitle}</span>
+              <span className="text-[10px] text-muted-foreground">{copy.laneBNote}</span>
+            </div>
+            <div className="flex min-h-9 flex-wrap items-center gap-1 rounded-md border border-border/60 bg-muted/30 p-2">
+              {freeCells.map((c, i) => (
+                <span
+                  key={`free-${i}`}
+                  className={[
+                    'rounded px-1.5 py-0.5 font-mono text-[11px] transition-colors',
+                    c.kind === 'gold'
+                      ? 'bg-emerald-500/70 text-white outline outline-1 outline-emerald-400'
+                      : 'bg-rose-500/70 text-white outline outline-1 outline-rose-400',
+                  ].join(' ')}
+                >
+                  {renderToken(c.text)}
+                </span>
+              ))}
+              {revealed === 0 ? (
+                <span className="font-mono text-[11px] text-muted-foreground/60">{copy.start}</span>
+              ) : null}
+              <span className="ml-0.5 font-mono text-[11px] text-muted-foreground" aria-hidden>
+                ▮
+              </span>
+            </div>
+          </div>
+        </div>
+      </DiagramFrame>
+
+      {/* The chapter's takeaway, not a diagram footnote: body copy at body
+          weight, so it stays outside the frame rather than being folded into
+          `note` (which renders at footnote tier). */}
       <p className="text-[12px] text-foreground/85">{copy.summary}</p>
-    </div>
+    </>
   );
 }

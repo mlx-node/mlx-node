@@ -45,19 +45,31 @@ export type StepPlayer = {
  *                            the finished picture is the informative still.
  * @param opts.loop           when false, the sweep stops on the last frame
  *                            instead of wrapping (default true)
+ * @param opts.initialPlaying whether the sweep runs on its own from mount
+ *                            (default true). Pass `false` for a widget whose
+ *                            payoff is the ANSWER — a capstone that autoplays
+ *                            hands the reader the ending before they have read
+ *                            the setup, and a non-looping one then parks there
+ *                            forever, so the beginning is never seen at all.
  */
 export function useStepPlayer(
   total: number,
-  opts: { frameMs?: number; initialFrame?: number; restFrame?: number; loop?: boolean } = {},
+  opts: {
+    frameMs?: number;
+    initialFrame?: number;
+    restFrame?: number;
+    loop?: boolean;
+    initialPlaying?: boolean;
+  } = {},
 ): StepPlayer {
-  const { frameMs = 1500, initialFrame = 0, loop = true } = opts;
+  const { frameMs = 1500, initialFrame = 0, loop = true, initialPlaying = true } = opts;
   const restFrame = opts.restFrame ?? total - 1;
 
   const reducedMotion = usePrefersReducedMotion();
 
   // Deterministic on the server: a fixed frame, never a media query.
   const [frame, setFrame] = React.useState(initialFrame);
-  const [playing, setPlaying] = React.useState(true);
+  const [playing, setPlaying] = React.useState(initialPlaying);
 
   // Retarget AFTER mount. Also fires if the preference flips mid-session.
   React.useEffect(() => {
@@ -99,8 +111,11 @@ export function useStepPlayer(
 
   const step = React.useCallback(() => {
     setPlaying(false);
-    setFrame((f) => (f + 1) % total);
-  }, [total]);
+    // Same end-of-sweep rule as the interval: a non-looping sweep stops on the
+    // last frame. Wrapping here would let "Step" teleport a reader who is
+    // reading the final state back to the beginning, which no caption expects.
+    setFrame((f) => (f + 1 < total ? f + 1 : loop ? 0 : total - 1));
+  }, [total, loop]);
 
   const goTo = React.useCallback(
     (f: number) => {
@@ -114,8 +129,11 @@ export function useStepPlayer(
 
   const reset = React.useCallback(() => {
     setFrame(reducedMotion ? restFrame : initialFrame);
-    setPlaying(!reducedMotion);
-  }, [reducedMotion, restFrame, initialFrame]);
+    // "Back to how it started" — including whether it started moving. A widget
+    // that opts out of autoplay wants Reset to rewind, not to launch the sweep
+    // it deliberately kept parked.
+    setPlaying(!reducedMotion && initialPlaying);
+  }, [reducedMotion, restFrame, initialFrame, initialPlaying]);
 
   return { frame, playing, reducedMotion, toggle, step, reset, goTo };
 }

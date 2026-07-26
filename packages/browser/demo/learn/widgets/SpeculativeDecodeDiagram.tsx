@@ -1,6 +1,19 @@
 import * as React from 'react';
 
 import { useLocale } from '../../lib/i18n-react';
+import {
+  DASH,
+  DIM,
+  DiagramFrame,
+  EMERALD,
+  HatchDefs,
+  hatchFill,
+  PanBox,
+  RED,
+  RX,
+  SW,
+  useStepPlayer,
+} from '../motion';
 
 /**
  * SpeculativeDecodeDiagram — Multi-Token Prediction sub-chapter centerpiece: the
@@ -33,10 +46,11 @@ import { useLocale } from '../../lib/i18n-react';
  *
  * Phase state machine (within one step), 5 phases:
  *   0 commit  — show the committed prefix only.
- *   1 draft   — the MTP head's d₁…d_D appear, muted + dashed ("draft").
- *   2 verify  — the full model lights up all D+1 positions at once (one pass).
- *   3 accept  — left→right resolve: accepted drafts → green ✓; first mismatch →
- *               red ✗ replaced by the correction; or, on full accept, a bonus
+ *   1 draft   — the MTP head's d₁…d_D appear, dim + dashed ("draft").
+ *   2 verify  — a RED bracket over all D+1 positions and a RED hatch inside each
+ *               of them: one expensive pass, chewing on every position at once.
+ *   3 accept  — left→right resolve: accepted drafts → EMERALD ✓; first mismatch →
+ *               RED ✗ replaced by the correction; or, on full accept, a bonus
  *               token appears.
  *   4 tally   — "tokens this pass: K+1" + running passes/tokens average.
  *
@@ -44,8 +58,31 @@ import { useLocale } from '../../lib/i18n-react';
  *   A "partial accept": D=3, accept d₁,d₂, reject d₃ → correction → 3 tokens.
  *   B "full accept":    D=3, accept all → +1 bonus      → 4 tokens.
  *
- * Honors prefers-reduced-motion: no auto-play, renders the final (tally) frame
- * of Scenario A, and the Play button is hidden.
+ * Animation model: `useStepPlayer` from `learn/motion`, replacing this file's
+ * former hand-rolled `setInterval` + private `usePrefersReducedMotion` + play /
+ * prev / next buttons. Reduced-motion readers still rest on the final (tally)
+ * frame — that is `useStepPlayer`'s default `restFrame` — and still lose the
+ * Play button but keep Step.
+ *
+ * ── THE PALETTE ────────────────────────────────────────────────────────────
+ *
+ * This diagram is `skin`'s two hues used for exactly what they mean, and the
+ * accept/reject pair is a contract with two neighbours (PrefixCacheDiagram,
+ * SpeculativeVerifyLive) that hardcode the same two hexes:
+ *
+ *   dashed, dim, neutral   a draft — proposed, not verified, NOT REAL YET. This
+ *                          holds through phase 2 as well: the verify pass is
+ *                          still running, so a guess is still a guess.
+ *   RED + diagonal hatch   the one expensive full-model pass, happening now
+ *   RED, solid             the correction the full model had to emit itself
+ *   EMERALD, solid         an accepted draft, or the free bonus token — kept
+ *
+ * The one place this departs from `skin`'s "hue is permanent identity" rule is
+ * the same departure BackpropFlowDiagram documents: every cell here has the
+ * SAME job (it is a token slot), so there is no competing identity for hue to
+ * lose, and the only thing the reader tracks is where the sweep is. "Not real
+ * yet" is still the DASH and "busy this step" is still the HATCH — a draft is
+ * never given a hue of its own.
  */
 
 type Verdict = 'accept' | 'reject';
@@ -89,10 +126,6 @@ const D = 3; // draft depth used by both scenarios
 const PHASES = 5; // commit, draft, verify, accept, tally
 const FRAME_MS = 2200;
 
-// Tailwind palette hexes, used for SVG fills/strokes (SVG can't take TW classes).
-const EMERALD = '#10b981'; // emerald-500 — accepted
-const RED = '#ef4444'; // red-500 — rejected
-
 /** Index of the first rejected draft, or -1 if all accepted (full accept). */
 function firstReject(s: Scenario): number {
   return s.verdicts.findIndex((v) => v === 'reject');
@@ -106,13 +139,13 @@ function tokensThisPass(s: Scenario): number {
 }
 
 // ── Per-locale copy. COPY.en strings are the original English, verbatim. ─────
+//
+// Play / Pause / Step are NOT here any more, and neither are the prev/next
+// phase arrows: those verbs now belong to the shared `StepControls`, which
+// carries its own en/zh pair so every animated widget says the same word.
 const COPY = {
   en: {
     title: 'Speculative decoding — draft, verify, accept',
-    pause: '❚❚ Pause',
-    play: '▶ Play',
-    prevAria: 'Previous phase',
-    nextAria: 'Next phase',
     scenarioLabel: 'scenario',
     scenarioA: 'partial accept',
     scenarioB: 'full accept',
@@ -196,10 +229,6 @@ const COPY = {
   },
   zh: {
     title: 'speculative decoding——draft、verify、accept',
-    pause: '❚❚ 暂停',
-    play: '▶ 播放',
-    prevAria: '上一阶段',
-    nextAria: '下一阶段',
     scenarioLabel: '场景',
     scenarioA: '部分接受',
     scenarioB: '全部接受',
@@ -280,21 +309,6 @@ const COPY = {
   },
 } as const;
 
-function usePrefersReducedMotion(): boolean {
-  const [reduced, setReduced] = React.useState<boolean>(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
-    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  });
-  React.useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
-    const mql = window.matchMedia('(prefers-reduced-motion: reduce)');
-    const onChange = (e: MediaQueryListEvent) => setReduced(e.matches);
-    mql.addEventListener('change', onChange);
-    return () => mql.removeEventListener('change', onChange);
-  }, []);
-  return reduced;
-}
-
 // ── SVG geometry ────────────────────────────────────────────────────────────
 const VB_W = 760;
 const VB_H = 200;
@@ -321,12 +335,13 @@ function windowCellX(j: number): number {
 }
 
 export function SpeculativeDecodeDiagram() {
-  const copy = COPY[useLocale()];
-  const reducedMotion = usePrefersReducedMotion();
+  const locale = useLocale();
+  const copy = COPY[locale];
+  // Reduced-motion readers rest on the LAST frame (the tally) — `useStepPlayer`'s
+  // default `restFrame` — which is the same still this widget used to pin.
+  const player = useStepPlayer(PHASES, { frameMs: FRAME_MS });
+  const phase = player.frame;
   const [scenarioIdx, setScenarioIdx] = React.useState(0);
-  // Under reduced motion: jump to the final (tally) phase of Scenario A, never play.
-  const [phase, setPhase] = React.useState(reducedMotion ? PHASES - 1 : 0);
-  const [playing, setPlaying] = React.useState(!reducedMotion);
   // Running tally accumulated as the user/auto-play completes whole passes.
   const [passes, setPasses] = React.useState(0);
   const [tokens, setTokens] = React.useState(0);
@@ -337,12 +352,6 @@ export function SpeculativeDecodeDiagram() {
   const fr = firstReject(scenario);
   const isFullAccept = fr === -1;
   const nThisPass = tokensThisPass(scenario);
-
-  React.useEffect(() => {
-    if (!playing || reducedMotion) return;
-    const t = window.setInterval(() => setPhase((p) => (p + 1) % PHASES), FRAME_MS);
-    return () => window.clearInterval(t);
-  }, [playing, reducedMotion]);
 
   // When we land on the tally phase, fold this pass into the running average once.
   React.useEffect(() => {
@@ -356,20 +365,17 @@ export function SpeculativeDecodeDiagram() {
     }
   }, [phase, nThisPass]);
 
-  const step = (dir: number) => {
-    setPlaying(false);
-    setPhase((p) => Math.min(PHASES - 1, Math.max(0, p + dir)));
-  };
   const pickScenario = (i: number) => {
-    setPlaying(false);
     setScenarioIdx(i);
-    setPhase(0);
+    // `goTo` pauses first, so switching scenario parks the reader on the commit
+    // phase of the new one — the same "stop and restart" the old handler did.
+    player.goTo(0);
     tallied.current = false;
   };
 
   // Phase booleans.
   const showDrafts = phase >= 1; // drafts visible from phase 1
-  const verifying = phase === 2; // all D+1 positions highlighted at once
+  const verifying = phase === 2; // the one expensive pass, chewing on D+1 positions
   const resolved = phase >= 3; // accept/reject coloring applied
   const isTally = phase === PHASES - 1;
 
@@ -381,75 +387,72 @@ export function SpeculativeDecodeDiagram() {
   else if (phase === 3) caption = isFullAccept ? copy.captions.acceptFull : copy.captions.acceptPartial(fr);
   else caption = copy.captions.tally(nThisPass);
 
+  // Every caption this sweep can reach, so DiagramFrame reserves the tallest and
+  // the chapter body cannot hop when the beat changes. Phases 0-2 read the same
+  // in both scenarios; phases 3 and 4 do NOT — the accept beat forks on
+  // `isFullAccept` and the tally beat interpolates `tokensThisPass` — and the
+  // scenario toggle can swap those at any frame, so BOTH scenarios' arms are
+  // enumerated here, off the same two helpers the visible caption uses.
+  const captions = [
+    copy.captions.commit,
+    copy.captions.draft,
+    copy.captions.verify,
+    ...SCENARIOS.flatMap((s) => {
+      const r = firstReject(s);
+      return [
+        r === -1 ? copy.captions.acceptFull : copy.captions.acceptPartial(r),
+        copy.captions.tally(tokensThisPass(s)),
+      ];
+    }),
+  ];
+
+  /** Skip every transition under reduced motion — Step is a state change, not motion. */
+  const ease = player.reducedMotion ? undefined : 'stroke 300ms ease, stroke-opacity 300ms ease';
+  const fade = player.reducedMotion ? undefined : 'opacity 300ms';
+
   const avg = passes > 0 ? (tokens / passes).toFixed(2) : '—';
   const anchor = scenario.committed[scenario.committed.length - 1];
   const shownPrefix = scenario.committed.slice(-PREFIX_SHOWN - 1, -1); // 2 cells before the anchor
 
   return (
-    <div className="not-prose my-5 space-y-3 rounded-md border border-border bg-background p-3">
-      {/* Header: title + controls */}
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.title}</div>
-        <div className="flex items-center gap-1">
-          {/* Scenario selector */}
-          <div className="mr-1 flex items-center gap-1 text-[11px] text-muted-foreground">
-            <span className="hidden sm:inline">{copy.scenarioLabel}:</span>
-            <div className="flex overflow-hidden rounded border border-border">
-              <button
-                type="button"
-                onClick={() => pickScenario(0)}
-                aria-pressed={scenarioIdx === 0}
-                aria-label={copy.scenarioAAria}
-                className="px-2 py-1 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-                style={{
-                  background: scenarioIdx === 0 ? 'var(--primary)' : 'transparent',
-                  color: scenarioIdx === 0 ? 'var(--background)' : 'var(--muted-foreground)',
-                }}
-              >
-                A · {copy.scenarioA}
-              </button>
-              <button
-                type="button"
-                onClick={() => pickScenario(1)}
-                aria-pressed={scenarioIdx === 1}
-                aria-label={copy.scenarioBAria}
-                className="border-l border-border px-2 py-1 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-                style={{
-                  background: scenarioIdx === 1 ? 'var(--primary)' : 'transparent',
-                  color: scenarioIdx === 1 ? 'var(--background)' : 'var(--muted-foreground)',
-                }}
-              >
-                B · {copy.scenarioB}
-              </button>
-            </div>
-          </div>
-          {!reducedMotion ? (
-            <button
-              type="button"
-              onClick={() => setPlaying((p) => !p)}
-              aria-pressed={playing}
-              className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-            >
-              {playing ? copy.pause : copy.play}
-            </button>
-          ) : null}
+    <DiagramFrame
+      title={copy.title}
+      player={player}
+      locale={locale}
+      caption={caption}
+      captions={captions}
+      note={copy.footnote}
+    >
+      {/* Scenario selector — a variant toggle, not a player control, so it stays
+          with the widget and sits directly above the diagram body. */}
+      <div className="flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
+        <span className="hidden sm:inline">{copy.scenarioLabel}:</span>
+        <div className="flex overflow-hidden rounded border border-border">
           <button
             type="button"
-            onClick={() => step(-1)}
-            disabled={phase === 0}
-            aria-label={copy.prevAria}
-            className="inline-flex items-center justify-center max-sm:min-h-[40px] max-sm:min-w-[40px] rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-30"
+            onClick={() => pickScenario(0)}
+            aria-pressed={scenarioIdx === 0}
+            aria-label={copy.scenarioAAria}
+            className="px-2 py-1 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            style={{
+              background: scenarioIdx === 0 ? 'var(--primary)' : 'transparent',
+              color: scenarioIdx === 0 ? 'var(--background)' : 'var(--muted-foreground)',
+            }}
           >
-            ‹
+            A · {copy.scenarioA}
           </button>
           <button
             type="button"
-            onClick={() => step(1)}
-            disabled={phase === PHASES - 1}
-            aria-label={copy.nextAria}
-            className="inline-flex items-center justify-center max-sm:min-h-[40px] max-sm:min-w-[40px] rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-30"
+            onClick={() => pickScenario(1)}
+            aria-pressed={scenarioIdx === 1}
+            aria-label={copy.scenarioBAria}
+            className="border-l border-border px-2 py-1 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            style={{
+              background: scenarioIdx === 1 ? 'var(--primary)' : 'transparent',
+              color: scenarioIdx === 1 ? 'var(--background)' : 'var(--muted-foreground)',
+            }}
           >
-            ›
+            B · {copy.scenarioB}
           </button>
         </div>
       </div>
@@ -480,252 +483,275 @@ export function SpeculativeDecodeDiagram() {
         })}
       </div>
 
-      {/* The diagram */}
-      <svg viewBox={`0 0 ${VB_W} ${VB_H}`} className="w-full" role="img" aria-label={copy.ariaLabel}>
-        {/* Section labels */}
-        <text x={ROW_X} y={ROW_Y - 16} style={{ fill: 'var(--muted-foreground)' }} className="text-[11px]">
-          {copy.committedLabel}
-        </text>
-        <text x={windowStartX()} y={ROW_Y - 16} style={{ fill: 'var(--muted-foreground)' }} className="text-[11px]">
-          {showDrafts ? (verifying || resolved ? copy.verifyLabel : copy.draftLabel) : copy.draftLabel}
-        </text>
-
-        {/* Committed prefix cells (last 2 before the anchor) */}
-        {shownPrefix.map((tok, i) => {
-          const x = prefixCellX(i);
-          return (
-            <g key={`p${i}`}>
-              <rect
-                x={x}
-                y={ROW_Y}
-                width={CELL_W}
-                height={CELL_H}
-                rx={6}
-                style={{ fill: 'var(--card)', stroke: 'var(--border)' }}
-                strokeWidth={1.5}
-              />
-              <text
-                x={x + CELL_W / 2}
-                y={ROW_Y + CELL_H / 2 + 5}
-                textAnchor="middle"
-                style={{ fill: 'var(--muted-foreground)' }}
-                className="font-mono text-[14px]"
-              >
-                {tok}
-              </text>
-            </g>
-          );
-        })}
-        {/* ellipsis hinting there's more prefix to the left */}
-        <text
-          x={ROW_X - 4}
-          y={ROW_Y + CELL_H / 2 + 5}
-          textAnchor="end"
-          style={{ fill: 'var(--muted-foreground)' }}
-          className="font-mono text-[14px]"
+      {/* The diagram.
+          `min-w` is the reason this svg — and ONLY this svg — is wrapped in
+          `PanBox`. A bare `w-full` svg does not reflow in a narrow column — it
+          SCALES, text and all, so at a 375px viewport (a 320-unit column) every
+          label here lands around 4.6 CSS px and stops being readable. The floor
+          stops the shrink and `PanBox` pans to reach the rest.
+          8px legibility floor / smallest size a reader must read: 8 * 760 / 11
+          = 552.7 → 553. That smallest size is 11px, and all six of its uses are
+          real prose — the two section labels, the d1…d3 draft indices, and the
+          draft / correction / bonus badges — so none of them get to duck under
+          the floor the way a true superscript would.
+          The floor belongs to the svg ALONE, which is why `PanBox` wraps the
+          svg and nothing else: the scenario toggle and the phase rail above,
+          and the chips and tally below, stay DiagramFrame's own children — so
+          they size to the visible width, keep the frame's `space-y-4` gaps, and
+          stay reachable without panning. */}
+      <PanBox locale={locale}>
+        <svg
+          viewBox={`0 0 ${VB_W} ${VB_H}`}
+          className="w-full min-w-[553px]"
+          role="img"
+          aria-label={copy.ariaLabel}
         >
-          …
-        </text>
+          <HatchDefs />
 
-        {/* Verify window: anchor (last committed) + D draft slots */}
-        {/* verify-pass bracket over all D+1 positions */}
-        {verifying ? (
-          <rect
-            x={windowCellX(0) - 5}
-            y={ROW_Y - 6}
-            width={(D + 1) * CELL_W + D * CELL_GAP + 10}
-            height={CELL_H + 12}
-            rx={9}
-            fill="var(--primary)"
-            fillOpacity={0.08}
-            stroke="var(--primary)"
-            strokeWidth={2}
-          />
-        ) : null}
-
-        {/* anchor cell */}
-        <g>
-          <rect
-            x={windowCellX(0)}
-            y={ROW_Y}
-            width={CELL_W}
-            height={CELL_H}
-            rx={6}
-            style={{
-              fill: verifying ? 'var(--primary)' : 'var(--card)',
-              fillOpacity: verifying ? 0.16 : 1,
-              stroke: verifying ? 'var(--primary)' : 'var(--border)',
-            }}
-            strokeWidth={verifying ? 2 : 1.5}
-          />
-          <text
-            x={windowCellX(0) + CELL_W / 2}
-            y={ROW_Y + CELL_H / 2 + 5}
-            textAnchor="middle"
-            style={{ fill: 'var(--foreground)' }}
-            className="font-mono text-[14px] font-semibold"
-          >
-            {anchor}
+          {/* Section labels. Bare `<text>`, NOT FrameLabel: both sit at ROW_Y - 16,
+              a clear 10 units above the verify bracket's top edge (ROW_Y - 6), so
+              there is no stroke under either one for a plate to erase. */}
+          <text x={ROW_X} y={ROW_Y - 16} style={{ fill: 'var(--muted-foreground)' }} className="text-[11px]">
+            {copy.committedLabel}
           </text>
-        </g>
+          <text
+            x={windowStartX()}
+            y={ROW_Y - 16}
+            style={{ fill: verifying ? RED : 'var(--muted-foreground)' }}
+            className="text-[11px]"
+          >
+            {showDrafts ? (verifying || resolved ? copy.verifyLabel : copy.draftLabel) : copy.draftLabel}
+          </text>
 
-        {/* D draft slots */}
-        {scenario.drafts.map((draft, j) => {
-          const slot = j + 1; // window slot index (anchor is 0)
-          const x = windowCellX(slot);
-          const accepted = resolved && scenario.verdicts[j] === 'accept';
-          const rejected = resolved && scenario.verdicts[j] === 'reject';
-          // After resolution, a rejected slot shows the CORRECTION instead of the draft.
-          const display = rejected ? scenario.correction : draft;
-          // Border/strokes: dashed while a draft; solid once resolved.
-          let stroke = 'var(--border)';
-          let fill = 'var(--card)';
-          let fillOpacity = 1;
-          let textColor = 'var(--muted-foreground)';
-          let dash: string | undefined = showDrafts ? '5 4' : undefined;
-          if (!showDrafts) {
-            // phase 0: draft slots are empty placeholders
-            fillOpacity = 0;
-            stroke = 'transparent';
-          } else if (verifying) {
-            stroke = 'var(--primary)';
-            fill = 'var(--primary)';
-            fillOpacity = 0.16;
-            textColor = 'var(--foreground)';
-            dash = undefined;
-          } else if (accepted) {
-            stroke = EMERALD;
-            fill = EMERALD;
-            fillOpacity = 0.14;
-            textColor = EMERALD;
-            dash = undefined;
-          } else if (rejected) {
-            stroke = RED;
-            fill = RED;
-            fillOpacity = 0.14;
-            textColor = RED;
-            dash = undefined;
-          } else {
-            // phase 1 (draft proposed, not yet verified): muted + dashed
-            textColor = 'var(--muted-foreground)';
-          }
-          return (
-            <g key={`d${j}`} style={{ opacity: showDrafts ? 1 : 0, transition: 'opacity 300ms' }}>
-              <rect
-                x={x}
-                y={ROW_Y}
-                width={CELL_W}
-                height={CELL_H}
-                rx={6}
-                fill={fill}
-                fillOpacity={fillOpacity}
-                stroke={stroke}
-                strokeWidth={accepted || rejected || verifying ? 2 : 1.5}
-                strokeDasharray={dash}
-              />
-              {showDrafts ? (
+          {/* Committed prefix cells (last 2 before the anchor) */}
+          {shownPrefix.map((tok, i) => {
+            const x = prefixCellX(i);
+            return (
+              <g key={`p${i}`}>
+                <rect
+                  x={x}
+                  y={ROW_Y}
+                  width={CELL_W}
+                  height={CELL_H}
+                  rx={RX}
+                  style={{ fill: 'var(--card)', stroke: 'var(--border)' }}
+                  strokeWidth={SW.OUTER}
+                />
                 <text
                   x={x + CELL_W / 2}
                   y={ROW_Y + CELL_H / 2 + 5}
                   textAnchor="middle"
-                  fill={textColor}
-                  className="font-mono text-[14px] font-semibold"
-                >
-                  {display}
-                </text>
-              ) : null}
-              {/* draft index label dᵢ above each slot, phases 1-2 */}
-              {showDrafts && !resolved ? (
-                <text
-                  x={x + CELL_W / 2}
-                  y={ROW_Y - 16}
-                  textAnchor="middle"
                   style={{ fill: 'var(--muted-foreground)' }}
-                  className="font-mono text-[11px]"
+                  className="font-mono text-[14px]"
                 >
-                  d{j + 1}
+                  {tok}
                 </text>
-              ) : null}
-              {/* ✓ / ✗ verdict marks + badge, phase 3+ */}
-              {resolved ? (
-                <text
-                  x={x + CELL_W - 8}
-                  y={ROW_Y + 16}
-                  textAnchor="end"
-                  fill={accepted ? EMERALD : RED}
-                  className="text-[13px] font-bold"
-                >
-                  {accepted ? '✓' : '✗'}
-                </text>
-              ) : null}
-            </g>
-          );
-        })}
+              </g>
+            );
+          })}
+          {/* ellipsis hinting there's more prefix to the left */}
+          <text
+            x={ROW_X - 4}
+            y={ROW_Y + CELL_H / 2 + 5}
+            textAnchor="end"
+            style={{ fill: 'var(--muted-foreground)' }}
+            className="font-mono text-[14px]"
+          >
+            …
+          </text>
 
-        {/* Bonus token cell (full-accept only), appears in phase 3+ to the right */}
-        {resolved && isFullAccept ? (
-          <g style={{ opacity: 1, transition: 'opacity 300ms' }}>
+          {/* Verify window: anchor (last committed) + D draft slots */}
+          {/* The verify-pass bracket over all D+1 positions. RED because it IS the
+              expensive full-model pass, which is exactly what `skin` reserves RED
+              for — and a bare rect, NOT a PanelFrame: a 56-unit-tall PanelFrame
+              insets its dashed inner border by 5, which lands one unit off the
+              cell outlines it wraps and reads as a stray second stroke. This is a
+              bracket AROUND boxes, not a stage box with contents drawn inside. */}
+          {verifying ? (
             <rect
-              x={windowCellX(D + 1)}
+              x={windowCellX(0) - 5}
+              y={ROW_Y - 6}
+              width={(D + 1) * CELL_W + D * CELL_GAP + 10}
+              height={CELL_H + 12}
+              rx={RX}
+              fill="none"
+              stroke={RED}
+              strokeWidth={SW.OUTER}
+            />
+          ) : null}
+
+          {/* anchor cell — the last committed token. Permanently neutral: it is
+              real in every frame. Verify does not change that, it only makes it
+              BUSY, which is the hatch's job. */}
+          <g>
+            <rect
+              x={windowCellX(0)}
               y={ROW_Y}
               width={CELL_W}
               height={CELL_H}
-              rx={6}
-              fill={EMERALD}
-              fillOpacity={0.14}
-              stroke={EMERALD}
-              strokeWidth={2}
+              rx={RX}
+              style={{ fill: 'var(--card)', stroke: 'var(--border)' }}
+              strokeWidth={SW.OUTER}
             />
+            {verifying ? (
+              <rect x={windowCellX(0)} y={ROW_Y} width={CELL_W} height={CELL_H} rx={RX} fill={hatchFill('red')} />
+            ) : null}
             <text
-              x={windowCellX(D + 1) + CELL_W / 2}
+              x={windowCellX(0) + CELL_W / 2}
               y={ROW_Y + CELL_H / 2 + 5}
               textAnchor="middle"
-              fill={EMERALD}
+              style={{ fill: 'var(--foreground)' }}
               className="font-mono text-[14px] font-semibold"
             >
-              {scenario.bonus}
-            </text>
-            <text
-              x={windowCellX(D + 1) + CELL_W / 2}
-              y={ROW_Y - 16}
-              textAnchor="middle"
-              fill={EMERALD}
-              className="text-[11px] font-semibold"
-            >
-              {copy.bonusBadge} +1
+              {anchor}
             </text>
           </g>
-        ) : null}
 
-        {/* draft / correction badge under the window (phase 1+ / phase 3+) */}
-        {showDrafts && !resolved ? (
-          <text
-            x={windowCellX(1)}
-            y={ROW_Y + CELL_H + 22}
-            style={{ fill: 'var(--muted-foreground)' }}
-            className="text-[11px]"
-          >
-            ← {copy.draftBadge} d1…d{D} (dashed = unverified)
-          </text>
-        ) : null}
-        {resolved && !isFullAccept ? (
-          <text
-            x={windowCellX(fr + 1) + CELL_W / 2}
-            y={ROW_Y + CELL_H + 22}
-            textAnchor="middle"
-            fill={RED}
-            className="text-[11px] font-medium"
-          >
-            ↑ {copy.correctionBadge}
-          </text>
-        ) : null}
-      </svg>
+          {/* D draft slots */}
+          {scenario.drafts.map((draft, j) => {
+            const slot = j + 1; // window slot index (anchor is 0)
+            const x = windowCellX(slot);
+            const accepted = resolved && scenario.verdicts[j] === 'accept';
+            const rejected = resolved && scenario.verdicts[j] === 'reject';
+            // After resolution, a rejected slot shows the CORRECTION instead of the draft.
+            const display = rejected ? scenario.correction : draft;
+            // "Becomes real" is `skin`'s three-part transform, applied all at once:
+            // dash off, SW.INNER -> SW.OUTER, neutral -> hued. Note what is NOT in
+            // that list: `verifying`. A draft under verification is still a guess
+            // — the pass has not answered yet — so phases 1 AND 2 both stay dashed
+            // and dim, and "the expensive thing is happening to this cell" is
+            // carried by the hatch, which is orthogonal to both channels.
+            const real = accepted || rejected;
+            const hue = accepted ? EMERALD : rejected ? RED : undefined;
+            const textColor = hue ?? (verifying ? 'var(--foreground)' : 'var(--muted-foreground)');
+            return (
+              <g key={`d${j}`} style={{ opacity: showDrafts ? 1 : 0, transition: fade }}>
+                <rect
+                  x={x}
+                  y={ROW_Y}
+                  width={CELL_W}
+                  height={CELL_H}
+                  rx={RX}
+                  style={{
+                    fill: 'var(--card)',
+                    stroke: hue ?? 'var(--muted-foreground)',
+                    transition: ease,
+                  }}
+                  strokeOpacity={real ? 1 : DIM.EMPTY_SLOT}
+                  strokeWidth={real ? SW.OUTER : SW.INNER}
+                  strokeDasharray={real ? undefined : DASH.BORDER}
+                />
+                {verifying ? (
+                  <rect x={x} y={ROW_Y} width={CELL_W} height={CELL_H} rx={RX} fill={hatchFill('red')} />
+                ) : null}
+                {showDrafts ? (
+                  <text
+                    x={x + CELL_W / 2}
+                    y={ROW_Y + CELL_H / 2 + 5}
+                    textAnchor="middle"
+                    fill={textColor}
+                    className="font-mono text-[14px] font-semibold"
+                  >
+                    {display}
+                  </text>
+                ) : null}
+                {/* draft index label dᵢ above each slot — phase 1 ONLY, not 1-2.
+                    On phase 2 the section label above swaps to the much longer
+                    verify string, and in EN it collides: 'full-model verify (one
+                    pass)' measures 143.9 units from x=242 (right edge 385.9) while
+                    d₁'s box starts at 381.4 — a 4.5-unit overlap. (zh's shorter
+                    string ends at 351.6 and clears by 29.8.) The drafts are still
+                    labelled on phase 1 and named in the verify caption, so hiding
+                    the dᵢ here costs nothing. */}
+                {showDrafts && !verifying && !resolved ? (
+                  <text
+                    x={x + CELL_W / 2}
+                    y={ROW_Y - 16}
+                    textAnchor="middle"
+                    style={{ fill: 'var(--muted-foreground)' }}
+                    className="font-mono text-[11px]"
+                  >
+                    d{j + 1}
+                  </text>
+                ) : null}
+                {/* ✓ / ✗ verdict marks + badge, phase 3+ */}
+                {resolved ? (
+                  <text
+                    x={x + CELL_W - 8}
+                    y={ROW_Y + 16}
+                    textAnchor="end"
+                    fill={accepted ? EMERALD : RED}
+                    className="text-[13px] font-bold"
+                  >
+                    {accepted ? '✓' : '✗'}
+                  </text>
+                ) : null}
+              </g>
+            );
+          })}
+
+          {/* Bonus token cell (full-accept only), appears in phase 3+ to the right.
+              Real the moment it is drawn — the full model produced it — so it is
+              solid + SW.OUTER + EMERALD, never dashed. */}
+          {resolved && isFullAccept ? (
+            <g style={{ opacity: 1, transition: fade }}>
+              <rect
+                x={windowCellX(D + 1)}
+                y={ROW_Y}
+                width={CELL_W}
+                height={CELL_H}
+                rx={RX}
+                style={{ fill: 'var(--card)', stroke: EMERALD }}
+                strokeWidth={SW.OUTER}
+              />
+              <text
+                x={windowCellX(D + 1) + CELL_W / 2}
+                y={ROW_Y + CELL_H / 2 + 5}
+                textAnchor="middle"
+                fill={EMERALD}
+                className="font-mono text-[14px] font-semibold"
+              >
+                {scenario.bonus}
+              </text>
+              <text
+                x={windowCellX(D + 1) + CELL_W / 2}
+                y={ROW_Y - 16}
+                textAnchor="middle"
+                fill={EMERALD}
+                className="text-[11px] font-semibold"
+              >
+                {copy.bonusBadge} +1
+              </text>
+            </g>
+          ) : null}
+
+          {/* draft / correction badge under the window (phase 1+ / phase 3+) */}
+          {showDrafts && !resolved ? (
+            <text
+              x={windowCellX(1)}
+              y={ROW_Y + CELL_H + 22}
+              style={{ fill: 'var(--muted-foreground)' }}
+              className="text-[11px]"
+            >
+              ← {copy.draftBadge} d1…d{D} (dashed = unverified)
+            </text>
+          ) : null}
+          {resolved && !isFullAccept ? (
+            <text
+              x={windowCellX(fr + 1) + CELL_W / 2}
+              y={ROW_Y + CELL_H + 22}
+              textAnchor="middle"
+              fill={RED}
+              className="text-[11px] font-medium"
+            >
+              ↑ {copy.correctionBadge}
+            </text>
+          ) : null}
+        </svg>
+      </PanBox>
 
       {/* Illustrative-tokens caption */}
       <p className="text-[10px] italic text-muted-foreground/70">{copy.illustrativeCaption}</p>
-
-      {/* Plain-language caption per phase */}
-      <p className="min-h-[3.25rem] text-[13px] text-foreground/90">{caption}</p>
 
       {/* Status chips */}
       <div className="flex flex-wrap items-center gap-2">
@@ -747,8 +773,6 @@ export function SpeculativeDecodeDiagram() {
         </div>
         <div className="text-[11px] text-muted-foreground">{copy.runningTally(passes, tokens, avg)}</div>
       </div>
-
-      <p className="text-[10px] text-muted-foreground/70">{copy.footnote}</p>
-    </div>
+    </DiagramFrame>
   );
 }

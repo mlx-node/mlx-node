@@ -2,6 +2,7 @@ import * as React from 'react';
 
 import { useLocale } from '../../lib/i18n-react';
 import { TopKBars } from '../inspector/TopKBars';
+import { DiagramFrame, useStepPlayer } from '../motion';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
 
@@ -17,14 +18,26 @@ import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
  *   3. exponentiate      e^{z/T}
  *   4. normalize         e^{z/T} / Σ e^{z/T}   ← a probability distribution
  *
- * It loops with a play/pause button (same pattern as the GenerationLoop
- * animation), highlighting which token is "winning" — the current argmax —
- * at each phase. The widget needs every intermediate column (not just the
- * final distribution), so the staged math lives here (self-contained, no
- * model / worker).
+ * It loops, highlighting which token is "winning" — the current argmax — at
+ * each phase. The widget needs every intermediate column (not just the final
+ * distribution), so the staged math lives here (self-contained, no model /
+ * worker).
+ *
+ * Animation model: `useStepPlayer` + `DiagramFrame` from `learn/motion`,
+ * replacing this file's former hand-rolled `setInterval`, private
+ * `usePrefersReducedMotion`, header row, play button and caption paragraph.
+ * There is no `<svg>` here — the "diagram" is a numeric column plus bars — so
+ * this is a kit-only adoption: the frame, the player and the caption slot, and
+ * none of the SVG skin tokens (there is nothing for them to apply to).
  *
  * On `prefers-reduced-motion: reduce` the auto-advance is suppressed and the
- * widget parks on the final (normalized) phase, the meaningful end state.
+ * widget parks on the final (normalized) phase, the meaningful end state —
+ * `useStepPlayer`'s default `restFrame` (last frame) is exactly that, so the
+ * behaviour carries over unchanged.
+ *
+ * The T picker and the phase rail stay widget-owned: `DiagramFrame` renders
+ * play/step only, so the rail is also what tells the reader which of the four
+ * phases is on screen (the frame has no counter slot).
  */
 
 // Eight synthetic tokens with hand-picked logits — a plausible-looking
@@ -95,12 +108,13 @@ const ZH_PHASES: PhaseSpec[] = [
   },
 ];
 
+// Play / Pause are NOT here any more: those verbs now belong to the shared
+// `StepControls` that `DiagramFrame` renders, which carries its own en/zh pair
+// so every animated widget in the course says the same word.
 const COPY = {
   en: {
     phases: PHASES,
     header: 'Softmax with temperature, phase by phase',
-    pause: '❚❚ Pause',
-    play: '▶ Play',
     temperatureLabel: 'Temperature',
     temperatureAria: 'Temperature preset',
     sharpens: 'sharpens — closer to greedy',
@@ -119,8 +133,6 @@ const COPY = {
   zh: {
     phases: ZH_PHASES,
     header: '带温度的 softmax，逐阶段拆解',
-    pause: '❚❚ 暂停',
-    play: '▶ 播放',
     temperatureLabel: 'Temperature',
     temperatureAria: 'Temperature 预设',
     sharpens: '更尖——更接近贪心',
@@ -147,21 +159,6 @@ function fmtVal(v: number, phase: Phase): string {
 }
 
 const FRAME_MS = 1600;
-
-function usePrefersReducedMotion(): boolean {
-  const [reduced, setReduced] = React.useState<boolean>(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
-    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  });
-  React.useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
-    const mql = window.matchMedia('(prefers-reduced-motion: reduce)');
-    const onChange = (e: MediaQueryListEvent) => setReduced(e.matches);
-    mql.addEventListener('change', onChange);
-    return () => mql.removeEventListener('change', onChange);
-  }, []);
-  return reduced;
-}
 
 /**
  * Exponentiate-phase bars: true e^{z/T} values, widths scaled by the max.
@@ -213,18 +210,14 @@ function ExpBars({ values, winnerIndex }: { values: number[]; winnerIndex: numbe
 }
 
 export function SoftmaxTemperatureSteps() {
-  const copy = COPY[useLocale()];
-  const reducedMotion = usePrefersReducedMotion();
-  // Park on the final phase when motion is reduced; otherwise start at raw.
-  const [phase, setPhase] = React.useState<Phase>(reducedMotion ? 3 : 0);
-  const [playing, setPlaying] = React.useState(!reducedMotion);
+  const locale = useLocale();
+  const copy = COPY[locale];
+  // The sweep length IS the phase count, so `player.frame` always addresses a
+  // real phase spec — read `key` off the spec instead of casting number→Phase.
+  const player = useStepPlayer(PHASES.length, { frameMs: FRAME_MS });
+  const current = copy.phases[player.frame]!;
+  const phase = current.key;
   const [temperature, setTemperature] = React.useState<number>(DEFAULT_TEMPERATURE);
-
-  React.useEffect(() => {
-    if (!playing || reducedMotion) return;
-    const t = window.setInterval(() => setPhase((p) => ((p + 1) % 4) as Phase), FRAME_MS);
-    return () => window.clearInterval(t);
-  }, [playing, reducedMotion]);
 
   // Staged math. Each column is derived from the previous one so the four
   // phases line up exactly with the formula.
@@ -259,125 +252,125 @@ export function SoftmaxTemperatureSteps() {
   }, [numericValues]);
 
   const ids = TOKENS.map((_, i) => i);
-  const current = copy.phases[phase]!;
+
+  // Every caption this widget can show — FOUR phases x THREE presets, not four.
+  // Phase 1's sentence interpolates the preset AND branches on `T < 1`, so a
+  // list built from the current temperature alone would let the slot resize
+  // when the reader switches T. Which branch wraps longest also differs by
+  // locale, so the whole product is passed and the grid measures it.
+  const captions: React.ReactNode[] = TEMPERATURES.flatMap((t) => copy.phases.map((p) => p.caption(t)));
 
   return (
-    <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.header}</div>
-        <button
-          type="button"
-          onClick={() => setPlaying((p) => !p)}
-          aria-pressed={playing}
-          disabled={reducedMotion}
-          className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
-        >
-          {playing ? copy.pause : copy.play}
-        </button>
-      </div>
+    <DiagramFrame
+      title={copy.header}
+      player={player}
+      locale={locale}
+      caption={current.caption(temperature)}
+      captions={captions}
+      note={copy.footnote}
+    >
+      <div className="space-y-3">
+        {/* Temperature presets — same eight logits, three temperatures. Not the
+            frame's business: it owns play/step only, so widget controls sit
+            here, above the body. */}
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[11px] uppercase tracking-wider text-muted-foreground">{copy.temperatureLabel}</span>
+          <SegmentedToggle
+            value={temperature}
+            onChange={setTemperature}
+            ariaLabel={copy.temperatureAria}
+            options={TEMPERATURES.map((t) => ({ value: t, label: `T = ${t}` }))}
+          />
+          <span className="text-[11px] text-muted-foreground">
+            {temperature < 1 ? copy.sharpens : copy.flattens}
+          </span>
+        </div>
 
-      {/* Temperature presets — same eight logits, three temperatures. */}
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-[11px] uppercase tracking-wider text-muted-foreground">{copy.temperatureLabel}</span>
-        <SegmentedToggle
-          value={temperature}
-          onChange={setTemperature}
-          ariaLabel={copy.temperatureAria}
-          options={TEMPERATURES.map((t) => ({ value: t, label: `T = ${t}` }))}
-        />
-        <span className="text-[11px] text-muted-foreground">
-          {temperature < 1 ? copy.sharpens : copy.flattens}
-        </span>
-      </div>
+        <MathDisplay latex={String.raw`p_i = \frac{e^{z_i / T}}{\sum_j e^{z_j / T}} \qquad T = ${temperature}`} />
 
-      <MathDisplay latex={String.raw`p_i = \frac{e^{z_i / T}}{\sum_j e^{z_j / T}} \qquad T = ${temperature}`} />
-
-      {/* Phase rail — four steps; the active one lights up. */}
-      <div className="flex flex-wrap items-center gap-1.5">
-        {copy.phases.map((p, i) => (
-          <React.Fragment key={p.key}>
-            <button
-              type="button"
-              onClick={() => {
-                setPlaying(false);
-                setPhase(p.key);
-              }}
-              aria-pressed={phase === p.key}
-              className={[
-                'rounded px-2 py-1 font-mono text-[11px] transition-colors',
-                phase === p.key ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
-              ].join(' ')}
-            >
-              {i + 1}. {p.label}
-            </button>
-            {i < copy.phases.length - 1 ? (
-              <span aria-hidden className="text-muted-foreground/50">
-                →
-              </span>
-            ) : null}
-          </React.Fragment>
-        ))}
-      </div>
-
-      <p className="min-h-[2.5em] text-[12px] text-foreground/85">{current.caption(temperature)}</p>
-
-      {/* Numeric column + bars. The numeric value is always the TRUE phase
-          value. Bars are shown only once the values are non-negative (the
-          exponentiate and normalize phases) and are labelled with that same
-          true value, so a token never shows two different numbers at once. */}
-      <div className="grid gap-3 sm:grid-cols-[minmax(0,11rem)_minmax(0,1fr)]">
-        <div className="space-y-0.5 rounded-md border border-border/60 bg-muted/20 p-2 font-mono text-[11px]">
-          <div className="mb-1 flex items-center justify-between text-muted-foreground">
-            <span>{copy.tokenColumnLabel}</span>
-            <span>{current.label}</span>
-          </div>
-          {TOKENS.map((tok, i) => (
-            <div
-              key={tok}
-              className={[
-                'flex items-center justify-between rounded px-1 py-0.5',
-                i === winnerIndex ? 'bg-primary/10 text-primary' : 'text-foreground/80',
-              ].join(' ')}
-            >
-              <span className="truncate">{tok.trim()}</span>
-              <span>{fmtVal(numericValues[i]!, phase)}</span>
-            </div>
+        {/* Phase rail — four steps; the active one lights up. Also the widget's
+            "step 3 of 4" readout: StepControls has no counter slot, and these
+            captions never say which phase they are. `goTo` pauses first, which
+            is what the hand-rolled onClick did with its own setPlaying(false). */}
+        <div className="flex flex-wrap items-center gap-1.5">
+          {copy.phases.map((p, i) => (
+            <React.Fragment key={p.key}>
+              <button
+                type="button"
+                onClick={() => player.goTo(p.key)}
+                aria-pressed={phase === p.key}
+                className={[
+                  'rounded px-2 py-1 font-mono text-[11px] transition-colors',
+                  phase === p.key ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
+                ].join(' ')}
+              >
+                {i + 1}. {p.label}
+              </button>
+              {i < copy.phases.length - 1 ? (
+                <span aria-hidden className="text-muted-foreground/50">
+                  →
+                </span>
+              ) : null}
+            </React.Fragment>
           ))}
-          {phase === 2 || phase === 3 ? (
-            <div className="mt-1 flex items-center justify-between border-t border-border/60 pt-1 text-muted-foreground">
-              <span>Σ</span>
-              <span>{phase === 2 ? fmtVal(expSum, 2) : probs.reduce((s, p) => s + p, 0).toFixed(3)}</span>
-            </div>
-          ) : null}
         </div>
 
-        <div className="space-y-1">
-          <div className="text-[11px] text-muted-foreground">
-            {copy.winningLabel}
-            <span className="font-mono text-primary">{TOKENS[winnerIndex]!.trim()}</span>
-            {phase < 3 ? copy.argmaxNote : copy.highestProbNote}
-          </div>
-          {phase === 3 ? (
-            <TopKBars
-              ids={ids}
-              probs={probs}
-              texts={TOKENS}
-              sampledTokenId={winnerIndex}
-              // Changes on every phase OR temperature change so the grow-in
-              // animation re-fires when the distribution actually moves.
-              runKey={phase * 100 + Math.round(temperature * 10)}
-            />
-          ) : phase === 2 ? (
-            <ExpBars values={exps} winnerIndex={winnerIndex} />
-          ) : (
-            <div className="flex min-h-[8rem] items-center justify-center rounded-md border border-dashed border-border/60 px-3 text-center text-[11px] text-muted-foreground">
-              {phase === 0 ? copy.rawEmpty : copy.scaledEmpty}
+        {/* Numeric column + bars. The numeric value is always the TRUE phase
+            value. Bars are shown only once the values are non-negative (the
+            exponentiate and normalize phases) and are labelled with that same
+            true value, so a token never shows two different numbers at once. */}
+        <div className="grid gap-3 sm:grid-cols-[minmax(0,11rem)_minmax(0,1fr)]">
+          <div className="space-y-0.5 rounded-md border border-border/60 bg-muted/20 p-2 font-mono text-[11px]">
+            <div className="mb-1 flex items-center justify-between text-muted-foreground">
+              <span>{copy.tokenColumnLabel}</span>
+              <span>{current.label}</span>
             </div>
-          )}
+            {TOKENS.map((tok, i) => (
+              <div
+                key={tok}
+                className={[
+                  'flex items-center justify-between rounded px-1 py-0.5',
+                  i === winnerIndex ? 'bg-primary/10 text-primary' : 'text-foreground/80',
+                ].join(' ')}
+              >
+                <span className="truncate">{tok.trim()}</span>
+                <span>{fmtVal(numericValues[i]!, phase)}</span>
+              </div>
+            ))}
+            {phase === 2 || phase === 3 ? (
+              <div className="mt-1 flex items-center justify-between border-t border-border/60 pt-1 text-muted-foreground">
+                <span>Σ</span>
+                <span>{phase === 2 ? fmtVal(expSum, 2) : probs.reduce((s, p) => s + p, 0).toFixed(3)}</span>
+              </div>
+            ) : null}
+          </div>
+
+          <div className="space-y-1">
+            <div className="text-[11px] text-muted-foreground">
+              {copy.winningLabel}
+              <span className="font-mono text-primary">{TOKENS[winnerIndex]!.trim()}</span>
+              {phase < 3 ? copy.argmaxNote : copy.highestProbNote}
+            </div>
+            {phase === 3 ? (
+              <TopKBars
+                ids={ids}
+                probs={probs}
+                texts={TOKENS}
+                sampledTokenId={winnerIndex}
+                // Changes on every phase OR temperature change so the grow-in
+                // animation re-fires when the distribution actually moves.
+                runKey={phase * 100 + Math.round(temperature * 10)}
+              />
+            ) : phase === 2 ? (
+              <ExpBars values={exps} winnerIndex={winnerIndex} />
+            ) : (
+              <div className="flex min-h-[8rem] items-center justify-center rounded-md border border-dashed border-border/60 px-3 text-center text-[11px] text-muted-foreground">
+                {phase === 0 ? copy.rawEmpty : copy.scaledEmpty}
+              </div>
+            )}
+          </div>
         </div>
       </div>
-
-      <p className="text-[10px] text-muted-foreground">{copy.footnote}</p>
-    </div>
+    </DiagramFrame>
   );
 }

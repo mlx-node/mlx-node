@@ -210,12 +210,60 @@ export default function JSpaceApp() {
   const { mlxWorkerRef, inspectorAbortRef } = useFreeChat();
   const modelReady = modelStatus === 'ready';
 
+  // ---- permalink restore: read the HASH once, during the FIRST render ------
+  // NOT in a mount effect. A permalink restores STATE (it never runs, never
+  // downloads), and an effect lands one commit LATE — which is observable three
+  // ways: (1) a shared `#p=<custom prompt>` link paints the model-free starter
+  // grid under someone else's prompt for a frame before the skeleton replaces it,
+  // breaking the view invariant below; (2) a restored `#sel=` ring flickers in a
+  // frame late; (3) the hash-WRITE effect below fires first, sees the pristine
+  // cold defaults, decides "cold default" and STRIPS the visitor's permalink out
+  // of the URL before a second pass rewrites it. Seeding the state here removes
+  // all three: the very first render already IS the restored state, so the write
+  // effect's first pass agrees with the URL and leaves it untouched.
+  // Reading `location.hash` during render is safe here: /jspace never
+  // server-renders (scripts/prerender.entry.tsx prerenders lesson bodies only)
+  // and the SPA boots with createRoot, not hydrateRoot — there is no hydration
+  // diff to mismatch — and the `typeof window` guard keeps it inert if it ever
+  // does. The refs are seeded inside the SAME one-shot block so a re-invoked
+  // render can never resurrect an already-consumed restore.
+  const restoreRef = React.useRef<{
+    prompt: string;
+    mode: LensMode;
+    pins: number[];
+    sel: CellRef | null;
+    starterSlug: string;
+  } | null>(null);
+  const lastWrittenHashRef = React.useRef<string | null>(null);
+  // A selection restored from a permalink onto a CUSTOM prompt can't render until
+  // the reader runs (skeleton until then) and `handleRun` clears `selected` before
+  // dispatch — so hold it here and re-apply it ONCE after the first slice arrives,
+  // clamped to that slice. Consumed once; later runs never re-apply it.
+  const pendingSelRef = React.useRef<CellRef | null>(null);
+  if (restoreRef.current === null) {
+    const hash = typeof window !== 'undefined' ? window.location.hash : '';
+    const decoded = applyPermalink(DEFAULTS, hash);
+    restoreRef.current = {
+      ...decoded,
+      // A shared cold URL restores the exact tile (#2) — but `decoded.starterSlug`
+      // is untrusted (`#s=` accepts any string), so CLAMP it to a real gallery tile.
+      // An inherited key like `s=__proto__` would otherwise poison the render lookup.
+      starterSlug: resolveStarterSlug(decoded.starterSlug),
+    };
+    pendingSelRef.current = decoded.sel; // …survives the first Run for a CUSTOM permalink
+    lastWrittenHashRef.current = hash.startsWith('#') ? hash.slice(1) : hash;
+  }
+  const restored = restoreRef.current;
+
   // ---- state --------------------------------------------------------------
-  const [prompt, setPrompt] = React.useState('');
-  const [mode, setMode] = React.useState<LensMode>(DEFAULTS.mode);
-  const [pins, setPins] = React.useState<number[]>([]);
-  const [activePinIdx, setActivePinIdx] = React.useState<number | null>(null);
-  const [selected, setSelected] = React.useState<CellRef | null>(null);
+  const [prompt, setPrompt] = React.useState(restored.prompt);
+  const [mode, setMode] = React.useState<LensMode>(restored.mode);
+  const [pins, setPins] = React.useState<number[]>(restored.pins);
+  const [activePinIdx, setActivePinIdx] = React.useState<number | null>(restored.pins.length > 0 ? 0 : null);
+  // Renders IMMEDIATELY for a STARTER permalink (the grid is already present);
+  // for a CUSTOM one it is cleared by `handleRun` and re-applied from
+  // `pendingSelRef` once the first live slice arrives.
+  const [selected, setSelected] = React.useState<CellRef | null>(restored.sel);
   const [hovered, setHovered] = React.useState<CellRef | null>(null);
   // Sticky "last engaged cell". The per-cell readout and the cross-section strips
   // are MOUNT-gated on `activeCellRef` (= hovered ?? selected). `hovered` flips to
@@ -227,7 +275,7 @@ export default function JSpaceApp() {
   // mounted; hover still drives their CONTENT. Reset on every new run / mode change.
   const [focusCell, setFocusCell] = React.useState<CellRef | null>(null);
   const [showWhitespace, setShowWhitespace] = React.useState(false);
-  const [starterSlug, setStarterSlug] = React.useState<string>(STARTER_SLUGS[0]!);
+  const [starterSlug, setStarterSlug] = React.useState<string>(restored.starterSlug);
   const [tokenCount, setTokenCount] = React.useState<number | null>(null);
   const [runError, setRunError] = React.useState<string | null>(null);
   const [jac, setJac] = React.useState<JacState>({ status: 'idle' });
@@ -260,13 +308,6 @@ export default function JSpaceApp() {
   // toggle, addPin/removePin → runReadout) coalesce onto ONE 46 MB download + ONE
   // self-test instead of racing concurrent activations (F2).
   const jacActivationRef = React.useRef<Promise<'ok' | 'failed' | 'unavailable'> | null>(null);
-  const hashAppliedRef = React.useRef(false);
-  const lastWrittenHashRef = React.useRef<string | null>(null);
-  // A selection restored from a permalink onto a CUSTOM prompt can't render until
-  // the reader runs (skeleton until then) and `handleRun` clears `selected` before
-  // dispatch — so hold it here and re-apply it ONCE after the first slice arrives,
-  // clamped to that slice. Consumed once; later runs never re-apply it.
-  const pendingSelRef = React.useRef<CellRef | null>(null);
   // Monotonic "current user intent" token. handleRun / handleModeChange / openStarter
   // each claim a fresh intent; their continuations, which resume AFTER an await on
   // tokenize or the 46 MB Jacobian activation, bail if a later intent superseded them.
@@ -408,13 +449,27 @@ export default function JSpaceApp() {
     }
     if (runIntentRef.current !== intent) return; // superseded before dispatch (openStarter cleared the view)
     committedPromptIdsRef.current = promptIds;
-    await lensRun.run({
+    const result = await lensRun.run({
       promptIds,
       layers: layersFor(m),
       topK: TOP_K,
       pinnedIds: pinsArr,
       useJacobian: m === 'jacobian',
     });
+    // Re-apply a permalink-restored selection ONCE, on the first slice that lands:
+    // the custom-prompt path starts as a skeleton and `handleRun` clears `selected`
+    // before dispatch, so without this the shared cell would be lost. Clamp it to the
+    // real slice and consume it. Done HERE rather than in an effect on `lensRun.state`
+    // because `lensRun.run` resolves in the same microtask chain that set
+    // `status: 'done'` — React batches this into the SAME render, so the restored ring
+    // is on the grid the moment the grid exists. A post-commit effect would paint the
+    // fresh grid unselected for one frame and only then add the ring. A `null` result
+    // means superseded/errored (`useLensRun` drops stale results), so the restore
+    // simply stays pending for the run that actually lands.
+    if (result && pendingSelRef.current) {
+      setSelected(normalizeSelected(pendingSelRef.current, buildLensSlice(result)));
+      pendingSelRef.current = null;
+    }
   }
 
   async function handleRun(): Promise<void> {
@@ -549,42 +604,13 @@ export default function JSpaceApp() {
     if (ids) void runReadout(ids, next, mode, ++runIntentRef.current);
   }
 
-  // -------------------------------------------------------------------------
-  // Permalink — read the HASH once on mount (never runs, never downloads).
-  // -------------------------------------------------------------------------
-  React.useEffect(() => {
-    if (hashAppliedRef.current) return;
-    hashAppliedRef.current = true;
-    const hash = typeof window !== 'undefined' ? window.location.hash : '';
-    const restored = applyPermalink(DEFAULTS, hash);
-    setPrompt(restored.prompt);
-    setMode(restored.mode);
-    setPins(restored.pins);
-    // A shared cold URL restores the exact tile (#2) — but `restored.starterSlug`
-    // is untrusted (`#s=` accepts any string), so CLAMP it to a real gallery tile.
-    // An inherited key like `s=__proto__` would otherwise poison the render lookup.
-    setStarterSlug(resolveStarterSlug(restored.starterSlug));
-    setSelected(restored.sel); // renders immediately for a STARTER permalink (grid is present)
-    pendingSelRef.current = restored.sel; // …and survives the first Run for a CUSTOM permalink
-    setActivePinIdx(restored.pins.length > 0 ? 0 : null);
-    lastWrittenHashRef.current = hash.startsWith('#') ? hash.slice(1) : hash;
-  }, []);
-
-  // Re-apply a permalink-restored selection ONCE after the first live slice: the
-  // custom-prompt path starts as a skeleton and `handleRun` clears `selected`, so
-  // without this the shared cell would be lost. Clamp to the real slice and consume.
-  React.useEffect(() => {
-    if (lensRun.state.status !== 'done' || pendingSelRef.current === null) return;
-    const slice = buildLensSlice(lensRun.state.result);
-    setSelected(normalizeSelected(pendingSelRef.current, slice));
-    pendingSelRef.current = null;
-  }, [lensRun.state]);
-
   // Write the permalink to the HASH with replaceState — NEVER navigate (the root
   // route's searchSchema would strip it). Skips redundant writes + the cold
-  // default so a fresh visit keeps a clean URL.
+  // default so a fresh visit keeps a clean URL. No "has the hash been read yet?"
+  // guard is needed (or possible to get right in an effect): the restore is seeded
+  // during the first RENDER, so this effect's very first pass already sees the
+  // restored state and agrees with the URL it came from.
   React.useEffect(() => {
-    if (!hashAppliedRef.current) return;
     if (typeof window === 'undefined') return;
     // Only the FULL default cold view stays URL-clean: cold prompt, no pins/selection,
     // default lens AND the default tile. A non-default tile or a toggled lens writes an

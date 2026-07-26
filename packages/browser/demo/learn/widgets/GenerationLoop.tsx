@@ -2,6 +2,7 @@ import * as React from 'react';
 
 import { useLocale } from '../../lib/i18n-react';
 import { TopKBars, cleanupTokenText } from '../inspector/TopKBars';
+import { DiagramFrame, useStepPlayer } from '../motion';
 
 /**
  * Chapter 1 (overview) — the autoregressive generation loop, animated.
@@ -14,6 +15,20 @@ import { TopKBars, cleanupTokenText } from '../inspector/TopKBars';
  * A pseudocode block highlights the line matching the current phase; the
  * candidate bars (reused TopKBars) show "the model scored every token, we kept
  * one"; the token strip grows as each sampled token is appended.
+ *
+ * Animation model: `useStepPlayer` + `DiagramFrame` from `learn/motion`, in
+ * place of this file's former hand-rolled `setInterval`, its own Play/Pause
+ * button, and its own card shell. Frame count (12) and pace (1150ms) are
+ * unchanged — this was a refactor, not a retune. Three things the swap fixes:
+ * reduced-motion readers used to mount paused on frame 0 with NO Step button,
+ * i.e. stranded on "forward pass, nothing sampled yet"; the local `useState`
+ * initializer could not see the OS preference flipping mid-session; and the
+ * caption's `aria-live` toggled between `off` and `polite` on the same commit
+ * that changed its text, which is not reliably announced. `DiagramFrame` owns
+ * all three now (a separate `sr-only` region, filled only on reader intent).
+ *
+ * There is no `<svg>` here — the diagram body is divs — so this widget takes
+ * the motion kit only, and none of the skin's SVG tokens apply.
  */
 
 const PROMPT = ['The', ' cat', ' sat', ' on', ' the'];
@@ -77,11 +92,12 @@ const LINES: { code: string; phase: Phase | null }[] = [
   { code: '}', phase: null },
 ];
 
+// Play / Pause are NOT here any more: those verbs now belong to the shared
+// `StepControls` (rendered by `DiagramFrame`), which carries its own en/zh pair
+// so every animated widget in the course says the same word.
 const COPY = {
   en: {
     title: 'The generation loop',
-    pause: '❚❚ Pause',
-    play: '▶ Play',
     lineComments: {
       forward: 'one forward pass',
       sample: 'pick one token',
@@ -103,8 +119,6 @@ const COPY = {
   },
   zh: {
     title: '生成循环',
-    pause: '❚❚ 暂停',
-    play: '▶ 播放',
     lineComments: {
       forward: '一次前向传播',
       sample: '挑出一个 token',
@@ -127,17 +141,10 @@ const COPY = {
 } as const;
 
 export function GenerationLoop() {
-  const copy = COPY[useLocale()];
-  const [frame, setFrame] = React.useState(0);
-  const [playing, setPlaying] = React.useState(() =>
-    typeof window !== 'undefined' ? !window.matchMedia('(prefers-reduced-motion: reduce)').matches : true,
-  );
-
-  React.useEffect(() => {
-    if (!playing) return;
-    const t = window.setInterval(() => setFrame((f) => (f + 1) % TOTAL_FRAMES), FRAME_MS);
-    return () => window.clearInterval(t);
-  }, [playing]);
+  const locale = useLocale();
+  const copy = COPY[locale];
+  const player = useStepPlayer(TOTAL_FRAMES, { frameMs: FRAME_MS });
+  const { frame } = player;
 
   const step = Math.floor(frame / PHASES.length);
   const phase = PHASES[frame % PHASES.length];
@@ -156,84 +163,86 @@ export function GenerationLoop() {
   // Highlight the kept token only once we've "sampled" it.
   const sampledTokenId = phase === 'forward' ? -1 : pickedIndex;
 
+  // Every caption this loop can reach. The visible caption is
+  // `copy.phaseCaption[phase]` and NOTHING else picks it — `phase` is
+  // `PHASES[frame % PHASES.length]`, so the three entries of PHASES are the
+  // complete set of arms. Stacking all three lets DiagramFrame reserve the
+  // tallest, so the chapter body cannot hop as the loop cycles (the zh
+  // "采样 → 留下一个（贪心 = 最高的那根条）" line wraps a row earlier than the
+  // other two on a phone).
+  const captions: React.ReactNode[] = PHASES.map((p) => copy.phaseCaption[p]);
+
   return (
-    <div className="space-y-3 rounded-md border border-border bg-background p-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.title}</div>
-        <button
-          type="button"
-          onClick={() => setPlaying((p) => !p)}
-          aria-pressed={playing}
-          className="rounded px-2.5 py-1 max-sm:py-2 max-sm:min-h-[44px] text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
-        >
-          {playing ? copy.pause : copy.play}
-        </button>
-      </div>
-
-      {/* Token strip — grows as tokens are appended. */}
-      <div className="flex flex-wrap items-center gap-1 rounded-md border border-border/60 bg-muted/30 p-2">
-        {PROMPT.map((t, i) => (
-          <span
-            key={`p-${i}`}
-            className="rounded bg-background px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground"
-          >
-            {cleanupTokenText(t)}
+    <>
+      <DiagramFrame
+        title={copy.title}
+        player={player}
+        locale={locale}
+        caption={copy.phaseCaption[phase]}
+        captions={captions}
+        note={copy.footnote}
+      >
+        {/* Token strip — grows as tokens are appended. */}
+        <div className="flex flex-wrap items-center gap-1 rounded-md border border-border/60 bg-muted/30 p-2">
+          {PROMPT.map((t, i) => (
+            <span
+              key={`p-${i}`}
+              className="rounded bg-background px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground"
+            >
+              {cleanupTokenText(t)}
+            </span>
+          ))}
+          {generated.map((t, i) => (
+            <span
+              key={`g-${i}`}
+              className={[
+                'rounded px-1.5 py-0.5 font-mono text-[11px] transition-colors',
+                i === flashIndex
+                  ? 'bg-primary/20 text-primary ring-1 ring-primary/40'
+                  : 'bg-primary/10 text-foreground/90',
+              ].join(' ')}
+            >
+              {cleanupTokenText(t)}
+            </span>
+          ))}
+          <span className="ml-0.5 font-mono text-[11px] text-muted-foreground" aria-hidden>
+            ▮
           </span>
-        ))}
-        {generated.map((t, i) => (
-          <span
-            key={`g-${i}`}
-            className={[
-              'rounded px-1.5 py-0.5 font-mono text-[11px] transition-colors',
-              i === flashIndex
-                ? 'bg-primary/20 text-primary ring-1 ring-primary/40'
-                : 'bg-primary/10 text-foreground/90',
-            ].join(' ')}
-          >
-            {cleanupTokenText(t)}
-          </span>
-        ))}
-        <span className="ml-0.5 font-mono text-[11px] text-muted-foreground" aria-hidden>
-          ▮
-        </span>
-      </div>
+        </div>
 
-      <div className="grid gap-3 sm:grid-cols-2">
-        {/* Pseudocode with the active line highlighted. */}
-        <pre className="overflow-x-auto rounded-md border border-border/60 bg-muted/30 p-2 font-mono text-[11px] leading-relaxed">
-          {LINES.map((ln, i) => {
-            const active = ln.phase !== null && ln.phase === phase;
-            return (
-              <div
-                key={i}
-                className={[
-                  'rounded px-1 transition-colors',
-                  active ? 'bg-primary/15 text-foreground' : 'text-foreground/70',
-                ].join(' ')}
-              >
-                <span>{ln.code}</span>
-                {ln.phase ? <span className="text-muted-foreground"> {`// ${copy.lineComments[ln.phase]}`}</span> : null}
-              </div>
-            );
-          })}
-        </pre>
+        <div className="grid gap-3 sm:grid-cols-2">
+          {/* Pseudocode with the active line highlighted. */}
+          <pre className="overflow-x-auto rounded-md border border-border/60 bg-muted/30 p-2 font-mono text-[11px] leading-relaxed">
+            {LINES.map((ln, i) => {
+              const active = ln.phase !== null && ln.phase === phase;
+              return (
+                <div
+                  key={i}
+                  className={[
+                    'rounded px-1 transition-colors',
+                    active ? 'bg-primary/15 text-foreground' : 'text-foreground/70',
+                  ].join(' ')}
+                >
+                  <span>{ln.code}</span>
+                  {ln.phase ? (
+                    <span className="text-muted-foreground"> {`// ${copy.lineComments[ln.phase]}`}</span>
+                  ) : null}
+                </div>
+              );
+            })}
+          </pre>
 
-        {/* Candidate distribution for this step. */}
-        <div className="space-y-1">
-          <div
-            className="text-[11px] text-muted-foreground"
-            aria-live={playing ? 'off' : 'polite'}
-            aria-atomic="true"
-          >
-            {copy.phaseCaption[phase]}
-          </div>
+          {/* Candidate distribution for this step. The phase caption that used
+              to sit above these bars is now the frame's caption — one sentence,
+              one accessible copy, in the slot the frame reserves for it. */}
           <TopKBars ids={ids} probs={probs} texts={texts} sampledTokenId={sampledTokenId} runKey={frame} />
         </div>
-      </div>
+      </DiagramFrame>
 
-      <p className="text-[10px] text-muted-foreground">{copy.footnote}</p>
-
+      {/* The chapter's takeaway, not a diagram footnote: it stays body copy at
+          body weight, outside the frame, rather than being folded into `note`
+          (11px muted) alongside the illustrative-numbers disclaimer. */}
       <p className="text-[12px] text-foreground/85">{copy.outro}</p>
-    </div>
+    </>
   );
 }

@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import { useLocale } from '../../lib/i18n-react';
+import { DIM, DiagramFrame, EMERALD, HatchDefs, hatchFill, PanBox, RED, RX, SW, useStepPlayer } from '../motion';
 
 /**
  * StreamingSoftmaxDiagram — chapter 4 deep-dive, the "online softmax" precursor
@@ -25,10 +26,51 @@ import { useLocale } from '../../lib/i18n-react';
  * the row in chunks. m, ℓ, o are computed IN-RENDER from the scores array with
  * Math.exp, so the panel and the cells can never disagree.
  *
- * Animation model: a small set of discrete frames (one chunk consumed each),
- * advanced by a setInterval inside a guarded useEffect. Honors
- * prefers-reduced-motion (jumps straight to the final, fully-processed frame,
- * no autoplay).
+ * Animation model: `useStepPlayer` from `learn/motion`, replacing this file's
+ * former hand-rolled `setInterval` + private `usePrefersReducedMotion` + private
+ * play/step buttons. Same 6 frames at the same 1900ms pace, same wrap, and
+ * reduced-motion readers still rest on the final frame — but they now get there
+ * via an effect after mount instead of a `useState` initializer, which is also
+ * what makes flipping the OS preference mid-session work. They also keep a Step
+ * button now (the old version hid the whole control row, stranding them on the
+ * last frame with no way to reach the rescale beats, which ARE the lesson).
+ *
+ * ── THE PALETTE ─────────────────────────────────────────────────────────────
+ *
+ * `skin` allows exactly two hues and says a hue is a box's PERMANENT IDENTITY,
+ * never a state. The two things this widget contrasts are the two recipes, so
+ * they take the two hues and never change:
+ *
+ *   RED      the naïve recipe — TWO passes over the row. Expensive, and the
+ *            thing we are not doing. It appears once, on the chip that names it.
+ *   EMERALD  the streaming recipe and everything it carries: the "1 pass" chip,
+ *            the running-state panel (m, ℓ, o), and the rescale badge that keeps
+ *            that state exact. Emerald in EVERY frame, including the initial one
+ *            where the state is still empty — the state exists from the start.
+ *
+ * That also keeps this widget in step with `FlashTilingDiagram`, which renders
+ * two paragraphs further down the SAME page and paints the identical object —
+ * its "streaming softmax · running m, ℓ, Oᵢ" accumulator — EMERALD.
+ *
+ * The row of scores stays NEUTRAL: it is the input data, not one of the two
+ * recipes. Its three states ride the orthogonal channels instead —
+ *
+ *   hatch (`hatchFill`)  this chunk is being consumed THIS step; and, on the
+ *                        panel, the rescale multiply landing on m, ℓ, o
+ *   DIM.*                pending (IDLE_EDGE) / not started (EMPTY_SLOT) /
+ *                        already consumed (FILLED)
+ *
+ * Before this change every one of those states was painted `var(--primary)`
+ * (book-pink) — hue-as-state, the one thing this palette cannot do. It is now
+ * gone from the COPY too: the live m/ℓ in the counter row take
+ * `text-foreground/90`, matching both the numerals they echo inside the boxes
+ * and the chunk cell beside them in the same row; the multiplier in the rescale
+ * caption goes bare `font-mono`, matching the two spans either side of it in
+ * that same sentence. Neither number needed a hue — a third one would have read
+ * as a third actor. Legibility was never the reason: measured against the real
+ * page background (`--bg` #0f0d11, the only one this app has — there is no light
+ * theme) EMERALD reads 7.6:1 and the chosen `foreground/90` reads 12.5:1. Both
+ * clear AA. Hue-on-state is the rule being kept, not a contrast floor.
  */
 
 // ── Fixed illustrative row, split into 4 chunks of 3 ─────────────────────────
@@ -100,12 +142,13 @@ function fmt(x: number): string {
 }
 
 // ── Per-locale copy. COPY.en strings are the original English, verbatim. ─────
+//
+// Play / Pause / Step are NOT here any more: those verbs belong to the shared
+// `StepControls`, which carries its own en/zh pair so every animated widget in
+// the course says the same word.
 const COPY = {
   en: {
     title: 'Streaming softmax — the whole row in one pass',
-    pause: '❚❚ Pause',
-    play: '▶ Play',
-    step: 'Step ›',
     naiveChip: (
       <>
         naïve softmax: <span className="font-mono text-foreground/80">2 passes</span> over the row
@@ -134,7 +177,7 @@ const COPY = {
       <>
         Chunk {chunkNo} holds a bigger value (local max <span className="font-mono">{localMax}</span> &gt; old{' '}
         <span className="font-mono">m</span>). <strong>Rescale first:</strong> multiply ℓ and o by{' '}
-        <span className="font-mono text-primary">
+        <span className="font-mono">
           e<sup>m_old − m_new</sup> = {mult}
         </span>
         , then fold in this chunk&apos;s e<sup>score − m</sup> terms.
@@ -177,9 +220,9 @@ const COPY = {
     ),
     runningFooter: (mStr: string, lStr: string) => (
       <>
-        running <span className="font-mono text-primary">m = {mStr}</span>
+        running <span className="font-mono text-foreground/90">m = {mStr}</span>
         {'  ·  '}
-        running <span className="font-mono text-primary">ℓ = {lStr}</span>
+        running <span className="font-mono text-foreground/90">ℓ = {lStr}</span>
       </>
     ),
     footnote:
@@ -187,9 +230,6 @@ const COPY = {
   },
   zh: {
     title: '流式 softmax——一遍扫完整行',
-    pause: '❚❚ 暂停',
-    play: '▶ 播放',
-    step: '单步 ›',
     naiveChip: (
       <>
         朴素 softmax：<span className="font-mono text-foreground/80">2 遍</span>扫过整行
@@ -217,7 +257,7 @@ const COPY = {
       <>
         块 {chunkNo} 出现了更大的值（局部最大值 <span className="font-mono">{localMax}</span> &gt; 旧的{' '}
         <span className="font-mono">m</span>）。<strong>先重缩放：</strong>把 ℓ 和 o 乘以{' '}
-        <span className="font-mono text-primary">
+        <span className="font-mono">
           e<sup>m_old − m_new</sup> = {mult}
         </span>
         ，再并入这一块的 e<sup>score − m</sup> 项。
@@ -261,30 +301,15 @@ const COPY = {
     ),
     runningFooter: (mStr: string, lStr: string) => (
       <>
-        滚动 <span className="font-mono text-primary">m = {mStr}</span>
+        滚动 <span className="font-mono text-foreground/90">m = {mStr}</span>
         {'  ·  '}
-        滚动 <span className="font-mono text-primary">ℓ = {lStr}</span>
+        滚动 <span className="font-mono text-foreground/90">ℓ = {lStr}</span>
       </>
     ),
     footnote:
       '这个单遍重缩放，正是后来 FlashAttention 完全在 GPU 微小片上内存（SRAM）里运行的种子——因此 N×N 分数矩阵永远不必写出到慢速主内存。',
   },
 } as const;
-
-function usePrefersReducedMotion(): boolean {
-  const [reduced, setReduced] = React.useState<boolean>(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
-    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  });
-  React.useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
-    const mql = window.matchMedia('(prefers-reduced-motion: reduce)');
-    const onChange = (e: MediaQueryListEvent) => setReduced(e.matches);
-    mql.addEventListener('change', onChange);
-    return () => mql.removeEventListener('change', onChange);
-  }, []);
-  return reduced;
-}
 
 // ── SVG geometry ────────────────────────────────────────────────────────────
 const VB_W = 760;
@@ -312,226 +337,269 @@ const PANEL = {
 };
 
 export function StreamingSoftmaxDiagram() {
-  const copy = COPY[useLocale()];
-  const reducedMotion = usePrefersReducedMotion();
-  // Under reduced motion, start on the done frame and never auto-play.
-  const [frame, setFrame] = React.useState(reducedMotion ? DONE_FRAME : 0);
-  const [playing, setPlaying] = React.useState(!reducedMotion);
-
-  React.useEffect(() => {
-    if (!playing || reducedMotion) return;
-    const t = window.setInterval(() => setFrame((f) => (f + 1) % TOTAL_FRAMES), FRAME_MS);
-    return () => window.clearInterval(t);
-  }, [playing, reducedMotion]);
+  const locale = useLocale();
+  const copy = COPY[locale];
+  const player = useStepPlayer(TOTAL_FRAMES, { frameMs: FRAME_MS });
+  const { frame } = player;
 
   const chunkIdx = FRAME_CHUNKS[frame]; // -1 .. 3
   const isInitial = chunkIdx < 0;
   const isDone = frame === DONE_FRAME;
   const st = stateAfter(chunkIdx);
-  // Flash the panel on the rescale moment (only on the live chunk frame, not the
-  // repeated done frame, and never under reduced motion).
-  const flashing = st.rescaled && !isDone && !reducedMotion;
+  // The rescale moment: only on the live chunk frame, not the repeated done
+  // frame. NOT gated on reduced motion any more — the emphasis is now a static
+  // hatch plus a badge, i.e. no motion at all, so there is nothing to withhold.
+  // Withholding it used to hide the rescale beat, which is the whole lesson,
+  // from exactly the readers who can only step through it.
+  const rescaling = st.rescaled && !isDone;
 
-  const step = () => {
-    setPlaying(false);
-    setFrame((x) => (x + 1) % TOTAL_FRAMES);
+  // Plain-language caption per frame. Factored out of the render so `captions`
+  // below can be built by mapping the SAME function over every frame index —
+  // which makes the reserved slot exhaustive BY CONSTRUCTION rather than by a
+  // hand-kept list that a new branch could fall out of.
+  const captionFor = (fr: number): React.ReactNode => {
+    const ck = FRAME_CHUNKS[fr];
+    const s = stateAfter(ck);
+    if (ck < 0) return copy.captionInitial;
+    if (fr === DONE_FRAME) return copy.captionDone(fmt(s.o / s.l));
+    if (s.rescaled) return copy.captionRescaled(ck + 1, s.localMax, fmt(s.mult ?? 0));
+    return copy.captionNoRescale(ck + 1, s.localMax, fmt(s.m));
   };
 
-  // Plain-language caption per frame.
-  let caption: React.ReactNode;
-  if (isInitial) {
-    caption = copy.captionInitial;
-  } else if (isDone) {
-    caption = copy.captionDone(fmt(st.o / st.l));
-  } else if (st.rescaled) {
-    caption = copy.captionRescaled(chunkIdx + 1, st.localMax, fmt(st.mult ?? 0));
-  } else {
-    caption = copy.captionNoRescale(chunkIdx + 1, st.localMax, fmt(st.m));
-  }
+  const caption = captionFor(frame);
+  // Every caption this sweep can reach, so DiagramFrame reserves the tallest at
+  // the current width and the chapter body cannot hop when the beat changes.
+  // `frame` never leaves [0, TOTAL_FRAMES) and TOTAL_FRAMES === FRAME_CHUNKS
+  // .length, so this covers all four arms of the switch above and every value
+  // the three caption builders can be called with.
+  const captions = FRAME_CHUNKS.map((_, i) => captionFor(i));
 
   return (
-    <div className="not-prose my-5 space-y-3 rounded-md border border-border bg-background p-3">
-      {/* Header: title + controls */}
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.title}</div>
-        <div className="flex items-center gap-1">
-          {!reducedMotion ? (
-            <>
-              <button
-                type="button"
-                onClick={() => setPlaying((p) => !p)}
-                aria-pressed={playing}
-                className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-              >
-                {playing ? copy.pause : copy.play}
-              </button>
-              <button
-                type="button"
-                onClick={step}
-                className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-              >
-                {copy.step}
-              </button>
-            </>
-          ) : null}
-        </div>
-      </div>
-
-      {/* Pass-count contrast chips (static) */}
+    <DiagramFrame
+      title={copy.title}
+      player={player}
+      locale={locale}
+      caption={caption}
+      captions={captions}
+      note={copy.footnote}
+    >
+      {/* Pass-count contrast chips (static). The two recipes are the two things
+          this widget contrasts, so they are where the two hues live: RED for the
+          expensive two-pass one, EMERALD for the one-pass one the rest of the
+          diagram then carries out. Neither ever changes — they are labels, not
+          state. The tinted `bg-*` fills are gone with them: RED and EMERALD both
+          clear 4.5:1 against the page background, but RED lands at 3.9:1 on
+          `--muted`, which is a fail for 11px text. */}
       <div className="flex flex-wrap items-center gap-2">
-        <span className="inline-flex items-center gap-1.5 rounded border border-border bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+        <span
+          className="inline-flex items-center gap-1.5 rounded border px-2 py-0.5 text-[11px]"
+          style={{ borderColor: RED, color: RED }}
+        >
           {copy.naiveChip}
         </span>
-        <span className="inline-flex items-center gap-1.5 rounded border border-primary bg-primary/10 px-2 py-0.5 text-[11px] text-primary">
+        <span
+          className="inline-flex items-center gap-1.5 rounded border px-2 py-0.5 text-[11px]"
+          style={{ borderColor: EMERALD, color: EMERALD }}
+        >
           {copy.streamChip}
         </span>
       </div>
 
-      {/* The diagram */}
-      <svg
-        viewBox={`0 0 ${VB_W} ${VB_H}`}
-        className="w-full"
-        role="img"
-        aria-label={copy.ariaLabel}
-      >
-        {/* ── The row of scores, grouped into 4 chunks ── */}
-        {SCORES.map((s, i) => {
-          const chunk = Math.floor(i / CHUNK_SIZE);
-          const isCurrent = !isInitial && chunk === chunkIdx;
-          const isConsumed = !isInitial && chunk < chunkIdx;
-          const x = cellX(i);
-          return (
-            <g key={i} style={{ opacity: isInitial ? 0.55 : isCurrent ? 1 : isConsumed ? 0.85 : 0.4 }}>
-              <rect
-                x={x}
-                y={ROW_Y}
-                width={CELL_W}
-                height={CELL_H}
-                rx={6}
+      {/* The diagram.
+
+          `min-w` is the legibility floor that pairs with the `PanBox` around
+          the svg — and around the svg ONLY: the chips above and the counters
+          below are siblings, so they size to the visible width and never scroll
+          out of reach. A bare `w-full` svg does not reflow in a narrow column,
+          it SCALES — at a 375px viewport the 760-wide viewBox rendered at 320,
+          dragging every label down with it. The floor stops the shrink and the
+          box pans the rest.
+
+          8px is the smallest a label may render at, and the smallest size a
+          reader has to READ here is 10px — the chunk labels, the three panel
+          headings, "answer so far", and the rescale badge:
+
+            8 * 760 / 10 = 608
+
+          The 7px `score − m` inside two of those headings is deliberately NOT
+          the number we size against. It is a genuine superscript — the exponent
+          of e, raised by `dy={-3}` and returned to the baseline by the `dy={3}`
+          tspan after it, the same shape the captions write as e^(score − m).
+          Superscripts are meant to sit under their base, and sizing the whole
+          canvas to one would push the floor past the viewBox itself. */}
+      <PanBox locale={locale}>
+        <svg viewBox={`0 0 ${VB_W} ${VB_H}`} className="w-full min-w-[608px]" role="img" aria-label={copy.ariaLabel}>
+          <HatchDefs />
+
+          {/* ── The row of scores, grouped into 4 chunks ── */}
+          {SCORES.map((s, i) => {
+            const chunk = Math.floor(i / CHUNK_SIZE);
+            const isCurrent = !isInitial && chunk === chunkIdx;
+            const isConsumed = !isInitial && chunk < chunkIdx;
+            const x = cellX(i);
+            return (
+              // The four opacities were already exactly the skin's ladder before
+              // this conversion; only the names changed.
+              <g
+                key={i}
                 style={{
-                  fill: isCurrent ? 'var(--primary)' : 'var(--card)',
-                  fillOpacity: isCurrent ? 0.16 : 1,
-                  stroke: isCurrent ? 'var(--primary)' : 'var(--border)',
+                  opacity: isInitial
+                    ? DIM.EMPTY_SLOT
+                    : isCurrent
+                      ? 1
+                      : isConsumed
+                        ? DIM.FILLED
+                        : DIM.IDLE_EDGE,
                 }}
-                strokeWidth={isCurrent ? 2 : 1.5}
-              />
-              <text
-                x={x + CELL_W / 2}
-                y={ROW_Y + CELL_H / 2 + 5}
-                textAnchor="middle"
-                style={{ fill: isCurrent ? 'var(--primary)' : 'var(--foreground)' }}
-                className="font-mono text-[14px] font-semibold"
               >
-                {s}
-              </text>
-            </g>
-          );
-        })}
-        {/* chunk labels under each group */}
-        {Array.from({ length: CHUNK_COUNT }, (_, k) => {
-          const [s] = chunkRange(k);
-          const cx = cellX(s) + (CHUNK_SIZE * (CELL_W + CELL_GAP) - CELL_GAP) / 2;
-          const isCurrent = !isInitial && k === chunkIdx;
-          return (
-            <text
-              key={k}
-              x={cx}
-              y={ROW_Y + CELL_H + 16}
-              textAnchor="middle"
-              style={{ fill: isCurrent ? 'var(--primary)' : 'var(--muted-foreground)' }}
-              className="text-[10px] font-medium"
-            >
-              {copy.chunkLabel(k + 1)}
-            </text>
-          );
-        })}
-        <text x={ROW_X} y={ROW_Y - 12} style={{ fill: 'var(--muted-foreground)' }} className="text-[11px]">
-          {copy.rowLabel}
-        </text>
-
-        {/* ── Running-state panel: m, ℓ, o ── */}
-        <g className={flashing ? 'animate-pulse' : undefined}>
-          {/* m */}
-          <StateBox x={PANEL.m.x} w={PANEL.m.w} flashing={flashing}>
-            <text x={PANEL.m.x + 12} y={PANEL_Y + 20} style={{ fill: 'var(--muted-foreground)' }} className="text-[10px]">
-              {copy.runningMax}
-            </text>
-            <text
-              x={PANEL.m.x + 12}
-              y={PANEL_Y + 46}
-              style={{ fill: 'var(--foreground)' }}
-              className="font-mono text-[18px] font-semibold"
-            >
-              m = {Number.isFinite(st.m) ? fmt(st.m) : '−∞'}
-            </text>
-          </StateBox>
-
-          {/* ℓ */}
-          <StateBox x={PANEL.l.x} w={PANEL.l.w} flashing={flashing}>
-            <text x={PANEL.l.x + 12} y={PANEL_Y + 20} style={{ fill: 'var(--muted-foreground)' }} className="text-[10px]">
-              {copy.runningSum}
-            </text>
-            <text
-              x={PANEL.l.x + 12}
-              y={PANEL_Y + 46}
-              style={{ fill: 'var(--foreground)' }}
-              className="font-mono text-[18px] font-semibold"
-            >
-              ℓ = {fmt(st.l)}
-            </text>
-          </StateBox>
-
-          {/* o */}
-          <StateBox x={PANEL.o.x} w={PANEL.o.w} flashing={flashing}>
-            <text x={PANEL.o.x + 12} y={PANEL_Y + 20} style={{ fill: 'var(--muted-foreground)' }} className="text-[10px]">
-              {copy.outputAcc}
-            </text>
-            <text
-              x={PANEL.o.x + 12}
-              y={PANEL_Y + 46}
-              style={{ fill: 'var(--foreground)' }}
-              className="font-mono text-[18px] font-semibold"
-            >
-              o = {fmt(st.o)}
-            </text>
-            <text x={PANEL.o.x + 12} y={PANEL_Y + 64} style={{ fill: 'var(--muted-foreground)' }} className="text-[10px]">
-              {copy.answerSoFar}
-              <tspan className="font-mono" style={{ fill: 'var(--foreground)' }}>
-                o / ℓ = {st.l > 0 ? fmt(st.o / st.l) : '—'}
-              </tspan>
-            </text>
-          </StateBox>
-
-          {/* Rescale badge — only on a real rescale frame */}
-          {flashing ? (
-            <g>
-              <rect
-                x={PANEL.l.x + PANEL.l.w / 2 - 86}
-                y={PANEL_Y - 26}
-                width={172}
-                height={20}
-                rx={10}
-                style={{ fill: 'var(--primary)', stroke: 'var(--primary)' }}
-                strokeWidth={1}
-              />
+                {/* Neutral in every frame — a score is a score, whichever chunk it
+                    is in. "Being consumed right now" is the hatch, which is the
+                    one state cue that does not spend a hue and still reads in
+                    monochrome. The stroke never changes, so nothing here flips. */}
+                <rect
+                  x={x}
+                  y={ROW_Y}
+                  width={CELL_W}
+                  height={CELL_H}
+                  rx={RX}
+                  fill={isCurrent ? hatchFill('muted') : 'none'}
+                  style={{ stroke: 'var(--border)' }}
+                  strokeWidth={SW.INNER}
+                />
+                <text
+                  x={x + CELL_W / 2}
+                  y={ROW_Y + CELL_H / 2 + 5}
+                  textAnchor="middle"
+                  style={{ fill: 'var(--foreground)' }}
+                  className="font-mono text-[14px] font-semibold"
+                >
+                  {s}
+                </text>
+              </g>
+            );
+          })}
+          {/* chunk labels under each group */}
+          {Array.from({ length: CHUNK_COUNT }, (_, k) => {
+            const [s] = chunkRange(k);
+            const cx = cellX(s) + (CHUNK_SIZE * (CELL_W + CELL_GAP) - CELL_GAP) / 2;
+            const isCurrent = !isInitial && k === chunkIdx;
+            return (
               <text
-                x={PANEL.l.x + PANEL.l.w / 2}
-                y={PANEL_Y - 12}
+                key={k}
+                x={cx}
+                y={ROW_Y + CELL_H + 16}
                 textAnchor="middle"
-                style={{ fill: 'var(--bg)' }}
-                className="font-mono text-[10px] font-semibold"
+                // A tone step, not a hue: the label of the chunk being consumed
+                // comes forward to full foreground, the rest stay muted.
+                style={{ fill: isCurrent ? 'var(--foreground)' : 'var(--muted-foreground)' }}
+                className="text-[10px] font-medium"
               >
-                {copy.rescaleBadge(fmt(st.mult ?? 0))}
+                {copy.chunkLabel(k + 1)}
               </text>
-            </g>
-          ) : null}
-        </g>
-      </svg>
+            );
+          })}
+          <text x={ROW_X} y={ROW_Y - 12} style={{ fill: 'var(--muted-foreground)' }} className="text-[11px]">
+            {copy.rowLabel}
+          </text>
 
-      {/* Caption — what this chunk does */}
-      <p className="min-h-[3.25rem] text-[13px] text-foreground/90">{caption}</p>
+          {/* ── Running-state panel: m, ℓ, o ──
+              This group used to carry `className="animate-pulse"` on rescale
+              frames. A CSS animation cannot see the JS frame timer, so pressing
+              Pause stopped the sweep while this kept breathing — a Pause button
+              that visibly does not pause (WCAG 2.2.2 Pause, Stop, Hide). The
+              emphasis is now entirely static: the boxes take the hatch on the
+              frame the rescale lands, and the badge below appears. Nothing here
+              moves at all, so there is nothing left for Pause to fail to stop. ── */}
+          <g>
+            {/* m */}
+            <StateBox x={PANEL.m.x} w={PANEL.m.w} busy={rescaling}>
+              <text x={PANEL.m.x + 12} y={PANEL_Y + 20} style={{ fill: 'var(--muted-foreground)' }} className="text-[10px]">
+                {copy.runningMax}
+              </text>
+              <text
+                x={PANEL.m.x + 12}
+                y={PANEL_Y + 46}
+                style={{ fill: 'var(--foreground)' }}
+                className="font-mono text-[18px] font-semibold"
+              >
+                m = {Number.isFinite(st.m) ? fmt(st.m) : '−∞'}
+              </text>
+            </StateBox>
 
-      {/* Live counters */}
+            {/* ℓ */}
+            <StateBox x={PANEL.l.x} w={PANEL.l.w} busy={rescaling}>
+              <text x={PANEL.l.x + 12} y={PANEL_Y + 20} style={{ fill: 'var(--muted-foreground)' }} className="text-[10px]">
+                {copy.runningSum}
+              </text>
+              <text
+                x={PANEL.l.x + 12}
+                y={PANEL_Y + 46}
+                style={{ fill: 'var(--foreground)' }}
+                className="font-mono text-[18px] font-semibold"
+              >
+                ℓ = {fmt(st.l)}
+              </text>
+            </StateBox>
+
+            {/* o */}
+            <StateBox x={PANEL.o.x} w={PANEL.o.w} busy={rescaling}>
+              <text x={PANEL.o.x + 12} y={PANEL_Y + 20} style={{ fill: 'var(--muted-foreground)' }} className="text-[10px]">
+                {copy.outputAcc}
+              </text>
+              <text
+                x={PANEL.o.x + 12}
+                y={PANEL_Y + 46}
+                style={{ fill: 'var(--foreground)' }}
+                className="font-mono text-[18px] font-semibold"
+              >
+                o = {fmt(st.o)}
+              </text>
+              <text x={PANEL.o.x + 12} y={PANEL_Y + 64} style={{ fill: 'var(--muted-foreground)' }} className="text-[10px]">
+                {copy.answerSoFar}
+                <tspan className="font-mono" style={{ fill: 'var(--foreground)' }}>
+                  o / ℓ = {st.l > 0 ? fmt(st.o / st.l) : '—'}
+                </tspan>
+              </text>
+            </StateBox>
+
+            {/* Rescale badge — only on a real rescale frame. EMERALD like the
+                panel it annotates: it is the operation that keeps that running
+                state exact, not a separate actor. The badge's existence is the
+                state; its hue never changes. */}
+            {rescaling ? (
+              <g>
+                {/* DOCUMENTED CARVE-OUT: this `rx` stays 10, not RX. At height 20
+                    that is a stadium pill, and it is the only pill on the diagram
+                    — squaring it would turn a badge into a fifth rectangle sitting
+                    among four real boxes. Every other `rx` in this file is RX. */}
+                <rect
+                  x={PANEL.l.x + PANEL.l.w / 2 - 86}
+                  y={PANEL_Y - 26}
+                  width={172}
+                  height={20}
+                  rx={10}
+                  style={{ fill: EMERALD, stroke: EMERALD }}
+                  strokeWidth={SW.INNER}
+                />
+                <text
+                  x={PANEL.l.x + PANEL.l.w / 2}
+                  y={PANEL_Y - 12}
+                  textAnchor="middle"
+                  style={{ fill: 'var(--bg)' }}
+                  className="font-mono text-[10px] font-semibold"
+                >
+                  {copy.rescaleBadge(fmt(st.mult ?? 0))}
+                </text>
+              </g>
+            ) : null}
+          </g>
+        </svg>
+      </PanBox>
+
+      {/* Live counters. These stay the widget's own node inside the frame:
+          `StepControls` renders play/step and nothing else, and the captions
+          only name the chunk on the middle four frames — so dropping this row
+          would lose "chunk 0 / 4 · not started" and the live m/ℓ readout. */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-3">
         <div className="text-[11px] text-muted-foreground">
           {isInitial ? copy.chunkNotStarted : copy.chunkProgress(Math.min(chunkIdx + 1, CHUNK_COUNT))}
@@ -540,24 +608,19 @@ export function StreamingSoftmaxDiagram() {
           {copy.runningFooter(Number.isFinite(st.m) ? fmt(st.m) : '−∞', fmt(st.l))}
         </div>
       </div>
-
-      <p className="text-[10px] text-muted-foreground/70">{copy.footnote}</p>
-    </div>
+    </DiagramFrame>
   );
 }
 
-/** One running-state box (m / ℓ / o). Highlighted while the panel flashes. */
-function StateBox({
-  x,
-  w,
-  flashing,
-  children,
-}: {
-  x: number;
-  w: number;
-  flashing: boolean;
-  children: React.ReactNode;
-}) {
+/**
+ * One running-state box (m / ℓ / o).
+ *
+ * EMERALD in every frame — the running state is what this widget is about, and
+ * it exists from the initial frame onward (empty, but there: m = −∞, ℓ = 0).
+ * `busy` is the rescale landing on it, carried by the hatch rather than by a
+ * hue swap or a third stroke width.
+ */
+function StateBox({ x, w, busy, children }: { x: number; w: number; busy: boolean; children: React.ReactNode }) {
   return (
     <g>
       <rect
@@ -565,13 +628,10 @@ function StateBox({
         y={PANEL_Y}
         width={w}
         height={PANEL_H}
-        rx={8}
-        style={{
-          fill: flashing ? 'var(--primary)' : 'var(--card)',
-          fillOpacity: flashing ? 0.1 : 1,
-          stroke: flashing ? 'var(--primary)' : 'var(--border)',
-        }}
-        strokeWidth={flashing ? 2 : 1.5}
+        rx={RX}
+        fill={busy ? hatchFill('emerald') : 'none'}
+        style={{ stroke: EMERALD }}
+        strokeWidth={SW.OUTER}
       />
       {children}
     </g>

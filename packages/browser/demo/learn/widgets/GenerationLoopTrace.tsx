@@ -2,6 +2,7 @@ import * as React from 'react';
 
 import { useLocale } from '../../lib/i18n-react';
 import { TopKBars, cleanupTokenText } from '../inspector/TopKBars';
+import { DiagramFrame, useStepPlayer } from '../motion';
 import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
 
 /**
@@ -22,6 +23,18 @@ import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
  * This is deliberately distinct from the in-chapter `DecodeAnimation` in the
  * Try-It panel (which draws bespoke SVG attention arcs and has no cache
  * toggle): here it's a token strip + per-step TopKBars + a per-step work bar.
+ *
+ * Animation model: `useStepPlayer` + `DiagramFrame` from `learn/motion`,
+ * replacing this file's former hand-rolled `setInterval`, its private
+ * `prefersReducedMotion()` read inside a `useState` initializer, and its own
+ * play/pause button, header, caption paragraph and footnote. There is no `<svg>`
+ * here at all, so this is a KIT-ONLY adoption — none of the skin's drawing
+ * tokens (RX / SW / DASH / PanelFrame …) have anything to apply to.
+ *
+ * The KV-cache toggle is NOT a frame control, so it stays with the widget,
+ * inside `children` directly above the body — and because it swaps one whole
+ * family of captions for another, BOTH families are listed in `captions` so the
+ * slot is sized for the tallest either mode can produce.
  */
 
 // Scripted sequence. Prompt is prefilled once; the rest is decoded one token
@@ -63,11 +76,13 @@ const DECODE_STEPS: ReadonlyArray<{ cands: Cand[] }> = [
 ];
 
 // Per-locale copy. COPY.en is the original English, moved verbatim.
+//
+// Play / Pause are NOT here any more: those verbs now belong to the shared
+// `StepControls`, which carries its own en/zh pair so every animated widget in
+// the course says the same word.
 const COPY = {
   en: {
     title: 'The generation loop — KV reuse vs recompute',
-    pause: '❚❚ Pause',
-    play: '▶ Play',
     kvCacheLabel: 'KV cache',
     toggleAria: 'KV cache toggle',
     toggleOn: 'on',
@@ -107,8 +122,6 @@ const COPY = {
   },
   zh: {
     title: '生成循环——KV 复用 vs 重新计算',
-    pause: '❚❚ 暂停',
-    play: '▶ 播放',
     kvCacheLabel: 'KV 缓存',
     toggleAria: 'KV 缓存开关',
     toggleOn: '开',
@@ -150,21 +163,12 @@ const PROMPT_LEN = PROMPT.length;
 const TOTAL_FRAMES = 1 + GENERATED.length;
 const FRAME_MS = 1300;
 
-const prefersReducedMotion = (): boolean =>
-  typeof window !== 'undefined' ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false;
-
 export function GenerationLoopTrace() {
-  const copy = COPY[useLocale()];
-  // Animation guard: don't auto-play under prefers-reduced-motion.
-  const [playing, setPlaying] = React.useState<boolean>(() => !prefersReducedMotion());
-  const [frame, setFrame] = React.useState(0);
+  const locale = useLocale();
+  const copy = COPY[locale];
+  const player = useStepPlayer(TOTAL_FRAMES, { frameMs: FRAME_MS });
+  const { frame } = player;
   const [cacheOn, setCacheOn] = React.useState(true);
-
-  React.useEffect(() => {
-    if (!playing) return undefined;
-    const id = window.setInterval(() => setFrame((f) => (f + 1) % TOTAL_FRAMES), FRAME_MS);
-    return () => window.clearInterval(id);
-  }, [playing]);
 
   const isPrefill = frame === 0;
   const decodeIdx = frame - 1; // valid only when !isPrefill
@@ -205,136 +209,164 @@ export function GenerationLoopTrace() {
   const texts = cands.map((c) => c.text);
   const sampledTokenId = isPrefill ? -1 : 0;
 
+  // The per-beat sentence. Exactly three arms, and the cache toggle picks
+  // between the last two.
+  const caption = isPrefill
+    ? copy.prefillExplain(PROMPT_LEN)
+    : cacheOn
+      ? copy.cacheOnExplain(priorLen)
+      : copy.cacheOffExplain(priorLen, workThisStep);
+
+  // Every caption this sweep can reach, so DiagramFrame reserves the tallest and
+  // the chapter body cannot hop when the beat changes. All three arms are
+  // builders, so each is mapped over the full set of arguments it can be called
+  // with — read straight off the derivations above:
+  //   prefill  → prefillExplain(PROMPT_LEN), one fixed call (frame 0 only).
+  //   decode   → decodeIdx = frame - 1 walks [0, GENERATED.length), so
+  //              priorLen = PROMPT_LEN + k and, in the OFF arm,
+  //              workThisStep = priorLen + 1. Both cache modes are listed
+  //              because the toggle swaps one whole family for the other and the
+  //              OFF sentences are the longer ones.
+  const decodeIdxs = Array.from({ length: GENERATED.length }, (_, k) => k);
+  const captions = [
+    copy.prefillExplain(PROMPT_LEN),
+    ...decodeIdxs.map((k) => copy.cacheOnExplain(PROMPT_LEN + k)),
+    ...decodeIdxs.map((k) => copy.cacheOffExplain(PROMPT_LEN + k, PROMPT_LEN + k + 1)),
+  ];
+
   return (
-    <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.title}</div>
-        <button
-          type="button"
-          onClick={() => setPlaying((p) => !p)}
-          aria-pressed={playing}
-          className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
-        >
-          {playing ? copy.pause : copy.play}
-        </button>
-      </div>
+    <DiagramFrame
+      title={copy.title}
+      player={player}
+      locale={locale}
+      caption={caption}
+      captions={captions}
+      note={
+        // `summary` is body prose and would normally sit OUTSIDE the frame (see
+        // GenerationLoop). Here it is authored BEFORE the footnote, and moving
+        // only one of them out would flip the reading order — so both stay, and
+        // `summary` carries its own tier explicitly rather than inheriting the
+        // 11px footnote size.
+        <>
+          <p className="text-[12px] text-foreground/85">{copy.summary}</p>
+          <p>{copy.footnote}</p>
+        </>
+      }
+    >
+      {/* The body keeps its own tighter rhythm; DiagramFrame's `space-y-4` is
+          for the frame's own parts. */}
+      <div className="space-y-3">
+        {/* Cache toggle — an extra control the frame does not own, so it stays
+            with the widget, directly above the diagram body. */}
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[11px] uppercase tracking-wider text-muted-foreground">{copy.kvCacheLabel}</span>
+          <SegmentedToggle
+            value={cacheOn}
+            onChange={setCacheOn}
+            ariaLabel={copy.toggleAria}
+            options={[
+              { value: true, label: copy.toggleOn },
+              { value: false, label: copy.toggleOff },
+            ]}
+          />
+          <span className="text-[11px] text-muted-foreground">{cacheOn ? copy.hintOn : copy.hintOff}</span>
+        </div>
 
-      {/* Cache toggle. */}
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-[11px] uppercase tracking-wider text-muted-foreground">{copy.kvCacheLabel}</span>
-        <SegmentedToggle
-          value={cacheOn}
-          onChange={setCacheOn}
-          ariaLabel={copy.toggleAria}
-          options={[
-            { value: true, label: copy.toggleOn },
-            { value: false, label: copy.toggleOff },
-          ]}
-        />
-        <span className="text-[11px] text-muted-foreground">{cacheOn ? copy.hintOn : copy.hintOff}</span>
-      </div>
-
-      {/* Token strip: wide/dim prompt (prefilled in parallel) + decode chips. */}
-      <div className="flex flex-wrap items-center gap-1 rounded-md border border-border/60 bg-muted/30 p-2">
-        <span className="mr-1 text-[10px] uppercase tracking-wider text-muted-foreground">{copy.prefillStrip}</span>
-        {PROMPT.map((t, i) => (
-          <span
-            key={`p-${i}`}
-            className={[
-              'rounded px-2 py-0.5 font-mono text-[11px] tracking-wide transition-colors',
-              isPrefill ? 'bg-primary/15 text-primary ring-1 ring-primary/40' : 'bg-background text-muted-foreground',
-            ].join(' ')}
-          >
-            {cleanupTokenText(t)}
-          </span>
-        ))}
-        <span className="mx-1 text-muted-foreground" aria-hidden>
-          →
-        </span>
-        <span className="mr-1 text-[10px] uppercase tracking-wider text-muted-foreground">{copy.decodeStrip}</span>
-        {generated.map((t, i) => (
-          <span
-            key={`g-${i}`}
-            className={[
-              'rounded px-1.5 py-0.5 font-mono text-[11px] transition-colors',
-              i === flashIndex
-                ? 'bg-primary/20 text-primary ring-1 ring-primary/40'
-                : 'bg-primary/10 text-foreground/90',
-            ].join(' ')}
-          >
-            {cleanupTokenText(t)}
-          </span>
-        ))}
-        <span className="ml-0.5 font-mono text-[11px] text-muted-foreground" aria-hidden>
-          ▮
-        </span>
-      </div>
-
-      <div className="grid gap-3 sm:grid-cols-2">
-        {/* Per-step work meter — the heart of the cache contrast. */}
-        <div className="space-y-2">
-          <div className="flex items-baseline justify-between text-[11px]">
-            <span className="text-muted-foreground">
-              {isPrefill ? copy.prefillStep : copy.decodeStep(decodeIdx + 1, GENERATED.length)}
+        {/* Token strip: wide/dim prompt (prefilled in parallel) + decode chips. */}
+        <div className="flex flex-wrap items-center gap-1 rounded-md border border-border/60 bg-muted/30 p-2">
+          <span className="mr-1 text-[10px] uppercase tracking-wider text-muted-foreground">{copy.prefillStrip}</span>
+          {PROMPT.map((t, i) => (
+            <span
+              key={`p-${i}`}
+              className={[
+                'rounded px-2 py-0.5 font-mono text-[11px] tracking-wide transition-colors',
+                isPrefill ? 'bg-primary/15 text-primary ring-1 ring-primary/40' : 'bg-background text-muted-foreground',
+              ].join(' ')}
+            >
+              {cleanupTokenText(t)}
             </span>
-            <span className="font-mono text-foreground/85">{copy.positionsProcessed(workThisStep)}</span>
-          </div>
-          <div
-            className="relative h-6 w-full overflow-hidden rounded-sm bg-muted/60"
-            role="img"
-            aria-label={copy.workBarAria(workThisStep, maxWork)}
-          >
-            <div
-              className="absolute inset-y-0 left-0 transition-all"
-              style={{
-                width: `${Math.max(2, Math.min(100, workPct)).toFixed(1)}%`,
-                backgroundColor: isPrefill ? '#94a3b8' : cacheOn ? '#22c55e' : '#ef4444',
-              }}
-            />
-          </div>
-          <p className="text-[11px] leading-relaxed text-muted-foreground">
-            {isPrefill
-              ? copy.prefillExplain(PROMPT_LEN)
-              : cacheOn
-                ? copy.cacheOnExplain(priorLen)
-                : copy.cacheOffExplain(priorLen, workThisStep)}
-          </p>
-
-          {/* Running totals — the cumulative gap is the point. Both rows stay
-              visible; the active cache mode is accented. */}
-          <div className="rounded-md border border-border/60 bg-muted/30 p-2">
-            <div className="mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">{copy.totalsTitle}</div>
-            <div
+          ))}
+          <span className="mx-1 text-muted-foreground" aria-hidden>
+            →
+          </span>
+          <span className="mr-1 text-[10px] uppercase tracking-wider text-muted-foreground">{copy.decodeStrip}</span>
+          {generated.map((t, i) => (
+            <span
+              key={`g-${i}`}
               className={[
-                'flex items-baseline justify-between gap-2 font-mono text-[12px]',
-                cacheOn ? 'font-semibold text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground',
+                'rounded px-1.5 py-0.5 font-mono text-[11px] transition-colors',
+                i === flashIndex
+                  ? 'bg-primary/20 text-primary ring-1 ring-primary/40'
+                  : 'bg-primary/10 text-foreground/90',
               ].join(' ')}
             >
-              <span>{copy.totalOnRow(onTerms.join(' + '))}</span>
-              <span className="text-sm">= {totalOn}</span>
-            </div>
-            <div
-              className={[
-                'flex items-baseline justify-between gap-2 font-mono text-[12px]',
-                !cacheOn ? 'font-semibold text-red-600 dark:text-red-400' : 'text-muted-foreground',
-              ].join(' ')}
-            >
-              <span>{copy.totalOffRow(offTerms.join(' + '))}</span>
-              <span className="text-sm">= {totalOff}</span>
-            </div>
-          </div>
+              {cleanupTokenText(t)}
+            </span>
+          ))}
+          <span className="ml-0.5 font-mono text-[11px] text-muted-foreground" aria-hidden>
+            ▮
+          </span>
         </div>
 
-        {/* Current decode step's next-token distribution. */}
-        <div className="space-y-1">
-          <div className="text-[11px] text-muted-foreground">{isPrefill ? copy.barsPrefill : copy.barsDecode}</div>
-          <TopKBars ids={ids} probs={probs} texts={texts} sampledTokenId={sampledTokenId} runKey={frame + 1} />
+        <div className="grid gap-3 sm:grid-cols-2">
+          {/* Per-step work meter — the heart of the cache contrast. */}
+          <div className="space-y-2">
+            <div className="flex items-baseline justify-between text-[11px]">
+              <span className="text-muted-foreground">
+                {isPrefill ? copy.prefillStep : copy.decodeStep(decodeIdx + 1, GENERATED.length)}
+              </span>
+              <span className="font-mono text-foreground/85">{copy.positionsProcessed(workThisStep)}</span>
+            </div>
+            <div
+              className="relative h-6 w-full overflow-hidden rounded-sm bg-muted/60"
+              role="img"
+              aria-label={copy.workBarAria(workThisStep, maxWork)}
+            >
+              <div
+                className="absolute inset-y-0 left-0 transition-all"
+                style={{
+                  width: `${Math.max(2, Math.min(100, workPct)).toFixed(1)}%`,
+                  backgroundColor: isPrefill ? '#94a3b8' : cacheOn ? '#22c55e' : '#ef4444',
+                }}
+              />
+            </div>
+
+            {/* The per-step explanation that used to sit here is now the frame's
+                caption — one accessible copy, and a slot sized for the tallest
+                sentence either cache mode can reach.
+
+                Running totals — the cumulative gap is the point. Both rows stay
+                visible; the active cache mode is accented. */}
+            <div className="rounded-md border border-border/60 bg-muted/30 p-2">
+              <div className="mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">{copy.totalsTitle}</div>
+              <div
+                className={[
+                  'flex items-baseline justify-between gap-2 font-mono text-[12px]',
+                  cacheOn ? 'font-semibold text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground',
+                ].join(' ')}
+              >
+                <span>{copy.totalOnRow(onTerms.join(' + '))}</span>
+                <span className="text-sm">= {totalOn}</span>
+              </div>
+              <div
+                className={[
+                  'flex items-baseline justify-between gap-2 font-mono text-[12px]',
+                  !cacheOn ? 'font-semibold text-red-600 dark:text-red-400' : 'text-muted-foreground',
+                ].join(' ')}
+              >
+                <span>{copy.totalOffRow(offTerms.join(' + '))}</span>
+                <span className="text-sm">= {totalOff}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Current decode step's next-token distribution. */}
+          <div className="space-y-1">
+            <div className="text-[11px] text-muted-foreground">{isPrefill ? copy.barsPrefill : copy.barsDecode}</div>
+            <TopKBars ids={ids} probs={probs} texts={texts} sampledTokenId={sampledTokenId} runKey={frame + 1} />
+          </div>
         </div>
       </div>
-
-      <p className="text-[12px] text-foreground/85">{copy.summary}</p>
-
-      <p className="text-[10px] text-muted-foreground">{copy.footnote}</p>
-    </div>
+    </DiagramFrame>
   );
 }

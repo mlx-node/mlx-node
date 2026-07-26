@@ -9,6 +9,7 @@ import {
   FlowDots,
   FrameLabel,
   HatchDefs,
+  PanBox,
   PanelFrame,
   RED,
   RX,
@@ -172,6 +173,20 @@ const DONE_FRAME = TOTAL_FRAMES - 1;
 // The height is whatever the stack needs (376 + a 16 margin). A four-block
 // vertical stack in a narrow column comes out TALLER than wide; forcing it to
 // 16:9 is what pushed the width to 700 in the first place.
+//
+// That whole argument is about a DESKTOP column, and on a phone it turns back
+// against us: at a 375px viewport the column is 320, so the scale is 0.70 and
+// the 9px lane captions land at 6.26 CSS px — measured, not estimated. `w-full`
+// does not reflow a drawing when the column narrows, it SHRINKS it, text and
+// all. So the svg carries a min-width floor and a `PanBox` around it lets the
+// reader pan sideways for the rest instead of squinting at all of it.
+//
+// The floor is 8 * VB_W / (the smallest font a reader actually has to READ).
+// Nothing on this canvas is decorative — the 9px lane captions are the ONLY
+// thing telling the forward lane from the gradient lane, which is the lesson —
+// so the smallest font is also the floor font: 8 * 460 / 9 = 409. That sits
+// under the 460 canvas, so the pan is a few pixels on a phone and desktop never
+// overflows at all.
 const VB_W = 460;
 const VB_H = 392;
 const CX = VB_W / 2;
@@ -279,170 +294,176 @@ export function BackpropFlowDiagram() {
       captions={captions}
       note={copy.footer}
     >
-      <svg viewBox={`0 0 ${VB_W} ${VB_H}`} className="w-full" role="img" aria-label={copy.svgAria}>
-        <HatchDefs />
-        <defs>
-          <marker id="bp-fwd" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-            <path d="M 0 0 L 10 5 L 0 10 Z" style={{ fill: 'var(--muted-foreground)' }} opacity={DIM.IDLE_EDGE} />
-          </marker>
-          <marker id="bp-grad" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-            <path d="M 0 0 L 10 5 L 0 10 Z" style={{ fill: EMERALD }} />
-          </marker>
-        </defs>
+      {/* 8px floor: 8 * 460 / 9 = 409, the 9 being COL_LABEL_FONT. See the
+          geometry note above for why 9 is the size a reader must read. The
+          floor is on the svg alone, inside `PanBox` — nothing else in here is a
+          sibling, but keeping it that way is the contract `PanBox` documents. */}
+      <PanBox locale={locale}>
+        <svg viewBox={`0 0 ${VB_W} ${VB_H}`} className="w-full min-w-[409px]" role="img" aria-label={copy.svgAria}>
+          <HatchDefs />
+          <defs>
+            <marker id="bp-fwd" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+              <path d="M 0 0 L 10 5 L 0 10 Z" style={{ fill: 'var(--muted-foreground)' }} opacity={DIM.IDLE_EDGE} />
+            </marker>
+            <marker id="bp-grad" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+              <path d="M 0 0 L 10 5 L 0 10 Z" style={{ fill: EMERALD }} />
+            </marker>
+          </defs>
 
-        {/* ── Loss node at the top: RED in every frame — it is the head of the
-            backward pass, not a state that comes and goes. ── */}
-        <PanelFrame x={LOSS_X} y={LOSS_Y} w={LOSS_W} h={LOSS_H} tone="red" fill="none" />
-        <text
-          x={CX}
-          y={LOSS_CY + 4}
-          textAnchor="middle"
-          style={{ fill: RED }}
-          className="text-[10px] font-semibold uppercase tracking-wider"
-        >
-          {copy.oneNumber}
-        </text>
+          {/* ── Loss node at the top: RED in every frame — it is the head of the
+              backward pass, not a state that comes and goes. ── */}
+          <PanelFrame x={LOSS_X} y={LOSS_Y} w={LOSS_W} h={LOSS_H} tone="red" fill="none" />
+          <text
+            x={CX}
+            y={LOSS_CY + 4}
+            textAnchor="middle"
+            style={{ fill: RED }}
+            className="text-[10px] font-semibold uppercase tracking-wider"
+          >
+            {copy.oneNumber}
+          </text>
 
-        {/* ── Ellipsis between layer 24 and layer 1 ── */}
-        <text
-          x={CX}
-          y={(blockY(1) + BLOCK_H + blockY(2)) / 2 + 4}
-          textAnchor="middle"
-          style={{ fill: 'var(--muted-foreground)' }}
-          className="font-mono text-[11px]"
-        >
-          {copy.moreLayers}
-        </text>
+          {/* ── Ellipsis between layer 24 and layer 1 ── */}
+          <text
+            x={CX}
+            y={(blockY(1) + BLOCK_H + blockY(2)) / 2 + 4}
+            textAnchor="middle"
+            style={{ fill: 'var(--muted-foreground)' }}
+            className="font-mono text-[11px]"
+          >
+            {copy.moreLayers}
+          </text>
 
-        {/* ── Arrows in each gap: faint forward up (left), gradient down (right) ── */}
-        {BLOCKS.map((b, i) => {
-          const d = gradD(i);
-          // Already walked: solid, EMERALD, arrowhead landing on the block.
-          const delivered = isDone || activeIdx > i;
-          // Being walked right now: the dots, and only the dots.
-          const inFlight = !isDone && activeIdx === i;
-          return (
-            <g key={`arrows-${b.id}`}>
-              {/* Forward: bottom → top. SOLID and dim, never dashed. Dash means
-                  "has not happened yet" everywhere else in this course, and the
-                  forward pass is the one thing on this diagram that HAS already
-                  happened — the caption says so on every frame. Dashing it made
-                  this lane byte-identical to the un-walked gradient lane.
+          {/* ── Arrows in each gap: faint forward up (left), gradient down (right) ── */}
+          {BLOCKS.map((b, i) => {
+            const d = gradD(i);
+            // Already walked: solid, EMERALD, arrowhead landing on the block.
+            const delivered = isDone || activeIdx > i;
+            // Being walked right now: the dots, and only the dots.
+            const inFlight = !isDone && activeIdx === i;
+            return (
+              <g key={`arrows-${b.id}`}>
+                {/* Forward: bottom → top. SOLID and dim, never dashed. Dash means
+                    "has not happened yet" everywhere else in this course, and the
+                    forward pass is the one thing on this diagram that HAS already
+                    happened — the caption says so on every frame. Dashing it made
+                    this lane byte-identical to the un-walked gradient lane.
 
-                  `strokeOpacity`, NOT `opacity`: element opacity composites the
-                  marker too, so 0.4 on the path times 0.4 inside the marker put
-                  the arrowhead at 0.16 — and the arrowhead is the only thing
-                  carrying "this lane points UP". strokeOpacity leaves it alone. */}
-              <path
-                d={fwdD(i)}
-                fill="none"
-                style={{ stroke: 'var(--muted-foreground)' }}
-                strokeOpacity={DIM.IDLE_EDGE}
-                strokeWidth={SW.INNER}
-                markerEnd="url(#bp-fwd)"
-              />
-              {/* gradient: the edge always exists — dashed until it carries something */}
-              <path
-                d={d}
-                fill="none"
-                style={{
-                  stroke: delivered ? EMERALD : 'var(--muted-foreground)',
-                  opacity: delivered ? 1 : DIM.IDLE_EDGE,
-                  transition: ease,
-                }}
-                strokeWidth={delivered ? SW.OUTER : SW.INNER}
-                strokeDasharray={delivered ? undefined : DASH.BORDER}
-                markerEnd={delivered ? 'url(#bp-grad)' : undefined}
-              />
-              <FlowDots d={d} hidden={!inFlight} paused={!player.playing} spacing={12} />
-            </g>
-          );
-        })}
-
-        {/* ── Lane captions, centred over the lane each one names.
-            AFTER the arrows on purpose. SVG paints in document order, so while
-            these were bare `<text>` drawn first, the gap-0 elbow — which runs
-            x=FWD_X / x=GRAD_X from y=36 down to y=89 — was stroked straight
-            through the letters (measured: "GRAD|ENT", "FORWARD | ↑"). The
-            band between the loss box and block 0 is clear, but the LANE ISN'T,
-            and the lane is exactly what a centred caption sits on.
-
-            FrameLabel puts a `--background` plate under each one, so the arrow
-            reads as passing behind the label rather than through it. Centring
-            rather than pushing them outward is what keeps the widest string
-            ("FORWARD ↑ (DONE)", ~129 units) inside a 460-wide canvas. ── */}
-        <FrameLabel
-          x={FWD_X}
-          y={COL_LABEL_Y}
-          align="middle"
-          font={COL_LABEL_FONT}
-          label={copy.forwardCol}
-        />
-        <FrameLabel
-          x={GRAD_X}
-          y={COL_LABEL_Y}
-          align="middle"
-          font={COL_LABEL_FONT}
-          fill={frame > 0 ? EMERALD : 'var(--muted-foreground)'}
-          label={copy.gradientCol}
-        />
-
-        {/* ── The stacked blocks ── */}
-        {BLOCKS.map((b, i) => {
-          const y = blockY(i);
-          const isActive = !isDone && activeIdx === i;
-          const gradReady = isDone || activeIdx > i;
-          return (
-            <g key={b.id}>
-              {isActive || gradReady ? (
-                <PanelFrame
-                  x={BLOCK_X}
-                  y={y}
-                  w={BLOCK_W}
-                  h={BLOCK_H}
-                  tone={isActive ? 'red' : 'emerald'}
-                  hatched={isActive}
+                    `strokeOpacity`, NOT `opacity`: element opacity composites the
+                    marker too, so 0.4 on the path times 0.4 inside the marker put
+                    the arrowhead at 0.16 — and the arrowhead is the only thing
+                    carrying "this lane points UP". strokeOpacity leaves it alone. */}
+                <path
+                  d={fwdD(i)}
                   fill="none"
+                  style={{ stroke: 'var(--muted-foreground)' }}
+                  strokeOpacity={DIM.IDLE_EDGE}
+                  strokeWidth={SW.INNER}
+                  markerEnd="url(#bp-fwd)"
                 />
-              ) : (
-                // Not reached yet — but SOLID, and a real `var(--border)`, not
-                // the dashed dim ghost. These blocks exist and have already run:
-                // the forward pass went through all four of them before frame 0,
-                // which is exactly what the caption says. Dash is this course's
-                // spelling for "does not exist yet"; using it here contradicted
-                // the lesson and drew the boxes at 2.2:1 besides. The state that
-                // IS changing is carried by hue — neutral → RED → EMERALD.
-                <rect
-                  x={BLOCK_X}
-                  y={y}
-                  width={BLOCK_W}
-                  height={BLOCK_H}
-                  rx={RX}
+                {/* gradient: the edge always exists — dashed until it carries something */}
+                <path
+                  d={d}
                   fill="none"
-                  style={{ stroke: 'var(--border)', transition: ease }}
-                  strokeWidth={SW.OUTER}
+                  style={{
+                    stroke: delivered ? EMERALD : 'var(--muted-foreground)',
+                    opacity: delivered ? 1 : DIM.IDLE_EDGE,
+                    transition: ease,
+                  }}
+                  strokeWidth={delivered ? SW.OUTER : SW.INNER}
+                  strokeDasharray={delivered ? undefined : DASH.BORDER}
+                  markerEnd={delivered ? 'url(#bp-grad)' : undefined}
                 />
-              )}
-              {gradReady ? (
-                <text
-                  x={CX}
-                  y={y + BLOCK_H / 2 + 4}
-                  textAnchor="middle"
-                  style={{ fill: EMERALD }}
-                  className="text-[10px] font-medium uppercase tracking-wider"
-                >
-                  {copy.gradReady}
-                </text>
-              ) : null}
-              {/* Chip last: its job is to erase the border under the label. */}
-              <FrameLabel x={CX} y={y} label={copy.blocks[i]!} align="middle" />
-            </g>
-          );
-        })}
+                <FlowDots d={d} hidden={!inFlight} paused={!player.playing} spacing={12} />
+              </g>
+            );
+          })}
 
-        {/* Loss chip drawn after the lanes so the elbows tuck under it cleanly. */}
-        <FrameLabel x={CX} y={LOSS_Y} label={copy.lossNode} align="middle" />
-      </svg>
+          {/* ── Lane captions, centred over the lane each one names.
+              AFTER the arrows on purpose. SVG paints in document order, so while
+              these were bare `<text>` drawn first, the gap-0 elbow — which runs
+              x=FWD_X / x=GRAD_X from y=36 down to y=89 — was stroked straight
+              through the letters (measured: "GRAD|ENT", "FORWARD | ↑"). The
+              band between the loss box and block 0 is clear, but the LANE ISN'T,
+              and the lane is exactly what a centred caption sits on.
+
+              FrameLabel puts a `--background` plate under each one, so the arrow
+              reads as passing behind the label rather than through it. Centring
+              rather than pushing them outward is what keeps the widest string
+              ("FORWARD ↑ (DONE)", ~129 units) inside a 460-wide canvas. ── */}
+          <FrameLabel
+            x={FWD_X}
+            y={COL_LABEL_Y}
+            align="middle"
+            font={COL_LABEL_FONT}
+            label={copy.forwardCol}
+          />
+          <FrameLabel
+            x={GRAD_X}
+            y={COL_LABEL_Y}
+            align="middle"
+            font={COL_LABEL_FONT}
+            fill={frame > 0 ? EMERALD : 'var(--muted-foreground)'}
+            label={copy.gradientCol}
+          />
+
+          {/* ── The stacked blocks ── */}
+          {BLOCKS.map((b, i) => {
+            const y = blockY(i);
+            const isActive = !isDone && activeIdx === i;
+            const gradReady = isDone || activeIdx > i;
+            return (
+              <g key={b.id}>
+                {isActive || gradReady ? (
+                  <PanelFrame
+                    x={BLOCK_X}
+                    y={y}
+                    w={BLOCK_W}
+                    h={BLOCK_H}
+                    tone={isActive ? 'red' : 'emerald'}
+                    hatched={isActive}
+                    fill="none"
+                  />
+                ) : (
+                  // Not reached yet — but SOLID, and a real `var(--border)`, not
+                  // the dashed dim ghost. These blocks exist and have already run:
+                  // the forward pass went through all four of them before frame 0,
+                  // which is exactly what the caption says. Dash is this course's
+                  // spelling for "does not exist yet"; using it here contradicted
+                  // the lesson and drew the boxes at 2.2:1 besides. The state that
+                  // IS changing is carried by hue — neutral → RED → EMERALD.
+                  <rect
+                    x={BLOCK_X}
+                    y={y}
+                    width={BLOCK_W}
+                    height={BLOCK_H}
+                    rx={RX}
+                    fill="none"
+                    style={{ stroke: 'var(--border)', transition: ease }}
+                    strokeWidth={SW.OUTER}
+                  />
+                )}
+                {gradReady ? (
+                  <text
+                    x={CX}
+                    y={y + BLOCK_H / 2 + 4}
+                    textAnchor="middle"
+                    style={{ fill: EMERALD }}
+                    className="text-[10px] font-medium uppercase tracking-wider"
+                  >
+                    {copy.gradReady}
+                  </text>
+                ) : null}
+                {/* Chip last: its job is to erase the border under the label. */}
+                <FrameLabel x={CX} y={y} label={copy.blocks[i]!} align="middle" />
+              </g>
+            );
+          })}
+
+          {/* Loss chip drawn after the lanes so the elbows tuck under it cleanly. */}
+          <FrameLabel x={CX} y={LOSS_Y} label={copy.lossNode} align="middle" />
+        </svg>
+      </PanBox>
     </DiagramFrame>
   );
 }

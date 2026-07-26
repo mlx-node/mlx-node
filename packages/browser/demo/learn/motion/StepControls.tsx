@@ -31,8 +31,14 @@ const COPY = {
   zh: { play: '播放', pause: '暂停', step: '单步', reset: '重置' },
 } as const satisfies Record<Locale, { play: string; pause: string; step: string; reset: string }>;
 
+// `py-1.5` at `text-xs` is a 28px button — fine for a mouse, under the course's
+// 44px touch floor. The `max-sm:` bump is the same one the unskinned widgets
+// (FlashTrafficDiagram, Fp8QuantDiagram, BaseVsInstructDiagram, …) already
+// carry; `inline-flex items-center` keeps the label centred once min-height
+// exceeds the line box. This is the play/step control of every skinned widget,
+// so the floor has to live here rather than in sixteen call sites.
 const BTN =
-  'rounded px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary';
+  'inline-flex items-center rounded px-2.5 py-1.5 max-sm:min-h-[44px] max-sm:px-3 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary';
 
 export function StepControls({
   player,

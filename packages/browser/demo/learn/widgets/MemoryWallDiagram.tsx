@@ -1,6 +1,21 @@
 import * as React from 'react';
 
 import { useLocale } from '../../lib/i18n-react';
+import {
+  DASH,
+  DIM,
+  DiagramFrame,
+  EMERALD,
+  FrameLabel,
+  HatchDefs,
+  PanBox,
+  PanelFrame,
+  RED,
+  RX,
+  SW,
+  hatchFill,
+  useStepPlayer,
+} from '../motion';
 
 /**
  * MemoryWallDiagram — chapter 4 deep-dive "The memory wall".
@@ -18,10 +33,35 @@ import { useLocale } from '../../lib/i18n-react';
  * to weight V. A running "moved over the bus" counter and an N selector make
  * the quadratic (N²) blow-up tangible.
  *
- * Animation model: a small set of discrete frames (one bus crossing each). The
- * packet cluster slides between the two memory boxes via a CSS transform
- * transition, so no global keyframes are needed. Honors prefers-reduced-motion
- * (jumps straight to the final tally, no motion).
+ * Animation model: a small set of discrete frames (one bus crossing each),
+ * driven by `useStepPlayer` from `learn/motion` — which replaces this file's
+ * former hand-rolled `setInterval` + `playing` flag + private
+ * `usePrefersReducedMotion`, and whose reduced-motion contract still rests the
+ * reader on the last frame (the tally), same as before. The packet cluster
+ * slides between the two memory boxes via a CSS transform transition, so no
+ * global keyframes are needed.
+ *
+ * ── THE PALETTE ────────────────────────────────────────────────────────────
+ *
+ * `skin` says hue is a box's PERMANENT IDENTITY and state rides on hatch (busy)
+ * / dash (not real yet) / opacity (dimmed). The two tiers ARE the lesson — the
+ * prose above this widget introduces them as "two kinds of GPU memory" — so
+ * they take the two hues, and neither one ever changes:
+ *
+ *   RED      HBM — the warehouse down the hall. Far, slow, expensive to touch;
+ *            every trip across the bus is a trip to this box.
+ *   EMERALD  SRAM — the desk. On-chip, fast, where the math happens. Its
+ *            `math` badge is EMERALD too: it belongs to this tier, and painting
+ *            it RED ("compute happening now") would contradict the entire
+ *            lesson, which is that the compute is the cheap part.
+ *   primary  the N×N matrix itself — the payload both tiers fight over, plus
+ *            the live "moved over the bus" byte counter that measures it. A
+ *            third PERMANENT identity, not a state: the block is `--primary` in
+ *            every frame, and where it currently sits is carried by POSITION.
+ *
+ * The state channels are therefore: position (which tier holds the matrix),
+ * hatch (the math badge is working this step), and DIM.EMPTY_SLOT (the dock
+ * this tier is not holding the matrix in). No hue anywhere flips.
  */
 
 // ── Sequence-length presets — matrix bytes grow with N². bf16 = 2 bytes/score,
@@ -78,6 +118,10 @@ const TOTAL_FRAMES = FRAMES.length;
 const FRAME_MS = 1500;
 
 // ── Per-locale copy. COPY.en strings are the original English, verbatim. ─────
+//
+// Play / Pause / Step are NOT here any more: those verbs belong to the shared
+// `StepControls`, which carries its own en/zh pair so every animated widget in
+// the course says the same word.
 const COPY = {
   en: {
     captions: [
@@ -89,9 +133,6 @@ const COPY = {
       'The N×N matrix crossed the slow bus ~4 times. Almost all the time went to moving it, not computing.',
     ],
     title: 'The memory wall — why attention is bandwidth-bound',
-    pause: '❚❚ Pause',
-    play: '▶ Play',
-    step: 'Step ›',
     ariaLabel:
       'Diagram of the N by N attention score matrix shuttling between slow HBM main memory and fast on-chip SRAM across the memory bus four times.',
     memoryBus: 'memory bus',
@@ -128,9 +169,6 @@ const COPY = {
       'N×N 矩阵在慢速总线上往返了约 4 趟。几乎所有时间都花在搬运它，而不是计算。',
     ],
     title: '显存带宽墙——注意力为何受带宽限制',
-    pause: '❚❚ 暂停',
-    play: '▶ 播放',
-    step: '单步 ›',
     ariaLabel: 'N×N 注意力分数矩阵在慢速 HBM 主内存与快速片上 SRAM 之间跨内存总线往返四趟的示意图。',
     memoryBus: '内存总线',
     busHint: '慢——瓶颈所在',
@@ -162,21 +200,6 @@ const COPY = {
 // as such in the UI). Attention is bandwidth-bound, so data movement dominates.
 const MOVE_PCT = 88;
 
-function usePrefersReducedMotion(): boolean {
-  const [reduced, setReduced] = React.useState<boolean>(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
-    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  });
-  React.useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
-    const mql = window.matchMedia('(prefers-reduced-motion: reduce)');
-    const onChange = (e: MediaQueryListEvent) => setReduced(e.matches);
-    mql.addEventListener('change', onChange);
-    return () => mql.removeEventListener('change', onChange);
-  }, []);
-  return reduced;
-}
-
 // ── SVG geometry ────────────────────────────────────────────────────────────
 // One matrix "block" docks in a clearly-marked empty slot inside each memory
 // tier and slides between them along the bus — so nothing overlaps.
@@ -194,20 +217,15 @@ const HBM_DOCK_X = HBM.x + HBM.w - BLOCK_W - 26; // rests near the bus, inside H
 const SRAM_DOCK_X = SRAM.x + 22; // rests on the bus side of SRAM
 // The compute zone sits in the free right side of SRAM, clear of the dock.
 const COMPUTE_CX = SRAM.x + SRAM.w - 42;
+/** Tier hint text, now that the tier TITLE has moved onto the top border. */
+const HINT_DY = 30;
 
 export function MemoryWallDiagram() {
-  const copy = COPY[useLocale()];
-  const reducedMotion = usePrefersReducedMotion();
+  const locale = useLocale();
+  const copy = COPY[locale];
+  const player = useStepPlayer(TOTAL_FRAMES, { frameMs: FRAME_MS });
+  const { frame } = player;
   const [seqIdx, setSeqIdx] = React.useState(1); // default N = 4K (matches prose)
-  // Under reduced motion, start on the tally frame and never auto-play.
-  const [frame, setFrame] = React.useState(reducedMotion ? TOTAL_FRAMES - 1 : 0);
-  const [playing, setPlaying] = React.useState(!reducedMotion);
-
-  React.useEffect(() => {
-    if (!playing || reducedMotion) return;
-    const t = window.setInterval(() => setFrame((f) => (f + 1) % TOTAL_FRAMES), FRAME_MS);
-    return () => window.clearInterval(t);
-  }, [playing, reducedMotion]);
 
   const f = FRAMES[frame];
   const seq = SEQ_OPTIONS[seqIdx];
@@ -217,147 +235,147 @@ export function MemoryWallDiagram() {
   const dockX = f.at === 'hbm' ? HBM_DOCK_X : SRAM_DOCK_X;
   const matrixInHbm = f.at === 'hbm';
 
-  const step = () => {
-    setPlaying(false);
-    setFrame((x) => (x + 1) % TOTAL_FRAMES);
-  };
+  // TWO arms, and only two. The tally frame speaks `tallyLine` — the bolded
+  // punchline that used to sit inside TimeSplitBar, above the split — and every
+  // other frame speaks its index-aligned entry in `captions`. Nothing else
+  // reaches the caption: the N selector below moves the byte counters only.
+  const caption = f.tally ? copy.tallyLine : copy.captions[frame];
+  // Every caption this sweep can reach, so DiagramFrame reserves the tallest and
+  // the chapter body cannot hop when the beat changes. The whole `captions`
+  // array covers the non-tally arm (index 5 is unreachable while FRAMES[5] is
+  // the tally frame — it costs a few px and survives that frame being retyped),
+  // and `tallyLine` covers the tally arm.
+  const captions = [...copy.captions, copy.tallyLine];
 
   return (
-    <div className="not-prose my-5 space-y-3 rounded-md border border-border bg-background p-3">
-      {/* Header: title + controls */}
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.title}</div>
-        <div className="flex items-center gap-1">
-          {!reducedMotion ? (
-            <>
-              <button
-                type="button"
-                onClick={() => setPlaying((p) => !p)}
-                aria-pressed={playing}
-                className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
-              >
-                {playing ? copy.pause : copy.play}
-              </button>
-              <button
-                type="button"
-                onClick={step}
-                className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
-              >
-                {copy.step}
-              </button>
-            </>
-          ) : null}
-        </div>
-      </div>
+    <DiagramFrame title={copy.title} player={player} locale={locale} caption={caption} captions={captions}>
+      {/* `min-w` is why this svg — and ONLY this svg — is wrapped in `PanBox`.
+          A bare `w-full` svg does not REFLOW in a narrow column, it SCALES —
+          text and all — so at a 375px viewport (a 320-unit column) the 9px
+          `math` badge lands at 4.0 CSS px and the whole drawing turns to
+          smudges. The floor stops the shrink at 8 CSS px for the smallest
+          label and `PanBox` pans to reach the rest.
 
-      {/* The diagram */}
-      <svg
-        viewBox={`0 0 ${VB_W} ${VB_H}`}
-        className="w-full"
-        role="img"
-        aria-label={copy.ariaLabel}
-      >
-        {/* ── Memory bus channel (the bottleneck the block travels) ── */}
-        <rect
-          x={BUS.x1}
-          y={BUS.y}
-          width={BUS.x2 - BUS.x1}
-          height={BUS.h}
-          rx={4}
-          style={{ fill: 'var(--muted)', stroke: 'var(--border)' }}
-          strokeWidth={1}
-        />
-        <text
-          x={(BUS.x1 + BUS.x2) / 2}
-          y={BUS.y - 10}
-          textAnchor="middle"
-          style={{ fill: 'var(--muted-foreground)' }}
-          className="text-[11px]"
-        >
-          {copy.memoryBus}
-        </text>
-        <text
-          x={(BUS.x1 + BUS.x2) / 2}
-          y={BUS.y + BUS.h + 20}
-          textAnchor="middle"
-          style={{ fill: 'var(--muted-foreground)' }}
-          className="text-[10px]"
-        >
-          {copy.busHint}
-        </text>
+          The floor is set by `math` at 9px — 8 × 720 / 9 = 640 — and not by the
+          10px chips or the 11px hints, which clear 8px once the shrink stops.
+          `math` is not a superscript that may duck under the floor: it NAMES
+          the compute core, and the palette note at the top of this file spends
+          a paragraph on it because the reader is meant to notice that the
+          emerald math step is the cheap part. In zh it is 计算 — CJK at 9px
+          needs the floor more, not less.
 
-        {/* ── HBM box (big, slow, far) ── */}
-        <rect
-          x={HBM.x}
-          y={HBM.y}
-          width={HBM.w}
-          height={HBM.h}
-          rx={10}
-          style={{ fill: 'var(--card)', stroke: 'var(--border)' }}
-          strokeWidth={1.5}
-        />
-        <text x={HBM.x + 16} y={HBM.y + 27} style={{ fill: 'var(--foreground)' }} className="text-[14px] font-semibold">
-          {copy.hbmTitle}
-        </text>
-        <text x={HBM.x + 16} y={HBM.y + 46} style={{ fill: 'var(--muted-foreground)' }} className="text-[11px]">
-          {copy.hbmHint}
-        </text>
-        <DockSlot x={HBM_DOCK_X} occupied={matrixInHbm} />
+          Only the svg goes inside `PanBox`, and only the svg gets the floor.
+          The 1K/4K/16K selector, the byte counters and the tally bar stay
+          DiagramFrame's own children: they size to the VISIBLE width, they
+          keep the frame's `space-y-4` gaps, and — the reason this matters most
+          for THIS widget — the selector never slides sideways out of reach
+          while the reader is panning the drawing it controls. */}
+      <PanBox locale={locale}>
+        <svg viewBox={`0 0 ${VB_W} ${VB_H}`} className="w-full min-w-[640px]" role="img" aria-label={copy.ariaLabel}>
+          <HatchDefs />
 
-        {/* ── SRAM box (tiny, fast, on-chip) ── */}
-        <rect
-          x={SRAM.x}
-          y={SRAM.y}
-          width={SRAM.w}
-          height={SRAM.h}
-          rx={10}
-          style={{ fill: 'var(--card)', stroke: 'var(--border)' }}
-          strokeWidth={1.5}
-        />
-        <text x={SRAM.x + 14} y={SRAM.y + 25} style={{ fill: 'var(--foreground)' }} className="text-[14px] font-semibold">
-          {copy.sramTitle}
-        </text>
-        <text x={SRAM.x + 14} y={SRAM.y + 43} style={{ fill: 'var(--muted-foreground)' }} className="text-[11px]">
-          {copy.sramHint}
-        </text>
-        <DockSlot x={SRAM_DOCK_X} occupied={!matrixInHbm} />
-        {/* compute marker — lights up only on the math frames, clear of the dock */}
-        <g className={f.compute ? 'animate-pulse' : undefined}>
-          <circle
-            cx={COMPUTE_CX}
-            cy={LANE_Y}
-            r={18}
-            style={{ fill: f.compute ? 'var(--primary)' : 'var(--muted)', stroke: 'var(--border)' }}
-            strokeWidth={1}
+          {/* ── Memory bus channel (the bottleneck the block travels). Neutral on
+              purpose: it is the CHANNEL between the two tiers, not a third tier,
+              and its cost is already spelled out by the traffic on it. ── */}
+          <rect
+            x={BUS.x1}
+            y={BUS.y}
+            width={BUS.x2 - BUS.x1}
+            height={BUS.h}
+            rx={RX}
+            style={{ fill: 'var(--muted)', stroke: 'var(--border)' }}
+            strokeWidth={SW.INNER}
           />
           <text
-            x={COMPUTE_CX}
-            y={LANE_Y + 3}
+            x={(BUS.x1 + BUS.x2) / 2}
+            y={BUS.y - 10}
             textAnchor="middle"
-            style={{ fill: f.compute ? 'var(--bg)' : 'var(--muted-foreground)' }}
-            className="text-[9px] font-semibold"
+            style={{ fill: 'var(--muted-foreground)' }}
+            className="text-[11px]"
           >
-            {copy.math}
+            {copy.memoryBus}
           </text>
-        </g>
+          <text
+            x={(BUS.x1 + BUS.x2) / 2}
+            y={BUS.y + BUS.h + 20}
+            textAnchor="middle"
+            style={{ fill: 'var(--muted-foreground)' }}
+            className="text-[10px]"
+          >
+            {copy.busHint}
+          </text>
 
-        {/* ── The N×N matrix block, docking in one tier at a time ── */}
-        <g
-          style={{
-            transform: `translateX(${dockX - HBM_DOCK_X}px)`,
-            transition: reducedMotion ? undefined : 'transform 900ms cubic-bezier(0.4, 0, 0.2, 1)',
-          }}
-        >
-          <MatrixBlock />
-        </g>
-      </svg>
+          {/* ── HBM box (big, slow, far) — RED in every frame ── */}
+          <PanelFrame x={HBM.x} y={HBM.y} w={HBM.w} h={HBM.h} tone="red" fill="none" />
+          <text
+            x={HBM.x + 16}
+            y={HBM.y + HINT_DY}
+            style={{ fill: 'var(--muted-foreground)' }}
+            className="text-[11px]"
+          >
+            {copy.hbmHint}
+          </text>
+          <DockSlot x={HBM_DOCK_X} tone="red" occupied={matrixInHbm} />
+          {/* Chip after the panel: its job is to erase the border under the title. */}
+          <FrameLabel x={HBM.x + 16} y={HBM.y} label={copy.hbmTitle} fill={RED} />
 
-      {/* Caption / tally */}
-      {f.tally ? (
+          {/* ── SRAM box (tiny, fast, on-chip) — EMERALD in every frame ── */}
+          <PanelFrame x={SRAM.x} y={SRAM.y} w={SRAM.w} h={SRAM.h} tone="emerald" fill="none" />
+          <text
+            x={SRAM.x + 14}
+            y={SRAM.y + HINT_DY}
+            style={{ fill: 'var(--muted-foreground)' }}
+            className="text-[11px]"
+          >
+            {copy.sramHint}
+          </text>
+          <DockSlot x={SRAM_DOCK_X} tone="emerald" occupied={!matrixInHbm} />
+          {/* Compute marker — part of the SRAM tier, so EMERALD in every frame.
+              "A math step happens HERE, on THIS frame" is the hatch plus the step
+              back down to DIM.IDLE_EDGE, never a change of hue. It also used to
+              carry `animate-pulse`, which the Pause button could not stop (the CSS
+              animation cannot see the JS frame timer) — the hatch has no such
+              problem. */}
+          <g style={{ opacity: f.compute ? 1 : DIM.IDLE_EDGE }}>
+            <circle
+              cx={COMPUTE_CX}
+              cy={LANE_Y}
+              r={18}
+              fill={f.compute ? hatchFill('emerald') : 'none'}
+              style={{ stroke: EMERALD }}
+              strokeWidth={SW.INNER}
+            />
+            <text
+              x={COMPUTE_CX}
+              y={LANE_Y + 3}
+              textAnchor="middle"
+              style={{ fill: EMERALD }}
+              className="text-[9px] font-semibold"
+            >
+              {copy.math}
+            </text>
+          </g>
+          <FrameLabel x={SRAM.x + 14} y={SRAM.y} label={copy.sramTitle} fill={EMERALD} />
+
+          {/* ── The N×N matrix block, docking in one tier at a time ── */}
+          <g
+            style={{
+              transform: `translateX(${dockX - HBM_DOCK_X}px)`,
+              transition: player.reducedMotion ? undefined : 'transform 900ms cubic-bezier(0.4, 0, 0.2, 1)',
+            }}
+          >
+            <MatrixBlock />
+          </g>
+        </svg>
+      </PanBox>
+
+      {/* The tally's time-split bar. Present on EVERY frame but `invisible` off
+          the tally, so the space is reserved and the page cannot hop when the
+          sweep reaches the last beat — the same trick DiagramFrame plays on the
+          caption slot. `visibility: hidden` also keeps it out of the a11y tree. */}
+      <div className={f.tally ? undefined : 'invisible'} aria-hidden={f.tally ? undefined : 'true'}>
         <TimeSplitBar />
-      ) : (
-        <p className="min-h-[2.5rem] text-[13px] text-foreground/90">{copy.captions[frame]}</p>
-      )}
+      </div>
 
       {/* Live counters + N selector */}
       <div className="flex flex-wrap items-end justify-between gap-3 border-t border-border/60 pt-3">
@@ -397,30 +415,33 @@ export function MemoryWallDiagram() {
           <div className="text-[10px] text-muted-foreground/70">{copy.allHeads(fmtBytes(moved * HEADS), HEADS)}</div>
         </div>
       </div>
-    </div>
+    </DiagramFrame>
   );
 }
 
-/** A dashed docking slot — shows where the matrix block can rest in a tier.
- * Hidden while the block occupies it (the block draws on top). */
-function DockSlot({ x, occupied }: { x: number; occupied: boolean }) {
+/** A dashed docking slot — shows where the matrix block can rest in a tier, in
+ * that tier's own hue. Hidden while the block occupies it (the block draws on
+ * top, and its `--card` fill is opaque). */
+function DockSlot({ x, tone, occupied }: { x: number; tone: 'red' | 'emerald'; occupied: boolean }) {
   return (
     <rect
       x={x}
       y={BLOCK_Y}
       width={BLOCK_W}
       height={BLOCK_H}
-      rx={8}
+      rx={RX}
       fill="none"
-      style={{ stroke: 'var(--border)', opacity: occupied ? 0 : 0.9 }}
-      strokeWidth={1.5}
-      strokeDasharray="5 5"
+      style={{ stroke: tone === 'red' ? RED : EMERALD, opacity: occupied ? 0 : DIM.EMPTY_SLOT }}
+      strokeWidth={SW.INNER}
+      strokeDasharray={DASH.SLOT}
     />
   );
 }
 
 /** The N×N score matrix as ONE labeled block. Drawn at the HBM dock position;
- * the parent <g> slides it to whichever tier currently holds it. */
+ * the parent <g> slides it to whichever tier currently holds it. `--primary` in
+ * every frame: it is the payload, not a tier, and where it sits is carried by
+ * its position rather than by its colour. */
 function MatrixBlock() {
   const copy = COPY[useLocale()];
   const cols = 5;
@@ -433,14 +454,17 @@ function MatrixBlock() {
   const vpad = (BLOCK_H - (rows * cell + (rows - 1) * gx)) / 2;
   return (
     <g>
+      {/* Opaque `--card` body: this is a physical block that occludes the dock
+          slot and the bus channel it slides along — which is also why the old
+          0.16 body tint (a magic alpha outside the DIM ladder) is not missed. */}
       <rect
         x={HBM_DOCK_X}
         y={BLOCK_Y}
         width={BLOCK_W}
         height={BLOCK_H}
-        rx={8}
-        style={{ fill: 'var(--primary)', fillOpacity: 0.16, stroke: 'var(--primary)' }}
-        strokeWidth={1.5}
+        rx={RX}
+        style={{ fill: 'var(--card)', stroke: 'var(--primary)' }}
+        strokeWidth={SW.OUTER}
       />
       {Array.from({ length: rows }, (_, r) =>
         Array.from({ length: cols }, (_, c) => (
@@ -450,8 +474,8 @@ function MatrixBlock() {
             y={BLOCK_Y + vpad + r * (cell + gx)}
             width={cell}
             height={cell}
-            rx={1.5}
-            style={{ fill: 'var(--primary)', fillOpacity: 0.85 }}
+            rx={RX}
+            style={{ fill: 'var(--primary)', fillOpacity: DIM.FILLED }}
           />
         )),
       )}
@@ -468,22 +492,24 @@ function MatrixBlock() {
   );
 }
 
-/** Illustrative "where the time goes" split shown on the tally frame. */
+/** Illustrative "where the time goes" split shown on the tally frame. The two
+ * segments are the two tiers' costs, so they take the tiers' own hues: the 88%
+ * is trips to RED HBM, the sliver is math in EMERALD SRAM. The sentence above
+ * the bar is the frame's caption now, not part of this component. */
 function TimeSplitBar() {
   const copy = COPY[useLocale()];
   return (
     <div className="space-y-1.5">
-      <p className="text-[13px] text-foreground/90">{copy.tallyLine}</p>
       <div className="flex h-5 w-full overflow-hidden rounded border border-border" aria-hidden>
         <div
           className="flex items-center justify-center text-[10px] font-medium"
-          style={{ width: `${MOVE_PCT}%`, background: 'var(--primary)', color: 'var(--bg)' }}
+          style={{ width: `${MOVE_PCT}%`, background: RED, color: 'var(--bg)' }}
         >
           {copy.movingTheMatrix}
         </div>
         <div
-          className="flex items-center justify-center text-[10px] text-muted-foreground"
-          style={{ width: `${100 - MOVE_PCT}%`, background: 'var(--muted)' }}
+          className="flex items-center justify-center text-[10px] font-medium"
+          style={{ width: `${100 - MOVE_PCT}%`, background: EMERALD, color: 'var(--bg)' }}
         >
           {copy.compute}
         </div>

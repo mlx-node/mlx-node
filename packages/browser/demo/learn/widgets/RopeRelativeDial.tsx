@@ -478,7 +478,7 @@ export function RopeRelativeDial() {
                 disabled={!canShiftDown}
                 className="inline-flex items-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 px-2.5 py-1 text-xs font-medium text-foreground hover:bg-primary/20 disabled:opacity-50"
               >
-                <span aria-hidden="true">−1</span>
+                <span>−1</span>
                 {copy.shiftBoth}
               </button>
               <button
@@ -487,7 +487,7 @@ export function RopeRelativeDial() {
                 disabled={!canShiftUp}
                 className="inline-flex items-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 px-2.5 py-1 text-xs font-medium text-foreground hover:bg-primary/20 disabled:opacity-50"
               >
-                <span aria-hidden="true">+1</span>
+                <span>+1</span>
                 {copy.shiftBoth}
               </button>
             </div>

@@ -423,6 +423,101 @@ export function FrameLabel({
 const CAPTION_CLS = 'text-[12px] leading-relaxed text-muted-foreground';
 
 /**
+ * Keys that ACTIVATE a control (Enter/Space) or drive one (arrows, Home/End on a
+ * radio group, tablist, or slider). Deliberately excludes Tab — see
+ * `noticeKeyIntent`.
+ */
+const ACTIVATION_KEYS = new Set([
+  'Enter',
+  ' ',
+  'Spacebar', // legacy name, still emitted by some IMEs and older WebKit
+  'ArrowLeft',
+  'ArrowRight',
+  'ArrowUp',
+  'ArrowDown',
+  'Home',
+  'End',
+]);
+
+// Names the pan container when the diagram actually overflows. Chrome, not a
+// Glossary term, so it translates.
+const PAN_LABEL: Record<Locale, string> = {
+  en: 'Diagram — scroll sideways to see the rest',
+  zh: '示意图 — 左右滑动查看其余部分',
+};
+
+/**
+ * PanBox — lets a too-wide `<svg>` pan sideways instead of shrinking to fit.
+ *
+ * Every `<svg>` here is `w-full` + `viewBox` with nothing to stop it, so a
+ * narrow column does not reflow the drawing — it SCALES the whole canvas down,
+ * text included. Measured at a real 375px viewport (column = 320px): a 760-wide
+ * viewBox renders at 320, so a 10px label lands at 4.2px. Ten diagrams were
+ * between 2.95px and 6.26px — none of them legible.
+ *
+ * Wrap the svg in this, then give the svg a `min-w-[Npx]` floor, where
+ * `N = ceil(8 * VB_W / smallestFontSize)` (8px being the legibility floor). The
+ * svg stops shrinking at N and this container pans to reach the rest.
+ *
+ * WRAP THE SVG, NOT THE WIDGET. An earlier revision put this on DiagramFrame as
+ * a `panWide` flag around ALL its children, which broke twice: the frame's
+ * `space-y-4` is a DIRECT-child rule (`> :not(:last-child)`), so a single
+ * wrapper swallowed every inter-child gap; and a widget's own controls —
+ * MemoryWall's 1K/4K/16K buttons, ResidualStream's mode toggle — sat inside the
+ * scroller and slid out of reach exactly when the reader needed them. Siblings
+ * belong OUTSIDE, where they size to the visible width.
+ *
+ * Desktop is untouched: the column is wider than every floor, so nothing
+ * overflows, no scrollbar appears, and no tab stop is added.
+ */
+export function PanBox({
+  locale,
+  className,
+  children,
+}: {
+  locale: Locale;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  // A pannable region has to be reachable by keyboard (WCAG 2.1.1) — Chrome,
+  // unlike Firefox, will not focus an overflow container on its own. But the
+  // tab stop is only earned when there is actually something off-screen: on
+  // desktop the column clears every floor, and 10 diagrams that each swallow a
+  // Tab press to scroll nothing is its own kind of broken. So measure.
+  const ref = React.useRef<HTMLDivElement | null>(null);
+  const [canPan, setCanPan] = React.useState(false);
+  React.useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const measure = () => setCanPan(el.scrollWidth > el.clientWidth + 1);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // A tab stop with no visible focus indicator fails WCAG 2.4.7, and this one is
+  // easy to miss because the element it lands on is an empty scroll container.
+  // The ring is drawn on THIS element, and `overflow` clips descendants rather
+  // than the element's own box-shadow, so it survives the scroller it sits on.
+  const FOCUS = 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary';
+
+  return (
+    // `group`, not `region`: this needs a name and a tab stop, not a
+    // seventeenth landmark in the reader's rotor.
+    <div
+      ref={ref}
+      className={className ? `overflow-x-auto ${FOCUS} ${className}` : `overflow-x-auto ${FOCUS}`}
+      tabIndex={canPan ? 0 : undefined}
+      role={canPan ? 'group' : undefined}
+      aria-label={canPan ? PAN_LABEL[locale] : undefined}
+    >
+      {children}
+    </div>
+  );
+}
+
+/**
  * DiagramFrame — the shell every animated diagram repeats: header row, the svg,
  * the caption, the footnote. Pass the `<svg>` as children; this owns everything
  * around it.
@@ -501,8 +596,17 @@ export function DiagramFrame({
   showReset = false,
   children,
 }: {
-  /** Heading text, upper-cased by CSS. Already localised by the caller. */
-  title: string;
+  /**
+   * Heading text, upper-cased by CSS. Already localised by the caller.
+   *
+   * `ReactNode` for the same reason `caption` is: a few headings carry inline
+   * markup that IS content. BpeMergeWalkthrough's heading ends in the literal
+   * input it tokenises, in a mono chip — flattening it to a string turned the
+   * one thing the chapter is about into ordinary prose. This slot's className
+   * is byte-identical to the header div those widgets used before the
+   * conversion, so a node passed here renders exactly as it did.
+   */
+  title: React.ReactNode;
   player: StepPlayer;
   locale: Locale;
   /**
@@ -526,7 +630,18 @@ export function DiagramFrame({
    * reserves a few px. Omitting it entirely falls back to a three-line guess.
    */
   captions?: React.ReactNode[];
-  /** Optional standing footnote — "these numbers are illustrative", etc. */
+  /**
+   * Optional standing footnote — "these numbers are illustrative", a source, a
+   * caveat. Renders in a `div`, so several `<p>` are fine; a `p` here forced
+   * callers with two trailing paragraphs to fake them as block `<span>`.
+   *
+   * FOOTNOTE TIER ONLY. This slot is 11px muted, so a body-sized teaching
+   * paragraph dropped in here is silently demoted a tier. Match what the
+   * paragraph was BEFORE the conversion: footnote-sized text belongs in `note`,
+   * body-sized text stays a sibling OUTSIDE the frame (return a fragment).
+   * Three of the first eight conversions demoted a teaching paragraph before
+   * this rule existed, and each picked a different workaround.
+   */
   note?: React.ReactNode;
   /** Worth it for long sweeps; noise for short loops. See StepControls.tsx:44. */
   showReset?: boolean;
@@ -546,11 +661,40 @@ export function DiagramFrame({
     reset: ask(player.reset),
     goTo: ask(player.goTo),
   };
+  // `ask` only reaches the copy handed to `StepControls`. `children` gets the
+  // caller's OWN player, unwrapped — so a widget with its own phase rail or
+  // scrubber (SoftmaxTemperatureSteps) called `goTo`, paused, and left the live
+  // region EMPTY: the reader pressed something and heard nothing back. Rather
+  // than thread a second player through `children` and make every caller
+  // remember which one to use, catch the interaction where it happens.
+  //
+  // `click`, not `pointerdown`, because a screen reader's virtual click fires
+  // no pointer events — and that reader is the whole point of this contract.
+  // `keydown` for Space/Enter and for arrow-key controls. `closest` so that
+  // selecting the caption text is not mistaken for an ask, which would put the
+  // unsolicited-announcement failure (see 2. above) back on the table.
+  const controlHit = (e: React.SyntheticEvent) =>
+    (e.target as Element | null)?.closest?.(
+      'button,input,select,summary,a[href],[role="button"],[role="radio"],[role="tab"],[role="slider"]',
+    ) != null;
+  const noticeIntent = (e: React.SyntheticEvent) => {
+    if (controlHit(e)) setAsked(true);
+  };
+
+  // Keyboard is not the same as pointer here: `keydown` also fires for Tab, and
+  // Tab merely LANDING on the play button is navigation, not a request. `asked`
+  // is a one-way latch wired to a live region, so treating arrival as intent
+  // means a reader tabbing past the widget gets the caption read at them — the
+  // exact unsolicited announcement this contract exists to prevent.
+  const noticeKeyIntent = (e: React.KeyboardEvent) => {
+    if (ACTIVATION_KEYS.has(e.key)) noticeIntent(e);
+  };
+
   /** Is the live region holding the caption right now? */
   const announcing = asked && !player.playing;
 
   return (
-    <div className="not-prose my-6 space-y-4">
+    <div className="not-prose my-6 space-y-4" onClickCapture={noticeIntent} onKeyDownCapture={noticeKeyIntent}>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">{title}</div>
         <StepControls player={intent} locale={locale} showReset={showReset} />
@@ -594,7 +738,9 @@ export function DiagramFrame({
       </span>
 
       {note ? (
-        <p className="border-t border-border/60 pt-2 text-[11px] leading-relaxed text-muted-foreground">{note}</p>
+        <div className="space-y-2 border-t border-border/60 pt-2 text-[11px] leading-relaxed text-muted-foreground">
+          {note}
+        </div>
       ) : null}
     </div>
   );

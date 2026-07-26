@@ -5,6 +5,7 @@ import * as React from 'react';
 import { Button } from '../../components/ui/button';
 import { useLocale } from '../../lib/i18n-react';
 import { TopKBars, cleanupTokenText } from '../inspector/TopKBars';
+import { DiagramFrame, PanBox, RX, SW, useStepPlayer } from '../motion';
 
 /**
  * Course capstone — "Follow one token's journey".
@@ -20,6 +21,51 @@ import { TopKBars, cleanupTokenText } from '../inspector/TopKBars';
  * never by `Math.random` or `Date.now` — so it renders instantly even while the
  * real model is still downloading. The numbers and heatmaps are schematic
  * stand-ins for the real 1024-dim vectors and 248,320 logits, not live output.
+ *
+ * ── ANIMATION MODEL ────────────────────────────────────────────────────────
+ *
+ * `useStepPlayer` + `DiagramFrame` from `learn/motion`, replacing this file's
+ * former hand-rolled `setInterval`, its private `usePrefersReducedMotion`, the
+ * card shell, the header row, its own Play / Pause / Replay button and its own
+ * `aria-live` status region. The player is 0-indexed and everything else here
+ * is 1-indexed, so there is exactly ONE conversion — `stage = frame + 1` — and
+ * nothing downstream of it changes.
+ *
+ * Three things stay widget-owned on purpose, because `DiagramFrame` renders
+ * play/step and nothing else:
+ *   - the 6-chip stage rail, wired through `player.goTo` (the frame has no
+ *     scrubber, and the rail is also what says which stage is on screen);
+ *   - the Prev / Next pair (the frame's Step only goes forward);
+ *   - the visible "Stage n / 6" counter — the frame has no counter slot.
+ *
+ * The caption is the status sentence the old `sr-only role="status"` region
+ * announced, moved verbatim into the frame's caption slot: the frame owns the
+ * a11y contract now, so that sentence has to live where the frame can both show
+ * it and announce it. It is the one string that changes on every beat and is
+ * built from the same per-locale `STAGES` table the rail and the spine read, so
+ * `captions` is that table mapped one-to-one — every arm, by construction.
+ *
+ * That sentence is now VISIBLE as well as spoken, and it restates the panel
+ * header and the spine badge. Every other per-beat string in this widget is
+ * already placed by its own design — the stage prose sits above its visual, the
+ * data shape sits in the spine — so there was no spare sentence for the slot,
+ * and inventing one, demoting the prose into it, or deleting the spine to free
+ * it are all CONTENT calls, not conversion calls. The conversion took the option
+ * that removes nothing: the announcement is preserved exactly, and if the
+ * repetition is unwanted the fix is one line here plus one deletion, either the
+ * spine badge or the panel's stage/title row.
+ *
+ * Reduced motion parks on stage 1 (`restFrame: 0`), not on `useStepPlayer`'s
+ * default last frame: this is a guided walk whose reduced-motion hint tells the
+ * reader to step forward with Prev / Next, and stage 6 is the answer.
+ *
+ * COLOUR CARVE-OUT. This widget runs FOUR independent colour channels — the
+ * diverging teal/amber heatmap (sign of a value), the red query row (which token
+ * is asking), the 24-step blue depth ramp, and the green winning logit. None of
+ * them maps onto the skin's two hues, so only the STRUCTURAL tokens are adopted
+ * (`RX` on the rects, `SW` on the two hand-tuned stroke widths). Every hue in
+ * this file is left exactly as it was, and `RED` / `EMERALD` are deliberately
+ * not imported.
  */
 
 // ---------------------------------------------------------------------------
@@ -246,11 +292,11 @@ const COPY = {
       `Stage ${stage} of ${total}: ${title}. Data now: ${dataNow}.`,
     stageCount: (stage: number, total: number) => `Stage ${stage} / ${total}`,
     learnMore: (label: string) => `Learn more: ${label} →`,
+    // Play / Pause / Step live in the shared `StepControls` now, which carries
+    // its own en/zh pair so every animated widget in the course says the same
+    // word. Prev / Next stay here: the frame owns no backward step.
     prev: '‹ Prev',
     next: 'Next ›',
-    pause: 'Pause',
-    replay: 'Replay',
-    play: 'Play',
     hintReduced: 'Use Prev / Next to step through the forward pass.',
     hintPlay: 'Scrub the rail, or press Play to watch the forward pass run.',
     footer:
@@ -316,37 +362,12 @@ const COPY = {
     learnMore: (label: string) => `深入了解：${label} →`,
     prev: '‹ 上一步',
     next: '下一步 ›',
-    pause: '暂停',
-    replay: '重播',
-    play: '播放',
     hintReduced: '用“上一步 / 下一步”逐步走完这次前向传播。',
     hintPlay: '在阶段条上点选，或按“播放”观看前向传播完整跑一遍。',
     footer:
       '仅为示意——真实前向传播的简化示意图；图中的数字和热力图只是真实 1024 维向量与 248,320 个 logits 的替身，并非模型实时输出。',
   },
 } as const;
-
-// ---------------------------------------------------------------------------
-// Reduced-motion hook — read the media query once (SSR-guarded) into state.
-// ---------------------------------------------------------------------------
-
-function usePrefersReducedMotion(): boolean {
-  const [reduced, setReduced] = React.useState(
-    () =>
-      typeof window !== 'undefined' &&
-      typeof window.matchMedia === 'function' &&
-      window.matchMedia('(prefers-reduced-motion: reduce)').matches,
-  );
-  React.useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return undefined;
-    const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
-    setReduced(mq.matches);
-    const onChange = (e: MediaQueryListEvent) => setReduced(e.matches);
-    mq.addEventListener('change', onChange);
-    return () => mq.removeEventListener('change', onChange);
-  }, []);
-  return reduced;
-}
 
 // ---------------------------------------------------------------------------
 // Stage 1 — token chips: token text above its id, leading space made visible.
@@ -428,7 +449,7 @@ function EmbeddingHeatmap() {
                     y={y}
                     width={cellW}
                     height={cellH}
-                    rx={3}
+                    rx={RX}
                     fill={heatmapFill(v)}
                     stroke="currentColor"
                     strokeOpacity={0.08}
@@ -450,7 +471,8 @@ function EmbeddingHeatmap() {
 // ---------------------------------------------------------------------------
 
 function AttentionArcs() {
-  const copy = COPY[useLocale()];
+  const locale = useLocale();
+  const copy = COPY[locale];
   const slotW = 78;
   const padX = 12;
   const rowY = 78;
@@ -479,91 +501,98 @@ function AttentionArcs() {
 
   return (
     <div className="space-y-1.5">
-      <svg
-        viewBox={`0 0 ${width} ${height}`}
-        role="img"
-        aria-label={copy.arcsAria}
-        className="block h-auto w-full max-w-[460px]"
-      >
-        {/* Query bubble above the last token. */}
-        <rect
-          x={qCx - slotW / 2 + 6}
-          y={queryY}
-          width={slotW - 12}
-          height={slotH - 6}
-          rx={5}
-          fill="oklch(0.65 0.2 25)"
-        />
-        <text
-          x={qCx}
-          y={queryY + 16}
-          fontSize={11}
-          textAnchor="middle"
-          fill="white"
-          style={{ fontFamily: 'var(--font-mono, monospace)' }}
+      {/* Legibility floor: viewBox is 414 wide (padX*2 + 5*slotW) and the
+          smallest face in here is the 9px weight row, so the canvas may not
+          scale below ceil(8 * 414 / 9) = 368px or that row drops under the
+          course's 8 CSS px floor (it rendered at ~6.4px in a 320px column).
+          PanBox pans what no longer fits; the caption stays outside it. */}
+      <PanBox locale={locale}>
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          role="img"
+          aria-label={copy.arcsAria}
+          className="block h-auto w-full min-w-[368px] max-w-[460px]"
         >
-          query
-        </text>
+          {/* Query bubble above the last token. */}
+          <rect
+            x={qCx - slotW / 2 + 6}
+            y={queryY}
+            width={slotW - 12}
+            height={slotH - 6}
+            rx={RX}
+            fill="oklch(0.65 0.2 25)"
+          />
+          <text
+            x={qCx}
+            y={queryY + 16}
+            fontSize={11}
+            textAnchor="middle"
+            fill="white"
+            style={{ fontFamily: 'var(--font-mono, monospace)' }}
+          >
+            query
+          </text>
 
-        {/* Backward arcs, thickness/opacity ∝ attention weight. */}
-        {ATTENTION_WEIGHTS.map((w, i) => {
-          const t = w / maxW;
-          return (
-            <path
-              key={`arc-${i}`}
-              d={arcTo(i)}
-              fill="none"
-              stroke="oklch(0.65 0.2 25)"
-              strokeOpacity={0.3 + t * 0.6}
-              strokeWidth={1 + t * 3.5}
-            />
-          );
-        })}
-
-        {/* Token row. */}
-        {TOKEN_TEXTS.map((raw, i) => {
-          const x = padX + i * slotW;
-          const isQuery = i === queryIdx;
-          return (
-            <g key={`tok-${i}`}>
-              <rect
-                x={x + 4}
-                y={rowY}
-                width={slotW - 8}
-                height={slotH}
-                rx={5}
-                fill={isQuery ? 'oklch(0.65 0.2 25)' : 'currentColor'}
-                fillOpacity={isQuery ? 0.18 : 0.06}
-                stroke={isQuery ? 'oklch(0.65 0.2 25)' : 'currentColor'}
-                strokeOpacity={isQuery ? 0.8 : 0.18}
-                strokeWidth={isQuery ? 1.4 : 1}
+          {/* Backward arcs, thickness/opacity ∝ attention weight. */}
+          {ATTENTION_WEIGHTS.map((w, i) => {
+            const t = w / maxW;
+            return (
+              <path
+                key={`arc-${i}`}
+                d={arcTo(i)}
+                fill="none"
+                stroke="oklch(0.65 0.2 25)"
+                strokeOpacity={0.3 + t * 0.6}
+                strokeWidth={1 + t * 3.5}
               />
-              <text
-                x={slotCx(i)}
-                y={rowY + slotH / 2 + 4}
-                fontSize={11}
-                textAnchor="middle"
-                fill="currentColor"
-                fillOpacity={0.85}
-                style={{ fontFamily: 'var(--font-mono, monospace)' }}
-              >
-                {cleanupTokenText(raw)}
-              </text>
-              <text
-                x={slotCx(i)}
-                y={rowY + slotH + 14}
-                fontSize={9}
-                textAnchor="middle"
-                fill="currentColor"
-                fillOpacity={0.5}
-                style={{ fontFamily: 'var(--font-mono, monospace)' }}
-              >
-                {ATTENTION_WEIGHTS[i]?.toFixed(2)}
-              </text>
-            </g>
-          );
-        })}
-      </svg>
+            );
+          })}
+
+          {/* Token row. */}
+          {TOKEN_TEXTS.map((raw, i) => {
+            const x = padX + i * slotW;
+            const isQuery = i === queryIdx;
+            return (
+              <g key={`tok-${i}`}>
+                <rect
+                  x={x + 4}
+                  y={rowY}
+                  width={slotW - 8}
+                  height={slotH}
+                  rx={RX}
+                  fill={isQuery ? 'oklch(0.65 0.2 25)' : 'currentColor'}
+                  fillOpacity={isQuery ? 0.18 : 0.06}
+                  stroke={isQuery ? 'oklch(0.65 0.2 25)' : 'currentColor'}
+                  strokeOpacity={isQuery ? 0.8 : 0.18}
+                  strokeWidth={isQuery ? SW.OUTER : SW.INNER}
+                />
+                <text
+                  x={slotCx(i)}
+                  y={rowY + slotH / 2 + 4}
+                  fontSize={11}
+                  textAnchor="middle"
+                  fill="currentColor"
+                  fillOpacity={0.85}
+                  style={{ fontFamily: 'var(--font-mono, monospace)' }}
+                >
+                  {cleanupTokenText(raw)}
+                </text>
+                <text
+                  x={slotCx(i)}
+                  y={rowY + slotH + 14}
+                  fontSize={9}
+                  textAnchor="middle"
+                  fill="currentColor"
+                  fillOpacity={0.5}
+                  style={{ fontFamily: 'var(--font-mono, monospace)' }}
+                >
+                  {ATTENTION_WEIGHTS[i]?.toFixed(2)}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+      </PanBox>
       <p className="text-[11px] text-muted-foreground">{copy.arcsCaption}</p>
     </div>
   );
@@ -574,7 +603,8 @@ function AttentionArcs() {
 // ---------------------------------------------------------------------------
 
 function LayerStack() {
-  const copy = COPY[useLocale()];
+  const locale = useLocale();
+  const copy = COPY[locale];
   const width = 320;
   const barH = 5;
   const gap = 2.5;
@@ -582,51 +612,74 @@ function LayerStack() {
   const padX = 44;
   const height = padTop * 2 + NUM_LAYERS * (barH + gap);
   return (
-    <div className="flex items-start gap-3">
-      <svg
-        viewBox={`0 0 ${width} ${height}`}
-        role="img"
-        aria-label={copy.layersAria}
-        className="block h-auto w-full max-w-[340px]"
-      >
-        <text x={padX - 6} y={padTop + 8} fontSize={9} textAnchor="end" fill="currentColor" fillOpacity={0.55}>
-          {copy.layersIn}
-        </text>
-        <text x={padX - 6} y={height - padTop - 2} fontSize={9} textAnchor="end" fill="currentColor" fillOpacity={0.55}>
-          {copy.layersOut}
-        </text>
-        {Array.from({ length: NUM_LAYERS }).map((_, i) => {
-          const y = padTop + i * (barH + gap);
-          // Intensify with depth: deeper layers carry a richer running vector.
-          const t = i / (NUM_LAYERS - 1);
-          const alpha = (0.22 + t * 0.66).toFixed(3);
-          return (
-            <g key={`layer-${i}`}>
-              <rect
-                x={padX}
-                y={y}
-                width={width - padX - 8}
-                height={barH}
-                rx={2}
-                fill={`oklch(0.62 0.16 265 / ${alpha})`}
-              />
-              {(i + 1) % 4 === 0 ? (
-                <text
-                  x={width - 4}
-                  y={y + barH}
-                  fontSize={7.5}
-                  textAnchor="end"
-                  fill="currentColor"
-                  fillOpacity={0.4}
-                  style={{ fontFamily: 'var(--font-mono, monospace)' }}
-                >
-                  {i + 1}
-                </text>
-              ) : null}
-            </g>
-          );
-        })}
-      </svg>
+    // The svg used to be a bare flex child next to the "× 24" badge column, and
+    // a flex child with `w-full` has no width of its own to defend: measured at
+    // 375px the row squeezed this canvas to ~183px, scale 0.57, which put the
+    // 7.5px layer numbers at 4.3px and the 9px in/out labels at 5.1px. Two
+    // things fix it, and both are needed. (1) The `min-w` floor below stops the
+    // shrink — and because PanBox sets `overflow-x`, its own automatic minimum
+    // size as a flex item is zero, so the ROW still fits the column and pans
+    // inside instead of pushing the page sideways. (2) Below `sm` the row
+    // stacks, so the diagram gets the whole column rather than sharing ~320px
+    // with a 160px badge and panning through the ~200px that would be left.
+    <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
+      {/* Legibility floor: viewBox 320 wide, smallest face 7.5px (the every-4th
+          layer number), so ceil(8 * 320 / 7.5) = 342px. The old `max-w-[340px]`
+          cap moves to 342 to match — 2px, and a cap BELOW the floor would just
+          be dead CSS, since min-width wins over max-width. */}
+      <PanBox locale={locale}>
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          role="img"
+          aria-label={copy.layersAria}
+          className="block h-auto w-full min-w-[342px] max-w-[342px]"
+        >
+          <text x={padX - 6} y={padTop + 8} fontSize={9} textAnchor="end" fill="currentColor" fillOpacity={0.55}>
+            {copy.layersIn}
+          </text>
+          <text
+            x={padX - 6}
+            y={height - padTop - 2}
+            fontSize={9}
+            textAnchor="end"
+            fill="currentColor"
+            fillOpacity={0.55}
+          >
+            {copy.layersOut}
+          </text>
+          {Array.from({ length: NUM_LAYERS }).map((_, i) => {
+            const y = padTop + i * (barH + gap);
+            // Intensify with depth: deeper layers carry a richer running vector.
+            const t = i / (NUM_LAYERS - 1);
+            const alpha = (0.22 + t * 0.66).toFixed(3);
+            return (
+              <g key={`layer-${i}`}>
+                <rect
+                  x={padX}
+                  y={y}
+                  width={width - padX - 8}
+                  height={barH}
+                  rx={RX}
+                  fill={`oklch(0.62 0.16 265 / ${alpha})`}
+                />
+                {(i + 1) % 4 === 0 ? (
+                  <text
+                    x={width - 4}
+                    y={y + barH}
+                    fontSize={7.5}
+                    textAnchor="end"
+                    fill="currentColor"
+                    fillOpacity={0.4}
+                    style={{ fontFamily: 'var(--font-mono, monospace)' }}
+                  >
+                    {i + 1}
+                  </text>
+                ) : null}
+              </g>
+            );
+          })}
+        </svg>
+      </PanBox>
       <div className="flex flex-col justify-center self-stretch">
         <div className="rounded-md border border-primary/40 bg-primary/10 px-2.5 py-1 text-center">
           <div className="font-mono text-lg font-semibold text-primary">× 24</div>
@@ -650,7 +703,8 @@ function logitBarHeight(i: number): number {
 }
 
 function LogitsStrip() {
-  const copy = COPY[useLocale()];
+  const locale = useLocale();
+  const copy = COPY[locale];
   const width = 480;
   const height = 96;
   const vecCells = 6;
@@ -667,76 +721,82 @@ function LogitsStrip() {
   const barGap = stripW / LOGIT_BAR_COUNT;
   return (
     <div className="space-y-1.5">
-      <svg
-        viewBox={`0 0 ${width} ${height}`}
-        role="img"
-        aria-label={copy.logitsAria}
-        className="block h-auto w-full"
-      >
-        {/* Last token's vector — a small row of cells. */}
-        {Array.from({ length: vecCells }).map((_, i) => (
-          <rect
-            key={`vec-${i}`}
-            x={vecX + i * (vecCellW + 2)}
-            y={vecY}
-            width={vecCellW}
-            height={vecCellH}
-            rx={2}
-            fill={heatmapFill(heatmapValue(HEATMAP_ROWS - 1, i))}
-            stroke="currentColor"
-            strokeOpacity={0.1}
-          />
-        ))}
-        <text x={vecX} y={vecY - 6} fontSize={9} fill="currentColor" fillOpacity={0.55}>
-          {copy.lastVector}
-        </text>
-
-        {/* Arrow. */}
-        <line
-          x1={arrowX0}
-          y1={height / 2}
-          x2={arrowX1 - 4}
-          y2={height / 2}
-          stroke="currentColor"
-          strokeOpacity={0.5}
-          strokeWidth={1.4}
-        />
-        <path
-          d={`M ${arrowX1 - 4} ${height / 2 - 4} L ${arrowX1 + 3} ${height / 2} L ${arrowX1 - 4} ${height / 2 + 4} Z`}
-          fill="currentColor"
-          fillOpacity={0.5}
-        />
-
-        {/* Wide logits strip baseline + bars. */}
-        <line
-          x1={stripX}
-          y1={stripTop + stripH}
-          x2={stripX + stripW}
-          y2={stripTop + stripH}
-          stroke="currentColor"
-          strokeOpacity={0.2}
-        />
-        {Array.from({ length: LOGIT_BAR_COUNT }).map((_, i) => {
-          const h = logitBarHeight(i) * stripH;
-          const isWinner = i === 4; // one prominent spike standing in for the winning token
-          const bh = isWinner ? Math.max(h, stripH * 0.92) : h;
-          return (
+      {/* Legibility floor: viewBox 480 wide and the only two labels here are
+          9px, so ceil(8 * 480 / 9) = 427px. This svg carried no width floor and
+          no cap at all, so a 320px column scaled it to 0.67 and both labels
+          landed at ~5.5 CSS px. */}
+      <PanBox locale={locale}>
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          role="img"
+          aria-label={copy.logitsAria}
+          className="block h-auto w-full min-w-[427px]"
+        >
+          {/* Last token's vector — a small row of cells. */}
+          {Array.from({ length: vecCells }).map((_, i) => (
             <rect
-              key={`logit-${i}`}
-              x={stripX + i * barGap + 0.6}
-              y={stripTop + stripH - bh}
-              width={Math.max(1.5, barGap - 1.2)}
-              height={bh}
-              rx={0.8}
-              fill={isWinner ? 'oklch(0.68 0.17 150)' : 'currentColor'}
-              fillOpacity={isWinner ? 1 : 0.4}
+              key={`vec-${i}`}
+              x={vecX + i * (vecCellW + 2)}
+              y={vecY}
+              width={vecCellW}
+              height={vecCellH}
+              rx={RX}
+              fill={heatmapFill(heatmapValue(HEATMAP_ROWS - 1, i))}
+              stroke="currentColor"
+              strokeOpacity={0.1}
             />
-          );
-        })}
-        <text x={stripX} y={stripTop - 5} fontSize={9} fill="currentColor" fillOpacity={0.55}>
-          {copy.logitsLabel}
-        </text>
-      </svg>
+          ))}
+          <text x={vecX} y={vecY - 6} fontSize={9} fill="currentColor" fillOpacity={0.55}>
+            {copy.lastVector}
+          </text>
+
+          {/* Arrow. */}
+          <line
+            x1={arrowX0}
+            y1={height / 2}
+            x2={arrowX1 - 4}
+            y2={height / 2}
+            stroke="currentColor"
+            strokeOpacity={0.5}
+            strokeWidth={SW.INNER}
+          />
+          <path
+            d={`M ${arrowX1 - 4} ${height / 2 - 4} L ${arrowX1 + 3} ${height / 2} L ${arrowX1 - 4} ${height / 2 + 4} Z`}
+            fill="currentColor"
+            fillOpacity={0.5}
+          />
+
+          {/* Wide logits strip baseline + bars. */}
+          <line
+            x1={stripX}
+            y1={stripTop + stripH}
+            x2={stripX + stripW}
+            y2={stripTop + stripH}
+            stroke="currentColor"
+            strokeOpacity={0.2}
+          />
+          {Array.from({ length: LOGIT_BAR_COUNT }).map((_, i) => {
+            const h = logitBarHeight(i) * stripH;
+            const isWinner = i === 4; // one prominent spike standing in for the winning token
+            const bh = isWinner ? Math.max(h, stripH * 0.92) : h;
+            return (
+              <rect
+                key={`logit-${i}`}
+                x={stripX + i * barGap + 0.6}
+                y={stripTop + stripH - bh}
+                width={Math.max(1.5, barGap - 1.2)}
+                height={bh}
+                rx={RX}
+                fill={isWinner ? 'oklch(0.68 0.17 150)' : 'currentColor'}
+                fillOpacity={isWinner ? 1 : 0.4}
+              />
+            );
+          })}
+          <text x={stripX} y={stripTop - 5} fontSize={9} fill="currentColor" fillOpacity={0.55}>
+            {copy.logitsLabel}
+          </text>
+        </svg>
+      </PanBox>
       <p className="text-[11px] text-muted-foreground">{copy.logitsCaption}</p>
     </div>
   );
@@ -811,140 +871,167 @@ export function TokenJourney() {
   const locale = useLocale();
   const copy = COPY[locale];
   const stages = STAGES[locale];
-  const [stage, setStage] = React.useState(1);
-  const [playing, setPlaying] = React.useState(false);
-  const reducedMotion = usePrefersReducedMotion();
+  // `loop: false` — the old autoplay parked on the last stage instead of
+  // wrapping, and `useStepPlayer.toggle` turns a Play press on a parked sweep
+  // back into the "Replay" this widget used to spell out on its own button.
+  //
+  // `initialPlaying: false` restores what this widget did BEFORE the skin
+  // conversion (`useState(false)`), which `useStepPlayer`'s `useState(true)`
+  // default had silently flipped. This is the capstone: the payoff is stage 6,
+  // the answer. At 2200ms x 6 stages the sweep is over in ~11s and it is not
+  // viewport-gated, so a reader scrolling down to it arrives at a sweep that
+  // already ran and parked on the ending — the setup never seen, and `loop:
+  // false` means it never comes back around. It is also what makes
+  // `copy.hintPlay` ("press Play …") true again: with autoplay on, the hint
+  // said Play while the button said Pause.
+  const player = useStepPlayer(TOTAL_STAGES, {
+    frameMs: AUTOPLAY_MS,
+    loop: false,
+    restFrame: 0,
+    initialPlaying: false,
+  });
+  // The only 0-indexed ↔ 1-indexed conversion in the file.
+  const stage = player.frame + 1;
 
   const atStart = stage <= 1;
   const atEnd = stage >= TOTAL_STAGES;
   const current = stages[stage - 1]!;
 
-  // Autoplay: advance one stage every AUTOPLAY_MS, stop at the last stage.
-  // Disabled entirely under reduced motion (Play is hidden below).
-  React.useEffect(() => {
-    if (!playing || reducedMotion) return undefined;
-    const id = window.setInterval(() => {
-      setStage((s) => {
-        if (s + 1 >= TOTAL_STAGES) {
-          setPlaying(false);
-          return TOTAL_STAGES;
-        }
-        return s + 1;
-      });
-    }, AUTOPLAY_MS);
-    return () => window.clearInterval(id);
-  }, [playing, reducedMotion]);
+  // The per-beat sentence. The old `sr-only role="status"` region held exactly
+  // this string; `DiagramFrame` owns the a11y contract now, so it moves into the
+  // caption slot — visible, and announced when the reader pauses or steps.
+  const caption = copy.srStatus(stage, TOTAL_STAGES, current.title, current.dataNow);
 
-  function go(next: number) {
-    setPlaying(false);
-    setStage(Math.max(1, Math.min(TOTAL_STAGES, next)));
-  }
-
-  function togglePlay() {
-    if (atEnd) {
-      // "Replay" — jump back to the start and play forward again.
-      setStage(1);
-      setPlaying(true);
-    } else {
-      setPlaying((p) => !p);
-    }
-  }
-
-  const playLabel = playing ? copy.pause : atEnd ? copy.replay : copy.play;
+  // Every caption this sweep can reach, so DiagramFrame reserves the tallest and
+  // the chapter body cannot hop when the stage changes. The selector above has
+  // exactly ONE arm — `srStatus` called with the current stage — and `stage`
+  // walks [1, TOTAL_STAGES], which is precisely the index set of `stages`. So
+  // mapping that table is the whole reachable set, per locale, by construction.
+  const captions = stages.map((s) => copy.srStatus(s.n, TOTAL_STAGES, s.title, s.dataNow));
 
   return (
-    <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
-      {/* Header + the running example. */}
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.headerTitle}</div>
+    <DiagramFrame
+      title={copy.headerTitle}
+      player={player}
+      locale={locale}
+      caption={caption}
+      captions={captions}
+      note={copy.footer}
+    >
+      {/* The body keeps its own tighter rhythm; DiagramFrame's `space-y-4` is
+          for the frame's own parts. */}
+      <div className="space-y-3">
+        {/* The running example. It used to share the header row with the title;
+            DiagramFrame owns that row (title + StepControls), so it moves in
+            here. */}
         <div className="font-mono text-[11px] text-muted-foreground">
           &quot;{PROMPT}&quot; <span className="text-foreground/70">→ ?</span>
         </div>
-      </div>
 
-      {/* Stage rail: 6 numbered, clickable chips. */}
-      <div className="flex flex-wrap gap-1.5" role="group" aria-label={copy.railAria}>
-        {stages.map((s) => {
-          const isCurrent = s.n === stage;
-          return (
-            <button
-              key={s.n}
-              type="button"
-              onClick={() => go(s.n)}
-              aria-current={isCurrent ? 'step' : undefined}
-              aria-label={copy.goToStage(s.n, s.title)}
-              className={cn(
-                'flex items-center gap-1.5 rounded-md border px-2 py-1 max-sm:px-2.5 max-sm:py-1.5 max-sm:min-h-[40px] text-left text-[11px] transition-colors',
-                reducedMotion && 'transition-none',
-                isCurrent
-                  ? 'border-primary/50 bg-primary/15 text-primary'
-                  : 'border-border/60 bg-muted/20 text-muted-foreground hover:bg-foreground/5',
-              )}
-            >
-              <span
+        {/* Stage rail: 6 numbered, clickable chips. Not a frame control — the
+            frame renders play/step only — so the scrubber stays widget-owned
+            and drives the player through `goTo`, which pauses first. */}
+        <div className="flex flex-wrap gap-1.5" role="group" aria-label={copy.railAria}>
+          {stages.map((s) => {
+            const isCurrent = s.n === stage;
+            return (
+              <button
+                key={s.n}
+                type="button"
+                onClick={() => player.goTo(s.n - 1)}
+                aria-current={isCurrent ? 'step' : undefined}
+                aria-label={copy.goToStage(s.n, s.title)}
                 className={cn(
-                  'inline-flex h-4 w-4 max-sm:h-5 max-sm:w-5 items-center justify-center rounded-full font-mono text-[10px] tabular-nums',
-                  isCurrent ? 'bg-primary text-primary-foreground' : 'bg-foreground/10 text-foreground/70',
+                  'flex items-center gap-1.5 rounded-md border px-2 py-1 max-sm:px-2.5 max-sm:py-1.5 max-sm:min-h-[40px] text-left text-[11px] transition-colors',
+                  player.reducedMotion && 'transition-none',
+                  isCurrent
+                    ? 'border-primary/50 bg-primary/15 text-primary'
+                    : 'border-border/60 bg-muted/20 text-muted-foreground hover:bg-foreground/5',
                 )}
               >
-                {s.n}
-              </span>
-              <span className="hidden font-medium sm:inline">{s.title}</span>
-            </button>
-          );
-        })}
-      </div>
-
-      {/* Through-line spine: always-visible "right now the data is" badge. */}
-      <div className="flex flex-wrap items-center gap-2 rounded-md border border-border/70 bg-muted/30 px-3 py-2">
-        <span className="text-[11px] uppercase tracking-wider text-muted-foreground">{copy.rightNow}</span>
-        <span className="font-mono text-[12px] font-medium text-foreground/90">{current.dataNow}</span>
-      </div>
-
-      {/* Stage panel. A single visually-hidden status region announces the stage
-          number, title, AND the current data shape on every change — the
-          data-shape through-line is the whole point, so screen-reader users hear
-          it, not just the title. The verbose SVG aria-labels sit outside it, so
-          they are not re-read on every scrub or autoplay tick. */}
-      <div className="space-y-3 rounded-md border border-border/60 bg-muted/10 p-3">
-        <div className="sr-only" role="status" aria-live="polite">
-          {copy.srStatus(stage, TOTAL_STAGES, current.title, current.dataNow)}
+                <span
+                  className={cn(
+                    'inline-flex h-4 w-4 max-sm:h-5 max-sm:w-5 items-center justify-center rounded-full font-mono text-[10px] tabular-nums',
+                    isCurrent ? 'bg-primary text-primary-foreground' : 'bg-foreground/10 text-foreground/70',
+                  )}
+                >
+                  {s.n}
+                </span>
+                <span className="hidden font-medium sm:inline">{s.title}</span>
+              </button>
+            );
+          })}
         </div>
-        <div className="flex items-baseline gap-2">
-          <span className="font-mono text-[11px] text-muted-foreground">{copy.stageCount(stage, TOTAL_STAGES)}</span>
-          <span className="text-sm font-semibold text-foreground">{current.title}</span>
+
+        {/* Through-line spine: always-visible "right now the data is" badge. */}
+        <div className="flex flex-wrap items-center gap-2 rounded-md border border-border/70 bg-muted/30 px-3 py-2">
+          <span className="text-[11px] uppercase tracking-wider text-muted-foreground">{copy.rightNow}</span>
+          <span className="font-mono text-[12px] font-medium text-foreground/90">{current.dataNow}</span>
         </div>
-        <StageBody stage={stage} />
-        <div className="text-[12px]">
-          <ChapterLink
-            chapterId={current.chapterId}
-            className="text-primary underline-offset-4 hover:underline"
+
+        {/* Stage panel. The visually-hidden status region that used to live here
+            is gone: DiagramFrame owns the a11y contract, and the sentence it
+            announced is now the caption. The visible "Stage n / 6" counter
+            stays, because the frame has no counter slot. The verbose SVG
+            aria-labels sit outside any live region, so they are not re-read on
+            every scrub. */}
+        <div className="space-y-3 rounded-md border border-border/60 bg-muted/10 p-3">
+          <div className="flex items-baseline gap-2">
+            <span className="font-mono text-[11px] text-muted-foreground">{copy.stageCount(stage, TOTAL_STAGES)}</span>
+            <span className="text-sm font-semibold text-foreground">{current.title}</span>
+          </div>
+          <StageBody stage={stage} />
+          <div className="text-[12px]">
+            <ChapterLink
+              chapterId={current.chapterId}
+              className="text-primary underline-offset-4 hover:underline"
+            >
+              {copy.learnMore(current.chapterLabel)}
+            </ChapterLink>
+          </div>
+        </div>
+
+        {/* Prev / Next. Play, Pause and Step are the frame's now; these two stay
+            because `StepControls` has no backward step and this is a walk the
+            reader is meant to be able to back up through.
+
+            `aria-disabled`, never the real `disabled` attribute. A keyboard
+            reader walking this sweep is holding focus on ONE of these two
+            buttons, and the button they are pressing is exactly the one that
+            goes inert at the boundary — a real `disabled` drops focus to
+            `<body>`, so reaching stage 1 or stage 6 costs them their place in
+            the page entirely and they have to Tab back in from the top. Kept
+            focusable and announced as unavailable instead: the handler no-ops,
+            and the styling is the same `pointer-events-none opacity-50` the
+            Button's own `disabled:` variants paint, so nothing looks different. */}
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              if (!atStart) player.goTo(player.frame - 1);
+            }}
+            aria-disabled={atStart}
+            className={cn(atStart && 'pointer-events-none opacity-50')}
           >
-            {copy.learnMore(current.chapterLabel)}
-          </ChapterLink>
+            {copy.prev}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              if (!atEnd) player.goTo(player.frame + 1);
+            }}
+            aria-disabled={atEnd}
+            className={cn(atEnd && 'pointer-events-none opacity-50')}
+          >
+            {copy.next}
+          </Button>
+          <span className="ml-auto text-[11px] text-muted-foreground">
+            {player.reducedMotion ? copy.hintReduced : copy.hintPlay}
+          </span>
         </div>
       </div>
-
-      {/* Controls. */}
-      <div className="flex flex-wrap items-center gap-2">
-        <Button size="sm" variant="outline" onClick={() => go(stage - 1)} disabled={atStart}>
-          {copy.prev}
-        </Button>
-        <Button size="sm" variant="outline" onClick={() => go(stage + 1)} disabled={atEnd}>
-          {copy.next}
-        </Button>
-        {reducedMotion ? null : (
-          <Button size="sm" onClick={togglePlay} aria-pressed={playing}>
-            {playLabel}
-          </Button>
-        )}
-        <span className="ml-auto text-[11px] text-muted-foreground">
-          {reducedMotion ? copy.hintReduced : copy.hintPlay}
-        </span>
-      </div>
-
-      {/* Honesty footer. */}
-      <p className="text-[10px] text-muted-foreground">{copy.footer}</p>
-    </div>
+    </DiagramFrame>
   );
 }

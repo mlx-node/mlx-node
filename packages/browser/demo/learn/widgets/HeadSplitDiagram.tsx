@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import { useLocale } from '../../lib/i18n-react';
+import { DiagramFrame, PanBox, RX, SW, useStepPlayer } from '../motion';
 
 /**
  * HeadSplitDiagram — chapter 4, the mirror of <MultiheadConcat />.
@@ -15,9 +16,8 @@ import { useLocale } from '../../lib/i18n-react';
  * Self-contained: NO worker, NO model, NO WASM — pure SVG + React state, so
  * it server-renders for crawlers and works while the model downloads.
  *
- * Animation model mirrors StreamingSoftmaxDiagram: a small set of discrete
- * frames advanced by a setInterval inside a guarded useEffect. Honors
- * prefers-reduced-motion (jumps straight to the final frame, no autoplay).
+ * Animation model: `useStepPlayer` + `DiagramFrame` from `learn/motion` own the
+ * frame timer, the play/step controls, the caption slot and the a11y contract.
  *
  * Head colors reuse MultiheadConcat's oklch hue wheel so a band here and a
  * band in the concat diagram with the same color are the same head.
@@ -38,29 +38,15 @@ const FRAME_MS = 2600;
 //   2 — the strip is cut into 8 colored bands (the actual "split")
 //   3 — K/V path appears: only 2 bands of 256
 //   4 — done (repeats the final state)
+// `useStepPlayer`'s default `restFrame` is TOTAL_FRAMES - 1, so reduced-motion
+// readers rest on frame 4 — the finished split — exactly as before.
 const TOTAL_FRAMES = 5;
-const DONE_FRAME = TOTAL_FRAMES - 1;
 
 // Same hue wheel as MultiheadConcat so head identity colors match across the
 // two diagrams (data colors, not theme surfaces — surfaces use CSS tokens).
 function headColor(i: number, alpha = 0.7): string {
   const hue = (i * 360) / H;
   return `oklch(0.7 0.13 ${hue} / ${alpha})`;
-}
-
-function usePrefersReducedMotion(): boolean {
-  const [reduced, setReduced] = React.useState<boolean>(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
-    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  });
-  React.useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
-    const mql = window.matchMedia('(prefers-reduced-motion: reduce)');
-    const onChange = (e: MediaQueryListEvent) => setReduced(e.matches);
-    mql.addEventListener('change', onChange);
-    return () => mql.removeEventListener('change', onChange);
-  }, []);
-  return reduced;
 }
 
 // ── SVG geometry ────────────────────────────────────────────────────────────
@@ -86,12 +72,19 @@ const KV_X = (VB_W - KV_W) / 2;
 
 // Per-locale copy: every user-visible string lives here so /zh localizes while
 // the English output stays byte-identical.
+//
+// Play / Pause / Step are NOT here any more: those verbs belong to the shared
+// `StepControls`, which carries its own en/zh pair so every animated widget in
+// the course says the same word.
+//
+// `header` is a plain string rather than a fragment because nothing in this
+// heading needs markup — `DiagramFrame` takes `title: React.ReactNode`, so a
+// fragment would be legal, it just has nothing to carry here. It renders in the
+// same `text-xs uppercase tracking-wider` header row the hand-rolled one did —
+// the words are unchanged.
 const COPY = {
   en: {
-    header: <>Split into heads — one vector in, {H} bands out</>,
-    pause: '❚❚ Pause',
-    play: '▶ Play',
-    step: 'Step ›',
+    header: `Split into heads — one vector in, ${H} bands out`,
     svgAria: `Diagram of the head split: a ${HIDDEN}-wide token vector is projected by W_q to ${Q_OUT} numbers, then reshaped into ${H} bands of ${D_HEAD} — one per query head. The K and V projections produce only ${KV_OUT} numbers, which reshape into just ${KV} bands of ${D_HEAD}: grouped-query attention.`,
     inputLabel: <>one token&apos;s vector x · [{HIDDEN}]</>,
     inputNumbers: `${HIDDEN} numbers`,
@@ -146,10 +139,7 @@ const COPY = {
     ),
   },
   zh: {
-    header: <>拆分成头——一个向量进来，{H} 条带出去</>,
-    pause: '❚❚ 暂停',
-    play: '▶ 播放',
-    step: '单步 ›',
+    header: `拆分成头——一个向量进来，${H} 条带出去`,
     svgAria: `头拆分示意图：一个 ${HIDDEN} 宽的 token 向量经 W_q 投影成 ${Q_OUT} 个数，再 reshape 成 ${H} 条 ${D_HEAD} 宽的带——每条对应一个 query 头。K 和 V 的投影只产出 ${KV_OUT} 个数，reshape 后只有 ${KV} 条 ${D_HEAD} 宽的带：分组查询注意力。`,
     inputLabel: <>一个 token 的向量 x · [{HIDDEN}]</>,
     inputNumbers: `${HIDDEN} 个数`,
@@ -206,22 +196,10 @@ const COPY = {
 } as const;
 
 export function HeadSplitDiagram() {
-  const copy = COPY[useLocale()];
-  const reducedMotion = usePrefersReducedMotion();
-  // Under reduced motion, start on the done frame and never auto-play.
-  const [frame, setFrame] = React.useState(reducedMotion ? DONE_FRAME : 0);
-  const [playing, setPlaying] = React.useState(!reducedMotion);
-
-  React.useEffect(() => {
-    if (!playing || reducedMotion) return;
-    const t = window.setInterval(() => setFrame((f) => (f + 1) % TOTAL_FRAMES), FRAME_MS);
-    return () => window.clearInterval(t);
-  }, [playing, reducedMotion]);
-
-  const step = () => {
-    setPlaying(false);
-    setFrame((f) => (f + 1) % TOTAL_FRAMES);
-  };
+  const locale = useLocale();
+  const copy = COPY[locale];
+  const player = useStepPlayer(TOTAL_FRAMES, { frameMs: FRAME_MS });
+  const { frame } = player;
 
   const showProj = frame >= 1;
   const showBands = frame >= 2;
@@ -240,224 +218,224 @@ export function HeadSplitDiagram() {
     caption = copy.captionDone;
   }
 
+  // Every caption this sweep can reach — one per arm of the chain above, and
+  // the chain has exactly these five arms (frame is always 0..TOTAL_FRAMES-1,
+  // so the `else` is frame 4 and nothing else). DiagramFrame stacks them in one
+  // grid cell and reserves the tallest, so the chapter body cannot hop when the
+  // beat changes. Which of the five is tallest flips between en and zh, so the
+  // whole set goes in rather than a hand-picked "longest" one.
+  const captions = [copy.caption0, copy.caption1, copy.caption2, copy.caption3, copy.captionDone];
+
   return (
-    <div className="not-prose my-5 space-y-3 rounded-md border border-border bg-background p-3">
-      {/* Header: title + controls */}
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.header}</div>
-        <div className="flex items-center gap-1">
-          {!reducedMotion ? (
-            <>
-              <button
-                type="button"
-                onClick={() => setPlaying((p) => !p)}
-                aria-pressed={playing}
-                className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-              >
-                {playing ? copy.pause : copy.play}
-              </button>
-              <button
-                type="button"
-                onClick={step}
-                className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-              >
-                {copy.step}
-              </button>
-            </>
-          ) : null}
-        </div>
-      </div>
-
-      <svg viewBox={`0 0 ${VB_W} ${VB_H}`} className="w-full" role="img" aria-label={copy.svgAria}>
-        {/* ── Input vector ── */}
-        <text x={IN_X} y={IN_Y - 8} style={{ fill: 'var(--muted-foreground)' }} className="text-[11px]">
-          {copy.inputLabel}
-        </text>
-        <rect
-          x={IN_X}
-          y={IN_Y}
-          width={IN_W}
-          height={STRIP_H}
-          rx={5}
-          style={{ fill: 'var(--card)', stroke: 'var(--border)' }}
-          strokeWidth={1.5}
-        />
-        <text
-          x={IN_X + IN_W / 2}
-          y={IN_Y + STRIP_H / 2 + 4}
-          textAnchor="middle"
-          style={{ fill: 'var(--foreground)' }}
-          className="font-mono text-[11px]"
-        >
-          {copy.inputNumbers}
-        </text>
-
-        {/* ── Projection block ── */}
-        <g style={{ opacity: showProj ? 1 : 0.12 }}>
-          <line
-            x1={VB_W / 2}
-            y1={IN_Y + STRIP_H}
-            x2={VB_W / 2}
-            y2={PROJ_Y}
-            style={{ stroke: 'var(--muted-foreground)' }}
-            strokeOpacity={0.5}
-            strokeWidth={1.2}
-          />
+    <DiagramFrame
+      title={copy.header}
+      player={player}
+      locale={locale}
+      caption={caption}
+      captions={captions}
+      note={copy.footnote}
+    >
+      {/*
+        The floor that makes the `PanBox` below worth wrapping. A `w-full` svg
+        does not reflow in a narrow column — it SCALES, text and all — so at a
+        375px viewport (320px article column) this 760-wide canvas dragged its
+        smallest type down to 4.2px. That smallest type is the 10px band row:
+        `head 0`…`head 7`, `256 each`, `K/V 0`, and the `only 2 bands` GQA
+        punchline. Every one of them is a label the lesson asks you to read —
+        none is a superscript or a decorative tick — so 10px is the size the
+        8px legibility floor has to be computed against: 8 * 760 / 10 = 608.
+        Below 608px the svg stops shrinking and `PanBox` pans the last 152px
+        sideways. The floor and the box ride the svg ONLY; the play/step
+        controls are siblings outside it, so they keep sizing to the visible
+        width.
+      */}
+      <PanBox locale={locale}>
+        <svg viewBox={`0 0 ${VB_W} ${VB_H}`} className="w-full min-w-[608px]" role="img" aria-label={copy.svgAria}>
+          {/* ── Input vector ── */}
+          <text x={IN_X} y={IN_Y - 8} style={{ fill: 'var(--muted-foreground)' }} className="text-[11px]">
+            {copy.inputLabel}
+          </text>
           <rect
-            x={PROJ_X}
-            y={PROJ_Y}
-            width={PROJ_W}
-            height={PROJ_H}
-            rx={6}
-            style={{
-              fill: showProj ? 'var(--primary)' : 'var(--card)',
-              fillOpacity: showProj ? 0.12 : 1,
-              stroke: showProj ? 'var(--primary)' : 'var(--border)',
-            }}
-            strokeWidth={showProj ? 1.8 : 1.5}
+            x={IN_X}
+            y={IN_Y}
+            width={IN_W}
+            height={STRIP_H}
+            rx={RX}
+            style={{ fill: 'var(--card)', stroke: 'var(--border)' }}
+            strokeWidth={SW.OUTER}
           />
           <text
-            x={VB_W / 2}
-            y={PROJ_Y + PROJ_H / 2 + 4}
+            x={IN_X + IN_W / 2}
+            y={IN_Y + STRIP_H / 2 + 4}
             textAnchor="middle"
             style={{ fill: 'var(--foreground)' }}
             className="font-mono text-[11px]"
           >
-            W_q · [{HIDDEN} × {Q_OUT}]
+            {copy.inputNumbers}
           </text>
-          <line
-            x1={VB_W / 2}
-            y1={PROJ_Y + PROJ_H}
-            x2={VB_W / 2}
-            y2={Q_Y - 14}
-            style={{ stroke: 'var(--muted-foreground)' }}
-            strokeOpacity={0.5}
-            strokeWidth={1.2}
-          />
-        </g>
 
-        {/* ── Q output strip: flat at frame 1, banded from frame 2 ── */}
-        <g style={{ opacity: showProj ? 1 : 0.12 }}>
-          <text x={Q_X} y={Q_Y - 6} style={{ fill: 'var(--muted-foreground)' }} className="text-[11px]">
-            {showBands ? copy.queriesBanded : copy.queriesFlat}
-          </text>
-          {showBands ? (
-            <>
-              {Array.from({ length: H }, (_, i) => (
-                <g key={i}>
-                  <rect
-                    x={Q_X + i * BAND_W}
-                    y={Q_Y}
-                    width={BAND_W}
-                    height={STRIP_H}
-                    fill={headColor(i, 0.65)}
-                    style={{ stroke: 'var(--border)' }}
-                    strokeWidth={1}
-                  />
-                  <text
-                    x={Q_X + i * BAND_W + BAND_W / 2}
-                    y={Q_Y + STRIP_H + 13}
-                    textAnchor="middle"
-                    style={{ fill: 'var(--muted-foreground)' }}
-                    className="text-[10px]"
-                  >
-                    {copy.headBand(i)}
-                  </text>
-                </g>
-              ))}
-            </>
-          ) : (
+          {/* ── Projection block ── */}
+          <g style={{ opacity: showProj ? 1 : 0.12 }}>
+            <line
+              x1={VB_W / 2}
+              y1={IN_Y + STRIP_H}
+              x2={VB_W / 2}
+              y2={PROJ_Y}
+              style={{ stroke: 'var(--muted-foreground)' }}
+              strokeOpacity={0.5}
+              strokeWidth={SW.INNER}
+            />
+            <rect
+              x={PROJ_X}
+              y={PROJ_Y}
+              width={PROJ_W}
+              height={PROJ_H}
+              rx={RX}
+              style={{
+                fill: showProj ? 'var(--primary)' : 'var(--card)',
+                fillOpacity: showProj ? 0.12 : 1,
+                stroke: showProj ? 'var(--primary)' : 'var(--border)',
+              }}
+              strokeWidth={SW.OUTER}
+            />
+            <text
+              x={VB_W / 2}
+              y={PROJ_Y + PROJ_H / 2 + 4}
+              textAnchor="middle"
+              style={{ fill: 'var(--foreground)' }}
+              className="font-mono text-[11px]"
+            >
+              W_q · [{HIDDEN} × {Q_OUT}]
+            </text>
+            <line
+              x1={VB_W / 2}
+              y1={PROJ_Y + PROJ_H}
+              x2={VB_W / 2}
+              y2={Q_Y - 14}
+              style={{ stroke: 'var(--muted-foreground)' }}
+              strokeOpacity={0.5}
+              strokeWidth={SW.INNER}
+            />
+          </g>
+
+          {/* ── Q output strip: flat at frame 1, banded from frame 2 ── */}
+          <g style={{ opacity: showProj ? 1 : 0.12 }}>
+            <text x={Q_X} y={Q_Y - 6} style={{ fill: 'var(--muted-foreground)' }} className="text-[11px]">
+              {showBands ? copy.queriesBanded : copy.queriesFlat}
+            </text>
+            {showBands ? (
+              <>
+                {Array.from({ length: H }, (_, i) => (
+                  <g key={i}>
+                    <rect
+                      x={Q_X + i * BAND_W}
+                      y={Q_Y}
+                      width={BAND_W}
+                      height={STRIP_H}
+                      fill={headColor(i, 0.65)}
+                      style={{ stroke: 'var(--border)' }}
+                      strokeWidth={SW.INNER}
+                    />
+                    <text
+                      x={Q_X + i * BAND_W + BAND_W / 2}
+                      y={Q_Y + STRIP_H + 13}
+                      textAnchor="middle"
+                      style={{ fill: 'var(--muted-foreground)' }}
+                      className="text-[10px]"
+                    >
+                      {copy.headBand(i)}
+                    </text>
+                  </g>
+                ))}
+              </>
+            ) : (
+              <rect
+                x={Q_X}
+                y={Q_Y}
+                width={Q_W}
+                height={STRIP_H}
+                rx={RX}
+                style={{ fill: 'var(--primary)', fillOpacity: 0.18, stroke: 'var(--primary)' }}
+                strokeWidth={SW.OUTER}
+              />
+            )}
+            {/* outer border around the banded strip */}
             <rect
               x={Q_X}
               y={Q_Y}
               width={Q_W}
               height={STRIP_H}
-              rx={5}
-              style={{ fill: 'var(--primary)', fillOpacity: 0.18, stroke: 'var(--primary)' }}
-              strokeWidth={1.5}
+              rx={RX}
+              fill="none"
+              style={{ stroke: 'var(--foreground)' }}
+              strokeOpacity={0.35}
+              strokeWidth={SW.OUTER}
             />
-          )}
-          {/* outer border around the banded strip */}
-          <rect
-            x={Q_X}
-            y={Q_Y}
-            width={Q_W}
-            height={STRIP_H}
-            rx={5}
-            fill="none"
-            style={{ stroke: 'var(--foreground)' }}
-            strokeOpacity={0.35}
-            strokeWidth={1.2}
-          />
-          <text
-            x={Q_X + Q_W + 8}
-            y={Q_Y + STRIP_H / 2 + 4}
-            style={{ fill: 'var(--muted-foreground)' }}
-            className="font-mono text-[10px]"
-          >
-            {copy.eachBand}
-          </text>
-        </g>
+            <text
+              x={Q_X + Q_W + 8}
+              y={Q_Y + STRIP_H / 2 + 4}
+              style={{ fill: 'var(--muted-foreground)' }}
+              className="font-mono text-[10px]"
+            >
+              {copy.eachBand}
+            </text>
+          </g>
 
-        {/* ── K/V path (GQA): only 2 bands ── */}
-        <g style={{ opacity: showKv ? 1 : 0.12 }}>
-          <text
-            x={KV_X - 8}
-            y={KV_Y + STRIP_H / 2 + 4}
-            textAnchor="end"
-            style={{ fill: 'var(--muted-foreground)' }}
-            className="text-[11px]"
-          >
-            {copy.kvPathLabel}
-          </text>
-          {Array.from({ length: KV }, (_, g) => (
-            <g key={g}>
-              <rect
-                x={KV_X + g * BAND_W}
-                y={KV_Y}
-                width={BAND_W}
-                height={STRIP_H}
-                fill={headColor(g * (H / KV), 0.65)}
-                style={{ stroke: 'var(--border)' }}
-                strokeWidth={1}
-              />
-              <text
-                x={KV_X + g * BAND_W + BAND_W / 2}
-                y={KV_Y + STRIP_H + 13}
-                textAnchor="middle"
-                style={{ fill: 'var(--muted-foreground)' }}
-                className="text-[10px]"
-              >
-                {copy.kvBand(g)}
-              </text>
-            </g>
-          ))}
-          <rect
-            x={KV_X}
-            y={KV_Y}
-            width={KV_W}
-            height={STRIP_H}
-            rx={5}
-            fill="none"
-            style={{ stroke: 'var(--foreground)' }}
-            strokeOpacity={0.35}
-            strokeWidth={1.2}
-          />
-          <text
-            x={KV_X + KV_W + 8}
-            y={KV_Y + STRIP_H / 2 + 4}
-            style={{ fill: 'var(--muted-foreground)' }}
-            className="font-mono text-[10px]"
-          >
-            {copy.kvOnly}
-          </text>
-        </g>
-      </svg>
-
-      {/* Caption — what this frame shows */}
-      <p className="min-h-[3.25rem] text-[13px] text-foreground/90">{caption}</p>
-
-      <p className="text-[10px] text-muted-foreground/70">{copy.footnote}</p>
-    </div>
+          {/* ── K/V path (GQA): only 2 bands ── */}
+          <g style={{ opacity: showKv ? 1 : 0.12 }}>
+            <text
+              x={KV_X - 8}
+              y={KV_Y + STRIP_H / 2 + 4}
+              textAnchor="end"
+              style={{ fill: 'var(--muted-foreground)' }}
+              className="text-[11px]"
+            >
+              {copy.kvPathLabel}
+            </text>
+            {Array.from({ length: KV }, (_, g) => (
+              <g key={g}>
+                <rect
+                  x={KV_X + g * BAND_W}
+                  y={KV_Y}
+                  width={BAND_W}
+                  height={STRIP_H}
+                  fill={headColor(g * (H / KV), 0.65)}
+                  style={{ stroke: 'var(--border)' }}
+                  strokeWidth={SW.INNER}
+                />
+                <text
+                  x={KV_X + g * BAND_W + BAND_W / 2}
+                  y={KV_Y + STRIP_H + 13}
+                  textAnchor="middle"
+                  style={{ fill: 'var(--muted-foreground)' }}
+                  className="text-[10px]"
+                >
+                  {copy.kvBand(g)}
+                </text>
+              </g>
+            ))}
+            <rect
+              x={KV_X}
+              y={KV_Y}
+              width={KV_W}
+              height={STRIP_H}
+              rx={RX}
+              fill="none"
+              style={{ stroke: 'var(--foreground)' }}
+              strokeOpacity={0.35}
+              strokeWidth={SW.OUTER}
+            />
+            <text
+              x={KV_X + KV_W + 8}
+              y={KV_Y + STRIP_H / 2 + 4}
+              style={{ fill: 'var(--muted-foreground)' }}
+              className="font-mono text-[10px]"
+            >
+              {copy.kvOnly}
+            </text>
+          </g>
+        </svg>
+      </PanBox>
+    </DiagramFrame>
   );
 }

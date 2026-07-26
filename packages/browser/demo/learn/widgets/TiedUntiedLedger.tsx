@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import { useLocale } from '../../lib/i18n-react';
+import { PanBox } from '../motion';
 
 /**
  * Chapter 10 (lm-head) supplement — the tied-vs-untied parameter ledger.
@@ -91,7 +92,8 @@ const UNTIED_Y = 54;
 const SCALE = BAR_W / UNTIED_TOTAL; // untied total spans the full bar
 
 export function TiedUntiedLedger() {
-  const copy = COPY[useLocale()];
+  const locale = useLocale();
+  const copy = COPY[locale];
 
   const tiedW = TOTAL * SCALE;
   const tiedEmbedW = EMBED * SCALE;
@@ -100,76 +102,87 @@ export function TiedUntiedLedger() {
 
   return (
     <div className="not-prose my-5 space-y-3 rounded-md border border-border bg-background p-3">
-      {/* Two totals to scale: tied vs untied. The lit portion is the embedding. */}
-      <svg viewBox={`0 0 ${VB_W} ${VB_H}`} className="w-full" role="img" aria-hidden="true">
-        {/* tied row */}
-        <text x={0} y={TIED_Y + BAR_H / 2 + 4} style={{ fill: 'var(--muted-foreground)' }} className="text-[11px]">
-          {copy.barTiedLabel}
-        </text>
-        <rect
-          x={BAR_X}
-          y={TIED_Y}
-          width={Math.max(tiedW, 1)}
-          height={BAR_H}
-          style={{ fill: 'var(--primary)', fillOpacity: 0.18, stroke: 'var(--border)' }}
-          strokeWidth={1}
-        />
-        <rect
-          x={BAR_X}
-          y={TIED_Y}
-          width={Math.max(tiedEmbedW, 1)}
-          height={BAR_H}
-          style={{ fill: 'var(--primary)', fillOpacity: 0.7, stroke: 'var(--border)' }}
-          strokeWidth={1}
-        />
-        <text
-          x={BAR_X + tiedW + 6}
-          y={TIED_Y + BAR_H / 2 + 4}
-          style={{ fill: 'var(--muted-foreground)' }}
-          className="font-mono text-[10px]"
-        >
-          853M
-        </text>
+      {/* Two totals to scale: tied vs untied. The lit portion is the embedding.
+          `min-w` + PanBox is the 375px legibility floor. A `w-full` svg does not
+          reflow in a narrow column — it scales the whole canvas, text included —
+          so at a 375px viewport (column ≈ 320px) this VB_W = 520 canvas renders
+          at 0.62× and the 10px `853M` / `~1.107B` totals land at ~5.7 CSS px.
+          8px is the floor, so ceil(8 * 520 / 10) = 416px, and PanBox pans the
+          remaining ~96px. 10 is the smallest face on the canvas: the `tied` /
+          `untied` row labels are 11px, everything else here is markup. The
+          numeric ledger below is a real table and reflows on its own, so only
+          the svg takes the floor. */}
+      <PanBox locale={locale}>
+        <svg viewBox={`0 0 ${VB_W} ${VB_H}`} className="w-full min-w-[416px]" aria-hidden="true">
+          {/* tied row */}
+          <text x={0} y={TIED_Y + BAR_H / 2 + 4} style={{ fill: 'var(--muted-foreground)' }} className="text-[11px]">
+            {copy.barTiedLabel}
+          </text>
+          <rect
+            x={BAR_X}
+            y={TIED_Y}
+            width={Math.max(tiedW, 1)}
+            height={BAR_H}
+            style={{ fill: 'var(--primary)', fillOpacity: 0.18, stroke: 'var(--border)' }}
+            strokeWidth={1}
+          />
+          <rect
+            x={BAR_X}
+            y={TIED_Y}
+            width={Math.max(tiedEmbedW, 1)}
+            height={BAR_H}
+            style={{ fill: 'var(--primary)', fillOpacity: 0.7, stroke: 'var(--border)' }}
+            strokeWidth={1}
+          />
+          <text
+            x={BAR_X + tiedW + 6}
+            y={TIED_Y + BAR_H / 2 + 4}
+            style={{ fill: 'var(--muted-foreground)' }}
+            className="font-mono text-[10px]"
+          >
+            853M
+          </text>
 
-        {/* untied row */}
-        <text x={0} y={UNTIED_Y + BAR_H / 2 + 4} style={{ fill: 'var(--muted-foreground)' }} className="text-[11px]">
-          {copy.barUntiedLabel}
-        </text>
-        <rect
-          x={BAR_X}
-          y={UNTIED_Y}
-          width={Math.max(untiedW, 1)}
-          height={BAR_H}
-          style={{ fill: 'var(--primary)', fillOpacity: 0.18, stroke: 'var(--border)' }}
-          strokeWidth={1}
-        />
-        <rect
-          x={BAR_X}
-          y={UNTIED_Y}
-          width={Math.max(untiedEmbedW, 1)}
-          height={BAR_H}
-          style={{ fill: 'var(--primary)', fillOpacity: 0.7, stroke: 'var(--border)' }}
-          strokeWidth={1}
-        />
-        {/* divider marking where the duplicated copy begins */}
-        <line
-          x1={BAR_X + tiedEmbedW}
-          y1={UNTIED_Y - 2}
-          x2={BAR_X + tiedEmbedW}
-          y2={UNTIED_Y + BAR_H + 2}
-          style={{ stroke: 'var(--foreground)', strokeOpacity: 0.5 }}
-          strokeWidth={1}
-          strokeDasharray="2 2"
-        />
-        <text
-          x={BAR_X + untiedW + 6}
-          y={UNTIED_Y + BAR_H / 2 + 4}
-          style={{ fill: 'var(--muted-foreground)' }}
-          className="font-mono text-[10px]"
-        >
-          ~1.107B
-        </text>
-      </svg>
+          {/* untied row */}
+          <text x={0} y={UNTIED_Y + BAR_H / 2 + 4} style={{ fill: 'var(--muted-foreground)' }} className="text-[11px]">
+            {copy.barUntiedLabel}
+          </text>
+          <rect
+            x={BAR_X}
+            y={UNTIED_Y}
+            width={Math.max(untiedW, 1)}
+            height={BAR_H}
+            style={{ fill: 'var(--primary)', fillOpacity: 0.18, stroke: 'var(--border)' }}
+            strokeWidth={1}
+          />
+          <rect
+            x={BAR_X}
+            y={UNTIED_Y}
+            width={Math.max(untiedEmbedW, 1)}
+            height={BAR_H}
+            style={{ fill: 'var(--primary)', fillOpacity: 0.7, stroke: 'var(--border)' }}
+            strokeWidth={1}
+          />
+          {/* divider marking where the duplicated copy begins */}
+          <line
+            x1={BAR_X + tiedEmbedW}
+            y1={UNTIED_Y - 2}
+            x2={BAR_X + tiedEmbedW}
+            y2={UNTIED_Y + BAR_H + 2}
+            style={{ stroke: 'var(--foreground)', strokeOpacity: 0.5 }}
+            strokeWidth={1}
+            strokeDasharray="2 2"
+          />
+          <text
+            x={BAR_X + untiedW + 6}
+            y={UNTIED_Y + BAR_H / 2 + 4}
+            style={{ fill: 'var(--muted-foreground)' }}
+            className="font-mono text-[10px]"
+          >
+            ~1.107B
+          </text>
+        </svg>
+      </PanBox>
 
       {/* Side-by-side numeric ledger */}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">

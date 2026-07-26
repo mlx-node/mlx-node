@@ -14,7 +14,8 @@
  *   HatchDefs / hatchFill    diagonal hatch ("this box is busy this step")
  *   skin                     the LOOK: two hues, one radius, two stroke widths,
  *                            two dasharrays, a named opacity ladder, and the
- *                            PanelFrame / FrameLabel / DiagramFrame primitives
+ *                            PanelFrame / FrameLabel / DiagramFrame / PanBox
+ *                            primitives
  *
  * Everything is SSR-safe: no window access during render, deterministic first
  * frame, and the animation itself is either CSS (compositor) or a post-mount
@@ -22,7 +23,7 @@
  */
 export { FLOW_BLUE, FlowDots, type FlowDotsProps } from './FlowDots';
 export { HatchDefs, hatchFill, type HatchTone } from './HatchPattern';
-export { DASH, DIM, DiagramFrame, EMERALD, elbow, FrameLabel, PanelFrame, RED, RX, SW } from './skin';
+export { DASH, DIM, DiagramFrame, EMERALD, elbow, FrameLabel, PanBox, PanelFrame, RED, RX, SW } from './skin';
 export { StepControls } from './StepControls';
 export { usePrefersReducedMotion } from './use-prefers-reduced-motion';
 export { useStepPlayer, type StepPlayer } from './use-step-player';

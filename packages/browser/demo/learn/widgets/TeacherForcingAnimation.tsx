@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import { useLocale } from '../../lib/i18n-react';
+import { DiagramFrame, useStepPlayer } from '../motion';
 
 /**
  * Chapter 12 (Training) supplement — animate teacher forcing.
@@ -24,6 +25,18 @@ import { useLocale } from '../../lib/i18n-react';
  *
  * Numbers are illustrative — the point is the *shape* of the training step,
  * not real model probabilities.
+ *
+ * Animation model: `useStepPlayer` + `DiagramFrame` from `learn/motion`,
+ * replacing this file's former hand-rolled `setInterval`, its private
+ * play/pause button and its own `aria-live` caption box. Same four frames at
+ * the same 2200ms pace — this is a refactor, not a retune. The frame now owns
+ * the header row, the controls, the caption slot and the whole a11y contract
+ * (one accessible copy of the caption at every instant; the live region only
+ * fills once the reader presses something).
+ *
+ * There is no SVG here — the diagram is four rows of divs — so this widget
+ * takes the kit only, not the `skin` tokens (RX/SW/DASH/DIM have nothing to
+ * apply to).
  */
 
 const SEQ = ['The', ' cat', ' sat', ' on', ' the', ' mat'];
@@ -66,12 +79,15 @@ function renderToken(t: string): string {
 
 // Per-locale copy — every user-visible English string moved here verbatim.
 // Model tokens and the [cat, sat, on, the, mat, dog] bucket labels stay English.
+//
+// Play / Pause are NOT here any more: those verbs belong to the shared
+// `StepControls`, which carries its own en/zh pair so every animated widget in
+// the course says the same word. The old "step 3/4" counter is gone with them —
+// every one of the four captions already opens with its own step number
+// ("Step 3 — …" / "第 3 步——…"), so nothing a reader could see was lost.
 const COPY = {
   en: {
     title: 'Teacher forcing — one training step on six tokens',
-    pause: 'Pause',
-    play: 'Play',
-    stepCounter: (s: number) => `step ${s}/4`,
     stepLabels: [
       'Step 1 — Feed the whole sequence in (one parallel forward pass).',
       'Step 2 — At every position, predict a distribution over the next token. Causal mask keeps each prediction honest.',
@@ -104,9 +120,6 @@ const COPY = {
   },
   zh: {
     title: 'Teacher forcing——在六个 token 上的一次训练步',
-    pause: '暂停',
-    play: '播放',
-    stepCounter: (s: number) => `第 ${s}/4 步`,
     stepLabels: [
       '第 1 步——把整条序列一次喂入（一次并行前向传播）。',
       '第 2 步——在每个位置预测下一个 token 的分布。因果掩码让每个预测保持诚实。',
@@ -137,22 +150,25 @@ const COPY = {
   },
 } as const;
 
+/** One frame per step of the training step. Unchanged from the old modulo-4 sweep. */
+const TOTAL_FRAMES = 4;
+/** The old hand-rolled `setInterval` pace, kept exactly. */
+const FRAME_MS = 2200;
+
 export function TeacherForcingAnimation() {
-  const copy = COPY[useLocale()];
-  const [step, setStep] = React.useState<0 | 1 | 2 | 3>(0);
-  const [playing, setPlaying] = React.useState(() =>
-    typeof window !== 'undefined' ? !window.matchMedia('(prefers-reduced-motion: reduce)').matches : true,
-  );
+  const locale = useLocale();
+  const copy = COPY[locale];
+  const player = useStepPlayer(TOTAL_FRAMES, { frameMs: FRAME_MS });
+  const step = player.frame;
 
-  React.useEffect(() => {
-    if (!playing) return;
-    const t = window.setInterval(() => {
-      setStep((s) => ((s + 1) % 4) as 0 | 1 | 2 | 3);
-    }, 2200);
-    return () => window.clearInterval(t);
-  }, [playing]);
-
-  const stepLabels = copy.stepLabels;
+  // Every caption this sweep can reach, so DiagramFrame reserves the tallest
+  // and chapter 12's body cannot hop when the beat changes.
+  //
+  // The visible caption has exactly ONE source — `copy.stepLabels[step]`, with
+  // `step` the player's frame in [0, 4) — so the sizer list IS that array. No
+  // branch, no builder, no variant toggle: four frames, four sentences, and
+  // nothing else can appear in the slot.
+  const captions = [...copy.stepLabels];
 
   // Per-position cross-entropy: -log p(target).
   const losses = POSITIONS.map((p) => (p.targetIdx < 0 ? null : -Math.log(Math.max(1e-9, p.probs[p.targetIdx]!))));
@@ -160,163 +176,152 @@ export function TeacherForcingAnimation() {
   const meanLoss = trainedLosses.reduce((a, b) => a + b, 0) / Math.max(1, trainedLosses.length);
 
   return (
-    <div className="space-y-4 rounded-md border border-border bg-background p-4">
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.title}</div>
-        <div className="inline-flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setPlaying((p) => !p)}
-            className="rounded border border-border/60 bg-muted/40 px-2 py-0.5 text-[11px] max-sm:px-2.5 max-sm:py-1.5 max-sm:text-xs max-sm:min-h-[36px] hover:bg-muted/70"
-            aria-pressed={playing}
-          >
-            {playing ? copy.pause : copy.play}
-          </button>
-          <span className="font-mono text-[11px] text-muted-foreground">{copy.stepCounter(step + 1)}</span>
-        </div>
-      </div>
-
-      <div
-        className="rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-[12px] text-foreground/95"
-        aria-live={playing ? 'off' : 'polite'}
-        aria-atomic="true"
-      >
-        {stepLabels[step]}
-      </div>
-
-      {/* Row 1 — input tokens */}
-      <div className="space-y-1">
-        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.inputRow}</div>
-        <div className="flex gap-1.5">
-          {SEQ.map((t, i) => (
-            <div
-              key={`in-${i}`}
-              className={[
-                'flex h-9 flex-1 items-center justify-center rounded border font-mono text-[12px] transition-all duration-300',
-                step >= 0
-                  ? 'border-primary/40 bg-primary/10 text-foreground/95'
-                  : 'border-border/40 bg-muted/40 text-muted-foreground/50',
-              ].join(' ')}
-            >
-              {renderToken(t)}
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Row 2 — per-position predicted distributions */}
-      <div className="space-y-1">
-        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.predictionsRow}</div>
-        <div className="flex gap-1.5">
-          {POSITIONS.map((pos, i) => {
-            const visible = step >= 1;
-            const targetVisible = step >= 2;
-            return (
+    <DiagramFrame
+      title={copy.title}
+      player={player}
+      locale={locale}
+      caption={copy.stepLabels[step]}
+      captions={captions}
+      note={
+        // All three were footnote-tier before the conversion (11px / 11px /
+        // 10px, all muted), so all three belong in `note`. It renders a div, so
+        // these are real paragraphs.
+        <>
+          <p>{copy.bridgeNote}</p>
+          <p>{copy.observations}</p>
+          <p className="text-[10px]">{copy.illustrative}</p>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        {/* Row 1 — input tokens */}
+        <div className="space-y-1">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.inputRow}</div>
+          <div className="flex gap-1.5">
+            {SEQ.map((t, i) => (
               <div
-                key={`pos-${i}`}
+                key={`in-${i}`}
                 className={[
-                  'flex flex-1 flex-col items-stretch gap-0.5 rounded border p-1 transition-all duration-500',
-                  visible ? 'border-border/60 bg-background' : 'border-border/30 bg-muted/20 opacity-40',
+                  'flex h-9 flex-1 items-center justify-center rounded border font-mono text-[12px] transition-all duration-300',
+                  step >= 0
+                    ? 'border-primary/40 bg-primary/10 text-foreground/95'
+                    : 'border-border/40 bg-muted/40 text-muted-foreground/50',
                 ].join(' ')}
               >
-                {pos.probs.map((p, k) => {
-                  const isTarget = k === pos.targetIdx;
-                  return (
-                    <div key={`b-${i}-${k}`} className="flex items-center gap-1">
-                      <span
-                        className={[
-                          'w-7 shrink-0 truncate font-mono text-[9px]',
-                          isTarget && targetVisible
-                            ? 'text-emerald-600 dark:text-emerald-300'
-                            : 'text-muted-foreground/70',
-                        ].join(' ')}
-                      >
-                        {pos.labels[k]}
-                      </span>
-                      <div className="relative flex-1">
-                        <div
-                          className={[
-                            'h-2.5 rounded-sm transition-all duration-500',
-                            isTarget && targetVisible
-                              ? 'bg-emerald-500/70 outline outline-1 outline-emerald-400'
-                              : 'bg-primary/40',
-                          ].join(' ')}
-                          style={{ width: `${visible ? Math.max(2, p * 100) : 0}%` }}
-                        />
-                      </div>
-                      <span className="w-7 shrink-0 text-right font-mono text-[9px] text-muted-foreground">
-                        {visible ? p.toFixed(2) : ''}
-                      </span>
-                    </div>
-                  );
-                })}
+                {renderToken(t)}
               </div>
-            );
-          })}
+            ))}
+          </div>
         </div>
-      </div>
 
-      {/* Row 3 — per-position loss = -log p(target) */}
-      <div className="space-y-1">
-        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.lossRow}</div>
-        <div className="flex gap-1.5">
-          {POSITIONS.map((pos, i) => {
-            const visible = step >= 2;
-            const l = losses[i];
-            if (l === null) {
+        {/* Row 2 — per-position predicted distributions */}
+        <div className="space-y-1">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.predictionsRow}</div>
+          <div className="flex gap-1.5">
+            {POSITIONS.map((pos, i) => {
+              const visible = step >= 1;
+              const targetVisible = step >= 2;
+              return (
+                <div
+                  key={`pos-${i}`}
+                  className={[
+                    'flex flex-1 flex-col items-stretch gap-0.5 rounded border p-1 transition-all duration-500',
+                    visible ? 'border-border/60 bg-background' : 'border-border/30 bg-muted/20 opacity-40',
+                  ].join(' ')}
+                >
+                  {pos.probs.map((p, k) => {
+                    const isTarget = k === pos.targetIdx;
+                    return (
+                      <div key={`b-${i}-${k}`} className="flex items-center gap-1">
+                        <span
+                          className={[
+                            'w-7 shrink-0 truncate font-mono text-[9px]',
+                            isTarget && targetVisible
+                              ? 'text-emerald-600 dark:text-emerald-300'
+                              : 'text-muted-foreground/70',
+                          ].join(' ')}
+                        >
+                          {pos.labels[k]}
+                        </span>
+                        <div className="relative flex-1">
+                          <div
+                            className={[
+                              'h-2.5 rounded-sm transition-all duration-500',
+                              isTarget && targetVisible
+                                ? 'bg-emerald-500/70 outline outline-1 outline-emerald-400'
+                                : 'bg-primary/40',
+                            ].join(' ')}
+                            style={{ width: `${visible ? Math.max(2, p * 100) : 0}%` }}
+                          />
+                        </div>
+                        <span className="w-7 shrink-0 text-right font-mono text-[9px] text-muted-foreground">
+                          {visible ? p.toFixed(2) : ''}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Row 3 — per-position loss = -log p(target) */}
+        <div className="space-y-1">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.lossRow}</div>
+          <div className="flex gap-1.5">
+            {POSITIONS.map((pos, i) => {
+              const visible = step >= 2;
+              const l = losses[i];
+              if (l === null) {
+                return (
+                  <div
+                    key={`l-${i}`}
+                    className={[
+                      'flex h-12 flex-1 items-center justify-center rounded border text-[9px] text-muted-foreground/70',
+                      visible ? 'border-border/40 bg-muted/30' : 'border-border/20 bg-muted/10 opacity-30',
+                    ].join(' ')}
+                  >
+                    {copy.noTarget}
+                  </div>
+                );
+              }
+              const maxLossForScale = 3.5;
+              const heightPct = Math.min(100, (l / maxLossForScale) * 100);
               return (
                 <div
                   key={`l-${i}`}
                   className={[
-                    'flex h-12 flex-1 items-center justify-center rounded border text-[9px] text-muted-foreground/70',
-                    visible ? 'border-border/40 bg-muted/30' : 'border-border/20 bg-muted/10 opacity-30',
+                    'flex h-12 flex-1 flex-col items-stretch justify-end rounded border p-1 transition-all duration-500',
+                    visible ? 'border-amber-500/40 bg-amber-500/5' : 'border-border/30 bg-muted/20 opacity-30',
                   ].join(' ')}
                 >
-                  {copy.noTarget}
+                  <div
+                    className="w-full rounded-sm bg-amber-500/70 transition-all duration-500"
+                    style={{ height: `${visible ? heightPct : 0}%` }}
+                  />
+                  <span className="mt-0.5 text-center font-mono text-[9px] text-amber-700 dark:text-amber-400">
+                    {visible ? l.toFixed(2) : ''}
+                  </span>
                 </div>
               );
-            }
-            const maxLossForScale = 3.5;
-            const heightPct = Math.min(100, (l / maxLossForScale) * 100);
-            return (
-              <div
-                key={`l-${i}`}
-                className={[
-                  'flex h-12 flex-1 flex-col items-stretch justify-end rounded border p-1 transition-all duration-500',
-                  visible ? 'border-amber-500/40 bg-amber-500/5' : 'border-border/30 bg-muted/20 opacity-30',
-                ].join(' ')}
-              >
-                <div
-                  className="w-full rounded-sm bg-amber-500/70 transition-all duration-500"
-                  style={{ height: `${visible ? heightPct : 0}%` }}
-                />
-                <span className="mt-0.5 text-center font-mono text-[9px] text-amber-700 dark:text-amber-400">
-                  {visible ? l.toFixed(2) : ''}
-                </span>
-              </div>
-            );
-          })}
+            })}
+          </div>
+        </div>
+
+        {/* Row 4 — mean = the training loss */}
+        <div
+          className={[
+            'flex items-center justify-between rounded-md border px-3 py-2 transition-colors duration-500',
+            step >= 3 ? 'border-amber-500/50 bg-amber-500/10' : 'border-border/40 bg-muted/30 opacity-50',
+          ].join(' ')}
+        >
+          <div className="font-mono text-[12px] text-foreground/95">{copy.meanRow}</div>
+          <div className="font-mono text-[14px] text-amber-700 dark:text-amber-400">
+            = {step >= 3 ? meanLoss.toFixed(3) : '— —'}
+          </div>
         </div>
       </div>
-
-      {/* Row 4 — mean = the training loss */}
-      <div
-        className={[
-          'flex items-center justify-between rounded-md border px-3 py-2 transition-colors duration-500',
-          step >= 3 ? 'border-amber-500/50 bg-amber-500/10' : 'border-border/40 bg-muted/30 opacity-50',
-        ].join(' ')}
-      >
-        <div className="font-mono text-[12px] text-foreground/95">{copy.meanRow}</div>
-        <div className="font-mono text-[14px] text-amber-700 dark:text-amber-400">
-          = {step >= 3 ? meanLoss.toFixed(3) : '— —'}
-        </div>
-      </div>
-
-      <p className="text-[11px] text-muted-foreground">{copy.bridgeNote}</p>
-
-      <p className="text-[11px] text-muted-foreground">{copy.observations}</p>
-
-      <p className="text-[10px] text-muted-foreground">{copy.illustrative}</p>
-    </div>
+    </DiagramFrame>
   );
 }
