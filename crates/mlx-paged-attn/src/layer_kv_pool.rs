@@ -2336,22 +2336,61 @@ mod tests {
         assert!(pool.read_block_all_layers(pool.num_blocks()).is_err());
     }
 
-    /// Swap one layer's key buffer for a 1-byte one — exactly the placeholder
-    /// `new_for_test` used to hand every caller — and return the pair that was
-    /// there so the caller can put it back.
+    /// Which side of a layer's `(key, value)` pair a mutation shrinks.
+    ///
+    /// Both are checked by `check_slot_fits`, and a test that only ever shrinks
+    /// the key buffer cannot tell the `("value", ..)` row of that loop from a
+    /// deleted one.
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Copy)]
+    enum ShrinkSide {
+        Key,
+        Value,
+    }
+
+    /// Swap one layer's key OR value buffer for a 1-byte one — exactly the
+    /// placeholder `new_for_test` used to hand every caller — and return the
+    /// pair that was there so the caller can put it back.
     ///
     /// The LAST layer is the victim on purpose: a check that inspects only
     /// layer 0 passes with this in place.
     #[cfg(target_os = "macos")]
-    fn shrink_layer_key_buffer(pool: &mut LayerKVPool, layer_idx: usize) -> (Buffer, Buffer) {
+    fn shrink_layer_buffer(
+        pool: &mut LayerKVPool,
+        layer_idx: usize,
+        side: ShrinkSide,
+    ) -> (Buffer, Buffer) {
         use crate::metal::MetalState;
         use metal::MTLResourceOptions;
         let state = MetalState::get().expect("metal state for the shrink");
         let saved = pool.layers[layer_idx].clone();
-        pool.layers[layer_idx].0 = state
+        let stub = state
             .device
             .new_buffer(1, MTLResourceOptions::StorageModePrivate);
+        match side {
+            ShrinkSide::Key => pool.layers[layer_idx].0 = stub,
+            ShrinkSide::Value => pool.layers[layer_idx].1 = stub,
+        }
         saved
+    }
+
+    /// A payload that differs from `distinct_layer_bytes` in every byte, so a
+    /// blit that should have been rejected is visible in a pool snapshot.
+    ///
+    /// Re-offering the SAME bytes the pool was seeded with cannot show that:
+    /// an unchecked write would rewrite each layer with what was already
+    /// there and the snapshot would compare equal.
+    #[cfg(target_os = "macos")]
+    fn poison_layer_bytes(payload: &[BlockLayerBytes]) -> Vec<BlockLayerBytes> {
+        payload
+            .iter()
+            .map(|(keys, values)| {
+                (
+                    keys.iter().map(|byte| byte ^ 0xff).collect(),
+                    values.iter().map(|byte| byte ^ 0xff).collect(),
+                )
+            })
+            .collect()
     }
 
     /// `block_id < num_blocks` says the id is a legal index. It does NOT say
@@ -2366,7 +2405,13 @@ mod tests {
     /// The only thing that can reject it is a length check in Rust.
     ///
     /// Dies if `check_slot_fits_all_layers` is dropped from either entry
-    /// point, and dies if it is narrowed to layer 0.
+    /// point, if it is narrowed to layer 0, or if either the `("key", ..)` or
+    /// the `("value", ..)` row is dropped from `check_slot_fits`'s loop.
+    ///
+    /// The rejected write offers POISON rather than the bytes already in the
+    /// pool, so the "did not modify the pool" assertion is a real detector: an
+    /// unchecked write reaches every non-victim layer, and re-offering the
+    /// seeded bytes would have left the snapshot equal either way.
     #[cfg(target_os = "macos")]
     #[test]
     fn batched_block_io_rejects_a_layer_buffer_too_small_for_the_slot() {
@@ -2385,47 +2430,59 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
             .collect();
+        let poison = poison_layer_bytes(&payload);
+        let poison_borrowed: Vec<(&[u8], &[u8])> = poison
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
         pool.write_block_all_layers(2, &borrowed).expect("seed");
         let before = snapshot_pool(&pool);
 
         let victim = LAYERS - 1;
-        let saved = shrink_layer_key_buffer(&mut pool, victim);
+        for side in [ShrinkSide::Key, ShrinkSide::Value] {
+            let saved = shrink_layer_buffer(&mut pool, victim, side);
 
-        let read_err = pool.read_block_all_layers(2).expect_err(
-            "reading a block out of a 1-byte layer buffer must be rejected, not blitted",
-        );
-        let write_err = pool
-            .write_block_all_layers(2, &borrowed)
-            .expect_err("writing a block into a 1-byte layer buffer must be rejected, not blitted");
-        for (label, err) in [("read", &read_err), ("write", &write_err)] {
-            assert!(
-                err.contains(&format!("layer {victim}")),
-                "{label} error must name the offending layer: {err}"
+            let read_err = pool.read_block_all_layers(2).expect_err(
+                "reading a block out of a 1-byte layer buffer must be rejected, not blitted",
             );
-            assert!(
-                err.contains("is 1 bytes"),
-                "{label} error must report the buffer's real length: {err}"
+            let write_err = pool.write_block_all_layers(2, &poison_borrowed).expect_err(
+                "writing a block into a 1-byte layer buffer must be rejected, not blitted",
             );
-            assert!(
-                err.contains(&format!("{per_side} bytes per block")),
-                "{label} error must report the slot size it needed: {err}"
+            for (label, err) in [("read", &read_err), ("write", &write_err)] {
+                assert!(
+                    err.contains(&format!("layer {victim}")),
+                    "{label} error must name the offending layer: {err}"
+                );
+                assert!(
+                    err.contains("is 1 bytes"),
+                    "{label} error must report the buffer's real length: {err}"
+                );
+                assert!(
+                    err.contains(&format!("{per_side} bytes per block")),
+                    "{label} error must report the slot size it needed: {err}"
+                );
+            }
+
+            // Restore the real buffer, then prove neither rejection touched the
+            // pool: both must return before the first blit is encoded, which is
+            // the partial-overwrite invariant `write_block_all_layers` documents.
+            pool.layers[victim] = saved;
+            assert_eq!(
+                snapshot_pool(&pool),
+                before,
+                "a transfer rejected for a short buffer must not modify any byte of the pool"
             );
         }
-
-        // Restore the real buffer, then prove neither rejection touched the
-        // pool: both must return before the first blit is encoded, which is
-        // the partial-overwrite invariant `write_block_all_layers` documents.
-        pool.layers[victim] = saved;
-        assert_eq!(
-            snapshot_pool(&pool),
-            before,
-            "a transfer rejected for a short buffer must not modify any byte of the pool"
-        );
     }
 
     /// The per-layer pair carries the same defect and is the one that runs in
     /// production — `PagedKVCacheAdapter::read_kv_range` calls
     /// `read_blocks_to_host` on every cache-hit prefill.
+    ///
+    /// The `Value` arm is what covers `check_slot_fits`'s `("value", ..)` row:
+    /// with only the value buffer short, an unchecked write still blits the
+    /// full-size KEY into the real key buffer, so the poison shows up in the
+    /// snapshot after the value buffer is put back.
     #[cfg(target_os = "macos")]
     #[test]
     fn per_layer_block_io_rejects_a_layer_buffer_too_small_for_the_slot() {
@@ -2444,41 +2501,44 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
             .collect();
+        let poison = poison_layer_bytes(&payload);
         pool.write_block_all_layers(2, &borrowed).expect("seed");
         let before = snapshot_pool(&pool);
 
         let victim = LAYERS - 1;
-        let saved = shrink_layer_key_buffer(&mut pool, victim);
+        for side in [ShrinkSide::Key, ShrinkSide::Value] {
+            let saved = shrink_layer_buffer(&mut pool, victim, side);
 
-        let read_err = pool
-            .read_blocks_to_host(victim as u32, &[2])
-            .expect_err("per-layer read out of a 1-byte buffer must be rejected");
-        let (keys, values) = &payload[victim];
-        let write_err = pool
-            .write_blocks_from_host(victim as u32, &[2], keys, values)
-            .expect_err("per-layer write into a 1-byte buffer must be rejected");
-        for (label, err) in [("read", &read_err), ("write", &write_err)] {
-            assert!(
-                err.contains(&format!("layer {victim}")),
-                "{label} error must name the offending layer: {err}"
-            );
-            assert!(
-                err.contains("is 1 bytes"),
-                "{label} error must report the buffer's real length: {err}"
+            let read_err = pool
+                .read_blocks_to_host(victim as u32, &[2])
+                .expect_err("per-layer read out of a 1-byte buffer must be rejected");
+            let (keys, values) = &poison[victim];
+            let write_err = pool
+                .write_blocks_from_host(victim as u32, &[2], keys, values)
+                .expect_err("per-layer write into a 1-byte buffer must be rejected");
+            for (label, err) in [("read", &read_err), ("write", &write_err)] {
+                assert!(
+                    err.contains(&format!("layer {victim}")),
+                    "{label} error must name the offending layer: {err}"
+                );
+                assert!(
+                    err.contains("is 1 bytes"),
+                    "{label} error must report the buffer's real length: {err}"
+                );
+            }
+
+            // An untouched layer of the same pool still works, so the check
+            // rejects the short buffer rather than the call.
+            pool.read_blocks_to_host(0, &[2])
+                .expect("a correctly sized layer must still transfer");
+
+            pool.layers[victim] = saved;
+            assert_eq!(
+                snapshot_pool(&pool),
+                before,
+                "a per-layer transfer rejected for a short buffer must not modify the pool"
             );
         }
-
-        // An untouched layer of the same pool still works, so the check
-        // rejects the short buffer rather than the call.
-        pool.read_blocks_to_host(0, &[2])
-            .expect("a correctly sized layer must still transfer");
-
-        pool.layers[victim] = saved;
-        assert_eq!(
-            snapshot_pool(&pool),
-            before,
-            "a per-layer transfer rejected for a short buffer must not modify the pool"
-        );
     }
 
     /// `new_for_test` pools must be able to do the block I/O the `mlx-core`

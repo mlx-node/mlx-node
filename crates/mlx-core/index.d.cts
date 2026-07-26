@@ -2579,8 +2579,13 @@ export interface CleanupStats {
  * the tier was never opened (nothing to flush) — and `false` on timeout.
  *
  * Called from the agent's one-shot (`mlx agent -p`) shutdown so a prompt's
- * just-persisted prefix blocks are durable before the process exits, rather
- * than being abandoned in the write queue.
+ * just-persisted prefix blocks reach the drive before the process exits,
+ * rather than being abandoned in the write queue.
+ *
+ * The payload flush is `fsync(2)`, not `F_FULLFSYNC`: a drained block
+ * survives process death and kernel panic, but a sudden power loss can leave
+ * it torn. Torn objects fail the payload checksum on the next read and are
+ * pruned as a miss, so the cost is a recomputed prefix, never wrong state.
  */
 export declare function coldCacheDrain(timeoutMs: number): boolean;
 

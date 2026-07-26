@@ -1702,13 +1702,16 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
 
                     // Delay physical paged-pool allocation until all text and
                     // vision weights are resident so the live-memory cap sees
-                    // the actual model footprint. Shadowing the witness (rather
-                    // than reassigning) keeps the cold-tier gate below the LAST
-                    // materialize pass, not merely the first.
+                    // the actual model footprint. Combining the two witnesses
+                    // (rather than reassigning or shadowing) keeps the cold-tier
+                    // gate below the LAST materialize pass AND leaves the
+                    // fingerprint's zero-coverage fail-safe describing the text
+                    // shards, not only the vision tensors.
                     let weights_resident = match vision_params.as_ref() {
                         Some(vparams) => {
                             let arrays: Vec<&MxArray> = vparams.values().collect();
-                            crate::array::memory::materialize_weights(&arrays)?
+                            weights_resident
+                                .and(crate::array::memory::materialize_weights(&arrays)?)
                         }
                         None => weights_resident,
                     };

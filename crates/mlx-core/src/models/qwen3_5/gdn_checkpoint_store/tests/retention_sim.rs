@@ -446,8 +446,7 @@ fn run(
             ));
             prune_gdn_checkpoints(
                 &mut store,
-                caps.limit,
-                caps.per_owner,
+                GdnRetentionCaps::ladder(caps.limit, caps.per_owner),
                 root,
                 policy.active_owner(owner_id),
             );
@@ -1098,8 +1097,10 @@ fn the_two_arms_disagree_about_who_pays() {
         ));
         prune_gdn_checkpoints(
             &mut control,
-            GDN_PREFIX_CHECKPOINT_LIMIT,
-            GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            GdnRetentionCaps::ladder(
+                GDN_PREFIX_CHECKPOINT_LIMIT,
+                GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            ),
             "owner-0",
             ABSENT_ACTIVE_OWNER,
         );

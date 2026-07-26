@@ -126,14 +126,44 @@ pub(crate) const GDN_PREFIX_CHECKPOINTS_PER_OWNER: usize = 4;
 /// prefix; persist-OFF gets nothing back for it.
 pub(crate) const GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER: usize = 2;
 
-/// The two caps one `prune_gdn_checkpoints` call enforces.
+/// Which victim a [`prune_gdn_checkpoints`] eviction picks, when more than one
+/// entry is eligible.
+///
+/// The two caps decide HOW MANY entries survive; this decides WHICH. Both move
+/// the same observable quantity — the depth a later turn restores from — so both
+/// have to answer to the same `want_ladder` predicate. See
+/// [`GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER`] for why a persistence-OFF turn
+/// may not pay for either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GdnRetentionPolicy {
+    /// The victim order this store used before the checkpoint ladder existed:
+    /// the FIRST same-owner ancestor in publish order, then the first entry of
+    /// an owner holding a spare, then the first non-root entry.
+    ///
+    /// Restored verbatim for turns that publish no ladder, so a persistence-OFF
+    /// session keeps not just the pre-ladder cap but the pre-ladder retained
+    /// SET. With one rung published per turn, "first ancestor in publish order"
+    /// is the shallowest rung, so a monotone conversation keeps its DEEPEST
+    /// entries — which is what a warm turn with a short paged hit lands on.
+    PreLadder,
+    /// Ladder-aware: defer the publishing owner (its cold capture runs at the
+    /// end of this same turn), then drop the most redundant rung by
+    /// [`least_valuable_same_owner_ancestor`]'s ratio.
+    ///
+    /// This deliberately keeps SHALLOW rungs alive, because those are the only
+    /// ones a cold restore can anchor on while the persisted K/V chain still
+    /// lags the prompt. That trade only pays for a turn that writes a sidecar.
+    Ladder,
+}
+
+/// Everything one `prune_gdn_checkpoints` call enforces.
 ///
 /// ```text
-///   want_ladder  explicit_root   ->  (global limit, per-owner limit)
-///   false        false               (2, 2)
-///   false        true                (5, 2)
-///   true         false               (4, 4)
-///   true         true                (5, 4)
+///   want_ladder  explicit_root   ->  limit  per_owner  policy
+///   false        false               2      2          PreLadder
+///   false        true                5      2          PreLadder
+///   true         false               4      4          Ladder
+///   true         true                5      4          Ladder
 /// ```
 ///
 /// `want_ladder` is `paged_forward::gdn_cold_sidecar_ladder_wanted` for the
@@ -149,19 +179,60 @@ pub(crate) const GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER: usize = 2;
 /// entry that is already gone.
 ///
 /// Single seam on purpose. The dense and MoE call sites are duplicated code, and
-/// this is the one decision they must not drift on.
-pub(crate) fn gdn_retention_caps(want_ladder: bool, explicit_root: bool) -> (usize, usize) {
-    let per_owner = if want_ladder {
-        GDN_PREFIX_CHECKPOINTS_PER_OWNER
+/// this is the one decision they must not drift on — and the policy travels with
+/// the caps for the same reason, so no call site can take one from the ladder
+/// column and the other from the pre-ladder column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GdnRetentionCaps {
+    /// Total entries the store may hold.
+    pub(crate) limit: usize,
+    /// Entries any one owner may hold.
+    pub(crate) per_owner: usize,
+    /// Which eligible entry an eviction takes.
+    pub(crate) policy: GdnRetentionPolicy,
+}
+
+#[cfg(test)]
+impl GdnRetentionCaps {
+    /// Caps with the ladder victim order, for tests that pin a bound directly
+    /// rather than going through [`gdn_retention_caps`].
+    pub(crate) fn ladder(limit: usize, per_owner: usize) -> Self {
+        Self {
+            limit,
+            per_owner,
+            policy: GdnRetentionPolicy::Ladder,
+        }
+    }
+
+    /// Caps with the pre-ladder victim order.
+    pub(crate) fn pre_ladder(limit: usize, per_owner: usize) -> Self {
+        Self {
+            limit,
+            per_owner,
+            policy: GdnRetentionPolicy::PreLadder,
+        }
+    }
+}
+
+pub(crate) fn gdn_retention_caps(want_ladder: bool, explicit_root: bool) -> GdnRetentionCaps {
+    let (per_owner, policy) = if want_ladder {
+        (GDN_PREFIX_CHECKPOINTS_PER_OWNER, GdnRetentionPolicy::Ladder)
     } else {
-        GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER
+        (
+            GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER,
+            GdnRetentionPolicy::PreLadder,
+        )
     };
     let limit = if explicit_root {
         GDN_PREFIX_CHECKPOINT_LIMIT
     } else {
         per_owner
     };
-    (limit, per_owner)
+    GdnRetentionCaps {
+        limit,
+        per_owner,
+        policy,
+    }
 }
 
 /// Keep one slot the publishing owner cannot occupy by itself. Equalize the two
@@ -340,10 +411,19 @@ fn redundant_victim<T: GdnCheckpointLineage>(
     checkpoints: &VecDeque<T>,
     scope: OwnerScope<'_>,
 ) -> Option<usize> {
-    if let Some(idx) = least_valuable_same_owner_ancestor(checkpoints, scope) {
-        return Some(idx);
-    }
+    least_valuable_same_owner_ancestor(checkpoints, scope)
+        .or_else(|| owner_with_a_spare(checkpoints, scope))
+}
 
+/// First entry, in publish order, whose owner would still hold a checkpoint
+/// after it is dropped.
+///
+/// Shared by both policies: it is the second arm of [`redundant_victim`] and,
+/// verbatim, the second arm of the pre-ladder global search.
+fn owner_with_a_spare<T: GdnCheckpointLineage>(
+    checkpoints: &VecDeque<T>,
+    scope: OwnerScope<'_>,
+) -> Option<usize> {
     (0..checkpoints.len()).find(|&idx| {
         let owner = checkpoints[idx].owner_id();
         scope.admits(owner)
@@ -352,6 +432,26 @@ fn redundant_victim<T: GdnCheckpointLineage>(
                 .filter(|checkpoint| checkpoint.owner_id() == owner)
                 .count()
                 > 1
+    })
+}
+
+/// First same-owner ancestor in publish order — the pre-ladder choice.
+///
+/// Same candidate set as [`least_valuable_same_owner_ancestor`], different tie
+/// break: position instead of redundancy ratio. On a monotone lineage that is
+/// the SHALLOWEST rung, so repeated pruning keeps the deepest entries; the
+/// ratio rule keeps a shallow one on purpose. The two therefore answer a later
+/// lookup from different depths, which is why the choice is gated rather than
+/// improved in place.
+fn first_same_owner_ancestor<T: GdnCheckpointLineage>(
+    checkpoints: &VecDeque<T>,
+    scope: OwnerScope<'_>,
+) -> Option<usize> {
+    (0..checkpoints.len()).find(|&idx| {
+        scope.admits(checkpoints[idx].owner_id())
+            && checkpoints.iter().enumerate().any(|(other_idx, other)| {
+                other_idx != idx && is_same_owner_ancestor(&checkpoints[idx], other)
+            })
     })
 }
 
@@ -383,6 +483,15 @@ fn last_resort_victim<T: GdnCheckpointLineage>(
 }
 
 /// Enforce the bounded branch-aware retention policy.
+///
+/// `caps.policy` selects the victim order, and everything below describes
+/// [`GdnRetentionPolicy::Ladder`] — the arm a turn that publishes a ladder
+/// takes. [`GdnRetentionPolicy::PreLadder`] restores 77e43031's order verbatim
+/// for turns that publish none: first same-owner ancestor in publish order, then
+/// [`owner_with_a_spare`], then [`last_resort_victim`], with no deferral of the
+/// publishing owner. Both caps AND the victim order are gated together, because
+/// both decide the depth a later turn restores from, and a persistence-OFF turn
+/// buys nothing with that drift.
 ///
 /// First enforce the owner cap, preferring the ancestor
 /// `least_valuable_same_owner_ancestor` picks.
@@ -439,8 +548,7 @@ fn last_resort_victim<T: GdnCheckpointLineage>(
 /// what that looks like.
 pub(crate) fn prune_gdn_checkpoints<T: GdnCheckpointLineage>(
     checkpoints: &mut VecDeque<T>,
-    limit: usize,
-    per_owner_limit: usize,
+    caps: GdnRetentionCaps,
     root_owner_id: &str,
     active_owner_id: &str,
 ) {
@@ -453,12 +561,18 @@ pub(crate) fn prune_gdn_checkpoints<T: GdnCheckpointLineage>(
             .iter()
             .filter(|checkpoint| checkpoint.owner_id() == owner)
             .count()
-            > per_owner_limit
+            > caps.per_owner
         {
-            let victim = least_valuable_same_owner_ancestor(checkpoints, OwnerScope::Only(&owner))
-                .or_else(|| {
-                    (0..checkpoints.len()).find(|&idx| checkpoints[idx].owner_id() == owner)
-                });
+            let scope = OwnerScope::Only(&owner);
+            let ancestor = match caps.policy {
+                GdnRetentionPolicy::PreLadder => first_same_owner_ancestor(checkpoints, scope),
+                GdnRetentionPolicy::Ladder => {
+                    least_valuable_same_owner_ancestor(checkpoints, scope)
+                }
+            };
+            let victim = ancestor.or_else(|| {
+                (0..checkpoints.len()).find(|&idx| checkpoints[idx].owner_id() == owner)
+            });
             let Some(idx) = victim else {
                 break;
             };
@@ -466,11 +580,21 @@ pub(crate) fn prune_gdn_checkpoints<T: GdnCheckpointLineage>(
         }
     }
 
-    while checkpoints.len() > limit {
-        let victim = redundant_victim(checkpoints, OwnerScope::Excluding(active_owner_id))
-            .or_else(|| redundant_victim(checkpoints, OwnerScope::Any))
-            .or_else(|| last_resort_victim(checkpoints, OwnerScope::Any, root_owner_id))
-            .unwrap_or(0);
+    while checkpoints.len() > caps.limit {
+        let victim = match caps.policy {
+            // Pre-ladder: no deferral of the publishing owner, and position
+            // rather than ratio decides among ancestors.
+            GdnRetentionPolicy::PreLadder => {
+                first_same_owner_ancestor(checkpoints, OwnerScope::Any)
+                    .or_else(|| owner_with_a_spare(checkpoints, OwnerScope::Any))
+            }
+            GdnRetentionPolicy::Ladder => {
+                redundant_victim(checkpoints, OwnerScope::Excluding(active_owner_id))
+                    .or_else(|| redundant_victim(checkpoints, OwnerScope::Any))
+            }
+        }
+        .or_else(|| last_resort_victim(checkpoints, OwnerScope::Any, root_owner_id))
+        .unwrap_or(0);
         checkpoints.remove(victim);
     }
 }
@@ -750,11 +874,15 @@ mod tests {
         }
     }
 
-    /// The four caps `prune_gdn_checkpoints` can be handed, in one table.
+    /// Everything `prune_gdn_checkpoints` can be handed, in one table: both
+    /// caps AND the victim order.
     ///
     /// Catches, verified by mutation: dropping the `want_ladder` arm from
     /// `gdn_retention_caps` so `per_owner` is always the ladder width — the two
-    /// no-ladder rows then read `(4, 4)` and `(5, 4)`.
+    /// no-ladder rows then read `(4, 4)`, `(5, 4)`. Separately, hardcoding
+    /// `policy` to `Ladder` — the no-ladder rows then carry the ladder's
+    /// victim order, which is the drift
+    /// `a_persist_off_lineage_keeps_the_pre_ladder_victim_order` measures.
     #[test]
     fn retention_caps_gate_the_per_owner_bound_on_the_ladder_predicate() {
         let ladder = GDN_PREFIX_CHECKPOINTS_PER_OWNER;
@@ -764,15 +892,21 @@ mod tests {
             "the table below only says anything while the two caps differ"
         );
 
-        assert_eq!(gdn_retention_caps(false, false), (pre_ladder, pre_ladder));
+        assert_eq!(
+            gdn_retention_caps(false, false),
+            GdnRetentionCaps::pre_ladder(pre_ladder, pre_ladder)
+        );
         assert_eq!(
             gdn_retention_caps(false, true),
-            (GDN_PREFIX_CHECKPOINT_LIMIT, pre_ladder)
+            GdnRetentionCaps::pre_ladder(GDN_PREFIX_CHECKPOINT_LIMIT, pre_ladder)
         );
-        assert_eq!(gdn_retention_caps(true, false), (ladder, ladder));
+        assert_eq!(
+            gdn_retention_caps(true, false),
+            GdnRetentionCaps::ladder(ladder, ladder)
+        );
         assert_eq!(
             gdn_retention_caps(true, true),
-            (GDN_PREFIX_CHECKPOINT_LIMIT, ladder)
+            GdnRetentionCaps::ladder(GDN_PREFIX_CHECKPOINT_LIMIT, ladder)
         );
     }
 
@@ -825,11 +959,11 @@ mod tests {
         // way `remember_*_gdn_materialized_prefix_checkpoint` does, then ask
         // whether the FIRST conversation can still be answered.
         let publish_all_then_look_up_the_first = |want_ladder: bool| -> (usize, Option<u32>) {
-            let (limit, per_owner) = gdn_retention_caps(want_ladder, false);
+            let caps = gdn_retention_caps(want_ladder, false);
             let mut store: VecDeque<Lineage> = VecDeque::new();
             for (index, tokens) in conversations.iter().enumerate() {
                 store.push_back(owner_checkpoint(NAMES[index], tokens, BLOCK));
-                prune_gdn_checkpoints(&mut store, limit, per_owner, "", "");
+                prune_gdn_checkpoints(&mut store, caps, "", "");
             }
             let extra_keys = vec![Vec::new(); 2];
             let hit = find_longest_valid_gdn_checkpoint_index(
@@ -860,6 +994,88 @@ mod tests {
         );
     }
 
+    /// The cap decides how many entries survive; the victim order decides WHICH.
+    /// Both move the depth a later turn restores from, so both are gated.
+    ///
+    /// One monotone conversation publishes three rungs under one owner. Holding
+    /// the caps fixed at the pre-ladder `(2, 2)` and varying ONLY the victim
+    /// order, the two policies keep different pairs:
+    ///
+    /// ```text
+    ///   published        16, 32, 48
+    ///   PreLadder  ->    32, 48      (drops the first ancestor in publish order)
+    ///   Ladder     ->    16, 48      (drops 32: smallest next/own ratio)
+    /// ```
+    ///
+    /// A warm turn whose paged hit lands at 32 — a retry, an edited prompt, or a
+    /// pool that evicted the tail — then restores from 32 under one and 16 under
+    /// the other. Different replay span through
+    /// `run_gdn_only_prefill_materialized`, different accumulation order,
+    /// different tokens. 77e43031 shipped the `PreLadder` order, so a
+    /// persistence-OFF turn has to keep taking it.
+    ///
+    /// Catches, verified by mutation:
+    /// - pointing `PreLadder`'s two arms in `prune_gdn_checkpoints` at
+    ///   `least_valuable_same_owner_ancestor` (i.e. never gating the order):
+    ///   the `PreLadder` row below becomes `[16, 48]` / `Some(16)`.
+    /// - hardcoding `gdn_retention_caps`'s `policy` to `Ladder`: the last
+    ///   assertion, which drives the seam the two model call sites use rather
+    ///   than naming a policy, fails the same way.
+    #[test]
+    fn a_persist_off_lineage_keeps_the_pre_ladder_victim_order() {
+        const BLOCK: u32 = 16;
+        let tokens: Vec<u32> = (0..4 * BLOCK).collect();
+        let extra_keys = vec![Vec::new(); 4];
+
+        let publish_three_rungs = |caps: GdnRetentionCaps| -> (Vec<u32>, Option<u32>) {
+            let mut store: VecDeque<Lineage> = VecDeque::new();
+            for rung in [BLOCK, 2 * BLOCK, 3 * BLOCK] {
+                store.push_back(owner_checkpoint("conv", &tokens, rung));
+                prune_gdn_checkpoints(&mut store, caps, "", "");
+            }
+            let retained: Vec<u32> = store.iter().map(|entry| entry.prefix_len).collect();
+            // The warm turn asks for a prefix the deepest rung overshoots, so
+            // the answer is whichever shallower rung survived.
+            let hit = find_longest_valid_gdn_checkpoint_index(
+                &store,
+                "",
+                &tokens,
+                2 * BLOCK,
+                BLOCK,
+                &extra_keys,
+                0,
+                |_| true,
+            )
+            .map(|index| store[index].prefix_len);
+            (retained, hit)
+        };
+
+        assert_eq!(
+            publish_three_rungs(GdnRetentionCaps::pre_ladder(2, 2)),
+            (vec![2 * BLOCK, 3 * BLOCK], Some(2 * BLOCK)),
+            "the pre-ladder order drops the shallowest ancestor, so a monotone \
+             conversation keeps its deepest rungs"
+        );
+        assert_eq!(
+            publish_three_rungs(GdnRetentionCaps::ladder(2, 2)),
+            (vec![BLOCK, 3 * BLOCK], Some(BLOCK)),
+            "the ladder order keeps a shallow rung on purpose — only a turn that \
+             writes a cold sidecar gets anything back for that"
+        );
+
+        // What the two model call sites actually hand `prune_gdn_checkpoints`
+        // for a persistence-OFF turn. Named policies above prove the two orders
+        // differ; this proves the seam picks the pre-ladder one.
+        let persist_off = gdn_retention_caps(false, false);
+        assert_eq!(persist_off.policy, GdnRetentionPolicy::PreLadder);
+        assert_eq!(
+            publish_three_rungs(persist_off),
+            (vec![2 * BLOCK, 3 * BLOCK], Some(2 * BLOCK)),
+            "a persistence-OFF turn must restore from the depth it restored \
+             from before the ladder existed"
+        );
+    }
+
     #[test]
     fn linear_history_keeps_a_spread_of_boundaries_under_the_owner_cap() {
         let mut checkpoints: VecDeque<_> = (1..=10)
@@ -871,8 +1087,10 @@ mod tests {
 
         prune_gdn_checkpoints(
             &mut checkpoints,
-            GDN_PREFIX_CHECKPOINT_LIMIT,
-            GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            GdnRetentionCaps::ladder(
+                GDN_PREFIX_CHECKPOINT_LIMIT,
+                GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            ),
             "root",
             "root",
         );
@@ -915,8 +1133,10 @@ mod tests {
 
         prune_gdn_checkpoints(
             &mut checkpoints,
-            GDN_PREFIX_CHECKPOINT_LIMIT,
-            GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            GdnRetentionCaps::ladder(
+                GDN_PREFIX_CHECKPOINT_LIMIT,
+                GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            ),
             "root",
             "child-3",
         );
@@ -945,8 +1165,10 @@ mod tests {
 
         prune_gdn_checkpoints(
             &mut checkpoints,
-            GDN_PREFIX_CHECKPOINT_LIMIT,
-            GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            GdnRetentionCaps::ladder(
+                GDN_PREFIX_CHECKPOINT_LIMIT,
+                GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            ),
             "root",
             "child-4",
         );
@@ -977,8 +1199,10 @@ mod tests {
             checkpoints.push_back(lineage(name, owner, &[hash]));
             prune_gdn_checkpoints(
                 &mut checkpoints,
-                GDN_PREFIX_CHECKPOINT_LIMIT,
-                GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+                GdnRetentionCaps::ladder(
+                    GDN_PREFIX_CHECKPOINT_LIMIT,
+                    GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+                ),
                 "root-1",
                 owner,
             );
@@ -1021,7 +1245,12 @@ mod tests {
             },
         ]);
 
-        prune_gdn_checkpoints(&mut checkpoints, 1, 2, "root", "root");
+        prune_gdn_checkpoints(
+            &mut checkpoints,
+            GdnRetentionCaps::ladder(1, 2),
+            "root",
+            "root",
+        );
 
         assert_eq!(checkpoints.len(), 1);
         assert_eq!(checkpoints.front().unwrap().name, "salt-b");
@@ -1035,7 +1264,12 @@ mod tests {
             lineage("head", "child", &[1, 2]),
         ]);
 
-        prune_gdn_checkpoints(&mut checkpoints, 5, 2, "root", "child");
+        prune_gdn_checkpoints(
+            &mut checkpoints,
+            GdnRetentionCaps::ladder(5, 2),
+            "root",
+            "child",
+        );
 
         assert_eq!(checkpoints.len(), 2);
         assert!(
@@ -1186,8 +1420,10 @@ mod tests {
             ));
             prune_gdn_checkpoints(
                 &mut checkpoints,
-                GDN_PREFIX_CHECKPOINT_LIMIT,
-                GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+                GdnRetentionCaps::ladder(
+                    GDN_PREFIX_CHECKPOINT_LIMIT,
+                    GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+                ),
                 "root",
                 "root",
             );
@@ -1255,8 +1491,10 @@ mod tests {
                 ));
                 prune_gdn_checkpoints(
                     &mut checkpoints,
-                    GDN_PREFIX_CHECKPOINT_LIMIT,
-                    GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+                    GdnRetentionCaps::ladder(
+                        GDN_PREFIX_CHECKPOINT_LIMIT,
+                        GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+                    ),
                     "root",
                     "root",
                 );
@@ -1334,8 +1572,10 @@ mod tests {
             ));
             prune_gdn_checkpoints(
                 &mut checkpoints,
-                GDN_PREFIX_CHECKPOINT_LIMIT,
-                GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+                GdnRetentionCaps::ladder(
+                    GDN_PREFIX_CHECKPOINT_LIMIT,
+                    GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+                ),
                 "root",
                 owner,
             );
@@ -1349,8 +1589,10 @@ mod tests {
             ));
             prune_gdn_checkpoints(
                 &mut checkpoints,
-                GDN_PREFIX_CHECKPOINT_LIMIT,
-                GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+                GdnRetentionCaps::ladder(
+                    GDN_PREFIX_CHECKPOINT_LIMIT,
+                    GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+                ),
                 "root",
                 "root",
             );
@@ -1424,8 +1666,7 @@ mod tests {
             ));
             prune_gdn_checkpoints(
                 checkpoints,
-                limit,
-                GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+                GdnRetentionCaps::ladder(limit, GDN_PREFIX_CHECKPOINTS_PER_OWNER),
                 root,
                 active,
             );
@@ -1456,8 +1697,7 @@ mod tests {
                 ));
                 prune_gdn_checkpoints(
                     checkpoints,
-                    limit,
-                    GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+                    GdnRetentionCaps::ladder(limit, GDN_PREFIX_CHECKPOINTS_PER_OWNER),
                     root,
                     owner,
                 );

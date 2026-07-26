@@ -339,16 +339,27 @@ present, so the global loop searches for a victim among every owner **except the
 publishing** first — otherwise the ladder eats itself down to the single endpoint rung
 it exists to replace.
 
-Which pair of caps a turn gets is decided by `gdn_retention_caps`, from the SAME
-predicate that decides the break set (`gdn_cold_sidecar_ladder_wanted`) plus whether the
-root owner was named:
+What a turn gets is decided by `gdn_retention_caps`, from the SAME predicate that
+decides the break set (`gdn_cold_sidecar_ladder_wanted`) plus whether the root owner was
+named. It returns the caps **and** the victim order together, because both move the same
+observable quantity — the depth a later turn restores from — so neither may be taken
+from a different column:
 
-| `want_ladder` | explicit root | global cap | per-owner cap |
-| --- | --- | --- | --- |
-| false | false | 2 | 2 |
-| false | true  | 5 | 2 |
-| true  | false | 4 | 4 |
-| true  | true  | 5 | 4 |
+| `want_ladder` | explicit root | global cap | per-owner cap | victim order |
+| --- | --- | --- | --- | --- |
+| false | false | 2 | 2 | `PreLadder` |
+| false | true  | 5 | 2 | `PreLadder` |
+| true  | false | 4 | 4 | `Ladder` |
+| true  | true  | 5 | 4 | `Ladder` |
+
+The caps decide how many entries survive; the victim order decides **which**.
+`Ladder` defers the publishing owner and then drops the rung with the smallest
+next/own length ratio, which deliberately keeps a SHALLOW rung alive — those are the
+only ones a cold restore can anchor on while the persisted K/V chain still lags the
+prompt. `PreLadder` is 77e43031's order verbatim: the first same-owner ancestor in
+publish order, no deferral. On a monotone conversation those keep different pairs
+(`16, 32, 48` published → `PreLadder` keeps `32, 48`, `Ladder` keeps `16, 48`), so a
+warm turn whose paged hit lands at 32 restores from a different depth under each.
 
 `GDN_PREFIX_CHECKPOINT_LIMIT` is the global cap only when the root owner was named
 explicitly, which today means `mlx agent`; every other caller leaves the root implicit,
@@ -375,11 +386,13 @@ three conversations over one model, turn 2 of the first:
                 -> emitted text diverges at character 56 of the same prompt
 ```
 
-So persistence-off keeps the pre-ladder 2. Persist-on pays that drift knowingly, in
-exchange for a restorable prefix; persistence-off would get nothing back for it. The
-predicate may also flip mid-session when a cold tier is installed after some turns have
-run, which is safe in both directions: 4 → 2 only prunes down at the next publish, and
-2 → 4 cannot resurrect an entry that is already gone.
+So persistence-off keeps the pre-ladder 2, and for the same reason keeps the pre-ladder
+victim order — a cap restored without the order still retains a different SET, which the
+next partial paged hit turns back into different tokens. Persist-on pays that drift
+knowingly, in exchange for a restorable prefix; persistence-off would get nothing back
+for it. The predicate may also flip mid-session when a cold tier is installed after some
+turns have run, which is safe in both directions: 4 → 2 only prunes down at the next
+publish, and 2 → 4 cannot resurrect an entry that is already gone.
 
 Be exact about who survives that, because the guarantee is narrower than "the
 publisher is protected". Preferring a foreign victim is a *preference*, not a floor:

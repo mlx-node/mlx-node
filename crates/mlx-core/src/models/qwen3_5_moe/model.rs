@@ -1218,7 +1218,7 @@ impl Qwen35MoeInner {
         // `get_or_insert_with` takes one and `wants_gdn_checkpoint_ladder`
         // needs `&self`, so an inline call in the argument list does not
         // borrow-check.
-        let (checkpoint_limit, per_owner_limit) = gdn_retention_caps(
+        let caps = gdn_retention_caps(
             self.wants_gdn_checkpoint_ladder(),
             self.gdn_root_cache_owner_is_explicit,
         );
@@ -1229,8 +1229,7 @@ impl Qwen35MoeInner {
             .clone();
         prune_gdn_checkpoints(
             &mut self.gdn_prefix_checkpoints,
-            checkpoint_limit,
-            per_owner_limit,
+            caps,
             &root_owner_id,
             &active_owner_id,
         );
@@ -9617,6 +9616,10 @@ mod paged_construction_tests {
     /// `qwen3_5::model::tests::test_dense_ladder_survives_sibling_owners_through_the_model_call_site`.
     /// The two share `prune_gdn_checkpoints` but not the call site that tells
     /// it which owner is publishing, which is exactly where they can drift.
+    ///
+    /// Like the dense twin, both arms are driven: publisher deferral exists
+    /// only under `GdnRetentionPolicy::Ladder`, so the cold tier has to be
+    /// installed for the mutation to be expressible at all.
     #[test]
     fn test_moe_ladder_survives_sibling_owners_through_the_model_call_site() {
         fn push(inner: &mut Qwen35MoeInner, owner_id: &str, root_owner_id: &str, blocks: u32) {
@@ -9639,34 +9642,60 @@ mod paged_construction_tests {
             inner.prune_moe_gdn_prefix_checkpoints();
         }
 
-        let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
-        push(&mut inner, "root", "root", 1);
-        push(&mut inner, "root", "root", 64);
-        for sibling in ["child-0", "child-1"] {
-            push(&mut inner, sibling, "root", 64);
-        }
-        for blocks in [1, 4, 16, 64] {
-            push(&mut inner, "child-3", "root", blocks);
+        fn run_fleet(inner: &mut Qwen35MoeInner) -> Vec<(String, u32)> {
+            inner.gdn_prefix_checkpoints.clear();
+            push(inner, "root", "root", 1);
+            push(inner, "root", "root", 64);
+            for sibling in ["child-0", "child-1"] {
+                push(inner, sibling, "root", 64);
+            }
+            for blocks in [1, 4, 16, 64] {
+                push(inner, "child-3", "root", blocks);
+            }
+            inner
+                .gdn_prefix_checkpoints
+                .iter()
+                .map(|checkpoint| (checkpoint.owner_id.clone(), checkpoint.prefix_len))
+                .collect()
         }
 
-        let shape: Vec<(&str, u32)> = inner
-            .gdn_prefix_checkpoints
-            .iter()
-            .map(|checkpoint| (checkpoint.owner_id.as_str(), checkpoint.prefix_len))
-            .collect();
+        let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
+            "test_moe_ladder_survives_sibling_owners_through_the_model_call_site",
+        ) else {
+            return;
+        };
+
+        assert!(!inner.wants_gdn_checkpoint_ladder());
         assert_eq!(
-            shape,
+            run_fleet(&mut inner),
             vec![
-                ("root", 1024),
-                ("child-0", 1024),
-                ("child-1", 1024),
-                ("child-3", 16),
-                ("child-3", 1024),
+                ("root".to_string(), 1024),
+                ("child-0".to_string(), 1024),
+                ("child-1".to_string(), 1024),
+                ("child-3".to_string(), 256),
+                ("child-3".to_string(), 1024),
+            ],
+            "a persistence-OFF turn takes the pre-ladder victim order, which \
+             keeps the publisher's DEEPEST rungs and defers nobody"
+        );
+
+        let root = moe_temp_cold_root("moe-ladder-sibling-call-site");
+        install_moe_gdn_cold_tier(&mut inner, &root);
+        assert!(inner.wants_gdn_checkpoint_ladder());
+        assert_eq!(
+            run_fleet(&mut inner),
+            vec![
+                ("root".to_string(), 1024),
+                ("child-0".to_string(), 1024),
+                ("child-1".to_string(), 1024),
+                ("child-3".to_string(), 16),
+                ("child-3".to_string(), 1024),
             ],
             "the publishing subagent must keep the shallow rung this turn's \
              capture anchors on, paid for by the root's spare rung, and no \
              sibling may be pushed to zero"
         );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -9932,7 +9961,12 @@ mod paged_construction_tests {
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(pool) => Arc::new(pool),
-            Err(err) if err.contains("No Metal device found") => {
+            // Routed through `test_support::metal_device_absent` rather than
+            // matching the string inline, so `MLX_TEST_REQUIRE_METAL=1` can
+            // turn a self-skip into a failure here too. libtest counts a
+            // skipped-and-returned test as passed, and these two are the only
+            // gates that can see a hardcoded arm at the prune call site.
+            Err(err) if crate::test_support::metal_device_absent(&err) => {
                 eprintln!("skipping {test_name} (no Metal device): {err}");
                 return None;
             }

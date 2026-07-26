@@ -519,6 +519,13 @@ fn eval_weight_materialize_chunk(
 /// `cold_tier::build_model_fingerprint` refuses a witness that materialized
 /// nothing. Without that, the ordering gate would be launderable by an empty
 /// call placed above the attach.
+///
+/// What the counters do NOT prove is that every array the model will read was
+/// in the pass. A loader that leaves one weight out of `materialize_weights`
+/// still `pread`s it after the fingerprint, and nothing here can see that. The
+/// counters bound the laundering hole, they do not close the coverage one. A
+/// loader that materializes in several passes must therefore fold them with
+/// [`WeightsResident::and`] rather than let the last one shadow the rest.
 pub struct WeightsResident {
     arrays: usize,
     bytes: u64,
@@ -533,6 +540,25 @@ impl WeightsResident {
     /// Total bytes those arrays occupy.
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Fold a later materialize pass into this witness.
+    ///
+    /// A loader that materializes in more than one pass (qwen3_5 and
+    /// qwen3_5_moe run a text pass and then a vision pass) must prove coverage
+    /// of ALL of them. Shadowing one witness with the next keeps the ordering
+    /// property — the later value is only in scope below the later pass — but
+    /// narrows `build_model_fingerprint`'s zero-coverage fail-safe to whatever
+    /// the LAST pass happened to read. Combining keeps both.
+    ///
+    /// Saturating: the counts are a coverage floor, and an overflow must not
+    /// wrap one to zero and re-open the door the fail-safe closes.
+    #[must_use]
+    pub fn and(self, later: WeightsResident) -> Self {
+        Self {
+            arrays: self.arrays.saturating_add(later.arrays),
+            bytes: self.bytes.saturating_add(later.bytes),
+        }
     }
 
     /// Forge a witness with chosen counts so tests can drive the callers that
@@ -714,6 +740,49 @@ mod tests {
             expected_bytes,
             "witness must count every materialized byte"
         );
+    }
+
+    /// The VLM loaders materialize twice (text, then vision) and hand ONE
+    /// witness to `build_model_fingerprint`. Shadowing the first with the
+    /// second would leave that function's zero-coverage fail-safe describing
+    /// only the vision tensors on a vision-bearing checkpoint.
+    ///
+    /// Catches, verified by mutation: replacing `weights_resident.and(..)` with
+    /// the bare vision witness at either loader — the combined counts below
+    /// then read as the second pass alone.
+    #[test]
+    fn combining_two_passes_counts_both() {
+        use crate::array::{DType, MxArray};
+
+        let text = [MxArray::zeros(&[8], Some(DType::Float32)).expect("zeros f32[8]")];
+        let vision = [MxArray::zeros(&[4, 4], Some(DType::BFloat16)).expect("zeros bf16[4,4]")];
+        let text_refs: Vec<&MxArray> = text.iter().collect();
+        let vision_refs: Vec<&MxArray> = vision.iter().collect();
+
+        let text_witness = materialize_weights(&text_refs).expect("text pass");
+        let vision_witness = materialize_weights(&vision_refs).expect("vision pass");
+        let text_bytes = text_witness.bytes();
+        let vision_bytes = vision_witness.bytes();
+        assert!(text_bytes > 0 && vision_bytes > 0, "both passes read bytes");
+
+        let combined = text_witness.and(vision_witness);
+        assert_eq!(
+            combined.arrays(),
+            2,
+            "combined witness must count both passes"
+        );
+        assert_eq!(
+            combined.bytes(),
+            text_bytes + vision_bytes,
+            "combined witness must count both passes' bytes"
+        );
+
+        // An empty second pass must not erase the first pass's coverage — that
+        // is what makes the fail-safe survive a text-only checkpoint.
+        let text_only = materialize_weights(&text_refs)
+            .expect("text pass")
+            .and(materialize_weights(&[]).expect("empty pass"));
+        assert_eq!(text_only.bytes(), text_bytes);
     }
 
     #[test]

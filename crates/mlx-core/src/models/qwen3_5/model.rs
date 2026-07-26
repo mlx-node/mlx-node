@@ -1851,7 +1851,7 @@ impl Qwen35Inner {
         // `get_or_insert_with` takes one and `wants_gdn_checkpoint_ladder`
         // needs `&self`, so an inline call in the argument list does not
         // borrow-check.
-        let (checkpoint_limit, per_owner_limit) = gdn_retention_caps(
+        let caps = gdn_retention_caps(
             self.wants_gdn_checkpoint_ladder(),
             self.gdn_root_cache_owner_is_explicit,
         );
@@ -1862,8 +1862,7 @@ impl Qwen35Inner {
             .clone();
         prune_gdn_checkpoints(
             &mut self.gdn_prefix_checkpoints,
-            checkpoint_limit,
-            per_owner_limit,
+            caps,
             &root_owner_id,
             &active_owner_id,
         );
@@ -13824,6 +13823,14 @@ mod paged_construction_tests {
     /// The root is seeded with a spare rung on purpose: that is the redundancy
     /// the first arm spends, and without it there is nothing for the arm to
     /// prefer and the mutation is invisible.
+    ///
+    /// The cold tier is installed for the same reason. Publisher deferral is a
+    /// `GdnRetentionPolicy::Ladder` behaviour and `active_owner_id` is read on
+    /// no other arm, so a turn with no GDN sidecar policy cannot express the
+    /// mutation at all — this test used to run on that arm and asserted the
+    /// ladder answer anyway, which only agreed while the policy was ungated.
+    /// The persistence-OFF push below pins the other arm's shape rather than
+    /// leaving it unmeasured.
     #[test]
     fn test_dense_ladder_survives_sibling_owners_through_the_model_call_site() {
         fn push(inner: &mut Qwen35Inner, owner_id: &str, root_owner_id: &str, blocks: u32) {
@@ -13846,39 +13853,67 @@ mod paged_construction_tests {
             inner.prune_dense_gdn_prefix_checkpoints();
         }
 
-        let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
-        // The root session holds a shallow rung and a deep one; two sibling
-        // subagents hold one each. Every slot is taken before the ladder starts.
-        push(&mut inner, "root", "root", 1);
-        push(&mut inner, "root", "root", 64);
-        for sibling in ["child-0", "child-1"] {
-            push(&mut inner, sibling, "root", 64);
-        }
-        // A third subagent publishes a whole quartered ladder, rung by rung,
-        // the way `publish_dense_gdn_materialized_prefix_checkpoint_with_keys`
-        // does.
-        for blocks in [1, 4, 16, 64] {
-            push(&mut inner, "child-3", "root", blocks);
+        /// Root seeded with a spare rung, two siblings holding one each, then a
+        /// third subagent publishing a whole quartered ladder rung by rung the
+        /// way `publish_dense_gdn_materialized_prefix_checkpoint_with_keys`
+        /// does. Every slot is taken before the ladder starts.
+        fn run_fleet(inner: &mut Qwen35Inner) -> Vec<(String, u32)> {
+            inner.gdn_prefix_checkpoints.clear();
+            push(inner, "root", "root", 1);
+            push(inner, "root", "root", 64);
+            for sibling in ["child-0", "child-1"] {
+                push(inner, sibling, "root", 64);
+            }
+            for blocks in [1, 4, 16, 64] {
+                push(inner, "child-3", "root", blocks);
+            }
+            inner
+                .gdn_prefix_checkpoints
+                .iter()
+                .map(|checkpoint| (checkpoint.owner_id.clone(), checkpoint.prefix_len))
+                .collect()
         }
 
-        let shape: Vec<(&str, u32)> = inner
-            .gdn_prefix_checkpoints
-            .iter()
-            .map(|checkpoint| (checkpoint.owner_id.as_str(), checkpoint.prefix_len))
-            .collect();
+        let Some(mut inner) = dense_inner_with_test_adapter_or_skip(
+            "test_dense_ladder_survives_sibling_owners_through_the_model_call_site",
+        ) else {
+            return;
+        };
+
+        // Persistence OFF: no deferral, and the pre-ladder per-owner cap of 2.
+        assert!(!inner.wants_gdn_checkpoint_ladder());
         assert_eq!(
-            shape,
+            run_fleet(&mut inner),
             vec![
-                ("root", 1024),
-                ("child-0", 1024),
-                ("child-1", 1024),
-                ("child-3", 16),
-                ("child-3", 1024),
+                ("root".to_string(), 1024),
+                ("child-0".to_string(), 1024),
+                ("child-1".to_string(), 1024),
+                ("child-3".to_string(), 256),
+                ("child-3".to_string(), 1024),
+            ],
+            "a persistence-OFF turn takes the pre-ladder victim order, which \
+             keeps the publisher's DEEPEST rungs and defers nobody"
+        );
+
+        // Persistence ON: the publisher's shallow rung is what this turn's cold
+        // capture anchors on, so it outlives the root's spare rung.
+        let root = temp_cold_root("dense-ladder-sibling-call-site");
+        install_gdn_cold_tier(&mut inner, &root);
+        assert!(inner.wants_gdn_checkpoint_ladder());
+        assert_eq!(
+            run_fleet(&mut inner),
+            vec![
+                ("root".to_string(), 1024),
+                ("child-0".to_string(), 1024),
+                ("child-1".to_string(), 1024),
+                ("child-3".to_string(), 16),
+                ("child-3".to_string(), 1024),
             ],
             "the publishing subagent must keep the shallow rung this turn's \
              capture anchors on, paid for by the root's spare rung, and no \
              sibling may be pushed to zero"
         );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -14616,7 +14651,12 @@ mod paged_construction_tests {
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(pool) => Arc::new(pool),
-            Err(err) if err.contains("No Metal device found") => {
+            // Routed through `test_support::metal_device_absent` rather than
+            // matching the string inline, so `MLX_TEST_REQUIRE_METAL=1` can
+            // turn a self-skip into a failure here too. libtest counts a
+            // skipped-and-returned test as passed, and these two are the only
+            // gates that can see a hardcoded arm at the prune call site.
+            Err(err) if crate::test_support::metal_device_absent(&err) => {
                 eprintln!("skipping {test_name} (no Metal device): {err}");
                 return None;
             }
