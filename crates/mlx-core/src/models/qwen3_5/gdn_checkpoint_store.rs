@@ -77,18 +77,107 @@ pub(crate) const GDN_PREFIX_CHECKPOINT_LIMIT: usize = 5;
 /// (`GDN_CHECKPOINT_LADDER_RUNGS`), so this cap alone never trims a ladder the
 /// turn that published it still needs. The GLOBAL cap does, whenever the store
 /// holds other owners — see `prune_gdn_checkpoints`.
+///
+/// It applies ONLY to a turn that publishes a ladder. A turn with no cold GDN
+/// policy publishes one rung, and widening its store instead changes which
+/// checkpoint later turns land on — see
+/// [`GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER`]. Pick between the two through
+/// [`gdn_retention_caps`], never by naming one directly at a call site.
 pub(crate) const GDN_PREFIX_CHECKPOINTS_PER_OWNER: usize = 4;
+
+/// Per-owner retention for a turn that publishes no ladder. This is the
+/// pre-ladder cap, restored verbatim.
+///
+/// The wider cap is not free on that arm, and the cost is emitted tokens, not
+/// memory. With no cold GDN policy a prefill publishes ONE boundary
+/// (`paged_forward::prefill_checkpoint_boundaries`, `want_ladder = false`), so
+/// the extra slots retain whole SIBLING lineages rather than a publisher's own
+/// shallow rungs — several conversations multiplexed over one model all publish
+/// under the same implicit owner id. Whether a later turn of the FIRST
+/// conversation still finds its own entry therefore depends on this number, and
+/// the two outcomes build the GDN recurrent state by different code:
+/// `prepare_dense_gdn_prefix_state`'s `checkpoint` arm installs a snapshot the
+/// chunked prefill took, its `replay_materialized` arm re-forwards the whole
+/// cached prefix through `run_gdn_only_prefill_materialized`. Different span,
+/// different accumulation order, different tokens.
+///
+/// Measured on real weights (qwen3.5-0.8b-mlx-bf16, greedy, persistence OFF,
+/// `MLX_PAGED_PREFILL_CHUNK_SIZE=2048` as `mlx launch claude` sets it, three
+/// conversations over one model, turn 2 of the first):
+///
+/// ```text
+///   cap 4   state=checkpoint           restored 3584  replayed    0
+///   cap 2   state=replay_materialized  restored    0  replayed 3584
+///           -> emitted text diverges at character 56 of the same prompt
+/// ```
+///
+/// So this is the same contract `prefill_checkpoint_boundaries` keeps: a
+/// persistence-OFF request must take the retention it took before the ladder
+/// existed. Persist-ON pays the drift knowingly, in exchange for a restorable
+/// prefix; persist-OFF gets nothing back for it.
+pub(crate) const GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER: usize = 2;
+
+/// The two caps one `prune_gdn_checkpoints` call enforces.
+///
+/// ```text
+///   want_ladder  explicit_root   ->  (global limit, per-owner limit)
+///   false        false               (2, 2)
+///   false        true                (5, 2)
+///   true         false               (4, 4)
+///   true         true                (5, 4)
+/// ```
+///
+/// `want_ladder` is `paged_forward::gdn_cold_sidecar_ladder_wanted` for the
+/// turn's adapter — the same predicate that decides the break set — so
+/// retention and the published rungs cannot disagree about whether this is a
+/// persist turn. `explicit_root` is `gdn_root_cache_owner_is_explicit`: without
+/// a named root there is no separate global budget to spend, so the per-owner
+/// cap is also the global one.
+///
+/// The predicate may flip mid-session (a cold tier is installed after some
+/// turns have run). That is safe in both directions and needs no reconciliation:
+/// 4 -> 2 only prunes down at the next publish, and 2 -> 4 cannot resurrect an
+/// entry that is already gone.
+///
+/// Single seam on purpose. The dense and MoE call sites are duplicated code, and
+/// this is the one decision they must not drift on.
+pub(crate) fn gdn_retention_caps(want_ladder: bool, explicit_root: bool) -> (usize, usize) {
+    let per_owner = if want_ladder {
+        GDN_PREFIX_CHECKPOINTS_PER_OWNER
+    } else {
+        GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER
+    };
+    let limit = if explicit_root {
+        GDN_PREFIX_CHECKPOINT_LIMIT
+    } else {
+        per_owner
+    };
+    (limit, per_owner)
+}
 
 /// Keep one slot the publishing owner cannot occupy by itself. Equalize the two
 /// and a single owner at its own cap fills the store, so the first checkpoint
 /// any second owner publishes is already over the global cap and every later
 /// turn trades one entry for one entry.
 ///
-/// This constrains the constants, not the call sites. `prune_dense_gdn_prefix_checkpoints`
-/// (and its MoE twin) deliberately pass `GDN_PREFIX_CHECKPOINTS_PER_OWNER` as
-/// the global limit on the implicit-root path, where `set_cache_owner_id`
-/// re-points the root at the active owner every turn and there is one owner.
+/// This constrains the constants, not the call sites. On the implicit-root path
+/// [`gdn_retention_caps`] hands the per-owner cap over as the global limit too,
+/// because there is no named root to budget siblings against.
 const _: () = assert!(GDN_PREFIX_CHECKPOINTS_PER_OWNER < GDN_PREFIX_CHECKPOINT_LIMIT);
+
+/// The pre-ladder cap can only ever be the tighter of the two. Reversing them
+/// would make a persistence-OFF turn retain MORE than a persist turn, which is
+/// the opposite of what the gate exists to do.
+const _: () =
+    assert!(GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER <= GDN_PREFIX_CHECKPOINTS_PER_OWNER);
+
+/// The ladder cap IS the ladder width; the doc on
+/// [`GDN_PREFIX_CHECKPOINTS_PER_OWNER`] says so and nothing else enforced it.
+/// Widening the ladder alone would silently trim every ladder by the difference
+/// on the very push that produced it.
+const _: () = assert!(
+    GDN_PREFIX_CHECKPOINTS_PER_OWNER == super::paged_forward::GDN_CHECKPOINT_LADDER_RUNGS as usize
+);
 
 /// Minimal identity needed to decide whether two materialized GDN sidecars
 /// belong to the same exact paged-cache lineage.
@@ -650,6 +739,116 @@ mod tests {
             tokens: (0..hashes.len() as u32).collect(),
             hashes: hashes.to_vec(),
         }
+    }
+
+    /// The four caps `prune_gdn_checkpoints` can be handed, in one table.
+    ///
+    /// Catches, verified by mutation: dropping the `want_ladder` arm from
+    /// `gdn_retention_caps` so `per_owner` is always the ladder width — the two
+    /// no-ladder rows then read `(4, 4)` and `(5, 4)`.
+    #[test]
+    fn retention_caps_gate_the_per_owner_bound_on_the_ladder_predicate() {
+        let ladder = GDN_PREFIX_CHECKPOINTS_PER_OWNER;
+        let pre_ladder = GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER;
+        assert_ne!(
+            ladder, pre_ladder,
+            "the table below only says anything while the two caps differ"
+        );
+
+        assert_eq!(gdn_retention_caps(false, false), (pre_ladder, pre_ladder));
+        assert_eq!(
+            gdn_retention_caps(false, true),
+            (GDN_PREFIX_CHECKPOINT_LIMIT, pre_ladder)
+        );
+        assert_eq!(gdn_retention_caps(true, false), (ladder, ladder));
+        assert_eq!(
+            gdn_retention_caps(true, true),
+            (GDN_PREFIX_CHECKPOINT_LIMIT, ladder)
+        );
+    }
+
+    /// One checkpoint at `prefix_len` on `tokens`, hashed the way the paged
+    /// allocator hashes it, so `find_longest_valid_gdn_checkpoint_index` can be
+    /// driven against the same token stream.
+    fn owner_checkpoint(name: &'static str, tokens: &[u32], prefix_len: u32) -> Lineage {
+        const BLOCK: u32 = 16;
+        let extra_keys = vec![Vec::new(); tokens.len().div_ceil(BLOCK as usize)];
+        let hashes = compute_paged_prefix_block_hashes(tokens, prefix_len, BLOCK, &extra_keys, 0)
+            .expect("a block-aligned prefix must hash");
+        Lineage {
+            name,
+            owner: "",
+            prefix_len,
+            block_size: BLOCK,
+            final_block_hash: hashes.last().copied().unwrap_or_default(),
+            tokens: tokens[..prefix_len as usize].to_vec(),
+            hashes,
+        }
+    }
+
+    /// The persistence-OFF defect the gate exists to stop, at the only layer
+    /// where it is decidable without weights.
+    ///
+    /// Several conversations multiplexed over one model all publish under the
+    /// same implicit owner id `""` (nothing but `mlx agent` ever sets one), and
+    /// with no cold GDN policy each turn publishes exactly ONE rung. So the cap
+    /// is not rationing a publisher's own ladder here — it decides whether the
+    /// FIRST conversation's own entry is still there when its next turn asks.
+    /// Losing it does not merely cost speed: the warm turn falls to
+    /// `prepare_dense_gdn_prefix_state`'s `replay_materialized` arm, which
+    /// rebuilds the recurrent state over a different span and emits different
+    /// tokens (measured on real weights; see
+    /// `GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER`).
+    ///
+    /// Catches, verified by mutation: ungating `gdn_retention_caps` so the
+    /// no-ladder arm also gets the ladder width — the no-ladder half then
+    /// retains 3 and HITS, i.e. persistence-OFF stops matching the pre-ladder
+    /// behaviour.
+    #[test]
+    fn a_persist_off_owner_keeps_the_pre_ladder_number_of_sibling_lineages() {
+        const BLOCK: u32 = 16;
+        const NAMES: [&str; 3] = ["conv-a", "conv-b", "conv-c"];
+        let conversations: Vec<Vec<u32>> = (0..3u32)
+            .map(|conv| (0..2 * BLOCK).map(|index| conv * 1000 + index).collect())
+            .collect();
+
+        // Publish one deep rung per conversation, pruning after each push the
+        // way `remember_*_gdn_materialized_prefix_checkpoint` does, then ask
+        // whether the FIRST conversation can still be answered.
+        let publish_all_then_look_up_the_first = |want_ladder: bool| -> (usize, Option<u32>) {
+            let (limit, per_owner) = gdn_retention_caps(want_ladder, false);
+            let mut store: VecDeque<Lineage> = VecDeque::new();
+            for (index, tokens) in conversations.iter().enumerate() {
+                store.push_back(owner_checkpoint(NAMES[index], tokens, BLOCK));
+                prune_gdn_checkpoints(&mut store, limit, per_owner, "", "");
+            }
+            let extra_keys = vec![Vec::new(); 2];
+            let hit = find_longest_valid_gdn_checkpoint_index(
+                &store,
+                "",
+                &conversations[0],
+                BLOCK,
+                BLOCK,
+                &extra_keys,
+                0,
+                |_| true,
+            )
+            .map(|index| store[index].prefix_len);
+            (store.len(), hit)
+        };
+
+        assert_eq!(
+            publish_all_then_look_up_the_first(false),
+            (GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER, None),
+            "a persistence-OFF turn must retain what it retained before the \
+             ladder existed, so the third conversation still evicts the first"
+        );
+        assert_eq!(
+            publish_all_then_look_up_the_first(true),
+            (3, Some(BLOCK)),
+            "a persist turn keeps the wider store the ladder needs, so the \
+             first conversation is still answerable"
+        );
     }
 
     #[test]

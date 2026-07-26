@@ -207,7 +207,7 @@ const GDN_CHECKPOINT_LADDER_RATIO: u32 = 4;
 /// onward: a single endpoint rung needs the chain to reach the prompt's own
 /// end, which takes tens of turns, whereas the ladder needs it to reach only
 /// a quarter of the deepest rung.
-const GDN_CHECKPOINT_LADDER_RUNGS: u32 = 4;
+pub(crate) const GDN_CHECKPOINT_LADDER_RUNGS: u32 = 4;
 
 /// Prefix boundaries this prefill materializes a GDN checkpoint at, ascending.
 ///

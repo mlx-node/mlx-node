@@ -35,11 +35,14 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
 #[cfg(test)]
-use super::gdn_checkpoint_store::compute_paged_prefix_block_hash;
 use super::gdn_checkpoint_store::{
-    GDN_PREFIX_CHECKPOINT_LIMIT, GDN_PREFIX_CHECKPOINTS_PER_OWNER, GdnCheckpointLineage,
-    GdnSidecarBoundary, compute_paged_prefix_block_hashes, find_longest_valid_gdn_checkpoint_index,
-    prune_gdn_checkpoints, replay_gdn_cache_and_commit, select_gdn_sidecar_boundary,
+    GDN_PREFIX_CHECKPOINTS_PER_OWNER, GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER,
+    compute_paged_prefix_block_hash,
+};
+use super::gdn_checkpoint_store::{
+    GdnCheckpointLineage, GdnSidecarBoundary, compute_paged_prefix_block_hashes,
+    find_longest_valid_gdn_checkpoint_index, gdn_retention_caps, prune_gdn_checkpoints,
+    replay_gdn_cache_and_commit, select_gdn_sidecar_boundary,
 };
 use super::layer_cache::Qwen3_5LayerCache;
 use super::mtp::Qwen3_5MTPModule;
@@ -1833,20 +1836,23 @@ impl Qwen35Inner {
     }
 
     fn prune_dense_gdn_prefix_checkpoints(&mut self) {
+        // Probe the ladder predicate BEFORE the `&mut self` borrows below:
+        // `get_or_insert_with` takes one and `wants_gdn_checkpoint_ladder`
+        // needs `&self`, so an inline call in the argument list does not
+        // borrow-check.
+        let (checkpoint_limit, per_owner_limit) = gdn_retention_caps(
+            self.wants_gdn_checkpoint_ladder(),
+            self.gdn_root_cache_owner_is_explicit,
+        );
         let active_owner_id = self.active_cache_owner_id.clone();
         let root_owner_id = self
             .gdn_root_cache_owner_id
             .get_or_insert_with(|| active_owner_id.clone())
             .clone();
-        let checkpoint_limit = if self.gdn_root_cache_owner_is_explicit {
-            GDN_PREFIX_CHECKPOINT_LIMIT
-        } else {
-            GDN_PREFIX_CHECKPOINTS_PER_OWNER
-        };
         prune_gdn_checkpoints(
             &mut self.gdn_prefix_checkpoints,
             checkpoint_limit,
-            GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            per_owner_limit,
             &root_owner_id,
             &active_owner_id,
         );
@@ -13712,17 +13718,90 @@ mod paged_construction_tests {
                 .any(|checkpoint| checkpoint.owner_id == "root-1")
         );
 
-        // Without an explicit root there is only ever one owner, so the owner
-        // cap is also the global cap.
+        // Without an explicit root there is no separate global budget, so the
+        // owner cap is also the global cap. This model has no paged adapter and
+        // therefore no cold GDN policy, so the owner cap is the PRE-LADDER one:
+        // nothing here could ever read a ladder, and widening the store on that
+        // arm changes which checkpoint a later persistence-OFF turn lands on.
         let mut legacy = Qwen35Inner::new(tiny_cfg(false)).expect("construct legacy dense model");
+        assert!(
+            !legacy.wants_gdn_checkpoint_ladder(),
+            "a model with no paged adapter cannot have a cold GDN sidecar policy"
+        );
         for marker in 1..=(GDN_PREFIX_CHECKPOINTS_PER_OWNER as u32 + 1) {
             push_checkpoint(&mut legacy, "", None, marker);
         }
         assert!(!legacy.gdn_root_cache_owner_is_explicit);
         assert_eq!(
             legacy.gdn_prefix_checkpoints.len(),
-            GDN_PREFIX_CHECKPOINTS_PER_OWNER
+            GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER
         );
+    }
+
+    /// The retention cap is chosen at this call site, not inside the store, and
+    /// the two arms are reachable only from here: `wants_gdn_checkpoint_ladder`
+    /// reads the adapter's installed cold-tier policy, which no store-level test
+    /// can see.
+    ///
+    /// Push the SAME four-rung ladder both ways. With a GDN sidecar policy
+    /// installed the whole ladder must survive — that is what the ladder is for.
+    /// With the policy removed the same push must collapse to the pre-ladder
+    /// number, because a turn that publishes no ladder must retain what it
+    /// retained before the ladder existed.
+    ///
+    /// Catches: hardcoding either arm at the call site. `true` regresses every
+    /// persistence-OFF request's emitted tokens; `false` silently reverts
+    /// persist-ON to single-endpoint retention.
+    #[test]
+    fn dense_gdn_retention_follows_the_installed_cold_sidecar_policy() {
+        let Some(mut inner) = dense_inner_with_test_adapter_or_skip(
+            "dense_gdn_retention_follows_the_installed_cold_sidecar_policy",
+        ) else {
+            return;
+        };
+        let tokens: Vec<u32> = (0..64u32).collect();
+        let extra_keys = vec![Vec::new(); 4];
+
+        let push_ladder = |inner: &mut Qwen35Inner| {
+            inner.gdn_prefix_checkpoints.clear();
+            crate::engine::backend::ChatBackend::set_cache_owner_id(inner, "", None);
+            for rung in 1..=4u32 {
+                let prefix_len = rung * 16;
+                let block_hashes =
+                    compute_paged_prefix_block_hashes(&tokens, prefix_len, 16, &extra_keys, 0)
+                        .expect("block-aligned rung must hash");
+                inner
+                    .gdn_prefix_checkpoints
+                    .push_back(DenseGdnPrefixCheckpoint {
+                        owner_id: inner.active_cache_owner_id.clone(),
+                        prefix_len,
+                        block_size: 16,
+                        final_block_hash: block_hashes.last().copied().unwrap_or_default(),
+                        block_hashes,
+                        tokens: tokens[..prefix_len as usize].to_vec(),
+                        caches: Vec::new(),
+                    });
+                inner.prune_dense_gdn_prefix_checkpoints();
+            }
+            inner.gdn_prefix_checkpoints.len()
+        };
+
+        assert!(!inner.wants_gdn_checkpoint_ladder());
+        assert_eq!(
+            push_ladder(&mut inner),
+            GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER,
+            "with no cold GDN policy the store must stay at the pre-ladder cap"
+        );
+
+        let root = temp_cold_root("dense-gdn-retention-policy");
+        install_gdn_cold_tier(&mut inner, &root);
+        assert!(inner.wants_gdn_checkpoint_ladder());
+        assert_eq!(
+            push_ladder(&mut inner),
+            GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            "a cold GDN sidecar policy must keep the whole published ladder"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The retention policy lives in `gdn_checkpoint_store`, but WHICH owner it

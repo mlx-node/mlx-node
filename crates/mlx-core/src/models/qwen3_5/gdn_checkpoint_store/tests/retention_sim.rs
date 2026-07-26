@@ -525,9 +525,11 @@ const CAPACITY_SWEEP: [Caps; 9] = [
         limit: 7,
         per_owner: 4,
     },
-    // The implicit-root call site: `model.rs` passes
-    // `GDN_PREFIX_CHECKPOINTS_PER_OWNER` as the GLOBAL limit when no root owner
-    // was named, so limit and per-owner are both 4 there.
+    // The implicit-root call site on a PERSIST turn: `gdn_retention_caps`
+    // hands the per-owner cap over as the GLOBAL limit when no root owner was
+    // named, so limit and per-owner are both 4 there. The persist-OFF pair
+    // (2, 2) is deliberately absent — this sim measures cold-sidecar coverage,
+    // and a turn with no cold policy writes no sidecar to measure.
     Caps {
         limit: 4,
         per_owner: 4,

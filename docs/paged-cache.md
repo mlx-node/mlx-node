@@ -331,11 +331,49 @@ already at the global cap sees a ladder arrive one rung at a time. Judged on
 redundancy alone the newest rung's own predecessor is always the most redundant entry
 present, so the global loop searches for a victim among every owner **except the one
 publishing** first — otherwise the ladder eats itself down to the single endpoint rung
-it exists to replace. The global cap is `GDN_PREFIX_CHECKPOINT_LIMIT` only when the
-root owner was named explicitly, which today means `mlx agent`; every other caller
-leaves the root implicit and gets the tighter `GDN_PREFIX_CHECKPOINTS_PER_OWNER = 4`,
-which is one publisher's whole ladder — on that path `set_cache_owner_id` re-points the
-root at the active owner every turn, so there is normally only one owner anyway.
+it exists to replace.
+
+Which pair of caps a turn gets is decided by `gdn_retention_caps`, from the SAME
+predicate that decides the break set (`gdn_cold_sidecar_ladder_wanted`) plus whether the
+root owner was named:
+
+| `want_ladder` | explicit root | global cap | per-owner cap |
+| --- | --- | --- | --- |
+| false | false | 2 | 2 |
+| false | true  | 5 | 2 |
+| true  | false | 4 | 4 |
+| true  | true  | 5 | 4 |
+
+`GDN_PREFIX_CHECKPOINT_LIMIT` is the global cap only when the root owner was named
+explicitly, which today means `mlx agent`; every other caller leaves the root implicit,
+and without a named root there is no separate global budget to spend, so the per-owner
+cap is also the global one.
+
+The `want_ladder = false` column is the same compatibility contract
+`prefill_checkpoint_boundaries` keeps, for the same reason. With no cold GDN policy a
+prefill publishes ONE rung, so the extra slots do not hold a publisher's own shallow
+rungs — they hold whole **sibling lineages**, because several conversations multiplexed
+over one model all publish under the same implicit owner id `""`. Whether the first
+conversation's own entry survives until its next turn therefore depends on this number,
+and the two outcomes build the recurrent state by different code:
+`prepare_dense_gdn_prefix_state`'s `checkpoint` arm installs a snapshot the chunked
+prefill took, its `replay_materialized` arm re-forwards the whole cached prefix through
+`run_gdn_only_prefill_materialized`. Different span, different accumulation order,
+different tokens. Measured on qwen3.5-0.8b-mlx-bf16, greedy, persistence **off**,
+`MLX_PAGED_PREFILL_CHUNK_SIZE=2048` (what `mlx launch claude` sets unconditionally),
+three conversations over one model, turn 2 of the first:
+
+```text
+  per-owner 4   state=checkpoint           restored 3584  replayed    0
+  per-owner 2   state=replay_materialized  restored    0  replayed 3584
+                -> emitted text diverges at character 56 of the same prompt
+```
+
+So persistence-off keeps the pre-ladder 2. Persist-on pays that drift knowingly, in
+exchange for a restorable prefix; persistence-off would get nothing back for it. The
+predicate may also flip mid-session when a cold tier is installed after some turns have
+run, which is safe in both directions: 4 → 2 only prunes down at the next publish, and
+2 → 4 cannot resurrect an entry that is already gone.
 
 Be exact about who survives that, because the guarantee is narrower than "the
 publisher is protected". Preferring a foreign victim is a *preference*, not a floor:

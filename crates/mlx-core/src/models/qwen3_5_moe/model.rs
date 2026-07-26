@@ -25,11 +25,14 @@ use crate::inference_trace::{
 };
 use crate::model_thread::ResponseTx;
 #[cfg(test)]
-use crate::models::qwen3_5::gdn_checkpoint_store::compute_paged_prefix_block_hash;
 use crate::models::qwen3_5::gdn_checkpoint_store::{
-    GDN_PREFIX_CHECKPOINT_LIMIT, GDN_PREFIX_CHECKPOINTS_PER_OWNER, GdnCheckpointLineage,
-    GdnSidecarBoundary, compute_paged_prefix_block_hashes, find_longest_valid_gdn_checkpoint_index,
-    prune_gdn_checkpoints, replay_gdn_cache_and_commit, select_gdn_sidecar_boundary,
+    GDN_PREFIX_CHECKPOINTS_PER_OWNER, GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER,
+    compute_paged_prefix_block_hash,
+};
+use crate::models::qwen3_5::gdn_checkpoint_store::{
+    GdnCheckpointLineage, GdnSidecarBoundary, compute_paged_prefix_block_hashes,
+    find_longest_valid_gdn_checkpoint_index, gdn_retention_caps, prune_gdn_checkpoints,
+    replay_gdn_cache_and_commit, select_gdn_sidecar_boundary,
 };
 use crate::models::qwen3_5::model::{
     IMAGE_TOKEN_ID, Qwen3_5ContextLimits, VisionCache, VisionCacheInner, async_eval_layer_caches,
@@ -1200,20 +1203,23 @@ impl Qwen35MoeInner {
     }
 
     fn prune_moe_gdn_prefix_checkpoints(&mut self) {
+        // Probe the ladder predicate BEFORE the `&mut self` borrows below:
+        // `get_or_insert_with` takes one and `wants_gdn_checkpoint_ladder`
+        // needs `&self`, so an inline call in the argument list does not
+        // borrow-check.
+        let (checkpoint_limit, per_owner_limit) = gdn_retention_caps(
+            self.wants_gdn_checkpoint_ladder(),
+            self.gdn_root_cache_owner_is_explicit,
+        );
         let active_owner_id = self.active_cache_owner_id.clone();
         let root_owner_id = self
             .gdn_root_cache_owner_id
             .get_or_insert_with(|| active_owner_id.clone())
             .clone();
-        let checkpoint_limit = if self.gdn_root_cache_owner_is_explicit {
-            GDN_PREFIX_CHECKPOINT_LIMIT
-        } else {
-            GDN_PREFIX_CHECKPOINTS_PER_OWNER
-        };
         prune_gdn_checkpoints(
             &mut self.gdn_prefix_checkpoints,
             checkpoint_limit,
-            GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            per_owner_limit,
             &root_owner_id,
             &active_owner_id,
         );
@@ -9502,6 +9508,98 @@ mod paged_construction_tests {
                 .iter()
                 .any(|checkpoint| checkpoint.owner_id == "root-1")
         );
+
+        // The implicit-root arm, which the rotation cases above never reach
+        // because they always name a root. Every caller except `mlx agent`
+        // lands here: `cacheRootOwnerId` is set in exactly one place
+        // (`packages/agent/src/provider/chat-config.ts`), so a plain
+        // `@mlx-node/lm` ChatSession publishes under the implicit owner `""`.
+        // This model has no paged adapter and so no cold GDN policy, which
+        // makes the pre-ladder cap the right one — see the dense twin.
+        let mut legacy = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct legacy MoE");
+        assert!(
+            !legacy.wants_gdn_checkpoint_ladder(),
+            "a model with no paged adapter cannot have a cold GDN sidecar policy"
+        );
+        for marker in 1..=(GDN_PREFIX_CHECKPOINTS_PER_OWNER as u32 + 1) {
+            crate::engine::backend::ChatBackend::set_cache_owner_id(&mut legacy, "", None);
+            let tokens: Vec<u32> = (0..16).map(|offset| marker * 100 + offset).collect();
+            legacy
+                .gdn_prefix_checkpoints
+                .push_back(MoeGdnPrefixCheckpoint {
+                    owner_id: legacy.active_cache_owner_id.clone(),
+                    prefix_len: 16,
+                    block_size: 16,
+                    final_block_hash: marker as u64,
+                    block_hashes: vec![marker as u64],
+                    tokens,
+                    caches: Vec::new(),
+                });
+            legacy.prune_moe_gdn_prefix_checkpoints();
+        }
+        assert!(!legacy.gdn_root_cache_owner_is_explicit);
+        assert_eq!(
+            legacy.gdn_prefix_checkpoints.len(),
+            GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER
+        );
+    }
+
+    /// MoE twin of
+    /// `qwen3_5::model::paged_construction_tests::dense_gdn_retention_follows_the_installed_cold_sidecar_policy`.
+    /// The retention cap is chosen at the call site, and the twins have two of
+    /// them.
+    ///
+    /// Catches: hardcoding either arm in `prune_moe_gdn_prefix_checkpoints`.
+    #[test]
+    fn moe_gdn_retention_follows_the_installed_cold_sidecar_policy() {
+        let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
+            "moe_gdn_retention_follows_the_installed_cold_sidecar_policy",
+        ) else {
+            return;
+        };
+        let tokens: Vec<u32> = (0..64u32).collect();
+        let extra_keys = vec![Vec::new(); 4];
+
+        let push_ladder = |inner: &mut Qwen35MoeInner| {
+            inner.gdn_prefix_checkpoints.clear();
+            crate::engine::backend::ChatBackend::set_cache_owner_id(inner, "", None);
+            for rung in 1..=4u32 {
+                let prefix_len = rung * 16;
+                let block_hashes =
+                    compute_paged_prefix_block_hashes(&tokens, prefix_len, 16, &extra_keys, 0)
+                        .expect("block-aligned rung must hash");
+                inner
+                    .gdn_prefix_checkpoints
+                    .push_back(MoeGdnPrefixCheckpoint {
+                        owner_id: inner.active_cache_owner_id.clone(),
+                        prefix_len,
+                        block_size: 16,
+                        final_block_hash: block_hashes.last().copied().unwrap_or_default(),
+                        block_hashes,
+                        tokens: tokens[..prefix_len as usize].to_vec(),
+                        caches: Vec::new(),
+                    });
+                inner.prune_moe_gdn_prefix_checkpoints();
+            }
+            inner.gdn_prefix_checkpoints.len()
+        };
+
+        assert!(!inner.wants_gdn_checkpoint_ladder());
+        assert_eq!(
+            push_ladder(&mut inner),
+            GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER,
+            "with no cold GDN policy the store must stay at the pre-ladder cap"
+        );
+
+        let root = moe_temp_cold_root("moe-gdn-retention-policy");
+        install_moe_gdn_cold_tier(&mut inner, &root);
+        assert!(inner.wants_gdn_checkpoint_ladder());
+        assert_eq!(
+            push_ladder(&mut inner),
+            GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            "a cold GDN sidecar policy must keep the whole published ladder"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// MoE twin of
