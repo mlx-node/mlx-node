@@ -386,7 +386,7 @@ pub(crate) fn metal_device_absent_when(require_metal: bool, msg: &str) -> bool {
 
 #[cfg(test)]
 mod skip_predicate_tests {
-    use super::{metal_device_absent, metal_device_absent_when};
+    use super::metal_device_absent_when;
 
     /// `MLX_TEST_REQUIRE_METAL=1` must remove the skip licence for the device-
     /// absence strings too, not just for config failures.
@@ -423,8 +423,14 @@ mod skip_predicate_tests {
             "No Metal device found",
             "paged init failed: Metal GPU not available",
         ] {
+            // The pure form, not `metal_device_absent`: this arm asserts that
+            // device absence licenses a skip, which is only true while
+            // MLX_TEST_REQUIRE_METAL is unset. Reading the env here would make
+            // the test assert the ambient environment rather than the
+            // predicate, and it fails on any run that sets the var — which the
+            // `cargo test` CI leg now does for every test in the crate.
             assert!(
-                metal_device_absent(absent),
+                metal_device_absent_when(false, absent),
                 "a genuinely device-less host must still be able to skip: {absent}"
             );
         }
@@ -435,7 +441,7 @@ mod skip_predicate_tests {
             "block_size must be > 0",
         ] {
             assert!(
-                !metal_device_absent(real_failure),
+                !metal_device_absent_when(false, real_failure),
                 "a config/caller failure must fail the test, not silently skip it: \
                  {real_failure}"
             );

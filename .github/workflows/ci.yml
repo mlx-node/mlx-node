@@ -212,6 +212,19 @@ jobs:
           RUST_BACKTRACE: 1
           CARGO_INCREMENTAL: 1
           HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
+          # This leg runs on a Metal runner, so a test that self-skips because
+          # it found no GPU has not passed — it reported a green it never
+          # earned. `metal_device_absent` withdraws the skip licence when this
+          # is set, turning that case into a failure instead.
+          #
+          # The `model-test` leg sets the same var, but only around its `--lib`
+          # filter step, which names two tests. Every OTHER Metal-gated test in
+          # the crate runs here — including the ladder-retention pair, which
+          # became skippable when arming the ladder started requiring a paged
+          # adapter. Scoping this to the leg rather than to a name list means a
+          # test that grows a Metal dependency later is covered on the day it
+          # does, without anyone remembering to add it.
+          MLX_TEST_REQUIRE_METAL: '1'
 
   # Heavy real-model end-to-end leg — reuses the `build` job's native addon +
   # metallib artifacts (no second native build). Each matrix leg downloads +
