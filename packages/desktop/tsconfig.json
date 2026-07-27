@@ -8,6 +8,6 @@
     "types": ["node"],
     "lib": ["ESNext", "DOM"]
   },
-  "include": ["src/**/*.ts"],
+  "include": ["src/**/*.ts", "src/**/*.cts"],
   "references": [{ "path": "../dashboard" }, { "path": "../server" }]
 }
