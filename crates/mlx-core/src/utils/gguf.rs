@@ -1993,13 +1993,33 @@ impl SourceQuantProfile {
 /// because the flag alone is not enough. `attention_k_eq_v` only takes effect
 /// on layers the config calls `full_attention`, and when `layer_types` is
 /// absent the loader synthesizes one from `sliding_window_pattern`, which
-/// defaults to 5 and puts the global layers at indices 4, 9, 14 … The GGUF
-/// carries `sliding_window_pattern` as a *bool*, so the cycle length cannot be
-/// read from metadata at all — but the tensors give it exactly: on a checkpoint
-/// with this layout the layers missing `attn_v` are precisely the global ones.
-/// Emitting the array measured off the tensors avoids guessing a period that is
-/// 6 here and would silently mistype every layer if guessed as 5.
-fn gemma4_layer_types_from_missing_v(gguf: &GgufFile) -> Option<Vec<String>> {
+/// defaults to 5 and puts the global layers at indices 4, 9, 14 … The real file
+/// has a period of 6, and guessing 5 silently mistypes every layer.
+///
+/// `gemma4.attention.sliding_window_pattern` would say so directly, but it is an
+/// array of GGUF element type 7 (bool), which [`read_meta_array`] has no variant
+/// for: the unsupported-type arm skips the payload and yields an empty
+/// `ArrayU32`. It is in any case only a redundant second witness. The reliable
+/// one is `gemma4.attention.head_count_kv`, an `ArrayI32` with one entry per
+/// layer whose minimum marks the global layers — the same array
+/// [`apply_gemma4_attention_geometry`] already reads.
+///
+/// Both witnesses must agree before the flag is flipped, because the tensor list
+/// alone is fail-open: a checkpoint truncated mid-download, or corrupted, is
+/// missing an `attn_v` too, and reading that as K=V suppresses the loader's
+/// missing-weight check (`models/gemma4/persistence.rs`, `v_proj required when
+/// this layer does not use k_eq_v`) and feeds attention the keys as values. So
+/// once the tensors claim the interleave, the header must corroborate it
+/// exactly:
+///
+/// * the `blk.N` indices are exactly `0 .. gemma4.block_count`,
+/// * `head_count_kv` has one entry per layer, and
+/// * the layers at its minimum are precisely the layers with no `attn_v`.
+///
+/// Anything else is a named error rather than a silent `None`: the tensor list
+/// is a partial-V mixture either way, so the load cannot succeed, and reporting
+/// the disagreement beats relocating the failure to `layers.N.self_attn.v_proj`.
+fn gemma4_layer_types_from_missing_v(gguf: &GgufFile) -> Result<Option<Vec<String>>> {
     let mut layers = std::collections::BTreeSet::new();
     for tensor in &gguf.tensors {
         if let Some(rest) = tensor.name.strip_prefix("blk.")
@@ -2010,21 +2030,111 @@ fn gemma4_layer_types_from_missing_v(gguf: &GgufFile) -> Option<Vec<String>> {
         }
     }
 
-    let mut types = Vec::with_capacity(layers.len());
-    let mut with_v = false;
-    let mut without_v = false;
-    for layer in layers {
-        let prefix = format!("blk.{layer}.attn_v");
-        if gguf.tensors.iter().any(|t| t.name.starts_with(&prefix)) {
-            with_v = true;
-            types.push("sliding_attention".to_string());
-        } else {
-            without_v = true;
-            types.push("full_attention".to_string());
-        }
+    let missing_v: std::collections::BTreeSet<u32> = layers
+        .iter()
+        .copied()
+        .filter(|layer| {
+            let prefix = format!("blk.{layer}.attn_v");
+            !gguf.tensors.iter().any(|t| t.name.starts_with(&prefix))
+        })
+        .collect();
+
+    // Not the interleave: every layer projects V (an ordinary checkpoint), or
+    // none does (a V-less file is not the sliding/global mix this describes).
+    // Neither may flip the flag, and neither is an error.
+    if missing_v.is_empty() || missing_v.len() == layers.len() {
+        return Ok(None);
     }
 
-    (with_v && without_v).then_some(types)
+    let block_count = gguf
+        .metadata
+        .get("gemma4.block_count")
+        .and_then(GgufMetaValue::as_u32);
+    if !block_count.is_some_and(|n| layers.iter().copied().eq(0..n)) {
+        return Err(Error::from_reason(format!(
+            "Gemma4 GGUF omits 'attn_v' on {} of {} decoder blocks, but its blocks are not \
+             exactly 0..gemma4.block_count ({block_count:?}) — the tensor list is truncated or \
+             renumbered, refusing to read it as the key-equals-value attention layout",
+            missing_v.len(),
+            layers.len(),
+        )));
+    }
+
+    let kv_per_layer = gemma4_kv_head_counts(&gguf.metadata);
+    if kv_per_layer.len() != layers.len() {
+        return Err(Error::from_reason(format!(
+            "Gemma4 GGUF omits 'attn_v' on {} of {} decoder blocks, but \
+             'gemma4.attention.head_count_kv' holds {} entries instead of one per layer — \
+             nothing corroborates which layers are global, refusing to read it as the \
+             key-equals-value attention layout",
+            missing_v.len(),
+            layers.len(),
+            kv_per_layer.len(),
+        )));
+    }
+
+    let fewest_kv_heads = kv_per_layer
+        .iter()
+        .copied()
+        .min()
+        .expect("length was just checked against a non-empty layer set");
+    let global_by_kv: std::collections::BTreeSet<u32> = kv_per_layer
+        .iter()
+        .enumerate()
+        .filter(|&(_, &heads)| heads == fewest_kv_heads)
+        .map(|(idx, _)| idx as u32)
+        .collect();
+    if global_by_kv != missing_v {
+        return Err(Error::from_reason(format!(
+            "Gemma4 GGUF omits 'attn_v' on layers {missing_v:?}, but \
+             'gemma4.attention.head_count_kv' puts its {fewest_kv_heads}-head layers at \
+             {global_by_kv:?} — the tensor list and the header disagree about which layers are \
+             global, refusing to read it as the key-equals-value attention layout"
+        )));
+    }
+
+    Ok(Some(
+        layers
+            .iter()
+            .map(|layer| {
+                if missing_v.contains(layer) {
+                    "full_attention".to_string()
+                } else {
+                    "sliding_attention".to_string()
+                }
+            })
+            .collect(),
+    ))
+}
+
+/// Whether a config already states `key`, looked up the way the Gemma4 loader
+/// looks it up: `text_config` first, then the top level (`get_config_bool` and
+/// `parse_layer_types` in `models/gemma4/persistence.rs`). Checking both means a
+/// nested statement is honored even though the converter writes flat keys — a
+/// top-level write would be shadowed by `text_config` and silently do nothing.
+fn gemma4_config_states(config: &serde_json::Value, key: &str) -> bool {
+    config
+        .get("text_config")
+        .and_then(|text_config| text_config.get(key))
+        .is_some()
+        || config.get(key).is_some()
+}
+
+/// The per-layer KV head counts a Gemma4 GGUF declares, empty when the key is
+/// absent.
+///
+/// Gemma4 varies the KV head count per layer, so `head_count_kv` is an *array*
+/// rather than the scalar the generic metadata mapping handles. Shared by
+/// [`gemma4_layer_types_from_missing_v`] and
+/// [`apply_gemma4_attention_geometry`] so the array the layer types are checked
+/// against is literally the array the geometry is built from.
+fn gemma4_kv_head_counts(metadata: &HashMap<String, GgufMetaValue>) -> Vec<u32> {
+    match metadata.get("gemma4.attention.head_count_kv") {
+        Some(GgufMetaValue::ArrayI32(v)) => v.iter().map(|&n| n as u32).collect(),
+        Some(GgufMetaValue::ArrayU32(v)) => v.clone(),
+        Some(scalar) => scalar.as_u32().into_iter().collect(),
+        None => Vec::new(),
+    }
 }
 
 /// Fill in the Gemma4 attention geometry that the generic metadata mapping
@@ -2073,12 +2183,7 @@ fn apply_gemma4_attention_geometry(
         put("sliding_window", w);
     }
 
-    let kv_per_layer = match metadata.get("gemma4.attention.head_count_kv") {
-        Some(GgufMetaValue::ArrayI32(v)) => v.iter().map(|&n| n as u32).collect::<Vec<_>>(),
-        Some(GgufMetaValue::ArrayU32(v)) => v.clone(),
-        Some(scalar) => scalar.as_u32().into_iter().collect(),
-        None => Vec::new(),
-    };
+    let kv_per_layer = gemma4_kv_head_counts(metadata);
     if kv_per_layer.is_empty() {
         return;
     }
@@ -2400,6 +2505,45 @@ pub async fn convert_gguf_to_safetensors(
                  a dequantized copy.",
             ));
         }
+    }
+
+    // Symmetric ggml blocks (`d * (q - Z)`: Q4_0, Q8_0) repack losslessly into
+    // MLX affine groups whose `.biases` companion is DERIVED from the scale at
+    // load rather than stored, which only works because the emitted config
+    // carries `symmetric_zero_point`. `--quantize` skips every already-packed
+    // group, so the body is unchanged, but the config write then takes the
+    // freshly-quantized branch and emits a `build_quantization_object` that
+    // knows nothing about the marker — a checkpoint that converts and then
+    // cannot be loaded.
+    //
+    // Carrying the marker forward instead is not an option: with `--quantize`
+    // the output is a MIXTURE of skipped symmetric groups (bias derived) and
+    // newly quantized float tensors (bias stored), and a single top-level claim
+    // would falsely describe the latter. Reject upfront, mirroring the K-quant
+    // guard above and the already-quantized gemma-QAT reject in
+    // `convert::convert_model_inner`.
+    //
+    // Not mirrored in the CLI: unlike `--gguf-kquant`, this condition is read
+    // off the file's tensor types rather than the flags, and nothing on the TS
+    // side parses GGUF. The check still runs before a single weight byte is
+    // read — `parse_gguf` above reads only the header, metadata, and tensor
+    // descriptors.
+    if options.quantize.unwrap_or(false)
+        && let Some(tensor) = gguf
+            .tensors
+            .iter()
+            .find(|t| symmetric_zero_point(t.tensor_type).is_some())
+    {
+        return Err(Error::from_reason(format!(
+            "GGUF tensor '{}' is already quantized ({}); convert without --quantize \
+             (--q-mxfp requires it). Symmetric ggml blocks are repacked losslessly to \
+             MLX affine groups whose '.biases' companion is derived from the scale \
+             instead of being stored, and --quantize skips them and then writes a \
+             quantization block describing only the tensors it did quantize — \
+             dropping the '{SYMMETRIC_ZERO_POINT_KEY}' that derivation needs.",
+            tensor.name,
+            tensor.tensor_type.name(),
+        )));
     }
 
     // Output keys an optional global `--dtype` request must leave alone,
@@ -2787,21 +2931,28 @@ pub async fn convert_gguf_to_safetensors(
             extract_config(&gguf.metadata)
         };
 
-        // Read off the tensor list, not the metadata, and applied to both config
-        // sources: a hand-supplied config.json for a GGUF whose global layers
-        // carry no `attn_v` is describing weights that do not exist, and the
-        // weights are the artifact.
+        // Measured off the tensor list and cross-checked against the header, so
+        // it also applies to a hand-supplied config.json: a config for a GGUF
+        // whose global layers carry no `attn_v` but that says nothing about the
+        // layout is describing weights that do not exist, and the weights are
+        // the artifact. A config that DOES state either field is the stronger
+        // source and keeps it — writing over an explicit statement would make
+        // `--config-dir` unable to correct a mislabelled checkpoint.
         if is_gemma4_main_gguf(&gguf.metadata) {
-            let layer_types = gemma4_layer_types_from_missing_v(&gguf);
+            let layer_types = gemma4_layer_types_from_missing_v(&gguf)?;
             if let Some(ref types) = layer_types {
-                config_json["attention_k_eq_v"] = serde_json::Value::Bool(true);
-                config_json["layer_types"] = serde_json::Value::Array(
-                    types
-                        .iter()
-                        .cloned()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                );
+                if !gemma4_config_states(&config_json, "attention_k_eq_v") {
+                    config_json["attention_k_eq_v"] = serde_json::Value::Bool(true);
+                }
+                if !gemma4_config_states(&config_json, "layer_types") {
+                    config_json["layer_types"] = serde_json::Value::Array(
+                        types
+                            .iter()
+                            .cloned()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    );
+                }
             }
             // Only when we synthesized the config: an authoritative config.json
             // already states this geometry, and the GGUF is the weaker source.
@@ -2949,6 +3100,14 @@ mod tests {
                 GgufMetaValue::Float32(v) => {
                     buf.extend_from_slice(&(GgufValueType::Float32 as u32).to_le_bytes());
                     buf.extend_from_slice(&v.to_le_bytes());
+                }
+                GgufMetaValue::ArrayI32(values) => {
+                    buf.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+                    buf.extend_from_slice(&(GgufValueType::Int32 as u32).to_le_bytes());
+                    buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                    for v in values {
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    }
                 }
                 _ => panic!("Unsupported metadata type in test helper"),
             }
@@ -4370,8 +4529,23 @@ mod tests {
         }
     }
 
+    /// The layers a healthy Gemma4 checkpoint of `n` blocks runs as global: KV
+    /// heads drop to 1 on every sixth layer, matching
+    /// `gemma-4-12b-it-qat-q4_0.gguf`, whose `head_count_kv` is
+    /// `[8,8,8,8,8,1, 8,8,8,8,8,1, …]`.
+    fn healthy_global_layers(n: u32) -> Vec<u32> {
+        (0..n).filter(|layer| (layer + 1) % 6 == 0).collect()
+    }
+
     /// Layer names for `n` decoder layers, where every layer listed in
-    /// `global` is written without an `attn_v` tensor.
+    /// `global` is written without an `attn_v` tensor, paired with the header a
+    /// healthy `n`-block Gemma4 checkpoint carries.
+    ///
+    /// The tensor list and the header are supplied independently on purpose:
+    /// truncation and corruption remove tensors, they do not rewrite the
+    /// header, so a damaged checkpoint is exactly a `global` that disagrees
+    /// with `gemma4.attention.head_count_kv`. Tests that need a damaged header
+    /// instead mutate `metadata` on the returned file.
     fn kv_layout_fixture(n: u32, global: &[u32]) -> GgufFile {
         let mut names = Vec::new();
         for layer in 0..n {
@@ -4386,7 +4560,23 @@ mod tests {
             .iter()
             .map(|n| (n.as_str(), GgufTensorType::Q4_0))
             .collect();
-        source_quant_fixture(&refs)
+        let mut gguf = source_quant_fixture(&refs);
+        let healthy = healthy_global_layers(n);
+        let head_count_kv: Vec<i32> = (0..n)
+            .map(|layer| if healthy.contains(&layer) { 1 } else { 8 })
+            .collect();
+        gguf.metadata = HashMap::from([
+            (
+                "general.architecture".to_string(),
+                GgufMetaValue::String("gemma4".to_string()),
+            ),
+            ("gemma4.block_count".to_string(), GgufMetaValue::Uint32(n)),
+            (
+                "gemma4.attention.head_count_kv".to_string(),
+                GgufMetaValue::ArrayI32(head_count_kv),
+            ),
+        ]);
+        gguf
     }
 
     /// The shape of Google's `gemma-4-12b-it-qat-q4_0-gguf`: 48 layers, every
@@ -4401,10 +4591,11 @@ mod tests {
     /// this fixture reproduces.
     #[test]
     fn gemma4_missing_attn_v_yields_layer_types_at_the_real_period() {
-        let global: Vec<u32> = (0..48).filter(|l| (l + 1) % 6 == 0).collect();
+        let global = healthy_global_layers(48);
         assert_eq!(global.len(), 8, "gemma4 publishes 8 global layers of 48");
 
         let types = gemma4_layer_types_from_missing_v(&kv_layout_fixture(48, &global))
+            .expect("a corroborated checkpoint is not an error")
             .expect("a mixed checkpoint yields layer_types");
         assert_eq!(types.len(), 48);
 
@@ -4426,18 +4617,121 @@ mod tests {
     /// the keys as values — silent corruption rather than a load failure. A
     /// checkpoint whose layers all carry `attn_v` must yield nothing, and so
     /// must the degenerate all-missing case, which is not the interleave this
-    /// describes.
+    /// describes. Neither is an error: they are simply not this layout.
     #[test]
     fn gemma4_kv_detection_needs_a_genuine_mix() {
         assert!(
-            gemma4_layer_types_from_missing_v(&kv_layout_fixture(48, &[])).is_none(),
+            gemma4_layer_types_from_missing_v(&kv_layout_fixture(48, &[]))
+                .unwrap()
+                .is_none(),
             "every layer has attn_v: this is an ordinary checkpoint"
         );
         let all: Vec<u32> = (0..48).collect();
         assert!(
-            gemma4_layer_types_from_missing_v(&kv_layout_fixture(48, &all)).is_none(),
+            gemma4_layer_types_from_missing_v(&kv_layout_fixture(48, &all))
+                .unwrap()
+                .is_none(),
             "no layer has attn_v: not the sliding/global interleave"
         );
+    }
+
+    /// A partial-V tensor list the header does not corroborate is rejected by
+    /// name instead of being read as the key-equals-value layout.
+    ///
+    /// Both cases are damage, not a layout: one `attn_v` lost to a truncated
+    /// download, and a contiguous run lost to a corrupt one. The old acceptance
+    /// test was `with_v && without_v`, which is true for every mixture, so both
+    /// were reclassified as K=V — and that flag suppresses the loader's
+    /// `Missing required weight: layers.N.self_attn.v_proj` check on exactly the
+    /// layers whose weights went missing.
+    ///
+    /// Mutation this catches: drop the `head_count_kv` cross-check (or weaken it
+    /// to a count/cadence comparison) and both calls return `Ok(Some(..))` at
+    /// the damaged period, failing the `unwrap_err`.
+    #[test]
+    fn gemma4_kv_detection_rejects_a_tensor_list_the_header_contradicts() {
+        let stray = gemma4_layer_types_from_missing_v(&kv_layout_fixture(48, &[37]))
+            .expect_err("a single stray missing attn_v is damage, not a layout");
+        let stray = format!("{stray}");
+        assert!(stray.contains("37"), "{stray}");
+        assert!(stray.contains("head_count_kv"), "{stray}");
+
+        let block: Vec<u32> = (15..35).collect();
+        let contiguous = gemma4_layer_types_from_missing_v(&kv_layout_fixture(48, &block))
+            .expect_err("a contiguous V-less run is not the sliding/global cadence");
+        let contiguous = format!("{contiguous}");
+        assert!(contiguous.contains("head_count_kv"), "{contiguous}");
+    }
+
+    /// The two structural preconditions the set comparison rests on. Without
+    /// them the comparison is between a set of layer indices and a set of
+    /// positions in an array that need not describe the same layers.
+    ///
+    /// Mutation this catches: drop either length/range check and the calls
+    /// return `Ok(..)` instead of erroring — a 47-entry header would silently
+    /// corroborate a 48-block file, and a renumbered tensor list would index the
+    /// array at the wrong layers.
+    #[test]
+    fn gemma4_kv_detection_requires_a_header_that_covers_every_block() {
+        let global = healthy_global_layers(48);
+
+        let mut short_header = kv_layout_fixture(48, &global);
+        short_header.metadata.insert(
+            "gemma4.attention.head_count_kv".to_string(),
+            GgufMetaValue::ArrayI32(vec![8; 47]),
+        );
+        let err = format!(
+            "{}",
+            gemma4_layer_types_from_missing_v(&short_header)
+                .expect_err("a header with fewer entries than layers corroborates nothing")
+        );
+        assert!(err.contains("47 entries"), "{err}");
+
+        let mut wrong_block_count = kv_layout_fixture(48, &global);
+        wrong_block_count
+            .metadata
+            .insert("gemma4.block_count".to_string(), GgufMetaValue::Uint32(47));
+        let err = format!(
+            "{}",
+            gemma4_layer_types_from_missing_v(&wrong_block_count)
+                .expect_err("a block count that disagrees with the tensor list is damage")
+        );
+        assert!(err.contains("block_count"), "{err}");
+
+        let mut no_header = kv_layout_fixture(48, &global);
+        no_header.metadata.remove("gemma4.attention.head_count_kv");
+        assert!(
+            gemma4_layer_types_from_missing_v(&no_header).is_err(),
+            "a file with no per-layer KV header has no second witness"
+        );
+    }
+
+    /// An authoritative config that already states the layout keeps it; one that
+    /// says nothing still gets the measured answer.
+    ///
+    /// `text_config` is checked as well as the top level because that is where
+    /// `parse_layer_types` looks first — a top-level write beside a
+    /// `text_config.layer_types` is dead weight the loader never reads.
+    ///
+    /// Mutation this catches: reverting the call site to an unconditional write
+    /// makes the first two assertions fail.
+    #[test]
+    fn an_authoritative_gemma4_config_keeps_the_layout_it_states() {
+        let stated = serde_json::json!({
+            "attention_k_eq_v": false,
+            "text_config": { "layer_types": ["full_attention"] },
+        });
+        assert!(gemma4_config_states(&stated, "attention_k_eq_v"));
+        assert!(gemma4_config_states(&stated, "layer_types"));
+
+        let nested_flag = serde_json::json!({
+            "text_config": { "attention_k_eq_v": true },
+        });
+        assert!(gemma4_config_states(&nested_flag, "attention_k_eq_v"));
+
+        let silent = serde_json::json!({ "text_config": { "head_dim": 256 } });
+        assert!(!gemma4_config_states(&silent, "attention_k_eq_v"));
+        assert!(!gemma4_config_states(&silent, "layer_types"));
     }
 
     #[test]
@@ -4648,6 +4942,273 @@ mod tests {
         ));
 
         fs::remove_dir_all(root).ok();
+    }
+
+    /// A miniature of Google's QAT layout on disk: `layers` decoder blocks in
+    /// Q4_0, `global` written without `attn_v`, and the header that corroborates
+    /// it — `block_count` plus a `head_count_kv` array whose minimum sits on
+    /// exactly those layers.
+    fn write_gemma4_kv_layout_gguf(root: &Path, layers: u32, global: &[u32]) -> PathBuf {
+        let mut q4 = [0u8; 18];
+        q4[..2].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
+        q4[2..].fill(0x87);
+
+        let mut names = Vec::new();
+        for layer in 0..layers {
+            names.push(format!("blk.{layer}.attn_q.weight"));
+            names.push(format!("blk.{layer}.attn_k.weight"));
+            if !global.contains(&layer) {
+                names.push(format!("blk.{layer}.attn_v.weight"));
+            }
+            names.push(format!("blk.{layer}.attn_output.weight"));
+        }
+        let tensors: Vec<(&str, &[u64], GgufTensorType, &[u8])> = names
+            .iter()
+            .map(|name| {
+                (
+                    name.as_str(),
+                    &[32u64, 1][..],
+                    GgufTensorType::Q4_0,
+                    &q4[..],
+                )
+            })
+            .collect();
+
+        let head_count_kv: Vec<i32> = (0..layers)
+            .map(|layer| if global.contains(&layer) { 1 } else { 8 })
+            .collect();
+        let data = build_minimal_gguf(
+            &[
+                (
+                    "general.architecture",
+                    GgufMetaValue::String("gemma4".to_string()),
+                ),
+                ("gemma4.block_count", GgufMetaValue::Uint32(layers)),
+                (
+                    "gemma4.attention.head_count_kv",
+                    GgufMetaValue::ArrayI32(head_count_kv),
+                ),
+            ],
+            &tensors,
+        );
+        let input = root.join("model.gguf");
+        fs::write(&input, data).unwrap();
+        input
+    }
+
+    /// End-to-end at the call site: an authoritative `--config-dir` config that
+    /// already states the attention layout keeps its own answer, and one that
+    /// says nothing gets the measured one.
+    ///
+    /// The helper-level test above cannot see this — the call site could go back
+    /// to writing both keys unconditionally and `gemma4_config_states` would
+    /// still behave. `layer_types` is stated under `text_config` because that is
+    /// where `parse_layer_types` reads it first, so a top-level write beside it
+    /// is not merely redundant: it is silently ignored while claiming to have
+    /// corrected the config.
+    ///
+    /// Mutation this catches: drop either `gemma4_config_states` check at the
+    /// call site and the first block's assertions fail — `attention_k_eq_v`
+    /// flips to `true` and a top-level `layer_types` appears.
+    #[tokio::test]
+    async fn an_authoritative_config_outranks_the_measured_gemma4_layout() {
+        let unique = format!(
+            "mlx-node-gguf-k-eq-v-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let input = write_gemma4_kv_layout_gguf(&root, 6, &[5]);
+
+        let convert_with = |config: serde_json::Value, output: PathBuf| {
+            fs::write(
+                source.join("config.json"),
+                serde_json::to_vec_pretty(&config).unwrap(),
+            )
+            .unwrap();
+            let input = input.clone();
+            let source = source.clone();
+            async move {
+                convert_gguf_to_safetensors(GgufConversionOptions {
+                    input_path: input.to_string_lossy().into_owned(),
+                    output_dir: output.to_string_lossy().into_owned(),
+                    config_source_dir: Some(source.to_string_lossy().into_owned()),
+                    dtype: None,
+                    verbose: Some(false),
+                    quantize: Some(false),
+                    quant_bits: None,
+                    quant_group_size: None,
+                    quant_mode: None,
+                    quant_recipe: None,
+                    imatrix_path: None,
+                    output_filename: None,
+                    vlm_key_prefix: Some(false),
+                    quant_mxfp: Some(false),
+                    import_k_quants: Some(false),
+                })
+                .await
+                .unwrap();
+                let written: serde_json::Value =
+                    serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
+                written
+            }
+        };
+
+        let stated = convert_with(
+            serde_json::json!({
+                "model_type": "gemma4",
+                "attention_k_eq_v": false,
+                "text_config": {
+                    "layer_types": vec!["sliding_attention"; 6],
+                },
+            }),
+            root.join("stated"),
+        )
+        .await;
+        assert_eq!(stated["attention_k_eq_v"], serde_json::json!(false));
+        assert_eq!(
+            stated["text_config"]["layer_types"],
+            serde_json::json!(vec!["sliding_attention"; 6])
+        );
+        assert!(
+            stated.get("layer_types").is_none(),
+            "a top-level layer_types beside text_config.layer_types is never read: {stated}"
+        );
+
+        let silent = convert_with(
+            serde_json::json!({ "model_type": "gemma4" }),
+            root.join("silent"),
+        )
+        .await;
+        assert_eq!(silent["attention_k_eq_v"], serde_json::json!(true));
+        assert_eq!(
+            silent["layer_types"],
+            serde_json::json!([
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ])
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `--quantize` on a GGUF that already carries symmetric ggml blocks is
+    /// rejected at convert time, not at load time.
+    ///
+    /// Q4_0/Q8_0 groups arrive already packed, so `quantize_weights_inner` skips
+    /// every one of them and records no per-layer override. The config write
+    /// then takes the `do_quantize` branch, emits a fresh
+    /// `build_quantization_object`, and never reaches the arm that would carry
+    /// `preserved_source_quantization` forward — so the `symmetric_zero_point`
+    /// that `expand_symmetric_affine_biases` needs to rebuild the omitted
+    /// `.biases` is dropped. Before this guard both conversions succeeded and
+    /// produced a checkpoint no loader can read.
+    ///
+    /// Both fixtures are genuine mixtures — a packed symmetric attention
+    /// projection beside a float FFN tensor the quantizer really does quantize —
+    /// which is why keeping the top-level marker is not an option: it would
+    /// claim a derived bias for the freshly quantized tensor that stores a real
+    /// one.
+    ///
+    /// Mutation this catches: delete the guard, or narrow it to K-quants only,
+    /// and both conversions succeed again — the `expect_err` fails.
+    #[tokio::test]
+    async fn quantize_is_rejected_for_a_symmetric_gguf_source() {
+        let mut q4 = [0u8; 18];
+        q4[..2].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
+        q4[2..].fill(0x87);
+        let mut q8 = [0u8; 34];
+        q8[..2].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
+        q8[2..].fill(0x11);
+
+        let cases: [(GgufTensorType, &[u8], i32); 2] = [
+            (GgufTensorType::Q4_0, &q4, 4),
+            (GgufTensorType::Q8_0, &q8, 8),
+        ];
+        for (tensor_type, block, bits) in cases {
+            // A float tensor the quantizer really does quantize, so the output
+            // would be a mixture rather than an all-skipped body.
+            let ffn = vec![0u8; 64 * 4];
+            let norm = 3.25f32.to_le_bytes();
+            let data = build_minimal_gguf(
+                &[(
+                    "general.architecture",
+                    GgufMetaValue::String("qwen3".to_string()),
+                )],
+                &[
+                    ("blk.0.attn_q.weight", &[32, 1], tensor_type, block),
+                    ("blk.0.ffn_down.weight", &[64, 1], GgufTensorType::F32, &ffn),
+                    ("output_norm.weight", &[1], GgufTensorType::F32, &norm),
+                ],
+            );
+            let root = std::env::temp_dir().join(format!(
+                "mlx-node-gguf-symmetric-requantize-{}-{}-{}",
+                tensor_type.name(),
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let input = root.join("model.gguf");
+            fs::write(&input, data).unwrap();
+
+            let outcome = convert_gguf_to_safetensors(GgufConversionOptions {
+                input_path: input.to_string_lossy().into_owned(),
+                output_dir: root.join("output").to_string_lossy().into_owned(),
+                config_source_dir: None,
+                dtype: None,
+                verbose: Some(false),
+                quantize: Some(true),
+                quant_bits: Some(bits),
+                quant_group_size: Some(32),
+                quant_mode: None,
+                quant_recipe: None,
+                imatrix_path: None,
+                output_filename: None,
+                vlm_key_prefix: Some(false),
+                quant_mxfp: Some(false),
+                import_k_quants: Some(false),
+            })
+            .await;
+            fs::remove_dir_all(&root).ok();
+
+            let Err(err) = outcome else {
+                panic!(
+                    "--quantize on a {} GGUF must be rejected",
+                    tensor_type.name()
+                );
+            };
+            let message = format!("{err}");
+            assert!(message.contains("blk.0.attn_q.weight"), "{message}");
+            assert!(message.contains(tensor_type.name()), "{message}");
+            assert!(message.contains("without --quantize"), "{message}");
+            assert!(message.contains(SYMMETRIC_ZERO_POINT_KEY), "{message}");
+        }
+    }
+
+    /// The guard is scoped to the formats whose `.biases` is derived. Q4_1
+    /// stores a real per-block minimum no scale can reproduce, so it carries no
+    /// `symmetric_zero_point` and is not what this rejects.
+    ///
+    /// Mutation this catches: widening the guard to
+    /// `is_mlx_affine_quantized()` (or to any already-quantized tensor) starts
+    /// rejecting Q4_1 too and this assertion fails.
+    #[test]
+    fn the_symmetric_requantize_guard_does_not_cover_q4_1() {
+        assert!(symmetric_zero_point(GgufTensorType::Q4_0).is_some());
+        assert!(symmetric_zero_point(GgufTensorType::Q8_0).is_some());
+        assert!(symmetric_zero_point(GgufTensorType::Q4_1).is_none());
     }
 
     #[test]

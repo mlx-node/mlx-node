@@ -2119,6 +2119,7 @@ fn apply_embed_vision_projection(
             proj_prefix, vision_plq.mode
         )));
     }
+    ensure_affine_biases_present(params, proj_prefix, vision_plq.mode, "gemma4")?;
     if params.contains_key(&format!("{}.scales", proj_prefix))
         && let Some(w) = params.get(&format!("{}.weight", proj_prefix))
     {
@@ -2183,6 +2184,7 @@ fn apply_audio_weights(
             proj_prefix, audio_plq.mode
         )));
     }
+    ensure_affine_biases_present(params, proj_prefix, audio_plq.mode, "gemma4")?;
     if params.contains_key(&format!("{}.scales", proj_prefix))
         && let Some(w) = params.get(&format!("{}.weight", proj_prefix))
     {
@@ -4000,6 +4002,120 @@ mod tests {
             .expect("bf16");
         params.insert("embed_vision.embedding_projection.weight".into(), dense);
         run(&params).expect("bf16 dense projection must keep loading");
+    }
+
+    /// The vision and audio embedding projections name the tensor when their
+    /// affine `.biases` companion is missing, instead of handing the `None`
+    /// straight to `mlx_dequantize`.
+    ///
+    /// Affine decode is `scale * q + bias`, so a null bias is rejected inside
+    /// MLX — but that rejection prints to stderr and comes back as a null
+    /// handle, so the Rust error names only `dequantize_linear`: neither the
+    /// tensor nor `symmetric_zero_point`, the marker whose absence from
+    /// config.json is the reachable cause. These were the last two affine sites
+    /// without the guard.
+    ///
+    /// Mutation this catches: delete either `ensure_affine_biases_present` call
+    /// and the load still fails, but with the anonymous handle error — the
+    /// assertions on the tensor name and the marker fail.
+    #[test]
+    fn embedding_projections_name_a_missing_affine_bias() {
+        use crate::models::quant_dispatch::SYMMETRIC_ZERO_POINT_KEY;
+
+        let json = serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 64,
+            "use_block_paged_cache": false,
+            "has_audio": true,
+            "audio_samples_per_token": 64,
+            "vision_config": {
+                "hidden_size": 16,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-6,
+                "patch_size": 2,
+                "position_embedding_size": 4,
+                "default_output_length": 4,
+                "pooling_kernel_size": 1,
+                "use_clipped_linears": false,
+                "rope_theta": 100.0,
+                "standardize": false,
+            },
+        });
+        let config: Gemma4Config =
+            serde_json::from_value(json).expect("minimal Gemma4Config with vision + audio");
+
+        // Correctly shaped 4-bit affine groups so nothing but the absent
+        // `.biases` can be what rejects them: `load_quantized` checks
+        // out_features, and a shape error would pass this test for the wrong
+        // reason. Vision projects 16 → 16, audio 64 → 16, at group_size 16.
+        let packed = |cols: i64| {
+            MxArray::from_float32(&vec![0.0f32; 16 * cols as usize], &[16, cols])
+                .expect("from_float32")
+                .astype(DType::Uint32)
+                .expect("uint32")
+        };
+        let scales = |cols: i64| {
+            MxArray::from_float32(&vec![0.5f32; 16 * cols as usize], &[16, cols])
+                .expect("from_float32")
+                .astype(DType::Float16)
+                .expect("f16")
+        };
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("embed_vision.embedding_projection.weight".into(), packed(2));
+        params.insert("embed_vision.embedding_projection.scales".into(), scales(1));
+        params.insert("embed_audio.embedding_projection.weight".into(), packed(8));
+        params.insert("embed_audio.embedding_projection.scales".into(), scales(4));
+
+        let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
+        let err = format!(
+            "{}",
+            apply_embed_vision_projection(
+                &mut inner,
+                &params,
+                &HashMap::new(),
+                default_per_layer_quant(4, 16, PerLayerMode::Affine),
+            )
+            .expect_err("an affine vision projection with no .biases must fail loud")
+        );
+        assert!(err.contains("embed_vision.embedding_projection"), "{err}");
+        assert!(err.contains(SYMMETRIC_ZERO_POINT_KEY), "{err}");
+
+        let err = format!(
+            "{}",
+            apply_audio_weights(&mut inner, &params, 4, 16, None, &HashMap::new())
+                .expect_err("an affine audio projection with no .biases must fail loud")
+        );
+        assert!(err.contains("embed_audio.embedding_projection"), "{err}");
+        assert!(err.contains(SYMMETRIC_ZERO_POINT_KEY), "{err}");
+
+        // Control: with the companion present both projections load, so the
+        // guard is scoped to the missing-bias case and not rejecting every
+        // quantized projection.
+        params.insert("embed_vision.embedding_projection.biases".into(), scales(1));
+        params.insert("embed_audio.embedding_projection.biases".into(), scales(4));
+        let mut inner = Gemma4Inner::new(config).expect("Gemma4Inner::new");
+        apply_embed_vision_projection(
+            &mut inner,
+            &params,
+            &HashMap::new(),
+            default_per_layer_quant(4, 16, PerLayerMode::Affine),
+        )
+        .expect("a complete affine vision group must load");
+        apply_audio_weights(&mut inner, &params, 4, 16, None, &HashMap::new())
+            .expect("a complete affine audio group must load");
     }
 
     /// Validator side: `validate_required_weights`' `has()` does not treat a

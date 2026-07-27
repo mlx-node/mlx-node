@@ -110,6 +110,13 @@ pub(crate) fn load_all_safetensors(
     if let Some(path) = single_path {
         info!("Loading weights from: {} (mmap)", path.display());
         let mut params = load_safetensors_lazy(&path)?;
+        // Rebuild the derived biases BEFORE the media sidecar joins the map, and
+        // keep it that way. `SymmetricZeroPoints::for_key` falls back to the
+        // top-level default for any key it has no entry for, so a main model
+        // imported from Q4_0 (zero point 8) paired with an mmproj imported from
+        // Q8_0 (128) would derive every vision bias at the main model's offset.
+        // Running afterwards turns a loud missing-`.biases` failure into silent
+        // corruption; running first leaves the sidecar to its own guards.
         expand_symmetric_affine_biases(dir, &mut params)?;
         append_vision_safetensors(dir, load_vision, &mut params)?;
         return Ok(params);
@@ -151,6 +158,9 @@ pub(crate) fn load_all_safetensors(
         all_params.extend(shard_params);
     }
 
+    // Same deliberate order as the single-file branch above: derive first, then
+    // append the media sidecar, so a main/mmproj pair imported from different
+    // symmetric ggml formats cannot inherit the wrong zero point.
     expand_symmetric_affine_biases(dir, &mut all_params)?;
     append_vision_safetensors(dir, load_vision, &mut all_params)?;
 
