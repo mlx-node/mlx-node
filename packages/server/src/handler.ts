@@ -4,11 +4,30 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ResponseStore } from '@mlx-node/core';
 
+import { hasCredential, isAuthorized, sendUnauthorized } from './auth.js';
 import { sendInternalError } from './errors.js';
+import { createHealthReporter, type ServerHealth } from './health.js';
 import type { IdleSweeper } from './idle-sweeper.js';
 import { ModelWorkCoordinator } from './model-work-coordinator.js';
 import type { ModelRegistry } from './registry.js';
 import { routeRequest } from './router.js';
+
+/**
+ * Routes reachable WITHOUT a token when one is configured.
+ *
+ * A supervisor has to poll liveness before it can be handed a token (it may
+ * be the thing that generates it). Everything served here is scrubbed to
+ * `{ status, uptimeMs, pid }` by the router when the caller is
+ * unauthenticated — see `toMinimalHealth`.
+ *
+ * `/` is included because it is a pure liveness stub: the router answers it
+ * with a constant `{ service: 'mlx-node' }` and reads no state, so there is
+ * nothing to leak. Claude Code issues `HEAD /` before its first request — it
+ * does send `x-api-key`, so it would pass the check anyway, but gating a
+ * contentless probe would 401 every other client's liveness check for no
+ * security gain.
+ */
+const UNAUTHENTICATED_PATHS = new Set(['/', '/health', '/v1/health']);
 
 /**
  * Entry in the list returned by `GET /v1/models`. Matches the shape
@@ -24,7 +43,14 @@ export interface PublicModelEntry {
 }
 
 export interface HandlerOptions {
-  /** Enable CORS headers (default: true). */
+  /**
+   * Enable CORS headers.
+   *
+   * Default: `true` when no `authToken` is set (historical behaviour), and
+   * `false` once one is — `Access-Control-Allow-Origin: *` on a
+   * token-protected server would invite any web page to spend a leaked token
+   * from the user's browser. An explicit value always wins.
+   */
   cors?: boolean;
   /** Response store for previous_response_id support. */
   store?: ResponseStore | null;
@@ -62,19 +88,41 @@ export interface HandlerOptions {
    * returns this list instead of `registry.list()`.
    */
   listModels?: () => PublicModelEntry[];
+  /**
+   * Shared secret required on every route except `/health` and `/v1/health`.
+   *
+   * `undefined` (the default) disables the gate entirely and is byte-for-byte
+   * identical to the pre-auth behaviour: no header is inspected, no
+   * `WWW-Authenticate` is emitted, and CORS keeps its `true` default.
+   *
+   * Accepted as `x-api-key: <token>` (checked first — Anthropic clients send
+   * it) or `authorization: Bearer <token>` (scheme case-insensitive).
+   */
+  authToken?: string;
+  /**
+   * Builds the `/health` body. Supplied by `createServer` so the HTTP
+   * endpoint and `ServerInstance.health()` share one uptime origin. When
+   * omitted, `createHandler` builds its own reporter from `registry`,
+   * `idleSweeper` and `modelWorkCoordinator`.
+   */
+  health?: () => ServerHealth;
 }
 
 export function createHandler(
   registry: ModelRegistry,
   options?: HandlerOptions,
 ): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
-  const cors = options?.cors ?? true;
+  const authToken = options?.authToken;
+  // CORS defaults follow the auth posture; an explicit value still wins.
+  const cors = options?.cors ?? authToken === undefined;
   const store = options?.store ?? null;
   const responseRetentionSec = options?.responseRetentionSec;
   const idleSweeper = options?.idleSweeper ?? null;
   const resolveModel = options?.resolveModel;
   const modelWorkCoordinator = options?.modelWorkCoordinator ?? (resolveModel ? new ModelWorkCoordinator() : undefined);
   const listModels = options?.listModels;
+  const health =
+    options?.health ?? createHealthReporter({ registry, idleSweeper, modelWorkCoordinator: modelWorkCoordinator });
 
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     if (cors) {
@@ -86,6 +134,26 @@ export function createHandler(
         res.writeHead(204);
         res.end();
         return;
+      }
+    }
+
+    // Single auth choke point. `routeRequest` is called from exactly one
+    // place (below), so no route can be added that bypasses this.
+    //
+    // `authToken === undefined` short-circuits before any header is touched:
+    // an unprotected server behaves exactly as it did before auth existed.
+    let authenticated = true;
+    if (authToken !== undefined) {
+      authenticated = isAuthorized(req, authToken);
+      if (!authenticated) {
+        const path = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`).pathname;
+        // `/health` degrades to a liveness-only body instead of 401 — but
+        // ONLY when no credential was offered. A caller who presented a
+        // WRONG token gets the 401 it needs to notice the typo.
+        if (!UNAUTHENTICATED_PATHS.has(path) || hasCredential(req)) {
+          sendUnauthorized(res);
+          return;
+        }
       }
     }
 
@@ -103,6 +171,7 @@ export function createHandler(
         resolveModel,
         listModels,
         modelWorkCoordinator,
+        { health, authenticated },
       );
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Internal server error';

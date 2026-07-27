@@ -6,7 +6,25 @@
  */
 
 export { createServer } from './server.js';
-export type { ServerConfig, ServerInstance } from './server.js';
+export type { CloseOptions, CloseResult, ServerConfig, ServerInstance } from './server.js';
+
+/**
+ * Readiness reporting. `deriveHealthStatus` is pure — a supervisor can reuse
+ * it to classify a `ServerHealth` body fetched over HTTP.
+ */
+export { createHealthReporter, deriveHealthStatus, toMinimalHealth } from './health.js';
+export type {
+  HealthReporterDeps,
+  HealthStatusInputs,
+  ModelLoadRecord,
+  ServerHealth,
+  ServerHealthMinimal,
+  ServerHealthStatus,
+} from './health.js';
+
+export { ModelWorkCoordinator } from './model-work-coordinator.js';
+export type { ModelLoadOutcome } from './model-work-coordinator.js';
+export type { GuardedLoadDeps, LoadModelOptions } from './load-model.js';
 
 /**
  * Internal helpers re-exported for unit testing only. Not part of the
@@ -95,4 +113,4 @@ export type {
   SystemBlock,
 } from './types-anthropic.js';
 
-export { writeSSEEvent, beginSSE, endSSE } from './streaming.js';
+export { writeSSEEvent, beginSSE, endSSE, activeSSEStreamCount } from './streaming.js';

@@ -509,6 +509,16 @@ export class SessionRegistry {
   }
 
   /**
+   * Configured waiter cap for this model's execution mutex, or `undefined`
+   * when unbounded. Paired with {@link queueDepth} so a readiness probe can
+   * tell "3 waiters, unbounded" (fine) from "3 waiters, cap of 3" (the next
+   * request gets a 429) without reaching into private state.
+   */
+  get queueDepthLimit(): number | undefined {
+    return this.maxQueueDepth;
+  }
+
+  /**
    * Current sampling defaults applied to every new `ChatSession` this
    * registry allocates. Exposed primarily for tests and diagnostics.
    */

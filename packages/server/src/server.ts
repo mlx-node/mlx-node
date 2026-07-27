@@ -10,12 +10,25 @@ import { ResponseStore } from '@mlx-node/core';
 
 import type { PublicModelEntry } from './handler.js';
 import { createHandler } from './handler.js';
+import { createHealthReporter, type ServerHealth } from './health.js';
 import { createIdleSweeper, DEFAULT_IDLE_CLEAR_CACHE_MS, parseIdleClearCacheEnv } from './idle-sweeper.js';
+import { runGuardedModelLoad, type LoadModelOptions } from './load-model.js';
 import { ModelWorkCoordinator } from './model-work-coordinator.js';
 import { ModelRegistry } from './registry.js';
+import { activeSSEStreamCount } from './streaming.js';
 
 /** Cleanup interval for expired responses (ms). */
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Default grace period before {@link ServerInstance.close} destroys
+ * still-open connections.
+ *
+ * 5 s is deliberately a little longer than the ~5 s GPU watchdog window: a
+ * decode loop that is about to yield its next token should get the chance to
+ * unwind cleanly rather than being cut off a hair early.
+ */
+const DEFAULT_CLOSE_TIMEOUT_MS = 5000;
 
 /**
  * Default retention for persisted response rows in SQLite, in seconds.
@@ -97,8 +110,25 @@ export interface ServerConfig {
   storePath?: string;
   /** Disable response storage entirely (default: false). */
   disableStore?: boolean;
-  /** Enable CORS headers (default: true). */
+  /**
+   * Enable CORS headers.
+   *
+   * Default: `true` when no `authToken` is in effect (historical behaviour),
+   * `false` once one is. An explicit value always wins. See
+   * {@link ServerConfig.authToken}.
+   */
   cors?: boolean;
+  /**
+   * Shared secret required on every route except `/health` and `/v1/health`.
+   *
+   * Default: `process.env.MLX_SERVER_AUTH_TOKEN`, or `undefined` (no auth)
+   * when that is unset or empty. `undefined` is byte-for-byte identical to
+   * the pre-auth behaviour.
+   *
+   * Accepted as `x-api-key: <token>` or `authorization: Bearer <token>`.
+   * Setting it also flips the `cors` default to `false`.
+   */
+  authToken?: string;
   /**
    * Retention for persisted response rows, in seconds. Stamped as `expires_at`
    * on each committed response; controls how long `previous_response_id`
@@ -151,14 +181,82 @@ export interface ServerConfig {
   listModels?: () => PublicModelEntry[];
 }
 
+/** Options for {@link ServerInstance.close}. */
+export interface CloseOptions {
+  /**
+   * Grace period, in milliseconds, before still-open connections are
+   * destroyed. Default: {@link DEFAULT_CLOSE_TIMEOUT_MS} (5000).
+   *
+   * Only the FIRST `close()` call's value is honoured — later calls receive
+   * the memoized promise of the first, so their timeout is ignored.
+   */
+  timeoutMs?: number;
+}
+
+/** Outcome of {@link ServerInstance.close}. */
+export interface CloseResult {
+  /** `true` when the grace period expired and connections were destroyed. */
+  forced: boolean;
+  /** SSE streams open at the moment of the forced destroy. `0` when not forced. */
+  streamsAborted: number;
+  /** Wall-clock duration of the shutdown. */
+  durationMs: number;
+}
+
 export interface ServerInstance {
   server: Server;
   /** Register models before or after starting. */
   registry: ModelRegistry;
   /** Null when disabled. */
   store: ResponseStore | null;
-  /** Graceful shutdown. */
-  close(): Promise<void>;
+  /**
+   * Coordinates process-wide MLX work: model loads take the exclusive writer
+   * slot, inference takes shared reader slots. Exposed so callers can compose
+   * their own brackets (or read `writerActive` / `lastLoad` for diagnostics).
+   * Prefer {@link loadModel} for the common load case — it also handles the
+   * drain suspension, which is easy to get wrong.
+   */
+  readonly modelWork: ModelWorkCoordinator;
+  /**
+   * Current readiness snapshot — the same body an authenticated
+   * `GET /health` returns. Pure JavaScript state; no native calls.
+   */
+  health(): ServerHealth;
+  /**
+   * Bounded, idempotent shutdown.
+   *
+   * Stops accepting new connections, drops idle (keep-alive) ones
+   * immediately, then waits up to `timeoutMs` for the rest to finish. On
+   * expiry every remaining connection is destroyed, which fires the same
+   * `res.on('close')` path a client disconnect fires — so in-flight SSE
+   * generations are cancelled through `@mlx-node/lm` down to the native
+   * `ChatStreamHandle`.
+   *
+   * Idempotent: the promise is memoized, so repeated calls return the same
+   * promise and the same result. In particular a second call does NOT
+   * reject with `ERR_SERVER_NOT_RUNNING`.
+   *
+   * RESIDUAL: `ResponseStore` has no `close()` (it is a Rust-side handle),
+   * so the SQLite connection is released by process exit, not here. A
+   * long-lived process that creates and closes many servers will hold one
+   * store handle per server.
+   */
+  close(opts?: CloseOptions): Promise<CloseResult>;
+  /**
+   * Load a model out-of-band and register it, with idle drains suspended and
+   * inference excluded for the entire operation — including the wait for the
+   * coordinator's writer lock.
+   *
+   * This is the safe way to swap the resident model on a server that is
+   * already serving. Hand-rolling the two brackets in the wrong order races
+   * the process-wide Metal allocator; see `load-model.ts` for the full
+   * rationale.
+   *
+   * Rejects with the underlying error if `load()` throws; both brackets
+   * unwind cleanly, and `health().lastLoad` records the failure under
+   * `opts.name`.
+   */
+  loadModel(opts: LoadModelOptions): Promise<void>;
   /**
    * Run `fn` with the idle-drain timer suspended for the duration of
    * an unbracketed, allocator-heavy operation — most commonly a hot
@@ -219,7 +317,14 @@ export interface ServerInstance {
 export async function createServer(config?: ServerConfig): Promise<ServerInstance> {
   const port = config?.port ?? 8080;
   const host = config?.host ?? '127.0.0.1';
-  const cors = config?.cors ?? true;
+  // An empty env var means "not set" — an accidental `MLX_SERVER_AUTH_TOKEN=`
+  // in a launcher script must not enable auth with an empty secret that every
+  // credential-less request would then fail against.
+  const envAuthToken = process.env.MLX_SERVER_AUTH_TOKEN;
+  const authToken = config?.authToken ?? (envAuthToken != null && envAuthToken !== '' ? envAuthToken : undefined);
+  // Forwarded unresolved so `createHandler` applies the auth-aware default
+  // (`true` without a token, `false` with one) in exactly one place.
+  const cors = config?.cors;
   const disableStore = config?.disableStore ?? false;
   // Validate caller-supplied numeric knobs BEFORE consulting env fallbacks
   // so a bogus explicit value surfaces as a descriptive error instead of
@@ -266,6 +371,10 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
   }, CLEANUP_INTERVAL_MS);
   cleanupTimer.unref();
 
+  // One reporter shared by the HTTP endpoint and `ServerInstance.health()`
+  // so both report the same uptime origin.
+  const health = createHealthReporter({ registry, idleSweeper, modelWorkCoordinator });
+
   const handler = createHandler(registry, {
     cors,
     store,
@@ -274,6 +383,8 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     resolveModel: config?.resolveModel,
     modelWorkCoordinator,
     listModels: config?.listModels,
+    authToken,
+    health,
   });
   const server = httpCreateServer(handler);
 
@@ -289,19 +400,75 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     });
   });
 
+  // Memoized so a second `close()` returns the first call's promise instead
+  // of re-entering `server.close()` (which invokes its callback with
+  // ERR_SERVER_NOT_RUNNING once the server is already down).
+  let closePromise: Promise<CloseResult> | null = null;
+
+  const close = (opts?: CloseOptions): Promise<CloseResult> => {
+    if (closePromise !== null) return closePromise;
+    const startedAt = Date.now();
+    const requested = opts?.timeoutMs;
+    const timeoutMs =
+      typeof requested === 'number' && Number.isFinite(requested) && requested >= 0
+        ? requested
+        : DEFAULT_CLOSE_TIMEOUT_MS;
+
+    closePromise = (async (): Promise<CloseResult> => {
+      clearInterval(cleanupTimer);
+      idleSweeper.close();
+
+      let forced = false;
+      let streamsAborted = 0;
+
+      // Arm the wait BEFORE dropping idle sockets so nothing can complete in
+      // the gap and settle `server.close()` before we are listening.
+      const serverClosed = new Promise<void>((resolve, reject) => {
+        server.close((err) => {
+          // Tolerated defensively: memoization should make this unreachable,
+          // but a caller who also closed `instance.server` directly would
+          // otherwise turn a successful shutdown into a rejection.
+          if (err && (err as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') reject(err);
+          else resolve();
+        });
+      });
+
+      // Keep-alive sockets parked in a client pool hold no request; without
+      // this the shutdown would sit on them until the client's own timeout.
+      server.closeIdleConnections();
+
+      const forceTimer = setTimeout(() => {
+        forced = true;
+        // Snapshot BEFORE destroying: `closeAllConnections()` fires each
+        // response's `'close'` event, which unregisters it from the set.
+        streamsAborted = activeSSEStreamCount();
+        // Destroying the socket fires exactly the `res.on('close')` path a
+        // client disconnect fires, so the endpoint's AbortController cancels
+        // the native stream handle rather than leaking a running decode.
+        server.closeAllConnections();
+      }, timeoutMs);
+
+      try {
+        await serverClosed;
+      } finally {
+        clearTimeout(forceTimer);
+      }
+
+      return { forced, streamsAborted, durationMs: Date.now() - startedAt };
+    })();
+
+    return closePromise;
+  };
+
   return {
     server,
     registry,
     store,
-    async close() {
-      clearInterval(cleanupTimer);
-      idleSweeper.close();
-      await new Promise<void>((resolve, reject) => {
-        server.close((err) => {
-          if (err) reject(err);
-          else resolve();
-        });
-      });
+    modelWork: modelWorkCoordinator,
+    health,
+    close,
+    loadModel(opts: LoadModelOptions): Promise<void> {
+      return runGuardedModelLoad({ idleSweeper, modelWorkCoordinator, registry }, opts);
     },
     withSuspendedDrains<T>(fn: () => T | Promise<T>): T | Promise<T> {
       return idleSweeper.withSuspendedDrains(fn as () => Promise<T>);
