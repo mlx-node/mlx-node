@@ -283,26 +283,59 @@ at 0 makes the same sidecar object reusable by every later turn, and every later
 process, whose prompt shares that prefix; a prompt-anchored ladder would land on
 `112/496/2032` for one prompt and `128/512/2048` for the next and never dedup.
 
+**Both** publishers use the grid: the prefill chunk walk
+(`gemma4_sliding_chunk_checkpoint_boundaries`) and the decode step
+(`gemma4_sliding_decode_boundary_plan`, whose predicate is the cadence UNION the
+rungs). Decode has to, and not for symmetry's sake. The cadence is
+`max(window, block).div_ceil(block) * block` = 1024 on the 12B, and `window / block_size`
+is `64 = 4^3`, so every rung at `k >= 3` is also a cadence boundary and every rung
+below the window is not. For the shape `mlx agent` actually sends — a short prompt and
+a long generation — nothing else can ever publish `256`:
+
+```text
+turn 1 prefill 0..199   publishes {64}
+turn 1 decode  200..N   cadence only: 1024, 2048, …        256 never fires
+turn 2 prefill starts past 200      rung > start_offset  ->  256 refused
+```
+
 Capturing a rung is numerically transparent — `snapshot_from_attention_view` slices
 the attention view the chunk already produced, and the chunk plan is **not** split at
 a rung — so the whole cost is memory, which is why the grid is bounded two ways:
 
 | bound | value |
 | ----- | ----- |
-| `GEMMA4_SLIDING_ANCHOR_MAX_RUNGS` | 4 |
-| `GEMMA4_SLIDING_LADDER_MEMORY_BUDGET_BYTES` | 3 GiB for the whole retained set, at 4 bytes/element |
+| `GEMMA4_SLIDING_ANCHOR_MAX_RUNGS` | 4 — how many rungs the grid may hold |
+| `GEMMA4_SLIDING_LADDER_MEMORY_BUDGET_BYTES` | 3 GiB, at 4 bytes/element — the ceiling the rung grid is *admitted* against, and the ceiling `trim_gemma4_sliding_prefix_checkpoints` *enforces* over the entries actually retained |
 
 Sizing is per boundary (`min(b, window)` rows), not per window; that is what makes the
 two sub-window rungs nearly free and lets the fourth rung fit at all. On the 12B
 geometry: rungs 41.9 + 167.8 + 671.1 + 671.1 MB, plus a 1342.2 MB reserve for the
-pre-ladder entries, = 2894.1 MB of the 3072 MB budget (~1.4 GB actual bf16).
+pre-ladder entries, = 2894.1 MB of the 3221.2 MB budget (~1.4 GB actual bf16).
+
+That admission arithmetic assumes the retained set is a PLANNED mix of cheap
+sub-window rungs and a couple of deep entries, and nothing forces it to be. Once the
+cursor is past one window every retained entry costs a full window, and six of those
+are 4026.5 MB — 25% over the declared ceiling. So the `Ladder` arm enforces the budget
+a second time, in bytes, after the count trim: it evicts until the summed
+`min(b, window)` cost of the entries actually present fits. The count is a planning
+figure; the byte loop is the guarantee. On unified memory that difference is not "a
+cache tier degrades" — the extra gigabyte comes straight out of the weights and the
+paged pool (see `docs/architecture.md`).
 
 Retention answers to the same gate (`Gemma4SlidingRetentionPolicy`):
 
 | turn | limit (12B) | victim |
 | ---- | ----------- | ------ |
-| no cold tier — `PreLadder` | 2 | oldest non-image-protected entry (unchanged) |
-| cold sidecar — `Ladder` | 2 + 4 = 6 | oldest non-anchor; then the oldest anchor that is **not** an ancestor of the newest entry |
+| no cold tier — `PreLadder` | 2 | oldest non-image-protected entry (unchanged); count only, never bytes |
+| cold sidecar — `Ladder` | 2 + 4 = 6, then the byte ceiling | oldest non-anchor; then the oldest anchor that is **not** an ancestor of the newest entry; then the **deepest** anchor |
+
+The deepest-anchor step matters because the two image-protected prompt-boundary slots
+are never eviction candidates, so a `{image, image, rung, rung, rung, deep}` store —
+a VLM turn followed by a fresh text turn — leaves the first two steps with nothing to
+take. Falling through to the pre-ladder floor there would evict the *shallowest*
+entry, which is exactly the rung a chain advancing ~544 tokens per turn can reach.
+Giving up the deepest anchor instead costs the least: the deep end is what the chain
+reaches last.
 
 The `PreLadder` arm is a compatibility contract, not an optimization: which checkpoint
 a later warm turn lands on decides whether `prepare_gemma4_sliding_prefix` installs a

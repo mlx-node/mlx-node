@@ -1096,6 +1096,20 @@ impl Gemma4Inner {
     /// final one; the save's keep-all history then equals the physical
     /// cache offsets). No sample / push / emit; like the AR steppers, this
     /// deliberately does NOT fire a sliding decode-boundary checkpoint.
+    ///
+    /// Nor does anything else on the draft path, and that is structural rather
+    /// than an omission. `maybe_remember_gemma4_sliding_decode_boundary_checkpoint`
+    /// exists to feed `capture_gemma4_sliding_cold_sidecar`, which needs a
+    /// `PagedKVCacheAdapter` — and a draft turn provably has none:
+    /// `Gemma4Inner::load_from_dir` forces `use_block_paged_cache = Some(false)`
+    /// the moment a draft is resolved (an explicit `true` is a hard load error),
+    /// so `Gemma4Inner::new` builds no adapter, `build_cold_tier_context` returns
+    /// `None` for want of one, and neither this file nor `assistant_decode.rs`
+    /// touches `paged_adapter` at all. Publishing here would be dead code, not a
+    /// fix. See `persistence::tests::dspark_draft_conflicts_with_explicit_paged_cache`
+    /// / `embedded_draft_conflicts_with_explicit_paged_cache` for the guard, and
+    /// `model::tests::gemma4_draft_decode_paths_never_touch_the_paged_adapter` for
+    /// the tripwire that fires if that ever stops being true.
     fn dspark_materialize_final(&mut self, token_id: u32, stream: Stream) -> Result<()> {
         let caches = self
             .caches
