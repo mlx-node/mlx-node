@@ -869,6 +869,66 @@ pub fn cold_cache_stats() -> ColdCacheStatsJs {
     }
 }
 
+/// Snapshot of [`ColdSidecarTelemetry`] for JS. Counters are cumulative since
+/// process start; all values are `f64` to avoid BigInt round-trips.
+///
+/// Separate from [`ColdCacheStatsJs`] because the two count different objects:
+/// that one counts paged K/V BLOCKS, this one counts SIDECARS — the recurrent
+/// and sliding-window state that lives outside the pool. Both structs carry an
+/// `enqueued` and a `queue_drops`; they are not the same number and must never
+/// be summed. The JS side keeps them apart by prefix (`coldEnqueued` vs
+/// `coldSidecarEnqueued`).
+#[napi(object, js_name = "ColdSidecarStats")]
+#[derive(Clone, Debug, Default)]
+pub struct ColdSidecarStatsJs {
+    /// Turns that reached a family's sidecar capture at all. Every other
+    /// counter here is a sub-count of this one, so `captureReached == 0`
+    /// separates "the finalize path never calls the capture" from "the capture
+    /// ran and declined".
+    pub capture_reached: f64,
+    /// Turns whose persisted K/V chain covered no whole block, so there was no
+    /// prefix to anchor recurrent state under.
+    pub chain_empty: f64,
+    /// Turns whose chain covered blocks but where no retained checkpoint sat at
+    /// or below its reach.
+    pub boundary_skips: f64,
+    /// Turns that selected a boundary already on disk — nothing written, and
+    /// nothing needed to be. The steady state of a repeated prompt, and the
+    /// only thing that tells a healthy run from a collapsed ladder.
+    pub already_persisted: f64,
+    /// Sidecars handed to the bounded writer queue.
+    pub enqueued: f64,
+    /// Sidecars the bounded writer queue refused because it was full.
+    pub queue_drops: f64,
+    /// Restored sidecars a family actually INSTALLED as its live per-turn
+    /// state. The one read-side counter, and the only signal that separates
+    /// "restored and used" from "restored and silently re-derived by a full
+    /// O(prefix) replay" — every other counter, and text parity itself, is
+    /// satisfied by the replay.
+    pub installed: f64,
+}
+
+/// Return the process-wide sidecar counters. Unlike [`cold_cache_stats`] this
+/// never consults the tier at all, so it is valid before any inference has run
+/// and reports honestly even when the tier failed to open.
+///
+/// The plain-Rust [`cold_sidecar_telemetry`] stays as it is: the parity harness
+/// and the in-crate tests destructure `ColdSidecarTelemetry`, and a napi
+/// `#[napi(object)]` return type cannot serve both.
+#[napi]
+pub fn cold_sidecar_stats() -> ColdSidecarStatsJs {
+    let telemetry = cold_sidecar_telemetry();
+    ColdSidecarStatsJs {
+        capture_reached: telemetry.capture_reached as f64,
+        chain_empty: telemetry.chain_empty as f64,
+        boundary_skips: telemetry.boundary_skips as f64,
+        already_persisted: telemetry.already_persisted as f64,
+        enqueued: telemetry.enqueued as f64,
+        queue_drops: telemetry.queue_drops as f64,
+        installed: telemetry.installed as f64,
+    }
+}
+
 /// Flush every accepted cold-tier block to disk, blocking until the
 /// background writer has fsync+renamed each write enqueued before this call,
 /// or `timeout_ms` elapses. Returns `true` when the drain completed — or when
@@ -1656,5 +1716,63 @@ mod tests {
         let after = cold_sidecar_telemetry();
         assert_eq!(after.boundary_skips, before.boundary_skips + 1);
         assert_eq!(after.capture_reached, before.capture_reached + 1);
+    }
+
+    /// The napi mirror must carry each counter into the field of the SAME name.
+    ///
+    /// Asserted as a DELTA with a distinct increment per field, never as
+    /// equality against a fixed snapshot: the counters are one process-wide
+    /// static that earlier tests have already moved, so absolute values are not
+    /// reproducible — and, more importantly, equal absolute values would let a
+    /// cross-wired field (`capture_reached: telemetry.chain_empty`) pass
+    /// whenever the two counters happened to agree. Distinct increments make
+    /// every permutation observable.
+    #[test]
+    fn the_napi_sidecar_mirror_carries_each_counter_into_its_own_field() {
+        let _serialized = sidecar_counter_test_lock();
+        let before = cold_sidecar_stats();
+        let counters = cold_sidecar_counters();
+        for _ in 0..1 {
+            counters.record_capture_reached();
+        }
+        for _ in 0..2 {
+            counters.record_chain_empty();
+        }
+        for _ in 0..3 {
+            counters.record_boundary_skip();
+        }
+        for _ in 0..4 {
+            counters.record_already_persisted();
+        }
+        for _ in 0..5 {
+            counters.record_enqueued();
+        }
+        for _ in 0..6 {
+            counters.record_queue_drop();
+        }
+        for _ in 0..7 {
+            counters.record_install();
+        }
+        let after = cold_sidecar_stats();
+        assert_eq!(after.capture_reached - before.capture_reached, 1.0);
+        assert_eq!(after.chain_empty - before.chain_empty, 2.0);
+        assert_eq!(after.boundary_skips - before.boundary_skips, 3.0);
+        assert_eq!(after.already_persisted - before.already_persisted, 4.0);
+        assert_eq!(after.enqueued - before.enqueued, 5.0);
+        assert_eq!(after.queue_drops - before.queue_drops, 6.0);
+        assert_eq!(after.installed - before.installed, 7.0);
+
+        // …and it must agree with the plain-Rust reader the parity harness
+        // uses, so the two can never report different truths about the same
+        // static.
+        let telemetry = cold_sidecar_telemetry();
+        let mirror = cold_sidecar_stats();
+        assert_eq!(mirror.capture_reached, telemetry.capture_reached as f64);
+        assert_eq!(mirror.chain_empty, telemetry.chain_empty as f64);
+        assert_eq!(mirror.boundary_skips, telemetry.boundary_skips as f64);
+        assert_eq!(mirror.already_persisted, telemetry.already_persisted as f64);
+        assert_eq!(mirror.enqueued, telemetry.enqueued as f64);
+        assert_eq!(mirror.queue_drops, telemetry.queue_drops as f64);
+        assert_eq!(mirror.installed, telemetry.installed as f64);
     }
 }

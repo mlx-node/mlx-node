@@ -511,6 +511,55 @@ MoE-ness affects only the MLP, which carries no cross-token state. Sharing a cod
 with a passing family is not evidence, though, so the MoE ran its **own** restart-parity
 gate on a real MoE checkpoint before joining the allowlist.
 
+### Reading the counters from JS
+
+Two native structs, two `#[napi]` readers, one JSONL line per turn:
+
+```
+ColdCacheStats    coldCacheStats()     hits misses enqueued queueDrops bytesWritten
+  (paged blocks)                       bytesRestored evictions corruptions
+                                       + enabled root quotaBytes  (tier identity)
+
+ColdSidecarStats  coldSidecarStats()   captureReached chainEmpty boundarySkips
+  (out-of-pool                         alreadyPersisted enqueued queueDrops installed
+   state)
+        │
+        └── per-turn delta ──> ~/.mlx-node/metrics/traces/<date>-<pid>.jsonl
+                               cold<Field> / coldSidecar<Field>
+```
+
+`coldSidecarStats` is a **separate** reader on purpose. It never consults the tier, so
+it reports on a run where the tier failed to open — which is exactly the run that needs
+it. It is also why both prefixes exist: `ColdCacheStats.enqueued` counts K/V blocks and
+`ColdSidecarStats.enqueued` counts sidecars, and summing them is meaningless.
+
+`installed` is the only read-side counter, and it is the one that cannot be inferred.
+Every `install_*_cold_sidecar` early-return falls through to a full O(prefix) replay
+that produces CORRECT state, so a regression from "restored and used" to "restored and
+silently re-derived" leaves `text`, `num_tokens`, `cached_tokens`, `hits` and
+`corruptions` all unchanged. `cold_tier_parity_harness.rs` asserts `restore_installs >= 1`
+natively; `coldSidecarStats()` is the same fact for the dashboard and for `mlx agent`.
+
+The capture counters split a zero-reuse run into its causes without `MLX_INFERENCE_TRACE`:
+
+| line | reading |
+| --- | --- |
+| `coldSidecarCaptureReached == 0` | the turn's finalize never calls the capture |
+| `captureReached > 0`, `chainEmpty > 0` | no whole block of the request was persisted |
+| `captureReached > 0`, `boundarySkips > 0` | no retained checkpoint sat under the chain's reach |
+| `captureReached > 0`, `alreadyPersisted > 0` | steady state — the chain is already on disk |
+
+That last row is why `alreadyPersisted` is a counter rather than silence: after the
+first turn writes a rung, every later turn re-selects it and dedups, so `enqueued == 0`
+is the signature of a HEALTHY repeated prompt as well as of a broken one.
+
+`packages/agent/__test__/cold-counter-fields.test.ts` derives the JSONL field names from
+both structs at runtime and pins them against `COLD_DELTA_FIELDS`, then drives a turn
+through the provider and reads the file back. The field set narrowed twice before that
+existed — four `ColdCacheStats` counters were dropped by the provider, and
+`ColdSidecarTelemetry` had no binding at all — and neither narrowing breaks a type, a
+build, or any test asserting on the fields that did survive.
+
 ### Restart-parity gate (authorizes an allowlist entry)
 
 A family joins the allowlist only after `crates/mlx-core/tests/cold_tier_parity_harness.rs`

@@ -2708,6 +2708,66 @@ export interface ColdCacheStats {
 export declare function coldRestoreFamilies(): Array<string>;
 
 /**
+ * Return the process-wide sidecar counters. Unlike [`cold_cache_stats`] this
+ * never consults the tier at all, so it is valid before any inference has run
+ * and reports honestly even when the tier failed to open.
+ *
+ * The plain-Rust [`cold_sidecar_telemetry`] stays as it is: the parity harness
+ * and the in-crate tests destructure `ColdSidecarTelemetry`, and a napi
+ * `#[napi(object)]` return type cannot serve both.
+ */
+export declare function coldSidecarStats(): ColdSidecarStats;
+
+/**
+ * Snapshot of [`ColdSidecarTelemetry`] for JS. Counters are cumulative since
+ * process start; all values are `f64` to avoid BigInt round-trips.
+ *
+ * Separate from [`ColdCacheStatsJs`] because the two count different objects:
+ * that one counts paged K/V BLOCKS, this one counts SIDECARS — the recurrent
+ * and sliding-window state that lives outside the pool. Both structs carry an
+ * `enqueued` and a `queue_drops`; they are not the same number and must never
+ * be summed. The JS side keeps them apart by prefix (`coldEnqueued` vs
+ * `coldSidecarEnqueued`).
+ */
+export interface ColdSidecarStats {
+  /**
+   * Turns that reached a family's sidecar capture at all. Every other
+   * counter here is a sub-count of this one, so `captureReached == 0`
+   * separates "the finalize path never calls the capture" from "the capture
+   * ran and declined".
+   */
+  captureReached: number;
+  /**
+   * Turns whose persisted K/V chain covered no whole block, so there was no
+   * prefix to anchor recurrent state under.
+   */
+  chainEmpty: number;
+  /**
+   * Turns whose chain covered blocks but where no retained checkpoint sat at
+   * or below its reach.
+   */
+  boundarySkips: number;
+  /**
+   * Turns that selected a boundary already on disk — nothing written, and
+   * nothing needed to be. The steady state of a repeated prompt, and the
+   * only thing that tells a healthy run from a collapsed ladder.
+   */
+  alreadyPersisted: number;
+  /** Sidecars handed to the bounded writer queue. */
+  enqueued: number;
+  /** Sidecars the bounded writer queue refused because it was full. */
+  queueDrops: number;
+  /**
+   * Restored sidecars a family actually INSTALLED as its live per-turn
+   * state. The one read-side counter, and the only signal that separates
+   * "restored and used" from "restored and silently re-derived by a full
+   * O(prefix) replay" — every other counter, and text parity itself, is
+   * satisfied by the replay.
+   */
+  installed: number;
+}
+
+/**
  * Structured completion information aligned with ChatResult.
  * Contains pre-parsed tool calls, thinking, and clean text.
  */
