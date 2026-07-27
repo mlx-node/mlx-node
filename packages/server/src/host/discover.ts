@@ -5,7 +5,8 @@ import { readdir } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
 import { detectModelType, type ModelType } from '@mlx-node/lm';
-import { LAUNCH_PRESETS, type LaunchPreset } from '@mlx-node/server';
+
+import { LAUNCH_PRESETS, type LaunchPreset } from '../presets.js';
 
 /** A locally-downloaded model paired with its sampling preset. */
 export interface DiscoveredModel {

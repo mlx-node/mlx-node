@@ -5,8 +5,10 @@ import { join, resolve, dirname } from 'node:path';
 import { parseArgs } from 'node:util';
 
 import { listFiles, downloadFileToCacheDir, type ListFileEntry } from '@huggingface/hub';
+// Leaf subpath on purpose: `@mlx-node/server/host` would dlopen the native
+// addon, and downloading a model must work before any of that is needed.
+import { resolveModelsDir } from '@mlx-node/server/host/paths';
 
-import { resolveModelsDir } from '../config.js';
 import { ensureDir, formatBytes } from '../utils.js';
 import { resolveHuggingFaceToken, setToken } from './hf-token.js';
 

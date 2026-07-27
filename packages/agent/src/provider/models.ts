@@ -1,9 +1,8 @@
 /**
  * Local model discovery for the mlx pi provider.
  *
- * Ports the discovery walk from
- * `packages/cli/src/commands/launch-claude/discover.ts` (which is bin-only
- * and must not be imported from here; the cli copy stays untouched) and
+ * Ports the discovery walk from `@mlx-node/server/host`
+ * (`packages/server/src/host/discover.ts`; that copy stays untouched) and
  * pairs every discovered checkpoint with a pi `ProviderModelConfig` entry
  * ready for `pi.registerProvider('mlx', { models })`.
  *

@@ -729,9 +729,10 @@ export function deleteLocalModel(modelsDir: string, name: string): void {
 
 /**
  * Default models directory, mirroring `resolveModelsDir` in
- * `packages/cli/src/config.ts`: `MLX_MODELS_DIR` env → `modelsDir` field of
- * `~/.mlx-node/config.json` → `~/.mlx-node/models`. Unlike the CLI helper this
- * never creates the directory — a viewer only reads.
+ * `@mlx-node/server/host/paths` (`packages/server/src/host/paths.ts`):
+ * `MLX_MODELS_DIR` env → `modelsDir` field of `~/.mlx-node/config.json` →
+ * `~/.mlx-node/models`. Unlike that helper this never creates the directory —
+ * a viewer only reads.
  */
 export function defaultModelsDir(): string {
   const envDir = process.env.MLX_MODELS_DIR;

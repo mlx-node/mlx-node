@@ -665,7 +665,7 @@ function printAgentPreamble(): void {
  * module stays importable without the native addon.
  */
 export interface AgentRunDeps {
-  resolveModelsDir?: (typeof import('../../config.js'))['resolveModelsDir'];
+  resolveModelsDir?: (typeof import('@mlx-node/server/host/paths'))['resolveModelsDir'];
   discoverMlxModels?: (typeof import('@mlx-node/agent'))['discoverMlxModels'];
   runAgent?: (typeof import('@mlx-node/agent'))['runAgent'];
   /** Whole first-run wizard step (imports + IO wiring included). */
@@ -719,7 +719,7 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
 
   // Deferred imports: `@mlx-node/agent` loads the native addon and the
   // pure `scanAgentArgs` export above must stay importable without it.
-  const resolveModelsDir = deps.resolveModelsDir ?? (await import('../../config.js')).resolveModelsDir;
+  const resolveModelsDir = deps.resolveModelsDir ?? (await import('@mlx-node/server/host/paths')).resolveModelsDir;
   const runAgent = deps.runAgent ?? (await import('@mlx-node/agent')).runAgent;
 
   const modelsDir = resolveModelsDir(scan.modelsDir);

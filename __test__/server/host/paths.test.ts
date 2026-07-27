@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
-import { resolveModelsDir } from '../../packages/cli/src/config.js';
+import { resolveModelsDir } from '../../../packages/server/src/host/paths.js';
 
 describe('resolveModelsDir', () => {
   let workRoot: string;

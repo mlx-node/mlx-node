@@ -1,15 +1,17 @@
 /**
- * Single-resident lazy-load policy for `mlx launch claude`.
+ * Single-resident lazy-load policy for an inference host.
  *
- * The launch command discovers every local model up-front but loads at most
- * one into the `ModelRegistry` at a time. Switching models (e.g. via Claude
- * Code's `/model` picker) unregisters the previous instance, letting GC +
- * native destructors reclaim memory, before loading the new one.
+ * The host discovers every local model up-front but loads at most one into
+ * the `ModelRegistry` at a time. Switching models (e.g. via Claude Code's
+ * `/model` picker, or the desktop app's model menu) unregisters the previous
+ * instance, letting GC + native destructors reclaim memory, before loading
+ * the new one.
  */
 
 import type { LoadableModel, SessionCapableModel } from '@mlx-node/lm';
-import type { ModelRegistry, PublicModelEntry } from '@mlx-node/server';
 
+import type { PublicModelEntry } from '../handler.js';
+import type { ModelRegistry } from '../registry.js';
 import type { DiscoveredModel } from './discover.js';
 
 export interface SwapController {

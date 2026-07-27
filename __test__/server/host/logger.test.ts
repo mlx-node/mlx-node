@@ -6,7 +6,7 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
-import { attachLogger, resolveLogDir } from '../../../packages/cli/src/commands/launch-claude/logger.js';
+import { attachLogger, resolveLogDir } from '../../../packages/server/src/host/logger.js';
 
 function makeTmpDir(): string {
   return mkdtempSync(join(tmpdir(), 'mlx-log-test-'));

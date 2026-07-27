@@ -146,7 +146,16 @@ mlx-node/
 │   ├── server/                 @mlx-node/server
 │   │   └── src/
 │   │       ├── endpoints/        /v1/responses, /v1/messages
-│   │       └── session-registry.ts  SessionRegistry — owns ChatSession lifetimes
+│   │       ├── session-registry.ts  SessionRegistry — owns ChatSession lifetimes
+│   │       └── host/             @mlx-node/server/host — reusable inference-host
+│   │                             bootstrap (discovery, single-resident swap,
+│   │                             paged-config overrides, engine env policy).
+│   │                             Subpath export so the plain HTTP handler does
+│   │                             not pull in model loading. Used by `mlx serve`,
+│   │                             `mlx launch claude`, and the desktop sidecar.
+│   │                             `host/paths` is a further, dependency-free
+│   │                             subpath (~/.mlx-node layout) for callers that
+│   │                             must not dlopen the native addon.
 │   └── cli/                    @mlx-node/cli — see cli.md
 │
 ├── __test__/                   TypeScript tests

@@ -1,9 +1,9 @@
 import type { LoadableModel } from '@mlx-node/lm';
-import type { ModelRegistry } from '@mlx-node/server';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
-import type { DiscoveredModel } from '../../../packages/cli/src/commands/launch-claude/discover.js';
-import { makeSwapController } from '../../../packages/cli/src/commands/launch-claude/swap.js';
+import type { DiscoveredModel } from '../../../packages/server/src/host/discover.js';
+import { makeSwapController } from '../../../packages/server/src/host/swap.js';
+import type { ModelRegistry } from '../../../packages/server/src/registry.js';
 
 interface FakeRegistry {
   get: ReturnType<typeof vi.fn>;

@@ -278,9 +278,36 @@ at `~/.cache/nvidia-calib/cnn_nemotron_v2_calib.jsonl`. Running on a non-nvidia
 (no mxfp8 attn/GDN) model calibrates 0 projections and leaves `config.json`
 unchanged.
 
+## `mlx serve`
+
+Runs the shared inference host (`@mlx-node/server/host`) in the foreground: discovers every model under the models dir, binds an Anthropic/OpenAI-compatible HTTP endpoint, and lazily loads a model on the first request that names one. At most one model stays resident; requesting another swaps it.
+
+```bash
+mlx serve                                        # auto-picked free port
+mlx serve --port 8080
+mlx serve --port 0                               # ephemeral port, printed on startup
+mlx serve --port 8080 --model qwen3.5-9b         # pin the default model
+mlx serve --host 0.0.0.0 --auth-token "$(openssl rand -hex 16)"
+mlx serve --verbose                              # capture every HTTP turn to a log dir
+```
+
+| Flag                 | Meaning                                                                          |
+| -------------------- | -------------------------------------------------------------------------------- |
+| `--port <n>`         | Port to bind. Omitted ⇒ a free port is picked. `0` ⇒ ephemeral, real port printed |
+| `--host <h>`         | Bind address (default `127.0.0.1`). Non-loopback exposes local models — pair with `--auth-token` |
+| `--models-dir <dir>` | Discovery root (default `~/.mlx-node/models`; also `MLX_MODELS_DIR`, `~/.mlx-node/config.json`) |
+| `--model <name>`     | Default model. Falls back to `ANTHROPIC_MODEL`, then the first discovered model  |
+| `--auth-token <tok>` | Required on every route except `/health`, as `x-api-key` or `Authorization: Bearer`. Also `MLX_SERVER_AUTH_TOKEN` |
+| `-v, --verbose`      | Write every request/response to a log dir                                        |
+| `--log-dir <dir>`    | Override the log directory (implies `--verbose`)                                  |
+
+`GET /health` is unauthenticated and reports readiness (`ok` / `loading` / `degraded` / `error`), uptime, pid, resident models, and the last load's outcome — the same body `ServerInstance.health()` returns.
+
+Like `mlx launch claude`, it applies the launcher engine policy (`MLX_PAGED_PREFILL_CHUNK_SIZE=2048`) unless the variable is already set in the environment.
+
 ## `mlx launch claude`
 
-Launches the local `@mlx-node/server` and spawns Claude Code against it — the entry point for using MLX-Node as a Claude Code backend. The "serve" terminology in commit messages refers to internal server components only; there is no `mlx serve` command.
+Launches the same inference host as `mlx serve` and spawns Claude Code against it — the entry point for using MLX-Node as a Claude Code backend. Use `mlx serve` when you want the server without a Claude Code child (for example to point another client at it, or to reproduce a wedged sidecar in a terminal).
 
 ## `mlx agent`
 

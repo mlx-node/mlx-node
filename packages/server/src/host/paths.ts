@@ -1,6 +1,15 @@
 /**
- * Shared `$HOME/.mlx-node` layout helpers. Drives both `mlx download model`
- * (output destination) and `mlx launch claude` (model discovery root).
+ * Shared `$HOME/.mlx-node` layout helpers. Drives `mlx download model`
+ * (output destination), every inference host (`mlx serve`, `mlx launch
+ * claude`, the desktop sidecar) as the model discovery root, and the
+ * default log root.
+ *
+ * Published as its own `@mlx-node/server/host/paths` subpath, and it must
+ * stay a dependency-free leaf. `@mlx-node/server/host` value-imports
+ * `@mlx-node/lm`, which dlopens the native addon at module scope; commands
+ * that only need to know where models live — `mlx download model` above all,
+ * the one you run BEFORE you have anything to run — must not pay for that,
+ * and on a headless box the dlopen is a liability rather than a cost.
  */
 
 import { mkdirSync, readFileSync } from 'node:fs';
