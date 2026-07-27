@@ -3,11 +3,17 @@
  * its handler, and return an {@link ApiResponse} envelope. No `node:http` here —
  * the HTTP adapter in `server.ts` and the Electron MessagePort bridge both feed
  * this the same normalized input.
+ *
+ * Matching is thread-agnostic (it needs no context at all), so the 405-vs-404
+ * distinction is identical wherever a request lands. Only running the handler
+ * needs a context, and each thread has just its own half — hence
+ * {@link dispatchMain} / {@link dispatchWorker} beside the omniscient
+ * {@link dispatch}.
  */
 
-import type { ApiContext, ApiRequest } from './context.js';
-import { failure, toFailure, type ApiResponse } from './errors.js';
-import { ROUTES, type Route } from './routes.js';
+import type { ApiContext, ApiRequest, MainApiContext, WorkerApiContext } from './context.js';
+import { ApiError, failure, toFailure, type ApiResponse } from './errors.js';
+import { ROUTES, type Route, type RouteThread } from './routes.js';
 
 /** One normalized request, already split into path + query by the transport. */
 export interface ApiRequestInput {
@@ -75,7 +81,23 @@ export function matchStreamRoute(method: string, pathname: string): { params: Re
   return null;
 }
 
-export async function dispatch(ctx: ApiContext, input: ApiRequestInput): Promise<ApiResponse> {
+/**
+ * The thread that owns the route this request names, or `null` when nothing
+ * matches (a 404/405 needs no handler and is answered wherever it arrives).
+ * Callers route by THIS, never by a hard-coded path list.
+ */
+export function routeThreadFor(method: string, pathname: string): RouteThread | null {
+  const segments = splitSegments(pathname);
+  for (const r of ROUTES) {
+    if (matchRoute(r, method, segments) !== null) return r.thread;
+  }
+  return null;
+}
+
+/** Runs the matched route's handler against whatever context the caller holds. */
+type RouteRunner = (route: Route, req: ApiRequest) => unknown;
+
+async function dispatchWith(run: RouteRunner, input: ApiRequestInput): Promise<ApiResponse> {
   const { method, pathname, query } = input;
   const segments = splitSegments(pathname);
   let pathMatched = false;
@@ -94,7 +116,7 @@ export async function dispatch(ctx: ApiContext, input: ApiRequestInput): Promise
       ...(input.bodyError !== undefined ? { bodyError: input.bodyError } : {}),
     };
     try {
-      return { ok: true, status: r.successStatus ?? 200, body: await r.handler(ctx, req) };
+      return { ok: true, status: r.successStatus ?? 200, body: await run(r, req) };
     } catch (err) {
       return toFailure(err);
     }
@@ -105,4 +127,31 @@ export async function dispatch(ctx: ApiContext, input: ApiRequestInput): Promise
     return failure('E_METHOD_NOT_ALLOWED', `Method ${method} not allowed for ${pathname}`);
   }
   return failure('E_NOT_FOUND', `No route matches ${method} ${pathname}`);
+}
+
+/** Dispatch against a context carrying BOTH halves (a test driving the table). */
+export function dispatch(ctx: ApiContext, input: ApiRequestInput): Promise<ApiResponse> {
+  return dispatchWith((route, req) => route.handler(ctx, req), input);
+}
+
+function wrongThread(route: Route, thread: RouteThread): ApiError {
+  return ApiError.internal(
+    `Route ${route.method} /${route.segments.join('/')} is owned by the ${route.thread} thread, not ${thread}`,
+  );
+}
+
+/** Dispatch a transport-thread route. A worker-owned route never runs here. */
+export function dispatchMain(ctx: MainApiContext, input: ApiRequestInput): Promise<ApiResponse> {
+  return dispatchWith((route, req) => {
+    if (route.thread !== 'main') throw wrongThread(route, 'main');
+    return route.handler(ctx, req);
+  }, input);
+}
+
+/** Dispatch a database-worker route. A transport-owned route never runs here. */
+export function dispatchWorker(ctx: WorkerApiContext, input: ApiRequestInput): Promise<ApiResponse> {
+  return dispatchWith((route, req) => {
+    if (route.thread !== 'worker') throw wrongThread(route, 'worker');
+    return route.handler(ctx, req);
+  }, input);
 }

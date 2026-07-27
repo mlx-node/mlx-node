@@ -1,6 +1,6 @@
-import type { ApiContext } from '../context.js';
+import type { ApiPaths } from '../context.js';
 
-export function handleHealth(ctx: ApiContext): unknown {
+export function handleHealth(ctx: ApiPaths): unknown {
   return {
     status: 'ok',
     modelsDir: ctx.modelsDir,

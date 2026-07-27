@@ -17,7 +17,7 @@ import { networkInterfaces } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import { parseJsonBody } from './api/context.js';
-import { dispatch, isApiPath, matchStreamRoute } from './api/dispatch.js';
+import { isApiPath, matchStreamRoute } from './api/dispatch.js';
 import type { ApiResponse } from './api/errors.js';
 import type { DownloadEvent } from './download.js';
 import { createDashboardRuntime, type DashboardRuntime } from './runtime.js';
@@ -434,12 +434,10 @@ export async function startDashboardServer(opts: DashboardServerOptions = {}): P
       }
       // Only methods that can carry a payload pay for reading one.
       const payload = method === 'GET' || method === 'HEAD' ? { body: null } : await readJsonBody(req);
-      const response = await dispatch(runtime.context, {
-        method,
-        pathname: url.pathname,
-        query: url.searchParams,
-        ...payload,
-      });
+      // Through the runtime, not `dispatch`: most routes are answered by the
+      // database worker, and only the runtime knows which. `path` carries the
+      // query string because a `URLSearchParams` cannot cross a thread.
+      const response = await runtime.call({ method, path: url.pathname + url.search, ...payload });
       sendApiResponse(res, response);
     } catch (err) {
       if (!res.headersSent) {

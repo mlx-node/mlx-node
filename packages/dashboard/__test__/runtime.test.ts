@@ -1,5 +1,6 @@
 /**
- * The transport-independent runtime: bootstrap, `call`, and shutdown ordering.
+ * The transport-independent runtime: bootstrap, `call`, the thread split, and
+ * shutdown ordering.
  */
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -8,13 +9,22 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
-import { createDashboardRuntime, type DashboardRuntime } from '../src/runtime.js';
+import type { MainApiContext, WorkerApiContext } from '../src/api/context.js';
+import { dispatchMain, dispatchWorker, routeThreadFor } from '../src/api/dispatch.js';
+import { ROUTES } from '../src/api/routes.js';
+import { createDashboardRuntime, type DashboardRuntime, type RuntimeLifecycleEvent } from '../src/runtime.js';
 
 let base: string;
 let sessionsRoot: string;
 let tracesDir: string;
 let modelsDir: string;
 let runtime: DashboardRuntime;
+/**
+ * Shutdown witnesses in the order they happened. The database now lives on the
+ * worker, so its close is observed through the lifecycle notification the worker
+ * posts AFTER closing the handle; main-thread steps push into the same array.
+ */
+let order: string[];
 
 /** Enough real session files that an ingest spans several I/O turns. */
 const SESSION_COUNT = 120;
@@ -50,6 +60,19 @@ function seedSessions(root: string, count: number): void {
   }
 }
 
+/** Settle `promise`, or resolve to `'HUNG'` — a hang must fail fast, not at the 2 min test timeout. */
+async function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T | 'HUNG'> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<'HUNG'>((resolve) => {
+    timer = setTimeout(() => resolve('HUNG'), ms);
+  });
+  try {
+    return await Promise.race([promise, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 beforeEach(() => {
   base = mkdtempSync(join(tmpdir(), 'dash-runtime-'));
   sessionsRoot = join(base, 'sessions');
@@ -59,7 +82,14 @@ beforeEach(() => {
   modelsDir = join(base, 'models');
   mkdirSync(modelsDir, { recursive: true });
 
-  runtime = createDashboardRuntime({ dbPath: ':memory:', sessionsRoot, tracesDir, modelsDir });
+  order = [];
+  runtime = createDashboardRuntime({
+    dbPath: ':memory:',
+    sessionsRoot,
+    tracesDir,
+    modelsDir,
+    onLifecycle: (event: RuntimeLifecycleEvent) => order.push(event.type),
+  });
 });
 
 afterEach(async () => {
@@ -97,18 +127,93 @@ describe('dashboard runtime — call', () => {
   });
 });
 
+// The whole point of the split: a synchronous query on the worker must not stall
+// the thread that owns the transport, the download manager and its progress
+// events. Asserting SETTLE ORDER rather than a duration keeps it deterministic —
+// a transport-thread route is answered in microtasks, so it cannot lose to a
+// cross-thread round trip, let alone one queued behind a 120-session ingest.
+describe('dashboard runtime — thread split', () => {
+  it('answers a transport-thread route while the worker is busy ingesting', async () => {
+    const settled: string[] = [];
+    const heavy = runtime.call({ method: 'POST', path: '/api/ingest' }).then((res) => {
+      settled.push('worker');
+      return res;
+    });
+    const light = runtime.call({ method: 'GET', path: '/api/downloads' }).then((res) => {
+      settled.push('main');
+      return res;
+    });
+
+    const [heavyRes, lightRes] = await Promise.all([heavy, light]);
+    expect(lightRes.status).toBe(200);
+    expect(heavyRes.status).toBe(200);
+    expect(settled).toEqual(['main', 'worker']);
+  });
+
+  it('answers a transport-thread route before the worker has even booted', async () => {
+    // A cancel click during startup must not wait for the database to open.
+    const fresh = createDashboardRuntime({ dbPath: ':memory:', sessionsRoot, tracesDir, modelsDir });
+    try {
+      const settled: string[] = [];
+      const boot = fresh.call({ method: 'GET', path: '/api/health' }).then(() => settled.push('worker'));
+      const cancel = fresh.call({ method: 'DELETE', path: '/api/downloads/ghost' }).then(() => settled.push('main'));
+      await Promise.all([boot, cancel]);
+      expect(settled).toEqual(['main', 'worker']);
+    } finally {
+      await fresh.close();
+    }
+  });
+});
+
+// Ownership is data on the route, so it can be asserted as data. A route added
+// later lands on the thread its table entry names — this locks WHICH entries name
+// the transport thread, since everything else is the worker by construction.
+describe('dashboard runtime — route ownership', () => {
+  it('keeps exactly the download routes on the transport thread', () => {
+    const main = ROUTES.filter((r) => r.thread === 'main').map((r) => `${r.method} /${r.segments.join('/')}`);
+    expect(main).toEqual([
+      'GET /api/downloads',
+      'POST /api/downloads',
+      'DELETE /api/downloads/:id',
+      'GET /api/downloads/:id/events',
+    ]);
+  });
+
+  it('reports the owning thread per request, and none for an unmatched one', () => {
+    expect(routeThreadFor('GET', '/api/sessions')).toBe('worker');
+    expect(routeThreadFor('DELETE', '/api/downloads/job-1')).toBe('main');
+    // Wrong method on a known path, and an unknown path: no owner, answered
+    // wherever the request landed (405/404 needs no context).
+    expect(routeThreadFor('PUT', '/api/models')).toBe(null);
+    expect(routeThreadFor('GET', '/api/nope')).toBe(null);
+  });
+
+  it('refuses to run a route the other thread owns', async () => {
+    const mainCtx = { modelsDir, sessionsRoot, tracesDir, cacheRoot: undefined } as unknown as MainApiContext;
+    const workerCtx = { modelsDir, sessionsRoot, tracesDir, cacheRoot: undefined } as unknown as WorkerApiContext;
+    const query = new URLSearchParams();
+
+    const dbOnMain = await dispatchMain(mainCtx, { method: 'GET', pathname: '/api/sessions', query });
+    expect(dbOnMain.status).toBe(500);
+    expect(dbOnMain.ok ? '' : dbOnMain.message).toContain('owned by the worker thread');
+
+    const downloadOnWorker = await dispatchWorker(workerCtx, { method: 'GET', pathname: '/api/downloads', query });
+    expect(downloadOnWorker.status).toBe(500);
+    expect(downloadOnWorker.ok ? '' : downloadOnWorker.message).toContain('owned by the main thread');
+  });
+});
+
 describe('dashboard runtime — shutdown', () => {
   // `clearInterval` only stops FUTURE rescans. A tick already in flight kept
   // running against the database while `close()` shut it, and the failure was
-  // invisible because `doIngest`'s catch swallowed "database is not open" into a
+  // invisible because the ingest catch swallowed "database is not open" into a
   // warning nobody read. `close()` must await the ingest chain instead.
   it('awaits an in-flight ingest before closing the database', async () => {
     // `ingestSessions`/`ingestTraces` have synchronous bodies, so ONE queued
-    // rescan can finish inside the handful of microtasks `downloads.shutdown()`
-    // costs — a single-ingest assertion would pass even with the await removed.
-    // Queue a deep chain instead: it takes far more turns than the rest of the
-    // shutdown, so only a `close()` that actually awaits the chain can observe
-    // it settled.
+    // rescan can finish inside the handful of turns `downloads.shutdown()` costs
+    // — a single-ingest assertion would pass even with the await removed. Queue a
+    // deep chain instead: it takes far more turns than the rest of the shutdown,
+    // so only a `close()` that actually awaits the chain can observe it settled.
     const QUEUED = 40;
     let pending = runtime.ingestNow();
     for (let i = 1; i < QUEUED; i++) pending = runtime.ingestNow();
@@ -127,7 +232,8 @@ describe('dashboard runtime — shutdown', () => {
     expect(settled).toBe(true);
     const summary = await tail;
     // It ran to completion against an OPEN database: no swallowed
-    // "database is not open", and every seeded session was indexed.
+    // "database is not open", no worker torn down under it, and every seeded
+    // session was indexed.
     expect(summary.sessions.warnings).toEqual([]);
     expect(summary.sessions.scanned).toBe(SESSION_COUNT);
   });
@@ -135,22 +241,17 @@ describe('dashboard runtime — shutdown', () => {
   // Downloads must drain BEFORE anything else tears down: a shutdown that killed
   // the process mid-write would orphan a partial, potentially multi-GB `.staging`
   // tree, and a job publishing after the database closed would write into a dead
-  // handle. The database is the LAST thing to go.
+  // handle. The database is the LAST thing to go — and it now goes on another
+  // thread, so the witness is the worker's own post-close notification.
   it('drains downloads before it closes the database', async () => {
-    const order: string[] = [];
     const realShutdown = runtime.context.downloads.shutdown.bind(runtime.context.downloads);
     runtime.context.downloads.shutdown = async () => {
       order.push('downloads.shutdown');
       await realShutdown();
     };
-    const realClose = runtime.context.dash.close.bind(runtime.context.dash);
-    runtime.context.dash.close = () => {
-      order.push('dash.close');
-      realClose();
-    };
 
     await runtime.close();
-    expect(order).toEqual(['downloads.shutdown', 'dash.close']);
+    expect(order).toEqual(['downloads.shutdown', 'db-closed']);
   });
 
   it('is idempotent: a second close (and a drain after close) is a no-op', async () => {
@@ -158,5 +259,57 @@ describe('dashboard runtime — shutdown', () => {
     await runtime.close();
     await runtime.close();
     await runtime.drain();
+    // One database close, not one per call.
+    expect(order).toEqual(['db-closed']);
+  });
+});
+
+// A dead worker must never leave a caller waiting: the admin UI would show a
+// spinner forever and the supervisor's per-RPC timeouts would be the only thing
+// that noticed. Every unanswerable call comes back as a failure ENVELOPE.
+describe('dashboard runtime — worker death', () => {
+  it('settles an in-flight call when the worker dies under it', async () => {
+    const crashed = createDashboardRuntime({
+      dbPath: ':memory:',
+      sessionsRoot,
+      tracesDir,
+      modelsDir,
+      workerUrl: new URL('./helpers/crashing-db-worker.ts', import.meta.url),
+      onLifecycle: (event) => order.push(event.type),
+    });
+    try {
+      const inFlight = await withDeadline(crashed.call({ method: 'GET', path: '/api/sessions' }), 10_000);
+      expect(inFlight).not.toBe('HUNG');
+      const res = inFlight as Exclude<typeof inFlight, 'HUNG'>;
+      expect(res.ok).toBe(false);
+      expect(res.ok ? '' : res.code).toBe('E_UNAVAILABLE');
+
+      // And a call issued after the death fails fast rather than queueing onto a
+      // thread that will never read it.
+      const after = await withDeadline(crashed.call({ method: 'GET', path: '/api/models' }), 10_000);
+      expect(after).not.toBe('HUNG');
+      expect((after as Exclude<typeof after, 'HUNG'>).status).toBe(503);
+
+      expect(order).toContain('worker-down');
+      // A transport-thread route is untouched by the worker's death.
+      const downloads = await crashed.call({ method: 'GET', path: '/api/downloads' });
+      expect(downloads.status).toBe(200);
+    } finally {
+      expect(await withDeadline(crashed.close(), 10_000)).not.toBe('HUNG');
+    }
+  });
+
+  it('closes on a bounded timeout when the worker answers nothing', async () => {
+    const wedged = createDashboardRuntime({
+      dbPath: ':memory:',
+      sessionsRoot,
+      tracesDir,
+      modelsDir,
+      workerUrl: new URL('./helpers/wedged-db-worker.ts', import.meta.url),
+      shutdownTimeoutMs: 200,
+    });
+    // Two bounded steps (drain, then close) plus terminate: generous, but far
+    // below the point where "it hung" is indistinguishable from "it was slow".
+    expect(await withDeadline(wedged.close(), 10_000)).not.toBe('HUNG');
   });
 });

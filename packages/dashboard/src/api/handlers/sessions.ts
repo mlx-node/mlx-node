@@ -15,7 +15,7 @@ import {
   readSessionEntries,
   verifySessionFileId,
 } from '../../ingest/sessions.js';
-import type { ApiContext, ApiRequest } from '../context.js';
+import type { ApiPaths, ApiRequest, WorkerApiContext } from '../context.js';
 import { queryInt, requireBody, toInt } from '../context.js';
 import { ApiError } from '../errors.js';
 import { collectCallArgs, mapTranscriptEntry, type TranscriptEntry } from '../transcript.js';
@@ -39,7 +39,7 @@ import { collectCallArgs, mapTranscriptEntry, type TranscriptEntry } from '../tr
  */
 const LIVE_SESSION_WINDOW_MS = 30_000;
 
-export function handleSessionsList(ctx: ApiContext, req: ApiRequest): unknown {
+export function handleSessionsList(ctx: WorkerApiContext, req: ApiRequest): unknown {
   const q = req.query.get('q');
   const cwd = req.query.get('cwd');
   const model = req.query.get('model');
@@ -183,14 +183,17 @@ export function handleSessionsList(ctx: ApiContext, req: ApiRequest): unknown {
   return { sessions: list, total, tokens, cwds };
 }
 
-export function lookupSession(ctx: ApiContext, id: string): { path: string; row: typeof sessions.$inferSelect } | null {
+export function lookupSession(
+  ctx: WorkerApiContext,
+  id: string,
+): { path: string; row: typeof sessions.$inferSelect } | null {
   const rows = ctx.dash.db.select().from(sessions).where(eq(sessions.id, id)).all();
   if (rows.length === 0) return null;
   return { path: rows[0].path, row: rows[0] };
 }
 
 /** The row for `id`, or the 404 every session route raises for an unknown id. */
-export function requireSession(ctx: ApiContext, id: string): { path: string; row: typeof sessions.$inferSelect } {
+export function requireSession(ctx: WorkerApiContext, id: string): { path: string; row: typeof sessions.$inferSelect } {
   const found = lookupSession(ctx, id);
   if (found === null) throw ApiError.notFound(`Session "${id}" not found`);
   return found;
@@ -226,13 +229,13 @@ export function insideSessionsRoot(sessionsRoot: string, path: string): boolean 
 }
 
 /** The 403 raised when an indexed path resolves outside the managed root. */
-function requireInsideRoot(ctx: ApiContext, path: string): void {
+function requireInsideRoot(ctx: ApiPaths, path: string): void {
   if (!insideSessionsRoot(ctx.sessionsRoot, path)) {
     throw ApiError.forbidden('Session file resolves outside the managed sessions root');
   }
 }
 
-export async function handleSessionDetail(ctx: ApiContext, req: ApiRequest): Promise<unknown> {
+export async function handleSessionDetail(ctx: WorkerApiContext, req: ApiRequest): Promise<unknown> {
   const found = requireSession(ctx, req.params.id);
   // A GET must not disclose a transcript whose file resolves outside the managed
   // root (a stale/symlinked row). Ingestion no longer indexes symlinked files,
@@ -318,7 +321,7 @@ export async function handleSessionDetail(ctx: ApiContext, req: ApiRequest): Pro
   };
 }
 
-export async function handleSessionRename(ctx: ApiContext, req: ApiRequest): Promise<unknown> {
+export async function handleSessionRename(ctx: WorkerApiContext, req: ApiRequest): Promise<unknown> {
   const found = requireSession(ctx, req.params.id);
   const body = requireBody(req);
   const name = (body as { name?: unknown } | null)?.name;
@@ -383,7 +386,7 @@ export async function handleSessionRename(ctx: ApiContext, req: ApiRequest): Pro
   return { id: req.params.id, name };
 }
 
-export async function handleSessionDelete(ctx: ApiContext, req: ApiRequest): Promise<unknown> {
+export async function handleSessionDelete(ctx: WorkerApiContext, req: ApiRequest): Promise<unknown> {
   const found = requireSession(ctx, req.params.id);
   requireInsideRoot(ctx, found.path);
   // Decide what to do with the on-disk transcript BEFORE touching any rows. A bare

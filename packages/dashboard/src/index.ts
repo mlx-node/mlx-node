@@ -1,4 +1,12 @@
-export type { ApiContext, ApiRequest, Handler, IngestSummary } from './api/context.js';
+export type {
+  ApiContext,
+  ApiPaths,
+  ApiRequest,
+  Handler,
+  IngestSummary,
+  MainApiContext,
+  WorkerApiContext,
+} from './api/context.js';
 export {
   ApiError,
   statusForCode,
@@ -7,7 +15,16 @@ export {
   type ApiResponse,
   type ApiSuccess,
 } from './api/errors.js';
-export { dispatch, isApiPath, matchStreamRoute, type ApiRequestInput } from './api/dispatch.js';
+export {
+  dispatch,
+  dispatchMain,
+  dispatchWorker,
+  isApiPath,
+  matchStreamRoute,
+  routeThreadFor,
+  type ApiRequestInput,
+} from './api/dispatch.js';
+export { ROUTES, type Route, type RouteThread } from './api/routes.js';
 export type { MetricsOverview } from './api/handlers/metrics.js';
 export type { TranscriptEntry } from './api/transcript.js';
 export { type ColdCacheDiskInfo, clearColdCache, evictOlderThan, scanColdCache } from './cache.js';
@@ -32,5 +49,6 @@ export {
   createDashboardRuntime,
   type DashboardRuntime,
   type DashboardRuntimeOptions,
+  type RuntimeLifecycleEvent,
 } from './runtime.js';
 export { type DashboardServer, type DashboardServerOptions, startDashboardServer } from './server.js';

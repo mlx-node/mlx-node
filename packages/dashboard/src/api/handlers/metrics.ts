@@ -6,7 +6,7 @@
  * gross-vs-net token accounting, and must not drift from the query they explain.
  */
 
-import type { ApiContext, ApiRequest } from '../context.js';
+import type { ApiRequest, WorkerApiContext } from '../context.js';
 import { queryInt, toInt, toNum } from '../context.js';
 import { requireSession } from './sessions.js';
 
@@ -52,7 +52,7 @@ export interface MetricsOverview {
   };
 }
 
-export function handleSessionMetrics(ctx: ApiContext, req: ApiRequest): unknown {
+export function handleSessionMetrics(ctx: WorkerApiContext, req: ApiRequest): unknown {
   requireSession(ctx, req.params.id);
   // The per-turn set the SPA charts / counts / token totals are built from is this
   // session's persisted `turns` (LEFT JOINed to their trace) UNIONed with any
@@ -149,7 +149,7 @@ function rangeClause(from: number | null, to: number | null, column: string): { 
   return { sql: parts.length > 0 ? parts.join(' AND ') : '', args };
 }
 
-export function handleMetricsOverview(ctx: ApiContext, req: ApiRequest): unknown {
+export function handleMetricsOverview(ctx: WorkerApiContext, req: ApiRequest): unknown {
   const from = queryInt(req.query, 'from');
   const to = queryInt(req.query, 'to');
   const { sqlite } = ctx.dash;

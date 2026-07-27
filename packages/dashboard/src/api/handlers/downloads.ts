@@ -1,13 +1,13 @@
 import { DownloadsClosedError } from '../../download.js';
-import type { ApiContext, ApiRequest } from '../context.js';
+import type { ApiPaths, ApiRequest, MainApiContext } from '../context.js';
 import { requireBody } from '../context.js';
 import { ApiError } from '../errors.js';
 
-export function handleDownloadsList(ctx: ApiContext): unknown {
+export function handleDownloadsList(ctx: MainApiContext): unknown {
   return { jobs: ctx.downloads.jobs() };
 }
 
-export function handleDownloadStart(ctx: ApiContext, req: ApiRequest): unknown {
+export function handleDownloadStart(ctx: MainApiContext, req: ApiRequest): unknown {
   const body = requireBody(req);
   const repo = (body as { repo?: unknown } | null)?.repo;
   if (typeof repo !== 'string' || repo === '') {
@@ -34,7 +34,7 @@ export function handleDownloadStart(ctx: ApiContext, req: ApiRequest): unknown {
  * 404 means no such id, or the job is in its brief non-cancellable `committing`
  * (publish) window.
  */
-export function handleDownloadCancel(ctx: ApiContext, req: ApiRequest): unknown {
+export function handleDownloadCancel(ctx: MainApiContext, req: ApiRequest): unknown {
   if (ctx.downloads.cancel(req.params.id)) {
     return { cancelled: true, id: req.params.id };
   }
@@ -47,6 +47,6 @@ export function handleDownloadCancel(ctx: ApiContext, req: ApiRequest): unknown 
  * route before dispatch; a transport with no streaming channel reaches this and
  * is told so rather than getting a misleading 404.
  */
-export function handleDownloadEventsUnsupported(_ctx: ApiContext, req: ApiRequest): unknown {
+export function handleDownloadEventsUnsupported(_ctx: ApiPaths, req: ApiRequest): unknown {
   throw ApiError.unavailable(`Streaming route ${req.path} is not available over this transport`);
 }

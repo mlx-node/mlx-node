@@ -1,11 +1,17 @@
 /**
  * The transport-independent handler contract.
  *
- * A handler receives an {@link ApiContext} (the long-lived resources the
- * dashboard runtime owns) plus an {@link ApiRequest} (one already-parsed call)
- * and returns its response body, or throws an `ApiError`. Nothing here knows
- * about `node:http`: the same handlers serve the HTTP adapter in `server.ts` and,
- * later, an Electron MessagePort bridge.
+ * A handler receives the context of the thread that owns its route plus an
+ * {@link ApiRequest} (one already-parsed call) and returns its response body, or
+ * throws an `ApiError`. Nothing here knows about `node:http`: the same handlers
+ * serve the HTTP adapter in `server.ts` and the Electron MessagePort bridge.
+ *
+ * The resources are split by THREAD, because they live on different ones. The
+ * SQLite handle (`node:sqlite` + drizzle are synchronous) and every synchronous
+ * filesystem walk run on the database worker; the download manager stays on the
+ * thread that owns the transport so progress events and a cancel click are never
+ * queued behind a multi-second query. Which context a handler declares is what
+ * pins it to a thread — `routes.ts` cannot put it on the other one.
  */
 
 import type { DashboardDb } from '../db/open.js';
@@ -17,18 +23,33 @@ export interface IngestSummary {
   traces: { files: number; records: number; pruned: number; warnings: string[] };
 }
 
-/** Long-lived resources the handlers read, supplied by the dashboard runtime. */
-export interface ApiContext {
-  dash: DashboardDb;
+/** Resolved locations, readable from either thread (both are handed the same values). */
+export interface ApiPaths {
   modelsDir: string;
   sessionsRoot: string;
   tracesDir: string;
   /** Cold-tier root; `undefined` lets `cache.ts` resolve the running-tier default. */
   cacheRoot: string | undefined;
-  downloads: DownloadManager;
+}
+
+/** The database worker's context: it alone holds the SQLite handle and the ingest chain. */
+export interface WorkerApiContext extends ApiPaths {
+  dash: DashboardDb;
   /** Serialized incremental rescan (sessions + traces). */
   runIngest: () => Promise<IngestSummary>;
 }
+
+/** The transport thread's context: it alone holds the download manager. */
+export interface MainApiContext extends ApiPaths {
+  downloads: DownloadManager;
+}
+
+/**
+ * Both halves at once. No thread owns this — it is the input to the omniscient
+ * {@link dispatch}, used by callers that genuinely hold everything (a test
+ * driving the route table against stubs).
+ */
+export interface ApiContext extends WorkerApiContext, MainApiContext {}
 
 /** One already-parsed API call. */
 export interface ApiRequest {
@@ -53,8 +74,12 @@ export interface ApiRequest {
  * A route handler: return the response body, or throw an `ApiError`. The return
  * type covers a promise too (`unknown` subsumes it) — `dispatch` awaits whatever
  * comes back, so a handler may be sync or async.
+ *
+ * `C` is the context the handler needs, and therefore the thread it can run on:
+ * a handler declaring {@link ApiPaths} fits either side, one declaring
+ * {@link WorkerApiContext} only fits a worker route.
  */
-export type Handler = (ctx: ApiContext, req: ApiRequest) => unknown;
+export type Handler<C = ApiContext> = (ctx: C, req: ApiRequest) => unknown;
 
 /**
  * The request payload, or a 400 when the transport failed to parse it. Call this

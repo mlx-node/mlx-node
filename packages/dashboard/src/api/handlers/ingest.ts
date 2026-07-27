@@ -1,5 +1,5 @@
-import type { ApiContext } from '../context.js';
+import type { WorkerApiContext } from '../context.js';
 
-export async function handleIngest(ctx: ApiContext): Promise<unknown> {
+export async function handleIngest(ctx: WorkerApiContext): Promise<unknown> {
   return await ctx.runIngest();
 }

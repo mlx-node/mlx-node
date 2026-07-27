@@ -2,29 +2,38 @@
  * The dashboard runtime: everything the API needs to answer a call, with no
  * transport attached.
  *
- * It owns the SQLite index, the download manager and the serialized incremental
- * ingest (boot run + periodic rescan), and exposes them as `call` / `subscribe` /
- * `ingestNow` / `close`. `server.ts` is a thin HTTP adapter over this; the
- * Electron app will drive the same object over a MessagePort.
+ * It spans TWO threads. This one owns the download manager, the rescan timer and
+ * whatever transport is attached (`server.ts`'s HTTP adapter, or the Electron
+ * MessagePort bridge). A `node:worker_threads` worker owns the SQLite index, the
+ * serialized incremental ingest, and every route whose handler does synchronous
+ * work. `node:sqlite` and drizzle are synchronous, so with everything on one
+ * thread a single heavy query froze download progress for its whole duration
+ * (measured: a trivial RPC issued during a 1.5 s synchronous call waited
+ * 1449 ms), delayed a cancel click from even being RECEIVED, and false-positived
+ * the supervisor's per-RPC timeouts.
+ *
+ * Which side answers a route is declared on the route itself (`routes.ts`), not
+ * decided here.
  */
 
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-import type { ApiContext, IngestSummary } from './api/context.js';
-import { dispatch, isApiPath } from './api/dispatch.js';
+import type { IngestSummary, MainApiContext } from './api/context.js';
+import { dispatchMain, isApiPath, routeThreadFor } from './api/dispatch.js';
 import { failure, toFailure, type ApiResponse } from './api/errors.js';
-import { openDashboardDb, type DashboardDb } from './db/open.js';
 import { DownloadManager, type DownloadEvent } from './download.js';
-import { ingestSessions } from './ingest/sessions.js';
-import { ingestTraces } from './ingest/traces.js';
 import { defaultModelsDir } from './models.js';
 import { agentSessionsRoot, dashboardDbPath, metricsTraceDir } from './paths.js';
+import { startDbWorker, type DbWorkerLifecycle } from './worker/client.js';
 
-/** Trace-file retention passed to the periodic + boot ingest. */
-const RETENTION_DAYS = 30;
 /** Incremental rescan cadence while the runtime is alive. */
 const INGEST_INTERVAL_MS = 30_000;
+/** Default budget for one shutdown step before the worker is terminated. */
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5_000;
+
+export type RuntimeLifecycleEvent = DbWorkerLifecycle;
 
 export interface DashboardRuntimeOptions {
   dbPath?: string;
@@ -32,6 +41,19 @@ export interface DashboardRuntimeOptions {
   sessionsRoot?: string;
   tracesDir?: string;
   cacheRoot?: string;
+  /**
+   * Override the database worker's entry module. Packaging needs this: under
+   * Electron the worker must load from an unpacked path outside the asar archive.
+   */
+  workerUrl?: URL | string;
+  /**
+   * How long each shutdown step waits for the worker before it is terminated
+   * outright. A supervisor with its own quit deadline (Electron's `before-quit`)
+   * should set this below that deadline.
+   */
+  shutdownTimeoutMs?: number;
+  /** Worker lifecycle notifications, for a supervisor that must react to a dead worker. */
+  onLifecycle?: (event: RuntimeLifecycleEvent) => void;
 }
 
 /** One API call, addressed the way `fetch` would address it. */
@@ -41,6 +63,8 @@ export interface ApiCall {
   path: string;
   /** Already-parsed payload; omit when the call carries none. */
   body?: unknown;
+  /** Set instead of {@link body} when the transport could not parse the payload. */
+  bodyError?: string;
 }
 
 export interface DashboardRuntime {
@@ -48,8 +72,12 @@ export interface DashboardRuntime {
   readonly sessionsRoot: string;
   readonly tracesDir: string;
   readonly cacheRoot: string | undefined;
-  /** The handler context, for a transport that needs to dispatch itself. */
-  readonly context: ApiContext;
+  /**
+   * What THIS thread owns, for a transport that dispatches its own main-thread
+   * routes. The database is deliberately absent — it lives on the worker and is
+   * reachable only through {@link call}.
+   */
+  readonly context: MainApiContext;
   /** Answer one API call. Never rejects for an API failure — see `ApiResponse`. */
   call(call: ApiCall): Promise<ApiResponse>;
   /** Subscribe to a download job's progress events; returns the unsubscribe. */
@@ -62,8 +90,19 @@ export interface DashboardRuntime {
    * Idempotent; `close()` calls it for you.
    */
   drain(): Promise<void>;
-  /** {@link drain} then close the SQLite handle. Idempotent. */
+  /** {@link drain} then close the SQLite handle and end the worker. Idempotent. */
   close(): Promise<void>;
+}
+
+/**
+ * The shipped worker entry, or the source-run bootstrap when there is no build
+ * beside us (vitest, `oxnode scripts/dev-dashboard.ts`). Checking for the built
+ * file rather than sniffing the environment keeps a real `dist` authoritative —
+ * a stale build can never be silently papered over by the `.ts`.
+ */
+function defaultWorkerUrl(): URL {
+  const built = new URL('./worker/db-worker.js', import.meta.url);
+  return existsSync(fileURLToPath(built)) ? built : new URL('./worker/ts-bootstrap.ts', import.meta.url);
 }
 
 export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): DashboardRuntime {
@@ -73,48 +112,38 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
   const tracesDir = opts.tracesDir ?? metricsTraceDir();
   const cacheRoot = opts.cacheRoot;
 
+  // Kept on this thread: one `mkdir` at construction is not the blocking problem,
+  // and an unwritable location stays a synchronous, actionable throw from the
+  // factory instead of an asynchronous worker death.
   if (dbPath !== ':memory:') {
     mkdirSync(dirname(dbPath), { recursive: true });
   }
-  const dash: DashboardDb = openDashboardDb(dbPath);
+
+  // Spawning is asynchronous but `new Worker` is not, and messages queue on the
+  // port until the thread is up — so the factory stays synchronous and no caller
+  // has to await readiness.
+  const worker = startDbWorker({
+    workerUrl: opts.workerUrl ?? defaultWorkerUrl(),
+    shutdownTimeoutMs: opts.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS,
+    onLifecycle: opts.onLifecycle ?? ((): void => {}),
+    dbPath,
+    modelsDir,
+    sessionsRoot,
+    tracesDir,
+    cacheRoot,
+  });
   const downloads = new DownloadManager({ modelsDir });
 
-  // Serialize ingests so overlapping timer/boot/manual runs never interleave
-  // SQLite transactions. `doIngest` never throws, so a failed run cannot poison
-  // the chain for later callers (a rejected promise would skip every queued
-  // `.then`).
-  const doIngest = async (): Promise<IngestSummary> => {
-    try {
-      const sessionsResult = await ingestSessions(dash, sessionsRoot);
-      const tracesResult = await ingestTraces(dash, tracesDir, { retentionDays: RETENTION_DAYS });
-      return { sessions: sessionsResult, traces: tracesResult };
-    } catch (err) {
-      return {
-        sessions: { scanned: 0, updated: 0, removed: 0, warnings: [String(err)] },
-        traces: { files: 0, records: 0, pruned: 0, warnings: [] },
-      };
-    }
-  };
-  let ingestChain: Promise<IngestSummary> = Promise.resolve({
-    sessions: { scanned: 0, updated: 0, removed: 0, warnings: [] },
-    traces: { files: 0, records: 0, pruned: 0, warnings: [] },
-  });
-  const runIngest = (): Promise<IngestSummary> => {
-    ingestChain = ingestChain.then(doIngest);
-    return ingestChain;
-  };
+  const context: MainApiContext = { modelsDir, sessionsRoot, tracesDir, cacheRoot, downloads };
 
-  const context: ApiContext = { dash, modelsDir, sessionsRoot, tracesDir, cacheRoot, downloads, runIngest };
-
-  // Ingest on boot (non-blocking) plus a periodic rescan.
-  runIngest().catch(() => {});
+  // The boot ingest runs inside the worker; only the periodic rescan is driven
+  // from here.
   const ingestTimer = setInterval(() => {
-    runIngest().catch(() => {});
+    void worker.ingest();
   }, INGEST_INTERVAL_MS);
   ingestTimer.unref();
 
   let draining: Promise<void> | null = null;
-  let dbClosed = false;
 
   const drain = (): Promise<void> => {
     draining ??= (async () => {
@@ -125,15 +154,10 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
       // background job publish a model after the runtime is considered closed.
       await downloads.shutdown();
       // `clearInterval` only stops FUTURE ticks: a rescan already in flight kept
-      // running while `dash.close()` executed underneath it, which only ever
-      // looked harmless because `doIngest`'s catch swallowed the resulting
-      // "database is not open". Await the chain to its fixpoint instead — re-read
-      // after each await, since a caller can queue another ingest while we wait.
-      let awaited: Promise<IngestSummary> | null = null;
-      while (awaited !== ingestChain) {
-        awaited = ingestChain;
-        await awaited;
-      }
+      // running while the database closed underneath it, which only ever looked
+      // harmless because the ingest catch swallowed the resulting "database is
+      // not open". The worker awaits its chain to a fixpoint for us.
+      await worker.drain();
     })();
     return draining;
   };
@@ -155,15 +179,27 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
       if (!isApiPath(url.pathname)) {
         return failure('E_NOT_FOUND', `No route matches ${c.method} ${url.pathname}`);
       }
+      // Ownership is data on the route, never a path list here. An unmatched
+      // request has no owner and is answered locally — its 405/404 needs no
+      // context, and a garbage path never costs a round trip.
+      if (routeThreadFor(c.method, url.pathname) === 'worker') {
+        return await worker.call({
+          method: c.method,
+          path: c.path,
+          body: c.body,
+          ...(c.bodyError !== undefined ? { bodyError: c.bodyError } : {}),
+        });
+      }
       try {
-        return await dispatch(context, {
+        return await dispatchMain(context, {
           method: c.method,
           pathname: url.pathname,
           query: url.searchParams,
           body: c.body,
+          ...(c.bodyError !== undefined ? { bodyError: c.bodyError } : {}),
         });
       } catch (err) {
-        // `dispatch` converts handler throws itself; this catches a fault in
+        // `dispatchMain` converts handler throws itself; this catches a fault in
         // matching (e.g. `decodeURIComponent` on a malformed `%` escape) so the
         // documented "never rejects" contract holds for every caller. The HTTP
         // adapter keeps its own 500 path for the same case.
@@ -174,14 +210,12 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
       return downloads.subscribe(jobId, listener);
     },
     ingestNow(): Promise<IngestSummary> {
-      return runIngest();
+      return worker.ingest();
     },
     drain,
     async close(): Promise<void> {
       await drain();
-      if (dbClosed) return;
-      dbClosed = true;
-      dash.close();
+      await worker.close();
     },
   };
 }

@@ -1,16 +1,16 @@
 import { catalogWithState } from '../../catalog.js';
 import { discoverLocalModels, deleteLocalModel } from '../../models.js';
-import type { ApiContext, ApiRequest } from '../context.js';
+import type { ApiPaths, ApiRequest } from '../context.js';
 import { ApiError } from '../errors.js';
 
-export function handleModels(ctx: ApiContext): unknown {
+export function handleModels(ctx: ApiPaths): unknown {
   const { models, warnings } = discoverLocalModels(ctx.modelsDir);
   // `dir` lets the UI show WHERE these checkpoints live — the directory is
   // configurable (`--models-dir`), so the count alone is ambiguous.
   return { models, warnings, dir: ctx.modelsDir };
 }
 
-export function handleDeleteModel(ctx: ApiContext, req: ApiRequest): unknown {
+export function handleDeleteModel(ctx: ApiPaths, req: ApiRequest): unknown {
   try {
     deleteLocalModel(ctx.modelsDir, req.params.name);
     return { deleted: true, name: req.params.name };
@@ -22,6 +22,6 @@ export function handleDeleteModel(ctx: ApiContext, req: ApiRequest): unknown {
   }
 }
 
-export function handleCatalog(ctx: ApiContext): unknown {
+export function handleCatalog(ctx: ApiPaths): unknown {
   return { items: catalogWithState(ctx.modelsDir) };
 }

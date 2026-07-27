@@ -2,7 +2,7 @@ import { canonicalCacheRoot, coldTierRestoreFamilyList } from '@mlx-node/agent/c
 
 import { scanColdCache, clearColdCache, coldCacheRoot, evictOlderThan } from '../../cache.js';
 import { TRACE_RETENTION_DAYS } from '../../ingest/traces.js';
-import type { ApiContext, ApiRequest } from '../context.js';
+import type { ApiPaths, ApiRequest, WorkerApiContext } from '../context.js';
 import { requireBody, toInt } from '../context.js';
 import { ApiError } from '../errors.js';
 
@@ -82,7 +82,7 @@ import { ApiError } from '../errors.js';
  * legitimate non-zero steady state — every prompt's first turn declines — so a
  * "did this ever happen" latch would be pinned on from the first minute.
  */
-export function handleCacheGet(ctx: ApiContext): unknown {
+export function handleCacheGet(ctx: WorkerApiContext): unknown {
   const requestedRoot = coldCacheRoot(ctx.cacheRoot);
   const disk = scanColdCache(requestedRoot);
   // Both sides of the join canonicalize through the SAME helper the agent used
@@ -232,7 +232,7 @@ export function handleCacheGet(ctx: ApiContext): unknown {
   };
 }
 
-export function handleCacheDelete(ctx: ApiContext, req: ApiRequest): unknown {
+export function handleCacheDelete(ctx: ApiPaths, req: ApiRequest): unknown {
   const body = requireBody(req);
   const parsed = body as { all?: unknown; olderThanDays?: unknown } | null;
   const all = parsed?.all;
