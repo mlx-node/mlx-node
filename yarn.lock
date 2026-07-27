@@ -1359,7 +1359,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@mlx-node/dashboard@workspace:packages/dashboard":
+"@mlx-node/dashboard@workspace:*, @mlx-node/dashboard@workspace:packages/dashboard":
   version: 0.0.0-use.local
   resolution: "@mlx-node/dashboard@workspace:packages/dashboard"
   dependencies:
@@ -1405,6 +1405,7 @@ __metadata:
     "@electron/notarize": "npm:3.1.1"
     "@electron/osx-sign": "npm:2.6.0"
     "@electron/packager": "npm:20.0.4"
+    "@mlx-node/dashboard": "workspace:*"
     "@mlx-node/lm": "workspace:*"
     "@mlx-node/server": "workspace:*"
     "@types/node": "catalog:"

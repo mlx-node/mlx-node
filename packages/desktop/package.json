@@ -27,6 +27,7 @@
     "start": "electron ."
   },
   "dependencies": {
+    "@mlx-node/dashboard": "workspace:*",
     "@mlx-node/lm": "workspace:*",
     "@mlx-node/server": "workspace:*"
   },
