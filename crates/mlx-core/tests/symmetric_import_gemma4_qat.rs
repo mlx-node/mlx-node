@@ -34,6 +34,9 @@
 //! than passing on a comparison it never made — an acceptance gate that goes
 //! green because its fixture is absent is worse than no gate.
 //!
+//! `SYM_QAT_ROOT` unset is the only skip. Once it is set both conversions are
+//! required and a half-present root fails, naming what is missing.
+//!
 //! Run:
 //!   SYM_QAT_ROOT=... cargo test -p mlx-core --release \
 //!     --test symmetric_import_gemma4_qat -- --ignored --nocapture
@@ -159,15 +162,28 @@ struct Fixtures {
     new_quant: serde_json::Value,
 }
 
+/// `None` only when `SYM_QAT_ROOT` is unset. Once it is set the two
+/// conversions are required: skipping on a half-present root would report `ok`
+/// for a comparison that never ran, and these tests are `#[ignore]`d precisely
+/// so that cannot happen. Whoever set the variable asked for the gate.
 fn fixtures() -> Option<Fixtures> {
     let root = PathBuf::from(std::env::var("SYM_QAT_ROOT").ok()?);
     let old_dir = root.join("gemma4-qat-mlx");
     let new_dir = root.join("gemma4-qat-sym");
-    if !old_dir.join("model.safetensors").is_file() || !new_dir.join("model.safetensors").is_file()
-    {
-        eprintln!("SYM_QAT_ROOT set but the two conversions are not both present — skipping");
-        return None;
-    }
+    let missing: Vec<String> = [&old_dir, &new_dir]
+        .iter()
+        .flat_map(|d| ["model.safetensors", "config.json"].map(|f| d.join(f)))
+        .filter(|p| !p.is_file())
+        .map(|p| p.display().to_string())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "SYM_QAT_ROOT is set but {} fixture file(s) are missing:\n  {}\n\
+         Reconvert the QAT GGUF into both layouts (see the module docs) or \
+         unset SYM_QAT_ROOT to skip.",
+        missing.len(),
+        missing.join("\n  ")
+    );
     let quant = |d: &Path| -> serde_json::Value {
         let cfg: serde_json::Value =
             serde_json::from_reader(File::open(d.join("config.json")).expect("open config.json"))

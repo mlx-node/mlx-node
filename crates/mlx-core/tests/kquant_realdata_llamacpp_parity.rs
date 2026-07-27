@@ -44,6 +44,13 @@
 //! than passing on a comparison it never made — a parity gate that goes green
 //! because its fixture is absent is worse than no gate.
 //!
+//! `KQ_PARITY_ROOT` unset is the only skip. Once it is set the fixtures are
+//! required: a root that is not a directory, or one missing any file a case
+//! needs, fails and names what is missing. Skipping there would report `ok`
+//! for a comparison that never ran, which is the same failure mode the
+//! `#[ignore]` exists to prevent — just harder to notice, because the person
+//! seeing it went out of their way to ask for the gate.
+//!
 //! Run:
 //!   KQ_PARITY_ROOT=... cargo test -p mlx-core --release \
 //!     --test kquant_realdata_llamacpp_parity -- --ignored --nocapture
@@ -149,10 +156,43 @@ const CASES: &[Case] = &[
     },
 ];
 
+/// `None` only when `KQ_PARITY_ROOT` is unset. A root that is set but does not
+/// resolve to a directory is a broken invocation, not an absent fixture.
 fn root() -> Option<PathBuf> {
     let raw = std::env::var("KQ_PARITY_ROOT").ok()?;
     let p = PathBuf::from(raw);
-    p.is_dir().then_some(p)
+    assert!(
+        p.is_dir(),
+        "KQ_PARITY_ROOT is set to {} which is not a directory",
+        p.display()
+    );
+    Some(p)
+}
+
+/// Fail before any case runs if the root is missing something, listing every
+/// absent path at once — one run tells you the whole set to regenerate rather
+/// than surfacing them one failure at a time.
+fn require_every_fixture(root: &Path) {
+    let mut missing = Vec::new();
+    let mut want_file = |rel: &str| {
+        let p = root.join(rel);
+        if !p.is_file() {
+            missing.push(p.display().to_string());
+        }
+    };
+    for case in CASES {
+        want_file(case.source_gguf);
+        want_file(case.reference_gguf);
+        want_file(&format!("{}/config.json", case.mlx_dir));
+        want_file(&format!("{}/model.safetensors", case.mlx_dir));
+    }
+    assert!(
+        missing.is_empty(),
+        "KQ_PARITY_ROOT is set but {} fixture file(s) are missing:\n  {}\n\
+         Regenerate them (see the module docs) or unset KQ_PARITY_ROOT to skip.",
+        missing.len(),
+        missing.join("\n  ")
+    );
 }
 
 /// Read a whole F32 tensor out of a GGUF at its recorded data offset.
@@ -387,9 +427,10 @@ fn run_case(root: &Path, case: &Case) -> Totals {
 #[ignore = "needs KQ_PARITY_ROOT pointing at the GGUF + llama.cpp F32 fixtures"]
 fn imported_kquant_weights_match_llamacpp_dequantization() {
     let Some(root) = root() else {
-        eprintln!("KQ_PARITY_ROOT unset or not a directory — skipping real-data parity");
+        eprintln!("KQ_PARITY_ROOT unset — skipping real-data parity");
         return;
     };
+    require_every_fixture(&root);
 
     let mut failures = Vec::new();
     for case in CASES {
@@ -439,14 +480,18 @@ fn imported_kquant_weights_match_llamacpp_dequantization() {
 #[ignore = "needs KQ_PARITY_ROOT pointing at the GGUF + llama.cpp F32 fixtures"]
 fn the_symmetric_import_decodes_identically_to_the_stored_bias_import() {
     let Some(root) = root() else {
-        eprintln!("KQ_PARITY_ROOT unset or not a directory — skipping real-data A/B");
+        eprintln!("KQ_PARITY_ROOT unset — skipping real-data A/B");
         return;
     };
     let stored_dir = root.join("qwen3-q8-mlx2");
     let derived_dir = root.join("qwen3-q80-sym");
-    if !stored_dir.is_dir() || !derived_dir.is_dir() {
-        eprintln!("pre-symmetric and symmetric Q8_0 conversions not both present — skipping A/B");
-        return;
+    for dir in [&stored_dir, &derived_dir] {
+        assert!(
+            dir.join("model.safetensors").is_file(),
+            "KQ_PARITY_ROOT is set but {} is missing — the A/B needs both the \
+             pre-symmetric and the symmetric Q8_0 conversion",
+            dir.join("model.safetensors").display()
+        );
     }
 
     let read = |dir: &Path| {
