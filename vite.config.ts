@@ -77,6 +77,7 @@ export default defineConfig({
       // first: alias matching is prefix-based and first-match-wins, so the
       // bare key would otherwise rewrite `@mlx-node/server/host` to
       // `.../src/index.ts/host`.
+      '@mlx-node/server/host/env-policy': resolve(__dirname, './packages/server/src/host/env-policy.ts'),
       '@mlx-node/server/host/paths': resolve(__dirname, './packages/server/src/host/paths.ts'),
       '@mlx-node/server/host': resolve(__dirname, './packages/server/src/host/index.ts'),
       '@mlx-node/server': resolve(__dirname, './packages/server/src/index.ts'),
