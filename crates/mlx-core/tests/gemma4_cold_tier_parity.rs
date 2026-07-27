@@ -53,18 +53,22 @@
 //! decode-cadence one at exactly one window), not a structural claim about the
 //! layout.
 //!
-//! **Ceiling.** `gemma4_sliding_prefix_checkpoint_limit` bounds the in-memory
-//! checkpoint store by a memory budget — on a 26B checkpoint that works out to
-//! TWO entries — and prefill records one checkpoint per
-//! `gemma4_sliding_decode_checkpoint_interval` (= one window) crossed. A prompt
-//! several windows long therefore retains only its DEEPEST two checkpoints
-//! (e.g. 3072 and 4096) and evicts the one at 1024. Since the capture can only
-//! anchor at a boundary the persisted K/V chain also reaches — and that chain
-//! advances by one writer-queue's worth of blocks per turn — the deep
-//! checkpoints are unreachable and the shallow one is gone. Keeping the prompt
-//! inside the SECOND window means the only interval checkpoint is the one at
+//! **Ceiling.** This fixture predates the cold anchor rungs and is still sized
+//! for the world without them, deliberately: it keeps the prompt inside the
+//! SECOND window, so the only decode-cadence checkpoint is the one at
 //! `sliding_window`, which is both retained and the first boundary a growing
-//! chain can cover.
+//! chain can cover. That makes it a gate on the `>= window` PAYLOAD regime and
+//! nothing else — a prompt several windows long used to retain only its
+//! DEEPEST two checkpoints (`gemma4_sliding_prefix_checkpoint_limit` works out
+//! to TWO entries on a 26B) and evict the one at 1024, leaving nothing at or
+//! below the chain's reach.
+//!
+//! That eviction is the bug `gemma4_sliding_cold_anchor_rungs` fixes, and it is
+//! covered offline by
+//! `gemma4_sliding_ladder_retains_a_rung_the_lagging_chain_can_reach` (which
+//! replays the exact failing sequence) plus a real-weights `mlx agent` restart.
+//! Sizing this gate up to lean on the rungs would make it a duplicate of that
+//! coverage while giving up the payload-regime claim it exists for.
 //!
 //! # Why warm-up turns
 //!

@@ -217,19 +217,66 @@ while capture still wrote K/V blocks no restore could read back.
 Capture additionally refuses any non-bf16 cache (the snapshot type promises no dtype)
 and any media turn (v1), and never anchors deeper than the K/V chain actually reached
 (`PagedKVCacheAdapter::cold_captured_blocks`). It also only anchors where an
-in-memory checkpoint already sits, and below one window the sole such anchor is the
-prompt-boundary checkpoint (above a window the decode cadence supplies its own).
-Where that one *lands* decides whether anything can use it. A prefill over `N`
-tokens stores exactly one, and restore asks for at most `N - 1` tokens:
+in-memory checkpoint already sits — and that chain reach lags the prompt badly,
+because `capture_chain` stops at the first block the bounded writer queue refuses.
+Measured on `Gemma-4-12B-IT-nvidia-mxfp-mlx` with an ~8.1k-token prompt under
+`mlx agent`, it advanced ~34 blocks (544 tokens) per turn, reaching 1136 tokens by
+turn 2 of an 8128-token prompt boundary — 508 blocks.
 
-| prompt length          | checkpoint lands at            | usable |
-| ---------------------- | ------------------------------ | ------ |
-| `N % block_size != 0`  | `floor(N / block_size) * bs`   | yes    |
-| `N % block_size == 0`  | `N` — one block out of reach   | no     |
+### The cold anchor rungs
 
-So with `block_size = 16` a 500-token prompt anchors at 496 while a 512-token one
-anchors at 512 and gets nothing. A capture that finds no usable anchor traces
-`sliding_cold_sidecar_capture_skipped` rather than looking like a working cache.
+The decode cadence alone cannot serve that: it fires once per `sliding_window`, so
+its shallowest entry is a whole window, and a prompt several windows long ends the
+prefill holding only its deepest couple of entries — the run above finished at
+`{7168, 8128}` while the chain reached 1136, having created and then evicted the
+entry at 1024. Nothing was ever written.
+
+A persist turn therefore also publishes a fixed grid of **anchor rungs**,
+`gemma4_sliding_cold_anchor_rungs`:
+
+```text
+block_size * 4^k          ->  {64, 256, 1024, 4096}   at block_size 16
+```
+
+pinned to **zero**, not to the prompt end (which is where qwen3_5's GDN ladder walks
+from). A rung's cold key is the block chain over `tokens[0..b]`, so a grid anchored
+at 0 makes the same sidecar object reusable by every later turn, and every later
+process, whose prompt shares that prefix; a prompt-anchored ladder would land on
+`112/496/2032` for one prompt and `128/512/2048` for the next and never dedup.
+
+Capturing a rung is numerically transparent — `snapshot_from_attention_view` slices
+the attention view the chunk already produced, and the chunk plan is **not** split at
+a rung — so the whole cost is memory, which is why the grid is bounded two ways:
+
+| bound | value |
+| ----- | ----- |
+| `GEMMA4_SLIDING_ANCHOR_MAX_RUNGS` | 4 |
+| `GEMMA4_SLIDING_LADDER_MEMORY_BUDGET_BYTES` | 3 GiB for the whole retained set, at 4 bytes/element |
+
+Sizing is per boundary (`min(b, window)` rows), not per window; that is what makes the
+two sub-window rungs nearly free and lets the fourth rung fit at all. On the 12B
+geometry: rungs 41.9 + 167.8 + 671.1 + 671.1 MB, plus a 1342.2 MB reserve for the
+pre-ladder entries, = 2894.1 MB of the 3072 MB budget (~1.4 GB actual bf16).
+
+Retention answers to the same gate (`Gemma4SlidingRetentionPolicy`):
+
+| turn | limit (12B) | victim |
+| ---- | ----------- | ------ |
+| no cold tier — `PreLadder` | 2 | oldest non-image-protected entry (unchanged) |
+| cold sidecar — `Ladder` | 2 + 4 = 6 | oldest non-anchor; then the oldest anchor that is **not** an ancestor of the newest entry |
+
+The `PreLadder` arm is a compatibility contract, not an optimization: which checkpoint
+a later warm turn lands on decides whether `prepare_gemma4_sliding_prefix` installs a
+snapshot or replays the whole cached prefix through `run_sliding_only_prefill`, and
+those are different spans of arithmetic that can emit different tokens. A
+persistence-OFF request gets nothing back for that risk. The anchor-ancestor rule is
+what stops a finished conversation's rungs from squatting after a lineage switch.
+
+With the grid in place the 12B run above retains `{64, 256, 1024, 4096, 7168, 8128}`,
+so the chain's reach finds an anchor from turn 1 and deepens
+`256 -> 1024 -> 4096 -> …` as the writer queue drains. A capture that still finds no
+usable anchor traces `sliding_cold_sidecar_capture_skipped` (now carrying `retained=`
+and `anchor_rungs=`) rather than looking like a working cache.
 
 For gemma4 the sidecar is an **optimization, not a correctness prerequisite**, and
 that is precisely what licenses scaling the boundary: a sliding window is a

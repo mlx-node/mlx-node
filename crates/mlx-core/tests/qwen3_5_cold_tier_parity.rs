@@ -34,8 +34,7 @@
 //!
 //! # Why warm-up turns
 //!
-//! Unlike gemma4's sliding sidecar (representable only at a whole 1024-token
-//! window), the GDN sidecar may sit at any rung of the prefill's checkpoint
+//! The GDN sidecar may sit at any rung of the prefill's checkpoint
 //! ladder (`gdn_prefill_checkpoint_boundaries`): the deepest rung is
 //! `gdn_checkpoint_target` — the largest full block strictly before the end of
 //! the prompt — and each shallower rung is a block-aligned quarter of the one
