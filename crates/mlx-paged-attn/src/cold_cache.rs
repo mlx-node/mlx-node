@@ -35,6 +35,18 @@ use crate::{BlockAllocator, LayerKVPool, PhysicalBlock};
 const CACHE_ABI: &str = "mlx-paged-v1";
 /// Filename suffix shared by every cold object (KV blocks and sidecars).
 const OBJECT_SUFFIX: &str = ".safetensors";
+/// How many captured blocks may sit in host memory waiting for the writer.
+///
+/// This is a MEMORY bound and nothing else: `queue_depth * block_bytes` is the
+/// worst-case host footprint of the write-behind queue (8 x 1.84 MB = 15 MB on
+/// qwen3-0.6b). It used to double as the per-turn capture rate, because
+/// `ColdTierWalk::capture_chain` stopped at the first refusal, so a turn
+/// persisted `(Q + 1) / (1 - Tc/Tw)` blocks — a number nobody chose, that
+/// moved with the speed of the filesystem, and that went UNBOUNDED on a RAM
+/// disk. Capture depth is now the walk's own explicit budget
+/// (`MLX_COLD_CAPTURE_BLOCKS_PER_TURN`), which waits for a slot rather than
+/// giving up on one, so raising this constant no longer buys reach — it only
+/// buys queue slack, at the cost of host memory.
 const DEFAULT_QUEUE_DEPTH: usize = 8;
 const GIB: u64 = 1024 * 1024 * 1024;
 const MAX_DEFAULT_QUOTA: u64 = 100 * GIB;
@@ -1101,6 +1113,10 @@ impl ColdCacheManager {
     /// Capture one pinned physical block from Metal, then enqueue only the
     /// owned host bytes. The writer thread never calls MLX/Metal and never
     /// holds the allocator lock.
+    ///
+    /// Non-blocking admission: a full queue drops the write. Callers that
+    /// would rather wait a bounded time for a slot than lose the block use
+    /// [`Self::capture_and_enqueue_before`].
     pub fn capture_and_enqueue(
         &self,
         pool: &LayerKVPool,
@@ -1108,6 +1124,25 @@ impl ColdCacheManager {
         key: ColdCacheKey,
         fingerprint: ColdCacheFingerprint,
         tokens: &[u32],
+    ) -> Result<bool, String> {
+        self.capture_and_enqueue_before(pool, block, key, fingerprint, tokens, Instant::now())
+    }
+
+    /// [`Self::capture_and_enqueue`] with a bounded wait for a queue slot.
+    ///
+    /// The Metal blit happens first and unconditionally — it is the expensive
+    /// half and it must run while the block is pinned — then the owned host
+    /// bytes are offered to the writer until `deadline`. A caller walking a
+    /// chain of blocks passes the SAME deadline for every block, so the wait
+    /// is a budget over the whole walk, not per block.
+    pub fn capture_and_enqueue_before(
+        &self,
+        pool: &LayerKVPool,
+        block: &Arc<PhysicalBlock>,
+        key: ColdCacheKey,
+        fingerprint: ColdCacheFingerprint,
+        tokens: &[u32],
+        deadline: Instant,
     ) -> Result<bool, String> {
         if tokens.len() != pool.block_size() as usize {
             return Err("cold cache captures full blocks only".to_string());
@@ -1147,27 +1182,57 @@ impl ColdCacheManager {
             })
         })();
         let _ = block.decref();
-        self.enqueue(captured?)
+        let captured = captured?;
+        captured.validate()?;
+        self.send_before(WriteJob::Block(captured), deadline)
+    }
+
+    /// Offer `job` to the bounded writer queue, retrying until a slot frees or
+    /// `deadline` passes.
+    ///
+    /// `deadline <= now` degenerates to exactly one `try_send`, which is the
+    /// historical non-blocking contract of [`Self::enqueue`] /
+    /// [`Self::enqueue_sidecar`] — the retry loop below cannot sleep, because
+    /// the deadline check runs before the sleep. That degeneracy is what lets
+    /// this be the single admission implementation for every caller.
+    ///
+    /// `Ok(true)` accepted, `Ok(false)` refused within the deadline (the
+    /// caller decides whether that is a `queue_drops`), `Err` writer gone.
+    fn send_before(&self, job: WriteJob, deadline: Instant) -> Result<bool, String> {
+        let mut job = job;
+        loop {
+            match self.sender.try_send(job) {
+                Ok(()) => {
+                    self.shared.stats.enqueued.fetch_add(1, Ordering::Relaxed);
+                    return Ok(true);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err("cold-cache writer stopped".to_string());
+                }
+                Err(TrySendError::Full(returned)) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        self.shared
+                            .stats
+                            .queue_drops
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Ok(false);
+                    }
+                    job = returned;
+                    // A commit is ~0.4-1.3 ms, so 1 ms is roughly one slot's
+                    // worth of wait — short enough that the walk's block
+                    // budget, not the poll granularity, is what bounds it.
+                    std::thread::sleep(Duration::from_millis(1).min(remaining));
+                }
+            }
+        }
     }
 
     /// Non-blocking enqueue. A saturated queue deliberately drops the cold
     /// write so host buffers cannot grow without bound.
     pub fn enqueue(&self, block: ColdCacheBlock) -> Result<bool, String> {
         block.validate()?;
-        match self.sender.try_send(WriteJob::Block(block)) {
-            Ok(()) => {
-                self.shared.stats.enqueued.fetch_add(1, Ordering::Relaxed);
-                Ok(true)
-            }
-            Err(TrySendError::Full(_)) => {
-                self.shared
-                    .stats
-                    .queue_drops
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(false)
-            }
-            Err(TrySendError::Disconnected(_)) => Err("cold-cache writer stopped".to_string()),
-        }
+        self.send_before(WriteJob::Block(block), Instant::now())
     }
 
     /// Non-blocking enqueue of a state sidecar, with the same bounded-queue
@@ -1175,21 +1240,25 @@ impl ColdCacheManager {
     /// correctness problem: without it the next restore simply reconciles the
     /// candidate prefix down past that boundary and recomputes.
     pub fn enqueue_sidecar(&self, sidecar: ColdSidecar) -> Result<bool, String> {
+        self.enqueue_sidecar_before(sidecar, Instant::now())
+    }
+
+    /// [`Self::enqueue_sidecar`] with a bounded wait for a queue slot.
+    ///
+    /// Every hybrid family offers its sidecar MICROSECONDS after its K/V
+    /// capture walk returns, and that walk stops precisely when the queue is
+    /// saturated — so a non-blocking sidecar enqueue is offered to a queue the
+    /// walk just filled, and loses. A dropped sidecar is worse than a dropped
+    /// block: without it the whole restore reconciles down to nothing
+    /// (`ColdRestore::miss()`), so the turn's entire persisted chain is
+    /// unusable. Families therefore wait out the same walk budget here.
+    pub fn enqueue_sidecar_before(
+        &self,
+        sidecar: ColdSidecar,
+        deadline: Instant,
+    ) -> Result<bool, String> {
         sidecar.validate()?;
-        match self.sender.try_send(WriteJob::Sidecar(Box::new(sidecar))) {
-            Ok(()) => {
-                self.shared.stats.enqueued.fetch_add(1, Ordering::Relaxed);
-                Ok(true)
-            }
-            Err(TrySendError::Full(_)) => {
-                self.shared
-                    .stats
-                    .queue_drops
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(false)
-            }
-            Err(TrySendError::Disconnected(_)) => Err("cold-cache writer stopped".to_string()),
-        }
+        self.send_before(WriteJob::Sidecar(Box::new(sidecar)), deadline)
     }
 
     /// Block until every write accepted before this call has been committed
@@ -1221,6 +1290,13 @@ impl ColdCacheManager {
         let (tx, rx) = mpsc::sync_channel::<bool>(1);
         // Deadline-bounded admission: retry `try_send` (recovering the barrier
         // job on each `Full`) until a queue slot frees or the deadline passes.
+        //
+        // Deliberately NOT [`Self::send_before`], despite the identical shape.
+        // A barrier is not a write: admitting one must not bump `enqueued`,
+        // failing to admit one must not bump `queue_drops`, and a disconnected
+        // writer means the drain is already satisfied (`true`) rather than an
+        // error. Sharing the loop would have to thread all three differences
+        // through as flags, which is more code than the loop.
         let mut job = WriteJob::Barrier(tx);
         loop {
             match self.sender.try_send(job) {
@@ -1999,10 +2075,13 @@ fn open_identity(_file: &File) -> Option<FileIdentity> {
 /// and is device-wide. Measured by `bench_write_path_phase_decomposition` on
 /// a qwen3_5 dense block, the flush was 3.876 ms of a 4.267 ms per-object
 /// service time; `fsync(2)` costs 0.089 ms of 0.432 ms in the same harness.
-/// Because the writer is a single thread, every queued block waited behind
-/// that drive round trip — which is what pinned the persisted chain at
-/// exactly 9 blocks per turn no matter how fast the producer ran
-/// (`bench_chain_advance_per_turn`).
+/// Because the writer is a single thread, every queued block waits behind that
+/// drive round trip, so `Tw` is what a capture walk's per-block wait converges
+/// to once its budget outruns the queue. Under `F_FULLFSYNC` that wait pinned
+/// the persisted chain at exactly 9 blocks per turn no matter how fast the
+/// producer ran (`bench_chain_advance_per_turn`); the walk no longer stops at a
+/// refusal, so `Tw` now sets how long a budgeted walk TAKES rather than how far
+/// it REACHES.
 ///
 /// The guarantee that is dropped is power-loss durability, and only that:
 /// `fsync(2)` still hands the bytes to the kernel's device queue, so process
@@ -4905,6 +4984,194 @@ mod tests {
 
         // Release the writer so teardown drains cleanly.
         release.store(true, Ordering::Relaxed);
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Park the writer inside its post-rename directory fsync for `commit_ms`
+    /// per object, so the queue drains at a known, slow, controllable rate.
+    /// Returns the flag that releases it; hold it alive for the test's body.
+    fn slow_writer(
+        manager: &ColdCacheManager,
+        commit_ms: u64,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let for_writer = Arc::clone(&release);
+        *manager.shared.dir_sync_override.lock().unwrap() = Some(Box::new(move || {
+            let until = Instant::now() + Duration::from_millis(commit_ms);
+            while Instant::now() < until && !for_writer.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(())
+        }));
+        release
+    }
+
+    /// Fill the queue until the RAW channel refuses, proving it is full behind
+    /// the parked writer. Returns how many were accepted.
+    ///
+    /// Deliberately bypasses `enqueue`: every test below exists to pin some
+    /// property of `send_before`, and a fixture that reached saturation THROUGH
+    /// `send_before` would be defeated by the very mutations it must catch —
+    /// the helper would block or over-accept and panic before the test's own
+    /// assertion ever ran.
+    fn saturate(manager: &ColdCacheManager, depth: usize) -> usize {
+        let mut accepted = 0usize;
+        for i in 0..(depth as u32 + 8) {
+            let toks = vec![i, i + 100, i + 200, i + 300];
+            let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &toks, &[], 0, 0);
+            let mut candidate = block(key);
+            candidate.tokens = toks;
+            match manager.sender.try_send(WriteJob::Block(candidate)) {
+                Ok(()) => accepted += 1,
+                Err(TrySendError::Full(_)) => return accepted,
+                Err(TrySendError::Disconnected(_)) => panic!("writer thread is gone"),
+            }
+        }
+        panic!("the bounded queue never refused a block");
+    }
+
+    // `enqueue` is the non-blocking admission API and MUST stay that way. The
+    // deadline-aware `send_before` it now delegates to degenerates to exactly
+    // one `try_send` when the deadline is already past, so a full queue behind
+    // a stuck writer is refused promptly and counted as a drop.
+    //
+    // Without this, a refactor that gave `enqueue` a non-zero default deadline
+    // would turn every existing caller blocking behind the writer's back —
+    // silently, since the return value would still be `Ok(true)`. The wedge is
+    // short for the same reason as in `a_wedged_writer_cannot_hang_a_bounded_enqueue`:
+    // under that mutation `saturate` itself starts blocking, and it must reach
+    // a verdict rather than stall the suite.
+    #[test]
+    fn enqueue_keeps_its_non_blocking_contract() {
+        let root = temp_root("enqueue-nonblocking");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let release = slow_writer(&manager, 400);
+        saturate(&manager, 2);
+
+        let before = manager.stats().queue_drops;
+        let toks = vec![9u32, 8, 7, 6];
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &toks, &[], 0, 0);
+        let mut candidate = block(key);
+        candidate.tokens = toks;
+
+        let start = Instant::now();
+        let accepted = manager.enqueue(candidate).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(!accepted, "a full queue must refuse a non-blocking enqueue");
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "enqueue must not wait for a slot, took {elapsed:?}"
+        );
+        assert_eq!(
+            manager.stats().queue_drops - before,
+            1,
+            "the refusal must be counted"
+        );
+
+        release.store(true, Ordering::Relaxed);
+        *manager.shared.dir_sync_override.lock().unwrap() = None;
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // A saturated queue must not cost a family its state sidecar.
+    //
+    // Every hybrid family offers its sidecar microseconds after its K/V
+    // capture walk returns, and that walk now SPENDS its budget filling the
+    // queue — so a non-blocking sidecar offer is guaranteed to arrive at a full
+    // queue. A dropped sidecar is worse than a dropped block: the restore
+    // reconciles down to the deepest boundary a validated sidecar backs, so
+    // losing it makes the turn's whole persisted chain unusable.
+    #[test]
+    fn a_saturated_queue_still_admits_the_family_sidecar() {
+        let root = temp_root("sidecar-admit");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        // 30 ms per commit: the queue only frees a slot by draining, so an
+        // admission that does not wait cannot possibly succeed here.
+        let release = slow_writer(&manager, 30);
+        saturate(&manager, 2);
+
+        let key = ColdCacheKey::chain(
+            ColdGroup::GdnState,
+            fingerprint(),
+            None,
+            &[1, 2, 3, 4],
+            &[],
+            0,
+            0,
+        );
+        let start = Instant::now();
+        let accepted = manager
+            .enqueue_sidecar_before(
+                sidecar(key, ColdGroup::GdnState),
+                Instant::now() + Duration::from_millis(2_000),
+            )
+            .unwrap();
+
+        assert!(
+            accepted,
+            "the sidecar must wait out a slot rather than be dropped ({:?})",
+            start.elapsed()
+        );
+
+        release.store(true, Ordering::Relaxed);
+        *manager.shared.dir_sync_override.lock().unwrap() = None;
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // The bounded wait must be BOUNDED. A writer wedged for far longer than the
+    // deadline must yield a refusal at the deadline — this is what keeps a
+    // stalled storage device from turning a capture walk into unbounded turn
+    // tail (`docs/paged-cache.md`).
+    //
+    // The wedge is 2 s rather than "forever" on purpose: a walk that lost its
+    // deadline check would HANG on a forever-wedge, and a hung suite is a much
+    // worse signal than a failed assert. At 2 s the unbounded version instead
+    // succeeds ~20x past the deadline and both asserts below fire.
+    #[test]
+    fn a_wedged_writer_cannot_hang_a_bounded_enqueue() {
+        let root = temp_root("wedged-writer");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let release = slow_writer(&manager, 2_000);
+        saturate(&manager, 2);
+
+        let deadline_ms = 100u64;
+        let key = ColdCacheKey::chain(
+            ColdGroup::GdnState,
+            fingerprint(),
+            None,
+            &[5, 6, 7, 8],
+            &[],
+            0,
+            0,
+        );
+        let start = Instant::now();
+        let accepted = manager
+            .enqueue_sidecar_before(
+                sidecar(key, ColdGroup::GdnState),
+                Instant::now() + Duration::from_millis(deadline_ms),
+            )
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            !accepted,
+            "a writer wedged past the deadline must produce a refusal"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(deadline_ms),
+            "the wait must actually run to the deadline, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(deadline_ms) + Duration::from_millis(400),
+            "the wait must STOP at the deadline, took {elapsed:?}"
+        );
+
+        release.store(true, Ordering::Relaxed);
+        *manager.shared.dir_sync_override.lock().unwrap() = None;
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }

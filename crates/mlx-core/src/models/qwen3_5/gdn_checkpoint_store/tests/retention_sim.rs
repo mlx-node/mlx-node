@@ -81,33 +81,32 @@ use crate::models::qwen3_5::paged_forward::gdn_prefill_checkpoint_boundaries;
 /// Blocks the persisted K/V chain advances per turn.
 ///
 /// `ColdTierWalk::capture_chain` walks a request's blocks from index 0, skips
-/// every block `contains` already reports on disk at no cost, and BREAKS at the
-/// first block `capture_and_enqueue` does not accept. The writer queue is a
-/// bounded `sync_channel` (`mlx_paged_attn::cold_cache`'s private
-/// `DEFAULT_QUEUE_DEPTH`, 8) drained by a background thread, so the frontier
-/// ratchets by `N = (Q + 1) / (1 - Tc/Tw)` blocks per turn — the accepted
-/// prefix before one refusal — regardless of how long the prompt is.
+/// every block `contains` already reports on disk at no cost, and spends an
+/// explicit per-turn budget — `MLX_COLD_CAPTURE_BLOCKS_PER_TURN`, default 128
+/// — on the rest, waiting for a writer-queue slot rather than stopping when it
+/// finds none. So the ratchet is this number, exactly, on any filesystem.
 ///
-/// The value is what `cold_cache::bench_chain_advance_per_turn` counts off the
-/// real writer at the real per-block capture cost: 25-28 for a dense block,
-/// 17-18 for MoE. It was 8-9 while the writer still called `F_FULLFSYNC` per
-/// object, which made `Tw` so much larger than `Tc` that `N` collapsed onto
-/// `Q + 1` and the queue depth was the whole answer; `docs/paged-cache.md`
-/// carries both columns.
+/// It used to be an emergent quantity instead: the walk broke at the first
+/// block the bounded queue refused, which put the frontier at
+/// `N = (Q + 1) / (1 - Tc/Tw)` — 25-28 dense and 17-18 MoE off
+/// `cold_cache::bench_chain_advance_per_turn`, 8-9 while the writer still
+/// called `F_FULLFSYNC` per object, and unbounded on a filesystem faster than
+/// the capture. `docs/paged-cache.md` carries the whole derivation as history.
 ///
 /// This is the one number here that is a dial rather than a call, so
 /// `chain_speed_changes_the_level_not_the_ranking` re-runs the sweep at half
-/// and double this value, 13 and 52. 13 sits under the MoE rate, 52 is past
-/// the point where every fixture saturates, and the old `F_FULLFSYNC` rate is
-/// swept as a third point — [`PRE_FSYNC_BLOCKS_PER_TURN`].
-const QUEUE_BLOCKS_PER_TURN: u32 = 26;
+/// and double this value. The pre-budget rates are swept alongside it
+/// ([`PRE_FSYNC_BLOCKS_PER_TURN`]), because the retention ranking has to hold
+/// at a chain speed an order of magnitude slower than the shipped one.
+const QUEUE_BLOCKS_PER_TURN: u32 = 128;
 
-/// The ratchet before the writer stopped calling `F_FULLFSYNC` per object.
+/// The ratchet before the writer stopped calling `F_FULLFSYNC` per object, and
+/// before the walk had a budget at all.
 ///
-/// Kept as a sweep point because a cold tier on a filesystem where `fsync(2)`
-/// is as expensive as `F_FULLFSYNC` — or a host whose SSD is that much slower
-/// than its GPU — still lands here, and the retention ranking has to hold at
-/// both ends.
+/// Kept as a sweep point because it is the slowest chain speed the retention
+/// ranking is ever asked to hold at: a cold tier on a filesystem where
+/// `fsync(2)` is as expensive as `F_FULLFSYNC` still spends its whole budget
+/// waiting, and lands here.
 const PRE_FSYNC_BLOCKS_PER_TURN: u32 = 8;
 
 /// Owner ids the sweep hands out, in the order it hands them out. `OWNERS[0]` is
@@ -176,13 +175,18 @@ struct Fixture {
 impl Fixture {
     /// An agentic session: a large seeded context and turns that carry tool
     /// output. It opens 64 blocks (1024 tokens) behind and each of an owner's
-    /// own turns adds 16 blocks against a chain that ratchets
-    /// [`QUEUE_BLOCKS_PER_TURN`], so the chain closes the gap by ~10 blocks per
-    /// own-turn and needs ~7 of them to catch up. Spread over the owner sweep
-    /// that is most of the 40 turns spent behind — the regime the checkpoint
-    /// ladder was added for. Under the pre-`fsync(2)` writer
-    /// ([`PRE_FSYNC_BLOCKS_PER_TURN`]) the chain LOST 8 blocks per own-turn and
-    /// never caught up at all.
+    /// own turns adds 16 more.
+    ///
+    /// At the shipped [`QUEUE_BLOCKS_PER_TURN`] the chain clears all 64 on the
+    /// turn that opens them and never falls behind again, which is what the
+    /// capture budget was added to do — so this fixture no longer exercises the
+    /// behind-the-prompt regime at the shipped speed, and the sweep in
+    /// `chain_speed_changes_the_level_not_the_ranking` reaches that regime
+    /// through its slower points instead. At 16 blocks/turn the chain gains
+    /// nothing per own-turn and the gap persists; under the pre-`fsync(2)`
+    /// writer ([`PRE_FSYNC_BLOCKS_PER_TURN`]) it LOST 8 blocks per own-turn and
+    /// never caught up at all. That span is the regime the checkpoint ladder
+    /// was added for.
     const AGENT: Self = Self {
         label: "agent   1024+256/turn",
         block_size: 16,
@@ -1320,10 +1324,21 @@ fn one_owner_is_the_same_policy_either_way() {
 
 /// The writer's ratchet is the one modelled number here, so check the sweep's
 /// ranking does not hang off its exact value.
+///
+/// The ranking must never INVERT at any swept speed, and it must still be a
+/// ranking at SOME of them. Those are two assertions on purpose. At the shipped
+/// budget the chain covers this fixture's whole prompt on the turn it opens, so
+/// both arms capture every checkpoint and the arms are genuinely tied — a real
+/// result, and the one this change was made to produce, but a tie proves
+/// nothing about retention. Demanding a strict win at every speed would fail on
+/// that tie; accepting ties everywhere would let a policy that does nothing
+/// pass. So: `>=` at every speed, and strictly greater at at least one.
 #[test]
 fn chain_speed_changes_the_level_not_the_ranking() {
+    let mut strict_wins = 0usize;
     for queue in [
         PRE_FSYNC_BLOCKS_PER_TURN,
+        QUEUE_BLOCKS_PER_TURN / 8,
         QUEUE_BLOCKS_PER_TURN / 2,
         QUEUE_BLOCKS_PER_TURN * 2,
     ] {
@@ -1365,13 +1380,30 @@ fn chain_speed_changes_the_level_not_the_ranking() {
                 control.replay_fraction() * 100.0
             ));
         }
-        println!("queue {queue} blocks/turn: {}", line.join("   "));
+        println!(
+            "queue {queue} blocks/turn: {}{}",
+            line.join("   "),
+            if applied_total == control_total {
+                "   [tied: the chain covers the fixture from turn 1]"
+            } else {
+                ""
+            }
+        );
         assert!(
-            applied_total > control_total,
-            "queue {queue}: the ranking inverted at this chain speed, \
+            applied_total >= control_total,
+            "queue {queue}: the ranking INVERTED at this chain speed, \
              {applied_total} vs {control_total} sidecars",
         );
+        if applied_total > control_total {
+            strict_wins += 1;
+        }
     }
+    assert!(
+        strict_wins > 0,
+        "every swept chain speed tied, so this sweep no longer measures the retention \
+         policy at all — a do-nothing policy would pass it. Add a slower speed, or \
+         lengthen the fixture so the chain starts behind again."
+    );
 }
 
 /// A count bound is a bound on the wrong quantity when the thing counted scales

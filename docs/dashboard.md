@@ -117,6 +117,8 @@ restored on a hot-cache miss before falling back to a normal prefill.
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `MLX_AGENT_METRICS=0` | Kill switch for the always-on metrics sink (`0` / `false` / `off`). Without it, the agent writes a trace per turn — no metrics page data means no traces to ingest. |
 | `MLX_COLD_CACHE_DIR`  | Parent dir for the cold tier (operates in its `mlx-paged-v1` child). Default `~/.mlx-node/cache/paged/v1`.                                                          |
+| `MLX_COLD_CAPTURE_BLOCKS_PER_TURN` | Blocks one turn's cold-tier capture walk may persist. Default `128` (2048 tokens at block size 16). Raising it covers a long prompt in fewer turns at the cost of turn tail. |
+| `MLX_COLD_CAPTURE_BUDGET_MS` | Wall-clock ceiling on one capture walk. Default `250`. A walk that hits it warns and ratchets less than configured. |
 | `MLX_MODELS_DIR`      | Local models directory when `--models-dir` is omitted.                                                                                                              |
 
 ## Security model

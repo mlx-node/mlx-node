@@ -2137,6 +2137,14 @@ impl Qwen35Inner {
             return;
         };
         let block_size = adapter.block_size();
+        // The K/V capture walk that just ran spends its budget waiting for
+        // writer-queue slots, so it hands this sidecar a queue it may well have
+        // filled microseconds ago. A non-blocking offer here loses that race,
+        // and a dropped sidecar is strictly worse than a dropped block: the
+        // restore reconciles down to the deepest boundary a VALIDATED sidecar
+        // backs, so losing it makes the turn's entire persisted K/V chain
+        // unusable. Wait out the same budget the walk did.
+        let sidecar_wait = adapter.cold_capture_budget().max_walk;
         if block_size == 0 {
             return;
         }
@@ -2269,11 +2277,14 @@ impl Qwen35Inner {
             layout: super::gdn_sidecar::layout_at(&geometry, boundary),
             tensors,
         };
-        match cold.manager.enqueue_sidecar(sidecar) {
+        match cold
+            .manager
+            .enqueue_sidecar_before(sidecar, std::time::Instant::now() + sidecar_wait)
+        {
             Ok(true) => crate::cold_tier::cold_sidecar_counters().record_enqueued(),
-            // The bounded writer queue refused the sidecar. Nothing is written
-            // and nothing failed, so this turn is otherwise indistinguishable
-            // from a successful capture.
+            // The bounded writer queue stayed full for the whole capture
+            // budget. Nothing is written and nothing failed, so this turn is
+            // otherwise indistinguishable from a successful capture.
             Ok(false) => {
                 crate::cold_tier::cold_sidecar_counters().record_queue_drop();
                 tracing::debug!(

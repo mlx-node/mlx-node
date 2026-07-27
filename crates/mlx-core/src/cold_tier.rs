@@ -33,6 +33,53 @@ const COLD_CACHE_DIR_ENV: &str = "MLX_COLD_CACHE_DIR";
 /// never the user-supplied directory verbatim.
 const MANAGED_SUBDIR: &str = "mlx-paged-v1";
 
+/// How many blocks one turn's cold-tier capture walk may add to the persisted
+/// chain, and how long that walk may take. Both read once, on first use.
+const CAPTURE_BLOCKS_ENV: &str = "MLX_COLD_CAPTURE_BLOCKS_PER_TURN";
+const CAPTURE_BUDGET_MS_ENV: &str = "MLX_COLD_CAPTURE_BUDGET_MS";
+
+/// Default per-turn capture depth, in blocks.
+///
+/// The walk used to have no policy at all: it stopped at the first block the
+/// bounded writer queue refused, which made the per-turn rate an emergent
+/// function of the filesystem — `(Q + 1) / (1 - Tc/Tw)`, ~12 blocks on this
+/// machine, 9 under `F_FULLFSYNC`, and UNBOUNDED on a RAM disk. At ~12 blocks
+/// (192 tokens) an 8 K-token prompt needed ~40 turns to persist, which is why
+/// the restored prefix measured 1.4-6.2% of the prompt.
+///
+/// 128 blocks is chosen so a typical agent prompt is fully covered within a few
+/// turns while the tail stays inside the deadline below at the measured `Tw`
+/// (~0.43-1.27 ms/object): 128 x 1.27 ms = 163 ms worst case, 55 ms typical.
+const DEFAULT_CAPTURE_BLOCKS_PER_TURN: usize = 128;
+
+/// Wall-clock ceiling on one capture walk. Bounds the turn tail even when the
+/// storage device stalls, and is what makes the walk safe on a filesystem fast
+/// enough that the queue never refuses (where the old walk covered the whole
+/// prompt in one turn: ~0.9 s of tail at 64 K tokens).
+const DEFAULT_CAPTURE_BUDGET_MS: u64 = 250;
+
+/// Per-turn budget for `ColdTierWalk::capture_chain`, read once from the
+/// environment.
+///
+/// Deliberately a policy the walk carries rather than a property of the writer
+/// queue: the queue's depth is a host-MEMORY bound (blocks in flight), while
+/// this is a TURN-TAIL bound (how much of the prompt one turn is willing to pay
+/// to persist). Conflating them is what made the old rate move with `Tw`.
+pub fn cold_capture_budget() -> (usize, std::time::Duration) {
+    static BUDGET: OnceLock<(usize, std::time::Duration)> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let blocks = std::env::var(CAPTURE_BLOCKS_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_CAPTURE_BLOCKS_PER_TURN);
+        let millis = std::env::var(CAPTURE_BUDGET_MS_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_CAPTURE_BUDGET_MS);
+        (blocks, std::time::Duration::from_millis(millis))
+    })
+}
+
 /// Lazily open the process-wide cold tier. Returns `None` when the tier
 /// cannot be opened (fail-open: inference proceeds without persistence).
 pub fn global_cold_cache() -> Option<Arc<ColdCacheManager>> {

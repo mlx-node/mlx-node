@@ -75,7 +75,7 @@
 //! flat path. See `finalize_turn_keep_live` for full discussion.
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use mlx_paged_attn::metal::KvScaleManager;
@@ -847,6 +847,12 @@ impl ColdTierWalk<'_> {
             sidecar = Some(state);
         }
 
+        // The restore loop has no budget and deliberately gets none: capping it
+        // would cap REUSE, which is the whole feature. It is timed instead,
+        // because the per-block restore cost is what decides whether reuse pays
+        // at all — a block restored slower than the prefill that would have
+        // recomputed it is a loss no coverage can fix.
+        let restore_started = Instant::now();
         while idx < limit {
             let Some(extra_keys) = extra_keys_for(idx) else {
                 break;
@@ -883,6 +889,21 @@ impl ColdTierWalk<'_> {
                 }
                 None => break,
             }
+        }
+        if inference_trace_enabled() {
+            let elapsed_ms = restore_started.elapsed().as_secs_f64() * 1000.0;
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] paged cold_restore_walk blocks={} base={} limit={} elapsed_ms={:.3} per_block_ms={:.3}",
+                restored.len(),
+                base,
+                limit,
+                elapsed_ms,
+                if restored.is_empty() {
+                    0.0
+                } else {
+                    elapsed_ms / restored.len() as f64
+                },
+            ));
         }
 
         // Phase 4: the restore stopped short of the boundary the sidecar backs
@@ -1068,25 +1089,51 @@ impl ColdTierWalk<'_> {
     /// `contains` dedups re-publishes of a chain already on disk without
     /// touching Metal.
     ///
-    /// Returns how many leading blocks the persisted chain now covers — every
+    /// Reports how many leading blocks the persisted chain now covers — every
     /// block that was already on disk or was accepted by the writer queue, up
     /// to the first one that was not. A family capturing an auxiliary sidecar
     /// alongside the chain must not anchor it deeper than this: a sidecar past
     /// the chain's break can never be selected on restore
     /// ([`Self::kv_chain_upper_bound`] caps the descent at the chain's reach),
     /// so writing it would only burn quota.
+    ///
+    /// # What bounds this walk
+    ///
+    /// `budget`, and only `budget`. Until this took a budget the walk was
+    /// bounded by the writer queue refusing a block, which made the per-turn
+    /// capture depth an emergent property of the filesystem rather than a
+    /// policy — `(Q + 1) / (1 - Tc/Tw)` blocks, measured at ~12 on this
+    /// machine — so an 8 K-token prompt needed ~40 turns to persist and the
+    /// restored prefix measured a few percent of the prompt. Waiting a bounded
+    /// time for a queue slot (`capture_and_enqueue_before`) instead of giving
+    /// up on one decouples the depth from `Tw` entirely.
+    ///
+    /// # Why it still breaks rather than skipping
+    ///
+    /// A block that did not land ends the walk, and every deeper block is left
+    /// for a later turn. Skipping it instead would buy nothing on the turn that
+    /// hits it: [`Self::kv_chain_upper_bound`] and [`Self::restore_extend`]
+    /// both stop at the first key that is absent, so the chain's REACH is the
+    /// index of the first hole under either policy. It would only pay from the
+    /// turn after — at the price of a full Metal blit per skipped block, all of
+    /// them on the inference thread, all of them discarded. Under a budget
+    /// there is no cheap refusal left to skip anyway: `Ok(false)` now means the
+    /// deadline expired, which is exactly when the walk should stop.
     fn capture_chain<'k>(
         &self,
         request_tokens: &[u32],
         blocks_slice: &[Arc<PhysicalBlock>],
         cache_salt: u64,
+        budget: ColdCaptureBudget,
         extra_keys_for: impl Fn(usize) -> Option<&'k [u64]>,
-    ) -> usize {
+    ) -> ColdCaptureOutcome {
+        let started = Instant::now();
+        let deadline = started + budget.max_walk;
+        let mut outcome = ColdCaptureOutcome::default();
         let bs = self.block_size as usize;
         if bs == 0 {
-            return 0;
+            return outcome;
         }
-        let mut captured = 0usize;
         let mut parent: Option<mlx_paged_attn::ColdCacheKey> = None;
         for (i, block) in blocks_slice.iter().enumerate() {
             // Both lookups are infallible under the callers' own
@@ -1107,38 +1154,123 @@ impl ColdTierWalk<'_> {
                 i,
             );
             if !self.cold.manager.contains(&key) {
-                // Stop the chain on the first non-`Ok(true)`: a saturated
-                // writer queue (`Ok(false)`) or a capture error means this
-                // block did not land, so every descendant would either pay a
-                // full Metal blit only to be dropped again or, worse, be
-                // persisted under a missing parent (a chain hole that is
-                // unrestorable after restart). Breaking keeps the enqueued set
-                // a contiguous prefix.
-                //
-                // That break is also the ONLY bound on this loop. Each
-                // iteration past it costs one blocking `read_block_all_layers`
-                // round trip (~0.2 ms) on the inference thread, and the queue
-                // only refuses while the writer is slower than the capture. On
-                // a cold-tier directory fast enough to invert that — a RAM
-                // disk — nothing refuses and the walk covers the whole prompt
-                // in one turn: ~0.9 s of turn tail at 64 K tokens. See
-                // `docs/paged-cache.md`.
-                match self.cold.manager.capture_and_enqueue(
+                // Budget checks guard the CAPTURE, not the free `contains`
+                // skip above: re-walking a chain already on disk costs an
+                // in-memory index probe per block and must not consume a
+                // turn's capture depth, or a long persisted prefix would stop
+                // the walk before it reached the first block that needs
+                // writing.
+                if outcome.enqueued >= budget.max_blocks {
+                    outcome.stop = ColdCaptureStop::Budget;
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    outcome.stop = ColdCaptureStop::Deadline;
+                    break;
+                }
+                match self.cold.manager.capture_and_enqueue_before(
                     self.pool,
                     block,
                     key,
                     self.cold.fingerprint,
                     toks,
+                    deadline,
                 ) {
-                    Ok(true) => {}
-                    _ => break,
+                    Ok(true) => outcome.enqueued += 1,
+                    // The queue stayed full for the rest of the budget: the
+                    // storage device, not the walk, is the bottleneck.
+                    Ok(false) => {
+                        outcome.stop = ColdCaptureStop::Deadline;
+                        break;
+                    }
+                    // A failed blit leaves nothing to chain off. Descendants
+                    // must not be persisted under a missing parent — that is a
+                    // chain hole, and a hole is unrestorable past its index.
+                    Err(_) => {
+                        outcome.stop = ColdCaptureStop::Error;
+                        break;
+                    }
                 }
             }
             parent = Some(key);
-            captured = i + 1;
+            outcome.blocks = i + 1;
         }
-        captured
+        outcome.elapsed = started.elapsed();
+        outcome
     }
+}
+
+/// How much of the prompt one turn's cold-tier capture walk may persist.
+///
+/// Two independent bounds because they answer different failure modes.
+/// `max_blocks` bounds the STEADY state: how fast the persisted chain is
+/// allowed to ratchet up a long prompt, which is a trade of turn tail against
+/// how many turns it takes before a restore covers anything worth having.
+/// `max_walk` bounds the TAIL: it is what stops a stalled storage device, or a
+/// filesystem so fast that the queue never pushes back, from turning a 64 K
+/// first turn into a second of dead time after the last token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColdCaptureBudget {
+    pub max_blocks: usize,
+    pub max_walk: Duration,
+}
+
+impl Default for ColdCaptureBudget {
+    /// The process-wide budget, from `MLX_COLD_CAPTURE_BLOCKS_PER_TURN` /
+    /// `MLX_COLD_CAPTURE_BUDGET_MS`.
+    fn default() -> Self {
+        let (max_blocks, max_walk) = crate::cold_tier::cold_capture_budget();
+        Self {
+            max_blocks,
+            max_walk,
+        }
+    }
+}
+
+/// Why [`ColdTierWalk::capture_chain`] stopped.
+///
+/// `End` and `Budget` are the healthy states — the walk ran out of prompt, or
+/// spent its depth. `Deadline` means the writer could not keep up within
+/// `max_walk`, so this turn ratcheted less than it was allowed to; `Error`
+/// means a Metal blit failed. Both of the latter are visible per turn in the
+/// `cold_capture_walk` trace line, and `Deadline` additionally warns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColdCaptureStop {
+    /// Walked every full block of the request.
+    #[default]
+    End,
+    /// Spent `max_blocks`.
+    Budget,
+    /// Ran out of `max_walk` waiting on the writer queue.
+    Deadline,
+    /// A capture failed; the chain must stay contiguous, so the walk stopped.
+    Error,
+}
+
+impl ColdCaptureStop {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::End => "end",
+            Self::Budget => "budget",
+            Self::Deadline => "deadline",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// Outcome of one [`ColdTierWalk::capture_chain`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ColdCaptureOutcome {
+    /// Leading blocks the persisted chain covers after this walk. Includes
+    /// blocks that were already on disk, so it is the number a sidecar may
+    /// anchor under — NOT the number this turn wrote.
+    pub blocks: usize,
+    /// Blocks this walk actually handed to the writer queue. What the budget
+    /// counts, and what separates "the chain advanced" from "the chain was
+    /// already there".
+    pub enqueued: usize,
+    pub elapsed: Duration,
+    pub stop: ColdCaptureStop,
 }
 
 /// Per-model session-friendly KV cache adapter.
@@ -1259,7 +1391,12 @@ pub struct PagedKVCacheAdapter {
     /// ceiling). Publishing this lets the family cap its sidecar boundary at
     /// the chain's real reach instead of writing a payload that can never be
     /// chosen. Cleared by `reset_for_new_request` / `release_request`.
-    cold_captured_blocks: u32,
+    cold_capture: ColdCaptureOutcome,
+
+    /// Per-turn budget handed to [`ColdTierWalk::capture_chain`]. Process-wide
+    /// by default ([`ColdCaptureBudget::default`] reads the environment once);
+    /// per-adapter so a test can drive a specific depth without a global.
+    cold_capture_budget: ColdCaptureBudget,
 
     /// Optional FP8 K/V scale manager. When `Some`, the adapter
     /// reads per-layer K/V scales from the manager and threads them into
@@ -1473,7 +1610,8 @@ impl PagedKVCacheAdapter {
             suppress_cold_restore_once: false,
             restored_sidecar: None,
             aux_prefix_unbacked: false,
-            cold_captured_blocks: 0,
+            cold_capture: ColdCaptureOutcome::default(),
+            cold_capture_budget: ColdCaptureBudget::default(),
             #[cfg(target_os = "macos")]
             scale_manager: None,
             #[cfg(target_os = "macos")]
@@ -1520,11 +1658,65 @@ impl PagedKVCacheAdapter {
     }
 
     /// How many leading K/V blocks of this request the persisted cold chain
-    /// covers after the last capture. See the `cold_captured_blocks` field
-    /// doc; `0` when nothing was captured (no tier, no finalize yet, or the
-    /// chain broke on its very first block).
+    /// covers after the last capture. See the `cold_capture` field doc; `0`
+    /// when nothing was captured (no tier, no finalize yet, or the chain broke
+    /// on its very first block).
     pub fn cold_captured_blocks(&self) -> u32 {
-        self.cold_captured_blocks
+        self.cold_capture.blocks.try_into().unwrap_or(u32::MAX)
+    }
+
+    /// Full outcome of the last capture walk: reach, how much of it this turn
+    /// wrote, how long it took, and why it stopped.
+    pub fn cold_capture(&self) -> ColdCaptureOutcome {
+        self.cold_capture
+    }
+
+    /// The per-turn capture budget this adapter walks under.
+    pub fn cold_capture_budget(&self) -> ColdCaptureBudget {
+        self.cold_capture_budget
+    }
+
+    /// Override the per-turn capture budget. Tests drive a specific depth
+    /// through this rather than through the process-wide environment read.
+    pub fn set_cold_capture_budget(&mut self, budget: ColdCaptureBudget) {
+        self.cold_capture_budget = budget;
+    }
+
+    /// Publish one capture walk's outcome.
+    ///
+    /// The trace line carries the whole ratchet: `enqueued` is what this turn
+    /// added, `blocks` is where the chain now reaches, and `stop` says which
+    /// bound ended it. A `deadline` stop additionally warns, because unlike the
+    /// other three it is not a policy decision — it means the storage device
+    /// could not absorb the turn's budget, so the chain ratcheted slower than
+    /// configured and the next restore covers less than it should.
+    fn trace_cold_capture_walk(
+        entry: &str,
+        outcome: ColdCaptureOutcome,
+        budget: ColdCaptureBudget,
+    ) {
+        if inference_trace_enabled() {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] paged cold_capture_walk entry={} blocks={} enqueued={} stop={} elapsed_ms={:.3} budget_blocks={} budget_ms={}",
+                entry,
+                outcome.blocks,
+                outcome.enqueued,
+                outcome.stop.as_str(),
+                outcome.elapsed.as_secs_f64() * 1000.0,
+                budget.max_blocks,
+                budget.max_walk.as_millis(),
+            ));
+        }
+        if outcome.stop == ColdCaptureStop::Deadline {
+            tracing::warn!(
+                target: "mlx_core::paged::cold",
+                "cold-tier capture walk hit its {} ms deadline after {} of {} budgeted blocks; \
+                 the persisted prefix will ratchet slower than configured",
+                budget.max_walk.as_millis(),
+                outcome.enqueued,
+                budget.max_blocks,
+            );
+        }
     }
 
     /// Whether the prefix this request is resuming from has an auxiliary
@@ -1638,7 +1830,7 @@ impl PagedKVCacheAdapter {
         self.aux_prefix_unbacked = false;
         // The previous turn's capture depth describes the previous turn's
         // tokens; a family must never anchor this turn's sidecar on it.
-        self.cold_captured_blocks = 0;
+        self.cold_capture = ColdCaptureOutcome::default();
         #[cfg(target_os = "macos")]
         {
             self.prefill_attention_inputs_cache = None;
@@ -4663,16 +4855,21 @@ impl PagedKVCacheAdapter {
         // Persist the same chain to the SSD cold tier (see
         // [`ColdTierWalk::capture_chain`]).
         if let Some(cold) = self.cold_tier.as_ref() {
-            let captured = ColdTierWalk {
+            let outcome = ColdTierWalk {
                 cold,
                 pool: &self.layer_kv_pool,
                 allocator: &self.allocator,
                 block_size: self.block_size,
             }
-            .capture_chain(&self.request_tokens, blocks_slice, cache_salt, |_| {
-                Some(extra_keys)
-            });
-            self.cold_captured_blocks = captured.try_into().unwrap_or(u32::MAX);
+            .capture_chain(
+                &self.request_tokens,
+                blocks_slice,
+                cache_salt,
+                self.cold_capture_budget,
+                |_| Some(extra_keys),
+            );
+            Self::trace_cold_capture_walk("uniform", outcome, self.cold_capture_budget);
+            self.cold_capture = outcome;
         }
 
         // Mark registered ONLY on the success path so an Err leaves
@@ -4821,16 +5018,21 @@ impl PagedKVCacheAdapter {
         // check above already guarantees a per-block entry for every block
         // handed to the walk.
         if let Some(cold) = self.cold_tier.as_ref() {
-            let captured = ColdTierWalk {
+            let outcome = ColdTierWalk {
                 cold,
                 pool: &self.layer_kv_pool,
                 allocator: &self.allocator,
                 block_size: self.block_size,
             }
-            .capture_chain(&self.request_tokens, blocks_slice, cache_salt, |i| {
-                extra_keys_per_block.get(i).map(Vec::as_slice)
-            });
-            self.cold_captured_blocks = captured.try_into().unwrap_or(u32::MAX);
+            .capture_chain(
+                &self.request_tokens,
+                blocks_slice,
+                cache_salt,
+                self.cold_capture_budget,
+                |i| extra_keys_per_block.get(i).map(Vec::as_slice),
+            );
+            Self::trace_cold_capture_walk("per_block", outcome, self.cold_capture_budget);
+            self.cold_capture = outcome;
         }
 
         self.already_registered = true;
@@ -4871,7 +5073,7 @@ impl PagedKVCacheAdapter {
         self.restored_sidecar = None;
         // The request that carried the obligation is gone.
         self.aux_prefix_unbacked = false;
-        self.cold_captured_blocks = 0;
+        self.cold_capture = ColdCaptureOutcome::default();
         #[cfg(target_os = "macos")]
         {
             self.prefill_attention_inputs_cache = None;
@@ -6508,6 +6710,251 @@ mod tests {
         assert_eq!(
             persisted, 2,
             "exactly one file per full block across both entry points"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Wire a fresh adapter to a cold tier whose writer queue is DELIBERATELY
+    /// far shallower than the capture budget under test, so the only way to
+    /// spend the budget is to wait for slots.
+    ///
+    /// Returns `None` when Metal is unavailable (the caller skips).
+    fn cold_capture_fixture(
+        tag: &str,
+        blocks: u32,
+        block_size: u32,
+        queue_depth: usize,
+    ) -> Option<(
+        PagedKVCacheAdapter,
+        Arc<mlx_paged_attn::ColdCacheManager>,
+        std::path::PathBuf,
+    )> {
+        let allocator = new_allocator(blocks, block_size);
+        let mut adapter = maybe_adapter(Arc::clone(&allocator), block_size)?;
+        let root = std::env::temp_dir().join(format!(
+            "mlx-adapter-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let manager = Arc::new(
+            mlx_paged_attn::ColdCacheManager::open_at(root.clone(), 8 << 30, 0, queue_depth)
+                .expect("temp-dir cold cache must open"),
+        );
+        adapter.set_cold_tier(ColdTierContext {
+            manager: Arc::clone(&manager),
+            fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
+                tag.as_bytes(),
+                b"capture-budget".as_slice(),
+            ]),
+            sidecar_policy: None,
+        });
+        Some((adapter, manager, root))
+    }
+
+    /// Fill the writer queue and PROVE it is full, by offering ballast blocks
+    /// until one is refused.
+    ///
+    /// The ballast is deliberately huge (`mib` megabytes per object) so the
+    /// commit the writer is parked in outlasts, by orders of magnitude, the one
+    /// host blit between this function returning and the capture walk's first
+    /// admission attempt. Without that margin the writer frees a slot in the
+    /// gap and a non-waiting walk sails through, which is exactly how the first
+    /// version of this fixture passed under the mutation it exists to catch.
+    ///
+    /// Returns how long the last, refused offer took — a non-blocking `enqueue`
+    /// must not have waited, and the caller asserts that as a second check that
+    /// the saturation is real rather than a fast writer being missed.
+    fn saturate_cold_queue(
+        manager: &mlx_paged_attn::ColdCacheManager,
+        fingerprint: mlx_paged_attn::ColdCacheFingerprint,
+        mib: usize,
+    ) -> std::time::Duration {
+        let bytes = mib * 1024 * 1024;
+        for i in 0..64u32 {
+            let tokens = vec![i; 4];
+            let ballast = mlx_paged_attn::ColdCacheBlock {
+                key: mlx_paged_attn::ColdCacheKey::chain(
+                    mlx_paged_attn::ColdGroup::Kv,
+                    fingerprint,
+                    None,
+                    &tokens,
+                    &[],
+                    u64::from(i) + 1,
+                    0,
+                ),
+                fingerprint,
+                tokens,
+                layout: mlx_paged_attn::ColdCacheLayout {
+                    block_size: 4,
+                    num_layers: 1,
+                    num_kv_heads: 1,
+                    head_size: 1,
+                    cache_dtype: "BFloat16".to_string(),
+                    key_bytes_per_layer: bytes,
+                    value_bytes_per_layer: bytes,
+                },
+                layers: vec![mlx_paged_attn::ColdLayerBlock {
+                    keys: vec![0u8; bytes],
+                    values: vec![0u8; bytes],
+                }],
+            };
+            let started = Instant::now();
+            if !manager.enqueue(ballast).expect("writer must be alive") {
+                return started.elapsed();
+            }
+        }
+        panic!("the bounded writer queue never refused a ballast block");
+    }
+
+    /// The per-turn capture depth must be the BUDGET, not the writer queue's
+    /// depth.
+    ///
+    /// This is the whole bug. The walk used to stop at the first block the
+    /// bounded queue refused, so a turn persisted `(Q + 1) / (1 - Tc/Tw)`
+    /// blocks — an emergent number, ~12 in the field — and an 8 K-token prompt
+    /// needed ~40 turns before a restore covered anything. Waiting a bounded
+    /// time for a slot decouples the two.
+    ///
+    /// Vacuity is the real hazard here and the ballast is the answer to it. A
+    /// shallow queue alone does NOT saturate: on this machine the tiny test
+    /// blocks commit faster than they blit, so the queue stays empty, both
+    /// admission policies behave identically, and the test passes under its own
+    /// mutation. The walk therefore starts against a queue that has been
+    /// PROVEN full, so its very first block can only land by waiting.
+    #[test]
+    fn capture_walk_persists_the_whole_budget_not_just_the_queue_depth() {
+        const BLOCKS: u32 = 64;
+        const BS: u32 = 4;
+        let Some((mut adapter, manager, root)) =
+            cold_capture_fixture("cold-budget-depth", BLOCKS, BS, 1)
+        else {
+            eprintln!(
+                "skipping capture_walk_persists_the_whole_budget_not_just_the_queue_depth: Metal unavailable"
+            );
+            return;
+        };
+        adapter.set_cold_capture_budget(ColdCaptureBudget {
+            max_blocks: BLOCKS as usize,
+            max_walk: std::time::Duration::from_secs(60),
+        });
+        let fingerprint = adapter
+            .cold_tier()
+            .expect("fixture wires a cold tier")
+            .fingerprint;
+        let refusal = saturate_cold_queue(&manager, fingerprint, 96);
+        assert!(
+            refusal < std::time::Duration::from_millis(50),
+            "the refused ballast proves saturation only if `enqueue` did not wait for it \
+             ({refusal:?})"
+        );
+        let drops_before = manager.stats().queue_drops;
+
+        let tokens: Vec<u32> = (0..BLOCKS * BS).collect();
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(tokens.len() as u32).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
+
+        let outcome = adapter.cold_capture();
+        assert_eq!(
+            outcome.blocks, BLOCKS as usize,
+            "the chain must reach the whole budget, not the queue depth ({outcome:?})"
+        );
+        assert_eq!(
+            outcome.enqueued, BLOCKS as usize,
+            "every block of the budget must have been handed to the writer ({outcome:?})"
+        );
+        assert_eq!(
+            outcome.stop,
+            ColdCaptureStop::End,
+            "the walk ran out of prompt before it ran out of budget ({outcome:?})"
+        );
+        assert_eq!(
+            manager.stats().queue_drops - drops_before,
+            0,
+            "waiting for a slot must replace dropping, not supplement it"
+        );
+
+        assert!(
+            manager.drain(std::time::Duration::from_secs(60)),
+            "every accepted block must commit"
+        );
+        let persisted = std::fs::read_dir(&root)
+            .expect("cold root must be listable")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".safetensors")
+            })
+            .count();
+        assert!(
+            persisted >= BLOCKS as usize,
+            "one committed object per budgeted block, plus the ballast (got {persisted})"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The budget must also STOP the walk, and must count only blocks this
+    /// turn actually wrote — so a turn resumes the ratchet where the last one
+    /// left off instead of re-spending its depth on the chain already on disk.
+    ///
+    /// Turn 1 covers exactly the budget; turn 2 walks the same 16 blocks for
+    /// free through the `contains` probe and then spends its own 16 on the
+    /// next stretch, reaching 32.
+    #[test]
+    fn capture_walk_stops_at_the_block_budget_and_resumes_next_turn() {
+        const BLOCKS: u32 = 64;
+        const BS: u32 = 4;
+        const BUDGET: usize = 16;
+        let Some((mut adapter, manager, root)) =
+            cold_capture_fixture("cold-budget-stop", BLOCKS, BS, 1)
+        else {
+            eprintln!(
+                "skipping capture_walk_stops_at_the_block_budget_and_resumes_next_turn: Metal unavailable"
+            );
+            return;
+        };
+        adapter.set_cold_capture_budget(ColdCaptureBudget {
+            max_blocks: BUDGET,
+            max_walk: std::time::Duration::from_secs(60),
+        });
+
+        let tokens: Vec<u32> = (0..BLOCKS * BS).collect();
+        let turn = |adapter: &mut PagedKVCacheAdapter, id: u32| -> ColdCaptureOutcome {
+            adapter.reset_for_new_request(id).unwrap();
+            adapter.allocate_suffix_blocks(tokens.len() as u32).unwrap();
+            adapter.record_tokens(&tokens).unwrap();
+            adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
+            let outcome = adapter.cold_capture();
+            adapter.release_request().unwrap();
+            outcome
+        };
+
+        let first = turn(&mut adapter, 0);
+        assert_eq!(
+            (first.blocks, first.enqueued, first.stop),
+            (BUDGET, BUDGET, ColdCaptureStop::Budget),
+            "turn 1 must spend exactly its budget and stop there ({first:?})"
+        );
+
+        // The writer must have committed turn 1's chain, or turn 2's `contains`
+        // probes miss and it re-captures the same blocks instead of advancing.
+        assert!(
+            manager.drain(std::time::Duration::from_secs(30)),
+            "turn 1's chain must commit before turn 2 probes for it"
+        );
+
+        let second = turn(&mut adapter, 1);
+        assert_eq!(
+            (second.blocks, second.enqueued, second.stop),
+            (BUDGET * 2, BUDGET, ColdCaptureStop::Budget),
+            "turn 2 must skip turn 1's chain for free and spend its own budget on \
+             the next stretch ({second:?})"
         );
 
         let _ = std::fs::remove_dir_all(&root);

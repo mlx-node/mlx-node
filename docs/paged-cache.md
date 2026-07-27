@@ -165,24 +165,63 @@ dense block `payload_checksum` is 0.061 ms of a 0.432 ms `Tw`, so making it *fre
 (the harness prints that projection) would reach only 0.366 ms — worth ~3 more blocks
 per turn, against invalidating every cache on disk.
 
-`Q` — `DEFAULT_QUEUE_DEPTH`, 8 — is now the binding term again, and it is untouched
-here. `N` cannot run far past `Q + 1` until `Tw` falls under `Tc`, and at the measured
-`Tc` (~0.21 ms) it has not: `Tw` is ~0.31-0.43 ms. Raising `Q` is the next lever, and
-cutting `Tw` ~10x is what makes it affordable — the backlog a larger queue admits now
-drains an order of magnitude faster, and `drain()` at agent exit is bounded by the same
-`Tw`.
+### The per-turn capture budget
 
-**What happens if `Tw` does fall under `Tc`**, on a `MLX_COLD_CACHE_DIR` pointed at a
-RAM disk or a drive faster than the one measured: the queue stops refusing, `N` has no
-frontier, and `capture_chain` walks **every** full block of the request in one turn.
-That is the intent of the walk — the whole prompt persists on its first turn — but the
-cost lands on the inference thread as one blocking `read_block_all_layers` per new
-block, after the turn's last token. It is bounded by prompt length, not by anything
-tunable: a first turn on a 64 K-token prompt is 4096 blocks x ~0.2 ms = **~0.9 s of
-added turn tail**, and nothing counts or caps it. The margin against that today is
-`Tw/Tc` ~ 2x on the measured pair, and the `fsync(2)` `Tw` above is an over-estimate,
-so the real margin is smaller than 2x. Whoever raises `Q` should put a cap and a
-counter on the walk in the same change.
+Everything above derives `N` — how far one turn's chain advances — from the writer.
+That was the bug, not the analysis. `N` was **emergent**: it moved with the
+filesystem, it was never chosen, and end to end it left the restored prefix at
+**1.4-6.2% of the prompt** after a full session.
+
+| prompt | restored | share |
+| ------ | -------- | ----- |
+| 7781 (qwen3)      | 208 | 2.7% |
+| 8025 (qwen3_5_moe)| 496 | 6.2% |
+| 8025 (qwen3_5 27B)| 112 | 1.4% |
+
+Every turn showed `enqueued=12 queueDrops=1`: the walk stopped because the queue
+refused, and it refused at the same place regardless of prompt length.
+
+`capture_chain` now spends an explicit budget instead, and waits for a queue slot
+rather than treating a full queue as a stop:
+
+| | memory pinned | ratchet | disk-independent | bounded tail |
+| --- | --- | --- | --- | --- |
+| break-at-refusal, `Q`=8  | 8 blk  | 9-14, emergent  | no  | no (unbounded on a RAM disk) |
+| break-at-refusal, `Q`=64 | 64 blk | 92-126, emergent| no  | no |
+| **budget, `Q`=8**        | 8 blk  | **= budget, exact** | **yes** | **yes** |
+
+* `MLX_COLD_CAPTURE_BLOCKS_PER_TURN` (default **128** = 2048 tokens at block 16)
+  bounds the steady-state ratchet.
+* `MLX_COLD_CAPTURE_BUDGET_MS` (default **250**) bounds the turn tail.
+* `DEFAULT_QUEUE_DEPTH` stays **8** and is now purely a host-memory bound
+  (`Q x block_bytes` in flight). Raising it no longer buys reach.
+
+The budget counts blocks this turn WROTE, not blocks it walked: a `contains` hit on
+an already-persisted block is an in-memory index probe and does not spend depth, so a
+long persisted prefix cannot stall the ratchet before it reaches the first block that
+needs writing.
+
+**Why it still breaks at a failed capture rather than skipping ahead.** Both
+`kv_chain_upper_bound` and the restore loop stop at the first key that is absent, so
+the chain's REACH is the index of the first hole under either policy — skipping buys
+nothing on the turn that hits the hole, and costs one discarded Metal blit per skipped
+block on the inference thread.
+
+**The RAM-disk case is now answered rather than warned about.** On a
+`MLX_COLD_CACHE_DIR` fast enough that the queue never pushes back, the old walk covered
+the whole prompt in one turn: a 64 K-token first turn was 4096 blocks x ~0.2 ms =
+~0.9 s of turn tail, uncounted and uncapped. The budget caps it at 128 blocks, the
+deadline caps it at 250 ms, and `[MLX_TRACE] paged cold_capture_walk … stop= elapsed_ms=`
+reports both per turn (`stop=deadline` also warns, since it means the device could not
+absorb the configured budget).
+
+**One hazard the deeper walk creates, fixed in the same change.** Every hybrid family
+offers its state sidecar microseconds after the K/V walk returns, onto the same queue.
+While the walk stopped *because* the queue was full, a non-blocking sidecar offer was
+guaranteed to lose — and a dropped sidecar is worse than a dropped block, because the
+restore reconciles down to the deepest boundary a validated sidecar backs, so losing it
+makes the turn's whole chain unusable. The families now use
+`enqueue_sidecar_before(…, now + budget.max_walk)`.
 
 ### gemma4's sliding-window sidecar
 
