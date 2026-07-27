@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Hardened-runtime entitlements. Deliberately minimal: one entry.
+
+  com.apple.security.cs.allow-jit
+      V8 needs it. Nothing else here does.
+
+  Three entitlements that are conventional in Electron/local-LLM apps and are
+  deliberately NOT here:
+
+  allow-unsigned-executable-memory
+      Apple's own guidance is that it materially increases attack surface, and on
+      arm64 it buys nothing — W^X is always enforced there. allow-jit already
+      covers V8's legitimate need.
+
+  disable-library-validation
+      Only required to dlopen third-party code signed by someone else. We sign
+      our single .node with our own Team ID, so library validation passes. (oMLX
+      needs this for its bundled CPython .so sprawl; we have no equivalent.)
+
+  Any Metal/GPU entitlement
+      There is none to add. Shader compilation does not run in our process — it
+      is out-of-process in Apple's own signed MTLCompilerService.xpc.
+
+  Note also what is NOT needed for the network sidecar: the inference server
+  binds 127.0.0.1, and outside the App Sandbox there is no network entitlement to
+  request. com.apple.security.network.* apply to sandboxed apps only, and this
+  app is hardened-runtime, not sandboxed.
+-->
+<plist version="1.0">
+  <dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+  </dict>
+</plist>
