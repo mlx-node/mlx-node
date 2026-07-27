@@ -81,7 +81,18 @@ echo "[2/4] every Mach-O carries a Team ID"
 # and were killed. Batching turns it into a handful of execs.
 MACHO_LIST="$(mktemp)"
 trap 'rm -f "$MACHO_LIST"' EXIT
-find "$APP" -type f -print0 | xargs -0 file | sed -n 's/^\(.*\): .*Mach-O.*/\1/p' > "$MACHO_LIST"
+# Parsing `file` output for NAMES is fiddly and two obvious forms are both wrong. `sed 's/^\(.*\): .*Mach-O.*/\1/p'` is
+# WRONG here and was: `.*` is greedy, and `file` prints
+#   path: Mach-O universal binary with 2 architectures: [x86_64:...] [arm64:...]
+# so the capture ran past the second colon. `awk -F': '` fails too, because a
+# universal binary emits one line PER ARCHITECTURE and those use a different
+# separator entirely:
+#   path (for architecture x86_64):<TAB>Mach-O 64-bit dynamically linked ...
+# So: cut at the FIRST colon, strip a trailing " (for architecture …)", dedupe.
+# Thin binaries parsed fine under both broken versions, which is exactly why this
+# survived the first pass.
+find "$APP" -type f -print0 | xargs -0 file \
+  | awk '/Mach-O/ { i = index($0, ":"); if (i == 0) next; n = substr($0, 1, i - 1); sub(/ \(for architecture [^)]*\)$/, "", n); print n }' | sort -u > "$MACHO_LIST"
 macho_count="$(wc -l < "$MACHO_LIST" | tr -d ' ')"
 
 while IFS= read -r f; do

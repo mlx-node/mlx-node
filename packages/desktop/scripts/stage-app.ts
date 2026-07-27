@@ -17,7 +17,7 @@
  * registry and could ship something nobody ran.
  */
 
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 interface PackageJson {
@@ -117,6 +117,37 @@ export function runtimeClosure(
   };
 }
 
+/**
+ * Directories inside a published package that are never imported at runtime.
+ *
+ * Pruning them is not a size optimisation that happens to help — it is required.
+ * `@electron/osx-sign` walks the bundle and tries to sign anything that looks like
+ * a binary, and `@earendil-works/pi-coding-agent` ships
+ * `examples/extensions/doom-overlay/doom/build/doom.wasm`. A .wasm is not a Mach-O,
+ * codesign fails on it, and the whole signing step dies on a DOOM build that has no
+ * business being in an inference app in the first place.
+ *
+ * Deliberately conservative: only directories that are unambiguously not shipping
+ * code. `src/` is NOT pruned — plenty of packages resolve their entry points into
+ * it — and neither is anything that could be a runtime asset.
+ */
+const NON_RUNTIME_DIRS = new Set(['examples', 'example', '__tests__', '.github', 'docs']);
+
+function pruneNonRuntime(dir: string): number {
+  let removed = 0;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    if (NON_RUNTIME_DIRS.has(entry.name)) {
+      rmSync(join(dir, entry.name), { recursive: true, force: true });
+      removed += 1;
+      continue;
+    }
+    if (entry.name === 'node_modules') continue;
+    removed += pruneNonRuntime(join(dir, entry.name));
+  }
+  return removed;
+}
+
 export interface StageResult {
   appDir: string;
   externalCount: number;
@@ -125,6 +156,8 @@ export interface StageResult {
   skippedOptional: string[];
   /** napi prebuilt packages deliberately left out; the payload ships once, in Resources/native. */
   excludedPrebuilt: string[];
+  /** Count of examples/docs/test directories removed from staged packages. */
+  prunedDirs: number;
 }
 
 /**
@@ -193,11 +226,14 @@ export function stageApp(opts: {
     }
   }
 
+  const prunedDirs = pruneNonRuntime(modules);
+
   return {
     appDir: stageDir,
     externalCount: external.length,
     workspaceCount: workspace.length,
     skippedOptional,
     excludedPrebuilt,
+    prunedDirs,
   };
 }

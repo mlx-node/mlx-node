@@ -78,6 +78,7 @@ run('install_name_tool', ['-id', `@rpath/${NATIVE_FILES[0]}`, stagedAddon]);
 
 const staged = stageApp({ repoRoot: REPO_ROOT, desktopDir: APP_DIR, stageDir: STAGE_APP, roots: RUNTIME_ROOTS });
 console.log(`staged ${staged.externalCount} external + ${staged.workspaceCount} workspace packages`);
+console.log(`  pruned ${staged.prunedDirs} examples/docs/test dirs from staged packages`);
 if (staged.excludedPrebuilt.length > 0) {
   console.log(`  excluded ${staged.excludedPrebuilt.join(', ')} — payload ships once, in Resources/native`);
 }
@@ -131,20 +132,39 @@ if (sign) {
   const identity = process.env.SIGN_IDENTITY ?? findIdentity();
   const entitlements = join(APP_DIR, 'build', 'entitlements.mac.plist');
 
-  // Inside-out, and the addon FIRST: signing the outer bundle seals whatever its
-  // nested Mach-O files look like at that moment, so anything signed afterwards
-  // breaks the outer seal. The addon also takes --identifier, to replace the
-  // `libmlx_core.dylib` build-artifact identity.
-  run('codesign', codesignArgs({ file: stagedAddonInBundle(resources), identity, identifier: `${BUNDLE_ID}.mlx-core` }));
+  // Signed explicitly rather than with @electron/osx-sign. That library decides
+  // what to sign by SNIFFING FILE CONTENT (isBinaryFile), and with `asar: false`
+  // every asset is a loose file — so it tried to codesign
+  // `.../doom-overlay/doom/build/doom.wasm` and then `.../assets/clankolas.png`
+  // and died on each. `file` reports the actual Mach-O header instead, which is
+  // the same detection the release gate uses, so what gets signed here and what
+  // gets checked there cannot drift apart.
+  const machO = execFileSync('bash', ['-c',
+    `find ${JSON.stringify(appPath)} -type f -print0 | xargs -0 file | awk '/Mach-O/ { i = index($0, ":"); if (i == 0) next; n = substr($0, 1, i - 1); sub(/ \\(for architecture [^)]*\\)$/, "", n); print n }' | sort -u`,
+  ], { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 }).split('\n').filter(Boolean);
 
-  const { sign: osxSign } = await import('@electron/osx-sign');
-  await osxSign({
-    app: appPath,
-    identity,
-    platform: 'darwin',
-    optionsForFile: () => ({ entitlements, hardenedRuntime: true, timestamp: true }),
-  });
-  console.log('signed.');
+  // Inside-out. Signing a bundle seals whatever its nested code looks like at that
+  // moment, so anything signed afterwards breaks the outer seal. Deepest path
+  // first gives that ordering without having to model the bundle tree.
+  const byDepth = (a: string, b: string): number => b.split('/').length - a.split('/').length;
+
+  for (const file of machO.sort(byDepth)) {
+    // The addon carries `Identifier=libmlx_core.dylib`, a build-artifact name that
+    // would otherwise become this app's identity for its largest binary.
+    const identifier = file.endsWith(NATIVE_FILES[0]) ? `${BUNDLE_ID}.mlx-core` : undefined;
+    run('codesign', codesignArgs({ file, identity, entitlements, identifier }));
+  }
+
+  // Nested .app bundles (the Electron helpers) then the outer bundle, same order.
+  const bundles = execFileSync('bash', ['-c',
+    `find ${JSON.stringify(appPath)} -name '*.app' -type d`,
+  ], { encoding: 'utf-8' }).split('\n').filter(Boolean);
+  for (const bundle of bundles.sort(byDepth)) {
+    run('codesign', codesignArgs({ file: bundle, identity, entitlements }));
+  }
+  run('codesign', codesignArgs({ file: appPath, identity, entitlements }));
+
+  console.log(`signed ${machO.length} Mach-O + ${bundles.length + 1} bundles.`);
 } else {
   console.log('unsigned (pass --sign for Developer ID).');
 }
