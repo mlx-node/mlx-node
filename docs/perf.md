@@ -424,6 +424,35 @@ The Qwen3.5 GDN recurrence uses the **per-step** kernel by default on **every** 
 | FP8 E4M3 import | Source `.weight_scale_inv` checkpoints are dequantized **before** expert stacking; no re-quantization after stacking                              |
 | Plain FP8 weights | Unsloth DGX high class: `fp8_e4m3` raw U8 weights + per-output BF16 scales; current runtime dequantizes once to BF16 and runs A16 matmul/gather-mm (not native W8A8) |
 | FP8 KV cache | Paged-adapter only — `KVCacheDType::Fp8` with per-layer scale management via `KvScaleManager`. FP8 KV is intentionally rejected by the flat-path attach. |
+| ggml K-quants | `--gguf-kquant` on a GGUF import; modes `q6k` / `q4k` / `q5k`. Consume-only — `quantize()` throws, since producing them needs ggml's `make_qkx2_quants` search |
+| Symmetric ggml Q4_0 / Q8_0 | GGUF import, automatic. `w = d*(q - Z)` has no stored offset, so `.biases` is omitted and rebuilt from `symmetric_zero_point` in `config.json` |
+
+**K-quants are affine per sub-block**, which is why they need no new kernel family: `scale`/`bias` are computed by a two-level decode instead of a scalar load, and `qdot` / `qouter` / `dequantize` are unchanged.
+
+```
+Q4_K/Q5_K   y = d*sc[j]*q - dmin*m[j]   ->  scale = d*sc[j]   bias = -dmin*m[j]
+Q6_K        y = d*sc[j]*(q-32)          ->  scale = d*sc[j]   bias = -32*d*sc[j]
+```
+
+Sub-scales ride in the existing `.scales` / `.biases` sidecars as interleaved pairs, so FFI arity stays at two companion arrays. **`.biases` holds ggml's `d`, a scale — not an additive bias**, and its dtype must stay `float16`: `resolve_kquant_group` requires it exactly, and the converter's dtype passes skip it for that reason (`kquant_biases_to_preserve`).
+
+Density, and where it differs from ggml:
+
+| mode | mlx-node | ggml | why |
+| ---- | -------- | ---- | --- |
+| q6k | 6.5625 bpw | 6.5625 | exact |
+| q4k | 4.6250 bpw | 4.5000 | sub-scales stored unpacked, +0.125 |
+| q5k | 5.6250 bpw | 5.5000 | same |
+| Q4_0 | 4.5000 bpw | 4.5000 | exact, once the derived bias is dropped |
+| Q8_0 | 8.5000 bpw | 8.5000 | exact, same reason |
+
+ggml packs Q4_K/Q5_K sub-scales into 6 bits. Storing them unpacked costs 0.125 bpw but keeps the affine pointer-walk contract (`scales += block_size/group_size`) intact at ~20 call sites and keeps a divergent branch out of `qmv`'s innermost loop.
+
+### K-quants and the NAX tensor op
+
+K-quant prefill is routed onto the NAX tensor op through a `nax_supports_mode()` allowlist in `metal/quantized.cpp`. **Do not gate this on `is_nax_available()`** — that is a device capability shared with matmul and SDPA. With the allowlist closed, K-quant `qmm_t` runs 3.40–3.49× the affine control; open, it is level with affine (`M=512 N=8192 K=8192`, bf16, M5 Max). That is removal of a penalty, not a win over affine — an A/A affine control on the same harness lands 0.53% off unity, which is the noise floor those deltas sit near.
+
+`kquant_nax_bench` only means anything on `applegpu_g17s` / macOS ≥ 26.2; elsewhere both arms fall back to the same simdgroup kernel. `KQ_NAX_REQUIRE=1` turns its skip — and the NAX band inside `kquant_mode_guards` — into a hard failure.
 
 ### Recipes
 

@@ -28,6 +28,24 @@ The bridge between MLX (C++) and the NAPI/Rust layer lives in `crates/mlx-sys/`.
 
 `crates/mlx-sys/src/lib.rs` is the FFI declaration root (~300 `pub fn` wrappers around `unsafe extern "C-unwind"` blocks).
 
+Because the wrappers are `extern "C-unwind"`, a C++ function that lets an exception escape **aborts the process** rather than returning an `Err` — every `.cpp` here catches and returns `nullptr`, and the Rust side turns a null handle into an error. A panic on a load path is therefore not recoverable; guards that want to name a bad tensor must run *before* the FFI call, not rely on MLX rejecting it.
+
+### Two build-side inputs that are not `.cpp` files
+
+| Path | Purpose |
+| ---- | ------- |
+| `crates/mlx-sys/cmake/switch-exhaustiveness.cmake` | Injected into the vendored MLX build via `CMAKE_PROJECT_TOP_LEVEL_INCLUDES` from `crates/mlx-sys/build.rs` — **macOS only** |
+| `crates/mlx-core/vendor/ggml/ggml_kquant_ref.{c,h}` | ggml's own Q4_K/Q5_K/Q6_K decoders, vendored verbatim, compiled by `crates/mlx-core/build.rs` as the K-quant parity oracle |
+
+**`switch-exhaustiveness.cmake` exists because `-w` is absolute in clang.** The `cmake` crate composes `CMAKE_CXX_FLAGS` through `cc` with warnings off, which appends `-w`; clang then drops every non-error diagnostic and keeps dropping it however late a `-W`/`-Werror=` flag appears. The file rewrites `-w` to `-Wno-everything` (same silence, but later flags can re-enable individual diagnostics) and then sets `-Werror=switch`. That makes a `switch` over `QuantizationMode` with no `default:` label a **compile error** when an enumerator is missing — which is the point: `QuantizationMode` is append-only and serialized by ordinal through `export.cpp`, so adding a mode must break the build rather than fall through silently. (`primitives.h` states the same contract: reordering or removing a mode reinterprets every previously exported graph as a different quantization format.)
+
+Two limits of that guard, both deliberate and both worth knowing before trusting it:
+
+- **macOS only.** The Linux/CUDA branch of `build.rs` does not apply the file, because `-Wno-everything` is clang-only and nvcc drives host compilation through GCC. A `switch` that misses an enumerator in CUDA-only code compiles clean; CUDA sources are built nowhere else in CI, so those have to be walked by hand.
+- **Needs CMake ≥ 3.29.** `CMAKE_PROJECT_TOP_LEVEL_INCLUDES` was introduced there, while the vendored `mlx/CMakeLists.txt` only declares `cmake_minimum_required(VERSION 3.25)` and nothing pins a toolchain cmake. On 3.25–3.28 the define is silently ignored and the guard is inert rather than failing loudly.
+
+**The vendored ggml reference is a test oracle, not a runtime dependency.** It is compiled with `-ffp-contract=off` — contracting `d * sc * q` into an fma would round differently from ggml's own build and quietly move the reference. Its three functions are referenced by no production path, so the linker drops the object from the cdylib and only the test binaries pull it in. `ggml_quants_upstream.inc` is a byte-verbatim upstream anchor guarded by `vendored_ggml_reference_is_verbatim`; **never reformat it** (a repo-wide `vp fmt` once cut it from 117 lines to 43).
+
 ## Compiled forward paths
 
 Qwen3.5 dense + MoE decode use `mlx::core::compile` to cache the forward graph: trace once, reuse via `compile_replace`. Key design points:

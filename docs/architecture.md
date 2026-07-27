@@ -99,6 +99,8 @@ mlx-node/
 
 If you added a **new** `.cpp` file, run `rm -rf target/release/build/mlx-sys-*` once — the `cc` crate caches the source-file list across builds and won't pick up new files otherwise.
 
+`mlx-core` also has a `build.rs` that drives `cc`, for vendored C compiled as a test oracle rather than as part of the bridge (`crates/mlx-core/vendor/ggml/`, see [ffi-cpp.md](ffi-cpp.md)). The same caching applies, so a new `.c` file there needs `rm -rf target/release/build/mlx-core-*`.
+
 ## Adding a TypeScript utility
 
 1. Pick the package by responsibility: `lm` (inference), `trl` (training), `vlm` (vision), `server` (HTTP), `cli` (CLI).
