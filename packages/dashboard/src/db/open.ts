@@ -18,7 +18,7 @@ export interface DashboardDb {
  * rather than migrated in place. The index is disposable and repopulated from
  * JSONL on boot, so a rebuild never loses source-of-truth data.
  */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS sessions (
@@ -71,6 +71,14 @@ CREATE TABLE IF NOT EXISTS traces (
   cold_misses INTEGER,
   cold_bytes_written INTEGER,
   cold_bytes_restored INTEGER,
+  cold_root TEXT,
+  cold_enabled INTEGER,
+  cold_enqueued INTEGER,
+  cold_queue_drops INTEGER,
+  cold_evictions INTEGER,
+  cold_corruptions INTEGER,
+  cold_corruptions_total INTEGER,
+  cold_queue_drops_total INTEGER,
   source_file TEXT
 );
 
@@ -84,6 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_turns_session_id ON turns (session_id);
 CREATE INDEX IF NOT EXISTS idx_traces_session_id ON traces (session_id);
 CREATE INDEX IF NOT EXISTS idx_traces_root_session_id ON traces (root_session_id);
 CREATE INDEX IF NOT EXISTS idx_traces_trace_id ON traces (trace_id);
+CREATE INDEX IF NOT EXISTS idx_traces_cold_root ON traces (cold_root);
 `;
 
 /** SQLite errors that mean the file on disk is not a usable database. */

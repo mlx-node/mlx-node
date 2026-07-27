@@ -5,6 +5,8 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -13,13 +15,15 @@ import {
 } from 'node:fs';
 import { request, type IncomingMessage, type ServerResponse } from 'node:http';
 import { homedir, networkInterfaces, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { canonicalCacheRoot, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import { createDownloadSseSender, handleApiRequest, type ApiDeps } from '../src/api.js';
 import type { DownloadEvent } from '../src/download.js';
+import { TRACE_RETENTION_DAYS } from '../src/ingest/traces.js';
 import { agentSessionsRoot } from '../src/paths.js';
 import { bracketHost, startDashboardServer, type DashboardServer } from '../src/server.js';
 
@@ -1327,6 +1331,387 @@ describe('dashboard server — cache', () => {
 
     const after = (await (await fetch(`${server.url}/api/cache`)).json()) as { disk: { entryCount: number } };
     expect(after.disk.entryCount).toBe(1);
+  });
+});
+
+/**
+ * F1 — the Cache page's hit rate and trend must describe THE CACHE IT IS
+ * SHOWING.
+ *
+ * Before the root filter, `disk` was a filesystem scan of one root while
+ * `trend` was an unfiltered `SUM()` over every trace row ever ingested: a
+ * dashboard pointed at an empty cache dir reported `exists: false,
+ * entryCount: 0` beside a hit rate summed across every cache directory the
+ * machine had ever used. Nothing in the suite could have caught it — every
+ * existing /api/cache assertion read `body.disk.*` and none had ever touched
+ * `trend`.
+ *
+ * These fixtures deliberately make the WRONG answer much larger than the right
+ * one, so a regression cannot hide inside a plausible-looking number.
+ */
+describe('dashboard server — cache trend scoping', () => {
+  /** Canonical spelling of the fixture cache root, resolved independently of the
+   *  implementation (`/var/folders/...` → `/private/var/folders/...` on macOS). */
+  let canonicalCacheRootPath: string;
+
+  /** Append one trace JSONL line shaped like `MetricsTrace.record()` output. */
+  function writeTraceFile(name: string, records: Array<Record<string, unknown>>): void {
+    const lines = records.map((r) => JSON.stringify({ v: 1, model: 'm', durationMs: 1, finishReason: 'stop', ...r }));
+    writeFileSync(join(tracesDir, name), `${lines.join('\n')}\n`);
+  }
+
+  interface CacheBody {
+    disk: { root: string; entryCount: number };
+    trend: Array<{ day: string; hits: number; misses: number; bytesWritten: number; bytesRestored: number }>;
+    scope: {
+      root: string;
+      trendWindowDays: number;
+      legacy: { turns: number; hits: number; misses: number };
+      otherRoots: { turns: number; hits: number; misses: number };
+      unattributed: { turns: number; hits: number; misses: number };
+      disabledTurns: number;
+    };
+    health: {
+      enqueued: number;
+      queueDrops: number;
+      evictions: number;
+      corruptions: number;
+      corruptionsTotal: number;
+      queueDropsTotal: number;
+    };
+    restoreFamilies: string[];
+  }
+
+  function totals(body: CacheBody): { hits: number; misses: number } {
+    return body.trend.reduce((a, r) => ({ hits: a.hits + r.hits, misses: a.misses + r.misses }), {
+      hits: 0,
+      misses: 0,
+    });
+  }
+
+  beforeEach(async () => {
+    canonicalCacheRootPath = realpathSync(cacheRoot);
+    // Start from an empty trace dir: the shared fixtures carry their own
+    // (legitimately unattributed) cold rows, and this suite asserts exact
+    // totals so a fixture edit can never quietly move them.
+    for (const n of readdirSync(tracesDir)) if (n.endsWith('.jsonl')) unlinkSync(join(tracesDir, n));
+    // 11 hits / 3 misses belong to THIS cache; 9999 hits belong to another cache
+    // dir; 5000 hits predate attribution entirely. Anything unscoped reads 15010.
+    writeTraceFile('2026-07-20-1.jsonl', [
+      {
+        traceId: 'mine-1',
+        ts: Date.UTC(2026, 6, 20, 10),
+        coldHits: 7,
+        coldMisses: 2,
+        coldBytesWritten: 100,
+        coldBytesRestored: 700,
+        coldRoot: canonicalCacheRootPath,
+        coldEnabled: true,
+        coldEnqueued: 5,
+        coldQueueDrops: 1,
+        coldEvictions: 2,
+        coldCorruptions: 0,
+        // DISTINCT non-zero cumulative totals across the two attributed rows so
+        // MAX (5) and SUM (7) disagree. With 0 and 2 they were equal and the
+        // reducer the acceptance bar depends on could be swapped for SUM with
+        // the suite still green.
+        coldCorruptionsTotal: 2,
+        coldQueueDropsTotal: 4,
+      },
+      {
+        traceId: 'mine-2',
+        ts: Date.UTC(2026, 6, 21, 10),
+        coldHits: 4,
+        coldMisses: 1,
+        coldBytesWritten: 50,
+        coldBytesRestored: 400,
+        coldRoot: canonicalCacheRootPath,
+        coldEnabled: true,
+        coldEnqueued: 3,
+        coldQueueDrops: 0,
+        coldEvictions: 1,
+        coldCorruptions: 2,
+        coldCorruptionsTotal: 5,
+        coldQueueDropsTotal: 4,
+      },
+      {
+        traceId: 'other-root-1',
+        ts: Date.UTC(2026, 6, 20, 11),
+        coldHits: 9999,
+        coldMisses: 7,
+        coldRoot: '/some/other/cache/mlx-paged-v1',
+        coldEnabled: true,
+        coldCorruptions: 55,
+        coldCorruptionsTotal: 55,
+      },
+      // No coldRoot AND no coldEnabled: written by a build that predates
+      // attribution. Not "the tier was off" — genuinely unknown.
+      { traceId: 'legacy-1', ts: Date.UTC(2026, 6, 19, 10), coldHits: 5000, coldMisses: 11 },
+      // Tier explicitly off this turn: known, attributable, and zero.
+      { traceId: 'disabled-1', ts: Date.UTC(2026, 6, 20, 12), coldHits: 0, coldMisses: 0, coldEnabled: false },
+      // The partition hole: tier ON, root NULL. Matches none of `cold_root = ?`,
+      // `cold_root IS NULL AND cold_enabled IS NULL`, `cold_root <> ?`, or
+      // `cold_enabled = 0` — so before the fourth bucket these 777 hits were
+      // reported by nothing at all.
+      {
+        traceId: 'orphan-1',
+        ts: Date.UTC(2026, 6, 20, 13),
+        coldHits: 777,
+        coldMisses: 5,
+        coldEnabled: true,
+      },
+    ]);
+    await ingest();
+  });
+
+  it('scopes the hit/miss trend to the cache root being shown', async () => {
+    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    // ONLY this root's rows. 15010 would mean the filter is gone.
+    expect(totals(body)).toEqual({ hits: 11, misses: 3 });
+    expect(body.scope.root).toBe(canonicalCacheRootPath);
+    // Two days, two rows — neither the other root's day nor the legacy day.
+    expect(body.trend.map((r) => r.day)).toEqual(['2026-07-20', '2026-07-21']);
+    expect(body.trend.reduce((a, r) => a + r.bytesRestored, 0)).toBe(1100);
+    expect(body.trend.reduce((a, r) => a + r.bytesWritten, 0)).toBe(150);
+  });
+
+  // The decision, pinned: a NULL-root row is EXCLUDED from the shown cache's
+  // rate (counting it is the original defect) but REPORTED in its own bucket
+  // (dropping it silently would make a real history vanish next to a root path
+  // the user is staring at). It is bounded — trace JSONL retention prunes it —
+  // so the bucket empties on its own.
+  it('excludes legacy NULL-root rows from the rate but reports them as their own bucket', async () => {
+    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    expect(totals(body).hits).toBe(11);
+    expect(body.scope.legacy).toEqual({ turns: 1, hits: 5000, misses: 11 });
+    expect(body.scope.trendWindowDays).toBe(TRACE_RETENTION_DAYS);
+    // A turn that ran with the tier OFF is a different story from an
+    // unattributable one, and must not be folded into `legacy`.
+    expect(body.scope.disabledTurns).toBe(1);
+  });
+
+  /**
+   * The buckets must PARTITION the table, not merely be disjoint. A row with
+   * `cold_enabled = 1` and a NULL `cold_root` matched no arm, so its 777 hits
+   * were reported by nothing: trend 0, legacy 0, otherRoots 0, disabledTurns 0.
+   * That is the silent-zero the whole scope design exists to refuse, in the one
+   * shape it could still take.
+   *
+   * Asserted as a CONSERVATION law against the table's own total rather than by
+   * enumerating the arms, so any future fifth shape has to be accounted for too.
+   */
+  it('accounts for every trace row: the buckets partition the table, they do not just avoid overlap', async () => {
+    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    expect(body.scope.unattributed).toEqual({ turns: 1, hits: 777, misses: 5 });
+    const shown = totals(body);
+    const accounted = {
+      hits: shown.hits + body.scope.legacy.hits + body.scope.otherRoots.hits + body.scope.unattributed.hits,
+      misses: shown.misses + body.scope.legacy.misses + body.scope.otherRoots.misses + body.scope.unattributed.misses,
+    };
+    // Every cold lookup the fixture wrote: 11 + 5000 + 9999 + 777 hits.
+    expect(accounted).toEqual({ hits: 15_787, misses: 26 });
+  });
+
+  it('reports another cache directory as otherRoots rather than merging it in', async () => {
+    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    expect(body.scope.otherRoots).toEqual({ turns: 1, hits: 9999, misses: 7 });
+    expect(totals(body).hits).toBe(11);
+  });
+
+  // The writer and the reader are different PROCESSES resolving the root from
+  // their own environments. A raw string compare is a silent-zero trap: on macOS
+  // `/tmp` → `/private/tmp` alone makes two identical-looking spellings unequal.
+  it('matches a symlinked cache root through canonicalization', async () => {
+    const linkRoot = join(base, 'cache-link');
+    symlinkSync(cacheRoot, linkRoot);
+    const linked = await startDashboardServer({
+      port: 0,
+      dbPath: join(base, 'linked.db'),
+      sessionsRoot,
+      tracesDir,
+      modelsDir,
+      cacheRoot: linkRoot,
+      webRoot,
+    });
+    try {
+      expect((await fetch(`${linked.url}/api/ingest`, { method: 'POST' })).status).toBe(200);
+      const body = (await (await fetch(`${linked.url}/api/cache`)).json()) as CacheBody;
+      // Rows were written under the REAL path; the dashboard was pointed at the
+      // symlink. A lexical compare would report a flat zero here.
+      expect(body.scope.root).toBe(canonicalCacheRootPath);
+      expect(totals(body)).toEqual({ hits: 11, misses: 3 });
+    } finally {
+      await linked.close();
+    }
+  });
+
+  // The four counters `coldCacheStats()` always exposed and the agent always
+  // dropped. "corruptions must be 0" is the stated acceptance bar for admitting
+  // a family to the restore allowlist and was previously uncheckable from
+  // anything the user runs.
+  it('surfaces the cold-tier counters the agent used to drop, scoped to this cache', async () => {
+    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    expect(body.health.enqueued).toBe(8);
+    expect(body.health.queueDrops).toBe(1);
+    expect(body.health.evictions).toBe(3);
+    expect(body.health.corruptions).toBe(2);
+    // Cumulative totals reduce with MAX, not SUM (each process restarts at 0),
+    // and are scoped — the other root's 55 corruptions must not leak in.
+    //
+    // The two attributed rows carry 2 and 5, so MAX is 5 and SUM would be 7:
+    // asserting 5 is what makes the reducer, not just the scope, load-bearing.
+    // Three processes that each saw 2 corruptions must report 2 under a label
+    // that says "cumulative max", never 6.
+    expect(body.health.corruptionsTotal).toBe(5);
+    // Same shape for drops: both rows carry 4, so MAX is 4 and SUM would be 8.
+    expect(body.health.queueDropsTotal).toBe(4);
+  });
+
+  // TRACE_RETENTION_DAYS is exported precisely so the window the UI prints and
+  // the window the pruner enforces can never drift. Asserting the literal 30
+  // passes whether `api.ts` imports the constant or hardcodes it, which defeats
+  // the point — so pin the COUPLING: whatever the constant says, the payload
+  // says.
+  it('reports the trend window as the trace retention constant, not a copy of it', async () => {
+    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    expect(body.scope.trendWindowDays).toBe(TRACE_RETENTION_DAYS);
+    // Guard the guard: a constant that went 0/NaN would make the assert vacuous.
+    expect(TRACE_RETENTION_DAYS).toBeGreaterThan(0);
+  });
+
+  // F5: the UI must not carry a fifth hardcoded copy of the allowlist, so the
+  // server sends it. The browser bundle cannot import @mlx-node/agent (it
+  // transitively loads the native addon), and a hardcoded array in cache.tsx
+  // would sit outside the native drift guard.
+  it('serves the cold-tier restore allowlist so the SPA never hardcodes it', async () => {
+    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    expect(body.restoreFamilies).toEqual(coldTierRestoreFamilyList());
+    expect(body.restoreFamilies.length).toBeGreaterThan(1);
+  });
+});
+
+/**
+ * The join key a real `mlx dashboard` run actually uses.
+ *
+ * Every other cache test hands the server an explicit `cacheRoot`, but
+ * `packages/cli/src/commands/dashboard.ts` never supplies one: in production
+ * `deps.cacheRoot` is `undefined` and the scope root comes from
+ * `coldCacheRoot(undefined)` → `defaultColdCacheDir()` → the `mlx-paged-v1`
+ * child of `MLX_COLD_CACHE_DIR`, canonicalized. Whether THAT string equals what
+ * the agent recorded was asserted nowhere — both sides were literals the tests
+ * chose. A one-segment disagreement shows the Cache page a flat 0/0 trend beside
+ * a populated disk scan: quieter than the 16189 the scoping fix was written to
+ * kill, and just as wrong.
+ *
+ * `MLX_COLD_CACHE_DIR` is pointed at a SYMLINK here so the canonicalization step
+ * is load-bearing on every platform, not only where `tmpdir()` happens to sit
+ * under one.
+ */
+describe('dashboard server — production cache root (no explicit cacheRoot)', () => {
+  interface DefaultCacheBody {
+    disk: { root: string; exists: boolean; entryCount: number };
+    trend: Array<{ hits: number; misses: number }>;
+    scope: { root: string; otherRoots: { turns: number }; legacy: { turns: number } };
+  }
+
+  let envBase: string;
+  let realColdDir: string;
+  let linkedColdDir: string;
+  /** Where the native tier actually opens: `<MLX_COLD_CACHE_DIR>/mlx-paged-v1`. */
+  let managedRoot: string;
+  let previousEnv: string | undefined;
+  let defaulted: DashboardServer;
+
+  async function cacheBody(): Promise<DefaultCacheBody> {
+    return (await (await fetch(`${defaulted.url}/api/cache`)).json()) as DefaultCacheBody;
+  }
+
+  beforeEach(async () => {
+    envBase = mkdtempSync(join(tmpdir(), 'dash-coldenv-'));
+    realColdDir = join(envBase, 'cold');
+    managedRoot = join(realColdDir, 'mlx-paged-v1');
+    mkdirSync(managedRoot, { recursive: true });
+    writeFileSync(join(managedRoot, hexBlock(9)), Buffer.alloc(512));
+    linkedColdDir = join(envBase, 'cold-link');
+    symlinkSync(realColdDir, linkedColdDir);
+
+    previousEnv = process.env.MLX_COLD_CACHE_DIR;
+    process.env.MLX_COLD_CACHE_DIR = linkedColdDir;
+
+    // One trace row, written the way the agent writes it: the root goes through
+    // `canonicalCacheRoot` in `provider/index.ts` before `record()` sees it, so
+    // the WRITER side of the join is production code here, not a literal.
+    for (const n of readdirSync(tracesDir)) if (n.endsWith('.jsonl')) unlinkSync(join(tracesDir, n));
+    writeFileSync(
+      join(tracesDir, '2026-07-22-default.jsonl'),
+      `${JSON.stringify({
+        v: 1,
+        model: 'm',
+        durationMs: 1,
+        finishReason: 'stop',
+        traceId: 'default-root-1',
+        ts: Date.UTC(2026, 6, 22, 9),
+        coldHits: 23,
+        coldMisses: 5,
+        coldEnabled: true,
+        coldRoot: canonicalCacheRoot(managedRoot),
+      })}\n`,
+    );
+
+    defaulted = await startDashboardServer({
+      port: 0,
+      dbPath: ':memory:',
+      sessionsRoot,
+      tracesDir,
+      modelsDir,
+      // Exactly what the CLI passes.
+      cacheRoot: undefined,
+      webRoot,
+    });
+    expect((await fetch(`${defaulted.url}/api/ingest`, { method: 'POST' })).status).toBe(200);
+  });
+
+  afterEach(async () => {
+    await defaulted.close();
+    if (previousEnv === undefined) delete process.env.MLX_COLD_CACHE_DIR;
+    else process.env.MLX_COLD_CACHE_DIR = previousEnv;
+    rmSync(envBase, { recursive: true, force: true });
+  });
+
+  it('scans the managed child of MLX_COLD_CACHE_DIR, never the directory itself', async () => {
+    const body = await cacheBody();
+    expect(body.disk.exists).toBe(true);
+    expect(body.disk.entryCount).toBe(1);
+    // Asserted structurally rather than against a repeated literal: the tier
+    // always nests one managed level under the env var.
+    expect(body.disk.root).not.toBe(linkedColdDir);
+    expect(dirname(body.disk.root)).toBe(linkedColdDir);
+  });
+
+  it('joins the agent-written root when the CLI supplies no cacheRoot', async () => {
+    const body = await cacheBody();
+    expect(body.scope.root).toBe(canonicalCacheRoot(managedRoot));
+    // JOINED, not merely "not crashed": the row's lookups land in the trend and
+    // in neither exclusion bucket.
+    expect(
+      body.trend.reduce((a, r) => ({ hits: a.hits + r.hits, misses: a.misses + r.misses }), { hits: 0, misses: 0 }),
+    ).toEqual({
+      hits: 23,
+      misses: 5,
+    });
+    expect(body.scope.otherRoots.turns).toBe(0);
+    expect(body.scope.legacy.turns).toBe(0);
+  });
+
+  it('canonicalizes the derived root, so a symlinked MLX_COLD_CACHE_DIR still joins', async () => {
+    const body = await cacheBody();
+    // The reader was pointed at the symlink and the writer recorded the real
+    // path. A lexical compare reports a flat zero here beside a disk scan that
+    // just found a block.
+    expect(body.disk.root.startsWith(linkedColdDir)).toBe(true);
+    expect(body.scope.root.startsWith(realpathSync(realColdDir))).toBe(true);
+    expect(body.scope.root).not.toBe(body.disk.root);
+    expect(body.trend.length).toBe(1);
   });
 });
 

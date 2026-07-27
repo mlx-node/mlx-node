@@ -73,8 +73,12 @@ export class PagedConfigOverrideManager {
    * AUTHORITATIVE: it writes `persist_paged_cache: <value>` into the cloned
    * config, overriding whatever the source config.json carries (either alias),
    * and forces a clone whenever the source's value disagrees so the directive
-   * actually reaches the loader. Callers gate the boolean to families with a
-   * sound paged cold restore (qwen3 dense).
+   * actually reaches the loader. Callers gate the boolean to the families whose
+   * paged cold restore is sound — the allowlist in
+   * `packages/agent/src/cold-tier.ts`, mirrored by `COLD_RESTORE_FAMILIES` in
+   * `crates/mlx-core/src/cold_tier.rs`. It is a SET, not one family, and it is
+   * deliberately not repeated here: `MlxModelHost` calls this for every
+   * allowlisted family, and a second copy of the list would drift.
    */
   async resolve(modelPath: string, canonicalModelType?: string, persistPagedCache?: boolean): Promise<string> {
     if (this.disposed) {
@@ -117,9 +121,7 @@ export class PagedConfigOverrideManager {
     // not read as `true` here (an OR) while native reads snake=false, silently
     // dropping an authoritative `true` request.
     const sourcePersist =
-      typeof config.persist_paged_cache === 'boolean'
-        ? config.persist_paged_cache
-        : config.persistPagedCache === true;
+      typeof config.persist_paged_cache === 'boolean' ? config.persist_paged_cache : config.persistPagedCache === true;
     const persistOverrideNeeded = persistPagedCache !== undefined && persistPagedCache !== sourcePersist;
 
     // Gemma4's DSpark / assistant speculative executor currently owns flat KV

@@ -86,6 +86,17 @@ function defaultColdCacheDir(): string {
   return join(homedir(), '.mlx-node', 'cache', 'paged', 'v1');
 }
 
+/**
+ * The single root every cold-tier view resolves to: an explicit override, else
+ * the running tier's own default. Exported so a caller that needs the root as a
+ * VALUE — the API scoping its trace query to this cache and no other — resolves
+ * the exact same string `scanColdCache` would have defaulted to, instead of
+ * re-deriving it and drifting.
+ */
+export function coldCacheRoot(root?: string): string {
+  return root ?? defaultColdCacheDir();
+}
+
 interface BlockEntry {
   path: string;
   size: number;

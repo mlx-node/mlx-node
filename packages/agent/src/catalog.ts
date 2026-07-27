@@ -85,3 +85,19 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
 export function visibleCatalog(): CatalogEntry[] {
   return MODEL_CATALOG.filter((entry) => !entry.hidden);
 }
+
+/**
+ * Cold-tier facts, re-exported through this subpath.
+ *
+ * `@mlx-node/agent/catalog` is the agent package's one NATIVE-FREE entry point:
+ * the package root re-exports `provider/index.ts`, which value-imports
+ * `@mlx-node/core`. The dashboard is a separate viewer process that must never
+ * link the addon (docs/dashboard.md: "no Metal init, instant start"), and
+ * `mlx agent --help` must print without loading weights — so both reach the
+ * cold-tier allowlist and the cache-root canonicalizer through here.
+ *
+ * These are RE-EXPORTS. The definitions live in `./cold-tier.ts` and there is
+ * exactly one of each; `packages/agent/__test__/cold-tier-families.test.ts`
+ * guards the allowlist against the native side.
+ */
+export { COLD_TIER_RESTORE_FAMILIES, canonicalCacheRoot, coldTierRestoreFamilyList } from './cold-tier.js';

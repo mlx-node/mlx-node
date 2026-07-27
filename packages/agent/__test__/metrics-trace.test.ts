@@ -117,6 +117,53 @@ describe('MetricsTrace', () => {
     });
   });
 
+  /**
+   * `record()` rebuilds the output field by field from an allowlist, so a
+   * counter added to the interface and to the delta computation but NOT to the
+   * rebuild is silently discarded — a green typecheck and an empty column. Four
+   * counters `coldCacheStats()` has always exposed were dropped this way before
+   * ever reaching the allowlist.
+   */
+  it('writes the cold-tier counters and cache identity the allowlist used to drop', () => {
+    const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
+    trace.record(
+      baseRecord({
+        coldRoot: '/private/tmp/cache/mlx-paged-v1',
+        coldEnabled: true,
+        coldEnqueued: 12,
+        coldQueueDrops: 3,
+        coldEvictions: 5,
+        coldCorruptions: 1,
+        coldCorruptionsTotal: 9,
+        coldQueueDropsTotal: 7,
+      }),
+    );
+    const [line] = readLines(trace.currentFile()) as MetricsTraceRecord[];
+    expect(line).toMatchObject({
+      coldRoot: '/private/tmp/cache/mlx-paged-v1',
+      coldEnabled: true,
+      coldEnqueued: 12,
+      coldQueueDrops: 3,
+      coldEvictions: 5,
+      coldCorruptions: 1,
+      coldCorruptionsTotal: 9,
+      coldQueueDropsTotal: 7,
+    });
+  });
+
+  // A cache identity is only meaningful for a tier that was open. An empty root
+  // (what the native struct reports while disabled) would create a bucket no
+  // dashboard root can ever match, so it must be omitted — while `coldEnabled:
+  // false` IS recorded, because "the tier was off" and "we do not know" are
+  // different answers the Cache page reports differently.
+  it('omits an empty coldRoot but still records coldEnabled: false', () => {
+    const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
+    trace.record(baseRecord({ coldRoot: '', coldEnabled: false }));
+    const [line] = readLines(trace.currentFile()) as Record<string, unknown>[];
+    expect('coldRoot' in line).toBe(false);
+    expect(line.coldEnabled).toBe(false);
+  });
+
   it('omits absent optional fields rather than writing null', () => {
     const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
     trace.record(baseRecord({ sessionId: undefined }));

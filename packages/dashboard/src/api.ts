@@ -17,9 +17,10 @@ import {
   type FileEntry,
   type SessionEntry,
 } from '@earendil-works/pi-coding-agent';
+import { canonicalCacheRoot, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
 import { eq } from 'drizzle-orm';
 
-import { scanColdCache, clearColdCache, evictOlderThan } from './cache.js';
+import { scanColdCache, clearColdCache, coldCacheRoot, evictOlderThan } from './cache.js';
 import { catalogWithState } from './catalog.js';
 import type { DashboardDb } from './db/open.js';
 import { sessions, turns } from './db/schema.js';
@@ -33,6 +34,7 @@ import {
   readSessionEntries,
   verifySessionFileId,
 } from './ingest/sessions.js';
+import { TRACE_RETENTION_DAYS } from './ingest/traces.js';
 import { discoverLocalModels, deleteLocalModel } from './models.js';
 
 /** Runtime dependencies the handlers close over, supplied by `server.ts`. */
@@ -1243,17 +1245,62 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
   sendJson(res, 200, overview);
 }
 
+/**
+ * Cold-tier view for ONE cache root: the on-disk scan, the trace-derived trend
+ * SCOPED TO THAT SAME ROOT, and an explicit account of everything the scope
+ * excluded.
+ *
+ * The scoping is the whole point. Before it, `disk` was a filesystem scan of one
+ * root while `trend` was an unfiltered `SUM()` over every trace row ever
+ * ingested, so a dashboard pointed at an EMPTY cache dir reported
+ * `exists: false, entryCount: 0` beside a hit rate summed from every cache
+ * directory the machine had ever used. Two disjoint notions of "the cache" in
+ * one payload.
+ *
+ * Rows the scope drops are REPORTED, never silently discarded. The buckets
+ * below are disjoint AND EXHAUSTIVE over every trace row — that is the point of
+ * them, and it is asserted directly (the sum of trend + legacy + otherRoots +
+ * unattributed hits equals the table's own `SUM(cold_hits)`). An earlier
+ * partition had a hole: `cold_enabled = 1` with a NULL `cold_root` matched no
+ * arm at all, so a turn whose tier was open but whose root went unrecorded had
+ * its hits vanish — the exact outcome the scope design exists to refuse.
+ *  - `legacy` — written before the agent recorded a root (`cold_enabled` NULL).
+ *    Counting these into the shown cache IS the original bug; dropping them
+ *    without a word makes a real 16K-lookup history vanish next to a root path
+ *    the user is staring at. The bucket is bounded and self-clearing: trace
+ *    JSONL is pruned at {@link TRACE_RETENTION_DAYS} days and the rows go with
+ *    it, so it empties on its own once the recording build has shipped that
+ *    long.
+ *  - `otherRoots` — genuinely a different cache directory. A different user
+ *    story from `legacy`, so a different line.
+ *  - `unattributed` — the tier was ON (`cold_enabled` truthy) but the turn
+ *    carried no root. The writer no longer produces this (it gates the record
+ *    on the CANONICAL root, the same emptiness test `canonicalCacheRoot`
+ *    applies), so the bucket should stay empty; it exists so that if one ever
+ *    appears the lookups are shown rather than dropped on the floor.
+ *  - `disabledTurns` — the tier was off (`--no-persist-cache`, or a family off
+ *    the restore allowlist). Their deltas are all zero, so they are counted but
+ *    carry no lookups. Overlaps the buckets above by design: it is a TURN
+ *    count, not a lookup bucket.
+ */
 function handleCacheGet({ res, deps }: RouteCtx): void {
-  const disk = deps.cacheRoot !== undefined ? scanColdCache(deps.cacheRoot) : scanColdCache();
+  const requestedRoot = coldCacheRoot(deps.cacheRoot);
+  const disk = scanColdCache(requestedRoot);
+  // Both sides of the join canonicalize through the SAME helper the agent used
+  // when it wrote the row. A raw string compare would be a silent-zero trap:
+  // the writer and the reader are different processes resolving the root from
+  // their own environments, and on macOS `/tmp` → `/private/tmp` alone makes
+  // two identical-looking spellings unequal.
+  const scopeRoot = canonicalCacheRoot(requestedRoot);
   const trend = deps.dash.sqlite
     .prepare(
       `SELECT date(ts / 1000, 'unixepoch') AS day,
               COALESCE(SUM(cold_hits), 0) AS hits, COALESCE(SUM(cold_misses), 0) AS misses,
               COALESCE(SUM(cold_bytes_written), 0) AS bytesWritten,
               COALESCE(SUM(cold_bytes_restored), 0) AS bytesRestored
-       FROM traces WHERE ts > 0 GROUP BY day ORDER BY day`,
+       FROM traces WHERE ts > 0 AND cold_root = ? GROUP BY day ORDER BY day`,
     )
-    .all()
+    .all(scopeRoot)
     .map((row) => ({
       day: String(row.day),
       hits: toInt(row.hits),
@@ -1261,7 +1308,83 @@ function handleCacheGet({ res, deps }: RouteCtx): void {
       bytesWritten: toInt(row.bytesWritten),
       bytesRestored: toInt(row.bytesRestored),
     }));
-  sendJson(res, 200, { disk, trend });
+
+  // `CASE WHEN` rather than `FILTER` — portable across whatever SQLite the
+  // bundled `node:sqlite` links.
+  const excluded = deps.dash.sqlite
+    .prepare(
+      `SELECT
+         COUNT(CASE WHEN cold_root IS NULL AND cold_enabled IS NULL THEN 1 END) AS legacyTurns,
+         COALESCE(SUM(CASE WHEN cold_root IS NULL AND cold_enabled IS NULL THEN cold_hits END), 0) AS legacyHits,
+         COALESCE(SUM(CASE WHEN cold_root IS NULL AND cold_enabled IS NULL THEN cold_misses END), 0) AS legacyMisses,
+         COUNT(CASE WHEN cold_root IS NOT NULL AND cold_root <> ? THEN 1 END) AS otherTurns,
+         COALESCE(SUM(CASE WHEN cold_root IS NOT NULL AND cold_root <> ? THEN cold_hits END), 0) AS otherHits,
+         COALESCE(SUM(CASE WHEN cold_root IS NOT NULL AND cold_root <> ? THEN cold_misses END), 0) AS otherMisses,
+         COUNT(CASE WHEN cold_root IS NULL AND cold_enabled IS NOT NULL AND cold_enabled <> 0 THEN 1 END)
+           AS unattributedTurns,
+         COALESCE(SUM(CASE WHEN cold_root IS NULL AND cold_enabled IS NOT NULL AND cold_enabled <> 0
+                           THEN cold_hits END), 0) AS unattributedHits,
+         COALESCE(SUM(CASE WHEN cold_root IS NULL AND cold_enabled IS NOT NULL AND cold_enabled <> 0
+                           THEN cold_misses END), 0) AS unattributedMisses,
+         COUNT(CASE WHEN cold_enabled = 0 THEN 1 END) AS disabledTurns
+       FROM traces WHERE ts > 0`,
+    )
+    .get(scopeRoot, scopeRoot, scopeRoot);
+
+  // Cumulative counters use MAX, not SUM: each process's total restarts at 0
+  // when its tier opens, so summing across processes double-counts. We only
+  // need 0-vs-non-zero ("did this EVER happen against this cache"), and
+  // MAX > 0 answers exactly that — including for a turn that aborted before it
+  // could record a delta.
+  const health = deps.dash.sqlite
+    .prepare(
+      `SELECT COALESCE(SUM(cold_enqueued), 0) AS enqueued,
+              COALESCE(SUM(cold_queue_drops), 0) AS queueDrops,
+              COALESCE(SUM(cold_evictions), 0) AS evictions,
+              COALESCE(SUM(cold_corruptions), 0) AS corruptions,
+              COALESCE(MAX(cold_corruptions_total), 0) AS corruptionsTotal,
+              COALESCE(MAX(cold_queue_drops_total), 0) AS queueDropsTotal
+       FROM traces WHERE ts > 0 AND cold_root = ?`,
+    )
+    .get(scopeRoot);
+
+  sendJson(res, 200, {
+    disk,
+    trend,
+    scope: {
+      root: scopeRoot,
+      trendWindowDays: TRACE_RETENTION_DAYS,
+      legacy: {
+        turns: toInt(excluded?.legacyTurns),
+        hits: toInt(excluded?.legacyHits),
+        misses: toInt(excluded?.legacyMisses),
+      },
+      otherRoots: {
+        turns: toInt(excluded?.otherTurns),
+        hits: toInt(excluded?.otherHits),
+        misses: toInt(excluded?.otherMisses),
+      },
+      unattributed: {
+        turns: toInt(excluded?.unattributedTurns),
+        hits: toInt(excluded?.unattributedHits),
+        misses: toInt(excluded?.unattributedMisses),
+      },
+      disabledTurns: toInt(excluded?.disabledTurns),
+    },
+    health: {
+      enqueued: toInt(health?.enqueued),
+      queueDrops: toInt(health?.queueDrops),
+      evictions: toInt(health?.evictions),
+      corruptions: toInt(health?.corruptions),
+      corruptionsTotal: toInt(health?.corruptionsTotal),
+      queueDropsTotal: toInt(health?.queueDropsTotal),
+    },
+    // Sent over the wire rather than bundled into the SPA: the browser build
+    // cannot import `@mlx-node/agent` (it transitively loads the native addon),
+    // and a hardcoded copy in the UI would sit outside the drift guard in
+    // `packages/agent/__test__/cold-tier-families.test.ts`.
+    restoreFamilies: coldTierRestoreFamilyList(),
+  });
 }
 
 async function handleCacheDelete({ req, res, deps }: RouteCtx): Promise<void> {

@@ -30,10 +30,57 @@ export function formatNumber(n: number): string {
   return new Intl.NumberFormat('en-US').format(Math.round(n));
 }
 
-/** Whole-percent string (`73%`); `fraction` is 0..1. */
+/**
+ * Whole-percent string (`73%`); `fraction` is 0..1.
+ *
+ * SATURATING at both ends: `100%` and `0%` are reachable ONLY from an exact 1
+ * and an exact 0. A plain `Math.round(fraction * 100)` renders 0.996982 — a
+ * real cache with 16189 hits and 49 misses — as a flat "100%", i.e. a page
+ * claiming perfection directly above the line "49 misses". Anything short of
+ * the endpoint now reads `>99%` / `<1%` instead of rounding into a lie.
+ */
 export function formatPercent(fraction: number): string {
   if (!Number.isFinite(fraction)) return '0%';
-  return `${Math.round(fraction * 100)}%`;
+  const pct = fraction * 100;
+  if (pct >= 100) return '100%';
+  if (pct <= 0) return '0%';
+  if (pct >= 99.5) return '>99%';
+  if (pct < 0.5) return '<1%';
+  return `${Math.round(pct)}%`;
+}
+
+/**
+ * Percent as an integer for `aria-valuenow` and CSS widths, saturated the same
+ * way {@link formatPercent} is so the accessible value can never announce 100
+ * while the visible label says `>99%`.
+ */
+export function percentInt(fraction: number): number {
+  if (!Number.isFinite(fraction)) return 0;
+  const pct = fraction * 100;
+  if (pct >= 100) return 100;
+  if (pct <= 0) return 0;
+  return Math.min(99, Math.max(1, Math.round(pct)));
+}
+
+/**
+ * Success rate from the RAW COUNTS rather than a pre-divided fraction, so the
+ * endpoint cases are decided by integers instead of by rounding.
+ *
+ * A fraction alone cannot tell 0.9996 from 1.0 once rounded, and a cache page
+ * that prints "100%" while a non-zero miss count sits beside it is lying. Here
+ * `100%` requires `total - hits === 0` and `0%` requires `hits === 0`; every
+ * other value saturates to `>99%` / `<1%`. `total <= 0` is "no lookups", not
+ * zero percent, so it renders as an em dash.
+ */
+export function formatRate(hits: number, total: number): string {
+  if (!Number.isFinite(hits) || !Number.isFinite(total) || total <= 0) return '—';
+  if (hits <= 0) return '0%';
+  const misses = total - hits;
+  if (misses <= 0) return '100%';
+  const pct = (hits / total) * 100;
+  if (pct >= 99.5) return '>99%';
+  if (pct < 0.5) return '<1%';
+  return `${Math.round(pct)}%`;
 }
 
 /** Absolute local date + time from an ms-epoch timestamp (`Jul 20, 2026, 3:41 PM`). */

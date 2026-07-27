@@ -53,6 +53,23 @@ export const traces = sqliteTable('traces', {
   coldMisses: integer('cold_misses'),
   coldBytesWritten: integer('cold_bytes_written'),
   coldBytesRestored: integer('cold_bytes_restored'),
+  /**
+   * Canonical cold-cache root this turn ran against — the scope key for the
+   * Cache page. NULL means "unattributed": either the tier was off (paired with
+   * `coldEnabled = 0`) or the record predates attribution (`coldEnabled` NULL
+   * too). Never folded into the shown cache's totals; reported separately.
+   */
+  coldRoot: text('cold_root'),
+  /** 1 when the cold tier was open for the turn, 0 when off; NULL if unknown. */
+  coldEnabled: integer('cold_enabled'),
+  coldEnqueued: integer('cold_enqueued'),
+  coldQueueDrops: integer('cold_queue_drops'),
+  coldEvictions: integer('cold_evictions'),
+  coldCorruptions: integer('cold_corruptions'),
+  /** Cumulative (not per-turn) — see `MetricsTraceRecord.coldCorruptionsTotal`. */
+  coldCorruptionsTotal: integer('cold_corruptions_total'),
+  /** Cumulative (not per-turn) — see `MetricsTraceRecord.coldQueueDropsTotal`. */
+  coldQueueDropsTotal: integer('cold_queue_drops_total'),
   sourceFile: text('source_file'),
 });
 

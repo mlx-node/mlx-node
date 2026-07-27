@@ -3,7 +3,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
-import { formatCount, formatDateTime, formatNumber } from '@/lib/format';
+import { formatBytes, formatCount, formatDateTime, formatNumber, formatRate } from '@/lib/format';
 import { shQuote } from '@/lib/shell';
 import type { SessionDetailResponse, SessionMetricsResponse, SessionTurnMetric } from '@/lib/types';
 import { useJson } from '@/lib/use-api';
@@ -94,6 +94,27 @@ export default function SessionDetail() {
     return { input, output, cached, avgDecode, avgTtft };
   }, [turns, traces]);
 
+  /**
+   * Per-turn cold-tier reuse for this session. The API has always returned
+   * these four fields on every trace row and nothing rendered them, so the one
+   * question a cold tier exists to answer — "did resuming this session actually
+   * reuse anything?" — had no answer anywhere in the UI.
+   */
+  const cold = useMemo(() => {
+    let coldHits = 0;
+    let coldMisses = 0;
+    let coldBytesRestored = 0;
+    let coldBytesWritten = 0;
+    for (const t of traces) {
+      coldHits += t.coldHits ?? 0;
+      coldMisses += t.coldMisses ?? 0;
+      coldBytesRestored += t.coldBytesRestored ?? 0;
+      coldBytesWritten += t.coldBytesWritten ?? 0;
+    }
+    return { coldHits, coldMisses, coldBytesRestored, coldBytesWritten };
+  }, [traces]);
+  const coldLookups = cold.coldHits + cold.coldMisses;
+
   const hasTokenData = points.some((p) => p.input + p.output + p.cached > 0);
   const hasDecodeData = points.some((p) => p.decodeTps !== null);
 
@@ -169,6 +190,16 @@ export default function SessionDetail() {
               )}
               {totals.avgTtft !== null && (
                 <MetricChip label="TTFT" value={Math.round(totals.avgTtft).toString()} unit="ms avg" />
+              )}
+              {coldLookups > 0 && (
+                <>
+                  <MetricChip label="Cold hit rate" value={formatRate(cold.coldHits, coldLookups)} />
+                  <MetricChip
+                    label="Cold reuse"
+                    value={formatBytes(cold.coldBytesRestored)}
+                    unit={`restored · ${formatBytes(cold.coldBytesWritten)} written`}
+                  />
+                </>
               )}
             </div>
           )}

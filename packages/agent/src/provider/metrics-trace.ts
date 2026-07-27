@@ -22,11 +22,62 @@ import { dirname, join } from 'node:path';
 import { metricsTraceDir } from '../paths.js';
 
 /**
+ * Per-turn delta of every COUNTER on the native `ColdCacheStats` — the paged
+ * K/V block traffic. One entry per native counter field, named
+ * `cold` + PascalCase(nativeKey); the three non-counter fields (`enabled`,
+ * `root`, `quotaBytes`) describe the tier's identity rather than a turn and are
+ * carried separately as {@link MetricsTraceRecord.coldEnabled} /
+ * {@link MetricsTraceRecord.coldRoot}.
+ *
+ * This is the TS half of a cross-language invariant.
+ * `__test__/cold-counter-fields.test.ts` derives the same names from
+ * `coldCacheStats()` at runtime and demands an exact match, so a counter added
+ * natively but not here — or, the failure this list exists for, one quietly
+ * dropped from here — is a red test rather than an empty dashboard column.
+ */
+export const COLD_COUNTER_FIELDS = [
+  'coldHits',
+  'coldMisses',
+  'coldEnqueued',
+  'coldQueueDrops',
+  'coldBytesWritten',
+  'coldBytesRestored',
+  'coldEvictions',
+  'coldCorruptions',
+] as const;
+
+/**
+ * Per-turn delta of every counter on the native `ColdSidecarStats` — the
+ * recurrent / sliding-window state that lives OUTSIDE the paged pool. Named
+ * `coldSidecar` + PascalCase(nativeKey).
+ *
+ * Deliberately a second, differently-prefixed list rather than a merge: both
+ * native structs carry `enqueued` and `queueDrops`, and they count different
+ * objects (blocks vs sidecars). Flattening them into one namespace would make
+ * two unrelated numbers collide on one column.
+ */
+export const COLD_SIDECAR_FIELDS = [
+  'coldSidecarCaptureReached',
+  'coldSidecarChainEmpty',
+  'coldSidecarBoundarySkips',
+  'coldSidecarAlreadyPersisted',
+  'coldSidecarEnqueued',
+  'coldSidecarQueueDrops',
+  'coldSidecarInstalled',
+] as const;
+
+/** Every cold-tier per-turn delta field, in native-struct order. */
+export const COLD_DELTA_FIELDS = [...COLD_COUNTER_FIELDS, ...COLD_SIDECAR_FIELDS] as const;
+
+/** A key of {@link COLD_DELTA_FIELDS}; every one is an optional `number`. */
+export type ColdDeltaField = (typeof COLD_DELTA_FIELDS)[number];
+
+/**
  * One inference turn's telemetry. Every field is a number, a small
  * enumerated string (`finishReason`), or an identifier — never model output
  * text, tool arguments, or prompt content.
  */
-export interface MetricsTraceRecord {
+export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, number>> {
   /** Schema version. */
   v: 1;
   /** Join key minted by `TurnEmitter`; also stamped on the pi message as `mlxTraceId`. */
@@ -74,6 +125,96 @@ export interface MetricsTraceRecord {
   coldBytesWritten?: number;
   /** Cold-tier bytes read back on validated hits this turn (synchronous — exact). */
   coldBytesRestored?: number;
+  /**
+   * Canonical cold-cache root this turn's tier was operating in, as produced by
+   * `canonicalCacheRoot` — the JOIN KEY the dashboard scopes its hit-rate and
+   * trend to. Written ONLY when the tier was actually open; a turn that ran
+   * with the tier off carries `coldEnabled: false` and NO root, and a record
+   * written by a build that predates this field carries neither. Those two
+   * states are deliberately distinguishable: the dashboard reports "recorded
+   * before cache attribution existed" separately from "the tier was off".
+   */
+  coldRoot?: string;
+  /** Whether the cold tier was open for this turn (`ColdCacheStats.enabled`). */
+  coldEnabled?: boolean;
+  /**
+   * Cold-tier write-queue submissions accrued this turn. Incremented on the
+   * calling thread, so this delta is EXACT.
+   */
+  coldEnqueued?: number;
+  /**
+   * Cold-tier writes dropped this turn. MIXED provenance, so treat as
+   * APPROXIMATE: the queue-full arm increments synchronously on the calling
+   * thread, while the commit-rename-failure arm increments on the background
+   * writer.
+   */
+  coldQueueDrops?: number;
+  /**
+   * Cold-tier objects evicted by quota enforcement this turn. Advances on the
+   * background writer thread — APPROXIMATE, same caveat as `coldBytesWritten`.
+   */
+  coldEvictions?: number;
+  /**
+   * Cold-tier objects that failed validation on restore this turn. Incremented
+   * on the calling thread, so this delta is EXACT. Always accompanied by a
+   * miss, i.e. corruptions are a SUBSET of `coldMisses` — never add the two.
+   */
+  coldCorruptions?: number;
+  /**
+   * CUMULATIVE corruptions since the tier opened in this process, not a delta.
+   * Carried because the acceptance bar is "corruptions must be 0" and a delta
+   * alone cannot prove it: a turn that aborts or errors never reaches
+   * `record()`, so a corruption during it lands in no delta at all. The next
+   * successful turn's absolute total still includes it, so `MAX(total) > 0`
+   * over any window is the sound "did this ever happen" latch.
+   */
+  coldCorruptionsTotal?: number;
+  /**
+   * CUMULATIVE queue drops since the tier opened in this process, for the same
+   * reason as {@link coldCorruptionsTotal}: an errored turn's dropped writes
+   * would otherwise be invisible.
+   */
+  coldQueueDropsTotal?: number;
+  /**
+   * Turns this turn's process spent reaching a family's sidecar capture. Every
+   * other `coldSidecar*` counter is a sub-count of this one, so `0` here while
+   * blocks were written means the finalize path never called the capture at
+   * all — a different bug from a capture that ran and declined.
+   */
+  coldSidecarCaptureReached?: number;
+  /**
+   * Sidecar captures that found no whole persisted block to anchor recurrent
+   * state under.
+   */
+  coldSidecarChainEmpty?: number;
+  /**
+   * Sidecar captures whose chain covered blocks but where no retained
+   * checkpoint sat at or below its reach — the "ladder collapsed to its
+   * deepest rung" signature.
+   */
+  coldSidecarBoundarySkips?: number;
+  /**
+   * Sidecar captures that selected a boundary already on disk. The STEADY
+   * STATE of a repeated prompt, not a fault: without it a healthy run
+   * (`coldSidecarEnqueued == 0` because the first turn already wrote it) is
+   * indistinguishable from a broken one.
+   */
+  coldSidecarAlreadyPersisted?: number;
+  /**
+   * Sidecars handed to the writer queue this turn. NOT the same number as
+   * {@link coldEnqueued}, which counts paged K/V blocks — never sum them.
+   */
+  coldSidecarEnqueued?: number;
+  /** Sidecars the writer queue refused because it was full. */
+  coldSidecarQueueDrops?: number;
+  /**
+   * Restored sidecars a family INSTALLED as its live per-turn state. The one
+   * read-side sidecar counter, and the only thing that separates "restored and
+   * used" from "restored, then silently re-derived by a full O(prefix) replay":
+   * the replay produces correct state, so `cachedTokens`, `coldHits`,
+   * `coldCorruptions` and the output text are all identical either way.
+   */
+  coldSidecarInstalled?: number;
 }
 
 type MetricsTraceInput = Omit<MetricsTraceRecord, 'v'>;
@@ -143,14 +284,23 @@ export class MetricsTrace {
       if (mtpCycles !== undefined) out.mtpCycles = mtpCycles;
       const mtpMeanAccepted = finite(rec.mtpMeanAccepted);
       if (mtpMeanAccepted !== undefined) out.mtpMeanAccepted = mtpMeanAccepted;
-      const coldHits = finite(rec.coldHits);
-      if (coldHits !== undefined) out.coldHits = coldHits;
-      const coldMisses = finite(rec.coldMisses);
-      if (coldMisses !== undefined) out.coldMisses = coldMisses;
-      const coldBytesWritten = finite(rec.coldBytesWritten);
-      if (coldBytesWritten !== undefined) out.coldBytesWritten = coldBytesWritten;
-      const coldBytesRestored = finite(rec.coldBytesRestored);
-      if (coldBytesRestored !== undefined) out.coldBytesRestored = coldBytesRestored;
+      // Every cold-tier delta comes off ONE list, so a counter can only be
+      // dropped from the JSONL by being dropped from `COLD_DELTA_FIELDS` —
+      // which `__test__/cold-counter-fields.test.ts` pins to the native structs.
+      // Spelling them out here is what let four `coldCacheStats()` counters sit
+      // unwritten for the life of the feature.
+      for (const key of COLD_DELTA_FIELDS) {
+        const value = finite(rec[key]);
+        if (value !== undefined) out[key] = value;
+      }
+      // A cache identity is only meaningful for a tier that was actually open;
+      // an empty root would create a bucket no dashboard root can ever match.
+      if (typeof rec.coldRoot === 'string' && rec.coldRoot.length > 0) out.coldRoot = rec.coldRoot;
+      if (typeof rec.coldEnabled === 'boolean') out.coldEnabled = rec.coldEnabled;
+      const coldCorruptionsTotal = finite(rec.coldCorruptionsTotal);
+      if (coldCorruptionsTotal !== undefined) out.coldCorruptionsTotal = coldCorruptionsTotal;
+      const coldQueueDropsTotal = finite(rec.coldQueueDropsTotal);
+      if (coldQueueDropsTotal !== undefined) out.coldQueueDropsTotal = coldQueueDropsTotal;
 
       const file = this.currentFile();
       mkdirSync(dirname(file), { recursive: true });

@@ -2,7 +2,7 @@ import { StatTile } from '@/components/stat-tile';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
-import { formatBytes, formatCount, formatPercent, formatRelativeTime } from '@/lib/format';
+import { formatBytes, formatCount, formatPercent, formatRate, formatRelativeTime, percentInt } from '@/lib/format';
 import type {
   CacheResponse,
   DownloadsResponse,
@@ -48,12 +48,15 @@ export default function Overview() {
   const cacheBytes = disk?.totalBytes ?? 0;
   const quotaBytes = disk?.quotaBytes ?? 0;
   const quotaFraction = quotaBytes > 0 ? Math.min(1, cacheBytes / quotaBytes) : 0;
+  // `trend` is scoped server-side to the cache root shown on the Cache page, so
+  // this tile reports THAT cache's reuse — not a sum over every cache directory
+  // the machine has ever used.
   const cacheTotals = cache.data?.trend.reduce(
     (acc, row) => ({ hits: acc.hits + row.hits, misses: acc.misses + row.misses }),
     { hits: 0, misses: 0 },
   );
+  const cacheHits = cacheTotals?.hits ?? 0;
   const cacheLookups = cacheTotals ? cacheTotals.hits + cacheTotals.misses : 0;
-  const hitRate = cacheLookups > 0 ? cacheTotals!.hits / cacheLookups : null;
 
   const jobs = downloads.data?.jobs ?? [];
   const jobsRunning = jobs.filter((job) => job.state === 'running').length;
@@ -113,7 +116,7 @@ export default function Overview() {
             ) : (
               <span>
                 {quotaBytes > 0 ? `${formatPercent(quotaFraction)} of ${formatBytes(quotaBytes)}` : 'no quota'}
-                {hitRate !== null ? ` · hit rate ${formatPercent(hitRate)}` : ''}
+                {cacheLookups > 0 ? ` · hit rate ${formatRate(cacheHits, cacheLookups)}` : ''}
               </span>
             )
           }
@@ -122,10 +125,7 @@ export default function Overview() {
               <Skeleton className="h-2 w-full rounded-full" />
             ) : cache.error ? undefined : (
               <div className="bg-secondary h-2 w-full overflow-hidden rounded-full" aria-hidden>
-                <div
-                  className="bg-primary h-full rounded-full"
-                  style={{ width: `${Math.round(quotaFraction * 100)}%` }}
-                />
+                <div className="bg-primary h-full rounded-full" style={{ width: `${percentInt(quotaFraction)}%` }} />
               </div>
             )
           }

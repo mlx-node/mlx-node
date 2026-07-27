@@ -37,9 +37,24 @@ interface ParsedTrace {
   coldMisses?: unknown;
   coldBytesWritten?: unknown;
   coldBytesRestored?: unknown;
+  coldRoot?: unknown;
+  coldEnabled?: unknown;
+  coldEnqueued?: unknown;
+  coldQueueDrops?: unknown;
+  coldEvictions?: unknown;
+  coldCorruptions?: unknown;
+  coldCorruptionsTotal?: unknown;
+  coldQueueDropsTotal?: unknown;
 }
 
 const DAY_MS = 86_400_000;
+
+/**
+ * How far back trace JSONL (and therefore every row derived from it) is kept.
+ * Exported so the API can LABEL the cache trend with its real window instead of
+ * letting it read as all-time, and so the two can never drift apart.
+ */
+export const TRACE_RETENTION_DAYS = 30;
 
 function numOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -69,7 +84,7 @@ export async function ingestTraces(
 ): Promise<TraceIngestResult> {
   const { db, sqlite } = dash;
   const traceDir = dir ?? metricsTraceDir();
-  const retentionDays = opts?.retentionDays ?? 30;
+  const retentionDays = opts?.retentionDays ?? TRACE_RETENTION_DAYS;
   const cutoff = Date.now() - retentionDays * DAY_MS;
 
   let files = 0;
@@ -219,6 +234,18 @@ export async function ingestTraces(
             coldMisses: numOrNull(trace.coldMisses),
             coldBytesWritten: numOrNull(trace.coldBytesWritten),
             coldBytesRestored: numOrNull(trace.coldBytesRestored),
+            // The writer only emits `coldRoot` for a tier that was actually
+            // open, so an absent value stays NULL here — the "unattributed"
+            // bucket the Cache page reports separately rather than folding into
+            // the shown cache's hit rate.
+            coldRoot: strOrNull(trace.coldRoot),
+            coldEnabled: boolToInt(trace.coldEnabled),
+            coldEnqueued: numOrNull(trace.coldEnqueued),
+            coldQueueDrops: numOrNull(trace.coldQueueDrops),
+            coldEvictions: numOrNull(trace.coldEvictions),
+            coldCorruptions: numOrNull(trace.coldCorruptions),
+            coldCorruptionsTotal: numOrNull(trace.coldCorruptionsTotal),
+            coldQueueDropsTotal: numOrNull(trace.coldQueueDropsTotal),
             sourceFile: name,
           })
           .onConflictDoNothing()

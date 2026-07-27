@@ -13,56 +13,21 @@
  * overlapping native activity on the compiled-path globals).
  */
 
-import { ChatSession, loadModel, type ModelType, type SessionCapableModel } from '@mlx-node/lm';
+import { ChatSession, loadModel, type SessionCapableModel } from '@mlx-node/lm';
 
+import { COLD_TIER_RESTORE_FAMILIES } from '../cold-tier.js';
 import type { DiscoveredModelLike } from '../types.js';
 
 /**
- * Model families whose paged prefix blocks can be restored from the SSD cold
- * tier soundly. The single source of truth on the TypeScript side, mirroring
- * `COLD_RESTORE_FAMILIES` in `crates/mlx-core/src/cold_tier.rs`; the two gate
- * the same decision from opposite ends, and
- * `packages/agent/__test__/cold-tier-families.test.ts` asserts they never
- * drift.
- *
- * A family belongs here only when EVERY piece of per-token state its forward
- * pass carries between turns is reconstructible from the tier — either because
- * it all lives inside the paged pool, or because the part that does not is
- * persisted alongside as a cold-tier sidecar and the restore reconciles down to
- * a boundary that sidecar actually backs:
- *
- *  - `qwen3` (dense) sizes its pool over all layers, so the pool holds the
- *    complete KV for the prefix and needs no sidecar.
- *  - `gemma4` sizes its pool over the full-attention layers only, but persists
- *    its out-of-pool sliding-window `RotatingKVCache` state as a
- *    `ColdGroup::SlidingWindow` sidecar, and its `ColdSidecarPolicy` makes the
- *    native restore walk refuse any boundary a validated sidecar does not back.
- *  - `qwen3_5` (dense) sizes its pool over the full-attention layers only, but
- *    persists its out-of-pool GDN recurrent state (conv + recurrent) as a
- *    `ColdGroup::GdnState` sidecar, and its `ColdSidecarPolicy` reconciles the
- *    native restore down to the deepest block-aligned boundary a validated
- *    sidecar backs (a recurrent state is valid only at its exact prefix length).
- *  - `qwen3_5_moe` keeps the SAME GDN recurrent state outside the pool — same
- *    shapes, same dtype, same layer mapping — so it shares the dense family's
- *    sidecar codec and `ColdSidecarPolicy` verbatim. Its restart-parity gate has
- *    since been run on `Qwen3.6-35b-a3b-UD-Q2_K_XL-mlx`: the restore reconciled
- *    onto ladder rung 304 of `[16, 64, 304, 1248]` with `hits=42` and
- *    `corruptions=0`, and the text matched a no-persist baseline.
- *  - `lfm2` / `lfm2_moe` keep short-conv state outside the pool with no
- *    serialization path for it at all, AND drive the uniform native adapter
- *    API whose restore branch is already wired to the tier — asking for
- *    persistence on their behalf would restore an incomplete prefix silently.
- *
- * Widening this set is a correctness decision, never a perf one, and it is
- * authorized by exactly one thing: the family's native restart-parity gate
- * passing on real weights with `hits > 0` and `corruptions == 0`.
+ * Re-exported so the HOST consults exactly the symbol the drift guard and the
+ * `--no-persist-cache` help text consult. The definition lives in the
+ * native-free `../cold-tier.js` leaf (reachable off-package through the
+ * `@mlx-node/agent/catalog` subpath, which re-exports it)
+ * because this module value-imports `@mlx-node/lm`, which loads the native
+ * addon — the dashboard and the CLI help path must be able to read the list
+ * without that.
  */
-export const COLD_TIER_RESTORE_FAMILIES: ReadonlySet<string> = new Set<ModelType>([
-  'gemma4',
-  'qwen3',
-  'qwen3_5',
-  'qwen3_5_moe',
-]);
+export { COLD_TIER_RESTORE_FAMILIES };
 
 /** Per-load policy handed to {@link MlxModelHostOptions.resolveModelPathFn}. */
 export interface ModelLoadPolicy {

@@ -131,7 +131,7 @@ describe('dashboard db', () => {
     const seed = openDashboardDb(file);
     seed.close();
     const bump = new DatabaseSync(file);
-    bump.exec('PRAGMA user_version = 3;'); // > SCHEMA_VERSION (2)
+    bump.exec('PRAGMA user_version = 4;'); // > SCHEMA_VERSION (3)
     bump.close();
 
     const dash = openDashboardDb(file);
@@ -185,7 +185,7 @@ describe('dashboard db', () => {
         cold_hits INTEGER, cold_bytes_restored INTEGER
       );`,
     );
-    raw.exec('PRAGMA user_version = 2;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 3;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
 
     const dash = openDashboardDb(file);
@@ -231,7 +231,7 @@ describe('dashboard db', () => {
         cold_bytes_written INTEGER, cold_bytes_restored INTEGER, source_file TEXT
       );`,
     );
-    raw.exec('PRAGMA user_version = 2;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 3;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
 
     const dash = openDashboardDb(file);
@@ -277,7 +277,7 @@ describe('dashboard db', () => {
         cold_bytes_written INTEGER, cold_bytes_restored INTEGER, source_file TEXT
       );`,
     );
-    raw.exec('PRAGMA user_version = 2;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 3;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
 
     const dash = openDashboardDb(file);
@@ -344,7 +344,7 @@ describe('dashboard db', () => {
         input_tokens, output_tokens, cached_tokens, reasoning_tokens
       FROM turns_backing;`,
     );
-    raw.exec('PRAGMA user_version = 2;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 3;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
 
     const dash = openDashboardDb(file);
@@ -394,7 +394,7 @@ describe('dashboard db', () => {
         input_tokens, output_tokens, cached_tokens, reasoning_tokens
       );`,
     );
-    raw.exec('PRAGMA user_version = 2;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 3;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
 
     const dash = openDashboardDb(file);
@@ -443,7 +443,7 @@ describe('dashboard db', () => {
         cold_bytes_written INTEGER, cold_bytes_restored INTEGER, source_file TEXT
       );`,
     );
-    raw.exec('PRAGMA user_version = 2;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 3;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
 
     // First open: signature probe finds queue_ms/resident missing → quarantine+rebuild.
@@ -499,10 +499,13 @@ describe('dashboard db', () => {
         mtp_mean_accepted REAL, duration_ms REAL, queue_ms INTEGER, finish_reason TEXT,
         resident INTEGER, prompt_tokens INTEGER, cached_tokens INTEGER, output_tokens INTEGER,
         reasoning_tokens INTEGER, cold_hits INTEGER, cold_misses INTEGER,
-        cold_bytes_written INTEGER, cold_bytes_restored INTEGER, source_file TEXT
+        cold_bytes_written INTEGER, cold_bytes_restored INTEGER,
+        cold_root TEXT, cold_enabled INTEGER, cold_enqueued INTEGER, cold_queue_drops INTEGER,
+        cold_evictions INTEGER, cold_corruptions INTEGER, cold_corruptions_total INTEGER,
+        cold_queue_drops_total INTEGER, source_file TEXT
       );`,
     );
-    raw.exec('PRAGMA user_version = 2;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 3;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
 
     // First open: signature probe finds trace_files missing → quarantine+rebuild.
@@ -521,6 +524,98 @@ describe('dashboard db', () => {
     // it validates in place — the seeded row survives, nothing new is quarantined.
     const second = openDashboardDb(file);
     expect(second.db.select().from(traceFiles).all()).toHaveLength(1);
+    second.close();
+    expect(readdirSync(d).filter((n) => n.startsWith('index.db.corrupt-'))).toHaveLength(1);
+
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  // F1 migration: the cold-attribution columns (cold_root / cold_enabled) and the
+  // four dropped cold-tier counters are a DDL change, so an existing v2 index —
+  // complete and valid for the build that wrote it — must be quarantined ASIDE
+  // (never deleted) and rebuilt carrying them, and the rebuilt file must then
+  // re-validate in place instead of re-quarantining on every subsequent open.
+  it('quarantines a complete v2 db lacking the cold-attribution columns, rebuilds with them, and re-validates', () => {
+    const d = mkdtempSync(join(tmpdir(), 'dash-coldcols-'));
+    const file = join(d, 'index.db');
+    const raw = new DatabaseSync(file);
+    // Byte-for-byte the schema SCHEMA_VERSION 2 shipped: every table complete,
+    // every v2 column present. The ONLY gap is the new cold-attribution set.
+    raw.exec(
+      `CREATE TABLE sessions (
+        id TEXT PRIMARY KEY, path TEXT NOT NULL, cwd TEXT NOT NULL, name TEXT,
+        created INTEGER NOT NULL, modified INTEGER NOT NULL,
+        message_count INTEGER NOT NULL DEFAULT 0, first_message TEXT,
+        last_ingested_mtime INTEGER NOT NULL DEFAULT 0, last_ingested_size INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE turns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, entry_id TEXT,
+        trace_id TEXT, ts INTEGER NOT NULL, model TEXT, input_tokens INTEGER,
+        output_tokens INTEGER, cached_tokens INTEGER, reasoning_tokens INTEGER
+      );
+      CREATE TABLE traces (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT NOT NULL UNIQUE,
+        session_id TEXT, root_session_id TEXT, ts INTEGER NOT NULL, model TEXT,
+        ttft_ms REAL, prefill_tps REAL, decode_tps REAL, mtp_cycles INTEGER,
+        mtp_mean_accepted REAL, duration_ms REAL, queue_ms INTEGER, finish_reason TEXT,
+        resident INTEGER, prompt_tokens INTEGER, cached_tokens INTEGER, output_tokens INTEGER,
+        reasoning_tokens INTEGER, cold_hits INTEGER, cold_misses INTEGER,
+        cold_bytes_written INTEGER, cold_bytes_restored INTEGER, source_file TEXT
+      );
+      CREATE TABLE trace_files (
+        name TEXT PRIMARY KEY, last_ingested_mtime INTEGER NOT NULL, last_ingested_size INTEGER NOT NULL
+      );`,
+    );
+    raw.exec("INSERT INTO traces (trace_id, ts, cold_hits) VALUES ('legacy-1', 1, 7);");
+    raw.exec('PRAGMA user_version = 2;'); // the PREVIOUS SCHEMA_VERSION
+    raw.close();
+
+    // Opening does not throw and does not wedge: quarantine + rebuild.
+    const first = openDashboardDb(file);
+    const quarantined = readdirSync(d).filter((n) => n.startsWith('index.db.corrupt-'));
+    expect(quarantined).toHaveLength(1);
+    // The user's old index is preserved on disk, not discarded.
+    expect(readFileSync(join(d, quarantined[0])).subarray(0, 15).toString('utf-8')).toContain('SQLite format 3');
+
+    // Every new column is live and round-trips through drizzle.
+    first.db
+      .insert(traces)
+      .values({
+        traceId: 't1',
+        ts: 1,
+        coldRoot: '/canonical/cache/root',
+        coldEnabled: 1,
+        coldEnqueued: 4,
+        coldQueueDrops: 1,
+        coldEvictions: 2,
+        coldCorruptions: 0,
+        coldCorruptionsTotal: 0,
+        coldQueueDropsTotal: 3,
+      })
+      .run();
+    const rows = first.db.select().from(traces).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].coldRoot).toBe('/canonical/cache/root');
+    expect(rows[0].coldEnabled).toBe(1);
+    expect(rows[0].coldEnqueued).toBe(4);
+    expect(rows[0].coldQueueDrops).toBe(1);
+    expect(rows[0].coldEvictions).toBe(2);
+    expect(rows[0].coldCorruptions).toBe(0);
+    expect(rows[0].coldCorruptionsTotal).toBe(0);
+    expect(rows[0].coldQueueDropsTotal).toBe(3);
+
+    // The DDL change came WITH a version bump. Without one, the next build to
+    // touch the schema would open a drifted db on the version check alone.
+    // If this number needs changing, every `PRAGMA user_version` fixture above
+    // must be restamped in the same commit — otherwise the version check
+    // short-circuits and their signature probes silently stop running.
+    const uv = first.sqlite.prepare('PRAGMA user_version').get() as { user_version: number };
+    expect(uv.user_version).toBe(3);
+    first.close();
+
+    // Reopening the rebuilt file validates in place: no second quarantine.
+    const second = openDashboardDb(file);
+    expect(second.db.select().from(traces).all()).toHaveLength(1);
     second.close();
     expect(readdirSync(d).filter((n) => n.startsWith('index.db.corrupt-'))).toHaveLength(1);
 

@@ -9,7 +9,7 @@ import {
   TOOLTIP_CONTENT_STYLE,
   buildSeriesColorMap,
 } from '@/lib/chart';
-import { formatCount, formatNumber } from '@/lib/format';
+import { formatCount, formatNumber, formatRate } from '@/lib/format';
 import type {
   MetricsOverviewResponse,
   ModelShareRow,
@@ -59,6 +59,20 @@ function formatDay(day: string): string {
 /** Truncate a long model id for an axis/legend tick; the full name lives in the tooltip. */
 function shortModel(model: string): string {
   return model.length > 22 ? `${model.slice(0, 21)}…` : model;
+}
+
+/**
+ * Tooltip text for one model-usage-share slice.
+ *
+ * A named export rather than an inline closure because the percentage here is
+ * another call site of the rounding rule the Cache page's hit rate carried: a
+ * bare `Math.round((turns / total) * 100)` renders 9999 turns out of 10000 as a
+ * flat "100%" while the legend right beside it lists two models. `formatRate`
+ * decides both endpoints from the raw counts, so "100%" requires every other
+ * slice to be empty.
+ */
+export function modelShareLabel(turns: number, total: number): string {
+  return `${formatNumber(turns)} turns · ${formatRate(turns, total)}`;
 }
 
 /** Stable trend pickers (module-level so they never re-trigger the pivot memo). */
@@ -339,10 +353,8 @@ export default function Metrics() {
                 <Tooltip
                   contentStyle={TOOLTIP_CONTENT_STYLE}
                   formatter={(value, _name, item) => {
-                    const turns = Number(value);
-                    const pct = shareTotal > 0 ? Math.round((turns / shareTotal) * 100) : 0;
                     const model = String((item as { payload?: { model?: string } }).payload?.model ?? '');
-                    return [`${formatNumber(turns)} turns · ${pct}%`, model];
+                    return [modelShareLabel(Number(value), shareTotal), model];
                   }}
                 />
                 <Legend

@@ -16,8 +16,9 @@
  */
 
 import type { ExtensionAPI, InlineExtension } from '@earendil-works/pi-coding-agent';
-import { coldCacheStats, type ColdCacheStats } from '@mlx-node/core';
+import { coldCacheStats, coldSidecarStats, type ColdCacheStats, type ColdSidecarStats } from '@mlx-node/core';
 
+import { canonicalCacheRoot } from '../cold-tier.js';
 import { MetricsTrace, type MetricsTraceRecord } from './metrics-trace.js';
 import { MLX_API, MLX_API_KEY, MLX_BASE_URL, MLX_PROVIDER_ID } from './mlx-identity.js';
 import { MlxModelHost } from './model-host.js';
@@ -34,10 +35,27 @@ function safeColdStats(): ColdCacheStats | undefined {
   }
 }
 
+/**
+ * Read the process-wide sidecar counters. Separate from {@link safeColdStats}
+ * because it reads a different native struct that has no `enabled` gate: the
+ * counters live in a plain static, not in the tier, so they are valid even
+ * when the tier never opened — which is exactly the case a run with zero
+ * sidecars needs distinguished.
+ */
+function safeSidecarStats(): ColdSidecarStats | undefined {
+  try {
+    return coldSidecarStats();
+  } catch {
+    return undefined;
+  }
+}
+
 /** Injectable seams for {@link createMlxProviderExtension} (unit tests). */
 export interface MlxProviderExtensionDeps {
   /** Process-wide cold-tier reader; defaults to the native addon (absent in unit tests). */
   coldStats?: () => ColdCacheStats | undefined;
+  /** Process-wide sidecar-counter reader; defaults to the native addon. */
+  sidecarStats?: () => ColdSidecarStats | undefined;
   /** Durable per-turn telemetry sink; defaults to a fresh {@link MetricsTrace}. */
   metricsTrace?: MetricsTrace;
 }
@@ -58,6 +76,7 @@ export function createMlxProviderExtension(
   const performanceStatus = new PerformanceStatus();
   const metricsTrace = deps.metricsTrace ?? new MetricsTrace();
   const readColdStats = deps.coldStats ?? safeColdStats;
+  const readSidecarStats = deps.sidecarStats ?? safeSidecarStats;
   // This closure outlives Pi runtime replacement. Pi creates a replacement
   // runtime for /new and /resume and reruns inline extension factories; each
   // new factory's session_start updates the root while child sessions keep
@@ -72,12 +91,22 @@ export function createMlxProviderExtension(
   // errored — which never reaches `onTurnRecord` — can't leak its restores into
   // the next successful turn's delta. Inference is serialized per process (host
   // promise chain), so by the time a turn snapshots, any prior turn has fully
-  // drained. The SYNCHRONOUS counters (hits/misses/bytesRestored) are exact
-  // per-turn; bytesWritten advances on the async writer thread, so its delta is
-  // approximate (documented on the record).
+  // drained. The SYNCHRONOUS counters (hits/misses/bytesRestored/enqueued/
+  // corruptions) are exact per-turn; bytesWritten and evictions advance on the
+  // async writer thread and queueDrops has one arm on each, so those deltas are
+  // approximate (documented per field on the record).
+  //
+  // The SIDECAR counters are snapshotted the same way but are exact without
+  // exception: every one of them is recorded inside the native turn finalize,
+  // on the calling thread, before the turn returns. They also have no `enabled`
+  // gate — they live in a plain process static rather than in the tier — so
+  // they read honestly on a run where the tier never opened, which is the run
+  // that most needs them.
   let turnStartCold = readColdStats();
+  let turnStartSidecar = readSidecarStats();
   const onTurnStart = (): void => {
     turnStartCold = readColdStats();
+    turnStartSidecar = readSidecarStats();
   };
   const onTurnRecord: TurnRecorder = ({
     traceId,
@@ -121,6 +150,47 @@ export function createMlxProviderExtension(
       rec.coldMisses = cold.misses - turnStartCold.misses;
       rec.coldBytesWritten = cold.bytesWritten - turnStartCold.bytesWritten;
       rec.coldBytesRestored = cold.bytesRestored - turnStartCold.bytesRestored;
+      rec.coldEnqueued = cold.enqueued - turnStartCold.enqueued;
+      rec.coldQueueDrops = cold.queueDrops - turnStartCold.queueDrops;
+      rec.coldEvictions = cold.evictions - turnStartCold.evictions;
+      rec.coldCorruptions = cold.corruptions - turnStartCold.corruptions;
+      // Absolutes, not deltas: an aborted/errored turn never reaches this
+      // recorder, so a corruption or a dropped write during one lands in NO
+      // delta. The cumulative counter observed by the next successful turn
+      // still carries it, which is what makes "corruptions must be 0"
+      // checkable at all (`MAX(total) > 0` over any window).
+      rec.coldCorruptionsTotal = cold.corruptions;
+      rec.coldQueueDropsTotal = cold.queueDrops;
+      // Cache IDENTITY comes from the END-of-turn snapshot, never the baseline:
+      // the tier opens LAZILY on first use, so on a process's first turn
+      // `turnStartCold` is the all-zero default with `enabled: false` and an
+      // empty root. Canonicalized here — in the writer — so the dashboard
+      // never has to match whatever spelling Rust happened to construct.
+      rec.coldEnabled = cold.enabled;
+      // ONE emptiness test, applied to the CANONICAL value. Gating on the raw
+      // native string used a DIFFERENT test from the one `canonicalCacheRoot`
+      // applies (it trims), so a whitespace-only root passed `length > 0` here
+      // and canonicalized to `''` — which `MetricsTrace.record` then dropped,
+      // leaving a row that says the tier was ON while carrying no root at all.
+      if (cold.enabled) {
+        const canonicalRoot = canonicalCacheRoot(cold.root);
+        if (canonicalRoot.length > 0) rec.coldRoot = canonicalRoot;
+      }
+    }
+    // Its own guard, deliberately not folded into the block above: the sidecar
+    // reader never consults the tier, so it keeps reporting when `cold` is
+    // undefined or the tier failed to open. A run with `coldHits: 0` and no
+    // tier is exactly when "did the capture even run?" is the question, and
+    // gating these on `cold` would blank them precisely then.
+    const sidecar = readSidecarStats();
+    if (sidecar && turnStartSidecar) {
+      rec.coldSidecarCaptureReached = sidecar.captureReached - turnStartSidecar.captureReached;
+      rec.coldSidecarChainEmpty = sidecar.chainEmpty - turnStartSidecar.chainEmpty;
+      rec.coldSidecarBoundarySkips = sidecar.boundarySkips - turnStartSidecar.boundarySkips;
+      rec.coldSidecarAlreadyPersisted = sidecar.alreadyPersisted - turnStartSidecar.alreadyPersisted;
+      rec.coldSidecarEnqueued = sidecar.enqueued - turnStartSidecar.enqueued;
+      rec.coldSidecarQueueDrops = sidecar.queueDrops - turnStartSidecar.queueDrops;
+      rec.coldSidecarInstalled = sidecar.installed - turnStartSidecar.installed;
     }
     metricsTrace.record(rec);
   };

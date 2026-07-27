@@ -184,9 +184,54 @@ export interface CacheTrendRow {
   bytesRestored: number;
 }
 
+/** Lookups the trend's root filter left out, so the page can say so out loud. */
+export interface CacheExcludedBucket {
+  turns: number;
+  hits: number;
+  misses: number;
+}
+
+/** What `trend` is (and is not) counting. */
+export interface CacheScope {
+  /** Canonical cache root every `trend` row is filtered to. */
+  root: string;
+  /** Trace retention, i.e. the real width of the trend window. */
+  trendWindowDays: number;
+  /** Turns recorded before cache attribution existed — excluded, not lost. */
+  legacy: CacheExcludedBucket;
+  /** Turns attributed to a DIFFERENT cache directory. */
+  otherRoots: CacheExcludedBucket;
+  /**
+   * Turns whose tier was ON but which recorded no root. The writer cannot
+   * produce these any more; the bucket keeps the partition EXHAUSTIVE so such a
+   * row's lookups are shown rather than silently dropped.
+   */
+  unattributed: CacheExcludedBucket;
+  /** Turns that ran with the cold tier switched off (their deltas are all 0). */
+  disabledTurns: number;
+}
+
+/**
+ * Cold-tier counters beyond hit/miss. `corruptionsTotal` / `queueDropsTotal`
+ * are CUMULATIVE process totals reduced with MAX (not summed deltas), so a
+ * corruption during a turn that aborted before it could record still shows.
+ */
+export interface ColdTierHealth {
+  enqueued: number;
+  queueDrops: number;
+  evictions: number;
+  corruptions: number;
+  corruptionsTotal: number;
+  queueDropsTotal: number;
+}
+
 export interface CacheResponse {
   disk: ColdCacheDiskInfo;
   trend: CacheTrendRow[];
+  scope: CacheScope;
+  health: ColdTierHealth;
+  /** Families whose prefixes may be restored — served, never bundled. */
+  restoreFamilies: string[];
 }
 
 /** Result of `DELETE /api/cache` (clear all or evict older-than). */

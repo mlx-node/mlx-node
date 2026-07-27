@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import { clearColdCache, evictOlderThan, scanColdCache } from '../src/cache.js';
 import { mutate } from '../ui/src/lib/api.js';
+import { coldObjectCounts, evictPreview, histogramObjectTotal } from '../ui/src/lib/cold-tier.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -297,5 +298,128 @@ describe('cache DELETE request body (Cache page → mutate)', () => {
     expect(JSON.parse(calls[0].body as string)).toEqual({ all: true });
     expect(JSON.parse(calls[1].body as string)).toEqual({ olderThanDays: 7 });
     expect(calls[2].body).toBeUndefined();
+  });
+});
+
+/**
+ * F2 — the Blocks tile and the Blocks-by-age chart disagreed by exactly
+ * `sidecarCount` (136 vs 138). Both numbers were correct; both were LABELLED
+ * "blocks". `entryCount` is KV blocks alone, while the histogram (and
+ * `totalBytes`, and both mtimes) covers blocks AND sidecars because clear/evict
+ * remove both.
+ *
+ * These run the real filesystem scan and then the real UI counting helpers on
+ * its output, so the invariant is asserted end-to-end rather than against a
+ * hand-written literal that could agree with itself.
+ */
+describe('cold-tier object counting (Cache page ↔ scan)', () => {
+  it('reports the histogram total as OBJECTS, matching blocks + sidecars', () => {
+    const now = Date.now();
+    stage(now);
+    // Two sidecars beside the four blocks — the 138-vs-136 shape, in miniature.
+    for (const [index, group, ageDays] of [
+      [5, 'gdn_state', 0.5],
+      [6, 'sliding_window', 10],
+    ] as const) {
+      const path = join(root, sidecarName(index, group));
+      writeFileSync(path, Buffer.alloc(5));
+      const when = new Date(now - ageDays * DAY_MS);
+      utimesSync(path, when, when);
+    }
+
+    const info = scanColdCache(root);
+    const counts = coldObjectCounts(info);
+
+    // The tile's own number, unchanged and still blocks-only.
+    expect(counts.blocks).toBe(info.entryCount);
+    expect(counts.sidecars).toBe(info.sidecarCount);
+    // THE INVARIANT: whatever the chart totals is what `objects` reports. A
+    // tile driven by `blocks` disagrees with this chart by `sidecars`.
+    expect(counts.objects).toBe(histogramObjectTotal(info.ageHistogram));
+    expect(counts.objects).toBe(6);
+    expect(counts.blocks).toBe(4);
+    expect(counts.sidecars).toBe(2);
+    // And the two really are different numbers here, so the assertion above is
+    // not passing by coincidence on an all-blocks fixture.
+    expect(counts.objects).not.toBe(counts.blocks);
+  });
+
+  it('counts sidecars in the eviction preview, matching what evictOlderThan unlinks', () => {
+    const now = Date.now();
+    stage(now);
+    // One sidecar older than 7 days: it WILL be unlinked, so the preview the
+    // confirm dialog shows has to include it.
+    const old = join(root, sidecarName(6, 'sliding_window'));
+    writeFileSync(old, Buffer.alloc(5));
+    const when = new Date(now - 10 * DAY_MS);
+    utimesSync(old, when, when);
+
+    const preview = evictPreview(scanColdCache(root).ageHistogram, 7);
+    const actual = evictOlderThan(7, root);
+    expect(preview.count).toBe(actual.removed);
+    expect(preview.bytes).toBe(actual.freedBytes);
+    // blocks #3 (10d) + #4 (40d) + the sidecar.
+    expect(actual.removed).toBe(3);
+  });
+
+  /**
+   * `startIndex` has THREE arms and only the middle one was reachable from a
+   * test: `days = 7` maps to 2 under both `days >= 30 ? 3 : days >= 7 ? 2 : 1`
+   * and the collapsed `days >= 30 ? 3 : 2`, so the obvious mutation was a no-op
+   * and the 1-day and 30-day arms shipped unexercised. Both are reachable from
+   * the page's own `EVICT_OPTIONS`.
+   *
+   * Each case is oracled against `evictOlderThan` at the same threshold — the
+   * function the dialog is predicting — rather than against a hand-computed
+   * number, so the preview cannot drift from the deletion.
+   */
+  for (const [days, removed, freed] of [
+    [1, 3, 90], // #2 (3d) + #3 (10d) + #4 (40d)
+    [7, 2, 70], // #3 + #4
+    [30, 1, 40], // #4
+  ] as const) {
+    it(`previews exactly what evictOlderThan(${days}) removes`, () => {
+      stage(Date.now());
+      const preview = evictPreview(scanColdCache(root).ageHistogram, days);
+      const actual = evictOlderThan(days, root);
+      expect(preview.count).toBe(actual.removed);
+      expect(preview.bytes).toBe(actual.freedBytes);
+      // Pinned so a fixture that stopped straddling the boundary (making the
+      // oracle agree trivially at 0) would be caught too.
+      expect(actual.removed).toBe(removed);
+      expect(actual.freedBytes).toBe(freed);
+    });
+  }
+
+  it('does not grey out the Evict button when the only evictable objects sit in the 1-7d bucket', () => {
+    // The live consequence of the untested 1-day arm: the page disables Evict
+    // on `evictP.count === 0`, so a preview that skipped the 1-7d bucket left
+    // occupied quota with no way to clear it — the same dead end the
+    // sidecar-only fix closed.
+    const histogram = [
+      { label: '<1d', count: 1, bytes: 25 },
+      { label: '1-7d', count: 5, bytes: 500 },
+      { label: '7-30d', count: 0, bytes: 0 },
+      { label: '>30d', count: 0, bytes: 0 },
+    ];
+    expect(evictPreview(histogram, 1)).toEqual({ count: 5, bytes: 500 });
+    // …and the other two thresholds genuinely have nothing to offer here, so
+    // the 1-day arm is the only thing standing between the user and the quota.
+    expect(evictPreview(histogram, 7)).toEqual({ count: 0, bytes: 0 });
+    expect(evictPreview(histogram, 30)).toEqual({ count: 0, bytes: 0 });
+  });
+
+  it('treats a sidecar-only tier as non-empty so its quota is clearable', () => {
+    // Reachable state: blocks evicted, sidecars left behind. Gating the
+    // destructive controls on `entryCount` showed occupied quota the UI refused
+    // to clear, and the age chart claimed "no blocks persisted yet".
+    const solo = join(root, sidecarName(9, 'gdn_state'));
+    writeFileSync(solo, Buffer.alloc(64));
+
+    const info = scanColdCache(root);
+    expect(info.entryCount).toBe(0);
+    expect(info.totalBytes).toBeGreaterThan(0);
+    expect(coldObjectCounts(info).objects).toBe(1);
+    expect(clearColdCache(root).removed).toBe(1);
   });
 });

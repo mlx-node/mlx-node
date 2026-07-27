@@ -10,8 +10,13 @@
     { "path": "./packages/privacy" },
     { "path": "./packages/server" },
     { "path": "./packages/dashboard" },
+    { "path": "./packages/dashboard/ui" },
     { "path": "./examples" },
-    { "path": "./__test__" }
+    { "path": "./__test__" },
+    { "path": "./packages/agent/__test__" },
+    { "path": "./packages/cli/__test__" },
+    { "path": "./packages/dashboard/__test__" },
+    { "path": "./packages/privacy/__test__" }
   ],
   "compilerOptions": {
     "strict": true,

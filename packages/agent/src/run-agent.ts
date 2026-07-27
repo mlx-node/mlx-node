@@ -60,10 +60,12 @@ export interface RunAgentOptions {
   /** Native inference-log path to surface after Pi takes over the TUI. */
   traceLogFile?: string;
   /**
-   * Enable the qwen3 dense cold tier by default (the agent's default; the CLI
-   * sets it false for `--no-persist-cache`). Forwarded to {@link MlxModelHost},
-   * which applies it to qwen3-family loads only. `undefined` keeps the host's
-   * on-by-default behavior.
+   * Enable the SSD cold tier by default (the agent's default; the CLI sets it
+   * false for `--no-persist-cache`). Forwarded to {@link MlxModelHost}, which
+   * applies this ONE value to every load whose family is in
+   * `COLD_TIER_RESTORE_FAMILIES` — not to qwen3 alone. Families off that list
+   * are handed no policy because they can never persist, not because this flag
+   * spares them. `undefined` keeps the host's on-by-default behavior.
    */
   persistPagedCache?: boolean;
   /** @internal Test seam; when set, the pi dynamic import is skipped entirely. */

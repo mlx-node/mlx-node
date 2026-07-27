@@ -75,6 +75,10 @@ export default defineConfig({
       '@mlx-node/trl': resolve(__dirname, './packages/trl/src/index.ts'),
       '@mlx-node/server': resolve(__dirname, './packages/server/src/index.ts'),
       '@mlx-node/dashboard': resolve(__dirname, './packages/dashboard/src/index.ts'),
+      // The dashboard SPA's own `@/…` alias (packages/dashboard/ui/vite.config.ts),
+      // repeated here so a test can import a page component. Keyed with the
+      // trailing slash so it can never swallow an `@mlx-node/…` specifier.
+      '@/': `${resolve(__dirname, './packages/dashboard/ui/src')}/`,
     },
   },
 });
