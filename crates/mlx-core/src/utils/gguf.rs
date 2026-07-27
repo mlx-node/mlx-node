@@ -2004,21 +2004,32 @@ impl SourceQuantProfile {
 /// layer whose minimum marks the global layers — the same array
 /// [`apply_gemma4_attention_geometry`] already reads.
 ///
-/// Both witnesses must agree before the flag is flipped, because the tensor list
-/// alone is fail-open: a checkpoint truncated mid-download, or corrupted, is
-/// missing an `attn_v` too, and reading that as K=V suppresses the loader's
+/// The header is cross-checked before the flag is flipped, because the tensor
+/// list alone is fail-open: a checkpoint truncated mid-download, or corrupted,
+/// is missing an `attn_v` too, and reading that as K=V suppresses the loader's
 /// missing-weight check (`models/gemma4/persistence.rs`, `v_proj required when
 /// this layer does not use k_eq_v`) and feeds attention the keys as values. So
-/// once the tensors claim the interleave, the header must corroborate it
-/// exactly:
+/// where the header says something, it has to say the same thing:
 ///
-/// * the `blk.N` indices are exactly `0 .. gemma4.block_count`,
-/// * `head_count_kv` has one entry per layer, and
-/// * the layers at its minimum are precisely the layers with no `attn_v`.
+/// * the `blk.N` indices run `0..N` with no gaps, and `gemma4.block_count`, when
+///   present, equals `N`,
+/// * `head_count_kv`, when it is an ARRAY, has one entry per layer, and
+/// * the layers at that array's minimum are precisely the layers with no
+///   `attn_v`.
 ///
-/// Anything else is a named error rather than a silent `None`: the tensor list
+/// A disagreement is a named error rather than a silent `None`: the tensor list
 /// is a partial-V mixture either way, so the load cannot succeed, and reporting
 /// the disagreement beats relocating the failure to `layers.N.self_attn.v_proj`.
+///
+/// A header that says NOTHING is a different case and is not an error. Absence
+/// of a witness is not evidence of corruption, and refusing there would reject
+/// files that convert fine — the geometry helper fifty lines below degrades
+/// gracefully on exactly the same input, so erroring here also made the two
+/// disagree about how much header they require. The downstream is not
+/// defenceless either: every published Gemma-4 gives its global layers
+/// `head_dim` 256 against `global_head_dim` 512, so a genuinely mistyped layer
+/// still fails loudly on its projection shapes. This cross-check is defence in
+/// depth, not the only line.
 fn gemma4_layer_types_from_missing_v(gguf: &GgufFile) -> Result<Option<Vec<String>>> {
     let mut layers = std::collections::BTreeSet::new();
     for tensor in &gguf.tensors {
@@ -2046,11 +2057,19 @@ fn gemma4_layer_types_from_missing_v(gguf: &GgufFile) -> Result<Option<Vec<Strin
         return Ok(None);
     }
 
+    // Both the emitted `layer_types` and the `head_count_kv` comparison below
+    // are positional — entry `i` describes block `i` — so they only mean
+    // anything if the blocks run `0..N` with no gaps. `gemma4.block_count`, when
+    // the file states it, must agree with that count; when it is absent there is
+    // simply nothing to compare against, and refusing on that basis would reject
+    // a file whose own tensor list is perfectly self-consistent.
     let block_count = gguf
         .metadata
         .get("gemma4.block_count")
         .and_then(GgufMetaValue::as_u32);
-    if !block_count.is_some_and(|n| layers.iter().copied().eq(0..n)) {
+    if !layers.iter().copied().eq(0..layers.len() as u32)
+        || block_count.is_some_and(|n| n as usize != layers.len())
+    {
         return Err(Error::from_reason(format!(
             "Gemma4 GGUF omits 'attn_v' on {} of {} decoder blocks, but its blocks are not \
              exactly 0..gemma4.block_count ({block_count:?}) — the tensor list is truncated or \
@@ -2058,6 +2077,26 @@ fn gemma4_layer_types_from_missing_v(gguf: &GgufFile) -> Result<Option<Vec<Strin
             missing_v.len(),
             layers.len(),
         )));
+    }
+
+    let types: Vec<String> = layers
+        .iter()
+        .map(|layer| {
+            if missing_v.contains(layer) {
+                "full_attention".to_string()
+            } else {
+                "sliding_attention".to_string()
+            }
+        })
+        .collect();
+
+    // `head_count_kv` only carries per-layer information when it is an ARRAY. A
+    // scalar states one count for the whole model and an absent key states
+    // nothing at all; neither can mark which layers are global, so neither
+    // contradicts the tensor list. Return the measured answer instead of
+    // erroring — see the doc comment for why absence is not corruption.
+    if !gemma4_kv_head_counts_are_per_layer(&gguf.metadata) {
+        return Ok(Some(types));
     }
 
     let kv_per_layer = gemma4_kv_head_counts(&gguf.metadata);
@@ -2093,18 +2132,21 @@ fn gemma4_layer_types_from_missing_v(gguf: &GgufFile) -> Result<Option<Vec<Strin
         )));
     }
 
-    Ok(Some(
-        layers
-            .iter()
-            .map(|layer| {
-                if missing_v.contains(layer) {
-                    "full_attention".to_string()
-                } else {
-                    "sliding_attention".to_string()
-                }
-            })
-            .collect(),
-    ))
+    Ok(Some(types))
+}
+
+/// Whether `gemma4.attention.head_count_kv` is spelled as an array, the only
+/// form that says anything per layer.
+///
+/// [`gemma4_kv_head_counts`] flattens a scalar into a one-element vector so the
+/// geometry helper can still use it, which makes a scalar indistinguishable from
+/// a one-entry array by length alone. The cross-check needs the distinction: a
+/// scalar is silence, not a contradicting witness.
+fn gemma4_kv_head_counts_are_per_layer(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+    matches!(
+        metadata.get("gemma4.attention.head_count_kv"),
+        Some(GgufMetaValue::ArrayI32(_) | GgufMetaValue::ArrayU32(_))
+    )
 }
 
 /// Whether a config already states `key`, looked up the way the Gemma4 loader
@@ -2546,6 +2588,66 @@ pub async fn convert_gguf_to_safetensors(
         )));
     }
 
+    // The output file name decides whether this conversion owns config.json, and
+    // two checks below turn on that: the secondary-output reject immediately
+    // after, and the Gemma4 layout detection. Both belong here, ahead of the
+    // save — `save_safetensors` opens the destination with `File::create`, which
+    // truncates any existing file the instant it runs, so a rejection raised
+    // after that point has already destroyed a readable checkpoint.
+    let safetensors_filename = options
+        .output_filename
+        .as_deref()
+        .unwrap_or("model.safetensors");
+    let is_primary_model = safetensors_filename == "model.safetensors";
+
+    // A secondary output (`--mmproj` writes `vision.safetensors`) shares the
+    // output directory with the primary conversion and deliberately writes no
+    // config.json — the primary one owns it. So a tensor whose decode geometry
+    // can ONLY be expressed in config.json has nowhere to record it: a symmetric
+    // ggml block loses the `symmetric_zero_point` its derived `.biases` is
+    // rebuilt from, and an imported K-quant loses the mode/bits/group_size that
+    // spell out ggml's geometry. Either way the bytes land packed correctly and
+    // are then decoded as the runtime's generic affine default.
+    //
+    // K-quant tensors are exempt when the import is off, matching
+    // `preserved_source_quantization`: without the import no K-quant array
+    // reaches the output for a config entry to describe.
+    //
+    // Header-only, like the two guards above — `parse_gguf` has read the header,
+    // metadata and tensor descriptors and nothing else.
+    if !is_primary_model
+        && let Some((tensor, profile)) = gguf.tensors.iter().find_map(|t| {
+            if !import_k_quants && t.tensor_type.k_quant_format().is_some() {
+                return None;
+            }
+            let profile = SourceQuantProfile::for_gguf_type(t.tensor_type)?;
+            (profile.symmetric_zero_point.is_some() || profile.requires_explicit_entry())
+                .then_some((t, profile))
+        })
+    {
+        return Err(Error::from_reason(format!(
+            "GGUF tensor '{}' is {}, which loads as {} only when config.json says so — but this \
+             conversion writes '{safetensors_filename}', a secondary output that writes no \
+             config.json (the primary 'model.safetensors' conversion owns it). The packed bytes \
+             would be written and then decoded with the runtime's default geometry. Convert this \
+             file as the primary output, or use a source whose tensors are float or plain \
+             group-32 affine.",
+            tensor.name,
+            tensor.tensor_type.name(),
+            profile.describe(),
+        )));
+    }
+
+    // Measured off the tensor list and cross-checked against the header, both of
+    // which `parse_gguf` has already read, so the whole decision is available
+    // before the destructive save. Only the primary output can act on it: the
+    // fields it produces are config.json fields.
+    let gemma4_layer_types = if is_primary_model && is_gemma4_main_gguf(&gguf.metadata) {
+        gemma4_layer_types_from_missing_v(&gguf)?
+    } else {
+        None
+    };
+
     // Output keys an optional global `--dtype` request must leave alone,
     // spelled out rather than inferred from a suffix or a dtype.
     //
@@ -2882,10 +2984,6 @@ pub async fn convert_gguf_to_safetensors(
         .sum();
 
     // Save SafeTensors
-    let safetensors_filename = options
-        .output_filename
-        .as_deref()
-        .unwrap_or("model.safetensors");
     let safetensors_path = output_dir.join(safetensors_filename);
     info!("Saving to {}", safetensors_path.display());
     // Capture tensor names BEFORE `save_safetensors` — it drains `weights`
@@ -2899,11 +2997,10 @@ pub async fn convert_gguf_to_safetensors(
     let st_metadata = serde_json::json!({ "format": "mlx" });
     save_safetensors(&safetensors_path, &mut weights, Some(st_metadata))?;
 
-    // Only write config.json and tokenizer files for the primary model file.
-    // Secondary files (e.g., vision.safetensors for mmproj) should not overwrite
-    // the config written by the primary LLM conversion.
-    let is_primary_model = safetensors_filename == "model.safetensors";
-
+    // Only write config.json and tokenizer files for the primary model file
+    // (`is_primary_model`, resolved before the save). Secondary files (e.g.,
+    // vision.safetensors for mmproj) should not overwrite the config written by
+    // the primary LLM conversion.
     if is_primary_model {
         // config.json: an explicit source directory is authoritative (needed by
         // unified Gemma4, whose full text/vision/audio config cannot be rebuilt
@@ -2939,8 +3036,7 @@ pub async fn convert_gguf_to_safetensors(
         // source and keeps it — writing over an explicit statement would make
         // `--config-dir` unable to correct a mislabelled checkpoint.
         if is_gemma4_main_gguf(&gguf.metadata) {
-            let layer_types = gemma4_layer_types_from_missing_v(&gguf)?;
-            if let Some(ref types) = layer_types {
+            if let Some(types) = &gemma4_layer_types {
                 if !gemma4_config_states(&config_json, "attention_k_eq_v") {
                     config_json["attention_k_eq_v"] = serde_json::Value::Bool(true);
                 }
@@ -2957,7 +3053,7 @@ pub async fn convert_gguf_to_safetensors(
             // Only when we synthesized the config: an authoritative config.json
             // already states this geometry, and the GGUF is the weaker source.
             if synthesized_config && let Some(obj) = config_json.as_object_mut() {
-                apply_gemma4_attention_geometry(obj, &gguf.metadata, layer_types.as_deref());
+                apply_gemma4_attention_geometry(obj, &gguf.metadata, gemma4_layer_types.as_deref());
             }
         }
 
@@ -4697,13 +4793,96 @@ mod tests {
                 .expect_err("a block count that disagrees with the tensor list is damage")
         );
         assert!(err.contains("block_count"), "{err}");
+    }
 
-        let mut no_header = kv_layout_fixture(48, &global);
-        no_header.metadata.remove("gemma4.attention.head_count_kv");
-        assert!(
-            gemma4_layer_types_from_missing_v(&no_header).is_err(),
-            "a file with no per-layer KV header has no second witness"
+    /// A header that says nothing is silence, not a contradiction: the measured
+    /// layout stands.
+    ///
+    /// `head_count_kv` is optional and may be written as a scalar, and
+    /// `block_count` may be missing outright. Erroring on any of those rejects a
+    /// partial-V checkpoint whose own tensor list is self-consistent — and
+    /// `apply_gemma4_attention_geometry`, which reads the very same array,
+    /// degrades gracefully on exactly this input, so refusing here also made the
+    /// two disagree about how much header they demand. The mistyping this used
+    /// to guard against still fails loudly downstream, on the 256-vs-512
+    /// `head_dim` split every published Gemma-4 carries.
+    ///
+    /// Mutation this catches: restore `kv_per_layer.len() != layers.len()` as an
+    /// unconditional reject (or require `block_count` to be present) and each of
+    /// these three calls returns `Err`, failing the `expect`.
+    #[test]
+    fn gemma4_kv_detection_accepts_a_header_that_corroborates_nothing() {
+        let global = healthy_global_layers(48);
+        let expected: Vec<usize> = global.iter().map(|&layer| layer as usize).collect();
+
+        let full_attention = |file: &GgufFile, why: &str| -> Vec<usize> {
+            let types = gemma4_layer_types_from_missing_v(file)
+                .unwrap_or_else(|e| panic!("{why}: {e}"))
+                .unwrap_or_else(|| panic!("{why}: a mixed checkpoint yields layer_types"));
+            types
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| *t == "full_attention")
+                .map(|(i, _)| i)
+                .collect()
+        };
+
+        let mut absent = kv_layout_fixture(48, &global);
+        absent.metadata.remove("gemma4.attention.head_count_kv");
+        assert_eq!(
+            full_attention(&absent, "an absent head_count_kv corroborates nothing"),
+            expected
         );
+
+        let mut scalar = kv_layout_fixture(48, &global);
+        scalar.metadata.insert(
+            "gemma4.attention.head_count_kv".to_string(),
+            GgufMetaValue::Uint32(8),
+        );
+        assert_eq!(
+            full_attention(&scalar, "a scalar head_count_kv says nothing per layer"),
+            expected
+        );
+
+        let mut no_block_count = kv_layout_fixture(48, &global);
+        no_block_count.metadata.remove("gemma4.block_count");
+        assert_eq!(
+            full_attention(
+                &no_block_count,
+                "an absent block_count corroborates nothing"
+            ),
+            expected
+        );
+    }
+
+    /// The positional premise the whole comparison rests on: entry `i` of
+    /// `head_count_kv` describes block `i`, and `layer_types[i]` is written for
+    /// block `i`. A tensor list that does not run `0..N` breaks both, and
+    /// tolerating an absent `block_count` must not tolerate that.
+    ///
+    /// Mutation this catches: replace the contiguity test with a bare
+    /// `block_count.is_some_and(...)` check and the renumbered list is accepted,
+    /// mislabelling every layer by the offset.
+    #[test]
+    fn gemma4_kv_detection_rejects_blocks_that_do_not_start_at_zero() {
+        let global = healthy_global_layers(48);
+        let mut renumbered = kv_layout_fixture(48, &global);
+        for tensor in &mut renumbered.tensors {
+            if let Some(rest) = tensor.name.strip_prefix("blk.")
+                && let Some((idx, tail)) = rest.split_once('.')
+                && let Ok(n) = idx.parse::<u32>()
+            {
+                tensor.name = format!("blk.{}.{tail}", n + 1);
+            }
+        }
+        renumbered.metadata.remove("gemma4.attention.head_count_kv");
+        renumbered.metadata.remove("gemma4.block_count");
+        let err = format!(
+            "{}",
+            gemma4_layer_types_from_missing_v(&renumbered)
+                .expect_err("blocks that do not start at 0 break the positional mapping")
+        );
+        assert!(err.contains("truncated or renumbered"), "{err}");
     }
 
     /// An authoritative config that already states the layout keeps it; one that
@@ -4949,6 +5128,20 @@ mod tests {
     /// it — `block_count` plus a `head_count_kv` array whose minimum sits on
     /// exactly those layers.
     fn write_gemma4_kv_layout_gguf(root: &Path, layers: u32, global: &[u32]) -> PathBuf {
+        write_gemma4_kv_layout_gguf_with_header(root, layers, global, global)
+    }
+
+    /// Writes a gemma4 GGUF whose tensor list and `head_count_kv` header can be
+    /// made to disagree: `tensor_global` picks the layers that omit `attn_v`,
+    /// `header_global` picks the layers the header marks as low-KV. Passing the
+    /// same set for both produces a self-consistent file.
+    fn write_gemma4_kv_layout_gguf_with_header(
+        root: &Path,
+        layers: u32,
+        tensor_global: &[u32],
+        header_global: &[u32],
+    ) -> PathBuf {
+        let global = tensor_global;
         let mut q4 = [0u8; 18];
         q4[..2].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
         q4[2..].fill(0x87);
@@ -4975,7 +5168,7 @@ mod tests {
             .collect();
 
         let head_count_kv: Vec<i32> = (0..layers)
-            .map(|layer| if global.contains(&layer) { 1 } else { 8 })
+            .map(|layer| if header_global.contains(&layer) { 1 } else { 8 })
             .collect();
         let data = build_minimal_gguf(
             &[
@@ -5007,6 +5200,76 @@ mod tests {
     /// is not merely redundant: it is silently ignored while claiming to have
     /// corrected the config.
     ///
+    /// `save_safetensors` opens the destination with `File::create`, which
+    /// truncates it before the first byte is written, so a conversion that can
+    /// still fail afterwards destroys a previously good output on its way to
+    /// reporting the error. The gemma4 layout check reads nothing but tensor
+    /// names and metadata, both of which `parse_gguf` has already produced, so
+    /// it belongs with the other guards that run before any weight is loaded.
+    ///
+    /// Mutation this catches: move `gemma4_layer_types_from_missing_v` back
+    /// below `save_safetensors` and the prior `model.safetensors` comes back
+    /// truncated or replaced, so the byte comparison fails. The conversion
+    /// still returns `Err` either way — the error is not what is being pinned,
+    /// the survival of the destination is.
+    #[tokio::test]
+    async fn a_contradicted_gemma4_layout_is_rejected_before_the_output_is_touched() {
+        let unique = format!(
+            "mlx-node-gguf-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let output = root.join("out");
+        fs::create_dir_all(&output).unwrap();
+
+        // Tensors omit `attn_v` on layer 3; the header marks layer 5 as the
+        // low-KV one. Exactly the disagreement the cross-check exists to catch.
+        let input = write_gemma4_kv_layout_gguf_with_header(&root, 6, &[3], &[5]);
+
+        let existing = output.join("model.safetensors");
+        let sentinel = b"a previously converted model that must survive a failed re-convert";
+        fs::write(&existing, sentinel).unwrap();
+
+        let converted = convert_gguf_to_safetensors(GgufConversionOptions {
+            input_path: input.to_string_lossy().into_owned(),
+            output_dir: output.to_string_lossy().into_owned(),
+            config_source_dir: None,
+            dtype: None,
+            verbose: Some(false),
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            output_filename: None,
+            vlm_key_prefix: Some(false),
+            quant_mxfp: Some(false),
+            import_k_quants: Some(false),
+        })
+        .await;
+        let Err(err) = converted else {
+            panic!("a header that contradicts the tensor list must be rejected");
+        };
+        assert!(
+            err.reason.contains("head_count_kv"),
+            "the error must name the header it disagreed with: {}",
+            err.reason
+        );
+
+        assert_eq!(
+            fs::read(&existing).unwrap(),
+            sentinel,
+            "the destination was written before the layout was validated"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// Mutation this catches: drop either `gemma4_config_states` check at the
     /// call site and the first block's assertions fail — `attention_k_eq_v`
     /// flips to `true` and a top-level `layer_types` appears.
@@ -5209,6 +5472,168 @@ mod tests {
         assert!(symmetric_zero_point(GgufTensorType::Q4_0).is_some());
         assert!(symmetric_zero_point(GgufTensorType::Q8_0).is_some());
         assert!(symmetric_zero_point(GgufTensorType::Q4_1).is_none());
+    }
+
+    /// A float-only source cannot trip the secondary-output guard, because a
+    /// float tensor has no quantization metadata to record in the first place.
+    ///
+    /// This is the blast radius of that guard on the only mmproj Google ships
+    /// for the QAT checkpoint: `mmproj-gemma-4-12b-it-qat-q4_0.gguf` holds nine
+    /// F32 tensors and two BF16 ones and nothing else, so neither predicate can
+    /// fire on it.
+    #[test]
+    fn float_gguf_types_carry_no_source_quantization_profile() {
+        for ty in [
+            GgufTensorType::F32,
+            GgufTensorType::F16,
+            GgufTensorType::BF16,
+        ] {
+            assert!(
+                SourceQuantProfile::for_gguf_type(ty).is_none(),
+                "{}",
+                ty.name()
+            );
+        }
+    }
+
+    /// A secondary output writes no config.json, so a source carrying tensors
+    /// that can only be decoded with a config entry is rejected upfront.
+    ///
+    /// `--mmproj` runs a second conversion into `vision.safetensors`, and only
+    /// the primary `model.safetensors` conversion writes config.json. A
+    /// symmetric ggml block landing there loses the `symmetric_zero_point` its
+    /// derived `.biases` is rebuilt from; an imported K-quant loses the
+    /// mode/bits/group_size that spell out ggml's geometry. Either way the
+    /// packed bytes are written correctly and then decoded as generic affine.
+    ///
+    /// Mutation this catches: drop the guard, or narrow it to one of the two
+    /// predicates, and the corresponding `expect_err` fails. The last two cases
+    /// are the scope controls — widening the guard to every output breaks the
+    /// primary case, and dropping its `import_k_quants` exemption breaks the
+    /// dequantized-Q6_K case.
+    #[tokio::test]
+    async fn a_secondary_output_rejects_tensors_that_need_a_config_entry() {
+        let mut q4 = [0u8; 18];
+        q4[..2].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
+        q4[2..].fill(0x87);
+        let q6k = pack_q6k_block(&[0; 256], &[1; 16], 1.0);
+
+        fn run(
+            name: &str,
+            dims: &[u64],
+            tensor_type: GgufTensorType,
+            payload: &[u8],
+            output_filename: Option<&str>,
+            import_k_quants: bool,
+        ) -> (std::path::PathBuf, GgufConversionOptions) {
+            let norm = 3.25f32.to_le_bytes();
+            let data = build_minimal_gguf(
+                &[(
+                    "general.architecture",
+                    GgufMetaValue::String("gemma4".to_string()),
+                )],
+                &[
+                    (name, dims, tensor_type, payload),
+                    ("output_norm.weight", &[1], GgufTensorType::F32, &norm),
+                ],
+            );
+            let root = std::env::temp_dir().join(format!(
+                "mlx-node-gguf-secondary-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let input = root.join("model.gguf");
+            fs::write(&input, data).unwrap();
+            let options = GgufConversionOptions {
+                input_path: input.to_string_lossy().into_owned(),
+                output_dir: root.join("output").to_string_lossy().into_owned(),
+                config_source_dir: None,
+                dtype: None,
+                verbose: Some(false),
+                quantize: Some(false),
+                quant_bits: None,
+                quant_group_size: None,
+                quant_mode: None,
+                quant_recipe: None,
+                imatrix_path: None,
+                output_filename: output_filename.map(str::to_string),
+                vlm_key_prefix: Some(false),
+                quant_mxfp: Some(false),
+                import_k_quants: Some(import_k_quants),
+            };
+            (root, options)
+        }
+
+        // A symmetric ggml block in a secondary output has nowhere to record
+        // `symmetric_zero_point`.
+        let (root, options) = run(
+            "blk.0.attn_q.weight",
+            &[32, 1],
+            GgufTensorType::Q4_0,
+            &q4,
+            Some("vision.safetensors"),
+            false,
+        );
+        let outcome = convert_gguf_to_safetensors(options).await;
+        fs::remove_dir_all(&root).ok();
+        let Err(err) = outcome else {
+            panic!("a symmetric block in a secondary output must be rejected");
+        };
+        let message = format!("{err}");
+        assert!(message.contains("blk.0.attn_q.weight"), "{message}");
+        assert!(message.contains("Q4_0"), "{message}");
+        assert!(message.contains("vision.safetensors"), "{message}");
+        assert!(message.contains("config.json"), "{message}");
+
+        // An imported K-quant has nowhere to record its ggml geometry.
+        let (root, options) = run(
+            "token_embd.weight",
+            &[256, 1],
+            GgufTensorType::Q6K,
+            &q6k,
+            Some("vision.safetensors"),
+            true,
+        );
+        let outcome = convert_gguf_to_safetensors(options).await;
+        fs::remove_dir_all(&root).ok();
+        let Err(err) = outcome else {
+            panic!("an imported K-quant in a secondary output must be rejected");
+        };
+        let message = format!("{err}");
+        assert!(message.contains("token_embd.weight"), "{message}");
+        assert!(message.contains("Q6_K"), "{message}");
+        assert!(message.contains("q6k"), "{message}");
+
+        // Scope control: the primary output records both, so it stays allowed.
+        let (root, options) = run(
+            "blk.0.attn_q.weight",
+            &[32, 1],
+            GgufTensorType::Q4_0,
+            &q4,
+            None,
+            false,
+        );
+        let outcome = convert_gguf_to_safetensors(options).await;
+        fs::remove_dir_all(&root).ok();
+        outcome.expect("the primary output writes config.json and keeps working");
+
+        // Scope control: without the import, Q6_K is dequantized to BF16 and
+        // needs no config entry — so a secondary output may carry it.
+        let (root, options) = run(
+            "token_embd.weight",
+            &[256, 1],
+            GgufTensorType::Q6K,
+            &q6k,
+            Some("vision.safetensors"),
+            false,
+        );
+        let outcome = convert_gguf_to_safetensors(options).await;
+        fs::remove_dir_all(&root).ok();
+        outcome.expect("a dequantized Q6_K embedding needs no config entry");
     }
 
     #[test]

@@ -6284,6 +6284,34 @@ fn quantize_weights_inner(
                              requested top-level mode"
                         )));
                     }
+                    // Skipping the group keeps its packed bytes, but nothing
+                    // here records a per-layer override, so the config writer
+                    // stamps the REQUESTED top-level triple over the whole
+                    // checkpoint. The skip is therefore only safe when the
+                    // request already describes what is on disk — group-32 data
+                    // relabelled group-64, or K-quant bytes relabelled affine,
+                    // survive the write and then surface at first decode as
+                    // `null handle returned: quantized_matmul`, naming neither
+                    // the layer nor the shape. The recipe branch above validates
+                    // for the same reason; this arm is the one that did not.
+                    //
+                    // sym8 is left to `enforce_sym8_group_coherence`, which runs
+                    // after this loop under the same no-recipe condition and
+                    // reports the whole group — which member is orphaned, which
+                    // is still float — where this check can only name the one
+                    // tensor it was handed.
+                    if default_mode != "sym8" {
+                        validate_existing_quantized_entry(
+                            weights,
+                            base,
+                            &QuantEntry {
+                                key: key.clone(),
+                                bits: default_bits,
+                                group_size: default_group_size,
+                                mode: default_mode.to_string(),
+                            },
+                        )?;
+                    }
                 }
                 info!(
                     "skipping quantization of '{}': already quantized (sidecar present)",
@@ -9935,20 +9963,23 @@ mod tests {
         let mut weights: HashMap<String, MxArray> = HashMap::new();
 
         // (1) An already-quantized affine group: packed `Uint32` `.weight` of
-        // shape [out, packed]. Both dims chosen so the shape/divisibility gate
-        // would otherwise ACCEPT it — proving the SKIP fires in the new guard,
-        // not as an unrelated shape rejection. Distinct values prove identity.
+        // shape [out, packed]. The sidecars describe the SAME 4-bit group-64
+        // geometry the call below requests, so nothing here can be rejected as a
+        // metadata mismatch — proving the SKIP fires in the new guard, not as an
+        // unrelated shape rejection. Distinct values prove identity.
         let out = 8i64;
-        let packed = h; // 64, divisible by group_size 64
+        let packed = h; // 64 uint32 words → K = 64 * (32/4) = 512 at 4 bits
+        let groups = 512 / 64; // 8 groups of 64 per row
         let packed_key = "model.layers.1.feed_forward.switch_mlp.gate_proj.weight";
         let scales_key = "model.layers.1.feed_forward.switch_mlp.gate_proj.scales";
+        let biases_key = "model.layers.1.feed_forward.switch_mlp.gate_proj.biases";
         let packed_data: Vec<u32> = (0..(out * packed) as u32).collect();
         weights.insert(
             packed_key.into(),
             MxArray::from_uint32(&packed_data, &[out, packed]).expect("from_uint32 packed"),
         );
-        // group_size 64 over last dim 64 → 1 group per row.
-        weights.insert(scales_key.into(), lfm2_bf16(&[out, 1], 0.5));
+        weights.insert(scales_key.into(), lfm2_bf16(&[out, groups], 0.5));
+        weights.insert(biases_key.into(), lfm2_bf16(&[out, groups], -0.25));
 
         // Snapshot the packed input bytes for an identity assertion afterwards.
         let input_packed: Vec<u32> = weights
@@ -9991,11 +10022,20 @@ mod tests {
             weights.contains_key(scales_key),
             "pre-existing scales sidecar must be preserved"
         );
-        // The skip must NOT have inserted a fresh affine `.biases` for this group.
-        let gate_biases_key = "model.layers.1.feed_forward.switch_mlp.gate_proj.biases";
-        assert!(
-            !weights.contains_key(gate_biases_key),
-            "skipped group must not gain a new biases sidecar"
+        // The skip must have left the group's own `.biases` untouched rather
+        // than overwriting it with a freshly computed one.
+        let out_biases = weights
+            .get(biases_key)
+            .expect("pre-existing biases sidecar must be preserved");
+        assert_eq!(
+            out_biases.shape().unwrap().to_vec(),
+            vec![out, groups],
+            "skipped group must keep its own biases sidecar"
+        );
+        assert_eq!(
+            out_biases.dtype().unwrap(),
+            DType::BFloat16,
+            "skipped group must keep its own biases dtype"
         );
 
         // Positive control: the float weight WAS quantized (now Uint32 packed,
@@ -10015,6 +10055,65 @@ mod tests {
 
         // The default 4-bit affine control needs no per-layer override.
         let _ = overrides;
+    }
+
+    /// Re-quantizing an already-converted directory without a recipe must reject
+    /// a group whose stored geometry is not the requested one.
+    ///
+    /// `mlx convert -i <converted-dir> -o out2 -q` skips every group that
+    /// already carries `.scales` and records no per-layer override, so the
+    /// config writer then stamps the requested top-level triple — bare `-q`
+    /// means 4-bit group-64 — over data packed at group 32. The result loads and
+    /// dies inside `mlx_quantized_matmul` as `null handle returned:
+    /// quantized_matmul`, naming neither the layer nor the shape.
+    ///
+    /// Mutation this catches: delete the `validate_existing_quantized_entry`
+    /// call from the no-recipe `has_scales` arm and the call below returns
+    /// `Ok`, failing the `expect_err`.
+    #[test]
+    fn quantize_rejects_an_already_quantized_group_at_another_group_size() {
+        let out = 8i64;
+        let packed = 64i64; // K = 512 at 4 bits
+        let prefix = "model.layers.1.feed_forward.switch_mlp.gate_proj";
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        weights.insert(
+            format!("{prefix}.weight"),
+            MxArray::from_uint32(&vec![0u32; (out * packed) as usize], &[out, packed]).unwrap(),
+        );
+        // Packed at group 32: 512 / 32 = 16 groups per row, not the 8 that the
+        // requested group_size of 64 implies.
+        weights.insert(format!("{prefix}.scales"), lfm2_bf16(&[out, 16], 0.5));
+        weights.insert(format!("{prefix}.biases"), lfm2_bf16(&[out, 16], -0.25));
+
+        let err = quantize_weights(&mut weights, 4, 64, "affine", false)
+            .expect_err("group-32 data relabelled group-64 must be rejected at convert time");
+        assert!(err.reason.contains(prefix), "{}", err.reason);
+        assert!(err.reason.contains("group_size=64"), "{}", err.reason);
+        assert!(err.reason.contains("[8, 16]"), "{}", err.reason);
+    }
+
+    /// The same guard covers a `--gguf-kquant` import directory, whose config
+    /// carries `mode: q4k/q5k/q6k` plus a per-tensor entry for every K-quant
+    /// group. Bare `-q` would replace all of it with affine/4/64 while leaving
+    /// ggml's packed blocks on disk untouched.
+    ///
+    /// Mutation this catches: the same deleted call — the K-quant sidecars are
+    /// int8/uint8, which the affine arm's float-scale test rejects, so without
+    /// the call the group is silently skipped and relabelled.
+    #[test]
+    fn quantize_rejects_an_imported_kquant_group_without_a_recipe() {
+        for format in [KQuantFormat::Q4K, KQuantFormat::Q5K, KQuantFormat::Q6K] {
+            let prefix = "model.layers.0.mlp.gate_proj";
+            let mut weights: HashMap<String, MxArray> = HashMap::new();
+            insert_valid_kquant_group(&mut weights, prefix, format, 4, 512);
+            let mode = format.mlx_mode();
+            let err = quantize_weights(&mut weights, 4, 64, "affine", false)
+                .err()
+                .unwrap_or_else(|| panic!("{mode} bytes relabelled affine must be rejected"))
+                .reason;
+            assert!(err.contains(prefix), "{mode}: {err}");
+            assert!(err.contains("affine storage"), "{mode}: {err}");
+        }
     }
 
     #[test]
