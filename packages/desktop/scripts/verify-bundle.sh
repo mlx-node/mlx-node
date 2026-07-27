@@ -75,16 +75,19 @@ fi
 # rather than a Team ID — which is why this never scans outside $APP.
 # ---------------------------------------------------------------------------
 echo "[2/4] every Mach-O carries a Team ID"
-macho_count=0
-while IFS= read -r -d '' f; do
-  case "$(file -b "$f")" in
-    *Mach-O*) ;;
-    *) continue ;;
-  esac
-  macho_count=$((macho_count + 1))
+# ONE `file` pass over the whole bundle, batched through xargs. The obvious
+# implementation -- `find -exec file {} \;` per step -- spawns one process per
+# file, and this bundle has ~30k of them; two such passes took over two minutes
+# and were killed. Batching turns it into a handful of execs.
+MACHO_LIST="$(mktemp)"
+trap 'rm -f "$MACHO_LIST"' EXIT
+find "$APP" -type f -print0 | xargs -0 file | sed -n 's/^\(.*\): .*Mach-O.*/\1/p' > "$MACHO_LIST"
+macho_count="$(wc -l < "$MACHO_LIST" | tr -d ' ')"
+
+while IFS= read -r f; do
   # `|| true` is load-bearing, not defensive noise. On a file that is not signed
   # AT ALL, `codesign -dv` exits non-zero; with `set -e` + `pipefail` that aborts
-  # the whole script mid-scan — no FAIL line, no count, no later steps. The one
+  # the whole script mid-scan -- no FAIL line, no count, no later steps. The one
   # case this gate exists to catch would produce the LEAST diagnostic output, and
   # an operator would read the abort as some unrelated bundle problem.
   team="$(codesign -dv "$f" 2>&1 | sed -n 's/^TeamIdentifier=//p' || true)"
@@ -95,22 +98,18 @@ while IFS= read -r -d '' f; do
     note "FAIL" "Team ID $team != $TEAM_ID: ${f#"$APP"/}"
     fail=1
   fi
-done < <(find "$APP" -type f -print0)
+done < "$MACHO_LIST"
 note "scanned" "$macho_count Mach-O files"
-[ "$macho_count" -gt 0 ] || { note "FAIL" "found no Mach-O at all — wrong path?"; fail=1; }
+[ "$macho_count" -gt 0 ] || { note "FAIL" "found no Mach-O at all -- wrong path?"; fail=1; }
 
 # ---------------------------------------------------------------------------
 # 3. Build-path leak. Not a signing failure, but it ships a developer's home
 #    directory (and CI layout) to every user, and it is invisible in the UI.
 # ---------------------------------------------------------------------------
 echo "[3/4] no build paths baked into load commands"
-while IFS= read -r -d '' f; do
-  case "$(file -b "$f")" in
-    *Mach-O*) ;;
-    *) continue ;;
-  esac
-  # Same `|| true` reasoning as above: grep exits 1 when it matches nothing, which
-  # is the HEALTHY case here.
+while IFS= read -r f; do
+  # Same `|| true` reasoning: grep exits 1 when it matches nothing, which is the
+  # HEALTHY case here.
   leaks="$(otool -l "$f" 2>/dev/null | sed -n 's/^ *name \(.*\) (offset.*/\1/p' \
     | grep -E '^/Users/|/target/' || true)"
   if [ -n "$leaks" ]; then
@@ -118,7 +117,7 @@ while IFS= read -r -d '' f; do
     printf '%s\n' "$leaks" | sed 's/^/           /'
     fail=1
   fi
-done < <(find "$APP" -type f -print0)
+done < "$MACHO_LIST"
 
 # ---------------------------------------------------------------------------
 # 4. Post-notarization only. Gatekeeper assessment + a stapled ticket, so the app

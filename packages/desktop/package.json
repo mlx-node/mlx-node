@@ -21,14 +21,19 @@
   },
   "scripts": {
     "build": "tsc -b",
+    "package": "oxnode scripts/package.ts",
     "spike:electron": "electron spike/main.mjs",
     "spike:node": "node spike/workload.mjs",
     "start": "electron ."
   },
   "dependencies": {
-    "@mlx-node/lm": "workspace:*"
+    "@mlx-node/lm": "workspace:*",
+    "@mlx-node/server": "workspace:*"
   },
   "devDependencies": {
+    "@electron/notarize": "3.1.1",
+    "@electron/osx-sign": "2.6.0",
+    "@electron/packager": "20.0.4",
     "@types/node": "catalog:",
     "electron": "43.2.0",
     "vite-plus": "catalog:"
