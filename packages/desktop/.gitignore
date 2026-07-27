@@ -1,0 +1,6 @@
+# Phase 0 spike output — JSONL token streams, tens of MB per run.
+spike/.spike-logs/
+
+# Packaging staging + packager output. `out` is already ignored repo-wide, but
+# being explicit here keeps the build products discoverable to a reader.
+out/
