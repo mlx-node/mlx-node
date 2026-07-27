@@ -51,6 +51,11 @@ let win;
 let child;
 const started = Date.now();
 
+// DO NOT rewrite this as a top-level `await app.whenReady()`. It DEADLOCKS:
+// Electron waits for the ESM main module to finish evaluating before it emits
+// `ready`, so awaiting `ready` at module scope waits on an event that cannot
+// fire until the await returns. Verified on Electron 43.2.0 — the process hangs
+// with no output and has to be SIGTERMed. `void` here is deliberate, not lazy.
 void app.whenReady().then(() => {
   const lag = startLagProbe();
 
@@ -66,7 +71,12 @@ void app.whenReady().then(() => {
       sandbox: true,
     },
   });
-  void win.loadFile(join(HERE, 'index.html'));
+  // Never swallow this. A loadFile rejection is the classic packaged-app
+  // failure — blank window, no error — and under app:// it is exactly what a
+  // missing hashed asset or a broken protocol handler looks like.
+  win.loadFile(join(HERE, 'index.html')).catch((err) => {
+    log({ event: 'window-load-failed', message: String(err?.stack ?? err) });
+  });
 
   child = utilityProcess.fork(join(HERE, 'workload.mjs'), [], {
     serviceName: 'mlx-inference-spike',
