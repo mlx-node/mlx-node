@@ -26,7 +26,6 @@
     "@inquirer/prompts": "^8.5.2",
     "@mlx-node/agent": "workspace:*",
     "@mlx-node/core": "workspace:*",
-    "@mlx-node/dashboard": "workspace:*",
     "@mlx-node/lm": "workspace:*",
     "@mlx-node/privacy": "workspace:*",
     "@mlx-node/server": "workspace:*",

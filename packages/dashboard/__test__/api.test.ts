@@ -1,3 +1,13 @@
+/**
+ * The behavioural gate for the whole dashboard API.
+ *
+ * Every assertion here drives `runtime.call` — the same entry point the Electron
+ * MessagePort bridge feeds — so it tests API behaviour and not transport
+ * plumbing. The one block that deliberately goes through the real RPC transport
+ * is at the bottom: it holds the port bridge to the identical error-model
+ * contract end to end, over a real structured clone.
+ */
+
 import {
   chmodSync,
   cpSync,
@@ -13,10 +23,10 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { request } from 'node:http';
-import { homedir, networkInterfaces, tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { MessageChannel } from 'node:worker_threads';
 
 import { canonicalCacheRoot, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
@@ -24,16 +34,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 import type { ApiContext } from '../src/api/context.js';
 import { dispatch, isApiPath } from '../src/api/dispatch.js';
 import { openDashboardDb } from '../src/db/open.js';
-import { DownloadsClosedError, type DownloadEvent } from '../src/download.js';
+import { DownloadsClosedError } from '../src/download.js';
 import { TRACE_RETENTION_DAYS } from '../src/ingest/traces.js';
 import { agentSessionsRoot } from '../src/paths.js';
-import {
-  bindAllowedHosts,
-  bracketHost,
-  createDownloadSseSender,
-  startDashboardServer,
-  type DashboardServer,
-} from '../src/server.js';
+import { createRpcClient } from '../src/rpc/client.js';
+import { serveRuntimeOverPort } from '../src/rpc/host.js';
+import { bindEventTargetPort } from '../src/rpc/port.js';
+import { createDashboardRuntime, type DashboardRuntime } from '../src/runtime.js';
 import { createTestClient, type TestClient } from './helpers/api-client.js';
 
 const FIXTURE_SESSIONS = fileURLToPath(new URL('./fixtures/sessions', import.meta.url));
@@ -51,32 +58,8 @@ let sessionsRoot: string;
 let tracesDir: string;
 let modelsDir: string;
 let cacheRoot: string;
-let webRoot: string;
-let server: DashboardServer;
-/**
- * API calls go straight at the server's runtime (no socket). The security /
- * static / SSE blocks below still drive the real HTTP surface through `fetch`
- * and `rawRequest`, so both transports stay covered.
- */
+let runtime: DashboardRuntime;
 let api: TestClient;
-
-/** Raw HTTP request so security tests can set forbidden `Host`/`Origin` headers. */
-function rawRequest(
-  port: number,
-  method: string,
-  path: string,
-  headers: Record<string, string>,
-): Promise<{ status: number; body: string }> {
-  return new Promise((resolve, reject) => {
-    const req = request({ host: '127.0.0.1', port, method, path, headers }, (res) => {
-      const chunks: Buffer[] = [];
-      res.on('data', (c: Buffer) => chunks.push(c));
-      res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf-8') }));
-    });
-    req.on('error', reject);
-    req.end();
-  });
-}
 
 /** Run a full incremental ingest and wait for it to land in the index. */
 async function ingest(): Promise<void> {
@@ -84,8 +67,8 @@ async function ingest(): Promise<void> {
   expect(res.status).toBe(200);
 }
 
-beforeEach(async () => {
-  base = mkdtempSync(join(tmpdir(), 'dash-server-'));
+beforeEach(() => {
+  base = mkdtempSync(join(tmpdir(), 'dash-api-'));
   sessionsRoot = join(base, 'sessions');
   cpSync(FIXTURE_SESSIONS, sessionsRoot, { recursive: true });
   tracesDir = join(base, 'traces');
@@ -101,29 +84,22 @@ beforeEach(async () => {
   writeFileSync(join(cacheRoot, hexBlock(1)), Buffer.alloc(100));
   writeFileSync(join(cacheRoot, hexBlock(2)), Buffer.alloc(200));
 
-  webRoot = join(base, 'web');
-  mkdirSync(webRoot, { recursive: true });
-  writeFileSync(join(webRoot, 'index.html'), '<!doctype html><title>mlx dashboard</title><div id="root"></div>');
-  writeFileSync(join(webRoot, 'app.js'), 'console.log("app");');
-
-  server = await startDashboardServer({
-    port: 0,
+  runtime = createDashboardRuntime({
     dbPath: ':memory:',
     sessionsRoot,
     tracesDir,
     modelsDir,
     cacheRoot,
-    webRoot,
   });
-  api = createTestClient(server.runtime);
+  api = createTestClient(runtime);
 });
 
 afterEach(async () => {
-  await server.close();
+  await runtime.close();
   rmSync(base, { recursive: true, force: true });
 });
 
-describe('dashboard server — models & catalog', () => {
+describe('dashboard api — models & catalog', () => {
   it('lists local models', async () => {
     const res = await api.fetch('/api/models');
     expect(res.status).toBe(200);
@@ -167,7 +143,7 @@ describe('dashboard server — models & catalog', () => {
   });
 });
 
-describe('dashboard server — sessions', () => {
+describe('dashboard api — sessions', () => {
   it('lists ingested sessions', async () => {
     await ingest();
     const res = await api.fetch('/api/sessions');
@@ -212,14 +188,14 @@ describe('dashboard server — sessions', () => {
     // narrows. Serving the tokens beside the count is what makes the two halves
     // describable by one sentence.
     await ingest();
-    const body = (await (await fetch(`${server.url}/api/sessions`)).json()) as { total: number; tokens: number };
+    const body = (await (await api.fetch('/api/sessions')).json()) as { total: number; tokens: number };
     expect(body.total).toBe(2);
     // fix-1: (100 + 50) + (180 + 60); fix-2: 40 + 20. The three fixture traces
     // are NOT delegated work — none carries a root_session_id pointing here — so
     // none of them belongs to these sessions.
     expect(body.tokens).toBe(450);
 
-    const overview = (await (await fetch(`${server.url}/api/metrics/overview`)).json()) as {
+    const overview = (await (await api.fetch('/api/metrics/overview')).json()) as {
       totals: { inputTokens: number; outputTokens: number };
     };
     // The same window, machine-wide: the two orphan traces add 390 tokens that
@@ -306,7 +282,7 @@ describe('dashboard server — sessions', () => {
     );
     await ingest();
 
-    const body = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+    const body = (await (await api.fetch('/api/sessions')).json()) as {
       total: number;
       tokens: number;
       sessions: Array<{ id: string; inputTokens: number; outputTokens: number }>;
@@ -329,7 +305,7 @@ describe('dashboard server — sessions', () => {
     // The per-session `/metrics` endpoint agrees with its own row, copy for copy.
     const perSession: number[] = [];
     for (const id of ['fix-1', 'fix-2', 'fork-1']) {
-      const m = (await (await fetch(`${server.url}/api/sessions/${id}/metrics`)).json()) as {
+      const m = (await (await api.fetch(`/api/sessions/${id}/metrics`)).json()) as {
         turns: Array<{ inputTokens: number | null; outputTokens: number | null }>;
       };
       perSession.push(m.turns.reduce((sum, t) => sum + (t.inputTokens ?? 0) + (t.outputTokens ?? 0), 0));
@@ -348,22 +324,21 @@ describe('dashboard server — sessions', () => {
     // other renders "Sessions 0 · 530 tokens".
     const emptyRoot = join(base, 'empty-sessions');
     mkdirSync(emptyRoot, { recursive: true });
-    const other = await startDashboardServer({
-      port: 0,
+    const other = createDashboardRuntime({
       dbPath: ':memory:',
       sessionsRoot: emptyRoot,
       tracesDir,
       modelsDir,
       cacheRoot,
-      webRoot,
     });
+    const otherApi = createTestClient(other);
     try {
-      expect((await fetch(`${other.url}/api/ingest`, { method: 'POST' })).status).toBe(200);
-      const body = (await (await fetch(`${other.url}/api/sessions`)).json()) as { total: number; tokens: number };
+      expect((await otherApi.fetch('/api/ingest', { method: 'POST' })).status).toBe(200);
+      const body = (await (await otherApi.fetch('/api/sessions')).json()) as { total: number; tokens: number };
       expect(body.total).toBe(0);
       expect(body.tokens).toBe(0);
 
-      const overview = (await (await fetch(`${other.url}/api/metrics/overview`)).json()) as {
+      const overview = (await (await otherApi.fetch('/api/metrics/overview')).json()) as {
         totals: { inputTokens: number; outputTokens: number };
       };
       expect(overview.totals.inputTokens + overview.totals.outputTokens).toBeGreaterThan(0);
@@ -398,7 +373,7 @@ describe('dashboard server — sessions', () => {
     const file = join(sessionsRoot, '--w--', '2026-07-01T10-00-00_fix-1.jsonl');
     writeFileSync(file, `null\n${readFileSync(file, 'utf8')}`);
 
-    const res = await fetch(`${server.url}/api/sessions/fix-1`);
+    const res = await api.fetch('/api/sessions/fix-1');
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       session: { id: string };
@@ -423,7 +398,7 @@ describe('dashboard server — sessions', () => {
     const original = readFileSync(file, 'utf8');
     for (const record of ['null', '123', '"str"', 'true', '[]']) {
       writeFileSync(file, `${record}\n${original}`);
-      const res = await fetch(`${server.url}/api/sessions/fix-1`);
+      const res = await api.fetch('/api/sessions/fix-1');
       const body = (await res.json()) as { transcriptError?: string };
       expect([record, res.status]).toEqual([record, 200]);
       expect([record, body.transcriptError]).toEqual([
@@ -766,17 +741,17 @@ describe('dashboard server — sessions', () => {
   // regression, not a hardening.
   it('deletes a session that was just written (no liveness refusal)', async () => {
     await ingest();
-    const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+    const before = (await (await api.fetch('/api/sessions')).json()) as {
       sessions: Array<{ id: string; path: string }>;
     };
     const filePath = before.sessions.find((s) => s.id === 'fix-2')!.path;
     const now = Date.now() / 1000;
     utimesSync(filePath, now, now);
 
-    const del = await fetch(`${server.url}/api/sessions/fix-2`, { method: 'DELETE' });
+    const del = await api.fetch('/api/sessions/fix-2', { method: 'DELETE' });
     expect(del.status).toBe(200);
     expect(existsSync(filePath)).toBe(false);
-    expect((await fetch(`${server.url}/api/sessions/fix-2`)).status).toBe(404);
+    expect((await api.fetch('/api/sessions/fix-2')).status).toBe(404);
   });
 
   // A file that exists on disk but cannot be verified (unreadable / corrupt) must
@@ -1053,7 +1028,7 @@ describe('dashboard server — sessions', () => {
     writeFileSync(join(dir, 'clock.jsonl'), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
     await ingest();
 
-    const detail = (await (await fetch(`${server.url}/api/sessions/clock-1`)).json()) as {
+    const detail = (await (await api.fetch('/api/sessions/clock-1')).json()) as {
       session: { firstMessage: string | null };
       transcript: Array<{ role: string; text: string }>;
     };
@@ -1323,7 +1298,7 @@ describe('dashboard server — session directories past the page cap', () => {
 // is never indexed, so its external id is simply unknown (404). Defense-in-depth
 // — a GET whose indexed path resolves outside the managed root (via a symlink
 // swapped in after indexing) is refused (403) by the realpath containment guard.
-describe('dashboard server — session symlink containment (Finding 4)', () => {
+describe('dashboard api — session symlink containment (Finding 4)', () => {
   it('never indexes a symlinked transcript, so its external id 404s on GET and PATCH', async () => {
     const externalFile = join(base, 'external.jsonl');
     writeFileSync(
@@ -1412,16 +1387,16 @@ describe('dashboard server — session symlink containment (Finding 4)', () => {
   });
 });
 
-describe('dashboard server — ingest fault isolation', () => {
+describe('dashboard api — ingest fault isolation', () => {
   // chmod 000 is a no-op for root, so the unreadable root would still list — skip.
   const canTestUnreadable = (process.getuid?.() ?? 0) !== 0;
 
   (canTestUnreadable ? it : it.skip)('still ingests traces when the session root is unreadable', async () => {
     // `doIngest` wraps BOTH halves in one try/catch, so a throw out of the session
     // scan means the trace ingest on the next line never runs: every periodic pass
-    // fails identically, `/api/ingest` reports all-zero with HTTP 200, and the
-    // metrics pages go stale while the 30-day trace prune (which lives inside the
-    // trace ingest) freezes. The session scan must degrade to a warning instead.
+    // fails identically, `/api/ingest` reports all-zero with a 200, and the metrics
+    // pages go stale while the 30-day trace prune (which lives inside the trace
+    // ingest) freezes. The session scan must degrade to a warning instead.
     await ingest();
 
     writeFileSync(
@@ -1442,7 +1417,7 @@ describe('dashboard server — ingest fault isolation', () => {
 
     chmodSync(sessionsRoot, 0o000);
     try {
-      const res = await fetch(`${server.url}/api/ingest`, { method: 'POST' });
+      const res = await api.fetch('/api/ingest', { method: 'POST' });
       expect(res.status).toBe(200);
       const body = (await res.json()) as {
         sessions: { removed: number; warnings: string[] };
@@ -1456,7 +1431,7 @@ describe('dashboard server — ingest fault isolation', () => {
       expect(body.sessions.removed).toBe(0);
 
       // An unreadable root is unknown, not empty: the indexed sessions survive it.
-      const list = (await (await fetch(`${server.url}/api/sessions`)).json()) as { total: number };
+      const list = (await (await api.fetch('/api/sessions')).json()) as { total: number };
       expect(list.total).toBe(2);
     } finally {
       chmodSync(sessionsRoot, 0o755); // restore so afterEach cleanup can remove it
@@ -1464,7 +1439,7 @@ describe('dashboard server — ingest fault isolation', () => {
   });
 });
 
-describe('dashboard server — metrics overview', () => {
+describe('dashboard api — metrics overview', () => {
   it('returns aggregate arrays', async () => {
     await ingest();
     const res = await api.fetch('/api/metrics/overview');
@@ -1736,7 +1711,7 @@ describe('dashboard server — metrics overview', () => {
   });
 });
 
-describe('dashboard server — cache', () => {
+describe('dashboard api — cache', () => {
   it('scans and clears the cold cache with an explicit {all:true}', async () => {
     const res = await api.fetch('/api/cache');
     expect(res.status).toBe(200);
@@ -1816,7 +1791,7 @@ describe('dashboard server — cache', () => {
  * These fixtures deliberately make the WRONG answer much larger than the right
  * one, so a regression cannot hide inside a plausible-looking number.
  */
-describe('dashboard server — cache trend scoping', () => {
+describe('dashboard api — cache trend scoping', () => {
   /** Canonical spelling of the fixture cache root, resolved independently of the
    *  implementation (`/var/folders/...` → `/private/var/folders/...` on macOS). */
   let canonicalCacheRootPath: string;
@@ -2006,7 +1981,7 @@ describe('dashboard server — cache trend scoping', () => {
   });
 
   it('scopes the hit/miss trend to the cache root being shown', async () => {
-    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    const body = (await (await api.fetch('/api/cache')).json()) as CacheBody;
     // ONLY this root's rows. 15010 would mean the filter is gone.
     expect(totals(body)).toEqual({ hits: 11, misses: 3 });
     expect(body.scope.root).toBe(canonicalCacheRootPath);
@@ -2022,7 +1997,7 @@ describe('dashboard server — cache trend scoping', () => {
   // the user is staring at). It is bounded — trace JSONL retention prunes it —
   // so the bucket empties on its own.
   it('excludes legacy NULL-root rows from the rate but reports them as their own bucket', async () => {
-    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    const body = (await (await api.fetch('/api/cache')).json()) as CacheBody;
     expect(totals(body).hits).toBe(11);
     expect(body.scope.legacy).toEqual({ turns: 1, hits: 5000, misses: 11 });
     expect(body.scope.trendWindowDays).toBe(TRACE_RETENTION_DAYS);
@@ -2042,7 +2017,7 @@ describe('dashboard server — cache trend scoping', () => {
    * enumerating the arms, so any future fifth shape has to be accounted for too.
    */
   it('accounts for every trace row: the buckets partition the table, they do not just avoid overlap', async () => {
-    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    const body = (await (await api.fetch('/api/cache')).json()) as CacheBody;
     expect(body.scope.unattributed).toEqual({ turns: 1, hits: 777, misses: 5 });
     const shown = totals(body);
     const accounted = {
@@ -2054,7 +2029,7 @@ describe('dashboard server — cache trend scoping', () => {
   });
 
   it('reports another cache directory as otherRoots rather than merging it in', async () => {
-    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    const body = (await (await api.fetch('/api/cache')).json()) as CacheBody;
     expect(body.scope.otherRoots).toEqual({ turns: 1, hits: 9999, misses: 7 });
     expect(totals(body).hits).toBe(11);
   });
@@ -2065,18 +2040,17 @@ describe('dashboard server — cache trend scoping', () => {
   it('matches a symlinked cache root through canonicalization', async () => {
     const linkRoot = join(base, 'cache-link');
     symlinkSync(cacheRoot, linkRoot);
-    const linked = await startDashboardServer({
-      port: 0,
-      dbPath: join(base, 'linked.db'),
+    const linked = createDashboardRuntime({
+      dbPath: ':memory:',
       sessionsRoot,
       tracesDir,
       modelsDir,
       cacheRoot: linkRoot,
-      webRoot,
     });
+    const linkedApi = createTestClient(linked);
     try {
-      expect((await fetch(`${linked.url}/api/ingest`, { method: 'POST' })).status).toBe(200);
-      const body = (await (await fetch(`${linked.url}/api/cache`)).json()) as CacheBody;
+      expect((await linkedApi.fetch('/api/ingest', { method: 'POST' })).status).toBe(200);
+      const body = (await (await linkedApi.fetch('/api/cache')).json()) as CacheBody;
       // Rows were written under the REAL path; the dashboard was pointed at the
       // symlink. A lexical compare would report a flat zero here.
       expect(body.scope.root).toBe(canonicalCacheRootPath);
@@ -2091,7 +2065,7 @@ describe('dashboard server — cache trend scoping', () => {
   // a family to the restore allowlist and was previously uncheckable from
   // anything the user runs.
   it('surfaces the cold-tier counters the agent used to drop, scoped to this cache', async () => {
-    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    const body = (await (await api.fetch('/api/cache')).json()) as CacheBody;
     expect(body.health.enqueued).toBe(8);
     // Object-scoped: 3 + 5 across the two attributed rows. Blocks and state
     // sidecars share this queue, so it is the SUPERSET of `sidecarQueueDrops`.
@@ -2128,7 +2102,7 @@ describe('dashboard server — cache trend scoping', () => {
    * either reducer changes a number here.
    */
   it('surfaces write errors and restore declines, scoped and reduced correctly', async () => {
-    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    const body = (await (await api.fetch('/api/cache')).json()) as CacheBody;
     // Deltas SUM across this cache's rows: 3 + 4. The other root's 500 must not
     // appear — a broken cache elsewhere is not this cache's alarm.
     expect(body.health.writeErrors).toBe(7);
@@ -2159,7 +2133,7 @@ describe('dashboard server — cache trend scoping', () => {
    * a number here. The other root's much larger traffic pins the scope.
    */
   it('projects every cold sidecar counter, summed per turn and scoped to this cache', async () => {
-    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    const body = (await (await api.fetch('/api/cache')).json()) as CacheBody;
     // 6 + 4. MAX would say 6; the other root's 900 would say the scope is gone.
     expect(body.health.sidecarCaptureReached).toBe(10);
     // 1 + 3 (MAX 3), 2 + 9 (MAX 9), 7 + 9 (MAX 9).
@@ -2194,7 +2168,7 @@ describe('dashboard server — cache trend scoping', () => {
    * counters were added to record.
    */
   it('reports sidecar captures that ran with no tier instead of dropping them', async () => {
-    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    const body = (await (await api.fetch('/api/cache')).json()) as CacheBody;
     // 13 (tier off) + 21 (tier on, root unrecorded). The rooted rows' 10 must
     // NOT appear here, and the other root's 900 must not appear at all: a
     // rootless bucket that leaked either would read 23 / 34+10 / 934.
@@ -2210,7 +2184,7 @@ describe('dashboard server — cache trend scoping', () => {
   // the point — so pin the COUPLING: whatever the constant says, the payload
   // says.
   it('reports the trend window as the trace retention constant, not a copy of it', async () => {
-    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    const body = (await (await api.fetch('/api/cache')).json()) as CacheBody;
     expect(body.scope.trendWindowDays).toBe(TRACE_RETENTION_DAYS);
     // Guard the guard: a constant that went 0/NaN would make the assert vacuous.
     expect(TRACE_RETENTION_DAYS).toBeGreaterThan(0);
@@ -2221,18 +2195,19 @@ describe('dashboard server — cache trend scoping', () => {
   // transitively loads the native addon), and a hardcoded array in cache.tsx
   // would sit outside the native drift guard.
   it('serves the cold-tier restore allowlist so the SPA never hardcodes it', async () => {
-    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    const body = (await (await api.fetch('/api/cache')).json()) as CacheBody;
     expect(body.restoreFamilies).toEqual(coldTierRestoreFamilyList());
     expect(body.restoreFamilies.length).toBeGreaterThan(1);
   });
 });
 
 /**
- * The join key a real `mlx dashboard` run actually uses.
+ * The join key a real Admin-window run actually uses.
  *
- * Every other cache test hands the server an explicit `cacheRoot`, but
- * `packages/cli/src/commands/dashboard.ts` never supplies one: in production
- * `deps.cacheRoot` is `undefined` and the scope root comes from
+ * Every other cache test hands the runtime an explicit `cacheRoot`, but nothing
+ * in production supplies one — the app's Admin entry constructs the runtime with
+ * no cache root at all. So in production `ctx.cacheRoot` is `undefined` and the
+ * scope root comes from
  * `coldCacheRoot(undefined)` → `defaultColdCacheDir()` → the `mlx-paged-v1`
  * child of `MLX_COLD_CACHE_DIR`, canonicalized. Whether THAT string equals what
  * the agent recorded was asserted nowhere — both sides were literals the tests
@@ -2244,7 +2219,7 @@ describe('dashboard server — cache trend scoping', () => {
  * is load-bearing on every platform, not only where `tmpdir()` happens to sit
  * under one.
  */
-describe('dashboard server — production cache root (no explicit cacheRoot)', () => {
+describe('dashboard api — production cache root (no explicit cacheRoot)', () => {
   interface DefaultCacheBody {
     disk: { root: string; exists: boolean; entryCount: number };
     trend: Array<{ hits: number; misses: number }>;
@@ -2257,10 +2232,11 @@ describe('dashboard server — production cache root (no explicit cacheRoot)', (
   /** Where the native tier actually opens: `<MLX_COLD_CACHE_DIR>/mlx-paged-v1`. */
   let managedRoot: string;
   let previousEnv: string | undefined;
-  let defaulted: DashboardServer;
+  let defaulted: DashboardRuntime;
+  let defaultedApi: TestClient;
 
   async function cacheBody(): Promise<DefaultCacheBody> {
-    return (await (await fetch(`${defaulted.url}/api/cache`)).json()) as DefaultCacheBody;
+    return (await (await defaultedApi.fetch('/api/cache')).json()) as DefaultCacheBody;
   }
 
   beforeEach(async () => {
@@ -2295,17 +2271,16 @@ describe('dashboard server — production cache root (no explicit cacheRoot)', (
       })}\n`,
     );
 
-    defaulted = await startDashboardServer({
-      port: 0,
+    defaulted = createDashboardRuntime({
       dbPath: ':memory:',
       sessionsRoot,
       tracesDir,
       modelsDir,
-      // Exactly what the CLI passes.
+      // Exactly what the app's Admin entry passes.
       cacheRoot: undefined,
-      webRoot,
     });
-    expect((await fetch(`${defaulted.url}/api/ingest`, { method: 'POST' })).status).toBe(200);
+    defaultedApi = createTestClient(defaulted);
+    expect((await defaultedApi.fetch('/api/ingest', { method: 'POST' })).status).toBe(200);
   });
 
   afterEach(async () => {
@@ -2352,7 +2327,7 @@ describe('dashboard server — production cache root (no explicit cacheRoot)', (
   });
 });
 
-describe('dashboard server — downloads', () => {
+describe('dashboard api — downloads', () => {
   it('lists jobs and rejects a non-catalog repo', async () => {
     const list = (await (await api.fetch('/api/downloads')).json()) as { jobs: unknown[] };
     expect(Array.isArray(list.jobs)).toBe(true);
@@ -2365,13 +2340,24 @@ describe('dashboard server — downloads', () => {
     expect(bad.status).toBe(400);
   });
 
-  // Finding E: the cancel route is wired end-to-end through the real server; an
-  // unknown/terminal id is a 404 (nothing to cancel). The known-id → 200 branch
-  // is exercised deterministically below without a live download.
+  // Finding E: the cancel route is wired end-to-end through the real runtime and
+  // its real DownloadManager; an unknown/terminal id is a 404 (nothing to
+  // cancel). The known-id → 200 branch is exercised deterministically below
+  // without a live download.
   it('404s DELETE /api/downloads/:id for an unknown job', async () => {
-    const res = await fetch(`${server.url}/api/downloads/no-such-job`, { method: 'DELETE' });
+    const res = await api.fetch('/api/downloads/no-such-job', { method: 'DELETE' });
     expect(res.status).toBe(404);
-    expect(res.headers.get('content-type')).toContain('application/json');
+  });
+
+  // The progress stream is a transport capability, not a handler: a transport
+  // that can stream intercepts this route before dispatch, and one that cannot
+  // must reach the placeholder and be TOLD so. A plain `call` — which is exactly
+  // what the port bridge issues, since it carries progress over `subscribe`
+  // instead — must therefore see 503, never a misleading 404.
+  it('answers the streaming route 503, not a misleading 404, for a caller that cannot stream', async () => {
+    const res = await api.fetch('/api/downloads/some-job/events');
+    expect(res.status).toBe(503);
+    expect(((await res.json()) as { error: string }).error).toMatch(/not available over this transport/i);
   });
 });
 
@@ -2384,7 +2370,7 @@ function call(ctx: ApiContext, method: string, pathname: string, body?: unknown)
 // with the decoded id and maps its boolean to 200 (cancelled) / 404 (unknown or
 // already-terminal) — verified at the route layer with a stub manager so no live
 // download or network is needed.
-describe('dashboard server — cancel download route', () => {
+describe('dashboard api — cancel download route', () => {
   function ctxWith(cancel: (id: string) => boolean): ApiContext {
     return { downloads: { cancel } } as unknown as ApiContext;
   }
@@ -2418,7 +2404,7 @@ describe('dashboard server — cancel download route', () => {
 // A route that only ACCEPTS work answers 202, not 200: starting a download queues
 // a job that has not run yet. Asserted at the route layer with a stub manager so
 // no multi-GB transfer is triggered — a live-repo POST would really download.
-describe('dashboard server — download start is 202 Accepted', () => {
+describe('dashboard api — download start is 202 Accepted', () => {
   it('answers 202 (not 200) for an accepted download start', async () => {
     const ctx = { downloads: { start: () => 'job-1' } } as unknown as ApiContext;
     const res = await call(ctx, 'POST', '/api/downloads', { repo: 'org/repo' });
@@ -2431,7 +2417,7 @@ describe('dashboard server — download start is 202 Accepted', () => {
 // keeps matching after a method mismatch and remembers that the path shape (with
 // its `:param` segments) existed. Losing that collapses every wrong-method call to
 // a misleading "no such route".
-describe('dashboard server — method-not-allowed vs not-found', () => {
+describe('dashboard api — method-not-allowed vs not-found', () => {
   const ctx = {} as unknown as ApiContext;
 
   it('405s a known path reached with the wrong method', async () => {
@@ -2467,7 +2453,7 @@ describe('dashboard server — method-not-allowed vs not-found', () => {
 // A POST that lands while `close()` is draining downloads is refused by the
 // manager. That refusal is a server-lifecycle condition, not a malformed request,
 // so it must not be reported as a 400 blaming the caller.
-describe('dashboard server — start download route', () => {
+describe('dashboard api — start download route', () => {
   function postDownload(start: () => string): ReturnType<typeof dispatch> {
     const ctx = { downloads: { start } } as unknown as ApiContext;
     return call(ctx, 'POST', '/api/downloads', { repo: 'org/model' });
@@ -2492,70 +2478,72 @@ describe('dashboard server — start download route', () => {
   });
 });
 
-describe('dashboard server — static SPA', () => {
-  it('serves index.html at /', async () => {
-    const res = await fetch(`${server.url}/`);
-    expect(res.status).toBe(200);
-    expect(res.headers.get('content-type')).toContain('text/html');
-    expect(res.headers.get('cache-control')).toContain('no-cache');
-    expect(await res.text()).toContain('mlx dashboard');
-  });
-
-  it('falls back to index.html for an unknown non-api path', async () => {
-    const res = await fetch(`${server.url}/sessions/deep/link`);
-    expect(res.status).toBe(200);
-    expect(await res.text()).toContain('mlx dashboard');
-  });
-
-  it('serves a real asset with its content-type', async () => {
-    const res = await fetch(`${server.url}/app.js`);
-    expect(res.status).toBe(200);
-    expect(res.headers.get('content-type')).toContain('javascript');
-  });
-
-  it('404s a JSON error for an unknown api path', async () => {
-    const res = await fetch(`${server.url}/api/nope`);
+describe('dashboard api — health and unknown paths', () => {
+  it('404s an unknown api path', async () => {
+    const res = await api.fetch('/api/nope');
     expect(res.status).toBe(404);
-    expect(res.headers.get('content-type')).toContain('application/json');
   });
 
   it('reports health', async () => {
-    const res = await fetch(`${server.url}/health`);
+    const res = await api.fetch('/health');
     expect(res.status).toBe(200);
     expect(((await res.json()) as { status: string }).status).toBe('ok');
   });
 
-  it('also serves health under /api/health (reachable through the UI /api proxy)', async () => {
-    const res = await fetch(`${server.url}/api/health`);
+  it('also serves health under /api/health', async () => {
+    const res = await api.fetch('/api/health');
     expect(res.status).toBe(200);
     expect(((await res.json()) as { status: string }).status).toBe('ok');
   });
 });
 
-// The API suite above drives the runtime directly, so these hold the HTTP adapter
-// itself to the same contract end to end: an `ApiError` code must reach the wire
-// as its derived status with the `{error}` body the SPA reads, and a body the
-// transport cannot parse must surface as the handler's 400 rather than a crash.
-describe('dashboard server — HTTP adapter maps the error model onto the wire', () => {
-  it('serves a handler 404 as a 404 JSON body', async () => {
-    const res = await fetch(`${server.url}/api/sessions/no-such-session`);
+// The suite above drives `runtime.call` in-process. This block runs the SAME
+// error-model contract through the real RPC transport — two real ports, real
+// structured clone — so an envelope the bridge mangles (a lost `code`, a
+// re-derived status, a `bodyError` dropped on the floor) fails here rather than
+// only in the renderer. Everything else stays in-process because it is API
+// behaviour, not transport behaviour.
+describe('dashboard api — the RPC transport carries the error model over a port', () => {
+  let rpc: TestClient;
+  let teardown: () => void;
+
+  beforeEach(() => {
+    const { port1, port2 } = new MessageChannel();
+    port1.unref();
+    port2.unref();
+    const dispose = serveRuntimeOverPort(runtime, bindEventTargetPort(port2));
+    const client = createRpcClient(bindEventTargetPort(port1));
+    rpc = createTestClient(client);
+    teardown = () => {
+      client.close();
+      dispose();
+    };
+  });
+
+  afterEach(() => {
+    teardown();
+  });
+
+  it('answers a plain read over the port', async () => {
+    const res = await rpc.fetch('/api/models');
+    expect(res.status).toBe(200);
+    expect((await res.json()) as { dir: string }).toMatchObject({ dir: modelsDir });
+  });
+
+  it('carries a handler 404 across with its message', async () => {
+    const res = await rpc.fetch('/api/sessions/no-such-session');
     expect(res.status).toBe(404);
-    expect(res.headers.get('content-type')).toContain('application/json');
     expect((await res.json()) as { error: string }).toMatchObject({ error: expect.stringContaining('not found') });
   });
 
-  it('serves a wrong method on a known path as 405, not 404', async () => {
-    const res = await fetch(`${server.url}/api/models`, { method: 'PUT' });
+  it('carries a wrong method on a known path as 405, not 404', async () => {
+    const res = await rpc.fetch('/api/models', { method: 'PUT' });
     expect(res.status).toBe(405);
     expect(((await res.json()) as { error: string }).error).toContain('PUT');
   });
 
-  it('serves an unparseable request body as a 400 from the handler that needed it', async () => {
-    const res = await fetch(`${server.url}/api/cache`, {
-      method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{ this is not json',
-    });
+  it('carries an unparseable request body as a 400 from the handler that needed it', async () => {
+    const res = await rpc.fetch('/api/cache', { method: 'DELETE', rawBody: '{ this is not json' });
     expect(res.status).toBe(400);
     expect(((await res.json()) as { error: string }).error).toBe('Invalid JSON in request body');
     // Nothing was cleared by the rejected call.
@@ -2567,522 +2555,16 @@ describe('dashboard server — HTTP adapter maps the error model onto the wire',
     // The rename handler looks the session up first; an unparseable body must not
     // pre-empt that 404 (the transport records the parse failure as data instead
     // of raising it at read time).
-    const res = await fetch(`${server.url}/api/sessions/no-such-session`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{ not json either',
-    });
+    const res = await rpc.fetch('/api/sessions/no-such-session', { method: 'PATCH', rawBody: '{ not json either' });
     expect(res.status).toBe(404);
   });
-});
 
-describe('dashboard server — local-origin guard', () => {
-  it('rejects a mutating request with a cross-site Origin', async () => {
-    const res = await rawRequest(server.port, 'POST', '/api/ingest', {
-      Origin: 'https://evil.example',
-    });
-    expect(res.status).toBe(403);
-  });
-
-  it('allows a mutating request with no Origin (curl-style)', async () => {
-    const res = await rawRequest(server.port, 'POST', '/api/ingest', {});
+  it('reaches the database worker through the port, not just main-thread routes', async () => {
+    // `/api/models` and `/api/sessions` are worker-owned: a reply proves the port
+    // hop and the thread hop compose, which no in-process test can show.
+    const res = await rpc.fetch('/api/sessions');
     expect(res.status).toBe(200);
-  });
-
-  it('rejects a mutating request with a non-local Host', async () => {
-    const res = await rawRequest(server.port, 'POST', '/api/ingest', {
-      Host: 'attacker.example:6590',
-    });
-    expect(res.status).toBe(403);
-  });
-
-  it('rejects a mutating Origin that omits the port (a port-80 loopback page is cross-origin)', async () => {
-    // Server binds an ephemeral (non-80) port, so `http://127.0.0.1` (port 80
-    // omitted) is a different origin and must not be treated as same-origin.
-    const res = await rawRequest(server.port, 'POST', '/api/ingest', {
-      Origin: 'http://127.0.0.1',
-    });
-    expect(res.status).toBe(403);
-  });
-
-  it('allows a mutating Origin that carries the matching server port', async () => {
-    const res = await rawRequest(server.port, 'POST', '/api/ingest', {
-      Origin: `http://127.0.0.1:${server.port}`,
-    });
-    expect(res.status).toBe(200);
-  });
-
-  it('does not guard GET reads', async () => {
-    const res = await rawRequest(server.port, 'GET', '/api/models', {
-      Origin: 'https://evil.example',
-    });
-    expect(res.status).toBe(200);
-  });
-
-  // The read path normalizes the Host through `new URL(...)`; the mutation path
-  // compared the raw header against the same canonical allowlist. A client sending
-  // a valid non-canonical spelling therefore read fine and had every PATCH / POST /
-  // DELETE rejected — the two checks disagreeing about one authority.
-  it('accepts the same non-canonical Host on mutations that reads already allow', async () => {
-    for (const host of [`LOCALHOST:${server.port}`, `[0:0:0:0:0:0:0:1]:${server.port}`]) {
-      const read = await rawRequest(server.port, 'GET', '/api/models', { Host: host });
-      const write = await rawRequest(server.port, 'POST', '/api/ingest', { Host: host });
-      expect({ host, read: read.status, write: write.status }).toEqual({ host, read: 200, write: 200 });
-    }
-  });
-
-  // Over-correction guard: normalizing must not turn a foreign Host into an
-  // allowed one, on either path.
-  it('still rejects a foreign Host on both paths after normalization', async () => {
-    const read = await rawRequest(server.port, 'GET', '/api/models', { Host: `EVIL.example:${server.port}` });
-    const write = await rawRequest(server.port, 'POST', '/api/ingest', { Host: `EVIL.example:${server.port}` });
-    expect([read.status, write.status]).toEqual([403, 403]);
-  });
-});
-
-describe('dashboard server — loopback Host guard (all methods)', () => {
-  it('rejects a GET read with a non-loopback Host (DNS-rebinding)', async () => {
-    const res = await rawRequest(server.port, 'GET', '/api/models', { Host: 'evil.example' });
-    expect(res.status).toBe(403);
-  });
-
-  it('allows a GET read with a loopback Host', async () => {
-    const res = await rawRequest(server.port, 'GET', '/api/models', { Host: `127.0.0.1:${server.port}` });
-    expect(res.status).toBe(200);
-  });
-});
-
-describe('dashboard server — malformed Host header', () => {
-  it('answers 400 for a malformed Host and stays alive', async () => {
-    const bad = await rawRequest(server.port, 'GET', '/health', { Host: '[' });
-    expect(bad.status).toBe(400);
-    // The process must survive: a subsequent well-formed request still answers.
-    const ok = await rawRequest(server.port, 'GET', '/health', { Host: `127.0.0.1:${server.port}` });
-    expect(ok.status).toBe(200);
-  });
-});
-
-describe('dashboard server — wildcard bind Host allowlist', () => {
-  function firstLocalIpv4(): string | undefined {
-    for (const addrs of Object.values(networkInterfaces())) {
-      for (const a of addrs ?? []) {
-        if (a.family === 'IPv4' && !a.internal) return a.address;
-      }
-    }
-    return undefined;
-  }
-
-  // Finding E: `--host 0.0.0.0` is a documented feature. A wildcard bind must
-  // accept a LAN client whose Host carries a real local interface IP while still
-  // rejecting a rebound attacker domain (no matching local IP). The loopback
-  // default is covered by the existing rebinding tests and stays unchanged.
-  it('allows a real local-interface Host and still rejects a rebound domain under a wildcard bind', async () => {
-    let wild: DashboardServer;
-    try {
-      wild = await startDashboardServer({
-        port: 0,
-        host: '0.0.0.0',
-        dbPath: ':memory:',
-        sessionsRoot,
-        tracesDir,
-        modelsDir,
-        cacheRoot,
-        webRoot,
-      });
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      // Some sandboxes forbid a wildcard bind; an environment limit, not a defect.
-      if (code === 'EPERM' || code === 'EACCES') return;
-      throw err;
-    }
-    try {
-      // A rebound attacker domain has no matching local IP → still 403.
-      const evil = await rawRequest(wild.port, 'GET', '/api/models', { Host: `evil.example:${wild.port}` });
-      expect(evil.status).toBe(403);
-
-      // Loopback stays reachable under a wildcard bind.
-      const loop = await rawRequest(wild.port, 'GET', '/api/models', { Host: `127.0.0.1:${wild.port}` });
-      expect(loop.status).toBe(200);
-
-      // A real local-interface IP (LAN reachability) is now allowed. If the host
-      // has no external interface, skip that leg without weakening the assertions.
-      const ip = firstLocalIpv4();
-      if (ip !== undefined) {
-        const lan = await rawRequest(wild.port, 'GET', '/api/models', { Host: `${ip}:${wild.port}` });
-        expect(lan.status).toBe(200);
-      }
-    } finally {
-      await wild.close();
-    }
-  });
-});
-
-describe('dashboard server — connectable display URL', () => {
-  async function startWild(host: string): Promise<DashboardServer | undefined> {
-    try {
-      return await startDashboardServer({
-        port: 0,
-        host,
-        dbPath: ':memory:',
-        sessionsRoot,
-        tracesDir,
-        modelsDir,
-        cacheRoot,
-        webRoot,
-      });
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      // Some sandboxes forbid a wildcard/non-loopback bind; an environment limit.
-      if (code === 'EPERM' || code === 'EACCES') return undefined;
-      throw err;
-    }
-  }
-
-  it('advertises the literal loopback host for a concrete bind (default 127.0.0.1)', () => {
-    // beforeEach binds the default host; its URL must carry the literal host.
-    expect(server.url).toBe(`http://127.0.0.1:${server.port}`);
-  });
-
-  it('advertises a bracketed [::1] for a concrete ::1 bind', async () => {
-    const s = await startWild('::1');
-    if (s === undefined) return; // IPv6 loopback bind blocked in this sandbox.
-    try {
-      expect(s.url).toBe(`http://[::1]:${s.port}`);
-      const res = await fetch(`${s.url}/health`);
-      expect(res.status).toBe(200);
-    } finally {
-      await s.close();
-    }
-  });
-
-  // Finding 6: a wildcard bind has no connectable literal host — advertising the
-  // raw wildcard yields a URL the server's own Host allowlist rejects
-  // (`0.0.0.0` → 403 from classifyHost) or that `new URL` cannot even parse
-  // (`::` → `:::`, '' → `:`). The returned URL must instead name a loopback the
-  // allowlist accepts and a client can actually reach.
-  it('advertises a connectable loopback URL for each wildcard bind', async () => {
-    const cases: Array<{ host: string; authority: string }> = [
-      { host: '0.0.0.0', authority: '127.0.0.1' },
-      { host: '::', authority: '[::1]' },
-      { host: '', authority: '127.0.0.1' },
-    ];
-    for (const { host, authority } of cases) {
-      const s = await startWild(host);
-      if (s === undefined) continue; // wildcard bind blocked in this sandbox.
-      try {
-        // Parses cleanly: the '' and '::' cases previously produced malformed URLs.
-        const u = new URL(s.url);
-        expect(u.protocol).toBe('http:');
-        expect(u.hostname).toBe(authority); // URL keeps the [] for an IPv6 literal.
-        expect(u.port).toBe(String(s.port));
-        expect(s.url).toBe(`http://${authority}:${s.port}`);
-        // Loopback is in the Host allowlist AND actually reachable → 200, unlike
-        // the raw wildcard Host (0.0.0.0 → 403, ::/'' → malformed) it replaces.
-        const res = await fetch(`${s.url}/health`);
-        expect(res.status).toBe(200);
-      } finally {
-        await s.close();
-      }
-    }
-  });
-});
-
-describe('dashboard SSE progress — backpressure coalescing', () => {
-  const progress = (received: number): DownloadEvent => ({
-    type: 'progress',
-    id: 'job',
-    file: 'model.safetensors',
-    receivedBytes: received,
-    jobReceivedBytes: received,
-    totalBytes: 1000,
-    fileIndex: 0,
-    fileCount: 1,
-  });
-
-  /** A writable whose backpressure is driven manually. */
-  function fakeWritable(): {
-    write(chunk: string): boolean;
-    on(event: 'drain', listener: () => void): void;
-    writes: string[];
-    setCanWrite(v: boolean): void;
-    drain(): void;
-  } {
-    const writes: string[] = [];
-    let canWrite = true;
-    let drainListener: (() => void) | null = null;
-    return {
-      writes,
-      write(chunk: string): boolean {
-        writes.push(chunk);
-        return canWrite;
-      },
-      on(event: 'drain', listener: () => void): void {
-        if (event === 'drain') drainListener = listener;
-      },
-      setCanWrite(v: boolean): void {
-        canWrite = v;
-      },
-      drain(): void {
-        drainListener?.();
-      },
-    };
-  }
-
-  it('coalesces a flood of progress frames while the socket is backpressured', () => {
-    const res = fakeWritable();
-    const send = createDownloadSseSender(res);
-
-    send(progress(1));
-    expect(res.writes.length).toBe(1); // drained synchronously
-
-    res.setCanWrite(false);
-    send(progress(2)); // written, returns false → now blocked
-    expect(res.writes.length).toBe(2);
-
-    for (let i = 3; i <= 1000; i++) send(progress(i)); // 998 more, all coalesced
-    expect(res.writes.length).toBe(2); // bounded: nothing extra buffered to the socket
-
-    res.setCanWrite(true);
-    res.drain();
-    expect(res.writes.length).toBe(3); // exactly one coalesced frame flushed
-    expect(res.writes[2]).toContain('"receivedBytes":1000'); // carrying the latest bytes
-  });
-
-  it('keeps a terminal done frame after coalesced progress', () => {
-    const res = fakeWritable();
-    const send = createDownloadSseSender(res);
-
-    res.setCanWrite(false);
-    send(progress(1)); // written, returns false → blocked
-    for (let i = 2; i <= 100; i++) send(progress(i)); // coalesced
-    send({ type: 'done', id: 'job', outputDir: '/models/job' }); // queued, not dropped
-    expect(res.writes.length).toBe(1);
-
-    res.setCanWrite(true);
-    res.drain();
-    // Latest progress then the terminal frame, in order.
-    expect(res.writes.length).toBe(3);
-    expect(res.writes[1]).toContain('"receivedBytes":100');
-    expect(res.writes[2]).toContain('event: done');
-  });
-
-  /** The `event:` name of an emitted SSE frame. */
-  function frameType(frame: string): string {
-    return frame.slice('event: '.length, frame.indexOf('\n'));
-  }
-
-  // Regression: a `false` return from `write` means Node BUFFERED the chunk, not
-  // that it refused it. Re-queueing the head after a false return replays a frame
-  // that is already on the wire — and for a frame larger than the socket
-  // high-water mark (an unbounded remote `error.message` from the hub) every
-  // subsequent flush returns false too, so the same frame is rewritten without
-  // bound. Both drains here happen while the socket is still full, which no other
-  // test does.
-  it('never re-sends a frame the socket already accepted under backpressure', () => {
-    const res = fakeWritable();
-    const send = createDownloadSseSender(res);
-
-    res.setCanWrite(false);
-    send(progress(1)); // written, returns false → blocked
-    send({ type: 'done', id: 'job', outputDir: '/models/job' }); // queued
-    expect(res.writes.length).toBe(1);
-
-    // Socket still full: the terminal frame is written AND accepted, yet `write`
-    // returns false again.
-    res.drain();
-    expect(res.writes.length).toBe(2);
-    expect(res.writes[1]).toContain('event: done');
-
-    // Nothing left to send — the terminal frame is already on the wire.
-    res.setCanWrite(true);
-    res.drain();
-    expect(res.writes.filter((frame) => frameType(frame) === 'done').length).toBe(1);
-    expect(res.writes.length).toBe(2);
-  });
-
-  it('keeps coalesced ordering across a drain that is itself backpressured', () => {
-    const res = fakeWritable();
-    const send = createDownloadSseSender(res);
-
-    res.setCanWrite(false);
-    send(progress(1)); // written, returns false → blocked
-    send(progress(2)); // queued
-    send(progress(3)); // coalesced onto the queued progress
-    send({ type: 'done', id: 'job', outputDir: '/models/job' }); // queued behind it
-    expect(res.writes.length).toBe(1);
-
-    res.drain(); // still full: flushes the coalesced progress only
-    res.setCanWrite(true);
-    res.drain(); // the terminal frame follows
-
-    expect(res.writes.map(frameType)).toEqual(['progress', 'progress', 'done']);
-    expect(res.writes[0]).toContain('"receivedBytes":1');
-    expect(res.writes[1]).toContain('"receivedBytes":3');
-  });
-});
-
-describe('dashboard server — SSE downloads', () => {
-  it('opens an event stream and cleans up on abort', async () => {
-    const controller = new AbortController();
-    const res = await fetch(`${server.url}/api/downloads/unknown-job/events`, { signal: controller.signal });
-    expect(res.status).toBe(200);
-    expect(res.headers.get('content-type')).toContain('text/event-stream');
-    const reader = res.body!.getReader();
-    const { value } = await reader.read();
-    expect(new TextDecoder().decode(value)).toContain('connected');
-    await reader.cancel();
-    controller.abort();
-  });
-});
-
-// Finding low: the round-6 display fix bracketed ONLY the `::1` loopback literal,
-// so a concrete non-loopback IPv6 bind (`--host 2001:db8::1`) rendered
-// `http://2001:db8::1:PORT`, which `new URL()` rejects → the CLI prints/opens a
-// broken address. Every bare IPv6 literal must be bracketed. Verified via the
-// exported `bracketHost` so the assertion is deterministic without an actual
-// non-loopback bind (which a sandbox cannot perform); the `::1` and wildcard
-// binds still exercise the full path in the blocks above.
-describe('dashboard server — bracketHost display URL (every IPv6 literal)', () => {
-  it('brackets bare IPv6 literals and leaves IPv4/hostnames/pre-bracketed hosts alone', () => {
-    expect(bracketHost('127.0.0.1')).toBe('127.0.0.1');
-    expect(bracketHost('localhost')).toBe('localhost');
-    expect(bracketHost('::1')).toBe('[::1]');
-    expect(bracketHost('2001:db8::1')).toBe('[2001:db8::1]');
-    expect(bracketHost('[::1]')).toBe('[::1]'); // already bracketed → unchanged
-  });
-
-  it('yields a URL new URL() accepts for a concrete non-loopback IPv6 bind', () => {
-    const url = `http://${bracketHost('2001:db8::1')}:6590`;
-    const parsed = new URL(url);
-    expect(parsed.protocol).toBe('http:');
-    expect(parsed.hostname).toBe('[2001:db8::1]');
-    expect(parsed.port).toBe('6590');
-    expect(url).toBe('http://[2001:db8::1]:6590');
-  });
-
-  it('brackets a scoped link-local literal so the string stays well-formed', () => {
-    // A `%zone` id cannot ride in a WHATWG URL, but the printed string must at
-    // least be bracketed (not a raw `fe80::1%en0:PORT`) and must not crash.
-    expect(bracketHost('fe80::1%en0')).toBe('[fe80::1%en0]');
-  });
-});
-
-// The Host allowlist is compared against an authority that has been through
-// `new URL(...)`, which does more than ASCII-lowercase: it also compresses IPv6
-// literals and re-spells IPv4-mapped ones. A bind host stored verbatim therefore
-// drifts from every request the browser sends, and a server that bound fine
-// answers 403 to everything. Asserted on the exported builder because a
-// non-loopback IPv6 address cannot actually be bound here.
-describe('dashboard server — bind host canonicalized like the request authority', () => {
-  /** The exact hostname `classifyHost` derives from a browser `Host` header. */
-  function requestHostname(host: string): string {
-    const authority = new URL(`http://${bracketHost(host)}:6590`).host;
-    return authority.startsWith('[') ? authority.slice(1, authority.indexOf(']')) : authority.split(':')[0]!;
-  }
-
-  it('compresses a full-length IPv6 bind host to the spelling requests carry', () => {
-    const hosts = bindAllowedHosts('2001:0db8:0000:0000:0000:0000:0000:0001');
-    expect(hosts.has('2001:db8::1')).toBe(true);
-  });
-
-  it('lowercases an uppercase-hex IPv6 bind host', () => {
-    expect(bindAllowedHosts('2001:DB8::1').has('2001:db8::1')).toBe(true);
-    expect(bindAllowedHosts('FE80::ABCD').has('fe80::abcd')).toBe(true);
-  });
-
-  it('re-spells an IPv4-mapped literal the way the URL parser does', () => {
-    expect(bindAllowedHosts('::ffff:192.168.1.9').has('::ffff:c0a8:109')).toBe(true);
-  });
-
-  it('admits every spelling the request side can normalize to', () => {
-    const spellings = [
-      '2001:0db8:0000:0000:0000:0000:0000:0001',
-      '2001:0DB8:0000:0000:0000:0000:0000:0001',
-      '2001:db8::1',
-      'fe80::ABCD',
-      '::ffff:192.168.1.9',
-      '192.168.31.204',
-    ];
-    // Deliberately absent: a leading-zero IPv4 like `192.168.031.204`. The URL
-    // parser reads `031` as octal (→ .25.204) while getaddrinfo reads it as
-    // decimal (→ .31.204), so no allowlist spelling can match the bound socket;
-    // that input is unusable either way and must not be presented as supported.
-    for (const host of spellings) {
-      expect(bindAllowedHosts(host).has(requestHostname(host))).toBe(true);
-    }
-  });
-
-  it('keeps a hostname bind working and does not IPv6-ify it', () => {
-    const hosts = bindAllowedHosts('MyMac.local');
-    expect(hosts.has('mymac.local')).toBe(true);
-    expect(hosts.has('[mymac.local]')).toBe(false);
-    expect(bindAllowedHosts('localhost').has('localhost')).toBe(true);
-  });
-
-  it('keeps the loopback names and does not widen past the configured host', () => {
-    const hosts = bindAllowedHosts('2001:0db8:0000:0000:0000:0000:0000:0001');
-    for (const local of ['localhost', '127.0.0.1', '::1']) expect(hosts.has(local)).toBe(true);
-    expect(hosts.has('2001:db8::2')).toBe(false);
-    expect(hosts.has('evil.example')).toBe(false);
-    expect(hosts.size).toBe(4);
-  });
-
-  it('never lifts a bare host out of a bind string carrying more than a host', () => {
-    // Canonicalizing must not turn an unbindable string into a usable allowlist
-    // entry: `evil.example` is not what `--host` named.
-    for (const smuggled of ['evil.example/@ok', 'evil.example?x', 'user@evil.example', 'evil.example:8080']) {
-      expect(bindAllowedHosts(smuggled).has('evil.example')).toBe(false);
-    }
-  });
-
-  it('does not throw on a scoped link-local bind host', () => {
-    // `new URL` rejects the `%zone`; the builder must fall back, not crash.
-    expect(() => bindAllowedHosts('fe80::1%en0')).not.toThrow();
-    expect(bindAllowedHosts('fe80::1%en0').has('fe80::1%en0')).toBe(true);
-  });
-
-  // The whole path over a real socket. An IPv4-mapped bind is the one non-loopback
-  // *spelling* reachable without a second machine: macOS binds `::ffff:127.0.0.1`,
-  // and the client rewrites the authority to `[::ffff:7f00:1]:PORT` on the wire — so
-  // a verbatim allowlist entry answers 403 to the very URL the dashboard printed.
-  it('answers its own advertised URL when the bind host is a non-canonical literal', async () => {
-    let bound: DashboardServer;
-    try {
-      bound = await startDashboardServer({
-        port: 0,
-        host: '::ffff:127.0.0.1',
-        dbPath: ':memory:',
-        sessionsRoot,
-        tracesDir,
-        modelsDir,
-        cacheRoot,
-        webRoot,
-      });
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      // Some sandboxes/kernels refuse an IPv4-mapped bind; an environment limit.
-      if (code === 'EPERM' || code === 'EACCES' || code === 'EADDRNOTAVAIL' || code === 'EAFNOSUPPORT') return;
-      throw err;
-    }
-    try {
-      expect(bound.url).toBe(`http://[::ffff:127.0.0.1]:${bound.port}`);
-      const res = await fetch(`${bound.url}/health`);
-      expect(res.status).toBe(200);
-    } finally {
-      await bound.close();
-    }
-  });
-
-  it('stores interface addresses in the same canonical spelling', () => {
-    // A wildcard bind enumerates addresses the user never typed; they must land
-    // in the set already normalized, or a LAN client's Host cannot match.
-    const hosts = bindAllowedHosts('0.0.0.0');
-    for (const addrs of Object.values(networkInterfaces())) {
-      for (const a of addrs ?? []) {
-        if (a.address.includes('%')) continue; // scoped: never reaches a browser Host
-        expect(hosts.has(requestHostname(a.address))).toBe(true);
-      }
-    }
+    expect((await res.json()) as { total: number }).toMatchObject({ total: expect.any(Number) });
   });
 });
 

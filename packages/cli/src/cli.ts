@@ -22,7 +22,6 @@ Commands:
   serve              Serve local models over an Anthropic/OpenAI-compatible API
   launch claude      Start a local server and spawn Claude Code pointed at it
   agent              Start the local coding agent (pi-based, fully offline)
-  dashboard          Start the local web dashboard
 
 Options:
   -h, --help         Show this help message
@@ -38,7 +37,6 @@ Examples:
   mlx launch claude
   mlx agent
   mlx agent -c
-  mlx dashboard
 `);
 }
 
@@ -92,12 +90,6 @@ async function main() {
 
     case 'serve': {
       const { run } = await import('./commands/serve.js');
-      await run(args.slice(1));
-      break;
-    }
-
-    case 'dashboard': {
-      const { run } = await import('./commands/dashboard.js');
       await run(args.slice(1));
       break;
     }
