@@ -134,19 +134,19 @@ split). `--q-mtp split` (alias `drafter`) emits a body checkpoint with **no
 `qwen3_5_mtp` format (bare-keyed, BF16 MTP head); it does not require
 `--quantize`/`--q-recipe` and the body may be BF16 or already-quantized.
 
-| Flag               | Purpose                                                                                   |
-| ------------------ | ----------------------------------------------------------------------------------------- |
-| `-i`, `--input`    | Source model directory (required)                                                         |
-| `-o`, `--output`   | Output directory (required)                                                               |
-| `-d`, `--dtype`    | Target dtype: `float32` / `float16` / `bfloat16`                                          |
-| `-q`, `--quantize` | Enable quantization                                                                       |
-| `--q-recipe`       | One of `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`, `qwen3_5`, `unsloth`, `nvidia` |
-| `--q-mode`         | `affine` (default), `mxfp4`, `mxfp8`, `nvfp4`, or `sym8`                                  |
+| Flag               | Purpose                                                                                       |
+| ------------------ | --------------------------------------------------------------------------------------------- |
+| `-i`, `--input`    | Source model directory (required)                                                             |
+| `-o`, `--output`   | Output directory (required)                                                                   |
+| `-d`, `--dtype`    | Target dtype: `float32` / `float16` / `bfloat16`                                              |
+| `-q`, `--quantize` | Enable quantization                                                                           |
+| `--q-recipe`       | One of `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`, `qwen3_5`, `unsloth`, `nvidia`     |
+| `--q-mode`         | `affine` (default), `mxfp4`, `mxfp8`, `nvfp4`, or `sym8`                                      |
 | `--q-mxfp`         | Select Unsloth's fixed MXFP tensor-class map, or upgrade eligible decisions for other recipes |
-| `--q-mtp`          | Qwen MTP-quant policy: `off`, `cyankiwi`, `all`, or `split` (alias `drafter`)             |
-| `--imatrix-path`   | Path to imatrix file for AWQ pre-scaling                                                  |
-| `--mmproj`         | Vision-encoder conversion path                                                            |
-| `-v`, `--verbose`  | Verbose logging                                                                           |
+| `--q-mtp`          | Qwen MTP-quant policy: `off`, `cyankiwi`, `all`, or `split` (alias `drafter`)                 |
+| `--imatrix-path`   | Path to imatrix file for AWQ pre-scaling                                                      |
+| `--mmproj`         | Vision-encoder conversion path                                                                |
+| `-v`, `--verbose`  | Verbose logging                                                                               |
 
 ### GGUF → SafeTensors
 
@@ -291,15 +291,15 @@ mlx serve --host 0.0.0.0 --auth-token "$(openssl rand -hex 16)"
 mlx serve --verbose                              # capture every HTTP turn to a log dir
 ```
 
-| Flag                 | Meaning                                                                          |
-| -------------------- | -------------------------------------------------------------------------------- |
-| `--port <n>`         | Port to bind. Omitted ⇒ a free port is picked. `0` ⇒ ephemeral, real port printed |
-| `--host <h>`         | Bind address (default `127.0.0.1`). Non-loopback exposes local models — pair with `--auth-token` |
-| `--models-dir <dir>` | Discovery root (default `~/.mlx-node/models`; also `MLX_MODELS_DIR`, `~/.mlx-node/config.json`) |
-| `--model <name>`     | Default model. Falls back to `ANTHROPIC_MODEL`, then the first discovered model  |
+| Flag                 | Meaning                                                                                                           |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `--port <n>`         | Port to bind. Omitted ⇒ a free port is picked. `0` ⇒ ephemeral, real port printed                                 |
+| `--host <h>`         | Bind address (default `127.0.0.1`). Non-loopback exposes local models — pair with `--auth-token`                  |
+| `--models-dir <dir>` | Discovery root (default `~/.mlx-node/models`; also `MLX_MODELS_DIR`, `~/.mlx-node/config.json`)                   |
+| `--model <name>`     | Default model. Falls back to `ANTHROPIC_MODEL`, then the first discovered model                                   |
 | `--auth-token <tok>` | Required on every route except `/health`, as `x-api-key` or `Authorization: Bearer`. Also `MLX_SERVER_AUTH_TOKEN` |
-| `-v, --verbose`      | Write every request/response to a log dir                                        |
-| `--log-dir <dir>`    | Override the log directory (implies `--verbose`)                                  |
+| `-v, --verbose`      | Write every request/response to a log dir                                                                         |
+| `--log-dir <dir>`    | Override the log directory (implies `--verbose`)                                                                  |
 
 `GET /health` is unauthenticated and reports readiness (`ok` / `loading` / `degraded` / `error`), uptime, pid, resident models, and the last load's outcome — the same body `ServerInstance.health()` returns.
 
@@ -366,28 +366,9 @@ mlx agent config             # edit which are enabled
 
 `mlx agent update` is intentionally blocked (it maps to pi's npm self-update, which would fight the installed `@mlx-node/cli`); update `@mlx-node/cli` through your package manager instead. `mlx agent -h`/`--help` prints the mlx options above and then pi's full flag list. `mlx agent --version`/`-v` and `mlx agent --export <session>` are answered by pi directly — no local model needed, so the first-run wizard stays out — and `--version` prints the embedded pi version, not `@mlx-node/cli`'s (`mlx --version`).
 
-## `mlx dashboard`
+## Dashboard
 
-Starts the local web dashboard (`@mlx-node/dashboard`) for browsing local models,
-`mlx agent` sessions, inference metrics, and the paged-attention cold cache. It is a
-separate viewer process that never links the native addon — all data comes from disk
-under `~/.mlx-node`. Requires Node.js ≥ 22.19.
-
-```bash
-mlx dashboard                       # start on 127.0.0.1:6590, open a browser
-mlx dashboard --port 8080           # pick a port
-mlx dashboard --no-open             # do not launch a browser
-```
-
-| Flag           | Default                    | Purpose                                                             |
-| -------------- | -------------------------- | ------------------------------------------------------------------- |
-| `--port`       | `6590`                     | Port to listen on (`0` = ephemeral)                                 |
-| `--host`       | `127.0.0.1`                | Host to bind; a non-loopback host prints a no-auth exposure warning |
-| `--no-open`    | (opens a browser)          | Do not open a browser                                               |
-| `--db`         | `~/.mlx-node/dashboard.db` | Override the disposable SQLite index path                           |
-| `--models-dir` | `~/.mlx-node/models`       | Directory to read local models from                                 |
-
-Binds `127.0.0.1` by default with no authentication; mutating requests are guarded by
-a local-origin check. See [docs/dashboard.md](dashboard.md) for pages, data sources,
-`persistPagedCache` (qwen3-dense-only cold restore), the `MLX_AGENT_METRICS` kill
-switch, `MLX_COLD_CACHE_DIR`, and the security model.
+`mlx dashboard` was **removed**. The dashboard is now the Admin window of the mlx-node
+desktop app, opened from the tray — it is served over `app://` and a MessagePort, so
+there is no port to bind and no unauthenticated HTTP surface to guard. See
+[docs/dashboard.md](dashboard.md).
