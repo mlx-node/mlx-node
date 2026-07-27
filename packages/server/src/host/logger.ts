@@ -45,6 +45,35 @@ interface UsageSummary {
   server_paged_decode_cache_clear_interval?: number;
 }
 
+/**
+ * Headers whose value is a credential and must never reach the log file.
+ *
+ * The log lands in `~/.mlx-node/logs/<timestamp>/requests.ndjson`, which users
+ * paste into bug reports, and every client of a protected host presents a live
+ * secret on every turn: the per-launch token `mlx launch claude` generates, or
+ * `MLX_SERVER_AUTH_TOKEN` — or, before the launcher stopped handing it down,
+ * the user's own `sk-ant-…` key.
+ */
+const REDACTED_REQUEST_HEADERS = ['authorization', 'x-api-key', 'proxy-authorization', 'cookie'] as const;
+
+/**
+ * Copy `headers`, replacing credential values with a marker.
+ *
+ * The KEY is kept: "a token was presented and it was wrong" and "no token was
+ * presented at all" are different bugs, and a log that drops the header cannot
+ * tell them apart. Node lower-cases incoming header names, so the comparison
+ * needs no folding.
+ */
+function redactRequestHeaders(headers: NodeJS.Dict<string | string[]>): NodeJS.Dict<string | string[]> {
+  let copy: NodeJS.Dict<string | string[]> | null = null;
+  for (const name of REDACTED_REQUEST_HEADERS) {
+    if (headers[name] === undefined) continue;
+    copy ??= { ...headers };
+    copy[name] = '[redacted]';
+  }
+  return copy ?? headers;
+}
+
 function parseJsonObject(value: string | null): Record<string, unknown> | null {
   if (!value) return null;
   try {
@@ -304,7 +333,7 @@ export function attachLogger(server: Server, logDir: string): Logger {
         t: new Date(start).toISOString(),
         method: req.method,
         path: req.url,
-        reqHeaders: req.headers,
+        reqHeaders: redactRequestHeaders(req.headers),
         reqBody: reqBody || null,
         status: res.statusCode,
         resHeaders: res.getHeaders(),

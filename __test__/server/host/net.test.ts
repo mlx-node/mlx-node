@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net';
 
 import { describe, expect, it } from 'vite-plus/test';
 
-import { bracketHost, hostUrl, pickFreePort } from '../../../packages/server/src/host/net.js';
+import { bracketHost, hostUrl, isLoopbackBindHost, pickFreePort } from '../../../packages/server/src/host/net.js';
 
 describe('bracketHost', () => {
   it('leaves IPv4 literals and hostnames untouched', () => {
@@ -44,6 +44,42 @@ describe('hostUrl', () => {
     expect(hostUrl('0.0.0.0', 1234)).toBe('http://127.0.0.1:1234');
     expect(hostUrl('', 1234)).toBe('http://127.0.0.1:1234');
     expect(hostUrl('::', 1234)).toBe('http://[::1]:1234');
+  });
+});
+
+describe('isLoopbackBindHost', () => {
+  it('accepts every loopback form a host can be asked to bind', () => {
+    for (const host of ['127.0.0.1', '127.0.0.2', '127.255.255.254', 'localhost', '::1', '[::1]', '::ffff:127.0.0.1']) {
+      expect(isLoopbackBindHost(host), host).toBe(true);
+    }
+  });
+
+  it('rejects the wildcards, which `hostUrl` ADVERTISES as loopback', () => {
+    // The trap this predicate exists for. `hostUrl('0.0.0.0', p)` returns
+    // `http://127.0.0.1:p` because that is what a client should connect to —
+    // so a reachability check written against the advertised URL would call a
+    // bind on every interface safe. These bind every interface.
+    for (const host of ['0.0.0.0', '::', '']) {
+      expect(isLoopbackBindHost(host), host).toBe(false);
+    }
+  });
+
+  it('rejects routable addresses and names that merely look loopback-ish', () => {
+    for (const host of [
+      '192.168.1.10',
+      '10.0.0.1',
+      '0.0.0.1',
+      // Off by one octet from the loopback block, and a real routable address.
+      '128.0.0.1',
+      '2001:db8::1',
+      'my-mac.local',
+      // Resolves wherever DNS says; the name is not the loopback name.
+      'localhost.evil.example',
+      // A prefix match on '127.' would accept this.
+      '127.0.0.1.evil.example',
+    ]) {
+      expect(isLoopbackBindHost(host), host).toBe(false);
+    }
   });
 });
 

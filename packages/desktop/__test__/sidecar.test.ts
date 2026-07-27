@@ -24,6 +24,7 @@ import {
   resolveParentChannel,
   runSidecar,
   SIDECAR_HOST_OPTIONS,
+  sidecarHostOptions,
   type ParentChannel,
   type SidecarHost,
 } from '../src/inference/sidecar.js';
@@ -151,6 +152,32 @@ describe('the readiness handshake', () => {
     // Loopback is what makes the supervisor's `isLoopbackHttpUrl` guard pass by
     // construction rather than by luck.
     expect(SIDECAR_HOST_OPTIONS.host).toBe('127.0.0.1');
+  });
+
+  it('gates the port with a secret, because loopback is not a closed door', () => {
+    // Any local process can reach a loopback port, and so can JavaScript on any
+    // page the user's browser is showing — `fetch('http://127.0.0.1:<port>')`
+    // is an ordinary cross-origin request, and the server's pre-auth default of
+    // `Access-Control-Allow-Origin: *` made the reply readable to it. Without a
+    // token here, `/v1/messages` is open to every one of them.
+    const options = sidecarHostOptions();
+    expect(typeof options.authToken).toBe('string');
+    // 32 CSPRNG bytes, base64url. A short or low-entropy value is worse than
+    // none: it also switches CORS off, so the surface LOOKS protected.
+    expect(options.authToken.length).toBeGreaterThanOrEqual(40);
+  });
+
+  it('mints a fresh token per process, never a build-time constant', () => {
+    // A module-level constant would be identical in every install of the app,
+    // which makes it a published password.
+    const tokens = new Set(Array.from({ length: 8 }, () => sidecarHostOptions().authToken));
+    expect(tokens.size).toBe(8);
+  });
+
+  it('keeps the bind that the token protects', () => {
+    const options = sidecarHostOptions();
+    expect(options.port).toBe(SIDECAR_HOST_OPTIONS.port);
+    expect(options.host).toBe(SIDECAR_HOST_OPTIONS.host);
   });
 
   it('says nothing at all when the host cannot start', async () => {

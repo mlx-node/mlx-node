@@ -217,10 +217,11 @@ describe('INFERENCE is the one that does', () => {
     // A file that imports `@mlx-node/server/host` cannot be imported by any test
     // that has to run without a GPU, so it holds no rules — `sidecar.ts` does.
     const source = readFileSync(src('inference/index.ts'), 'utf-8');
-    expect(source).toContain('SIDECAR_HOST_OPTIONS');
-    // A literal port here would reintroduce the `pickFreePort` race the options
-    // constant exists to avoid, and no test of `sidecar.ts` could see it.
-    expect(/createInferenceHost\(\s*\{\s*port\s*:/.test(source)).toBe(false);
+    expect(source).toContain('sidecarHostOptions()');
+    // An options literal here would reintroduce whatever `sidecarHostOptions`
+    // decides — the `pickFreePort` race a literal port brings back, or a bind
+    // with no `authToken` — and no test of `sidecar.ts` could see either.
+    expect(/createInferenceHost\(\s*\{/.test(source)).toBe(false);
   });
 });
 

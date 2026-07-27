@@ -101,6 +101,26 @@ function normalizePositiveIntConfig(value: number | undefined, name: string): nu
   return value;
 }
 
+/**
+ * Resolve the effective auth token from an explicit value plus the env
+ * fallback.
+ *
+ * Exported because `createInferenceHost` has to answer "is this server going
+ * to be protected?" BEFORE it binds, in order to refuse a non-loopback bind
+ * that would serve anonymously. Two independent copies of this rule would
+ * drift, and the direction it would drift is a host that refuses to start
+ * while `MLX_SERVER_AUTH_TOKEN` is sitting right there in the environment.
+ *
+ * An empty env var means "not set". An accidental `MLX_SERVER_AUTH_TOKEN=` in
+ * a launcher script must not enable auth with an empty secret that every
+ * credential-less request would then fail against.
+ */
+export function resolveAuthToken(explicit: string | undefined): string | undefined {
+  if (explicit !== undefined) return explicit;
+  const fromEnv = process.env.MLX_SERVER_AUTH_TOKEN;
+  return fromEnv != null && fromEnv !== '' ? fromEnv : undefined;
+}
+
 export interface ServerConfig {
   /** Port to listen on (default: 8080). */
   port?: number;
@@ -317,11 +337,7 @@ export interface ServerInstance {
 export async function createServer(config?: ServerConfig): Promise<ServerInstance> {
   const port = config?.port ?? 8080;
   const host = config?.host ?? '127.0.0.1';
-  // An empty env var means "not set" — an accidental `MLX_SERVER_AUTH_TOKEN=`
-  // in a launcher script must not enable auth with an empty secret that every
-  // credential-less request would then fail against.
-  const envAuthToken = process.env.MLX_SERVER_AUTH_TOKEN;
-  const authToken = config?.authToken ?? (envAuthToken != null && envAuthToken !== '' ? envAuthToken : undefined);
+  const authToken = resolveAuthToken(config?.authToken);
   // Forwarded unresolved so `createHandler` applies the auth-aware default
   // (`true` without a token, `false` with one) in exactly one place.
   const cors = config?.cors;

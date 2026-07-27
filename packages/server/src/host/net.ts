@@ -34,6 +34,29 @@ export function hostUrl(host: string, port: number): string {
 }
 
 /**
+ * Does this BIND address keep the socket unreachable from another machine?
+ *
+ * Distinct from the desktop supervisor's `isLoopbackHttpUrl`, which classifies
+ * a URL a client would connect TO. This one classifies the string handed to
+ * `server.listen(port, host)`, where the failure modes are different: the
+ * wildcards (`0.0.0.0`, `::`, `''`) are not routable addresses at all yet bind
+ * every interface, and `hostUrl` deliberately ADVERTISES them as loopback — so
+ * a check written against the advertised URL would call a wildcard bind safe.
+ *
+ * Loopback: the whole `127.0.0.0/8` block, `::1` (bracketed or not), and
+ * `localhost`. Anything else — a LAN address, a wildcard, a hostname that
+ * resolves off-box — is treated as reachable, because a predicate that has to
+ * resolve DNS to answer would either block startup or guess.
+ */
+export function isLoopbackBindHost(host: string): boolean {
+  if (host === 'localhost' || host === '::1' || host === '[::1]') return true;
+  // `::ffff:127.0.0.1` is the IPv4-mapped form Node accepts on a dual-stack
+  // socket; it binds the same loopback interface.
+  if (/^::ffff:127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/i.test(host)) return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+
+/**
  * Ask the kernel for a free port by binding to port 0, reading the assigned
  * port, and closing immediately.
  *

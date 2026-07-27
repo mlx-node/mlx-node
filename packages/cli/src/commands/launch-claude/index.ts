@@ -2,6 +2,7 @@
 
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { accessSync, constants as fsConstants } from 'node:fs';
 import { constants as osConstants } from 'node:os';
 import { delimiter, join } from 'node:path';
@@ -26,7 +27,10 @@ Usage:
 
 Options:
   --port <n>         Port for the local server (default: auto-pick a free port)
-  --host <h>         Host to bind (default: 127.0.0.1)
+  --host <h>         Host to bind (default: 127.0.0.1). The server requires a
+                     per-launch token that only the spawned \`claude\` is given,
+                     so a non-loopback bind is reachable but not usable by
+                     anyone else on the network.
   --models-dir <dir> Directory to discover models from
                      (default: ~/.mlx-node/models; overridable via
                      MLX_MODELS_DIR env or ~/.mlx-node/config.json)
@@ -119,6 +123,26 @@ export interface LaunchClaudeFlags {
   modelsDir?: string;
   model?: string;
   logDir?: string;
+  /**
+   * The per-launch secret. Not a flag — {@link run} generates it and hands the
+   * same value to the host and to the spawned `claude`. Optional only so the
+   * pure mapping stays callable from a test without one.
+   */
+  authToken?: string;
+}
+
+/**
+ * A fresh secret for one `mlx launch claude` run, shared with exactly one
+ * child process and never written down.
+ *
+ * The pre-auth launcher passed the constant `mlx-node-local` to Claude Code and
+ * configured no token on the host at all, so the string was decorative: every
+ * route was open to any local process, and to any web page the user's browser
+ * was showing (`Access-Control-Allow-Origin: *` was the default with no token,
+ * which made the replies readable cross-origin as well).
+ */
+function newLaunchAuthToken(): string {
+  return randomBytes(32).toString('base64url');
 }
 
 /**
@@ -136,11 +160,55 @@ export function launchClaudeHostOptions(flags: LaunchClaudeFlags): InferenceHost
     modelsDir: flags.modelsDir,
     model: flags.model,
     logDir: flags.logDir,
+    authToken: flags.authToken,
     // Launcher policy, not an engine default: the shared native var still
     // reads 0 as "disable chunking", and a value already set in the user's
     // shell wins (see `applyEnginePolicy`).
     enginePolicy: LAUNCHER_ENGINE_POLICY,
   };
+}
+
+/**
+ * Build the environment the spawned `claude` runs under.
+ *
+ * Exported and pure because the one rule here that is not obvious was measured
+ * rather than assumed, and a regression would look like "every request 401s"
+ * with nothing in the code to point at.
+ *
+ * Measured against Claude Code 2.1.220, sending both variables at a local
+ * base URL:
+ *
+ *   ANTHROPIC_AUTH_TOKEN only  → `authorization: Bearer <token>`
+ *   + ANTHROPIC_API_KEY        → `authorization: Bearer <token>`
+ *                                `x-api-key: <the user's own key>`
+ *
+ * The gate reads `x-api-key` FIRST (Anthropic clients send it, and checking it
+ * first stops an injected `authorization` shadowing a caller's real key), so an
+ * inherited `ANTHROPIC_API_KEY` would beat our bearer and 401 the whole
+ * session. It is therefore dropped, not overwritten: the child is pointed at
+ * loopback and has no reason to hold a key for api.anthropic.com — one that
+ * `--verbose` would then write into the request log on disk.
+ */
+export function claudeChildEnv(
+  parent: NodeJS.ProcessEnv,
+  opts: { baseUrl: string; model: string; authToken: string },
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...parent,
+    ANTHROPIC_BASE_URL: opts.baseUrl,
+    ANTHROPIC_AUTH_TOKEN: opts.authToken,
+    ANTHROPIC_MODEL: opts.model,
+    // NOTE: intentionally NOT setting ANTHROPIC_SMALL_FAST_MODEL /
+    // ANTHROPIC_DEFAULT_HAIKU_MODEL. Claude Code falls back to
+    // `claude-haiku-*` for subagents + title generation; the swap
+    // controller aliases any unknown name to the current resident
+    // so those calls always follow whatever model the user picked
+    // via `/model`.
+  };
+  // `delete`, not `= undefined`: `spawn` skipping undefined values is an
+  // implementation detail of `child_process`, and this must not depend on it.
+  delete env.ANTHROPIC_API_KEY;
+  return env;
 }
 
 export async function run(argv: string[]): Promise<void> {
@@ -197,6 +265,8 @@ export async function run(argv: string[]): Promise<void> {
     process.exit(1);
   }
 
+  const authToken = newLaunchAuthToken();
+
   const host = await createInferenceHost(
     launchClaudeHostOptions({
       port: portArg,
@@ -204,6 +274,7 @@ export async function run(argv: string[]): Promise<void> {
       modelsDir: args['models-dir'],
       model: args.model,
       logDir,
+      authToken,
     }),
   ).catch((err: unknown) => {
     if (err instanceof NoModelsDiscoveredError) {
@@ -230,18 +301,7 @@ export async function run(argv: string[]): Promise<void> {
 
   const child = spawn(claudeBin, claudeArgs, {
     stdio: 'inherit',
-    env: {
-      ...process.env,
-      ANTHROPIC_BASE_URL: host.url,
-      ANTHROPIC_AUTH_TOKEN: 'mlx-node-local',
-      ANTHROPIC_MODEL: host.boundModel,
-      // NOTE: intentionally NOT setting ANTHROPIC_SMALL_FAST_MODEL /
-      // ANTHROPIC_DEFAULT_HAIKU_MODEL. Claude Code falls back to
-      // `claude-haiku-*` for subagents + title generation; the swap
-      // controller aliases any unknown name to the current resident
-      // so those calls always follow whatever model the user picked
-      // via `/model`.
-    },
+    env: claudeChildEnv(process.env, { baseUrl: host.url, model: host.boundModel, authToken }),
   });
 
   let shuttingDown = false;

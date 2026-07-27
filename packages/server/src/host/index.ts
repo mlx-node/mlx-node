@@ -41,11 +41,11 @@ import type { Server } from 'node:http';
 import { loadModel as loadModelNative, PagedConfigOverrideManager, type LoadableModel } from '@mlx-node/lm';
 
 import type { ServerHealth } from '../health.js';
-import { createServer, type CloseOptions, type ServerInstance } from '../server.js';
+import { createServer, resolveAuthToken, type CloseOptions, type ServerInstance } from '../server.js';
 import { discoverModels, type DiscoveredModel } from './discover.js';
 import { applyEnginePolicy, type EnginePolicy } from './env-policy.js';
 import { attachLogger as defaultAttachLogger, type Logger } from './logger.js';
-import { hostUrl, pickFreePort } from './net.js';
+import { hostUrl, isLoopbackBindHost, pickFreePort } from './net.js';
 import { resolveModelsDir } from './paths.js';
 import { makeSwapController } from './swap.js';
 import { hostTempDirPrefix, sweepOrphanHostTempRoots } from './temp-root.js';
@@ -58,6 +58,27 @@ export class NoModelsDiscoveredError extends Error {
   constructor(readonly modelsDir: string) {
     super(`No models discovered under ${modelsDir}.`);
     this.name = 'NoModelsDiscoveredError';
+  }
+}
+
+/**
+ * Thrown when a bind reachable from the network was asked for with no shared
+ * secret to gate it.
+ *
+ * There is no safe way to serve that: every route but the `/health` liveness
+ * carve-out runs inference, so an unauthenticated LAN-reachable bind hands
+ * anyone who can route to this machine the GPU, the RAM, and the list of
+ * models on disk. Failing at startup is the only outcome the operator can act
+ * on — serving-with-a-warning is a warning nobody reads scrolling past a
+ * model load.
+ */
+export class InsecureBindError extends Error {
+  constructor(readonly host: string) {
+    super(
+      `Refusing to bind ${host} without an auth token: every route except /health runs inference. ` +
+        `Pass an auth token (mlx serve --auth-token, or MLX_SERVER_AUTH_TOKEN), or bind 127.0.0.1.`,
+    );
+    this.name = 'InsecureBindError';
   }
 }
 
@@ -81,7 +102,14 @@ export interface InferenceHostOptions {
    * ephemeral port and the real one is read back off the socket.
    */
   port?: number;
-  /** Host to bind. Default `127.0.0.1`. */
+  /**
+   * Host to bind. Default `127.0.0.1`.
+   *
+   * A non-loopback value (including the wildcards `0.0.0.0` / `::`) requires
+   * an auth token — from {@link InferenceHostOptions.authToken} or
+   * `MLX_SERVER_AUTH_TOKEN` — or the call throws {@link InsecureBindError}
+   * instead of listening.
+   */
   host?: string;
   /** Model discovery root. Default: {@link resolveModelsDir}'s resolution order. */
   modelsDir?: string;
@@ -174,11 +202,22 @@ export interface InferenceHost {
 /**
  * Start a local inference host.
  *
- * Throws {@link NoModelsDiscoveredError} / {@link ModelNotFoundError} rather
- * than exiting — a library cannot know whether its caller is a CLI, a test, or
- * an Electron main process. Front-ends render those into their own messages.
+ * Throws {@link NoModelsDiscoveredError} / {@link ModelNotFoundError} /
+ * {@link InsecureBindError} rather than exiting — a library cannot know
+ * whether its caller is a CLI, a test, or an Electron main process. Front-ends
+ * render those into their own messages.
  */
 export async function createInferenceHost(opts: InferenceHostOptions = {}): Promise<InferenceHost> {
+  const host = opts.host ?? '127.0.0.1';
+  // BEFORE the engine policy, the temp sweep and discovery — all of which
+  // mutate state outside this function — so a refused start leaves nothing
+  // behind. Resolved through `resolveAuthToken` rather than reading
+  // `opts.authToken`, or `MLX_SERVER_AUTH_TOKEN=… mlx serve --host 0.0.0.0`
+  // would be refused despite being fully protected.
+  if (!isLoopbackBindHost(host) && resolveAuthToken(opts.authToken) === undefined) {
+    throw new InsecureBindError(host);
+  }
+
   // FIRST, before anything can touch the engine: the native side latches
   // these via `OnceLock` on first read, so a policy applied after a load has
   // silently done nothing.
@@ -207,7 +246,6 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   }
   const boundEntry = requestedEntry ?? models[0];
 
-  const host = opts.host ?? '127.0.0.1';
   // `undefined` means "you pick"; `0` means "the kernel picks and I will read
   // it back". Only the former needs the up-front probe.
   const requestedPort = opts.port ?? (await pickFreePort());
@@ -323,7 +361,7 @@ export {
   type EnginePolicy,
 } from './env-policy.js';
 export { attachLogger, resolveLogDir, type Logger } from './logger.js';
-export { bracketHost, hostUrl, pickFreePort } from './net.js';
+export { bracketHost, hostUrl, isLoopbackBindHost, pickFreePort } from './net.js';
 export { resolveMlxNodeHome, resolveModelsDir } from './paths.js';
 export { makeSwapController, type SwapController } from './swap.js';
 export {

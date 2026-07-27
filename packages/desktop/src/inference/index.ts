@@ -22,7 +22,7 @@ import { writeSync } from 'node:fs';
 
 import { createInferenceHost } from '@mlx-node/server/host';
 
-import { NoParentChannelError, resolveParentChannel, runSidecar, SIDECAR_HOST_OPTIONS } from './sidecar.js';
+import { NoParentChannelError, resolveParentChannel, runSidecar, sidecarHostOptions } from './sidecar.js';
 
 /** stdout/stderr are async pipes under both transports; an exit right after a write truncates it. */
 function logError(line: string): void {
@@ -45,7 +45,7 @@ const channel = (() => {
 
 void runSidecar({
   channel,
-  createHost: () => createInferenceHost({ ...SIDECAR_HOST_OPTIONS }),
+  createHost: () => createInferenceHost(sidecarHostOptions()),
   onStopSignal: (handler) => {
     // SIGTERM is what `utilityProcess.kill()` sends and the only stop signal
     // production ever produces. SIGINT is here for the hand-run reproduction

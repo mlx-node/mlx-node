@@ -15,8 +15,11 @@
  * `__test__/fixtures/sidecar.mjs`.
  */
 
+import { randomBytes } from 'node:crypto';
+
 /**
- * Options the entry passes to `createInferenceHost`.
+ * Where the sidecar binds. See {@link sidecarHostOptions} for what the entry
+ * actually passes.
  *
  * `port: 0` is the load-bearing part. `createInferenceHost` treats an omitted
  * port as "pick one for me" and calls `pickFreePort()`, which binds, reads the
@@ -33,6 +36,41 @@
  * construction instead of by luck.
  */
 export const SIDECAR_HOST_OPTIONS = Object.freeze({ port: 0, host: '127.0.0.1' });
+
+/**
+ * A fresh secret for one sidecar process.
+ *
+ * 32 bytes from the CSPRNG. Not derived from the pid, the port or the clock:
+ * all three are observable by any local process, and a token an attacker can
+ * recompute is worse than no token because it also switches CORS off and makes
+ * the surface look protected.
+ */
+export function newSidecarAuthToken(): string {
+  return randomBytes(32).toString('base64url');
+}
+
+/**
+ * What the entry passes to `createInferenceHost`.
+ *
+ * A loopback bind is NOT a closed door. Every local process on the machine can
+ * reach the port, and so can JavaScript on any page the user's browser happens
+ * to be showing — `fetch('http://127.0.0.1:<port>/v1/messages')` from a hostile
+ * page is an ordinary cross-origin request, and the pre-auth default of
+ * `Access-Control-Allow-Origin: *` made the reply readable to it. The token is
+ * what makes that request a 401; the server's own CORS default then follows the
+ * auth posture and stops sending the wildcard at all.
+ *
+ * A NEW token per call, per process. It is never persisted and never leaves
+ * this process: the Admin window talks to ADMIN over a transferred
+ * `MessagePort` and the supervisor polls `/health`, which is deliberately
+ * carved out of the gate, so nothing outside needs it. Adding it to the `info`
+ * reply would put a live secret into the supervisor's per-generation trace file
+ * on disk — if a consumer ever genuinely needs it, that is the hazard to solve
+ * first.
+ */
+export function sidecarHostOptions(): { port: number; host: string; authToken: string } {
+  return { ...SIDECAR_HOST_OPTIONS, authToken: newSidecarAuthToken() };
+}
 
 /**
  * The slice of `InferenceHost` this module uses.

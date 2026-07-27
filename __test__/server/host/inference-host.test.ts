@@ -7,8 +7,10 @@ import { join } from 'node:path';
 import type { LoadableModel } from '@mlx-node/lm';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
+import { isServingStatus } from '../../../packages/desktop/src/main/supervisor/state.js';
 import {
   createInferenceHost,
+  InsecureBindError,
   LAUNCHER_ENGINE_POLICY,
   ModelNotFoundError,
   NoModelsDiscoveredError,
@@ -167,6 +169,127 @@ describe('createInferenceHost — binding and health', () => {
     expect((await fetch(url)).status).toBe(200);
     await host.close({ timeoutMs: 0 });
     await expect(fetch(url)).rejects.toThrow();
+  });
+});
+
+describe('createInferenceHost — a network-reachable bind must be gated', () => {
+  /**
+   * Every route but the `/health` carve-out runs inference, so an
+   * unauthenticated bind on a routable interface hands the GPU, the RAM and
+   * the on-disk model list to anyone who can route to this machine. There is
+   * no serving posture that makes that acceptable, so it fails at startup.
+   */
+
+  const AUTH_ENV = 'MLX_SERVER_AUTH_TOKEN';
+
+  afterEach(() => {
+    delete process.env[AUTH_ENV];
+  });
+
+  it('refuses a wildcard bind with no token, and listens on nothing', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    for (const host of ['0.0.0.0', '::']) {
+      await expect(start({ modelsDir, host, port: 0 }), host).rejects.toBeInstanceOf(InsecureBindError);
+    }
+    // `hostUrl` advertises a wildcard bind as loopback, so the refusal has to
+    // come from the BIND address; a check on the advertised URL would pass.
+    await expect(start({ modelsDir, host: '192.168.7.7', port: 0 })).rejects.toBeInstanceOf(InsecureBindError);
+  });
+
+  it('names the fix in the message — this is the only signal the operator gets', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    await expect(start({ modelsDir, host: '0.0.0.0' })).rejects.toThrow(/auth token|MLX_SERVER_AUTH_TOKEN/);
+  });
+
+  it('refuses BEFORE mutating anything outside the call', async () => {
+    // The engine policy writes `process.env`, and the temp sweep and discovery
+    // both touch the filesystem. A guard placed after them leaves the refused
+    // start's side effects behind — and `MLX_PAGED_PREFILL_CHUNK_SIZE` latches
+    // in the native layer through a `OnceLock`, so it cannot be taken back.
+    delete process.env[CHUNK_ENV];
+    await expect(
+      start({ modelsDir: '/definitely/not/a/models/dir', host: '0.0.0.0', enginePolicy: LAUNCHER_ENGINE_POLICY }),
+    ).rejects.toBeInstanceOf(InsecureBindError);
+    expect(process.env[CHUNK_ENV]).toBeUndefined();
+  });
+
+  it('allows a non-loopback bind once a token is configured', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    const host = await start({ modelsDir, host: '0.0.0.0', port: 0, authToken: 'a-real-secret' });
+    expect(host.port).toBeGreaterThan(0);
+    expect((await fetch(`${host.url}/v1/models`, { headers: { 'x-api-key': 'a-real-secret' } })).status).toBe(200);
+    expect((await fetch(`${host.url}/v1/models`)).status).toBe(401);
+  });
+
+  it('accepts the token from MLX_SERVER_AUTH_TOKEN, which the handler also honours', async () => {
+    // Refusing here would be the guard disagreeing with the gate it is
+    // guarding: `createServer` picks the env var up, so the server WOULD be
+    // protected. Two copies of the "is there a token" rule is how that drifts.
+    process.env[AUTH_ENV] = 'from-the-environment';
+    const modelsDir = await makeModelsDir(['alpha']);
+    const host = await start({ modelsDir, host: '0.0.0.0', port: 0 });
+    expect((await fetch(`${host.url}/v1/models`)).status).toBe(401);
+  });
+
+  it('ignores an EMPTY MLX_SERVER_AUTH_TOKEN, which enables nothing', async () => {
+    // `MLX_SERVER_AUTH_TOKEN=` in a launcher script does not configure auth —
+    // treating it as a token here would open the bind it is meant to gate.
+    process.env[AUTH_ENV] = '';
+    const modelsDir = await makeModelsDir(['alpha']);
+    await expect(start({ modelsDir, host: '0.0.0.0' })).rejects.toBeInstanceOf(InsecureBindError);
+  });
+
+  it('leaves an unauthenticated loopback bind exactly as it was', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    for (const bind of ['127.0.0.1', 'localhost', undefined]) {
+      const host = await start({ modelsDir, host: bind, port: 0 });
+      expect((await fetch(`${host.url}/v1/models`)).status, String(bind)).toBe(200);
+    }
+  });
+});
+
+describe('createInferenceHost — a tokenized host still answers the supervisor', () => {
+  /**
+   * The desktop sidecar now binds with a per-launch token. The supervisor
+   * polls `/health` with NO credential and reads `response.ok` plus
+   * `body.status`; if either changed, a healthy sidecar would never reach
+   * `running` and the restart budget would crash-loop it. Asserted against the
+   * supervisor's own predicate rather than a restated list of statuses.
+   */
+
+  it('serves an anonymous /health that the supervisor reads as serving', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    const host = await start({ modelsDir, authToken: 'per-launch-secret' });
+
+    const res = await fetch(`${host.url}/health`);
+    expect(res.ok).toBe(true);
+    const body = (await res.json()) as { status: string };
+    expect(isServingStatus(body.status)).toBe(true);
+  });
+
+  it('withholds the model names an anonymous poll must not see', async () => {
+    const modelsDir = await makeModelsDir(['a-client-project-name']);
+    const host = await start({ modelsDir, authToken: 'per-launch-secret' });
+    await host.loadModel('a-client-project-name');
+
+    expect(await (await fetch(`${host.url}/health`)).text()).not.toContain('a-client-project-name');
+    const authed = await (await fetch(`${host.url}/health`, { headers: { 'x-api-key': 'per-launch-secret' } })).json();
+    expect((authed as { models: { resident: string[] } }).models.resident).toContain('a-client-project-name');
+  });
+
+  it('gates the generative endpoints the supervisor never touches', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    const host = await start({ modelsDir, authToken: 'per-launch-secret' });
+
+    const anonymous = await fetch(`${host.url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'alpha', messages: [{ role: 'user', content: 'hi' }], max_tokens: 8 }),
+    });
+    expect(anonymous.status).toBe(401);
+    expect((await fetch(`${host.url}/v1/models`, { headers: { 'x-api-key': 'wrong-secret' } })).status).toBe(401);
+    // …and no wildcard for a browser to spend a leaked token through.
+    expect(anonymous.headers.get('access-control-allow-origin')).toBeNull();
   });
 });
 

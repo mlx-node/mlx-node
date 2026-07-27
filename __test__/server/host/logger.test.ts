@@ -216,4 +216,89 @@ describe('attachLogger', () => {
     const pretty = readFileSync(join(logDir, 'session.log'), 'utf-8');
     expect(pretty).toContain('server(resolve=60300ms load_wait=60290ms load_owner=false queue=1ms pre=60302ms)');
   });
+
+  it('redacts credential headers, keeping the header names', async () => {
+    // `requests.ndjson` is what users paste into bug reports, and every client
+    // of a protected host presents a live secret on every turn — the per-launch
+    // token `mlx launch claude` generates, or `MLX_SERVER_AUTH_TOKEN`. The
+    // NAMES stay: "presented a token and it was wrong" and "presented nothing"
+    // are different bugs, and a log that drops the header cannot tell them
+    // apart.
+    const logDir = makeTmpDir();
+    const port = await pickFreePort();
+
+    const srv = createServer((_req, res) => {
+      res.writeHead(200).end('{}');
+    });
+    const logger = attachLogger(srv, logDir);
+    await new Promise<void>((resolve) => srv.listen(port, '127.0.0.1', resolve));
+
+    await new Promise<void>((resolve, reject) => {
+      const req = httpRequest(
+        {
+          host: '127.0.0.1',
+          port,
+          method: 'GET',
+          path: '/v1/models',
+          headers: {
+            authorization: 'Bearer the-live-bearer-token',
+            'x-api-key': 'sk-ant-the-users-own-key',
+            'proxy-authorization': 'Basic the-proxy-secret',
+            cookie: 'session=the-session-cookie',
+            'anthropic-version': '2023-06-01',
+          },
+        },
+        (res) => {
+          res.resume();
+          res.on('end', () => resolve());
+        },
+      );
+      req.on('error', reject);
+      req.end();
+    });
+
+    await logger.close();
+    await closeServer(srv);
+
+    const raw = readFileSync(join(logDir, 'requests.ndjson'), 'utf-8');
+    for (const secret of [
+      'the-live-bearer-token',
+      'sk-ant-the-users-own-key',
+      'the-proxy-secret',
+      'the-session-cookie',
+    ]) {
+      expect(raw, secret).not.toContain(secret);
+    }
+    const row = JSON.parse(raw.trim()) as { reqHeaders: Record<string, string> };
+    expect(row.reqHeaders.authorization).toBe('[redacted]');
+    expect(row.reqHeaders['x-api-key']).toBe('[redacted]');
+    expect(row.reqHeaders['proxy-authorization']).toBe('[redacted]');
+    expect(row.reqHeaders.cookie).toBe('[redacted]');
+    // Everything else still lands verbatim — the log's whole job.
+    expect(row.reqHeaders['anthropic-version']).toBe('2023-06-01');
+  });
+
+  it('leaves a request with no credentials untouched', async () => {
+    const logDir = makeTmpDir();
+    const port = await pickFreePort();
+
+    const srv = createServer((_req, res) => {
+      res.writeHead(200).end('{}');
+    });
+    const logger = attachLogger(srv, logDir);
+    await new Promise<void>((resolve) => srv.listen(port, '127.0.0.1', resolve));
+
+    await postJson(port, { ping: 1 });
+    await logger.close();
+    await closeServer(srv);
+
+    const row = JSON.parse(readFileSync(join(logDir, 'requests.ndjson'), 'utf-8').trim()) as {
+      reqHeaders: Record<string, string>;
+    };
+    // A blanket `'[redacted]'` for absent headers would invent a credential
+    // that was never presented.
+    expect('authorization' in row.reqHeaders).toBe(false);
+    expect('x-api-key' in row.reqHeaders).toBe(false);
+    expect(row.reqHeaders['content-type']).toBe('application/json');
+  });
 });
