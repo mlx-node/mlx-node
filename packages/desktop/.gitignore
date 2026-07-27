@@ -4,3 +4,8 @@ spike/.spike-logs/
 # Packaging staging + packager output. `out` is already ignored repo-wide, but
 # being explicit here keeps the build products discoverable to a reader.
 out/
+
+# `iconutil` input only: 10 PNGs that make-icons.py regenerates and that carry no
+# information `icon.icns` does not already hold. The .icns itself IS committed —
+# packagers reference it directly, and building one should not require Python+PIL.
+build/icon.iconset/
