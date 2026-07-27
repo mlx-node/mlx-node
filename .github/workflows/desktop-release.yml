@@ -1,0 +1,242 @@
+name: Desktop Release
+
+# Signing cannot live in ci.yml's `publish` job: that one runs on ubuntu-latest,
+# and codesign/notarytool/stapler are macOS-only. This is a separate workflow on a
+# macOS runner rather than another job in ci.yml because it needs Apple secrets
+# that no PR-triggered job should ever be able to read.
+#
+# `dry_run` builds, packages and signs but does NOT notarize or publish. That path
+# needs only CSC_LINK + CSC_KEY_PASSWORD, so the pipeline is exercisable before the
+# notarization secrets exist — which matters, because notarization is the step with
+# the slowest feedback loop and the least reproducible failures.
+#
+# Required secrets (none of these exist in the repo yet):
+#   CSC_LINK                     base64 of the Developer ID Application .p12
+#   CSC_KEY_PASSWORD             its export password
+#   APPLE_ID                     Apple account email
+#   APPLE_TEAM_ID                10-char Team ID
+#   APPLE_APP_SPECIFIC_PASSWORD  app-specific password, NOT the account password
+# Optional:
+#   HOMEBREW_TAP_TOKEN           PAT with contents:write on the tap repo
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and sign, but skip notarization and publishing'
+        type: boolean
+        default: true
+
+env:
+  # Must match ci.yml. Without it the deployment floor silently tracks the runner
+  # image's macOS version and ratchets with runner updates.
+  MACOSX_DEPLOYMENT_TARGET: '26.0'
+  MLX_METALLIB_STRICT: '1'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Sign, notarize, publish
+    runs-on: macos-26
+    permissions:
+      contents: write
+    env:
+      # Hoisted so the cask step's `if` can test it — see the comment there.
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'yarn'
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: aarch64-apple-darwin
+          cache: false
+          rustflags: ''
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v1-rust
+
+      - name: Configure GitHub token for CMake downloads
+        run: |
+          echo "machine github.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          echo "machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          chmod 600 ~/.netrc
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      # Deliberately a fresh build, not a `gh run download` of ci.yml's artifacts.
+      # A release is rare and the ~16 min is worth it: artifact reuse is exactly how
+      # a stale metallib gets paired with a current .node, and that failure mode is
+      # garbage inference output with no load-time error.
+      - name: Build native + TypeScript
+        run: yarn build
+
+      - name: Build dashboard UI
+        run: yarn workspace @mlx-node/dashboard build:ui
+
+      # A dedicated keychain, not the login keychain: the runner is ephemeral but
+      # the login keychain is shared with every other step, and `security unlock`
+      # on it would expose anything else stored there.
+      - name: Import signing certificate
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          # Random, never printed. It only has to outlive this job.
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+          echo -n "$CSC_LINK" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # Default timeout locks the keychain mid-job on a slow build.
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$CSC_KEY_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          # Without this codesign blocks on a GUI keychain-access prompt that can
+          # never be answered, and the job hangs until it times out.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)"
+          [ -n "$IDENTITY" ] || { echo "::error::no Developer ID Application identity in the keychain"; exit 1; }
+          echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "Found identity: ${IDENTITY%% (*} (…)"
+
+      # Packages, rewrites the addon's LC_ID_DYLIB + code-signing identifier, then
+      # signs inside-out with @electron/osx-sign. The install-name rewrite is not
+      # cosmetic: the addon ships `/Users/<builder>/.../target/.../libmlx_core.dylib`
+      # otherwise, leaking a home directory to every user.
+      - name: Package and sign
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: yarn workspace @mlx-node/desktop package --sign
+
+      # The gate that matters. `codesign --verify --deep --strict` passes on a
+      # bundle containing an unsigned Mach-O and the notary rejects it hours later,
+      # so this runs BEFORE submission — a notarization round trip is the most
+      # expensive way possible to discover a missed binary.
+      - name: Verify bundle (pre-notarization)
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: ./packages/desktop/scripts/verify-bundle.sh packages/desktop/out/mlx-node.app
+
+      - name: Notarize and staple
+        if: inputs.dry_run != true
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          APP=packages/desktop/out/mlx-node.app
+          # notarytool takes an archive, never a .app directory. ditto preserves the
+          # extended attributes and symlinks that a plain `zip` drops — and a dropped
+          # symlink inside a .framework invalidates the signature.
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/upload.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/upload.zip" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" --wait --timeout 45m
+          # Staple the .app itself so first launch works with no network. Documented
+          # service limit is 75 submissions/day; most return in under 5 minutes.
+          xcrun stapler staple "$APP"
+
+      - name: Verify bundle (post-notarization)
+        if: inputs.dry_run != true
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: ./packages/desktop/scripts/verify-bundle.sh packages/desktop/out/mlx-node.app --notarized
+
+      - name: Build DMG
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./packages/desktop/package.json').version")"
+          DMG="packages/desktop/out/mlx-node-${VERSION}-arm64.dmg"
+          STAGE="$RUNNER_TEMP/dmg"
+          mkdir -p "$STAGE"
+          # Copy the STAPLED .app; a ticket stapled after imaging would not be inside.
+          ditto packages/desktop/out/mlx-node.app "$STAGE/mlx-node.app"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "mlx-node" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      # The DMG is a separate distributable and Gatekeeper assesses it on its own,
+      # so it needs its own signature, notarization and ticket. Skipping this is the
+      # classic "the .app is notarized but the download is still quarantined" bug.
+      - name: Sign, notarize and staple the DMG
+        if: inputs.dry_run != true
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          codesign --sign "$SIGN_IDENTITY" --timestamp --options runtime "$DMG"
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" --wait --timeout 45m
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: mlx-node-desktop-dmg
+          path: ${{ env.DMG }}
+
+      - name: Attach DMG to the release
+        if: inputs.dry_run != true && github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "$DMG" --clobber
+
+      # The `secrets` context is NOT available in a step `if` — only github, needs,
+      # strategy, matrix, job, runner, env, vars, steps and inputs are. Writing
+      # `secrets.HOMEBREW_TAP_TOKEN != ''` there parses but never fires, so the cask
+      # would silently stop being bumped. The token is hoisted to job-level `env`
+      # (which IS in scope) and tested there instead.
+      - name: Bump the Homebrew cask
+        if: inputs.dry_run != true && github.event_name == 'release' && env.HOMEBREW_TAP_TOKEN != ''
+        env:
+          GH_TOKEN: ${{ env.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          SHA256="$(shasum -a 256 "$DMG" | cut -d' ' -f1)"
+          git clone --depth 1 "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY_OWNER/homebrew-tap.git" "$RUNNER_TEMP/tap"
+          CASK="$RUNNER_TEMP/tap/Casks/mlx-node.rb"
+          # Anchored to the field names so a version string appearing elsewhere in
+          # the cask (a caveat, a zap path) is not rewritten too.
+          sed -i '' -e "s|^  version \".*\"|  version \"$VERSION\"|" \
+                    -e "s|^  sha256 \".*\"|  sha256 \"$SHA256\"|" "$CASK"
+          git -C "$RUNNER_TEMP/tap" add Casks/mlx-node.rb
+          git -C "$RUNNER_TEMP/tap" -c user.name=github-actions \
+            -c user.email=github-actions@github.com commit -m "mlx-node $VERSION"
+          git -C "$RUNNER_TEMP/tap" push
+
+      # `always()` so a failure anywhere above still removes the private key from
+      # the runner. The runner is ephemeral, but a leaked key outliving the job on a
+      # reused runner is not a risk worth carrying for one line.
+      - name: Remove the signing keychain
+        if: always()
+        run: security delete-keychain "$KEYCHAIN" || true
