@@ -13,6 +13,7 @@ import type { MainApiContext, WorkerApiContext } from '../src/api/context.js';
 import { dispatchMain, dispatchWorker, routeThreadFor } from '../src/api/dispatch.js';
 import { ROUTES } from '../src/api/routes.js';
 import { createDashboardRuntime, type DashboardRuntime, type RuntimeLifecycleEvent } from '../src/runtime.js';
+import { startDbWorker } from '../src/worker/client.js';
 
 let base: string;
 let sessionsRoot: string;
@@ -311,5 +312,50 @@ describe('dashboard runtime — worker death', () => {
     // Two bounded steps (drain, then close) plus terminate: generous, but far
     // below the point where "it hung" is indistinguishable from "it was slow".
     expect(await withDeadline(wedged.close(), 10_000)).not.toBe('HUNG');
+  });
+
+  // The other half of "wedged": the thread stays ALIVE and simply never answers,
+  // so nothing emits `error` or `exit` and `goDown` never runs. Bounding only the
+  // shutdown steps left every ORDINARY request pending forever — the caller's
+  // promise never settled, its `pending` entry was never removed, and each one
+  // held `worker.ref()`, so a 30s periodic ingest accumulated one leak per tick
+  // and kept the process alive on a worker that would never reply.
+  //
+  // Driven against `startDbWorker` rather than the runtime because the deadline
+  // being asserted is the client's, and the runtime does not surface it.
+  it('settles ordinary calls on a deadline when the worker stays alive and silent', async () => {
+    const lifecycle: string[] = [];
+    const client = startDbWorker({
+      workerUrl: new URL('./helpers/wedged-db-worker.ts', import.meta.url),
+      shutdownTimeoutMs: 200,
+      requestTimeoutMs: 150,
+      onLifecycle: (event) => lifecycle.push(event.type),
+      dbPath: ':memory:',
+      modelsDir,
+      sessionsRoot,
+      tracesDir,
+      cacheRoot: undefined,
+    });
+
+    try {
+      const call = await withDeadline(client.call({ method: 'GET', path: '/api/sessions' }), 5_000);
+      expect(call).not.toBe('HUNG');
+      const res = call as Exclude<typeof call, 'HUNG'>;
+      expect(res.status).toBe(503);
+      expect(res.ok ? '' : res.code).toBe('E_UNAVAILABLE');
+
+      // The periodic rescan is the leak's engine, so it needs the same bound.
+      const ingest = await withDeadline(client.ingest(), 5_000);
+      expect(ingest).not.toBe('HUNG');
+      expect((ingest as Exclude<typeof ingest, 'HUNG'>).sessions.warnings).toHaveLength(1);
+
+      // A slow answer is not a dead thread: the deadline settles the CALLER and
+      // must not latch the client down, or one slow query would permanently
+      // disable every database route.
+      expect(lifecycle).not.toContain('worker-down');
+      expect(await withDeadline(client.call({ method: 'GET', path: '/api/models' }), 5_000)).not.toBe('HUNG');
+    } finally {
+      expect(await withDeadline(client.close(), 10_000)).not.toBe('HUNG');
+    }
   });
 });

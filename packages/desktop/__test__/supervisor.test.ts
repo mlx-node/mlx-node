@@ -100,6 +100,22 @@ async function waitFor(
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * `'settled'`, or `'hung'` after `ms`. A promise that never settles has to fail
+ * as an assertion here, not as a two-minute suite timeout with no message.
+ */
+async function settleWithin(promise: Promise<unknown>, ms: number): Promise<'settled' | 'hung'> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<'hung'>((resolve) => {
+    timer = setTimeout(() => resolve('hung'), ms);
+  });
+  try {
+    return await Promise.race([promise.then(() => 'settled' as const), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 describe('start-up', () => {
   it('becomes running on the port the child actually bound', async () => {
     const { supervisor, events } = makeSupervisor();
@@ -204,6 +220,96 @@ describe('intent', () => {
     await supervisor.stop();
 
     expect(supervisor.snapshot().lastExit).toMatchObject({ verdict: 'clean', signal: 'SIGKILL' });
+  });
+
+  // ---------------------------------------------------------------------
+  // Readiness must never outlive the decision to kill. `markReady` clears the
+  // WHOLE generation timer set, and that set is also where termination lives:
+  // the SIGTERM→SIGKILL escalation and `stop`'s completion cap. A `/health`
+  // that reports `ok` after `stop()` therefore used to disarm the only two
+  // things that can end a child which ignores SIGTERM — leaving `stop()`, and
+  // every app quit or restart behind it, pending forever.
+  //
+  // Two windows, one per guard: before the probe is issued, and across a probe
+  // already in flight.
+  // ---------------------------------------------------------------------
+
+  // `mlx:ready` assigns `url`, emits, and only THEN starts polling — so a
+  // `stop()` issued from that emit lands before the first probe exists.
+  it('abandons the handshake when a stop lands before the first readiness probe', async () => {
+    const { supervisor } = makeSupervisor({ mode: 'ignore-sigterm', timings: { killGraceMs: 100 } });
+
+    const stops: Promise<void>[] = [];
+    const off = supervisor.on(() => {
+      if (stops.length > 0 || supervisor.snapshot().url === null) return;
+      off();
+      stops.push(supervisor.stop());
+    });
+
+    // Rejects once the stop wins. On the broken path it RESOLVES instead, which
+    // is the other half of the same lie.
+    void supervisor.start().catch(() => {});
+    await waitFor(supervisor, (s) => s.url !== null, 'the handshake');
+    expect(stops).toHaveLength(1);
+
+    const pid = supervisor.snapshot().pid;
+    try {
+      // Well past the 200ms cap (2 × killGraceMs) that must still be armed.
+      expect(await settleWithin(Promise.all(stops), 1_500)).toBe('settled');
+      expect(supervisor.snapshot().lastExit).toMatchObject({ verdict: 'clean', signal: 'SIGKILL' });
+      expect(supervisor.snapshot().state).toBe('stopped');
+    } finally {
+      // Leave no orphan holding a real port: when this bug is present nothing
+      // else will ever kill this child, including `dispose()` in `afterEach`.
+      if (pid !== undefined) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // Already reaped — the expected case.
+        }
+      }
+    }
+  });
+
+  // The reviewer's window, entered exactly: the fixture PARKS the first /health
+  // and releases it — as `ok` — from its own SIGTERM handler, so the probe is
+  // provably in flight when `stop()` runs and provably reports serving after.
+  // Nothing here depends on a timing margin.
+  it('does not let a readiness probe already in flight cancel a stop', async () => {
+    const { supervisor } = makeSupervisor({
+      mode: 'ignore-sigterm',
+      env: { MLX_TEST_HOLD_HEALTH: '1' },
+      // The parked probe must not be aborted by its own request timeout before
+      // the stop lands.
+      timings: { killGraceMs: 100, healthRequestTimeoutMs: 5_000 },
+    });
+
+    const parked = new Promise<void>((resolve) => {
+      supervisor.on((event) => {
+        if (event.type === 'log' && event.line.includes('holding /health')) resolve();
+      });
+    });
+
+    void supervisor.start().catch(() => {});
+    await parked;
+
+    const pid = supervisor.snapshot().pid;
+    // Synchronously: intent becomes `stop` and SIGTERM goes out, which is what
+    // releases the parked response.
+    const stopping = supervisor.stop();
+    try {
+      expect(await settleWithin(stopping, 1_500)).toBe('settled');
+      expect(supervisor.snapshot().lastExit).toMatchObject({ verdict: 'clean', signal: 'SIGKILL' });
+      expect(supervisor.snapshot().state).toBe('stopped');
+    } finally {
+      if (pid !== undefined) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // Already reaped — the expected case.
+        }
+      }
+    }
   });
 
   it('does not count a restart the user asked for as a crash', async () => {

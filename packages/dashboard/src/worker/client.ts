@@ -34,8 +34,24 @@ export interface DbWorkerOptions extends DbWorkerBootstrap {
   workerUrl: URL | string;
   /** Budget for one shutdown step before the thread is terminated outright. */
   shutdownTimeoutMs: number;
+  /**
+   * Budget for one ordinary request. Defaults to {@link DEFAULT_REQUEST_TIMEOUT_MS}.
+   *
+   * Its job is boundedness, not responsiveness: a worker that is ALIVE but
+   * blocked emits neither `error` nor `exit`, so nothing else can ever settle a
+   * caller. Set it above the slowest legitimate query rather than near it.
+   */
+  requestTimeoutMs?: number;
   onLifecycle: (event: DbWorkerLifecycle) => void;
 }
+
+/**
+ * Long on purpose. This is the backstop for a thread that will never answer, not
+ * a latency target — a boot ingest over a large sessions tree can hold the
+ * worker for tens of seconds, and killing that caller would turn a slow scan into
+ * a visible failure.
+ */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 
 export interface DbWorkerCall {
   method: string;
@@ -107,18 +123,50 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
     // The db-closed witness is reported even if nobody is waiting on the reply,
     // so a supervisor sees the handle go down in the right order.
     if (message.kind === 'closed') opts.onLifecycle({ type: 'db-closed' });
-    const settle = pending.get(message.id);
-    if (settle === undefined) return;
-    pending.delete(message.id);
-    syncRef();
-    settle({ ok: true, reply: message });
+    // Undefined means the request already settled — it timed out, or the worker
+    // was declared down. Dropping the late reply is the only correct move.
+    // `settle` owns the map and ref bookkeeping, so nothing is done here.
+    pending.get(message.id)?.({ ok: true, reply: message });
   });
 
-  const send = (build: (id: number) => MainToWorker): Promise<SendResult> => {
+  /**
+   * Post one request and settle exactly once — on the reply, on a clone refusal,
+   * on the worker dying, or on `ms` elapsing.
+   *
+   * The deadline is inside `send` rather than racing outside it so that a
+   * timeout DROPS the `pending` entry. A worker that is alive but blocked emits
+   * neither `error` nor `exit`, so `goDown` never runs and nothing else would
+   * ever remove the entry: the caller's promise, its closure and the `worker.ref()`
+   * that `syncRef` took would all survive forever, once per periodic ingest.
+   *
+   * A timeout deliberately does NOT call `goDown`. `down` is a latch, and
+   * latching it on one slow query would permanently fail every database route
+   * for a worker that was merely busy. The caller gets `E_UNAVAILABLE` and the
+   * next request gets a fresh chance.
+   */
+  const send = (
+    build: (id: number) => MainToWorker,
+    ms: number = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+  ): Promise<SendResult> => {
     if (down !== null) return Promise.resolve({ ok: false, why: 'down', reason: down });
     const id = nextId++;
     return new Promise<SendResult>((resolve) => {
-      pending.set(id, resolve);
+      // `goDown` clears the whole map before invoking the settlers, so this
+      // cannot be a `pending.delete(id)` check — it would swallow that path.
+      let settled = false;
+      const settle = (result: SendResult): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        pending.delete(id);
+        syncRef();
+        resolve(result);
+      };
+      // Never the reason the process stays up: `syncRef` already refs the worker
+      // for exactly as long as this request is outstanding.
+      const timer = setTimeout(() => settle({ ok: false, why: 'down', reason: `timed out after ${ms}ms` }), ms);
+      timer.unref?.();
+      pending.set(id, settle);
       syncRef();
       try {
         worker.postMessage(build(id));
@@ -126,24 +174,9 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
         // A payload the structured clone algorithm refuses throws HERE, before
         // the worker ever sees it. Settling now is what keeps the caller from
         // waiting on a request that was never delivered.
-        pending.delete(id);
-        syncRef();
-        resolve({ ok: false, why: 'undeliverable', reason: err instanceof Error ? err.message : String(err) });
+        settle({ ok: false, why: 'undeliverable', reason: err instanceof Error ? err.message : String(err) });
       }
     });
-  };
-
-  /** `send` with a deadline, for the shutdown steps a wedged worker must not stall. */
-  const sendBounded = async (build: (id: number) => MainToWorker, ms: number): Promise<SendResult> => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<SendResult>((resolve) => {
-      timer = setTimeout(() => resolve({ ok: false, why: 'down', reason: `timed out after ${ms}ms` }), ms);
-    });
-    try {
-      return await Promise.race([send(build), deadline]);
-    } finally {
-      clearTimeout(timer);
-    }
   };
 
   let closed: Promise<void> | null = null;
@@ -177,12 +210,12 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
       return result.reply.summary;
     },
     async drain(): Promise<void> {
-      await sendBounded((id) => ({ kind: 'drain', id }), opts.shutdownTimeoutMs);
+      await send((id) => ({ kind: 'drain', id }), opts.shutdownTimeoutMs);
     },
     close(): Promise<void> {
       closed ??= (async () => {
         closing = true;
-        await sendBounded((id) => ({ kind: 'close', id }), opts.shutdownTimeoutMs);
+        await send((id) => ({ kind: 'close', id }), opts.shutdownTimeoutMs);
         // Unconditional: after the ack the thread is already ending (it closed
         // its port), and a worker that never acked must not outlive the runtime.
         await worker.terminate();

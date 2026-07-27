@@ -45,10 +45,26 @@ if (MODE === 'no-ready') {
   setInterval(() => {}, 60_000);
 } else {
   const status = process.env.MLX_TEST_HEALTH ?? 'ok';
+  // Park the FIRST /health and release it only on SIGTERM. That is the only way
+  // to put a readiness probe in flight ACROSS a `stop()` deterministically: the
+  // supervisor's fetch cannot complete until the test has asked it to stop.
+  const holdHealth = process.env.MLX_TEST_HOLD_HEALTH === '1';
+  let heldHealth = null;
+
+  function answerHealth(res) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status, uptimeMs: 1, pid: process.pid }));
+  }
+
   const server = createServer((req, res) => {
     if (req.url === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status, uptimeMs: 1, pid: process.pid }));
+      if (holdHealth && heldHealth === null) {
+        heldHealth = res;
+        // The test's witness that the probe is parked, not merely scheduled.
+        errSync('fixture: holding /health');
+        return;
+      }
+      answerHealth(res);
       return;
     }
     res.writeHead(404).end();
@@ -65,6 +81,13 @@ if (MODE === 'no-ready') {
   } else {
     process.on('SIGTERM', () => {
       errSync('fixture: refusing SIGTERM');
+      // Answer the parked probe now, so the supervisor gets a serving /health
+      // for a child it has ALREADY decided to kill.
+      if (heldHealth !== null) {
+        const res = heldHealth;
+        heldHealth = null;
+        answerHealth(res);
+      }
     });
   }
 

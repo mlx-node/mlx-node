@@ -349,11 +349,27 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
     genTimer(tick, timings.healthIntervalMs);
   }
 
+  /**
+   * `intent !== 'run'` abandons the handshake, and it is load-bearing rather
+   * than tidiness.
+   *
+   * `markReady` clears the WHOLE generation timer set, and that set is also
+   * where termination lives: `killWithEscalation`'s SIGTERM→SIGKILL timer and
+   * `stop`'s completion cap. A probe still in flight when `stop()` (or an
+   * `abort()`) lands would otherwise resolve `ok`, disarm both, restore
+   * `running`, and resolve `start()` — so a child that ignores SIGTERM is never
+   * force-killed and `stop()` never settles, hanging restart and app quit.
+   *
+   * Keyed on `intent` and not on `lifecycle` because `intent` is per-generation
+   * and `spawn()` resets it to `'run'`: a restart (user-requested or after a
+   * crash) re-arms readiness for the NEW child, while the dying one stays
+   * abandoned. It also covers `abort`, which arms the same escalation timer.
+   */
   function pollUntilServing(): void {
     const gen = generation;
-    if (becameReady || child === null || url === null) return;
+    if (becameReady || child === null || url === null || intent !== 'run') return;
     void probeHealth(url).then((probe) => {
-      if (generation !== gen || becameReady || child === null) return;
+      if (generation !== gen || becameReady || child === null || intent !== 'run') return;
       health = probe;
       if (probe !== null && isServingStatus(probe.status)) {
         markReady();
