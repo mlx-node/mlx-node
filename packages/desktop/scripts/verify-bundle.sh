@@ -54,7 +54,7 @@ echo "==> $APP"
 # ---------------------------------------------------------------------------
 # 1. What codesign DOES check. Necessary, and nowhere near sufficient.
 # ---------------------------------------------------------------------------
-echo "[1/4] codesign --verify --deep --strict"
+echo "[1/5] codesign --verify --deep --strict"
 if codesign --verify --deep --strict --verbose=4 "$APP" 2>&1 | sed 's/^/  /'; then
   note "ok" "bundle seal intact"
 else
@@ -74,7 +74,7 @@ fi
 # binaries report the same thing because they are signed under Apple's authority
 # rather than a Team ID — which is why this never scans outside $APP.
 # ---------------------------------------------------------------------------
-echo "[2/4] every Mach-O carries a Team ID"
+echo "[2/5] every Mach-O carries a Team ID"
 # ONE `file` pass over the whole bundle, batched through xargs. The obvious
 # implementation -- `find -exec file {} \;` per step -- spawns one process per
 # file, and this bundle has ~30k of them; two such passes took over two minutes
@@ -117,7 +117,7 @@ note "scanned" "$macho_count Mach-O files"
 # 3. Build-path leak. Not a signing failure, but it ships a developer's home
 #    directory (and CI layout) to every user, and it is invisible in the UI.
 # ---------------------------------------------------------------------------
-echo "[3/4] no build paths baked into load commands"
+echo "[3/5] no build paths baked into load commands"
 while IFS= read -r f; do
   # Same `|| true` reasoning: grep exits 1 when it matches nothing, which is the
   # HEALTHY case here.
@@ -134,7 +134,7 @@ done < "$MACHO_LIST"
 # 4. Post-notarization only. Gatekeeper assessment + a stapled ticket, so the app
 #    opens on a machine that has never seen it and is offline.
 # ---------------------------------------------------------------------------
-echo "[4/4] notarization"
+echo "[4/5] notarization"
 if [ "$NOTARIZED" -eq 1 ]; then
   if spctl -a -vvv -t install "$APP" 2>&1 | sed 's/^/  /'; then
     note "ok" "gatekeeper accepts"
@@ -150,6 +150,47 @@ if [ "$NOTARIZED" -eq 1 ]; then
   fi
 else
   note "skip" "pass --notarized after the notary returns"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. LSMinimumSystemVersion vs what the binaries actually demand.
+#
+# @electron/packager writes Electron's template floor (12.0) regardless of what
+# the payload was built against. Release builds set MACOSX_DEPLOYMENT_TARGET=26.0,
+# so the addon's LC_BUILD_VERSION says minos 26.0 and dyld refuses to map it on
+# 12-15 -- but LaunchServices reads the plist, so the app OPENS there and only
+# then fails to load the addon. The supervisor sees a dead sidecar and restarts
+# it, forever, with nothing naming the real cause.
+#
+# Computed over EVERY Mach-O here, while package.ts sets the plist from three
+# representative binaries. Deliberately two independent derivations: if they
+# agreed by construction this step would only be able to pass.
+# ---------------------------------------------------------------------------
+echo "[5/5] LSMinimumSystemVersion matches the binaries' build floor"
+PLIST="$APP/Contents/Info.plist"
+declared="$(plutil -extract LSMinimumSystemVersion raw -o - "$PLIST" 2>/dev/null || true)"
+# Highest minos over the whole bundle. `sort -t. -kNn` rather than `sort -V`:
+# version sort is a GNU extension that BSD sort has only sometimes had, and this
+# runs on whatever macOS the runner image ships.
+required="$(while IFS= read -r f; do otool -l "$f" 2>/dev/null || true; done < "$MACHO_LIST" \
+  | awk '/^ *minos /{ print $2 }' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
+
+if [ -z "$declared" ]; then
+  note "FAIL" "Info.plist has no LSMinimumSystemVersion — packager's default would apply"
+  fail=1
+elif [ -z "$required" ]; then
+  note "FAIL" "no LC_BUILD_VERSION on any Mach-O — cannot tell what the floor should be"
+  fail=1
+elif ! awk -v a="$declared" -v b="$required" 'BEGIN {
+       split(a, x, "."); split(b, y, ".");
+       for (i = 1; i <= 3; i++) if (x[i] + 0 != y[i] + 0) exit 1;
+       exit 0 }'; then
+  # Both directions are bugs: too low and it launches where it cannot run, too
+  # high and it refuses to launch where it could.
+  note "FAIL" "declares $declared but its binaries demand $required"
+  fail=1
+else
+  note "ok" "declares $declared, binaries demand $required"
 fi
 
 echo

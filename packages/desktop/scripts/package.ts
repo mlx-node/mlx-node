@@ -1,22 +1,29 @@
 /**
- * Build `packages/desktop/out/mlx-node.app`.
+ * Build `packages/desktop/out/mlx-node-darwin-arm64/mlx-node.app`.
  *
- *   yarn workspace @mlx-node/desktop package            unsigned, for local runs
- *   yarn workspace @mlx-node/desktop package --sign     Developer ID + hardened runtime
+ *   yarn workspace @mlx-node/desktop package                       unsigned, for local runs
+ *   yarn workspace @mlx-node/desktop package --sign                Developer ID + hardened runtime
+ *   yarn workspace @mlx-node/desktop package --app-version 0.0.9   stamp a version other than the manifest's
  *
  * Signing needs an identity in the keychain and `APPLE_TEAM_ID`. Notarization is
  * NOT here — it belongs to `.github/workflows/desktop-release.yml`, which submits
  * and staples. Verify either result with `scripts/verify-bundle.sh`.
+ *
+ * The bundle path is NOT predictable from this file's constants — packager owns
+ * the platform directory name — so it is written to `out/package-result.json`
+ * instead of re-derived by every consumer.
  */
 
 import { execFileSync } from 'node:child_process';
-import { cpSync, mkdirSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { packager } from '@electron/packager';
 
+import { maxOsVersion, parseMinOs } from './min-os.js';
 import { bundledAddonPath, codesignArgs, NATIVE_FILES, PayloadError, resolvePayload } from './payload.js';
+import { assertSemver } from './release-version.js';
 import { stageApp } from './stage-app.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -34,8 +41,23 @@ const STAGE_APP = join(STAGE, 'app');
 const RUNTIME_ROOTS = ['@mlx-node/server', '@mlx-node/dashboard'];
 const BUNDLE_ID = 'ai.mlxnode.desktop';
 const PRODUCT_NAME = 'mlx-node';
+const RESULT_FILE = join(OUT, 'package-result.json');
 
 const sign = process.argv.includes('--sign');
+
+// The manifest is `private: true`, and `tools bump` only bumps public workspaces,
+// so on a tagged release the manifest version is stale. The release workflow
+// passes the tag's version here; see `scripts/release-version.ts`.
+const manifestVersion = (await import(join(APP_DIR, 'package.json'), { with: { type: 'json' } })).default.version;
+const versionFlag = process.argv.indexOf('--app-version');
+if (versionFlag !== -1 && process.argv[versionFlag + 1] === undefined) {
+  console.error('\n--app-version needs a value\n');
+  process.exit(1);
+}
+const appVersion = assertSemver(
+  versionFlag === -1 ? 'packages/desktop/package.json version' : '--app-version',
+  versionFlag === -1 ? manifestVersion : process.argv[versionFlag + 1],
+);
 
 function run(cmd: string, args: string[]): void {
   execFileSync(cmd, args, { stdio: 'inherit' });
@@ -95,7 +117,7 @@ const [outDir] = await packager({
   platform: 'darwin',
   arch: 'arm64',
   appBundleId: BUNDLE_ID,
-  appVersion: (await import(join(APP_DIR, 'package.json'), { with: { type: 'json' } })).default.version,
+  appVersion,
   icon: join(APP_DIR, 'build', 'icon.icns'),
   overwrite: true,
   // `asar: false` is deliberate. dlopen cannot read out of an asar archive, and
@@ -120,6 +142,18 @@ const [outDir] = await packager({
 // actually present.
 const appPath = join(outDir, `${PRODUCT_NAME}.app`);
 
+// Asserted HERE, at the one place that knows how the path was derived. Without it
+// a packager layout change surfaces three steps later as an ENOENT on some file
+// deep inside a bundle that was never there, and the reported path looks correct.
+//
+// Info.plist and not just the directory: `appPath = outDir` — the mistake this
+// whole file's comment warns about — names a directory that DOES exist, so an
+// existence check alone passes and the run still dies later on a plausible path.
+if (!existsSync(join(appPath, 'Contents', 'Info.plist'))) {
+  console.error(`\npackager returned ${outDir} but ${appPath} is not a bundle — the layout changed.\n`);
+  process.exit(1);
+}
+
 // extraResource keeps the source directory name; the app expects `www`.
 const resources = join(appPath, 'Contents', 'Resources');
 rmSync(join(resources, 'www'), { recursive: true, force: true });
@@ -127,6 +161,33 @@ cpSync(join(resources, 'web'), join(resources, 'www'), { recursive: true });
 rmSync(join(resources, 'web'), { recursive: true, force: true });
 
 console.log(`addon will load from: ${bundledAddonPath(resources)}`);
+
+// Packager writes Electron's template floor (12.0). The addon is built with
+// MACOSX_DEPLOYMENT_TARGET=26.0 on release, so on macOS 12-15 the app would open
+// and only then fail to dlopen it — which the supervisor treats as a crashed
+// sidecar and restarts forever. Must precede signing: editing Info.plist after a
+// signature invalidates it.
+const minOsProbes = [
+  bundledAddonPath(resources),
+  join(appPath, 'Contents', 'MacOS', PRODUCT_NAME),
+  join(appPath, 'Contents', 'Frameworks', 'Electron Framework.framework', 'Versions', 'A', 'Electron Framework'),
+].filter((f) => existsSync(f));
+const floors = minOsProbes
+  .map((f) => parseMinOs(execFileSync('otool', ['-l', f], { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 })))
+  .filter((v): v is string => v !== null);
+if (floors.length === 0) {
+  console.error(`\nno LC_BUILD_VERSION on any of:\n  ${minOsProbes.join('\n  ')}\n`);
+  process.exit(1);
+}
+const minimumSystemVersion = maxOsVersion(floors);
+run('plutil', [
+  '-replace',
+  'LSMinimumSystemVersion',
+  '-string',
+  minimumSystemVersion,
+  join(appPath, 'Contents', 'Info.plist'),
+]);
+console.log(`LSMinimumSystemVersion: ${minimumSystemVersion} (highest minos of ${floors.length} binaries)`);
 
 if (sign) {
   const identity = process.env.SIGN_IDENTITY ?? findIdentity();
@@ -139,9 +200,16 @@ if (sign) {
   // and died on each. `file` reports the actual Mach-O header instead, which is
   // the same detection the release gate uses, so what gets signed here and what
   // gets checked there cannot drift apart.
-  const machO = execFileSync('bash', ['-c',
-    `find ${JSON.stringify(appPath)} -type f -print0 | xargs -0 file | awk '/Mach-O/ { i = index($0, ":"); if (i == 0) next; n = substr($0, 1, i - 1); sub(/ \\(for architecture [^)]*\\)$/, "", n); print n }' | sort -u`,
-  ], { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 }).split('\n').filter(Boolean);
+  const machO = execFileSync(
+    'bash',
+    [
+      '-c',
+      `find ${JSON.stringify(appPath)} -type f -print0 | xargs -0 file | awk '/Mach-O/ { i = index($0, ":"); if (i == 0) next; n = substr($0, 1, i - 1); sub(/ \\(for architecture [^)]*\\)$/, "", n); print n }' | sort -u`,
+    ],
+    { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 },
+  )
+    .split('\n')
+    .filter(Boolean);
 
   // Inside-out. Signing a bundle seals whatever its nested code looks like at that
   // moment, so anything signed afterwards breaks the outer seal. Deepest path
@@ -156,9 +224,11 @@ if (sign) {
   }
 
   // Nested .app bundles (the Electron helpers) then the outer bundle, same order.
-  const bundles = execFileSync('bash', ['-c',
-    `find ${JSON.stringify(appPath)} -name '*.app' -type d`,
-  ], { encoding: 'utf-8' }).split('\n').filter(Boolean);
+  const bundles = execFileSync('bash', ['-c', `find ${JSON.stringify(appPath)} -name '*.app' -type d`], {
+    encoding: 'utf-8',
+  })
+    .split('\n')
+    .filter(Boolean);
   for (const bundle of bundles.sort(byDepth)) {
     run('codesign', codesignArgs({ file: bundle, identity, entitlements }));
   }
@@ -170,11 +240,28 @@ if (sign) {
 }
 
 rmSync(STAGE, { recursive: true, force: true });
-console.log(`\n${appPath}\n\n  verify: ./packages/desktop/scripts/verify-bundle.sh "${appPath}"\n`);
 
-function stagedAddonInBundle(resourcesPath: string): string {
-  return bundledAddonPath(resourcesPath);
-}
+// One canonical path for everything downstream. The release workflow used to
+// spell `out/mlx-node.app` in four places; packager puts the bundle inside a
+// PLATFORM directory, so all four were wrong and every step after packaging
+// failed. Consumers read this file rather than guessing the layout again.
+writeFileSync(
+  RESULT_FILE,
+  `${JSON.stringify(
+    {
+      appPath,
+      version: appVersion,
+      minimumSystemVersion,
+      bundleId: BUNDLE_ID,
+      productName: PRODUCT_NAME,
+      signed: sign,
+    },
+    null,
+    2,
+  )}\n`,
+);
+
+console.log(`\n${appPath}\n\n  verify: ./packages/desktop/scripts/verify-bundle.sh "${appPath}"\n`);
 
 function findIdentity(): string {
   const out = execFileSync('security', ['find-identity', '-v', '-p', 'codesigning'], { encoding: 'utf-8' });
