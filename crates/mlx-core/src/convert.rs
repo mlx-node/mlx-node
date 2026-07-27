@@ -6167,6 +6167,163 @@ fn enforce_sym8_group_coherence(
     Ok(())
 }
 
+/// The no-recipe (legacy) per-key quantization decision: `should_quantize`, the
+/// sym8-scoped dense exclusions, the affine-only force, the router-gate pin, and
+/// the sym8 eligibility fallback, in that order. `None` means the key stays
+/// dense.
+///
+/// Both callers in `quantize_weights_inner` resolve through here — the fresh
+/// float path and the arm that skips an already-quantized group — so the two can
+/// never disagree about what a key's parameters are. The skip arm needs the same
+/// answer for two reasons: it validates the stored sidecar against the resolved
+/// triple (validating against the raw top-level defaults rejects every key the
+/// ladder moves off them, starting with the router gates a first conversion
+/// pinned to 8/64 affine), and it re-emits the per-layer override that decision
+/// carried. Dropping the override leaves the config writer stamping the
+/// top-level triple over a router gate whose bytes are 8-bit, which dies at
+/// first decode as `null handle returned: quantized_matmul`.
+///
+/// `for_existing` marks the already-packed call site. `sym8_eligible` reads the
+/// ARRAY, and its `ndim == 2 && K % 16 == 0` test is satisfied by a packed
+/// affine tensor (`U32 [256, 512]`) just as well as by a float one, so on packed
+/// input it answers a question about the packing rather than about the source
+/// weight. What the stored dtype does say is which arm the first conversion
+/// took: sym8 stores int8 `[N, K]`, every fallback stores a packed `U32`.
+fn resolve_legacy_entry(
+    key: &str,
+    weights: &HashMap<String, MxArray>,
+    default_bits: i32,
+    default_group_size: i32,
+    default_mode: &str,
+    embed_quantizable: bool,
+    for_existing: bool,
+) -> Result<Option<QuantEntry>> {
+    // Gate quantization defaults (8-bit affine, group 64).
+    const GATE_BITS: i32 = 8;
+    const GATE_GROUP_SIZE: i32 = 64;
+
+    if !should_quantize(key, embed_quantizable) {
+        return Ok(None);
+    }
+
+    // sym8-scoped exclusions (legacy path only — recipes reject sym8):
+    // gemma4 PLE linears (`per_layer_model_projection`, `per_layer_input_gate`,
+    // `per_layer_projection`) load DENSE-ONLY (`Linear::set_weight`), and the
+    // Rust loader skips audio-tower weights entirely. A sym8 PLE entry would
+    // keep the [N,K] shape (int8) so no shape guard trips at load — silent
+    // garbage; a forced-affine entry fails the dense-only loader too. Keep them
+    // bf16 under a sym8 default.
+    if default_mode == "sym8"
+        && (key.contains("per_layer_model_projection")
+            || key.contains("per_layer_input_gate")
+            || key.contains("per_layer_projection")
+            || key.contains("audio_tower")
+            || key.contains("audio_encoder")
+            || key.contains("embed_audio"))
+    {
+        return Ok(None);
+    }
+
+    // EXCEPTION (lfm2/lfm2_moe): when `embed_quantizable`, the lfm2 PACKED
+    // embedding backend (`load_quantized_packed`) DOES support mxfp4/mxfp8/nvfp4
+    // (mode threaded through gather-dequant + quantized matmul), so the
+    // embedding keys must NOT be force-downgraded to affine below — they keep
+    // the global non-affine mode.
+    let is_lfm2_packed_embed =
+        embed_quantizable && (key.contains("embed_tokens") || key.contains("embedding."));
+    // sym8 is the EXCEPTION-to-the-exception: keep the lfm2 embedding DENSE bf16
+    // (NO QuantEntry at all) under a sym8 default. The packed backend has no
+    // sym8 gather-dequant, and the previous forced-affine-8 downgrade emitted
+    // `embed_tokens.scales`, which bars the ENTIRE lfm2 compiled path at load
+    // time (`quant_embed_supported` in lfm2/persistence.rs keys on that tensor —
+    // the compiled forwards do a dense `take()` over the raw embedding table).
+    // Dense bf16 keeps sym8 checkpoints compiled-eligible, matching main-branch
+    // quantized-lfm2 behavior (every other quantized lfm2 recipe leaves the
+    // compiled path on).
+    if default_mode == "sym8" && is_lfm2_packed_embed {
+        return Ok(None);
+    }
+
+    // Mirror `apply_mxfp_upgrade`'s exclusions for affine-only loader keys:
+    // those keys load through affine-only `Linear::load_quantized` /
+    // `Embedding::load_quantized` helpers (dense Qwen3.5 lm_head, Gemma4 MoE
+    // `router.proj`, Gemma4 `embed_tokens` and `embed_tokens_per_layer`, Gemma4
+    // `embed_vision.embedding_projection`), so emitting MXFP / NVFP weights for
+    // them would be silently mis-dequantized at load time. Force a safe 8-bit
+    // affine (group_size 64) override and let the loader pick up the per-layer
+    // override via mode-aware dispatch.
+    //
+    // Note: `lm_head` is already filtered out by `should_quantize` above (the
+    // legacy path never quantizes the output head), so in practice this branch
+    // fires for `router.proj`, `embed_tokens*`, and `embedding_projection` keys.
+    // The `lm_head` arm is kept for defense-in-depth: if a future edit ever
+    // relaxes `should_quantize`, the MXFP/NVFP-mode safety net still holds.
+    //
+    // `embed_tokens` matches both the top-level Gemma4 embedding and the PLE
+    // `embed_tokens_per_layer` via substring.
+    let is_non_affine_default = default_mode == "mxfp4"
+        || default_mode == "mxfp8"
+        || default_mode == "nvfp4"
+        || default_mode == "sym8";
+    // (`is_lfm2_packed_embed` under a sym8 default already returned above, so
+    // here it always means "keeps the non-affine default".)
+    if is_non_affine_default && is_affine_only_key(key) && !is_lfm2_packed_embed {
+        return Ok(Some(QuantEntry {
+            key: key.to_string(),
+            bits: 8,
+            group_size: GATE_GROUP_SIZE,
+            mode: "affine".to_string(),
+        }));
+    }
+
+    if is_router_gate(key) {
+        // Router gates ALWAYS stay at 8-bit affine, regardless of the top-level
+        // default mode. MXFP8 (E8M0 per-group power-of-two scales, group_size
+        // 32) has ~10x the round-trip error of affine 8-bit on small-magnitude
+        // gate weights — too much noise for top-K expert routing. This matches
+        // Python mlx-lm's `quant_predicate` in `qwen3_5.py` which hardcodes
+        // gates to `{group_size: 64, bits: 8}` affine.
+        //
+        // See also the matching gate exclusion in `apply_mxfp_upgrade`, which
+        // fires for the recipe (`-q --q-mxfp --q-recipe ...`) path; this branch
+        // handles the no-recipe legacy path.
+        return Ok(Some(QuantEntry {
+            key: key.to_string(),
+            bits: GATE_BITS,
+            group_size: GATE_GROUP_SIZE,
+            mode: "affine".to_string(),
+        }));
+    }
+
+    if default_mode == "sym8" {
+        // sym8 requires a 2D [N,K] weight with K % 16 == 0 (the int8 kernel
+        // operand gate). Everything else — stacked-expert 3D [E,N,K] tensors
+        // (MoE is out of sym8 v1 scope) and odd-K linears — is FORCED to 8-bit
+        // affine; the mode difference vs the sym8 default makes the caller
+        // record a per-layer override so the loader dispatches per-layer.
+        let stays_sym8 = match weights.get(key) {
+            Some(array) if for_existing => array.dtype()? == DType::Int8,
+            Some(array) => sym8_eligible(array)?,
+            None => false,
+        };
+        if !stays_sym8 {
+            return Ok(Some(QuantEntry {
+                key: key.to_string(),
+                bits: GATE_BITS,
+                group_size: GATE_GROUP_SIZE,
+                mode: "affine".to_string(),
+            }));
+        }
+    }
+
+    Ok(Some(QuantEntry {
+        key: key.to_string(),
+        bits: default_bits,
+        group_size: default_group_size,
+        mode: default_mode.to_string(),
+    }))
+}
+
 /// Quantize weights in-place using MLX's quantize operation.
 ///
 /// Replaces qualifying `.weight` tensors with quantized (uint32 packed) versions
@@ -6197,10 +6354,6 @@ fn quantize_weights_inner(
     if predicate.is_some() && default_mode == "sym8" {
         return Err(Error::from_reason(SYM8_RECIPE_ERROR.to_string()));
     }
-
-    // Gate quantization defaults (used when no predicate)
-    let gate_bits: i32 = 8;
-    let gate_group_size: i32 = 64;
 
     // Collect quantization decisions for each weight key (see the
     // module-level `QuantEntry`).
@@ -6284,34 +6437,61 @@ fn quantize_weights_inner(
                              requested top-level mode"
                         )));
                     }
-                    // Skipping the group keeps its packed bytes, but nothing
-                    // here records a per-layer override, so the config writer
-                    // stamps the REQUESTED top-level triple over the whole
-                    // checkpoint. The skip is therefore only safe when the
-                    // request already describes what is on disk — group-32 data
-                    // relabelled group-64, or K-quant bytes relabelled affine,
-                    // survive the write and then surface at first decode as
-                    // `null handle returned: quantized_matmul`, naming neither
-                    // the layer nor the shape. The recipe branch above validates
-                    // for the same reason; this arm is the one that did not.
+                    // Skipping the group keeps its packed bytes on disk, so this
+                    // arm has to reproduce the decision that packed them —
+                    // `resolve_legacy_entry`, the same ladder the fresh path
+                    // walks — and then do BOTH halves of what the recipe branch
+                    // above does with it.
                     //
-                    // sym8 is left to `enforce_sym8_group_coherence`, which runs
-                    // after this loop under the same no-recipe condition and
-                    // reports the whole group — which member is orphaned, which
-                    // is still float — where this check can only name the one
-                    // tensor it was handed.
-                    if default_mode != "sym8" {
-                        validate_existing_quantized_entry(
-                            weights,
-                            base,
-                            &QuantEntry {
-                                key: key.clone(),
-                                bits: default_bits,
-                                group_size: default_group_size,
-                                mode: default_mode.to_string(),
-                            },
-                        )?;
+                    // Validate: the request has to describe what is on disk.
+                    // Group-32 data relabelled group-64, or K-quant bytes
+                    // relabelled affine, otherwise survive the write and surface
+                    // at first decode as `null handle returned:
+                    // quantized_matmul`, naming neither the layer nor the shape.
+                    //
+                    // Record: a key the ladder moves off the top-level triple
+                    // (every router gate, pinned to 8-bit affine) needs its
+                    // per-layer override re-emitted. Without it the config
+                    // writer stamps the top-level triple over 8-bit bytes and
+                    // the same nameless decode failure comes back — validating
+                    // alone would only have proved the bytes were fine.
+                    let Some(entry) = resolve_legacy_entry(
+                        key,
+                        weights,
+                        default_bits,
+                        default_group_size,
+                        default_mode,
+                        embed_quantizable,
+                        /* for_existing */ true,
+                    )?
+                    else {
+                        return Err(Error::from_reason(format!(
+                            "cannot safely re-convert already-quantized group '{base}': \
+                             the default predicate does not quantize this key"
+                        )));
+                    };
+                    // Members of a co-quantized group under a sym8 default are
+                    // left to `enforce_sym8_group_coherence`, which runs after
+                    // this loop under the same no-recipe condition and reports
+                    // the whole group — which member is orphaned, which is still
+                    // float — where this check can only name the one tensor it
+                    // was handed. Every other key (router gates, attention/GDN
+                    // projections, embeddings, and every co-quantized member
+                    // under a non-sym8 default, which no coherence pass covers)
+                    // is validated here.
+                    let deferred_to_group_coherence =
+                        default_mode == "sym8" && coquant_group_members(base).is_some();
+                    if !deferred_to_group_coherence {
+                        validate_existing_quantized_entry(weights, base, &entry)?;
                     }
+                    record_quant_override_if_non_default(
+                        &mut preexisting_overrides,
+                        base,
+                        &entry,
+                        default_bits,
+                        default_group_size,
+                        default_mode,
+                    );
                 }
                 info!(
                     "skipping quantization of '{}': already quantized (sidecar present)",
@@ -6361,131 +6541,22 @@ fn quantize_weights_inner(
                 }
             }
         } else {
-            // Legacy path: use should_quantize + is_router_gate
-            if !should_quantize(key, embed_quantizable) {
+            // Legacy path: `should_quantize` + the affine-only / router-gate /
+            // sym8 ladder, shared with the already-quantized skip arm above so
+            // the two cannot drift. See `resolve_legacy_entry`.
+            let Some(entry) = resolve_legacy_entry(
+                key,
+                weights,
+                default_bits,
+                default_group_size,
+                default_mode,
+                embed_quantizable,
+                /* for_existing */ false,
+            )?
+            else {
                 continue;
-            }
-            // Mirror `apply_mxfp_upgrade`'s exclusions for affine-only
-            // loader keys: those keys load through affine-only
-            // `Linear::load_quantized` / `Embedding::load_quantized` helpers
-            // (dense Qwen3.5 lm_head, Gemma4 MoE `router.proj`, Gemma4
-            // `embed_tokens` and `embed_tokens_per_layer`, Gemma4
-            // `embed_vision.embedding_projection`), so emitting MXFP / NVFP
-            // weights for them would be silently mis-dequantized at load
-            // time. Force a safe 8-bit affine (group_size 64) override and
-            // let the loader pick up the per-layer override via mode-aware
-            // dispatch.
-            //
-            // Note: `lm_head` is already filtered out by `should_quantize`
-            // above (the legacy path never quantizes the output head), so
-            // in practice this branch fires for `router.proj`,
-            // `embed_tokens*`, and `embedding_projection` keys. The
-            // `lm_head` arm is kept for defense-in-depth: if a future edit
-            // ever relaxes `should_quantize`, the MXFP/NVFP-mode safety net
-            // still holds.
-            //
-            // `embed_tokens` matches both the top-level Gemma4 embedding
-            // and the PLE `embed_tokens_per_layer` via substring.
-            //
-            // sym8-scoped exclusions (legacy path only — recipes reject sym8):
-            // gemma4 PLE linears (`per_layer_model_projection`,
-            // `per_layer_input_gate`, `per_layer_projection`) load DENSE-ONLY
-            // (`Linear::set_weight`), and the Rust loader skips audio-tower
-            // weights entirely. A sym8 PLE entry would keep the [N,K] shape
-            // (int8) so no shape guard trips at load — silent garbage; a
-            // forced-affine entry fails the dense-only loader too. Keep them
-            // bf16 under a sym8 default.
-            if default_mode == "sym8"
-                && (key.contains("per_layer_model_projection")
-                    || key.contains("per_layer_input_gate")
-                    || key.contains("per_layer_projection")
-                    || key.contains("audio_tower")
-                    || key.contains("audio_encoder")
-                    || key.contains("embed_audio"))
-            {
-                continue;
-            }
-            // EXCEPTION (lfm2/lfm2_moe): when `embed_quantizable`, the lfm2
-            // PACKED embedding backend (`load_quantized_packed`) DOES support
-            // mxfp4/mxfp8/nvfp4 (mode threaded through gather-dequant +
-            // quantized matmul), so the embedding keys must NOT be force-
-            // downgraded to affine here — they keep the global non-affine mode.
-            let is_lfm2_packed_embed =
-                embed_quantizable && (key.contains("embed_tokens") || key.contains("embedding."));
-            // sym8 is the EXCEPTION-to-the-exception: keep the lfm2 embedding
-            // DENSE bf16 (NO QuantEntry at all) under a sym8 default. The
-            // packed backend has no sym8 gather-dequant, and the previous
-            // forced-affine-8 downgrade emitted `embed_tokens.scales`, which
-            // bars the ENTIRE lfm2 compiled path at load time
-            // (`quant_embed_supported` in lfm2/persistence.rs keys on that
-            // tensor — the compiled forwards do a dense `take()` over the raw
-            // embedding table). Dense bf16 keeps sym8 checkpoints
-            // compiled-eligible, matching main-branch quantized-lfm2 behavior
-            // (every other quantized lfm2 recipe leaves the compiled path on).
-            if default_mode == "sym8" && is_lfm2_packed_embed {
-                continue;
-            }
-            let is_non_affine_default = default_mode == "mxfp4"
-                || default_mode == "mxfp8"
-                || default_mode == "nvfp4"
-                || default_mode == "sym8";
-            // (`is_lfm2_packed_embed` under a sym8 default already `continue`d
-            // above, so here it always means "keeps the non-affine default".)
-            if is_non_affine_default && is_affine_only_key(key) && !is_lfm2_packed_embed {
-                entries.push(QuantEntry {
-                    key: key.clone(),
-                    bits: 8,
-                    group_size: gate_group_size,
-                    mode: "affine".to_string(),
-                });
-                continue;
-            }
-            if is_router_gate(key) {
-                // Router gates ALWAYS stay at 8-bit affine, regardless of the
-                // top-level default mode. MXFP8 (E8M0 per-group power-of-two
-                // scales, group_size 32) has ~10x the round-trip error of
-                // affine 8-bit on small-magnitude gate weights — too much
-                // noise for top-K expert routing. This matches Python
-                // mlx-lm's `quant_predicate` in `qwen3_5.py` which hardcodes
-                // gates to `{group_size: 64, bits: 8}` affine.
-                //
-                // See also the matching gate exclusion in
-                // `apply_mxfp_upgrade`, which fires for the recipe (`-q
-                // --q-mxfp --q-recipe ...`) path; this branch handles the
-                // no-recipe legacy path.
-                entries.push(QuantEntry {
-                    key: key.clone(),
-                    bits: gate_bits,
-                    group_size: gate_group_size,
-                    mode: "affine".to_string(),
-                });
-            } else if default_mode == "sym8"
-                && !weights
-                    .get(key)
-                    .map(sym8_eligible)
-                    .transpose()?
-                    .unwrap_or(false)
-            {
-                // sym8 requires a 2D [N,K] weight with K % 16 == 0 (the int8
-                // kernel operand gate). Everything else — stacked-expert 3D
-                // [E,N,K] tensors (MoE is out of sym8 v1 scope) and odd-K
-                // linears — is FORCED to 8-bit affine; the mode difference vs
-                // the sym8 default makes the emission loop record a per-layer
-                // override so the loader dispatches per-layer.
-                entries.push(QuantEntry {
-                    key: key.clone(),
-                    bits: gate_bits,
-                    group_size: gate_group_size,
-                    mode: "affine".to_string(),
-                });
-            } else {
-                entries.push(QuantEntry {
-                    key: key.clone(),
-                    bits: default_bits,
-                    group_size: default_group_size,
-                    mode: default_mode.to_string(),
-                });
-            }
+            };
+            entries.push(entry);
         }
     }
 
@@ -10090,6 +10161,143 @@ mod tests {
         assert!(err.reason.contains(prefix), "{}", err.reason);
         assert!(err.reason.contains("group_size=64"), "{}", err.reason);
         assert!(err.reason.contains("[8, 16]"), "{}", err.reason);
+    }
+
+    /// The same re-conversion must ACCEPT a group whose stored geometry is the
+    /// one the no-recipe ladder resolves for it, and re-emit the per-layer
+    /// override that geometry needs. Router gates are the reachable case: the
+    /// first conversion pins them to 8-bit affine group-64 whatever the
+    /// top-level default is, so on the way back in they match neither the
+    /// requested bits nor (via the packing) the requested scale shape.
+    ///
+    /// The group-size test above cannot cover this — `switch_mlp.gate_proj` is
+    /// an expert projection, not a router, so it resolves to the plain default.
+    ///
+    /// Mutations this catches: (1) validate against the raw top-level defaults
+    /// instead of the resolved entry — 4 bits reads the [8, 128] packing as
+    /// K=1024 and demands [8, 16] scales, so the conversion fails outright;
+    /// (2) drop the `record_quant_override_if_non_default` call — the
+    /// conversion succeeds but the returned map is empty, and the config writer
+    /// then stamps 4/64 over 8-bit bytes.
+    #[test]
+    fn quantize_preserves_a_pre_quantized_router_gate_and_its_override() {
+        // 8-bit affine of a [8, 512] gate: U32 [8, 128] + [8, 8] sidecars.
+        let out = 8i64;
+        let packed = 128i64;
+        let groups = 8i64;
+        for gate in [
+            "model.layers.0.mlp.gate",
+            "model.layers.0.mlp.shared_expert_gate",
+            "model.layers.0.feed_forward.gate",
+        ] {
+            let mut weights: HashMap<String, MxArray> = HashMap::new();
+            weights.insert(
+                format!("{gate}.weight"),
+                MxArray::from_uint32(&vec![0u32; (out * packed) as usize], &[out, packed]).unwrap(),
+            );
+            weights.insert(format!("{gate}.scales"), lfm2_bf16(&[out, groups], 0.5));
+            weights.insert(format!("{gate}.biases"), lfm2_bf16(&[out, groups], -0.25));
+
+            let overrides = quantize_weights(&mut weights, 4, 64, "affine", false)
+                .unwrap_or_else(|e| panic!("re-converting a pinned router gate: {}", e.reason));
+            assert_eq!(
+                overrides.get(gate),
+                Some(&serde_json::json!({
+                    "bits": 8,
+                    "group_size": 64,
+                    "mode": "affine",
+                })),
+                "{gate} must carry its 8/64 affine override into the new config"
+            );
+            assert_eq!(
+                weights[&format!("{gate}.weight")].dtype().unwrap(),
+                DType::Uint32,
+                "{gate} packed bytes must be passed through untouched"
+            );
+        }
+    }
+
+    /// `sym8_eligible` reads the ARRAY (`ndim == 2 && K % 16 == 0`), which a
+    /// PACKED affine tensor satisfies just as well as a float one. Re-converting
+    /// an affine checkpoint under `--q-mode sym8` therefore must not ask it:
+    /// U32 [8, 128] would answer "eligible", resolve to sym8, and be rejected by
+    /// the sym8 storage check (int8 only) — a conversion that should succeed.
+    /// The stored dtype is the honest witness, and the affine override it
+    /// resolves is what lets the loader decode these bytes under a sym8 config.
+    ///
+    /// Mutation this catches: pass `for_existing = false` from the skip arm (or
+    /// call `sym8_eligible` unconditionally) and the conversion fails with
+    /// "does not match resolved sym8 storage".
+    #[test]
+    fn quantize_under_a_sym8_default_keeps_a_pre_quantized_affine_tensor_affine() {
+        let out = 8i64;
+        let packed = 128i64;
+        let groups = 8i64;
+        let prefix = "model.layers.0.self_attn.q_proj";
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        weights.insert(
+            format!("{prefix}.weight"),
+            MxArray::from_uint32(&vec![0u32; (out * packed) as usize], &[out, packed]).unwrap(),
+        );
+        weights.insert(format!("{prefix}.scales"), lfm2_bf16(&[out, groups], 0.5));
+        weights.insert(format!("{prefix}.biases"), lfm2_bf16(&[out, groups], -0.25));
+
+        let overrides = quantize_weights(&mut weights, 8, 64, "sym8", false).unwrap_or_else(|e| {
+            panic!(
+                "re-converting affine bytes under a sym8 default: {}",
+                e.reason
+            )
+        });
+        assert_eq!(
+            overrides.get(prefix),
+            Some(&serde_json::json!({
+                "bits": 8,
+                "group_size": 64,
+                "mode": "affine",
+            })),
+            "the stored affine geometry must be recorded against the sym8 default"
+        );
+    }
+
+    /// Converting a converted directory again with identical flags must be a
+    /// fixed point: same weights, same per-layer overrides. The second pass sees
+    /// every group already sidecarred, so it exercises the skip arm for every
+    /// key at once — including the router gate the first pass moved off the
+    /// top-level triple.
+    ///
+    /// Mutation this catches: drop the override recording from the skip arm and
+    /// the second map comes back empty while the first still carries the gate.
+    #[test]
+    fn requantizing_an_already_converted_map_reproduces_the_same_overrides() {
+        let float = |shape: &[i64]| {
+            let a = MxArray::random_normal(shape, 0.0, 0.02, Some(DType::Float32)).unwrap();
+            a.eval();
+            a
+        };
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        weights.insert("model.layers.0.mlp.gate.weight".into(), float(&[8, 512]));
+        weights.insert(
+            "model.layers.0.self_attn.q_proj.weight".into(),
+            float(&[64, 512]),
+        );
+
+        let first = quantize_weights(&mut weights, 4, 64, "affine", false).expect("first pass");
+        assert_eq!(
+            first.get("model.layers.0.mlp.gate"),
+            Some(&serde_json::json!({
+                "bits": 8,
+                "group_size": 64,
+                "mode": "affine",
+            })),
+            "the first pass must pin the router gate to 8/64 affine"
+        );
+
+        let second =
+            quantize_weights(&mut weights, 4, 64, "affine", false).expect("second pass on output");
+        assert_eq!(
+            second, first,
+            "re-converting with identical flags must reproduce the same quantization block"
+        );
     }
 
     /// The same guard covers a `--gguf-kquant` import directory, whose config

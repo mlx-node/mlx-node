@@ -2022,14 +2022,21 @@ impl SourceQuantProfile {
 /// the disagreement beats relocating the failure to `layers.N.self_attn.v_proj`.
 ///
 /// A header that says NOTHING is a different case and is not an error. Absence
-/// of a witness is not evidence of corruption, and refusing there would reject
-/// files that convert fine — the geometry helper fifty lines below degrades
-/// gracefully on exactly the same input, so erroring here also made the two
-/// disagree about how much header they require. The downstream is not
-/// defenceless either: every published Gemma-4 gives its global layers
-/// `head_dim` 256 against `global_head_dim` 512, so a genuinely mistyped layer
-/// still fails loudly on its projection shapes. This cross-check is defence in
-/// depth, not the only line.
+/// of a witness is not evidence of corruption, and the types measured off the
+/// tensor list are right whatever the header does or does not repeat; erroring
+/// here would also reject a file whose config the caller supplies with
+/// `--config-dir`, where the header is never consulted at all.
+///
+/// That tolerance is only safe because the caller refuses the case it creates.
+/// A header with no per-layer counts leaves
+/// [`apply_gemma4_attention_geometry`] unable to state
+/// `num_global_key_value_heads`, and a synthesized config would then describe
+/// the global layers with the sliding layers' KV head count — which nothing
+/// downstream catches, because the quantized load path discards `out_features`
+/// and the mismatch only surfaces as an abort inside `reshape` at the first
+/// token. So `convert_gguf_to_safetensors` requires both counts before it
+/// writes anything, and this helper is left free to answer the question it can
+/// actually answer.
 fn gemma4_layer_types_from_missing_v(gguf: &GgufFile) -> Result<Option<Vec<String>>> {
     let mut layers = std::collections::BTreeSet::new();
     for tensor in &gguf.tensors {
@@ -2176,6 +2183,35 @@ fn gemma4_kv_head_counts(metadata: &HashMap<String, GgufMetaValue>) -> Vec<u32> 
         Some(GgufMetaValue::ArrayU32(v)) => v.clone(),
         Some(scalar) => scalar.as_u32().into_iter().collect(),
         None => Vec::new(),
+    }
+}
+
+/// Whether `head_count_kv` can give [`apply_gemma4_attention_geometry`] BOTH the
+/// sliding and the global KV head count for `layer_types` — literally the pair
+/// of lookups that helper's `pick` makes, so the two cannot disagree about what
+/// counts as "stated".
+fn gemma4_kv_counts_cover_both_layer_types(
+    metadata: &HashMap<String, GgufMetaValue>,
+    layer_types: &[String],
+) -> bool {
+    let kv_per_layer = gemma4_kv_head_counts(metadata);
+    [false, true].into_iter().all(|global| {
+        layer_types
+            .iter()
+            .position(|t| (t == "full_attention") == global)
+            .is_some_and(|idx| idx < kv_per_layer.len())
+    })
+}
+
+/// How `gemma4.attention.head_count_kv` is spelled, for the error raised when it
+/// cannot supply both counts.
+fn describe_gemma4_kv_head_counts(metadata: &HashMap<String, GgufMetaValue>) -> String {
+    match metadata.get("gemma4.attention.head_count_kv") {
+        None => "the key is absent".to_string(),
+        Some(GgufMetaValue::ArrayI32(_) | GgufMetaValue::ArrayU32(_)) => {
+            format!("it holds {} entries", gemma4_kv_head_counts(metadata).len())
+        }
+        Some(_) => "it is a single scalar covering the whole model".to_string(),
     }
 }
 
@@ -2648,6 +2684,44 @@ pub async fn convert_gguf_to_safetensors(
         None
     };
 
+    // Where config.json and the runtime assets are read from: an explicit
+    // `--config-dir` is authoritative, otherwise the directory beside the GGUF.
+    // Resolved here rather than at the config write below because the guard that
+    // follows has to know whether the config will be SYNTHESIZED, and it has to
+    // know it before `save_safetensors` truncates the destination.
+    let gguf_dir = input_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let asset_dir = config_source_dir.clone().unwrap_or(gguf_dir);
+    let src_config = asset_dir.join("config.json");
+    let synthesized_config = !src_config.exists();
+
+    // A synthesized config gets its KV head counts from
+    // `apply_gemma4_attention_geometry`, which can only tell the sliding count
+    // from the global one when `head_count_kv` is an array with an entry per
+    // layer. A scalar leaves `num_global_key_value_heads` unwritten and the
+    // loader reuses the sliding count for the global layers; an absent key
+    // leaves both unwritten and the loader falls back to 2. Detecting the K=V
+    // layout is proof that those two counts DIFFER, so either fallback builds
+    // global K/V projections at the wrong width. Nothing downstream catches it —
+    // the quantized load path discards `out_features`, so the first token
+    // reaches `keys.reshape(...)` and MLX aborts the process across the
+    // `extern "C-unwind"` boundary instead of returning an error. An
+    // authoritative config states the counts itself and needs no header.
+    if let Some(types) = &gemma4_layer_types
+        && synthesized_config
+        && !gemma4_kv_counts_cover_both_layer_types(&gguf.metadata, types)
+    {
+        return Err(Error::from_reason(format!(
+            "Gemma4 GGUF omits 'attn_v' on {} of its {} decoder blocks, so its global layers \
+             have a different KV head count from its sliding ones — but \
+             'gemma4.attention.head_count_kv' does not state both ({}), and there is no \
+             config.json to take them from, so the converted config would describe the global \
+             layers with the sliding count. Supply the model's config.json with --config-dir.",
+            types.iter().filter(|t| *t == "full_attention").count(),
+            types.len(),
+            describe_gemma4_kv_head_counts(&gguf.metadata),
+        )));
+    }
+
     // Output keys an optional global `--dtype` request must leave alone,
     // spelled out rather than inferred from a suffix or a dtype.
     //
@@ -3002,14 +3076,12 @@ pub async fn convert_gguf_to_safetensors(
     // vision.safetensors for mmproj) should not overwrite the config written by
     // the primary LLM conversion.
     if is_primary_model {
-        // config.json: an explicit source directory is authoritative (needed by
+        // `asset_dir` / `src_config` / `synthesized_config` were resolved before
+        // the save (an explicit `--config-dir` is authoritative — needed by
         // unified Gemma4, whose full text/vision/audio config cannot be rebuilt
-        // from GGUF metadata). Otherwise preserve the existing alongside-GGUF
-        // lookup and metadata-extraction fallback.
-        let gguf_dir = input_path.parent().unwrap_or(Path::new("."));
-        let asset_dir = config_source_dir.as_deref().unwrap_or(gguf_dir);
+        // from GGUF metadata — otherwise the alongside-GGUF lookup and the
+        // metadata-extraction fallback).
         let config_path = output_dir.join("config.json");
-        let src_config = asset_dir.join("config.json");
         if config_source_dir.is_some() && !src_config.exists() {
             return Err(Error::from_reason(format!(
                 "Authoritative config.json not found in config source directory: {}",
@@ -3018,7 +3090,6 @@ pub async fn convert_gguf_to_safetensors(
         }
 
         // Load or extract config, then inject quantization metadata if needed
-        let synthesized_config = !src_config.exists();
         let mut config_json: serde_json::Value = if src_config.exists() {
             let data = fs::read_to_string(&src_config)
                 .map_err(|e| Error::from_reason(format!("Failed to read config.json: {e}")))?;
@@ -5141,6 +5212,27 @@ mod tests {
         tensor_global: &[u32],
         header_global: &[u32],
     ) -> PathBuf {
+        let head_count_kv: Vec<i32> = (0..layers)
+            .map(|layer| if header_global.contains(&layer) { 1 } else { 8 })
+            .collect();
+        write_gemma4_kv_layout_gguf_with_kv_meta(
+            root,
+            layers,
+            tensor_global,
+            Some(GgufMetaValue::ArrayI32(head_count_kv)),
+        )
+    }
+
+    /// The same file with `gemma4.attention.head_count_kv` spelled however the
+    /// caller likes — `None` omits the key entirely, a scalar states one count
+    /// for the whole model. Both are legal GGUF and neither says which layers
+    /// are global.
+    fn write_gemma4_kv_layout_gguf_with_kv_meta(
+        root: &Path,
+        layers: u32,
+        tensor_global: &[u32],
+        head_count_kv: Option<GgufMetaValue>,
+    ) -> PathBuf {
         let global = tensor_global;
         let mut q4 = [0u8; 18];
         q4[..2].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
@@ -5167,23 +5259,17 @@ mod tests {
             })
             .collect();
 
-        let head_count_kv: Vec<i32> = (0..layers)
-            .map(|layer| if header_global.contains(&layer) { 1 } else { 8 })
-            .collect();
-        let data = build_minimal_gguf(
-            &[
-                (
-                    "general.architecture",
-                    GgufMetaValue::String("gemma4".to_string()),
-                ),
-                ("gemma4.block_count", GgufMetaValue::Uint32(layers)),
-                (
-                    "gemma4.attention.head_count_kv",
-                    GgufMetaValue::ArrayI32(head_count_kv),
-                ),
-            ],
-            &tensors,
-        );
+        let mut metadata = vec![
+            (
+                "general.architecture",
+                GgufMetaValue::String("gemma4".to_string()),
+            ),
+            ("gemma4.block_count", GgufMetaValue::Uint32(layers)),
+        ];
+        if let Some(value) = head_count_kv {
+            metadata.push(("gemma4.attention.head_count_kv", value));
+        }
+        let data = build_minimal_gguf(&metadata, &tensors);
         let input = root.join("model.gguf");
         fs::write(&input, data).unwrap();
         input
@@ -5268,6 +5354,121 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// Detecting the K=V layout proves the sliding and the global layers have
+    /// DIFFERENT KV head counts. A synthesized config can only state the global
+    /// one when `head_count_kv` is a per-layer array: a scalar leaves
+    /// `num_global_key_value_heads` unwritten and the loader reuses the sliding
+    /// count, an absent key leaves both unwritten and it falls back to 2. Either
+    /// way the conversion and the load both SUCCEED — the quantized path
+    /// discards `out_features`, so nothing checks the width — and the process
+    /// aborts inside `mlx_array_reshape` at the first token, across an
+    /// `extern "C-unwind"` boundary that turns the error into a crash. So the
+    /// converter refuses, names the header, and points at `--config-dir`, which
+    /// supplies the counts and converts.
+    ///
+    /// `apply_gemma4_attention_geometry` has no other test: the whole failure
+    /// mode is that it degrades quietly.
+    ///
+    /// Mutations this catches: (1) drop the guard — both conversions return Ok
+    /// and the sentinel is gone; (2) put the guard at the geometry call site
+    /// instead, which runs after `save_safetensors` — the Err still comes back
+    /// but the sentinel assertion fails, exactly the property the pre-write test
+    /// above pins; (3) weaken it to `head_count_kv` merely being present — the
+    /// scalar case stops failing.
+    #[tokio::test]
+    async fn a_synthesized_gemma4_config_needs_both_kv_head_counts() {
+        for (label, header) in [
+            ("an absent", None),
+            ("a scalar", Some(GgufMetaValue::Uint32(8))),
+        ] {
+            let unique = format!(
+                "mlx-node-gguf-kv-counts-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let root = std::env::temp_dir().join(unique);
+            let output = root.join("out");
+            fs::create_dir_all(&output).unwrap();
+
+            // Layer 5 omits `attn_v` — the same partial-V tensor list the
+            // helper writes for the self-consistent case, with only the header
+            // changed.
+            let input = write_gemma4_kv_layout_gguf_with_kv_meta(&root, 6, &[5], header);
+
+            let existing = output.join("model.safetensors");
+            let sentinel = b"a previously converted model that must survive a failed re-convert";
+            fs::write(&existing, sentinel).unwrap();
+
+            let options =
+                |output_dir: &Path, config_source_dir: Option<String>| GgufConversionOptions {
+                    input_path: input.to_string_lossy().into_owned(),
+                    output_dir: output_dir.to_string_lossy().into_owned(),
+                    config_source_dir,
+                    dtype: None,
+                    verbose: Some(false),
+                    quantize: Some(false),
+                    quant_bits: None,
+                    quant_group_size: None,
+                    quant_mode: None,
+                    quant_recipe: None,
+                    imatrix_path: None,
+                    output_filename: None,
+                    vlm_key_prefix: Some(false),
+                    quant_mxfp: Some(false),
+                    import_k_quants: Some(false),
+                };
+
+            let Err(err) = convert_gguf_to_safetensors(options(&output, None)).await else {
+                panic!("{label} head_count_kv cannot describe the global layers of a K=V GGUF");
+            };
+            assert!(
+                err.reason.contains("gemma4.attention.head_count_kv"),
+                "the error must name the header it needs: {}",
+                err.reason
+            );
+            assert!(
+                err.reason.contains("--config-dir"),
+                "the error must name the escape hatch: {}",
+                err.reason
+            );
+            assert_eq!(
+                fs::read(&existing).unwrap(),
+                sentinel,
+                "the destination was written before the KV head counts were checked"
+            );
+
+            // The escape hatch: an authoritative config states the geometry
+            // itself, so the header is never consulted and the same file
+            // converts.
+            let source = root.join("source");
+            fs::create_dir_all(&source).unwrap();
+            fs::write(
+                source.join("config.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "model_type": "gemma4",
+                    "num_key_value_heads": 8,
+                    "num_global_key_value_heads": 1,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let with_config = root.join("with-config");
+            fs::create_dir_all(&with_config).unwrap();
+            convert_gguf_to_safetensors(options(
+                &with_config,
+                Some(source.to_string_lossy().into_owned()),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("--config-dir must still convert {label}: {}", e.reason));
+            assert!(with_config.join("model.safetensors").is_file());
+
+            fs::remove_dir_all(&root).ok();
+        }
     }
 
     /// Mutation this catches: drop either `gemma4_config_states` check at the
