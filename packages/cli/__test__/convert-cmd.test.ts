@@ -83,6 +83,31 @@ describe('mlx convert GGUF validation', () => {
     expect(convertGgufToSafetensors).not.toHaveBeenCalled();
   });
 
+  // K-quant import is a property of reading ggml blocks, so the flag is
+  // meaningless for a SafeTensors input. The `.gguf` branch `return`s before
+  // the flag is read again, so this used to exit 0 having silently ignored an
+  // argument the user passed — the one outcome a CLI should never have.
+  it('rejects --gguf-kquant for SafeTensors input instead of ignoring it', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    const stDir = join(tmp, 'st-in');
+    mkdirSync(stDir, { recursive: true });
+    writeFileSync(join(stDir, 'config.json'), JSON.stringify({ model_type: 'qwen3' }));
+
+    await expect(runConvert(['--input', stDir, '--output', join(tmp, 'out'), '--gguf-kquant'])).rejects.toThrow(
+      'process.exit(1)',
+    );
+
+    const errors = errSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(errors).toContain('--gguf-kquant applies only to GGUF input');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(convertGgufToSafetensors).not.toHaveBeenCalled();
+  });
+
   it('rejects --gguf-kquant combined with --imatrix-path for .gguf input upfront', async () => {
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -94,15 +119,7 @@ describe('mlx convert GGUF validation', () => {
     // existence/extension checks and reaches the K-quant import guard — proving
     // the guard fires on --imatrix-path, a trigger distinct from --quantize.
     await expect(
-      runConvert([
-        '--input',
-        ggufPath,
-        '--output',
-        join(tmp, 'out'),
-        '--gguf-kquant',
-        '--imatrix-path',
-        ggufPath,
-      ]),
+      runConvert(['--input', ggufPath, '--output', join(tmp, 'out'), '--gguf-kquant', '--imatrix-path', ggufPath]),
     ).rejects.toThrow('process.exit(1)');
 
     const errors = errSpy.mock.calls.map((c) => String(c[0])).join('\n');

@@ -2542,6 +2542,12 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         }
     }
 
+    let kquant_biases_keys = if has_custom_sanitizer {
+        HashSet::new()
+    } else {
+        kquant_biases_to_preserve(&tensors)?
+    };
+
     let mut gemma_pre_overrides: Option<HashMap<String, serde_json::Value>> = None;
     let converted_tensors = if is_gemma_e2b_import {
         let dtype = match target_dtype.as_str() {
@@ -2595,7 +2601,12 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             // packed Uint32 weights, Uint8 FP8/MXFP scales) must NEVER be astype'd
             // — a numeric cast corrupts the packed/quantized bit layout. Pass them
             // through unchanged.
-            if matches!(current_dtype, DType::Int8 | DType::Uint32 | DType::Uint8) {
+            // A K-quant `.biases` is storage that happens to be Float16 (ggml's
+            // `d`), so the dtype rule above cannot see it — see
+            // `kquant_biases_to_preserve`.
+            if matches!(current_dtype, DType::Int8 | DType::Uint32 | DType::Uint8)
+                || kquant_biases_keys.contains(&name)
+            {
                 converted_tensors.insert(name.clone(), array);
                 tensor_names.push(name);
                 continue;
@@ -5439,6 +5450,46 @@ enum Sym8ScalesCastAction {
     /// unambiguous sym8 intent stored at half precision. NORMALIZE to Float32
     /// (lossless upcast) so the group is loadable regardless of target dtype.
     NormalizeToF32,
+}
+
+/// The `{prefix}.biases` keys the generic dtype pass must leave alone because
+/// they are K-quant storage rather than a decoded float companion.
+///
+/// The pass's existing rule is dtype-shaped: `Int8`/`Uint32`/`Uint8` are packed
+/// storage and never cast, everything float follows `--dtype`. K-quants break
+/// that correspondence. A `.biases` there holds ggml's `d` super-block scale,
+/// which is storage, but its dtype is `Float16` — so it falls through to the
+/// cast and, at the default `--dtype bfloat16`, loses three mantissa bits.
+/// `resolve_kquant_group` requires exactly `Float16`, so the re-converted
+/// checkpoint no longer loads. The GGUF importer already skips both companions
+/// by suffix (`utils::gguf`); this is the SafeTensors-input half of that rule.
+///
+/// Keyed on the storage signature the loader's own `ensure_kquant_storage_
+/// resolves_kquant` uses — `Int8` scales (q6k) or `Uint8` scales (q4k/q5k),
+/// each beside a `Float16` `.biases`. Deliberately NOT a bare `.biases` suffix
+/// test: an affine group's `.biases` is a decoded float that must keep
+/// following `--dtype`, and mxfp/nvfp4 carry `Uint8` scales with no `.biases`
+/// at all, so neither is caught here.
+fn kquant_biases_to_preserve(tensors: &HashMap<String, MxArray>) -> Result<HashSet<String>> {
+    let mut preserved = HashSet::new();
+    for (name, scales) in tensors {
+        let Some(base) = name.strip_suffix(".scales") else {
+            continue;
+        };
+        if !matches!(scales.dtype()?, DType::Int8 | DType::Uint8) {
+            continue;
+        }
+        let biases_key = format!("{base}.biases");
+        if tensors
+            .get(&biases_key)
+            .map(|b| b.dtype())
+            .transpose()?
+            .is_some_and(|d| d == DType::Float16)
+        {
+            preserved.insert(biases_key);
+        }
+    }
+    Ok(preserved)
 }
 
 /// Classify a tensor for the sym8-sidecar rule in the dtype-conversion passes.
@@ -9945,6 +9996,74 @@ mod tests {
             format!("{prefix}.biases"),
             MxArray::from_float16(&vec![0u16; rows * bc], &[rows as i64, bc as i64]).unwrap(),
         );
+    }
+
+    /// The generic dtype pass classifies by DTYPE — `Int8`/`Uint32`/`Uint8` is
+    /// storage, anything float follows `--dtype`. A K-quant `.biases` is
+    /// storage stored as `Float16`, so it sits on the wrong side of that line
+    /// and, at the default `--dtype bfloat16`, was silently cast: three
+    /// mantissa bits off ggml's `d`, and `resolve_kquant_group` (which demands
+    /// exactly `Float16`) then refuses the checkpoint the converter just wrote.
+    /// The GGUF importer skips both companions by suffix; nothing did on the
+    /// SafeTensors side, and gemma4 — the family that ships K-quants — is not
+    /// in `owns_dtype_cast`, so it takes exactly this loop.
+    ///
+    /// Both directions matter. Under-reaching re-breaks the round trip;
+    /// over-reaching to a bare `.biases` suffix test would freeze an AFFINE
+    /// group's decoded float bias at its source dtype and silently stop
+    /// honouring `--dtype` for every checkpoint in the repo.
+    ///
+    /// Mutation this catches: widening `kquant_biases_to_preserve` to every
+    /// `.biases` (verified — the assert goes red).
+    ///
+    /// Mutation this does NOT catch, verified by planting it: replacing
+    /// `|| kquant_biases_keys.contains(&name)` in the cast loop with `|| false`
+    /// leaves this green. It pins the CLASSIFIER, not the wiring, because
+    /// `convert_model_inner` has no test entry point — nothing in the crate
+    /// calls it, so the skip itself, `expand_symmetric_affine_biases` and
+    /// `strip_symmetric_zero_point` are all reachable only through the CLI.
+    /// Closing that needs a seam around the tensor-map passes; until then this
+    /// test is one half of the property and the gap is stated rather than
+    /// implied.
+    #[test]
+    fn the_dtype_pass_preserves_kquant_biases_and_only_those() {
+        for format in [KQuantFormat::Q4K, KQuantFormat::Q5K, KQuantFormat::Q6K] {
+            let mut weights: HashMap<String, MxArray> = HashMap::new();
+            insert_valid_kquant_group(&mut weights, "model.layers.0.mlp.gate_proj", format, 4, 512);
+
+            // An affine group: float scales AND a float bias that must keep
+            // following `--dtype`.
+            weights.insert(
+                "model.layers.1.mlp.gate_proj.weight".to_string(),
+                MxArray::from_uint32(&[0u32; 256], &[4, 64]).unwrap(),
+            );
+            weights.insert(
+                "model.layers.1.mlp.gate_proj.scales".to_string(),
+                MxArray::from_float16(&[0u16; 64], &[4, 16]).unwrap(),
+            );
+            weights.insert(
+                "model.layers.1.mlp.gate_proj.biases".to_string(),
+                MxArray::from_float16(&[0u16; 64], &[4, 16]).unwrap(),
+            );
+
+            // mxfp-shaped: uint8 scales, no `.biases` at all.
+            weights.insert(
+                "model.layers.2.mlp.gate_proj.weight".to_string(),
+                MxArray::from_uint32(&[0u32; 256], &[4, 64]).unwrap(),
+            );
+            weights.insert(
+                "model.layers.2.mlp.gate_proj.scales".to_string(),
+                MxArray::from_uint8(&[1u8; 64], &[4, 16]).unwrap(),
+            );
+
+            let preserved = kquant_biases_to_preserve(&weights).expect("classify");
+            assert_eq!(
+                preserved,
+                HashSet::from(["model.layers.0.mlp.gate_proj.biases".to_string()]),
+                "{}: only the K-quant .biases may skip the cast",
+                format.mlx_mode()
+            );
+        }
     }
 
     fn kquant_entry(prefix: &str, format: KQuantFormat) -> QuantEntry {

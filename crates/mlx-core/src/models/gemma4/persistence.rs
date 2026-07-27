@@ -1067,6 +1067,21 @@ fn widen_bf16_affine_text_qmm_sidecars(
             continue;
         }
 
+        // An INTEGER `.scales` means the storage is not affine-float whatever
+        // the mode says — K-quant (int8 for q6k, uint8 for q4k/q5k) or mxfp.
+        // Widening such a group's Float16 `.biases` to Float32 would erase the
+        // very signature `ensure_kquant_storage_resolves_kquant` keys on
+        // (uint8 scales BESIDE a float16 `.biases`), so a Q4_K/Q5_K tensor
+        // whose metadata drifted to affine would sail past the guard here and
+        // surface later as an anonymous shape error from MLX instead of a
+        // named refusal at load. Float scale dtypes are untouched by this
+        // test, so every genuinely affine group widens exactly as before.
+        if let Some(scales) = params.get(&format!("{prefix}.scales"))
+            && matches!(scales.dtype()?, DType::Int8 | DType::Uint8)
+        {
+            continue;
+        }
+
         let mut widened_projection = false;
         for suffix in ["scales", "biases"] {
             let sidecar_key = format!("{prefix}.{suffix}");
@@ -1572,6 +1587,12 @@ fn apply_weights(
                         "Missing embed_tokens_per_layer.scales for quantized PLE embedding",
                     )
                 })?;
+                ensure_affine_biases_present(
+                    params,
+                    "embed_tokens_per_layer",
+                    ple_embed_plq.mode,
+                    "gemma4",
+                )?;
                 let biases = params.get("embed_tokens_per_layer.biases");
                 // Keep the PLE table PACKED (gather-then-dequant only the looked-up
                 // rows in `forward`) instead of pre-dequantizing the whole table into
@@ -1830,6 +1851,7 @@ fn apply_weights(
                             router_prefix
                         ))
                     })?;
+                ensure_affine_biases_present(params, &router_prefix, router_plq.mode, "gemma4")?;
                 let biases = params.get(&format!("{}.biases", router_prefix));
                 layer.set_router_proj_quantized(
                     w,
@@ -3400,6 +3422,66 @@ mod tests {
         }
     }
 
+    /// The widener runs 18 lines before `apply_weights`, so whatever it leaves
+    /// behind is what `ensure_kquant_storage_resolves_kquant` gets to inspect.
+    /// That guard identifies Q4_K/Q5_K storage by a PAIR — uint8 `.scales`
+    /// beside a float16 `.biases` — and the widener's own filters do not
+    /// exclude such a group: a K-quant `.weight` is `Uint32` and the drifted
+    /// mode is `Affine`, so both pass. Widening the `.biases` to Float32 erases
+    /// half the signature, the guard returns `Ok`, and a checkpoint whose
+    /// metadata says affine over Q4_K bytes loads "successfully" and then dies
+    /// on the first forward with an anonymous shape error out of MLX instead of
+    /// a named refusal naming the tensor.
+    ///
+    /// Q6_K is not at risk — `looks_q6k` keys on int8 `.scales` alone, and int8
+    /// is not Float16 so the widener never touched it — but it is asserted here
+    /// so a future change to either dtype table has to face both cases.
+    ///
+    /// Mutation this catches: delete the integer-`.scales` skip in the widener
+    /// (verified — `arrays`/`projections` move off zero and the biases dtype
+    /// assert goes red).
+    #[test]
+    fn affine_sidecar_widen_leaves_kquant_storage_alone() {
+        for (label, scales) in [
+            ("q4k/q5k", MxArray::zeros(&[2, 32], Some(DType::Uint8))),
+            ("q6k", MxArray::zeros(&[2, 16], Some(DType::Int8))),
+        ] {
+            let mut params = HashMap::new();
+            params.insert(
+                "layers.0.self_attn.q_proj.weight".to_string(),
+                MxArray::zeros(&[2, 64], Some(DType::Uint32)).expect("packed weight"),
+            );
+            params.insert(
+                "layers.0.self_attn.q_proj.scales".to_string(),
+                scales.expect("kquant scales"),
+            );
+            params.insert(
+                "layers.0.self_attn.q_proj.biases".to_string(),
+                MxArray::zeros(&[2, 2], Some(DType::Float16)).expect("ggml d"),
+            );
+
+            let stats = widen_bf16_affine_text_qmm_sidecars(
+                &mut params,
+                true,
+                4,
+                32,
+                Some(PerLayerMode::Affine),
+                &HashMap::new(),
+            )
+            .expect("widen");
+
+            assert_eq!(stats.arrays, 0, "{label}: K-quant storage must not widen");
+            assert_eq!(stats.projections, 0, "{label}: no projection may count");
+            assert_eq!(
+                params["layers.0.self_attn.q_proj.biases"]
+                    .dtype()
+                    .expect("biases dtype"),
+                DType::Float16,
+                "{label}: the float16 .biases is the guard's signature and must survive"
+            );
+        }
+    }
+
     #[test]
     fn affine_sidecar_widen_gate_requires_explicit_nested_bfloat16() {
         let cases = [
@@ -4012,8 +4094,16 @@ mod tests {
     /// MLX — but that rejection prints to stderr and comes back as a null
     /// handle, so the Rust error names only `dequantize_linear`: neither the
     /// tensor nor `symmetric_zero_point`, the marker whose absence from
-    /// config.json is the reachable cause. These were the last two affine sites
-    /// without the guard.
+    /// config.json is the reachable cause.
+    ///
+    /// The guard now covers all six gemma4 affine sites that read `.biases` as
+    /// an `Option`: the two linear builders, these two projections, the PLE
+    /// embedding and `router.proj`. An earlier revision of this comment claimed
+    /// these two were the last; they were not, and the two it missed failed in
+    /// the two different ways the guard exists to prevent — `router.proj`
+    /// builds its dequant graph eagerly and throws an anonymous null handle at
+    /// load, while the PLE defers and throws on the first forward, after the
+    /// load has already reported success.
     ///
     /// Mutation this catches: delete either `ensure_affine_biases_present` call
     /// and the load still fails, but with the anonymous handle error — the

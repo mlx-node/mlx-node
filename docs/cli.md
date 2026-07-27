@@ -154,7 +154,49 @@ split). `--q-mtp split` (alias `drafter`) emits a body checkpoint with **no
 mlx convert --input ./model.gguf --output ./model-mlx
 ```
 
-Auto-detected by the `.gguf` extension. Supports BF16, F16, F32, Q4_0, Q4_1, Q8_0 source quantization types.
+Auto-detected by the `.gguf` extension. Supports BF16, F16, F32, Q4_0, Q4_1 and
+Q8_0 source types directly, plus the ggml K-quants Q6_K, Q4_K and Q5_K behind
+`--gguf-kquant`.
+
+#### K-quants (Q6_K, Q4_K, Q5_K)
+
+```bash
+mlx convert --input ./model-UD-Q6_K_XL.gguf --output ./model-mlx --gguf-kquant
+```
+
+Imports llama.cpp / Unsloth-Dynamic K-quant tensors with weights **bit-identical
+to llama.cpp's**, at ggml byte size, rather than requantizing into MLX's affine
+format — which is lossy, and where it is exact is *larger* than the source (Q6_K
+→ affine needs `group_size=16`, costing an fp16 scale **and** bias per 16 weights
+= 8.0 bpw against ggml's 6.5625).
+
+This works because K-quants are algebraically affine per sub-block, so the kernel
+is MLX's affine kernel with the scalar `(scale, bias)` load replaced by a
+two-level decode:
+
+```
+Q4_K/Q5_K   y = d*sc[j]*q - dmin*m[j]   ->  scale = d*sc[j]   bias = -dmin*m[j]
+Q6_K        y = d*sc[j]*(q-32)          ->  scale = d*sc[j]   bias = -32*d*sc[j]
+```
+
+| source | mlx-node | ggml | note |
+| ------ | -------- | ---- | ---- |
+| Q6_K   | 6.5625 bpw | 6.5625 | exact parity |
+| Q4_K   | 4.6250 bpw | 4.5000 | +0.125 for unpacked sub-scales |
+| Q5_K   | 5.6250 bpw | 5.5000 | +0.125, same reason |
+
+The sub-scales are stored unpacked rather than in ggml's 6-bit packing: packing
+would preserve the exact 4.5 bpw but breaks the affine pointer-walk contract and
+puts a divergent branch in the innermost loop of the matvec kernel.
+
+`--gguf-kquant` cannot be combined with `--quantize`, `--q-recipe`, `--q-mxfp` or
+`--imatrix-path` — the blocks are imported bit-for-bit and never dequantized, so
+there is nothing for a re-quantizer to act on. The combination is rejected
+upfront rather than silently ignored.
+
+Producing K-quants is not supported; they are consume-only. IQ4_XS is a 16-entry
+non-uniform codebook rather than a scale/bias grid, does not share the kernel
+shape, and is not supported.
 
 #### Symmetric formats (Q4_0, Q8_0)
 

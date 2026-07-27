@@ -572,10 +572,14 @@ export async function run(argv: string[]) {
           dtype: 'bfloat16',
           verbose,
           quantize: false,
-          // Import K-quants for the vision encoder too, so a UD mmproj carrying
-          // Q4_K/Q5_K/Q6_K tensors repacks bit-for-bit instead of tripping the
-          // K-quant rejection — matching the main model conversion above rather
-          // than splitting behaviour silently between text and vision.
+          // Forwarded so the two calls stay in step, NOT because it makes a
+          // K-quant mmproj work: it cannot. A secondary output owns no
+          // config.json, so a K-quant tensor there has nowhere to record its
+          // mode/bits/group_size and is refused either way — with the flag by
+          // the secondary-output guard, without it by the loader's "needs the
+          // K-quant import". Forwarding only picks the accurate message of the
+          // two for someone who did pass --gguf-kquant. Supporting a K-quant
+          // mmproj needs a per-output config, which is not in this PR.
           importKQuants: args['gguf-kquant'],
           configSourceDir,
           outputFilename: 'vision.safetensors',
@@ -590,6 +594,14 @@ export async function run(argv: string[]) {
       process.exit(1);
     }
     return;
+  }
+
+  // Everything below converts a SafeTensors input, where --gguf-kquant has no
+  // meaning: K-quant import is a property of reading ggml blocks. Saying so is
+  // better than exiting 0 having quietly ignored a flag the user passed.
+  if (args['gguf-kquant']) {
+    console.error('Error: --gguf-kquant applies only to GGUF input; ' + `'${inputPath}' is not a .gguf file`);
+    process.exit(1);
   }
 
   // Auto-detect model type from config.json if not specified

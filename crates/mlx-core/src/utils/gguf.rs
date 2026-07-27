@@ -1,9 +1,22 @@
 /// GGUF Binary Format Parser and Converter
 ///
 /// Reads GGUF model files and converts tensors to MLX SafeTensors format.
-/// Supports BF16/F16/F32 unquantized tensors, Q4_0/Q4_1/Q8_0 tensors repacked
-/// into MLX affine quantization, and the Gemma4 token embedding's Q6_K fallback
-/// (dequantized to BF16).
+/// Supports:
+///   * BF16/F16/F32 unquantized tensors, copied through;
+///   * Q4_1, repacked into MLX affine quantization — it stores a real
+///     per-block minimum, so it keeps its `.biases` companion;
+///   * Q4_0/Q8_0, which ggml defines symmetrically as `w = d * (q - Z)`. The
+///     bias is `-Z * scale` for every group, so it is NOT written: the zero
+///     point goes in `config.json` as `symmetric_zero_point` and the loader
+///     rebuilds the array. See `derived_symmetric_bias_bits`.
+///   * Q6_K/Q4_K/Q5_K, repacked bit-for-bit into MLX's LSB-first bitstream
+///     with the ggml sub-scales carried in `.scales`/`.biases` — enabled by
+///     `GgufConversionOptions::import_k_quants` (`--gguf-kquant`), see
+///     `crate::utils::gguf_kquant`. Note `.biases` holds ggml's `d`, which is
+///     a SCALE, not an additive bias.
+///
+/// With `import_k_quants` off, the Gemma4 token embedding's Q6_K tensor still
+/// takes the older dequantize-to-BF16 fallback, byte-identically.
 ///
 /// Reference: https://github.com/ggml-org/ggml/blob/master/docs/gguf.md
 use std::collections::HashMap;
@@ -1208,9 +1221,27 @@ fn gemma4_name_to_hf(name: &str) -> Option<String> {
 }
 
 fn gemma4_mmproj_name_to_hf(name: &str) -> Option<String> {
+    // The two projections are whole-string matches, so — exactly like
+    // `token_embd`/`output` in the two mappers above — a quantized one needs
+    // its `.scales`/`.biases` carried across or the group silently degrades to
+    // a bare packed weight under the renamed key while the sidecars stay
+    // behind under their GGUF names. Reachable whenever an mmproj is the
+    // PRIMARY output, where the secondary-output guard does not run.
+    for (from, to) in [
+        (
+            "mm.a.input_projection",
+            "model.embed_audio.embedding_projection",
+        ),
+        (
+            "mm.input_projection",
+            "model.embed_vision.embedding_projection",
+        ),
+    ] {
+        if let Some(renamed) = rename_global_quant_group(name, from, to) {
+            return Some(renamed);
+        }
+    }
     let mapped = match name {
-        "mm.a.input_projection.weight" => "model.embed_audio.embedding_projection.weight",
-        "mm.input_projection.weight" => "model.embed_vision.embedding_projection.weight",
         "v.patch_embd.weight" => "model.vision_embedder.patch_dense.weight",
         "v.patch_embd.bias" => "model.vision_embedder.patch_dense.bias",
         "v.patch_norm.1.weight" => "model.vision_embedder.patch_ln1.weight",
