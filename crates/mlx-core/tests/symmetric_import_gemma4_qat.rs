@@ -34,8 +34,7 @@
 //! than passing on a comparison it never made — an acceptance gate that goes
 //! green because its fixture is absent is worse than no gate.
 //!
-//! `SYM_QAT_ROOT` unset is the only skip. Once it is set both conversions are
-//! required and a half-present root fails, naming what is missing.
+//! `SYM_QAT_ROOT` unset is the only skip; a half-present root fails.
 //!
 //! Run:
 //!   SYM_QAT_ROOT=... cargo test -p mlx-core --release \
@@ -162,10 +161,9 @@ struct Fixtures {
     new_quant: serde_json::Value,
 }
 
-/// `None` only when `SYM_QAT_ROOT` is unset. Once it is set the two
-/// conversions are required: skipping on a half-present root would report `ok`
-/// for a comparison that never ran, and these tests are `#[ignore]`d precisely
-/// so that cannot happen. Whoever set the variable asked for the gate.
+/// `None` only when `SYM_QAT_ROOT` is unset. Once set, both conversions are
+/// required — skipping a half-present root would report `ok` for a comparison
+/// that never ran.
 fn fixtures() -> Option<Fixtures> {
     let root = PathBuf::from(std::env::var("SYM_QAT_ROOT").ok()?);
     let old_dir = root.join("gemma4-qat-mlx");

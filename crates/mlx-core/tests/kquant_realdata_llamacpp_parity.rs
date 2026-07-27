@@ -44,12 +44,9 @@
 //! than passing on a comparison it never made — a parity gate that goes green
 //! because its fixture is absent is worse than no gate.
 //!
-//! `KQ_PARITY_ROOT` unset is the only skip. Once it is set the fixtures are
-//! required: a root that is not a directory, or one missing any file a case
-//! needs, fails and names what is missing. Skipping there would report `ok`
-//! for a comparison that never ran, which is the same failure mode the
-//! `#[ignore]` exists to prevent — just harder to notice, because the person
-//! seeing it went out of their way to ask for the gate.
+//! `KQ_PARITY_ROOT` unset is the only skip. Once set, the fixtures are
+//! required and a missing one fails naming the path — skipping there would
+//! report `ok` for a comparison that never ran.
 //!
 //! Run:
 //!   KQ_PARITY_ROOT=... cargo test -p mlx-core --release \
@@ -80,6 +77,28 @@ enum Expect {
     /// llama.cpp's f32 value rounded to float16, which pins the divergence to
     /// round-off and rules out a wrong scale, a wrong code, or a wrong layout.
     F16RoundedDecode,
+    /// Both of the above. A symmetric affine source needs both at once: the
+    /// decode is f16, AND its zero-crossing code (`q == Z`) makes ggml's
+    /// `d * 0` give `-0.0` wherever `d < 0` while the folded form gives `+0.0`
+    /// — and `-0.0` rounded to f16 is still `-0.0`, so the f16 arm cannot
+    /// absorb it either.
+    F16RoundedModuloSignedZero,
+}
+
+impl Expect {
+    fn allows_signed_zero(self) -> bool {
+        matches!(
+            self,
+            Self::BitExactModuloSignedZero | Self::F16RoundedModuloSignedZero
+        )
+    }
+
+    fn allows_f16_rounding(self) -> bool {
+        matches!(
+            self,
+            Self::F16RoundedDecode | Self::F16RoundedModuloSignedZero
+        )
+    }
 }
 
 /// One (source GGUF, llama.cpp F32 dequantization, our conversion) triple.
@@ -122,26 +141,26 @@ const CASES: &[Case] = &[
         source_gguf: "gguf/qwen3-0.6b-pure-Q8_0.gguf",
         reference_gguf: "deq/q8_0-deq-f32.gguf",
         mlx_dir: "qwen3-q8-mlx2",
-        expect: Expect::F16RoundedDecode,
+        expect: Expect::F16RoundedModuloSignedZero,
     },
     // The symmetric affine import: ggml Q4_0 is `d * (q - 8)` and Q8_0 is
     // `d * (q - 128)`, so neither writes a `.biases` companion any more and the
-    // loader rebuilds it from the scale. They are held to the SAME expectation
-    // as the stored-bias control above — if the reconstruction moved a value,
-    // it stops equalling llama.cpp's f32 rounded to float16 and the case fails.
+    // loader rebuilds it from the scale. Held to the same expectation as the
+    // stored-bias control above — if the reconstruction moved a value it stops
+    // equalling llama.cpp's f32 rounded to f16 and the case fails.
     Case {
         label: "Q4_0-symmetric",
         source_gguf: "gguf/qwen3-0.6b-pure-Q4_0.gguf",
         reference_gguf: "deq/q4_0-deq-f32.gguf",
         mlx_dir: "qwen3-q40-sym",
-        expect: Expect::BitExactModuloSignedZero,
+        expect: Expect::F16RoundedModuloSignedZero,
     },
     Case {
         label: "Q8_0-symmetric",
         source_gguf: "gguf/qwen3-0.6b-pure-Q8_0.gguf",
         reference_gguf: "deq/q8_0-deq-f32.gguf",
         mlx_dir: "qwen3-q80-sym",
-        expect: Expect::F16RoundedDecode,
+        expect: Expect::F16RoundedModuloSignedZero,
     },
     // Q4_1 is the asymmetric sibling: its second f16 field is a per-block
     // minimum, not a function of the scale, so its `.biases` must still be
@@ -169,9 +188,7 @@ fn root() -> Option<PathBuf> {
     Some(p)
 }
 
-/// Fail before any case runs if the root is missing something, listing every
-/// absent path at once — one run tells you the whole set to regenerate rather
-/// than surfacing them one failure at a time.
+/// Fail before any case runs, listing every absent path at once.
 fn require_every_fixture(root: &Path) {
     let mut missing = Vec::new();
     let mut want_file = |rel: &str| {
@@ -391,11 +408,11 @@ fn run_case(root: &Path, case: &Case) -> Totals {
             if a.to_bits() == c.to_bits() {
                 continue;
             }
-            if case.expect == Expect::BitExactModuloSignedZero && a == 0.0 && c == 0.0 {
+            if case.expect.allows_signed_zero() && a == 0.0 && c == 0.0 {
                 totals.zero_sign_diffs += 1;
                 continue;
             }
-            if case.expect == Expect::F16RoundedDecode && a.to_bits() == round_to_f16(c).to_bits() {
+            if case.expect.allows_f16_rounding() && a.to_bits() == round_to_f16(c).to_bits() {
                 totals.f16_round_diffs += 1;
                 continue;
             }

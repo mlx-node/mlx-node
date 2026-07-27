@@ -572,14 +572,9 @@ export async function run(argv: string[]) {
           dtype: 'bfloat16',
           verbose,
           quantize: false,
-          // Forwarded so the two calls stay in step, NOT because it makes a
-          // K-quant mmproj work: it cannot. A secondary output owns no
-          // config.json, so a K-quant tensor there has nowhere to record its
-          // mode/bits/group_size and is refused either way — with the flag by
-          // the secondary-output guard, without it by the loader's "needs the
-          // K-quant import". Forwarding only picks the accurate message of the
-          // two for someone who did pass --gguf-kquant. Supporting a K-quant
-          // mmproj needs a per-output config, which is not in this PR.
+          // Does NOT make a K-quant mmproj work — a secondary output owns no
+          // config.json to record mode/bits/group_size, so it is refused either
+          // way. Forwarding just picks the accurate error of the two.
           importKQuants: args['gguf-kquant'],
           configSourceDir,
           outputFilename: 'vision.safetensors',
@@ -596,9 +591,7 @@ export async function run(argv: string[]) {
     return;
   }
 
-  // Everything below converts a SafeTensors input, where --gguf-kquant has no
-  // meaning: K-quant import is a property of reading ggml blocks. Saying so is
-  // better than exiting 0 having quietly ignored a flag the user passed.
+  // Below here the input is SafeTensors, where --gguf-kquant has no meaning.
   if (args['gguf-kquant']) {
     console.error('Error: --gguf-kquant applies only to GGUF input; ' + `'${inputPath}' is not a .gguf file`);
     process.exit(1);

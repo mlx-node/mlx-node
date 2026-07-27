@@ -5452,24 +5452,14 @@ enum Sym8ScalesCastAction {
     NormalizeToF32,
 }
 
-/// The `{prefix}.biases` keys the generic dtype pass must leave alone because
-/// they are K-quant storage rather than a decoded float companion.
+/// `.biases` keys the dtype pass must not cast: they hold ggml's `d`, which is
+/// storage, but are `Float16`, so the pass's dtype rule (`Int8`/`Uint32`/
+/// `Uint8` never cast, float follows `--dtype`) misses them and
+/// `resolve_kquant_group` then rejects the result.
 ///
-/// The pass's existing rule is dtype-shaped: `Int8`/`Uint32`/`Uint8` are packed
-/// storage and never cast, everything float follows `--dtype`. K-quants break
-/// that correspondence. A `.biases` there holds ggml's `d` super-block scale,
-/// which is storage, but its dtype is `Float16` — so it falls through to the
-/// cast and, at the default `--dtype bfloat16`, loses three mantissa bits.
-/// `resolve_kquant_group` requires exactly `Float16`, so the re-converted
-/// checkpoint no longer loads. The GGUF importer already skips both companions
-/// by suffix (`utils::gguf`); this is the SafeTensors-input half of that rule.
-///
-/// Keyed on the storage signature the loader's own `ensure_kquant_storage_
-/// resolves_kquant` uses — `Int8` scales (q6k) or `Uint8` scales (q4k/q5k),
-/// each beside a `Float16` `.biases`. Deliberately NOT a bare `.biases` suffix
-/// test: an affine group's `.biases` is a decoded float that must keep
-/// following `--dtype`, and mxfp/nvfp4 carry `Uint8` scales with no `.biases`
-/// at all, so neither is caught here.
+/// Keyed on the same signature the loader guards on — int8 scales (q6k) or
+/// uint8 scales (q4k/q5k) beside a float16 `.biases` — not on the `.biases`
+/// suffix, which would freeze affine biases that must keep following `--dtype`.
 fn kquant_biases_to_preserve(tensors: &HashMap<String, MxArray>) -> Result<HashSet<String>> {
     let mut preserved = HashSet::new();
     for (name, scales) in tensors {
@@ -9998,33 +9988,14 @@ mod tests {
         );
     }
 
-    /// The generic dtype pass classifies by DTYPE — `Int8`/`Uint32`/`Uint8` is
-    /// storage, anything float follows `--dtype`. A K-quant `.biases` is
-    /// storage stored as `Float16`, so it sits on the wrong side of that line
-    /// and, at the default `--dtype bfloat16`, was silently cast: three
-    /// mantissa bits off ggml's `d`, and `resolve_kquant_group` (which demands
-    /// exactly `Float16`) then refuses the checkpoint the converter just wrote.
-    /// The GGUF importer skips both companions by suffix; nothing did on the
-    /// SafeTensors side, and gemma4 — the family that ships K-quants — is not
-    /// in `owns_dtype_cast`, so it takes exactly this loop.
+    /// Both directions: a K-quant `.biases` must skip the cast, an affine one
+    /// must not (freezing those would stop honouring `--dtype` everywhere).
     ///
-    /// Both directions matter. Under-reaching re-breaks the round trip;
-    /// over-reaching to a bare `.biases` suffix test would freeze an AFFINE
-    /// group's decoded float bias at its source dtype and silently stop
-    /// honouring `--dtype` for every checkpoint in the repo.
-    ///
-    /// Mutation this catches: widening `kquant_biases_to_preserve` to every
-    /// `.biases` (verified — the assert goes red).
-    ///
-    /// Mutation this does NOT catch, verified by planting it: replacing
-    /// `|| kquant_biases_keys.contains(&name)` in the cast loop with `|| false`
-    /// leaves this green. It pins the CLASSIFIER, not the wiring, because
-    /// `convert_model_inner` has no test entry point — nothing in the crate
-    /// calls it, so the skip itself, `expand_symmetric_affine_biases` and
-    /// `strip_symmetric_zero_point` are all reachable only through the CLI.
-    /// Closing that needs a seam around the tensor-map passes; until then this
-    /// test is one half of the property and the gap is stated rather than
-    /// implied.
+    /// Pins the classifier only. Replacing the cast loop's
+    /// `|| kquant_biases_keys.contains(&name)` with `|| false` stays green —
+    /// `convert_model_inner` has no test entry point, so the skip itself,
+    /// `expand_symmetric_affine_biases` and `strip_symmetric_zero_point` are
+    /// reachable only through the CLI.
     #[test]
     fn the_dtype_pass_preserves_kquant_biases_and_only_those() {
         for format in [KQuantFormat::Q4K, KQuantFormat::Q5K, KQuantFormat::Q6K] {

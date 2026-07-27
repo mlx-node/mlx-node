@@ -83,10 +83,8 @@ describe('mlx convert GGUF validation', () => {
     expect(convertGgufToSafetensors).not.toHaveBeenCalled();
   });
 
-  // K-quant import is a property of reading ggml blocks, so the flag is
-  // meaningless for a SafeTensors input. The `.gguf` branch `return`s before
-  // the flag is read again, so this used to exit 0 having silently ignored an
-  // argument the user passed — the one outcome a CLI should never have.
+  // The `.gguf` branch returns before the flag is read again, so this used to
+  // exit 0 having silently ignored an argument the user passed.
   it('rejects --gguf-kquant for SafeTensors input instead of ignoring it', async () => {
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     vi.spyOn(console, 'log').mockImplementation(() => {});
