@@ -27,6 +27,82 @@ speculative-decoding plan, see [inference-architecture.md](inference-architectur
 └──────────────────────────────────────────────────────────┘
 ```
 
+## Memory model: unified memory decides the cache hierarchy
+
+MLX is built for Apple Silicon's unified memory — the CPU and the GPU address **one
+physical pool**. There is no separate VRAM to spill out of. That single fact shapes
+every caching decision in this repo, and it is why designs borrowed from vLLM have to
+be re-derived rather than ported.
+
+```
+vLLM (discrete GPU)                 mlx-node (unified memory)
+
+  GPU VRAM      scarce                unified pool   weights
+     │  offload frees real bytes         │           paged KV pool
+  host RAM      abundant                 │           sidecars / checkpoints
+     │                                   │           ALL COMPETE FOR THE SAME BYTES
+   disk         capacity               disk          the only tier below the pool
+
+  two hops                            one hop
+```
+
+**A RAM tier would be a no-op.** vLLM's `CPUOffloadingManager` earns its keep because
+moving KV from VRAM to host RAM frees a genuinely separate, scarce resource. Here the
+destination *is* the source. Disk is the only place a block can go that gives memory
+back, so the cold tier
+([paged-cache.md](paged-cache.md#ssd-cold-tier-hybrid-families-and-the-auxiliary-sidecar))
+is a single hop, not the bottom of a ladder.
+
+**Every in-memory retention limit is a tax on the model.** A checkpoint kept for reuse
+takes bytes from the weights and the paged pool. This is why the sliding-window and
+GDN checkpoint stores derive their limits from a byte budget
+(`GEMMA4_SLIDING_CHECKPOINT_MEMORY_BUDGET_BYTES`,
+`GEMMA4_SLIDING_LADDER_MEMORY_BUDGET_BYTES`, `cold_tier::gdn_prefix_checkpoint_limit`)
+rather than from a tuned count — and why raising one is never free. The same pressure
+runs the other way: oversizing the paged pool tanks long-context decode through
+residency thrash, and pool bytes sit **outside** the MLX cache-limit budget, so the
+pool is sized to the context, not to the machine.
+
+**Persistence, not capacity.** vLLM's filesystem tier
+(`vllm/v1/kv_offload/tiering/fs/`) buys capacity inside one process lifetime: it has no
+`fsync`, no crash-durability contract, and nothing rebuilds an index from files already
+on disk, so a fresh process cannot see what the last one wrote. Reuse *by a later
+process* is exactly our feature, which is why the cold tier carries fingerprints,
+payload checksums, version-skew rejection and a real `fsync(2)` — machinery vLLM does
+not need and does not have.
+
+**Unified memory makes the disk hop cheap, and cheaper the bigger the model.** Staging
+buffers are `StorageModeShared`, so a "readback" is a blit inside the same memory with
+no PCIe crossing. Measured on M5 Max, `--release`, after the single-command-buffer
+batching. The restore figure is the batched `restore_block` cost also cited in
+[paged-cache.md](paged-cache.md); the prefill column is per-model TTFT divided by
+blocks prefilled, taken from `mlx agent` turns on real weights, so treat it as the
+right order of magnitude rather than a bench-grade constant:
+
+| model         | prefill ms/block | restore ms/block | restore wins by |
+| ------------- | ---------------- | ---------------- | --------------- |
+| `qwen3` 0.6B  | 3.80             | 1.158            | 3.3×            |
+| `qwen3_5_moe` | 11.10            | 1.158            | 9.6×            |
+| `qwen3_5` 27B | 24.82            | 1.158            | 21.4×           |
+
+Capture costs the inference thread 0.323 ms/block for the readback (the disk write
+itself is off-thread, on the writer). A restored block saves `prefill - restore` =
+2.64 / 9.94 / 23.66 ms, so **one restored block pays for capturing 8 / 31 / 73 blocks**.
+Restoring from SSD already beats recomputing, and
+the margin **grows** with model size — the opposite of the usual "disk is too slow"
+intuition. So per-block cost is not the constraint and there is no transfer-vs-recompute
+heuristic to tune. What limits payoff is reuse **depth**: how far back a chain can
+anchor. That is the axis the checkpoint ladders exist to move.
+
+The rule that falls out:
+
+```
+scarce  →  the one unified pool, and the per-turn tax on the inference thread
+cheap   →  disk capacity, and per-block restore
+```
+
+Bound memory hard, bound disk by quota, and spend the per-turn write budget on depth.
+
 ## Package dependency chain
 
 ```
