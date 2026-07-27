@@ -13,21 +13,28 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { request, type IncomingMessage, type ServerResponse } from 'node:http';
+import { request } from 'node:http';
 import { homedir, networkInterfaces, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
 import { canonicalCacheRoot, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
-import { createDownloadSseSender, handleApiRequest, type ApiDeps } from '../src/api.js';
+import type { ApiContext } from '../src/api/context.js';
+import { dispatch, isApiPath } from '../src/api/dispatch.js';
 import { openDashboardDb } from '../src/db/open.js';
 import { DownloadsClosedError, type DownloadEvent } from '../src/download.js';
 import { TRACE_RETENTION_DAYS } from '../src/ingest/traces.js';
 import { agentSessionsRoot } from '../src/paths.js';
-import { bindAllowedHosts, bracketHost, startDashboardServer, type DashboardServer } from '../src/server.js';
+import {
+  bindAllowedHosts,
+  bracketHost,
+  createDownloadSseSender,
+  startDashboardServer,
+  type DashboardServer,
+} from '../src/server.js';
+import { createTestClient, type TestClient } from './helpers/api-client.js';
 
 const FIXTURE_SESSIONS = fileURLToPath(new URL('./fixtures/sessions', import.meta.url));
 const FIXTURE_TRACES = fileURLToPath(new URL('./fixtures/traces', import.meta.url));
@@ -46,6 +53,12 @@ let modelsDir: string;
 let cacheRoot: string;
 let webRoot: string;
 let server: DashboardServer;
+/**
+ * API calls go straight at the server's runtime (no socket). The security /
+ * static / SSE blocks below still drive the real HTTP surface through `fetch`
+ * and `rawRequest`, so both transports stay covered.
+ */
+let api: TestClient;
 
 /** Raw HTTP request so security tests can set forbidden `Host`/`Origin` headers. */
 function rawRequest(
@@ -67,7 +80,7 @@ function rawRequest(
 
 /** Run a full incremental ingest and wait for it to land in the index. */
 async function ingest(): Promise<void> {
-  const res = await fetch(`${server.url}/api/ingest`, { method: 'POST' });
+  const res = await api.fetch('/api/ingest', { method: 'POST' });
   expect(res.status).toBe(200);
 }
 
@@ -102,6 +115,7 @@ beforeEach(async () => {
     cacheRoot,
     webRoot,
   });
+  api = createTestClient(server.runtime);
 });
 
 afterEach(async () => {
@@ -111,7 +125,7 @@ afterEach(async () => {
 
 describe('dashboard server — models & catalog', () => {
   it('lists local models', async () => {
-    const res = await fetch(`${server.url}/api/models`);
+    const res = await api.fetch('/api/models');
     expect(res.status).toBe(200);
     const body = (await res.json()) as { models: Array<{ name: string; modelType: string }>; dir: string };
     expect(body.models.map((m) => m.name)).toContain('model-a');
@@ -120,8 +134,32 @@ describe('dashboard server — models & catalog', () => {
     expect(body.dir).toBe(modelsDir);
   });
 
+  // The delete route distinguishes an unknown name from every other refusal ONLY
+  // by sniffing `/not found/i` on the store's error message: an unknown checkpoint
+  // is a 404, a refused-but-present one (reserved dir, symlink, not a checkpoint,
+  // escaping path) is a 400. Nothing else in the store carries that distinction,
+  // so the sniff is load-bearing.
+  it('deletes a local model, 404s an unknown name and 400s a refused one', async () => {
+    mkdirSync(join(modelsDir, 'not-a-checkpoint'), { recursive: true });
+
+    const ok = await api.fetch('/api/models/model-a', { method: 'DELETE' });
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toEqual({ deleted: true, name: 'model-a' });
+    expect(existsSync(join(modelsDir, 'model-a'))).toBe(false);
+
+    const unknown = await api.fetch('/api/models/ghost-model', { method: 'DELETE' });
+    expect(unknown.status).toBe(404);
+    expect(((await unknown.json()) as { error: string }).error).toMatch(/not found/i);
+
+    // Present on disk but not a checkpoint → a refusal, not a 404.
+    const refused = await api.fetch('/api/models/not-a-checkpoint', { method: 'DELETE' });
+    expect(refused.status).toBe(400);
+    expect(((await refused.json()) as { error: string }).error).toMatch(/not a model checkpoint/i);
+    expect(existsSync(join(modelsDir, 'not-a-checkpoint'))).toBe(true);
+  });
+
   it('serves the catalog with install state', async () => {
-    const res = await fetch(`${server.url}/api/catalog`);
+    const res = await api.fetch('/api/catalog');
     expect(res.status).toBe(200);
     const body = (await res.json()) as { items: Array<{ slug: string; installed: boolean; hfRepo: string }> };
     expect(body.items.length).toBeGreaterThan(0);
@@ -132,7 +170,7 @@ describe('dashboard server — models & catalog', () => {
 describe('dashboard server — sessions', () => {
   it('lists ingested sessions', async () => {
     await ingest();
-    const res = await fetch(`${server.url}/api/sessions`);
+    const res = await api.fetch('/api/sessions');
     expect(res.status).toBe(200);
     const body = (await res.json()) as { sessions: Array<{ id: string; name: string | null; models: string[] }> };
     const ids = body.sessions.map((s) => s.id);
@@ -142,7 +180,7 @@ describe('dashboard server — sessions', () => {
 
   it('reports the true total and honors limit/offset paging', async () => {
     await ingest();
-    const all = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+    const all = (await (await api.fetch('/api/sessions')).json()) as {
       sessions: Array<{ id: string }>;
       total: number;
     };
@@ -151,14 +189,14 @@ describe('dashboard server — sessions', () => {
 
     // A capped page still reports the full match total (so the Overview tile is
     // accurate past the page size), and offset walks to the next row.
-    const page = (await (await fetch(`${server.url}/api/sessions?limit=1`)).json()) as {
+    const page = (await (await api.fetch('/api/sessions?limit=1')).json()) as {
       sessions: Array<{ id: string }>;
       total: number;
     };
     expect(page.total).toBe(2);
     expect(page.sessions).toHaveLength(1);
 
-    const next = (await (await fetch(`${server.url}/api/sessions?limit=1&offset=1`)).json()) as {
+    const next = (await (await api.fetch('/api/sessions?limit=1&offset=1')).json()) as {
       sessions: Array<{ id: string }>;
       total: number;
     };
@@ -336,7 +374,7 @@ describe('dashboard server — sessions', () => {
 
   it('returns a session detail with transcript text', async () => {
     await ingest();
-    const res = await fetch(`${server.url}/api/sessions/fix-1`);
+    const res = await api.fetch('/api/sessions/fix-1');
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       session: { id: string };
@@ -397,13 +435,13 @@ describe('dashboard server — sessions', () => {
 
   it('404s an unknown session', async () => {
     await ingest();
-    const res = await fetch(`${server.url}/api/sessions/does-not-exist`);
+    const res = await api.fetch('/api/sessions/does-not-exist');
     expect(res.status).toBe(404);
   });
 
   it('renames a session (persists a session_info line and reflects the new name)', async () => {
     await ingest();
-    const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+    const before = (await (await api.fetch('/api/sessions')).json()) as {
       sessions: Array<{ id: string; path: string }>;
     };
     const filePath = before.sessions.find((s) => s.id === 'fix-1')!.path;
@@ -413,14 +451,14 @@ describe('dashboard server — sessions', () => {
     const old = Date.now() / 1000 - 600;
     utimesSync(filePath, old, old);
 
-    const patch = await fetch(`${server.url}/api/sessions/fix-1`, {
+    const patch = await api.fetch('/api/sessions/fix-1', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: 'Renamed Session' }),
     });
     expect(patch.status).toBe(200);
 
-    const detail = (await (await fetch(`${server.url}/api/sessions/fix-1`)).json()) as {
+    const detail = (await (await api.fetch('/api/sessions/fix-1')).json()) as {
       session: { name: string | null };
     };
     expect(detail.session.name).toBe('Renamed Session');
@@ -434,7 +472,7 @@ describe('dashboard server — sessions', () => {
   // before writing its name — a reused path must not stamp a foreign session.
   it('refuses to rename when the indexed path was reused by another session', async () => {
     await ingest();
-    const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+    const before = (await (await api.fetch('/api/sessions')).json()) as {
       sessions: Array<{ id: string; path: string }>;
     };
     const filePath = before.sessions.find((s) => s.id === 'fix-1')!.path;
@@ -446,7 +484,7 @@ describe('dashboard server — sessions', () => {
       `${JSON.stringify({ type: 'session', version: 3, id: 'reused-B', timestamp: '2026-07-09T10:00:00.000Z', cwd: '/w' })}\n${JSON.stringify({ type: 'message', id: 'b1', parentId: null, timestamp: '2026-07-09T10:00:01.000Z', message: { role: 'user', content: 'from B' } })}\n`,
     );
 
-    const patch = await fetch(`${server.url}/api/sessions/fix-1`, {
+    const patch = await api.fetch('/api/sessions/fix-1', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: 'Hijack' }),
@@ -498,10 +536,16 @@ describe('dashboard server — sessions', () => {
       '{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-07-12T10:00:03.000Z","message":{"role":"asst';
     const original = `${header}\n${user}\n${asst}\n${truncated}`;
     writeFileSync(file, original);
+    // Age it past the liveness window. Without this the file's fresh mtime trips
+    // the ACTIVE-session refusal, which is also a 409 — so the assertion below
+    // would pass even with the data-loss guard removed. Ageing it leaves the
+    // data-loss guard as the only thing that can produce this 409.
+    const old = Date.now() / 1000 - 600;
+    utimesSync(file, old, old);
     await ingest();
     const before = readFileSync(file);
 
-    const patch = await fetch(`${server.url}/api/sessions/rn-trunc`, {
+    const patch = await api.fetch('/api/sessions/rn-trunc', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: 'Should Not Apply' }),
@@ -560,7 +604,7 @@ describe('dashboard server — sessions', () => {
     await ingest();
     const before = readFileSync(liveFile);
 
-    const live = await fetch(`${server.url}/api/sessions/rn-live`, {
+    const live = await api.fetch('/api/sessions/rn-live', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: 'Should Not Apply (active)' }),
@@ -584,13 +628,13 @@ describe('dashboard server — sessions', () => {
     utimesSync(idleFile, old, old);
     await ingest();
 
-    const idle = await fetch(`${server.url}/api/sessions/rn-idle`, {
+    const idle = await api.fetch('/api/sessions/rn-idle', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: 'Idle Renamed' }),
     });
     expect(idle.status).toBe(200);
-    const detail = (await (await fetch(`${server.url}/api/sessions/rn-idle`)).json()) as {
+    const detail = (await (await api.fetch('/api/sessions/rn-idle')).json()) as {
       session: { name: string | null };
     };
     expect(detail.session.name).toBe('Idle Renamed');
@@ -641,7 +685,7 @@ describe('dashboard server — sessions', () => {
     );
     await ingest();
 
-    const body = (await (await fetch(`${server.url}/api/sessions/detach-1`)).json()) as {
+    const body = (await (await api.fetch('/api/sessions/detach-1')).json()) as {
       transcript: Array<{ text: string }>;
     };
     const texts = body.transcript.map((t) => t.text);
@@ -685,7 +729,7 @@ describe('dashboard server — sessions', () => {
     await ingest();
     const before = readFileSync(file);
 
-    const res = await fetch(`${server.url}/api/sessions/ro-1`);
+    const res = await api.fetch('/api/sessions/ro-1');
     expect(res.status).toBe(200);
     const body = (await res.json()) as { transcript: Array<{ text: string }> };
     const texts = body.transcript.map((t) => t.text);
@@ -700,19 +744,19 @@ describe('dashboard server — sessions', () => {
 
   it('deletes a session (file and rows removed)', async () => {
     await ingest();
-    const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+    const before = (await (await api.fetch('/api/sessions')).json()) as {
       sessions: Array<{ id: string; path: string }>;
     };
     const filePath = before.sessions.find((s) => s.id === 'fix-2')!.path;
     expect(existsSync(filePath)).toBe(true);
 
-    const del = await fetch(`${server.url}/api/sessions/fix-2`, { method: 'DELETE' });
+    const del = await api.fetch('/api/sessions/fix-2', { method: 'DELETE' });
     expect(del.status).toBe(200);
     expect(existsSync(filePath)).toBe(false);
 
-    const after = (await (await fetch(`${server.url}/api/sessions`)).json()) as { sessions: Array<{ id: string }> };
+    const after = (await (await api.fetch('/api/sessions')).json()) as { sessions: Array<{ id: string }> };
     expect(after.sessions.map((s) => s.id)).not.toContain('fix-2');
-    expect((await fetch(`${server.url}/api/sessions/fix-2`)).status).toBe(404);
+    expect((await api.fetch('/api/sessions/fix-2')).status).toBe(404);
   });
 
   // Delete carries NO liveness pre-check, unlike rename — see the note in
@@ -747,7 +791,7 @@ describe('dashboard server — sessions', () => {
     'refuses to delete an unreadable session file, keeping the row and the file',
     async () => {
       await ingest();
-      const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+      const before = (await (await api.fetch('/api/sessions')).json()) as {
         sessions: Array<{ id: string; path: string }>;
       };
       const filePath = before.sessions.find((s) => s.id === 'fix-2')!.path;
@@ -757,7 +801,7 @@ describe('dashboard server — sessions', () => {
       // the existing row rather than quarantining it.
       chmodSync(filePath, 0o000);
       try {
-        const del = await fetch(`${server.url}/api/sessions/fix-2`, { method: 'DELETE' });
+        const del = await api.fetch('/api/sessions/fix-2', { method: 'DELETE' });
         expect(del.status).toBe(409);
       } finally {
         chmodSync(filePath, 0o644); // restore so the assertions below (and cleanup) can read it
@@ -765,7 +809,7 @@ describe('dashboard server — sessions', () => {
 
       // Neither the file nor the row was removed.
       expect(existsSync(filePath)).toBe(true);
-      expect((await fetch(`${server.url}/api/sessions/fix-2`)).status).toBe(200);
+      expect((await api.fetch('/api/sessions/fix-2')).status).toBe(200);
     },
   );
 
@@ -774,7 +818,7 @@ describe('dashboard server — sessions', () => {
   // session's file. This is `different`, not `unverifiable`, so it still succeeds.
   it('deletes only the stale rows when the path was reused by a newer session', async () => {
     await ingest();
-    const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+    const before = (await (await api.fetch('/api/sessions')).json()) as {
       sessions: Array<{ id: string; path: string }>;
     };
     const filePath = before.sessions.find((s) => s.id === 'fix-2')!.path;
@@ -794,7 +838,7 @@ describe('dashboard server — sessions', () => {
     ].join('\n');
     writeFileSync(filePath, `${reused}\n`);
 
-    const del = await fetch(`${server.url}/api/sessions/fix-2`, { method: 'DELETE' });
+    const del = await api.fetch('/api/sessions/fix-2', { method: 'DELETE' });
     expect(del.status).toBe(200);
     expect((await del.json()) as { deleted: boolean; id: string }).toMatchObject({ deleted: true, id: 'fix-2' });
 
@@ -802,9 +846,9 @@ describe('dashboard server — sessions', () => {
     // fix-2 row is gone; a fresh ingest then surfaces the newer session.
     expect(existsSync(filePath)).toBe(true);
     expect(readFileSync(filePath, 'utf-8')).toContain('reused-B');
-    expect((await fetch(`${server.url}/api/sessions/fix-2`)).status).toBe(404);
+    expect((await api.fetch('/api/sessions/fix-2')).status).toBe(404);
     await ingest();
-    const after = (await (await fetch(`${server.url}/api/sessions`)).json()) as { sessions: Array<{ id: string }> };
+    const after = (await (await api.fetch('/api/sessions')).json()) as { sessions: Array<{ id: string }> };
     expect(after.sessions.map((s) => s.id)).toContain('reused-B');
   });
 
@@ -812,16 +856,16 @@ describe('dashboard server — sessions', () => {
   // nothing on disk left to orphan, so this is a plain success, not a conflict.
   it('deletes the rows when the session file is already gone', async () => {
     await ingest();
-    const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+    const before = (await (await api.fetch('/api/sessions')).json()) as {
       sessions: Array<{ id: string; path: string }>;
     };
     const filePath = before.sessions.find((s) => s.id === 'fix-2')!.path;
     unlinkSync(filePath);
 
-    const del = await fetch(`${server.url}/api/sessions/fix-2`, { method: 'DELETE' });
+    const del = await api.fetch('/api/sessions/fix-2', { method: 'DELETE' });
     expect(del.status).toBe(200);
     expect((await del.json()) as { deleted: boolean; id: string }).toMatchObject({ deleted: true, id: 'fix-2' });
-    expect((await fetch(`${server.url}/api/sessions/fix-2`)).status).toBe(404);
+    expect((await api.fetch('/api/sessions/fix-2')).status).toBe(404);
   });
 
   it('renders image reads as thumbnails and raw-binary reads as chips (not garbage)', async () => {
@@ -871,7 +915,7 @@ describe('dashboard server — sessions', () => {
     writeFileSync(join(dir, 'img.jsonl'), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
     await ingest();
 
-    const detail = (await (await fetch(`${server.url}/api/sessions/img-1`)).json()) as {
+    const detail = (await (await api.fetch('/api/sessions/img-1')).json()) as {
       transcript: Array<{
         role: string;
         text: string;
@@ -935,7 +979,7 @@ describe('dashboard server — sessions', () => {
     writeFileSync(join(dir, 'call.jsonl'), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
     await ingest();
 
-    const detail = (await (await fetch(`${server.url}/api/sessions/call-1`)).json()) as {
+    const detail = (await (await api.fetch('/api/sessions/call-1')).json()) as {
       transcript: Array<{
         role: string;
         title?: string;
@@ -1022,7 +1066,7 @@ describe('dashboard server — sessions', () => {
 
   it('joins turns and traces for session metrics', async () => {
     await ingest();
-    const res = await fetch(`${server.url}/api/sessions/fix-1/metrics`);
+    const res = await api.fetch('/api/sessions/fix-1/metrics');
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       turns: Array<{ traceId: string | null; ttftMs: number | null }>;
@@ -1055,7 +1099,7 @@ describe('dashboard server — sessions', () => {
       })}\n`,
     );
     await ingest();
-    const res = await fetch(`${server.url}/api/sessions/fix-1/metrics`);
+    const res = await api.fetch('/api/sessions/fix-1/metrics');
     expect(res.status).toBe(200);
     const body = (await res.json()) as { traces: Array<{ traceId: string }> };
     const traceIds = body.traces.map((t) => t.traceId);
@@ -1091,7 +1135,7 @@ describe('dashboard server — sessions', () => {
       })}\n`,
     );
     await ingest();
-    const res = await fetch(`${server.url}/api/sessions/fix-1/metrics`);
+    const res = await api.fetch('/api/sessions/fix-1/metrics');
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       turns: Array<{
@@ -1175,7 +1219,7 @@ describe('dashboard server — sessions', () => {
         .join('\n')}\n`,
     );
     await ingest();
-    const res = await fetch(`${server.url}/api/sessions/fix-1/metrics`);
+    const res = await api.fetch('/api/sessions/fix-1/metrics');
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       turns: Array<{ traceId: string | null; inputTokens: number | null; outputTokens: number | null }>;
@@ -1216,8 +1260,8 @@ describe('dashboard server — session directories past the page cap', () => {
   const OLD_DIR = '/tmp/only-old';
   const NEW_DIR = '/tmp/recent';
 
-  /** Fake deps over an in-memory index holding one row past the 500-row page cap. */
-  function seededDeps(): { deps: ApiDeps; close: () => void } {
+  /** Fake context over an in-memory index holding one row past the 500-row page cap. */
+  function seededCtx(): { ctx: ApiContext; close: () => void } {
     const dash = openDashboardDb(':memory:');
     const insert = dash.sqlite.prepare(
       'INSERT INTO sessions (id, path, cwd, name, created, modified, message_count) VALUES (?, ?, ?, NULL, ?, ?, 1)',
@@ -1228,21 +1272,19 @@ describe('dashboard server — session directories past the page cap', () => {
     for (let i = 0; i < 500; i++) {
       insert.run(`new-${i}`, `${NEW_DIR}/new-${i}.jsonl`, NEW_DIR, 10_000 + i, 10_000 + i);
     }
-    return { deps: { dash } as unknown as ApiDeps, close: dash.close };
+    return { ctx: { dash } as unknown as ApiContext, close: dash.close };
   }
 
   it('serves every indexed directory even when its sessions fall outside the served page', async () => {
-    const { deps, close } = seededDeps();
+    const { ctx, close } = seededCtx();
     try {
-      const { res, captured } = fakeRes();
-      const handled = await handleApiRequest(
-        { method: 'GET' } as IncomingMessage,
-        res,
-        new URL('http://localhost/api/sessions'),
-        deps,
-      );
-      expect(handled).toBe(true);
-      const body = JSON.parse(captured.body) as { sessions: Array<{ cwd: string }>; total: number; cwds: string[] };
+      const res = await call(ctx, 'GET', '/api/sessions');
+      expect(res.ok).toBe(true);
+      const body = (res.ok ? res.body : null) as {
+        sessions: Array<{ cwd: string }>;
+        total: number;
+        cwds: string[];
+      };
 
       // The fixture really does exercise the cap: 501 matches, 500 rows served,
       // and the old directory appears on none of them.
@@ -1259,16 +1301,15 @@ describe('dashboard server — session directories past the page cap', () => {
   });
 
   it('keeps the directory list unfiltered so a chosen directory never hides the others', async () => {
-    const { deps, close } = seededDeps();
+    const { ctx, close } = seededCtx();
     try {
-      const { res, captured } = fakeRes();
-      await handleApiRequest(
-        { method: 'GET' } as IncomingMessage,
-        res,
-        new URL(`http://localhost/api/sessions?cwd=${encodeURIComponent(NEW_DIR)}`),
-        deps,
-      );
-      const body = JSON.parse(captured.body) as { total: number; cwds: string[] };
+      const res = await dispatch(ctx, {
+        method: 'GET',
+        pathname: '/api/sessions',
+        query: new URLSearchParams({ cwd: NEW_DIR }),
+        body: null,
+      });
+      const body = (res.ok ? res.body : null) as { total: number; cwds: string[] };
       expect(body.total).toBe(500);
       // Narrowing to one directory must not strand the user there.
       expect(body.cwds).toEqual([NEW_DIR, OLD_DIR].sort((a, b) => (a < b ? -1 : 1)));
@@ -1303,8 +1344,8 @@ describe('dashboard server — session symlink containment (Finding 4)', () => {
     symlinkSync(externalFile, join(sessionsRoot, '--w--', 'evil.jsonl'));
     await ingest();
 
-    expect((await fetch(`${server.url}/api/sessions/external-1`)).status).toBe(404);
-    const patch = await fetch(`${server.url}/api/sessions/external-1`, {
+    expect((await api.fetch('/api/sessions/external-1')).status).toBe(404);
+    const patch = await api.fetch('/api/sessions/external-1', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: 'x' }),
@@ -1314,7 +1355,7 @@ describe('dashboard server — session symlink containment (Finding 4)', () => {
 
   it('refuses a GET whose indexed file was swapped to an external symlink', async () => {
     await ingest();
-    const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+    const before = (await (await api.fetch('/api/sessions')).json()) as {
       sessions: Array<{ id: string; path: string }>;
     };
     const filePath = before.sessions.find((s) => s.id === 'fix-1')!.path;
@@ -1326,7 +1367,7 @@ describe('dashboard server — session symlink containment (Finding 4)', () => {
     symlinkSync(externalFile, filePath);
 
     // The row still points at filePath, but it now resolves outside the root.
-    expect((await fetch(`${server.url}/api/sessions/fix-1`)).status).toBe(403);
+    expect((await api.fetch('/api/sessions/fix-1')).status).toBe(403);
   });
 
   // Finding 5: an IN-ROOT swap passes realpath containment (the target is a real
@@ -1335,7 +1376,7 @@ describe('dashboard server — session symlink containment (Finding 4)', () => {
   // holds a different session → 409, and reconciling the stale row → 404 next.
   it('409s a GET whose indexed file resolves in-root to a different session, then drops the row', async () => {
     await ingest();
-    const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+    const before = (await (await api.fetch('/api/sessions')).json()) as {
       sessions: Array<{ id: string; path: string }>;
     };
     const aPath = before.sessions.find((s) => s.id === 'fix-1')!.path;
@@ -1363,11 +1404,11 @@ describe('dashboard server — session symlink containment (Finding 4)', () => {
     symlinkSync(bPath, aPath);
 
     // fix-1's row resolves (in-root) to B, whose header id is sess-B, not fix-1 → 409.
-    expect((await fetch(`${server.url}/api/sessions/fix-1`)).status).toBe(409);
+    expect((await api.fetch('/api/sessions/fix-1')).status).toBe(409);
     // The 409 path reconciles: A's row (now a symlink, not a regular file) is dropped.
-    expect((await fetch(`${server.url}/api/sessions/fix-1`)).status).toBe(404);
+    expect((await api.fetch('/api/sessions/fix-1')).status).toBe(404);
     // B itself indexes and serves normally.
-    expect((await fetch(`${server.url}/api/sessions/sess-B`)).status).toBe(200);
+    expect((await api.fetch('/api/sessions/sess-B')).status).toBe(200);
   });
 });
 
@@ -1426,7 +1467,7 @@ describe('dashboard server — ingest fault isolation', () => {
 describe('dashboard server — metrics overview', () => {
   it('returns aggregate arrays', async () => {
     await ingest();
-    const res = await fetch(`${server.url}/api/metrics/overview`);
+    const res = await api.fetch('/api/metrics/overview');
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       tokensByDay: unknown[];
@@ -1496,7 +1537,7 @@ describe('dashboard server — metrics overview', () => {
     );
     await ingest();
 
-    const body = (await (await fetch(`${server.url}/api/metrics/overview`)).json()) as {
+    const body = (await (await api.fetch('/api/metrics/overview')).json()) as {
       modelShare: Array<{ model: string; turns: number; outputTokens: number }>;
       totals: {
         turns: number;
@@ -1577,7 +1618,7 @@ describe('dashboard server — metrics overview', () => {
     await ingest();
 
     // Scope to the seeded day so totals are deterministic regardless of other fixtures.
-    const body = (await (await fetch(`${server.url}/api/metrics/overview?from=${dayStart}&to=${dayEnd}`)).json()) as {
+    const body = (await (await api.fetch(`/api/metrics/overview?from=${dayStart}&to=${dayEnd}`)).json()) as {
       tokensByDay: Array<{ day: string; input: number; output: number; cached: number; reasoning: number }>;
       modelShare: Array<{ model: string; turns: number; outputTokens: number }>;
       totals: {
@@ -1623,7 +1664,7 @@ describe('dashboard server — metrics overview', () => {
     );
     await ingest();
 
-    const body = (await (await fetch(`${server.url}/api/metrics/overview`)).json()) as {
+    const body = (await (await api.fetch('/api/metrics/overview')).json()) as {
       throughputTrend: Array<{
         model: string;
         day: string;
@@ -1662,7 +1703,7 @@ describe('dashboard server — metrics overview', () => {
     );
     await ingest();
 
-    const body = (await (await fetch(`${server.url}/api/metrics/overview`)).json()) as {
+    const body = (await (await api.fetch('/api/metrics/overview')).json()) as {
       throughputTrend: Array<{
         model: string;
         day: string;
@@ -1697,13 +1738,13 @@ describe('dashboard server — metrics overview', () => {
 
 describe('dashboard server — cache', () => {
   it('scans and clears the cold cache with an explicit {all:true}', async () => {
-    const res = await fetch(`${server.url}/api/cache`);
+    const res = await api.fetch('/api/cache');
     expect(res.status).toBe(200);
     const body = (await res.json()) as { disk: { entryCount: number; totalBytes: number } };
     expect(body.disk.entryCount).toBe(2);
     expect(body.disk.totalBytes).toBe(300);
 
-    const del = await fetch(`${server.url}/api/cache`, {
+    const del = await api.fetch('/api/cache', {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ all: true }),
@@ -1713,7 +1754,7 @@ describe('dashboard server — cache', () => {
     expect(cleared.removed).toBe(2);
     expect(cleared.freedBytes).toBe(300);
 
-    const after = (await (await fetch(`${server.url}/api/cache`)).json()) as { disk: { entryCount: number } };
+    const after = (await (await api.fetch('/api/cache')).json()) as { disk: { entryCount: number } };
     expect(after.disk.entryCount).toBe(0);
   });
 
@@ -1727,14 +1768,14 @@ describe('dashboard server — cache', () => {
       JSON.stringify({ olderThanDays: -1 }),
     ];
     for (const b of bodies) {
-      const del = await fetch(`${server.url}/api/cache`, {
+      const del = await api.fetch('/api/cache', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         ...(b === undefined ? {} : { body: b }),
       });
       expect(del.status).toBe(400);
       // Nothing was cleared — both blocks survive.
-      const after = (await (await fetch(`${server.url}/api/cache`)).json()) as { disk: { entryCount: number } };
+      const after = (await (await api.fetch('/api/cache')).json()) as { disk: { entryCount: number } };
       expect(after.disk.entryCount).toBe(2);
     }
   });
@@ -1745,7 +1786,7 @@ describe('dashboard server — cache', () => {
     const oldSec = (Date.now() - 10 * 86_400_000) / 1000;
     utimesSync(oldBlock, oldSec, oldSec);
 
-    const del = await fetch(`${server.url}/api/cache`, {
+    const del = await api.fetch('/api/cache', {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ olderThanDays: 7 }),
@@ -1755,7 +1796,7 @@ describe('dashboard server — cache', () => {
     expect(evicted.removed).toBe(1);
     expect(evicted.freedBytes).toBe(100);
 
-    const after = (await (await fetch(`${server.url}/api/cache`)).json()) as { disk: { entryCount: number } };
+    const after = (await (await api.fetch('/api/cache')).json()) as { disk: { entryCount: number } };
     expect(after.disk.entryCount).toBe(1);
   });
 });
@@ -2313,10 +2354,10 @@ describe('dashboard server — production cache root (no explicit cacheRoot)', (
 
 describe('dashboard server — downloads', () => {
   it('lists jobs and rejects a non-catalog repo', async () => {
-    const list = (await (await fetch(`${server.url}/api/downloads`)).json()) as { jobs: unknown[] };
+    const list = (await (await api.fetch('/api/downloads')).json()) as { jobs: unknown[] };
     expect(Array.isArray(list.jobs)).toBe(true);
 
-    const bad = await fetch(`${server.url}/api/downloads`, {
+    const bad = await api.fetch('/api/downloads', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ repo: 'someone/not-in-catalog' }),
@@ -2334,22 +2375,9 @@ describe('dashboard server — downloads', () => {
   });
 });
 
-/** Minimal `ServerResponse` capturing the status + JSON body a handler writes. */
-function fakeRes(): { res: ServerResponse; captured: { status: number; body: string } } {
-  const captured = { status: 0, body: '' };
-  const res = {
-    headersSent: false,
-    writeHead(status: number, _headers?: unknown) {
-      captured.status = status;
-      (res as { headersSent: boolean }).headersSent = true;
-      return res;
-    },
-    end(chunk?: string) {
-      if (chunk !== undefined) captured.body = chunk;
-      return res;
-    },
-  };
-  return { res: res as unknown as ServerResponse, captured };
+/** Dispatch one request against a stub context, with no runtime or socket. */
+function call(ctx: ApiContext, method: string, pathname: string, body?: unknown): ReturnType<typeof dispatch> {
+  return dispatch(ctx, { method, pathname, query: new URLSearchParams(), body });
 }
 
 // Finding E: the DELETE /api/downloads/:id handler invokes DownloadManager.cancel
@@ -2357,37 +2385,82 @@ function fakeRes(): { res: ServerResponse; captured: { status: number; body: str
 // already-terminal) — verified at the route layer with a stub manager so no live
 // download or network is needed.
 describe('dashboard server — cancel download route', () => {
-  function depsWith(cancel: (id: string) => boolean): ApiDeps {
-    return { downloads: { cancel } } as unknown as ApiDeps;
+  function ctxWith(cancel: (id: string) => boolean): ApiContext {
+    return { downloads: { cancel } } as unknown as ApiContext;
   }
 
   it('returns 200 and cancels a known job id', async () => {
     const seen: string[] = [];
-    const deps = depsWith((id) => {
+    const ctx = ctxWith((id) => {
       seen.push(id);
       return id === 'known-job';
     });
-    const { res, captured } = fakeRes();
-    const url = new URL('http://localhost/api/downloads/known-job');
-    const req = { method: 'DELETE' } as IncomingMessage;
 
-    const handled = await handleApiRequest(req, res, url, deps);
-    expect(handled).toBe(true);
+    expect(isApiPath('/api/downloads/known-job')).toBe(true);
+    const res = await call(ctx, 'DELETE', '/api/downloads/known-job');
     expect(seen).toEqual(['known-job']);
-    expect(captured.status).toBe(200);
-    expect(JSON.parse(captured.body)).toEqual({ cancelled: true, id: 'known-job' });
+    expect(res.status).toBe(200);
+    expect(res.ok).toBe(true);
+    expect(res.ok ? res.body : null).toEqual({ cancelled: true, id: 'known-job' });
   });
 
   it('returns 404 for an unknown/terminal job id', async () => {
-    const deps = depsWith(() => false);
-    const { res, captured } = fakeRes();
-    const url = new URL('http://localhost/api/downloads/ghost');
-    const req = { method: 'DELETE' } as IncomingMessage;
+    const ctx = ctxWith(() => false);
 
-    const handled = await handleApiRequest(req, res, url, deps);
-    expect(handled).toBe(true);
-    expect(captured.status).toBe(404);
-    expect((JSON.parse(captured.body) as { error: string }).error).toContain('ghost');
+    const res = await call(ctx, 'DELETE', '/api/downloads/ghost');
+    expect(res.status).toBe(404);
+    expect(res.ok).toBe(false);
+    expect(res.ok ? '' : res.code).toBe('E_NOT_FOUND');
+    expect(res.ok ? '' : res.message).toContain('ghost');
+  });
+});
+
+// A route that only ACCEPTS work answers 202, not 200: starting a download queues
+// a job that has not run yet. Asserted at the route layer with a stub manager so
+// no multi-GB transfer is triggered — a live-repo POST would really download.
+describe('dashboard server — download start is 202 Accepted', () => {
+  it('answers 202 (not 200) for an accepted download start', async () => {
+    const ctx = { downloads: { start: () => 'job-1' } } as unknown as ApiContext;
+    const res = await call(ctx, 'POST', '/api/downloads', { repo: 'org/repo' });
+    expect(res.status).toBe(202);
+    expect(res.ok ? res.body : null).toEqual({ id: 'job-1', repo: 'org/repo' });
+  });
+});
+
+// A KNOWN path reached with the wrong method must be 405, not 404: the dispatcher
+// keeps matching after a method mismatch and remembers that the path shape (with
+// its `:param` segments) existed. Losing that collapses every wrong-method call to
+// a misleading "no such route".
+describe('dashboard server — method-not-allowed vs not-found', () => {
+  const ctx = {} as unknown as ApiContext;
+
+  it('405s a known path reached with the wrong method', async () => {
+    for (const [method, pathname] of [
+      ['PUT', '/api/models'],
+      ['POST', '/api/sessions/fix-1'],
+      ['GET', '/api/ingest'],
+      ['PATCH', '/api/downloads/some-id'],
+    ] as const) {
+      const res = await call(ctx, method, pathname);
+      expect(res.status).toBe(405);
+      expect(res.ok ? '' : res.code).toBe('E_METHOD_NOT_ALLOWED');
+      expect(res.ok ? '' : res.message).toContain(method);
+    }
+  });
+
+  it('404s a path no route has, whatever the method', async () => {
+    for (const method of ['GET', 'POST', 'DELETE'] as const) {
+      const res = await call(ctx, method, '/api/nope');
+      expect(res.status).toBe(404);
+      expect(res.ok ? '' : res.code).toBe('E_NOT_FOUND');
+    }
+  });
+
+  it('does not treat a non-API path as a route', () => {
+    expect(isApiPath('/')).toBe(false);
+    expect(isApiPath('/sessions/deep/link')).toBe(false);
+    expect(isApiPath('/health')).toBe(true);
+    expect(isApiPath('/api/models')).toBe(true);
   });
 });
 
@@ -2395,29 +2468,27 @@ describe('dashboard server — cancel download route', () => {
 // manager. That refusal is a server-lifecycle condition, not a malformed request,
 // so it must not be reported as a 400 blaming the caller.
 describe('dashboard server — start download route', () => {
-  function postDownload(start: () => string): Promise<{ status: number; body: string }> {
-    const deps = { downloads: { start } } as unknown as ApiDeps;
-    const { res, captured } = fakeRes();
-    const url = new URL('http://localhost/api/downloads');
-    const req = Object.assign(Readable.from([Buffer.from(JSON.stringify({ repo: 'org/model' }))]), {
-      method: 'POST',
-    }) as unknown as IncomingMessage;
-    return handleApiRequest(req, res, url, deps).then(() => captured);
+  function postDownload(start: () => string): ReturnType<typeof dispatch> {
+    const ctx = { downloads: { start } } as unknown as ApiContext;
+    return call(ctx, 'POST', '/api/downloads', { repo: 'org/model' });
   }
 
   it('answers 503 once the download manager is shutting down', async () => {
-    const captured = await postDownload(() => {
+    const res = await postDownload(() => {
       throw new DownloadsClosedError();
     });
-    expect(captured.status).toBe(503);
-    expect((JSON.parse(captured.body) as { error: string }).error).toMatch(/shutting down/i);
+    expect(res.status).toBe(503);
+    expect(res.ok).toBe(false);
+    expect(res.ok ? '' : res.code).toBe('E_UNAVAILABLE');
+    expect(res.ok ? '' : res.message).toMatch(/shutting down/i);
   });
 
   it('still answers 400 for a repo the catalog does not carry', async () => {
-    const captured = await postDownload(() => {
+    const res = await postDownload(() => {
       throw new Error('Repo "org/model" is not in the model catalog');
     });
-    expect(captured.status).toBe(400);
+    expect(res.status).toBe(400);
+    expect(res.ok ? '' : res.code).toBe('E_BAD_REQUEST');
   });
 });
 
@@ -2458,6 +2529,50 @@ describe('dashboard server — static SPA', () => {
     const res = await fetch(`${server.url}/api/health`);
     expect(res.status).toBe(200);
     expect(((await res.json()) as { status: string }).status).toBe('ok');
+  });
+});
+
+// The API suite above drives the runtime directly, so these hold the HTTP adapter
+// itself to the same contract end to end: an `ApiError` code must reach the wire
+// as its derived status with the `{error}` body the SPA reads, and a body the
+// transport cannot parse must surface as the handler's 400 rather than a crash.
+describe('dashboard server — HTTP adapter maps the error model onto the wire', () => {
+  it('serves a handler 404 as a 404 JSON body', async () => {
+    const res = await fetch(`${server.url}/api/sessions/no-such-session`);
+    expect(res.status).toBe(404);
+    expect(res.headers.get('content-type')).toContain('application/json');
+    expect((await res.json()) as { error: string }).toMatchObject({ error: expect.stringContaining('not found') });
+  });
+
+  it('serves a wrong method on a known path as 405, not 404', async () => {
+    const res = await fetch(`${server.url}/api/models`, { method: 'PUT' });
+    expect(res.status).toBe(405);
+    expect(((await res.json()) as { error: string }).error).toContain('PUT');
+  });
+
+  it('serves an unparseable request body as a 400 from the handler that needed it', async () => {
+    const res = await fetch(`${server.url}/api/cache`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{ this is not json',
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe('Invalid JSON in request body');
+    // Nothing was cleared by the rejected call.
+    const after = (await (await api.fetch('/api/cache')).json()) as { disk: { entryCount: number } };
+    expect(after.disk.entryCount).toBe(2);
+  });
+
+  it('checks the session id BEFORE the body, so an unknown id still 404s', async () => {
+    // The rename handler looks the session up first; an unparseable body must not
+    // pre-empt that 404 (the transport records the parse failure as data instead
+    // of raising it at read time).
+    const res = await fetch(`${server.url}/api/sessions/no-such-session`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{ not json either',
+    });
+    expect(res.status).toBe(404);
   });
 });
 

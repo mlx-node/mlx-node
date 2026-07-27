@@ -1,0 +1,108 @@
+/**
+ * Transport-independent dispatch: match one request against {@link ROUTES}, run
+ * its handler, and return an {@link ApiResponse} envelope. No `node:http` here —
+ * the HTTP adapter in `server.ts` and the Electron MessagePort bridge both feed
+ * this the same normalized input.
+ */
+
+import type { ApiContext, ApiRequest } from './context.js';
+import { failure, toFailure, type ApiResponse } from './errors.js';
+import { ROUTES, type Route } from './routes.js';
+
+/** One normalized request, already split into path + query by the transport. */
+export interface ApiRequestInput {
+  method: string;
+  /** Path only, no query string. */
+  pathname: string;
+  query: URLSearchParams;
+  /** Parsed payload; `null` when the caller sent none. */
+  body?: unknown;
+  /** Set when the transport could not parse the payload (see `requireBody`). */
+  bodyError?: string;
+}
+
+/**
+ * Whether a path belongs to the API surface at all. The HTTP adapter serves the
+ * static SPA for everything else; a path under `/api` that matches no route is
+ * still an API path and yields a JSON 404, not `index.html`.
+ */
+export function isApiPath(pathname: string): boolean {
+  return pathname === '/health' || pathname === '/api' || pathname.startsWith('/api/');
+}
+
+export function splitSegments(pathname: string): string[] {
+  return pathname.split('/').filter((s) => s.length > 0);
+}
+
+/** Match a `:param` route against concrete path segments. */
+function matchRoute(route: Route, method: string, segments: string[]): Record<string, string> | null {
+  if (route.method !== method) return null;
+  if (route.segments.length !== segments.length) return null;
+  const params: Record<string, string> = {};
+  for (let i = 0; i < route.segments.length; i++) {
+    const pat = route.segments[i];
+    if (pat.startsWith(':')) {
+      params[pat.slice(1)] = decodeURIComponent(segments[i]);
+    } else if (pat !== segments[i]) {
+      return null;
+    }
+  }
+  return params;
+}
+
+/** Whether a route's segment pattern shape matches concrete segments (ignoring method/values). */
+function segmentsMatch(pattern: string[], segments: string[]): boolean {
+  if (pattern.length !== segments.length) return false;
+  for (let i = 0; i < pattern.length; i++) {
+    if (!pattern[i].startsWith(':') && pattern[i] !== segments[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * The transport-owned stream route (SSE download progress) this request names,
+ * if any. A transport that can stream calls this BEFORE {@link dispatch} and
+ * handles the request itself; one that cannot simply dispatches and gets the
+ * handler's "not available over this transport" failure.
+ */
+export function matchStreamRoute(method: string, pathname: string): { params: Record<string, string> } | null {
+  const segments = splitSegments(pathname);
+  for (const r of ROUTES) {
+    if (r.stream !== true) continue;
+    const params = matchRoute(r, method, segments);
+    if (params !== null) return { params };
+  }
+  return null;
+}
+
+export async function dispatch(ctx: ApiContext, input: ApiRequestInput): Promise<ApiResponse> {
+  const { method, pathname, query } = input;
+  const segments = splitSegments(pathname);
+  let pathMatched = false;
+  for (const r of ROUTES) {
+    const params = matchRoute(r, method, segments);
+    if (params === null) {
+      if (segmentsMatch(r.segments, segments)) pathMatched = true;
+      continue;
+    }
+    const req: ApiRequest = {
+      method,
+      path: pathname,
+      query,
+      params,
+      body: input.body ?? null,
+      ...(input.bodyError !== undefined ? { bodyError: input.bodyError } : {}),
+    };
+    try {
+      return { ok: true, status: r.successStatus ?? 200, body: await r.handler(ctx, req) };
+    } catch (err) {
+      return toFailure(err);
+    }
+  }
+
+  // A known path with the wrong method → 405; otherwise 404.
+  if (pathMatched) {
+    return failure('E_METHOD_NOT_ALLOWED', `Method ${method} not allowed for ${pathname}`);
+  }
+  return failure('E_NOT_FOUND', `No route matches ${method} ${pathname}`);
+}

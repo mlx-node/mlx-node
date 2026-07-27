@@ -1,4 +1,15 @@
-export type { MetricsOverview, TranscriptEntry } from './api.js';
+export type { ApiContext, ApiRequest, Handler, IngestSummary } from './api/context.js';
+export {
+  ApiError,
+  statusForCode,
+  type ApiErrorCode,
+  type ApiFailure,
+  type ApiResponse,
+  type ApiSuccess,
+} from './api/errors.js';
+export { dispatch, isApiPath, matchStreamRoute, type ApiRequestInput } from './api/dispatch.js';
+export type { MetricsOverview } from './api/handlers/metrics.js';
+export type { TranscriptEntry } from './api/transcript.js';
 export { type ColdCacheDiskInfo, clearColdCache, evictOlderThan, scanColdCache } from './cache.js';
 export { type CatalogItem, catalogSlug, catalogWithState } from './catalog.js';
 export { type DashboardDb, openDashboardDb } from './db/open.js';
@@ -16,4 +27,10 @@ export {
   type LocalModel,
 } from './models.js';
 export { agentSessionsRoot, dashboardDbPath, metricsTraceDir, mlxNodeHome } from './paths.js';
+export {
+  type ApiCall,
+  createDashboardRuntime,
+  type DashboardRuntime,
+  type DashboardRuntimeOptions,
+} from './runtime.js';
 export { type DashboardServer, type DashboardServerOptions, startDashboardServer } from './server.js';

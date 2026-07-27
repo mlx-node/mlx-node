@@ -1,27 +1,26 @@
 /**
  * Dashboard HTTP server: static SPA + JSON `/api` + SSE, over plain `node:http`.
  *
- * Lifecycle and routing live here; the route handlers are in `api.ts` and the
- * SPA file serving in `static.ts`. The server binds `127.0.0.1` by default and
- * validates a loopback `Host` on EVERY request (reads included) to block
- * DNS-rebinding against the loopback port, additionally requiring a local
- * `Origin` on mutations to block drive-by CSRF. It never links the native
- * addon — all data comes from disk via the C1–C4 modules.
+ * This is a THIN ADAPTER. All API behaviour lives in the transport-independent
+ * layer under `api/` and is driven through the runtime in `runtime.ts`; what
+ * remains here is genuinely HTTP: the loopback `Host`/`Origin` guards, request
+ * body streaming, status/JSON framing, SSE, and the listening socket's
+ * lifecycle. The server binds `127.0.0.1` by default and validates a loopback
+ * `Host` on EVERY request (reads included) to block DNS-rebinding against the
+ * loopback port, additionally requiring a local `Origin` on mutations to block
+ * drive-by CSRF. It never links the native addon — all data comes from disk via
+ * the C1–C4 modules.
  */
 
-import { mkdirSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { networkInterfaces } from 'node:os';
-import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { handleApiRequest, type ApiDeps, type IngestSummary, type SseClient } from './api.js';
-import { openDashboardDb, type DashboardDb } from './db/open.js';
-import { DownloadManager } from './download.js';
-import { ingestSessions } from './ingest/sessions.js';
-import { ingestTraces } from './ingest/traces.js';
-import { defaultModelsDir } from './models.js';
-import { agentSessionsRoot, dashboardDbPath, metricsTraceDir } from './paths.js';
+import { parseJsonBody } from './api/context.js';
+import { dispatch, isApiPath, matchStreamRoute } from './api/dispatch.js';
+import type { ApiResponse } from './api/errors.js';
+import type { DownloadEvent } from './download.js';
+import { createDashboardRuntime, type DashboardRuntime } from './runtime.js';
 import { serveStatic } from './static.js';
 
 export interface DashboardServerOptions {
@@ -38,17 +37,27 @@ export interface DashboardServerOptions {
 export interface DashboardServer {
   url: string;
   port: number;
+  /**
+   * The transport-independent runtime this server adapts. Exposed so an
+   * in-process caller (tests, the Electron main process) can issue API calls
+   * without a socket. `close()` closes it.
+   */
+  runtime: DashboardRuntime;
   close(): Promise<void>;
 }
 
 /** Default port; matches `mlx dashboard --port 6590`. */
 const DEFAULT_PORT = 6590;
-/** Trace-file retention passed to the periodic + boot ingest. */
-const RETENTION_DAYS = 30;
-/** Incremental rescan cadence while the server runs. */
-const INGEST_INTERVAL_MS = 30_000;
+
+/** Request bodies are capped at 1 MB. */
+const MAX_BODY_BYTES = 1024 * 1024;
 
 const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1']);
+
+export interface SseClient {
+  res: ServerResponse;
+  cleanup: () => void;
+}
 
 /**
  * Wrap a bare IPv6 literal in `[...]` so it is safe inside a URL authority. Any
@@ -197,6 +206,102 @@ function isRequestAllowed(req: IncomingMessage, port: number, allowedHosts: Set<
   return isAllowedAuthority(parsed.host, port, allowedHosts);
 }
 
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' });
+  res.end(payload);
+}
+
+/** Write a dispatch envelope: the route's success status, or the code's status. */
+function sendApiResponse(res: ServerResponse, response: ApiResponse): void {
+  if (response.ok) sendJson(res, response.status, response.body);
+  else sendJson(res, response.status, { error: response.message });
+}
+
+/**
+ * Read a JSON request body, capped at 1 MB. An empty body is `null`. A failure
+ * is returned as `bodyError` rather than thrown so each handler surfaces it at
+ * the point it needs the body, keeping earlier checks (404 on an unknown id, …)
+ * ahead of a body-parse failure.
+ */
+function readJsonBody(req: IncomingMessage): Promise<{ body: unknown } | { bodyError: string }> {
+  return new Promise((resolveBody) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    req.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > MAX_BODY_BYTES) {
+        resolveBody({ bodyError: 'Request body too large' });
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      resolveBody(parseJsonBody(Buffer.concat(chunks).toString('utf-8')));
+    });
+    req.on('error', (err: Error) => {
+      resolveBody({ bodyError: err.message });
+    });
+  });
+}
+
+/** Minimal writable surface a backpressure-aware SSE sender depends on. */
+interface SseWritable {
+  write(chunk: string): boolean;
+  on(event: 'drain', listener: () => void): void;
+}
+
+function sseFrame(event: DownloadEvent): string {
+  return `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+}
+
+/**
+ * Backpressure-aware SSE sender for download progress. `res.write` returning
+ * false means the socket buffer is full; further frames are queued in memory
+ * until `'drain'`. A subscriber that never reads during a multi-GB download
+ * would otherwise accumulate one buffered frame per progress tick without
+ * bound, so a run of consecutive `progress` frames is coalesced to the latest.
+ * Lifecycle frames (`start`/`done`/`error`) are kept in order so terminal
+ * delivery is never dropped, bounding the queue to at most one frame between
+ * lifecycle events.
+ */
+export function createDownloadSseSender(res: SseWritable): (event: DownloadEvent) => void {
+  let blocked = false;
+  const pending: DownloadEvent[] = [];
+
+  // A `false` return from `write` means the chunk was BUFFERED, not refused — so
+  // a frame is dequeued before its result is read, exactly as the unblocked path
+  // below never re-queues one. Keeping the head instead would rewrite an
+  // already-sent frame on every drain, and for a frame larger than the socket
+  // high-water mark (an unbounded remote `error.message` from the hub) every
+  // rewrite returns false again, replaying it without bound.
+  const flush = (): void => {
+    blocked = false;
+    while (pending.length > 0) {
+      const event = pending.shift()!;
+      if (!res.write(sseFrame(event))) {
+        blocked = true;
+        return;
+      }
+    }
+  };
+  res.on('drain', flush);
+
+  return (event: DownloadEvent): void => {
+    if (blocked) {
+      const last = pending[pending.length - 1];
+      if (event.type === 'progress' && last !== undefined && last.type === 'progress') {
+        pending[pending.length - 1] = event;
+      } else {
+        pending.push(event);
+      }
+      return;
+    }
+    if (!res.write(sseFrame(event))) blocked = true;
+  };
+}
+
 function defaultWebRoot(): string {
   // dist/server.js → ../web (the built SPA shipped in package `files`).
   return fileURLToPath(new URL('../web', import.meta.url));
@@ -205,11 +310,6 @@ function defaultWebRoot(): string {
 export async function startDashboardServer(opts: DashboardServerOptions = {}): Promise<DashboardServer> {
   const host = opts.host ?? '127.0.0.1';
   const requestedPort = opts.port ?? DEFAULT_PORT;
-  const dbPath = opts.dbPath ?? dashboardDbPath();
-  const modelsDir = opts.modelsDir ?? defaultModelsDir();
-  const sessionsRoot = opts.sessionsRoot ?? agentSessionsRoot();
-  const tracesDir = opts.tracesDir ?? metricsTraceDir();
-  const cacheRoot = opts.cacheRoot;
   const webRoot = opts.webRoot ?? defaultWebRoot();
 
   if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
@@ -218,39 +318,15 @@ export async function startDashboardServer(opts: DashboardServerOptions = {}): P
     );
   }
 
-  if (dbPath !== ':memory:') {
-    mkdirSync(dirname(dbPath), { recursive: true });
-  }
-  const dash: DashboardDb = openDashboardDb(dbPath);
-  const downloads = new DownloadManager({ modelsDir });
-  const sseClients = new Set<SseClient>();
-
-  // Serialize ingests so overlapping timer/boot/manual runs never interleave
-  // SQLite transactions. `doIngest` never throws, so a failed run cannot poison
-  // the chain for later callers (a rejected promise would skip every queued
-  // `.then`).
-  const doIngest = async (): Promise<IngestSummary> => {
-    try {
-      const sessionsResult = await ingestSessions(dash, sessionsRoot);
-      const tracesResult = await ingestTraces(dash, tracesDir, { retentionDays: RETENTION_DAYS });
-      return { sessions: sessionsResult, traces: tracesResult };
-    } catch (err) {
-      return {
-        sessions: { scanned: 0, updated: 0, removed: 0, warnings: [String(err)] },
-        traces: { files: 0, records: 0, pruned: 0, warnings: [] },
-      };
-    }
-  };
-  let ingestChain: Promise<IngestSummary> = Promise.resolve({
-    sessions: { scanned: 0, updated: 0, removed: 0, warnings: [] },
-    traces: { files: 0, records: 0, pruned: 0, warnings: [] },
+  const runtime = createDashboardRuntime({
+    dbPath: opts.dbPath,
+    modelsDir: opts.modelsDir,
+    sessionsRoot: opts.sessionsRoot,
+    tracesDir: opts.tracesDir,
+    cacheRoot: opts.cacheRoot,
   });
-  const runIngest = (): Promise<IngestSummary> => {
-    ingestChain = ingestChain.then(doIngest);
-    return ingestChain;
-  };
-
-  const deps: ApiDeps = { dash, modelsDir, sessionsRoot, tracesDir, cacheRoot, downloads, runIngest, sseClients };
+  /** Live SSE connections, tracked so `close()` can end them. */
+  const sseClients = new Set<SseClient>();
 
   // The actual bound port (may differ from requested when 0 is used).
   let boundPort = requestedPort;
@@ -278,6 +354,36 @@ export async function startDashboardServer(opts: DashboardServerOptions = {}): P
       }
     });
   });
+
+  /** Open a download-progress event stream. Owned by the transport, not the API. */
+  function streamDownloadEvents(req: IncomingMessage, res: ServerResponse, id: string): void {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+    res.write(': connected\n\n');
+
+    const send = createDownloadSseSender(res);
+    const unsubscribe = runtime.subscribe(id, send);
+
+    const heartbeat = setInterval(() => res.write(': ping\n\n'), 15_000);
+    heartbeat.unref();
+
+    const client: SseClient = {
+      res,
+      cleanup: () => {
+        clearInterval(heartbeat);
+        unsubscribe();
+      },
+    };
+    sseClients.add(client);
+
+    req.on('close', () => {
+      client.cleanup();
+      sseClients.delete(client);
+    });
+  }
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const method = req.method ?? 'GET';
@@ -315,8 +421,26 @@ export async function startDashboardServer(opts: DashboardServerOptions = {}): P
     }
 
     try {
-      const handled = await handleApiRequest(req, res, url, deps);
-      if (!handled) serveStatic(req, res, webRoot, url.pathname);
+      if (!isApiPath(url.pathname)) {
+        serveStatic(req, res, webRoot, url.pathname);
+        return;
+      }
+      // A long-lived stream the transport owns end to end; intercepted before
+      // dispatch, which has no way to express one.
+      const stream = matchStreamRoute(method, url.pathname);
+      if (stream !== null) {
+        streamDownloadEvents(req, res, stream.params.id);
+        return;
+      }
+      // Only methods that can carry a payload pay for reading one.
+      const payload = method === 'GET' || method === 'HEAD' ? { body: null } : await readJsonBody(req);
+      const response = await dispatch(runtime.context, {
+        method,
+        pathname: url.pathname,
+        query: url.searchParams,
+        ...payload,
+      });
+      sendApiResponse(res, response);
     } catch (err) {
       if (!res.headersSent) {
         res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -341,13 +465,6 @@ export async function startDashboardServer(opts: DashboardServerOptions = {}): P
     });
   });
 
-  // Ingest on boot (non-blocking) plus a periodic rescan.
-  runIngest().catch(() => {});
-  const ingestTimer = setInterval(() => {
-    runIngest().catch(() => {});
-  }, INGEST_INTERVAL_MS);
-  ingestTimer.unref();
-
   // A wildcard bind has no connectable literal host: advertise a loopback the
   // Host allowlist accepts. `::` binds IPv6 → `[::1]`; `0.0.0.0`/'' bind IPv4 →
   // `127.0.0.1`. Both are in LOCAL_HOSTNAMES, so the printed/opened URL passes
@@ -361,13 +478,15 @@ export async function startDashboardServer(opts: DashboardServerOptions = {}): P
   return {
     url,
     port: boundPort,
+    runtime,
     async close() {
-      clearInterval(ingestTimer);
-      // Abort and drain in-flight downloads BEFORE anything else so a shutdown
-      // (SIGINT/SIGTERM → `process.exit`) can't kill the process mid-write and
-      // orphan a partial, potentially multi-GB `.staging` tree, nor let a
-      // background job publish a model after the server is considered closed.
-      await downloads.shutdown();
+      // Stop the rescan timer, abort and drain in-flight downloads, and await any
+      // in-flight ingest BEFORE anything else, so a shutdown (SIGINT/SIGTERM →
+      // `process.exit`) can't kill the process mid-write and orphan a partial,
+      // potentially multi-GB `.staging` tree, nor let a background job publish a
+      // model after the server is considered closed. The database stays open
+      // until every reader — including in-flight requests below — is finished.
+      await runtime.drain();
       for (const client of sseClients) {
         try {
           client.cleanup();
@@ -383,7 +502,7 @@ export async function startDashboardServer(opts: DashboardServerOptions = {}): P
           else resolveClose();
         });
       });
-      dash.close();
+      await runtime.close();
     },
   };
 }
