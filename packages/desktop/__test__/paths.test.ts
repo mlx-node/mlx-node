@@ -9,6 +9,7 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vite-plus/test';
 
+import { bundledAddonPath, NATIVE_FILES } from '../scripts/payload.js';
 import { resolveAppPaths, type AppLayout } from '../src/main/paths.js';
 
 const DEV: AppLayout = {
@@ -55,6 +56,41 @@ describe('resolveAppPaths', () => {
     for (const layout of [DEV, PACKAGED]) {
       expect(resolveAppPaths(layout).sidecarEntry).toBe(join(layout.appPath, 'dist/inference/index.js'));
     }
+  });
+
+  it('finds the admin entry beside it', () => {
+    for (const layout of [DEV, PACKAGED]) {
+      expect(resolveAppPaths(layout).adminEntry).toBe(join(layout.appPath, 'dist/admin/index.js'));
+    }
+    // Two entries, never one file doing both jobs: the whole point of ADMIN is
+    // that it does not load what INFERENCE loads.
+    expect(resolveAppPaths(DEV).adminEntry).not.toBe(resolveAppPaths(DEV).sidecarEntry);
+  });
+
+  // `packages/core/index.cjs` checks `NAPI_RS_NATIVE_LIBRARY_PATH` first in
+  // `requireNative()` and passes it straight to `require()`. Naming the
+  // containing directory instead resolves back to `index.cjs` itself — a
+  // circular self-require that returns half-built exports with no error at all.
+  it('names the addon FILE, not the directory holding it', () => {
+    for (const layout of [DEV, PACKAGED]) {
+      const { nativeAddon } = resolveAppPaths(layout);
+      expect(nativeAddon.endsWith(`/${NATIVE_FILES[0]}`), nativeAddon).toBe(true);
+    }
+  });
+
+  // The runtime path and the packaging path are decided in two files that cannot
+  // import each other — `src` must not depend on `scripts`. This is the only
+  // thing keeping them together, and a mismatch is an app that packages cleanly
+  // and cannot find its addon on first launch.
+  it('agrees with where packaging puts the addon', () => {
+    expect(resolveAppPaths(PACKAGED).nativeAddon).toBe(bundledAddonPath(PACKAGED.resourcesPath));
+  });
+
+  it('reads the addon out of the workspace in dev', () => {
+    // The same file napi's own platform lookup would have found, so dev and the
+    // bundle take the same branch of `requireNative()` rather than the packaged
+    // path being exercised only by a packaged build.
+    expect(resolveAppPaths(DEV).nativeAddon).toBe(join('/repo/packages/core', NATIVE_FILES[0]));
   });
 
   // A sandboxed preload must be CommonJS, which is why the source is `.cts` and

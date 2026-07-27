@@ -12,6 +12,16 @@
 
 import { join } from 'node:path';
 
+/**
+ * The addon's filename, duplicated from `scripts/payload.ts`'s `NATIVE_FILES[0]`.
+ *
+ * `src` may not import from `scripts` — the app would then carry its packaging
+ * tool around at runtime — so the two copies are kept honest by a test that reads
+ * both. A rename that only lands in one of them produces an app that packages
+ * fine and cannot find its addon.
+ */
+const ADDON_FILE = 'mlx-core.darwin-arm64.node';
+
 /** The Electron-supplied facts this depends on. See `app.getPath` / `app.getAppPath`. */
 export interface AppLayout {
   /**
@@ -41,6 +51,34 @@ export interface AppPaths {
    * `asar: false` or list this subtree in `asarUnpack`.
    */
   sidecarEntry: string;
+  /**
+   * The ADMIN utilityProcess's built JS entry — the dashboard runtime and its
+   * SQLite worker thread.
+   *
+   * Beside the sidecar entry and under the same rule about asar, for a different
+   * reason: this one spawns a `node:worker_threads` worker, and `new Worker()`
+   * takes a real path too.
+   */
+  adminEntry: string;
+  /**
+   * The native addon, as a path to the **`.node` file itself**.
+   *
+   * Handed to the INFERENCE child as `NAPI_RS_NATIVE_LIBRARY_PATH`, which
+   * `packages/core/index.cjs` checks FIRST in `requireNative()` and passes
+   * straight to `require()`. Naming the containing directory instead does not
+   * fail cleanly — measured on this tree:
+   *
+   *   the .node file            -> loads, 68 exports
+   *   `packages/core/`          -> LOADS, 67 exports, `loadModel` undefined
+   *                                (`require(dir)` resolves back to index.cjs and
+   *                                 the module circularly requires itself)
+   *   any other directory       -> throws "Cannot find native binding"
+   *
+   * The middle row is why this is a file path and why a test pins it: a sidecar
+   * that starts, serves `/health`, and has no `loadModel` is the silent failure
+   * this whole app is built to avoid.
+   */
+  nativeAddon: string;
   /** Per-generation `MLX_INFERENCE_TRACE_FILE` directory. Created by the supervisor. */
   traceDir: string;
   settingsFile: string;
@@ -59,6 +97,15 @@ export function resolveAppPaths(layout: AppLayout): AppPaths {
     // visible on the next window load with no copy step.
     wwwRoot: packaged ? join(resourcesPath, 'www') : join(appPath, '..', 'dashboard', 'web'),
     sidecarEntry: join(appPath, 'dist', 'inference', 'index.js'),
+    adminEntry: join(appPath, 'dist', 'admin', 'index.js'),
+    // Packaged, `scripts/package.ts` stages the addon and both metallibs into
+    // `Contents/Resources/native` — they must stay in ONE directory, since MLX
+    // loads mlx.metallib from beside the binary and paged_attn.metallib
+    // dladdr-relative from the .node. In dev it is read out of the workspace,
+    // which is also where napi's own fallback would have found it: the variable
+    // is set in both modes anyway so that dev and the bundle take the same code
+    // path through `requireNative()`.
+    nativeAddon: packaged ? join(resourcesPath, 'native', ADDON_FILE) : join(appPath, '..', 'core', ADDON_FILE),
     traceDir: join(userData, 'traces'),
     settingsFile: join(userData, 'settings.json'),
     trayIcon: join(appPath, 'build', 'iconTemplate.png'),

@@ -17,8 +17,11 @@
  */
 
 import { engineEnvFor, LAUNCHER_ENGINE_POLICY } from '@mlx-node/server/host/env-policy';
-import { app, Menu, screen, type MenuItemConstructorOptions } from 'electron';
+import { app, Menu, screen, type MenuItemConstructorOptions, type WebContents } from 'electron';
 
+import { electronBrokerDeps } from './admin-child.js';
+import { createAdminBroker, type AdminBroker } from './broker.js';
+import { adminEnvOverrides, sidecarEnvOverrides } from './child-env.js';
 import { resolveAppPaths, type AppPaths } from './paths.js';
 import { installAppProtocol, registerAppScheme } from './protocol.js';
 import {
@@ -53,6 +56,7 @@ let saveDirty = false;
 let supervisor: Supervisor | null = null;
 let tray: TrayController | null = null;
 let admin: AdminWindowManager | null = null;
+let broker: AdminBroker<WebContents> | null = null;
 
 /**
  * "The app is exiting", as opposed to "a window is closing". Without the
@@ -185,7 +189,12 @@ async function bootstrap(): Promise<void> {
     // `@mlx-node/lm` and maps the 233 MB native addon into whatever process
     // evaluates it, which is the one thing MAIN must never do.
     enginePolicyEnv: engineEnvFor(LAUNCHER_ENGINE_POLICY),
-    ...(settings.modelsDir === null ? {} : { env: { MLX_MODELS_DIR: settings.modelsDir } }),
+    // `NAPI_RS_NATIVE_LIBRARY_PATH` is in here, and fork time is the only moment
+    // it can be set: `packages/core/index.cjs` reads it inside `requireNative()`,
+    // which runs while `@mlx-node/lm` is being imported at the sidecar entry's
+    // module scope. Writing it from MAIN afterwards is a no-op that looks like it
+    // worked.
+    env: sidecarEnvOverrides({ nativeAddon: paths.nativeAddon, modelsDir: settings.modelsDir }),
   });
 
   supervisor.on((event) => {
@@ -212,6 +221,20 @@ async function bootstrap(): Promise<void> {
     }
   });
 
+  broker = createAdminBroker<WebContents>({
+    ...electronBrokerDeps({
+      entry: paths.adminEntry,
+      env: { ...process.env, ...adminEnvOverrides({ modelsDir: settings.modelsDir }) } as Record<string, string>,
+      onLog: (stream, line) => {
+        if (stream === 'stderr') console.error(`[mlx] admin: ${line}`);
+      },
+    }),
+    report: (event) => {
+      if (event.type === 'brokered') return;
+      console.error(`[mlx] admin ${event.type}:`, event);
+    },
+  });
+
   admin = createAdminWindowManager({
     preload: paths.adminPreload,
     bounds: () => settings.adminWindow,
@@ -221,13 +244,12 @@ async function bootstrap(): Promise<void> {
       settings = { ...settings, adminWindow: bounds };
       scheduleSave();
     },
-    // The broker seam. When the ADMIN utilityProcess exists, this becomes:
-    //   onAdminReady: (contents) => broker.attach(contents)
-    // where `attach` creates a `MessageChannelMain`, serves the dashboard
-    // runtime on port1 (`serveRuntimeOverPort` in @mlx-node/dashboard) and posts
-    // port2 with `contents.postMessage(ADMIN_PORT_CHANNEL, null, [port2])`.
-    // Left undefined until then: the window renders and stays empty, which is a
-    // visible failure rather than a crash at launch.
+    // The renderer asked, so mint it a channel. Pull, not push: a transferred
+    // port is consumed once, and a reload gets a fresh one because the old one
+    // died with the old page.
+    onAdminReady: (contents) => {
+      broker?.attach(contents);
+    },
   });
 
   tray = createTray({
@@ -328,7 +350,11 @@ async function shutdown(): Promise<void> {
   await flushSettings();
   admin?.dispose();
   tray?.dispose();
-  await supervisor?.dispose();
+  // Both awaited, and in parallel: ADMIN's shutdown drains in-flight downloads
+  // so a partial multi-GB `.staging` tree is not orphaned, and INFERENCE's frees
+  // its temp root. Serialising them would spend two kill-grace periods against
+  // one 10 s quit deadline.
+  await Promise.all([broker?.dispose(), supervisor?.dispose()]);
 }
 
 async function withDeadline(work: Promise<void>, ms: number): Promise<void> {

@@ -3,6 +3,11 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vite-plus/test';
 
+// Not via `@mlx-node/dashboard`: the barrel re-exports the guards from
+// `rpc/protocol.js` but not this constant, and the SPA reaches it by relative
+// path too. Imported rather than regex-matched so a rename over there fails to
+// compile here instead of quietly weakening the assertion.
+import { DASHBOARD_PORT_MESSAGE } from '../../dashboard/src/rpc/protocol.js';
 import { ADMIN_PORT_CHANNEL, ADMIN_READY_CHANNEL, ADMIN_URL, classifyNavigation } from '../src/main/window-policy.js';
 
 describe('classifyNavigation', () => {
@@ -73,5 +78,36 @@ describe('the preload contract', () => {
   // `window` is a capability the page can never give back.
   it('exposes no API to the page', () => {
     expect(source).not.toContain('exposeInMainWorld');
+  });
+
+  /*
+   * The page-facing half of the hop. The SPA compares `event.data` against
+   * `DASHBOARD_PORT_MESSAGE` — a bare string, not an envelope — and a mismatch is
+   * completely silent on both sides: the window renders its "Connecting to the
+   * mlx runtime…" placeholder forever and nothing is logged anywhere. That is
+   * exactly what the previous literal did.
+   */
+  it('posts the tag the SPA is listening for, as a bare string', () => {
+    expect(source).toContain(`'${DASHBOARD_PORT_MESSAGE}'`);
+    expect(source).toContain(`window.postMessage(DASHBOARD_PORT_MESSAGE, '*', [port])`);
+    // An object would satisfy `toContain` on the literal above while still never
+    // matching the SPA's `event.data !== DASHBOARD_PORT_MESSAGE` check.
+    expect(source).not.toContain(`window.postMessage({ type: ADMIN_PORT_CHANNEL }`);
+  });
+
+  /*
+   * Who starts the handshake. MAIN still answers rather than pushes — a
+   * transferred port is consumed once, so pushing on `did-finish-load` races the
+   * page's listener with no recovery — but the ASKING has to come from somewhere,
+   * and the SPA never asks. The preload does, at `DOMContentLoaded`: deferred
+   * module scripts (the SPA is one) all run before it, so the page's `message`
+   * listener is provably installed by then.
+   */
+  it('asks for a port itself, once the page scripts have run', () => {
+    expect(source).toContain(`ipcRenderer.send(ADMIN_READY_CHANNEL)`);
+    expect(source).toContain(`document.addEventListener('DOMContentLoaded', requestPort, { once: true })`);
+    // The `readyState` branch matters: a preload that only subscribes would miss
+    // a document that had already finished parsing.
+    expect(source).toContain(`document.readyState === 'loading'`);
   });
 });

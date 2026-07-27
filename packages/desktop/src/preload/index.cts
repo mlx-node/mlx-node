@@ -29,14 +29,47 @@ const ADMIN_PORT_CHANNEL = 'mlx:admin-port';
 const ADMIN_READY_CHANNEL = 'mlx:admin-ready';
 
 /**
- * The page tells us it has a `message` listener installed; we ask MAIN for a
- * port. Pull, not push: a transferred port is consumed on delivery, so a port
- * pushed before the page was listening is simply lost, and there is no way to
- * re-send it — only to build a new channel. Asking makes a reload ordinary.
+ * Keep in sync with `DASHBOARD_PORT_MESSAGE` in
+ * `packages/dashboard/src/rpc/protocol.ts` — the tag the SPA compares `event.data`
+ * against, as a bare string rather than an envelope.
  *
- * Any script running in the page can send this. That is not a privilege
- * boundary being crossed: the page is our own bundle under a `script-src 'self'`
- * CSP, and anything executing there already has whatever the port grants.
+ * Third literal in this file for the same reason as the other two, and the one
+ * that actually crosses a package boundary: `window-policy.test.ts` reads both
+ * sources and pins them together, because a mismatch here is completely silent —
+ * the page renders its "Connecting…" placeholder forever and nothing is logged
+ * on either side.
+ */
+const DASHBOARD_PORT_MESSAGE = 'mlx:dashboard-port';
+
+/** Ask MAIN for a port. Safe to call again: each request mints a fresh channel. */
+function requestPort(): void {
+  ipcRenderer.send(ADMIN_READY_CHANNEL);
+}
+
+/**
+ * The handshake is started HERE, at `DOMContentLoaded`, rather than by the page.
+ *
+ * Pull, not push, is still the rule — MAIN answers a request instead of posting
+ * blind, so a reload is ordinary and a missed port can always be replaced. What
+ * this settles is who does the asking, and the preload can do it without a race:
+ * a preload runs before any page script, and deferred module scripts (the SPA is
+ * one) all execute BEFORE `DOMContentLoaded`. So by the time this fires, the
+ * page's `message` listener is installed. Sending it any earlier is the exact
+ * race the pull exists to avoid.
+ */
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', requestPort, { once: true });
+} else {
+  requestPort();
+}
+
+/**
+ * The page may also ask, which is how it recovers if it ever loses the port
+ * without navigating.
+ *
+ * Any script running in the page can send this. That is not a privilege boundary
+ * being crossed: the page is our own bundle under a `script-src 'self'` CSP, and
+ * anything executing there already has whatever the port grants.
  */
 window.addEventListener('message', (event: MessageEvent) => {
   // An iframe's message arrives on this same window with a different `source`.
@@ -46,7 +79,7 @@ window.addEventListener('message', (event: MessageEvent) => {
   const data: unknown = event.data;
   if (typeof data !== 'object' || data === null) return;
   if ((data as { type?: unknown }).type !== ADMIN_READY_CHANNEL) return;
-  ipcRenderer.send(ADMIN_READY_CHANNEL);
+  requestPort();
 });
 
 ipcRenderer.on(ADMIN_PORT_CHANNEL, (event: IpcRendererEvent) => {
@@ -56,5 +89,5 @@ ipcRenderer.on(ADMIN_PORT_CHANNEL, (event: IpcRendererEvent) => {
   // dropped in silence, and the symptom — a window that renders and never
   // connects — is indistinguishable from the broker being down. There is no
   // third party to protect against here; the message goes to this window only.
-  window.postMessage({ type: ADMIN_PORT_CHANNEL }, '*', [port]);
+  window.postMessage(DASHBOARD_PORT_MESSAGE, '*', [port]);
 });
