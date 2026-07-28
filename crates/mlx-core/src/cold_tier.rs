@@ -855,11 +855,14 @@ pub struct ColdCacheStatsJs {
     pub hits: f64,
     /// Lookups that found no usable block (includes corrupt entries).
     pub misses: f64,
-    /// Blocks accepted onto the background write queue.
+    /// Objects accepted onto the background write queue — K/V blocks and
+    /// family state sidecars alike, since both take a slot in the same queue.
+    /// `coldSidecarEnqueued` counts a subset of this; never sum them.
     pub enqueued: f64,
-    /// Writes REFUSED at admission because the bounded queue was full.
-    /// Disjoint from `writeErrors`, which counts accepted writes that then
-    /// failed to land — never sum the two into one "lost writes" number.
+    /// Writes REFUSED at admission because the bounded queue was full. Same
+    /// object scope as `enqueued`. Disjoint from `writeErrors`, which counts
+    /// accepted writes that then failed to land — never sum the two into one
+    /// "lost writes" number.
     pub queue_drops: f64,
     /// Bytes that LANDED, credited after the payload sync, the commit rename
     /// and the directory fsync all succeeded. Not an enqueue-time estimate:
@@ -931,12 +934,14 @@ pub fn cold_cache_stats() -> ColdCacheStatsJs {
 /// Snapshot of [`ColdSidecarTelemetry`] for JS. Counters are cumulative since
 /// process start; all values are `f64` to avoid BigInt round-trips.
 ///
-/// Separate from [`ColdCacheStatsJs`] because the two count different objects:
-/// that one counts paged K/V BLOCKS, this one counts SIDECARS — the recurrent
-/// and sliding-window state that lives outside the pool. Both structs carry an
-/// `enqueued` and a `queue_drops`; they are not the same number and must never
-/// be summed. The JS side keeps them apart by prefix (`coldEnqueued` vs
-/// `coldSidecarEnqueued`).
+/// Separate from [`ColdCacheStatsJs`] because this one isolates SIDECARS — the
+/// recurrent and sliding-window state that lives outside the pool — while that
+/// one is scoped to the write queue as a whole. Both structs carry an
+/// `enqueued` and a `queue_drops`, and they are NOT disjoint: a sidecar
+/// admission bumps both, so these are a subset of those and summing them
+/// double-counts. The JS side keeps them apart by prefix (`coldEnqueued` vs
+/// `coldSidecarEnqueued`); read the sidecar pair when you need "did the family
+/// state persist?", the block pair when you need "is the writer keeping up?".
 #[napi(object, js_name = "ColdSidecarStats")]
 #[derive(Clone, Debug, Default)]
 pub struct ColdSidecarStatsJs {

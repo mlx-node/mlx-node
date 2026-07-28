@@ -550,9 +550,9 @@ Two native structs, two `#[napi]` readers, one JSONL line per turn:
 
 ```
 ColdCacheStats    coldCacheStats()     hits misses enqueued queueDrops bytesWritten
-  (paged blocks)                       bytesRestored evictions corruptions
-                                       writeErrors restoreDeclines
-                                       + enabled root quotaBytes  (tier identity)
+  (the tier: reads                     bytesRestored evictions corruptions
+   block-scoped, the                   writeErrors restoreDeclines
+   write queue object-scoped)          + enabled root quotaBytes  (tier identity)
 
 ColdSidecarStats  coldSidecarStats()   captureReached chainEmpty boundarySkips
   (out-of-pool                         alreadyPersisted enqueued queueDrops installed
@@ -564,8 +564,18 @@ ColdSidecarStats  coldSidecarStats()   captureReached chainEmpty boundarySkips
 
 `coldSidecarStats` is a **separate** reader on purpose. It never consults the tier, so
 it reports on a run where the tier failed to open — which is exactly the run that needs
-it. It is also why both prefixes exist: `ColdCacheStats.enqueued` counts K/V blocks and
-`ColdSidecarStats.enqueued` counts sidecars, and summing them is meaningless.
+it. It is also why both prefixes exist.
+
+The two `enqueued` / `queueDrops` pairs are **nested, not disjoint** — the one place the
+scopes differ. `ColdCacheStats` answers *is the writer keeping up?*, so it counts every
+object that took a slot in the shared queue, sidecars included; `ColdSidecarStats`
+answers *did the family state persist?*, so it isolates the sidecars. **Summing them
+double-counts every sidecar.** Read the block pair for queue health and the sidecar pair
+for chain health. Scoping the queue counters to blocks would look tidier and would hide
+the failure that matters most: a capture walk that fills the queue and starves the
+sidecar leaves the whole turn's chain unrestorable, and only `ColdCacheStats.queueDrops`
+reaches the dashboard. `ColdCacheStats.hits` and `bytesRestored` stay block-only, and
+say so.
 
 `installed` is the only read-side counter, and it is the one that cannot be inferred.
 Every `install_*_cold_sidecar` early-return falls through to a full O(prefix) replay

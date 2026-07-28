@@ -252,11 +252,15 @@ export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, numbe
    */
   coldSidecarAlreadyPersisted?: number;
   /**
-   * Sidecars handed to the writer queue this turn. NOT the same number as
-   * {@link coldEnqueued}, which counts paged K/V blocks — never sum them.
+   * Sidecars handed to the writer queue this turn. A SUBSET of
+   * {@link coldEnqueued}, which counts every object that took a queue slot —
+   * so summing them double-counts each sidecar.
    */
   coldSidecarEnqueued?: number;
-  /** Sidecars the writer queue refused because it was full. */
+  /**
+   * Sidecars the writer queue refused because it was full. Likewise a subset
+   * of {@link coldQueueDrops}, not a separate population.
+   */
   coldSidecarQueueDrops?: number;
   /**
    * Restored sidecars a family INSTALLED as its live per-turn state. The one

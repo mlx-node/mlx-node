@@ -450,7 +450,9 @@ export default function Cache() {
               <HealthStat
                 label="Queue drops"
                 value={formatNumber(health?.queueDrops ?? 0)}
-                hint={`cumulative max ${formatNumber(health?.queueDropsTotal ?? 0)} · ${formatNumber(health?.enqueued ?? 0)} enqueued`}
+                // Both numbers are object-scoped — blocks and family state sidecars
+                // share this queue, so "objects" is what the counter actually counts.
+                hint={`cumulative max ${formatNumber(health?.queueDropsTotal ?? 0)} · ${formatNumber(health?.enqueued ?? 0)} objects enqueued`}
                 alarm={(health?.queueDropsTotal ?? 0) > 0}
                 loading={cache.loading}
               />

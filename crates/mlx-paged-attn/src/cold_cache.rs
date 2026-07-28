@@ -528,8 +528,17 @@ pub struct RestorePrefixIdentity {
 pub struct ColdCacheStats {
     pub hits: u64,
     pub misses: u64,
+    /// Writes ACCEPTED onto the bounded queue — every object that took a slot,
+    /// blocks and family state sidecars alike. Object-scoped on purpose: the
+    /// queue is shared, so "is the writer keeping up?" can only be answered by
+    /// counting everything that entered it. The sidecar telemetry in
+    /// `mlx-core` counts a SUB-set of this, not a disjoint peer — never sum
+    /// the two.
     pub enqueued: u64,
-    /// Writes REFUSED at admission because the bounded queue was full. The
+    /// Writes REFUSED at admission because the bounded queue was full. Same
+    /// object scope as [`Self::enqueued`], and a starved sidecar is the failure
+    /// this counter most needs to show: a turn that loses one restores nothing
+    /// at all. The
     /// counterpart of [`Self::write_errors`], and deliberately disjoint from
     /// it: this one is the producer's problem (offer rate above writer
     /// throughput), that one is the storage's. A single write can only ever be
@@ -5296,6 +5305,62 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    // A refused sidecar is a queue drop. `queue_drops` answers "did the write
+    // queue refuse work?", and the queue is shared: a sidecar occupies a slot
+    // exactly as a block does.
+    //
+    // Scoping this counter to blocks would read like a tightening and would
+    // instead hide the failure this whole bounded-wait path exists to prevent.
+    // `ColdSidecarTelemetry.queue_drops` is not among the sidecar fields the
+    // dashboard stores, so a run whose capture walk fills the queue and starves
+    // the sidecar every turn — the chain then restores nothing — would report a
+    // perfectly healthy queue and leave the drop alarm silent.
+    //
+    // `saturate` fills the queue through the raw sender rather than `enqueue`,
+    // so the counters below see the sidecar and nothing else.
+    #[test]
+    fn a_refused_sidecar_is_counted_as_a_queue_drop() {
+        let root = temp_root("sidecar-queue-drop");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let release = slow_writer(&manager, 2_000);
+        assert_eq!(
+            saturate(&manager, 2),
+            2,
+            "the queue must be full before the refusal is measured"
+        );
+
+        let key = ColdCacheKey::chain(
+            ColdGroup::GdnState,
+            fingerprint(),
+            None,
+            &[4, 3, 2, 1],
+            &[],
+            0,
+            0,
+        );
+        assert!(
+            !manager
+                .enqueue_sidecar(sidecar(key, ColdGroup::GdnState))
+                .unwrap(),
+            "a full queue refuses the non-blocking sidecar offer"
+        );
+
+        let stats = manager.stats();
+        assert_eq!(
+            stats.queue_drops, 1,
+            "the refused sidecar is the queue's refusal to count"
+        );
+        assert_eq!(
+            stats.enqueued, 0,
+            "nothing was admitted through `send_before`"
+        );
+
+        release.store(true, Ordering::Relaxed);
+        *manager.shared.dir_sync_override.lock().unwrap() = None;
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
     // A post-rename directory fsync failure must leave in-process accounting
     // consistent with the on-disk canonical file: the rename is the true
     // commit point (the payload was already `sync_all`'d), so the index entry
@@ -6442,6 +6507,20 @@ mod tests {
         assert_eq!(
             stats.bytes_written, 0,
             "`bytes_written` is landed bytes: a deleted root must credit none"
+        );
+        // `write_errors` is documented as a SUBSET of `enqueued`, and this row is
+        // the only one where the subset is non-trivial: the object that failed is
+        // a sidecar. Counting admissions per block kind would leave `enqueued` at
+        // 0 beside a `write_errors` of 1 and break the invariant here.
+        assert_eq!(
+            stats.enqueued, 1,
+            "a sidecar took a queue slot, so it is an admission"
+        );
+        assert!(
+            stats.write_errors <= stats.enqueued,
+            "`write_errors` must stay a subset of `enqueued` ({} > {})",
+            stats.write_errors,
+            stats.enqueued
         );
         assert_eq!(stats.queue_drops, 0, "the queue was never full");
         assert_eq!(stats.corruptions, 0);

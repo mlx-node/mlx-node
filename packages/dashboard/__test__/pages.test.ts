@@ -178,7 +178,7 @@ describe('Cache page', () => {
     expect(text).toContain('Corruptions');
     expect(text).toContain('none seen (acceptance bar: 0)');
     expect(text).toContain('Queue drops');
-    expect(text).toContain('cumulative max 6 · 500 enqueued');
+    expect(text).toContain('cumulative max 6 · 500 objects enqueued');
     expect(text).toContain('Evictions');
     expect(text).toContain('Bytes restored');
     expect(text).toContain('Write errors');
