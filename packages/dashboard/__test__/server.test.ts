@@ -27,7 +27,7 @@ import { openDashboardDb } from '../src/db/open.js';
 import { DownloadsClosedError, type DownloadEvent } from '../src/download.js';
 import { TRACE_RETENTION_DAYS } from '../src/ingest/traces.js';
 import { agentSessionsRoot } from '../src/paths.js';
-import { bracketHost, startDashboardServer, type DashboardServer } from '../src/server.js';
+import { bindAllowedHosts, bracketHost, startDashboardServer, type DashboardServer } from '../src/server.js';
 
 const FIXTURE_SESSIONS = fileURLToPath(new URL('./fixtures/sessions', import.meta.url));
 const FIXTURE_TRACES = fileURLToPath(new URL('./fixtures/traces', import.meta.url));
@@ -2761,6 +2761,125 @@ describe('dashboard server — bracketHost display URL (every IPv6 literal)', ()
     // A `%zone` id cannot ride in a WHATWG URL, but the printed string must at
     // least be bracketed (not a raw `fe80::1%en0:PORT`) and must not crash.
     expect(bracketHost('fe80::1%en0')).toBe('[fe80::1%en0]');
+  });
+});
+
+// The Host allowlist is compared against an authority that has been through
+// `new URL(...)`, which does more than ASCII-lowercase: it also compresses IPv6
+// literals and re-spells IPv4-mapped ones. A bind host stored verbatim therefore
+// drifts from every request the browser sends, and a server that bound fine
+// answers 403 to everything. Asserted on the exported builder because a
+// non-loopback IPv6 address cannot actually be bound here.
+describe('dashboard server — bind host canonicalized like the request authority', () => {
+  /** The exact hostname `classifyHost` derives from a browser `Host` header. */
+  function requestHostname(host: string): string {
+    const authority = new URL(`http://${bracketHost(host)}:6590`).host;
+    return authority.startsWith('[') ? authority.slice(1, authority.indexOf(']')) : authority.split(':')[0]!;
+  }
+
+  it('compresses a full-length IPv6 bind host to the spelling requests carry', () => {
+    const hosts = bindAllowedHosts('2001:0db8:0000:0000:0000:0000:0000:0001');
+    expect(hosts.has('2001:db8::1')).toBe(true);
+  });
+
+  it('lowercases an uppercase-hex IPv6 bind host', () => {
+    expect(bindAllowedHosts('2001:DB8::1').has('2001:db8::1')).toBe(true);
+    expect(bindAllowedHosts('FE80::ABCD').has('fe80::abcd')).toBe(true);
+  });
+
+  it('re-spells an IPv4-mapped literal the way the URL parser does', () => {
+    expect(bindAllowedHosts('::ffff:192.168.1.9').has('::ffff:c0a8:109')).toBe(true);
+  });
+
+  it('admits every spelling the request side can normalize to', () => {
+    const spellings = [
+      '2001:0db8:0000:0000:0000:0000:0000:0001',
+      '2001:0DB8:0000:0000:0000:0000:0000:0001',
+      '2001:db8::1',
+      'fe80::ABCD',
+      '::ffff:192.168.1.9',
+      '192.168.31.204',
+    ];
+    // Deliberately absent: a leading-zero IPv4 like `192.168.031.204`. The URL
+    // parser reads `031` as octal (→ .25.204) while getaddrinfo reads it as
+    // decimal (→ .31.204), so no allowlist spelling can match the bound socket;
+    // that input is unusable either way and must not be presented as supported.
+    for (const host of spellings) {
+      expect(bindAllowedHosts(host).has(requestHostname(host))).toBe(true);
+    }
+  });
+
+  it('keeps a hostname bind working and does not IPv6-ify it', () => {
+    const hosts = bindAllowedHosts('MyMac.local');
+    expect(hosts.has('mymac.local')).toBe(true);
+    expect(hosts.has('[mymac.local]')).toBe(false);
+    expect(bindAllowedHosts('localhost').has('localhost')).toBe(true);
+  });
+
+  it('keeps the loopback names and does not widen past the configured host', () => {
+    const hosts = bindAllowedHosts('2001:0db8:0000:0000:0000:0000:0000:0001');
+    for (const local of ['localhost', '127.0.0.1', '::1']) expect(hosts.has(local)).toBe(true);
+    expect(hosts.has('2001:db8::2')).toBe(false);
+    expect(hosts.has('evil.example')).toBe(false);
+    expect(hosts.size).toBe(4);
+  });
+
+  it('never lifts a bare host out of a bind string carrying more than a host', () => {
+    // Canonicalizing must not turn an unbindable string into a usable allowlist
+    // entry: `evil.example` is not what `--host` named.
+    for (const smuggled of ['evil.example/@ok', 'evil.example?x', 'user@evil.example', 'evil.example:8080']) {
+      expect(bindAllowedHosts(smuggled).has('evil.example')).toBe(false);
+    }
+  });
+
+  it('does not throw on a scoped link-local bind host', () => {
+    // `new URL` rejects the `%zone`; the builder must fall back, not crash.
+    expect(() => bindAllowedHosts('fe80::1%en0')).not.toThrow();
+    expect(bindAllowedHosts('fe80::1%en0').has('fe80::1%en0')).toBe(true);
+  });
+
+  // The whole path over a real socket. An IPv4-mapped bind is the one non-loopback
+  // *spelling* reachable without a second machine: macOS binds `::ffff:127.0.0.1`,
+  // and the client rewrites the authority to `[::ffff:7f00:1]:PORT` on the wire — so
+  // a verbatim allowlist entry answers 403 to the very URL the dashboard printed.
+  it('answers its own advertised URL when the bind host is a non-canonical literal', async () => {
+    let bound: DashboardServer;
+    try {
+      bound = await startDashboardServer({
+        port: 0,
+        host: '::ffff:127.0.0.1',
+        dbPath: ':memory:',
+        sessionsRoot,
+        tracesDir,
+        modelsDir,
+        cacheRoot,
+        webRoot,
+      });
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // Some sandboxes/kernels refuse an IPv4-mapped bind; an environment limit.
+      if (code === 'EPERM' || code === 'EACCES' || code === 'EADDRNOTAVAIL' || code === 'EAFNOSUPPORT') return;
+      throw err;
+    }
+    try {
+      expect(bound.url).toBe(`http://[::ffff:127.0.0.1]:${bound.port}`);
+      const res = await fetch(`${bound.url}/health`);
+      expect(res.status).toBe(200);
+    } finally {
+      await bound.close();
+    }
+  });
+
+  it('stores interface addresses in the same canonical spelling', () => {
+    // A wildcard bind enumerates addresses the user never typed; they must land
+    // in the set already normalized, or a LAN client's Host cannot match.
+    const hosts = bindAllowedHosts('0.0.0.0');
+    for (const addrs of Object.values(networkInterfaces())) {
+      for (const a of addrs ?? []) {
+        if (a.address.includes('%')) continue; // scoped: never reaches a browser Host
+        expect(hosts.has(requestHostname(a.address))).toBe(true);
+      }
+    }
   });
 });
 

@@ -273,6 +273,11 @@ export class DownloadsClosedError extends Error {
  */
 type JobStatus = 'running' | 'committing' | 'done' | 'error' | 'cancelled';
 
+/** A settled job: it holds no in-flight work and no longer owns its repo. */
+function isTerminal(state: JobStatus): boolean {
+  return state === 'done' || state === 'error' || state === 'cancelled';
+}
+
 interface JobState {
   id: string;
   repo: string;
@@ -356,12 +361,25 @@ export class DownloadManager {
    * `overwrite` (default false) permits replacing a final dir the downloader does
    * not own; callers (the API/UI) leave it unset so an unowned local checkpoint
    * is never silently destroyed.
+   *
+   * At most ONE nonterminal job exists per repo: a request that arrives while a
+   * job for that repo is queued or in flight hands back THAT job's id instead of
+   * allocating another. The Models page tracks a single job id per repo, so a
+   * duplicate request (a double-click on Install, or a second dashboard tab whose
+   * card still reads Install) would otherwise leave an untracked twin that Cancel
+   * can no longer reach yet that still downloads and installs. Reusing keeps the
+   * request idempotent — no 409 for the SPA to render as a red failure — and
+   * matches the stance {@link processJob} already takes below, where re-asking for
+   * an already-published repo+revision short-circuits to `done` rather than
+   * erroring. The existing job's `overwrite` stands; it is not re-negotiated.
    */
   start(repo: string, opts?: { overwrite?: boolean }): string {
     if (this.closed) throw new DownloadsClosedError();
     if (!MODEL_CATALOG.some((entry) => entry.hfRepo === repo)) {
       throw new Error(`Repo "${repo}" is not in the model catalog`);
     }
+    const active = this.activeJobFor(repo);
+    if (active !== undefined) return active.id;
     const id = randomUUID();
     this.jobsById.set(id, {
       id,
@@ -377,6 +395,20 @@ export class DownloadManager {
     this.queue.push(id);
     void this.drain();
     return id;
+  }
+
+  /**
+   * The one nonterminal (queued / in-flight / committing) job for `repo`, if any.
+   * Derived from `jobsById` on demand rather than kept in a repo→id index, so it
+   * can never go stale: every terminal transition and every dismissal already
+   * updates `jobsById`, and a second structure would have to be cleared at each of
+   * those sites. The registry holds at most a handful of catalog repos.
+   */
+  private activeJobFor(repo: string): JobState | undefined {
+    for (const job of this.jobsById.values()) {
+      if (job.repo === repo && !isTerminal(job.state)) return job;
+    }
+    return undefined;
   }
 
   /**
@@ -408,7 +440,7 @@ export class DownloadManager {
     // Terminal-dismiss: a settled job carries no in-flight work and is not the
     // `currentJob`, so evicting it from every tracking structure is safe and lets
     // the DELETE route succeed instead of 404ing on a failed card.
-    if (job.state === 'error' || job.state === 'cancelled' || job.state === 'done') {
+    if (isTerminal(job.state)) {
       this.jobsById.delete(id);
       const at = this.order.indexOf(id);
       if (at !== -1) this.order.splice(at, 1);

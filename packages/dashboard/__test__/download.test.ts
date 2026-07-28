@@ -219,6 +219,8 @@ async function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<void> {
 
 const REPO = MODEL_CATALOG[0]!.hfRepo;
 const SLUG = REPO.split('/').pop()!.toLowerCase();
+/** A SECOND catalog repo, for the cases that need two genuinely distinct jobs. */
+const REPO_OTHER = MODEL_CATALOG[1]!.hfRepo;
 
 let modelsDir: string;
 let cacheDir: string;
@@ -1483,6 +1485,104 @@ describe('DownloadManager', () => {
     expect(() => manager.start('someone/not-in-catalog')).toThrow();
   });
 
+  // Two POSTs for one repo before the first response lands (a double-click on
+  // Install, or a second dashboard tab whose card still reads Install) used to
+  // allocate two jobs. The Models page keeps ONE job id per repo, so it tracked
+  // only the last: cancelling the visible card left the other job downloading —
+  // and publishing — with no card to stop it. A repo that already has a
+  // nonterminal job hands back THAT job's id, so the second request is idempotent.
+  it('reuses the in-flight job for a repo instead of allocating a second one', async () => {
+    let blocked = false;
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeCancelFetch({ 'config.json': 12, 'model.safetensors': 300 }, 'model.safetensors', () => {
+        blocked = true;
+      }),
+    });
+    const id1 = manager.start(REPO);
+    await waitFor(() => blocked);
+
+    expect(manager.start(REPO)).toBe(id1);
+    expect(manager.jobs().filter((job) => job.repo === REPO)).toHaveLength(1);
+
+    // The id the UI tracks is the only running job, so Cancel really stops it.
+    expect(manager.cancel(id1)).toBe(true);
+    await waitFor(() => manager.jobs().find((job) => job.id === id1)!.state === 'cancelled');
+    await waitFor(() => jobStagingDirs().length === 0);
+    expect(existsSync(finalDir())).toBe(false);
+  });
+
+  // The reuse covers a job that is still QUEUED (behind another repo's download)
+  // as well as the in-flight one, and never collapses two DIFFERENT repos.
+  it('reuses a queued job for the same repo but keeps a different repo on its own job', async () => {
+    let blocked = false;
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeCancelFetch({ 'config.json': 12, 'model.safetensors': 300 }, 'model.safetensors', () => {
+        blocked = true;
+      }),
+    });
+    // Occupy the single-threaded drain with a different repo's job.
+    const idOther = manager.start(REPO_OTHER);
+    await waitFor(() => blocked);
+
+    const queued = manager.start(REPO);
+    expect(queued).not.toBe(idOther);
+    expect(manager.start(REPO)).toBe(queued);
+    expect(manager.jobs()).toHaveLength(2);
+
+    expect(manager.cancel(queued)).toBe(true);
+    expect(manager.cancel(idOther)).toBe(true);
+    await waitFor(() => manager.jobs().every((job) => job.state === 'cancelled'));
+  });
+
+  // Over-correction guard: reuse must apply ONLY while a job is nonterminal. Once
+  // the first attempt has failed, Install must start a genuinely new job and
+  // install — never hand back the settled failure forever.
+  it('allocates a FRESH job once the previous one for that repo failed, so a retry installs', async () => {
+    hub.failOn = ['model.safetensors'];
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events1: DownloadEvent[] = [];
+    const id1 = manager.start(REPO);
+    manager.subscribe(id1, (event) => events1.push(event));
+    await waitFor(() => events1.some((event) => event.type === 'error'));
+
+    hub.failOn = [];
+    const id2 = manager.start(REPO);
+    expect(id2).not.toBe(id1);
+    await waitFor(() => manager.jobs().some((job) => job.id === id2 && job.state === 'done'));
+    expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
+  });
+
+  // Over-correction guard: the same for a CANCELLED job — the card resets to
+  // Install, and that Install must run rather than resolve to the cancelled job.
+  it('allocates a FRESH job once the previous one for that repo was cancelled', async () => {
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events1: DownloadEvent[] = [];
+    const id1 = manager.start(REPO);
+    manager.subscribe(id1, (event) => events1.push(event));
+    stagingHook.onVerifyWindow = () => {
+      manager.cancel(id1);
+    };
+    await waitFor(() => events1.some((event) => event.type === 'cancelled'));
+    await waitFor(() => jobStagingDirs().length === 0);
+
+    const id2 = manager.start(REPO);
+    expect(id2).not.toBe(id1);
+    await waitFor(() => manager.jobs().some((job) => job.id === id2 && job.state === 'done'));
+    expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
+  });
+
   // Finding C: an untrusted `listFiles` path is about to become a
   // `join(stagingDir, path)` write target. A traversal or absolute path must be
   // refused (fail closed) at ingestion — nothing is written outside stagingDir.
@@ -1580,8 +1680,9 @@ describe('DownloadManager', () => {
     const id1 = manager.start(REPO);
     await waitFor(() => blocked);
 
-    // Job 2 queues behind it and is cancelled before it can run.
-    const id2 = manager.start(REPO);
+    // Job 2 (a DIFFERENT repo — a same-repo request would reuse job 1) queues
+    // behind it and is cancelled before it can run.
+    const id2 = manager.start(REPO_OTHER);
     const events2: DownloadEvent[] = [];
     manager.subscribe(id2, (event) => events2.push(event));
     expect(manager.cancel(id2)).toBe(true);
@@ -1796,8 +1897,9 @@ describe('DownloadManager', () => {
     const id1 = manager.start(REPO);
     await waitFor(() => blocked);
 
-    // Job 2 queues behind it (drain is busy) and has not started.
-    const id2 = manager.start(REPO);
+    // Job 2 (a DIFFERENT repo — a same-repo request would reuse job 1) queues
+    // behind it (drain is busy) and has not started.
+    const id2 = manager.start(REPO_OTHER);
     const events2: DownloadEvent[] = [];
     manager.subscribe(id2, (event) => events2.push(event));
 

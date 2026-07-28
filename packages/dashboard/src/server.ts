@@ -63,31 +63,6 @@ export function bracketHost(host: string): string {
   return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
 }
 
-/**
- * Build the Host/Origin allowlist for a bind. A concrete host allows the
- * loopback names plus that exact host. A wildcard bind (`0.0.0.0`, `::`, or the
- * empty string) cannot allowlist the literal wildcard — no browser ever sends it
- * as `Host` — so it enumerates the machine's real interface addresses instead: a
- * LAN client's `Host: <iface-ip>:<port>` then matches while a rebound
- * `Host: evil.example` (no matching local IP) is still rejected, preserving the
- * DNS-rebinding defense. `networkInterfaces()` is a boot snapshot, adequate for a
- * local tool; IPv6 zone ids (`fe80::1%en0`) never appear in a browser Host, so
- * link-local entries are inert.
- */
-function bindAllowedHosts(host: string): Set<string> {
-  const wildcard = host === '0.0.0.0' || host === '::' || host === '';
-  // Hostnames are ASCII case-insensitive, and request classification normalizes the
-  // authority through `new URL(...)` (which ASCII-lowercases the host). Lowercase the
-  // configured host too so a mixed-case `--host MyMac.local` isn't rejected 403 on
-  // every request even though the server bound to it successfully.
-  if (!wildcard) return new Set([...LOCAL_HOSTNAMES, host.toLowerCase()]);
-  const hosts = new Set<string>(LOCAL_HOSTNAMES);
-  for (const addrs of Object.values(networkInterfaces())) {
-    for (const a of addrs ?? []) hosts.add(a.address);
-  }
-  return hosts;
-}
-
 /** Split a `Host`/URL authority into hostname + optional port, handling `[::1]`. */
 function splitHostPort(authority: string): { hostname: string; port: string } {
   if (authority.startsWith('[')) {
@@ -101,6 +76,53 @@ function splitHostPort(authority: string): { hostname: string; port: string } {
   // A bare IPv6 literal (multiple colons, unbracketed) has no port component.
   if (colon === -1 || authority.indexOf(':', colon + 1) !== -1) return { hostname: authority, port: '' };
   return { hostname: authority.slice(0, colon), port: authority.slice(colon + 1) };
+}
+
+/**
+ * Rewrite a bind host into the exact spelling a request carries by the time it is
+ * compared, i.e. after the same `new URL(...)` authority parse `classifyHost` runs.
+ * That parser does more than ASCII-lowercase a hostname: it also compresses IPv6
+ * literals and re-spells IPv4-mapped ones, so a host kept verbatim here
+ * (`2001:0db8:0000:0000:0000:0000:0000:0001`, `::ffff:127.0.0.1`) can never equal the
+ * `2001:db8::1` / `::ffff:7f00:1` a browser sends, and a server that bound fine
+ * answers 403 to every request.
+ *
+ * A host the parser rejects (a scoped `fe80::1%en0`) or one carrying anything beyond
+ * a bare host keeps its lowercased spelling: no request authority normalizes to those
+ * either, so the fallback can only leave the allowlist narrower, never wider — the
+ * `href` check is what stops a `--host evil.example/x` from being lifted into the
+ * usable entry `evil.example`.
+ */
+function canonicalHost(host: string): string {
+  try {
+    const url = new URL(`http://${bracketHost(host)}`);
+    if (url.port === '' && url.href === `http://${url.host}/`) return splitHostPort(url.host).hostname;
+  } catch {
+    // Not a parseable authority; the raw spelling is the best available.
+  }
+  return host.toLowerCase();
+}
+
+/**
+ * Build the Host/Origin allowlist for a bind. A concrete host allows the
+ * loopback names plus that exact host. A wildcard bind (`0.0.0.0`, `::`, or the
+ * empty string) cannot allowlist the literal wildcard — no browser ever sends it
+ * as `Host` — so it enumerates the machine's real interface addresses instead: a
+ * LAN client's `Host: <iface-ip>:<port>` then matches while a rebound
+ * `Host: evil.example` (no matching local IP) is still rejected, preserving the
+ * DNS-rebinding defense. `networkInterfaces()` is a boot snapshot, adequate for a
+ * local tool; IPv6 zone ids (`fe80::1%en0`) never appear in a browser Host, so
+ * link-local entries are inert. Configured and enumerated hosts alike go through
+ * `canonicalHost`, so neither side of the comparison can drift from the other.
+ */
+export function bindAllowedHosts(host: string): Set<string> {
+  const wildcard = host === '0.0.0.0' || host === '::' || host === '';
+  if (!wildcard) return new Set([...LOCAL_HOSTNAMES, canonicalHost(host)]);
+  const hosts = new Set<string>(LOCAL_HOSTNAMES);
+  for (const addrs of Object.values(networkInterfaces())) {
+    for (const a of addrs ?? []) hosts.add(canonicalHost(a.address));
+  }
+  return hosts;
 }
 
 /**
