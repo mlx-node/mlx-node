@@ -882,10 +882,17 @@ async function handleSessionDetail({ res, params, deps }: RouteCtx): Promise<voi
       // natural leaf is a detached `session_info` (e.g. after a rename), this
       // re-projects from the latest message-bearing leaf — never a flat union of
       // every abandoned branch, which would resurrect superseded turns.
+      //
+      // The branch walk returns a root-to-leaf parent chain, which IS the order to
+      // render: a tool result follows its call because it is that call's child.
+      // Re-sorting by wall clock would let a clock step backwards, or one message
+      // with no parseable timestamp (`ts = 0`, which the topology guard accepts),
+      // hoist a result above its call — and would then disagree with `firstMessage`,
+      // which the index derives from this same chain without sorting. `ts` is for
+      // display only.
       const branch = activeBranchEntries(entries);
       const callArgs = collectCallArgs(branch);
       transcript = branch.map((entry) => mapTranscriptEntry(entry, callArgs)).filter(isMessage);
-      transcript.sort((a, b) => a.ts - b.ts);
     }
   }
   sendJson(res, 200, {

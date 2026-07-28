@@ -887,6 +887,71 @@ describe('dashboard server — sessions', () => {
     expect(resultEntry?.title).toBe('/callproj/src/lib.rs');
   });
 
+  it('renders the causal parent chain, not the wall clock', async () => {
+    // A clock step backwards mid-session (an NTP correction) makes the tool result
+    // and the closing reply older than the prompt that caused them. The branch walk
+    // returns them in parent order; ordering by `ts` instead would render the result
+    // card ABOVE the assistant bubble holding its call, and the reply above the
+    // prompt — while the session list still shows the correct first message, because
+    // the index derives `firstMessage` from the same chain WITHOUT sorting.
+    //
+    // The step-back is load-bearing: with a monotonic fixture this passes with or
+    // without a sort, and would pin nothing.
+    const dir = join(sessionsRoot, '--clockstep--');
+    mkdirSync(dir, { recursive: true });
+    const lines = [
+      { type: 'session', version: 3, id: 'clock-1', timestamp: '2026-07-20T10:00:00.000Z', cwd: '/clockstep' },
+      {
+        type: 'message',
+        id: 'u1',
+        parentId: null,
+        timestamp: '2026-07-20T10:00:10.000Z',
+        message: { role: 'user', content: 'read it' },
+      },
+      {
+        type: 'message',
+        id: 'a1',
+        parentId: 'u1',
+        timestamp: '2026-07-20T10:00:11.000Z',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'toolCall', id: 'call_step', name: 'read', arguments: { path: '/clockstep/lib.rs' } }],
+        },
+      },
+      {
+        type: 'message',
+        id: 'r1',
+        parentId: 'a1',
+        timestamp: '2026-07-20T10:00:05.000Z',
+        message: {
+          role: 'toolResult',
+          toolCallId: 'call_step',
+          toolName: 'read',
+          content: [{ type: 'text', text: 'fn main() {}' }],
+        },
+      },
+      {
+        type: 'message',
+        id: 'a2',
+        parentId: 'r1',
+        timestamp: '2026-07-20T10:00:06.000Z',
+        message: { role: 'assistant', content: 'done' },
+      },
+    ];
+    writeFileSync(join(dir, 'clock.jsonl'), `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
+    await ingest();
+
+    const detail = (await (await fetch(`${server.url}/api/sessions/clock-1`)).json()) as {
+      session: { firstMessage: string | null };
+      transcript: Array<{ role: string; text: string }>;
+    };
+
+    expect(detail.transcript.map((entry) => entry.role)).toEqual(['user', 'assistant', 'toolResult', 'assistant']);
+    // The list row and the transcript must agree on where the conversation starts.
+    expect(detail.session.firstMessage).toBe('read it');
+    expect(detail.transcript[0]?.text).toBe('read it');
+  });
+
   it('joins turns and traces for session metrics', async () => {
     await ingest();
     const res = await fetch(`${server.url}/api/sessions/fix-1/metrics`);
