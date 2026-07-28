@@ -140,14 +140,24 @@ async function gitBlobSha1(path: string): Promise<string> {
  *
  *   - size must match the manifest (fast gate, catches truncation);
  *   - if the manifest advertises `lfs.oid` (the LFS sha256 of the content), the
- *     file's sha256 must match it;
+ *     file's sha256 must match it. This is the branch every weight takes, Xet
+ *     included: a Xet-backed entry carries `oid`, `lfs.oid` AND `xetHash` at once,
+ *     and its `lfs.oid` is a plain sha256 of the bytes — so Xet files are content-
+ *     verified here, not size-checked;
  *   - else, for a plain file (no LFS, no Xet), the top-level git `oid` is the
  *     git-blob sha1 of the actual content, so the file's git-blob sha1 must match
- *     it. For Xet-backed files that `oid` hashes the pointer, not the content, so
- *     it is deliberately NOT used (a mismatch would force a needless re-fetch);
- *   - otherwise (no usable hash) fall back to size alone — the runner still
- *     cross-checks the full manifest before writing the completion marker, so a
- *     partial set can never be published as complete.
+ *     it. The `xetHash` clause excludes only the hypothetical Xet-without-LFS
+ *     entry, whose `oid` would hash the POINTER rather than the content — it is
+ *     not a statement that Xet files go unverified;
+ *   - otherwise (no usable hash) fall back to size alone. No real catalog entry
+ *     reaches this: across the API responses for the catalog repos every file
+ *     lands on one of the two branches above. The runner also cross-checks the
+ *     full manifest before writing the completion marker, so a partial set can
+ *     never be published as complete.
+ *
+ * `xetHash` is deliberately never recomputed: it is a Merkle/chunk hash over the
+ * Xet chunking, not a digest of the file, so verifying against it would mean
+ * reimplementing that chunker for no gain over the sha256 already checked.
  */
 async function isStagedCopyComplete(destPath: string, file: ListFileEntry): Promise<boolean> {
   if (!existsSync(destPath)) return false;

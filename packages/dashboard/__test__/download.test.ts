@@ -46,6 +46,8 @@ interface ManifestEntry {
   size: number;
   oid?: string;
   lfs?: { oid: string; size: number; pointerSize: number };
+  /** Present on every file in a Xet-backed repo, ALONGSIDE `oid` and `lfs.oid`. */
+  xetHash?: string;
 }
 
 // Shared, hoisted state the mocked `@huggingface/hub` reads/writes. Reset per test.
@@ -656,6 +658,49 @@ describe('DownloadManager', () => {
     // The corrupt cache entry failed sha256 → was invalidated → really re-fetched →
     // matched → published (without invalidation the retry would recopy the same blob).
     expect(hub.downloaded).toContain('model.safetensors');
+    expect(readFileSync(join(finalDir(), 'model.safetensors'))).toEqual(Buffer.alloc(300));
+    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
+  });
+
+  it('content-verifies a XET-backed weight, which carries all three digest fields at once', async () => {
+    // The shape a real Xet repo actually returns — checked against the live API for
+    // `Brooooooklyn/Qwen3.6-27B-NVFP4-mlx`, where every weight has `oid` AND
+    // `lfs.oid` AND `xetHash` together:
+    //
+    //   "oid": "a90b8dec…"                      git-blob sha1 of the POINTER
+    //   "lfs": { "oid": "4f44f844…" }           sha256 of the CONTENT
+    //   "xetHash": "8b5d1bdf…"                  Merkle/chunk hash, not recomputable here
+    //
+    // So a Xet weight is not a digest-less file: `lfs.oid` is a plain sha256 of the
+    // bytes (verified by fetching one and hashing it), and the resume check must
+    // take that branch. The `xetHash === undefined` clause on the git-blob branch
+    // exists only to keep the POINTER `oid` from being hashed against content — it
+    // must never read as "Xet files are unverifiable, accept on size".
+    hub.manifest = [
+      { type: 'file', path: 'config.json', size: 12, oid: zerosGitOid(12) },
+      {
+        type: 'file',
+        path: 'model.safetensors',
+        size: 300,
+        oid: 'a'.repeat(40),
+        lfs: { oid: zerosSha256(300), size: 300, pointerSize: 135 },
+        xetHash: 'b'.repeat(64),
+      },
+    ];
+    // Corrupt at EXACTLY the manifest size — the case size alone cannot catch.
+    seedCorruptCache('model.safetensors', hub.sha, 300);
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const id = manager.start(REPO);
+    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+
+    expect(hub.downloaded, 'a same-length corrupt Xet blob was accepted without a re-fetch').toContain(
+      'model.safetensors',
+    );
     expect(readFileSync(join(finalDir(), 'model.safetensors'))).toEqual(Buffer.alloc(300));
     expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
   });
