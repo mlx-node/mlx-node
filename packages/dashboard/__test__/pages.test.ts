@@ -1162,13 +1162,30 @@ describe('Models page — the Install affordance', () => {
     expect(dismissed(calls)).toEqual([]);
   });
 
-  it('leaves a job that is mid-publish alone', async () => {
+  it('hydrates a job that is mid-publish, and never dismisses it', async () => {
     // `committing` is the brief non-cancellable publish window. It is not
     // `running`, so a dismiss gated on `state !== "running"` fires a DELETE at a
     // job that is still installing a model — which is why the gate is the
     // terminal set instead.
+    //
+    // It is equally not absent: the catalog snapshot is read before the publish
+    // renames the model into place, so an unhydrated card offers Install for a
+    // model that is installing, subscribes to nothing, and — since neither query
+    // polls — never learns the job finished.
+    stubEventSource();
     const calls = recordRequests(catalogRoutes({}, [downloadJob({ id: 'job-commit', state: 'committing' })]));
     await mountModels();
+    expect(openedStreams).toEqual(['/api/downloads/job-commit/events']);
+    expect(buttonLabels()).not.toContain('Install');
     expect(dismissed(calls)).toEqual([]);
+  });
+
+  it('offers no Cancel for a publish the server refuses to cancel', async () => {
+    // `cancel()` rejects a `committing` job outright, so the route 404s and the
+    // button can only ever raise "Failed to cancel download".
+    stubEventSource();
+    recordRequests(catalogRoutes({}, [downloadJob({ id: 'job-commit', state: 'committing' })]));
+    await mountModels();
+    expect(buttonLabels()).not.toContain('Cancel');
   });
 });

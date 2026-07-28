@@ -58,6 +58,17 @@ function isTerminalJob(state: DownloadJob['state']): boolean {
   return state === 'done' || state === 'error' || state === 'cancelled';
 }
 
+/**
+ * A download this page is following: the one job the server holds for a repo
+ * while it is neither settled nor absent. `committing` is carried because the
+ * card has to drop its Cancel there — `cancel()` refuses a publishing job, so the
+ * button could only ever raise a red toast.
+ */
+interface ActiveJob {
+  id: string;
+  committing: boolean;
+}
+
 function QuantBadge({ quant }: { quant: string | null }) {
   if (quant === null) {
     return (
@@ -80,16 +91,24 @@ export default function Models() {
 
   const [pendingDelete, setPendingDelete] = useState<LocalModel | null>(null);
   const [deleting, setDeleting] = useState(false);
-  /** repo → active download job id (seeded from the server, added on install). */
-  const [active, setActive] = useState<Record<string, string>>({});
+  /** repo → active download job (seeded from the server, added on install). */
+  const [active, setActive] = useState<Record<string, ActiveJob>>({});
 
   useEffect(() => {
     const jobs = downloads.data?.jobs;
     if (jobs === undefined) return;
+    // Every NONTERMINAL job — the exact complement of the dismiss loop below, and
+    // deliberately not `state === 'running'`: `committing` is a job that is still
+    // installing a model. Its catalog snapshot was read before the publish renamed
+    // the model into place, so leaving it unhydrated offers Install for a model
+    // that is being installed, subscribes to nothing, and — neither query polls —
+    // never learns the job finished. The card would sit on a stale "absent" and
+    // the settled job would be retained server-side until the next mount.
     setActive((prev) => {
       const next = { ...prev };
       for (const job of jobs) {
-        if (job.state === 'running' && next[job.repo] === undefined) next[job.repo] = job.id;
+        if (isTerminalJob(job.state)) continue;
+        if (next[job.repo] === undefined) next[job.repo] = { id: job.id, committing: job.state === 'committing' };
       }
       return next;
     });
@@ -120,7 +139,7 @@ export default function Models() {
   const install = async (repo: string): Promise<void> => {
     try {
       const res = await mutate<DownloadStartResponse>('POST', '/downloads', { repo });
-      setActive((prev) => ({ ...prev, [repo]: res.id }));
+      setActive((prev) => ({ ...prev, [repo]: { id: res.id, committing: false } }));
     } catch (err) {
       toast.error('Failed to start download', { description: errMessage(err) });
     }
@@ -128,7 +147,7 @@ export default function Models() {
 
   const onDownloadDone = (repo: string): void => {
     toast.success('Download complete', { description: repo });
-    const id = active[repo];
+    const id = active[repo]?.id;
     setActive((prev) => {
       const next = { ...prev };
       delete next[repo];
@@ -148,7 +167,7 @@ export default function Models() {
 
   const onDownloadError = (repo: string, message: string): void => {
     toast.error('Download failed', { description: message });
-    const id = active[repo];
+    const id = active[repo]?.id;
     setActive((prev) => {
       const next = { ...prev };
       delete next[repo];
@@ -367,7 +386,7 @@ export default function Models() {
             <CatalogCard
               key={item.hfRepo}
               item={item}
-              jobId={active[item.hfRepo]}
+              job={active[item.hfRepo]}
               onInstall={() => install(item.hfRepo)}
               onDone={() => onDownloadDone(item.hfRepo)}
               onError={(message) => onDownloadError(item.hfRepo, message)}
@@ -405,18 +424,18 @@ export default function Models() {
 
 interface CatalogCardProps {
   item: CatalogItem;
-  jobId: string | undefined;
+  job: ActiveJob | undefined;
   onInstall: () => void;
   onDone: () => void;
   onError: (message: string) => void;
   onCancel: (id: string) => void;
 }
 
-function CatalogCard({ item, jobId, onInstall, onDone, onError, onCancel }: CatalogCardProps) {
+function CatalogCard({ item, job, onInstall, onDone, onError, onCancel }: CatalogCardProps) {
   // Gate on `present` (loadable checkpoint on disk), not `installed` (dashboard
   // marker): a model installed via the `mlx download` CLI / wizard is present but
   // unowned, so offering Install would refuse to overwrite it and fail.
-  const downloading = jobId !== undefined && !item.present;
+  const downloading = job !== undefined && !item.present;
 
   return (
     <Card className="gap-4">
@@ -438,18 +457,23 @@ function CatalogCard({ item, jobId, onInstall, onDone, onError, onCancel }: Cata
           </span>
           <span className="tabular-nums">~{item.sizeGb} GB</span>
         </div>
-        {downloading && jobId !== undefined ? (
+        {downloading && job !== undefined ? (
           <div className="space-y-2">
-            <DownloadProgress id={jobId} onDone={onDone} onError={onError} />
-            <Button
-              variant="ghost"
-              size="sm"
-              className="text-muted-foreground hover:text-destructive w-full"
-              onClick={() => onCancel(jobId)}
-            >
-              <X className="size-4" />
-              Cancel
-            </Button>
+            <DownloadProgress id={job.id} onDone={onDone} onError={onError} />
+            {/* No Cancel while publishing: `cancel()` refuses a `committing` job
+                and the route 404s, so the button could only report a failure for
+                an install that then succeeds anyway. The progress bar stays. */}
+            {!job.committing && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-muted-foreground hover:text-destructive w-full"
+                onClick={() => onCancel(job.id)}
+              >
+                <X className="size-4" />
+                Cancel
+              </Button>
+            )}
           </div>
         ) : item.present ? (
           <Button variant="outline" className="w-full" disabled>
