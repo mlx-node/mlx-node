@@ -152,6 +152,76 @@ describe('ingestTraces', () => {
     expect(cold.resident).toBe(0);
   });
 
+  /**
+   * The ingest mapping is written one line per column, so a field the agent
+   * emits and this list forgets is dropped in silence — which is what happened
+   * to seven of the eight `coldSidecar*` counters (only `restoreSuppressed` was
+   * mapped). `coldSidecarInstalled` is the one that cannot be re-derived from
+   * anything else in the row: every `install_*_cold_sidecar` early-return falls
+   * through to a full O(prefix) replay that produces CORRECT state, so a
+   * regression from "restored and used" to "restored and silently re-derived"
+   * leaves `cachedTokens`, `coldHits` and `coldCorruptions` untouched.
+   *
+   * Every value is DISTINCT, and the two object-scoped supersets
+   * (`coldEnqueued` / `coldQueueDrops`) carry values far from their sidecar
+   * subsets, so a column wired to its neighbour — or to the block counter that
+   * shares its name — cannot round-trip.
+   */
+  it('stores every cold sidecar counter, not just the suppressed one', async () => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, '2026-07-27-sidecar.jsonl'),
+      `${JSON.stringify({
+        v: 1,
+        traceId: 'trace-sidecar',
+        ts: 1782036502000,
+        model: 'qwen3_5',
+        durationMs: 100,
+        finishReason: 'stop',
+        promptTokens: 1,
+        cachedTokens: 0,
+        outputTokens: 1,
+        reasoningTokens: 0,
+        // Object-scoped: blocks AND sidecars share this queue, so these are the
+        // SUPERSETS of the two sidecar counters below, never their peers.
+        coldEnqueued: 90,
+        coldQueueDrops: 91,
+        coldSidecarCaptureReached: 11,
+        coldSidecarChainEmpty: 12,
+        coldSidecarBoundarySkips: 13,
+        coldSidecarAlreadyPersisted: 14,
+        coldSidecarEnqueued: 15,
+        coldSidecarQueueDrops: 16,
+        coldSidecarInstalled: 17,
+        coldSidecarRestoreSuppressed: 18,
+      })}\n`,
+    );
+    await ingestTraces(dash, dir);
+    const row = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-sidecar')).all()[0];
+    expect(row.coldEnqueued).toBe(90);
+    expect(row.coldQueueDrops).toBe(91);
+    expect(row.coldSidecarCaptureReached).toBe(11);
+    expect(row.coldSidecarChainEmpty).toBe(12);
+    expect(row.coldSidecarBoundarySkips).toBe(13);
+    expect(row.coldSidecarAlreadyPersisted).toBe(14);
+    expect(row.coldSidecarEnqueued).toBe(15);
+    expect(row.coldSidecarQueueDrops).toBe(16);
+    expect(row.coldSidecarInstalled).toBe(17);
+    expect(row.coldSidecarRestoreSuppressed).toBe(18);
+  });
+
+  // A record from a build that predates the sidecar counters must ingest them as
+  // NULL, not 0: `MAX(...) = 0` and "never recorded" are different answers, and
+  // only NULL keeps them apart.
+  it('leaves the cold sidecar counters NULL when a trace record omits them', async () => {
+    cpSync(FIXTURE_TRACES, dir, { recursive: true });
+    await ingestTraces(dash, dir);
+    const row = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-bbb')).all()[0];
+    expect(row.coldSidecarCaptureReached).toBeNull();
+    expect(row.coldSidecarInstalled).toBeNull();
+    expect(row.coldSidecarRestoreSuppressed).toBeNull();
+  });
+
   // Finding #7: older JSONL without the new fields ingests them as NULL, not 0.
   it('leaves queueMs/resident NULL when a trace record omits them', async () => {
     cpSync(FIXTURE_TRACES, dir, { recursive: true });

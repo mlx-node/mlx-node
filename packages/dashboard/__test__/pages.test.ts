@@ -22,6 +22,7 @@ import type {
   CacheResponse,
   CatalogItem,
   CatalogResponse,
+  ColdTierHealth,
   DownloadsResponse,
   MetricsOverviewResponse,
   ModelsResponse,
@@ -45,11 +46,18 @@ import { renderPage, stubChartMetrics, stubFetch, TICK_CHAR_PX, TICK_LINE_PX, ty
 const MIB = 1024 * 1024;
 
 /**
+ * `health` is overridable field-by-field: it now carries eighteen counters, and
+ * a test that must restate all of them to change one buries its own intent —
+ * and quietly acquires a second meaning every time a counter is added.
+ */
+type CacheFixtureOverrides = Omit<Partial<CacheResponse>, 'health'> & { health?: Partial<ColdTierHealth> };
+
+/**
  * The reported shape that produced the original bug report: 136 KV blocks plus
  * 2 state sidecars, a histogram summing to 138, and 16189 hits against 49
  * misses (99.6982 %).
  */
-function cacheFixture(overrides: Partial<CacheResponse> = {}): CacheResponse {
+function cacheFixture(overrides: CacheFixtureOverrides = {}): CacheResponse {
   return {
     disk: {
       root: '/tmp/cold/mlx-paged-v1',
@@ -93,6 +101,18 @@ function cacheFixture(overrides: Partial<CacheResponse> = {}): CacheResponse {
       writeErrorsTotal: 0,
       restoreDeclines: 0,
       restoreSuppressed: 0,
+      // A healthy hybrid run: the capture ran on every turn, wrote its sidecar
+      // once and re-found it thereafter, and the restore side installed what it
+      // was handed. `sidecarEnqueued` / `sidecarQueueDrops` sit UNDER the
+      // object-scoped `enqueued` / `queueDrops` above — they are the sidecar
+      // share of the same queue, never a second population.
+      sidecarCaptureReached: 20,
+      sidecarChainEmpty: 1,
+      sidecarBoundarySkips: 2,
+      sidecarAlreadyPersisted: 16,
+      sidecarEnqueued: 1,
+      sidecarQueueDrops: 0,
+      sidecarInstalled: 15,
       ...overrides.health,
     },
     restoreFamilies: overrides.restoreFamilies ?? ['gemma4', 'qwen3', 'qwen3_5', 'qwen3_5_moe'],
@@ -281,6 +301,113 @@ describe('Cache page', () => {
     );
     expect(text).toContain('cumulative max 3 — investigate');
     expect(text).not.toContain('none seen (acceptance bar: 0)');
+  });
+
+  /**
+   * `installed` is the one cold-tier counter that cannot be inferred from any
+   * other number on this page. Every `install_*_cold_sidecar` early-return
+   * falls through to a full O(prefix) replay that produces CORRECT state, so a
+   * regression from "restored and INSTALLED" to "restored and silently
+   * re-derived" leaves the hit rate, the trend, the bytes and the corruption
+   * count all exactly as they were. A counter that reaches the API and is
+   * never rendered is the same defect one layer up.
+   */
+  it('renders the sidecar install and capture counters', async () => {
+    const text = await mount(createElement(Cache), { '/cache': cacheFixture() }, 'mlx-paged-v1');
+    expect(text).toContain('Sidecar installs');
+    expect(text).toContain('restored prefixes that reused family state instead of replaying it');
+    expect(text).toContain('Sidecar captures');
+    // The write-side outcomes of those 20 captures: 1 wrote, 16 re-found the
+    // same chain on disk, 3 (1 chain-empty + 2 boundary skips) found no anchor.
+    expect(text).toContain('1 written · 16 already on disk · 3 found no anchor');
+  });
+
+  /**
+   * The regression the counter exists for, at the pixel it is read from.
+   *
+   * The prefix WAS restored (real hits, real bytes) and the family's state
+   * sidecar WAS on disk — the capture re-found it — yet nothing was installed,
+   * so every restored turn silently replayed the whole prefix. Every other
+   * number on the page is identical to a healthy run, which is why the tile
+   * has to say it.
+   */
+  it('flags restored prefixes whose state was re-derived instead of installed', async () => {
+    const text = await mount(
+      createElement(Cache),
+      { '/cache': cacheFixture({ health: { sidecarInstalled: 0, sidecarAlreadyPersisted: 12 } }) },
+      'mlx-paged-v1',
+    );
+    expect(text).toContain('state was on disk and prefixes restored — every one re-derived by a full replay');
+    expect(text).not.toContain('restored prefixes that reused family state instead of replaying it');
+    // The counters that CAN be read off the rest of the page are untouched:
+    // this is a clean cache by every pre-existing measure.
+    expect(text).toContain('none seen (acceptance bar: 0)');
+    expect(text).toContain('none seen (writes are landing)');
+  });
+
+  /**
+   * The write-side dead end: the capture ran on every turn and never once
+   * wrote a sidecar or found one already there, so nothing hybrid will ever
+   * restore its state. `alreadyPersisted` is what separates this from the
+   * healthy steady state, where `enqueued` is legitimately 0 because the first
+   * turn already wrote the chain every later turn re-selects.
+   */
+  it('flags a capture that never lands or finds a sidecar', async () => {
+    const text = await mount(
+      createElement(Cache),
+      {
+        '/cache': cacheFixture({
+          health: {
+            sidecarCaptureReached: 30,
+            sidecarChainEmpty: 12,
+            sidecarBoundarySkips: 18,
+            sidecarAlreadyPersisted: 0,
+            sidecarEnqueued: 0,
+          },
+        }),
+      },
+      'mlx-paged-v1',
+    );
+    expect(text).toContain('nothing written and nothing on disk — no prefix can restore state');
+    expect(text).not.toContain('already on disk');
+  });
+
+  // Dense families never enter a sidecar capture at all (`record_capture_reached`
+  // is called only by gemma4 / qwen3_5 / qwen3_5_moe), so a zero here is the
+  // NORMAL qwen3 reading and must not wear an alarm.
+  it('reads a zero capture count as a dense family, not a fault', async () => {
+    const text = await mount(
+      createElement(Cache),
+      {
+        '/cache': cacheFixture({
+          health: {
+            sidecarCaptureReached: 0,
+            sidecarChainEmpty: 0,
+            sidecarBoundarySkips: 0,
+            sidecarAlreadyPersisted: 0,
+            sidecarEnqueued: 0,
+            sidecarInstalled: 0,
+          },
+        }),
+      },
+      'mlx-paged-v1',
+    );
+    expect(text).toContain('not reached — dense families keep no state outside the pool');
+    expect(text).not.toContain('nothing written and nothing on disk');
+    // No install, but nothing restored state either — not the replay alarm.
+    expect(text).not.toContain('every one re-derived by a full replay');
+  });
+
+  // The sidecar queue counters are the sidecar SHARE of the object-scoped
+  // numbers beside them (one admission bumps both), so the card must frame them
+  // as a share and never as a second population a reader could add.
+  it('labels the sidecar queue counters as a share of the object counters', async () => {
+    const text = await mount(
+      createElement(Cache),
+      { '/cache': cacheFixture({ health: { sidecarEnqueued: 12, sidecarQueueDrops: 3 } }) },
+      'mlx-paged-v1',
+    );
+    expect(text).toContain('500 objects enqueued · 12 sidecars among them, 3 of the drops');
   });
 
   it('never rounds a hit rate with real misses up to 100%', async () => {

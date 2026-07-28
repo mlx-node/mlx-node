@@ -1366,6 +1366,13 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
  *    refusal performs no block lookup, so it moves neither `hits` nor `misses`
  *    and lands in `trend` as an absent row, which the UI would otherwise render
  *    as "no lookups recorded" — "nothing ran", when the truth is the opposite.
+ *  - `sidecar*` — the family state that lives OUTSIDE the paged pool.
+ *    `sidecarInstalled` is the only read-side one and the only counter in this
+ *    payload that nothing else can stand in for: every
+ *    `install_*_cold_sidecar` early-return falls through to a full O(prefix)
+ *    replay that produces CORRECT state, so "restored and INSTALLED" and
+ *    "restored and silently re-derived" agree on hits, cached tokens,
+ *    corruptions and the emitted text alike.
  *
  * The two families reduce differently and must not be swapped. `*Total` fields
  * are per-process cumulative counters reduced with MAX (see below); declines
@@ -1437,7 +1444,14 @@ function handleCacheGet({ res, deps }: RouteCtx): void {
               COALESCE(SUM(cold_write_errors), 0) AS writeErrors,
               COALESCE(MAX(cold_write_errors_total), 0) AS writeErrorsTotal,
               COALESCE(SUM(cold_restore_declines), 0) AS restoreDeclines,
-              COALESCE(SUM(cold_sidecar_restore_suppressed), 0) AS restoreSuppressed
+              COALESCE(SUM(cold_sidecar_restore_suppressed), 0) AS restoreSuppressed,
+              COALESCE(SUM(cold_sidecar_capture_reached), 0) AS sidecarCaptureReached,
+              COALESCE(SUM(cold_sidecar_chain_empty), 0) AS sidecarChainEmpty,
+              COALESCE(SUM(cold_sidecar_boundary_skips), 0) AS sidecarBoundarySkips,
+              COALESCE(SUM(cold_sidecar_already_persisted), 0) AS sidecarAlreadyPersisted,
+              COALESCE(SUM(cold_sidecar_enqueued), 0) AS sidecarEnqueued,
+              COALESCE(SUM(cold_sidecar_queue_drops), 0) AS sidecarQueueDrops,
+              COALESCE(SUM(cold_sidecar_installed), 0) AS sidecarInstalled
        FROM traces WHERE ts > 0 AND cold_root = ?`,
     )
     .get(scopeRoot);
@@ -1480,6 +1494,24 @@ function handleCacheGet({ res, deps }: RouteCtx): void {
       // on from the first minute and carry no information.
       restoreDeclines: toInt(health?.restoreDeclines),
       restoreSuppressed: toInt(health?.restoreSuppressed),
+      // The other seven `ColdSidecarStats` counters. Every one is a per-turn
+      // DELTA, so every one SUMS — none has a cumulative `*_total` twin, and
+      // MAX would not stand in for one: over deltas it reports the busiest
+      // single turn rather than "did this ever happen".
+      //
+      // `sidecarEnqueued` / `sidecarQueueDrops` are the sidecar SHARE of the
+      // object-scoped `enqueued` / `queueDrops` above (a sidecar admission
+      // bumps both counters), so a consumer reads them as a subset and never
+      // adds the pairs. `restoreSuppressed` is the eighth of this family and
+      // keeps its unprefixed name because it is read beside `restoreDeclines`,
+      // the other way reuse is refused.
+      sidecarCaptureReached: toInt(health?.sidecarCaptureReached),
+      sidecarChainEmpty: toInt(health?.sidecarChainEmpty),
+      sidecarBoundarySkips: toInt(health?.sidecarBoundarySkips),
+      sidecarAlreadyPersisted: toInt(health?.sidecarAlreadyPersisted),
+      sidecarEnqueued: toInt(health?.sidecarEnqueued),
+      sidecarQueueDrops: toInt(health?.sidecarQueueDrops),
+      sidecarInstalled: toInt(health?.sidecarInstalled),
     },
     // Sent over the wire rather than bundled into the SPA: the browser build
     // cannot import `@mlx-node/agent` (it transitively loads the native addon),

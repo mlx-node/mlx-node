@@ -1668,6 +1668,13 @@ describe('dashboard server — cache trend scoping', () => {
       writeErrorsTotal: number;
       restoreDeclines: number;
       restoreSuppressed: number;
+      sidecarCaptureReached: number;
+      sidecarChainEmpty: number;
+      sidecarBoundarySkips: number;
+      sidecarAlreadyPersisted: number;
+      sidecarEnqueued: number;
+      sidecarQueueDrops: number;
+      sidecarInstalled: number;
     };
     restoreFamilies: string[];
   }
@@ -1698,7 +1705,7 @@ describe('dashboard server — cache trend scoping', () => {
         coldRoot: canonicalCacheRootPath,
         coldEnabled: true,
         coldEnqueued: 5,
-        coldQueueDrops: 1,
+        coldQueueDrops: 3,
         coldEvictions: 2,
         coldCorruptions: 0,
         // DISTINCT non-zero cumulative totals across the two attributed rows so
@@ -1714,6 +1721,20 @@ describe('dashboard server — cache trend scoping', () => {
         coldWriteErrorsTotal: 6,
         coldRestoreDeclines: 2,
         coldSidecarRestoreSuppressed: 1,
+        // Every sidecar counter is a per-turn DELTA, so all eight SUM. The two
+        // attributed rows carry different values for each so a reducer swapped
+        // to MAX changes a number in the assertions below, and the eight sums
+        // are pairwise distinct so a column aliased to a neighbour does too.
+        // `coldSidecarEnqueued`/`coldSidecarQueueDrops` stay under the
+        // object-scoped `coldEnqueued`/`coldQueueDrops` above, which they are a
+        // subset of — the same admission bumps both.
+        coldSidecarCaptureReached: 6,
+        coldSidecarChainEmpty: 1,
+        coldSidecarBoundarySkips: 2,
+        coldSidecarAlreadyPersisted: 7,
+        coldSidecarEnqueued: 2,
+        coldSidecarQueueDrops: 2,
+        coldSidecarInstalled: 4,
       },
       {
         traceId: 'mine-2',
@@ -1725,7 +1746,7 @@ describe('dashboard server — cache trend scoping', () => {
         coldRoot: canonicalCacheRootPath,
         coldEnabled: true,
         coldEnqueued: 3,
-        coldQueueDrops: 0,
+        coldQueueDrops: 5,
         coldEvictions: 1,
         coldCorruptions: 2,
         coldCorruptionsTotal: 5,
@@ -1736,6 +1757,13 @@ describe('dashboard server — cache trend scoping', () => {
         coldWriteErrorsTotal: 9,
         coldRestoreDeclines: 5,
         coldSidecarRestoreSuppressed: 2,
+        coldSidecarCaptureReached: 4,
+        coldSidecarChainEmpty: 3,
+        coldSidecarBoundarySkips: 9,
+        coldSidecarAlreadyPersisted: 9,
+        coldSidecarEnqueued: 3,
+        coldSidecarQueueDrops: 4,
+        coldSidecarInstalled: 8,
       },
       {
         traceId: 'other-root-1',
@@ -1751,6 +1779,15 @@ describe('dashboard server — cache trend scoping', () => {
         coldWriteErrorsTotal: 900,
         coldRestoreDeclines: 400,
         coldSidecarRestoreSuppressed: 300,
+        // Another root's sidecar traffic, an order of magnitude larger, so a
+        // projection that lost the `cold_root = ?` filter cannot look plausible.
+        coldSidecarCaptureReached: 900,
+        coldSidecarChainEmpty: 600,
+        coldSidecarBoundarySkips: 500,
+        coldSidecarAlreadyPersisted: 700,
+        coldSidecarEnqueued: 400,
+        coldSidecarQueueDrops: 350,
+        coldSidecarInstalled: 800,
       },
       // No coldRoot AND no coldEnabled: written by a build that predates
       // attribution. Not "the tier was off" — genuinely unknown.
@@ -1860,7 +1897,9 @@ describe('dashboard server — cache trend scoping', () => {
   it('surfaces the cold-tier counters the agent used to drop, scoped to this cache', async () => {
     const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
     expect(body.health.enqueued).toBe(8);
-    expect(body.health.queueDrops).toBe(1);
+    // Object-scoped: 3 + 5 across the two attributed rows. Blocks and state
+    // sidecars share this queue, so it is the SUPERSET of `sidecarQueueDrops`.
+    expect(body.health.queueDrops).toBe(8);
     expect(body.health.evictions).toBe(3);
     expect(body.health.corruptions).toBe(2);
     // Cumulative totals reduce with MAX, not SUM (each process restarts at 0),
@@ -1904,6 +1943,39 @@ describe('dashboard server — cache trend scoping', () => {
     // latch would be pinned on from the first minute and mean nothing.
     expect(body.health.restoreDeclines).toBe(7);
     expect(body.health.restoreSuppressed).toBe(3);
+  });
+
+  /**
+   * The other seven `coldSidecar*` counters, which the ingest mapping dropped
+   * on the floor while only `restoreSuppressed` reached a column.
+   *
+   * `sidecarInstalled` is the reason this matters: every
+   * `install_*_cold_sidecar` early-return falls through to a full O(prefix)
+   * replay that produces CORRECT state, so a regression from "restored and
+   * INSTALLED" to "restored and silently re-derived" leaves hits, cached
+   * tokens, corruptions and the emitted text all unchanged. Nothing else in
+   * the payload moves.
+   *
+   * All eight are per-turn DELTAS — none has a per-process cumulative twin —
+   * so every one SUMS. The fixture's two attributed rows carry different
+   * values for each counter, and the eight sums are pairwise distinct, so
+   * swapping any reducer to MAX or aliasing any column to a neighbour changes
+   * a number here. The other root's much larger traffic pins the scope.
+   */
+  it('projects every cold sidecar counter, summed per turn and scoped to this cache', async () => {
+    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    // 6 + 4. MAX would say 6; the other root's 900 would say the scope is gone.
+    expect(body.health.sidecarCaptureReached).toBe(10);
+    // 1 + 3 (MAX 3), 2 + 9 (MAX 9), 7 + 9 (MAX 9).
+    expect(body.health.sidecarChainEmpty).toBe(4);
+    expect(body.health.sidecarBoundarySkips).toBe(11);
+    expect(body.health.sidecarAlreadyPersisted).toBe(16);
+    // Subsets of the object-scoped counters asserted above (8 enqueued, 8
+    // dropped) — the same admission bumps both, so these are never added to them.
+    expect(body.health.sidecarEnqueued).toBe(5);
+    expect(body.health.sidecarQueueDrops).toBe(6);
+    // 4 + 8. MAX would say 8, and the unscoped total would say 812.
+    expect(body.health.sidecarInstalled).toBe(12);
   });
 
   // TRACE_RETENTION_DAYS is exported precisely so the window the UI prints and

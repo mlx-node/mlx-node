@@ -50,6 +50,13 @@ interface ParsedTrace {
   coldWriteErrors?: unknown;
   coldWriteErrorsTotal?: unknown;
   coldRestoreDeclines?: unknown;
+  coldSidecarCaptureReached?: unknown;
+  coldSidecarChainEmpty?: unknown;
+  coldSidecarBoundarySkips?: unknown;
+  coldSidecarAlreadyPersisted?: unknown;
+  coldSidecarEnqueued?: unknown;
+  coldSidecarQueueDrops?: unknown;
+  coldSidecarInstalled?: unknown;
   coldSidecarRestoreSuppressed?: unknown;
 }
 
@@ -325,6 +332,21 @@ export async function ingestTraces(
             coldWriteErrors: numOrNull(trace.coldWriteErrors),
             coldWriteErrorsTotal: numOrNull(trace.coldWriteErrorsTotal),
             coldRestoreDeclines: numOrNull(trace.coldRestoreDeclines),
+            // All eight `ColdSidecarStats` counters, not just the suppressed
+            // one: this mapping is written a line per column, so a field the
+            // agent emits and this list forgets is discarded in silence — and
+            // `coldSidecarInstalled` is the one nothing else can stand in for.
+            // Every `install_*_cold_sidecar` early-return falls through to a
+            // full O(prefix) replay that produces CORRECT state, so a
+            // regression from "restored and INSTALLED" to "restored and
+            // re-derived" moves no other column in this row.
+            coldSidecarCaptureReached: numOrNull(trace.coldSidecarCaptureReached),
+            coldSidecarChainEmpty: numOrNull(trace.coldSidecarChainEmpty),
+            coldSidecarBoundarySkips: numOrNull(trace.coldSidecarBoundarySkips),
+            coldSidecarAlreadyPersisted: numOrNull(trace.coldSidecarAlreadyPersisted),
+            coldSidecarEnqueued: numOrNull(trace.coldSidecarEnqueued),
+            coldSidecarQueueDrops: numOrNull(trace.coldSidecarQueueDrops),
+            coldSidecarInstalled: numOrNull(trace.coldSidecarInstalled),
             coldSidecarRestoreSuppressed: numOrNull(trace.coldSidecarRestoreSuppressed),
             sourceFile: name,
           })

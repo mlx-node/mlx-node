@@ -131,6 +131,28 @@ export default function Cache() {
   // family threw away a prefix it had).
   const refusals = (health?.restoreDeclines ?? 0) + (health?.restoreSuppressed ?? 0);
 
+  const sidecarCaptures = health?.sidecarCaptureReached ?? 0;
+  const sidecarInstalled = health?.sidecarInstalled ?? 0;
+  const sidecarPersisted = health?.sidecarAlreadyPersisted ?? 0;
+  const sidecarWritten = health?.sidecarEnqueued ?? 0;
+  // Chain-empty and boundary-skip are ONE number here on purpose: both end with
+  // the capture holding no rung to anchor state under, and the operator's next
+  // move is the same either way. Which of the two it was goes to the
+  // `[MLX_TRACE] paged` line, and both stay separate over the wire.
+  const sidecarNoAnchor = (health?.sidecarChainEmpty ?? 0) + (health?.sidecarBoundarySkips ?? 0);
+  // The regression `installed` exists to expose. Prefixes WERE restored (real
+  // hits) and the family's state WAS on disk (the capture re-found the same
+  // chain), yet nothing was installed — so every restored turn silently
+  // replayed the whole prefix. The replay produces CORRECT state, which is why
+  // every other number on this page reads exactly like a healthy run.
+  const sidecarReplayed = sidecarInstalled === 0 && sidecarPersisted > 0 && trendTotals.hits > 0;
+  // The write-side dead end: the capture ran and never once wrote a sidecar nor
+  // found one already there, so no prefix will ever restore state.
+  // `alreadyPersisted` is the discriminator — without it the healthy steady
+  // state (nothing enqueued because the FIRST turn wrote the chain every later
+  // turn re-selects) carries the identical signature.
+  const sidecarStranded = sidecarCaptures > 0 && sidecarWritten === 0 && sidecarPersisted === 0;
+
   const runDelete = async (action: Exclude<PendingAction, null>): Promise<void> => {
     setBusy(true);
     try {
@@ -430,8 +452,10 @@ export default function Cache() {
               <CardDescription>
                 Per-turn counters recorded against this cache root. Corruptions are a SUBSET of misses (a failed
                 validation always costs a miss), so never add the two. Declines are NEITHER — a refused restore performs
-                no lookup, so it moves neither hits nor misses. Writes, evictions and write errors advance on a
-                background writer thread, making those totals approximate.
+                no lookup, so it moves neither hits nor misses. Sidecars are the family state kept outside the paged
+                pool; the sidecar figures on the queue tile are a SHARE of the object counts beside them, since one
+                admission bumps both. Writes, evictions and write errors advance on a background writer thread, making
+                those totals approximate.
               </CardDescription>
             </CardHeader>
             <CardContent className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -450,9 +474,12 @@ export default function Cache() {
               <HealthStat
                 label="Queue drops"
                 value={formatNumber(health?.queueDrops ?? 0)}
-                // Both numbers are object-scoped — blocks and family state sidecars
-                // share this queue, so "objects" is what the counter actually counts.
-                hint={`cumulative max ${formatNumber(health?.queueDropsTotal ?? 0)} · ${formatNumber(health?.enqueued ?? 0)} objects enqueued`}
+                // The value and `enqueued` are object-scoped — blocks and family
+                // state sidecars share this queue, so "objects" is what they
+                // count. The two sidecar figures are the sidecar SHARE of those
+                // same numbers, phrased "among them" / "of the drops" so nobody
+                // reads them as a second population to add.
+                hint={`cumulative max ${formatNumber(health?.queueDropsTotal ?? 0)} · ${formatNumber(health?.enqueued ?? 0)} objects enqueued · ${formatNumber(sidecarWritten)} sidecar${sidecarWritten === 1 ? '' : 's'} among them, ${formatNumber(health?.sidecarQueueDrops ?? 0)} of the drops`}
                 alarm={(health?.queueDropsTotal ?? 0) > 0}
                 loading={cache.loading}
               />
@@ -468,10 +495,52 @@ export default function Cache() {
                 alarm={writeErrorsSeen}
                 loading={cache.loading}
               />
+              {/*
+                The write side of the family state that lives OUTSIDE the paged
+                pool. Only the hybrid families enter this capture, so a zero
+                beside real block traffic is the normal dense-model reading and
+                deliberately wears no alarm.
+              */}
+              <HealthStat
+                label="Sidecar captures"
+                value={formatNumber(sidecarCaptures)}
+                hint={
+                  sidecarCaptures === 0
+                    ? 'not reached — dense families keep no state outside the pool'
+                    : sidecarStranded
+                      ? 'nothing written and nothing on disk — no prefix can restore state'
+                      : `${formatNumber(sidecarWritten)} written · ${formatNumber(sidecarPersisted)} already on disk · ${formatNumber(sidecarNoAnchor)} found no anchor`
+                }
+                icon={sidecarStranded ? ShieldAlert : undefined}
+                alarm={sidecarStranded}
+                loading={cache.loading}
+              />
               <HealthStat
                 label="Restore declines"
                 value={formatNumber(health?.restoreDeclines ?? 0)}
                 hint={`${formatNumber(health?.restoreSuppressed ?? 0)} suppressed after restore · neither counts as a lookup`}
+                loading={cache.loading}
+              />
+              {/*
+                The one cold-tier counter nothing else on this page can stand in
+                for. Every `install_*_cold_sidecar` early-return falls through to
+                a full O(prefix) replay that produces CORRECT state, so a
+                regression from "restored and INSTALLED" to "restored and
+                silently re-derived" leaves the hit rate, the trend, the bytes
+                and the corruption count all exactly where they were.
+              */}
+              <HealthStat
+                label="Sidecar installs"
+                value={formatNumber(sidecarInstalled)}
+                hint={
+                  sidecarReplayed
+                    ? 'state was on disk and prefixes restored — every one re-derived by a full replay'
+                    : sidecarInstalled > 0
+                      ? 'restored prefixes that reused family state instead of replaying it'
+                      : 'no restored prefix carried family state in this window'
+                }
+                icon={sidecarReplayed ? ShieldAlert : undefined}
+                alarm={sidecarReplayed}
                 loading={cache.loading}
               />
               <HealthStat

@@ -88,6 +88,40 @@ export const traces = sqliteTable('traces', {
    */
   coldRestoreDeclines: integer('cold_restore_declines'),
   /**
+   * The eight `ColdSidecarStats` counters — the recurrent / sliding-window
+   * state that lives OUTSIDE the paged pool. Every one is a per-turn DELTA
+   * (`provider/index.ts` differences the native snapshot across the turn), so
+   * every one SUMS. None has a cumulative `*_total` twin, and MAX would not
+   * substitute for one: over deltas it reports the busiest single turn, which
+   * answers no question anyone asks.
+   *
+   * Their own `cold_sidecar_*` prefix rather than a merge with the block
+   * counters above, because both native structs carry `enqueued` and
+   * `queue_drops` and they count different OBJECTS. The sidecar pair is the
+   * sidecar SHARE of the block pair (one admission bumps both), so they are
+   * read as a subset and never summed with it.
+   */
+  coldSidecarCaptureReached: integer('cold_sidecar_capture_reached'),
+  coldSidecarChainEmpty: integer('cold_sidecar_chain_empty'),
+  coldSidecarBoundarySkips: integer('cold_sidecar_boundary_skips'),
+  /**
+   * Captures that selected a boundary already on disk — the STEADY STATE of a
+   * repeated prompt, not a fault. Without it a healthy run (`enqueued = 0`
+   * because the first turn already wrote the chain) is indistinguishable from
+   * a run whose ladder collapsed.
+   */
+  coldSidecarAlreadyPersisted: integer('cold_sidecar_already_persisted'),
+  coldSidecarEnqueued: integer('cold_sidecar_enqueued'),
+  coldSidecarQueueDrops: integer('cold_sidecar_queue_drops'),
+  /**
+   * Restored sidecars a family INSTALLED as live state. The only column that
+   * separates "restored and used" from "restored, then silently re-derived by
+   * a full O(prefix) replay": the replay produces correct state, so every
+   * other column in this row — `cached_tokens`, `cold_hits`,
+   * `cold_corruptions` — reads identically either way.
+   */
+  coldSidecarInstalled: integer('cold_sidecar_installed'),
+  /**
    * Restores a family threw away after the walk served them. Preceded by real
    * `coldHits`, which is what makes it the harder of the two to spot.
    */

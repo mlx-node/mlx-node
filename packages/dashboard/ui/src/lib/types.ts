@@ -252,8 +252,45 @@ export interface ColdTierHealth {
    * normal on any prompt's first turn, so a latch would carry no information.
    */
   restoreDeclines: number;
-  /** Restores a family threw away after the walk served them. Also summed. */
+  /**
+   * Restores a family threw away after the walk served them. Also summed, and
+   * the eighth of the `ColdSidecarStats` family below — unprefixed because it
+   * is read beside `restoreDeclines`, the other way reuse is refused.
+   */
   restoreSuppressed: number;
+  /**
+   * Turns that entered a family's sidecar capture. Every other `sidecar*`
+   * counter is a sub-count of this one. Only the hybrid families
+   * (gemma4 / qwen3_5 / qwen3_5_moe) ever enter it, so `0` beside real block
+   * traffic is the normal reading for a dense model, not a fault.
+   */
+  sidecarCaptureReached: number;
+  /** Captures that found no whole persisted block to anchor state under. */
+  sidecarChainEmpty: number;
+  /** Captures whose chain covered blocks but had no retained checkpoint at or below its reach. */
+  sidecarBoundarySkips: number;
+  /**
+   * Captures that selected a boundary already on disk — the steady state of a
+   * repeated prompt. It is what separates a healthy run (`sidecarEnqueued = 0`
+   * because the first turn already wrote the chain) from one whose ladder
+   * never reaches a persistable rung.
+   */
+  sidecarAlreadyPersisted: number;
+  /**
+   * Sidecars handed to the writer queue. The sidecar SHARE of `enqueued`, not
+   * a second population — one admission bumps both, so never add them.
+   */
+  sidecarEnqueued: number;
+  /** Sidecars the queue refused. Likewise the sidecar share of `queueDrops`. */
+  sidecarQueueDrops: number;
+  /**
+   * Restored sidecars a family INSTALLED as live state. The one counter here
+   * that cannot be inferred: every `install_*_cold_sidecar` early-return falls
+   * through to a full O(prefix) replay producing CORRECT state, so a
+   * regression from "restored and used" to "restored and re-derived" leaves
+   * the hit rate, the trend and the corruption count untouched.
+   */
+  sidecarInstalled: number;
 }
 
 export interface CacheResponse {
