@@ -186,7 +186,7 @@ jobs:
       - name: Verify bundle (pre-notarization)
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: ./packages/desktop/scripts/verify-bundle.sh "${{ steps.package.outputs.app }}"
+        run: yarn oxnode packages/desktop/scripts/verify-bundle.ts "${{ steps.package.outputs.app }}"
 
       - name: Notarize and staple
         if: inputs.dry_run != true
@@ -212,7 +212,7 @@ jobs:
         if: inputs.dry_run != true
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: ./packages/desktop/scripts/verify-bundle.sh "${{ steps.package.outputs.app }}" --notarized
+        run: yarn oxnode packages/desktop/scripts/verify-bundle.ts "${{ steps.package.outputs.app }}" --notarized
 
       # The filename is spelled once, by `scripts/release-version.ts`, and parsed
       # back out of it by the next step — so a DMG whose name disagrees with what

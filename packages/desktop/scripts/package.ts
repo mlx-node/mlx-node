@@ -7,7 +7,7 @@
  *
  * Signing needs an identity in the keychain and `APPLE_TEAM_ID`. Notarization is
  * NOT here — it belongs to `.github/workflows/desktop-release.yml`, which submits
- * and staples. Verify either result with `scripts/verify-bundle.sh`.
+ * and staples. Verify either result with `scripts/verify-bundle.ts`.
  *
  * The bundle path is NOT predictable from this file's constants — packager owns
  * the platform directory name — so it is written to `out/package-result.json`
@@ -275,7 +275,7 @@ writeFileSync(
   )}\n`,
 );
 
-console.log(`\n${appPath}\n\n  verify: ./packages/desktop/scripts/verify-bundle.sh "${appPath}"\n`);
+console.log(`\n${appPath}\n\n  verify: yarn oxnode packages/desktop/scripts/verify-bundle.ts "${appPath}"\n`);
 
 function findIdentity(): string {
   const out = execFileSync('security', ['find-identity', '-v', '-p', 'codesigning'], { encoding: 'utf-8' });

@@ -64,7 +64,7 @@ function isPrebuiltAddonPackage(name: string): boolean {
  * They fail the release gate outright. Both darwin prebuilts bake upstream's CI
  * home into their load commands —
  * `/Users/runner/work/clipboard/clipboard/target/…/libcrosscopy_clipboard.dylib`
- * — and step [3/5] of `verify-bundle.sh` refuses a bundle that ships a build
+ * — and step [3/5] of `verify-bundle.ts` refuses a bundle that ships a build
  * path. That is not our leak to fix: it is baked into the published tarball, so
  * the only lever on this side is not to carry it.
  *

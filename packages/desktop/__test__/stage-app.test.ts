@@ -12,7 +12,7 @@
  *    239 MB native payload a second time (993 MB total) even though nothing
  *    loads it.
  *  - `@mariozechner/clipboard*` bakes upstream's CI home into its load commands,
- *    which `verify-bundle.sh` step [3/5] refuses outright.
+ *    which `verify-bundle.ts` step [3/5] refuses outright.
  *  - The cloud-LLM provider SDKs behind `@earendil-works/pi-ai` were 114 MB of
  *    an app that exists to run models locally, reachable only from a
  *    `stream()` call this app never makes.
