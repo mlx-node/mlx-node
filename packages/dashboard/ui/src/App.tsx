@@ -6,6 +6,7 @@ import Models from '@/pages/models';
 import Overview from '@/pages/overview';
 import SessionDetail from '@/pages/session-detail';
 import Sessions from '@/pages/sessions';
+import type { CSSProperties } from 'react';
 import { Boxes, HardDrive, LayoutDashboard, type LucideIcon, MessagesSquare, TrendingUp } from 'lucide-react';
 import { BrowserRouter, NavLink, Outlet, Route, Routes } from 'react-router-dom';
 
@@ -27,6 +28,23 @@ const NAV_ITEMS: NavItem[] = [
 function Sidebar() {
   return (
     <aside className="bg-sidebar/75 text-sidebar-foreground sticky top-0 flex h-screen w-60 shrink-0 flex-col border-r backdrop-blur-xl">
+      {/*
+        The window is `titleBarStyle: 'hiddenInset'`, so macOS paints the close/
+        minimise/zoom buttons OVER the content at the top-left — which is exactly
+        where this sidebar puts its logo. Without this strip the traffic lights
+        sit on top of the mark.
+
+        It doubles as the drag handle. `hiddenInset` removes the title bar you
+        would otherwise grab, so something has to be declared draggable or the
+        window can only be moved by its edges. Children must opt back out with
+        `no-drag` or they stop receiving clicks — which is why the strip is empty
+        rather than wrapping the header.
+
+        Harmless outside Electron (`-webkit-app-region` is ignored in a plain
+        browser), so no platform branch is needed for `vp dev`.
+      */}
+      <div className="h-9 shrink-0" style={{ WebkitAppRegion: 'drag' } as CSSProperties} aria-hidden />
+
       <div className="flex h-16 items-center gap-2.5 px-5">
         <span className="bg-brand-gradient text-primary-foreground shadow-soft flex size-9 items-center justify-center rounded-xl">
           <Boxes className="size-5" aria-hidden />
