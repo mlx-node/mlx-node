@@ -51,6 +51,13 @@ export interface DownloadProgressProps {
   id: string;
   onDone?: () => void;
   onError?: (message: string) => void;
+  /**
+   * The job stopped without finishing. Distinct from {@link onError}: a cancel is
+   * not a failure and must not raise a red notice. Needed because a `cancelled`
+   * frame does NOT imply this card asked for it — a second tab, or `shutdown()`
+   * aborting the in-flight job, sends one to a card that clicked nothing.
+   */
+  onCancelled?: () => void;
 }
 
 /**
@@ -65,12 +72,14 @@ export interface DownloadProgressProps {
  * finished files and would render the current file's bytes as the job's —
  * short by every completed shard.
  */
-export function DownloadProgress({ id, onDone, onError }: DownloadProgressProps) {
+export function DownloadProgress({ id, onDone, onError, onCancelled }: DownloadProgressProps) {
   const [state, setState] = useState<ProgressState>(INITIAL);
   const doneCb = useRef(onDone);
   const errorCb = useRef(onError);
+  const cancelledCb = useRef(onCancelled);
   doneCb.current = onDone;
   errorCb.current = onError;
+  cancelledCb.current = onCancelled;
 
   useEffect(() => {
     setState(INITIAL);
@@ -101,15 +110,23 @@ export function DownloadProgress({ id, onDone, onError }: DownloadProgressProps)
             case 'error':
               return { ...prev, phase: 'error', message: event.message };
             case 'cancelled':
-              // The Cancel action reverts the card to Install via the DELETE
-              // response (this component then unmounts); if the terminal frame
-              // still arrives first, settle on a non-spinning "stopped" state
-              // rather than a false "Complete".
+              // Settle on a non-spinning "stopped" state rather than a false
+              // "Complete". Usually invisible: the owner clears this card on the
+              // DELETE response and it unmounts. It IS what a card sees when the
+              // cancel came from somewhere else, which is why the frame must also
+              // call back below rather than only render.
               return { ...prev, phase: 'error', message: 'Cancelled' };
           }
         });
         if (event.type === 'done') doneCb.current?.();
         if (event.type === 'error') errorCb.current?.(event.message);
+        // A terminal frame the owner cannot have been waiting for. The server
+        // answers a cancel while the job is still `running` — it lets `processJob`
+        // emit this frame as it unwinds — so a cancel from a second tab, or from
+        // `shutdown()`, lands on a card that never clicked Cancel. Without this
+        // the card renders "Cancelled" beside a live Cancel button forever: the
+        // page keeps the job in `active`, and nothing polls to correct it.
+        if (event.type === 'cancelled') cancelledCb.current?.();
       },
       undefined,
       ['start', 'progress', 'done', 'error', 'cancelled'],

@@ -417,7 +417,14 @@ export class DownloadManager {
    */
   private activeJobFor(repo: string): JobState | undefined {
     for (const job of this.jobsById.values()) {
-      if (job.repo === repo && !isTerminal(job.state)) return job;
+      // `!job.cancelled` as well as the state: a cancel of the IN-FLIGHT job
+      // returns while the job is still `running`, because `cancel()` leaves the
+      // terminal transition to `processJob` as it unwinds (that is what keeps the
+      // `cancelled` event from being emitted twice). Handing that job back would
+      // answer a fresh Install with an id that is already stopping — the caller
+      // subscribes to a stream whose next frame is `cancelled`, and no download
+      // happens. A job on its way out is not an active job.
+      if (job.repo === repo && !isTerminal(job.state) && !job.cancelled) return job;
     }
     return undefined;
   }

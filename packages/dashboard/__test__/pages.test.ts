@@ -1024,25 +1024,41 @@ describe('Models page — the Install affordance', () => {
   let openedStreams: string[] = [];
   let restoreSse: (() => void) | undefined;
 
+  /** Deliver one SSE frame to every open stream, as the server would. */
+  let emitSse: (type: string, payload: Record<string, unknown>) => void = () => {};
+
   /**
    * happy-dom ships no `EventSource`, and hydrating a running job mounts
-   * `DownloadProgress`, which opens one. The stand-in records the URL and
-   * delivers nothing: these tests assert what the page does with the job
-   * REGISTRY, not what the stream carries.
+   * `DownloadProgress`, which opens one. The stand-in records the URL and, unlike
+   * a pure no-op, can DELIVER frames — a terminal frame is the only way to reach
+   * what the page does when a job settles from the stream rather than from a
+   * request it made itself, which no request-level assertion can observe.
    */
   function stubEventSource(): void {
     openedStreams = [];
+    const listeners: Array<{ type: string; fn: (ev: MessageEvent<string>) => void }> = [];
     const holder = globalThis as unknown as { EventSource?: unknown };
     const previous = holder.EventSource;
     holder.EventSource = class {
       constructor(url: string) {
         openedStreams.push(url);
       }
-      addEventListener(): void {}
+      addEventListener(type: string, fn: (ev: MessageEvent<string>) => void): void {
+        listeners.push({ type, fn });
+      }
       close(): void {}
+    };
+    emitSse = (type, payload) => {
+      // `subscribeSSE` registers one handler per named event and parses `ev.data`,
+      // so a frame must carry its JSON exactly as the wire does.
+      const ev = { data: JSON.stringify({ type, ...payload }) } as MessageEvent<string>;
+      for (const l of listeners) {
+        if (l.type === type) l.fn(ev);
+      }
     };
     restoreSse = () => {
       holder.EventSource = previous;
+      emitSse = () => {};
     };
   }
 
@@ -1135,6 +1151,38 @@ describe('Models page — the Install affordance', () => {
       // cancel was their own — so neither may raise a failure notice.
       expect(failed.mock.calls).toEqual([]);
       expect(buttonLabels()).toContain('Installed');
+    } finally {
+      failed.mockRestore();
+    }
+  });
+
+  it('reverts to Install when a job is cancelled from somewhere else', async () => {
+    // The card never clicked Cancel. The server answers a cancel while the job is
+    // still `running` — it lets `processJob` emit the terminal frame as it unwinds
+    // — so a cancel from a second tab, or from `shutdown()` aborting the in-flight
+    // job, arrives only as a stream frame. `cancelled` used to render "Cancelled"
+    // and call nothing back, unlike `done`/`error`, so the card sat on a stopped
+    // job beside a live Cancel button with nothing to correct it: no query polls
+    // and `downloads` is never reloaded.
+    stubEventSource();
+    const failed = vi.spyOn(toast, 'error');
+    try {
+      recordRequests({
+        ...catalogRoutes({}, [downloadJob({ id: 'job-run', state: 'running' })]),
+        '/downloads/job-run': { cancelled: true, id: 'job-run' },
+      });
+      await mountModels();
+      expect(buttonLabels()).toContain('Cancel');
+
+      const { act } = await import('react');
+      await act(async () => {
+        emitSse('cancelled', { id: 'job-run' });
+      });
+      expect(buttonLabels()).toContain('Install');
+      expect(buttonLabels()).not.toContain('Cancel');
+      // A cancel is not a failure, and whoever issued it already saw their own
+      // confirmation — so this must stay silent, unlike the error path.
+      expect(failed.mock.calls).toEqual([]);
     } finally {
       failed.mockRestore();
     }

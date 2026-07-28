@@ -206,6 +206,28 @@ export default function Models() {
     }
   };
 
+  /**
+   * The job stopped without finishing, learned from the STREAM rather than from a
+   * DELETE this page issued. `cancel()` below already clears `active` when the
+   * user's own cancel resolves, so this is the case it cannot see: the server
+   * answers a cancel while the job is still `running` and lets `processJob` emit
+   * the terminal frame as it unwinds, so a cancel from a second tab — or from
+   * `shutdown()` aborting the in-flight job — arrives here having clicked nothing.
+   * Without this the card renders "Cancelled" beside a live Cancel button and
+   * never recovers: no query polls, and `downloads` is never reloaded.
+   *
+   * Silent, unlike `onDownloadError`. A cancel is not a failure, and whoever
+   * issued it already got their own confirmation.
+   */
+  const onDownloadCancelled = (repo: string): void => {
+    setActive((prev) => {
+      if (prev[repo] === undefined) return prev;
+      const next = { ...prev };
+      delete next[repo];
+      return next;
+    });
+  };
+
   const cancel = async (repo: string, id: string): Promise<void> => {
     try {
       await mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(id)}`);
@@ -414,6 +436,7 @@ export default function Models() {
               onInstall={() => install(item.hfRepo)}
               onDone={() => onDownloadDone(item.hfRepo)}
               onError={(message) => onDownloadError(item.hfRepo, message)}
+              onCancelled={() => onDownloadCancelled(item.hfRepo)}
               onCancel={(id) => void cancel(item.hfRepo, id)}
             />
           ))}
@@ -452,10 +475,11 @@ interface CatalogCardProps {
   onInstall: () => void;
   onDone: () => void;
   onError: (message: string) => void;
+  onCancelled: () => void;
   onCancel: (id: string) => void;
 }
 
-function CatalogCard({ item, job, onInstall, onDone, onError, onCancel }: CatalogCardProps) {
+function CatalogCard({ item, job, onInstall, onDone, onError, onCancelled, onCancel }: CatalogCardProps) {
   // Gate on `present` (loadable checkpoint on disk), not `installed` (dashboard
   // marker): a model installed via the `mlx download` CLI / wizard is present but
   // unowned, so offering Install would refuse to overwrite it and fail.
@@ -483,7 +507,7 @@ function CatalogCard({ item, job, onInstall, onDone, onError, onCancel }: Catalo
         </div>
         {downloading && job !== undefined ? (
           <div className="space-y-2">
-            <DownloadProgress id={job.id} onDone={onDone} onError={onError} />
+            <DownloadProgress id={job.id} onDone={onDone} onError={onError} onCancelled={onCancelled} />
             {/* No Cancel while publishing: `cancel()` refuses a `committing` job
                 and the route 404s, so the button could only report a failure for
                 an install that then succeeds anyway. The progress bar stays. */}

@@ -1007,6 +1007,32 @@ describe('DownloadManager', () => {
     expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.blockedByForeignDir).toBe(true);
   });
 
+  it('does not hand back an in-flight job that is already cancelling', async () => {
+    // `cancel()` of the IN-FLIGHT job returns while the state is still `running`:
+    // the terminal transition is left to `processJob` as it unwinds, which is what
+    // stops the `cancelled` event being emitted twice. A repo lookup that reads
+    // only the state would hand that job back to the next Install, so the caller
+    // would subscribe to a stream whose next frame is `cancelled` — and nothing
+    // would download. The window is a whole non-abortable file copy + hash wide.
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events1: DownloadEvent[] = [];
+    const id1 = manager.start(REPO);
+    manager.subscribe(id1, (event) => events1.push(event));
+    let idDuringCancel: string | undefined;
+    stagingHook.onVerifyWindow = () => {
+      manager.cancel(id1);
+      // SYNCHRONOUSLY inside the window — no await, so `processJob` has not yet
+      // reached its catch and the job still reads `running`.
+      idDuringCancel = manager.start(REPO);
+    };
+    await waitFor(() => events1.some((event) => event.type === 'cancelled'));
+    expect(idDuringCancel).not.toBe(id1);
+  });
+
   it('refuses to overwrite an unowned dir that races in between the ownership check and the swap', async () => {
     // finalDir is ABSENT at the first ownership check; an external process installs an
     // UNOWNED dir just before the swap (modeled by creating it when the marker is
