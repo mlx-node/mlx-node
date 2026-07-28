@@ -8,6 +8,9 @@
  * These are the checks that make the four values disagree loudly instead.
  */
 
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
 import { describe, expect, it } from 'vite-plus/test';
 
 import {
@@ -140,5 +143,41 @@ describe('assertVersionsAgree, untagged path', () => {
     // else in this module can cover it.
     const junk = { tag: null, manifest: 'nightly', bundleShort: 'nightly', bundleVersion: 'nightly', dmg: 'nightly' };
     expect(() => assertVersionsAgree(junk)).toThrow(/packages\/desktop\/package\.json version/);
+  });
+});
+
+/**
+ * The guard that runs BEFORE a tag exists.
+ *
+ * Everything above only fires inside `desktop-release.yml`, which on a
+ * `release: published` run cannot start any earlier than the release itself. By
+ * then the mismatch costs a release with no DMG attached, and re-running is
+ * awkward: `workflow_dispatch` carries no tag, and the upload step is gated on
+ * `github.event_name == 'release'`.
+ *
+ * The drift is created by `tools bump`, in an ordinary commit, days earlier —
+ * so that is where it should be caught. `tools bump` reads its current version
+ * from `packages/core/package.json` and writes the new one to every
+ * `private !== true` workspace; @mlx-node/desktop is private, so it is left
+ * behind. This test goes red on that commit, in the normal test gate, with the
+ * whole remedy in one line.
+ */
+describe('the desktop manifest tracks the version `tools bump` writes', () => {
+  const versionOf = (relative: string): string => {
+    const path = fileURLToPath(new URL(relative, import.meta.url));
+    return (JSON.parse(readFileSync(path, 'utf-8')) as { version: string }).version;
+  };
+
+  it('matches the public workspace version', () => {
+    // `packages/core` is the manifest `tools bump` reads to compute the next
+    // version, which makes it the canonical one to track.
+    expect(versionOf('../package.json')).toBe(versionOf('../../core/package.json'));
+  });
+
+  it('is a version the release gate would accept', () => {
+    // A tagged release stamps the TAG, not this — but `assertVersionsAgree`
+    // still requires the two to be equal, so an unparseable manifest fails the
+    // release even when the tag is perfect.
+    expect(assertSemver('packages/desktop/package.json version', versionOf('../package.json'))).toMatch(/^\d/);
   });
 });

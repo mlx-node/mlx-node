@@ -13,6 +13,8 @@
  * leaving them hanging.
  */
 
+import type { MessagePort } from 'node:worker_threads';
+
 import type { IngestSummary } from '../api/context.js';
 import type { ApiResponse } from '../api/errors.js';
 
@@ -23,6 +25,21 @@ export interface DbWorkerBootstrap {
   sessionsRoot: string;
   tracesDir: string;
   cacheRoot: string | undefined;
+}
+
+/**
+ * The actual `workerData`: the caller's bootstrap plus the one thing the client
+ * owns rather than receives.
+ *
+ * `withdrawPort` is a second, transferred `MessagePort` carrying nothing but
+ * ids the transport thread has given up waiting for. It is separate from the
+ * request channel because a withdrawal sent down the request channel would
+ * queue behind the very request it withdraws — see `client.ts`. Optional, so a
+ * test fixture may be started with a plain {@link DbWorkerBootstrap}; the
+ * worker then simply has nothing to withdraw.
+ */
+export interface DbWorkerBoot extends DbWorkerBootstrap {
+  withdrawPort?: MessagePort;
 }
 
 export type MainToWorker =

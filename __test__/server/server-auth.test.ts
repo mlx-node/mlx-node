@@ -1,10 +1,11 @@
 import type { IncomingMessage } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { connect as netConnect, type AddressInfo } from 'node:net';
 
 import { createServer, type ServerInstance } from '@mlx-node/server';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 import { extractPresentedToken, isAuthorized, tokensMatch } from '../../packages/server/src/auth.js';
+import { resolveAuthToken } from '../../packages/server/src/server.js';
 
 /**
  * Bearer-token auth + the `/health` disclosure split.
@@ -101,6 +102,48 @@ describe('tokensMatch', () => {
     // outright on a size mismatch.
     expect(tokensMatch('\u00e9', 'e\u0301')).toBe(false);
     expect(tokensMatch('\u00e9', '\u00e9')).toBe(true);
+  });
+
+  it('never matches an empty expected token', () => {
+    // `timingSafeEqual` on two zero-length buffers returns TRUE, so a server
+    // misconfigured with an empty secret would have authenticated anyone who
+    // sent an empty `x-api-key`. The empty string is not a credential in
+    // either position.
+    expect(tokensMatch('', '')).toBe(false);
+    expect(tokensMatch(TOKEN, '')).toBe(false);
+    expect(isAuthorized({ headers: { 'x-api-key': '' } } as unknown as IncomingMessage, '')).toBe(false);
+  });
+});
+
+/**
+ * `--auth-token "$VAR"` with `VAR` unset arrives here as `''`, and `''` used to
+ * mean "auth is configured" to the bind guard and "everyone is authorised" to
+ * the comparator: the two halves of a wildcard bind published under a
+ * credential anyone can guess.
+ */
+describe('an empty explicit auth token is a configuration error', () => {
+  it('is rejected by resolveAuthToken rather than resolving to a value', () => {
+    expect(() => resolveAuthToken('')).toThrow(/empty string/);
+    // Not merely "no auth": a token that silently vanishes would hand back the
+    // unauthenticated, wildcard-CORS server the operator was trying not to
+    // start. Both other inputs still resolve as before.
+    expect(resolveAuthToken(TOKEN)).toBe(TOKEN);
+    expect(resolveAuthToken(undefined)).toBeUndefined();
+  });
+
+  it('does not become "auth configured" for an env var either', () => {
+    process.env.MLX_SERVER_AUTH_TOKEN = '';
+    try {
+      expect(resolveAuthToken(undefined)).toBeUndefined();
+    } finally {
+      delete process.env.MLX_SERVER_AUTH_TOKEN;
+    }
+  });
+
+  it('fails createServer before it binds', async () => {
+    await expect(createServer({ port: 0, host: '127.0.0.1', disableStore: true, authToken: '' })).rejects.toThrow(
+      /empty string/,
+    );
   });
 });
 
@@ -405,6 +448,73 @@ describe('`/` liveness probe is reachable without a token', () => {
     const base = await start({ authToken: TOKEN });
     expect((await fetch(`${base}/v1/models`)).status).toBe(401);
     expect((await fetch(`${base}/v1/nope`)).status).toBe(401);
+  });
+});
+
+/**
+ * The auth gate has to classify the request path before it can apply the
+ * `/health` carve-out, and it used to do that by building a `URL` whose base
+ * came from the `Host` header. `Host` is attacker-controlled text on every
+ * request: `Host: [` makes `new URL()` throw `ERR_INVALID_URL` out of an async
+ * request listener, whose promise `http.createServer` discards — an unhandled
+ * rejection, which under Node's default `--unhandled-rejections=throw` ends the
+ * process. Any client that could open the socket could kill inference with one
+ * request, and only on a server with auth ENABLED, because that is the only
+ * branch that parsed the path.
+ *
+ * Driven over a raw socket: `fetch` (and every other HTTP client) refuses to
+ * send a syntactically invalid `Host`, so the bug is unreachable from one.
+ */
+describe('a malformed Host header cannot take the server down', () => {
+  /** One request, written verbatim, answered with the status line. */
+  async function rawRequest(base: string, lines: string[]): Promise<string> {
+    const { port } = new URL(base);
+    return await new Promise<string>((resolve, reject) => {
+      const socket = netConnect(Number(port), '127.0.0.1', () => {
+        socket.write(`${lines.join('\r\n')}\r\n\r\n`);
+      });
+      let received = '';
+      socket.on('data', (chunk: Buffer) => (received += chunk.toString('utf-8')));
+      socket.on('close', () => resolve(received.split('\r\n')[0] ?? ''));
+      socket.on('error', reject);
+      // A hang IS the failure — pre-fix the listener rejected and nothing was
+      // ever written back — so it must not wait for the suite timeout.
+      setTimeout(() => {
+        socket.destroy();
+        resolve(received.split('\r\n')[0] ?? '<no response>');
+      }, 4_000).unref();
+    });
+  }
+
+  for (const host of ['[', '[::1', 'a b', '%%']) {
+    it(`answers 401 instead of throwing on \`Host: ${host}\``, async () => {
+      const base = await start({ authToken: TOKEN });
+      expect(await rawRequest(base, ['GET /v1/models HTTP/1.1', `Host: ${host}`, 'Connection: close'])).toContain(
+        '401',
+      );
+    });
+  }
+
+  it('still serves the next request afterwards', async () => {
+    const base = await start({ authToken: TOKEN });
+    await rawRequest(base, ['GET /v1/models HTTP/1.1', 'Host: [', 'Connection: close']);
+    const res = await fetch(`${base}/v1/models`, { headers: { 'x-api-key': TOKEN } });
+    expect(res.status).toBe(200);
+  });
+
+  it('keeps the /health carve-out working when Host is unparseable', async () => {
+    // The carve-out is decided from the same pathname, so a fallback that
+    // returned a constant would have quietly 401'd every liveness probe.
+    const base = await start({ authToken: TOKEN });
+    expect(await rawRequest(base, ['GET /health HTTP/1.1', 'Host: [', 'Connection: close'])).toContain('200');
+  });
+
+  it('routes normally on an unauthenticated server too', async () => {
+    // `routeRequest` parsed the path the same way; there it was inside the
+    // try/catch, so the symptom was a 500 rather than a crash. Same fix.
+    const base = await start({});
+    expect(await rawRequest(base, ['GET /v1/models HTTP/1.1', 'Host: [', 'Connection: close'])).toContain('200');
+    expect(await rawRequest(base, ['GET /v1/nope HTTP/1.1', 'Host: [', 'Connection: close'])).toContain('404');
   });
 });
 

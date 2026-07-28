@@ -56,6 +56,14 @@ export function extractPresentedToken(req: IncomingMessage): string | null {
  * allow incremental guessing, stays constant-time.
  */
 export function tokensMatch(presented: string, expected: string): boolean {
+  // The empty string is not a credential, in either position. `timingSafeEqual`
+  // on two zero-length buffers returns TRUE, so a server misconfigured with an
+  // empty token would authenticate every caller who sent an empty `x-api-key`.
+  // `resolveAuthToken` rejects an empty token before it can reach a server built
+  // through `createServer`; this is the second latch, for a caller that
+  // constructs `createHandler` directly. Refusing is the fail-closed direction —
+  // an empty token 401s everything rather than admitting everything.
+  if (presented === '' || expected === '') return false;
   const presentedBytes = Buffer.from(presented, 'utf8');
   const expectedBytes = Buffer.from(expected, 'utf8');
   if (presentedBytes.length !== expectedBytes.length) return false;

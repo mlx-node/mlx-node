@@ -10,7 +10,7 @@ import { createHealthReporter, type ServerHealth } from './health.js';
 import type { IdleSweeper } from './idle-sweeper.js';
 import { ModelWorkCoordinator } from './model-work-coordinator.js';
 import type { ModelRegistry } from './registry.js';
-import { routeRequest } from './router.js';
+import { requestPathname, routeRequest } from './router.js';
 
 /**
  * Routes reachable WITHOUT a token when one is configured.
@@ -125,42 +125,51 @@ export function createHandler(
     options?.health ?? createHealthReporter({ registry, idleSweeper, modelWorkCoordinator: modelWorkCoordinator });
 
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    if (cors) {
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, anthropic-version');
+    // The guard spans the WHOLE listener, not just `routeRequest`. `http.createServer`
+    // discards the returned promise, so anything that escapes here is an unhandled
+    // rejection — and Node's default `--unhandled-rejections=throw` turns that into
+    // process death. A crash-by-request is the one failure a request handler must
+    // not have, so nothing before the routing call gets to be outside the try either.
+    try {
+      if (cors) {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, anthropic-version');
 
-      if (req.method === 'OPTIONS') {
-        res.writeHead(204);
-        res.end();
-        return;
-      }
-    }
-
-    // Single auth choke point. `routeRequest` is called from exactly one
-    // place (below), so no route can be added that bypasses this.
-    //
-    // `authToken === undefined` short-circuits before any header is touched:
-    // an unprotected server behaves exactly as it did before auth existed.
-    let authenticated = true;
-    if (authToken !== undefined) {
-      authenticated = isAuthorized(req, authToken);
-      if (!authenticated) {
-        const path = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`).pathname;
-        // `/health` degrades to a liveness-only body instead of 401 — but
-        // ONLY when no credential was offered. A caller who presented a
-        // WRONG token gets the 401 it needs to notice the typo.
-        if (!UNAUTHENTICATED_PATHS.has(path) || hasCredential(req)) {
-          sendUnauthorized(res);
+        if (req.method === 'OPTIONS') {
+          res.writeHead(204);
+          res.end();
           return;
         }
       }
-    }
 
-    // Returning the promise lets tests await the full lifecycle including
-    // post-`res.end()` bookkeeping (e.g. `SessionRegistry.adopt`). `http.createServer`
-    // ignores the return value, so this is transparent to production callers.
-    try {
+      // Single auth choke point. `routeRequest` is called from exactly one
+      // place (below), so no route can be added that bypasses this.
+      //
+      // `authToken === undefined` short-circuits before any header is touched:
+      // an unprotected server behaves exactly as it did before auth existed.
+      let authenticated = true;
+      if (authToken !== undefined) {
+        authenticated = isAuthorized(req, authToken);
+        if (!authenticated) {
+          // Host-independent: see `requestPathname`. Building the base from the
+          // `Host` header threw on `Host: [`, from a branch only an
+          // UNAUTHENTICATED request reaches — so enabling auth was what made the
+          // server killable by anyone who could open the socket.
+          const path = requestPathname(req);
+          // `/health` degrades to a liveness-only body instead of 401 — but
+          // ONLY when no credential was offered. A caller who presented a
+          // WRONG token gets the 401 it needs to notice the typo.
+          if (!UNAUTHENTICATED_PATHS.has(path) || hasCredential(req)) {
+            sendUnauthorized(res);
+            return;
+          }
+        }
+      }
+
+      // Returning the promise lets tests await the full lifecycle including
+      // post-`res.end()` bookkeeping (e.g. `SessionRegistry.adopt`). `http.createServer`
+      // ignores the return value, so this is transparent to production callers.
       await routeRequest(
         req,
         res,

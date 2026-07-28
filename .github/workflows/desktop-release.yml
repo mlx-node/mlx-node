@@ -28,6 +28,17 @@ on:
         description: 'Build and sign, but skip notarization and publishing'
         type: boolean
         default: true
+      # Without this a dispatch run has no tag, falls back to the desktop
+      # manifest, and therefore rehearses whatever version that file happens to
+      # hold — which on a release day is the STALE one, since `tools bump` skips
+      # private workspaces. The rehearsal would pass and the real
+      # `release: published` run would then be the first thing to see the tag,
+      # and to fail, with the release already public. Pass the tag you are about
+      # to cut and the dry run checks the same thing the real run will.
+      release_tag:
+        description: 'Tag to validate against, e.g. v0.0.9 (default: the desktop manifest version)'
+        type: string
+        default: ''
 
 env:
   # Must match ci.yml. Without it the deployment floor silently tracks the runner
@@ -87,13 +98,14 @@ jobs:
       # the DMG 0.0.8 and bumps the cask to 0.0.8: consistently wrong, because all
       # three read that same stale manifest.
       #
-      # `github.event.release.tag_name` is empty on workflow_dispatch; the script
-      # then treats the manifest as the source. Passed through `env` rather than
-      # interpolated into the script body — a tag name is attacker-supplied text.
+      # `github.event.release.tag_name` is empty on workflow_dispatch, where the
+      # `release_tag` input takes over; with neither, the script treats the
+      # manifest as the source. Passed through `env` rather than interpolated
+      # into the script body — a tag name is attacker-supplied text.
       - name: Resolve release version
         id: version
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: yarn oxnode packages/desktop/scripts/check-release.ts resolve --tag "$TAG" --manifest packages/desktop/package.json
 
       # Deliberately a fresh build, not a `gh run download` of ci.yml's artifacts.
@@ -228,7 +240,7 @@ jobs:
       # artifacts do. Runs before the DMG is notarized — the expensive step.
       - name: Validate artifact versions
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           yarn oxnode packages/desktop/scripts/check-release.ts verify \
             --tag "$TAG" --manifest packages/desktop/package.json \

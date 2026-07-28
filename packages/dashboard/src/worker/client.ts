@@ -9,11 +9,11 @@
  * holds whatever happens to the thread.
  */
 
-import { Worker } from 'node:worker_threads';
+import { MessageChannel, Worker } from 'node:worker_threads';
 
 import type { IngestSummary } from '../api/context.js';
 import { failure, type ApiResponse } from '../api/errors.js';
-import type { DbWorkerBootstrap, MainToWorker, WorkerToMain } from './protocol.js';
+import type { DbWorkerBoot, DbWorkerBootstrap, MainToWorker, WorkerToMain } from './protocol.js';
 
 /**
  * A reply, or why none is coming: `undeliverable` means the request never left
@@ -79,6 +79,26 @@ function unavailableSummary(reason: string): IngestSummary {
 }
 
 export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
+  /**
+   * The withdrawal channel. A deadline settles the CALLER, but the request
+   * itself was posted the moment `send` ran and is sitting in the worker's
+   * message queue — so without this a timed-out `DELETE /api/models/:name`
+   * answered the UI with `E_UNAVAILABLE` and then deleted the model anyway.
+   *
+   * It has to be a SECOND port. A cancellation posted on the main channel
+   * queues BEHIND the request it is cancelling — the worker is blocked, which
+   * is why the deadline fired at all — so it could only ever arrive too late.
+   * A dedicated port can be drained synchronously with `receiveMessageOnPort`
+   * at the instant the worker picks the request up, which is the one moment
+   * the answer matters.
+   */
+  const withdrawals = new MessageChannel();
+  // Never a reason the process stays alive: the request's own `worker.ref()`
+  // already bounds that, and this port carries nothing anyone waits for. The
+  // worker's end needs no equivalent — `receiveMessageOnPort` never starts it,
+  // so it holds no handle on that side either.
+  withdrawals.port1.unref();
+
   const worker = new Worker(opts.workerUrl, {
     workerData: {
       dbPath: opts.dbPath,
@@ -86,7 +106,9 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
       sessionsRoot: opts.sessionsRoot,
       tracesDir: opts.tracesDir,
       cacheRoot: opts.cacheRoot,
-    } satisfies DbWorkerBootstrap,
+      withdrawPort: withdrawals.port2,
+    } satisfies DbWorkerBoot,
+    transferList: [withdrawals.port2],
   });
 
   const pending = new Map<number, (result: SendResult) => void>();
@@ -143,10 +165,24 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
    * latching it on one slow query would permanently fail every database route
    * for a worker that was merely busy. The caller gets `E_UNAVAILABLE` and the
    * next request gets a fresh chance.
+   *
+   * `withdrawOnTimeout` makes the deadline mean "it did not happen" rather than
+   * only "you are not getting an answer". Set for `call` — the routes that
+   * DELETE models, sessions and cache entries live there, and telling the UI a
+   * delete failed while the worker performs it later is worse than either
+   * outcome on its own. Left off for `drain` / `close`, whose whole purpose is
+   * to run, and for `ingest`, which is idempotent bookkeeping.
+   *
+   * Residual: a request the worker has ALREADY begun cannot be withdrawn, so a
+   * deadline that expires mid-query still reports failure for work that
+   * completes. What is closed is the dominant case — the request still queued
+   * behind whatever blocked the worker long enough to blow the deadline.
    */
+  const requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const send = (
     build: (id: number) => MainToWorker,
-    ms: number = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+    ms: number = requestTimeoutMs,
+    withdrawOnTimeout = false,
   ): Promise<SendResult> => {
     if (down !== null) return Promise.resolve({ ok: false, why: 'down', reason: down });
     const id = nextId++;
@@ -164,7 +200,13 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
       };
       // Never the reason the process stays up: `syncRef` already refs the worker
       // for exactly as long as this request is outstanding.
-      const timer = setTimeout(() => settle({ ok: false, why: 'down', reason: `timed out after ${ms}ms` }), ms);
+      const timer = setTimeout(() => {
+        // Withdrawn BEFORE the caller is told, so the two can never disagree in
+        // the direction that matters: by the time anyone reads `E_UNAVAILABLE`,
+        // the request is already retractable-or-started, never merely queued.
+        if (withdrawOnTimeout) withdrawals.port1.postMessage(id);
+        settle({ ok: false, why: 'down', reason: `timed out after ${ms}ms` });
+      }, ms);
       timer.unref?.();
       pending.set(id, settle);
       syncRef();
@@ -183,14 +225,18 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
 
   return {
     async call(request: DbWorkerCall): Promise<ApiResponse> {
-      const result = await send((id) => ({
-        kind: 'call',
-        id,
-        method: request.method,
-        path: request.path,
-        body: request.body,
-        ...(request.bodyError !== undefined ? { bodyError: request.bodyError } : {}),
-      }));
+      const result = await send(
+        (id) => ({
+          kind: 'call',
+          id,
+          method: request.method,
+          path: request.path,
+          body: request.body,
+          ...(request.bodyError !== undefined ? { bodyError: request.bodyError } : {}),
+        }),
+        requestTimeoutMs,
+        true,
+      );
       if (!result.ok) {
         return result.why === 'undeliverable'
           ? failure('E_BAD_REQUEST', `Request cannot cross the worker boundary: ${result.reason}`)
@@ -219,6 +265,7 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
         // Unconditional: after the ack the thread is already ending (it closed
         // its port), and a worker that never acked must not outlive the runtime.
         await worker.terminate();
+        withdrawals.port1.close();
         goDown('dashboard database worker is closed');
       })();
       return closed;

@@ -239,6 +239,24 @@ describe('createInferenceHost — a network-reachable bind must be gated', () =>
     await expect(start({ modelsDir, host: '0.0.0.0' })).rejects.toBeInstanceOf(InsecureBindError);
   });
 
+  it('refuses an EMPTY explicit token instead of treating it as one', async () => {
+    // `mlx serve --host 0.0.0.0 --auth-token "$TOKEN"` with `TOKEN` unset
+    // arrived here as `''`. The guard read that as "auth is configured" and
+    // allowed the wildcard bind; the comparator then accepted an empty
+    // `x-api-key`, because `timingSafeEqual` on two empty buffers is true. The
+    // result was inference published to the LAN under a guessable credential.
+    const modelsDir = await makeModelsDir(['alpha']);
+    await expect(start({ modelsDir, host: '0.0.0.0', port: 0, authToken: '' })).rejects.toThrow(/empty string/);
+  });
+
+  it('refuses an empty explicit token on loopback too', async () => {
+    // Downgrading to "no auth" here would silently hand back the
+    // unauthenticated, wildcard-CORS server the operator was trying not to
+    // start — fail-open in the other direction.
+    const modelsDir = await makeModelsDir(['alpha']);
+    await expect(start({ modelsDir, host: '127.0.0.1', port: 0, authToken: '' })).rejects.toThrow(/empty string/);
+  });
+
   it('leaves an unauthenticated loopback bind exactly as it was', async () => {
     const modelsDir = await makeModelsDir(['alpha']);
     for (const bind of ['127.0.0.1', 'localhost', undefined]) {

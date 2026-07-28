@@ -26,6 +26,33 @@ import type { ResponsesAPIRequest } from './types.js';
 /** Max request body size (10 MB). */
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
 
+/**
+ * The request's pathname, parsed against a CONSTANT base.
+ *
+ * Never against `Host`. That header is attacker-controlled text on every
+ * request — `Host: [` makes `new URL()` throw `ERR_INVALID_URL`, and a throw
+ * from an async request listener is an unhandled rejection, which under Node's
+ * default `--unhandled-rejections=throw` takes the whole process down. One
+ * malformed byte from any client that can reach the socket was enough to end
+ * inference. A pathname does not depend on the authority anyway, so a fixed
+ * base is both safer and equivalent: an absolute-form request URI
+ * (`GET http://host/v1/models HTTP/1.1`, legal in HTTP/1.1) still wins over
+ * the base and yields the same path it always did.
+ *
+ * `req.url` itself is guarded too, for the same reason rather than a known
+ * input: this function's contract is that no request can make it throw.
+ */
+export function requestPathname(req: IncomingMessage): string {
+  const raw = req.url ?? '/';
+  try {
+    return new URL(raw, 'http://localhost').pathname;
+  } catch {
+    const cut = raw.search(/[?#]/);
+    const path = cut === -1 ? raw : raw.slice(0, cut);
+    return path.startsWith('/') ? path : '/';
+  }
+}
+
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -72,8 +99,7 @@ export async function routeRequest(
   modelWorkCoordinator?: ModelWorkCoordinator,
   extras?: RouteExtras,
 ): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-  const path = url.pathname;
+  const path = requestPathname(req);
 
   if (path === '/v1/models') {
     if (req.method !== 'GET') {

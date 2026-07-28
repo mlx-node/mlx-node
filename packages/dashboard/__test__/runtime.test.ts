@@ -3,7 +3,7 @@
  * shutdown ordering.
  */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -357,5 +357,72 @@ describe('dashboard runtime — worker death', () => {
     } finally {
       expect(await withDeadline(client.close(), 10_000)).not.toBe('HUNG');
     }
+  });
+});
+
+/**
+ * A deadline settles the CALLER, but the request was posted the moment `send`
+ * ran and is sitting in the worker's message queue. Without a way to retract
+ * it, a timed-out `DELETE` answered the UI `503 E_UNAVAILABLE` and then
+ * performed the deletion anyway — the user is told nothing happened, retries or
+ * gives up, and the model / session / cache entry is gone regardless.
+ *
+ * Asserted on the on-disk transcript rather than a database row: it is the part
+ * of the mutation that outlives the worker, and it is visible from this thread
+ * without asking the worker anything.
+ */
+describe('dashboard database worker — withdrawing an abandoned request', () => {
+  const transcriptOf = (id: string): string => join(sessionsRoot, '--w--', `2026-07-01T10-00-00_${id}.jsonl`);
+
+  function client(requestTimeoutMs: number): ReturnType<typeof startDbWorker> {
+    return startDbWorker({
+      // The SOURCE entry, not `defaultWorkerUrl()`: the check under test lives
+      // in `db-worker.ts`, and a stale `dist` beside it would test nothing.
+      workerUrl: new URL('../src/worker/ts-bootstrap.ts', import.meta.url),
+      shutdownTimeoutMs: 10_000,
+      requestTimeoutMs,
+      onLifecycle: (): void => {},
+      dbPath: ':memory:',
+      modelsDir,
+      sessionsRoot,
+      tracesDir,
+      cacheRoot: undefined,
+    });
+  }
+
+  it('does not delete a session whose caller was already told the call failed', async () => {
+    const doomed = transcriptOf('rt-0');
+    expect(existsSync(doomed)).toBe(true);
+
+    // 20 ms cannot survive worker startup, so the deadline is guaranteed to
+    // expire while the request is still queued — the exact window the
+    // withdrawal covers.
+    const timing = client(20);
+    const res = await withDeadline(timing.call({ method: 'DELETE', path: '/api/sessions/rt-0' }), 10_000);
+    expect(res).not.toBe('HUNG');
+    const failed = res as Exclude<typeof res, 'HUNG'>;
+    expect(failed.status).toBe(503);
+    expect(failed.ok ? '' : failed.code).toBe('E_UNAVAILABLE');
+
+    // `close` is posted AFTER the DELETE and the worker answers in order, so
+    // once it resolves the DELETE has provably been reached. No sleep, and no
+    // way for the assertion below to pass merely by running early.
+    await withDeadline(timing.close(), 10_000);
+    expect(existsSync(doomed)).toBe(true);
+  });
+
+  it('still deletes when the caller waits for the answer', async () => {
+    // The control. Without it the test above would pass just as well against a
+    // DELETE route that had stopped working altogether.
+    const doomed = transcriptOf('rt-1');
+    expect(existsSync(doomed)).toBe(true);
+
+    const patient = client(30_000);
+    const res = await withDeadline(patient.call({ method: 'DELETE', path: '/api/sessions/rt-1' }), 10_000);
+    expect(res).not.toBe('HUNG');
+    expect((res as Exclude<typeof res, 'HUNG'>).status).toBe(200);
+
+    await withDeadline(patient.close(), 10_000);
+    expect(existsSync(doomed)).toBe(false);
   });
 });

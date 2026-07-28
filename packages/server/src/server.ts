@@ -114,8 +114,26 @@ function normalizePositiveIntConfig(value: number | undefined, name: string): nu
  * An empty env var means "not set". An accidental `MLX_SERVER_AUTH_TOKEN=` in
  * a launcher script must not enable auth with an empty secret that every
  * credential-less request would then fail against.
+ *
+ * An empty EXPLICIT token is a different case and is rejected outright, for the
+ * same reason {@link normalizePositiveIntConfig} rejects a bogus explicit knob:
+ * somebody asked for a token and supplied nothing, which is
+ * `--auth-token "$TOKEN"` with `TOKEN` unset. Returning `''` made the bind
+ * guard read "auth is configured" and allow `0.0.0.0`, while the comparator
+ * accepted an empty `x-api-key` because both strings were empty — a wildcard
+ * bind published under a credential anyone can guess. Quietly downgrading to
+ * "no auth" instead would be fail-open in the other direction: on loopback it
+ * hands back the unauthenticated, wildcard-CORS server the operator was
+ * explicitly trying not to start. Throwing is the only answer that is wrong in
+ * neither bind mode, and it happens before anything binds or loads.
  */
 export function resolveAuthToken(explicit: string | undefined): string | undefined {
+  if (explicit === '') {
+    throw new Error(
+      'authToken was set to an empty string; pass a real secret or omit it entirely ' +
+        '(an unset shell variable in `--auth-token "$VAR"` is the usual cause).',
+    );
+  }
   if (explicit !== undefined) return explicit;
   const fromEnv = process.env.MLX_SERVER_AUTH_TOKEN;
   return fromEnv != null && fromEnv !== '' ? fromEnv : undefined;
@@ -143,7 +161,8 @@ export interface ServerConfig {
    *
    * Default: `process.env.MLX_SERVER_AUTH_TOKEN`, or `undefined` (no auth)
    * when that is unset or empty. `undefined` is byte-for-byte identical to
-   * the pre-auth behaviour.
+   * the pre-auth behaviour. An explicit `''` is rejected rather than treated as
+   * either — see {@link resolveAuthToken}.
    *
    * Accepted as `x-api-key: <token>` or `authorization: Bearer <token>`.
    * Setting it also flips the `cors` default to `false`.
