@@ -123,8 +123,22 @@ export function isModelInstalled(modelDir: string): boolean {
  * which writes the marker. Callers use it to show such a model as PRESENT without
  * offering a dashboard install, which would refuse to overwrite the unowned
  * directory (`DownloadManager.refuseIfUnownedFinal`) and fail deterministically.
+ *
+ * NO-FOLLOW on the final component, matching every other predicate that reasons
+ * about a model root: both discovery walks and the CLI's filter entries on
+ * `Dirent.isDirectory()`, which is FALSE for a symlink, and `deleteLocalModel`
+ * refuses one outright. A FOLLOWING check would call a symlinked slug present —
+ * a model the dashboard cannot list, the agent cannot pick, and delete refuses —
+ * and, because `present` short-circuits {@link isPathOccupied}, it would suppress
+ * the very cleanup notice that explains the state. Only the final component is
+ * `lstat`-ed, so a symlinked models ROOT still resolves normally.
  */
 export function isModelPresent(modelDir: string): boolean {
+  try {
+    if (!lstatSync(modelDir).isDirectory()) return false;
+  } catch {
+    return false;
+  }
   if (!existsSync(join(modelDir, 'config.json'))) return false;
   let entries: string[];
   try {

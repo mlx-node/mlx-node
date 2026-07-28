@@ -467,6 +467,29 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
     expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(true);
   });
 
+  it('flags a LIVE symlink to an external checkpoint as blocked, not installed', () => {
+    // Both discovery walks and the CLI's filter on `Dirent.isDirectory()`, false for a
+    // symlink, and delete refuses one outright — so a followed presence check would
+    // label "Installed" a model nothing can list, pick or remove, and would suppress
+    // the cleanup notice by short-circuiting the occupancy test.
+    const external = mkdtempSync(join(tmpdir(), 'dash-ext-ckpt-'));
+    writeFileSync(join(external, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+    writeFileSync(join(external, 'model.safetensors'), Buffer.alloc(2048));
+    const link = join(modelsDir, RECOMMENDED_SLUG);
+    symlinkSync(external, link);
+    try {
+      // The link is LIVE — without this the case would hold for the wrong reason.
+      expect(existsSync(join(link, 'config.json'))).toBe(true);
+      expect(isModelPresent(link)).toBe(false);
+      expect(catalogItem('Qwen3.6-27B').present).toBe(false);
+      expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(true);
+      // The same directory the catalog now calls blocked is absent from discovery.
+      expect(discoverLocalModels(modelsDir).models.map((model) => model.name)).not.toContain(RECOMMENDED_SLUG);
+    } finally {
+      rmSync(external, { recursive: true, force: true });
+    }
+  });
+
   it('leaves an OWNED but incomplete dir installable', () => {
     // Our marker is there, so the preflight permits the owned swap and a reinstall
     // genuinely works — blocking it would remove the one recovery that functions.
