@@ -107,6 +107,59 @@ describe('ingestSessions', () => {
     },
   );
 
+  (canTestUnreadable ? it : it.skip)('keeps indexed rows when the session ROOT itself is unreadable', async () => {
+    // An unreadable root is UNKNOWN, not empty. Reconciliation retains a row only
+    // while its path is in the discoverable set, so listing the root as empty
+    // would delete every session on a single chmod. The pass must be skipped —
+    // warned, rows untouched — and must not throw, or the caller's combined
+    // try/catch would skip the trace ingest that follows it.
+    await ingestSessions(dash, workRoot);
+    expect(dash.db.select().from(sessions).all()).toHaveLength(2);
+
+    chmodSync(workRoot, 0o000);
+    try {
+      const res = await ingestSessions(dash, workRoot);
+      expect(res.scanned).toBe(0);
+      expect(res.updated).toBe(0);
+      expect(res.removed).toBe(0);
+      expect(res.warnings.some((w) => w.includes('scan skipped'))).toBe(true);
+      expect(dash.db.select().from(sessions).all()).toHaveLength(2);
+      expect(dash.db.select().from(turns).all()).toHaveLength(3);
+    } finally {
+      chmodSync(workRoot, 0o755); // restore so afterEach cleanup can remove it
+    }
+  });
+
+  it('keeps indexed rows when the session root is a regular file, not a directory', async () => {
+    // `--session-dir` is never validated, so pointing it at a transcript instead
+    // of its directory makes the root listing throw ENOTDIR. Same unknown state
+    // as an unreadable root: warn and skip, never reconcile.
+    await ingestSessions(dash, workRoot);
+    expect(dash.db.select().from(sessions).all()).toHaveLength(2);
+
+    const notADir = join(workRoot, '..', 'sessions.jsonl');
+    writeFileSync(notADir, '{"type":"session","id":"typo"}\n');
+    const res = await ingestSessions(dash, notADir);
+    expect(res.scanned).toBe(0);
+    expect(res.removed).toBe(0);
+    expect(res.warnings.some((w) => w.includes('scan skipped'))).toBe(true);
+    expect(dash.db.select().from(sessions).all()).toHaveLength(2);
+  });
+
+  it('still reconciles indexed rows away when the session root is absent', async () => {
+    // The counterpart to the two above: an ABSENT root is provably empty, so the
+    // existing wipe stays. Skipping here instead would strand rows for a deleted
+    // root forever.
+    await ingestSessions(dash, workRoot);
+    expect(dash.db.select().from(sessions).all()).toHaveLength(2);
+
+    const res = await ingestSessions(dash, join(workRoot, '..', 'gone'));
+    expect(res.removed).toBe(2);
+    expect(res.warnings).toEqual([]);
+    expect(dash.db.select().from(sessions).all()).toHaveLength(0);
+    expect(dash.db.select().from(turns).all()).toHaveLength(0);
+  });
+
   it('skips unchanged files on re-ingest', async () => {
     await ingestSessions(dash, workRoot);
     const second = await ingestSessions(dash, workRoot);

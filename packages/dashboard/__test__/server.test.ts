@@ -16,13 +16,14 @@ import {
 import { request, type IncomingMessage, type ServerResponse } from 'node:http';
 import { homedir, networkInterfaces, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
 import { canonicalCacheRoot, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import { createDownloadSseSender, handleApiRequest, type ApiDeps } from '../src/api.js';
-import type { DownloadEvent } from '../src/download.js';
+import { DownloadsClosedError, type DownloadEvent } from '../src/download.js';
 import { TRACE_RETENTION_DAYS } from '../src/ingest/traces.js';
 import { agentSessionsRoot } from '../src/paths.js';
 import { bracketHost, startDashboardServer, type DashboardServer } from '../src/server.js';
@@ -1165,6 +1166,58 @@ describe('dashboard server — session symlink containment (Finding 4)', () => {
   });
 });
 
+describe('dashboard server — ingest fault isolation', () => {
+  // chmod 000 is a no-op for root, so the unreadable root would still list — skip.
+  const canTestUnreadable = (process.getuid?.() ?? 0) !== 0;
+
+  (canTestUnreadable ? it : it.skip)('still ingests traces when the session root is unreadable', async () => {
+    // `doIngest` wraps BOTH halves in one try/catch, so a throw out of the session
+    // scan means the trace ingest on the next line never runs: every periodic pass
+    // fails identically, `/api/ingest` reports all-zero with HTTP 200, and the
+    // metrics pages go stale while the 30-day trace prune (which lives inside the
+    // trace ingest) freezes. The session scan must degrade to a warning instead.
+    await ingest();
+
+    writeFileSync(
+      join(tracesDir, 'late.jsonl'),
+      `${JSON.stringify({
+        v: 1,
+        traceId: 'trace-after-chmod',
+        ts: 1782039999000,
+        model: 'qwen3_5',
+        durationMs: 10,
+        finishReason: 'stop',
+        promptTokens: 1,
+        cachedTokens: 0,
+        outputTokens: 1,
+        reasoningTokens: 0,
+      })}\n`,
+    );
+
+    chmodSync(sessionsRoot, 0o000);
+    try {
+      const res = await fetch(`${server.url}/api/ingest`, { method: 'POST' });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        sessions: { removed: number; warnings: string[] };
+        traces: { files: number; records: number };
+      };
+      // The trace half ran to completion and picked up the file written above.
+      expect(body.traces.files).toBeGreaterThan(0);
+      expect(body.traces.records).toBeGreaterThan(0);
+      // The session half reported a skip, not a scan, and deleted nothing.
+      expect(body.sessions.warnings.some((w) => w.includes('scan skipped'))).toBe(true);
+      expect(body.sessions.removed).toBe(0);
+
+      // An unreadable root is unknown, not empty: the indexed sessions survive it.
+      const list = (await (await fetch(`${server.url}/api/sessions`)).json()) as { total: number };
+      expect(list.total).toBe(2);
+    } finally {
+      chmodSync(sessionsRoot, 0o755); // restore so afterEach cleanup can remove it
+    }
+  });
+});
+
 describe('dashboard server — metrics overview', () => {
   it('returns aggregate arrays', async () => {
     await ingest();
@@ -2016,6 +2069,36 @@ describe('dashboard server — cancel download route', () => {
   });
 });
 
+// A POST that lands while `close()` is draining downloads is refused by the
+// manager. That refusal is a server-lifecycle condition, not a malformed request,
+// so it must not be reported as a 400 blaming the caller.
+describe('dashboard server — start download route', () => {
+  function postDownload(start: () => string): Promise<{ status: number; body: string }> {
+    const deps = { downloads: { start } } as unknown as ApiDeps;
+    const { res, captured } = fakeRes();
+    const url = new URL('http://localhost/api/downloads');
+    const req = Object.assign(Readable.from([Buffer.from(JSON.stringify({ repo: 'org/model' }))]), {
+      method: 'POST',
+    }) as unknown as IncomingMessage;
+    return handleApiRequest(req, res, url, deps).then(() => captured);
+  }
+
+  it('answers 503 once the download manager is shutting down', async () => {
+    const captured = await postDownload(() => {
+      throw new DownloadsClosedError();
+    });
+    expect(captured.status).toBe(503);
+    expect((JSON.parse(captured.body) as { error: string }).error).toMatch(/shutting down/i);
+  });
+
+  it('still answers 400 for a repo the catalog does not carry', async () => {
+    const captured = await postDownload(() => {
+      throw new Error('Repo "org/model" is not in the model catalog');
+    });
+    expect(captured.status).toBe(400);
+  });
+});
+
 describe('dashboard server — static SPA', () => {
   it('serves index.html at /', async () => {
     const res = await fetch(`${server.url}/`);
@@ -2323,6 +2406,60 @@ describe('dashboard SSE progress — backpressure coalescing', () => {
     expect(res.writes.length).toBe(3);
     expect(res.writes[1]).toContain('"receivedBytes":100');
     expect(res.writes[2]).toContain('event: done');
+  });
+
+  /** The `event:` name of an emitted SSE frame. */
+  function frameType(frame: string): string {
+    return frame.slice('event: '.length, frame.indexOf('\n'));
+  }
+
+  // Regression: a `false` return from `write` means Node BUFFERED the chunk, not
+  // that it refused it. Re-queueing the head after a false return replays a frame
+  // that is already on the wire — and for a frame larger than the socket
+  // high-water mark (an unbounded remote `error.message` from the hub) every
+  // subsequent flush returns false too, so the same frame is rewritten without
+  // bound. Both drains here happen while the socket is still full, which no other
+  // test does.
+  it('never re-sends a frame the socket already accepted under backpressure', () => {
+    const res = fakeWritable();
+    const send = createDownloadSseSender(res);
+
+    res.setCanWrite(false);
+    send(progress(1)); // written, returns false → blocked
+    send({ type: 'done', id: 'job', outputDir: '/models/job' }); // queued
+    expect(res.writes.length).toBe(1);
+
+    // Socket still full: the terminal frame is written AND accepted, yet `write`
+    // returns false again.
+    res.drain();
+    expect(res.writes.length).toBe(2);
+    expect(res.writes[1]).toContain('event: done');
+
+    // Nothing left to send — the terminal frame is already on the wire.
+    res.setCanWrite(true);
+    res.drain();
+    expect(res.writes.filter((frame) => frameType(frame) === 'done').length).toBe(1);
+    expect(res.writes.length).toBe(2);
+  });
+
+  it('keeps coalesced ordering across a drain that is itself backpressured', () => {
+    const res = fakeWritable();
+    const send = createDownloadSseSender(res);
+
+    res.setCanWrite(false);
+    send(progress(1)); // written, returns false → blocked
+    send(progress(2)); // queued
+    send(progress(3)); // coalesced onto the queued progress
+    send({ type: 'done', id: 'job', outputDir: '/models/job' }); // queued behind it
+    expect(res.writes.length).toBe(1);
+
+    res.drain(); // still full: flushes the coalesced progress only
+    res.setCanWrite(true);
+    res.drain(); // the terminal frame follows
+
+    expect(res.writes.map(frameType)).toEqual(['progress', 'progress', 'done']);
+    expect(res.writes[0]).toContain('"receivedBytes":1');
+    expect(res.writes[1]).toContain('"receivedBytes":3');
   });
 });
 

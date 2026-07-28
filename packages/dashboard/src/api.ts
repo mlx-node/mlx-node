@@ -24,7 +24,7 @@ import { scanColdCache, clearColdCache, coldCacheRoot, evictOlderThan } from './
 import { catalogWithState } from './catalog.js';
 import type { DashboardDb } from './db/open.js';
 import { sessions, turns } from './db/schema.js';
-import type { DownloadManager, DownloadEvent } from './download.js';
+import { DownloadsClosedError, type DownloadManager, type DownloadEvent } from './download.js';
 import {
   activeBranchEntries,
   classifySessionFile,
@@ -54,7 +54,7 @@ export interface ApiDeps {
 
 export interface IngestSummary {
   sessions: { scanned: number; updated: number; removed: number; warnings: string[] };
-  traces: { files: number; records: number; pruned: number };
+  traces: { files: number; records: number; pruned: number; warnings: string[] };
 }
 
 export interface SseClient {
@@ -309,6 +309,12 @@ async function handleDownloadStart({ req, res, deps }: RouteCtx): Promise<void> 
     const id = deps.downloads.start(repo);
     sendJson(res, 202, { id, repo });
   } catch (err) {
+    // The manager is draining for shutdown: the request is well-formed, the
+    // server is simply going away, so answer 503 rather than blaming the caller.
+    if (err instanceof DownloadsClosedError) {
+      sendError(res, 503, err.message);
+      return;
+    }
     sendError(res, 400, err instanceof Error ? err.message : 'Failed to start download');
   }
 }
@@ -353,14 +359,20 @@ export function createDownloadSseSender(res: SseWritable): (event: DownloadEvent
   let blocked = false;
   const pending: DownloadEvent[] = [];
 
+  // A `false` return from `write` means the chunk was BUFFERED, not refused — so
+  // a frame is dequeued before its result is read, exactly as the unblocked path
+  // below never re-queues one. Keeping the head instead would rewrite an
+  // already-sent frame on every drain, and for a frame larger than the socket
+  // high-water mark (an unbounded remote `error.message` from the hub) every
+  // rewrite returns false again, replaying it without bound.
   const flush = (): void => {
     blocked = false;
     while (pending.length > 0) {
-      if (!res.write(sseFrame(pending[0]))) {
+      const event = pending.shift()!;
+      if (!res.write(sseFrame(event))) {
         blocked = true;
         return;
       }
-      pending.shift();
     }
   };
   res.on('drain', flush);

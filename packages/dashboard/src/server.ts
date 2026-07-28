@@ -203,13 +203,13 @@ export async function startDashboardServer(opts: DashboardServerOptions = {}): P
     } catch (err) {
       return {
         sessions: { scanned: 0, updated: 0, removed: 0, warnings: [String(err)] },
-        traces: { files: 0, records: 0, pruned: 0 },
+        traces: { files: 0, records: 0, pruned: 0, warnings: [] },
       };
     }
   };
   let ingestChain: Promise<IngestSummary> = Promise.resolve({
     sessions: { scanned: 0, updated: 0, removed: 0, warnings: [] },
-    traces: { files: 0, records: 0, pruned: 0 },
+    traces: { files: 0, records: 0, pruned: 0, warnings: [] },
   });
   const runIngest = (): Promise<IngestSummary> => {
     ingestChain = ingestChain.then(doIngest);

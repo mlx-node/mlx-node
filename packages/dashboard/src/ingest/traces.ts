@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readdirSync, statSync, unlinkSync, type Stats } from 'node:fs';
 import { join } from 'node:path';
 
 import { eq, isNotNull } from 'drizzle-orm';
@@ -11,6 +11,8 @@ export interface TraceIngestResult {
   files: number;
   records: number;
   pruned: number;
+  /** Human-readable notes for a pass that was skipped (unreadable trace root). */
+  warnings: string[];
 }
 
 /** Structural view of a `MetricsTraceRecord` line (B1). Read defensively. */
@@ -94,6 +96,7 @@ export async function ingestTraces(
   let files = 0;
   let records = 0;
   let pruned = 0;
+  const warnings: string[] = [];
   if (!existsSync(traceDir)) {
     // A vanished trace directory means zero live source files: run the same
     // retention reconciliation the non-empty path does, against an empty live
@@ -103,7 +106,7 @@ export async function ingestTraces(
     // No live files means no valid watermarks; clear them so a recreated dir is
     // re-ingested from scratch and the table never tracks vanished files.
     db.delete(traceFiles).run();
-    return { files, records, pruned };
+    return { files, records, pruned, warnings };
   }
 
   // No-follow root guard (same lstat stance as `download.ts` `assertRealDirOrAbsent`):
@@ -114,9 +117,20 @@ export async function ingestTraces(
   // best-effort background work, so rather than throw we skip the whole pass (prune
   // nothing, ingest nothing) and leave everything untouched; a real directory behaves
   // exactly as before.
-  const rootStat = lstatSync(traceDir);
+  //
+  // The stat itself can still fail after `existsSync` said yes — another process
+  // removing `~/.mlx-node/metrics` mid-pass, or the parent turning unsearchable —
+  // so it is guarded too, and skips the pass rather than throwing out of the
+  // caller's combined ingest.
+  let rootStat: Stats;
+  try {
+    rootStat = lstatSync(traceDir);
+  } catch (err) {
+    warnings.push(`${traceDir}: trace root could not be read; scan skipped (${String(err)})`);
+    return { files, records, pruned, warnings };
+  }
   if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
-    return { files, records, pruned };
+    return { files, records, pruned, warnings };
   }
 
   // Reconcile rows whose backing file has vanished (renamed or manually deleted)
@@ -127,7 +141,21 @@ export async function ingestTraces(
   // trace would end up in NO row and never re-insert (the next scan skips b by its
   // watermark). Deleting a.jsonl's rows up front lets b's insert find no conflict.
   // Rows with a NULL source_file predate source tracking and are left untouched.
-  const liveFiles = new Set(readdirSync(traceDir).filter((n) => n.endsWith('.jsonl')));
+  //
+  // That reconciliation is exactly why an unreadable root (chmod/ACL drift, an
+  // external volume returning EACCES, fd exhaustion, a vanish racing another
+  // process) must skip the pass instead of falling back to an empty listing: an
+  // empty live set reads as "every source file is gone" and deletes the whole
+  // index on a fault that says nothing about the files.
+  let entries: string[];
+  try {
+    entries = readdirSync(traceDir);
+  } catch (err) {
+    warnings.push(`${traceDir}: trace root could not be listed; scan skipped (${String(err)})`);
+    return { files, records, pruned, warnings };
+  }
+
+  const liveFiles = new Set(entries.filter((n) => n.endsWith('.jsonl')));
   const trackedSources = sqlite
     .prepare('SELECT DISTINCT source_file AS sf FROM traces WHERE source_file IS NOT NULL')
     .all() as Array<{ sf: string }>;
@@ -135,7 +163,7 @@ export async function ingestTraces(
     if (!liveFiles.has(sf)) db.delete(traces).where(eq(traces.sourceFile, sf)).run();
   }
 
-  for (const name of readdirSync(traceDir)) {
+  for (const name of entries) {
     if (!name.endsWith('.jsonl')) continue;
     const filePath = join(traceDir, name);
 
@@ -288,11 +316,22 @@ export async function ingestTraces(
   // is included in the vanished set. (The trace-row reconciliation runs BEFORE the
   // loop; see the note there — a renamed file's row must be freed before its new
   // name is ingested.)
-  const live = new Set(readdirSync(traceDir).filter((n) => n.endsWith('.jsonl')));
+  //
+  // Guarded like the listing above, and for the same reason: the rows committed by
+  // the loop stand either way, but reconciling watermarks against a listing we could
+  // not take would clear every one of them and force a full re-read next pass.
+  let liveNames: string[];
+  try {
+    liveNames = readdirSync(traceDir);
+  } catch (err) {
+    warnings.push(`${traceDir}: trace root could not be re-listed; watermark reconciliation skipped (${String(err)})`);
+    return { files, records, pruned, warnings };
+  }
+  const live = new Set(liveNames.filter((n) => n.endsWith('.jsonl')));
   const trackedFiles = db.select({ name: traceFiles.name }).from(traceFiles).all();
   for (const { name: tracked } of trackedFiles) {
     if (!live.has(tracked)) db.delete(traceFiles).where(eq(traceFiles.name, tracked)).run();
   }
 
-  return { files, records, pruned };
+  return { files, records, pruned, warnings };
 }

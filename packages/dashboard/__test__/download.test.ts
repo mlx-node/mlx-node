@@ -61,6 +61,8 @@ const hub = vi.hoisted(() => ({
   revisions: [] as string[],
   /** Paths whose `downloadFileToCacheDir` should throw, to simulate a mid-job failure. */
   failOn: [] as string[],
+  /** Overrides the thrown message, so a remote-sized error body can be simulated. */
+  failMessage: null as string | null,
   /** The blob a snapshot pointer resolves to (content-addressed by rev + path). */
   cacheBlob: (cacheDir: string, revision: string, p: string): string =>
     `${cacheDir}/blobs/${revision}__${p.split('/').join('__')}`,
@@ -138,7 +140,9 @@ vi.mock('@huggingface/hub', () => ({
     fetch: typeof fetch;
   }) => {
     if (params.revision !== undefined) hub.revisions.push(params.revision);
-    if (hub.failOn.includes(params.path)) throw new Error(`simulated failure for ${params.path}`);
+    if (hub.failOn.includes(params.path)) {
+      throw new Error(hub.failMessage ?? `simulated failure for ${params.path}`);
+    }
     const revision = params.revision ?? 'main';
     const pointer = hub.cachePointer(params.cacheDir, revision, params.path);
     // Cache hit: a pinned revision returns the existing pointer without re-fetching.
@@ -259,6 +263,7 @@ beforeEach(() => {
   hub.sha = SHA_DEFAULT;
   hub.revisions = [];
   hub.failOn = [];
+  hub.failMessage = null;
   renameFault.failFromPath = null;
   renameFault.failFromPrefix = null;
   raceHook.onMarkerWrite = null;
@@ -1775,6 +1780,63 @@ describe('DownloadManager', () => {
     expect(manager.jobs().find((j) => j.id === id1)!.state).toBe('cancelled');
     expect(jobStagingDirs()).toEqual([]);
     expect(existsSync(finalDir())).toBe(false);
+  });
+
+  // Regression: the server's `close()` leaves the HTTP listener attached across
+  // `await downloads.shutdown()`, so a `POST /api/downloads` can land mid-drain.
+  // `shutdown` snapshots the queue ONCE, but the retained drain loop re-reads the
+  // live queue — so a job enqueued after that snapshot is adopted by the very
+  // promise `shutdown` awaits, and is never cancelled: one such job hangs close()
+  // forever. A closing manager must refuse new work instead.
+  it('refuses a job enqueued after shutdown began, so the drain can never be extended', async () => {
+    let blocked = false;
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeCancelFetch({ 'config.json': 12, 'model.safetensors': 300 }, 'model.safetensors', () => {
+        blocked = true;
+      }),
+    });
+    const id1 = manager.start(REPO);
+    await waitFor(() => blocked);
+
+    // `shutdown` flips the manager closed before its first await, so the refusal
+    // does not depend on how wide the in-flight job's unwind window happens to be.
+    const shutdownP = manager.shutdown();
+    expect(() => manager.start(REPO)).toThrow(/shutting down/i);
+    await shutdownP;
+
+    // The refused job was never registered, so nothing extended the drain and the
+    // in-flight job settled cancelled with its staging tree reclaimed.
+    expect(manager.jobs()).toHaveLength(1);
+    expect(manager.jobs().find((j) => j.id === id1)!.state).toBe('cancelled');
+    expect(jobStagingDirs()).toEqual([]);
+    expect(existsSync(finalDir())).toBe(false);
+  });
+
+  // `error.message` is the only unbounded DownloadEvent field: `@huggingface/hub`
+  // copies the REMOTE JSON error body into it verbatim. The frame is retained in
+  // `lastEvent` and replayed to every SSE subscriber that attaches later, so a
+  // remote-sized string must be truncated before it ever becomes an event.
+  it('truncates a remote-sized failure message before broadcasting it', async () => {
+    hub.failOn = ['model.safetensors'];
+    hub.failMessage = `boom ${'x'.repeat(100_000)}`;
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+
+    await waitFor(() => events.some((event) => event.type === 'error'));
+    const failure = events.find((event) => event.type === 'error')!;
+    const message = failure.type === 'error' ? failure.message : '';
+
+    expect(message.startsWith('boom ')).toBe(true);
+    expect(message.length).toBeLessThan(4096);
+    expect(message.endsWith('…')).toBe(true);
   });
 });
 

@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readFileSync, readdirSync, statSync, type Stats } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readdirSync, statSync, type Dirent, type Stats } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -332,8 +332,12 @@ export function verifySessionFileId(path: string, expectedId: string): boolean {
  * directory is never descended — so a symlinked transcript is never indexed and an
  * external Pi session cannot be surfaced under the target's id, matching the native
  * cold tier's no-follow policy.
+ *
+ * Returns `null` when the ROOT itself could not be listed — a state the caller must
+ * tell apart from an empty result, which reconciliation reads as "every session was
+ * deleted".
  */
-function listSessionFiles(root: string): string[] {
+function listSessionFiles(root: string): string[] | null {
   if (!existsSync(root)) return [];
   const files: string[] = [];
 
@@ -348,7 +352,19 @@ function listSessionFiles(root: string): string[] {
     if (stat.isFile()) files.push(full);
   };
 
-  for (const entry of readdirSync(root, { withFileTypes: true })) {
+  // The root listing itself can fail where `existsSync` cannot see it: EACCES on a
+  // chmod'd/ACL'd root, ENOTDIR when `--session-dir` names a transcript instead of
+  // its directory, EMFILE under fd pressure, or ENOENT racing another process. Any
+  // of those leaves the root's contents UNKNOWN, which is not the same as empty —
+  // hence `null` rather than `[]`.
+  let rootEntries: Dirent[];
+  try {
+    rootEntries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  for (const entry of rootEntries) {
     // `--<cwd>--/` project subdir: scan the `.jsonl` files inside it.
     if (entry.isDirectory()) {
       if (!entry.name.startsWith('--') || !entry.name.endsWith('--')) continue;
@@ -419,6 +435,15 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
   // files skipped by the mtime/size watermark are still in this set, so valid
   // in-root rows are never wrongly dropped.
   const discoverable = listSessionFiles(sessionRoot);
+  if (discoverable === null) {
+    // The root could not be listed, so nothing about the indexed rows can be
+    // proven stale — reconciling against an unknown set would wipe the whole
+    // session index on one chmod or a transient EMFILE. Warn and skip. Returning
+    // normally (rather than throwing) also keeps the caller on its happy path, so
+    // the trace ingest and its 30-day prune still run this pass.
+    warnings.push(`${sessionRoot}: session root could not be listed; scan skipped`);
+    return { scanned, updated, removed, warnings };
+  }
   const discoverableSet = new Set(discoverable);
 
   for (const filePath of discoverable) {

@@ -1,5 +1,6 @@
 import {
   appendFileSync,
+  chmodSync,
   cpSync,
   mkdirSync,
   mkdtempSync,
@@ -424,5 +425,33 @@ describe('ingestTraces', () => {
     const res = await ingestTraces(dash, dir);
     expect(res.files).toBe(0);
     expect(dash.db.select().from(traces).all()).toHaveLength(0);
+    expect(res.warnings).toEqual([]);
+  });
+
+  // chmod 000 is a no-op for root, so the unreadable dir would still list — skip.
+  const canTestUnreadable = (process.getuid?.() ?? 0) !== 0;
+  (canTestUnreadable ? it : it.skip)('skips the pass when the trace root is unreadable, keeping rows', async () => {
+    // A root that exists but cannot be listed (chmod/ACL drift, an external volume
+    // returning EACCES, fd exhaustion) is UNKNOWN, not empty. Throwing would abort
+    // the whole ingest pass; listing it as empty would let the reconciliation above
+    // delete every tracked source file. Warn, skip, touch nothing.
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'a.jsonl'), traceLine('trace-keep'));
+    await ingestTraces(dash, dir);
+    expect(dash.db.select().from(traces).all()).toHaveLength(1);
+    expect(dash.db.select().from(traceFiles).all()).toHaveLength(1);
+
+    chmodSync(dir, 0o000);
+    try {
+      const res = await ingestTraces(dash, dir, { retentionDays: 30 });
+      expect(res.files).toBe(0);
+      expect(res.records).toBe(0);
+      expect(res.pruned).toBe(0);
+      expect(res.warnings.some((w) => w.includes('scan skipped'))).toBe(true);
+      expect(dash.db.select().from(traces).all()).toHaveLength(1);
+      expect(dash.db.select().from(traceFiles).all()).toHaveLength(1);
+    } finally {
+      chmodSync(dir, 0o755); // restore so afterEach cleanup can remove it
+    }
   });
 });

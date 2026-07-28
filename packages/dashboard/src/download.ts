@@ -261,6 +261,31 @@ export type DownloadEvent =
   | { type: 'error'; id: string; message: string }
   | { type: 'cancelled'; id: string };
 
+/** Cap on the failure text an `error` event carries. */
+const MAX_ERROR_MESSAGE_CHARS = 2048;
+
+/**
+ * Bound the failure text of an `error` event. `@huggingface/hub` copies a remote
+ * JSON error body straight into `Error.message`, so this string is unbounded and
+ * shaped by the far end — and the event is retained in `lastEvent` and replayed
+ * to every SSE subscriber that attaches afterwards.
+ */
+function truncateMessage(message: string): string {
+  return message.length > MAX_ERROR_MESSAGE_CHARS ? `${message.slice(0, MAX_ERROR_MESSAGE_CHARS)}…` : message;
+}
+
+/**
+ * Thrown by {@link DownloadManager.start} once {@link DownloadManager.shutdown}
+ * has begun. Distinct from the catalog rejection (a bad request) so the API can
+ * answer 503 — the repo is fine, the server is just going away.
+ */
+export class DownloadsClosedError extends Error {
+  constructor() {
+    super('The dashboard is shutting down; not accepting new downloads');
+    this.name = 'DownloadsClosedError';
+  }
+}
+
 /**
  * `committing` is the brief, non-cancellable window from just before `publish`
  * until the job settles: `cancel()`'s `state !== 'running'` gate rejects it, so a
@@ -327,6 +352,10 @@ export class DownloadManager {
   // await every queued/running job's `finally` cleanup before the process exits;
   // `null` whenever no loop is running.
   private drainPromise: Promise<void> | null = null;
+  // Set by `shutdown` before it snapshots the queue: a closing manager accepts no
+  // new work. Without it a job enqueued during the drain lands outside that
+  // snapshot yet is still picked up by the retained loop `shutdown` awaits.
+  private closed = false;
 
   private currentJob: JobState | null = null;
   private currentFile: FileContext | null = null;
@@ -341,12 +370,16 @@ export class DownloadManager {
   }
 
   /**
-   * Queue a catalog repo for download. Rejects any repo not in the catalog.
+   * Queue a catalog repo for download. Rejects any repo not in the catalog, and
+   * refuses outright once {@link shutdown} has begun — the HTTP listener stays
+   * attached across the drain, so a late POST would otherwise be adopted by the
+   * loop `shutdown` is awaiting and could keep `close()` from ever completing.
    * `overwrite` (default false) permits replacing a final dir the downloader does
    * not own; callers (the API/UI) leave it unset so an unowned local checkpoint
    * is never silently destroyed.
    */
   start(repo: string, opts?: { overwrite?: boolean }): string {
+    if (this.closed) throw new DownloadsClosedError();
     if (!MODEL_CATALOG.some((entry) => entry.hfRepo === repo)) {
       throw new Error(`Repo "${repo}" is not in the model catalog`);
     }
@@ -438,6 +471,9 @@ export class DownloadManager {
    * to finish its atomic swap and simply awaited to completion. Never throws.
    */
   async shutdown(): Promise<void> {
+    // Refuse new work before anything else: the snapshot below is one-shot, so a
+    // `start` racing the drain would slip past it and be run anyway.
+    this.closed = true;
     // Snapshot the queue first: `cancel` splices each settled id out of it.
     for (const id of this.queue.slice()) this.cancel(id);
     // Abort the in-flight job (if any); its `processJob` unwinds via the aborted
@@ -786,7 +822,7 @@ export class DownloadManager {
         this.emit({ type: 'cancelled', id: job.id });
       } else {
         job.state = 'error';
-        this.emit({ type: 'error', id: job.id, message: (error as Error).message });
+        this.emit({ type: 'error', id: job.id, message: truncateMessage((error as Error).message) });
       }
     } finally {
       // Job-private staging is scratch: a successful publish already renamed it
