@@ -249,20 +249,21 @@ describe('parseMachOPaths', () => {
     ]);
   });
 
-  it('matches "Mach-O" anywhere on the line — faithful to the shell version, and WRONG', () => {
-    // NOT a description of desired behaviour. The shell version tested the whole
-    // `file` line for /Mach-O/, so a plain text file whose NAME happens to contain
-    // the string is treated as a binary, handed to `codesign -dv`, and reported as
-    // `FAIL no Team ID`. Reproduced on a real bundle: a file called
-    // `about-Mach-O.txt` fails the gate under both the old script and this one.
+  it('decides on the description, not the path — a file merely NAMED Mach-O is not one', () => {
+    // The shell version tested the whole `file` line for /Mach-O/, so a plain
+    // text file whose NAME contained the string was handed to `codesign -dv`
+    // and reported as `FAIL no Team ID`. A release blocked by a filename.
     //
-    // Preserved deliberately, because the port had to be behaviour-for-behaviour
-    // before it could be an improvement. The fix is to test only the description,
-    // i.e. `line.slice(colon + 1).includes('Mach-O')` — at which point this
-    // expectation becomes `toStrictEqual([])` and the mistake is a caught
-    // regression rather than a silent one.
-    expect(parseMachOPaths('Contents/Resources/about-Mach-O.txt: ASCII text\n')).toStrictEqual([
-      'Contents/Resources/about-Mach-O.txt',
+    // The failure is worse than a stray line: `[2/5]` is the step that exists
+    // to catch a genuinely unsigned binary, so a false entry there trains
+    // whoever reads the log to treat its output as noise.
+    expect(parseMachOPaths('Contents/Resources/about-Mach-O.txt: ASCII text\n')).toStrictEqual([]);
+
+    // The other half of the same rule: a path that says nothing about Mach-O
+    // must still be picked up when the DESCRIPTION does. Without this, testing
+    // only the path would pass the assertion above for the wrong reason.
+    expect(parseMachOPaths('Contents/Resources/native/addon.node: Mach-O 64-bit dynamically linked shared library arm64\n')).toStrictEqual([
+      'Contents/Resources/native/addon.node',
     ]);
   });
 

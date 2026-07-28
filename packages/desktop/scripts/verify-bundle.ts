@@ -68,9 +68,13 @@ import { fileURLToPath } from 'node:url';
 export function parseMachOPaths(fileOutput: string): string[] {
   const found = new Set<string>();
   for (const line of fileOutput.split('\n')) {
-    if (!line.includes('Mach-O')) continue;
     const colon = line.indexOf(':');
     if (colon === -1) continue;
+    // Only the DESCRIPTION decides, never the path. `file` prints
+    // `<path>: <description>`, and testing the whole line meant a plain text
+    // file merely NAMED `about-Mach-O.txt` was handed to `codesign -dv` and
+    // reported as `FAIL no Team ID` — a release blocked by a filename.
+    if (!line.slice(colon + 1).includes('Mach-O')) continue;
     found.add(line.slice(0, colon).replace(/ \(for architecture [^)]*\)$/, ''));
   }
   // Code-unit order, not `localeCompare`: this list drives the order of the FAIL

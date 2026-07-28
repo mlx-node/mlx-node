@@ -1,12 +1,31 @@
 {
+  // `include` and `outDir` resolve relative to THIS file, not the repo root.
+  // They were written as though they resolved from the root, so
+  // `./packages/internal-tools/**/*.ts` looked for
+  // packages/internal-tools/packages/internal-tools/**, which does not exist —
+  // the project matched ZERO files and type-checked nothing at all. The same
+  // mistake in `outDir` created a real stray directory,
+  // packages/internal-tools/packages/internal-tools/dist/, holding nothing but
+  // a tsbuildinfo for that empty compile.
+  //
+  // It stayed invisible because an empty project SUCCEEDS: `tsc -b` reports no
+  // errors on no files, so the gate was green precisely because it was checking
+  // nothing. The tell is `tsc --listFiles` printing nothing.
+  //
+  // `noEmit` + `composite: false` rather than a build: package.json declares
+  // `bin: { tools: "./index.ts" }`, so this is executed straight from source by
+  // oxnode and no consumer ever reads a `dist`. Emitting would only recreate the
+  // stray-output problem. Cross-package imports (`../core/build.ts` and what it
+  // pulls in) are followed automatically and need no `include` entry — listing
+  // every file is a requirement of project references, which this no longer uses.
   "extends": "../../tsconfig.json",
   "compilerOptions": {
-    "rootDir": "../..",
-    "outDir": "./packages/internal-tools/dist",
-    "composite": true,
+    "noEmit": true,
+    "composite": false,
     "target": "ESNext",
     "module": "ESNext",
-    "moduleResolution": "Bundler"
+    "moduleResolution": "Bundler",
+    "types": ["node"]
   },
-  "include": ["vite.config.ts", "./packages/internal-tools/**/*.ts", "./packages/core/build.ts"]
+  "include": ["./**/*.ts"]
 }
