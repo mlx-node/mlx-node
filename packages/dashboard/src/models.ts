@@ -9,11 +9,15 @@
  */
 
 import {
+  closeSync,
+  constants,
   type Dir,
   type Dirent,
   existsSync,
+  fstatSync,
   lstatSync,
   opendirSync,
+  openSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -98,13 +102,7 @@ export function isWeightFile(path: string): boolean {
  * installed, hiding the retry.
  */
 export function isModelInstalled(modelDir: string): boolean {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(join(modelDir, DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as unknown;
-  } catch {
-    return false;
-  }
-  const marker = asObject(parsed);
+  const marker = asObject(readMarkerFile(modelDir));
   if (marker === undefined || !Array.isArray(marker.files)) return false;
   const files = marker.files;
   // A loadable checkpoint needs a config AND a weight; a marker missing either
@@ -192,13 +190,7 @@ function shardsComplete(modelDir: string): boolean {
  * files still exist on disk (that is `isModelInstalled`'s job); callers pair the two.
  */
 export function readCompletion(finalDir: string): DownloadCompletion | undefined {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(join(finalDir, DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as unknown;
-  } catch {
-    return undefined;
-  }
-  const marker = asObject(parsed);
+  const marker = asObject(readMarkerFile(finalDir));
   if (
     marker === undefined ||
     typeof marker.repo !== 'string' ||
@@ -260,14 +252,45 @@ export function isDownloaderOwned(modelDir: string): boolean {
   } catch {
     return false;
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(join(modelDir, DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as unknown;
-  } catch {
-    return false;
-  }
-  const marker = asObject(parsed);
+  const marker = asObject(readMarkerFile(modelDir));
   return marker !== undefined && Array.isArray(marker.files);
+}
+
+/**
+ * Parse `<dir>/.mlx-download-complete.json` — the ONE reader every ownership,
+ * identity and completeness check goes through, so none of them can drift.
+ *
+ * Opened `O_NOFOLLOW | O_NONBLOCK` and gated on `fstat().isFile()`, because
+ * anything at that path which is not a regular file is not a marker we wrote,
+ * and two of the alternatives are actively harmful:
+ *
+ * - A SYMLINK's target says nothing about THIS directory. Following one lets a
+ *   link to any parseable marker vouch for a directory the downloader never
+ *   created — and {@link isDownloaderOwned} is what permits the publish swap to
+ *   move that directory aside and `rm -rf` the backup.
+ * - A FIFO would BLOCK `readFileSync` until a writer appears. `/api/catalog` is
+ *   synchronous and scans every child of the models dir, so one FIFO would wedge
+ *   the whole single-threaded server, not merely this call. `O_NOFOLLOW` alone
+ *   does not prevent that; the open must also be `O_NONBLOCK`, and the stat has
+ *   to be on the DESCRIPTOR so nothing can be swapped in after the check.
+ *
+ * Nothing legitimate is lost: our own publish writes a regular file, and a
+ * hard-linked copy (`cp -al`) is still a regular file.
+ */
+function readMarkerFile(dir: string): unknown {
+  let fd: number | undefined;
+  try {
+    fd = openSync(
+      join(dir, DOWNLOAD_COMPLETE_MARKER),
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    if (!fstatSync(fd).isFile()) return undefined;
+    return JSON.parse(readFileSync(fd, 'utf-8')) as unknown;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 function asObject(value: unknown): Record<string, unknown> | undefined {

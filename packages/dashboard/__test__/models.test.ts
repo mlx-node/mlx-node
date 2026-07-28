@@ -14,6 +14,7 @@ import {
   isDownloaderOwned,
   isModelInstalled,
   isModelPresent,
+  readCompletion,
 } from '../src/models.js';
 
 let modelsDir: string;
@@ -339,6 +340,33 @@ describe('isDownloaderOwned', () => {
     expect(isDownloaderOwned(dangling)).toBe(false);
     expect(isDownloaderOwned(join(modelsDir, 'absent'))).toBe(false);
   });
+
+  // The directory gate is not enough on its own: a REAL unowned directory whose
+  // MARKER is a symlink to any parseable marker used to read as owned, and
+  // ownership is what lets the publish swap move that directory aside and delete
+  // the backup. A link's target is proof about the target, never about the
+  // directory holding the link.
+  it('is false when the marker itself is a symlink to a foreign marker', () => {
+    const external = mkdtempSync(join(tmpdir(), 'dash-ext-marker-'));
+    const foreign = join(external, DOWNLOAD_COMPLETE_MARKER);
+    writeFileSync(
+      foreign,
+      JSON.stringify({ repo: 'owner/repo', revision: 'c'.repeat(40), files: ['config.json'], completedAt: 'x' }),
+    );
+    const victim = join(modelsDir, 'real-unowned-dir');
+    mkdirSync(victim, { recursive: true });
+    writeFileSync(join(victim, 'PRECIOUS.txt'), 'hand-made, not ours');
+    symlinkSync(foreign, join(victim, DOWNLOAD_COMPLETE_MARKER));
+
+    // The link resolves and parses — the only thing refusing it is the no-follow open.
+    expect(existsSync(join(victim, DOWNLOAD_COMPLETE_MARKER))).toBe(true);
+    expect(isDownloaderOwned(victim)).toBe(false);
+    // The identity reader shares the same gate, so the catalog cannot claim the dir either.
+    expect(readCompletion(victim)).toBeUndefined();
+    expect(isModelInstalled(victim)).toBe(false);
+
+    rmSync(external, { recursive: true, force: true });
+  });
 });
 
 describe('defaultModelsDir', () => {
@@ -488,6 +516,27 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
     } finally {
       rmSync(external, { recursive: true, force: true });
     }
+  });
+
+  it('stays blocked when the occupant fakes our marker with a symlink', () => {
+    // This is the state that decides whether the runner may delete the directory:
+    // an enabled Install here would move the user's folder to the backup and
+    // `rm -rf` it after publishing. A symlinked marker must not buy that.
+    const external = mkdtempSync(join(tmpdir(), 'dash-ext-marker2-'));
+    const foreign = join(external, DOWNLOAD_COMPLETE_MARKER);
+    writeFileSync(
+      foreign,
+      JSON.stringify({ repo: RECOMMENDED.hfRepo, revision: 'd'.repeat(40), files: ['config.json'], completedAt: 'x' }),
+    );
+    const victim = join(modelsDir, RECOMMENDED_SLUG);
+    mkdirSync(victim, { recursive: true });
+    writeFileSync(join(victim, 'PRECIOUS.txt'), 'hand-made, not ours');
+    symlinkSync(foreign, join(victim, DOWNLOAD_COMPLETE_MARKER));
+
+    expect(catalogItem('Qwen3.6-27B').present).toBe(false);
+    expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(true);
+
+    rmSync(external, { recursive: true, force: true });
   });
 
   it('leaves an OWNED but incomplete dir installable', () => {
