@@ -1041,6 +1041,20 @@ async function handleSessionDelete({ res, params, deps }: RouteCtx): Promise<voi
   //                      successful ingest (reappearing after we said `deleted`), or
   //                      linger as an orphan. Reconcile the index and refuse, mirroring
   //                      the rename handler, rather than half-delete.
+  // Unlike the rename above, delete deliberately carries NO liveness pre-check.
+  // Rename is a read-modify-write, so a concurrent turn silently orphans a record
+  // INSIDE a file that still looks intact — corruption the user never asked for and
+  // cannot see. Unlinking is neither: it is exactly the outcome the user asked for,
+  // behind a confirm dialog that names this hazard verbatim ("If an agent is
+  // currently using this session, deleting it may orphan in-progress turns"). A live
+  // agent's next append — pi's `SessionManager._persist` writes by PATH, not through
+  // a held fd — recreates the path holding that entry alone; ingest reports `no
+  // valid session header` and indexes nothing, and pi's own discovery drops
+  // headerless files from the resume list, so the leftover is inert. Borrowing
+  // LIVE_SESSION_WINDOW_MS here would not even prevent it: an agent idle at its
+  // prompt (where a session spends most of its life) has a stale mtime and still
+  // appends on the next message. It would only make a just-finished or just-crashed
+  // session undeletable until the window passes.
   const verdict = classifySessionFile(found.path, params.id);
   if (verdict === 'unverifiable') {
     await deps.runIngest();

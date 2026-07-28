@@ -668,6 +668,26 @@ describe('dashboard server — sessions', () => {
     expect((await fetch(`${server.url}/api/sessions/fix-2`)).status).toBe(404);
   });
 
+  // Delete carries NO liveness pre-check, unlike rename — see the note in
+  // `handleSessionDelete`. A session written a moment ago (the just-finished or
+  // just-crashed agent, the common cleanup case) must still delete outright rather
+  // than 409 like the rename path does, so borrowing that window here is a
+  // regression, not a hardening.
+  it('deletes a session that was just written (no liveness refusal)', async () => {
+    await ingest();
+    const before = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+      sessions: Array<{ id: string; path: string }>;
+    };
+    const filePath = before.sessions.find((s) => s.id === 'fix-2')!.path;
+    const now = Date.now() / 1000;
+    utimesSync(filePath, now, now);
+
+    const del = await fetch(`${server.url}/api/sessions/fix-2`, { method: 'DELETE' });
+    expect(del.status).toBe(200);
+    expect(existsSync(filePath)).toBe(false);
+    expect((await fetch(`${server.url}/api/sessions/fix-2`)).status).toBe(404);
+  });
+
   // A file that exists on disk but cannot be verified (unreadable / corrupt) must
   // NOT be half-deleted. The old code skipped the `rmSync` yet still dropped the
   // rows and replied `deleted`, so the transcript stayed on disk out of sync with
