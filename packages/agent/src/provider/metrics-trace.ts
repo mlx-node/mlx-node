@@ -44,6 +44,8 @@ export const COLD_COUNTER_FIELDS = [
   'coldBytesRestored',
   'coldEvictions',
   'coldCorruptions',
+  'coldWriteErrors',
+  'coldRestoreDeclines',
 ] as const;
 
 /**
@@ -64,6 +66,7 @@ export const COLD_SIDECAR_FIELDS = [
   'coldSidecarEnqueued',
   'coldSidecarQueueDrops',
   'coldSidecarInstalled',
+  'coldSidecarRestoreSuppressed',
 ] as const;
 
 /** Every cold-tier per-turn delta field, in native-struct order. */
@@ -118,9 +121,15 @@ export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, numbe
   /** Cold-tier lookup misses accrued this turn (synchronous counter — exact). */
   coldMisses?: number;
   /**
-   * Cold-tier bytes committed this turn. Advances on an async writer thread,
-   * so this delta is APPROXIMATE — it may attribute a prior turn's flush to
-   * the turn that observes it.
+   * Cold-tier bytes that LANDED this turn — credited natively only after the
+   * payload sync, the commit rename and the directory fsync all succeeded, so
+   * a write that failed contributes nothing here and one {@link
+   * coldWriteErrors} instead.
+   *
+   * Advances on an async writer thread, so this delta is APPROXIMATE — it may
+   * attribute a prior turn's flush to the turn that observes it, and a write
+   * still in flight at the end of the turn lands in a later one. That is the
+   * only sense in which it lags; it is never an enqueue-time estimate.
    */
   coldBytesWritten?: number;
   /** Cold-tier bytes read back on validated hits this turn (synchronous — exact). */
@@ -143,10 +152,13 @@ export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, numbe
    */
   coldEnqueued?: number;
   /**
-   * Cold-tier writes dropped this turn. MIXED provenance, so treat as
-   * APPROXIMATE: the queue-full arm increments synchronously on the calling
-   * thread, while the commit-rename-failure arm increments on the background
-   * writer.
+   * Cold-tier writes REFUSED at admission this turn because the bounded queue
+   * was full. Incremented on the calling thread, so this delta is EXACT.
+   *
+   * Now admission refusals only: the commit-rename-failure arm used to be
+   * counted here too, which put one event under a name describing a different
+   * cause. It is a {@link coldWriteErrors} instead, and the two are disjoint —
+   * never sum them.
    */
   coldQueueDrops?: number;
   /**
@@ -175,6 +187,45 @@ export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, numbe
    * would otherwise be invisible.
    */
   coldQueueDropsTotal?: number;
+  /**
+   * Cold-tier writes this turn that the queue ACCEPTED and that never reached
+   * disk — a read-only, full or unmounted cache root, a quota the object
+   * cannot fit, a failed rename, a failed fsync.
+   *
+   * The native writer is deliberately fail-open (a broken cache root must not
+   * change a single emitted token) and it returns its error to nobody, so
+   * before this counter existed the entire class was invisible: a turn against
+   * an unwritable root reported `coldQueueDrops 0`, `coldCorruptions 0`, an
+   * empty stderr and a clean exit. Advances on the background writer thread,
+   * so APPROXIMATE per turn in the same way {@link coldBytesWritten} is —
+   * non-zero over a window is the signal, not the exact attribution.
+   */
+  coldWriteErrors?: number;
+  /**
+   * Restores REFUSED this turn: the tier held candidate blocks and the walk
+   * handed back none of them.
+   *
+   * Neither a hit nor a miss, because both of those count per-block lookups
+   * and a refusal happens instead of one — which is why a refused restore
+   * reported `coldHits 0, coldMisses 0`, exactly the row a turn that never
+   * consulted the tier produces. Incremented on the calling thread, so EXACT.
+   * The reason (`no_backed_boundary`, `parent_chain_unavailable`,
+   * `restore_short_of_boundary`) and the block geometry go to the
+   * `[MLX_TRACE] paged cold_restore_declined` line.
+   */
+  coldRestoreDeclines?: number;
+  /**
+   * CUMULATIVE write errors since the tier opened in this process, for the
+   * same reason as {@link coldCorruptionsTotal} — and more sharply, since this
+   * counter advances on the background writer: the error covering the last
+   * turn before a crash reaches no delta at all.
+   *
+   * No such total exists for {@link coldRestoreDeclines} on purpose. A "did it
+   * ever happen" latch is only meaningful for a counter whose healthy value is
+   * zero; the first turn of any new prompt legitimately declines, so a latch
+   * there would be pinned on from the first minute and mean nothing.
+   */
+  coldWriteErrorsTotal?: number;
   /**
    * Turns this turn's process spent reaching a family's sidecar capture. Every
    * other `coldSidecar*` counter is a sub-count of this one, so `0` here while
@@ -215,6 +266,17 @@ export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, numbe
    * `coldCorruptions` and the output text are all identical either way.
    */
   coldSidecarInstalled?: number;
+  /**
+   * Restored prefixes a family THREW AWAY this turn, releasing the request and
+   * restarting the turn cold (gemma4's large-sliding-restore suppression).
+   *
+   * A different event from {@link coldRestoreDeclines}: there the walk refused
+   * to serve anything, here it served and the family discarded it. This one is
+   * therefore preceded by real `coldHits` and `coldBytesRestored`, so the turn
+   * reads as successful reuse right up to the point where it recomputes the
+   * whole prompt anyway.
+   */
+  coldSidecarRestoreSuppressed?: number;
 }
 
 type MetricsTraceInput = Omit<MetricsTraceRecord, 'v'>;
@@ -301,6 +363,8 @@ export class MetricsTrace {
       if (coldCorruptionsTotal !== undefined) out.coldCorruptionsTotal = coldCorruptionsTotal;
       const coldQueueDropsTotal = finite(rec.coldQueueDropsTotal);
       if (coldQueueDropsTotal !== undefined) out.coldQueueDropsTotal = coldQueueDropsTotal;
+      const coldWriteErrorsTotal = finite(rec.coldWriteErrorsTotal);
+      if (coldWriteErrorsTotal !== undefined) out.coldWriteErrorsTotal = coldWriteErrorsTotal;
 
       const file = this.currentFile();
       mkdirSync(dirname(file), { recursive: true });

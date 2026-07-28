@@ -73,6 +73,71 @@ export function stubFetch(routes: ApiStub): () => void {
   };
 }
 
+/**
+ * Advance width of one character of a 12px axis tick, and the line height of
+ * that same text. Both measured in Chrome against the SPA's font stack
+ * (`ui-sans-serif, system-ui, sans-serif`): `Gemma-4-31B-IT-UD-Q4_…` renders
+ * 161.5px wide and 14px tall, i.e. 7.34px per character. Rounded to 7.3.
+ */
+export const TICK_CHAR_PX = 7.3;
+export const TICK_LINE_PX = 14;
+
+/** Plot width a stubbed chart container reports, matching a half-width card. */
+const PLOT_WIDTH_PX = 420;
+
+/** Plot height for a chart whose card did not set an explicit pixel height. */
+const DEFAULT_PLOT_HEIGHT_PX = 224;
+
+function fakeRect(width: number, height: number): DOMRect {
+  return { width, height, top: 0, left: 0, right: width, bottom: height, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+}
+
+/**
+ * Give recharts real text and container measurements under happy-dom.
+ *
+ * happy-dom performs no layout, so `getBoundingClientRect()` answers 0 for
+ * everything. That is not a neutral default here — it silently disables the two
+ * recharts behaviours a per-model bar chart depends on. recharts hides category
+ * ticks it measures as overlapping (`getStringSize` → a hidden span → a rect),
+ * and sizes a `width="auto"` axis from its rendered ticks (each tick's own
+ * rect). At zero everything "fits" and the axis collapses, so a chart that drops
+ * half its labels in a browser renders all of them in a test, and a clipped
+ * label reports a left edge of 0. Both defects become invisible.
+ *
+ * The stub answers three questions and delegates the rest:
+ *  - recharts' hidden measurement span → `chars × TICK_CHAR_PX`,
+ *  - a rendered axis tick `<text>` → the same,
+ *  - a `ResponsiveContainer` → {@link PLOT_WIDTH_PX} by the pixel height its
+ *    parent carries inline (what `ChartCard`'s `heightPx` sets), else
+ *    {@link DEFAULT_PLOT_HEIGHT_PX}. Reading the parent is deliberate: it is
+ *    what makes a chart that outgrows its card observable from a test.
+ */
+export function stubChartMetrics(options: { tickLinePx?: number } = {}): () => void {
+  // `tickLinePx` above the row height is how a test reaches the case a normal
+  // render never shows: tick text taller than the space one row gives it, e.g.
+  // a browser minimum-font-size that scales the label but not the plot. That is
+  // where recharts' overlap rule starts hiding category names, so it is where a
+  // chart that must name every row has to prove it still does.
+  const lineHeight = options.tickLinePx ?? TICK_LINE_PX;
+  const proto = Element.prototype as unknown as { getBoundingClientRect: () => DOMRect };
+  const original = proto.getBoundingClientRect;
+  proto.getBoundingClientRect = function (this: Element): DOMRect {
+    const text = this.textContent ?? '';
+    if (this.id === 'recharts_measurement_span') return fakeRect(text.length * TICK_CHAR_PX, lineHeight);
+    if (this.classList?.contains('recharts-cartesian-axis-tick-value')) {
+      return fakeRect(text.length * TICK_CHAR_PX, lineHeight);
+    }
+    if (this.classList?.contains('recharts-responsive-container')) {
+      const declared = Number.parseFloat((this.parentElement as HTMLElement | null)?.style.height ?? '');
+      return fakeRect(PLOT_WIDTH_PX, Number.isFinite(declared) && declared > 0 ? declared : DEFAULT_PLOT_HEIGHT_PX);
+    }
+    return original.call(this) as DOMRect;
+  };
+  return () => {
+    proto.getBoundingClientRect = original;
+  };
+}
+
 /** How long {@link renderPage} waits for `until` before failing the test. */
 const SETTLE_TIMEOUT_MS = 2_000;
 

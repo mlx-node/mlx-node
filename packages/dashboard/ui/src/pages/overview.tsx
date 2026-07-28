@@ -3,20 +3,11 @@ import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { formatBytes, formatCount, formatPercent, formatRate, formatRelativeTime, percentInt } from '@/lib/format';
-import type {
-  CacheResponse,
-  DownloadsResponse,
-  MetricsOverviewResponse,
-  ModelsResponse,
-  SessionRow,
-  SessionsResponse,
-} from '@/lib/types';
+import type { CacheResponse, DownloadsResponse, ModelsResponse, SessionRow, SessionsResponse } from '@/lib/types';
 import { useJson } from '@/lib/use-api';
 import { AlertCircle, ArrowRight, Boxes, Download, HardDrive, Inbox, MessagesSquare } from 'lucide-react';
-import { useMemo } from 'react';
 import { Link } from 'react-router-dom';
 
-const DAY_MS = 24 * 60 * 60 * 1000;
 const RECENT_LIMIT = 6;
 
 function TileError({ message }: { message: string }) {
@@ -29,20 +20,30 @@ function TileError({ message }: { message: string }) {
 }
 
 export default function Overview() {
-  const sevenDaysAgo = useMemo(() => Date.now() - 7 * DAY_MS, []);
   const models = useJson<ModelsResponse>('/models');
   const sessions = useJson<SessionsResponse>('/sessions');
-  const metrics = useJson<MetricsOverviewResponse>(`/metrics/overview?from=${sevenDaysAgo}`);
   const cache = useJson<CacheResponse>('/cache');
   const downloads = useJson<DownloadsResponse>('/downloads');
 
   const modelCount = models.data?.models.length ?? 0;
   const modelBytes = models.data?.models.reduce((sum, m) => sum + m.sizeBytes, 0) ?? 0;
 
-  // The true match total (not the capped page length) so this tile is accurate
-  // past the server's default 500-row page.
+  // Both halves of the Sessions tile come from ONE response, so they describe
+  // ONE set of sessions. `total` is the true match total (not the capped page
+  // length) and `tokens` is the server-side total over exactly those sessions,
+  // counting each distinct inference once. It is not the sum of the per-row
+  // token columns: those are raw per-session sums, so a forked session's
+  // inherited turns appear in both rows while the tile bills them once.
+  //
+  // The subtitle used to read `/metrics/overview`, which is machine-wide: it
+  // sums `traces` from `~/.mlx-node/metrics/traces` regardless of which
+  // `--session-dir` the dashboard is listing. That rendered "Sessions 3" beside
+  // a 7-day token total from every session directory the machine had ever used
+  // — a number that did not move when the dashboard was pointed somewhere else.
+  // Same defect as the Cache page's unscoped trend, same fix: scope the number,
+  // and say in the tile which sessions it covers.
   const sessionCount = sessions.data?.total ?? 0;
-  const tokens7d = metrics.data ? metrics.data.totals.inputTokens + metrics.data.totals.outputTokens : 0;
+  const sessionTokens = sessions.data?.tokens ?? 0;
 
   const disk = cache.data?.disk;
   const cacheBytes = disk?.totalBytes ?? 0;
@@ -94,12 +95,10 @@ export default function Overview() {
           sub={
             sessions.error ? (
               <TileError message="Failed to load sessions" />
-            ) : metrics.error ? (
-              <TileError message="Tokens unavailable" />
-            ) : sessions.loading || metrics.loading ? (
+            ) : sessions.loading ? (
               <Skeleton className="h-4 w-32" />
             ) : (
-              `${formatCount(tokens7d)} tokens · last 7 days`
+              `${formatCount(sessionTokens)} tokens · these sessions only`
             )
           }
         />

@@ -806,6 +806,14 @@ impl ColdTierWalk<'_> {
         let mut parent_key: Option<mlx_paged_attn::ColdCacheKey> = None;
         for i in 0..idx {
             let Some(extra_keys) = extra_keys_for(i) else {
+                self.record_decline(
+                    "parent_chain_unavailable",
+                    base,
+                    full_blocks,
+                    full_blocks,
+                    bs,
+                    lookup_tokens.len(),
+                );
                 return ColdRestore::miss();
             };
             parent_key = Some(mlx_paged_attn::ColdCacheKey::chain(
@@ -841,6 +849,21 @@ impl ColdTierWalk<'_> {
                 base,
                 ceiling,
             ) else {
+                // The silent zero this whole counter exists for. Both probes
+                // this verdict rests on (`contains` / `contains_in`) are
+                // side-effect free by contract, `load_sidecar` and
+                // `restore_block` are never reached, and the walk returns
+                // above its own trace line — so a refused restore moved no
+                // counter and printed nothing, and the tier reported `0/0`
+                // exactly like a turn that never opened it.
+                self.record_decline(
+                    "no_backed_boundary",
+                    base,
+                    ceiling,
+                    full_blocks,
+                    bs,
+                    lookup_tokens.len(),
+                );
                 return ColdRestore::miss();
             };
             limit = backed;
@@ -948,12 +971,77 @@ impl ColdTierWalk<'_> {
                 for block in tail {
                     guard.free(block);
                 }
+                // Everything this walk restored was handed back to the
+                // allocator, so it extends the hot hit by nothing. Unlike the
+                // refusals above this one has already paid for real `hits` and
+                // `bytes_restored`, which is what makes it the more misleading
+                // of the two: the tier reports blocks restored on a turn that
+                // reuses none of them.
+                if restored.is_empty() {
+                    self.record_decline(
+                        "restore_short_of_boundary",
+                        base,
+                        keep,
+                        limit,
+                        bs,
+                        lookup_tokens.len(),
+                    );
+                }
             }
         }
 
         ColdRestore {
             blocks: restored,
             sidecar,
+        }
+    }
+
+    /// Count one restore this walk refused to serve, and trace why.
+    ///
+    /// The counter (`ColdCacheStats::restore_declines`) is what makes a refusal
+    /// exist at all for anything downstream: `hits` and `misses` count per-block
+    /// lookups, a refusal happens instead of those lookups, so before this a
+    /// refused restore was reported as `0 hits / 0 misses` — the same row a
+    /// turn that never touched the tier produces, which reads as "nothing ran"
+    /// rather than "reuse was refused".
+    ///
+    /// The block geometry goes to the trace instead of to counters on purpose.
+    /// A ceiling is a per-walk position, and summing positions across turns
+    /// produces a number with no meaning; what the diagnosis needs is the
+    /// single line where `ceiling` and `full_blocks` sit next to each other —
+    /// a capture that anchors one block past the restore's reach shows up here
+    /// as `ceiling` one short of the boundary it would need, on the turn it
+    /// happened.
+    ///
+    /// `ceiling_tokens` is that comparison already made. It is the DEEPEST
+    /// boundary this walk could name at all — every candidate
+    /// `deepest_backed_boundary` probed was at or below it — and it is directly
+    /// comparable with the `boundary_tokens=` a family's capture trace prints.
+    /// A capture line one block above a decline line's `ceiling_tokens`, for the
+    /// same prompt, IS the aligned-prompt gap: the lookup is capped at
+    /// `prompt_len - 1` (`lookup_tokens`), so a boundary at `prompt_len` has no
+    /// name on this side.
+    fn record_decline(
+        &self,
+        reason: &str,
+        base: usize,
+        ceiling: usize,
+        full_blocks: usize,
+        block_size: usize,
+        lookup_tokens: usize,
+    ) {
+        self.cold.manager.record_restore_decline();
+        if inference_trace_enabled() {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] paged cold_restore_declined reason={} base={} ceiling={} full_blocks={} block_size={} ceiling_tokens={} lookup_tokens={}",
+                reason,
+                base,
+                ceiling,
+                full_blocks,
+                block_size,
+                ceiling.saturating_mul(block_size),
+                lookup_tokens,
+            ));
         }
     }
 
@@ -7627,7 +7715,16 @@ mod tests {
                     );
                 }
             }
-            assert_eq!(manager.stats().hits, 8);
+            let stats = manager.stats();
+            assert_eq!(stats.hits, 8);
+            // The control must not move the new counter either. A decline
+            // recorded on a walk that served every block would be non-zero on
+            // every healthy dense turn, which is how a diagnostic counter
+            // becomes noise nobody reads.
+            assert_eq!(
+                stats.restore_declines, 0,
+                "a walk that restored the whole chain declined nothing"
+            );
             assert!(
                 adapter.take_restored_sidecar().is_none(),
                 "a family with no policy must never be handed auxiliary state"
@@ -7650,11 +7747,27 @@ mod tests {
             );
             assert!(prefix.blocks.is_empty());
             assert!(adapter.take_restored_sidecar().is_none());
+            let stats = manager.stats();
             assert_eq!(
-                manager.stats().hits,
-                0,
+                stats.hits, 0,
                 "the gate must fire BEFORE any block is blitted or published \
                  (per_block={per_block})"
+            );
+            // THE silent zero. `hits` and `misses` are both 0 here — the walk
+            // reached its verdict from index probes that are side-effect free
+            // by contract — so without `restore_declines` this refusal is
+            // reported as an empty row, identical to a turn that never
+            // consulted the tier. Asserted together, because the pair is the
+            // observation: a refusal that costs no lookup and still shows up.
+            assert_eq!(
+                stats.misses, 0,
+                "no block was looked up, so nothing may be counted as a miss \
+                 (per_block={per_block})"
+            );
+            assert_eq!(
+                stats.restore_declines, 1,
+                "a restore refused over an on-disk chain must be counted, or \
+                 `0 hits / 0 misses` reads as 'nothing ran' (per_block={per_block})"
             );
         }
 
@@ -7716,10 +7829,19 @@ mod tests {
                 restored.layout.boundary_tokens, prefix.cached_token_count,
                 "the state's boundary must equal the reused prefix exactly"
             );
+            let stats = manager.stats();
             assert_eq!(
-                manager.stats().hits,
-                4,
+                stats.hits, 4,
                 "only the backed blocks may be blitted and published \
+                 (per_block={per_block})"
+            );
+            // The negative control the decline counter needs: reconciling DOWN
+            // to a shorter backed boundary is reuse working as designed, not a
+            // refusal. A counter that also fired here would be non-zero on
+            // every healthy hybrid turn and worth nothing.
+            assert_eq!(
+                stats.restore_declines, 0,
+                "a restore that served a reconciled prefix is not a decline \
                  (per_block={per_block})"
             );
             assert!(
@@ -7757,6 +7879,16 @@ mod tests {
             assert_eq!(
                 stats.hits, 2,
                 "the two blocks before the corrupt one were published, then released"
+            );
+            // The most misleading shape of all, and the reason the counter is
+            // recorded in phase 4 too: this turn has `hits 2` and non-zero
+            // `bytes_restored`, so the tier looks like it reused a prefix —
+            // while `cached_token_count` is 0 and every restored block was
+            // handed straight back to the allocator.
+            assert_eq!(
+                stats.restore_declines, 1,
+                "a restore whose whole extension was released reused nothing \
+                 and must be counted as a decline"
             );
         }
 

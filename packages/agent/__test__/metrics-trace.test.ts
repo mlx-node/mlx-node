@@ -136,6 +136,12 @@ describe('MetricsTrace', () => {
         coldCorruptions: 1,
         coldCorruptionsTotal: 9,
         coldQueueDropsTotal: 7,
+        // The one cumulative total NOT carried by `COLD_DELTA_FIELDS`: like
+        // the two above it is spelled out by hand in the allowlist, which is
+        // precisely the shape that gets forgotten. Without it an operator
+        // whose cache root is refusing writes has no latch that survives the
+        // errored turn the failure most likely lands in.
+        coldWriteErrorsTotal: 11,
       }),
     );
     const [line] = readLines(trace.currentFile()) as MetricsTraceRecord[];
@@ -148,6 +154,7 @@ describe('MetricsTrace', () => {
       coldCorruptions: 1,
       coldCorruptionsTotal: 9,
       coldQueueDropsTotal: 7,
+      coldWriteErrorsTotal: 11,
     });
   });
 

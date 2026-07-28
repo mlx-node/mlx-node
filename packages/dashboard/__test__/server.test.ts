@@ -164,6 +164,174 @@ describe('dashboard server — sessions', () => {
     expect(next.sessions[0].id).not.toBe(page.sessions[0].id);
   });
 
+  it('serves a token total scoped to the sessions it counted, unlike the machine-wide metrics', async () => {
+    // The Overview "Sessions" tile shows a count and a token total side by side.
+    // The count can only ever describe THIS sessions root — ingest deletes rows
+    // whose file left it — while `/api/metrics/overview` sums `traces`, a
+    // machine-wide log under ~/.mlx-node/metrics/traces that no --session-dir
+    // narrows. Serving the tokens beside the count is what makes the two halves
+    // describable by one sentence.
+    await ingest();
+    const body = (await (await fetch(`${server.url}/api/sessions`)).json()) as { total: number; tokens: number };
+    expect(body.total).toBe(2);
+    // fix-1: (100 + 50) + (180 + 60); fix-2: 40 + 20. The three fixture traces
+    // are NOT delegated work — none carries a root_session_id pointing here — so
+    // none of them belongs to these sessions.
+    expect(body.tokens).toBe(450);
+
+    const overview = (await (await fetch(`${server.url}/api/metrics/overview`)).json()) as {
+      totals: { inputTokens: number; outputTokens: number };
+    };
+    // The same window, machine-wide: the two orphan traces add 390 tokens that
+    // belong to no session in this root. Pairing this number with `total` above
+    // is the defect; the gap is exactly what the tile used to misreport.
+    expect(overview.totals.inputTokens + overview.totals.outputTokens).toBe(840);
+  });
+
+  // The list token total and the per-session `/metrics` totals answer different
+  // questions and MUST NOT be assumed equal: a fork copies its parent's turns
+  // verbatim, so the list bills that shared history once while each session's own
+  // page keeps its copy. Both numbers are pinned here so neither can drift into
+  // the other's meaning unnoticed.
+  it('bills inherited fork turns once in the list total, twice across the per-session ones', async () => {
+    // fork-1 copies fix-1's m1..m4 VERBATIM (same entry ids, same mlxTraceId) and
+    // adds one new inference of its own.
+    const fork = [
+      { type: 'session', version: 3, id: 'fork-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
+      {
+        type: 'message',
+        id: 'm1',
+        parentId: null,
+        timestamp: '2026-07-01T10:00:01.000Z',
+        message: { role: 'user', content: 'Hello, world', timestamp: 1782036001000 },
+      },
+      {
+        type: 'message',
+        id: 'm2',
+        parentId: 'm1',
+        timestamp: '2026-07-01T10:00:02.000Z',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Hi there' }],
+          model: 'qwen3_5',
+          usage: { input: 100, output: 50, cacheRead: 10, reasoning: 5 },
+          timestamp: 1782036002000,
+          mlxTraceId: 'trace-aaa',
+        },
+      },
+      {
+        type: 'message',
+        id: 'm3',
+        parentId: 'm2',
+        timestamp: '2026-07-01T10:00:03.000Z',
+        message: { role: 'user', content: 'Second question', timestamp: 1782036003000 },
+      },
+      {
+        type: 'message',
+        id: 'm4',
+        parentId: 'm3',
+        timestamp: '2026-07-01T10:00:04.000Z',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'An answer' }],
+          model: 'qwen3_5',
+          usage: { input: 180, output: 60, cacheRead: 100, reasoning: 12 },
+          timestamp: 1782036004000,
+        },
+      },
+      {
+        type: 'message',
+        id: 'm5',
+        parentId: 'm4',
+        timestamp: '2026-07-01T11:00:05.000Z',
+        message: { role: 'user', content: 'Only on the fork', timestamp: 1782039605000 },
+      },
+      {
+        type: 'message',
+        id: 'm6',
+        parentId: 'm5',
+        timestamp: '2026-07-01T11:00:06.000Z',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Fork-only answer' }],
+          model: 'qwen3_5',
+          usage: { input: 7, output: 3, cacheRead: 0, reasoning: 0 },
+          timestamp: 1782039606000,
+        },
+      },
+    ];
+    writeFileSync(
+      join(sessionsRoot, '--w--', '2026-07-01T11-00-00_fork-1.jsonl'),
+      `${fork.map((l) => JSON.stringify(l)).join('\n')}\n`,
+    );
+    await ingest();
+
+    const body = (await (await fetch(`${server.url}/api/sessions`)).json()) as {
+      total: number;
+      tokens: number;
+      sessions: Array<{ id: string; inputTokens: number; outputTokens: number }>;
+    };
+    expect(body.total).toBe(3);
+    // Distinct inferences: trace-aaa (150) + entry m4 (240) — each held by BOTH
+    // fix-1 and fork-1 but billed once — plus fix-2's n2 (60) and the fork's own
+    // m6 (10).
+    expect(body.tokens).toBe(460);
+
+    // The per-row columns are raw per-session sums, so the fork's inherited
+    // history shows up in both rows. Summing them is NOT the headline total.
+    const byId = new Map(body.sessions.map((s) => [s.id, s.inputTokens + s.outputTokens]));
+    expect(byId.get('fix-1')).toBe(390);
+    expect(byId.get('fix-2')).toBe(60);
+    expect(byId.get('fork-1')).toBe(400);
+    const rowSum = [...byId.values()].reduce((a, b) => a + b, 0);
+    expect(rowSum).toBe(850);
+
+    // The per-session `/metrics` endpoint agrees with its own row, copy for copy.
+    const perSession: number[] = [];
+    for (const id of ['fix-1', 'fix-2', 'fork-1']) {
+      const m = (await (await fetch(`${server.url}/api/sessions/${id}/metrics`)).json()) as {
+        turns: Array<{ inputTokens: number | null; outputTokens: number | null }>;
+      };
+      perSession.push(m.turns.reduce((sum, t) => sum + (t.inputTokens ?? 0) + (t.outputTokens ?? 0), 0));
+    }
+    expect(perSession).toEqual([390, 60, 400]);
+
+    // The gap between the two readings is exactly the shared history (150 + 240),
+    // counted once by the list and once more by the fork's own page.
+    expect(rowSum - body.tokens).toBe(390);
+  });
+
+  it('reports no tokens for an empty sessions root while machine-wide metrics stay populated', async () => {
+    // Same machine, same trace log, a --session-dir holding nothing. The session
+    // list correctly says zero; the metrics overview still reports hundreds of
+    // tokens. A tile that reads its headline from one and its subtitle from the
+    // other renders "Sessions 0 · 530 tokens".
+    const emptyRoot = join(base, 'empty-sessions');
+    mkdirSync(emptyRoot, { recursive: true });
+    const other = await startDashboardServer({
+      port: 0,
+      dbPath: ':memory:',
+      sessionsRoot: emptyRoot,
+      tracesDir,
+      modelsDir,
+      cacheRoot,
+      webRoot,
+    });
+    try {
+      expect((await fetch(`${other.url}/api/ingest`, { method: 'POST' })).status).toBe(200);
+      const body = (await (await fetch(`${other.url}/api/sessions`)).json()) as { total: number; tokens: number };
+      expect(body.total).toBe(0);
+      expect(body.tokens).toBe(0);
+
+      const overview = (await (await fetch(`${other.url}/api/metrics/overview`)).json()) as {
+        totals: { inputTokens: number; outputTokens: number };
+      };
+      expect(overview.totals.inputTokens + overview.totals.outputTokens).toBeGreaterThan(0);
+    } finally {
+      await other.close();
+    }
+  });
+
   it('returns a session detail with transcript text', async () => {
     await ingest();
     const res = await fetch(`${server.url}/api/sessions/fix-1`);
@@ -1378,6 +1546,10 @@ describe('dashboard server — cache trend scoping', () => {
       corruptions: number;
       corruptionsTotal: number;
       queueDropsTotal: number;
+      writeErrors: number;
+      writeErrorsTotal: number;
+      restoreDeclines: number;
+      restoreSuppressed: number;
     };
     restoreFamilies: string[];
   }
@@ -1417,6 +1589,13 @@ describe('dashboard server — cache trend scoping', () => {
         // the suite still green.
         coldCorruptionsTotal: 2,
         coldQueueDropsTotal: 4,
+        // Write errors follow the corruption shape (SUM the deltas, MAX the
+        // totals); declines follow neither — they are summed, because a
+        // decline has a legitimate non-zero steady state.
+        coldWriteErrors: 3,
+        coldWriteErrorsTotal: 6,
+        coldRestoreDeclines: 2,
+        coldSidecarRestoreSuppressed: 1,
       },
       {
         traceId: 'mine-2',
@@ -1433,6 +1612,12 @@ describe('dashboard server — cache trend scoping', () => {
         coldCorruptions: 2,
         coldCorruptionsTotal: 5,
         coldQueueDropsTotal: 4,
+        coldWriteErrors: 4,
+        // Distinct from the other row's 6 so MAX (9) and SUM (15) disagree —
+        // the same reason `coldCorruptionsTotal` carries 2 and 5.
+        coldWriteErrorsTotal: 9,
+        coldRestoreDeclines: 5,
+        coldSidecarRestoreSuppressed: 2,
       },
       {
         traceId: 'other-root-1',
@@ -1443,6 +1628,11 @@ describe('dashboard server — cache trend scoping', () => {
         coldEnabled: true,
         coldCorruptions: 55,
         coldCorruptionsTotal: 55,
+        // Another root's faults must never leak into this cache's health.
+        coldWriteErrors: 500,
+        coldWriteErrorsTotal: 900,
+        coldRestoreDeclines: 400,
+        coldSidecarRestoreSuppressed: 300,
       },
       // No coldRoot AND no coldEnabled: written by a build that predates
       // attribution. Not "the tier was off" — genuinely unknown.
@@ -1565,6 +1755,37 @@ describe('dashboard server — cache trend scoping', () => {
     expect(body.health.corruptionsTotal).toBe(5);
     // Same shape for drops: both rows carry 4, so MAX is 4 and SUM would be 8.
     expect(body.health.queueDropsTotal).toBe(4);
+  });
+
+  /**
+   * The two failure modes that had no number anywhere.
+   *
+   * A write that the queue accepted and the disk refused was reported by
+   * nothing: the native writer is fail-open and swallows the error, so a root
+   * that was read-only, full or unmounted produced `queueDrops 0`,
+   * `corruptions 0` and a turn that exited 0 — a dashboard showing a perfectly
+   * healthy cache holding nothing. A refused RESTORE was equally silent for
+   * the opposite reason: it performs no lookup, so it moved neither hits nor
+   * misses and rendered as "no lookups recorded", which reads as "nothing ran"
+   * rather than "reuse was refused".
+   *
+   * The two reducers are asserted to DISAGREE with the alternative on purpose:
+   * `writeErrorsTotal` is MAX over per-process totals (6 and 9 → 9, never 15),
+   * while `restoreDeclines` is a SUM of deltas (2 + 5 → 7, never 5). Swapping
+   * either reducer changes a number here.
+   */
+  it('surfaces write errors and restore declines, scoped and reduced correctly', async () => {
+    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    // Deltas SUM across this cache's rows: 3 + 4. The other root's 500 must not
+    // appear — a broken cache elsewhere is not this cache's alarm.
+    expect(body.health.writeErrors).toBe(7);
+    // Cumulative totals reduce with MAX: 6 and 9 → 9. SUM would say 15.
+    expect(body.health.writeErrorsTotal).toBe(9);
+    // Declines are SUMMED and have no MAX'd total, because unlike a corruption
+    // a decline is normal on any prompt's first turn — a "did it ever happen"
+    // latch would be pinned on from the first minute and mean nothing.
+    expect(body.health.restoreDeclines).toBe(7);
+    expect(body.health.restoreSuppressed).toBe(3);
   });
 
   // TRACE_RETENTION_DAYS is exported precisely so the window the UI prints and

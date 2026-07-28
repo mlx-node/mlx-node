@@ -45,6 +45,10 @@ interface ParsedTrace {
   coldCorruptions?: unknown;
   coldCorruptionsTotal?: unknown;
   coldQueueDropsTotal?: unknown;
+  coldWriteErrors?: unknown;
+  coldWriteErrorsTotal?: unknown;
+  coldRestoreDeclines?: unknown;
+  coldSidecarRestoreSuppressed?: unknown;
 }
 
 const DAY_MS = 86_400_000;
@@ -246,6 +250,10 @@ export async function ingestTraces(
             coldCorruptions: numOrNull(trace.coldCorruptions),
             coldCorruptionsTotal: numOrNull(trace.coldCorruptionsTotal),
             coldQueueDropsTotal: numOrNull(trace.coldQueueDropsTotal),
+            coldWriteErrors: numOrNull(trace.coldWriteErrors),
+            coldWriteErrorsTotal: numOrNull(trace.coldWriteErrorsTotal),
+            coldRestoreDeclines: numOrNull(trace.coldRestoreDeclines),
+            coldSidecarRestoreSuppressed: numOrNull(trace.coldSidecarRestoreSuppressed),
             sourceFile: name,
           })
           .onConflictDoNothing()

@@ -70,6 +70,28 @@ export const traces = sqliteTable('traces', {
   coldCorruptionsTotal: integer('cold_corruptions_total'),
   /** Cumulative (not per-turn) — see `MetricsTraceRecord.coldQueueDropsTotal`. */
   coldQueueDropsTotal: integer('cold_queue_drops_total'),
+  /**
+   * Writes the queue accepted that never reached disk (read-only / full /
+   * unmounted root, failed rename or fsync). The native writer is fail-open
+   * and reports the error to nobody, so this is the only column that can tell
+   * a cache storing nothing from a cache with nothing to store.
+   */
+  coldWriteErrors: integer('cold_write_errors'),
+  /** Cumulative (not per-turn) — see `MetricsTraceRecord.coldWriteErrorsTotal`. */
+  coldWriteErrorsTotal: integer('cold_write_errors_total'),
+  /**
+   * Restores the walk refused outright. Neither a hit nor a miss, so without
+   * this column a refused restore is a row of zeros — read as "nothing ran"
+   * rather than "reuse was refused". Summed, never MAX'd: unlike corruptions,
+   * a decline is normal on any prompt's first turn, so a "did it ever happen"
+   * latch would be pinned on from the first minute.
+   */
+  coldRestoreDeclines: integer('cold_restore_declines'),
+  /**
+   * Restores a family threw away after the walk served them. Preceded by real
+   * `coldHits`, which is what makes it the harder of the two to spot.
+   */
+  coldSidecarRestoreSuppressed: integer('cold_sidecar_restore_suppressed'),
   sourceFile: text('source_file'),
 });
 

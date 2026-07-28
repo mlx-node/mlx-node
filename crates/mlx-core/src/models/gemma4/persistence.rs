@@ -2274,6 +2274,52 @@ fn apply_unified_vision_embedder_weights(
     Ok(())
 }
 
+/// Resolve the target's `use_block_paged_cache` against a resolved draft.
+///
+/// `explicit` is the value the checkpoint's `config.json` carried (`None`
+/// when the key is absent, which is the shipping case — no gemma4 checkpoint
+/// writes it). `draft_source` is `Some(label)` once a draft checkpoint has
+/// been resolved, where `label` names how it was requested, and `None` when
+/// there is no draft at all.
+///
+/// Draft speculative decoding runs only on the flat KV-cache path, so a draft
+/// forces flat. The forcing is what keeps a draft turn off the paged handler,
+/// and it is load-bearing rather than cosmetic:
+///
+/// ```text
+///   Some(false) here  ->  Gemma4Inner::new builds NO paged adapter
+///                     ->  ExecutionPlan.paged_attention = None
+///                     ->  TurnPlan::resolve keeps DecoderPlan::Speculative
+///                     ->  TurnPlan::path() = TurnPath::Speculative
+///
+///   drop it, and `use_block_paged_cache.unwrap_or(true)` builds the adapter
+///                     ->  paged ON + SpeculativePlan.supports_paged_attention:false
+///                     ->  TurnPlan::resolve downgrades to Autoregressive
+///                     ->  path() tests paged BEFORE speculative => TurnPath::Paged
+///                     ->  engine::paged_turn never reads `plan.decoder`
+/// ```
+///
+/// The draft would then load, hold its weights resident and answer
+/// `hasMtpWeights()`, while not one draft forward ever runs — a silent
+/// autoregressive decode. That is exactly the outcome the explicit-`true` arm
+/// below refuses to allow, so the two arms must stay in step.
+fn resolve_gemma4_draft_paged_cache(
+    explicit: Option<bool>,
+    draft_source: Option<&str>,
+) -> Result<Option<bool>> {
+    let Some(draft_source) = draft_source else {
+        return Ok(explicit);
+    };
+    if explicit == Some(true) {
+        return Err(Error::from_reason(format!(
+            "Gemma4 {draft_source} conflicts with use_block_paged_cache=true: draft \
+                 speculative decoding runs only on the flat KV-cache path. Remove the \
+                 draft request or set use_block_paged_cache to false in config.json."
+        )));
+    }
+    Ok(Some(false))
+}
+
 impl Gemma4Inner {
     /// Load a Gemma4Inner from a directory containing safetensors and config.json.
     ///
@@ -2323,16 +2369,10 @@ impl Gemma4Inner {
         // defaults ON (`unwrap_or(true)` in `Gemma4Inner::new`); a draft
         // request flips that default to flat, but an EXPLICIT `true` is a
         // config-level conflict the caller must resolve.
-        if resolved_draft_model_path.is_some() {
-            if config.use_block_paged_cache == Some(true) {
-                return Err(Error::from_reason(format!(
-                    "Gemma4 {draft_source} conflicts with use_block_paged_cache=true: draft \
-                         speculative decoding runs only on the flat KV-cache path. Remove the \
-                         draft request or set use_block_paged_cache to false in config.json."
-                )));
-            }
-            config.use_block_paged_cache = Some(false);
-        }
+        config.use_block_paged_cache = resolve_gemma4_draft_paged_cache(
+            config.use_block_paged_cache,
+            resolved_draft_model_path.is_some().then_some(draft_source),
+        )?;
 
         // Merge stop tokens and sampling defaults from generation_config.json
         let gen_config_path = path.join("generation_config.json");
@@ -3187,6 +3227,102 @@ mod tests {
             err.reason
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The whole truth table of [`resolve_gemma4_draft_paged_cache`], because
+    /// `load_from_dir` cannot reach the interesting rows: it runs
+    /// `validate_required_weights` before `Gemma4Inner::new`, so a config-only
+    /// fixture always dies on the missing safetensors long before the adapter
+    /// decision, and the two guard tests above can therefore only observe the
+    /// ABSENCE of the conflict error — which holds whether or not the flat
+    /// forcing survives.
+    ///
+    /// ```text
+    ///   explicit      draft   ->  resolved       what it pins
+    ///   None          no      ->  None           forcing is DRAFT-scoped
+    ///   Some(true)    no      ->  Some(true)     ...not a blanket override
+    ///   Some(false)   no      ->  Some(false)    passthrough
+    ///   None          yes     ->  Some(false)    THE SHIPPING ROW
+    ///   Some(false)   yes     ->  Some(false)    agreement, not conflict
+    ///   Some(true)    yes     ->  Err            the sibling arm
+    /// ```
+    ///
+    /// The `None + draft` row is the one that carries the feature: no gemma4
+    /// checkpoint writes `use_block_paged_cache`, so every real draft load
+    /// arrives with `explicit = None`. Delete the forcing and that row returns
+    /// `None`, `Gemma4Inner::new`'s `unwrap_or(true)` builds a paged adapter,
+    /// and the turn silently resolves to `TurnPath::Paged` with the draft
+    /// loaded but never stepped. It is also the only row that survives that
+    /// mutation as a distinguishable value — `Some(false) + draft` returns
+    /// `Some(false)` either way.
+    #[test]
+    fn draft_paged_cache_resolution_covers_the_whole_truth_table() {
+        for (explicit, draft_source, expected, why) in [
+            (
+                None,
+                None,
+                None,
+                "no draft: an absent key must stay absent, so a plain load keeps the \
+                 paged default",
+            ),
+            (
+                Some(true),
+                None,
+                Some(true),
+                "no draft: an explicit opt-in must survive — the forcing is scoped to \
+                 draft loads, not a blanket paged kill switch",
+            ),
+            (
+                Some(false),
+                None,
+                Some(false),
+                "no draft: an explicit opt-out passes through untouched",
+            ),
+            (
+                None,
+                Some("draft_model_path"),
+                Some(false),
+                "draft with the key absent — the shipping configuration. This MUST be \
+                 forced flat: `Gemma4Inner::new` reads `unwrap_or(true)`, so leaving it \
+                 `None` builds a paged adapter, `TurnPlan::path` prefers Paged over \
+                 Speculative, and the draft loads without ever running a forward",
+            ),
+            (
+                Some(false),
+                Some("embedded draft/ checkpoint"),
+                Some(false),
+                "draft plus an explicit opt-out agree; that is not a conflict",
+            ),
+        ] {
+            let resolved = match resolve_gemma4_draft_paged_cache(explicit, draft_source) {
+                Ok(v) => v,
+                Err(e) => panic!("({explicit:?}, {draft_source:?}) must resolve, got: {e}"),
+            };
+            assert_eq!(
+                resolved, expected,
+                "resolve_gemma4_draft_paged_cache({explicit:?}, {draft_source:?}) = \
+                 {resolved:?}, expected {expected:?} — {why}"
+            );
+        }
+
+        // The sibling arm: an EXPLICIT paged opt-in plus a draft is a config
+        // conflict the caller has to resolve, because silently dropping either
+        // one is worse than failing the load.
+        for draft_source in ["draft_model_path", "embedded draft/ checkpoint"] {
+            let err = match resolve_gemma4_draft_paged_cache(Some(true), Some(draft_source)) {
+                Ok(v) => panic!("explicit paged + {draft_source} must be rejected, got {v:?}"),
+                Err(e) => e,
+            };
+            assert_eq!(
+                err.reason,
+                format!(
+                    "Gemma4 {draft_source} conflicts with use_block_paged_cache=true: draft \
+                     speculative decoding runs only on the flat KV-cache path. Remove the \
+                     draft request or set use_block_paged_cache to false in config.json."
+                ),
+                "the conflict message is user-facing config advice; keep it verbatim"
+            );
+        }
     }
 
     // ── draft kind probe (load_draft_variant) ──────────────────────────

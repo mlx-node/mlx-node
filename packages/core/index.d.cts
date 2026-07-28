@@ -2665,6 +2665,13 @@ export declare function coldCacheDrain(timeoutMs: number): boolean;
  * Return a snapshot of the process-wide cold tier. Read-only: never opens
  * the tier itself, so it reports `enabled: false` until inference first
  * initializes the tier.
+ *
+ * The source snapshot is DESTRUCTURED rather than field-accessed, so a
+ * counter added to `ColdCacheStats` and forgotten here fails to compile.
+ * The failure this guards is silent and has already happened twice: a native
+ * counter that never reaches this struct reaches no JS consumer either, and
+ * nothing downstream can tell "the counter is zero" from "the counter was
+ * never carried across".
  */
 export declare function coldCacheStats(): ColdCacheStats;
 
@@ -2689,9 +2696,17 @@ export interface ColdCacheStats {
   misses: number;
   /** Blocks accepted onto the background write queue. */
   enqueued: number;
-  /** Writes dropped without landing on disk: queue full at enqueue, or the commit rename failed. */
+  /**
+   * Writes REFUSED at admission because the bounded queue was full.
+   * Disjoint from `writeErrors`, which counts accepted writes that then
+   * failed to land — never sum the two into one "lost writes" number.
+   */
   queueDrops: number;
-  /** Total bytes committed to disk. */
+  /**
+   * Bytes that LANDED, credited after the payload sync, the commit rename
+   * and the directory fsync all succeeded. Not an enqueue-time estimate:
+   * a failed write credits nothing here and one `writeErrors` instead.
+   */
   bytesWritten: number;
   /** Total bytes read back on validated hits. */
   bytesRestored: number;
@@ -2699,6 +2714,19 @@ export interface ColdCacheStats {
   evictions: number;
   /** Entries that failed checksum/identity validation and were removed. */
   corruptions: number;
+  /**
+   * Writes the queue accepted that never reached disk — a read-only, full
+   * or unmounted cache root, a failed rename, a failed fsync. The writer is
+   * fail-open and reports the error to nobody, so without this a cache that
+   * stores nothing at all still looks perfectly healthy.
+   */
+  writeErrors: number;
+  /**
+   * Restores refused before any block was looked up. Neither a hit nor a
+   * miss — so a refused restore reads as `0/0`, exactly like a turn that
+   * never consulted the tier.
+   */
+  restoreDeclines: number;
 }
 
 /**
@@ -2765,6 +2793,13 @@ export interface ColdSidecarStats {
    * satisfied by the replay.
    */
   installed: number;
+  /**
+   * Restores a family THREW AWAY after the walk served them, restarting the
+   * turn cold. Unlike `ColdCacheStats.restoreDeclines` this one comes AFTER
+   * real `coldHits` and `coldBytesRestored`, so the turn looks like it
+   * reused a prefix right up to the point where it recomputed all of it.
+   */
+  restoreSuppressed: number;
 }
 
 /**

@@ -8,6 +8,8 @@ import {
   OTHER_SERIES_COLOR,
   TOOLTIP_CONTENT_STYLE,
   buildSeriesColorMap,
+  categoryChartHeight,
+  categoryLabels,
 } from '@/lib/chart';
 import { formatCount, formatNumber, formatRate } from '@/lib/format';
 import type {
@@ -54,11 +56,6 @@ function formatDay(day: string): string {
   const parsed = new Date(`${day}T00:00:00Z`);
   if (Number.isNaN(parsed.getTime())) return day;
   return parsed.toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' });
-}
-
-/** Truncate a long model id for an axis/legend tick; the full name lives in the tooltip. */
-function shortModel(model: string): string {
-  return model.length > 22 ? `${model.slice(0, 21)}…` : model;
 }
 
 /**
@@ -109,10 +106,10 @@ export default function Metrics() {
   const mtp: MtpByModelRow[] = useMemo(() => metrics.data?.mtpByModel ?? [], [metrics.data]);
   const modelShare: ModelShareRow[] = useMemo(() => metrics.data?.modelShare ?? [], [metrics.data]);
 
-  // One colour per model, held constant across every chart. Ordering is a stable
-  // usage rank (share turns desc, then throughput, then mtp) so a colour follows
-  // the model rather than its position within any single chart.
-  const colorFor = useMemo(() => {
+  // Every model this page mentions, in a stable usage rank (share turns desc,
+  // then throughput, then mtp) so both the colour and the label that follow are
+  // properties of the model rather than of its position in any single chart.
+  const orderedModels = useMemo(() => {
     const seen = new Set<string>();
     const ordered: string[] = [];
     for (const rows of [modelShare, throughput, mtp, throughputTrend] as Array<Array<{ model: string }>>) {
@@ -123,9 +120,22 @@ export default function Metrics() {
         }
       }
     }
-    const map = buildSeriesColorMap(ordered);
-    return (model: string): string => map.get(model) ?? OTHER_SERIES_COLOR;
+    return ordered;
   }, [modelShare, throughput, mtp, throughputTrend]);
+
+  // One colour per model, held constant across every chart.
+  const colorFor = useMemo(() => {
+    const map = buildSeriesColorMap(orderedModels);
+    return (model: string): string => map.get(model) ?? OTHER_SERIES_COLOR;
+  }, [orderedModels]);
+
+  // One short label per model, likewise held constant across every chart and
+  // legend, and computed over the WHOLE page so two models can never collapse
+  // onto the same name — including in charts that list only one of them.
+  const labelFor = useMemo(() => {
+    const map = categoryLabels(orderedModels);
+    return (model: string): string => map.get(model) ?? model;
+  }, [orderedModels]);
 
   const tokensData = useMemo(
     () =>
@@ -267,6 +277,7 @@ export default function Metrics() {
             unit=" tok/s"
             valueFormat={(v) => v.toFixed(0)}
             colorFor={colorFor}
+            labelFor={labelFor}
           />
         </ChartBody>
       </ChartCard>
@@ -289,23 +300,38 @@ export default function Metrics() {
             unit=" ms"
             valueFormat={(v) => Math.round(v).toString()}
             colorFor={colorFor}
+            labelFor={labelFor}
           />
         </ChartBody>
       </ChartCard>
 
       <div className="grid gap-4 lg:grid-cols-2">
-        <ChartCard title="Decode throughput per model" subtitle="Average decode tokens/second (per model)">
+        <ChartCard
+          title="Decode throughput per model"
+          subtitle="Average decode tokens/second (per model)"
+          heightPx={categoryChartHeight(decodeData.length)}
+        >
           <ChartBody
             loading={loading}
             error={error}
             isEmpty={decodeData.length === 0}
             empty={<ChartEmpty icon={Zap} message="No throughput samples in this range." hint={RECORD_HINT} />}
           >
-            <ModelBarChart data={decodeData} unit=" tok/s" valueFormat={(v) => v.toFixed(0)} colorFor={colorFor} />
+            <ModelBarChart
+              data={decodeData}
+              unit=" tok/s"
+              valueFormat={(v) => v.toFixed(0)}
+              colorFor={colorFor}
+              labelFor={labelFor}
+            />
           </ChartBody>
         </ChartCard>
 
-        <ChartCard title="Time to first token per model" subtitle="Average TTFT in milliseconds (per model)">
+        <ChartCard
+          title="Time to first token per model"
+          subtitle="Average TTFT in milliseconds (per model)"
+          heightPx={categoryChartHeight(ttftData.length)}
+        >
           <ChartBody
             loading={loading}
             error={error}
@@ -317,6 +343,7 @@ export default function Metrics() {
               unit=" ms"
               valueFormat={(v) => Math.round(v).toString()}
               colorFor={colorFor}
+              labelFor={labelFor}
             />
           </ChartBody>
         </ChartCard>
@@ -324,6 +351,7 @@ export default function Metrics() {
         <ChartCard
           title="MTP mean accepted per model"
           subtitle="Average speculative-decoding tokens accepted per cycle"
+          heightPx={categoryChartHeight(mtpData.length)}
         >
           <ChartBody
             loading={loading}
@@ -337,7 +365,13 @@ export default function Metrics() {
               />
             }
           >
-            <ModelBarChart data={mtpData} unit="" valueFormat={(v) => v.toFixed(2)} colorFor={colorFor} />
+            <ModelBarChart
+              data={mtpData}
+              unit=""
+              valueFormat={(v) => v.toFixed(2)}
+              colorFor={colorFor}
+              labelFor={labelFor}
+            />
           </ChartBody>
         </ChartCard>
 
@@ -364,7 +398,7 @@ export default function Metrics() {
                   wrapperStyle={{ fontSize: 12, maxWidth: '45%' }}
                   formatter={(value) => (
                     <span className="text-foreground" title={String(value)}>
-                      {shortModel(String(value))}
+                      {labelFor(String(value))}
                     </span>
                   )}
                 />
@@ -398,6 +432,7 @@ interface ModelBarChartProps {
   unit: string;
   valueFormat: (value: number) => string;
   colorFor: (model: string) => string;
+  labelFor: (model: string) => string;
 }
 
 /**
@@ -405,8 +440,19 @@ interface ModelBarChartProps {
  * by the page-wide model palette so a reader can cross-reference the usage-share
  * legend. The category axis labels each model (no legend needed) and the value is
  * direct-labelled at the bar end (the sub-3:1 relief channel).
+ *
+ * Three properties every row on this chart depends on, none of them defaults:
+ *  - `interval={0}` draws EVERY category tick. recharts' default hides the ones
+ *    it measures as overlapping, which on a numeric axis is a fine economy and
+ *    on a category axis is a row with a bar and no name.
+ *  - the plot height comes from {@link categoryChartHeight} at the call site, so
+ *    the rows actually have the space `interval={0}` assumes.
+ *  - `width="auto"` lets recharts measure the rendered ticks and size the axis to
+ *    them. A fixed width silently clips: the ticks are anchored at the axis's
+ *    right edge, so anything wider than the reservation runs off the left of the
+ *    SVG and is cut off mid-name.
  */
-function ModelBarChart({ data, unit, valueFormat, colorFor }: ModelBarChartProps) {
+export function ModelBarChart({ data, unit, valueFormat, colorFor, labelFor }: ModelBarChartProps) {
   return (
     <ResponsiveContainer width="100%" height="100%">
       <BarChart layout="vertical" data={data} margin={{ top: 4, right: 44, bottom: 0, left: 8 }}>
@@ -424,8 +470,9 @@ function ModelBarChart({ data, unit, valueFormat, colorFor }: ModelBarChartProps
           tick={AXIS_TICK}
           tickLine={false}
           axisLine={false}
-          width={140}
-          tickFormatter={(v) => shortModel(String(v))}
+          width="auto"
+          interval={0}
+          tickFormatter={(v) => labelFor(String(v))}
         />
         <Tooltip
           cursor={{ fill: 'var(--color-muted)', opacity: 0.35 }}
@@ -457,6 +504,7 @@ interface ModelTrendChartProps {
   unit: string;
   valueFormat: (value: number) => string;
   colorFor: (model: string) => string;
+  labelFor: (model: string) => string;
 }
 
 /** One pivoted day row: a formatted day label plus one numeric column per model. */
@@ -469,7 +517,7 @@ type TrendRow = { day: string } & Record<string, number | string>;
  * their raw `YYYY-MM-DD` key before formatting so the axis stays chronological,
  * and only models carrying a finite value for `pick` become series.
  */
-function ModelTrendChart({ points, models, pick, unit, valueFormat, colorFor }: ModelTrendChartProps) {
+function ModelTrendChart({ points, models, pick, unit, valueFormat, colorFor, labelFor }: ModelTrendChartProps) {
   const { rows, series } = useMemo(() => {
     const byDay = new Map<string, TrendRow>();
     const present = new Set<string>();
@@ -507,13 +555,13 @@ function ModelTrendChart({ points, models, pick, unit, valueFormat, colorFor }: 
         <Tooltip
           cursor={{ stroke: 'var(--color-muted-foreground)', strokeWidth: 1 }}
           contentStyle={TOOLTIP_CONTENT_STYLE}
-          formatter={(value, name) => [`${valueFormat(Number(value))}${unit}`, shortModel(String(name))]}
+          formatter={(value, name) => [`${valueFormat(Number(value))}${unit}`, labelFor(String(name))]}
         />
         <Legend
           wrapperStyle={{ fontSize: 12 }}
           formatter={(value) => (
             <span className="text-foreground" title={String(value)}>
-              {shortModel(String(value))}
+              {labelFor(String(value))}
             </span>
           )}
         />

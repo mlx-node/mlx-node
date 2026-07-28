@@ -17,6 +17,7 @@
  * environment stays `node` for every other suite.
  */
 
+import { categoryLabels, truncateMiddle } from '@/lib/chart';
 import type {
   CacheResponse,
   DownloadsResponse,
@@ -29,13 +30,14 @@ import type {
   SessionTurnMetric,
 } from '@/lib/types';
 import Cache from '@/pages/cache';
+import Metrics from '@/pages/metrics';
 import Overview from '@/pages/overview';
 import SessionDetail from '@/pages/session-detail';
 import { createElement } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
-import { renderPage, stubFetch, type RenderedPage } from './render.js';
+import { renderPage, stubChartMetrics, stubFetch, TICK_CHAR_PX, TICK_LINE_PX, type RenderedPage } from './render.js';
 
 const MIB = 1024 * 1024;
 
@@ -84,6 +86,10 @@ function cacheFixture(overrides: Partial<CacheResponse> = {}): CacheResponse {
       corruptions: 0,
       corruptionsTotal: 0,
       queueDropsTotal: 6,
+      writeErrors: 0,
+      writeErrorsTotal: 0,
+      restoreDeclines: 0,
+      restoreSuppressed: 0,
       ...overrides.health,
     },
     restoreFamilies: overrides.restoreFamilies ?? ['gemma4', 'qwen3', 'qwen3_5', 'qwen3_5_moe'],
@@ -112,12 +118,15 @@ function emptyCacheFixture(): CacheResponse {
 
 let mounted: RenderedPage | undefined;
 let restoreFetch: (() => void) | undefined;
+let restoreMetrics: (() => void) | undefined;
 
 afterEach(() => {
   mounted?.unmount();
   mounted = undefined;
   restoreFetch?.();
   restoreFetch = undefined;
+  restoreMetrics?.();
+  restoreMetrics = undefined;
 });
 
 /**
@@ -169,6 +178,81 @@ describe('Cache page', () => {
     expect(text).toContain('cumulative max 6 · 500 enqueued');
     expect(text).toContain('Evictions');
     expect(text).toContain('Bytes restored');
+    expect(text).toContain('Write errors');
+    expect(text).toContain('none seen (writes are landing)');
+    expect(text).toContain('Restore declines');
+  });
+
+  /**
+   * The reported operator scenario, at the pixel it is read from: a cache root
+   * that accepts no writes.
+   *
+   * Every counter that existed before stays at zero — the queue was never
+   * full, nothing was ever read back so nothing could be corrupt — which is
+   * precisely why the row was unreadable. The card must say the root is
+   * refusing writes, not stay silent because the four old counters are clean.
+   */
+  it('raises an alarm when the cache root is refusing writes', async () => {
+    const text = await mount(
+      createElement(Cache),
+      {
+        '/cache': cacheFixture({
+          health: {
+            enqueued: 42,
+            queueDrops: 0,
+            evictions: 0,
+            corruptions: 0,
+            corruptionsTotal: 0,
+            queueDropsTotal: 0,
+            writeErrors: 42,
+            writeErrorsTotal: 42,
+            restoreDeclines: 0,
+            restoreSuppressed: 0,
+          },
+        }),
+      },
+      'mlx-paged-v1',
+    );
+    expect(text).toContain('cumulative max 42 — the cache root is refusing writes');
+    expect(text).not.toContain('none seen (writes are landing)');
+    // The pre-existing counters really are all clean, which is the point.
+    expect(text).toContain('none seen (acceptance bar: 0)');
+  });
+
+  /**
+   * The restore-side silent zero, at the same pixel.
+   *
+   * A refused restore performs no lookup, so `trend` is empty and the hit-rate
+   * tile used to print "no lookups recorded for this cache" — which reads as
+   * "nothing ran" when in fact reuse was offered and refused. Opposite
+   * diagnoses, same rendering.
+   */
+  it('says reuse was refused rather than "no lookups" when restores were declined', async () => {
+    const text = await mount(
+      createElement(Cache),
+      {
+        '/cache': cacheFixture({
+          trend: [],
+          health: {
+            enqueued: 12,
+            queueDrops: 0,
+            evictions: 0,
+            corruptions: 0,
+            corruptionsTotal: 0,
+            queueDropsTotal: 0,
+            writeErrors: 0,
+            writeErrorsTotal: 0,
+            restoreDeclines: 3,
+            restoreSuppressed: 1,
+          },
+        }),
+      },
+      'mlx-paged-v1',
+    );
+    expect(text).toContain('4 restores refused · no lookup was performed');
+    expect(text).not.toContain('no lookups recorded for this cache');
+    // And the card keeps the two causes apart, since the fixes differ.
+    expect(text).toContain('1 suppressed after restore · neither counts as a lookup');
   });
 
   it('flags a non-zero cumulative corruption total even when the window delta is 0', async () => {
@@ -176,7 +260,18 @@ describe('Cache page', () => {
       createElement(Cache),
       {
         '/cache': cacheFixture({
-          health: { enqueued: 9, queueDrops: 0, evictions: 0, corruptions: 0, corruptionsTotal: 3, queueDropsTotal: 0 },
+          health: {
+            enqueued: 9,
+            queueDrops: 0,
+            evictions: 0,
+            corruptions: 0,
+            corruptionsTotal: 3,
+            queueDropsTotal: 0,
+            writeErrors: 0,
+            writeErrorsTotal: 0,
+            restoreDeclines: 0,
+            restoreSuppressed: 0,
+          },
         }),
       },
       'mlx-paged-v1',
@@ -278,10 +373,12 @@ describe('Cache page', () => {
 });
 
 describe('Overview page', () => {
-  function overviewRoutes(cache: CacheResponse): Record<string, unknown> {
+  function overviewRoutes(cache: CacheResponse, sessions?: SessionsResponse): Record<string, unknown> {
     const models: ModelsResponse = { models: [], warnings: [], dir: '/models' };
-    const sessions: SessionsResponse = { sessions: [], total: 0 };
     const downloads: DownloadsResponse = { jobs: [] };
+    // Deliberately enormous, and deliberately UNRELATED to the session list.
+    // This route is the machine-wide one; nothing on the Sessions tile may read
+    // from it, so these numbers must not appear.
     const metrics: MetricsOverviewResponse = {
       range: { from: null, to: null },
       tokensByDay: [],
@@ -289,11 +386,18 @@ describe('Overview page', () => {
       throughputTrend: [],
       mtpByModel: [],
       modelShare: [],
-      totals: { turns: 0, traces: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0 },
+      totals: {
+        turns: 9_000,
+        traces: 9_000,
+        inputTokens: 1_500_000,
+        outputTokens: 500_000,
+        cachedTokens: 0,
+        reasoningTokens: 0,
+      },
     };
     return {
       '/models': models,
-      '/sessions': sessions,
+      '/sessions': sessions ?? { sessions: [], total: 0, tokens: 0 },
       '/downloads': downloads,
       '/metrics/overview': metrics,
       '/cache': cache,
@@ -319,6 +423,28 @@ describe('Overview page', () => {
     // catches the label disappearing or reverting to a raw Math.round.
   });
 
+  it('takes both halves of the Sessions tile from the session list, not the machine-wide metrics', async () => {
+    // The reported shape: three sessions holding 1,672 tokens between them, in a
+    // dashboard whose machine has 2,000,000 tokens of history across every
+    // session directory it has ever indexed. The tile counted the three and then
+    // captioned them with the two million, and the caption did not move when the
+    // dashboard was pointed at a different --session-dir.
+    const sessions: SessionsResponse = { sessions: [], total: 3, tokens: 1_672 };
+    const text = await mount(
+      createElement(MemoryRouter, null, createElement(Overview)),
+      overviewRoutes(cacheFixture(), sessions),
+      // Anchored on a SIBLING tile, deliberately: settling on this tile's own
+      // wording would turn a regression into a 2s timeout instead of an
+      // assertion that names the number it found.
+      'hit rate',
+    );
+    expect(text).toContain('1,672 tokens · these sessions only');
+    // 1_500_000 + 500_000 formatted by formatCount. Its presence anywhere on the
+    // tile means the machine-wide route is still being read.
+    expect(text).not.toContain('2M');
+    expect(text).not.toContain('last 7 days');
+  });
+
   it('saturates the quota meter width the same way the label is saturated', async () => {
     // `Math.round(quotaFraction * 100)` renders a 99.9%-full quota as a 100%
     // bar. `percentInt` caps it at 99 so the bar and the label agree.
@@ -334,6 +460,168 @@ describe('Overview page', () => {
     expect(widths).toContain('99%');
     expect(widths).not.toContain('100%');
     expect(mounted.text()).toContain('>99% of 9.5 MB');
+  });
+});
+
+describe('Metrics page — per-model bar charts', () => {
+  /**
+   * Eleven models, because eleven is what the bug report had and because the
+   * defect is a function of how many rows share a fixed-height plot. Two of them
+   * agree for their first 21 characters on purpose.
+   */
+  const MODELS = [
+    'Gemma-4-31B-IT-UD-Q4_K_XL-mlx',
+    'Gemma-4-31B-IT-UD-Q4_K_M-mlx',
+    'gemma-4-26b-a4b-nvfp4-mlx',
+    'Qwen3.5-30B-A3B-Instruct-mlx',
+    'Qwen3.5-30B-A3B-Thinking-mlx',
+    'Lfm2.5-8B-A1B-mlx-q4',
+    'AgentWorld-35B-UD-Q4_K_XL',
+    'Ornith-1.0-35B-UD-Q5_K_M',
+    'qwen3-8b',
+    'gemma-4-e2b-qat',
+    'Harrier-embed-1B',
+  ];
+
+  /**
+   * Only the three per-model bar charts carry data. The tokens/day, both trend
+   * charts and the usage-share pie stay empty on purpose, so every rendered
+   * chart in the page is one of the three under test and the assertions cannot
+   * accidentally read a numeric y-axis.
+   */
+  function metricsFixture(models: string[]): MetricsOverviewResponse {
+    return {
+      range: { from: null, to: null },
+      tokensByDay: [],
+      throughputByModel: models.map((model, i) => ({
+        model,
+        avgDecodeTps: 120 - i,
+        avgPrefillTps: 900,
+        avgTtftMs: 200 + i,
+        samples: 10,
+      })),
+      throughputTrend: [],
+      mtpByModel: models.map((model, i) => ({ model, meanAccepted: 1.9 - i * 0.05, avgCycles: 4, samples: 5 })),
+      modelShare: [],
+      totals: { turns: 0, traces: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0 },
+    };
+  }
+
+  /**
+   * Mount the Metrics page with chart measurement stubbed in. The settle anchor
+   * is a model id short enough to survive shortening verbatim, so it can only
+   * appear once the charts have actually drawn their category axis.
+   */
+  async function mountMetrics(models: string[], options: { tickLinePx?: number } = {}): Promise<RenderedPage> {
+    restoreMetrics = stubChartMetrics(options);
+    restoreFetch = stubFetch({ '/metrics/overview': metricsFixture(models) });
+    mounted = await renderPage(createElement(Metrics), (text) => text.includes('qwen3-8b'));
+    return mounted;
+  }
+
+  /** The three rendered plots, in page order: decode, TTFT, MTP. */
+  function plots(page: RenderedPage): Element[] {
+    return [...page.container.querySelectorAll('.recharts-responsive-container')];
+  }
+
+  /**
+   * Category tick labels of one plot with the geometry that decides whether they
+   * are readable: `left` is where the glyphs start, and a left-of-zero label is
+   * outside the SVG and therefore cut off mid-name.
+   */
+  function categoryTicks(plot: Element): Array<{ label: string; left: number; y: number }> {
+    return [...plot.querySelectorAll('[class*="yAxis-tick-labels"] text')].map((node) => {
+      const label = node.textContent ?? '';
+      const x = Number(node.getAttribute('x'));
+      const width = label.length * TICK_CHAR_PX;
+      return {
+        label,
+        left: node.getAttribute('text-anchor') === 'end' ? x - width : x,
+        y: Number(node.getAttribute('y')),
+      };
+    });
+  }
+
+  it('draws a category label for every bar, with room for it', async () => {
+    const page = await mountMetrics(MODELS);
+    const charts = plots(page);
+    expect(charts).toHaveLength(3);
+    for (const chart of charts) {
+      expect(chart.querySelectorAll('.recharts-bar-rectangle')).toHaveLength(MODELS.length);
+      const ticks = categoryTicks(chart);
+      // A skipped tick on a numeric axis is inferable; a skipped model name is
+      // not. recharts hides overlapping ticks unless `interval={0}` says not to.
+      expect(ticks).toHaveLength(MODELS.length);
+      // …and `interval={0}` alone would only stack them on top of each other, so
+      // the rows must also carry more than a line of text apiece. recharts' own
+      // collision rule is the tick height plus its 5px `minTickGap`.
+      const gaps = ticks.slice(1).map((tick, i) => tick.y - ticks[i].y);
+      for (const gap of gaps) expect(gap).toBeGreaterThan(TICK_LINE_PX + 5);
+    }
+  });
+
+  it('still names every model when the tick text is taller than the row it sits in', async () => {
+    // Sizing the rows generously is not the same as guaranteeing a label. Once
+    // the measured text outgrows its row, recharts is back to hiding whichever
+    // ticks it thinks collide — and it hides model NAMES, silently. Only
+    // `interval={0}` says "draw them all anyway"; without it this render loses
+    // five of the eleven.
+    //
+    // The ids are suffixed rather than reused: recharts memoises every text
+    // measurement in a module-level LRU keyed by the string, so a name already
+    // measured by another test in this file would keep that test's height and
+    // this one would silently assert nothing.
+    const page = await mountMetrics(
+      MODELS.map((model) => `${model}-tall`),
+      { tickLinePx: 34 },
+    );
+    for (const chart of plots(page)) {
+      expect(chart.querySelectorAll('.recharts-bar-rectangle')).toHaveLength(MODELS.length);
+      expect(categoryTicks(chart)).toHaveLength(MODELS.length);
+    }
+  });
+
+  it('keeps every category label inside the plot instead of running off its left edge', async () => {
+    const page = await mountMetrics(MODELS);
+    for (const chart of plots(page)) {
+      const ticks = categoryTicks(chart);
+      expect(ticks.length).toBeGreaterThan(0);
+      for (const tick of ticks) {
+        expect({ label: tick.label, left: tick.left }).toMatchObject({ left: expect.any(Number) });
+        expect(tick.left).toBeGreaterThanOrEqual(0);
+      }
+    }
+  });
+
+  it('never renders two different models under the same name', async () => {
+    // `Gemma-4-31B-IT-UD-Q4_K_XL-mlx` and `Gemma-4-31B-IT-UD-Q4_K_M-mlx` agree
+    // for 21 characters, so any head-keeping shortener collapses them onto one
+    // string — two rows of a comparison chart claiming to be the same model.
+    const page = await mountMetrics(MODELS);
+    for (const chart of plots(page)) {
+      const labels = categoryTicks(chart).map((tick) => tick.label);
+      expect(new Set(labels).size).toBe(labels.length);
+    }
+    const rendered = categoryTicks(plots(page)[0]).map((tick) => tick.label);
+    expect(rendered).toContain('Gemma-4-31B-I…-Q4_K_XL-mlx');
+    expect(rendered).toContain('Gemma-4-31B-I…D-Q4_K_M-mlx');
+  });
+
+  it('numbers the survivors when shortening cannot separate two ids at all', async () => {
+    // The residual case the render tests cannot reach: two ids that differ only
+    // past the budget on BOTH ends. A label may be ugly; it may not be a lie.
+    const head = 'a'.repeat(20);
+    const tail = 'b'.repeat(20);
+    const labels = categoryLabels([`${head}X${tail}`, `${head}Y${tail}`]);
+    expect(new Set(labels.values()).size).toBe(2);
+    expect([...labels.values()][1]).toMatch(/ \(2\)$/);
+  });
+
+  it('shortens from the middle so both ends of an id survive', () => {
+    expect(truncateMiddle('Gemma-4-31B-IT-UD-Q4_K_XL-mlx', 26)).toBe('Gemma-4-31B-I…-Q4_K_XL-mlx');
+    expect(truncateMiddle('Gemma-4-31B-IT-UD-Q4_K_XL-mlx', 26)).toHaveLength(26);
+    // Short enough already: untouched, no ellipsis.
+    expect(truncateMiddle('qwen3-8b', 26)).toBe('qwen3-8b');
   });
 });
 

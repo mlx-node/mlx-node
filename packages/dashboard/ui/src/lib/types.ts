@@ -91,6 +91,14 @@ export interface SessionsResponse {
   sessions: SessionRow[];
   /** Total sessions matching the filter, before `limit`/`offset` paging. */
   total: number;
+  /**
+   * Input + output tokens over exactly the sessions {@link total} counts.
+   *
+   * Served beside the count so a caller showing both cannot pair a session count
+   * scoped to the current `--session-dir` with a token total taken from the
+   * machine-wide `/metrics/overview`.
+   */
+  tokens: number;
 }
 
 /** One day's token totals from `GET /api/metrics/overview` `tokensByDay` (UTC day). */
@@ -212,9 +220,9 @@ export interface CacheScope {
 }
 
 /**
- * Cold-tier counters beyond hit/miss. `corruptionsTotal` / `queueDropsTotal`
- * are CUMULATIVE process totals reduced with MAX (not summed deltas), so a
- * corruption during a turn that aborted before it could record still shows.
+ * Cold-tier counters beyond hit/miss. The `*Total` fields are CUMULATIVE
+ * process totals reduced with MAX (not summed deltas), so a fault during a
+ * turn that aborted before it could record a delta still shows.
  */
 export interface ColdTierHealth {
   enqueued: number;
@@ -223,6 +231,22 @@ export interface ColdTierHealth {
   corruptions: number;
   corruptionsTotal: number;
   queueDropsTotal: number;
+  /**
+   * Writes the queue accepted that never reached disk. The native writer is
+   * fail-open and reports its error to nobody, so this is the only number that
+   * separates a cache storing nothing from a cache with nothing to store.
+   */
+  writeErrors: number;
+  writeErrorsTotal: number;
+  /**
+   * Restores the walk refused. Neither a hit nor a miss — without this, a
+   * refused restore renders as "no lookups recorded", which reads as "nothing
+   * ran" rather than "reuse was refused". SUMMED, not MAX'd: a decline is
+   * normal on any prompt's first turn, so a latch would carry no information.
+   */
+  restoreDeclines: number;
+  /** Restores a family threw away after the walk served them. Also summed. */
+  restoreSuppressed: number;
 }
 
 export interface CacheResponse {

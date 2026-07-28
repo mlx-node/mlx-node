@@ -3,10 +3,89 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
+import { getTableColumns } from 'drizzle-orm';
+import type { SQLiteTable } from 'drizzle-orm/sqlite-core';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { openDashboardDb } from '../src/db/open.js';
 import { sessions, traceFiles, traces, turns } from '../src/db/schema.js';
+
+/** The four tables `assertSchemaSignature` checks, in the order it checks them. */
+const SCHEMA_TABLES: Array<[string, SQLiteTable]> = [
+  ['sessions', sessions],
+  ['turns', turns],
+  ['traces', traces],
+  ['trace_files', traceFiles],
+];
+
+/** DB column names the live drizzle schema declares for a table. */
+function columnNames(table: SQLiteTable): string[] {
+  return Object.values(getTableColumns(table)).map((c) => c.name);
+}
+
+/**
+ * A `CREATE TABLE` for `name` carrying every column the live drizzle schema
+ * declares, minus `omit`.
+ *
+ * Derived rather than hand-listed on purpose. `assertSchemaSignature` throws on
+ * the FIRST gap it finds and walks the tables in a fixed order, so a fixture
+ * whose hand-written DDL falls behind a newly added schema column starts
+ * quarantining for THAT column instead of the gap its test names — the test
+ * keeps passing while the thing it guards stops being guarded. Deriving the DDL
+ * makes every fixture track `schema.ts` automatically, so the only gap is the
+ * one the caller asks for. An `omit` naming a column that does not exist throws
+ * rather than silently producing a complete fixture.
+ */
+function fixtureTable(name: string, table: SQLiteTable, omit: string[] = []): string {
+  const columns = Object.values(getTableColumns(table));
+  for (const col of omit) {
+    if (!columns.some((c) => c.name === col)) throw new Error(`fixtureTable(${name}): no such column "${col}"`);
+  }
+  const dropped = new Set(omit);
+  const defs = columns
+    .filter((c) => !dropped.has(c.name))
+    .map((c) => {
+      const parts = [c.name, c.getSQLType().toUpperCase()];
+      if (c.primary) parts.push('PRIMARY KEY');
+      else if (c.isUnique) parts.push('UNIQUE');
+      if (c.notNull && !c.primary) parts.push('NOT NULL');
+      if (typeof c.default === 'number' || typeof c.default === 'string') {
+        parts.push(`DEFAULT ${typeof c.default === 'number' ? c.default : `'${c.default}'`}`);
+      }
+      return parts.join(' ');
+    });
+  return `CREATE TABLE ${name} (${defs.join(', ')});`;
+}
+
+/**
+ * Assert the fixture on disk departs from the live schema in exactly the listed
+ * places (`"trace_files"` for a whole table, `"traces.source_file"` for a single
+ * column), reported in probe order.
+ *
+ * This is what keeps each quarantine test honest. The probe stops at the first
+ * gap, so any EXTRA drift short-circuits it and the test below still sees a
+ * quarantine — passing for a reason it never claimed. Asserting the gap set up
+ * front turns that silent meaning-change into a failure.
+ */
+function expectFixtureGaps(file: string, expected: string[]): void {
+  const raw = new DatabaseSync(file);
+  const gaps: string[] = [];
+  try {
+    for (const [name, table] of SCHEMA_TABLES) {
+      const meta = raw.prepare(`PRAGMA table_list(${name})`).get() as { type?: unknown } | undefined;
+      if (meta?.type !== 'table') {
+        gaps.push(name);
+        continue;
+      }
+      const rows = raw.prepare(`PRAGMA table_info(${name})`).all() as Array<{ name?: unknown }>;
+      const present = new Set(rows.map((r) => (typeof r.name === 'string' ? r.name : '')));
+      for (const col of columnNames(table)) if (!present.has(col)) gaps.push(`${name}.${col}`);
+    }
+  } finally {
+    raw.close();
+  }
+  expect(gaps).toEqual(expected);
+}
 
 describe('dashboard db', () => {
   it('bootstraps schema and round-trips a session row', () => {
@@ -131,7 +210,7 @@ describe('dashboard db', () => {
     const seed = openDashboardDb(file);
     seed.close();
     const bump = new DatabaseSync(file);
-    bump.exec('PRAGMA user_version = 4;'); // > SCHEMA_VERSION (3)
+    bump.exec('PRAGMA user_version = 5;'); // > SCHEMA_VERSION (4)
     bump.close();
 
     const dash = openDashboardDb(file);
@@ -166,27 +245,18 @@ describe('dashboard db', () => {
     const d = mkdtempSync(join(tmpdir(), 'dash-drift-'));
     const file = join(d, 'index.db');
     const raw = new DatabaseSync(file);
-    // Full sessions/turns, but traces is missing the newest `source_file` column.
+    // Everything complete except the single dropped column under test.
     raw.exec(
-      `CREATE TABLE sessions (
-        id TEXT PRIMARY KEY, path TEXT NOT NULL, cwd TEXT NOT NULL, name TEXT,
-        created INTEGER NOT NULL, modified INTEGER NOT NULL,
-        message_count INTEGER NOT NULL DEFAULT 0, first_message TEXT,
-        last_ingested_mtime INTEGER NOT NULL DEFAULT 0, last_ingested_size INTEGER NOT NULL DEFAULT 0
-      );
-      CREATE TABLE turns (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, entry_id TEXT,
-        trace_id TEXT, ts INTEGER NOT NULL, model TEXT, input_tokens INTEGER,
-        output_tokens INTEGER, cached_tokens INTEGER, reasoning_tokens INTEGER
-      );
-      CREATE TABLE traces (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT NOT NULL UNIQUE,
-        session_id TEXT, root_session_id TEXT, ts INTEGER NOT NULL, model TEXT,
-        cold_hits INTEGER, cold_bytes_restored INTEGER
-      );`,
+      [
+        fixtureTable('sessions', sessions),
+        fixtureTable('turns', turns),
+        fixtureTable('traces', traces, ['source_file']),
+        fixtureTable('trace_files', traceFiles),
+      ].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 3;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 4;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
+    expectFixtureGaps(file, ['traces.source_file']);
 
     const dash = openDashboardDb(file);
     // Rebuilt schema carries source_file; an insert using it round-trips.
@@ -213,26 +283,17 @@ describe('dashboard db', () => {
     const d = mkdtempSync(join(tmpdir(), 'dash-notable-'));
     const file = join(d, 'index.db');
     const raw = new DatabaseSync(file);
-    // Full sessions + traces, but NO turns table at all.
+    // Every other table complete; NO turns table at all.
     raw.exec(
-      `CREATE TABLE sessions (
-        id TEXT PRIMARY KEY, path TEXT NOT NULL, cwd TEXT NOT NULL, name TEXT,
-        created INTEGER NOT NULL, modified INTEGER NOT NULL,
-        message_count INTEGER NOT NULL DEFAULT 0, first_message TEXT,
-        last_ingested_mtime INTEGER NOT NULL DEFAULT 0, last_ingested_size INTEGER NOT NULL DEFAULT 0
-      );
-      CREATE TABLE traces (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT NOT NULL UNIQUE,
-        session_id TEXT, root_session_id TEXT, ts INTEGER NOT NULL, model TEXT,
-        ttft_ms REAL, prefill_tps REAL, decode_tps REAL, mtp_cycles INTEGER,
-        mtp_mean_accepted REAL, duration_ms REAL, finish_reason TEXT,
-        prompt_tokens INTEGER, cached_tokens INTEGER, output_tokens INTEGER,
-        reasoning_tokens INTEGER, cold_hits INTEGER, cold_misses INTEGER,
-        cold_bytes_written INTEGER, cold_bytes_restored INTEGER, source_file TEXT
-      );`,
+      [
+        fixtureTable('sessions', sessions),
+        fixtureTable('traces', traces),
+        fixtureTable('trace_files', traceFiles),
+      ].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 3;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 4;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
+    expectFixtureGaps(file, ['turns']);
 
     const dash = openDashboardDb(file);
     // Rebuilt schema carries a real `turns` table; an insert round-trips.
@@ -254,31 +315,18 @@ describe('dashboard db', () => {
     const d = mkdtempSync(join(tmpdir(), 'dash-nocol-'));
     const file = join(d, 'index.db');
     const raw = new DatabaseSync(file);
-    // sessions is missing the `name` column; turns + traces are complete.
+    // sessions is missing the `name` column; every other table is complete.
     raw.exec(
-      `CREATE TABLE sessions (
-        id TEXT PRIMARY KEY, path TEXT NOT NULL, cwd TEXT NOT NULL,
-        created INTEGER NOT NULL, modified INTEGER NOT NULL,
-        message_count INTEGER NOT NULL DEFAULT 0, first_message TEXT,
-        last_ingested_mtime INTEGER NOT NULL DEFAULT 0, last_ingested_size INTEGER NOT NULL DEFAULT 0
-      );
-      CREATE TABLE turns (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, entry_id TEXT,
-        trace_id TEXT, ts INTEGER NOT NULL, model TEXT, input_tokens INTEGER,
-        output_tokens INTEGER, cached_tokens INTEGER, reasoning_tokens INTEGER
-      );
-      CREATE TABLE traces (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT NOT NULL UNIQUE,
-        session_id TEXT, root_session_id TEXT, ts INTEGER NOT NULL, model TEXT,
-        ttft_ms REAL, prefill_tps REAL, decode_tps REAL, mtp_cycles INTEGER,
-        mtp_mean_accepted REAL, duration_ms REAL, finish_reason TEXT,
-        prompt_tokens INTEGER, cached_tokens INTEGER, output_tokens INTEGER,
-        reasoning_tokens INTEGER, cold_hits INTEGER, cold_misses INTEGER,
-        cold_bytes_written INTEGER, cold_bytes_restored INTEGER, source_file TEXT
-      );`,
+      [
+        fixtureTable('sessions', sessions, ['name']),
+        fixtureTable('turns', turns),
+        fixtureTable('traces', traces),
+        fixtureTable('trace_files', traceFiles),
+      ].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 3;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 4;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
+    expectFixtureGaps(file, ['sessions.name']);
 
     const dash = openDashboardDb(file);
     // Rebuilt sessions carries `name`; an insert using it round-trips.
@@ -316,36 +364,20 @@ describe('dashboard db', () => {
     const d = mkdtempSync(join(tmpdir(), 'dash-view-'));
     const file = join(d, 'index.db');
     const raw = new DatabaseSync(file);
-    // sessions + traces are real tables; `turns` is a VIEW over a backing table
-    // that projects exactly the expected `turns` columns.
+    // Every other table is real and complete; `turns` is a VIEW over a backing
+    // table that projects exactly the expected `turns` columns.
     raw.exec(
-      `CREATE TABLE sessions (
-        id TEXT PRIMARY KEY, path TEXT NOT NULL, cwd TEXT NOT NULL, name TEXT,
-        created INTEGER NOT NULL, modified INTEGER NOT NULL,
-        message_count INTEGER NOT NULL DEFAULT 0, first_message TEXT,
-        last_ingested_mtime INTEGER NOT NULL DEFAULT 0, last_ingested_size INTEGER NOT NULL DEFAULT 0
-      );
-      CREATE TABLE traces (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT NOT NULL UNIQUE,
-        session_id TEXT, root_session_id TEXT, ts INTEGER NOT NULL, model TEXT,
-        ttft_ms REAL, prefill_tps REAL, decode_tps REAL, mtp_cycles INTEGER,
-        mtp_mean_accepted REAL, duration_ms REAL, finish_reason TEXT,
-        prompt_tokens INTEGER, cached_tokens INTEGER, output_tokens INTEGER,
-        reasoning_tokens INTEGER, cold_hits INTEGER, cold_misses INTEGER,
-        cold_bytes_written INTEGER, cold_bytes_restored INTEGER, source_file TEXT
-      );
-      CREATE TABLE turns_backing (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, entry_id TEXT,
-        trace_id TEXT, ts INTEGER NOT NULL, model TEXT, input_tokens INTEGER,
-        output_tokens INTEGER, cached_tokens INTEGER, reasoning_tokens INTEGER
-      );
-      CREATE VIEW turns AS SELECT
-        id, session_id, entry_id, trace_id, ts, model,
-        input_tokens, output_tokens, cached_tokens, reasoning_tokens
-      FROM turns_backing;`,
+      [
+        fixtureTable('sessions', sessions),
+        fixtureTable('traces', traces),
+        fixtureTable('trace_files', traceFiles),
+        fixtureTable('turns_backing', turns),
+        `CREATE VIEW turns AS SELECT ${columnNames(turns).join(', ')} FROM turns_backing;`,
+      ].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 3;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 4;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
+    expectFixtureGaps(file, ['turns']);
 
     const dash = openDashboardDb(file);
     // Rebuilt schema carries a real `turns` table; an insert round-trips.
@@ -371,31 +403,19 @@ describe('dashboard db', () => {
     const d = mkdtempSync(join(tmpdir(), 'dash-fts5-'));
     const file = join(d, 'index.db');
     const raw = new DatabaseSync(file);
-    // sessions + traces are real tables; `turns` is an FTS5 virtual table whose
-    // declared columns are exactly the expected `turns` column set.
+    // Every other table is real and complete; `turns` is an FTS5 virtual table
+    // whose declared columns are exactly the expected `turns` column set.
     raw.exec(
-      `CREATE TABLE sessions (
-        id TEXT PRIMARY KEY, path TEXT NOT NULL, cwd TEXT NOT NULL, name TEXT,
-        created INTEGER NOT NULL, modified INTEGER NOT NULL,
-        message_count INTEGER NOT NULL DEFAULT 0, first_message TEXT,
-        last_ingested_mtime INTEGER NOT NULL DEFAULT 0, last_ingested_size INTEGER NOT NULL DEFAULT 0
-      );
-      CREATE TABLE traces (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT NOT NULL UNIQUE,
-        session_id TEXT, root_session_id TEXT, ts INTEGER NOT NULL, model TEXT,
-        ttft_ms REAL, prefill_tps REAL, decode_tps REAL, mtp_cycles INTEGER,
-        mtp_mean_accepted REAL, duration_ms REAL, finish_reason TEXT,
-        prompt_tokens INTEGER, cached_tokens INTEGER, output_tokens INTEGER,
-        reasoning_tokens INTEGER, cold_hits INTEGER, cold_misses INTEGER,
-        cold_bytes_written INTEGER, cold_bytes_restored INTEGER, source_file TEXT
-      );
-      CREATE VIRTUAL TABLE turns USING fts5(
-        id, session_id, entry_id, trace_id, ts, model,
-        input_tokens, output_tokens, cached_tokens, reasoning_tokens
-      );`,
+      [
+        fixtureTable('sessions', sessions),
+        fixtureTable('traces', traces),
+        fixtureTable('trace_files', traceFiles),
+        `CREATE VIRTUAL TABLE turns USING fts5(${columnNames(turns).join(', ')});`,
+      ].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 3;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 4;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
+    expectFixtureGaps(file, ['turns']);
 
     const dash = openDashboardDb(file);
     // Rebuilt schema carries a real `turns` table; an insert round-trips.
@@ -420,31 +440,18 @@ describe('dashboard db', () => {
     const d = mkdtempSync(join(tmpdir(), 'dash-metrics-'));
     const file = join(d, 'index.db');
     const raw = new DatabaseSync(file);
-    // Full sessions + turns; traces omits ONLY the newest queue_ms + resident.
+    // Every table complete; traces omits ONLY queue_ms + resident.
     raw.exec(
-      `CREATE TABLE sessions (
-        id TEXT PRIMARY KEY, path TEXT NOT NULL, cwd TEXT NOT NULL, name TEXT,
-        created INTEGER NOT NULL, modified INTEGER NOT NULL,
-        message_count INTEGER NOT NULL DEFAULT 0, first_message TEXT,
-        last_ingested_mtime INTEGER NOT NULL DEFAULT 0, last_ingested_size INTEGER NOT NULL DEFAULT 0
-      );
-      CREATE TABLE turns (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, entry_id TEXT,
-        trace_id TEXT, ts INTEGER NOT NULL, model TEXT, input_tokens INTEGER,
-        output_tokens INTEGER, cached_tokens INTEGER, reasoning_tokens INTEGER
-      );
-      CREATE TABLE traces (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT NOT NULL UNIQUE,
-        session_id TEXT, root_session_id TEXT, ts INTEGER NOT NULL, model TEXT,
-        ttft_ms REAL, prefill_tps REAL, decode_tps REAL, mtp_cycles INTEGER,
-        mtp_mean_accepted REAL, duration_ms REAL, finish_reason TEXT,
-        prompt_tokens INTEGER, cached_tokens INTEGER, output_tokens INTEGER,
-        reasoning_tokens INTEGER, cold_hits INTEGER, cold_misses INTEGER,
-        cold_bytes_written INTEGER, cold_bytes_restored INTEGER, source_file TEXT
-      );`,
+      [
+        fixtureTable('sessions', sessions),
+        fixtureTable('turns', turns),
+        fixtureTable('traces', traces, ['queue_ms', 'resident']),
+        fixtureTable('trace_files', traceFiles),
+      ].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 3;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 4;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
+    expectFixtureGaps(file, ['traces.queue_ms', 'traces.resident']);
 
     // First open: signature probe finds queue_ms/resident missing → quarantine+rebuild.
     const first = openDashboardDb(file);
@@ -475,38 +482,22 @@ describe('dashboard db', () => {
   // The rebuilt db round-trips a trace_files row AND re-validates on a second
   // open — proving the SCHEMA_VERSION bump + DDL + validation all agree (no
   // startup wedge, no re-quarantine loop).
+  //
+  // trace_files being checked LAST is exactly why the fixture must be derived
+  // from the live schema: while its traces DDL was hand-written it fell four
+  // columns behind, the probe threw on `traces.cold_write_errors` and never
+  // reached trace_files, and this test passed with the guard it exists for dead.
   it('quarantines a db missing the trace_files table and rebuilds, then re-validates without wedging', () => {
     const d = mkdtempSync(join(tmpdir(), 'dash-notracefiles-'));
     const file = join(d, 'index.db');
     const raw = new DatabaseSync(file);
     // Full sessions + turns + traces, but NO trace_files watermark table.
     raw.exec(
-      `CREATE TABLE sessions (
-        id TEXT PRIMARY KEY, path TEXT NOT NULL, cwd TEXT NOT NULL, name TEXT,
-        created INTEGER NOT NULL, modified INTEGER NOT NULL,
-        message_count INTEGER NOT NULL DEFAULT 0, first_message TEXT,
-        last_ingested_mtime INTEGER NOT NULL DEFAULT 0, last_ingested_size INTEGER NOT NULL DEFAULT 0
-      );
-      CREATE TABLE turns (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, entry_id TEXT,
-        trace_id TEXT, ts INTEGER NOT NULL, model TEXT, input_tokens INTEGER,
-        output_tokens INTEGER, cached_tokens INTEGER, reasoning_tokens INTEGER
-      );
-      CREATE TABLE traces (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT NOT NULL UNIQUE,
-        session_id TEXT, root_session_id TEXT, ts INTEGER NOT NULL, model TEXT,
-        ttft_ms REAL, prefill_tps REAL, decode_tps REAL, mtp_cycles INTEGER,
-        mtp_mean_accepted REAL, duration_ms REAL, queue_ms INTEGER, finish_reason TEXT,
-        resident INTEGER, prompt_tokens INTEGER, cached_tokens INTEGER, output_tokens INTEGER,
-        reasoning_tokens INTEGER, cold_hits INTEGER, cold_misses INTEGER,
-        cold_bytes_written INTEGER, cold_bytes_restored INTEGER,
-        cold_root TEXT, cold_enabled INTEGER, cold_enqueued INTEGER, cold_queue_drops INTEGER,
-        cold_evictions INTEGER, cold_corruptions INTEGER, cold_corruptions_total INTEGER,
-        cold_queue_drops_total INTEGER, source_file TEXT
-      );`,
+      [fixtureTable('sessions', sessions), fixtureTable('turns', turns), fixtureTable('traces', traces)].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 3;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 4;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
+    expectFixtureGaps(file, ['trace_files']);
 
     // First open: signature probe finds trace_files missing → quarantine+rebuild.
     const first = openDashboardDb(file);
@@ -567,7 +558,7 @@ describe('dashboard db', () => {
       );`,
     );
     raw.exec("INSERT INTO traces (trace_id, ts, cold_hits) VALUES ('legacy-1', 1, 7);");
-    raw.exec('PRAGMA user_version = 2;'); // the PREVIOUS SCHEMA_VERSION
+    raw.exec('PRAGMA user_version = 2;'); // two SCHEMA_VERSIONs back
     raw.close();
 
     // Opening does not throw and does not wedge: quarantine + rebuild.
@@ -591,6 +582,12 @@ describe('dashboard db', () => {
         coldCorruptions: 0,
         coldCorruptionsTotal: 0,
         coldQueueDropsTotal: 3,
+        // The v4 set: the two silent failure modes. Distinct values so a
+        // column wired to its neighbour in `schema.ts` cannot round-trip.
+        coldWriteErrors: 5,
+        coldWriteErrorsTotal: 6,
+        coldRestoreDeclines: 7,
+        coldSidecarRestoreSuppressed: 8,
       })
       .run();
     const rows = first.db.select().from(traces).all();
@@ -603,14 +600,21 @@ describe('dashboard db', () => {
     expect(rows[0].coldCorruptions).toBe(0);
     expect(rows[0].coldCorruptionsTotal).toBe(0);
     expect(rows[0].coldQueueDropsTotal).toBe(3);
+    expect(rows[0].coldWriteErrors).toBe(5);
+    expect(rows[0].coldWriteErrorsTotal).toBe(6);
+    expect(rows[0].coldRestoreDeclines).toBe(7);
+    expect(rows[0].coldSidecarRestoreSuppressed).toBe(8);
 
     // The DDL change came WITH a version bump. Without one, the next build to
     // touch the schema would open a drifted db on the version check alone.
     // If this number needs changing, every `PRAGMA user_version` fixture above
     // must be restamped in the same commit — otherwise the version check
-    // short-circuits and their signature probes silently stop running.
+    // short-circuits and their signature probes silently stop running. Their
+    // COLUMNS need no such maintenance: those fixtures build their DDL from the
+    // live schema via `fixtureTable`, so a new column lands in all of them at
+    // once and each keeps exactly the one gap `expectFixtureGaps` pins.
     const uv = first.sqlite.prepare('PRAGMA user_version').get() as { user_version: number };
-    expect(uv.user_version).toBe(3);
+    expect(uv.user_version).toBe(4);
     first.close();
 
     // Reopening the rebuilt file validates in place: no second quarantine.

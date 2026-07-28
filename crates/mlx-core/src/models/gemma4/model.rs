@@ -447,6 +447,43 @@ pub(crate) struct Gemma4Inner {
     pub(crate) layer_kinds: Vec<Gemma4LayerKind>,
     sliding_prefix_checkpoints: VecDeque<Gemma4SlidingPrefixCheckpoint>,
     sliding_prompt_boundary_checkpoint: Option<Gemma4SlidingPrefixCheckpoint>,
+    /// Sliding state at [`gemma4_cold_restore_reachable_boundary`] for the
+    /// prompt of the turn currently in flight, when that boundary differs from
+    /// `sliding_prompt_boundary_checkpoint`'s — i.e. exactly when the prompt
+    /// length is a multiple of the block size and the prompt boundary sits one
+    /// block past anything a restore can name.
+    ///
+    /// Deliberately NOT a member of `sliding_prefix_checkpoints`, and read by
+    /// nothing but [`Gemma4Inner::find_gemma4_sliding_capture_checkpoints`]:
+    ///
+    ///  * the retained SET decides which checkpoint a later warm turn resumes
+    ///    from, and that is observable in the emitted tokens, so a persist turn
+    ///    must retain exactly what a persistence-OFF turn retains. Keeping this
+    ///    outside the deque means the ladder, its limit and its eviction order
+    ///    are bit-for-bit what they were;
+    ///  * the ladder's eviction rule takes the oldest NON-anchor first, and this
+    ///    boundary is not on the `block_size * 4^k` grid, so an entry in the
+    ///    deque would be the preferred victim of the very next push — while it
+    ///    is the one boundary the turn's own capture most wants.
+    ///
+    /// Written only on a turn whose caps say [`Gemma4SlidingRetentionCaps::
+    /// wants_ladder`] (a persistence-OFF turn never allocates it), cleared at
+    /// the start of every prefill body that could publish it, so at most one
+    /// window of sliding K/V is held for it.
+    sliding_cold_restore_tail_checkpoint: Option<Gemma4SlidingPrefixCheckpoint>,
+    /// Token length of the prompt the paged text turn in flight planned, i.e.
+    /// `PagedBackend::prime_prefix_state`'s `plan.len()`.
+    ///
+    /// The capture at finalize runs over `adapter.request_tokens()`, which is
+    /// the prompt PLUS everything generated, and so cannot tell where the
+    /// prompt ended. It needs to, because the bound it must respect is
+    /// [`gemma4_cold_restore_reachable_boundary`] of the PROMPT — a later
+    /// restore of this same prompt looks up `prompt[..prompt_len - 1]`, and no
+    /// amount of generated tail widens that.
+    ///
+    /// `0` outside a paged text turn, which fails the capture closed (no
+    /// reachable boundary, so no sidecar) rather than open.
+    paged_turn_prompt_len: u32,
     sliding_last_history_checkpoint: Option<Gemma4SlidingHistoryCheckpoint>,
     /// Media kinds causally represented by the current session's live/persisted
     /// prefix. This survives every successful warm text continuation because
@@ -994,6 +1031,20 @@ struct Gemma4SlidingPrefixCheckpointDraft {
     protected_image_prompt_boundary: bool,
     tokens: Vec<u32>,
     snapshots: Vec<Option<RotatingKVCacheSnapshot>>,
+}
+
+/// Where a checkpoint captured inside a prefill compute chunk is filed.
+///
+/// The distinction is not bookkeeping: `PrefixStore` is the RETAINED set, and
+/// which entry a later warm turn resumes from decides the tokens it emits, so a
+/// persist turn may not put anything there a persistence-OFF turn would not.
+/// `ColdRestoreTail` is read by the cold sidecar capture and by nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gemma4SlidingCapturedCheckpointSink {
+    /// `sliding_prefix_checkpoints`, under this turn's retention caps.
+    PrefixStore,
+    /// `sliding_cold_restore_tail_checkpoint`, outside the retained set.
+    ColdRestoreTail,
 }
 
 impl Gemma4SlidingPrefixCheckpointDraft {
@@ -1705,6 +1756,8 @@ impl Gemma4Inner {
             layer_kinds,
             sliding_prefix_checkpoints: VecDeque::new(),
             sliding_prompt_boundary_checkpoint: None,
+            sliding_cold_restore_tail_checkpoint: None,
+            paged_turn_prompt_len: 0,
             sliding_last_history_checkpoint: None,
             media_session_context: MediaCapabilities::NONE,
             paged_text_turn_context: MediaCapabilities::NONE,
@@ -1820,6 +1873,8 @@ impl Gemma4Inner {
         self.paged_text_turn_context = MediaCapabilities::NONE;
         self.sliding_prefix_checkpoints.clear();
         self.sliding_prompt_boundary_checkpoint = None;
+        self.sliding_cold_restore_tail_checkpoint = None;
+        self.paged_turn_prompt_len = 0;
         self.sliding_last_history_checkpoint = None;
         // Covers both reset paths (init_caches_sync + reset_caches_sync): a
         // session that just dropped its media KV can no longer warm-continue.
@@ -2249,6 +2304,7 @@ impl Gemma4Inner {
         block_size: u32,
         cache_salt: u64,
         mut snapshots: Vec<Option<RotatingKVCacheSnapshot>>,
+        sink: Gemma4SlidingCapturedCheckpointSink,
     ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
         let trace_enabled = inference_trace_enabled();
         let total_start = trace_enabled.then(std::time::Instant::now);
@@ -2286,19 +2342,27 @@ impl Gemma4Inner {
 
         let update_start = trace_enabled.then(std::time::Instant::now);
         let caps = self.gemma4_sliding_retention_caps_for_turn(block_size);
-        upsert_gemma4_sliding_prefix_checkpoint(
-            &mut self.sliding_prefix_checkpoints,
-            Gemma4SlidingPrefixCheckpointDraft {
-                prefix_len,
-                block_size,
-                final_block_hash,
-                protected_image_prompt_boundary: false,
-                tokens: prefix_tokens,
-                snapshots,
-            },
-            caps,
-            trace_enabled,
-        );
+        let draft = Gemma4SlidingPrefixCheckpointDraft {
+            prefix_len,
+            block_size,
+            final_block_hash,
+            protected_image_prompt_boundary: false,
+            tokens: prefix_tokens,
+            snapshots,
+        };
+        match sink {
+            Gemma4SlidingCapturedCheckpointSink::PrefixStore => {
+                upsert_gemma4_sliding_prefix_checkpoint(
+                    &mut self.sliding_prefix_checkpoints,
+                    draft,
+                    caps,
+                    trace_enabled,
+                );
+            }
+            Gemma4SlidingCapturedCheckpointSink::ColdRestoreTail => {
+                self.sliding_cold_restore_tail_checkpoint = Some(draft.into_checkpoint(caps));
+            }
+        }
         trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
         trace.stored = true;
         Ok(trace.finish(total_start))
@@ -2808,7 +2872,34 @@ impl Gemma4Inner {
         // Ceiling: whole blocks of this request that the persisted K/V chain
         // actually covers.
         let full_blocks = request_tokens.len() / block_size as usize;
-        let chain_blocks = (adapter.cold_captured_blocks() as usize).min(full_blocks);
+        // ...and no deeper than a restore of this prompt could ever ASK for.
+        //
+        // The two sides count different sequences. This capture runs at
+        // finalize, so `request_tokens` is the prompt plus everything the turn
+        // generated; the restore that has to find this object runs at prepare,
+        // over `prompt[..prompt_len - 1]`. Generated tokens do not widen that —
+        // a later turn resends a prompt, not a prompt plus its own completion —
+        // so the honest bound is the deepest boundary a restore of a prompt
+        // ENDING HERE could probe, which is
+        // `gemma4_cold_restore_reachable_boundary(prompt_len)`, not
+        // `request_tokens.len()` rounded down.
+        //
+        // The bound is conservative in the one direction that matters. A
+        // growing conversation (turn N+1's prompt = this turn's prompt plus its
+        // completion plus new user text) could reach one block deeper, and gives
+        // that block up here; a REPLAY of this exact prompt — which is what a
+        // cold tier exists for, since its whole point is a later process — can
+        // reach no further, and under the unclamped ceiling got back nothing at
+        // all whenever `prompt_len` was block-aligned.
+        let reachable_blocks =
+            gemma4_cold_restore_reachable_boundary(self.paged_turn_prompt_len, block_size) as usize
+                / block_size as usize;
+        let chain_blocks = gemma4_sliding_cold_capture_ceiling_blocks(
+            adapter.cold_captured_blocks(),
+            request_tokens.len(),
+            self.paged_turn_prompt_len,
+            block_size,
+        );
         if chain_blocks == 0 {
             // A different diagnosis from the checkpoint miss below: the
             // persisted chain covers no whole block of this request, so no
@@ -2818,9 +2909,11 @@ impl Gemma4Inner {
             crate::cold_tier::cold_sidecar_counters().record_chain_empty();
             if inference_trace_enabled() {
                 write_inference_trace(format_args!(
-                    "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_skipped reason=persisted_chain_covers_no_whole_block cold_captured_blocks={} full_blocks={} block_size={} request_tokens={}",
+                    "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_skipped reason=persisted_chain_covers_no_whole_block cold_captured_blocks={} full_blocks={} restore_reachable_blocks={} prompt_tokens={} block_size={} request_tokens={}",
                     adapter.cold_captured_blocks(),
                     full_blocks,
+                    reachable_blocks,
+                    self.paged_turn_prompt_len,
                     block_size,
                     request_tokens.len()
                 ));
@@ -2833,15 +2926,18 @@ impl Gemma4Inner {
             &self.cached_paged_image_token_positions,
         );
 
-        // Descend to the deepest representable boundary an in-memory
-        // checkpoint already backs.
-        let Some((boundary, snapshots)) = self.find_gemma4_sliding_capture_checkpoint(
+        // Every representable boundary an in-memory checkpoint backs, deepest
+        // first. A LIST rather than the single deepest, because the deepest one
+        // may already be on disk and this walk has to be able to keep going —
+        // see the descent below.
+        let candidates = self.find_gemma4_sliding_capture_checkpoints(
             &geometry,
             request_tokens,
             block_size,
             chain_blocks,
             &extra_keys_per_block,
-        ) else {
+        );
+        if candidates.is_empty() {
             // The one silent way this whole feature stays inert: a capture needs
             // an already-materialized checkpoint sitting exactly on a block
             // boundary AT OR BELOW the chain's reach, and the chain only
@@ -2888,50 +2984,75 @@ impl Gemma4Inner {
                 ));
             }
             return;
-        };
+        }
+        // Descend the candidates, deepest first, past every boundary already on
+        // disk, and capture the first one that is not. See
+        // `gemma4_select_cold_capture_candidate` for why stopping at the first
+        // already-persisted one is an absorbing state.
+        //
         // The sidecar chain is the KV chain recomputed under the
         // `SlidingWindow` domain tag: identical per-block arguments, different
         // group (vLLM's `BlockHashWithGroupId`). `ColdTierWalk::
         // deepest_backed_boundary` derives the identical chain on restore.
         //
-        // Derived BEFORE the payload is built so the dedup below can skip the
-        // whole encode: reading this state back off the GPU is hundreds of MiB
-        // on a real checkpoint, and every later turn on the same prompt would
+        // Derived BEFORE the payload is built so the dedup can skip the whole
+        // encode: reading this state back off the GPU is hundreds of MiB on a
+        // real checkpoint, and every later turn on the same prompt would
         // otherwise redo it and rewrite an object already on disk.
-        let blocks = boundary as usize / block_size as usize;
-        let mut parent: Option<mlx_paged_attn::ColdCacheKey> = None;
-        for index in 0..blocks {
-            let (Some(extra_keys), Some(tokens)) = (
-                extra_keys_per_block.get(index),
-                request_tokens.get(index * block_size as usize..(index + 1) * block_size as usize),
-            ) else {
-                return;
-            };
-            parent = Some(mlx_paged_attn::ColdCacheKey::chain(
-                mlx_paged_attn::ColdGroup::SlidingWindow,
+        let selection = gemma4_select_cold_capture_candidate(candidates, |(boundary, _)| {
+            let Some(key) = gemma4_sliding_cold_sidecar_chain_key(
                 cold.fingerprint,
-                parent,
-                tokens,
-                extra_keys,
-                0,
-                index,
-            ));
-        }
-        let Some(key) = parent else {
-            return;
+                request_tokens,
+                &extra_keys_per_block,
+                block_size,
+                *boundary,
+            ) else {
+                return Gemma4ColdCaptureProbe::Underivable;
+            };
+            if cold
+                .manager
+                .contains_in(&key, mlx_paged_attn::ColdGroup::SlidingWindow)
+            {
+                Gemma4ColdCaptureProbe::Persisted
+            } else {
+                Gemma4ColdCaptureProbe::Missing(key)
+            }
+        });
+        let ((boundary, snapshots), key) = match selection {
+            Gemma4ColdCaptureSelection::Capture { candidate, key, .. } => (candidate, key),
+            // Every candidate is already on disk: nothing to do, and nothing
+            // wrong. Mirrors `ColdTierWalk::capture_chain`'s `contains` dedup,
+            // and `contains_in` is explicitly side-effect free (no hit/miss
+            // accounting), so this arm must do its own — an unrecorded exit here
+            // reads downstream as `enqueued=0`, which is also what a collapsed
+            // rung ladder produces.
+            Gemma4ColdCaptureSelection::AllPersisted { skipped_persisted } => {
+                crate::cold_tier::cold_sidecar_counters().record_already_persisted();
+                if inference_trace_enabled() {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_skipped reason=every_candidate_already_persisted already_persisted={} chain_reach_tokens={} block_size={}",
+                        skipped_persisted,
+                        chain_blocks as u64 * block_size as u64,
+                        block_size
+                    ));
+                }
+                return;
+            }
+            // No candidate's chain derived, so the tier holds nothing here and
+            // `already_persisted` would be a lie. Same diagnosis as an empty
+            // candidate list above: no usable boundary under the chain's reach.
+            Gemma4ColdCaptureSelection::NoChainDerived => {
+                crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
+                if inference_trace_enabled() {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_skipped reason=no_candidate_chain_derives chain_reach_tokens={} block_size={}",
+                        chain_blocks as u64 * block_size as u64,
+                        block_size
+                    ));
+                }
+                return;
+            }
         };
-        // Already persisted for this exact chain: nothing to do. Mirrors
-        // `ColdTierWalk::capture_chain`'s `contains` dedup, and `contains_in`
-        // is explicitly side-effect free (no hit/miss accounting), so this arm
-        // must do its own — an unrecorded exit here reads downstream as
-        // `enqueued=0`, which is also what a collapsed rung ladder produces.
-        if cold
-            .manager
-            .contains_in(&key, mlx_paged_attn::ColdGroup::SlidingWindow)
-        {
-            crate::cold_tier::cold_sidecar_counters().record_already_persisted();
-            return;
-        }
 
         let Ok(Some(tensors)) =
             sliding_sidecar::encode_tensors(&self.config, &geometry, snapshots, boundary)
@@ -2966,8 +3087,9 @@ impl Gemma4Inner {
         }
     }
 
-    /// Deepest already-materialized sliding checkpoint that can anchor a cold
-    /// sidecar for `request_tokens`, with its snapshots.
+    /// Every already-materialized sliding checkpoint that can anchor a cold
+    /// sidecar for `request_tokens`, with its snapshots, DEEPEST FIRST and
+    /// deduplicated by boundary.
     ///
     /// Candidates must sit at a boundary this layout can express
     /// (`boundary_is_representable`), be covered by the persisted K/V chain
@@ -2975,27 +3097,34 @@ impl Gemma4Inner {
     /// and the exact per-block cache identity — the same `final_block_hash`
     /// the in-memory lookup path checks, so a checkpoint recorded under
     /// different image keys can never anchor a text sidecar.
-    fn find_gemma4_sliding_capture_checkpoint<'a>(
+    ///
+    /// `sliding_cold_restore_tail_checkpoint` leads the chain because it is the
+    /// deepest boundary a restore of this turn's prompt can name; the prompt
+    /// boundary follows, and it is the SAME boundary except on a block-aligned
+    /// prompt, where it sits one block past the tail and the ceiling below
+    /// filters it out.
+    fn find_gemma4_sliding_capture_checkpoints<'a>(
         &'a self,
         geometry: &sliding_sidecar::SlidingSidecarGeometry,
         request_tokens: &[u32],
         block_size: u32,
         chain_blocks: usize,
         extra_keys_per_block: &[Vec<u64>],
-    ) -> Option<(u32, &'a [Option<RotatingKVCacheSnapshot>])> {
+    ) -> Vec<(u32, &'a [Option<RotatingKVCacheSnapshot>])> {
         let ceiling = (chain_blocks as u64).saturating_mul(block_size as u64);
         let ceiling = u32::try_from(ceiling).unwrap_or(u32::MAX);
-        let mut best: Option<(u32, &[Option<RotatingKVCacheSnapshot>])> = None;
+        let mut found: Vec<(u32, &[Option<RotatingKVCacheSnapshot>])> = Vec::new();
         let candidates = self
-            .sliding_prompt_boundary_checkpoint
+            .sliding_cold_restore_tail_checkpoint
             .iter()
+            .chain(self.sliding_prompt_boundary_checkpoint.iter())
             .chain(self.sliding_prefix_checkpoints.iter());
         for checkpoint in candidates {
             let boundary = checkpoint.prefix_len;
             if boundary > ceiling
                 || checkpoint.block_size != block_size
                 || !sliding_sidecar::boundary_is_representable(geometry, boundary, block_size)
-                || best.is_some_and(|(best_boundary, _)| best_boundary >= boundary)
+                || found.iter().any(|(seen, _)| *seen == boundary)
             {
                 continue;
             }
@@ -3017,9 +3146,10 @@ impl Gemma4Inner {
             if !gemma4_sliding_snapshots_ready_at(&self.config, &checkpoint.snapshots, boundary) {
                 continue;
             }
-            best = Some((boundary, checkpoint.snapshots.as_slice()));
+            found.push((boundary, checkpoint.snapshots.as_slice()));
         }
-        best
+        found.sort_unstable_by(|(left, _), (right, _)| right.cmp(left));
+        found
     }
 
     /// Build the process-global SSD cold-tier context (manager + COMPLETE
@@ -4331,6 +4461,19 @@ impl Gemma4Inner {
                 adapter.num_allocated_blocks()
             ));
         }
+        // Counted at the point of no return, not at the decision: everything
+        // above between here and the `return Ok(false)` can fail the turn with
+        // `?`, and a suppression that errored out is not a suppression that
+        // happened. The trace above fires earlier on purpose — it is the
+        // diagnosis, and it has to survive the failure it might be explaining.
+        //
+        // The counter exists because the trace alone cannot answer the
+        // question. `MLX_TRACE` is opt-in and per-process, so without a number
+        // a suppression firing on every turn is indistinguishable from a cache
+        // that is simply cold: both end with the whole prompt recomputed, both
+        // leave text and token counts identical, and this one is preceded by
+        // real `hits` that make it look like reuse worked.
+        crate::cold_tier::cold_sidecar_counters().record_restore_suppressed();
         Ok(true)
     }
 
@@ -4862,6 +5005,11 @@ impl Gemma4Inner {
             // splitting the chunk at it would change every downstream GEMM's
             // `M` and with it the accumulation order.
             let sliding_caps = self.gemma4_sliding_retention_caps_for_turn(block_size);
+            let cold_restore_tail_boundary =
+                gemma4_cold_restore_tail_publish(full_tokens_len, block_size, sliding_caps);
+            // Strictly a per-turn artifact: it costs one window of sliding K/V
+            // and only this turn's capture can use it.
+            self.sliding_cold_restore_tail_checkpoint = None;
             // Compute chunks follow the configured prefill step directly, as
             // in the authoritative mlx-lm generator. Sliding checkpoints are
             // captured from temporal K/V views inside a chunk; they must not
@@ -4935,8 +5083,24 @@ impl Gemma4Inner {
                 );
                 // The prompt boundary is already a real compute endpoint and
                 // is stored by the dedicated protected/prompt checkpoint path.
+                // It leaves the list here, which is why the tail below cannot
+                // use `already_published` to notice that it coincides with the
+                // prompt boundary — `gemma4_cold_restore_tail_publish` screens
+                // that case out instead.
                 checkpoint_boundaries
                     .retain(|&boundary| boundary != prompt_checkpoint_boundary_len);
+                let chunk_cold_restore_tail = gemma4_chunk_cold_restore_tail(
+                    cold_restore_tail_boundary,
+                    chunk_first_position,
+                    chunk_end_position,
+                    &checkpoint_boundaries,
+                );
+                if let Some(boundary) = chunk_cold_restore_tail {
+                    // `prepare_sliding_checkpoint_capture` rejects offsets that
+                    // are not strictly increasing.
+                    checkpoint_boundaries.push(boundary);
+                    checkpoint_boundaries.sort_unstable();
+                }
                 if !checkpoint_boundaries.is_empty() {
                     let caches = self.caches.as_mut().ok_or_else(|| {
                         Error::from_reason("Gemma4 paged prefill sliding checkpoint caches missing")
@@ -5044,20 +5208,27 @@ impl Gemma4Inner {
                 for (&boundary, snapshots) in checkpoint_boundaries.iter().zip(captured_checkpoints)
                 {
                     let is_anchor_rung = sliding_caps.anchors.contains(boundary);
+                    let sink = if chunk_cold_restore_tail == Some(boundary) {
+                        Gemma4SlidingCapturedCheckpointSink::ColdRestoreTail
+                    } else {
+                        Gemma4SlidingCapturedCheckpointSink::PrefixStore
+                    };
                     let store_trace = self.remember_gemma4_sliding_captured_prefix_checkpoint(
                         full_tokens,
                         boundary,
                         block_size,
                         0,
                         snapshots,
+                        sink,
                     )?;
                     if trace_enabled {
                         write_inference_trace(format_args!(
-                            "[MLX_TRACE] gemma4 paged_prefill_sliding_captured_checkpoint boundary_tokens={} block_size={} checkpoint_interval={} cold_anchor_rung={} stored={} materialize_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
+                            "[MLX_TRACE] gemma4 paged_prefill_sliding_captured_checkpoint boundary_tokens={} block_size={} checkpoint_interval={} cold_anchor_rung={} cold_restore_tail={} stored={} materialize_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
                             boundary,
                             block_size,
                             checkpoint_interval,
                             is_anchor_rung,
+                            sink == Gemma4SlidingCapturedCheckpointSink::ColdRestoreTail,
                             store_trace.stored,
                             store_trace.eval_ms,
                             store_trace.token_clone_ms,
@@ -6764,6 +6935,13 @@ impl PagedBackend for Gemma4Inner {
     ) -> Result<Self::PrefixState> {
         let trace_enabled = inference_trace_enabled();
         let total_budget = plan.len() as u32;
+        // The one writer of this field. `finalize_paged_turn` runs the cold
+        // sidecar capture over `request_tokens` = prompt + generated, and the
+        // boundary it may anchor at is bounded by the PROMPT
+        // (`gemma4_cold_restore_reachable_boundary`), so the prompt length has
+        // to survive the decode. `engine::paged_turn::run_paged_turn` calls this
+        // exactly once per turn and always before that finalize.
+        self.paged_turn_prompt_len = total_budget;
         // Per-turn seq_id: the adapter is single-request and the prepare's
         // warm-continue / cold-reset arms make the previous seq_id
         // irrelevant.
@@ -9067,6 +9245,281 @@ fn gemma4_sliding_decode_boundary_plan(
     })
 }
 
+/// What the cold tier already holds at one capture candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gemma4ColdCaptureProbe<K> {
+    /// The chain derives and nothing is on disk under it: capture here.
+    Missing(K),
+    /// The chain derives and the object is already on disk.
+    Persisted,
+    /// The chain cannot be derived at this boundary at all, so neither side can
+    /// name it. Not a skip — nothing was ever written here to skip.
+    Underivable,
+}
+
+/// How a descent over the capture candidates ended.
+///
+/// Three outcomes, not two, because the two that capture nothing are different
+/// states of the tier and the counters must not read them as one: a descent
+/// that found everything already written is a healthy saturated ladder, while a
+/// descent that could not derive a single chain has nothing on disk at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gemma4ColdCaptureSelection<C, K> {
+    /// Capture here. `skipped_persisted` deeper candidates were stepped past
+    /// because the tier already holds them.
+    Capture {
+        candidate: C,
+        key: K,
+        skipped_persisted: usize,
+    },
+    /// Every candidate whose chain derives is already on disk.
+    AllPersisted { skipped_persisted: usize },
+    /// Not one candidate named a chain, so nothing was ever written at any of
+    /// them to skip.
+    NoChainDerived,
+}
+
+/// The deepest capture candidate the cold tier does not already hold.
+///
+/// The DECISION half of `Gemma4Inner::capture_gemma4_sliding_cold_sidecar`'s
+/// descent, split out for the reason the file splits every such decision: the
+/// body around it needs a loaded checkpoint, a paged adapter and an open cold
+/// root, and this rule needs none of those.
+///
+/// Stopping at the first `Persisted` — what this used to do inline — makes the
+/// on-disk state ABSORBING. The next turn on the same prompt recomputes the
+/// same key, sees it present again, and exits before it can try anything
+/// shallower; a root that once acquired an unreachable object keeps it forever.
+/// It also stalls the anchor-rung ladder at its top, when the whole point of the
+/// ladder is to give a lagging K/V chain a SHALLOW boundary to reconcile down
+/// to. Only one candidate is ever captured per turn either way — the skips cost
+/// an index probe each.
+///
+/// The return is [`Gemma4ColdCaptureSelection`] rather than an
+/// `(Option<_>, usize)` pair so that an all-`Underivable` descent cannot reach
+/// the caller wearing an already-persisted count of zero: that pair shape is
+/// what let the capture record `already_persisted` for a tier that holds
+/// nothing.
+fn gemma4_select_cold_capture_candidate<C, K>(
+    candidates: impl IntoIterator<Item = C>,
+    mut probe: impl FnMut(&C) -> Gemma4ColdCaptureProbe<K>,
+) -> Gemma4ColdCaptureSelection<C, K> {
+    let mut skipped_persisted = 0usize;
+    for candidate in candidates {
+        match probe(&candidate) {
+            Gemma4ColdCaptureProbe::Missing(key) => {
+                return Gemma4ColdCaptureSelection::Capture {
+                    candidate,
+                    key,
+                    skipped_persisted,
+                };
+            }
+            Gemma4ColdCaptureProbe::Persisted => skipped_persisted += 1,
+            Gemma4ColdCaptureProbe::Underivable => {}
+        }
+    }
+    if skipped_persisted == 0 {
+        return Gemma4ColdCaptureSelection::NoChainDerived;
+    }
+    Gemma4ColdCaptureSelection::AllPersisted { skipped_persisted }
+}
+
+/// The `SlidingWindow`-group chain key that names the sidecar at `boundary`.
+///
+/// `None` when the chain cannot be derived — `boundary` is not a whole number of
+/// blocks of `request_tokens`, or a block has no `extra_keys` — which is the
+/// same break-at-the-first-underivable-block rule the restore's
+/// `deepest_backed_boundary` applies, so the two sides agree on which
+/// boundaries exist at all.
+fn gemma4_sliding_cold_sidecar_chain_key(
+    fingerprint: mlx_paged_attn::ColdCacheFingerprint,
+    request_tokens: &[u32],
+    extra_keys_per_block: &[Vec<u64>],
+    block_size: u32,
+    boundary: u32,
+) -> Option<mlx_paged_attn::ColdCacheKey> {
+    if block_size == 0 {
+        return None;
+    }
+    let blocks = boundary as usize / block_size as usize;
+    let mut parent: Option<mlx_paged_attn::ColdCacheKey> = None;
+    for index in 0..blocks {
+        let extra_keys = extra_keys_per_block.get(index)?;
+        let tokens =
+            request_tokens.get(index * block_size as usize..(index + 1) * block_size as usize)?;
+        parent = Some(mlx_paged_attn::ColdCacheKey::chain(
+            mlx_paged_attn::ColdGroup::SlidingWindow,
+            fingerprint,
+            parent,
+            tokens,
+            extra_keys,
+            0,
+            index,
+        ));
+    }
+    parent
+}
+
+/// The deepest block boundary a later restore of a `prompt_len`-token prompt
+/// can ever probe.
+///
+/// The whole reason this is not just "the last full block of the prompt": the
+/// two sides of the cold tier measure different sequences.
+///
+/// ```text
+///   capture (finalize)                  restore (a later turn on this prompt)
+///   request_tokens = prompt + generated lookup = prompt[..prompt_len - 1]
+///   ceiling = chain_blocks * bs         full_blocks = (prompt_len - 1) / bs
+///   anchors the DEEPEST candidate       probes counts full_blocks .. 1
+/// ```
+///
+/// `prompt_len - 1` is vLLM's `max_cache_hit_tokens` rule
+/// (`PagedKVCacheAdapter::find_cached_prefix_per_block_with_max_tokens`): a
+/// prefill needs at least one suffix token to forward, so the lookup never sees
+/// the last prompt token. `ColdTierWalk::deepest_backed_boundary` therefore
+/// enumerates `(prompt_len - 1) / bs` blocks and the deepest boundary it can
+/// name is that count times the block size — one block SHALLOWER than the
+/// prompt's own end whenever `prompt_len` is an exact multiple of `bs`.
+///
+/// A sidecar anchored past this line is unreachable by construction: nothing
+/// the restore derives ever spells its key. It is also self-locking, because
+/// the next capture recomputes the same key, `contains_in` reports it present,
+/// and the capture returns without trying anything shallower.
+///
+/// Same rule, same reason as `qwen3_5::paged_forward::gdn_checkpoint_target`,
+/// which the GDN ladder has always used; gemma4's sliding prompt boundary is
+/// the one publisher that rounded the other way.
+fn gemma4_cold_restore_reachable_boundary(prompt_len: u32, block_size: u32) -> u32 {
+    if block_size == 0 {
+        return 0;
+    }
+    prompt_len.saturating_sub(1) / block_size * block_size
+}
+
+/// How many whole blocks the cold sidecar capture may anchor within, given the
+/// three facts it has at finalize.
+///
+/// ```text
+///   cold_captured_blocks  how far the persisted K/V chain reached
+///   request_tokens_len    prompt + everything generated
+///   prompt_len            where the PROMPT ended
+/// ```
+///
+/// The first two were always here; the third is the one that makes the answer
+/// reachable. A sidecar is selected by a restore that derives its key from
+/// `prompt[..prompt_len - 1]`, so a boundary past
+/// [`gemma4_cold_restore_reachable_boundary`] is one nothing on the read side
+/// can spell — see that function.
+///
+/// The `prompt_len` bound applies to the WHOLE capture, not only to the aligned
+/// prompt boundary that motivated it, and that is deliberate. It also drops the
+/// candidates the decode published inside the generated region, which turn N+1
+/// of a growing conversation really could name. One sidecar is written per
+/// turn, so this is a priority rule, and it spends that write on the deepest
+/// boundary a restore of THIS prompt can name — the replay a cold tier exists
+/// for, and the case that measured zero reuse — rather than on a deeper
+/// boundary that pays off only if the conversation continues with exactly these
+/// tokens. The give-up is one turn deep: turn N+1's own ceiling covers
+/// everything turn N discarded. See
+/// `the_capture_ceiling_gives_up_this_turns_generated_region_and_the_next_turn_covers_it`.
+///
+/// A free function, and the reason is the same one
+/// [`gemma4_sliding_decode_boundary_plan`] gives: this is the DECISION, its
+/// caller contributes three adapter reads, and as a method on `Gemma4Inner` it
+/// would be reachable only from a loaded checkpoint on a GPU, i.e. from no test
+/// at all.
+fn gemma4_sliding_cold_capture_ceiling_blocks(
+    cold_captured_blocks: u32,
+    request_tokens_len: usize,
+    prompt_len: u32,
+    block_size: u32,
+) -> usize {
+    if block_size == 0 {
+        return 0;
+    }
+    let full_blocks = request_tokens_len / block_size as usize;
+    let reachable_blocks =
+        (gemma4_cold_restore_reachable_boundary(prompt_len, block_size) / block_size) as usize;
+    (cold_captured_blocks as usize)
+        .min(full_blocks)
+        .min(reachable_blocks)
+}
+
+/// The cold-restore tail boundary a prefill over `prompt_len` tokens publishes,
+/// or `None`.
+///
+/// [`gemma4_cold_restore_reachable_boundary`] on a persist turn over a
+/// BLOCK-ALIGNED prompt, nothing otherwise, and the alignment screen is as
+/// load-bearing as the persistence one.
+///
+/// The reachable boundary equals the prompt boundary
+/// (`prompt_checkpoint_boundary_len`) except when `prompt_len` is an exact
+/// multiple of `block_size`, where it is one block shallower — and that one
+/// block is the whole defect. On an aligned prompt the prompt boundary is the
+/// only tail checkpoint the turn has, it sits past `max_cache_hit_tokens =
+/// prompt_len - 1`, and the capture anchors a sidecar there that no restore can
+/// ever ask for. Everywhere else — 15 prompt lengths in 16 — the two COINCIDE,
+/// `maybe_remember_gemma4_sliding_prompt_boundary_checkpoint` already
+/// snapshots that offset (`gemma4_split_body_chunk_plan_at_position` splits the
+/// plan there, so a chunk always ends on it whenever the tail is in range), and
+/// `find_gemma4_sliding_capture_checkpoints` dedups the pair by boundary. A
+/// second snapshot of one offset is one sliding window of pure cost with no
+/// reader.
+///
+/// The chunk walk cannot make that call for us:
+/// `gemma4_chunk_cold_restore_tail`'s `already_published` argument is the
+/// chunk's boundary list AFTER the prompt boundary has been retained out of it,
+/// so its containment test is blind to precisely the coinciding case.
+///
+/// Two properties this must keep, and both are why it is a function rather than
+/// an expression at the prefill call site (the `want_ladder` hard-coded `false`
+/// that reverted decode to cadence-only is the precedent — see
+/// [`gemma4_sliding_decode_boundary_plan`]):
+///
+///  * gated on `caps.wants_ladder()`, like every other publisher here. A
+///    persistence-OFF turn must snapshot exactly what it snapshotted before the
+///    cold tier existed;
+///  * the boundary is CAPTURED from the temporal K/V view a chunk already
+///    produced, never reached by splitting the chunk plan. Splitting would
+///    change every downstream GEMM's `M` and with it the tokens the turn emits
+///    — on the persist side of a parity gate that compares persist against
+///    no-persist, that is a failure either way.
+fn gemma4_cold_restore_tail_publish(
+    prompt_len: u32,
+    block_size: u32,
+    caps: Gemma4SlidingRetentionCaps,
+) -> Option<u32> {
+    if !caps.wants_ladder() || block_size == 0 || !prompt_len.is_multiple_of(block_size) {
+        return None;
+    }
+    let boundary = gemma4_cold_restore_reachable_boundary(prompt_len, block_size);
+    (boundary > 0).then_some(boundary)
+}
+
+/// Where, if anywhere, one compute chunk captures the cold-restore tail.
+///
+/// `already_published` is what this chunk already snapshots — the decode cadence
+/// union this turn's anchor rungs, minus the prompt boundary. The tail is taken
+/// IN ADDITION to that set and never INSTEAD of a member of it, which is what
+/// keeps it inert for everything but the cold capture: the boundaries that reach
+/// `remember_gemma4_sliding_captured_prefix_checkpoint`'s retained store, and so
+/// the checkpoint a later warm turn resumes from, stay exactly the set a
+/// persistence-OFF turn produces. Only the extra snapshot, parked in a singleton
+/// outside the deque, is new.
+///
+/// `(start, end]` matches `gemma4_sliding_chunk_checkpoint_boundaries`'s rung
+/// filter: a boundary at or below where this chunk began was already passed.
+fn gemma4_chunk_cold_restore_tail(
+    tail: Option<u32>,
+    chunk_start: u32,
+    chunk_end: u32,
+    already_published: &[u32],
+) -> Option<u32> {
+    tail.filter(|boundary| {
+        *boundary > chunk_start && *boundary <= chunk_end && !already_published.contains(boundary)
+    })
+}
+
 fn gemma4_sliding_checkpoint_boundaries_crossed(
     start_offset: u32,
     end_offset: u32,
@@ -9846,6 +10299,7 @@ fn prompt_holds_media_placeholders(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::plan::{TurnPath, TurnPlan, TurnRequest};
     use crate::models::gemma4::output_parser::{StreamSegment, parse_gemma4_output};
 
     #[test]
@@ -10236,13 +10690,518 @@ mod tests {
 
     /// Deepest retained boundary a cold capture could anchor on, given the
     /// persisted K/V chain only reaches `chain_reach_tokens`. This is the
-    /// selection `find_gemma4_sliding_capture_checkpoint` performs.
+    /// selection `find_gemma4_sliding_capture_checkpoints` performs.
     fn deepest_reachable(retained: &[u32], chain_reach_tokens: u32) -> Option<u32> {
         retained
             .iter()
             .copied()
             .filter(|boundary| *boundary <= chain_reach_tokens)
             .max()
+    }
+
+    /// Every boundary a later restore of a `prompt_len`-token prompt would
+    /// probe, ascending.
+    ///
+    /// A restated COPY of the READ path, never a call into the capture-side
+    /// helpers it exists to pin — the same discipline
+    /// `cold_tier_parity_harness::expected_checkpoint_ladder` follows. A test
+    /// that derived its expectation from
+    /// `gemma4_cold_restore_reachable_boundary` would move with that function
+    /// and could never fail, which is exactly how the one-block gap survived
+    /// three green suites.
+    ///
+    /// ```text
+    ///   Gemma4Inner::prepare_gemma4_paged_turn
+    ///       max_cache_hit_tokens = total_budget - 1
+    ///   PagedKVCacheAdapter::find_cached_prefix_per_block_inner
+    ///       lookup_len    = min(max_cache_hit_tokens, prompt_tokens.len())
+    ///       lookup_tokens = &prompt_tokens[..lookup_len]
+    ///   ColdTierWalk::restore_extend
+    ///       full_blocks = lookup_tokens.len() / block_size
+    ///   ColdTierWalk::deepest_backed_boundary
+    ///       for count in (floor + 1..=keys.len()).rev()
+    ///           boundary = count * block_size
+    /// ```
+    fn restore_probeable_boundaries(prompt_len: u32, block_size: u32) -> Vec<u32> {
+        if block_size == 0 {
+            return Vec::new();
+        }
+        let lookup_len = prompt_len.saturating_sub(1);
+        let full_blocks = lookup_len / block_size;
+        (1..=full_blocks).map(|count| count * block_size).collect()
+    }
+
+    /// The capture may never anchor where the restore cannot look.
+    ///
+    /// With the persisted chain unbounded, the ceiling this pins is the ONLY
+    /// thing standing between the capture and a boundary no key on the read
+    /// side ever spells. `request_tokens` is deliberately swept past the prompt:
+    /// the capture runs at finalize, so it sees the completion too, and the
+    /// defect was precisely that it measured its ceiling against that longer
+    /// sequence.
+    #[test]
+    fn the_capture_ceiling_is_exactly_the_deepest_boundary_a_restore_can_probe() {
+        for block_size in [1u32, 8, 16, 32, 64] {
+            for prompt_len in 0..=400u32 {
+                let probeable = restore_probeable_boundaries(prompt_len, block_size);
+                for generated in [0usize, 1, 15, 512] {
+                    let request_tokens_len = prompt_len as usize + generated;
+                    let ceiling_blocks = gemma4_sliding_cold_capture_ceiling_blocks(
+                        u32::MAX,
+                        request_tokens_len,
+                        prompt_len,
+                        block_size,
+                    );
+                    let ceiling_tokens = ceiling_blocks as u32 * block_size;
+                    match probeable.last() {
+                        None => assert_eq!(
+                            ceiling_tokens, 0,
+                            "block_size={block_size} prompt_len={prompt_len} \
+                             generated={generated}: a restore of this prompt can probe NO \
+                             boundary, so a capture that names {ceiling_tokens} writes an \
+                             object nothing can ask for"
+                        ),
+                        Some(&deepest) => assert_eq!(
+                            ceiling_tokens, deepest,
+                            "block_size={block_size} prompt_len={prompt_len} \
+                             generated={generated}: the restore probes {probeable:?}; the \
+                             capture ceiling must be its deepest member, not \
+                             {ceiling_tokens}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The one-block gap, with the numbers it was measured at.
+    ///
+    /// A 4-token A/B on Gemma-4-26B-A4B-IT-UD-Q4_K_XL-mlx, everything else held
+    /// constant: the 6572-token prompt restored 6560 of 6572 tokens, the
+    /// 6576-token one restored ZERO. The only difference is that 6576 is a
+    /// multiple of 16, which puts the prompt-boundary checkpoint one block above
+    /// `max_cache_hit_tokens`.
+    #[test]
+    fn a_block_aligned_prompt_is_the_only_case_the_prompt_boundary_outruns_the_restore() {
+        const BS: u32 = 16;
+        for (prompt_len, prompt_boundary, reachable) in
+            [(6572u32, 6560u32, 6560u32), (6576, 6576, 6560)]
+        {
+            // What the prompt-boundary publisher aims at
+            // (`prompt_checkpoint_boundary_len` in `run_paged_prefill_chunk`).
+            assert_eq!(prompt_len / BS * BS, prompt_boundary);
+            assert_eq!(
+                gemma4_cold_restore_reachable_boundary(prompt_len, BS),
+                reachable
+            );
+            let probeable = restore_probeable_boundaries(prompt_len, BS);
+            assert!(
+                probeable.contains(&reachable),
+                "prompt_len={prompt_len}: the reachable boundary must be one the restore \
+                 actually enumerates"
+            );
+            assert_eq!(
+                probeable.contains(&prompt_boundary),
+                prompt_boundary == reachable,
+                "prompt_len={prompt_len}: the prompt boundary {prompt_boundary} is probeable \
+                 if and only if it IS the reachable one; when it is not, a sidecar anchored \
+                 there is dead on arrival and self-locking"
+            );
+
+            // And the ceiling the capture actually runs with, for the turn as
+            // it happened: a 6576-token prompt with a 40-token completion and a
+            // chain that covered every block of it.
+            let ceiling_blocks = gemma4_sliding_cold_capture_ceiling_blocks(
+                u32::MAX,
+                prompt_len as usize + 40,
+                prompt_len,
+                BS,
+            );
+            assert_eq!(
+                ceiling_blocks as u32 * BS,
+                reachable,
+                "prompt_len={prompt_len}: the capture must stop at {reachable}, the deepest \
+                 boundary a restore of this prompt enumerates. It measured \
+                 {} instead, which is what wrote 209.7 MB a restore could never name.",
+                ceiling_blocks as u32 * BS
+            );
+        }
+    }
+
+    /// What the reachability clamp COSTS a growing conversation, and the bound
+    /// on that cost.
+    ///
+    /// The clamp is scoped to the whole capture, not just to the aligned prompt
+    /// boundary it was written for, so it also drops every candidate the DECODE
+    /// published — `maybe_remember_gemma4_sliding_decode_boundary_checkpoint`
+    /// publishes over `request_tokens` = prompt + generated, so those
+    /// candidates are real, and turn N+1 of a growing conversation, whose
+    /// prompt contains them, really could name them.
+    ///
+    /// It is kept broad anyway, and this test is the ledger for that choice.
+    /// One sidecar is written per turn, so the clamp is a PRIORITY rule: it
+    /// spends the turn's single write on the deepest boundary a restore of THIS
+    /// prompt can name — the replay a cold tier exists for, and the case that
+    /// measured zero reuse — instead of on a deeper boundary that pays off only
+    /// if the conversation continues with exactly these tokens. The give-up is
+    /// bounded by one turn: turn N+1's own ceiling covers everything turn N
+    /// discarded, so the deeper boundaries are lost only to a process that dies
+    /// between the two finalizes.
+    #[test]
+    fn the_capture_ceiling_gives_up_this_turns_generated_region_and_the_next_turn_covers_it() {
+        const BS: u32 = 16;
+        // Turn N: an aligned 6576-token prompt and a 2048-token completion,
+        // long enough that the decode cadence published inside it.
+        let prompt_n = 6576u32;
+        let request_n = prompt_n as usize + 2048;
+        let unclamped_n = (request_n as u32 / BS) * BS;
+        let ceiling_n =
+            gemma4_sliding_cold_capture_ceiling_blocks(u32::MAX, request_n, prompt_n, BS) as u32
+                * BS;
+        assert_eq!(
+            ceiling_n, 6560,
+            "the capture stops at the deepest boundary a restore of THIS prompt enumerates"
+        );
+        assert_eq!(
+            unclamped_n, 8624,
+            "…while the chain and the request alone would have allowed 8624"
+        );
+        assert_eq!(
+            unclamped_n - ceiling_n,
+            2064,
+            "so the clamp gives up 2064 tokens' worth of generated-region candidates"
+        );
+
+        // Turn N+1 of the same conversation: its prompt is turn N's whole
+        // request plus new user text, so its own ceiling sits at or past
+        // everything turn N gave up.
+        for new_user_tokens in [1u32, 17, 512] {
+            let prompt_next = request_n as u32 + new_user_tokens;
+            let ceiling_next = gemma4_sliding_cold_capture_ceiling_blocks(
+                u32::MAX,
+                prompt_next as usize + 8,
+                prompt_next,
+                BS,
+            ) as u32
+                * BS;
+            assert!(
+                ceiling_next >= unclamped_n,
+                "new_user_tokens={new_user_tokens}: turn N+1 must be able to name every \
+                 boundary turn N discarded ({ceiling_next} < {unclamped_n}), or the clamp \
+                 loses them for good instead of deferring them by one turn"
+            );
+        }
+    }
+
+    /// Which prompts need the extra cold-restore tail checkpoint at all, and
+    /// where it must sit.
+    ///
+    /// Exactly the block-aligned ones, exactly one block below the prompt
+    /// boundary. Everywhere else the two coincide and the prefill publishes
+    /// nothing extra — which is what keeps the added snapshot from being a cost
+    /// every turn pays.
+    #[test]
+    fn the_cold_tail_checkpoint_is_needed_exactly_when_the_prompt_is_block_aligned() {
+        for block_size in [1u32, 8, 16, 32] {
+            for prompt_len in 1..=300u32 {
+                let prompt_boundary = prompt_len / block_size * block_size;
+                let tail = gemma4_cold_restore_reachable_boundary(prompt_len, block_size);
+                if prompt_len.is_multiple_of(block_size) {
+                    assert_eq!(
+                        tail + block_size,
+                        prompt_boundary,
+                        "block_size={block_size} prompt_len={prompt_len}: an aligned prompt \
+                         needs a tail one block below its own boundary"
+                    );
+                } else {
+                    assert_eq!(
+                        tail, prompt_boundary,
+                        "block_size={block_size} prompt_len={prompt_len}: a ragged prompt's \
+                         boundary is already reachable, so nothing extra may be published"
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE persistence-OFF transparency claim for this change, as a test.
+    ///
+    /// Chunk length is the GEMM's `M`, and the retained checkpoint set decides
+    /// which one a later warm turn resumes from, so both are observable in the
+    /// emitted tokens. A turn with no `SlidingWindow` sidecar policy must
+    /// therefore snapshot exactly what it snapshotted before the cold tier
+    /// existed: nothing extra, at any prompt length, at any block size.
+    #[test]
+    fn a_persistence_off_turn_publishes_no_cold_restore_tail_at_all() {
+        let config = twelve_b_sliding_config();
+        for block_size in [1u32, 8, 16, 32] {
+            let off = gemma4_sliding_retention_caps_for_override(&config, block_size, false, None);
+            let on = gemma4_sliding_retention_caps_for_override(&config, block_size, true, None);
+            assert!(!off.wants_ladder() && on.wants_ladder());
+            for prompt_len in 0..=300u32 {
+                assert_eq!(
+                    gemma4_cold_restore_tail_publish(prompt_len, block_size, off),
+                    None,
+                    "block_size={block_size} prompt_len={prompt_len}: a persistence-OFF turn \
+                     that snapshots one extra boundary changes the retained set, and with it \
+                     the depth a later warm turn resumes from"
+                );
+                let reachable = gemma4_cold_restore_reachable_boundary(prompt_len, block_size);
+                assert_eq!(
+                    gemma4_cold_restore_tail_publish(prompt_len, block_size, on),
+                    (prompt_len.is_multiple_of(block_size) && reachable > 0).then_some(reachable),
+                    "block_size={block_size} prompt_len={prompt_len}"
+                );
+            }
+        }
+    }
+
+    /// Where the tail lands inside the prefill's chunk walk, and — the half that
+    /// keeps it numerically inert — that it never displaces a boundary the
+    /// chunk was already going to snapshot.
+    #[test]
+    fn the_cold_restore_tail_is_captured_beside_the_chunks_own_boundaries_never_instead() {
+        // A 6576-token aligned prompt: the body runs to position 6575, so the
+        // tail at 6560 falls inside the final chunk.
+        let tail = gemma4_cold_restore_tail_publish(
+            6576,
+            16,
+            gemma4_sliding_retention_caps_for_override(&twelve_b_sliding_config(), 16, true, None),
+        );
+        assert_eq!(tail, Some(6560));
+
+        // Earlier chunks pass it by.
+        assert_eq!(gemma4_chunk_cold_restore_tail(tail, 0, 2048, &[1024]), None);
+        assert_eq!(
+            gemma4_chunk_cold_restore_tail(tail, 2048, 4096, &[3072]),
+            None
+        );
+        // The chunk that crosses it takes it.
+        assert_eq!(
+            gemma4_chunk_cold_restore_tail(tail, 4096, 6575, &[5120, 6144]),
+            Some(6560)
+        );
+        // `(start, end]`, so a chunk that merely STARTS there does not re-take
+        // it — `prepare_sliding_checkpoint_capture` needs strictly increasing
+        // offsets and a duplicate would be rejected.
+        assert_eq!(
+            gemma4_chunk_cold_restore_tail(tail, 6560, 6575, &[]),
+            None,
+            "a boundary at or below where the chunk began was already passed"
+        );
+        // And when the cadence or a rung already lands on it, the tail adds
+        // nothing: the retained set must stay byte-for-byte the persist-off one.
+        assert_eq!(
+            gemma4_chunk_cold_restore_tail(tail, 4096, 6575, &[5120, 6144, 6560]),
+            None,
+            "the tail must never be routed to the singleton INSTEAD of the store when the \
+             chunk was already publishing that boundary — that would silently remove an entry \
+             a persistence-OFF turn retains"
+        );
+    }
+
+    /// A RAGGED prompt must publish no tail at all, and the chunk walk cannot
+    /// be the thing that enforces it.
+    ///
+    /// On 15 prompts out of 16 the reachable boundary and the prompt boundary
+    /// are the same number, and the prompt boundary is already snapshotted by
+    /// `maybe_remember_gemma4_sliding_prompt_boundary_checkpoint` — which the
+    /// chunk plan is split at, so that path always fires when the tail would
+    /// have. Publishing the tail as well takes a SECOND full sliding-window
+    /// snapshot of one offset, and `find_gemma4_sliding_capture_checkpoints`
+    /// then dedups the pair back down to one candidate. Cost with no reader.
+    ///
+    /// The chunk walk cannot catch it: `run_paged_prefill_chunk` strips the
+    /// prompt boundary out of `checkpoint_boundaries` one line before handing
+    /// that same list in as `already_published`, so
+    /// `gemma4_chunk_cold_restore_tail`'s containment test is blind to exactly
+    /// the coinciding case. The publish gate is where it has to be decided.
+    #[test]
+    fn a_ragged_prompt_publishes_no_tail_beside_the_prompt_boundary_it_coincides_with() {
+        const BS: u32 = 16;
+        let caps =
+            gemma4_sliding_retention_caps_for_override(&twelve_b_sliding_config(), BS, true, None);
+
+        // The measured pair: 6572 ragged, 6576 aligned, same block size.
+        assert_eq!(
+            6572 / BS * BS,
+            gemma4_cold_restore_reachable_boundary(6572, BS)
+        );
+        assert_eq!(
+            gemma4_cold_restore_tail_publish(6572, BS, caps),
+            None,
+            "a ragged prompt's own boundary IS the reachable one and is already \
+             snapshotted; a tail here is a duplicate window nothing reads"
+        );
+        assert_eq!(
+            gemma4_cold_restore_tail_publish(6576, BS, caps),
+            Some(6560),
+            "the aligned prompt is the one case the tail exists for and must keep it"
+        );
+
+        // What the prefill would do with it. The chunk that ends on the ragged
+        // prompt boundary is the same chunk the prompt-boundary path fires
+        // after, and the stripped `already_published` cannot say so.
+        let ragged_tail = gemma4_cold_restore_tail_publish(6572, BS, caps);
+        assert_eq!(
+            gemma4_chunk_cold_restore_tail(ragged_tail, 4096, 6560, &[5120, 6144]),
+            None,
+            "the chunk that ends on the prompt boundary must publish nothing extra"
+        );
+
+        // And it is not one fixture: exactly the aligned prompts publish.
+        for block_size in [1u32, 8, 16, 32] {
+            let caps = gemma4_sliding_retention_caps_for_override(
+                &twelve_b_sliding_config(),
+                block_size,
+                true,
+                None,
+            );
+            for prompt_len in 1..=300u32 {
+                let published =
+                    gemma4_cold_restore_tail_publish(prompt_len, block_size, caps).is_some();
+                let reachable = gemma4_cold_restore_reachable_boundary(prompt_len, block_size);
+                assert_eq!(
+                    published,
+                    prompt_len.is_multiple_of(block_size) && reachable > 0,
+                    "block_size={block_size} prompt_len={prompt_len}: the tail exists only \
+                     where the prompt boundary outruns the restore, i.e. only on an aligned \
+                     prompt"
+                );
+            }
+        }
+    }
+
+    /// The descent must step PAST what is already on disk, or a poisoned root
+    /// never heals.
+    ///
+    /// The scenario is the one users already have: a pre-fix run anchored a
+    /// sidecar at the aligned prompt boundary 6576, which no restore can name.
+    /// Everything shallower is still missing. A walk that stops at the first
+    /// already-persisted candidate writes nothing, this turn and every turn
+    /// after it, because the key it recomputes is the same key.
+    #[test]
+    fn the_capture_descends_past_boundaries_already_on_disk() {
+        // Deepest first, exactly as `find_gemma4_sliding_capture_checkpoints`
+        // hands them over.
+        let candidates = [6576u32, 6560, 4096, 1024];
+        let on_disk = [6576u32];
+
+        assert_eq!(
+            gemma4_select_cold_capture_candidate(candidates, |boundary| {
+                if on_disk.contains(boundary) {
+                    Gemma4ColdCaptureProbe::Persisted
+                } else {
+                    Gemma4ColdCaptureProbe::Missing(*boundary)
+                }
+            }),
+            Gemma4ColdCaptureSelection::Capture {
+                candidate: 6560,
+                key: 6560,
+                skipped_persisted: 1,
+            },
+            "the deepest candidate is the useless one already on disk; the capture must go on \
+             to 6560, the boundary a restore of this prompt actually enumerates, and account \
+             for the one it passed over"
+        );
+
+        // Steady state: everything reachable is already written, so the turn
+        // does nothing and says so.
+        assert_eq!(
+            gemma4_select_cold_capture_candidate(candidates, |_| {
+                Gemma4ColdCaptureProbe::<u32>::Persisted
+            }),
+            Gemma4ColdCaptureSelection::AllPersisted {
+                skipped_persisted: candidates.len(),
+            },
+            "a fully populated ladder must write nothing, not re-enqueue its shallowest rung"
+        );
+
+        // A boundary whose chain cannot be derived is not a skip: nothing was
+        // ever written there to skip, and counting it as one would make a
+        // healthy short turn wear the signature of a saturated ladder.
+        assert_eq!(
+            gemma4_select_cold_capture_candidate(candidates, |boundary| match *boundary {
+                6576 => Gemma4ColdCaptureProbe::Underivable,
+                6560 => Gemma4ColdCaptureProbe::Persisted,
+                other => Gemma4ColdCaptureProbe::Missing(other),
+            }),
+            Gemma4ColdCaptureSelection::Capture {
+                candidate: 4096,
+                key: 4096,
+                skipped_persisted: 1,
+            }
+        );
+    }
+
+    /// A descent that derived NO chain at all must not reach the counters
+    /// wearing the saturated ladder's signature.
+    ///
+    /// `Underivable` and `Persisted` are opposite states of the tier — one
+    /// means nothing was ever written at that boundary, the other means
+    /// something was — and the capture records a different counter for each.
+    /// When the walk returned `(None, 0)` for both, the all-`Underivable` turn
+    /// bumped `already_persisted`, so a root holding nothing reported itself
+    /// full.
+    #[test]
+    fn an_all_underivable_descent_is_not_an_already_persisted_one() {
+        let candidates = [6576u32, 6560, 4096, 1024];
+
+        assert_eq!(
+            gemma4_select_cold_capture_candidate(candidates, |_| {
+                Gemma4ColdCaptureProbe::<u32>::Underivable
+            }),
+            Gemma4ColdCaptureSelection::NoChainDerived,
+            "not one chain derived, so the tier holds nothing here — reporting this as an \
+             already-persisted descent makes an empty root read as a saturated one"
+        );
+
+        // Mixed, and still not a persistence claim: one derivable boundary that
+        // IS on disk is what separates the two outcomes.
+        assert_eq!(
+            gemma4_select_cold_capture_candidate(candidates, |boundary| match *boundary {
+                1024 => Gemma4ColdCaptureProbe::Persisted,
+                _ => Gemma4ColdCaptureProbe::<u32>::Underivable,
+            }),
+            Gemma4ColdCaptureSelection::AllPersisted {
+                skipped_persisted: 1,
+            }
+        );
+
+        // An empty candidate list derives nothing either.
+        assert_eq!(
+            gemma4_select_cold_capture_candidate([0u32; 0], |_| {
+                Gemma4ColdCaptureProbe::<u32>::Underivable
+            }),
+            Gemma4ColdCaptureSelection::NoChainDerived
+        );
+    }
+
+    /// The reachability clamp is an EXTRA bound, not a replacement: the
+    /// persisted chain and the request still cap the capture, and a turn whose
+    /// prompt length was never recorded captures nothing rather than guessing.
+    #[test]
+    fn the_capture_ceiling_still_honours_the_chain_the_request_and_a_missing_prompt() {
+        assert_eq!(
+            gemma4_sliding_cold_capture_ceiling_blocks(3, 6616, 6576, 16),
+            3,
+            "a chain that reached 3 blocks bounds the capture at 3 blocks"
+        );
+        assert_eq!(
+            gemma4_sliding_cold_capture_ceiling_blocks(u32::MAX, 32, 6576, 16),
+            2,
+            "a request holding 2 whole blocks cannot anchor deeper than 2"
+        );
+        assert_eq!(
+            gemma4_sliding_cold_capture_ceiling_blocks(u32::MAX, 6576, 0, 16),
+            0,
+            "no recorded prompt length must fail CLOSED, never fall back to the request"
+        );
+        assert_eq!(
+            gemma4_sliding_cold_capture_ceiling_blocks(u32::MAX, 6576, 6576, 0),
+            0,
+            "block_size 0 folds to a no-op instead of dividing by zero"
+        );
     }
 
     #[test]
@@ -11298,6 +12257,146 @@ mod tests {
                  straight over a rung"
             );
         }
+    }
+
+    /// A draft turn's real, production-derived plan: no paged adapter, so the
+    /// turn reaches the speculative handler.
+    ///
+    /// `tiny_inner_with_draft` is the in-crate stand-in for a real draft load —
+    /// its config sets `use_block_paged_cache: false`, which is exactly what
+    /// `persistence::resolve_gemma4_draft_paged_cache` forces on every draft
+    /// checkpoint. This half of the pair asserts the arrangement that works;
+    /// [`gemma4_paged_plus_draft_silently_drops_the_draft`] asserts what the
+    /// other arrangement does.
+    #[test]
+    fn gemma4_flat_draft_plan_routes_to_the_speculative_handler() {
+        let inner = crate::models::gemma4::dspark_decode::tests::tiny_inner_with_draft();
+        let execution = inner.execution_plan();
+
+        assert!(
+            execution.paged_attention.is_none(),
+            "a draft-carrying Gemma4Inner must build no paged adapter — \
+             `use_block_paged_cache: false` in the config is the load-path forcing that \
+             keeps it that way, and it is the ONLY reason the draft actually runs"
+        );
+        let speculative = match execution.speculative {
+            Some(s) => s,
+            None => panic!("tiny_inner_with_draft carries a draft; the plan must advertise it"),
+        };
+        assert!(
+            !speculative.supports_paged_attention,
+            "gemma4 draft proposal/verification is implemented against flat KV only"
+        );
+
+        let plan = TurnPlan::resolve(
+            execution,
+            TurnRequest {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                speculative_requested: true,
+            },
+        );
+        assert_eq!(
+            plan.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+            "flat + draft + opt-in must select the draft decoder"
+        );
+        assert_eq!(
+            plan.path(),
+            TurnPath::Speculative,
+            "the draft decoder only runs when `path()` also lands on the speculative \
+             handler; `run_paged_turn` has no speculative branch to fall back on"
+        );
+    }
+
+    /// Paged and draft cannot coexist on a gemma4 turn, and the failure is
+    /// SILENT — no error, no log, just an autoregressive decode with a fully
+    /// loaded draft that is never stepped. This test states that in executable
+    /// form so the invariant is not carried by prose alone.
+    ///
+    /// ```text
+    ///   paged ON + supports_paged_attention:false  -> decoder downgraded to AR
+    ///   paged ON + supports_paged_attention:TRUE   -> decoder Speculative, but
+    ///                                                 path() tests paged FIRST
+    ///   ...both land on TurnPath::Paged -> engine::paged_turn, which never
+    ///      reads `plan.decoder` (the only mentions in that file are its own
+    ///      test fixture and a JSON key). The `debug_assert!` in
+    ///      `run_paged_turn` is compiled out of release.
+    /// ```
+    ///
+    /// The second row is the point. It is the shape a future change produces
+    /// when someone reads "draft turns are flat by construction", decides to
+    /// lift the restriction, and flips `supports_paged_attention` to `true`
+    /// here without touching the load path — and it still does not run. Paged
+    /// speculative decode needs a branch inside `engine::paged_turn`, not a
+    /// flag flip.
+    #[test]
+    fn gemma4_paged_plus_draft_silently_drops_the_draft() {
+        let inner = crate::models::gemma4::dspark_decode::tests::tiny_inner_with_draft();
+        let flat = inner.execution_plan();
+        let speculative = match flat.speculative {
+            Some(s) => s,
+            None => panic!("tiny_inner_with_draft carries a draft; the plan must advertise it"),
+        };
+
+        // Exactly what dropping the load-path forcing produces: the same draft
+        // plan, plus the paged adapter `unwrap_or(true)` would have built.
+        let paged_and_draft = ExecutionPlan {
+            paged_attention: Some(PagedAttentionPlan {
+                supports_delta: true,
+            }),
+            ..flat
+        };
+
+        let request = TurnRequest {
+            is_delta: false,
+            input_media: MediaCapabilities::NONE,
+            context_media: MediaCapabilities::NONE,
+            speculative_requested: true,
+        };
+
+        let plan = TurnPlan::resolve(paged_and_draft, request);
+        assert_eq!(
+            plan.decoder,
+            DecoderPlan::Autoregressive,
+            "paged ON + a paged-incapable proposer must downgrade to plain AR — the draft \
+             is loaded and resident, and not one draft forward runs"
+        );
+        assert_eq!(
+            plan.path(),
+            TurnPath::Paged,
+            "`path()` checks paged BEFORE speculative, so the turn goes to \
+             `engine::paged_turn`, which never reads `plan.decoder`. Silent loss of the \
+             measured draft speedup — the exact outcome the explicit-`true` config is \
+             hard-errored for. Keep the load path forcing paged OFF whenever a draft \
+             resolves"
+        );
+
+        // Flipping the capability flag alone does NOT fix it.
+        let flag_flipped = ExecutionPlan {
+            speculative: Some(SpeculativePlan {
+                supports_paged_attention: true,
+                ..speculative
+            }),
+            ..paged_and_draft
+        };
+        let flipped_plan = TurnPlan::resolve(flag_flipped, request);
+        assert_eq!(
+            flipped_plan.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+            "with the flag set, resolve() no longer downgrades the decoder"
+        );
+        assert_eq!(
+            flipped_plan.path(),
+            TurnPath::Paged,
+            "...and the turn STILL routes to `engine::paged_turn`, which has no \
+             speculative branch, so the draft is still never stepped — now without even \
+             the AR downgrade to make the plan honest. Setting \
+             `supports_paged_attention: true` is not the missing piece; a speculative \
+             branch inside `engine::paged_turn` (plus a CROSSED-boundary sliding \
+             checkpoint predicate, since a variable accept count jumps rungs) is"
+        );
     }
 
     /// A finished conversation's anchors must not squat. `Ladder` defers
@@ -13152,7 +14251,7 @@ mod tests {
     /// `min(boundary, window)` rows, so a 32-token boundary under a 128-token
     /// window describes exactly what a live `RotatingKVCache` holds there. The
     /// old `boundary >= window` rule made `boundary_is_representable` refuse
-    /// it, `find_gemma4_sliding_capture_checkpoint` return `None`, and gemma4's
+    /// it, `find_gemma4_sliding_capture_checkpoints` come back empty, and gemma4's
     /// sidecar inert for every typical chat prompt.
     ///
     /// Drives the REAL selector rather than `boundary_is_representable` alone,
@@ -13205,15 +14304,16 @@ mod tests {
             snapshots: sliding_capture_snapshots(&inner.config, boundary),
         });
 
-        let selected = inner.find_gemma4_sliding_capture_checkpoint(
+        let selected = inner.find_gemma4_sliding_capture_checkpoints(
             &geometry,
             &request_tokens,
             block_size,
             4,
             &extra_keys_per_block,
         );
-        let (selected_boundary, snapshots) =
-            selected.expect("a sub-window checkpoint must now anchor a capture");
+        let &(selected_boundary, snapshots) = selected
+            .first()
+            .expect("a sub-window checkpoint must now anchor a capture");
         assert_eq!(selected_boundary, boundary);
         assert_eq!(snapshots.len(), inner.config.num_hidden_layers as usize);
         for (layer, snapshot) in snapshots.iter().enumerate() {
@@ -13248,16 +14348,111 @@ mod tests {
         // never be selected on restore, so writing one would only burn quota.
         assert!(
             inner
-                .find_gemma4_sliding_capture_checkpoint(
+                .find_gemma4_sliding_capture_checkpoints(
                     &geometry,
                     &request_tokens,
                     block_size,
                     1,
                     &extra_keys_per_block,
                 )
-                .is_none(),
+                .is_empty(),
             "boundary 32 must not be selected when the chain reaches only 16 tokens"
         );
+    }
+
+    /// The aligned-prompt case end to end through the SELECTOR: with the prompt
+    /// boundary out of reach, the cold-restore tail is what the capture anchors
+    /// on — and it only gets that chance because it is a candidate at all.
+    ///
+    /// A 64-token prompt (4 whole blocks of 16) plus an 8-token completion. The
+    /// prompt boundary lands at 64; a restore of this prompt looks up
+    /// `prompt[..63]`, whose deepest block boundary is 48. Under the old
+    /// ceiling the selector took 64 — 209.7 MB of structurally valid sidecar at
+    /// an address no restore can name, rewritten every session.
+    #[test]
+    fn test_gemma4_capture_prefers_the_cold_tail_over_an_unreachable_prompt_boundary() {
+        let cfg = sliding_capture_config();
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(inner) => inner,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        let geometry = sliding_sidecar::geometry(&inner.config).expect("hybrid config geometry");
+        let block_size = 16u32;
+        let prompt_len = 64u32;
+        assert!(
+            prompt_len.is_multiple_of(block_size),
+            "the fixture's whole point is a block-ALIGNED prompt"
+        );
+        let prompt_boundary = prompt_len / block_size * block_size;
+        let tail_boundary = super::gemma4_cold_restore_reachable_boundary(prompt_len, block_size);
+        assert_eq!((prompt_boundary, tail_boundary), (64, 48));
+
+        // The capture sees the completion too, which is what used to widen its
+        // ceiling past the prompt.
+        let request_tokens: Vec<u32> = (7000..7072).collect();
+        let extra_keys_per_block =
+            engine::build_paged_extra_keys(request_tokens.len(), block_size, &[]);
+        let checkpoint_at = |boundary: u32| super::Gemma4SlidingPrefixCheckpoint {
+            prefix_len: boundary,
+            block_size,
+            final_block_hash: super::compute_gemma4_paged_prefix_block_hash_with_keys(
+                &request_tokens,
+                boundary,
+                block_size,
+                &extra_keys_per_block,
+                0,
+            )
+            .expect("prefix hash"),
+            protected_image_prompt_boundary: false,
+            cold_anchor_rung: false,
+            tokens: request_tokens[..boundary as usize].to_vec(),
+            snapshots: sliding_capture_snapshots(&inner.config, boundary),
+        };
+        inner.sliding_prompt_boundary_checkpoint = Some(checkpoint_at(prompt_boundary));
+        inner.sliding_cold_restore_tail_checkpoint = Some(checkpoint_at(tail_boundary));
+
+        // The chain covered every block of the request; only reachability binds.
+        let chain_blocks = super::gemma4_sliding_cold_capture_ceiling_blocks(
+            u32::MAX,
+            request_tokens.len(),
+            prompt_len,
+            block_size,
+        );
+        assert_eq!(chain_blocks, 3, "48 tokens, not the request's 72");
+
+        let candidates = inner.find_gemma4_sliding_capture_checkpoints(
+            &geometry,
+            &request_tokens,
+            block_size,
+            chain_blocks,
+            &extra_keys_per_block,
+        );
+        let boundaries: Vec<u32> = candidates.iter().map(|(boundary, _)| *boundary).collect();
+        assert_eq!(
+            boundaries,
+            vec![tail_boundary],
+            "the tail must be offered and the unreachable prompt boundary must not be"
+        );
+
+        // And it really is a usable anchor, not just a boundary number: the
+        // payload the capture would write encodes at it.
+        let (_, snapshots) = candidates[0];
+        let layout = sliding_sidecar::layout_at(&geometry, tail_boundary);
+        assert_eq!(layout.boundary_tokens, tail_boundary);
+        let tensors =
+            sliding_sidecar::encode_tensors(&inner.config, &geometry, snapshots, tail_boundary)
+                .expect("encode must not error")
+                .expect("the cold tail must encode");
+        assert_eq!(tensors.len(), layout.tensor_count().expect("tensor count"));
+        assert!(tensors.iter().all(|t| t.len() == layout.bytes_per_tensor));
     }
 
     #[test]

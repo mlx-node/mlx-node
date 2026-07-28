@@ -443,6 +443,7 @@ function handleSessionsList({ res, url, deps }: RouteCtx): void {
   }
 
   const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+  const matchedIds = `SELECT s.id FROM sessions s ${whereSql}`;
   const sql = `
     SELECT s.id, s.path, s.cwd, s.name, s.created, s.modified,
            s.message_count AS messageCount, s.first_message AS firstMessage,
@@ -460,6 +461,58 @@ function handleSessionsList({ res, url, deps }: RouteCtx): void {
   const total = toInt(
     (deps.dash.sqlite.prepare(`SELECT COUNT(*) AS n FROM sessions s ${whereSql}`).get(...args) as { n: unknown }).n,
   );
+
+  // Tokens over THOSE SAME sessions, from the SAME filter.
+  //
+  // This exists so a caller that shows both numbers cannot pair them with a
+  // different scope. `sessions`/`turns` hold only what lives under the CURRENT
+  // `--session-dir` (ingest deletes rows whose file left the root), while
+  // `traces` is a machine-wide log from `~/.mlx-node/metrics/traces` and
+  // `/metrics/overview` sums it whole. Reading a count from here and a token
+  // total from there produces a tile whose halves describe different session
+  // sets — the same defect the Cache page's root scoping fixed, where a
+  // filesystem scan of one cache root sat beside a hit rate summed over every
+  // root the machine ever used.
+  //
+  // This counts each DISTINCT inference in the matched set once — the same rule
+  // `/metrics/overview` applies — and is deliberately NOT the sum of the
+  // per-session `/api/sessions/:id/metrics` totals. The first arm collapses
+  // `turns` on their canonical identity across the WHOLE matched set, so a
+  // forked session (which copies inherited turns VERBATIM, same `trace_id` and
+  // `entry_id`) contributes its inherited history once, whereas each per-session
+  // call reports every copy to the session holding it. Adding those per-session
+  // totals up therefore exceeds this number by the shared history, and so does
+  // adding up the per-row `inputTokens`/`outputTokens` columns below, which stay
+  // plain per-session sums with no dedup and no trace arm precisely because a
+  // session row must show what THAT session spent. Both readings are wanted; the
+  // headline total is the one that must not bill a fork twice.
+  //
+  // The second arm adds subagent work, which runs on an in-memory session manager
+  // and therefore writes a `traces` row with no `turns` row at all. It is
+  // admitted only via `root_session_id` pointing INTO the matched set, and only
+  // when no `turns` row already carries that `trace_id`; the inner
+  // `trace_id IS NOT NULL` keeps `NOT IN` from going NULL and dropping the whole
+  // set. That dedup subquery is unscoped by session on purpose (the per-session
+  // handler scopes its own to `session_id = ?`): a trace some session already
+  // accounts for must never be added again to a set-wide total. Trace rows store
+  // GROSS `prompt_tokens`, so the input is clamped to the producer's net
+  // `MAX(prompt - cached, 0)` rather than double-counting cache reads against the
+  // already-net turns side.
+  const tokenTotals = deps.dash.sqlite
+    .prepare(
+      `SELECT COALESCE(SUM(inputTokens), 0) AS inputTokens, COALESCE(SUM(outputTokens), 0) AS outputTokens
+       FROM (SELECT COALESCE(input_tokens, 0) AS inputTokens, COALESCE(output_tokens, 0) AS outputTokens
+             FROM turns WHERE session_id IN (${matchedIds})
+             GROUP BY COALESCE(trace_id, entry_id, CAST(id AS TEXT))
+             UNION ALL
+             SELECT MAX(COALESCE(prompt_tokens, 0) - COALESCE(cached_tokens, 0), 0),
+                    COALESCE(output_tokens, 0)
+             FROM traces
+             WHERE root_session_id IN (${matchedIds}) AND session_id != root_session_id
+               AND trace_id NOT IN (SELECT trace_id FROM turns WHERE trace_id IS NOT NULL))`,
+    )
+    .get(...args, ...args) as { inputTokens: unknown; outputTokens: unknown } | undefined;
+  const tokens = toInt(tokenTotals?.inputTokens) + toInt(tokenTotals?.outputTokens);
   const rows = deps.dash.sqlite.prepare(sql).all(...args, limit, offset);
   const list = rows.map((row) => ({
     id: String(row.id),
@@ -474,7 +527,7 @@ function handleSessionsList({ res, url, deps }: RouteCtx): void {
     inputTokens: toInt(row.inputTokens),
     outputTokens: toInt(row.outputTokens),
   }));
-  sendJson(res, 200, { sessions: list, total });
+  sendJson(res, 200, { sessions: list, total, tokens });
 }
 
 function lookupSession(deps: ApiDeps, id: string): { path: string; row: typeof sessions.$inferSelect } | null {
@@ -1282,6 +1335,24 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
  *    the restore allowlist). Their deltas are all zero, so they are counted but
  *    carry no lookups. Overlaps the buckets above by design: it is a TURN
  *    count, not a lookup bucket.
+ *
+ * `health` carries the counters that are NOT lookups, and therefore cannot be
+ * read off the hit rate at all:
+ *  - `writeErrors` — writes the queue accepted that never reached disk. The
+ *    native writer is fail-open and returns the error to nobody, so a root that
+ *    is read-only, full or unmounted otherwise produces a spotless payload:
+ *    zero drops, zero corruptions, and a hit rate computed over a cache that
+ *    is storing nothing.
+ *  - `restoreDeclines` / `restoreSuppressed` — restores that were refused. A
+ *    refusal performs no block lookup, so it moves neither `hits` nor `misses`
+ *    and lands in `trend` as an absent row, which the UI would otherwise render
+ *    as "no lookups recorded" — "nothing ran", when the truth is the opposite.
+ *
+ * The two families reduce differently and must not be swapped. `*Total` fields
+ * are per-process cumulative counters reduced with MAX (see below); declines
+ * have no total and are SUMMED, because unlike a corruption a decline has a
+ * legitimate non-zero steady state — every prompt's first turn declines — so a
+ * "did this ever happen" latch would be pinned on from the first minute.
  */
 function handleCacheGet({ res, deps }: RouteCtx): void {
   const requestedRoot = coldCacheRoot(deps.cacheRoot);
@@ -1343,7 +1414,11 @@ function handleCacheGet({ res, deps }: RouteCtx): void {
               COALESCE(SUM(cold_evictions), 0) AS evictions,
               COALESCE(SUM(cold_corruptions), 0) AS corruptions,
               COALESCE(MAX(cold_corruptions_total), 0) AS corruptionsTotal,
-              COALESCE(MAX(cold_queue_drops_total), 0) AS queueDropsTotal
+              COALESCE(MAX(cold_queue_drops_total), 0) AS queueDropsTotal,
+              COALESCE(SUM(cold_write_errors), 0) AS writeErrors,
+              COALESCE(MAX(cold_write_errors_total), 0) AS writeErrorsTotal,
+              COALESCE(SUM(cold_restore_declines), 0) AS restoreDeclines,
+              COALESCE(SUM(cold_sidecar_restore_suppressed), 0) AS restoreSuppressed
        FROM traces WHERE ts > 0 AND cold_root = ?`,
     )
     .get(scopeRoot);
@@ -1378,6 +1453,14 @@ function handleCacheGet({ res, deps }: RouteCtx): void {
       corruptions: toInt(health?.corruptions),
       corruptionsTotal: toInt(health?.corruptionsTotal),
       queueDropsTotal: toInt(health?.queueDropsTotal),
+      writeErrors: toInt(health?.writeErrors),
+      writeErrorsTotal: toInt(health?.writeErrorsTotal),
+      // SUM, not MAX, and deliberately so: unlike corruptions and write
+      // errors these two have a legitimate non-zero steady state (any prompt's
+      // first turn declines), so a "did it ever happen" latch would be pinned
+      // on from the first minute and carry no information.
+      restoreDeclines: toInt(health?.restoreDeclines),
+      restoreSuppressed: toInt(health?.restoreSuppressed),
     },
     // Sent over the wire rather than bundled into the SPA: the browser build
     // cannot import `@mlx-node/agent` (it transitively loads the native addon),

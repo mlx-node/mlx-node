@@ -41,6 +41,8 @@ function coldSnapshot(over: Partial<ColdCacheStats>): ColdCacheStats {
     bytesRestored: 0,
     evictions: 0,
     corruptions: 0,
+    writeErrors: 0,
+    restoreDeclines: 0,
     ...over,
   };
 }

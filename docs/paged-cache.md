@@ -551,11 +551,12 @@ Two native structs, two `#[napi]` readers, one JSONL line per turn:
 ```
 ColdCacheStats    coldCacheStats()     hits misses enqueued queueDrops bytesWritten
   (paged blocks)                       bytesRestored evictions corruptions
+                                       writeErrors restoreDeclines
                                        + enabled root quotaBytes  (tier identity)
 
 ColdSidecarStats  coldSidecarStats()   captureReached chainEmpty boundarySkips
   (out-of-pool                         alreadyPersisted enqueued queueDrops installed
-   state)
+   state)                              restoreSuppressed
         │
         └── per-turn delta ──> ~/.mlx-node/metrics/traces/<date>-<pid>.jsonl
                                cold<Field> / coldSidecar<Field>

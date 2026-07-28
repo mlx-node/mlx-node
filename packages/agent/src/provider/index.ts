@@ -92,9 +92,9 @@ export function createMlxProviderExtension(
   // the next successful turn's delta. Inference is serialized per process (host
   // promise chain), so by the time a turn snapshots, any prior turn has fully
   // drained. The SYNCHRONOUS counters (hits/misses/bytesRestored/enqueued/
-  // corruptions) are exact per-turn; bytesWritten and evictions advance on the
-  // async writer thread and queueDrops has one arm on each, so those deltas are
-  // approximate (documented per field on the record).
+  // corruptions/queueDrops/restoreDeclines) are exact per-turn; bytesWritten,
+  // evictions and writeErrors advance on the async writer thread, so those
+  // deltas are approximate (documented per field on the record).
   //
   // The SIDECAR counters are snapshotted the same way but are exact without
   // exception: every one of them is recorded inside the native turn finalize,
@@ -154,6 +154,8 @@ export function createMlxProviderExtension(
       rec.coldQueueDrops = cold.queueDrops - turnStartCold.queueDrops;
       rec.coldEvictions = cold.evictions - turnStartCold.evictions;
       rec.coldCorruptions = cold.corruptions - turnStartCold.corruptions;
+      rec.coldWriteErrors = cold.writeErrors - turnStartCold.writeErrors;
+      rec.coldRestoreDeclines = cold.restoreDeclines - turnStartCold.restoreDeclines;
       // Absolutes, not deltas: an aborted/errored turn never reaches this
       // recorder, so a corruption or a dropped write during one lands in NO
       // delta. The cumulative counter observed by the next successful turn
@@ -161,6 +163,11 @@ export function createMlxProviderExtension(
       // checkable at all (`MAX(total) > 0` over any window).
       rec.coldCorruptionsTotal = cold.corruptions;
       rec.coldQueueDropsTotal = cold.queueDrops;
+      // Same latch, and the counter that needs it most: a write error is
+      // raised on the background writer, so the one covering the LAST turn
+      // before a crash lands in no delta at all — and "is my cache root
+      // broken?" is a question about ever, not about this turn.
+      rec.coldWriteErrorsTotal = cold.writeErrors;
       // Cache IDENTITY comes from the END-of-turn snapshot, never the baseline:
       // the tier opens LAZILY on first use, so on a process's first turn
       // `turnStartCold` is the all-zero default with `enabled: false` and an
@@ -191,6 +198,7 @@ export function createMlxProviderExtension(
       rec.coldSidecarEnqueued = sidecar.enqueued - turnStartSidecar.enqueued;
       rec.coldSidecarQueueDrops = sidecar.queueDrops - turnStartSidecar.queueDrops;
       rec.coldSidecarInstalled = sidecar.installed - turnStartSidecar.installed;
+      rec.coldSidecarRestoreSuppressed = sidecar.restoreSuppressed - turnStartSidecar.restoreSuppressed;
     }
     metricsTrace.record(rec);
   };

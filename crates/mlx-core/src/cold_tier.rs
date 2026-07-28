@@ -170,6 +170,19 @@ pub struct ColdSidecarTelemetry {
     /// "restored and used" to "restored and re-derived from scratch" is
     /// invisible, and that regression is the whole feature.
     pub installed: u64,
+    /// Restores a family THREW AWAY after the walk had already served them.
+    ///
+    /// The second read-side counter, and a different event from
+    /// `ColdCacheStats::restore_declines`: there the walk refused to hand
+    /// anything back, here it handed something back and the family released it
+    /// and restarted the turn cold (gemma4's large-sliding suppression, which
+    /// does a `release_request` + `reset_for_new_request` + forced-miss
+    /// re-lookup). Both end at "the prefix was recomputed", so they are
+    /// indistinguishable downstream — and only this one is preceded by real
+    /// `hits` and `bytes_restored`, which is what makes it look like reuse
+    /// worked. Split from the walk's counter so a suppression that starts
+    /// firing on every turn cannot hide inside a decline count.
+    pub restore_suppressed: u64,
 }
 
 /// The counters behind [`ColdSidecarTelemetry`].
@@ -186,6 +199,7 @@ pub struct ColdSidecarCounters {
     enqueued: AtomicU64,
     queue_drops: AtomicU64,
     installed: AtomicU64,
+    restore_suppressed: AtomicU64,
 }
 
 impl ColdSidecarCounters {
@@ -198,6 +212,7 @@ impl ColdSidecarCounters {
             enqueued: AtomicU64::new(0),
             queue_drops: AtomicU64::new(0),
             installed: AtomicU64::new(0),
+            restore_suppressed: AtomicU64::new(0),
         }
     }
 
@@ -242,6 +257,16 @@ impl ColdSidecarCounters {
         self.installed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a restored prefix a family discarded rather than reuse.
+    ///
+    /// Recorded at the point the family commits to the discard — after the
+    /// decision to suppress is final and before the adapter is reset — so a
+    /// turn that merely evaluated the suppression rule and kept its prefix
+    /// never lands here.
+    pub fn record_restore_suppressed(&self) {
+        self.restore_suppressed.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> ColdSidecarTelemetry {
         let load = |value: &AtomicU64| value.load(Ordering::Relaxed);
         ColdSidecarTelemetry {
@@ -252,6 +277,7 @@ impl ColdSidecarCounters {
             enqueued: load(&self.enqueued),
             queue_drops: load(&self.queue_drops),
             installed: load(&self.installed),
+            restore_suppressed: load(&self.restore_suppressed),
         }
     }
 }
@@ -831,9 +857,13 @@ pub struct ColdCacheStatsJs {
     pub misses: f64,
     /// Blocks accepted onto the background write queue.
     pub enqueued: f64,
-    /// Writes dropped without landing on disk: queue full at enqueue, or the commit rename failed.
+    /// Writes REFUSED at admission because the bounded queue was full.
+    /// Disjoint from `writeErrors`, which counts accepted writes that then
+    /// failed to land — never sum the two into one "lost writes" number.
     pub queue_drops: f64,
-    /// Total bytes committed to disk.
+    /// Bytes that LANDED, credited after the payload sync, the commit rename
+    /// and the directory fsync all succeeded. Not an enqueue-time estimate:
+    /// a failed write credits nothing here and one `writeErrors` instead.
     pub bytes_written: f64,
     /// Total bytes read back on validated hits.
     pub bytes_restored: f64,
@@ -841,28 +871,57 @@ pub struct ColdCacheStatsJs {
     pub evictions: f64,
     /// Entries that failed checksum/identity validation and were removed.
     pub corruptions: f64,
+    /// Writes the queue accepted that never reached disk — a read-only, full
+    /// or unmounted cache root, a failed rename, a failed fsync. The writer is
+    /// fail-open and reports the error to nobody, so without this a cache that
+    /// stores nothing at all still looks perfectly healthy.
+    pub write_errors: f64,
+    /// Restores refused before any block was looked up. Neither a hit nor a
+    /// miss — so a refused restore reads as `0/0`, exactly like a turn that
+    /// never consulted the tier.
+    pub restore_declines: f64,
 }
 
 /// Return a snapshot of the process-wide cold tier. Read-only: never opens
 /// the tier itself, so it reports `enabled: false` until inference first
 /// initializes the tier.
+///
+/// The source snapshot is DESTRUCTURED rather than field-accessed, so a
+/// counter added to `ColdCacheStats` and forgotten here fails to compile.
+/// The failure this guards is silent and has already happened twice: a native
+/// counter that never reaches this struct reaches no JS consumer either, and
+/// nothing downstream can tell "the counter is zero" from "the counter was
+/// never carried across".
 #[napi]
 pub fn cold_cache_stats() -> ColdCacheStatsJs {
     match GLOBAL.get().and_then(|slot| slot.clone()) {
         Some(manager) => {
-            let stats = manager.stats();
+            let mlx_paged_attn::ColdCacheStats {
+                hits,
+                misses,
+                enqueued,
+                queue_drops,
+                bytes_written,
+                bytes_restored,
+                evictions,
+                corruptions,
+                write_errors,
+                restore_declines,
+            } = manager.stats();
             ColdCacheStatsJs {
                 enabled: true,
                 root: manager.root().display().to_string(),
                 quota_bytes: manager.quota_bytes() as f64,
-                hits: stats.hits as f64,
-                misses: stats.misses as f64,
-                enqueued: stats.enqueued as f64,
-                queue_drops: stats.queue_drops as f64,
-                bytes_written: stats.bytes_written as f64,
-                bytes_restored: stats.bytes_restored as f64,
-                evictions: stats.evictions as f64,
-                corruptions: stats.corruptions as f64,
+                hits: hits as f64,
+                misses: misses as f64,
+                enqueued: enqueued as f64,
+                queue_drops: queue_drops as f64,
+                bytes_written: bytes_written as f64,
+                bytes_restored: bytes_restored as f64,
+                evictions: evictions as f64,
+                corruptions: corruptions as f64,
+                write_errors: write_errors as f64,
+                restore_declines: restore_declines as f64,
             }
         }
         None => ColdCacheStatsJs::default(),
@@ -906,6 +965,11 @@ pub struct ColdSidecarStatsJs {
     /// O(prefix) replay" — every other counter, and text parity itself, is
     /// satisfied by the replay.
     pub installed: f64,
+    /// Restores a family THREW AWAY after the walk served them, restarting the
+    /// turn cold. Unlike `ColdCacheStats.restoreDeclines` this one comes AFTER
+    /// real `coldHits` and `coldBytesRestored`, so the turn looks like it
+    /// reused a prefix right up to the point where it recomputed all of it.
+    pub restore_suppressed: f64,
 }
 
 /// Return the process-wide sidecar counters. Unlike [`cold_cache_stats`] this
@@ -917,15 +981,27 @@ pub struct ColdSidecarStatsJs {
 /// `#[napi(object)]` return type cannot serve both.
 #[napi]
 pub fn cold_sidecar_stats() -> ColdSidecarStatsJs {
-    let telemetry = cold_sidecar_telemetry();
+    // Destructured for the same reason [`cold_cache_stats`] is: a counter
+    // added to the telemetry and forgotten here must not compile.
+    let ColdSidecarTelemetry {
+        capture_reached,
+        chain_empty,
+        boundary_skips,
+        already_persisted,
+        enqueued,
+        queue_drops,
+        installed,
+        restore_suppressed,
+    } = cold_sidecar_telemetry();
     ColdSidecarStatsJs {
-        capture_reached: telemetry.capture_reached as f64,
-        chain_empty: telemetry.chain_empty as f64,
-        boundary_skips: telemetry.boundary_skips as f64,
-        already_persisted: telemetry.already_persisted as f64,
-        enqueued: telemetry.enqueued as f64,
-        queue_drops: telemetry.queue_drops as f64,
-        installed: telemetry.installed as f64,
+        capture_reached: capture_reached as f64,
+        chain_empty: chain_empty as f64,
+        boundary_skips: boundary_skips as f64,
+        already_persisted: already_persisted as f64,
+        enqueued: enqueued as f64,
+        queue_drops: queue_drops as f64,
+        installed: installed as f64,
+        restore_suppressed: restore_suppressed as f64,
     }
 }
 
@@ -1701,6 +1777,22 @@ mod tests {
                 enqueued: 1,
                 queue_drops: 1,
                 installed: 1,
+                ..Default::default()
+            }
+        );
+
+        counters.record_restore_suppressed();
+        assert_eq!(
+            counters.snapshot(),
+            ColdSidecarTelemetry {
+                capture_reached: 1,
+                chain_empty: 1,
+                boundary_skips: 1,
+                already_persisted: 1,
+                enqueued: 1,
+                queue_drops: 1,
+                installed: 1,
+                restore_suppressed: 1,
             }
         );
     }
@@ -1753,6 +1845,9 @@ mod tests {
         for _ in 0..7 {
             counters.record_install();
         }
+        for _ in 0..8 {
+            counters.record_restore_suppressed();
+        }
         let after = cold_sidecar_stats();
         assert_eq!(after.capture_reached - before.capture_reached, 1.0);
         assert_eq!(after.chain_empty - before.chain_empty, 2.0);
@@ -1761,6 +1856,7 @@ mod tests {
         assert_eq!(after.enqueued - before.enqueued, 5.0);
         assert_eq!(after.queue_drops - before.queue_drops, 6.0);
         assert_eq!(after.installed - before.installed, 7.0);
+        assert_eq!(after.restore_suppressed - before.restore_suppressed, 8.0);
 
         // …and it must agree with the plain-Rust reader the parity harness
         // uses, so the two can never report different truths about the same
@@ -1774,5 +1870,94 @@ mod tests {
         assert_eq!(mirror.enqueued, telemetry.enqueued as f64);
         assert_eq!(mirror.queue_drops, telemetry.queue_drops as f64);
         assert_eq!(mirror.installed, telemetry.installed as f64);
+        assert_eq!(
+            mirror.restore_suppressed,
+            telemetry.restore_suppressed as f64
+        );
+    }
+
+    /// A real manager, a real write failure, and the counter read back through
+    /// the same `stats()` snapshot the napi mirror maps from.
+    ///
+    /// The point is that BOTH new block counters move only for their own
+    /// event: the failed write must not register as a decline, and the two
+    /// declines must not register as writes. Asserted with distinct counts (1
+    /// vs 2) so a crossed pair cannot pass.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_write_and_a_refused_restore_land_in_different_block_counters() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "mlx-cold-tier-block-counters-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let Ok(manager) = mlx_paged_attn::ColdCacheManager::open_at(root.clone(), 1 << 30, 0, 4)
+        else {
+            eprintln!("skipping block-counter test: cold cache root would not open");
+            return;
+        };
+
+        // Revoke write permission on the already-open root, so the enqueued
+        // sidecar fails against the real filesystem rather than a hook.
+        let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500));
+        let key = mlx_paged_attn::ColdCacheKey::chain(
+            mlx_paged_attn::ColdGroup::GdnState,
+            mlx_paged_attn::ColdCacheFingerprint::from_components([b"counters".as_slice()]),
+            None,
+            &[1, 2, 3, 4],
+            &[],
+            0,
+            0,
+        );
+        let layout = mlx_paged_attn::ColdSidecarLayout {
+            group: mlx_paged_attn::ColdGroup::GdnState,
+            boundary_tokens: 16,
+            num_layers: 1,
+            tensors_per_layer: 1,
+            dtype: "BFloat16".to_string(),
+            dims: vec![2, 2],
+            bytes_per_tensor: 8,
+        };
+        let accepted = manager
+            .enqueue_sidecar(mlx_paged_attn::ColdSidecar {
+                key,
+                fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
+                    b"counters".as_slice()
+                ]),
+                layout,
+                tensors: vec![vec![0u8; 8]],
+            })
+            .unwrap_or(false);
+        let durable = manager.drain(std::time::Duration::from_secs(10));
+
+        manager.record_restore_decline();
+        manager.record_restore_decline();
+
+        let stats = manager.stats();
+        // Every observation is taken before the root is made writable again,
+        // and every assertion after it: a panic here must not unwind past the
+        // restore and leave an undeletable directory in the temp dir.
+        let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+
+        assert!(accepted, "the queue must accept the write it cannot land");
+        assert!(
+            !durable,
+            "the drain must report the covered write as not durable"
+        );
+        assert_eq!(stats.write_errors, 1, "one write, refused by the disk");
+        assert_eq!(stats.restore_declines, 2, "two restores, refused by policy");
+        assert_eq!(stats.bytes_written, 0, "nothing landed");
+        assert_eq!(stats.queue_drops, 0, "the queue was never full");
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+
+        drop(manager);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

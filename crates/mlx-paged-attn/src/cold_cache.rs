@@ -529,14 +529,48 @@ pub struct ColdCacheStats {
     pub hits: u64,
     pub misses: u64,
     pub enqueued: u64,
-    /// Writes dropped without landing on disk: the bounded queue was full
-    /// at enqueue, or the commit rename failed after the queue accepted
-    /// the job.
+    /// Writes REFUSED at admission because the bounded queue was full. The
+    /// counterpart of [`Self::write_errors`], and deliberately disjoint from
+    /// it: this one is the producer's problem (offer rate above writer
+    /// throughput), that one is the storage's. A single write can only ever be
+    /// one or the other — refused before the queue, or accepted and then
+    /// failed — so the two must never be summed into one "lost writes" number.
+    /// `write_errors` is a subset of `enqueued`; this is not.
     pub queue_drops: u64,
+    /// Bytes that LANDED: credited only after `write_all`, the payload sync,
+    /// the commit `renameat` and the directory `fsync` have all returned `Ok`
+    /// for one object. Not an enqueue-time estimate — a write that fails at
+    /// any of those steps adds nothing here and adds one to
+    /// [`Self::write_errors`] instead.
+    ///
+    /// The one thing it is NOT is synchronous with the caller: the writer
+    /// thread credits it, so a reader sampling right after `enqueue` sees the
+    /// bytes still in flight. `drain` closes that window; `write_errors` is
+    /// what distinguishes "still in flight" from "never going to land".
     pub bytes_written: u64,
     pub bytes_restored: u64,
     pub evictions: u64,
     pub corruptions: u64,
+    /// Writes the queue ACCEPTED that never reached disk — a read-only,
+    /// full, or unmounted cache root, a quota the object cannot fit, a failed
+    /// commit rename, a failed fsync.
+    ///
+    /// The writer is deliberately fail-open: it swallows every persist error
+    /// so a broken cache root cannot alter a single emitted token. Before this
+    /// counter that fail-open was also fail-SILENT — an operator whose root
+    /// was read-only saw `queue_drops 0`, `corruptions 0`, an empty stderr,
+    /// and a dashboard reporting a healthy cache that in fact held nothing.
+    pub write_errors: u64,
+    /// Restores the walk REFUSED to serve, having found candidates on disk.
+    ///
+    /// Neither a hit nor a miss, and that is exactly why it is here: those two
+    /// count per-BLOCK lookups, while a refusal happens before any block is
+    /// looked up. A refused restore therefore reports `0/0` — bit-for-bit the
+    /// signature of a turn that never consulted the tier at all, which reads
+    /// as "nothing ran" rather than "reuse was refused". Recorded by the
+    /// caller through [`ColdCacheManager::record_restore_decline`], since the
+    /// refusal is a policy decision the manager itself never sees.
+    pub restore_declines: u64,
 }
 
 #[derive(Default)]
@@ -549,6 +583,8 @@ struct AtomicStats {
     bytes_restored: AtomicU64,
     evictions: AtomicU64,
     corruptions: AtomicU64,
+    write_errors: AtomicU64,
+    restore_declines: AtomicU64,
 }
 
 impl AtomicStats {
@@ -563,6 +599,8 @@ impl AtomicStats {
             bytes_restored: load(&self.bytes_restored),
             evictions: load(&self.evictions),
             corruptions: load(&self.corruptions),
+            write_errors: load(&self.write_errors),
+            restore_declines: load(&self.restore_declines),
         }
     }
 }
@@ -1045,14 +1083,30 @@ impl ColdCacheManager {
                         // Fail-open: inference already has a valid hot block. A
                         // persistence error only means the next process
                         // recomputes — but a pending drain barrier must learn
-                        // that this covered block did not become durable.
+                        // that this covered block did not become durable, and
+                        // `write_errors` must learn it too. That counter is the
+                        // ONLY thing standing between a fail-open writer and a
+                        // fail-silent one: the error is returned to nobody, so
+                        // without the bump here a root that accepts no writes
+                        // at all still reports a spotless cache. Counted once
+                        // per accepted job, whatever step of the persist failed,
+                        // because this is the one place that sees every
+                        // outcome of every job the queue admitted.
                         WriteJob::Block(block) => {
                             if persist_block(&worker_shared, &block).is_err() {
+                                worker_shared
+                                    .stats
+                                    .write_errors
+                                    .fetch_add(1, Ordering::Relaxed);
                                 failed = true;
                             }
                         }
                         WriteJob::Sidecar(sidecar) => {
                             if persist_sidecar(&worker_shared, &sidecar).is_err() {
+                                worker_shared
+                                    .stats
+                                    .write_errors
+                                    .fetch_add(1, Ordering::Relaxed);
                                 failed = true;
                             }
                         }
@@ -1077,6 +1131,27 @@ impl ColdCacheManager {
 
     pub fn quota_bytes(&self) -> u64 {
         self.shared.quota_bytes
+    }
+
+    /// Record one restore this tier held candidates for and the caller refused
+    /// to serve — see [`ColdCacheStats::restore_declines`].
+    ///
+    /// Recorded by the caller because the refusal is decided outside this
+    /// crate: the restore walk lives in `mlx-core`, reaches its verdict from
+    /// side-effect-free `contains` / `contains_in` probes, and returns without
+    /// ever asking the manager to load anything. So the manager sees no
+    /// lookup, counts no hit and no miss, and the refusal is invisible unless
+    /// the walk says so here.
+    ///
+    /// Deliberately a counter and not a log line: a decline is a steady-state
+    /// event on the first turn of any prompt, so it must be cheap and
+    /// aggregatable, and the diagnosis (which boundary, which ceiling) belongs
+    /// in the walk's `MLX_TRACE` line where the numbers still have context.
+    pub fn record_restore_decline(&self) {
+        self.shared
+            .stats
+            .restore_declines
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn stats(&self) -> ColdCacheStats {
@@ -1827,13 +1902,15 @@ fn persist_encoded(
             .index
             .lock()
             .map_err(|_| "cold-cache index mutex poisoned".to_string())?;
-        // A failed commit rename drops a write the queue already accepted;
-        // counting it in `queue_drops` keeps enqueue/write accounting
-        // honest, since the worker itself is fail-open and returns the
-        // error to nobody.
-        shared.root.rename(&temp, &destination).inspect_err(|_| {
-            shared.stats.queue_drops.fetch_add(1, Ordering::Relaxed);
-        })?;
+        // A failed commit rename is a write the queue ACCEPTED and could not
+        // land, so it is a `write_errors` — counted by the worker loop, which
+        // sees this `Err` along with every other way a persist can fail. It
+        // used to be counted here as a `queue_drops` because no write-error
+        // counter existed; that made one event move a counter named after a
+        // completely different cause (a full queue at admission) and left the
+        // other failure modes — a read-only root, a full disk, a failed fsync
+        // — with no counter at all.
+        shared.root.rename(&temp, &destination)?;
         if let Some(old) = index.entries.insert(
             key,
             IndexEntry {
@@ -3422,9 +3499,11 @@ mod write_decomposition_bench {
                 .index
                 .lock()
                 .map_err(|_| "cold-cache index mutex poisoned".to_string())?;
-            shared.root.rename(&temp, &destination).inspect_err(|_| {
-                shared.stats.queue_drops.fetch_add(1, Ordering::Relaxed);
-            })?;
+            // No stats bump on the rename error: this harness calls the persist
+            // body directly instead of going through the writer loop, and the
+            // loop is where `write_errors` is counted. Matching production here
+            // would count an error production counts elsewhere.
+            shared.root.rename(&temp, &destination)?;
             if let Some(old) = index.entries.insert(
                 key,
                 IndexEntry {
@@ -4991,19 +5070,52 @@ mod tests {
     /// Park the writer inside its post-rename directory fsync for `commit_ms`
     /// per object, so the queue drains at a known, slow, controllable rate.
     /// Returns the flag that releases it; hold it alive for the test's body.
+    ///
+    /// Returns only once the writer is PROVABLY parked. Installing the hook
+    /// alone does not park anything — the hook runs on the writer's first
+    /// commit, and until then the writer is sitting in `recv` popping whatever
+    /// `saturate` sends. A caller that raced that lost roughly one run in
+    /// three: `saturate` filled the two-slot channel before the writer popped
+    /// anything, the writer then popped one and freed a slot, and the refusal
+    /// the test exists to pin never happened. So a wedge job is pushed here and
+    /// waited on until the hook reports it has been entered; from that point the
+    /// writer cannot pop, and a full queue stays full.
     fn slow_writer(
         manager: &ColdCacheManager,
         commit_ms: u64,
     ) -> Arc<std::sync::atomic::AtomicBool> {
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let for_writer = Arc::clone(&release);
+        let parked_by_writer = Arc::clone(&parked);
         *manager.shared.dir_sync_override.lock().unwrap() = Some(Box::new(move || {
+            parked_by_writer.store(true, Ordering::Relaxed);
             let until = Instant::now() + Duration::from_millis(commit_ms);
             while Instant::now() < until && !for_writer.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(1));
             }
             Ok(())
         }));
+
+        // The wedge. Sent on the raw channel for the same reason `saturate`
+        // bypasses the public API: what these tests measure IS the public
+        // admission path, so the fixture must not consume any of its budget.
+        let toks = vec![u32::MAX, u32::MAX - 1, u32::MAX - 2, u32::MAX - 3];
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &toks, &[], 0, 0);
+        let mut wedge = block(key);
+        wedge.tokens = toks;
+        assert!(
+            manager.sender.try_send(WriteJob::Block(wedge)).is_ok(),
+            "the wedge job must fit an empty queue"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !parked.load(Ordering::Relaxed) {
+            assert!(
+                Instant::now() < deadline,
+                "the writer never reached the commit dir-sync the wedge installs"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         release
     }
 
@@ -5136,7 +5248,15 @@ mod tests {
         let root = temp_root("wedged-writer");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
         let release = slow_writer(&manager, 2_000);
-        saturate(&manager, 2);
+        // Exactly the depth, which is only true because `slow_writer` returned
+        // with the writer already parked. A writer still popping absorbs one of
+        // these and leaves a slot free behind the "full" queue, and the refusal
+        // below then never happens.
+        assert_eq!(
+            saturate(&manager, 2),
+            2,
+            "the queue must be full at its depth before the deadline is measured"
+        );
 
         let deadline_ms = 100u64;
         let key = ColdCacheKey::chain(
@@ -6166,7 +6286,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn writer_commit_rename_failure_counts_drop_and_removes_temp() {
+    fn writer_commit_rename_failure_counts_write_error_and_removes_temp() {
         let root = temp_root("commit-rename-failure");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
         let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
@@ -6176,15 +6296,20 @@ mod tests {
 
         assert!(manager.enqueue(block(key)).unwrap());
         for _ in 0..200 {
-            if manager.stats().queue_drops >= 1 {
+            if manager.stats().write_errors >= 1 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let stats = manager.stats();
         assert_eq!(
-            stats.queue_drops, 1,
+            stats.write_errors, 1,
             "a failed commit rename must be counted, not silently discarded"
+        );
+        assert_eq!(
+            stats.queue_drops, 0,
+            "the queue accepted this write, so it is not a queue drop: \
+             `queue_drops` is admission refusals only"
         );
         assert_eq!(stats.bytes_written, 0);
         assert!(!manager.contains(&key));
@@ -6201,6 +6326,127 @@ mod tests {
         assert!(path.is_dir() && path.join("marker.txt").exists());
         drop(manager);
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A cache root the process cannot write to must be VISIBLE, not merely
+    /// survivable.
+    ///
+    /// The failure is induced for real — the root is chmod'ed 0500 after the
+    /// manager has opened it, so the writer's `openat(O_CREAT)` returns EACCES
+    /// from the kernel — rather than simulated through a hook, because the
+    /// thing under test is precisely that a genuine storage refusal reaches a
+    /// counter.
+    ///
+    /// Every other counter is asserted to stay at zero on purpose: that
+    /// all-zeros row IS the reported bug. An operator whose root was read-only
+    /// saw `queue_drops 0`, `corruptions 0`, `bytes_written 0`, an empty
+    /// stderr and a successful turn, which is indistinguishable from a healthy
+    /// cache that had nothing to write.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_root_counts_write_errors_instead_of_failing_silently() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("read-only-root");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 4).unwrap();
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+
+        // Revoke write permission on the root the manager already holds open.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let accepted = manager.enqueue(block(key)).unwrap();
+        let durable = manager.drain(std::time::Duration::from_secs(10));
+
+        let stats = manager.stats();
+        // Every observation is taken above and every assertion below, so that
+        // restoring write permission here cannot be unwound past by a failing
+        // assertion — that would leave an undeletable directory behind.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            accepted,
+            "the queue accepts the write; only the disk refuses it"
+        );
+        assert!(
+            !durable,
+            "a drain covering a failed write must report the failure"
+        );
+        assert_eq!(
+            stats.write_errors, 1,
+            "a write the disk refused must be counted exactly once"
+        );
+        assert_eq!(
+            stats.bytes_written, 0,
+            "no bytes landed, so no bytes may be credited"
+        );
+        assert_eq!(stats.enqueued, 1, "the queue did accept it");
+        assert_eq!(
+            stats.queue_drops, 0,
+            "the queue had room; this was not an admission refusal"
+        );
+        assert_eq!(stats.corruptions, 0, "nothing was written, nothing to read");
+        assert!(
+            !manager.contains(&key),
+            "a write that never landed must not be indexed as present"
+        );
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The reported operator scenario, reproduced: the cache root is removed
+    /// out from under a running process, and the next turn writes a sidecar.
+    ///
+    /// This is the test that settles what `bytes_written` means. It is
+    /// credited only after `write_all` + payload sync + commit rename +
+    /// directory fsync all return `Ok` (`persist_encoded`), so a root that no
+    /// longer exists produces zero bytes written and one write error — not,
+    /// as an enqueue-time estimate would, a healthy-looking byte total for
+    /// data that never reached the disk.
+    ///
+    /// Uses a sidecar rather than a block so the sidecar arm of the writer
+    /// loop is covered too; its `persist_sidecar` is a separate call site and
+    /// would otherwise be counted only by inspection.
+    #[cfg(unix)]
+    #[test]
+    fn a_deleted_root_counts_write_errors_and_credits_no_bytes() {
+        let root = temp_root("deleted-root");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 4).unwrap();
+        let key = ColdCacheKey::chain(
+            ColdGroup::GdnState,
+            fingerprint(),
+            None,
+            &[9, 9, 9, 9],
+            &[],
+            0,
+            0,
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+        assert!(
+            !root.exists(),
+            "the root is gone before the write is offered"
+        );
+
+        assert!(
+            manager
+                .enqueue_sidecar(sidecar(key, ColdGroup::GdnState))
+                .unwrap()
+        );
+        assert!(
+            !manager.drain(std::time::Duration::from_secs(10)),
+            "a drain covering a failed sidecar write must report the failure"
+        );
+
+        let stats = manager.stats();
+        assert_eq!(stats.write_errors, 1, "the write had nowhere to land");
+        assert_eq!(
+            stats.bytes_written, 0,
+            "`bytes_written` is landed bytes: a deleted root must credit none"
+        );
+        assert_eq!(stats.queue_drops, 0, "the queue was never full");
+        assert_eq!(stats.corruptions, 0);
+        assert!(!root.exists(), "nothing may recreate the root behind us");
+        drop(manager);
     }
 
     #[test]

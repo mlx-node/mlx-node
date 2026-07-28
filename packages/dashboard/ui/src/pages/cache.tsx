@@ -123,6 +123,13 @@ export default function Cache() {
         scope.unattributed.misses
       : 0;
   const corruptionsSeen = (health?.corruptionsTotal ?? 0) > 0 || (health?.corruptions ?? 0) > 0;
+  const writeErrorsSeen = (health?.writeErrorsTotal ?? 0) > 0 || (health?.writeErrors ?? 0) > 0;
+  // The two ways reuse is refused, summed for the hit-rate tile only: both end
+  // with the prefix recomputed, and at the tile's altitude the operator needs
+  // to know a refusal happened at all. The health card below keeps them apart,
+  // because the causes are unrelated (the walk found no backed boundary vs a
+  // family threw away a prefix it had).
+  const refusals = (health?.restoreDeclines ?? 0) + (health?.restoreSuppressed ?? 0);
 
   const runDelete = async (action: Exclude<PendingAction, null>): Promise<void> => {
     setBusy(true);
@@ -257,6 +264,12 @@ export default function Cache() {
                   <Skeleton className="h-4 w-32" />
                 ) : hasTrend ? (
                   `${formatCount(trendTotals.hits)} hits · ${formatCount(trendTotals.misses)} misses · this cache only`
+                ) : refusals > 0 ? (
+                  // A refused restore performs no lookup, so it lands as 0/0
+                  // and used to render as the empty state below — telling an
+                  // operator "nothing ran" when what happened was "reuse was
+                  // refused". Those are opposite diagnoses.
+                  `${formatCount(refusals)} restore${refusals === 1 ? '' : 's'} refused · no lookup was performed`
                 ) : (
                   'no lookups recorded for this cache'
                 )
@@ -416,8 +429,9 @@ export default function Cache() {
               <CardTitle className="text-base">Cold-tier health</CardTitle>
               <CardDescription>
                 Per-turn counters recorded against this cache root. Corruptions are a SUBSET of misses (a failed
-                validation always costs a miss), so never add the two. Writes, evictions and part of the drop count
-                advance on a background writer thread, making those totals approximate.
+                validation always costs a miss), so never add the two. Declines are NEITHER — a refused restore performs
+                no lookup, so it moves neither hits nor misses. Writes, evictions and write errors advance on a
+                background writer thread, making those totals approximate.
               </CardDescription>
             </CardHeader>
             <CardContent className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -441,6 +455,24 @@ export default function Cache() {
                 loading={cache.loading}
               />
               <HealthStat
+                label="Write errors"
+                value={formatNumber(health?.writeErrors ?? 0)}
+                hint={
+                  writeErrorsSeen
+                    ? `cumulative max ${formatNumber(health?.writeErrorsTotal ?? 0)} — the cache root is refusing writes`
+                    : 'none seen (writes are landing)'
+                }
+                icon={writeErrorsSeen ? ShieldAlert : ShieldCheck}
+                alarm={writeErrorsSeen}
+                loading={cache.loading}
+              />
+              <HealthStat
+                label="Restore declines"
+                value={formatNumber(health?.restoreDeclines ?? 0)}
+                hint={`${formatNumber(health?.restoreSuppressed ?? 0)} suppressed after restore · neither counts as a lookup`}
+                loading={cache.loading}
+              />
+              <HealthStat
                 label="Evictions"
                 value={formatNumber(health?.evictions ?? 0)}
                 hint="objects removed by quota pressure"
@@ -449,7 +481,7 @@ export default function Cache() {
               <HealthStat
                 label="Bytes restored"
                 value={formatBytes(trendTotals.bytesRestored)}
-                hint={`${formatBytes(trendTotals.bytesWritten)} written`}
+                hint={`${formatBytes(trendTotals.bytesWritten)} landed`}
                 loading={cache.loading}
               />
             </CardContent>

@@ -132,6 +132,8 @@ function coldSnapshot(base: number): ColdCacheStats {
     bytesRestored: base + 6,
     evictions: base + 7,
     corruptions: base + 8,
+    writeErrors: base + 9,
+    restoreDeclines: base + 10,
   };
 }
 
@@ -145,6 +147,7 @@ function sidecarSnapshot(base: number): ColdSidecarStats {
     enqueued: base + 15,
     queueDrops: base + 16,
     installed: base + 17,
+    restoreSuppressed: base + 18,
   };
 }
 
@@ -163,6 +166,8 @@ const EXPECTED_DELTAS: Record<string, number> = {
   coldBytesRestored: 105,
   coldEvictions: 106,
   coldCorruptions: 107,
+  coldWriteErrors: 115,
+  coldRestoreDeclines: 116,
   coldSidecarCaptureReached: 108,
   coldSidecarChainEmpty: 109,
   coldSidecarBoundarySkips: 110,
@@ -170,6 +175,7 @@ const EXPECTED_DELTAS: Record<string, number> = {
   coldSidecarEnqueued: 112,
   coldSidecarQueueDrops: 113,
   coldSidecarInstalled: 114,
+  coldSidecarRestoreSuppressed: 117,
 };
 
 /**
@@ -213,7 +219,7 @@ describe('cold-tier counters end to end', () => {
    * would see the provider's argument and pass even if `record()`'s allowlist
    * dropped every cold field on the floor — which is the exact bug that shipped.
    */
-  it('writes all fifteen per-turn deltas to the JSONL line', async () => {
+  it('writes all eighteen per-turn deltas to the JSONL line', async () => {
     let cold = coldSnapshot(1000);
     let sidecar = sidecarSnapshot(2000);
 

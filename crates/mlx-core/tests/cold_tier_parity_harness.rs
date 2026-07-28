@@ -753,6 +753,9 @@ fn sidecar_telemetry_delta(
         enqueued: after.enqueued.saturating_sub(before.enqueued),
         queue_drops: after.queue_drops.saturating_sub(before.queue_drops),
         installed: after.installed.saturating_sub(before.installed),
+        restore_suppressed: after
+            .restore_suppressed
+            .saturating_sub(before.restore_suppressed),
     }
 }
 
@@ -957,7 +960,8 @@ where
     let sidecar_delta = sidecar_telemetry_delta(&sidecar_before, &sidecar_after);
     eprintln!(
         "[{}] sidecar telemetry over instances 1+2: capture_reached={} chain_empty={} \
-         boundary_skips={} already_persisted={} enqueued={} queue_drops={} installed={}",
+         boundary_skips={} already_persisted={} enqueued={} queue_drops={} installed={} \
+         restore_suppressed={}",
         spec.family,
         sidecar_delta.capture_reached,
         sidecar_delta.chain_empty,
@@ -965,7 +969,8 @@ where
         sidecar_delta.already_persisted,
         sidecar_delta.enqueued,
         sidecar_delta.queue_drops,
-        sidecar_delta.installed
+        sidecar_delta.installed,
+        sidecar_delta.restore_suppressed
     );
 
     // ---- 1b-diagnostic. The ladder, printed BEFORE any assertion ----------
@@ -1093,9 +1098,15 @@ where
          which text parity alone cannot detect",
         spec.family, after.corruptions
     );
+    // `write_errors` and `restore_declines` are printed with the rest because
+    // they are the two that explain an otherwise contradictory row: a restart
+    // with `hits 0 / misses 0` is a REFUSED restore when `restore_declines`
+    // moved, and a "successful" capture that stored nothing is a broken cache
+    // root when `write_errors` moved. Neither had a number before.
     eprintln!(
         "[{}] cold stats after restart: hits={} misses={} enqueued={} queue_drops={} \
-         bytes_written={} bytes_restored={} evictions={} corruptions={}",
+         bytes_written={} bytes_restored={} evictions={} corruptions={} write_errors={} \
+         restore_declines={}",
         spec.family,
         after.hits,
         after.misses,
@@ -1104,7 +1115,9 @@ where
         after.bytes_written,
         after.bytes_restored,
         after.evictions,
-        after.corruptions
+        after.corruptions,
+        after.write_errors,
+        after.restore_declines
     );
 
     // ---- 2a. The restored sidecar was INSTALLED, not just read -----------
