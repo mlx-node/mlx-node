@@ -259,6 +259,16 @@ export function isPathOccupied(path: string): boolean {
  * symlink into an external directory and read its foreign marker, reporting that
  * link as downloader-owned — which would slip a foreign install past the ownership
  * preflight/publish guards (a wasted overwrite, or a false "done" through the link).
+ *
+ * The shape test is {@link readCompletion}, our FULL marker, not merely "carries a
+ * `files` array". This is the only gate between `POST /api/downloads` and a
+ * `rename(finalDir → backup)` + `rm(backup, { recursive: true })`: the route never
+ * parses `overwrite`, so all three guards on that path reduce to this one predicate.
+ * A `{"files":[]}` file is not something we ever wrote — the marker has been the same
+ * four fields since the first commit that emitted one — so accepting it authorized
+ * the destructive swap on a directory we do not own. Going through the same reader
+ * as every other ownership, identity and completeness check is also what stops those
+ * from drifting apart.
  */
 export function isDownloaderOwned(modelDir: string): boolean {
   try {
@@ -266,8 +276,7 @@ export function isDownloaderOwned(modelDir: string): boolean {
   } catch {
     return false;
   }
-  const marker = asObject(readMarkerFile(modelDir));
-  return marker !== undefined && Array.isArray(marker.files);
+  return readCompletion(modelDir) !== undefined;
 }
 
 /**

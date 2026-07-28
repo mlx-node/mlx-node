@@ -426,6 +426,25 @@ describe('isDownloaderOwned', () => {
     expect(isDownloaderOwned(owned)).toBe(true);
   });
 
+  it('is false for a regular marker that is not the full shape we write', () => {
+    // Ownership authorizes `rename(dir → backup)` + `rm(backup, {recursive:true})`,
+    // and it is the ONLY gate on that path — the download route never parses
+    // `overwrite`. The marker we write has carried the same four fields since the
+    // first commit that emitted one, so none of these is a directory of ours, and
+    // treating one as ours means deleting somebody else's checkpoint.
+    for (const [name, body] of [
+      ['files-only', '{"files":[]}'],
+      ['files-not-strings', '{"files":[1,2]}'],
+      ['partial-shape', '{"repo":"owner/repo","files":["config.json"]}'],
+      ['wrong-types', '{"repo":1,"revision":2,"completedAt":3,"files":[]}'],
+    ]) {
+      const dir = join(modelsDir, name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, DOWNLOAD_COMPLETE_MARKER), body);
+      expect([name, isDownloaderOwned(dir)]).toEqual([name, false]);
+    }
+  });
+
   // A LIVE symlink whose target is an EXTERNAL directory carrying a valid marker must
   // NOT read as owned: `readFileSync` follows the link and would otherwise report the
   // foreign install as ours, letting the download runner overwrite/report-done through

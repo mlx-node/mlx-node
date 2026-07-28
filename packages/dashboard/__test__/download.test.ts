@@ -975,6 +975,38 @@ describe('DownloadManager', () => {
     expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
   });
 
+  it('refuses a dir whose marker is not the full shape we write, and leaves it intact', async () => {
+    // Ownership is the ONLY gate between `POST /api/downloads` and
+    // `rename(finalDir → backup)` + `rm(backup, { recursive: true })`: the route
+    // never parses `overwrite`, so all three guards on that path reduce to this
+    // one predicate. It used to accept anything carrying a `files` array, and the
+    // marker we write has been the same four fields since the first commit that
+    // emitted one — so a bare `{"files":[]}` authorized destroying a directory
+    // that was never ours.
+    mkdirSync(finalDir(), { recursive: true });
+    writeFileSync(join(finalDir(), 'PRECIOUS.safetensors'), Buffer.alloc(4096, 0x7f));
+    writeFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), '{"files":[]}');
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
+
+    expect(
+      readFileSync(join(finalDir(), 'PRECIOUS.safetensors')),
+      'a marker carrying only `files` authorized the destructive publish swap',
+    ).toEqual(Buffer.alloc(4096, 0x7f));
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+    // And the catalog must agree, or the UI would keep offering the Install that
+    // the runner now refuses every time.
+    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.blockedByForeignDir).toBe(true);
+  });
+
   it('refuses to overwrite an unowned dir that races in between the ownership check and the swap', async () => {
     // finalDir is ABSENT at the first ownership check; an external process installs an
     // UNOWNED dir just before the swap (modeled by creating it when the marker is
