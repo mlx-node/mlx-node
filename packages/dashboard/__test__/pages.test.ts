@@ -20,6 +20,7 @@
 import { categoryLabels, truncateMiddle } from '@/lib/chart';
 import type {
   CacheResponse,
+  CacheScope,
   CatalogItem,
   CatalogResponse,
   ColdTierHealth,
@@ -28,6 +29,7 @@ import type {
   ModelsResponse,
   SessionDetailResponse,
   SessionMetricsResponse,
+  SessionRow,
   SessionsResponse,
   SessionTraceMetric,
   SessionTurnMetric,
@@ -37,6 +39,7 @@ import Metrics from '@/pages/metrics';
 import Models from '@/pages/models';
 import Overview from '@/pages/overview';
 import SessionDetail from '@/pages/session-detail';
+import Sessions from '@/pages/sessions';
 import { createElement } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
@@ -46,11 +49,15 @@ import { renderPage, stubChartMetrics, stubFetch, TICK_CHAR_PX, TICK_LINE_PX, ty
 const MIB = 1024 * 1024;
 
 /**
- * `health` is overridable field-by-field: it now carries eighteen counters, and
- * a test that must restate all of them to change one buries its own intent —
- * and quietly acquires a second meaning every time a counter is added.
+ * `health` and `scope` are overridable field-by-field: between them they carry
+ * two dozen counters, and a test that must restate all of them to change one
+ * buries its own intent — and quietly acquires a second meaning every time a
+ * counter is added.
  */
-type CacheFixtureOverrides = Omit<Partial<CacheResponse>, 'health'> & { health?: Partial<ColdTierHealth> };
+type CacheFixtureOverrides = Omit<Partial<CacheResponse>, 'health' | 'scope'> & {
+  health?: Partial<ColdTierHealth>;
+  scope?: Partial<CacheScope>;
+};
 
 /**
  * The reported shape that produced the original bug report: 136 KV blocks plus
@@ -88,6 +95,7 @@ function cacheFixture(overrides: CacheFixtureOverrides = {}): CacheResponse {
       otherRoots: { turns: 3, hits: 17, misses: 19 },
       unattributed: { turns: 0, hits: 0, misses: 0 },
       disabledTurns: 2,
+      unrootedSidecarCaptures: 0,
       ...overrides.scope,
     },
     health: {
@@ -398,6 +406,38 @@ describe('Cache page', () => {
     expect(text).not.toContain('every one re-derived by a full replay');
   });
 
+  /**
+   * The same zero, a different cause, and the one the dense-family reading
+   * hides. `record_capture_reached()` runs above the `adapter.cold_tier()`
+   * guard in every family's capture, so a hybrid turn under
+   * `--no-persist-cache` — or one whose tier failed to open — counts the
+   * capture and then carries no root for the scope to match. Those captures
+   * arrive as `scope.unrootedSidecarCaptures`, and reading "dense families keep
+   * no state outside the pool" off them names the wrong cause for the exact
+   * failure these counters were added to record.
+   */
+  it('does not read a hybrid capture that never got a tier as a dense family', async () => {
+    const text = await mount(
+      createElement(Cache),
+      {
+        '/cache': cacheFixture({
+          scope: { unrootedSidecarCaptures: 34 },
+          health: {
+            sidecarCaptureReached: 0,
+            sidecarChainEmpty: 0,
+            sidecarBoundarySkips: 0,
+            sidecarAlreadyPersisted: 0,
+            sidecarEnqueued: 0,
+            sidecarInstalled: 0,
+          },
+        }),
+      },
+      'mlx-paged-v1',
+    );
+    expect(text).toContain('34 ran with no cache attached');
+    expect(text).not.toContain('not reached — dense families keep no state outside the pool');
+  });
+
   // The sidecar queue counters are the sidecar SHARE of the object-scoped
   // numbers beside them (one admission bumps both), so the card must frame them
   // as a share and never as a second population a reader could add.
@@ -527,7 +567,7 @@ describe('Overview page', () => {
     };
     return {
       '/models': models,
-      '/sessions': sessions ?? { sessions: [], total: 0, tokens: 0 },
+      '/sessions': sessions ?? { sessions: [], total: 0, tokens: 0, cwds: [] },
       '/downloads': downloads,
       '/metrics/overview': metrics,
       '/cache': cache,
@@ -559,7 +599,7 @@ describe('Overview page', () => {
     // session directory it has ever indexed. The tile counted the three and then
     // captioned them with the two million, and the caption did not move when the
     // dashboard was pointed at a different --session-dir.
-    const sessions: SessionsResponse = { sessions: [], total: 3, tokens: 1_672 };
+    const sessions: SessionsResponse = { sessions: [], total: 3, tokens: 1_672, cwds: [] };
     const text = await mount(
       createElement(MemoryRouter, null, createElement(Overview)),
       overviewRoutes(cacheFixture(), sessions),
@@ -590,6 +630,73 @@ describe('Overview page', () => {
     expect(widths).toContain('99%');
     expect(widths).not.toContain('100%');
     expect(mounted.text()).toContain('>99% of 9.5 MB');
+  });
+});
+
+describe('Sessions page — the directory filter', () => {
+  const OLD_DIR = '/tmp/only-old';
+  const RECENT_DIR = '/tmp/recent';
+
+  /**
+   * Exactly what the server hands the page once the index outgrows the 500-row
+   * cap: a full page of rows from ONE directory, a `total` that says 501 matched,
+   * and a directory list naming the one whose sessions all fell off the page.
+   * A shorter fixture would not reach the footnote, which is the moment the page
+   * tells the user to reach older sessions with this very filter.
+   */
+  function truncatedList(): SessionsResponse {
+    const sessions: SessionRow[] = Array.from({ length: 500 }, (_, i) => ({
+      id: `new-${i}`,
+      path: `${RECENT_DIR}/new-${i}.jsonl`,
+      cwd: RECENT_DIR,
+      name: `Session ${i}`,
+      created: 10_000 + i,
+      modified: 10_000 + i,
+      messageCount: 1,
+      firstMessage: null,
+      models: [],
+      inputTokens: 0,
+      outputTokens: 0,
+    }));
+    return { sessions, total: 501, tokens: 0, cwds: [OLD_DIR, RECENT_DIR] };
+  }
+
+  /**
+   * Open a Radix select by its trigger's aria-label and read the option labels.
+   * The listbox is portalled to `document.body`, and the trigger opens on a
+   * primary MOUSE pointerdown — nothing else in Radix's handler qualifies.
+   */
+  async function openOptions(label: string): Promise<string[]> {
+    const trigger = [...mounted!.container.querySelectorAll('button')].find(
+      (b) => b.getAttribute('aria-label') === label,
+    );
+    expect(trigger).toBeDefined();
+    const { act } = await import('react');
+    await act(async () => {
+      trigger?.dispatchEvent(
+        new PointerEvent('pointerdown', { bubbles: true, button: 0, pointerId: 1, pointerType: 'mouse' }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(trigger?.getAttribute('aria-expanded')).toBe('true');
+    return [...document.body.querySelectorAll('[role="option"]')].map((o) => (o.textContent ?? '').trim());
+  }
+
+  it('offers every indexed directory, not only those on the page of rows it was served', async () => {
+    // The page's own footnote sends the user to this dropdown to reach older
+    // sessions. Building its options from the served rows makes that advice
+    // circular: the directories worth choosing are exactly the ones missing.
+    const text = await mount(
+      createElement(MemoryRouter, null, createElement(Sessions)),
+      { '/sessions': truncatedList() },
+      'Session 0',
+    );
+    expect(text).toContain('Showing the newest 500 of 501 matching sessions');
+    expect(text).not.toContain(OLD_DIR);
+
+    const options = await openOptions('Filter by directory');
+    expect(options).toContain(OLD_DIR);
+    expect(options).toContain(RECENT_DIR);
   });
 });
 

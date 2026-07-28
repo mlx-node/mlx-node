@@ -64,14 +64,6 @@ export default function Sessions() {
     return () => clearTimeout(handle);
   }, [query]);
 
-  // Unfiltered list drives the stable directory dropdown, independent of filters.
-  const allSessions = useJson<SessionsResponse>('/sessions');
-  const cwdOptions = useMemo(() => {
-    const set = new Set<string>();
-    for (const s of allSessions.data?.sessions ?? []) set.add(s.cwd);
-    return [...set].sort((a, b) => a.localeCompare(b));
-  }, [allSessions.data]);
-
   const path = useMemo(() => {
     const params = new URLSearchParams();
     if (debouncedQuery !== '') params.set('q', debouncedQuery);
@@ -84,9 +76,18 @@ export default function Sessions() {
 
   const sessions = useJson<SessionsResponse>(path);
 
+  // Served, not derived from the rows: the list is capped at 500, so a directory
+  // whose sessions are all older than the cap has no row to be read off — and it
+  // would vanish from the filter exactly when the footnote below tells the user
+  // to reach older sessions with it. The served list is also unfiltered, so
+  // picking a directory never hides the others.
+  const cwdOptions = useMemo(
+    () => [...(sessions.data?.cwds ?? [])].sort((a, b) => a.localeCompare(b)),
+    [sessions.data],
+  );
+
   const refresh = (): void => {
     sessions.reload();
-    allSessions.reload();
   };
 
   const submitRename = async (): Promise<void> => {

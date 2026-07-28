@@ -106,6 +106,14 @@ export interface SessionsResponse {
    * machine-wide `/metrics/overview`.
    */
   tokens: number;
+  /**
+   * Every directory the index holds, sorted — the source for the directory
+   * filter. Unfiltered by the request's own `cwd`/`q`/date params (the dropdown
+   * has to offer the way out of a filter too) and independent of `limit`, so a
+   * directory whose sessions all fall outside the returned page is still
+   * offerable.
+   */
+  cwds: string[];
 }
 
 /** One day's token totals from `GET /api/metrics/overview` `tokensByDay` (UTC day). */
@@ -224,6 +232,16 @@ export interface CacheScope {
   unattributed: CacheExcludedBucket;
   /** Turns that ran with the cold tier switched off (their deltas are all 0). */
   disabledTurns: number;
+  /**
+   * Sidecar captures recorded by turns carrying no root — the one counter the
+   * buckets above cannot report, because a tier-less turn has no hits or
+   * misses to put in one. `record_capture_reached()` is the first statement of
+   * every family's capture, above its `adapter.cold_tier()` guard, so a hybrid
+   * turn under `--no-persist-cache` or one whose tier failed to open still
+   * counts the capture. Kept out of {@link ColdTierHealth} because these turns
+   * name no cache root and `health` promises one.
+   */
+  unrootedSidecarCaptures: number;
 }
 
 /**

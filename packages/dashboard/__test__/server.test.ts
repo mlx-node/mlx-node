@@ -23,6 +23,7 @@ import { canonicalCacheRoot, coldTierRestoreFamilyList } from '@mlx-node/agent/c
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import { createDownloadSseSender, handleApiRequest, type ApiDeps } from '../src/api.js';
+import { openDashboardDb } from '../src/db/open.js';
 import { DownloadsClosedError, type DownloadEvent } from '../src/download.js';
 import { TRACE_RETENTION_DAYS } from '../src/ingest/traces.js';
 import { agentSessionsRoot } from '../src/paths.js';
@@ -1138,6 +1139,78 @@ describe('dashboard server — sessions', () => {
   });
 });
 
+// The Sessions page's directory dropdown must offer every indexed directory, not
+// only the ones that happen to appear on the page of rows it was served. The list
+// is capped at 500 rows, so a directory whose sessions are all older than that cap
+// would be missing from the dropdown — and the page's own footnote tells the user
+// to reach older sessions with exactly that filter. The fixture is deliberately
+// larger than the cap: below 501 rows nothing distinguishes the two.
+describe('dashboard server — session directories past the page cap', () => {
+  const OLD_DIR = '/tmp/only-old';
+  const NEW_DIR = '/tmp/recent';
+
+  /** Fake deps over an in-memory index holding one row past the 500-row page cap. */
+  function seededDeps(): { deps: ApiDeps; close: () => void } {
+    const dash = openDashboardDb(':memory:');
+    const insert = dash.sqlite.prepare(
+      'INSERT INTO sessions (id, path, cwd, name, created, modified, message_count) VALUES (?, ?, ?, NULL, ?, ?, 1)',
+    );
+    // One session in OLD_DIR, older than every other row, then 500 newer ones in
+    // NEW_DIR — exactly enough to push the old row off the served page.
+    insert.run('old-1', `${OLD_DIR}/old-1.jsonl`, OLD_DIR, 1_000, 1_000);
+    for (let i = 0; i < 500; i++) {
+      insert.run(`new-${i}`, `${NEW_DIR}/new-${i}.jsonl`, NEW_DIR, 10_000 + i, 10_000 + i);
+    }
+    return { deps: { dash } as unknown as ApiDeps, close: dash.close };
+  }
+
+  it('serves every indexed directory even when its sessions fall outside the served page', async () => {
+    const { deps, close } = seededDeps();
+    try {
+      const { res, captured } = fakeRes();
+      const handled = await handleApiRequest(
+        { method: 'GET' } as IncomingMessage,
+        res,
+        new URL('http://localhost/api/sessions'),
+        deps,
+      );
+      expect(handled).toBe(true);
+      const body = JSON.parse(captured.body) as { sessions: Array<{ cwd: string }>; total: number; cwds: string[] };
+
+      // The fixture really does exercise the cap: 501 matches, 500 rows served,
+      // and the old directory appears on none of them.
+      expect(body.total).toBe(501);
+      expect(body.sessions).toHaveLength(500);
+      expect(body.sessions.map((s) => s.cwd)).not.toContain(OLD_DIR);
+
+      // …yet the directory list, which the dropdown is built from, still names it.
+      expect(body.cwds).toContain(OLD_DIR);
+      expect(body.cwds).toContain(NEW_DIR);
+    } finally {
+      close();
+    }
+  });
+
+  it('keeps the directory list unfiltered so a chosen directory never hides the others', async () => {
+    const { deps, close } = seededDeps();
+    try {
+      const { res, captured } = fakeRes();
+      await handleApiRequest(
+        { method: 'GET' } as IncomingMessage,
+        res,
+        new URL(`http://localhost/api/sessions?cwd=${encodeURIComponent(NEW_DIR)}`),
+        deps,
+      );
+      const body = JSON.parse(captured.body) as { total: number; cwds: string[] };
+      expect(body.total).toBe(500);
+      // Narrowing to one directory must not strand the user there.
+      expect(body.cwds).toEqual([NEW_DIR, OLD_DIR].sort((a, b) => (a < b ? -1 : 1)));
+    } finally {
+      close();
+    }
+  });
+});
+
 // Finding 4: session-file symlink containment. Primary — a symlinked transcript
 // is never indexed, so its external id is simply unknown (404). Defense-in-depth
 // — a GET whose indexed path resolves outside the managed root (via a symlink
@@ -1656,6 +1729,7 @@ describe('dashboard server — cache trend scoping', () => {
       otherRoots: { turns: number; hits: number; misses: number };
       unattributed: { turns: number; hits: number; misses: number };
       disabledTurns: number;
+      unrootedSidecarCaptures: number;
     };
     health: {
       enqueued: number;
@@ -1792,8 +1866,21 @@ describe('dashboard server — cache trend scoping', () => {
       // No coldRoot AND no coldEnabled: written by a build that predates
       // attribution. Not "the tier was off" — genuinely unknown.
       { traceId: 'legacy-1', ts: Date.UTC(2026, 6, 19, 10), coldHits: 5000, coldMisses: 11 },
-      // Tier explicitly off this turn: known, attributable, and zero.
-      { traceId: 'disabled-1', ts: Date.UTC(2026, 6, 20, 12), coldHits: 0, coldMisses: 0, coldEnabled: false },
+      // Tier explicitly off this turn: known, attributable, and zero — for
+      // every BLOCK counter. The sidecar capture is the exception and the
+      // reason this row carries one: `record_capture_reached()` is the first
+      // statement of `capture_gemma4_sliding_cold_sidecar`, above its
+      // `adapter.cold_tier()` guard, so a hybrid turn under
+      // `--no-persist-cache` reaches the capture, counts it, and returns with
+      // no tier to name a root from.
+      {
+        traceId: 'disabled-1',
+        ts: Date.UTC(2026, 6, 20, 12),
+        coldHits: 0,
+        coldMisses: 0,
+        coldEnabled: false,
+        coldSidecarCaptureReached: 13,
+      },
       // The partition hole: tier ON, root NULL. Matches none of `cold_root = ?`,
       // `cold_root IS NULL AND cold_enabled IS NULL`, `cold_root <> ?`, or
       // `cold_enabled = 0` — so before the fourth bucket these 777 hits were
@@ -1804,6 +1891,7 @@ describe('dashboard server — cache trend scoping', () => {
         coldHits: 777,
         coldMisses: 5,
         coldEnabled: true,
+        coldSidecarCaptureReached: 21,
       },
     ]);
     await ingest();
@@ -1976,6 +2064,36 @@ describe('dashboard server — cache trend scoping', () => {
     expect(body.health.sidecarQueueDrops).toBe(6);
     // 4 + 8. MAX would say 8, and the unscoped total would say 812.
     expect(body.health.sidecarInstalled).toBe(12);
+  });
+
+  /**
+   * `captureReached` is the one sidecar counter that moves with NO tier in
+   * hand. `record_capture_reached()` is the first statement of every family's
+   * capture — `crates/mlx-core/src/models/gemma4/model.rs:2839` sits above the
+   * `adapter.cold_tier()` guard at `:2843`, and qwen3_5 (`:2118` vs `:2122`)
+   * and qwen3_5_moe (`:1497` vs `:1501`) are identical — so a hybrid turn run
+   * under `--no-persist-cache`, or one whose tier failed to open, counts the
+   * capture and then returns with no tier to name a root from. The writer only
+   * emits `coldRoot` for a tier that was open
+   * (`packages/agent/src/provider/index.ts:182`), so those turns land with a
+   * NULL root and the root-scoped `health` query drops them.
+   *
+   * Reported as its own figure rather than folded into `health`: the scoping
+   * exists so another cache's numbers never bleed into the shown one, and a
+   * rootless row has no cache to bleed FROM. Dropping it silently is what makes
+   * the page say "not reached — dense families" while the hybrid capture ran on
+   * every turn and failed before acquiring a tier — the exact state these
+   * counters were added to record.
+   */
+  it('reports sidecar captures that ran with no tier instead of dropping them', async () => {
+    const body = (await (await fetch(`${server.url}/api/cache`)).json()) as CacheBody;
+    // 13 (tier off) + 21 (tier on, root unrecorded). The rooted rows' 10 must
+    // NOT appear here, and the other root's 900 must not appear at all: a
+    // rootless bucket that leaked either would read 23 / 34+10 / 934.
+    expect(body.scope.unrootedSidecarCaptures).toBe(34);
+    // The mirror assertion, and the one that pins the fix as ADDITIVE: the
+    // shown cache's own figure stays exactly its two rooted rows.
+    expect(body.health.sidecarCaptureReached).toBe(10);
   });
 
   // TRACE_RETENTION_DAYS is exported precisely so the window the UI prints and

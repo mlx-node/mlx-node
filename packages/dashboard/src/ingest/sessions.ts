@@ -108,6 +108,35 @@ export function activeBranchEntries(entries: FileEntry[]): SessionEntry[] {
 }
 
 /**
+ * Whether every parsed record is a non-null object. A syntactically-valid but
+ * non-object line (`null`) is kept verbatim by `parseSessionEntries`, and pi's
+ * migrator dereferences records without guarding: `migrateToCurrentVersion`
+ * locates the header with `entries.find((e) => e.type === 'session')`, and
+ * `migrateV1ToV2`/`migrateV2ToV3` re-walk EVERY record. So a top-level `null`
+ * throws a TypeError from `migrateSessionEntries` whenever it sits before the
+ * header, or anywhere at all once the header is legacy (v1/v2) or missing — the
+ * `find` short-circuit only protects a current-version file whose header is the
+ * first record. `isValidSessionTopology` rejects such a record too, but it needs
+ * the ids migration assigns and so can only run afterwards; screen with this
+ * first so the migrator is never handed a record it will dereference and throw on.
+ */
+function hasOnlyObjectRecords(entries: FileEntry[]): boolean {
+  for (const entry of entries) {
+    if (entry === null || typeof entry !== 'object') return false;
+  }
+  return true;
+}
+
+/** The session header, tolerating the non-object records pi's parser keeps verbatim. */
+function findSessionHeader(entries: FileEntry[]): SessionHeader | undefined {
+  for (const entry of entries) {
+    if (entry === null || typeof entry !== 'object') continue;
+    if (entry.type === 'session') return entry as SessionHeader;
+  }
+  return undefined;
+}
+
+/**
  * Whether the session entry tree is safe to project. pi's branch walker follows
  * `parentId` from the leaf to a root with no visited-set, so a self-parented
  * entry, a multi-entry cycle, or a duplicate id (which aliases an ancestor) grows
@@ -126,9 +155,11 @@ export function isValidSessionTopology(entries: FileEntry[]): boolean {
   // forever. Reject the whole file's topology BEFORE any `.type`/`.id` access so the
   // caller routes it into the existing topology-quarantine branch (removing the
   // rows), and so the downstream `activeBranchEntries`/`deriveSession` projections
-  // — which would throw the same way — are never reached.
+  // — which would throw the same way — are never reached. This guard runs only
+  // after migration (it needs the ids that assigns), so callers must ALSO screen
+  // with `hasOnlyObjectRecords` first — pi's migrator derefs the same records.
+  if (!hasOnlyObjectRecords(entries)) return false;
   for (const entry of entries) {
-    if (entry === null || typeof entry !== 'object') return false;
     // A message entry whose `message` payload is itself a non-object (`null`, a
     // scalar) passes the object check above but throws on the downstream
     // `msg.role`/`msg.content` deref in `deriveSession`/`mapTranscriptEntry`. That
@@ -261,11 +292,16 @@ export function lastLineParses(raw: string): boolean {
  * of a v1 or partially-corrupt session cannot persist the migration or drop
  * malformed lines the way `SessionManager.open` (which opens for write) would.
  * Read/parse errors propagate to the caller.
+ *
+ * A file carrying a non-object record is returned UNMIGRATED rather than throwing
+ * out of pi's migrator: the caller gates on `isValidSessionTopology`, which rejects
+ * it and reports the same "invalid session tree" verdict ingest does, instead of
+ * surfacing a raw TypeError as the transcript error.
  */
 export function readSessionEntries(path: string): FileEntry[] {
   const raw = readFileSync(path, 'utf8');
   const entries = parseSessionEntries(raw);
-  migrateSessionEntries(entries);
+  if (hasOnlyObjectRecords(entries)) migrateSessionEntries(entries);
   return entries;
 }
 
@@ -303,7 +339,7 @@ export function classifySessionFile(
   } catch {
     return 'unverifiable';
   }
-  const header = entries.find((e) => e.type === 'session') as SessionHeader | undefined;
+  const header = findSessionHeader(entries);
   if (header === undefined) return 'unverifiable';
   return header.id === expectedId ? 'matches' : 'different';
 }
@@ -481,11 +517,16 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
       // Migrate in place (v1→v3) before validating or deriving. This assigns
       // id/parentId in memory only (no disk write) and never changes the entry
       // count, so the `countJsonlLines` completeness check below still holds.
-      migrateSessionEntries(entries);
+      // The migrator itself derefs records unguarded, and it runs before the
+      // topology guard can reject a non-object one, so screen for that here —
+      // otherwise the TypeError lands in the per-file catch below, which only
+      // warns, and the file keeps its stale rows on every later scan.
+      const migratable = hasOnlyObjectRecords(entries);
+      if (migratable) migrateSessionEntries(entries);
 
       // Quarantine a topologically broken tree (cycle / duplicate ids) BEFORE any
       // branch projection: the walker would otherwise loop unbounded and OOM.
-      if (!isValidSessionTopology(entries)) {
+      if (!migratable || !isValidSessionTopology(entries)) {
         warnings.push(`${filePath}: invalid session tree (cycle, duplicate id, or non-object message); skipped`);
         if (quarantinePath(filePath)) removed++;
         continue;

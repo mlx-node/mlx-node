@@ -152,6 +152,13 @@ export default function Cache() {
   // state (nothing enqueued because the FIRST turn wrote the chain every later
   // turn re-selects) carries the identical signature.
   const sidecarStranded = sidecarCaptures > 0 && sidecarWritten === 0 && sidecarPersisted === 0;
+  // Captures that ran against NO cache root. The recorder sits above the
+  // capture's `adapter.cold_tier()` guard, so a hybrid turn with persistence
+  // off — or one whose tier failed to open — counts one and then carries no
+  // root for the scope to match. Reading that zero as "dense family" names the
+  // wrong cause for the one state these counters exist to catch, so it takes
+  // the hint over.
+  const sidecarUnrooted = scope?.unrootedSidecarCaptures ?? 0;
 
   const runDelete = async (action: Exclude<PendingAction, null>): Promise<void> => {
     setBusy(true);
@@ -499,14 +506,18 @@ export default function Cache() {
                 The write side of the family state that lives OUTSIDE the paged
                 pool. Only the hybrid families enter this capture, so a zero
                 beside real block traffic is the normal dense-model reading and
-                deliberately wears no alarm.
+                deliberately wears no alarm — but only once the rootless
+                captures are known to be zero too, since a hybrid that never got
+                a tier produces the same zero here for the opposite reason.
               */}
               <HealthStat
                 label="Sidecar captures"
                 value={formatNumber(sidecarCaptures)}
                 hint={
                   sidecarCaptures === 0
-                    ? 'not reached — dense families keep no state outside the pool'
+                    ? sidecarUnrooted > 0
+                      ? `${formatNumber(sidecarUnrooted)} ran with no cache attached — persistence off, or the tier never opened`
+                      : 'not reached — dense families keep no state outside the pool'
                     : sidecarStranded
                       ? 'nothing written and nothing on disk — no prefix can restore state'
                       : `${formatNumber(sidecarWritten)} written · ${formatNumber(sidecarPersisted)} already on disk · ${formatNumber(sidecarNoAnchor)} found no anchor`

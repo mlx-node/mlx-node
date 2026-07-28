@@ -1319,4 +1319,119 @@ describe('ingestSessions', () => {
 
     rmSync(soloBase, { recursive: true, force: true });
   });
+
+  // The test above pins only the case where the header is the FIRST record and is
+  // already at the current version: pi's migrator locates the header with
+  // `entries.find((e) => e.type === 'session')`, which short-circuits at index 0 and
+  // never dereferences a later `null`. That short-circuit does NOT generalize. A
+  // `null` positioned BEFORE the header is dereferenced by that same `find`, and a
+  // legacy (v1) header makes `migrateV1ToV2` re-walk EVERY record — so a `null`
+  // anywhere throws. Both throw a TypeError from `migrateSessionEntries` BEFORE
+  // `isValidSessionTopology` can reject the file, landing in the per-file catch that
+  // only warns — leaving the stale session and turn rows to feed the overview on
+  // every later scan. Each shape must reach the quarantine branch instead.
+  const preHeaderNullShapes: { name: string; build: (id: string) => string }[] = [
+    {
+      name: 'a null record before the header',
+      build: (id) =>
+        `null\n${JSON.stringify({ type: 'session', version: 3, id, timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' })}\n`,
+    },
+    {
+      name: 'a legacy v1 header followed by a null record',
+      build: (id) =>
+        `${JSON.stringify({ type: 'session', id, timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' })}\nnull\n`,
+    },
+  ];
+
+  for (const shape of preHeaderNullShapes) {
+    it(`quarantines stale rows when a file is swapped to ${shape.name}`, async () => {
+      const soloBase = mkdtempSync(join(tmpdir(), 'dash-null-premigrate-'));
+      const root = join(soloBase, 'sessions');
+      const file = writeSessionFile(soloBase, 's.jsonl', [
+        { type: 'session', version: 3, id: 'pm-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' },
+        {
+          type: 'message',
+          id: 'u1',
+          parentId: null,
+          timestamp: '2026-07-01T10:00:01.000Z',
+          message: { role: 'user', content: 'hi' },
+        },
+        {
+          type: 'message',
+          id: 'a1',
+          parentId: 'u1',
+          timestamp: '2026-07-01T10:00:02.000Z',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'yo' }],
+            model: 'qwen3_5',
+            usage: { input: 5, output: 6 },
+          },
+        },
+      ]);
+      await ingestSessions(dash, root);
+      expect(dash.db.select().from(sessions).where(eq(sessions.id, 'pm-1')).all()).toHaveLength(1);
+      expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'pm-1')).all()).toHaveLength(1);
+
+      writeFileSync(file, shape.build('pm-1'));
+      const later = Date.now() / 1000 + 5;
+      utimesSync(file, later, later);
+
+      const res = await ingestSessions(dash, root);
+      // The stale session AND its token turns are REMOVED, not retained forever.
+      expect(dash.db.select().from(sessions).where(eq(sessions.id, 'pm-1')).all()).toHaveLength(0);
+      expect(dash.db.select().from(turns).where(eq(turns.sessionId, 'pm-1')).all()).toHaveLength(0);
+      expect(res.removed).toBe(1);
+      // Routed through the topology quarantine, NOT past every branch into the
+      // per-file catch (whose warning would carry the raw TypeError text).
+      expect(res.warnings.some((w) => /cycle|duplicate|invalid session tree/i.test(w))).toBe(true);
+      expect(res.warnings.some((w) => /Cannot read properties of null/i.test(w))).toBe(false);
+
+      rmSync(soloBase, { recursive: true, force: true });
+    });
+  }
+
+  // The delete/rename guards find the header with the same unguarded `.type` deref,
+  // which a record before the header throws on — escaping both handlers. The header
+  // is still readable, parseable and present, so the documented verdict is the
+  // ownership answer ('matches'/'different'), NOT 'unverifiable': a session with one
+  // corrupt line must stay deletable rather than 409 forever.
+  it('classifySessionFile reads past a null record before the header', () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-null-classify-'));
+    const dir = join(soloBase, 'sessions', '--w--');
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, 's.jsonl');
+    writeFileSync(
+      file,
+      `null\n${JSON.stringify({ type: 'session', version: 3, id: 'cf-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' })}\n`,
+    );
+
+    expect(classifySessionFile(file, 'cf-1')).toBe('matches');
+    expect(classifySessionFile(file, 'cf-other')).toBe('different');
+    expect(verifySessionFileId(file, 'cf-1')).toBe(true);
+    expect(verifySessionFileId(file, 'cf-other')).toBe(false);
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
+
+  // The read-only detail path migrates too. A non-object record must not surface as
+  // a raw TypeError; the entries come back unmigrated so the caller's topology guard
+  // produces the same "invalid session tree" verdict ingest reports.
+  it('readSessionEntries returns non-object records instead of throwing from the migrator', () => {
+    const soloBase = mkdtempSync(join(tmpdir(), 'dash-null-read-'));
+    const dir = join(soloBase, 'sessions', '--w--');
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, 's.jsonl');
+    writeFileSync(
+      file,
+      `null\n${JSON.stringify({ type: 'session', version: 3, id: 'rd-1', timestamp: '2026-07-01T10:00:00.000Z', cwd: '/w' })}\n`,
+    );
+
+    const entries = readSessionEntries(file);
+    expect(entries).toHaveLength(2);
+    expect(entries[0]).toBeNull();
+    expect(isValidSessionTopology(entries)).toBe(false);
+
+    rmSync(soloBase, { recursive: true, force: true });
+  });
 });

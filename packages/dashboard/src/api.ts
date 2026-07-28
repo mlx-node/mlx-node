@@ -525,6 +525,28 @@ function handleSessionsList({ res, url, deps }: RouteCtx): void {
     )
     .get(...args, ...args) as { inputTokens: unknown; outputTokens: unknown } | undefined;
   const tokens = toInt(tokenTotals?.inputTokens) + toInt(tokenTotals?.outputTokens);
+
+  // Every directory the index holds — deliberately UNFILTERED, and deliberately
+  // served rather than left to the client.
+  //
+  // The Sessions page builds its directory dropdown from this. Deriving it from
+  // the rows instead cannot work: the page above is capped at `limit`, so a
+  // directory whose sessions are all older than the cap has no row to be read
+  // off, and it silently disappears from the filter — at exactly the moment the
+  // page's own footnote ("narrow with the directory filter to reach older ones")
+  // sends the user there, since that footnote only appears once `total` exceeds
+  // the page. The same defect `tokens` above exists to prevent: a number the
+  // client cannot compute from what it was handed must come from the server.
+  //
+  // Unfiltered because the dropdown is the way OUT of a filter as well as in.
+  // Scoping it to the current `where` would leave a chosen directory as the only
+  // option it lists, so the user could never switch to another one.
+  const cwds = (
+    deps.dash.sqlite.prepare('SELECT DISTINCT cwd FROM sessions ORDER BY cwd').all() as Array<{
+      cwd: unknown;
+    }>
+  ).map((row) => String(row.cwd));
+
   const rows = deps.dash.sqlite.prepare(sql).all(...args, limit, offset);
   const list = rows.map((row) => ({
     id: String(row.id),
@@ -539,7 +561,7 @@ function handleSessionsList({ res, url, deps }: RouteCtx): void {
     inputTokens: toInt(row.inputTokens),
     outputTokens: toInt(row.outputTokens),
   }));
-  sendJson(res, 200, { sessions: list, total, tokens });
+  sendJson(res, 200, { sessions: list, total, tokens, cwds });
 }
 
 function lookupSession(deps: ApiDeps, id: string): { path: string; row: typeof sessions.$inferSelect } | null {
@@ -1354,6 +1376,19 @@ function handleMetricsOverview({ res, url, deps }: RouteCtx): void {
  *    the restore allowlist). Their deltas are all zero, so they are counted but
  *    carry no lookups. Overlaps the buckets above by design: it is a TURN
  *    count, not a lookup bucket.
+ *  - `unrootedSidecarCaptures` — the one delta a rootless turn can still carry,
+ *    and the reason "their deltas are all zero" is true of the BLOCK counters
+ *    only. `record_capture_reached()` is the first statement of every family's
+ *    sidecar capture, above its `adapter.cold_tier()` guard
+ *    (`crates/mlx-core/src/models/gemma4/model.rs:2839` vs `:2843`, and the
+ *    same shape in qwen3_5 and qwen3_5_moe), so a hybrid turn with persistence
+ *    off — or one whose tier failed to open — counts the capture and then
+ *    returns with no tier to name a root from. Summed here rather than folded
+ *    into `health`: `health` means "against the root above", and these rows
+ *    name no root, so the root scoping cannot be widened to reach them without
+ *    also letting `otherRoots` in. Dropping them is what let the page report
+ *    "not reached — dense families" over a hybrid capture that ran every turn
+ *    and failed before it acquired a tier.
  *
  * `health` carries the counters that are NOT lookups, and therefore cannot be
  * read off the hit rate at all:
@@ -1423,7 +1458,9 @@ function handleCacheGet({ res, deps }: RouteCtx): void {
                            THEN cold_hits END), 0) AS unattributedHits,
          COALESCE(SUM(CASE WHEN cold_root IS NULL AND cold_enabled IS NOT NULL AND cold_enabled <> 0
                            THEN cold_misses END), 0) AS unattributedMisses,
-         COUNT(CASE WHEN cold_enabled = 0 THEN 1 END) AS disabledTurns
+         COUNT(CASE WHEN cold_enabled = 0 THEN 1 END) AS disabledTurns,
+         COALESCE(SUM(CASE WHEN cold_root IS NULL THEN cold_sidecar_capture_reached END), 0)
+           AS unrootedSidecarCaptures
        FROM traces WHERE ts > 0`,
     )
     .get(scopeRoot, scopeRoot, scopeRoot);
@@ -1478,6 +1515,13 @@ function handleCacheGet({ res, deps }: RouteCtx): void {
         misses: toInt(excluded?.unattributedMisses),
       },
       disabledTurns: toInt(excluded?.disabledTurns),
+      // The one counter above that keeps moving after the root is gone, so the
+      // one the buckets above cannot stand in for: they carry hits and misses,
+      // and a tier-less turn has neither. Reported here rather than merged into
+      // `health` because `health` means "this cache root", and these rows name
+      // no root at all — merging them would put numbers from a run that never
+      // touched the shown cache under a heading that promises it did.
+      unrootedSidecarCaptures: toInt(excluded?.unrootedSidecarCaptures),
     },
     health: {
       enqueued: toInt(health?.enqueued),
