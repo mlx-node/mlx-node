@@ -193,16 +193,20 @@ export default function Sessions() {
               {filtersActive ? 'No sessions match these filters.' : 'No sessions recorded yet.'}
             </div>
           ) : (
-            <Table>
+            // Fixed layout with proportional columns: every cell truncates instead of
+            // widening the table past the card, which used to hide the four right-hand
+            // columns behind a horizontal scroll. The outer cells carry the card's own
+            // 24px gutter so full-bleed row separators still line up with the footnote.
+            <Table className="table-fixed">
               <TableHeader>
                 <TableRow>
-                  <TableHead>Session</TableHead>
-                  <TableHead>Directory</TableHead>
-                  <TableHead>Models</TableHead>
-                  <TableHead className="text-right">Modified</TableHead>
-                  <TableHead className="text-right">Messages</TableHead>
-                  <TableHead className="text-right">Tokens</TableHead>
-                  <TableHead className="w-0" />
+                  <TableHead className="w-[50%] pl-6 lg:w-[40%] xl:w-[34%] 2xl:w-[30%]">Session</TableHead>
+                  <TableHead className="hidden xl:table-cell xl:w-[17%] 2xl:w-[14%]">Directory</TableHead>
+                  <TableHead className="hidden lg:table-cell lg:w-[21%] xl:w-[20%] 2xl:w-[14%]">Models</TableHead>
+                  <TableHead className="w-[24%] text-right lg:w-[17%] xl:w-[13%] 2xl:w-[11%]">Modified</TableHead>
+                  <TableHead className="hidden text-right 2xl:table-cell 2xl:w-[9%]">Messages</TableHead>
+                  <TableHead className="hidden text-right 2xl:table-cell 2xl:w-[8%]">Tokens</TableHead>
+                  <TableHead className="w-[26%] pr-6 lg:w-[22%] xl:w-[16%] 2xl:w-[14%]" />
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -307,7 +311,7 @@ function SessionTableRow({ session, onRename, onDelete }: SessionTableRowProps) 
 
   return (
     <TableRow>
-      <TableCell className="max-w-[24rem]">
+      <TableCell className="pl-6">
         <Link
           to={`/sessions/${encodeURIComponent(session.id)}`}
           className="block truncate font-medium hover:underline"
@@ -316,28 +320,34 @@ function SessionTableRow({ session, onRename, onDelete }: SessionTableRowProps) 
           {sessionTitle(session)}
         </Link>
       </TableCell>
-      <TableCell className="text-muted-foreground max-w-[16rem]">
+      <TableCell className="text-muted-foreground hidden xl:table-cell">
         <span className="block truncate font-mono text-xs" title={session.cwd}>
           {session.cwd}
         </span>
       </TableCell>
-      <TableCell>
-        <div className="flex flex-wrap items-center gap-1">
+      <TableCell className="hidden lg:table-cell">
+        <div className="flex items-center gap-1">
           {shownModels.map((model) => (
-            <Badge key={model} variant="secondary" className="font-normal">
-              {model}
+            // `shrink` overrides the badge's own `shrink-0`: a model name is long and
+            // this column is proportional, so the badge has to give before the cell does.
+            <Badge key={model} variant="secondary" className="min-w-0 shrink font-normal" title={model}>
+              <span className="truncate">{model}</span>
             </Badge>
           ))}
-          {extraModels > 0 && <span className="text-muted-foreground text-xs">+{extraModels}</span>}
+          {extraModels > 0 && <span className="text-muted-foreground shrink-0 text-xs">+{extraModels}</span>}
           {session.models.length === 0 && <span className="text-muted-foreground text-xs">—</span>}
         </div>
       </TableCell>
-      <TableCell className="text-muted-foreground text-right whitespace-nowrap">
+      <TableCell className="text-muted-foreground truncate text-right">
         {formatRelativeTime(session.modified)}
       </TableCell>
-      <TableCell className="text-right tabular-nums">{formatNumber(session.messageCount)}</TableCell>
-      <TableCell className="text-right tabular-nums">{tokens > 0 ? formatCount(tokens) : '—'}</TableCell>
-      <TableCell className="text-right">
+      <TableCell className="hidden text-right tabular-nums 2xl:table-cell">
+        {formatNumber(session.messageCount)}
+      </TableCell>
+      <TableCell className="hidden text-right tabular-nums 2xl:table-cell">
+        {tokens > 0 ? formatCount(tokens) : '—'}
+      </TableCell>
+      <TableCell className="pr-6 text-right">
         <div className="flex justify-end gap-0.5">
           <RowAction label="Copy resume command" onClick={() => copyResume(session)}>
             <Copy className="size-4" />
