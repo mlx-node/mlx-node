@@ -231,7 +231,18 @@ export type DownloadEvent =
       type: 'progress';
       id: string;
       file: string;
+      /** Bytes of THIS file so far. */
       receivedBytes: number;
+      /**
+       * Bytes of the WHOLE job so far — every already-finished file plus this
+       * one. Absolute, not a delta, because the frame has to stand alone: only
+       * the latest `progress` is replayed on attach (and the SSE sender
+       * coalesces a backlog down to that same one frame), so a subscriber that
+       * joins mid-download never witnesses the finished files' frames and
+       * cannot recover the job total by summing what it received.
+       */
+      jobReceivedBytes: number;
+      /** Size of THIS file; the job total travels on the `start` frame. */
       totalBytes: number;
       fileIndex: number;
       fileCount: number;
@@ -519,6 +530,11 @@ export class DownloadManager {
    * mid-download subscriber learns the job `totalBytes`/`fileCount` and renders an
    * aggregate byte bar instead of coarse file-index progress), then the most recent
    * event — skipping the duplicate when `start` IS the most recent.
+   *
+   * Those two frames are the WHOLE picture, which is why a `progress` frame
+   * states `jobReceivedBytes` outright: the finished files' frames are gone by
+   * then, so a subscriber that tried to add up what it received would report
+   * only the file in flight.
    */
   subscribe(id: string, fn: (event: DownloadEvent) => void): () => void {
     const start = this.startEvent.get(id);
@@ -569,6 +585,7 @@ export class DownloadManager {
             id: job.id,
             file: file.filePath,
             receivedBytes: file.received,
+            jobReceivedBytes: job.receivedBytes,
             totalBytes: file.fileSize,
             fileIndex: file.fileIndex,
             fileCount: file.fileCount,
@@ -772,7 +789,7 @@ export class DownloadManager {
         if (await isStagedCopyComplete(destPath, file)) {
           const fileBytes = file.size > 0 ? file.size : 0;
           job.receivedBytes = jobBaseBytes + fileBytes;
-          this.emitFileProgress(job.id, file.path, fileBytes, file.size, index, files.length);
+          this.emitFileProgress(job, file.path, fileBytes, file.size, index, files.length);
           continue;
         }
 
@@ -787,7 +804,7 @@ export class DownloadManager {
         // cache hit or a metadata-only response streamed nothing.
         const fileBytes = file.size > 0 ? file.size : context.received;
         job.receivedBytes = jobBaseBytes + fileBytes;
-        this.emitFileProgress(job.id, file.path, fileBytes, file.size, index, files.length);
+        this.emitFileProgress(job, file.path, fileBytes, file.size, index, files.length);
       }
 
       // A cancel issued after the fetch loop must still unwind here — before the
@@ -1095,14 +1112,28 @@ export class DownloadManager {
     await rm(backupDir, { recursive: true, force: true });
   }
 
+  /**
+   * Settle one file at its final size. Takes the JOB (not just its id) so the
+   * frame carries the job aggregate the caller just advanced — the running
+   * total is the only part a mid-download subscriber cannot reconstruct.
+   */
   private emitFileProgress(
-    id: string,
+    job: JobState,
     file: string,
     receivedBytes: number,
     totalBytes: number,
     fileIndex: number,
     fileCount: number,
   ): void {
-    this.emit({ type: 'progress', id, file, receivedBytes, totalBytes, fileIndex, fileCount });
+    this.emit({
+      type: 'progress',
+      id: job.id,
+      file,
+      receivedBytes,
+      jobReceivedBytes: job.receivedBytes,
+      totalBytes,
+      fileIndex,
+      fileCount,
+    });
   }
 }

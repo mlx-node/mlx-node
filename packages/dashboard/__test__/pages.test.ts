@@ -24,6 +24,7 @@ import type {
   CatalogItem,
   CatalogResponse,
   ColdTierHealth,
+  DownloadJob,
   DownloadsResponse,
   MetricsOverviewResponse,
   ModelsResponse,
@@ -42,7 +43,8 @@ import SessionDetail from '@/pages/session-detail';
 import Sessions from '@/pages/sessions';
 import { createElement } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { afterEach, describe, expect, it } from 'vite-plus/test';
+import { toast } from 'sonner';
+import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { renderPage, stubChartMetrics, stubFetch, TICK_CHAR_PX, TICK_LINE_PX, type RenderedPage } from './render.js';
 
@@ -978,13 +980,15 @@ describe('Session detail page', () => {
 });
 
 describe('Models page — the Install affordance', () => {
-  function catalogRoutes(item: Partial<CatalogItem>): Record<string, unknown> {
+  const REPO = 'Brooooooklyn/Qwen3.6-27B-NVFP4-mlx';
+
+  function catalogRoutes(item: Partial<CatalogItem>, jobs: DownloadJob[] = []): Record<string, unknown> {
     const models: ModelsResponse = { models: [], warnings: [], dir: '/models' };
     const catalog: CatalogResponse = {
       items: [
         {
           label: 'Qwen3.6-27B',
-          hfRepo: 'Brooooooklyn/Qwen3.6-27B-NVFP4-mlx',
+          hfRepo: REPO,
           sizeGb: 22.2,
           description: 'Best tool use',
           slug: 'qwen3.6-27b-nvfp4-mlx',
@@ -995,7 +999,7 @@ describe('Models page — the Install affordance', () => {
         },
       ],
     };
-    const downloads: DownloadsResponse = { jobs: [] };
+    const downloads: DownloadsResponse = { jobs };
     return { '/models': models, '/catalog': catalog, '/downloads': downloads };
   }
 
@@ -1003,6 +1007,75 @@ describe('Models page — the Install affordance', () => {
   function buttonLabels(): string[] {
     return Array.from(mounted!.container.querySelectorAll('button')).map((b) => (b.textContent ?? '').trim());
   }
+
+  function downloadJob(overrides: Partial<DownloadJob>): DownloadJob {
+    return { id: 'job-1', repo: REPO, state: 'running', receivedBytes: 0, totalBytes: 1024, ...overrides };
+  }
+
+  /** URLs of every stream {@link stubEventSource} was asked to open. */
+  let openedStreams: string[] = [];
+  let restoreSse: (() => void) | undefined;
+
+  /**
+   * happy-dom ships no `EventSource`, and hydrating a running job mounts
+   * `DownloadProgress`, which opens one. The stand-in records the URL and
+   * delivers nothing: these tests assert what the page does with the job
+   * REGISTRY, not what the stream carries.
+   */
+  function stubEventSource(): void {
+    openedStreams = [];
+    const holder = globalThis as unknown as { EventSource?: unknown };
+    const previous = holder.EventSource;
+    holder.EventSource = class {
+      constructor(url: string) {
+        openedStreams.push(url);
+      }
+      addEventListener(): void {}
+      close(): void {}
+    };
+    restoreSse = () => {
+      holder.EventSource = previous;
+    };
+  }
+
+  /**
+   * Install the route stub behind a recorder. A dismiss has no rendered
+   * consequence on this page — it is a `DELETE` and nothing else — so these
+   * tests have to read the requests, not only the DOM.
+   */
+  function recordRequests(routes: Record<string, unknown>): Array<{ method: string; url: string }> {
+    restoreFetch = stubFetch(routes);
+    const stubbed = globalThis.fetch;
+    const calls: Array<{ method: string; url: string }> = [];
+    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      calls.push({ method: init?.method ?? 'GET', url });
+      return stubbed(input, init);
+    }) as typeof globalThis.fetch;
+    return calls;
+  }
+
+  /** Job ids the page asked the server to dismiss, in order. */
+  function dismissed(calls: Array<{ method: string; url: string }>): string[] {
+    return calls.filter((call) => call.method === 'DELETE').map((call) => call.url.replace('/api/downloads/', ''));
+  }
+
+  async function mountModels(): Promise<void> {
+    mounted = await renderPage(createElement(Models), (text) => text.includes('Qwen3.6-27B'));
+    // The hydration effect fires once `/downloads` lands, which is after the
+    // catalog text the settle condition waits on; give it and its requests room.
+    const { act } = await import('react');
+    for (let i = 0; i < 10; i++) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    }
+  }
+
+  afterEach(() => {
+    restoreSse?.();
+    restoreSse = undefined;
+  });
 
   it('offers Install for a recommended model that is simply absent', async () => {
     // The over-correction guard: the card must keep its button when the slug is
@@ -1026,5 +1099,76 @@ describe('Models page — the Install affordance', () => {
     await mount(createElement(Models), catalogRoutes({ present: true, installed: true }), 'Qwen3.6-27B');
     expect(buttonLabels()).toContain('Installed');
     expect(buttonLabels()).not.toContain('Install');
+  });
+
+  it('dismisses a job that settled while the page was unmounted, without a word', async () => {
+    // `DownloadProgress` sends the terminal DELETE, and it was not mounted when
+    // these jobs settled — so nothing dismissed them and the server registry
+    // keeps the rows for the life of the process, with the Overview tile
+    // reporting "1 completed" beside a model that is simply installed.
+    const failed = vi.spyOn(toast, 'error');
+    try {
+      const calls = recordRequests({
+        ...catalogRoutes({ present: true, installed: true }, [
+          downloadJob({ id: 'job-done', state: 'done' }),
+          downloadJob({ id: 'job-gone', state: 'cancelled' }),
+        ]),
+        '/downloads/job-done': { cancelled: true, id: 'job-done' },
+        '/downloads/job-gone': { cancelled: true, id: 'job-gone' },
+      });
+      await mountModels();
+      expect(dismissed(calls)).toEqual(['job-done', 'job-gone']);
+      // Both outcomes are already known to the user — the model is installed, the
+      // cancel was their own — so neither may raise a failure notice.
+      expect(failed.mock.calls).toEqual([]);
+      expect(buttonLabels()).toContain('Installed');
+    } finally {
+      failed.mockRestore();
+    }
+  });
+
+  it('says a download failed while the page was unmounted rather than dismissing it in silence', async () => {
+    // The failed job's only trace: the card reverts to a plain Install, exactly
+    // as if the download had never been started. Dismissing it without a word
+    // is the one terminal state that loses information the user cannot recover
+    // from anywhere else on the page.
+    const failed = vi.spyOn(toast, 'error');
+    try {
+      const calls = recordRequests({
+        ...catalogRoutes({}, [downloadJob({ id: 'job-bad', state: 'error' })]),
+        '/downloads/job-bad': { cancelled: true, id: 'job-bad' },
+      });
+      await mountModels();
+      expect(
+        failed.mock.calls.map((call) => [call[0], (call[1] as { description?: string } | undefined)?.description]),
+      ).toEqual([['Download failed', REPO]]);
+      expect(dismissed(calls)).toEqual(['job-bad']);
+      // …and the card is back at Install, ready for the retry.
+      expect(buttonLabels()).toContain('Install');
+    } finally {
+      failed.mockRestore();
+    }
+  });
+
+  it('still hydrates a running job, and never dismisses it', async () => {
+    // The over-correction guard. A dismiss loop that reaches a live job would
+    // cancel a multi-GB download that is still running.
+    stubEventSource();
+    const calls = recordRequests(catalogRoutes({}, [downloadJob({ id: 'job-run', state: 'running' })]));
+    await mountModels();
+    expect(openedStreams).toEqual(['/api/downloads/job-run/events']);
+    expect(buttonLabels()).toContain('Cancel');
+    expect(buttonLabels()).not.toContain('Install');
+    expect(dismissed(calls)).toEqual([]);
+  });
+
+  it('leaves a job that is mid-publish alone', async () => {
+    // `committing` is the brief non-cancellable publish window. It is not
+    // `running`, so a dismiss gated on `state !== "running"` fires a DELETE at a
+    // job that is still installing a model — which is why the gate is the
+    // terminal set instead.
+    const calls = recordRequests(catalogRoutes({}, [downloadJob({ id: 'job-commit', state: 'committing' })]));
+    await mountModels();
+    expect(dismissed(calls)).toEqual([]);
   });
 });

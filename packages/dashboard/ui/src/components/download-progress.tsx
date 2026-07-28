@@ -11,7 +11,10 @@ type DownloadEvent =
       type: 'progress';
       id: string;
       file: string;
+      /** Bytes of the named file; `jobReceivedBytes` covers the whole job. */
       receivedBytes: number;
+      jobReceivedBytes: number;
+      /** Size of the named file; the job total travels on `start`. */
       totalBytes: number;
       fileIndex: number;
       fileCount: number;
@@ -27,7 +30,7 @@ interface ProgressState {
   fileCount: number;
   fileIndex: number;
   currentFile: string;
-  /** Aggregate bytes across all files (summed per file index). */
+  /** Aggregate bytes across all files, as reported by the latest frame. */
   receivedBytes: number;
   /** Job total from the `start` event; 0 until it arrives. */
   totalBytes: number;
@@ -52,20 +55,24 @@ export interface DownloadProgressProps {
 
 /**
  * Live progress for one catalog download, driven by the
- * `GET /api/downloads/:id/events` SSE stream. Aggregate byte progress is summed
- * from the per-file `progress` frames (the stream carries per-file bytes plus a
- * job total on `start`), so the bar reflects whole-job completion.
+ * `GET /api/downloads/:id/events` SSE stream. The bar reads each `progress`
+ * frame's `jobReceivedBytes` against the job total from `start`, so it reflects
+ * whole-job completion.
+ *
+ * Deliberately NOT summed from the per-file frames this card witnessed: the
+ * server replays only `start` plus the single latest event, so a card mounted
+ * mid-download (a page reload, or navigating back to Models) has never seen the
+ * finished files and would render the current file's bytes as the job's —
+ * short by every completed shard.
  */
 export function DownloadProgress({ id, onDone, onError }: DownloadProgressProps) {
   const [state, setState] = useState<ProgressState>(INITIAL);
-  const perFile = useRef<Map<number, number>>(new Map());
   const doneCb = useRef(onDone);
   const errorCb = useRef(onError);
   doneCb.current = onDone;
   errorCb.current = onError;
 
   useEffect(() => {
-    perFile.current = new Map();
     setState(INITIAL);
     const sub = subscribeSSE<DownloadEvent>(
       `/downloads/${id}/events`,
@@ -75,9 +82,6 @@ export function DownloadProgress({ id, onDone, onError }: DownloadProgressProps)
             case 'start':
               return { ...prev, phase: 'running', fileCount: event.fileCount, totalBytes: event.totalBytes };
             case 'progress': {
-              perFile.current.set(event.fileIndex, event.receivedBytes);
-              let received = 0;
-              for (const value of perFile.current.values()) received += value;
               const terminal = prev.phase === 'done' || prev.phase === 'error';
               return {
                 ...prev,
@@ -85,7 +89,7 @@ export function DownloadProgress({ id, onDone, onError }: DownloadProgressProps)
                 fileCount: event.fileCount > 0 ? event.fileCount : prev.fileCount,
                 fileIndex: event.fileIndex,
                 currentFile: event.file,
-                receivedBytes: received,
+                receivedBytes: event.jobReceivedBytes,
               };
             }
             case 'done':

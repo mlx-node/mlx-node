@@ -22,6 +22,7 @@ import type {
   CatalogItem,
   CatalogResponse,
   DeleteModelResponse,
+  DownloadJob,
   DownloadsResponse,
   DownloadStartResponse,
   LocalModel,
@@ -45,6 +46,16 @@ import { toast } from 'sonner';
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * A settled job — it holds no in-flight work and the server will never move it
+ * out of this state again. Mirrors `isTerminal` in `src/download.ts`, and is
+ * deliberately not spelled `state !== 'running'`: `committing` is the brief
+ * non-cancellable publish window of a job that is still installing a model.
+ */
+function isTerminalJob(state: DownloadJob['state']): boolean {
+  return state === 'done' || state === 'error' || state === 'cancelled';
 }
 
 function QuantBadge({ quant }: { quant: string | null }) {
@@ -82,6 +93,28 @@ export default function Models() {
       }
       return next;
     });
+    // A job that settled while this page was unmounted got no DownloadProgress
+    // callback, so nothing sent its terminal-dismiss DELETE: it sits in the
+    // server registry for the life of the process and Overview keeps counting a
+    // "completed" download beside a model that is simply installed. Dismiss it
+    // here, exactly as onDownloadDone/onDownloadError would have.
+    //
+    // A FAILED job is announced first. It is the one terminal state whose
+    // outcome is invisible on this page — its card reverts to a plain Install,
+    // as if the download had never been started — so a silent dismiss would be
+    // the only trace of the failure. `done` and `cancelled` stay quiet: the
+    // models table, the Installed card and the user's own Cancel already say it.
+    // The failure TEXT lives only in the SSE stream (`/api/downloads` carries no
+    // message), so this names the repo the way the toasts below do.
+    //
+    // Racing is safe: terminal is final on the server, so a job that reads
+    // terminal here cannot be running by the time the DELETE lands, and a
+    // duplicate dismiss (a second dashboard tab) answers 404 and is swallowed.
+    for (const job of jobs) {
+      if (!isTerminalJob(job.state)) continue;
+      if (job.state === 'error') toast.error('Download failed', { description: job.repo });
+      void mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(job.id)}`).catch(() => {});
+    }
   }, [downloads.data]);
 
   const install = async (repo: string): Promise<void> => {

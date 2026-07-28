@@ -2611,6 +2611,7 @@ describe('dashboard SSE progress — backpressure coalescing', () => {
     id: 'job',
     file: 'model.safetensors',
     receivedBytes: received,
+    jobReceivedBytes: received,
     totalBytes: 1000,
     fileIndex: 0,
     fileCount: 1,

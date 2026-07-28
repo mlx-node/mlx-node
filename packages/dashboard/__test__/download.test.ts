@@ -209,6 +209,37 @@ function makeCancelFetch(sizes: Record<string, number>, blockPath: string, onBlo
   };
 }
 
+/**
+ * A fetch that streams normally EXCEPT for `stallPath`, which delivers exactly
+ * `stallBytes` and then hangs until the job aborts — parking the job PART-WAY
+ * through one file while the files before it are already settled. That is the
+ * state a page reload lands in, and the only state where the replayed frames
+ * have to carry more than the current file's own bytes.
+ */
+function makeStallingFetch(sizes: Record<string, number>, stallPath: string, stallBytes: number): typeof fetch {
+  const normal = makeFetchImpl(sizes);
+  return (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const path = url.split('/').slice(3).join('/');
+    if (path !== stallPath) return normal(input, init);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(stallBytes));
+        const signal = init?.signal;
+        const abort = (): void => controller.error(new DOMException('The operation was aborted', 'AbortError'));
+        if (signal?.aborted) {
+          abort();
+          return;
+        }
+        signal?.addEventListener('abort', abort);
+      },
+    });
+    return Promise.resolve(
+      new Response(stream, { status: 200, headers: { 'content-length': String(sizes[path] ?? 0) } }),
+    );
+  };
+}
+
 async function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<void> {
   const t0 = Date.now();
   while (!cond()) {
@@ -1309,6 +1340,69 @@ describe('DownloadManager', () => {
     expect(replayed).toHaveLength(2);
     expect(replayed[0]).toMatchObject({ type: 'start', totalBytes: 312, fileCount: 2 });
     expect(replayed[1]).toMatchObject({ type: 'done' });
+  });
+
+  it('replays a mid-job progress frame carrying the WHOLE job aggregate, not just the current file', async () => {
+    // Three files of distinct sizes so a dropped one is a distinct number: the
+    // replay is one `start` plus ONE `progress` frame, and that frame's own
+    // `receivedBytes` is per-FILE. A subscriber that attaches here (a page
+    // reload mid-download) has never seen the settled frames of files 1-2, so
+    // unless the frame states the job aggregate it can only render the current
+    // file's bytes — 1 MiB of a 4 MiB job, under-reporting by 3 MiB.
+    const MIB = 1024 * 1024;
+    const SHARD = 'model-00002-of-00002.safetensors';
+    hub.manifest = [
+      { type: 'file', path: 'config.json', size: MIB },
+      { type: 'file', path: 'model-00001-of-00002.safetensors', size: 2 * MIB },
+      { type: 'file', path: SHARD, size: 4 * MIB },
+    ];
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeStallingFetch(
+        { 'config.json': MIB, 'model-00001-of-00002.safetensors': 2 * MIB, [SHARD]: 4 * MIB },
+        SHARD,
+        MIB,
+      ),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    // Park on the third file, 1 MiB in: files 1-2 settled (1 + 2 MiB), so the
+    // job has 4 MiB of its 7 MiB.
+    await waitFor(() => events.some((event) => event.type === 'progress' && event.file === SHARD));
+
+    // The aggregate advances by whole files and never rewinds: each finished
+    // file's LAST frame states the running total, not the file's own bytes.
+    const progress = events.filter((event) => event.type === 'progress');
+    const settleOf = (path: string): DownloadEvent => progress.filter((event) => event.file === path).at(-1)!;
+    expect(settleOf('config.json')).toMatchObject({ receivedBytes: MIB, jobReceivedBytes: MIB });
+    expect(settleOf('model-00001-of-00002.safetensors')).toMatchObject({
+      receivedBytes: 2 * MIB,
+      jobReceivedBytes: 3 * MIB,
+    });
+    const aggregates = progress.map((event) => (event.type === 'progress' ? event.jobReceivedBytes : 0));
+    for (let i = 1; i < aggregates.length; i++) expect(aggregates[i]).toBeGreaterThanOrEqual(aggregates[i - 1]);
+
+    const replayed: DownloadEvent[] = [];
+    manager.subscribe(id, (event) => replayed.push(event));
+    expect(replayed).toHaveLength(2);
+    expect(replayed[0]).toMatchObject({ type: 'start', totalBytes: 7 * MIB, fileCount: 3 });
+    expect(replayed[1]).toMatchObject({
+      type: 'progress',
+      file: SHARD,
+      fileIndex: 2,
+      // Per-file bytes: what this one file has received so far…
+      receivedBytes: MIB,
+      totalBytes: 4 * MIB,
+      // …and the job-level aggregate the bar is actually drawn from.
+      jobReceivedBytes: 4 * MIB,
+    });
+    // The same number `GET /api/downloads` already reports for the job.
+    expect(manager.jobs().find((j) => j.id === id)!.receivedBytes).toBe(4 * MIB);
+
+    manager.cancel(id);
+    await waitFor(() => events.some((event) => event.type === 'cancelled'));
   });
 
   it('unlinks the snapshot pointer but never deletes a blob resolving OUTSIDE the cache dir', async () => {
