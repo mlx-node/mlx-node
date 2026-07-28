@@ -348,6 +348,53 @@ describe('dashboard server — sessions', () => {
     expect(texts.some((t) => t.includes('Hi there'))).toBe(true);
   });
 
+  it('reports an invalid transcript rather than 500ing when a bare null precedes the header', async () => {
+    // `null` is a syntactically valid JSONL record that `parseSessionEntries` keeps
+    // verbatim, and `readSessionEntries` returns the array UNMIGRATED once any record
+    // is a non-object. The detail handler then looked the header up with a raw
+    // `.type` deref — before the topology gate that exists to reject exactly this —
+    // so the one record whose deref throws produced a 500 carrying a raw TypeError
+    // string. `isValidSessionTopology`'s own contract is to run "BEFORE any
+    // `.type`/`.id` access"; this was the site that broke it.
+    await ingest();
+    const file = join(sessionsRoot, '--w--', '2026-07-01T10-00-00_fix-1.jsonl');
+    writeFileSync(file, `null\n${readFileSync(file, 'utf8')}`);
+
+    const res = await fetch(`${server.url}/api/sessions/fix-1`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      session: { id: string };
+      transcript: unknown[];
+      transcriptError?: string;
+    };
+    // Not a 409: the header still names THIS row, so the file is this session,
+    // merely malformed. The row's last-known-good metadata is still served — the
+    // same answer every other non-object record already got.
+    expect(body.session.id).toBe('fix-1');
+    expect(body.transcript).toEqual([]);
+    expect(body.transcriptError).toContain('Session tree is invalid');
+  });
+
+  it('answers a non-object record the same way whether or not its deref would throw', async () => {
+    // The convention guard. `null` is the only first-record value whose `.type`
+    // deref throws — `(123).type` is merely `undefined`, and an array IS an object
+    // — so a fix that special-cases `null` into a 409 or a 404 would split one
+    // malformed-file behaviour into two. Both must land on the same answer.
+    await ingest();
+    const file = join(sessionsRoot, '--w--', '2026-07-01T10-00-00_fix-1.jsonl');
+    const original = readFileSync(file, 'utf8');
+    for (const record of ['null', '123', '"str"', 'true', '[]']) {
+      writeFileSync(file, `${record}\n${original}`);
+      const res = await fetch(`${server.url}/api/sessions/fix-1`);
+      const body = (await res.json()) as { transcriptError?: string };
+      expect([record, res.status]).toEqual([record, 200]);
+      expect([record, body.transcriptError]).toEqual([
+        record,
+        'Session tree is invalid (cycle, duplicate id, or non-object message); transcript unavailable',
+      ]);
+    }
+  });
+
   it('404s an unknown session', async () => {
     await ingest();
     const res = await fetch(`${server.url}/api/sessions/does-not-exist`);

@@ -128,7 +128,7 @@ function hasOnlyObjectRecords(entries: FileEntry[]): boolean {
 }
 
 /** The session header, tolerating the non-object records pi's parser keeps verbatim. */
-function findSessionHeader(entries: FileEntry[]): SessionHeader | undefined {
+export function findSessionHeader(entries: FileEntry[]): SessionHeader | undefined {
   for (const entry of entries) {
     if (entry === null || typeof entry !== 'object') continue;
     if (entry.type === 'session') return entry as SessionHeader;

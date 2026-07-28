@@ -29,6 +29,7 @@ import {
   activeBranchEntries,
   classifySessionFile,
   countJsonlLines,
+  findSessionHeader,
   isValidSessionTopology,
   lastLineParses,
   readSessionEntries,
@@ -884,7 +885,18 @@ async function handleSessionDetail({ res, params, deps }: RouteCtx): Promise<voi
     // Containment alone can't catch that (the target is still in-root), so require
     // the parsed header id to still be THIS row before serving its metadata with
     // that file's transcript. On mismatch, reconcile the stale row and refuse.
-    const header = entries.find((e) => e.type === 'session') as { id?: unknown } | undefined;
+    //
+    // Through `findSessionHeader`, never a raw `.type` filter: `readSessionEntries`
+    // returns the array UNMIGRATED once any record is a non-object, and a bare
+    // `null` line is a valid JSONL record that `parseSessionEntries` keeps
+    // verbatim. Dereferencing one throws here, ahead of the topology gate below
+    // whose whole contract is to run "BEFORE any `.type`/`.id` access" — turning a
+    // malformed file into a 500 carrying a raw TypeError, where every other
+    // non-object record already reports the transcript invalid and still serves
+    // the row. The lookup stays FIRST, though: it is the identity guard, and
+    // running the topology check ahead of it would serve this row's metadata for a
+    // file that had been swapped for a different, also-corrupt session.
+    const header = findSessionHeader(entries) as { id?: unknown } | undefined;
     if (header === undefined || header.id !== row.id) {
       await deps.runIngest();
       sendError(res, 409, `Session "${params.id}" no longer matches its indexed file`);
