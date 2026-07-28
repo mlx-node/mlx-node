@@ -2436,6 +2436,26 @@ describe('dashboard server — local-origin guard', () => {
     });
     expect(res.status).toBe(200);
   });
+
+  // The read path normalizes the Host through `new URL(...)`; the mutation path
+  // compared the raw header against the same canonical allowlist. A client sending
+  // a valid non-canonical spelling therefore read fine and had every PATCH / POST /
+  // DELETE rejected — the two checks disagreeing about one authority.
+  it('accepts the same non-canonical Host on mutations that reads already allow', async () => {
+    for (const host of [`LOCALHOST:${server.port}`, `[0:0:0:0:0:0:0:1]:${server.port}`]) {
+      const read = await rawRequest(server.port, 'GET', '/api/models', { Host: host });
+      const write = await rawRequest(server.port, 'POST', '/api/ingest', { Host: host });
+      expect({ host, read: read.status, write: write.status }).toEqual({ host, read: 200, write: 200 });
+    }
+  });
+
+  // Over-correction guard: normalizing must not turn a foreign Host into an
+  // allowed one, on either path.
+  it('still rejects a foreign Host on both paths after normalization', async () => {
+    const read = await rawRequest(server.port, 'GET', '/api/models', { Host: `EVIL.example:${server.port}` });
+    const write = await rawRequest(server.port, 'POST', '/api/ingest', { Host: `EVIL.example:${server.port}` });
+    expect([read.status, write.status]).toEqual([403, 403]);
+  });
 });
 
 describe('dashboard server — loopback Host guard (all methods)', () => {

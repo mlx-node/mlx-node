@@ -135,7 +135,19 @@ export function bindAllowedHosts(host: string): Set<string> {
  */
 function isAllowedAuthority(authority: string | undefined, port: number, allowedHosts: Set<string>): boolean {
   if (authority === undefined || authority === '') return false;
-  const { hostname, port: hostPort } = splitHostPort(authority);
+  // Normalize HERE, not at one caller: the allowlist holds canonical spellings, so
+  // any caller comparing a raw header against it drifts from the ones that parse
+  // first. That split let a `Host: LOCALHOST:6590` or an expanded `[0:0:0:0:0:0:0:1]`
+  // pass every read and 403 every mutation from the same authority. Idempotent for an
+  // authority already through `new URL`, so the Origin and `classifyHost` paths are
+  // unchanged.
+  let normalized: string;
+  try {
+    normalized = new URL(`http://${authority}`).host;
+  } catch {
+    return false;
+  }
+  const { hostname, port: hostPort } = splitHostPort(normalized);
   if (!allowedHosts.has(hostname)) return false;
   return hostPort === String(port) || (hostPort === '' && port === 80);
 }
