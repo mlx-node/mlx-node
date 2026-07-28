@@ -58,6 +58,33 @@ function isPrebuiltAddonPackage(name: string): boolean {
 }
 
 /**
+ * `@mariozechner/clipboard` and its per-platform prebuilts, which arrive
+ * transitively via `@earendil-works/pi-coding-agent` and must not ship.
+ *
+ * They fail the release gate outright. Both darwin prebuilts bake upstream's CI
+ * home into their load commands —
+ * `/Users/runner/work/clipboard/clipboard/target/…/libcrosscopy_clipboard.dylib`
+ * — and step [3/5] of `verify-bundle.sh` refuses a bundle that ships a build
+ * path. That is not our leak to fix: it is baked into the published tarball, so
+ * the only lever on this side is not to carry it.
+ *
+ * Dropping it is safe for three independent reasons, and it needs all three:
+ *  1. pi-coding-agent declares it under `optionalDependencies`, so absence is a
+ *     supported state rather than a tree we happen to get away with breaking.
+ *  2. `dist/utils/clipboard-native.js` loads it inside a `try {} catch {}` that
+ *     falls through to `null` — a terminal-clipboard helper degrading in a
+ *     process that has no terminal.
+ *  3. Nothing in this repo references it. We import pi-coding-agent for session
+ *     parsing (`SessionManager`, `parseSessionEntries`, `FileEntry`) only.
+ *
+ * It also ships TWICE for one architecture: `-darwin-arm64` (1.4 MB) alongside
+ * `-darwin-universal` (2.9 MB), whose x86_64 slices this app can never execute.
+ */
+function isExcludedThirdPartyBinary(name: string): boolean {
+  return /^@mariozechner\/clipboard(-|$)/.test(name);
+}
+
+/**
  * Transitive runtime closure of `roots`.
  *
  * devDependencies are excluded, which is what keeps Electron itself (a
@@ -75,11 +102,18 @@ function isPrebuiltAddonPackage(name: string): boolean {
 export function runtimeClosure(
   repoRoot: string,
   roots: string[],
-): { external: string[]; workspace: string[]; skippedOptional: string[]; excludedPrebuilt: string[] } {
+): {
+  external: string[];
+  workspace: string[];
+  skippedOptional: string[];
+  excludedPrebuilt: string[];
+  excludedThirdParty: string[];
+} {
   const external = new Set<string>();
   const workspace = new Set<string>();
   const skippedOptional: string[] = [];
   const excludedPrebuilt: string[] = [];
+  const excludedThirdParty: string[] = [];
   const seen = new Set<string>();
   const queue: Array<{ name: string; optional: boolean }> = roots.map((name) => ({ name, optional: false }));
 
@@ -90,6 +124,11 @@ export function runtimeClosure(
 
     if (isPrebuiltAddonPackage(name)) {
       excludedPrebuilt.push(name);
+      continue;
+    }
+
+    if (isExcludedThirdPartyBinary(name)) {
+      excludedThirdParty.push(name);
       continue;
     }
 
@@ -114,6 +153,7 @@ export function runtimeClosure(
     workspace: [...workspace].sort(),
     skippedOptional: skippedOptional.sort(),
     excludedPrebuilt: excludedPrebuilt.sort(),
+    excludedThirdParty: excludedThirdParty.sort(),
   };
 }
 
@@ -156,6 +196,8 @@ export interface StageResult {
   skippedOptional: string[];
   /** napi prebuilt packages deliberately left out; the payload ships once, in Resources/native. */
   excludedPrebuilt: string[];
+  /** Third-party binaries dropped because they leak a build path; see isExcludedThirdPartyBinary. */
+  excludedThirdParty: string[];
   /** Count of examples/docs/test directories removed from staged packages. */
   prunedDirs: number;
 }
@@ -200,7 +242,10 @@ export function stageApp(opts: {
     )}\n`,
   );
 
-  const { external, workspace, skippedOptional, excludedPrebuilt } = runtimeClosure(repoRoot, opts.roots);
+  const { external, workspace, skippedOptional, excludedPrebuilt, excludedThirdParty } = runtimeClosure(
+    repoRoot,
+    opts.roots,
+  );
   const modules = join(stageDir, 'node_modules');
 
   for (const name of external) {
@@ -234,6 +279,7 @@ export function stageApp(opts: {
     workspaceCount: workspace.length,
     skippedOptional,
     excludedPrebuilt,
+    excludedThirdParty,
     prunedDirs,
   };
 }

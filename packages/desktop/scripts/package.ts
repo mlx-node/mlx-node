@@ -101,6 +101,9 @@ run('install_name_tool', ['-id', `@rpath/${NATIVE_FILES[0]}`, stagedAddon]);
 const staged = stageApp({ repoRoot: REPO_ROOT, desktopDir: APP_DIR, stageDir: STAGE_APP, roots: RUNTIME_ROOTS });
 console.log(`staged ${staged.externalCount} external + ${staged.workspaceCount} workspace packages`);
 console.log(`  pruned ${staged.prunedDirs} examples/docs/test dirs from staged packages`);
+if (staged.excludedThirdParty.length > 0) {
+  console.log(`  excluded ${staged.excludedThirdParty.join(', ')} — leaks a build path, fails gate [3/5]`);
+}
 if (staged.excludedPrebuilt.length > 0) {
   console.log(`  excluded ${staged.excludedPrebuilt.join(', ')} — payload ships once, in Resources/native`);
 }
