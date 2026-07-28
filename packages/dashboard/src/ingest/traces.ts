@@ -76,6 +76,51 @@ function boolToInt(value: unknown): number | null {
 }
 
 /**
+ * Stat every `*.jsonl` entry ONCE so liveness is decided from what an entry IS, not
+ * from what it is named. Only a regular file is a trace source: a directory or a FIFO
+ * can carry the suffix too, and neither is readable as one. A directory fails
+ * `readFileSync` with EISDIR (and `unlinkSync` with EPERM), so judged by name it stays
+ * "live" forever and keeps its rows and watermark in the index; a FIFO is worse —
+ * `readFileSync` BLOCKS on it until a writer closes, and since the server funnels every
+ * pass through one serialized ingest chain that wedges the whole dashboard. Neither is
+ * reachable from product code (the writer only ever appends to `<date>-<pid>.jsonl`),
+ * but the sibling session ingest already stats its candidates, and the same rule belongs
+ * here.
+ *
+ * A stat FAILURE is NOT "gone": a root that is readable but not searchable (mode 0600)
+ * lists its entries and then gives EACCES per child. Those names map to `null` and stay
+ * live — rows kept, file skipped this pass — the same stance the root guard below takes,
+ * so a transient fault never reads as a deletion.
+ *
+ * `statSync` FOLLOWS symlinks, deliberately unlike `sessions.ts`'s no-follow listing:
+ * that one is no-follow so an external Pi transcript cannot surface under the target's
+ * id, an identity concern traces do not have. A symlinked trace entry is a legitimate
+ * source and ingests today; `unlinkSync` does not follow, so the 30-day prune can only
+ * ever remove the link itself, never an external target.
+ */
+function statTraceEntries(traceDir: string, entries: string[]): Map<string, Stats | null> {
+  const kinds = new Map<string, Stats | null>();
+  for (const name of entries) {
+    if (!name.endsWith('.jsonl')) continue;
+    try {
+      kinds.set(name, statSync(join(traceDir, name)));
+    } catch {
+      kinds.set(name, null);
+    }
+  }
+  return kinds;
+}
+
+/** Names reconciliation must treat as live: every regular file, plus every unstattable entry. */
+function liveSourceNames(kinds: Map<string, Stats | null>): Set<string> {
+  const live = new Set<string>();
+  for (const [name, stat] of kinds) {
+    if (stat === null || stat.isFile()) live.add(name);
+  }
+  return live;
+}
+
+/**
  * Ingest every trace JSONL under `dir` into the SQLite index. Each line is an
  * independent `MetricsTraceRecord`; malformed lines are skipped. Inserts are
  * idempotent on `trace_id`. Files whose mtime is older than `retentionDays` are
@@ -155,7 +200,8 @@ export async function ingestTraces(
     return { files, records, pruned, warnings };
   }
 
-  const liveFiles = new Set(entries.filter((n) => n.endsWith('.jsonl')));
+  const kinds = statTraceEntries(traceDir, entries);
+  const liveFiles = liveSourceNames(kinds);
   const trackedSources = sqlite
     .prepare('SELECT DISTINCT source_file AS sf FROM traces WHERE source_file IS NOT NULL')
     .all() as Array<{ sf: string }>;
@@ -163,16 +209,14 @@ export async function ingestTraces(
     if (!liveFiles.has(sf)) db.delete(traces).where(eq(traces.sourceFile, sf)).run();
   }
 
-  for (const name of entries) {
-    if (!name.endsWith('.jsonl')) continue;
+  for (const [name, stat] of kinds) {
+    // Reuse the one classification above rather than re-deciding here: an entry that
+    // is not a regular file was already left out of `liveFiles` (its rows reconciled
+    // away), and it must never reach the prune or the read below. An entry we could
+    // not stat is skipped too — kept live, retried next pass.
+    if (stat === null || !stat.isFile()) continue;
     const filePath = join(traceDir, name);
 
-    let stat;
-    try {
-      stat = statSync(filePath);
-    } catch {
-      continue;
-    }
     if (stat.mtimeMs < cutoff) {
       try {
         unlinkSync(filePath);
@@ -327,7 +371,9 @@ export async function ingestTraces(
     warnings.push(`${traceDir}: trace root could not be re-listed; watermark reconciliation skipped (${String(err)})`);
     return { files, records, pruned, warnings };
   }
-  const live = new Set(liveNames.filter((n) => n.endsWith('.jsonl')));
+  // Re-classified, not reused: the loop above may have pruned entries, and the same
+  // predicate has to hold here or a row set and its watermark end up disagreeing.
+  const live = liveSourceNames(statTraceEntries(traceDir, liveNames));
   const trackedFiles = db.select({ name: traceFiles.name }).from(traceFiles).all();
   for (const { name: tracked } of trackedFiles) {
     if (!live.has(tracked)) db.delete(traceFiles).where(eq(traceFiles.name, tracked)).run();

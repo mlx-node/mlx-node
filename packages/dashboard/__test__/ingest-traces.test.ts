@@ -454,4 +454,97 @@ describe('ingestTraces', () => {
       chmodSync(dir, 0o755); // restore so afterEach cleanup can remove it
     }
   });
+
+  // The live-source set decides which tracked rows survive reconciliation, so it
+  // must be decided from what an entry IS, not from what it is named. A DIRECTORY
+  // named `*.jsonl` judged by suffix alone reads as live: its rows and watermark are
+  // kept while the ingest loop fails EISDIR and continues, and because the metrics
+  // queries are unwindowed by default that stale telemetry keeps counting in the
+  // all-time aggregates for as long as the directory sits there.
+  it('reconciles rows when a trace file is replaced by a directory of the same name', async () => {
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, 'a.jsonl');
+    writeFileSync(file, traceLine('trace-A'));
+    await ingestTraces(dash, dir, { retentionDays: 30 });
+    expect(dash.db.select().from(traces).all()).toHaveLength(1);
+    expect(dash.db.select().from(traceFiles).all()).toHaveLength(1);
+
+    unlinkSync(file);
+    mkdirSync(file); // a DIRECTORY now shadows the indexed name
+
+    const res = await ingestTraces(dash, dir, { retentionDays: 30 });
+    expect(res.files).toBe(0);
+    expect(res.pruned).toBe(0);
+    expect(dash.db.select().from(traces).all()).toHaveLength(0);
+    expect(dash.db.select().from(traceFiles).all()).toHaveLength(0);
+  });
+
+  // The kind check FOLLOWS symlinks on purpose, unlike the session listing (which is
+  // no-follow so an external transcript cannot surface under the target's id). A
+  // symlinked trace entry ingests today and must keep ingesting: an `lstat().isFile()`
+  // check is false for a symlink, so a no-follow fix would silently stop reading it
+  // and reconcile its rows away.
+  it('ingests a trace entry that is a symlink to a real jsonl file', async () => {
+    const external = join(base, 'external');
+    mkdirSync(external, { recursive: true });
+    const target = join(external, 'real.jsonl');
+    writeFileSync(target, traceLine('trace-sym'));
+
+    mkdirSync(dir, { recursive: true });
+    symlinkSync(target, join(dir, 'b.jsonl'));
+
+    const res = await ingestTraces(dash, dir, { retentionDays: 30 });
+    expect(res.files).toBe(1);
+    expect(res.records).toBe(1);
+    const rows = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-sym')).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].sourceFile).toBe('b.jsonl');
+    expect(dash.db.select().from(traceFiles).all()).toHaveLength(1);
+  });
+
+  // Over-correction guard: excluding non-regular entries must not cost the regular
+  // ones sharing the root. Green before and after the kind check by design.
+  it('keeps ingesting a regular trace file beside a *.jsonl directory', async () => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'good.jsonl'), traceLine('trace-good'));
+    mkdirSync(join(dir, 'bogus.jsonl'));
+
+    const res = await ingestTraces(dash, dir, { retentionDays: 30 });
+    expect(res.files).toBe(1);
+    expect(res.records).toBe(1);
+    const rows = dash.db.select().from(traces).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].sourceFile).toBe('good.jsonl');
+    expect(
+      dash.db
+        .select()
+        .from(traceFiles)
+        .all()
+        .map((w) => w.name),
+    ).toEqual(['good.jsonl']);
+  });
+
+  // A stat FAILURE is not a deletion. A trace root that is readable but not
+  // searchable (mode 0600) lists its entries and then gives EACCES on every child;
+  // reading an unstattable entry as "not a regular file" would delete its rows and
+  // watermark on a fault that says nothing at all about the file — the same
+  // wipe-on-fault trap the unreadable-root guard above closes.
+  (canTestUnreadable ? it : it.skip)('keeps rows when a trace entry cannot be stat-ed', async () => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'a.jsonl'), traceLine('trace-keep'));
+    await ingestTraces(dash, dir);
+    expect(dash.db.select().from(traces).all()).toHaveLength(1);
+    expect(dash.db.select().from(traceFiles).all()).toHaveLength(1);
+
+    chmodSync(dir, 0o600); // readable, NOT searchable: readdir lists, child stat EACCES
+    try {
+      const res = await ingestTraces(dash, dir, { retentionDays: 30 });
+      expect(res.files).toBe(0);
+      expect(res.pruned).toBe(0);
+      expect(dash.db.select().from(traces).all()).toHaveLength(1);
+      expect(dash.db.select().from(traceFiles).all()).toHaveLength(1);
+    } finally {
+      chmodSync(dir, 0o755); // restore so afterEach cleanup can remove it
+    }
+  });
 });

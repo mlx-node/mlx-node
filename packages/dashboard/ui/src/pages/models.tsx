@@ -207,9 +207,9 @@ export default function Models() {
             catalog.loading ? (
               <Skeleton className="h-4 w-28" />
             ) : (
-              // Count `present` (loadable on disk, incl. fingerprint-matched /
-              // CLI-installed), matching what each card labels "Installed" — not
-              // the dashboard-owned `installed` marker, which misses those.
+              // Count `present` (loadable on disk, incl. a renamed dashboard
+              // install / a CLI install), matching what each card labels
+              // "Installed" — not the dashboard-owned `installed` marker.
               `${formatCount(catalogItems.filter((i) => i.present).length)} installed`
             )
           }
@@ -423,6 +423,20 @@ function CatalogCard({ item, jobId, onInstall, onDone, onError, onCancel }: Cata
             <Check className="size-4" />
             Installed
           </Button>
+        ) : item.blockedByForeignDir ? (
+          // The download's ownership preflight refuses an occupied directory it
+          // did not write, so an Install here can only ever raise a red toast.
+          // Name the directory in the way and the one step that clears it.
+          <div className="space-y-2">
+            <Button variant="outline" className="w-full" disabled>
+              <AlertCircle className="size-4" />
+              Needs cleanup
+            </Button>
+            <p className="text-muted-foreground text-xs">
+              <span className="font-mono">{item.slug}</span> already exists and was not created by the dashboard. Remove
+              it (or delete it below, if it is listed) to install.
+            </p>
+          </div>
         ) : (
           <Button className="w-full" onClick={onInstall}>
             <Download className="size-4" />

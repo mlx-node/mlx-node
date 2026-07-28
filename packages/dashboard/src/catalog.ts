@@ -11,7 +11,7 @@ import { join } from 'node:path';
 
 import { type CatalogEntry, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 
-import { isModelInstalled, isModelPresent, readCheckpointFingerprint } from './models.js';
+import { isDownloaderOwned, isModelInstalled, isModelPresent, isPathOccupied, readCompletion } from './models.js';
 
 export interface CatalogItem extends CatalogEntry {
   /** Local directory name a download lands in (`hfRepo` basename, lowercased). */
@@ -30,6 +30,16 @@ export interface CatalogItem extends CatalogEntry {
    * overwrite the unowned directory and fail.
    */
   present: boolean;
+  /**
+   * Whether `<slug>` is occupied by something the downloader may not touch — an
+   * interrupted `mlx download`, a hand-made directory, a stray file, a symlink —
+   * while holding no loadable checkpoint. An Install in this state cannot succeed:
+   * the runner's ownership preflight refuses every occupied, unowned final dir, so
+   * the UI states the blockage instead of offering a button that always errors.
+   * Never true for a dir carrying OUR marker: an owned dir, however incomplete, is
+   * legitimately re-installable through the owned swap.
+   */
+  blockedByForeignDir: boolean;
 }
 
 /** The slug a catalog entry installs to: the `hfRepo` basename, lowercased. */
@@ -38,57 +48,61 @@ export function catalogSlug(entry: CatalogEntry): string {
 }
 
 /**
+ * HF repos (lowercased) a local checkpoint under ANY folder name provably came
+ * from — read off the download completion marker, which pins the repo and the
+ * revision the bytes were fetched at. This is how a dashboard install the user
+ * RENAMED is still recognized as its catalog entry.
+ *
+ * Provenance, never config shape: a checkpoint's `model_type` + quant triple says
+ * what FORMAT it is, not which weights it holds. `mlx convert` mandates bits=4 /
+ * group_size=16 for nvfp4, so that triple is a constant across the family, and a
+ * local fine-tune of the same base is indistinguishable from the recommendation
+ * by config alone — matching on it marked such a fine-tune "Installed" and
+ * disabled the page's only Install button, hard-blocking the real download.
+ *
+ * A directory with no marker (hand-copied, or installed by `mlx download`, which
+ * writes none) is deliberately NOT matched here: the canonical-slug check below
+ * still covers it, and the worst case of missing a renamed copy is ONE redundant
+ * download, against a hard block for the false match.
+ *
+ * The marker records what was published, not what survives, so it is paired with
+ * an on-disk check ({@link isModelPresent}) — a dir gutted down to its marker is
+ * not a present checkpoint. Scanned once for the whole catalog.
+ */
+function downloadedRepos(modelsDir: string): Set<string> {
+  const repos = new Set<string>();
+  let names: string[];
+  try {
+    names = readdirSync(modelsDir);
+  } catch {
+    return repos;
+  }
+  for (const name of names) {
+    const dir = join(modelsDir, name);
+    const completion = readCompletion(dir);
+    if (completion === undefined || !isModelPresent(dir)) continue;
+    repos.add(completion.repo.toLowerCase());
+  }
+  return repos;
+}
+
+/**
  * The full catalog with each entry tagged by its install slug and whether that
  * slug's directory is present under `modelsDir`. Hidden entries are retained
  * here (the UI decides what to show); the agent wizard's `visibleCatalog()`
  * filter is a separate concern.
  */
-/**
- * Whether any local checkpoint IS this recommended model under a different folder
- * name — a renamed or re-quantized upload the canonical-slug check misses. Guards
- * against a false match two ways: the folder name must start with the entry
- * `label` (the base model name — so AgentWorld-35B-A3B and Qwen3.6-35B-A3B, both
- * `qwen3_5_moe` nvfp4, never cross-match), AND the checkpoint's `config.json`
- * fingerprint (family + quant bits/mode/group) must equal the entry's. Only reads
- * `config.json` for the few prefix-matching, loadable dirs, not the whole store.
- */
-function matchesLocalVariant(entry: CatalogEntry, modelsDir: string): boolean {
-  const fp = entry.fingerprint;
-  if (fp === undefined) return false;
-  const baseToken = entry.label.toLowerCase();
-  let names: string[];
-  try {
-    names = readdirSync(modelsDir);
-  } catch {
-    return false;
-  }
-  for (const name of names) {
-    if (!name.toLowerCase().startsWith(baseToken)) continue;
-    const dir = join(modelsDir, name);
-    if (!isModelPresent(dir)) continue;
-    const local = readCheckpointFingerprint(dir);
-    if (
-      local !== undefined &&
-      local.modelType === fp.modelType &&
-      local.quant !== null &&
-      local.quant.bits === fp.quant.bits &&
-      local.quant.mode === fp.quant.mode &&
-      local.quant.group === fp.quant.group
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
 export function catalogWithState(modelsDir: string): CatalogItem[] {
+  const downloaded = downloadedRepos(modelsDir);
   return MODEL_CATALOG.map((entry) => {
     const slug = catalogSlug(entry);
     const dir = join(modelsDir, slug);
-    // `present` is true for the canonical-slug dir OR any local checkpoint whose
-    // fingerprint matches — so a recommended model installed under a different
-    // folder name (a renamed / re-quantized upload) is still recognized.
-    const present = isModelPresent(dir) || matchesLocalVariant(entry, modelsDir);
-    return { ...entry, slug, installed: isModelInstalled(dir), present };
+    // `present` is true for a loadable checkpoint at the canonical slug OR under any
+    // folder name whose completion marker names this entry's repo.
+    const present = isModelPresent(dir) || downloaded.has(entry.hfRepo.toLowerCase());
+    // Exactly the state the download runner's ownership preflight refuses, computed
+    // with the SAME no-follow predicates it uses so the two cannot disagree.
+    const blockedByForeignDir = !present && isPathOccupied(dir) && !isDownloaderOwned(dir);
+    return { ...entry, slug, installed: isModelInstalled(dir), present, blockedByForeignDir };
   });
 }

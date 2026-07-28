@@ -20,6 +20,8 @@
 import { categoryLabels, truncateMiddle } from '@/lib/chart';
 import type {
   CacheResponse,
+  CatalogItem,
+  CatalogResponse,
   DownloadsResponse,
   MetricsOverviewResponse,
   ModelsResponse,
@@ -31,6 +33,7 @@ import type {
 } from '@/lib/types';
 import Cache from '@/pages/cache';
 import Metrics from '@/pages/metrics';
+import Models from '@/pages/models';
 import Overview from '@/pages/overview';
 import SessionDetail from '@/pages/session-detail';
 import { createElement } from 'react';
@@ -737,5 +740,57 @@ describe('Session detail page', () => {
     expect(text).toContain('Turns');
     expect(text).not.toContain('Cold hit rate');
     expect(text).not.toContain('Cold reuse');
+  });
+});
+
+describe('Models page — the Install affordance', () => {
+  function catalogRoutes(item: Partial<CatalogItem>): Record<string, unknown> {
+    const models: ModelsResponse = { models: [], warnings: [], dir: '/models' };
+    const catalog: CatalogResponse = {
+      items: [
+        {
+          label: 'Qwen3.6-27B',
+          hfRepo: 'Brooooooklyn/Qwen3.6-27B-NVFP4-mlx',
+          sizeGb: 22.2,
+          description: 'Best tool use',
+          slug: 'qwen3.6-27b-nvfp4-mlx',
+          installed: false,
+          present: false,
+          blockedByForeignDir: false,
+          ...item,
+        },
+      ],
+    };
+    const downloads: DownloadsResponse = { jobs: [] };
+    return { '/models': models, '/catalog': catalog, '/downloads': downloads };
+  }
+
+  /** Trimmed label of every rendered button. */
+  function buttonLabels(): string[] {
+    return Array.from(mounted!.container.querySelectorAll('button')).map((b) => (b.textContent ?? '').trim());
+  }
+
+  it('offers Install for a recommended model that is simply absent', async () => {
+    // The over-correction guard: the card must keep its button when the slug is
+    // free, or the blocked branch below could be "fixed" by never offering Install.
+    await mount(createElement(Models), catalogRoutes({}), 'Qwen3.6-27B');
+    expect(buttonLabels()).toContain('Install');
+  });
+
+  it('states the blockage instead of an Install that the runner always refuses', async () => {
+    // `<slug>` is occupied by an unowned directory (an interrupted `mlx download`).
+    // The download's ownership preflight refuses it every time, so the button would
+    // do nothing but raise a red toast.
+    const text = await mount(createElement(Models), catalogRoutes({ blockedByForeignDir: true }), 'Qwen3.6-27B');
+    expect(buttonLabels()).not.toContain('Install');
+    // And it says WHICH directory is in the way and what to do about it.
+    expect(text).toContain('qwen3.6-27b-nvfp4-mlx');
+    expect(text).toMatch(/remove/i);
+  });
+
+  it('still shows an installed model as installed', async () => {
+    await mount(createElement(Models), catalogRoutes({ present: true, installed: true }), 'Qwen3.6-27B');
+    expect(buttonLabels()).toContain('Installed');
+    expect(buttonLabels()).not.toContain('Install');
   });
 });

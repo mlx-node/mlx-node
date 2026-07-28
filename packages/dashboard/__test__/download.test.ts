@@ -747,6 +747,36 @@ describe('DownloadManager', () => {
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(false);
   });
 
+  it('flags the state it refuses: an interrupted CLI download is blocked, not installable', async () => {
+    // An interrupted `mlx download` leaves a config.json and no weights, so the dir
+    // is NOT present — which used to render an enabled Install button whose job the
+    // preflight below refuses every time. Catalog state and the runner must agree on
+    // that dir, which is why both read the same no-follow occupancy/ownership pair.
+    mkdirSync(finalDir(), { recursive: true });
+    writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xab));
+
+    const item = catalogWithState(modelsDir).find((entry) => entry.slug === SLUG)!;
+    expect(item.present).toBe(false);
+    expect(item.blockedByForeignDir).toBe(true);
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
+
+    const err = events.find((event) => event.type === 'error');
+    expect(err?.type).toBe('error');
+    if (err?.type === 'error') expect(err.message).toMatch(/not created by the dashboard/i);
+    // Zero bytes moved and the partial dir is untouched — a wart, not data loss.
+    expect(hub.downloaded).toEqual([]);
+    expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+  });
+
   it('fails fast on a DANGLING final symlink — before listing or downloading any bytes', async () => {
     // `<modelsDir>/<slug>` is a DANGLING symlink (its target does not exist — e.g. it
     // points at an unmounted volume). `existsSync` FOLLOWS the link and reports the

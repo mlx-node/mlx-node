@@ -2,9 +2,10 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { MODEL_CATALOG } from '@mlx-node/agent/catalog';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
-import { catalogWithState } from '../src/catalog.js';
+import { type CatalogItem, catalogSlug, catalogWithState } from '../src/catalog.js';
 import {
   DOWNLOAD_COMPLETE_MARKER,
   defaultModelsDir,
@@ -13,7 +14,6 @@ import {
   isDownloaderOwned,
   isModelInstalled,
   isModelPresent,
-  readCheckpointFingerprint,
 } from '../src/models.js';
 
 let modelsDir: string;
@@ -355,64 +355,131 @@ describe('defaultModelsDir', () => {
   });
 });
 
-describe('readCheckpointFingerprint', () => {
-  it('reads model_type + quant triple from config.json', () => {
-    writeModel(
-      modelsDir,
-      'fp-nvfp4',
-      JSON.stringify({ model_type: 'qwen3_5', quantization: { bits: 4, mode: 'nvfp4', group_size: 16 } }),
-      2048,
-    );
-    expect(readCheckpointFingerprint(join(modelsDir, 'fp-nvfp4'))).toEqual({
-      modelType: 'qwen3_5',
-      quant: { bits: 4, mode: 'nvfp4', group: 16 },
-    });
-  });
+/** The default recommendation (Qwen3.6-27B) and the folder a download lands in. */
+const RECOMMENDED = MODEL_CATALOG[0]!;
+const RECOMMENDED_SLUG = catalogSlug(RECOMMENDED);
 
-  it('returns quant null for a full-precision checkpoint', () => {
-    writeModel(modelsDir, 'fp-bf16', JSON.stringify({ model_type: 'gemma4' }), 2048);
-    expect(readCheckpointFingerprint(join(modelsDir, 'fp-bf16'))).toEqual({ modelType: 'gemma4', quant: null });
-  });
+/** The catalog row for `label`, from a fresh scan of the temp models dir. */
+function catalogItem(label: string): CatalogItem {
+  return catalogWithState(modelsDir).find((entry) => entry.label === label)!;
+}
 
-  it('returns undefined when config.json is missing', () => {
-    mkdirSync(join(modelsDir, 'no-config'), { recursive: true });
-    expect(readCheckpointFingerprint(join(modelsDir, 'no-config'))).toBeUndefined();
-  });
-});
+/** Write a download completion marker naming `repo` into `<modelsDir>/<name>`. */
+function writeCompletion(name: string, repo: string, files = ['config.json', 'model.safetensors']): void {
+  const dir = join(modelsDir, name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, DOWNLOAD_COMPLETE_MARKER),
+    JSON.stringify({ repo, revision: 'a'.repeat(40), files, completedAt: new Date().toISOString() }),
+  );
+}
 
-describe('catalogWithState — recognizes a recommended model under a renamed folder', () => {
-  // The Qwen3.6-27B recommendation is nvfp4/4/16 qwen3_5; an upload can live under a
-  // non-canonical folder name (only the quant suffix differs from the HF repo).
+describe('catalogWithState — a recommended model is identified by download provenance', () => {
+  // The Qwen3.6-27B recommendation is an nvfp4 qwen3_5 checkpoint. `mlx convert`
+  // mandates bits=4 / group_size=16 for nvfp4, so that triple is a FORMAT CONSTANT
+  // shared by every nvfp4 checkpoint of the family — config shape cannot tell two
+  // different weight sets apart, only a recorded repo can.
   const QWEN_27B_NVFP4 = JSON.stringify({
     model_type: 'qwen3_5',
     quantization: { bits: 4, mode: 'nvfp4', group_size: 16 },
   });
 
-  it('marks present when a same-base, same-quant checkpoint exists under a different name', () => {
-    writeModel(modelsDir, 'qwen3.6-27b-unsloth-nvfp4-fp8-dgx-mlx-fresh', QWEN_27B_NVFP4, 2048);
-    const item = catalogWithState(modelsDir).find((e) => e.label === 'Qwen3.6-27B')!;
-    expect(item.present).toBe(true);
+  it('does NOT mark present for a look-alike fine-tune with no download provenance', () => {
+    // A local fine-tune of the same base, same quant, under a name that starts with
+    // the catalog label. Marking it present disables the ONLY Install affordance on
+    // the Models page, hard-blocking the user from installing the real checkpoint.
+    writeModel(modelsDir, 'qwen3.6-27b-custom', QWEN_27B_NVFP4, 2048);
+    expect(catalogItem('Qwen3.6-27B').present).toBe(false);
+    expect(catalogItem('Qwen3.6-27B').installed).toBe(false);
   });
 
-  it('does NOT mark present for a same-base checkpoint of a different quant', () => {
-    // bf16 (no quant) of the same base is not the NVFP4 recommendation.
-    writeModel(modelsDir, 'qwen3.6-27b-mlx', JSON.stringify({ model_type: 'qwen3_5' }), 2048);
-    const item = catalogWithState(modelsDir).find((e) => e.label === 'Qwen3.6-27B')!;
-    expect(item.present).toBe(false);
+  it('marks present for a renamed folder carrying our completion marker for this repo', () => {
+    // The capability the folder-prefix heuristic was reaching for, done exactly: a
+    // dashboard install the user renamed is still recognized, because the marker
+    // pins WHICH repo those bytes came from.
+    writeModel(modelsDir, 'renamed-by-hand', QWEN_27B_NVFP4, 2048);
+    writeCompletion('renamed-by-hand', RECOMMENDED.hfRepo);
+    expect(catalogItem('Qwen3.6-27B').present).toBe(true);
   });
 
-  it('does NOT cross-match two same-arch, same-quant models (AgentWorld vs Qwen3.6-35B-A3B)', () => {
-    // A Qwen3.6-35B-A3B nvfp4 checkpoint has the SAME fingerprint as the AgentWorld
-    // recommendation (qwen3_5_moe nvfp4/4/16) but is a DIFFERENT model — the label
-    // prefix guard must keep it from lighting up the AgentWorld card.
+  it('marks present for a complete CLI install under the canonical slug', () => {
+    // `mlx download` writes no marker, so provenance comes from the slug itself.
+    writeModel(modelsDir, RECOMMENDED_SLUG, QWEN_27B_NVFP4, 2048);
+    expect(catalogItem('Qwen3.6-27B').present).toBe(true);
+    expect(catalogItem('Qwen3.6-27B').installed).toBe(false);
+  });
+
+  it('does NOT cross-match a marker that names a different repo', () => {
+    // Same architecture, same quant, marker present — but from another checkpoint.
     const MOE_NVFP4 = JSON.stringify({
       model_type: 'qwen3_5_moe',
       quantization: { bits: 4, mode: 'nvfp4', group_size: 16 },
     });
     writeModel(modelsDir, 'qwen3.6-35b-a3b-nvfp4-mlx', MOE_NVFP4, 2048);
-    expect(catalogWithState(modelsDir).find((e) => e.label === 'Qwen-AgentWorld-35B')!.present).toBe(false);
-    // The real AgentWorld folder (same fingerprint, matching prefix) DOES match.
-    writeModel(modelsDir, 'qwen-agentworld-35b-a3b-unsloth-nvfp4-mlx', MOE_NVFP4, 2048);
-    expect(catalogWithState(modelsDir).find((e) => e.label === 'Qwen-AgentWorld-35B')!.present).toBe(true);
+    writeCompletion('qwen3.6-35b-a3b-nvfp4-mlx', 'Brooooooklyn/Qwen3.6-35B-A3B-nvfp4-mlx');
+    expect(catalogItem('Qwen-AgentWorld-35B').present).toBe(false);
+  });
+
+  it('does NOT mark present when the marker survived but the checkpoint did not', () => {
+    // The marker records what was published, not what is still there: a dir gutted
+    // down to its marker is not a loadable checkpoint.
+    writeCompletion('gutted', RECOMMENDED.hfRepo);
+    expect(catalogItem('Qwen3.6-27B').present).toBe(false);
+  });
+});
+
+describe('catalogWithState — an occupied, unowned slug dir blocks Install', () => {
+  /** An interrupted `mlx download`: the index landed, one of two shards did not. */
+  function writePartialShardedInstall(name: string): void {
+    const dir = join(modelsDir, name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+    writeFileSync(
+      join(dir, 'model.safetensors.index.json'),
+      JSON.stringify({
+        weight_map: { 'a.weight': 'model-00001-of-00002.safetensors', 'b.weight': 'model-00002-of-00002.safetensors' },
+      }),
+    );
+    writeFileSync(join(dir, 'model-00001-of-00002.safetensors'), Buffer.alloc(8));
+  }
+
+  it('flags an interrupted CLI download as blocked rather than installable', () => {
+    // `present` is correctly false (the checkpoint cannot load), but Install would
+    // hit the runner's ownership preflight and error every single time, so the card
+    // must state the blockage instead of offering the button.
+    writePartialShardedInstall(RECOMMENDED_SLUG);
+    expect(catalogItem('Qwen3.6-27B').present).toBe(false);
+    expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(true);
+  });
+
+  it('flags an occupant with no config.json at all as blocked', () => {
+    // Ctrl-C during the CLI's manifest fetch leaves a bare directory. Model
+    // discovery folds it into the skipped-directories warning, so this state has no
+    // Delete row to recover through — all the more reason not to offer Install.
+    mkdirSync(join(modelsDir, RECOMMENDED_SLUG), { recursive: true });
+    expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(true);
+  });
+
+  it('flags a dangling symlink at the slug as blocked (no-follow occupancy)', () => {
+    // `existsSync` FOLLOWS the link and reads it as absent; the runner's preflight
+    // is `lstat`-based and refuses it, so catalog state must be `lstat`-based too.
+    symlinkSync(join(modelsDir, 'no-such-target'), join(modelsDir, RECOMMENDED_SLUG));
+    expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(true);
+  });
+
+  it('leaves an OWNED but incomplete dir installable', () => {
+    // Our marker is there, so the preflight permits the owned swap and a reinstall
+    // genuinely works — blocking it would remove the one recovery that functions.
+    writeCompletion(RECOMMENDED_SLUG, RECOMMENDED.hfRepo);
+    writeFileSync(join(modelsDir, RECOMMENDED_SLUG, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+    expect(catalogItem('Qwen3.6-27B').present).toBe(false);
+    expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(false);
+  });
+
+  it('is not blocked when the slug is free, nor when a complete install occupies it', () => {
+    expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(false);
+    writeModel(modelsDir, RECOMMENDED_SLUG, JSON.stringify({ model_type: 'qwen3_5' }), 2048);
+    expect(catalogItem('Qwen3.6-27B').present).toBe(true);
+    expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(false);
   });
 });

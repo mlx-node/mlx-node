@@ -199,6 +199,33 @@ export function readCompletion(finalDir: string): DownloadCompletion | undefined
 }
 
 /**
+ * No-follow occupancy: is ANYTHING present at this path — including a dangling or
+ * foreign symlink? `existsSync` FOLLOWS symlinks, so a `<modelsDir>/<slug>` that is
+ * a dangling link (target on an unmounted volume, say) reads as ABSENT and slips
+ * past the ownership preflight, triggering a full wasted download that only fails at
+ * publish. `lstatSync` stats the LINK itself, so such a path reads as occupied and
+ * is refused up front. {@link isDownloaderOwned} is likewise no-follow (it
+ * `lstat`-gates on a real directory before reading the marker), so ANY symlink here —
+ * a DANGLING link OR a LIVE link into an external marked dir — returns false and the
+ * preflight/publish guards refuse it. Without that, `readFileSync` would follow a live
+ * link and mistake the foreign marker for our own install, letting the runner
+ * overwrite or report done through a path it never wrote.
+ *
+ * Shared with the catalog so the state the UI renders and the state the download
+ * runner enforces are the SAME predicate: the runner refuses an occupied, unowned
+ * final dir (`DownloadManager`'s ownership preflight), and the catalog marks exactly
+ * that case blocked instead of offering an Install that would always error.
+ */
+export function isPathOccupied(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Whether a directory was written by the dashboard downloader — i.e. it carries
  * a parseable completion marker of our shape. Distinct from {@link isModelInstalled}:
  * ownership does NOT require every listed file to still be present (a partial,
@@ -299,48 +326,6 @@ function detectQuantLabel(config: Record<string, unknown>): string | null {
   if (bits !== undefined) return `affine-${bits}bit`;
   if (mode === 'affine') return 'affine';
   return null;
-}
-
-/** A checkpoint's content identity for catalog matching: family label + quant triple. */
-export interface CheckpointFingerprint {
-  modelType: string;
-  quant: { bits: number; mode: string; group: number } | null;
-}
-
-/**
- * Read `<modelDir>/config.json` into the identity the catalog matches on — the
- * family label ({@link detectModelTypeLabel}) plus the quant block's
- * bits/mode/group. `undefined` when the config is missing or unparseable;
- * `quant: null` for a full-precision checkpoint. Lets the dashboard recognize a
- * recommended model that lives under a non-canonical folder name.
- */
-export function readCheckpointFingerprint(modelDir: string): CheckpointFingerprint | undefined {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(join(modelDir, 'config.json'), 'utf-8')) as unknown;
-  } catch {
-    return undefined;
-  }
-  const config = asObject(parsed);
-  if (config === undefined) return undefined;
-  return { modelType: detectModelTypeLabel(config), quant: parseQuantTriple(config) };
-}
-
-/** The `{bits, mode, group}` quant triple, or `null` for a full-precision config. */
-function parseQuantTriple(config: Record<string, unknown>): { bits: number; mode: string; group: number } | null {
-  const quant = asObject(config.quantization) ?? asObject(config.quantization_config);
-  if (quant === undefined) return null;
-  const bits = typeof quant.bits === 'number' && Number.isFinite(quant.bits) ? quant.bits : undefined;
-  const mode =
-    typeof quant.mode === 'string'
-      ? quant.mode
-      : typeof quant.quant_method === 'string'
-        ? quant.quant_method
-        : undefined;
-  const group =
-    typeof quant.group_size === 'number' && Number.isFinite(quant.group_size) ? quant.group_size : undefined;
-  if (bits === undefined || mode === undefined || group === undefined) return null;
-  return { bits, mode, group };
 }
 
 function positiveInteger(value: unknown): number | undefined {

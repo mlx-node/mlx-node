@@ -50,6 +50,7 @@ import {
   DOWNLOAD_COMPLETE_MARKER,
   isDownloaderOwned,
   isModelInstalled,
+  isPathOccupied,
   isSafeRelPath,
   isWeightFile,
   readCompletion,
@@ -221,28 +222,6 @@ function assertRealDirOrAbsent(path: string): void {
     throw new Error(
       `Refusing to use staging root "${path}": it must be a real directory (found a symlink or non-directory)`,
     );
-  }
-}
-
-/**
- * No-follow occupancy: is ANYTHING present at this path — including a dangling or
- * foreign symlink? `existsSync` FOLLOWS symlinks, so a `<modelsDir>/<slug>` that is
- * a dangling link (target on an unmounted volume, say) reads as ABSENT and slips
- * past the ownership preflight, triggering a full wasted download that only fails at
- * publish. `lstatSync` stats the LINK itself, so such a path reads as occupied and
- * is refused up front. `isDownloaderOwned` is likewise no-follow (it `lstat`-gates on
- * a real directory before reading the marker), so ANY symlink here — a DANGLING link
- * OR a LIVE link into an external marked dir — returns false and the preflight/publish
- * guards refuse it. Without that, `readFileSync` would follow a live link and mistake
- * the foreign marker for our own install, letting the runner overwrite or report done
- * through a path it never wrote.
- */
-function occupied(path: string): boolean {
-  try {
-    lstatSync(path);
-    return true;
-  } catch {
-    return false;
   }
 }
 
@@ -641,7 +620,7 @@ export class DownloadManager {
       // below still guard the narrow check-then-swap race for a dir that races in
       // after this point.
       const refuseIfUnownedFinal = (): void => {
-        if (occupied(finalDir) && !isDownloaderOwned(finalDir) && !job.overwrite) {
+        if (isPathOccupied(finalDir) && !isDownloaderOwned(finalDir) && !job.overwrite) {
           throw new Error(
             `Refusing to install over "${finalDir}": it was not created by the dashboard downloader. ` +
               `Remove it manually to reinstall.`,
@@ -1040,7 +1019,7 @@ export class DownloadManager {
   ): Promise<void> {
     await mkdir(dirname(finalDir), { recursive: true });
 
-    if (occupied(finalDir) && !isDownloaderOwned(finalDir) && !overwrite) {
+    if (isPathOccupied(finalDir) && !isDownloaderOwned(finalDir) && !overwrite) {
       throw new Error(
         `Refusing to overwrite "${finalDir}": it was not created by the dashboard downloader. ` +
           `Remove it manually to reinstall.`,
@@ -1055,7 +1034,7 @@ export class DownloadManager {
     };
     await writeFile(join(stagingDir, DOWNLOAD_COMPLETE_MARKER), `${JSON.stringify(marker, null, 2)}\n`);
 
-    if (!occupied(finalDir)) {
+    if (!isPathOccupied(finalDir)) {
       await rename(stagingDir, finalDir);
       await fsyncDir(dirname(finalDir));
       return;

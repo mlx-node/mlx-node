@@ -39,6 +39,13 @@ export interface CatalogItem {
    * model can't be overwritten).
    */
   present: boolean;
+  /**
+   * The slug directory is occupied by something the downloader does not own and
+   * holds no loadable checkpoint (an interrupted `mlx download`, a hand-made
+   * folder, a symlink). Install is refused server-side in this state, so the card
+   * names the blockage rather than offering a button that always errors.
+   */
+  blockedByForeignDir: boolean;
 }
 
 export interface CatalogResponse {
