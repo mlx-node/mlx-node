@@ -46,7 +46,15 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { toast } from 'sonner';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
-import { renderPage, stubChartMetrics, stubFetch, TICK_CHAR_PX, TICK_LINE_PX, type RenderedPage } from './render.js';
+import {
+  renderPage,
+  sequence,
+  stubChartMetrics,
+  stubFetch,
+  TICK_CHAR_PX,
+  TICK_LINE_PX,
+  type RenderedPage,
+} from './render.js';
 
 const MIB = 1024 * 1024;
 
@@ -1055,6 +1063,11 @@ describe('Models page — the Install affordance', () => {
     return calls;
   }
 
+  /** How many times the page fetched `path` — a refetch is otherwise invisible. */
+  function gets(calls: Array<{ method: string; url: string }>, path: string): number {
+    return calls.filter((call) => call.method === 'GET' && call.url.split('?')[0] === path).length;
+  }
+
   /** Job ids the page asked the server to dismiss, in order. */
   function dismissed(calls: Array<{ method: string; url: string }>): string[] {
     return calls.filter((call) => call.method === 'DELETE').map((call) => call.url.replace('/api/downloads/', ''));
@@ -1122,6 +1135,71 @@ describe('Models page — the Install affordance', () => {
       // cancel was their own — so neither may raise a failure notice.
       expect(failed.mock.calls).toEqual([]);
       expect(buttonLabels()).toContain('Installed');
+    } finally {
+      failed.mockRestore();
+    }
+  });
+
+  it('reloads a catalog it read from BEFORE the download published', async () => {
+    // Mounting ACROSS a publish reads the two snapshots either side of it. The
+    // runner sets `job.state = 'done'` strictly AFTER `publish()` renames the
+    // staging dir into place, so `/catalog` answering first (`present: false`)
+    // and `/downloads` answering after (`done`) is an ordinary interleaving.
+    //
+    // Nothing repaired it: `useJson` has no polling and no focus revalidate,
+    // `downloads.reload()` has no call site, and the terminal job is deliberately
+    // kept out of `active` — so no `DownloadProgress` mounts and the reload in
+    // `onDownloadDone` never runs. The card offered Install for a model that was
+    // already installed, and clicking it cost a full round trip to reach `done`.
+    const absent = catalogRoutes({}, [downloadJob({ id: 'job-done', state: 'done' })]);
+    const published = catalogRoutes({ present: true, installed: true }, [
+      downloadJob({ id: 'job-done', state: 'done' }),
+    ]);
+    const calls = recordRequests({
+      ...absent,
+      '/catalog': sequence(absent['/catalog'], published['/catalog']),
+      '/models': sequence(absent['/models'], published['/models']),
+      '/downloads/job-done': { cancelled: true, id: 'job-done' },
+    });
+    await mountModels();
+    expect(buttonLabels()).toContain('Installed');
+    expect(buttonLabels()).not.toContain('Install');
+    // Exactly one repair, and exactly one dismiss: `reload` bumps only its own
+    // hook's nonce and nothing reloads `/downloads`, so `downloads.data` keeps one
+    // identity per mount and the effect body runs once. These counts catch a
+    // BOUNDED extra refetch. They do not catch an unbounded one — naming the
+    // unstable `models`/`catalog` objects in the effect's deps instead of their
+    // stable `reload`s spins forever and wedges the run (SIGKILL) rather than
+    // failing here, the same way the FIFO cases in models.test.ts do.
+    expect(gets(calls, '/api/catalog')).toBe(2);
+    expect(gets(calls, '/api/models')).toBe(2);
+    expect(dismissed(calls)).toEqual(['job-done']);
+  });
+
+  it('reloads after a FAILED job too — a failure can still leave the model installed', async () => {
+    // Why the reload is not gated on `done`. `publish()` renames staging into the
+    // final dir and only THEN removes the backup, and that `rm` runs inside the
+    // job's try: an EPERM there reports `error` for a model that is on disk.
+    // (`recoverBackup` restoring a crashed publish before a cancel does the same.)
+    // Gating on `done` would leave those cases showing Install for an installed
+    // model — the very bug this repairs, in the state that reports a failure.
+    const failed = vi.spyOn(toast, 'error');
+    try {
+      const absent = catalogRoutes({}, [downloadJob({ id: 'job-bad', state: 'error' })]);
+      const published = catalogRoutes({ present: true, installed: true }, [
+        downloadJob({ id: 'job-bad', state: 'error' }),
+      ]);
+      const calls = recordRequests({
+        ...absent,
+        '/catalog': sequence(absent['/catalog'], published['/catalog']),
+        '/models': sequence(absent['/models'], published['/models']),
+        '/downloads/job-bad': { cancelled: true, id: 'job-bad' },
+      });
+      await mountModels();
+      expect(buttonLabels()).toContain('Installed');
+      expect(gets(calls, '/api/catalog')).toBe(2);
+      // The failure is still announced — repairing the view must not swallow it.
+      expect(failed.mock.calls.length).toBe(1);
     } finally {
       failed.mockRestore();
     }

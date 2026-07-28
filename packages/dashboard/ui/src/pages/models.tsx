@@ -93,6 +93,12 @@ export default function Models() {
   const [deleting, setDeleting] = useState(false);
   /** repo → active download job (seeded from the server, added on install). */
   const [active, setActive] = useState<Record<string, ActiveJob>>({});
+  // Destructured, and that is load-bearing: `models`/`catalog` are new objects on
+  // every render, so naming THEM in the effect's deps below would re-run it every
+  // render — a dismiss/reload loop. `reload` is a `useCallback(…, [])`, so it is
+  // stable for the life of the hook and the deps array stays honest.
+  const { reload: reloadModels } = models;
+  const { reload: reloadCatalog } = catalog;
 
   useEffect(() => {
     const jobs = downloads.data?.jobs;
@@ -129,12 +135,30 @@ export default function Models() {
     // Racing is safe: terminal is final on the server, so a job that reads
     // terminal here cannot be running by the time the DELETE lands, and a
     // duplicate dismiss (a second dashboard tab) answers 404 and is swallowed.
+    let settled = false;
     for (const job of jobs) {
       if (!isTerminalJob(job.state)) continue;
       if (job.state === 'error') toast.error('Download failed', { description: job.repo });
+      settled = true;
       void mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(job.id)}`).catch(() => {});
     }
-  }, [downloads.data]);
+    // The catalog and models snapshots may predate the publish this job just
+    // finished: the runner sets `done` strictly AFTER `publish()` renames the
+    // staging dir into place, so a mount that spans that instant reads
+    // `present: false` from one request and `done` from the other. Nothing else
+    // repairs it — neither query polls, and a terminal job gets no
+    // `DownloadProgress`, so `onDownloadDone`'s reload never runs.
+    //
+    // Any terminal state, not just `done`. A model can be installed under an
+    // `error` too: `publish()` renames staging into final and only THEN removes
+    // the backup, and that `rm` is inside the job's try — so an EPERM there
+    // reports a failed download for a model that is on disk. `recoverBackup`
+    // likewise restores a crashed publish before the job can be cancelled.
+    if (settled) {
+      reloadModels();
+      reloadCatalog();
+    }
+  }, [downloads.data, reloadModels, reloadCatalog]);
 
   const install = async (repo: string): Promise<void> => {
     try {

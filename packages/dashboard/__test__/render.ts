@@ -37,6 +37,25 @@ export interface RenderedPage {
  */
 export type ApiStub = Record<string, unknown>;
 
+/** Brand for a route whose body CHANGES between calls; see {@link sequence}. */
+const SEQUENCE = Symbol('api-stub-sequence');
+
+/**
+ * A route body that differs per request: `bodies[n]` answers the n-th call and
+ * the last entry answers every call after it.
+ *
+ * This is how a test reaches a REFETCH. A single static body cannot distinguish
+ * "the page reloaded and got fresh state" from "the page never reloaded", so any
+ * assertion about repairing a stale snapshot is unfalsifiable without it.
+ *
+ * Branded rather than inferred from a bare array on purpose: a route body may
+ * legitimately BE an array, and guessing would make one indistinguishable from a
+ * two-call sequence.
+ */
+export function sequence(...bodies: unknown[]): unknown {
+  return { [SEQUENCE]: bodies };
+}
+
 /**
  * Install a `globalThis.fetch` that answers from `routes`. Returns a disposer.
  * Query strings are ignored when matching, so `/metrics/overview?from=…` hits
@@ -61,12 +80,21 @@ export function stubFetch(routes: ApiStub): () => void {
         resolve(new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }));
       }, 0);
     });
+  const served = new Map<string, number>();
+  const bodyFor = (path: string): unknown => {
+    const body = routes[path];
+    if (typeof body !== 'object' || body === null || !(SEQUENCE in body)) return body;
+    const bodies = (body as Record<symbol, unknown>)[SEQUENCE] as unknown[];
+    const nth = served.get(path) ?? 0;
+    served.set(path, nth + 1);
+    return bodies[Math.min(nth, bodies.length - 1)];
+  };
   globalThis.fetch = ((input: RequestInfo | URL): Promise<Response> => {
     const path = requestPath(input)
       .split('?')[0]
       .replace(/^\/api/, '');
     if (!Object.hasOwn(routes, path)) return respond({ error: `no stub for ${path}` }, 404);
-    return respond(routes[path], 200);
+    return respond(bodyFor(path), 200);
   }) as typeof globalThis.fetch;
   return () => {
     globalThis.fetch = previous;
