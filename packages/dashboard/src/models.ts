@@ -110,7 +110,7 @@ export function isModelInstalled(modelDir: string): boolean {
   const hasConfig = files.some((file) => file === 'config.json');
   const hasWeight = files.some((file) => typeof file === 'string' && isWeightFile(file));
   if (!hasConfig || !hasWeight) return false;
-  return files.every((file) => typeof file === 'string' && existsSync(join(modelDir, file)));
+  return files.every((file) => typeof file === 'string' && isRegularFile(join(modelDir, file)));
 }
 
 /**
@@ -137,30 +137,44 @@ export function isModelPresent(modelDir: string): boolean {
   } catch {
     return false;
   }
-  if (!existsSync(join(modelDir, 'config.json'))) return false;
+  if (!isRegularFile(join(modelDir, 'config.json'))) return false;
   let entries: string[];
   try {
     entries = readdirSync(modelDir);
   } catch {
     return false;
   }
-  const fileSet = new Set(entries);
-  // A single-file weight is a complete checkpoint on its own.
-  if (fileSet.has('model.safetensors') || fileSet.has('inference.pdiparams')) return true;
-  if (entries.some((file) => file.endsWith('.gguf'))) return true;
+  // Presence is about a checkpoint the LOADER can open, so every payload below is
+  // checked for its TYPE, never only its name. A directory named
+  // `model.safetensors` is reachable without touching the disk by hand: a repo
+  // holding `model.safetensors/x.safetensors` passes the download runner's path
+  // filter, and publishing it runs `mkdir(dirname(dest), { recursive: true })`.
+  // A name-only test then calls that wreckage present, which disables Install on
+  // the card AND short-circuits a re-download to `done` — self-locking, with the
+  // "needs cleanup" notice suppressed because `present` short-circuits it.
+  if (isRegularFile(join(modelDir, 'model.safetensors'))) return true;
+  if (isRegularFile(join(modelDir, 'inference.pdiparams'))) return true;
+  if (entries.some((file) => file.endsWith('.gguf') && isRegularFile(join(modelDir, file)))) return true;
   // Sharded safetensors: every shard the index references must exist on disk —
   // otherwise an interrupted download that landed the index + only the first
   // shard would falsely read as present (matches the CLI's completeness check,
   // `isModelAlreadyDownloaded`). A lone shard without its index is not complete.
-  if (fileSet.has('model.safetensors.index.json')) return shardsComplete(modelDir);
-  return false;
+  return shardsComplete(modelDir);
 }
 
-/** Every shard referenced by `model.safetensors.index.json`'s `weight_map` exists. */
+/**
+ * Every shard referenced by `model.safetensors.index.json`'s `weight_map` is a
+ * regular file. Both the index and the shards it names go through the type gates:
+ * a `weight_map` entry pointing at a directory describes nothing the loader can
+ * open, and an index that is itself a FIFO would otherwise block this scan — and
+ * with it the server — forever.
+ */
 function shardsComplete(modelDir: string): boolean {
+  const raw = readRegularFile(join(modelDir, 'model.safetensors.index.json'));
+  if (raw === undefined) return false;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(join(modelDir, 'model.safetensors.index.json'), 'utf-8')) as unknown;
+    parsed = JSON.parse(raw) as unknown;
   } catch {
     return false;
   }
@@ -175,7 +189,7 @@ function shardsComplete(modelDir: string): boolean {
   }
   if (shards.size === 0) return false;
   for (const shard of shards) {
-    if (!existsSync(join(modelDir, shard))) return false;
+    if (!isRegularFile(join(modelDir, shard))) return false;
   }
   return true;
 }
@@ -286,6 +300,56 @@ function readMarkerFile(dir: string): unknown {
     );
     if (!fstatSync(fd).isFile()) return undefined;
     return JSON.parse(readFileSync(fd, 'utf-8')) as unknown;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/**
+ * Is `path` a REGULAR FILE — not a directory, FIFO, socket or device?
+ *
+ * FOLLOWS symlinks, unlike the no-follow gate {@link readMarkerFile} puts on the
+ * marker and {@link isModelPresent} puts on the model ROOT, and the difference is
+ * deliberate. Those two guard a directory whose identity every other consumer
+ * also refuses to follow (discovery filters on `Dirent.isDirectory()`, which is
+ * false for a symlink; `deleteLocalModel` refuses one outright). A weight FILE is
+ * the opposite: every consumer follows it — the loader opens it, and `walkDirStats`
+ * already `statSync`s it precisely "so HF-cache-symlinked blobs count at their real
+ * byte size". A no-follow test here would call a symlinked weight missing and hide
+ * a checkpoint that loads perfectly, which is the regression this shape avoids.
+ */
+function isRegularFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read a regular file, or `undefined` for anything else — WITHOUT ever blocking.
+ *
+ * `readFileSync(path)` on a FIFO blocks until a writer appears, and both callers
+ * sit on the synchronous request path, so one FIFO under the models dir wedges
+ * the entire single-threaded server: not merely the request, but the event loop,
+ * including the client's own abort timer and the process's signal handling (it
+ * takes `SIGKILL` to reap). {@link readMarkerFile} already documents and solves
+ * exactly this for the marker; these two readers are the rest of that fix.
+ *
+ * `O_NONBLOCK` makes the open return instead of waiting, and the `fstat` is on the
+ * DESCRIPTOR so nothing can be swapped in after the check. `O_NOFOLLOW` is
+ * deliberately NOT set, for the reason given on {@link isRegularFile}: a
+ * HuggingFace snapshot stores `config.json` and the shard index as symlinks into
+ * `blobs/`, and refusing those would stop reading checkpoints that load today.
+ */
+function readRegularFile(path: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    if (!fstatSync(fd).isFile()) return undefined;
+    return readFileSync(fd, 'utf-8');
   } catch {
     return undefined;
   } finally {
@@ -560,7 +624,15 @@ export function discoverLocalModels(modelsDir: string): { models: LocalModel[]; 
 
     let config: Record<string, unknown>;
     try {
-      const parsed = JSON.parse(readFileSync(configPath, 'utf-8')) as unknown;
+      // Read through the type gate, not `readFileSync(path)`: discovery walks
+      // every child of the models dir, so a single `config.json` FIFO would hang
+      // this loop and the whole server with it.
+      const raw = readRegularFile(configPath);
+      if (raw === undefined) {
+        warnings.push(`${entry.name}: no readable config.json; skipped`);
+        continue;
+      }
+      const parsed = JSON.parse(raw) as unknown;
       const object = asObject(parsed);
       if (object === undefined) {
         warnings.push(`${entry.name}: config.json root is not a JSON object; skipped`);
@@ -635,6 +707,11 @@ export function deleteLocalModel(modelsDir: string, name: string): void {
   // carrying a `config.json`). The route takes an arbitrary name, so without
   // this a typo or hand-crafted request could `rmSync` an unrelated regular file
   // or non-model directory that merely happens to sit under `modelsDir`.
+  //
+  // `existsSync` and NOT the stricter `isRegularFile` the presence checks use:
+  // this is the guard on the only route that can CLEAR a malformed checkpoint,
+  // so a `config.json` that is a directory must still be deletable. Tightening
+  // it here would make the wreckage those checks now report permanent.
   if (!stat.isDirectory() || !existsSync(join(target, 'config.json'))) {
     throw new Error(`Refusing to delete "${name}": not a model checkpoint directory`);
   }
@@ -659,12 +736,10 @@ export function defaultModelsDir(): string {
 }
 
 function readModelsDirFromConfig(configPath: string): string | undefined {
-  let raw: string;
-  try {
-    raw = readFileSync(configPath, 'utf-8');
-  } catch {
-    return undefined;
-  }
+  // Type-gated like every other config read in this module: a FIFO here would
+  // block the server before it ever finished starting.
+  const raw = readRegularFile(configPath);
+  if (raw === undefined) return undefined;
   try {
     const parsed = JSON.parse(raw) as { modelsDir?: unknown };
     if (typeof parsed.modelsDir === 'string' && parsed.modelsDir.length > 0) return parsed.modelsDir;

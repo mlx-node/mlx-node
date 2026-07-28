@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -295,6 +296,117 @@ describe('isModelPresent', () => {
     );
     writeFileSync(join(partial, 'model-00001-of-00002.safetensors'), Buffer.alloc(8));
     expect(isModelPresent(partial)).toBe(false);
+  });
+});
+
+describe('a payload must be a REGULAR FILE, not merely a name on disk', () => {
+  /**
+   * A named pipe. Node has no `mkfifo`, and it is the one shape that turns a
+   * wrong answer into a hang: `readFileSync` on a FIFO blocks until a writer
+   * appears, and every reader here is on the synchronous request path.
+   *
+   * Note for whoever breaks this later: a regression does NOT fail these tests,
+   * it HANGS them. Blocking happens inside a sync syscall, so vitest's timeout
+   * never gets a turn — the run wedges instead of going red. That is the same
+   * property the server has, which is the whole reason for the gate.
+   */
+  function mkfifo(path: string): void {
+    execFileSync('mkfifo', [path]);
+  }
+
+  function writeMarker(dir: string, files: string[]): void {
+    writeFileSync(
+      join(dir, DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: 'org/repo', revision: 'main', completedAt: new Date().toISOString(), files }),
+    );
+  }
+
+  it('is NOT present when the weight is a directory — the shape a download can really leave', () => {
+    // Reachable without touching the disk by hand. `POST /api/downloads` takes an
+    // arbitrary repo, a repo file at `model.safetensors/x.safetensors` passes the
+    // runner's path filter, and publishing it runs `mkdir(dirname(dest))` — which
+    // creates a DIRECTORY named `model.safetensors`. A name-only check called that
+    // present, so the card showed a disabled "Installed" and a retry short-circuited
+    // to `done`: nothing the user could do from the dashboard, forever.
+    const dir = join(modelsDir, 'weight-is-a-dir');
+    mkdirSync(join(dir, 'model.safetensors'), { recursive: true });
+    writeFileSync(join(dir, 'config.json'), Buffer.alloc(4));
+    writeFileSync(join(dir, 'model.safetensors', 'x.safetensors'), Buffer.alloc(8));
+    expect(isModelPresent(dir)).toBe(false);
+  });
+
+  it('is NOT present when config.json is a directory', () => {
+    const dir = join(modelsDir, 'config-is-a-dir');
+    mkdirSync(join(dir, 'config.json'), { recursive: true });
+    writeFileSync(join(dir, 'model.safetensors'), Buffer.alloc(8));
+    expect(isModelPresent(dir)).toBe(false);
+  });
+
+  it('STAYS present when the weight is a symlink to a real file', () => {
+    // The guard on the fix itself. The obvious implementation of "must be a regular
+    // file" is `lstat`/`Dirent.isFile()`, and both answer FALSE for a symlink — which
+    // is how a HuggingFace snapshot stores every payload, as a link into `blobs/`.
+    // That version passes every other test in this block and silently unlists a
+    // checkpoint that loads perfectly. Only a FOLLOWING `statSync` gets both right.
+    const dir = join(modelsDir, 'weight-is-a-symlink');
+    const blobs = join(modelsDir, 'blobs-store');
+    mkdirSync(dir, { recursive: true });
+    mkdirSync(blobs, { recursive: true });
+    writeFileSync(join(blobs, 'sha256-abc'), Buffer.alloc(8));
+    writeFileSync(join(blobs, 'sha256-cfg'), Buffer.alloc(4));
+    symlinkSync(join(blobs, 'sha256-abc'), join(dir, 'model.safetensors'));
+    symlinkSync(join(blobs, 'sha256-cfg'), join(dir, 'config.json'));
+    expect(isModelPresent(dir)).toBe(true);
+  });
+
+  it('is NOT installed when a file the marker lists is a directory', () => {
+    const dir = join(modelsDir, 'marker-lists-a-dir');
+    mkdirSync(join(dir, 'model.safetensors'), { recursive: true });
+    writeFileSync(join(dir, 'config.json'), Buffer.alloc(4));
+    writeMarker(dir, ['config.json', 'model.safetensors']);
+    expect(isModelInstalled(dir)).toBe(false);
+  });
+
+  it('is NOT present when the shard index points at a directory', () => {
+    const dir = join(modelsDir, 'shard-is-a-dir');
+    mkdirSync(join(dir, 'model-00001-of-00001.safetensors'), { recursive: true });
+    writeFileSync(join(dir, 'config.json'), Buffer.alloc(4));
+    writeFileSync(
+      join(dir, 'model.safetensors.index.json'),
+      JSON.stringify({ weight_map: { 'a.weight': 'model-00001-of-00001.safetensors' } }),
+    );
+    expect(isModelPresent(dir)).toBe(false);
+  });
+
+  it('RETURNS instead of blocking when the weight or the shard index is a FIFO', () => {
+    const weight = join(modelsDir, 'weight-is-a-fifo');
+    mkdirSync(weight, { recursive: true });
+    writeFileSync(join(weight, 'config.json'), Buffer.alloc(4));
+    mkfifo(join(weight, 'model.safetensors'));
+    expect(isModelPresent(weight)).toBe(false);
+
+    // The index is the one that used to block: `shardsComplete` read it with a
+    // bare `readFileSync(path)`, so a single FIFO under the models dir hung
+    // `/api/catalog`, the event loop, and the process's own signal handling —
+    // it took SIGKILL to reap. The marker reader already had this gate; these
+    // are the rest of it.
+    const index = join(modelsDir, 'index-is-a-fifo');
+    mkdirSync(index, { recursive: true });
+    writeFileSync(join(index, 'config.json'), Buffer.alloc(4));
+    mkfifo(join(index, 'model.safetensors.index.json'));
+    expect(isModelPresent(index)).toBe(false);
+  });
+
+  it('RETURNS instead of blocking when a discovered checkpoint has a FIFO config.json', () => {
+    // `discoverLocalModels` walks every child of the models dir and read each
+    // `config.json` with a bare `readFileSync`, so this wedged `/api/models` the
+    // same way — and needs no catalog entry to reach.
+    const dir = join(modelsDir, 'fifo-config');
+    mkdirSync(dir, { recursive: true });
+    mkfifo(join(dir, 'config.json'));
+    const { models, warnings } = discoverLocalModels(modelsDir);
+    expect(models.map((m) => m.name)).not.toContain('fifo-config');
+    expect(warnings.some((w) => w.startsWith('fifo-config:'))).toBe(true);
   });
 });
 
