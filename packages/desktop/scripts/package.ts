@@ -101,6 +101,17 @@ run('install_name_tool', ['-id', `@rpath/${NATIVE_FILES[0]}`, stagedAddon]);
 const staged = stageApp({ repoRoot: REPO_ROOT, desktopDir: APP_DIR, stageDir: STAGE_APP, roots: RUNTIME_ROOTS });
 console.log(`staged ${staged.externalCount} external + ${staged.workspaceCount} workspace packages`);
 console.log(`  pruned ${staged.prunedDirs} examples/docs/test dirs from staged packages`);
+console.log(`  pruned ${staged.prunedFiles} .d.ts / source-map / tsbuildinfo files`);
+if (staged.excludedProviderSdk.length > 0) {
+  console.log(
+    `  excluded ${staged.excludedProviderSdk.join(', ')} — cloud LLM SDKs, unreachable without a pi-ai stream()`,
+  );
+}
+if (staged.prunedNested.length > 0) {
+  console.log(
+    `  removed ${staged.prunedNested.join(', ')} from nested node_modules — copied by directory, not by name`,
+  );
+}
 if (staged.excludedThirdParty.length > 0) {
   console.log(`  excluded ${staged.excludedThirdParty.join(', ')} — leaks a build path, fails gate [3/5]`);
 }

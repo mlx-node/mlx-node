@@ -85,6 +85,63 @@ function isExcludedThirdPartyBinary(name: string): boolean {
 }
 
 /**
+ * The cloud-LLM provider SDKs, ~114 MB of an app whose entire premise is that
+ * inference happens locally. They are `dependencies` of `@earendil-works/pi-ai`,
+ * which arrives under `@earendil-works/pi-coding-agent`. Our entire value-import
+ * surface on that package is four session-file parsing symbols —
+ * `SessionManager`, `parseSessionEntries`, `buildContextEntries`,
+ * `migrateSessionEntries` — plus erased `type` imports. Nothing else.
+ *
+ * Only these SEVEN names are listed. Everything else that goes with them —
+ * `zod`, `protobufjs`, `web-streams-polyfill`, `@opentelemetry/*`, the rest of
+ * `@aws-sdk/*` and `@smithy/*`, 81 packages in all — disappears because the walk
+ * below can no longer reach it, not because it was named. That distinction is
+ * the safety property: the day something in the app legitimately needs `zod`,
+ * `zod` comes back on its own.
+ *
+ * Unreachability is a property of pi-ai's design rather than an accident of our
+ * import graph, which is why this is safe against a code path nobody exercised:
+ *
+ *  1. Every provider SDK is behind a `*.lazy.js` shim. `api/lazy.js` calls
+ *     `load()` only from inside `stream()`/`streamSimple()` — the module is
+ *     fetched when a request is issued to that provider, not when the api object
+ *     is constructed. `bedrock-converse-stream.lazy.js` goes further and hides
+ *     the specifier in a variable so no bundler can follow it either.
+ *  2. So reaching any of them requires calling `stream()` on a pi-ai model. This
+ *     app never does: nothing under `packages/desktop`, `packages/dashboard` or
+ *     `packages/server` constructs an `AgentSession`, a `ModelRuntime`, or spawns
+ *     the `pi` binary. `@mlx-node/agent` is in the graph only through
+ *     `@mlx-node/agent/catalog`, a subpath whose built module has no imports at
+ *     all.
+ *  3. Measured, not reasoned: importing the whole `@mlx-node/dashboard` entry
+ *     under a `module.registerHooks` resolve hook loads 2330 modules and not one
+ *     file from any of these packages.
+ *  4. `@opentelemetry/api` is a declared dependency that pi-ai never imports —
+ *     the string does not appear in any `.js` it ships.
+ *
+ * The failure mode if this is ever wrong is loud rather than silent: an
+ * ERR_MODULE_NOT_FOUND out of a `lazyApi` load, surfaced by `lazyStream` as an
+ * error event on the very request that needed it.
+ */
+const CLOUD_PROVIDER_SDKS = new Set([
+  '@anthropic-ai/sdk',
+  '@aws-sdk/client-bedrock-runtime',
+  '@google/genai',
+  '@mistralai/mistralai',
+  '@opentelemetry/api',
+  '@smithy/node-http-handler',
+  'openai',
+]);
+
+function isCloudProviderSdk(name: string): boolean {
+  return CLOUD_PROVIDER_SDKS.has(name);
+}
+
+function isExcludedPackage(name: string): boolean {
+  return isPrebuiltAddonPackage(name) || isExcludedThirdPartyBinary(name) || isCloudProviderSdk(name);
+}
+
+/**
  * Transitive runtime closure of `roots`.
  *
  * devDependencies are excluded, which is what keeps Electron itself (a
@@ -108,12 +165,14 @@ export function runtimeClosure(
   skippedOptional: string[];
   excludedPrebuilt: string[];
   excludedThirdParty: string[];
+  excludedProviderSdk: string[];
 } {
   const external = new Set<string>();
   const workspace = new Set<string>();
   const skippedOptional: string[] = [];
   const excludedPrebuilt: string[] = [];
   const excludedThirdParty: string[] = [];
+  const excludedProviderSdk: string[] = [];
   const seen = new Set<string>();
   const queue: Array<{ name: string; optional: boolean }> = roots.map((name) => ({ name, optional: false }));
 
@@ -129,6 +188,11 @@ export function runtimeClosure(
 
     if (isExcludedThirdPartyBinary(name)) {
       excludedThirdParty.push(name);
+      continue;
+    }
+
+    if (isCloudProviderSdk(name)) {
+      excludedProviderSdk.push(name);
       continue;
     }
 
@@ -154,6 +218,7 @@ export function runtimeClosure(
     skippedOptional: skippedOptional.sort(),
     excludedPrebuilt: excludedPrebuilt.sort(),
     excludedThirdParty: excludedThirdParty.sort(),
+    excludedProviderSdk: excludedProviderSdk.sort(),
   };
 }
 
@@ -173,19 +238,114 @@ export function runtimeClosure(
  */
 const NON_RUNTIME_DIRS = new Set(['examples', 'example', '__tests__', '.github', 'docs']);
 
-function pruneNonRuntime(dir: string): number {
-  let removed = 0;
+/**
+ * Files a Node runtime never opens: TypeScript declarations, source maps, and
+ * `tsc -b`'s incremental state. 75 MB of the staged tree, and the single largest
+ * line item in it — `drizzle-orm` ships 17.8 MB of `.d.ts` + `.map` against
+ * 7.6 MB of executable code.
+ *
+ * Narrow on purpose, in both directions:
+ *
+ *  - `.d.ts`/`.d.cts`/`.d.mts` only, never plain `.ts`. Node 22+ executes `.ts`
+ *    directly, so a package whose entry point resolves into `src/*.ts` would stop
+ *    working; a declaration file has no runtime form to resolve to. Verified: no
+ *    file in the staged tree imports a `.d.ts` specifier.
+ *  - `.map` matched only behind a code extension. A stray `foo.map` could be a
+ *    package's own data; `foo.js.map` cannot be anything but a source map.
+ *    Verified: all 6571 `.map` files in the staged tree are `*.{js,cjs,mjs,ts,
+ *    cts,mts,css}.map`.
+ *
+ * Nothing reads them here. Neither Electron nor this app enables source maps
+ * (no `--enable-source-maps`, no `setSourceMapsEnabled`), and a `//#
+ * sourceMappingURL` pointing at a file that is gone is ignored rather than
+ * fatal even when they are on — the cost is a stack frame that names the emitted
+ * line instead of the source one. `.tsbuildinfo` is worse than dead weight: it
+ * is a build-layout record with no consumer inside a shipped app.
+ */
+const NON_RUNTIME_FILE = /(\.d\.[cm]?ts|\.(?:[cm]?[jt]s|css)\.map|\.tsbuildinfo)$/;
+
+/** Exported so the rule itself can be pinned, not just its effect on one tree. */
+export function isNonRuntimeFile(name: string): boolean {
+  return NON_RUNTIME_FILE.test(name);
+}
+
+interface PruneCount {
+  dirs: number;
+  files: number;
+}
+
+/**
+ * Recurses through nested `node_modules` as well. Yarn hoists most of the tree,
+ * but not all of it: `@earendil-works/*` alone carries 20 MB of nested copies,
+ * and skipping them left the biggest single duplicate — three copies of typebox
+ * — untouched.
+ */
+function pruneNonRuntime(dir: string, count: PruneCount = { dirs: 0, files: 0 }): PruneCount {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    if (NON_RUNTIME_DIRS.has(entry.name)) {
-      rmSync(join(dir, entry.name), { recursive: true, force: true });
-      removed += 1;
+    if (entry.isDirectory()) {
+      if (NON_RUNTIME_DIRS.has(entry.name)) {
+        rmSync(join(dir, entry.name), { recursive: true, force: true });
+        count.dirs += 1;
+        continue;
+      }
+      pruneNonRuntime(join(dir, entry.name), count);
       continue;
     }
-    if (entry.name === 'node_modules') continue;
-    removed += pruneNonRuntime(join(dir, entry.name));
+    if (entry.isFile() && NON_RUNTIME_FILE.test(entry.name)) {
+      rmSync(join(dir, entry.name), { force: true });
+      count.files += 1;
+    }
   }
-  return removed;
+  return count;
+}
+
+/** Package names directly under a `node_modules` directory, `@scope/name` included. */
+function packageNamesIn(nodeModules: string): string[] {
+  const names: string[] = [];
+  for (const entry of readdirSync(nodeModules, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    if (!entry.name.startsWith('@')) {
+      names.push(entry.name);
+      continue;
+    }
+    for (const scoped of readdirSync(join(nodeModules, entry.name), { withFileTypes: true })) {
+      if (scoped.isDirectory()) names.push(`${entry.name}/${scoped.name}`);
+    }
+  }
+  return names;
+}
+
+/**
+ * Remove excluded packages that ride in on a nested `node_modules`.
+ *
+ * `runtimeClosure` decides by NAME while the copy above happens by DIRECTORY,
+ * and the two disagree wherever Yarn could not hoist. `@earendil-works/pi-ai`
+ * carries its own `node_modules/@smithy/node-http-handler`, so the exclusion
+ * list refused the package and staged it anyway — a rule that reports success
+ * and does nothing.
+ *
+ * Today that gap is 232 KB. The reason to close it is not the 232 KB: nesting is
+ * a resolution outcome, so the same version bump that moves a provider SDK down
+ * one level would put the whole 114 MB back with no diff to explain it.
+ */
+export function pruneExcludedNested(modules: string): string[] {
+  const removed: string[] = [];
+  const visit = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const child = join(dir, entry.name);
+      if (entry.name === 'node_modules') {
+        for (const name of packageNamesIn(child)) {
+          if (!isExcludedPackage(name)) continue;
+          rmSync(join(child, name), { recursive: true, force: true });
+          removed.push(name);
+        }
+      }
+      visit(child);
+    }
+  };
+  visit(modules);
+  return removed.sort();
 }
 
 export interface StageResult {
@@ -198,8 +358,14 @@ export interface StageResult {
   excludedPrebuilt: string[];
   /** Third-party binaries dropped because they leak a build path; see isExcludedThirdPartyBinary. */
   excludedThirdParty: string[];
+  /** Cloud-LLM SDKs dropped because nothing local-inference can reach them; see isCloudProviderSdk. */
+  excludedProviderSdk: string[];
   /** Count of examples/docs/test directories removed from staged packages. */
   prunedDirs: number;
+  /** Count of .d.ts / source-map / tsbuildinfo files removed from the staged tree. */
+  prunedFiles: number;
+  /** Excluded packages that arrived nested inside another package's node_modules. */
+  prunedNested: string[];
 }
 
 /**
@@ -242,10 +408,8 @@ export function stageApp(opts: {
     )}\n`,
   );
 
-  const { external, workspace, skippedOptional, excludedPrebuilt, excludedThirdParty } = runtimeClosure(
-    repoRoot,
-    opts.roots,
-  );
+  const { external, workspace, skippedOptional, excludedPrebuilt, excludedThirdParty, excludedProviderSdk } =
+    runtimeClosure(repoRoot, opts.roots);
   const modules = join(stageDir, 'node_modules');
 
   for (const name of external) {
@@ -271,7 +435,11 @@ export function stageApp(opts: {
     }
   }
 
-  const prunedDirs = pruneNonRuntime(modules);
+  // The app's own `dist` is pruned too: `tsc -b` emits `.d.ts` + `.d.ts.map`
+  // beside every entry, and none of it is reachable once the app is running.
+  const pruned = pruneNonRuntime(modules);
+  pruneNonRuntime(join(stageDir, 'dist'), pruned);
+  const prunedNested = pruneExcludedNested(modules);
 
   return {
     appDir: stageDir,
@@ -280,6 +448,9 @@ export function stageApp(opts: {
     skippedOptional,
     excludedPrebuilt,
     excludedThirdParty,
-    prunedDirs,
+    excludedProviderSdk,
+    prunedDirs: pruned.dirs,
+    prunedFiles: pruned.files,
+    prunedNested,
   };
 }
