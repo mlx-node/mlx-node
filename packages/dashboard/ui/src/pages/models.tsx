@@ -84,6 +84,77 @@ function QuantBadge({ quant }: { quant: string | null }) {
   );
 }
 
+/**
+ * The column set of the local-models table, rendered by the loading branch and
+ * the loaded branch from this one definition.
+ *
+ * Both branches need it, and they must never disagree. A header that only the
+ * loaded branch renders is not a cosmetic difference: it appears out of nowhere
+ * when the request lands and pushes every row down by its own 40px, which is the
+ * jump this page was reported for. Sharing the markup is what makes the two
+ * branches structurally incapable of drifting apart again.
+ */
+function LocalModelsHead() {
+  return (
+    <TableHeader>
+      <TableRow>
+        <TableHead>Name</TableHead>
+        <TableHead>Family</TableHead>
+        <TableHead>Quantization</TableHead>
+        <TableHead className="text-right">Size</TableHead>
+        <TableHead className="text-right">Context</TableHead>
+        <TableHead className="w-0" />
+      </TableRow>
+    </TableHeader>
+  );
+}
+
+/**
+ * Three placeholder rows in the real table, under the real header.
+ *
+ * Three because a working install carries a handful of checkpoints, and because
+ * a fresh one resolves to the empty state below rather than to rows — three rows
+ * sit within half a row of that empty state's own height, so both outcomes land
+ * near the space held for them. The exact length cannot be known before the
+ * response arrives and that residual is unavoidable; what is fixed here is the
+ * header and the per-row box.
+ *
+ * Every bar is `h-[1lh]` — one line box of the text of the very cell it sits in
+ * — and the last cell reserves the delete button's `size-9`, which is what
+ * actually sets the row height (36px of button beats 20px of text inside the
+ * cell's `p-2`). Sized bars rather than full-width ones because this table uses
+ * the browser's automatic column algorithm, so the columns are solved from their
+ * content: a row of full-width bars would widen every column and then snap back.
+ */
+function LocalModelsSkeletonRows() {
+  return (
+    <TableBody>
+      {Array.from({ length: 3 }).map((_, i) => (
+        <TableRow key={i}>
+          <TableCell className="max-w-[22rem] truncate font-medium">
+            <Skeleton className="h-[1lh] w-52" />
+          </TableCell>
+          <TableCell className="text-muted-foreground">
+            <Skeleton className="h-[1lh] w-20" />
+          </TableCell>
+          <TableCell>
+            <Skeleton className="h-[1lh] w-16" />
+          </TableCell>
+          <TableCell className="text-right tabular-nums">
+            <Skeleton className="ml-auto h-[1lh] w-14" />
+          </TableCell>
+          <TableCell className="text-muted-foreground text-right tabular-nums">
+            <Skeleton className="ml-auto h-[1lh] w-14" />
+          </TableCell>
+          <TableCell className="text-right">
+            <Skeleton className="ml-auto size-9" />
+          </TableCell>
+        </TableRow>
+      ))}
+    </TableBody>
+  );
+}
+
 export default function Models() {
   const models = useJson<ModelsResponse>('/models');
   const catalog = useJson<CatalogResponse>('/catalog');
@@ -279,10 +350,22 @@ export default function Models() {
         <StatTile
           label="Installed"
           icon={Package}
-          value={models.loading ? <Skeleton className="h-8 w-12" /> : formatCount(localModels.length)}
+          value={models.loading ? <Skeleton className="h-[1lh] w-12" /> : formatCount(localModels.length)}
           sub={
             models.loading ? (
-              <Skeleton className="h-4 w-24" />
+              // Two lines, because the loaded sub is two lines: the directory
+              // below is drawn whenever the server names one, which is every
+              // case except an unconfigured install. Reserving one line here
+              // would leave the tile 22px short and shove the table below it
+              // down the moment the response lands — and the response is what
+              // says whether the second line exists at all, so the shape has to
+              // be guessed. Guess the common one.
+              <>
+                <Skeleton className="block h-[1lh] w-24" />
+                <span className="mt-0.5 block font-mono text-[11px]">
+                  <Skeleton className="h-[1lh] w-40 max-w-full" />
+                </span>
+              </>
             ) : (
               <>
                 <span className="block">{formatBytes(totalBytes)} on disk</span>
@@ -300,10 +383,10 @@ export default function Models() {
         <StatTile
           label="Recommended"
           icon={Download}
-          value={catalog.loading ? <Skeleton className="h-8 w-12" /> : formatCount(catalogItems.length)}
+          value={catalog.loading ? <Skeleton className="h-[1lh] w-12" /> : formatCount(catalogItems.length)}
           sub={
             catalog.loading ? (
-              <Skeleton className="h-4 w-28" />
+              <Skeleton className="h-[1lh] w-28" />
             ) : (
               // Count `present` (loadable on disk, incl. a renamed dashboard
               // install / a CLI install), matching what each card labels
@@ -351,11 +434,10 @@ export default function Models() {
               {models.error.message}
             </div>
           ) : models.loading ? (
-            <div className="space-y-3">
-              {Array.from({ length: 4 }).map((_, i) => (
-                <Skeleton key={i} className="h-10 w-full" />
-              ))}
-            </div>
+            <Table>
+              <LocalModelsHead />
+              <LocalModelsSkeletonRows />
+            </Table>
           ) : localModels.length === 0 ? (
             <div className="text-muted-foreground flex flex-col items-center gap-2 py-10 text-sm">
               <Inbox className="size-6" aria-hidden />
@@ -363,16 +445,7 @@ export default function Models() {
             </div>
           ) : (
             <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Name</TableHead>
-                  <TableHead>Family</TableHead>
-                  <TableHead>Quantization</TableHead>
-                  <TableHead className="text-right">Size</TableHead>
-                  <TableHead className="text-right">Context</TableHead>
-                  <TableHead className="w-0" />
-                </TableRow>
-              </TableHeader>
+              <LocalModelsHead />
               <TableBody>
                 {localModels.map((model) => (
                   <TableRow key={model.name}>
@@ -423,7 +496,7 @@ export default function Models() {
       ) : catalog.loading ? (
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
           {Array.from({ length: 3 }).map((_, i) => (
-            <Skeleton key={i} className="h-44 w-full rounded-xl" />
+            <CatalogCardSkeleton key={i} />
           ))}
         </div>
       ) : (
@@ -466,6 +539,51 @@ export default function Models() {
         </DialogContent>
       </Dialog>
     </div>
+  );
+}
+
+/**
+ * A placeholder that is a real {@link CatalogCard} with its text taken out:
+ * same `Card`/`CardHeader`/`CardContent` wrappers, same `gap-4`, same padding,
+ * same install button box — only the leaves are grey.
+ *
+ * It replaces one fixed 176px block, a height that stood for nothing in
+ * particular. The card these stand in for measures 170px (24px of `py-6`, a 16px
+ * `leading-none` title, `gap-1.5`, a 20px description line, `gap-4`, a 16px
+ * `text-xs` meta row, `space-y-3`, the 36px button, 24px of `py-6`) and grows
+ * another 20px the moment a description wraps to a second line, so no constant
+ * was ever going to be right. Built from the same wrappers there is no constant
+ * to get wrong: the height is whatever the loaded card computes to.
+ *
+ * Three of them because the served catalog holds exactly three visible entries.
+ * One residual is left standing: the single `isDefault` entry carries a badge
+ * that makes its title row 6px taller, and grid items stretch, so the row it
+ * lands in grows by that much. Painting a badge on all three to absorb it would
+ * claim a default on cards that have none.
+ */
+function CatalogCardSkeleton() {
+  return (
+    <Card className="gap-4">
+      <CardHeader>
+        <div className="flex items-start justify-between gap-2">
+          <CardTitle className="text-base">
+            <Skeleton className="h-[1lh] w-40" />
+          </CardTitle>
+        </div>
+        <CardDescription>
+          <Skeleton className="h-[1lh] w-full" />
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="mt-auto space-y-3">
+        <div className="flex items-center justify-between gap-2 text-xs">
+          <Skeleton className="h-[1lh] w-48" />
+          <Skeleton className="h-[1lh] w-12" />
+        </div>
+        {/* The button box, not a button: `h-9` is what `Button`'s default size
+            resolves to, and it is the tallest thing in the card's content. */}
+        <Skeleton className="h-9 w-full" />
+      </CardContent>
+    </Card>
   );
 }
 

@@ -18,6 +18,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { mutate } from '@/lib/api';
 import { formatCount, formatNumber, formatRelativeTime } from '@/lib/format';
 import { shQuote } from '@/lib/shell';
+import { stableNow } from '@/lib/stable-now';
 import type { SessionRenameResponse, SessionRow, SessionsResponse } from '@/lib/types';
 import { useJson } from '@/lib/use-api';
 import { AlertCircle, Copy, Inbox, Loader2, Pencil, Search, Trash2 } from 'lucide-react';
@@ -46,6 +47,28 @@ const SINCE_OPTIONS: Array<{ value: string; label: string; days: number | null }
   { value: '30', label: 'Last 30 days', days: 30 },
 ];
 
+/**
+ * The request path for a set of filters — and therefore the cache key.
+ *
+ * Exported and pure so the clock in it is testable. Inline in the component it
+ * was reachable only by driving a radix `Select`, which is not something a
+ * happy-dom test can do; the consequence was that the only guard on the `from`
+ * timestamp was one that never ran with a date filter set, and so passed just as
+ * happily against a raw `Date.now()`.
+ */
+export function sessionsPath({ query, cwd, since }: { query: string; cwd: string; since: string }): string {
+  const params = new URLSearchParams();
+  if (query !== '') params.set('q', query);
+  if (cwd !== 'all') params.set('cwd', cwd);
+  const days = SINCE_OPTIONS.find((o) => o.value === since)?.days ?? null;
+  // Quantized, for the reason spelled out in `stable-now.ts`. The default filter
+  // is "Any time", which adds no `from` at all, so the miss-every-visit bug was
+  // latent here rather than absent: it appeared the moment a date was picked.
+  if (days !== null) params.set('from', String(stableNow() - days * DAY_MS));
+  const qs = params.toString();
+  return qs === '' ? '/sessions' : `/sessions?${qs}`;
+}
+
 export default function Sessions() {
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
@@ -64,15 +87,7 @@ export default function Sessions() {
     return () => clearTimeout(handle);
   }, [query]);
 
-  const path = useMemo(() => {
-    const params = new URLSearchParams();
-    if (debouncedQuery !== '') params.set('q', debouncedQuery);
-    if (cwd !== 'all') params.set('cwd', cwd);
-    const days = SINCE_OPTIONS.find((o) => o.value === since)?.days ?? null;
-    if (days !== null) params.set('from', String(Date.now() - days * DAY_MS));
-    const qs = params.toString();
-    return qs === '' ? '/sessions' : `/sessions?${qs}`;
-  }, [debouncedQuery, cwd, since]);
+  const path = useMemo(() => sessionsPath({ query: debouncedQuery, cwd, since }), [debouncedQuery, cwd, since]);
 
   const sessions = useJson<SessionsResponse>(path);
 
@@ -183,11 +198,10 @@ export default function Sessions() {
               {sessions.error.message}
             </div>
           ) : sessions.loading ? (
-            <div className="space-y-3 px-6">
-              {Array.from({ length: 6 }).map((_, i) => (
-                <Skeleton key={i} className="h-10 w-full" />
-              ))}
-            </div>
+            <Table className="table-fixed">
+              <SessionsTableHead />
+              <SessionsSkeletonRows />
+            </Table>
           ) : rows.length === 0 ? (
             <div className="text-muted-foreground flex flex-col items-center gap-2 px-6 py-12 text-sm">
               <Inbox className="size-6" aria-hidden />
@@ -199,17 +213,7 @@ export default function Sessions() {
             // columns behind a horizontal scroll. The outer cells carry the card's own
             // 24px gutter so full-bleed row separators still line up with the footnote.
             <Table className="table-fixed">
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-[50%] pl-6 lg:w-[40%] xl:w-[34%] 2xl:w-[30%]">Session</TableHead>
-                  <TableHead className="hidden xl:table-cell xl:w-[17%] 2xl:w-[14%]">Directory</TableHead>
-                  <TableHead className="hidden lg:table-cell lg:w-[21%] xl:w-[20%] 2xl:w-[14%]">Models</TableHead>
-                  <TableHead className="w-[24%] text-right lg:w-[17%] xl:w-[13%] 2xl:w-[11%]">Modified</TableHead>
-                  <TableHead className="hidden text-right 2xl:table-cell 2xl:w-[9%]">Messages</TableHead>
-                  <TableHead className="hidden text-right 2xl:table-cell 2xl:w-[8%]">Tokens</TableHead>
-                  <TableHead className="w-[26%] pr-6 lg:w-[22%] xl:w-[16%] 2xl:w-[14%]" />
-                </TableRow>
-              </TableHeader>
+              <SessionsTableHead />
               <TableBody>
                 {rows.map((session) => (
                   <SessionTableRow
@@ -297,6 +301,86 @@ export default function Sessions() {
 
 function sessionTitle(session: SessionRow): string {
   return session.name ?? session.firstMessage ?? session.id;
+}
+
+/**
+ * The column set, rendered by the loading branch and the loaded branch from this
+ * one definition.
+ *
+ * Both branches need it and they must never disagree. A header only the loaded
+ * branch renders arrives with the response and shoves every row down by its own
+ * 40px; worse here than elsewhere, because these percentage widths are what the
+ * fixed layout solves the whole grid from — without them the loading rows would
+ * be laid out by a different algorithm and every column would jump sideways as
+ * well. Sharing the markup is what stops the two from drifting apart again.
+ */
+function SessionsTableHead() {
+  return (
+    <TableHeader>
+      <TableRow>
+        <TableHead className="w-[50%] pl-6 lg:w-[40%] xl:w-[34%] 2xl:w-[30%]">Session</TableHead>
+        <TableHead className="hidden xl:table-cell xl:w-[17%] 2xl:w-[14%]">Directory</TableHead>
+        <TableHead className="hidden lg:table-cell lg:w-[21%] xl:w-[20%] 2xl:w-[14%]">Models</TableHead>
+        <TableHead className="w-[24%] text-right lg:w-[17%] xl:w-[13%] 2xl:w-[11%]">Modified</TableHead>
+        <TableHead className="hidden text-right 2xl:table-cell 2xl:w-[9%]">Messages</TableHead>
+        <TableHead className="hidden text-right 2xl:table-cell 2xl:w-[8%]">Tokens</TableHead>
+        <TableHead className="w-[26%] pr-6 lg:w-[22%] xl:w-[16%] 2xl:w-[14%]" />
+      </TableRow>
+    </TableHeader>
+  );
+}
+
+/**
+ * Six placeholder rows in the real table, under the real header.
+ *
+ * Six because this page browses every recorded session and the server serves up
+ * to 500 of them, so a short list is the exception — under-reserving is the safe
+ * direction, and six rows is about what the card shows above the fold once the
+ * filter bar is subtracted. Claiming more would leave a gap on the one reading
+ * that legitimately comes back short.
+ *
+ * Each cell repeats its loaded counterpart's classes, responsive visibility
+ * included, so the same columns exist in both states. The bars are `h-[1lh]`,
+ * one line box of the text of the cell they sit in — the `text-xs` on the
+ * directory bar is what makes that the mono line box rather than the row's. Only
+ * the last cell is measured rather than approximated: three `size-9` icon
+ * buttons are the tallest thing in a row and are what set its 52px, so the model
+ * badges (22px) can be plain bars without moving anything.
+ */
+function SessionsSkeletonRows() {
+  return (
+    <TableBody>
+      {Array.from({ length: 6 }).map((_, i) => (
+        <TableRow key={i}>
+          <TableCell className="pl-6">
+            <Skeleton className="h-[1lh] w-3/4" />
+          </TableCell>
+          <TableCell className="text-muted-foreground hidden xl:table-cell">
+            <Skeleton className="h-[1lh] w-full text-xs" />
+          </TableCell>
+          <TableCell className="hidden lg:table-cell">
+            <Skeleton className="h-[1lh] w-24" />
+          </TableCell>
+          <TableCell className="text-muted-foreground text-right">
+            <Skeleton className="ml-auto h-[1lh] w-16" />
+          </TableCell>
+          <TableCell className="hidden text-right tabular-nums 2xl:table-cell">
+            <Skeleton className="ml-auto h-[1lh] w-8" />
+          </TableCell>
+          <TableCell className="hidden text-right tabular-nums 2xl:table-cell">
+            <Skeleton className="ml-auto h-[1lh] w-10" />
+          </TableCell>
+          <TableCell className="pr-6 text-right">
+            <div className="flex justify-end gap-0.5">
+              <Skeleton className="size-9" />
+              <Skeleton className="size-9" />
+              <Skeleton className="size-9" />
+            </div>
+          </TableCell>
+        </TableRow>
+      ))}
+    </TableBody>
+  );
 }
 
 interface SessionTableRowProps {

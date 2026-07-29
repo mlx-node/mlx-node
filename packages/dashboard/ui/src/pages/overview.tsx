@@ -5,10 +5,24 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { formatBytes, formatCount, formatPercent, formatRate, formatRelativeTime, percentInt } from '@/lib/format';
 import type { CacheResponse, DownloadsResponse, ModelsResponse, SessionRow, SessionsResponse } from '@/lib/types';
 import { useJson } from '@/lib/use-api';
+import { cn } from '@/lib/utils';
 import { AlertCircle, ArrowRight, Boxes, Download, HardDrive, Inbox, MessagesSquare } from 'lucide-react';
 import { Link } from 'react-router-dom';
 
 const RECENT_LIMIT = 6;
+
+/**
+ * The three class strings that decide a recent-session row's box.
+ *
+ * The loaded row and the row that stands in for it while `/sessions` is in
+ * flight have to measure the same, so the padding, the gaps and the two font
+ * sizes are written once and shared rather than retyped in both places — retyped
+ * they drift the first time anyone adjusts the row, and the drift is invisible
+ * until the list swaps and the card below it moves.
+ */
+const ROW_BOX = 'flex items-center gap-3 px-6 py-3';
+const ROW_TITLE = 'truncate text-sm font-medium';
+const ROW_META = 'text-muted-foreground mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs';
 
 function TileError({ message }: { message: string }) {
   return (
@@ -72,16 +86,27 @@ export default function Overview() {
         <p className="text-muted-foreground text-sm">Models, sessions, tokens, and cache at a glance.</p>
       </div>
 
+      {/*
+        Every bar below is `h-[1lh]`: one line box of the font its OWN wrapper
+        carries. StatTile renders `value` inside `text-3xl leading-none` and
+        `sub` inside `text-sm`, so the bar resolves to 30px and 20px without
+        anyone having to know that — and it stays right if either font size ever
+        changes. The hand-picked heights it replaces did not measure the same as
+        the text: `h-8` was 2px taller than the value and `h-4` 4px shorter than
+        the sub-line, so all four tiles grew 6px when their request landed, the
+        grid row grew with them, and the card underneath jumped four times over
+        as the four independent requests resolved.
+      */}
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatTile
           label="Local models"
           icon={Boxes}
-          value={models.loading ? <Skeleton className="h-8 w-16" /> : formatCount(modelCount)}
+          value={models.loading ? <Skeleton className="h-[1lh] w-16" /> : formatCount(modelCount)}
           sub={
             models.error ? (
               <TileError message="Failed to load models" />
             ) : models.loading ? (
-              <Skeleton className="h-4 w-24" />
+              <Skeleton className="h-[1lh] w-24" />
             ) : (
               `${formatBytes(modelBytes)} on disk`
             )
@@ -91,12 +116,12 @@ export default function Overview() {
         <StatTile
           label="Sessions"
           icon={MessagesSquare}
-          value={sessions.loading ? <Skeleton className="h-8 w-16" /> : formatCount(sessionCount)}
+          value={sessions.loading ? <Skeleton className="h-[1lh] w-16" /> : formatCount(sessionCount)}
           sub={
             sessions.error ? (
               <TileError message="Failed to load sessions" />
             ) : sessions.loading ? (
-              <Skeleton className="h-4 w-32" />
+              <Skeleton className="h-[1lh] w-32" />
             ) : (
               `${formatCount(sessionTokens)} tokens · these sessions only`
             )
@@ -106,12 +131,12 @@ export default function Overview() {
         <StatTile
           label="Cold cache"
           icon={HardDrive}
-          value={cache.loading ? <Skeleton className="h-8 w-20" /> : formatBytes(cacheBytes)}
+          value={cache.loading ? <Skeleton className="h-[1lh] w-20" /> : formatBytes(cacheBytes)}
           sub={
             cache.error ? (
               <TileError message="Failed to load cache" />
             ) : cache.loading ? (
-              <Skeleton className="h-4 w-40" />
+              <Skeleton className="h-[1lh] w-40" />
             ) : (
               <span>
                 {quotaBytes > 0 ? `${formatPercent(quotaFraction)} of ${formatBytes(quotaBytes)}` : 'no quota'}
@@ -133,12 +158,12 @@ export default function Overview() {
         <StatTile
           label="Active downloads"
           icon={Download}
-          value={downloads.loading ? <Skeleton className="h-8 w-12" /> : formatCount(jobsRunning)}
+          value={downloads.loading ? <Skeleton className="h-[1lh] w-12" /> : formatCount(jobsRunning)}
           sub={
             downloads.error ? (
               <TileError message="Failed to load downloads" />
             ) : downloads.loading ? (
-              <Skeleton className="h-4 w-28" />
+              <Skeleton className="h-[1lh] w-28" />
             ) : jobsRunning > 0 || jobsDone > 0 ? (
               <span>
                 {jobsDone > 0 ? `${formatCount(jobsDone)} completed · ` : ''}
@@ -169,11 +194,11 @@ export default function Overview() {
               {sessions.error.message}
             </div>
           ) : sessions.loading ? (
-            <div className="space-y-3 px-6">
-              {Array.from({ length: 4 }).map((_, i) => (
-                <Skeleton key={i} className="h-12 w-full" />
+            <ul className="divide-border divide-y">
+              {Array.from({ length: RECENT_LIMIT }).map((_, i) => (
+                <RecentSessionRowSkeleton key={i} />
               ))}
-            </div>
+            </ul>
           ) : recent.length === 0 ? (
             <div className="text-muted-foreground flex flex-col items-center gap-2 px-6 py-10 text-sm">
               <Inbox className="size-6" aria-hidden />
@@ -192,6 +217,44 @@ export default function Overview() {
   );
 }
 
+/**
+ * The row {@link RecentSessionRow} will become, with its text blanked.
+ *
+ * It is the same `<li>` in the same `<ul>` behind the same divider, so the list
+ * it forms is the height of the list that replaces it — the four free-standing
+ * `h-12` bars this replaces stacked to 228px against roughly 400px of real rows,
+ * and the card grew by a third of a screen the moment `/sessions` answered. The
+ * row count is `RECENT_LIMIT` for the same reason: it is the most rows `recent`
+ * can hold, so a full list swaps in without moving anything below it.
+ *
+ * The title sits in a `<div>` where the loaded row uses a `<p>` only because a
+ * `Skeleton` renders a `<div>`, which is not phrasing content and may not live
+ * inside a paragraph. Preflight zeroes a `<p>`'s margins, so the two boxes are
+ * identical.
+ *
+ * The second bar in the meta line stands in for a model badge, which is a line
+ * box plus `py-0.5` and a 1px border on each side — 0.375rem of chrome the
+ * timestamp beside it does not carry.
+ */
+function RecentSessionRowSkeleton() {
+  return (
+    <li>
+      <div className={ROW_BOX}>
+        <div className="min-w-0 flex-1">
+          <div className={ROW_TITLE}>
+            <Skeleton className="h-[1lh] w-48" />
+          </div>
+          <div className={ROW_META}>
+            <Skeleton className="h-[1lh] w-24" />
+            <Skeleton className="h-[calc(1lh_+_0.375rem)] w-20" />
+          </div>
+        </div>
+        <ArrowRight className="text-muted-foreground size-4 shrink-0 opacity-40" aria-hidden />
+      </div>
+    </li>
+  );
+}
+
 function RecentSessionRow({ session }: { session: SessionRow }) {
   const title = session.name ?? session.firstMessage ?? session.id;
   const tokens = session.inputTokens + session.outputTokens;
@@ -202,11 +265,11 @@ function RecentSessionRow({ session }: { session: SessionRow }) {
     <li>
       <Link
         to={`/sessions/${encodeURIComponent(session.id)}`}
-        className="hover:bg-muted/50 group flex items-center gap-3 px-6 py-3 transition-colors"
+        className={cn('hover:bg-muted/50 group transition-colors', ROW_BOX)}
       >
         <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-medium">{title}</p>
-          <div className="text-muted-foreground mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+          <p className={ROW_TITLE}>{title}</p>
+          <div className={ROW_META}>
             <span>{formatRelativeTime(session.modified)}</span>
             {tokens > 0 && (
               <>

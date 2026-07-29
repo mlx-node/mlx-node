@@ -16,6 +16,7 @@
 import type { DownloadEvent } from '../../../src/download.js';
 import { createRpcClient, type RpcClient, type RpcClientOptions } from '../../../src/rpc/client.js';
 import type { RpcPort } from '../../../src/rpc/port.js';
+import { clearCache } from './json-cache';
 
 /**
  * Error thrown for any failed API call.
@@ -53,12 +54,18 @@ let client: RpcClient | null = null;
  */
 export function connectDashboardApi(port: RpcPort, opts?: RpcClientOptions): void {
   client?.close();
+  // Cached bodies describe the runtime on the other end of the OLD port. A
+  // reconnect is a different runtime — a respawned sidecar, or a fresh stub in
+  // a test — so anything held from before it is not stale, it is about
+  // something else entirely.
+  clearCache();
   client = createRpcClient(port, opts);
 }
 
 /** Drop the connection. Every in-flight call settles as a failure rather than hanging. */
 export function disconnectDashboardApi(): void {
   client?.close();
+  clearCache();
   client = null;
 }
 
@@ -84,9 +91,21 @@ export function getJson<T>(path: string): Promise<T> {
   return callApi<T>('GET', path);
 }
 
-/** Send a mutating request (POST/PUT/PATCH/DELETE) with an optional JSON body, typed as `T`. */
-export function mutate<T>(method: HttpMutation, path: string, body?: unknown): Promise<T> {
-  return callApi<T>(method, path, body);
+/**
+ * Send a mutating request (POST/PUT/PATCH/DELETE) with an optional JSON body,
+ * typed as `T`.
+ *
+ * Drops every cached GET body, on failure as well as success: a write that
+ * reports an error may still have acted (a delete that removed the files and
+ * then failed to verify), and serving a body that a partly-applied write
+ * invalidated is worse than one extra round-trip.
+ */
+export async function mutate<T>(method: HttpMutation, path: string, body?: unknown): Promise<T> {
+  try {
+    return await callApi<T>(method, path, body);
+  } finally {
+    clearCache();
+  }
 }
 
 /** Handle to a live subscription; call `close()` to stop delivery. */

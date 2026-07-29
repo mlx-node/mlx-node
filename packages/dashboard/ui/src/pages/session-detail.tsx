@@ -145,9 +145,36 @@ export default function SessionDetail() {
           </CardContent>
         </Card>
       ) : detail.loading || session === undefined ? (
-        <div className="space-y-3">
-          <Skeleton className="h-8 w-96 max-w-full" />
-          <Skeleton className="h-4 w-72 max-w-full" />
+        /*
+          The loaded header's own markup with the leaf text swapped for bars, not
+          an approximation of it: same row, same `space-y-2` column, and each bar
+          INSIDE the element carrying the font, so `1lh` measures one line box of
+          that element and the header keeps its height when the session arrives.
+          The pair of free-standing bars this replaces sat in a `space-y-3` column
+          of their own and reflowed the whole page under them.
+
+          The model badges are deliberately not reserved. That row is gated on
+          `models.length > 0`, and `models` is derived from the METRICS request —
+          a second fetch that is usually still in flight when this branch ends —
+          so reserving the row here could not spare the page that row's own
+          reflow, while a session that names no model would pay a fresh collapse
+          for a row it never shows.
+        */
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0 space-y-2">
+            {/* The title's classes, but not its tag: a heading with no text in it
+                announces an empty heading, and `h1` may not contain the bar's
+                `div`. The classes are what decide the box. */}
+            <div className="text-2xl font-semibold tracking-tight break-words">
+              <Skeleton className="h-[1lh] w-96 max-w-full" />
+            </div>
+            <div className="text-muted-foreground flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+              <Skeleton className="h-[1lh] w-72 max-w-full" />
+            </div>
+          </div>
+          {/* The copy button is a fixed-size control (`h-9`), so it can be stood
+              in for exactly rather than left to appear from nowhere. */}
+          <Skeleton className="h-9 w-44" />
         </div>
       ) : (
         <>
