@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -24,6 +24,11 @@ static GLOBAL: OnceLock<Option<Arc<ColdCacheManager>>> = OnceLock::new();
 
 /// Per-turn capture budget, resolved once. See [`cold_capture_budget`].
 static BUDGET: OnceLock<(usize, std::time::Duration)> = OnceLock::new();
+
+/// Root that [`install_cold_cache_root`] opened the tier at, so a repeat call
+/// with the same directory can be told apart from a conflicting one. Set only
+/// by that function, and only after its `GLOBAL.set` succeeded.
+static INSTALLED_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// Overrides the cold-tier parent directory (primarily for tests). Read
 /// once on first `global_cold_cache()` call; an empty value means the
@@ -119,18 +124,38 @@ fn open_managed_cold_cache(parent: &Path) -> Option<Arc<ColdCacheManager>> {
 /// satisfied the Unix contract for `setenv` and was undefined behaviour that
 /// could manifest as unrelated flakiness.
 ///
-/// The `bool` matters as much as the safety: a `set` that loses the race is
-/// exactly the silent no-op where the harness believes it pinned a depth and
-/// the run used the 128-block default instead. Callers must assert on it.
+/// The `bool` matters as much as the safety: a budget that was already
+/// resolved to something ELSE is exactly the silent no-op where the harness
+/// believes it pinned a depth and the run used the 128-block default instead.
+/// Callers must assert on it.
+///
+/// Returns `true` when the effective budget equals the requested one, so a
+/// SECOND identical call is a no-op rather than a conflict. That is not a
+/// convenience: `gemma4_cold_tier_parity.rs` ships two `#[ignore]`d gates in
+/// one binary and documents running them together as supported, and each one
+/// installs the same constants. `false` therefore means what it should — the
+/// process is configured differently from what this caller asked for.
 pub fn install_cold_capture_budget(blocks: usize, budget: std::time::Duration) -> bool {
-    BUDGET.set((blocks, budget)).is_ok()
+    let requested = (blocks, budget);
+    *BUDGET.get_or_init(|| requested) == requested
 }
 
 /// Pin the cold-tier root directly; the [`install_cold_capture_budget`]
-/// rationale applies verbatim. Returns `false` if the tier was already opened,
-/// in which case the caller's root is NOT in effect.
+/// rationale applies verbatim, including idempotence on a repeat call with the
+/// same directory. Returns `false` when the tier is already open somewhere
+/// else, in which case the caller's root is NOT in effect.
 pub fn install_cold_cache_root(parent: &Path) -> bool {
-    GLOBAL.set(open_managed_cold_cache(parent)).is_ok()
+    if let Some(installed) = INSTALLED_ROOT.get() {
+        // Only this function ever sets `INSTALLED_ROOT`, and a caller whose
+        // `GLOBAL.set` failed returned `false` and never recorded one — so
+        // reaching here means an earlier install opened the tier successfully.
+        return installed == parent;
+    }
+    if GLOBAL.set(open_managed_cold_cache(parent)).is_err() {
+        return false;
+    }
+    let _ = INSTALLED_ROOT.set(parent.to_path_buf());
+    true
 }
 
 /// Counter snapshot of the global tier for Rust-side consumers (per-turn
