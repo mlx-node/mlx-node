@@ -1122,6 +1122,37 @@ where
         Vec::new()
     };
 
+    // ---- 0. The WRITE path worked ----------------------------------------
+    //
+    // Ordered ahead of every restore assertion deliberately. A capture that
+    // could not store what it enqueued makes each read assertion below
+    // downstream noise, and the read ones have the longer, more specific
+    // messages — so whichever fires first is where the next reader starts
+    // looking. Proven, not assumed: a torn tier root produced exactly this run,
+    //
+    //     [gemma4-sub-window] cold restore did not engage across restart:
+    //     cached_tokens=0 (expected >= 32)
+    //
+    // which sent the reader to the restore path for a fault in `prepare_cold_root`.
+    //
+    // A torn root is the usual cause: the directory unlinked out from under the
+    // live manager, which retains a descriptor rather than a pathname, so every
+    // `openat`/`renameat`/`unlinkat` returns ENOENT while `fsync` and `getdents`
+    // still succeed — the cache stores nothing and reads nothing, quietly.
+    //
+    // A missing snapshot is NOT silently skipped here: assertion 2 below panics
+    // on it explicitly.
+    if let Some(stats) = stats_after.as_ref() {
+        assert_eq!(
+            stats.write_errors, 0,
+            "[{}] cold tier recorded {} write error(s): the capture path could not store what it \
+             enqueued, so everything below about restore is downstream of a broken WRITE. The \
+             usual cause is a tier root that no longer exists at the descriptor the manager \
+             holds — check that nothing deleted or recreated it between gates.",
+            spec.family, stats.write_errors
+        );
+    }
+
     // ---- 1. Restore engaged at all ---------------------------------------
     let min_restored = spec.min_restored();
     assert!(
@@ -1234,22 +1265,6 @@ where
         after.corruptions,
         after.write_errors,
         after.restore_declines
-    );
-    // …and `write_errors` is now ASSERTED, not only printed. A torn tier root —
-    // the directory unlinked out from under the live manager, which retains a
-    // descriptor rather than a pathname — makes every `openat`/`renameat`/
-    // `unlinkat` return ENOENT while `fsync` and `getdents` still succeed.
-    // Capture then stores nothing and restore finds nothing, and the FIRST
-    // assertion to fire is "cold restore did not engage", which sends the
-    // reader to the restore path for a setup fault. This makes the setup name
-    // itself instead.
-    assert_eq!(
-        after.write_errors, 0,
-        "[{}] cold tier recorded {} write error(s): the capture path could not store what it \
-         enqueued, so anything below about restore is downstream of a broken WRITE. The usual \
-         cause is a tier root that no longer exists at the descriptor the manager holds — check \
-         that nothing deleted it between gates.",
-        spec.family, after.write_errors
     );
 
     // ---- 2a. The restored sidecar was INSTALLED, not just read -----------
