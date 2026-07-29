@@ -763,10 +763,43 @@ async fn lfm2_paged_vs_flat_prefix_reuse_parity() {
 // (`ContinuedLivePrefix`) and did not silently re-prefill from scratch.
 // ---------------------------------------------------------------------------
 
-/// Memory-probe config: budget 128 force-closes a looping `<think>`
-/// deterministically; max_new 512 leaves the post-`</think>` span free to
-/// state the actual number (every probe turn ends `finish=stop` well below
-/// the cap on this checkpoint).
+/// The surface a memory-probe answer is asserted against.
+///
+/// MUST NOT be `ChatResult.text`. lfm2 is `ThinkingPolicy::AlwaysOnBudgetFromEffort`,
+/// so `thinking_enabled` is ALWAYS true and
+/// `engine::finalize::parse_thinking_and_tools` routes every turn through the
+/// reasoning scrubber. That scrubber has two branches which return
+/// `text == ""` for a turn whose generation is perfectly correct:
+///
+///  (A) `finalize.rs:103-119` — no `</think>` TOKEN (id 64401) among the
+///      generated ids ⇒ `(String::new(), vec![], thinking)`, i.e. the ENTIRE
+///      output is reclassified as reasoning. Reached whenever the turn ends
+///      before the think-budget force arms (a short direct answer, or EOS on
+///      the same step that would have consumed the force — the force is gated
+///      behind `!is_terminal` at `engine/decode.rs:317`).
+///  (B) `tools/mod.rs:993-1012` — `</think>` present but `after_tag` trims to
+///      empty, i.e. the turn stopped immediately after the injected close.
+///
+/// Both are REACHABLE on this checkpoint with real weights (verified: (A)
+/// `num_tokens=512 reasoning_tokens=512 text=""` with a 2079-byte `raw_text`;
+/// (B) `num_tokens=130 reasoning_tokens=129 text=""` with a 493-byte
+/// `raw_text`). Neither says anything about cache correctness — which is all
+/// this test exists to check — so asserting on `text` makes the probe fail for
+/// a reason unrelated to what it guards.
+///
+/// `raw_text` is the verbatim decode here: `include_reasoning: Some(true)`
+/// makes `raw_text_with_reasoning_suppressed` (`finalize.rs:166-169`) return
+/// the generation unmodified. It is empty ONLY when `num_tokens == 0`, which
+/// IS a real failure and stays fatal.
+fn answer_surface(r: &mlx_core::engine::types::ChatResult) -> &str {
+    &r.raw_text
+}
+
+/// Memory-probe config: budget 128 force-closes a looping `<think>`;
+/// max_new 512 leaves the post-`</think>` span free to state the actual number.
+///
+/// NOTE: neither knob makes the ANSWER land in `ChatResult.text` — see
+/// [`answer_surface`]. The budget bounds reasoning length, nothing more.
 fn memory_probe_chat_config() -> ChatConfig {
     ChatConfig {
         cache_owner_id: None,
@@ -823,22 +856,38 @@ async fn lfm2_paged_delta_memory_probe_parity() {
         r1_flat.cached_tokens, r1_flat.text, r1_paged.cached_tokens, r1_paged.text,
     );
     assert!(
-        r1_paged.text.contains('7'),
+        answer_surface(&r1_paged).contains('7'),
         "paged turn 1 could not even recall the just-planted value: {:?}",
-        r1_paged.text,
+        r1_paged.raw_text,
     );
 
     // ---- Turn 2 (DELTA): sum of the planted values ----
     let user2 = "Add amber and cobalt together. What is the sum?";
+    // The flat CONTROL is driven over the PAGED arm's transcript, not over its
+    // own. Both arms are independent greedy decodes, and greedy trajectories on
+    // this checkpoint are hardware-dependent (a 1-ULP kernel difference flips a
+    // near-tie argmax — the file header documents one at token ~93 of turn 1).
+    // Letting each arm generate its own turn-1/turn-2 replies gave the control a
+    // DIFFERENT conversation by turn 3, so "flat says 31" was a second
+    // independent lottery rather than a control: on the CI failure that
+    // motivated this shape the arms' turn-3 prompts differed by 102 tokens.
+    // Feeding the control the paged transcript makes it answer the SAME question
+    // from the SAME context, which is what a differential control has to do.
+    // Byte-level paged-vs-flat parity — including a short DELTA turn — stays
+    // pinned by tests (a)/(a2)/(b2)/(c); this test's control exists for ANSWER
+    // agreement only (see the header). Same idiom as
+    // `lfm2_paged_prefill_bridge_cache_hit_ab_probe` below.
     let r2_flat = flat_model
-        .chat_session_continue(
-            user2.to_string(),
-            None,
-            None,
+        .chat_session_start(
+            vec![
+                user_message(prompt1),
+                assistant_message(&r1_paged.raw_text),
+                user_message(user2),
+            ],
             Some(memory_probe_chat_config()),
         )
         .await
-        .expect("turn 2 flat chat_session_continue failed");
+        .expect("turn 2 flat control chat_session_start failed");
     let r2_paged = paged_model
         .chat_session_continue(
             user2.to_string(),
@@ -865,29 +914,37 @@ async fn lfm2_paged_delta_memory_probe_parity() {
     // pre-fix corrupted continuation (empty flat attention KV) cannot
     // produce it.
     assert!(
-        r2_paged.text.contains("18"),
+        answer_surface(&r2_paged).contains("18"),
         "paged delta turn 2 lost the turn-1 context: expected the sum 18 in {:?}",
-        r2_paged.text,
+        r2_paged.raw_text,
     );
     // Answer-level parity with the forced-flat control (byte parity is
     // pinned at short lengths by tests (a)/(c) — see the header).
     assert!(
-        r2_flat.text.contains("18"),
-        "flat control turn 2 disagrees with the paged answer (expected 18): {:?}",
-        r2_flat.text,
+        answer_surface(&r2_flat).contains("18"),
+        "flat control turn 2 disagrees with the paged answer (expected 18) on the SAME \
+         context: finish={} num_tokens={} raw_text={:?}",
+        r2_flat.finish_reason,
+        r2_flat.num_tokens,
+        r2_flat.raw_text,
     );
 
     // ---- Turn 3 (DELTA): extend the context and re-derive ----
     let user3 = "One more value: jade = 13. What is amber + cobalt + jade in total?";
+    // Control over the PAGED transcript again — see the turn-2 comment.
     let r3_flat = flat_model
-        .chat_session_continue(
-            user3.to_string(),
-            None,
-            None,
+        .chat_session_start(
+            vec![
+                user_message(prompt1),
+                assistant_message(&r1_paged.raw_text),
+                user_message(user2),
+                assistant_message(&r2_paged.raw_text),
+                user_message(user3),
+            ],
             Some(memory_probe_chat_config()),
         )
         .await
-        .expect("turn 3 flat chat_session_continue failed");
+        .expect("turn 3 flat control chat_session_start failed");
     let r3_paged = paged_model
         .chat_session_continue(
             user3.to_string(),
@@ -909,14 +966,17 @@ async fn lfm2_paged_delta_memory_probe_parity() {
         r3_paged.cached_tokens,
     );
     assert!(
-        r3_paged.text.contains("31"),
+        answer_surface(&r3_paged).contains("31"),
         "paged delta turn 3 lost accumulated context: expected the sum 31 in {:?}",
-        r3_paged.text,
+        r3_paged.raw_text,
     );
     assert!(
-        r3_flat.text.contains("31"),
-        "flat control turn 3 disagrees with the paged answer (expected 31): {:?}",
-        r3_flat.text,
+        answer_surface(&r3_flat).contains("31"),
+        "flat control turn 3 disagrees with the paged answer (expected 31) on the SAME \
+         context: finish={} num_tokens={} raw_text={:?}",
+        r3_flat.finish_reason,
+        r3_flat.num_tokens,
+        r3_flat.raw_text,
     );
 
     eprintln!(
