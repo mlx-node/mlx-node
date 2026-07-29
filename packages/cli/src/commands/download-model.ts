@@ -1,13 +1,15 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { readdir, copyFile } from 'node:fs/promises';
+import { readdir, copyFile, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { listFiles, downloadFileToCacheDir, type ListFileEntry } from '@huggingface/hub';
+import { listFiles, downloadFileToCacheDir, modelInfo, type ListFileEntry } from '@huggingface/hub';
 
 import { resolveModelsDir } from '../config.js';
 import { ensureDir, formatBytes } from '../utils.js';
+import { readCompletion, writeCompletion, type DownloadCompletion } from './download-marker.js';
+import { buildMarkerFiles, computePruneList, fileUpToDate, isCompletionCurrent } from './download-sync.js';
 import { resolveHuggingFaceToken, setToken } from './hf-token.js';
 
 const DEFAULT_CACHE_DIR = join(homedir(), '.cache', 'huggingface');
@@ -212,6 +214,9 @@ Options:
   -o, --output <dir>      Output directory (default: ~/.mlx-node/models/<model-slug>;
                           honors MLX_MODELS_DIR env and ~/.mlx-node/config.json modelsDir)
   -g, --glob <pattern>    Filter files by glob pattern (can be repeated)
+  --force                 Re-sync against upstream even if the local copy
+                          looks up to date (changed files re-download,
+                          unchanged files are skipped by content hash)
   --cache-dir <dir>       HuggingFace cache directory (default: ~/.cache/huggingface)
   -h, --help              Show this help message
   --set-token             Set HuggingFace token
@@ -267,11 +272,11 @@ function matchesAnyGlob(filename: string, patterns: RegExp[]): boolean {
  * half-walked one. `listFiles` is paginated, so a 5xx can land part-way through
  * a large repo's walk.
  */
-async function getModelFiles(modelName: string, accessToken?: string, globPatterns?: string[]) {
-  return withRetries(`listing ${modelName}`, () => listModelFilesOnce(modelName, accessToken, globPatterns));
+async function getModelFiles(modelName: string, accessToken?: string, globPatterns?: string[], revision?: string) {
+  return withRetries(`listing ${modelName}`, () => listModelFilesOnce(modelName, accessToken, globPatterns, revision));
 }
 
-async function listModelFilesOnce(modelName: string, accessToken?: string, globPatterns?: string[]) {
+async function listModelFilesOnce(modelName: string, accessToken?: string, globPatterns?: string[], revision?: string) {
   let totalSize = 0;
   const filesToDownload: ListFileEntry[] = [];
   const allFiles: ListFileEntry[] = [];
@@ -279,7 +284,7 @@ async function listModelFilesOnce(modelName: string, accessToken?: string, globP
   // Compile glob patterns if provided
   const globs = globPatterns?.map(globToRegex);
 
-  for await (const file of listFiles({ repo: { type: 'model', name: modelName }, accessToken })) {
+  for await (const file of listFiles({ repo: { type: 'model', name: modelName }, accessToken, revision })) {
     allFiles.push(file);
 
     if (globs) {
@@ -314,6 +319,24 @@ async function listModelFilesOnce(modelName: string, accessToken?: string, globP
   }
 
   return { totalSize, filesToDownload, allFiles };
+}
+
+/**
+ * The current commit sha of the repo's `main`, or `null` when it cannot be
+ * resolved (offline, missing auth on a gated repo, API change). `null` makes
+ * the caller fall back to the legacy local-only behavior — the update check
+ * must never make the command less capable than it was without it.
+ */
+async function resolveRemoteRevision(modelName: string, accessToken?: string): Promise<string | null> {
+  try {
+    const info = await withRetries(`resolving latest revision of ${modelName}`, () =>
+      modelInfo({ name: modelName, additionalFields: ['sha'], accessToken }),
+    );
+    const sha: unknown = (info as { sha?: unknown }).sha;
+    return typeof sha === 'string' && /^[0-9a-f]{40}$/i.test(sha) ? sha : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -557,6 +580,10 @@ export async function run(argv: string[]) {
         short: 'g',
         multiple: true,
       },
+      force: {
+        type: 'boolean',
+        default: false,
+      },
       help: {
         type: 'boolean',
         short: 'h',
@@ -607,99 +634,108 @@ export async function run(argv: string[]) {
   }
   console.log(`Output: ${outputDir}\n`);
 
-  // Check if already downloaded.
-  //
-  // For non-GGUF repos the local-only `isModelAlreadyDownloaded` check
-  // is sufficient (single-file safetensors → 1 weight file; sharded →
-  // we parse the index and verify every shard is present). For GGUF
-  // repos the local-only path is wrong: a multi-variant repo (Q2_K,
-  // Q3_K_M, Q4_K_M, Q5_K_M, Q6_K, Q8_0 as separate files) where a
-  // prior interrupted run left only Q2_K on disk would silently exit
-  // as "already downloaded" without ever fetching the rest. So for the
-  // GGUF early-return we hoist the manifest fetch above the check and
-  // require EVERY remote `.gguf` to be present locally before
-  // declaring complete. The trade-off — one extra network round-trip
-  // on the hot "already downloaded" path — is intentional; correctness
-  // wins over the ~200ms saved.
+  const force = args.force ?? false;
+  const remoteSha = await resolveRemoteRevision(modelName, HUGGINGFACE_TOKEN);
+  if (remoteSha === null) {
+    console.warn('Could not resolve the latest revision from HuggingFace; update check disabled for this run.\n');
+  }
+
   let cachedManifest: { totalSize: number; filesToDownload: ListFileEntry[]; allFiles: ListFileEntry[] } | null = null;
+  let completion: DownloadCompletion | null = null;
+  // Content-hash verification is needed exactly when local files might be
+  // STALE: the dir predates this run and either no current marker proves it
+  // matches `remoteSha`, or the user forced a re-verify. A fresh dir or a
+  // current-marker dir only ever needs the cheap size check.
+  let verifyContent = false;
   if (existsSync(outputDir)) {
     const files = await readdir(outputDir);
     const hasGguf = files.some((f) => f.endsWith('.gguf'));
-    if (isModelAlreadyDownloaded(outputDir, files)) {
-      console.log('Model already downloaded!\n');
-      console.log('To re-download, delete the output directory first:');
-      console.log(`   rm -rf ${outputDir}\n`);
-      return;
-    }
-    if (hasGguf && !globPatterns?.length) {
-      // Manifest-aware completeness: only short-circuit when every
-      // remote `.gguf` is present locally. Falling through to the
-      // download loop is safe — `downloadFileToCacheDir` is content-
-      // addressed and the per-file loop's `isLocalCopyComplete` check
-      // skips the `copyFile` for files already on disk at the right
-      // size, so resume only does I/O for the genuinely missing shards.
-      console.log('Fetching file list from HuggingFace...\n');
-      cachedManifest = await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns);
-      const remoteBasenames = cachedManifest.allFiles.map((f) => f.path.split('/').pop() ?? f.path);
-      if (isGgufRepoComplete(files, remoteBasenames)) {
-        console.log('GGUF file(s) already downloaded!\n');
+    completion = await readCompletion(outputDir);
+    const markerCurrent = remoteSha !== null && isCompletionCurrent(completion, modelName, remoteSha);
+    if (remoteSha === null) {
+      // Legacy local-only behavior, byte-for-byte: without a resolvable
+      // upstream revision there is nothing to compare against.
+      if (isModelAlreadyDownloaded(outputDir, files)) {
+        console.log('Model already downloaded!\n');
         console.log('To re-download, delete the output directory first:');
         console.log(`   rm -rf ${outputDir}\n`);
         return;
       }
-      // Incomplete: fall through to the download loop. Report which
-      // variants are missing so the user knows what's about to fetch.
-      const missing = cachedManifest.allFiles.filter(
-        (f) => f.path.endsWith('.gguf') && !files.includes(f.path.split('/').pop() ?? f.path),
-      );
-      if (missing.length > 0) {
-        console.log(`Detected ${missing.length} missing GGUF file(s); resuming download...`);
-        for (const f of missing) {
-          console.log(`  ${f.path}${f.size ? ` (${formatBytes(f.size)})` : ''}`);
-        }
-        console.log('');
-      }
-    }
-    // For glob downloads, only declare "already downloaded" when EVERY
-    // remote file matching the user's glob is also present locally. The
-    // previous "at least one local hit" check (`isGlobVariantPresent`)
-    // would short-circuit on a partial download — e.g. an interrupted
-    // prior `--glob "*Q4*"` run that fetched one Q4 shard but not the
-    // others would silently exit as "Matched files already downloaded"
-    // and leave the local copy incomplete. CORE_FILES (config.json,
-    // tokenizer.json, …) are still implicitly excluded because they
-    // never match a quantization-variant glob.
-    //
-    // This is manifest-aware, so we pay one extra HuggingFace round-trip
-    // on the hot "already downloaded" path. Correctness wins over the
-    // ~200ms saved — symmetric to the non-glob GGUF completeness check
-    // a few lines above. We cache the manifest into `cachedManifest` so
-    // the post-`ensureDir` block reuses it instead of fetching twice.
-    if (hasGguf && globPatterns?.length && isGlobVariantPresent(files, globPatterns)) {
-      if (cachedManifest === null) {
+      if (hasGguf && !globPatterns?.length) {
+        // Manifest-aware completeness: a multi-variant GGUF repo where a
+        // prior interrupted run left only one variant on disk must not exit
+        // as "already downloaded" — only short-circuit when EVERY remote
+        // `.gguf` is present locally. The extra listing round-trip on the
+        // hot path is intentional; correctness wins over the ~200ms saved.
         console.log('Fetching file list from HuggingFace...\n');
         cachedManifest = await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns);
+        const remoteBasenames = cachedManifest.allFiles.map((f) => f.path.split('/').pop() ?? f.path);
+        if (isGgufRepoComplete(files, remoteBasenames)) {
+          console.log('GGUF file(s) already downloaded!\n');
+          console.log('To re-download, delete the output directory first:');
+          console.log(`   rm -rf ${outputDir}\n`);
+          return;
+        }
+        const missing = cachedManifest.allFiles.filter(
+          (f) => f.path.endsWith('.gguf') && !files.includes(f.path.split('/').pop() ?? f.path),
+        );
+        if (missing.length > 0) {
+          console.log(`Detected ${missing.length} missing GGUF file(s); resuming download...`);
+          for (const f of missing) {
+            console.log(`  ${f.path}${f.size ? ` (${formatBytes(f.size)})` : ''}`);
+          }
+          console.log('');
+        }
       }
-      const remoteBasenames = cachedManifest.allFiles.map((f) => f.path.split('/').pop() ?? f.path);
-      if (isGlobMatchedSetComplete(files, remoteBasenames, globPatterns)) {
-        console.log('Matched files already downloaded!\n');
-        console.log('To re-download, delete the output directory first:');
-        console.log(`   rm -rf ${outputDir}\n`);
+      // Glob runs are manifest-aware for the same reason: "at least one
+      // local hit" (`isGlobVariantPresent`) does not prove the whole
+      // glob-matched set is present, so completeness is checked against
+      // the remote manifest before declaring "already downloaded".
+      if (hasGguf && globPatterns?.length && isGlobVariantPresent(files, globPatterns)) {
+        if (cachedManifest === null) {
+          console.log('Fetching file list from HuggingFace...\n');
+          cachedManifest = await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns);
+        }
+        const remoteBasenames = cachedManifest.allFiles.map((f) => f.path.split('/').pop() ?? f.path);
+        if (isGlobMatchedSetComplete(files, remoteBasenames, globPatterns)) {
+          console.log('Matched files already downloaded!\n');
+          console.log('To re-download, delete the output directory first:');
+          console.log(`   rm -rf ${outputDir}\n`);
+          return;
+        }
+        const missing = cachedManifest.filesToDownload.filter((f) => {
+          const basename = f.path.split('/').pop() ?? f.path;
+          return !files.includes(basename);
+        });
+        if (missing.length > 0) {
+          console.log(`Detected ${missing.length} missing file(s); resuming download...`);
+          for (const f of missing) {
+            console.log(`  ${f.path}${f.size ? ` (${formatBytes(f.size)})` : ''}`);
+          }
+          console.log('');
+        }
+      }
+    } else if (markerCurrent && !force) {
+      // Same revision as the last successful sync. For a whole-model run with
+      // every marker file still on disk there is nothing to do. A glob run
+      // (selection may not be satisfied by the marker) or missing files fall
+      // through — at an unchanged revision the size-only per-file skip is
+      // trustworthy, so the loop stays cheap.
+      if (!globPatterns?.length && completion!.files.every((f) => existsSync(join(outputDir, f)))) {
+        console.log(`Model already up to date (revision ${remoteSha.slice(0, 7)}).\n`);
+        console.log('Use --force to re-verify every file against upstream.\n');
         return;
       }
-      // Incomplete: fall through to the download loop. The per-file
-      // loop's `isLocalCopyComplete` check skips already-present files,
-      // so resume only fetches/copies the genuinely missing shards.
-      const missing = cachedManifest.filesToDownload.filter((f) => {
-        const basename = f.path.split('/').pop() ?? f.path;
-        return !files.includes(basename);
-      });
-      if (missing.length > 0) {
-        console.log(`Detected ${missing.length} missing file(s); resuming download...`);
-        for (const f of missing) {
-          console.log(`  ${f.path}${f.size ? ` (${formatBytes(f.size)})` : ''}`);
-        }
-        console.log('');
+    } else {
+      verifyContent = true;
+      if (force) {
+        console.log('Re-verifying every file against upstream (--force)...\n');
+      } else if (completion === null) {
+        console.log('No download marker found; verifying local files against upstream...\n');
+      } else {
+        console.log(
+          `Upstream revision changed (${completion.revision.slice(0, 7)} → ${remoteSha.slice(0, 7)}); syncing...\n`,
+        );
       }
     }
   }
@@ -713,7 +749,7 @@ export async function run(argv: string[]) {
     console.log('Fetching file list from HuggingFace...\n');
   }
   const { totalSize, filesToDownload, allFiles } =
-    cachedManifest ?? (await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns));
+    cachedManifest ?? (await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns, remoteSha ?? undefined));
 
   if (filesToDownload.length === 0) {
     console.error('No files matched the given criteria.\n');
@@ -750,11 +786,13 @@ export async function run(argv: string[]) {
     const file = filesToDownload[i];
     const fileSizeStr = file.size ? formatBytes(file.size) : '';
     const destPath = join(outputDir, file.path);
-    // Skip files already on disk with matching size — `downloadFileToCacheDir`
-    // is content-addressed (no network re-fetch) but `copyFile` always copies
-    // bytes, so without this check a resumed sharded download re-writes every
-    // already-complete shard from cache to outputDir on every invocation.
-    if (isLocalCopyComplete(destPath, file.size)) {
+    // Cheap size gate normally; full content hash when local files might be
+    // stale (marker missing/stale or --force) — a re-uploaded repo can keep
+    // identical file sizes, which only the hash catches.
+    const alreadyPresent = verifyContent
+      ? await fileUpToDate(destPath, file)
+      : isLocalCopyComplete(destPath, file.size);
+    if (alreadyPresent) {
       console.log(
         `  [${i + 1}/${total}] ${file.path}${fileSizeStr ? ` (${fileSizeStr})` : ''} — already present, skipping copy`,
       );
@@ -766,6 +804,7 @@ export async function run(argv: string[]) {
           path: file.path,
           cacheDir,
           accessToken: HUGGINGFACE_TOKEN,
+          revision: remoteSha ?? undefined,
         }),
       );
       await ensureDir(dirname(destPath));
@@ -776,9 +815,40 @@ export async function run(argv: string[]) {
     }
   }
 
+  // Files the old marker recorded that the remote repo no longer has are
+  // stale garbage (e.g. shards of a superseded sharding layout) — a loader
+  // globbing the dir would read them. Only ever deletes old-marker entries.
+  if (completion !== null && remoteSha !== null) {
+    const pruneList = computePruneList(
+      completion.files,
+      allFiles.map((f) => f.path),
+      outputDir,
+    );
+    for (const rel of pruneList) {
+      console.log(`  Removing ${rel} (no longer in the upstream repo)`);
+      await rm(join(outputDir, rel), { force: true });
+    }
+  }
+
+  const writeMarker = async (): Promise<void> => {
+    if (remoteSha === null) return; // nothing trustworthy to pin
+    await writeCompletion(outputDir, {
+      repo: modelName,
+      revision: remoteSha,
+      files: buildMarkerFiles(
+        completion,
+        allFiles.map((f) => f.path),
+        filesToDownload.map((f) => f.path),
+        outputDir,
+      ),
+      completedAt: new Date().toISOString(),
+    });
+  };
+
   // For GGUF downloads, skip strict verification (no config.json required in GGUF repos)
   const hasGgufFiles = weightFiles.some((f) => f.endsWith('.gguf'));
   if (hasGgufFiles) {
+    await writeMarker();
     console.log(`\nDownload complete! ${weightFiles.length} file(s) saved to ${outputDir}\n`);
     console.log('To convert GGUF to MLX SafeTensors format:');
     for (const wf of weightFiles) {
@@ -794,6 +864,7 @@ export async function run(argv: string[]) {
     }
     // Glob filter matched non-weight files (e.g. imatrix, calibration data).
     // Skip model verification — user is downloading auxiliary files.
+    await writeMarker();
     console.log(`\nDownload complete! ${filesToDownload.length} non-weight file(s) saved to ${outputDir}\n`);
   } else {
     console.log(`Format: Base model (needs MLX conversion)`);
@@ -802,6 +873,7 @@ export async function run(argv: string[]) {
 
     const success = await verifyDownload(outputDir, weightFiles);
     if (success) {
+      await writeMarker();
       console.log('\nModel downloaded successfully!\n');
     } else {
       console.error('\nDownload incomplete. Please try again.\n');

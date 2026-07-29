@@ -10,12 +10,34 @@ The `mlx` binary is built from `packages/cli/` and exposes the top-level command
 mlx download model --model Qwen/Qwen3-0.6B
 ```
 
-| Flag             | Default           | Purpose                                                |
-| ---------------- | ----------------- | ------------------------------------------------------ |
-| `-m`, `--model`  | `Qwen/Qwen3-0.6B` | HuggingFace model id                                   |
-| `-g`, `--glob`   | —                 | Filename pattern filter (download only matching files) |
-| `--set-token`    | —                 | Store HuggingFace credentials                          |
-| `-o`, `--output` | —                 | Output directory                                       |
+The command resolves the repo's current revision on HuggingFace and pins the
+whole download to that commit. A successful download writes a
+`.mlx-download-complete.json` marker into the output directory (the same
+marker the dashboard reads and writes) recording the repo, the pinned
+revision, and the downloaded file list. Re-running the command then syncs
+instead of skipping blindly:
+
+- marker matches the current upstream revision and every recorded file is on
+  disk → "Model already up to date", nothing is touched;
+- upstream revision changed, or the marker is missing → every local file is
+  verified against upstream by content hash; changed files are re-downloaded,
+  unchanged files are kept, and files the upstream repo no longer has (only
+  ones the old marker recorded) are removed;
+- `--force` runs that hash-verify sync even when the marker looks current.
+
+There is no need to `rm -rf` a model directory to pick up an upstream update —
+re-running the command (or `--force`) is enough. When the revision cannot be
+resolved (offline, missing auth on a gated repo), the command warns and falls
+back to the previous local-only completeness checks.
+
+| Flag             | Default                | Purpose                                                |
+| ---------------- | ---------------------- | ------------------------------------------------------ |
+| `-m`, `--model`  | `Qwen/Qwen3-0.6B`      | HuggingFace model id                                   |
+| `-g`, `--glob`   | —                      | Filename pattern filter (download only matching files) |
+| `--force`        | `false`                | Re-verify every file against upstream by content hash  |
+| `--cache-dir`    | `~/.cache/huggingface` | HuggingFace cache directory                            |
+| `--set-token`    | —                      | Store HuggingFace credentials                          |
+| `-o`, `--output` | —                      | Output directory                                       |
 
 ### Datasets
 
@@ -134,19 +156,19 @@ split). `--q-mtp split` (alias `drafter`) emits a body checkpoint with **no
 `qwen3_5_mtp` format (bare-keyed, BF16 MTP head); it does not require
 `--quantize`/`--q-recipe` and the body may be BF16 or already-quantized.
 
-| Flag               | Purpose                                                                                   |
-| ------------------ | ----------------------------------------------------------------------------------------- |
-| `-i`, `--input`    | Source model directory (required)                                                         |
-| `-o`, `--output`   | Output directory (required)                                                               |
-| `-d`, `--dtype`    | Target dtype: `float32` / `float16` / `bfloat16`                                          |
-| `-q`, `--quantize` | Enable quantization                                                                       |
-| `--q-recipe`       | One of `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`, `qwen3_5`, `unsloth`, `nvidia` |
-| `--q-mode`         | `affine` (default), `mxfp4`, `mxfp8`, `nvfp4`, or `sym8`                                  |
+| Flag               | Purpose                                                                                       |
+| ------------------ | --------------------------------------------------------------------------------------------- |
+| `-i`, `--input`    | Source model directory (required)                                                             |
+| `-o`, `--output`   | Output directory (required)                                                                   |
+| `-d`, `--dtype`    | Target dtype: `float32` / `float16` / `bfloat16`                                              |
+| `-q`, `--quantize` | Enable quantization                                                                           |
+| `--q-recipe`       | One of `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`, `qwen3_5`, `unsloth`, `nvidia`     |
+| `--q-mode`         | `affine` (default), `mxfp4`, `mxfp8`, `nvfp4`, or `sym8`                                      |
 | `--q-mxfp`         | Select Unsloth's fixed MXFP tensor-class map, or upgrade eligible decisions for other recipes |
-| `--q-mtp`          | Qwen MTP-quant policy: `off`, `cyankiwi`, `all`, or `split` (alias `drafter`)             |
-| `--imatrix-path`   | Path to imatrix file for AWQ pre-scaling                                                  |
-| `--mmproj`         | Vision-encoder conversion path                                                            |
-| `-v`, `--verbose`  | Verbose logging                                                                           |
+| `--q-mtp`          | Qwen MTP-quant policy: `off`, `cyankiwi`, `all`, or `split` (alias `drafter`)                 |
+| `--imatrix-path`   | Path to imatrix file for AWQ pre-scaling                                                      |
+| `--mmproj`         | Vision-encoder conversion path                                                                |
+| `-v`, `--verbose`  | Verbose logging                                                                               |
 
 ### GGUF → SafeTensors
 
@@ -166,7 +188,7 @@ mlx convert --input ./model-UD-Q6_K_XL.gguf --output ./model-mlx --gguf-kquant
 
 Imports llama.cpp / Unsloth-Dynamic K-quant tensors with weights **bit-identical
 to llama.cpp's**, at ggml byte size, rather than requantizing into MLX's affine
-format — which is lossy, and where it is exact is *larger* than the source (Q6_K
+format — which is lossy, and where it is exact is _larger_ than the source (Q6_K
 → affine needs `group_size=16`, costing an fp16 scale **and** bias per 16 weights
 = 8.0 bpw against ggml's 6.5625).
 
@@ -179,11 +201,11 @@ Q4_K/Q5_K   y = d*sc[j]*q - dmin*m[j]   ->  scale = d*sc[j]   bias = -dmin*m[j]
 Q6_K        y = d*sc[j]*(q-32)          ->  scale = d*sc[j]   bias = -32*d*sc[j]
 ```
 
-| source | mlx-node | ggml | note |
-| ------ | -------- | ---- | ---- |
-| Q6_K   | 6.5625 bpw | 6.5625 | exact parity |
+| source | mlx-node   | ggml   | note                           |
+| ------ | ---------- | ------ | ------------------------------ |
+| Q6_K   | 6.5625 bpw | 6.5625 | exact parity                   |
 | Q4_K   | 4.6250 bpw | 4.5000 | +0.125 for unpacked sub-scales |
-| Q5_K   | 5.6250 bpw | 5.5000 | +0.125, same reason |
+| Q5_K   | 5.6250 bpw | 5.5000 | +0.125, same reason            |
 
 The sub-scales are stored unpacked rather than in ggml's 6-bit packing: packing
 would preserve the exact 4.5 bpw but breaks the affine pointer-walk contract and
@@ -210,10 +232,10 @@ companion off disk; the loader rebuilds it before any layer is constructed. The
 reconstruction is bitwise equal to what was stored — `Z` is a power of two, so
 the f16 product is exact — and the output lands at ggml's own density:
 
-| source | before | after | ggml |
-| ------ | ------ | ----- | ---- |
-| Q4_0   | 5.0000 bpw | 4.5000 bpw | 4.5000 |
-| Q8_0   | 9.0000 bpw | 8.5000 bpw | 8.5000 |
+| source | before     | after      | ggml                                |
+| ------ | ---------- | ---------- | ----------------------------------- |
+| Q4_0   | 5.0000 bpw | 4.5000 bpw | 4.5000                              |
+| Q8_0   | 9.0000 bpw | 8.5000 bpw | 8.5000                              |
 | Q4_1   | 5.0000 bpw | unchanged  | — (stores a real per-block minimum) |
 
 These outputs are **not mlx-lm-loadable**, since mlx-lm requires a stored

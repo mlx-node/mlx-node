@@ -31,16 +31,26 @@ Download model weights and tokenizer files from HuggingFace Hub:
 mlx download model --model Qwen/Qwen3-0.6B
 ```
 
-Downloads to `.cache/models/<model-slug>` by default. Skips if already downloaded.
+Downloads to `.cache/models/<model-slug>` by default, pinned to the repo's
+current revision. A successful download writes a `.mlx-download-complete.json`
+marker (shared with the dashboard) recording the repo, revision, and file
+list. Re-running the command checks the upstream revision: when nothing
+changed it exits with "already up to date"; when the repo was updated it
+re-downloads only the files whose content hash changed and removes files the
+repo no longer has — no need to delete the directory first. Use `--force` to
+re-verify every file even when the local copy looks current. If the revision
+cannot be resolved (offline), the previous local-only checks apply.
 
 #### Options
 
-| Flag          | Short | Default                | Description                               |
-| ------------- | ----- | ---------------------- | ----------------------------------------- |
-| `--model`     | `-m`  | `Qwen/Qwen3-0.6B`      | HuggingFace model name                    |
-| `--output`    | `-o`  | `.cache/models/<slug>` | Output directory                          |
-| `--glob`      | `-g`  | (all supported files)  | Filter files by glob pattern (repeatable) |
-| `--set-token` |       |                        | Set up HuggingFace authentication         |
+| Flag          | Short | Default                | Description                                           |
+| ------------- | ----- | ---------------------- | ----------------------------------------------------- |
+| `--model`     | `-m`  | `Qwen/Qwen3-0.6B`      | HuggingFace model name                                |
+| `--output`    | `-o`  | `.cache/models/<slug>` | Output directory                                      |
+| `--glob`      | `-g`  | (all supported files)  | Filter files by glob pattern (repeatable)             |
+| `--force`     |       | `false`                | Re-verify every file against upstream by content hash |
+| `--cache-dir` |       | `~/.cache/huggingface` | HuggingFace cache directory                           |
+| `--set-token` |       |                        | Set up HuggingFace authentication                     |
 
 #### Authentication
 
@@ -136,7 +146,7 @@ mlx convert \
 | `--quantize`     | `-q`  | `false`       | Enable quantization                                                    |
 | `--q-bits`       |       | `4`           | Quantization bits (4 or 8)                                             |
 | `--q-group-size` |       | `64`          | Quantization group size                                                |
-| `--q-mode`       |       | `affine`      | Mode: `affine`, `mxfp4`, `mxfp8`, `nvfp4`, or `sym8`                  |
+| `--q-mode`       |       | `affine`      | Mode: `affine`, `mxfp4`, `mxfp8`, `nvfp4`, or `sym8`                   |
 | `--q-recipe`     |       |               | Per-layer mixed-bit recipe                                             |
 | `--q-mtp`        |       | `off`         | Qwen MTP-quant policy: `cyankiwi`, `all`, or `split` (alias `drafter`) |
 | `--imatrix-path` |       |               | imatrix GGUF for AWQ pre-scaling                                       |
@@ -157,13 +167,13 @@ Auto-detected from `config.json` when not specified:
 
 #### Quantization Recipes
 
-| Recipe      | Description                                                            |
-| ----------- | ---------------------------------------------------------------------- |
-| `mixed_2_6` | 2-bit base, 6-bit sensitive layers                                     |
-| `mixed_3_4` | 3-bit base, 4-bit sensitive layers                                     |
-| `mixed_3_6` | 3-bit base, 6-bit sensitive layers                                     |
-| `mixed_4_6` | 4-bit base, 6-bit sensitive layers                                     |
-| `qwen3_5`   | Optimized for Qwen3.5 hybrid architecture                              |
+| Recipe      | Description                                                                      |
+| ----------- | -------------------------------------------------------------------------------- |
+| `mixed_2_6` | 2-bit base, 6-bit sensitive layers                                               |
+| `mixed_3_4` | 3-bit base, 4-bit sensitive layers                                               |
+| `mixed_3_6` | 3-bit base, 6-bit sensitive layers                                               |
+| `mixed_4_6` | 4-bit base, 6-bit sensitive layers                                               |
+| `qwen3_5`   | Optimized for Qwen3.5 hybrid architecture                                        |
 | `unsloth`   | Legacy affine, fixed MXFP/DGX tensor-class maps with `--q-mxfp`/`--q-mode nvfp4` |
 
 #### Unsloth Recipe
@@ -207,11 +217,11 @@ does not include Unsloth's calibrated NVFP4 global scales, W4A4/W8A8 activation
 execution, or calibrated FP8 KV-cache scales, and does not claim upstream
 numerical or performance parity.
 
-| Weight class                                                                     | `--q-mxfp` | `--q-mode nvfp4` |
-| -------------------------------------------------------------------------------- | ---------- | ---------------- |
-| FFN `gate_proj` / `up_proj` / `down_proj`, except the final 8 transformer layers | MXFP4 4/32 | NVFP4 4/16       |
+| Weight class                                                                     | `--q-mxfp` | `--q-mode nvfp4`                 |
+| -------------------------------------------------------------------------------- | ---------- | -------------------------------- |
+| FFN `gate_proj` / `up_proj` / `down_proj`, except the final 8 transformer layers | MXFP4 4/32 | NVFP4 4/16                       |
 | Final 8 FFNs; attention q/k/v/o; GDN qkv/z/out; `lm_head`                        | MXFP8 8/32 | E4M3 FP8 + per-output BF16 scale |
-| Embeddings; routers; GDN a/b; vision; MTP; norms; recurrent parameters           | BF16       | BF16             |
+| Embeddings; routers; GDN a/b; vision; MTP; norms; recurrent parameters           | BF16       | BF16                             |
 
 Per-tensor bit assignments (N = `--q-bits`):
 
