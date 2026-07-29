@@ -30,6 +30,11 @@ re-running the command (or `--force`) is enough. When the revision cannot be
 resolved (offline, missing auth on a gated repo), the command warns and falls
 back to the previous local-only completeness checks.
 
+Note that `--force` without `--glob` on a GGUF directory holding only some
+quantization variants downloads all remaining variants, and that the marker
+makes the directory dashboard-managed — a dashboard install into it may
+replace the contents wholesale.
+
 | Flag             | Default                | Purpose                                                |
 | ---------------- | ---------------------- | ------------------------------------------------------ |
 | `-m`, `--model`  | `Qwen/Qwen3-0.6B`      | HuggingFace model id                                   |

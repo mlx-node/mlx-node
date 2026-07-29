@@ -60,8 +60,9 @@ export function catalogSlug(entry: CatalogEntry): string {
  * by config alone — matching on it marked such a fine-tune "Installed" and
  * disabled the page's only Install button, hard-blocking the real download.
  *
- * A directory with no marker (hand-copied, or installed by `mlx download`, which
- * writes none) is deliberately NOT matched here: the canonical-slug check below
+ * A directory with no marker (hand-copied, or installed by an older
+ * `mlx download` CLI — the current CLI writes the shared marker) is
+ * deliberately NOT matched here: the canonical-slug check below
  * still covers it, and the worst case of missing a renamed copy is ONE redundant
  * download, against a hard block for the false match.
  *
