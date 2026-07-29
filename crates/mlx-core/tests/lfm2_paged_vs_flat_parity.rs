@@ -846,9 +846,16 @@ fn answer_surface(r: &mlx_core::engine::types::ChatResult) -> &str {
 fn states_number(haystack: &str, number: &str) -> bool {
     haystack.match_indices(number).any(|(at, _)| {
         let mut before = haystack[..at].chars().rev();
-        // A leading `.` only disqualifies as part of a decimal — `1.18` — so a
-        // bare `.18` is rejected too, and a sentence boundary is not.
-        let joined_left = matches!(before.next(), Some(c) if c.is_ascii_digit() || c == '.');
+        // `.` and `-` are part of the literal when DIRECTLY attached: `1.18` is
+        // a decimal and `-18` is a negative, and neither states 18. A bare
+        // `.18` is rejected for the same reason; a sentence boundary is not.
+        //
+        // Attachment is what makes this safe to tighten. `31 - 18 = 13` and a
+        // markdown `- 18` both keep a space before the digits, so they still
+        // count — only a sign glued to the number is treated as part of it.
+        // `+18` is deliberately absent: it is still positive 18.
+        let joined_left =
+            matches!(before.next(), Some(c) if c.is_ascii_digit() || c == '.' || c == '-');
 
         let mut after = haystack[at + number.len()..].chars();
         let joined_right = match after.next() {
@@ -974,9 +981,26 @@ fn states_number_rejects_digits_inside_a_longer_number() {
         "180",
         "18.5 is not it",
         "x=118",
+        // NEGATIVES. A corrupted turn that concludes `-18` is mathematically
+        // wrong — 7 + 11 is not -18 — and a sign glued to the digits used to
+        // read as a clean boundary, so the oracle accepted it.
+        "-18",
+        "the sum is -18",
+        "**Answer:** \\boxed{-18}",
+        "17-18",
     ] {
         assert!(!states_number(bad, "18"), "accepted a non-answer: {bad:?}");
     }
+    assert!(!states_number("\\boxed{-31}", "31"));
+    assert!(!states_number("amber is -7", "7"));
+
+    // Over-correction guard on the minus rule: only a sign ATTACHED to the
+    // digits disqualifies. A subtraction and a markdown bullet both keep a
+    // space, and both still state the number.
+    assert!(states_number("31 - 18 = 13", "18"));
+    assert!(states_number("- 18", "18"));
+    // `+18` is still positive 18.
+    assert!(states_number("+18", "18"));
 
     // A wrong total that merely contains the right digits is now rejected,
     // which is the whole point over the fallback surface.
