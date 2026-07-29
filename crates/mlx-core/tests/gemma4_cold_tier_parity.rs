@@ -86,6 +86,16 @@
 //! safe to run in one process: `run_restart_parity` honours an already-created
 //! root, the cold keys are content-derived (different prompts => disjoint
 //! chains), and every stats assertion is a delta around its own instance 2.
+//!
+//! That claim also depends on the tier ROOT outliving gate 1, which is why the
+//! harness no longer deletes it in teardown. It used to. Without an inherited
+//! `MLX_COLD_CACHE_DIR` the root is `temp_dir()/mlx-cold-parity-{pid}`, so gate
+//! 2 recreated the same pathname while the live manager still held a descriptor
+//! for the directory gate 1 had unlinked — and a descriptor to an unlinked
+//! directory fails every name lookup with ENOENT. Gate 2 stored nothing,
+//! restored nothing, and blamed the restore path. Every invocation below passes
+//! `MLX_COLD_CACHE_DIR` explicitly, which takes the inherited arm and never hit
+//! it; running the two gates with no cache dir set is what did.
 //! They are slow enough (~4 min per fresh load, dominated by full-shard weight
 //! hashing) that running them separately is usually what you want.
 //!

@@ -37,7 +37,33 @@ fn installing_the_same_settings_twice_is_a_no_op_not_a_conflict() {
 
     let budget = Duration::from_millis(60_000);
 
-    // First install: nothing has resolved either global yet.
+    // FIRST, while both globals are still unset: a root that cannot be OPENED
+    // must not report success. `open_managed_cold_cache` returns `None` when
+    // the managed `mlx-paged-v1` child cannot be opened, and `GLOBAL.set(None)`
+    // still succeeds — so reporting on the `set` alone told the caller its
+    // cache was installed while the tier was DISABLED. The harness would then
+    // run its whole gate and fail with "restore did not engage", blaming the
+    // restore path for a setup that never opened.
+    //
+    // This has to run BEFORE the successful install below, in this same test,
+    // rather than as a second `#[test]`: libtest shares one process, the first
+    // successful install owns `INSTALLED_ROOT` permanently, and a later bad-root
+    // call would then return false via the path-mismatch branch — passing for
+    // the wrong reason and proving nothing about the open.
+    let blocked = root.join("blocked-parent");
+    std::fs::create_dir_all(&blocked).expect("create blocked parent");
+    // A regular file at the exact name the opener needs as a directory, so the
+    // failure is a real filesystem refusal rather than a synthetic one.
+    std::fs::write(blocked.join("mlx-paged-v1"), b"not a directory").expect("write blocker");
+    assert!(
+        !install_cold_cache_root(&blocked),
+        "install reported success for a root whose managed child could not be opened — the \
+         caller would proceed with the tier DISABLED and blame the restore path"
+    );
+
+    // First install: nothing has resolved either global yet. This ALSO proves
+    // the failed attempt above did not poison them — it must return before
+    // touching `GLOBAL` or recording a root.
     assert!(
         install_cold_capture_budget(12, budget),
         "first budget install should win the OnceLock"

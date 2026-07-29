@@ -1221,6 +1221,22 @@ where
         after.write_errors,
         after.restore_declines
     );
+    // …and `write_errors` is now ASSERTED, not only printed. A torn tier root —
+    // the directory unlinked out from under the live manager, which retains a
+    // descriptor rather than a pathname — makes every `openat`/`renameat`/
+    // `unlinkat` return ENOENT while `fsync` and `getdents` still succeed.
+    // Capture then stores nothing and restore finds nothing, and the FIRST
+    // assertion to fire is "cold restore did not engage", which sends the
+    // reader to the restore path for a setup fault. This makes the setup name
+    // itself instead.
+    assert_eq!(
+        after.write_errors, 0,
+        "[{}] cold tier recorded {} write error(s): the capture path could not store what it \
+         enqueued, so anything below about restore is downstream of a broken WRITE. The usual \
+         cause is a tier root that no longer exists at the descriptor the manager holds — check \
+         that nothing deleted it between gates.",
+        spec.family, after.write_errors
+    );
 
     // ---- 2a. The restored sidecar was INSTALLED, not just read -----------
     //
@@ -1331,11 +1347,21 @@ where
     // Best-effort cleanup; only touches what this run created.
     let _ = fs::remove_dir_all(&persist_dir);
     let _ = fs::remove_dir_all(&nopersist_dir);
-    if let ColdRoot::Created(path) = &cold_root {
-        // SAFETY: single-threaded teardown, no other reader.
-        unsafe { std::env::remove_var("MLX_COLD_CACHE_DIR") };
-        let _ = fs::remove_dir_all(path);
-    }
+
+    // The tier ROOT is deliberately left in place.
+    //
+    // It used to be deleted here, alongside a `remove_var("MLX_COLD_CACHE_DIR")`
+    // that undid the `set_var` this harness no longer does. Deleting it is
+    // actively wrong now that a second gate in the same binary reuses the
+    // installed tier: `ColdRoot::Created` is `temp_dir()/mlx-cold-parity-{pid}`,
+    // so the next gate recreates the SAME pathname while the live manager still
+    // holds a descriptor for the directory this line unlinked. `install_cold_cache_root`
+    // sees a matching path and correctly reports the tier installed, but the two
+    // no longer refer to the same directory.
+    //
+    // It is pid-scoped and under the OS temp directory, and the per-instance
+    // model clones above — the actual bulk — are still removed. `--test-threads=1`
+    // plus one root per process means nothing else collides with it.
 }
 
 /// Offline cover for [`expected_checkpoint_ladder`].

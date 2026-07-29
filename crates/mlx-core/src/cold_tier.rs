@@ -142,16 +142,26 @@ pub fn install_cold_capture_budget(blocks: usize, budget: std::time::Duration) -
 
 /// Pin the cold-tier root directly; the [`install_cold_capture_budget`]
 /// rationale applies verbatim, including idempotence on a repeat call with the
-/// same directory. Returns `false` when the tier is already open somewhere
-/// else, in which case the caller's root is NOT in effect.
+/// same directory.
+///
+/// Returns `false` when the tier is already open somewhere else, OR when the
+/// managed child could not be opened at all — `open_managed_cold_cache` returns
+/// `None` on a refused or unwritable `mlx-paged-v1`, and `GLOBAL.set(None)`
+/// still succeeds, so reporting on the `set` alone would tell the caller its
+/// cache is installed while the tier is DISABLED. A harness that believed that
+/// would run its whole gate and fail with "restore did not engage", pointing
+/// the reader at the restore path instead of at the setup that never opened.
 pub fn install_cold_cache_root(parent: &Path) -> bool {
     if let Some(installed) = INSTALLED_ROOT.get() {
-        // Only this function ever sets `INSTALLED_ROOT`, and a caller whose
-        // `GLOBAL.set` failed returned `false` and never recorded one — so
-        // reaching here means an earlier install opened the tier successfully.
+        // Only this function ever sets `INSTALLED_ROOT`, and it does so only
+        // after a successful OPEN — so reaching here means an earlier install
+        // really did put a live manager at this path.
         return installed == parent;
     }
-    if GLOBAL.set(open_managed_cold_cache(parent)).is_err() {
+    let Some(manager) = open_managed_cold_cache(parent) else {
+        return false;
+    };
+    if GLOBAL.set(Some(manager)).is_err() {
         return false;
     }
     let _ = INSTALLED_ROOT.set(parent.to_path_buf());
