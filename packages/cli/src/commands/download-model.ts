@@ -12,6 +12,61 @@ import { resolveHuggingFaceToken, setToken } from './hf-token.js';
 
 const DEFAULT_CACHE_DIR = join(homedir(), '.cache', 'huggingface');
 
+/** Attempts per file before a download gives up. */
+const MAX_FETCH_ATTEMPTS = 4;
+
+/** Base backoff; attempt N waits `BASE << (N - 1)` ms (1s, 2s, 4s). */
+const RETRY_BASE_MS = 1_000;
+
+/**
+ * Whether a failed fetch is worth repeating.
+ *
+ * Retries a SERVER's admission that it failed (5xx) and an explicit rate limit
+ * (429), plus a transport error, which surfaces with no status at all. Anything
+ * else — 401/403 (no token, or no access to a gated repo), 404 (wrong repo or
+ * revision) — is a settled answer, and repeating it only delays the message the
+ * user needs.
+ */
+export function isRetriableFetchError(error: unknown): boolean {
+  const status = (error as { statusCode?: unknown } | null)?.statusCode;
+  if (typeof status === 'number') return status >= 500 || status === 429;
+  // No status: a transport-level failure (socket reset, DNS, TLS, timeout).
+  return error instanceof Error;
+}
+
+/**
+ * Run `attempt`, repeating it while the failure looks transient.
+ *
+ * A checkpoint is tens of files and tens of gigabytes pulled from a CDN, so a
+ * single 5xx somewhere in the set is ordinary — and without this ONE of them
+ * aborted the whole multi-GB download, discarding every completed file. This
+ * is what CI hit:
+ *
+ *   HubApiError: Api error with status 500
+ *     data: { message: 'Key service error: Timeout occurred while creating a new object' }
+ *
+ * The retry is cheap and safe to repeat: `downloadFileToCacheDir` is
+ * content-addressed, so a re-attempt resumes from the cache rather than
+ * re-fetching what already landed.
+ */
+export async function withRetries<T>(what: string, attempt: () => Promise<T>): Promise<T> {
+  for (let n = 1; ; n++) {
+    try {
+      return await attempt();
+    } catch (error) {
+      if (n >= MAX_FETCH_ATTEMPTS || !isRetriableFetchError(error)) throw error;
+      const waitMs = RETRY_BASE_MS << (n - 1);
+      // The status when there is one, else the transport error's message —
+      // never the error object itself, which stringifies to `[object Object]`
+      // and would make the one line explaining the pause useless.
+      const status = (error as { statusCode?: unknown }).statusCode;
+      const reason = typeof status === 'number' ? `HTTP ${status}` : (error as Error).message;
+      console.warn(`    ${what} failed (${reason}); retry ${n}/${MAX_FETCH_ATTEMPTS - 1} in ${waitMs}ms`);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+  }
+}
+
 const DEFAULT_MODEL = 'Qwen/Qwen3-0.6B';
 
 function printHelp(): void {
@@ -73,7 +128,19 @@ function matchesAnyGlob(filename: string, patterns: RegExp[]): boolean {
   return patterns.some((re) => re.test(filename));
 }
 
+/**
+ * List the repo's files, retrying a transient listing failure.
+ *
+ * Retried as a WHOLE call: every accumulator below is local to one invocation,
+ * so a second attempt starts from an empty set rather than appending to a
+ * half-walked one. `listFiles` is paginated, so a 5xx can land part-way through
+ * a large repo's walk.
+ */
 async function getModelFiles(modelName: string, accessToken?: string, globPatterns?: string[]) {
+  return withRetries(`listing ${modelName}`, () => listModelFilesOnce(modelName, accessToken, globPatterns));
+}
+
+async function listModelFilesOnce(modelName: string, accessToken?: string, globPatterns?: string[]) {
   let totalSize = 0;
   const filesToDownload: ListFileEntry[] = [];
   const allFiles: ListFileEntry[] = [];
@@ -562,12 +629,14 @@ export async function run(argv: string[]) {
       );
     } else {
       console.log(`  [${i + 1}/${total}] ${file.path}${fileSizeStr ? ` (${fileSizeStr})` : ''}...`);
-      const snapshotPath = await downloadFileToCacheDir({
-        repo: { type: 'model', name: modelName },
-        path: file.path,
-        cacheDir,
-        accessToken: HUGGINGFACE_TOKEN,
-      });
+      const snapshotPath = await withRetries(file.path, () =>
+        downloadFileToCacheDir({
+          repo: { type: 'model', name: modelName },
+          path: file.path,
+          cacheDir,
+          accessToken: HUGGINGFACE_TOKEN,
+        }),
+      );
       await ensureDir(dirname(destPath));
       await copyFile(snapshotPath, destPath);
     }
