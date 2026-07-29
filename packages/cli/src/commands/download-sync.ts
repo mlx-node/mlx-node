@@ -69,6 +69,14 @@ export function isCompletionCurrent(completion: DownloadCompletion | null, repo:
  * later run uses a narrower `--glob`. Only files the old marker listed are
  * ever eligible (no marker ⇒ nothing is deleted), and entries that are
  * absolute, empty, or resolve outside `outputDir` are dropped, never deleted.
+ *
+ * Nested entries (any path containing '/') are NEVER eligible either: the CLI
+ * lists the repo non-recursively, while the marker is shared with the
+ * dashboard, whose listing IS recursive — so a dashboard-written marker can
+ * record `sub/dir/file.json` that the CLI's `remotePaths` can never contain.
+ * Absence from a listing that cannot see the file proves nothing; pruning on
+ * it would delete a file that is still upstream and that the CLI's own
+ * non-recursive selection could never re-download.
  */
 export function computePruneList(previousFiles: string[], remotePaths: string[], outputDir: string): string[] {
   const remote = new Set(remotePaths);
@@ -76,6 +84,7 @@ export function computePruneList(previousFiles: string[], remotePaths: string[],
   const out: string[] = [];
   for (const rel of previousFiles) {
     if (remote.has(rel)) continue;
+    if (rel.includes('/')) continue;
     if (rel.length === 0 || isAbsolute(rel)) continue;
     const abs = resolve(root, rel);
     if (abs === root || !abs.startsWith(root + sep)) continue;
@@ -88,6 +97,12 @@ export function computePruneList(previousFiles: string[], remotePaths: string[],
  * File list for the next marker: the current selection plus every previous
  * marker file that is still on the remote AND still on disk. A `--glob` run
  * must not shrink the marker and forget files a previous full run downloaded.
+ *
+ * Previous NESTED entries (path containing '/') skip the remote check: they
+ * can come from a dashboard-written marker (recursive listing), so the CLI's
+ * non-recursive `remotePaths` can never contain them and the check could never
+ * pass — presence on disk alone decides, so a CLI sync does not silently
+ * forget the dashboard's nested files.
  */
 export function buildMarkerFiles(
   previous: DownloadCompletion | null,
@@ -99,7 +114,8 @@ export function buildMarkerFiles(
   if (previous !== null) {
     const remote = new Set(remotePaths);
     for (const file of previous.files) {
-      if (remote.has(file) && existsSync(join(outputDir, file))) files.add(file);
+      const provenOnRemote = file.includes('/') || remote.has(file);
+      if (provenOnRemote && existsSync(join(outputDir, file))) files.add(file);
     }
   }
   return [...files].sort();

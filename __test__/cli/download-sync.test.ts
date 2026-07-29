@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -116,8 +116,12 @@ describe('computePruneList', () => {
     expect(computePruneList(previous, [], '/out')).toEqual([]);
   });
 
-  it('keeps a legitimate nested path', () => {
-    expect(computePruneList(['sub/gone.gguf'], [], '/out')).toEqual(['sub/gone.gguf']);
+  it('never prunes nested paths — the non-recursive listing cannot prove they are gone', () => {
+    // The marker is shared with the dashboard, which lists RECURSIVELY; the
+    // CLI lists non-recursively, so `sub/gone.gguf` being absent from the
+    // CLI's remote list proves nothing. Mutation caught: pruning nested
+    // entries deletes files still upstream that the CLI can never re-fetch.
+    expect(computePruneList(['sub/gone.gguf'], [], '/out')).toEqual([]);
   });
 });
 
@@ -151,5 +155,33 @@ describe('buildMarkerFiles', () => {
 
   it('with no previous marker returns just the sorted selection', () => {
     expect(buildMarkerFiles(null, ['b.json', 'a.json'], ['b.json', 'a.json'], dir)).toEqual(['a.json', 'b.json']);
+  });
+
+  it('keeps a nested previous file on disk even when absent from the non-recursive remote list', () => {
+    // A dashboard-written marker (recursive listing) can record nested paths
+    // the CLI's non-recursive listing never sees; a CLI sync must not forget
+    // them while they still exist locally.
+    mkdirSync(join(dir, 'sub'));
+    writeFileSync(join(dir, 'sub', 'nested.json'), 'x');
+    const previous: DownloadCompletion = {
+      repo: 'org/model',
+      revision: SHA,
+      files: ['sub/nested.json'],
+      completedAt: '2026-07-29T00:00:00.000Z',
+    };
+    expect(buildMarkerFiles(previous, ['config.json'], ['config.json'], dir)).toEqual([
+      'config.json',
+      'sub/nested.json',
+    ]);
+  });
+
+  it('drops a nested previous file that is no longer on disk', () => {
+    const previous: DownloadCompletion = {
+      repo: 'org/model',
+      revision: SHA,
+      files: ['sub/nested.json'],
+      completedAt: '2026-07-29T00:00:00.000Z',
+    };
+    expect(buildMarkerFiles(previous, ['config.json'], ['config.json'], dir)).toEqual(['config.json']);
   });
 });
