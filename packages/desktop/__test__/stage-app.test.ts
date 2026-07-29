@@ -30,16 +30,44 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vite-plus/test';
 
-import { isNonRuntimeFile, pruneExcludedNested, runtimeClosure } from '../scripts/stage-app.js';
+import { isNonRuntimeFile, pruneExcludedNested, runtimeClosure, stageRuntimeBuildFiles } from '../scripts/stage-app.js';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+
+describe('runtime build assets', () => {
+  it('stages the tray images without generator inputs', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-desktop-build-'));
+    const desktop = join(root, 'desktop');
+    const stage = join(root, 'stage');
+    try {
+      mkdirSync(join(desktop, 'build'), { recursive: true });
+      for (const name of [
+        'iconTemplate.png',
+        'iconTemplate@2x.png',
+        'icon.icns',
+        'make-icons.ts',
+        'tray-icon-source.png',
+      ]) {
+        writeFileSync(join(desktop, 'build', name), name);
+      }
+      mkdirSync(join(desktop, 'build', 'icon.iconset'));
+      writeFileSync(join(desktop, 'build', 'icon.iconset', 'icon_16x16.png'), 'generated');
+
+      stageRuntimeBuildFiles(desktop, stage);
+
+      expect(readdirSync(join(stage, 'build')).sort()).toEqual(['iconTemplate.png', 'iconTemplate@2x.png'].sort());
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 // The same roots packaging uses: what the three entries import, not what
 // packages/desktop/package.json happens to declare.

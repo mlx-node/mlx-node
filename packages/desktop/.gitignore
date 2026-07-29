@@ -5,7 +5,7 @@ spike/.spike-logs/
 # being explicit here keeps the build products discoverable to a reader.
 out/
 
-# `iconutil` input only: 10 PNGs that make-icons.py regenerates and that carry no
+# `iconutil` input only: 10 PNGs that make-icons.ts regenerates and that carry no
 # information `icon.icns` does not already hold. The .icns itself IS committed —
-# packagers reference it directly, and building one should not require Python+PIL.
+# packagers reference it directly.
 build/icon.iconset/

@@ -20,6 +20,21 @@
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+export const RUNTIME_BUILD_FILES = ['iconTemplate.png', 'iconTemplate@2x.png'] as const;
+
+/**
+ * Only the tray images are opened at runtime. `icon.icns` is installed by
+ * Electron Packager, while the generator and its ignored iconset are build
+ * inputs that do not belong in `Contents/Resources/app`.
+ */
+export function stageRuntimeBuildFiles(desktopDir: string, stageDir: string): void {
+  const target = join(stageDir, 'build');
+  mkdirSync(target, { recursive: true });
+  for (const name of RUNTIME_BUILD_FILES) {
+    cpSync(join(desktopDir, 'build', name), join(target, name));
+  }
+}
+
 interface PackageJson {
   name?: string;
   version?: string;
@@ -385,7 +400,7 @@ export function stageApp(opts: {
   mkdirSync(stageDir, { recursive: true });
 
   cpSync(join(desktopDir, 'dist'), join(stageDir, 'dist'), { recursive: true });
-  cpSync(join(desktopDir, 'build'), join(stageDir, 'build'), { recursive: true });
+  stageRuntimeBuildFiles(desktopDir, stageDir);
 
   const source = readJson(join(desktopDir, 'package.json'));
   // Dependencies are stripped from the staged manifest on purpose. node_modules
