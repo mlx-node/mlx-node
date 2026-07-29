@@ -837,13 +837,13 @@ async fn lfm2_paged_delta_memory_probe_parity() {
     // checkpoint over-thinks meta-instructions and drags them into later
     // turns, poisoning the arithmetic probes.
     let prompt1 = "Here are values to remember: amber = 7 and cobalt = 11. What is amber?";
-    let r1_flat = flat_model
-        .chat_session_start(
-            vec![user_message(prompt1)],
-            Some(memory_probe_chat_config()),
-        )
-        .await
-        .expect("turn 1 flat chat_session_start failed");
+    // No flat turn 1. Once the control is rebuilt from the paged transcript
+    // below, a flat turn 1 is a 2.9s decode (of a 12s test) whose output and
+    // session state are both discarded — A/B'd: the turn-2 and turn-3 controls
+    // come out byte-identical with and without it, at `cached_tokens=0` either
+    // way, because a fresh `chat_session_start` prompt does not prefix-match
+    // the abandoned turn-1 history. It only adds a surface on which an
+    // unrelated inference error can fail the gate.
     let r1_paged = paged_model
         .chat_session_start(
             vec![user_message(prompt1)],
@@ -852,8 +852,8 @@ async fn lfm2_paged_delta_memory_probe_parity() {
         .await
         .expect("turn 1 paged chat_session_start failed");
     eprintln!(
-        "[mem-probe] turn1: flat cached={} text={:?} | paged cached={} text={:?}",
-        r1_flat.cached_tokens, r1_flat.text, r1_paged.cached_tokens, r1_paged.text,
+        "[mem-probe] turn1: paged cached={} finish={} text={:?}",
+        r1_paged.cached_tokens, r1_paged.finish_reason, r1_paged.text,
     );
     assert!(
         answer_surface(&r1_paged).contains('7'),
@@ -871,12 +871,44 @@ async fn lfm2_paged_delta_memory_probe_parity() {
     // DIFFERENT conversation by turn 3, so "flat says 31" was a second
     // independent lottery rather than a control: on the CI failure that
     // motivated this shape the arms' turn-3 prompts differed by 102 tokens.
-    // Feeding the control the paged transcript makes it answer the SAME question
-    // from the SAME context, which is what a differential control has to do.
+    //
+    // It is an EQUIVALENT-INFORMATION control, NOT a same-context one, and the
+    // difference is measurable. Two known, DETERMINISTIC gaps — neither of which
+    // reintroduces the compounding lottery above, since both are fixed given the
+    // paged transcript:
+    //
+    //  - +1 token on this turn: `save_paged_history` drops the last generated
+    //    token (it is never forwarded through the paged decode step, so keeping
+    //    it would desync the KV), while the jinja template re-emits the
+    //    `<|im_end|>` the paged delta builder never re-renders.
+    //  - -423 tokens on turn 3: `chat_template.jinja` defaults
+    //    `keep_past_thinking` to false and strips `content.split("</think>")[-1]`
+    //    from every assistant that is not the LAST one. So a rebuilt turn-3
+    //    prompt loses this turn's reasoning entirely (1817 B -> 125 B measured),
+    //    where the paged arm keeps it in KV. The control still carries every
+    //    FACT the probe asks about — the values live in the user turns and in
+    //    the post-`</think>` answer — which is what "answer agreement" needs.
+    //
     // Byte-level paged-vs-flat parity — including a short DELTA turn — stays
     // pinned by tests (a)/(a2)/(b2)/(c); this test's control exists for ANSWER
     // agreement only (see the header). Same idiom as
     // `lfm2_paged_prefill_bridge_cache_hit_ab_probe` below.
+    //
+    // The token-level gap stays at that ONE token only while the turn ends on
+    // `stop`: the dropped token is then `<|im_end|>`, which `raw_text` never
+    // contained (it decodes with `skip_special_tokens`). On a `length` exit the
+    // dropped token is a real word piece and `raw_text` DOES carry it, so the
+    // control would silently gain a token the paged arm never committed. Asserted
+    // rather than assumed, so that case is a diagnosable failure and not a skew.
+    assert_eq!(
+        r1_paged.finish_reason,
+        "stop",
+        "turn 1 hit the {} token cap, so the token `save_paged_history` dropped is a real word \
+         piece that `raw_text` still carries — the control below would silently gain a token the \
+         paged arm never committed. Raise max_new_tokens or shorten the prompt; do not paper over \
+         it by trimming raw_text, which is correct on the `stop` path.",
+        memory_probe_chat_config().max_new_tokens.unwrap_or(0),
+    );
     let r2_flat = flat_model
         .chat_session_start(
             vec![
@@ -931,7 +963,13 @@ async fn lfm2_paged_delta_memory_probe_parity() {
 
     // ---- Turn 3 (DELTA): extend the context and re-derive ----
     let user3 = "One more value: jade = 13. What is amber + cobalt + jade in total?";
-    // Control over the PAGED transcript again — see the turn-2 comment.
+    // Control over the PAGED transcript again — see the turn-2 comment, including
+    // why a `stop` exit is what keeps the dropped last token invisible.
+    assert_eq!(
+        r2_paged.finish_reason, "stop",
+        "turn 2 hit the token cap; see the turn-1 guard for why that makes the rebuilt control \
+         gain a token the paged arm never committed."
+    );
     let r3_flat = flat_model
         .chat_session_start(
             vec![
