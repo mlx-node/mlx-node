@@ -775,9 +775,84 @@ impl ColdRoot {
     }
 }
 
+/// Fail loudly when the capture turns can reach the prompt's END.
+///
+/// This is the invariant the whole `restore_prompt` fixture rests on and the
+/// one that silently rotted: a turn anchors ONE sidecar, at the deepest rung it
+/// reached, so if the capture turns between them cover the full prompt, the
+/// only sidecar written sits at the deepest rung — the one a diverged restore
+/// prompt can never name — and instance 2 restores zero. That surfaces as
+/// "restore did not engage", pointing the reader at the restore path, when the
+/// cause is that nothing shallow was ever written.
+///
+/// Checked against the LADDER rather than the raw block count because the
+/// deepest rung, not the prompt's end, is what a restore can address.
+fn assert_capture_reach_leaves_room(spec: &ColdTierParitySpec, ladder: &[u32], prompt_tokens: u32) {
+    let Some(&deepest) = ladder.last() else {
+        return;
+    };
+    let turns = spec.capture_warmup_turns + 1;
+    let reach_tokens = (turns * CAPTURE_BLOCKS_PER_TURN) as u32 * spec.block_size;
+    assert!(
+        reach_tokens < deepest,
+        "[{}] FIXTURE, not a product fault: {} capture turn(s) x {} blocks x {} tok = {} tok of \
+         reach, which covers this prompt's deepest ladder rung ({} tok of {} prompt tok). One \
+         turn writes ONE sidecar at the deepest rung it reaches, so the shallow rungs instance 2 \
+         needs are never written and the restore necessarily finds nothing. Lengthen the capture \
+         prompt, or lower CAPTURE_BLOCKS_PER_TURN / capture_warmup_turns — do NOT relax the \
+         restore assertions below, which would leave this gate green against a real regression.",
+        spec.family,
+        turns,
+        CAPTURE_BLOCKS_PER_TURN,
+        spec.block_size,
+        reach_tokens,
+        deepest,
+        prompt_tokens
+    );
+}
+
+/// Blocks one capture turn may persist, forced by [`prepare_cold_root`].
+///
+/// The fixture needs the chain to reach its frontier over SEVERAL turns: a turn
+/// anchors exactly one sidecar, at the deepest rung it reached, so a turn that
+/// walks the whole prompt writes only the deepest rung and leaves the ladder's
+/// shallow rungs empty — which is precisely what instance 2 needs after its
+/// prompt diverges. That used to happen for free, because the walk stopped
+/// wherever the bounded writer queue refused (~12 blocks here). It is now a
+/// policy defaulting to 128 blocks, so on any machine whose disk keeps up, one
+/// turn covers a fixture-sized prompt and the gate fails by construction.
+///
+/// Pinned rather than left to the default so the stop condition is ARITHMETIC.
+/// With this below the prompt's block count the walk always stops on `Budget`,
+/// so no disk or CPU speed can change which rung gets written. [`LADDER_RATIO`]
+/// governs how far apart the rungs are; this only has to be shallow enough that
+/// `(warm-up turns + 1) x this` stays under the deepest rung, which
+/// [`assert_capture_reach_leaves_room`] enforces.
+const CAPTURE_BLOCKS_PER_TURN: usize = 12;
+
+/// Wall-clock ceiling forced alongside [`CAPTURE_BLOCKS_PER_TURN`].
+///
+/// NOT a lengthened timeout hiding a race: with the block budget below the
+/// prompt's block count the walk stops on blocks every time, so this exists
+/// only to take the clock OUT of the outcome. A walk that would trip a 60 s
+/// deadline is a real hang, not a slow runner.
+const CAPTURE_BUDGET_MS: u64 = 60_000;
+
 /// Fix the tier root BEFORE any model load. The manager is a process-global
 /// `OnceLock` initialized once from this env, so a later change is ignored.
+///
+/// Same for the capture budget: `cold_capture_budget()` is a `OnceLock` read on
+/// first use, so it has to be pinned here, ahead of every model load.
 fn prepare_cold_root() -> ColdRoot {
+    // SAFETY: same contract as the root below — set before any model load, and
+    // `#[ignore]` + `--test-threads=1` keep this the sole toucher in-process.
+    unsafe {
+        std::env::set_var(
+            "MLX_COLD_CAPTURE_BLOCKS_PER_TURN",
+            CAPTURE_BLOCKS_PER_TURN.to_string(),
+        );
+        std::env::set_var("MLX_COLD_CAPTURE_BUDGET_MS", CAPTURE_BUDGET_MS.to_string());
+    }
     match std::env::var("MLX_COLD_CACHE_DIR") {
         Ok(dir) if !dir.trim().is_empty() => {
             let path = PathBuf::from(dir);
@@ -1001,6 +1076,7 @@ where
             ladder,
             result_b.cached_tokens
         );
+        assert_capture_reach_leaves_room(&spec, &ladder, result_a.prompt_tokens);
         ladder
     } else {
         Vec::new()
