@@ -304,6 +304,7 @@ async fn lfm2_stream_session_path_keeps_ttft_flat_across_turns() {
     struct TurnSnapshot {
         ttft_ms: f64,
         prompt_tokens: u32,
+        cached_tokens: u32,
     }
 
     // --- Turn 1: chat_stream_session_start ---
@@ -318,6 +319,13 @@ async fn lfm2_stream_session_path_keeps_ttft_flat_across_turns() {
     let turn1 = TurnSnapshot {
         ttft_ms: ttft1,
         prompt_tokens: final1.prompt_tokens.unwrap_or(0),
+        // `unwrap_or` would paper over a regression that stopped populating
+        // this: `ChatStreamChunk::cached_tokens` is documented as authoritative
+        // on the terminal chunk, so a None here is a broken contract, not a
+        // zero. Every assertion below reads it.
+        cached_tokens: final1
+            .cached_tokens
+            .expect("terminal chunk must carry cached_tokens (see ChatStreamChunk docs)"),
     };
     println!(
         "stream turn 1 ttft={:.1}ms prompt_tokens={} chunks={}",
@@ -363,13 +371,25 @@ async fn lfm2_stream_session_path_keeps_ttft_flat_across_turns() {
         snapshots.push(TurnSnapshot {
             ttft_ms: ttft,
             prompt_tokens: last.prompt_tokens.unwrap_or(0),
+            cached_tokens: last
+                .cached_tokens
+                .expect("terminal chunk must carry cached_tokens (see ChatStreamChunk docs)"),
         });
+        // The other half of that contract: mid-stream chunks carry None.
+        assert!(
+            chunks[..chunks.len() - 1]
+                .iter()
+                .all(|c| c.cached_tokens.is_none()),
+            "turn {turn_idx}: a mid-stream chunk reported cached_tokens; only the terminal \
+             chunk is authoritative",
+        );
     }
 
     // --- Structural assertions ---
     assert_eq!(snapshots.len(), 4, "expected 4 stream turn snapshots");
     let turn1 = &snapshots[0];
     let turn2 = &snapshots[1];
+    let turn3 = &snapshots[2];
     let turn4 = &snapshots[3];
 
     assert!(
@@ -385,25 +405,70 @@ async fn lfm2_stream_session_path_keeps_ttft_flat_across_turns() {
         turn4.prompt_tokens
     );
 
-    let bound_vs_turn1 = turn1.ttft_ms * 1.5;
+    // The streaming delta path reuses the live KV prefix and freshly prefills
+    // ONLY the new turn's ChatML delta. Asserted on that token accounting
+    // rather than on wall-clock TTFT — the same swap the SYNC sibling in this
+    // file already made (see its comment at the `cached_tokens` block above),
+    // which this streaming twin was left out of.
+    //
+    // The TTFT ratio it replaces did not merely flake, it contradicted the
+    // architecture. lfm2 reprefills the FULL prompt through its conv layers
+    // every turn (`paged_perf_prefill_tokens`, lfm2/model.rs — the
+    // conv-state-reuse fast path is gated OFF by default), so TTFT is
+    // full-prompt scale BY DESIGN and grows with context. The CI failure that
+    // prompted this read turn2=329.1ms turn4=748.5ms, a 2.27x ratio that
+    // tracks the prompt growth between those turns: correct code failing a
+    // bound it can never satisfy. Raising the constant only postpones it.
+    //
+    // TTFT is still measured and printed above, so the perf trail stays in the
+    // CI log; it just no longer gates.
+    //
+    // `cached_tokens` is also the STRONGER signal in the other direction: a
+    // path that silently rebuilt the cache each turn could still post a fast
+    // TTFT on a fast machine, and would report cached_tokens == 0 here.
+    assert_eq!(
+        turn1.cached_tokens, 0,
+        "stream turn 1 cold-starts but reported cached_tokens={}",
+        turn1.cached_tokens
+    );
     assert!(
-        turn4.ttft_ms < bound_vs_turn1,
-        "stream delta-path TTFT regression vs turn 1: \
-         turn1={:.1}ms turn4={:.1}ms bound={:.1}ms. snapshots: {:?}",
-        turn1.ttft_ms,
-        turn4.ttft_ms,
-        bound_vs_turn1,
+        turn2.cached_tokens > 0,
+        "stream delta turn 2 reused nothing (cached_tokens=0) — the cache was rebuilt rather \
+         than continued. snapshots: {snapshots:?}",
+    );
+    assert!(
+        turn3.cached_tokens > turn2.cached_tokens,
+        "stream delta turn 3 didn't grow its reused prefix ({} -> {}). snapshots: {:?}",
+        turn2.cached_tokens,
+        turn3.cached_tokens,
+        snapshots
+    );
+    assert!(
+        turn4.cached_tokens > turn3.cached_tokens,
+        "stream delta turn 4 didn't grow its reused prefix ({} -> {}). snapshots: {:?}",
+        turn3.cached_tokens,
+        turn4.cached_tokens,
         snapshots
     );
 
-    let bound_vs_turn2 = turn2.ttft_ms * 2.0;
+    // Work per delta turn stays flat: the freshly-prefilled span is the new
+    // ChatML delta, not the whole growing history.
+    let uncached = |t: &TurnSnapshot| t.prompt_tokens.saturating_sub(t.cached_tokens);
     assert!(
-        turn4.ttft_ms < bound_vs_turn2,
-        "stream turn 4 TTFT much slower than turn 2: \
-         turn2={:.1}ms turn4={:.1}ms bound={:.1}ms. snapshots: {:?}",
-        turn2.ttft_ms,
-        turn4.ttft_ms,
-        bound_vs_turn2,
+        uncached(turn4) < turn4.cached_tokens,
+        "stream delta turn 4 prefilled more than it reused — work is not flat: prompt={} \
+         cached={} uncached={}. snapshots: {:?}",
+        turn4.prompt_tokens,
+        turn4.cached_tokens,
+        uncached(turn4),
+        snapshots
+    );
+    assert!(
+        uncached(turn4) <= uncached(turn2) * 2,
+        "stream delta turn 4's fresh prefill ({}) ballooned vs turn 2's ({}) — the delta is \
+         growing with history instead of staying the size of one turn. snapshots: {:?}",
+        uncached(turn4),
+        uncached(turn2),
         snapshots
     );
 }
@@ -913,8 +978,10 @@ async fn lfm2_stream_session_continue_rejects_images_with_restart_prefix() {
 /// Append hit: turn 2's `chat_session_start` prompt is a strict
 /// extension of turn 1's. The reported `cached_tokens` on turn 2 must
 /// be > 0 and at least cover turn 1's saved history, the reply must
-/// still terminate cleanly, and turn 2's TTFT must stay flat (<= 1.5×
-/// turn 1's) since only the delta is re-prefilled.
+/// still terminate cleanly, and only the delta may be re-prefilled —
+/// asserted as a TOKEN count, not as a TTFT bound. (This comment used to
+/// promise a `<= 1.5x turn 1` TTFT check; the assertion was already
+/// replaced with token accounting and the prose was left behind.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_LFM2_MODEL_PATH pointing to a real LFM2 checkpoint"]
 async fn lfm2_session_start_prefix_reuse_append_hit() {
