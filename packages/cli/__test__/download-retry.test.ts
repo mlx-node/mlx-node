@@ -107,6 +107,20 @@ describe('isRetriableFetchError', () => {
     expect(isRetriableFetchError(hubError(403))).toBe(false);
   });
 
+  it('does NOT retry a payload the chunk reader refuses', () => {
+    // `XetBlob` throws these from inside the chunk loop (XetBlob.ts:387,395)
+    // after part of the shard has streamed. They carry no status and no errno,
+    // so before this they took the default-retry branch and cost three more
+    // full multi-GB transfers to fail identically on the same bytes.
+    for (const text of ['Unsupported chunk version 3', 'Unsupported compression scheme ByteGroupingLZ4x']) {
+      expect([text, isRetriableFetchError(text)]).toEqual([text, false]);
+      expect([text, isRetriableFetchError(new Error(text))]).toEqual([text, false]);
+    }
+    // The over-correction guard: a TRUNCATED transfer looks similar and is the
+    // transient case this retry exists for. It must stay retriable.
+    expect(isRetriableFetchError('Failed to fetch all data for term abc123, fetched 4 bytes out of 99')).toBe(true);
+  });
+
   it('retries transport failures that are not spelled "fetch failed"', () => {
     // Naming known network errors is a trap: `fetch` rejects `TypeError: fetch
     // failed` on connect/DNS but `TypeError: terminated` on a mid-body socket
@@ -147,6 +161,59 @@ describe('withRetries', () => {
     await vi.runAllTimersAsync();
     await expect(settled).resolves.toBe('/cache/blob');
     expect(attempt).toHaveBeenCalledTimes(2);
+  });
+
+  it('waits exactly 1s, then 2s, then 4s — not merely "some" delay', async () => {
+    // `runAllTimersAsync` drains ANY finite delay, so every other test in this
+    // file passes with `RETRY_BASE_MS = 0` (measured). That leaves the 1/2/4s
+    // schedule — the thing that stops a retry storm from amplifying the CDN
+    // failure it is reacting to — completely unguarded. This walks the clock
+    // instead, asserting no attempt fires one millisecond early.
+    const attempt = vi.fn(async () => {
+      throw hubError(503);
+    });
+    const settled = withRetries('model.safetensors', attempt);
+    const assertion = expect(settled).rejects.toMatchObject({ statusCode: 503 });
+
+    // Attempt 1 runs immediately, with no timer scheduled before it.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(attempt).toHaveBeenCalledTimes(1);
+
+    for (const [n, waitMs] of [
+      [2, 1_000],
+      [3, 2_000],
+      [4, 4_000],
+    ] as const) {
+      await vi.advanceTimersByTimeAsync(waitMs - 1);
+      expect([n, attempt.mock.calls.length]).toEqual([n, n - 1]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect([n, attempt.mock.calls.length]).toEqual([n, n]);
+    }
+
+    await assertion;
+    // The pause is explained to the user with the real wait, not a guess.
+    expect(warn).toHaveBeenCalledTimes(3);
+    expect(warn.mock.calls.map((c: unknown[]) => String(c[0]))).toEqual([
+      expect.stringContaining('retry 1/3 in 1000ms'),
+      expect.stringContaining('retry 2/3 in 2000ms'),
+      expect.stringContaining('retry 3/3 in 4000ms'),
+    ]);
+  });
+
+  it('names the failure in the retry line, including a bare-string one', async () => {
+    // Regression: `reason` read `.message` off the error, which is `undefined`
+    // on a string — so the content-GET failures this whole retry exists for
+    // logged `failed (undefined)` and hid their own cause.
+    const attempt = vi
+      .fn<() => Promise<string>>()
+      .mockRejectedValueOnce('Api error with status 500. URL: https://hf.co/x')
+      .mockResolvedValueOnce('/cache/blob');
+    const settled = withRetries('model-00001-of-00009.safetensors', attempt);
+    await vi.runAllTimersAsync();
+    await expect(settled).resolves.toBe('/cache/blob');
+    const line = String(warn.mock.calls[0][0]);
+    expect(line).toContain('Api error with status 500');
+    expect(line).not.toContain('undefined');
   });
 
   it('gives up after a bounded number of attempts rather than looping forever', async () => {

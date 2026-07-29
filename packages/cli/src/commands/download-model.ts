@@ -33,6 +33,27 @@ const PERMANENT_FS_CODES = new Set([
 ]);
 
 /**
+ * Hub-client PROTOCOL refusals: the bytes arrived and the parser rejected
+ * them. `XetBlob` throws these from inside the chunk reader
+ * (`XetBlob.ts:387,395`) after part of the shard has already streamed, and
+ * they carry no status and no errno — so without this they land on the
+ * default-retry branch and cost three more full multi-GB transfers to fail
+ * identically. Deterministic in the payload, so a retry cannot change them.
+ *
+ * Deliberately NOT here: `Failed to fetch all data for term …`
+ * (`XetBlob.ts:473`), which means the transfer was TRUNCATED. That is the
+ * transient case, and it must keep retrying.
+ */
+const PERMANENT_PROTOCOL_MESSAGES = ['Unsupported chunk version', 'Unsupported compression scheme'];
+
+/** The human-readable text of a failure, whatever shape it arrived in. */
+function failureText(error: unknown): string {
+  if (typeof error === 'string') return error;
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+/**
  * A hub error flattened to text; see {@link isRetriableFetchError}.
  *
  * Only matches when the failing response had a NON-JSON body. `createApiError`
@@ -91,8 +112,14 @@ function isRetriableStatus(status: number): boolean {
  * mid-body reset, and a timeout is a `DOMException` with a NUMERIC code — so an
  * allowlist of known network errors turns every unmodelled one into a hard
  * abort of a 30 GB download, which is the failure this retry exists to prevent.
- * The harm is asymmetric: retrying something hopeless costs 7 s of backoff,
- * refusing to retry something transient costs the whole download.
+ * The harm is asymmetric, but NOT as cheaply as "7 s of backoff": because each
+ * attempt truncates `<blob>.incomplete` and re-GETs without a Range header, a
+ * wrongly-retried failure also re-transfers the shard up to three more times.
+ * That is why the two categories which are deterministic AND status-less —
+ * {@link PERMANENT_FS_CODES} and {@link PERMANENT_PROTOCOL_MESSAGES} — are
+ * named explicitly instead of being left to the default. Refusing to retry
+ * something transient still costs the whole download, so everything else
+ * unmodelled keeps defaulting to retry.
  *
  * Never retried: 4xx other than 429 and 408 (401/403 is no token or no access,
  * 404 is the wrong repo or revision) and the filesystem refusals above. Those
@@ -108,11 +135,17 @@ function isRetriableStatus(status: number): boolean {
  * allowlist this function exists to avoid.
  */
 export function isRetriableFetchError(error: unknown): boolean {
+  if (typeof error !== 'string' && !(error instanceof Error)) return false;
+
+  // Checked on BOTH shapes: the chunk reader's refusals reach us as a bare
+  // string through the blob stream, but as an Error when awaited directly.
+  const text = failureText(error);
+  if (PERMANENT_PROTOCOL_MESSAGES.some((m) => text.includes(m))) return false;
+
   if (typeof error === 'string') {
     const status = FLATTENED_STATUS.exec(error);
     return status ? isRetriableStatus(Number(status[1])) : true;
   }
-  if (!(error instanceof Error)) return false;
 
   const status = (error as { statusCode?: unknown }).statusCode;
   if (typeof status === 'number') return isRetriableStatus(status);
@@ -151,11 +184,14 @@ export async function withRetries<T>(what: string, attempt: () => Promise<T>): P
     } catch (error) {
       if (n >= MAX_FETCH_ATTEMPTS || !isRetriableFetchError(error)) throw error;
       const waitMs = RETRY_BASE_MS << (n - 1);
-      // The status when there is one, else the transport error's message —
-      // never the error object itself, which stringifies to `[object Object]`
-      // and would make the one line explaining the pause useless.
+      // The status when there is one, else the failure's text — never the error
+      // object itself, which stringifies to `[object Object]` and would make the
+      // one line explaining the pause useless. `failureText` rather than
+      // `.message` because the content-GET failures this retry exists for
+      // arrive as bare STRINGS, on which `.message` is `undefined` — printing
+      // `failed (undefined)` for exactly the case that matters most.
       const status = (error as { statusCode?: unknown }).statusCode;
-      const reason = typeof status === 'number' ? `HTTP ${status}` : (error as Error).message;
+      const reason = typeof status === 'number' ? `HTTP ${status}` : failureText(error);
       console.warn(`    ${what} failed (${reason}); retry ${n}/${MAX_FETCH_ATTEMPTS - 1} in ${waitMs}ms`);
       await new Promise((resolve) => setTimeout(resolve, waitMs));
     }
