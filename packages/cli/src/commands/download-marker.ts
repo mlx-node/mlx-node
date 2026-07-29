@@ -1,4 +1,5 @@
-import { readFile, rename, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 /**
@@ -64,10 +65,20 @@ export async function readCompletion(dir: string): Promise<DownloadCompletion | 
  * Write the marker atomically (temp file + rename in the same directory), so
  * a crash mid-write can never leave a truncated marker that would then parse
  * as garbage on the next run.
+ *
+ * The temp name is unique per write (pid + random) and opened with `wx`: a
+ * fixed `.tmp` name could be pre-planted as a symlink (making the write land
+ * elsewhere) and races two concurrent writers onto the same temp file. On any
+ * failure the temp file is removed; after a successful rename it no longer
+ * exists and the cleanup is a no-op.
  */
 export async function writeCompletion(dir: string, completion: DownloadCompletion): Promise<void> {
   const finalPath = join(dir, DOWNLOAD_COMPLETE_MARKER);
-  const tmpPath = `${finalPath}.tmp`;
-  await writeFile(tmpPath, `${JSON.stringify(completion, null, 2)}\n`);
-  await rename(tmpPath, finalPath);
+  const tmpPath = `${finalPath}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
+  try {
+    await writeFile(tmpPath, `${JSON.stringify(completion, null, 2)}\n`, { flag: 'wx' });
+    await rename(tmpPath, finalPath);
+  } finally {
+    await rm(tmpPath, { force: true });
+  }
 }

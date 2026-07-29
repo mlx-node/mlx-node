@@ -62,6 +62,61 @@ export function isCompletionCurrent(completion: DownloadCompletion | null, repo:
 }
 
 /**
+ * May a marker-current no-glob run skip the sync entirely?
+ *
+ * The marker files all existing is NOT enough on its own: a `--glob "*.json"`
+ * run writes a selection-only marker, and a later full run must still download
+ * the weights that selection never covered. The caller passes the local SHAPE
+ * predicate (`isModelAlreadyDownloaded`: config + weights present) so a
+ * selection-only marker can never satisfy the full-run short-circuit. GGUF
+ * dirs fail the shape predicate and fall through to the manifest-checked
+ * loop — the same cost the legacy gate paid for them.
+ */
+export function canShortCircuitFullRun(
+  completion: DownloadCompletion,
+  outputDir: string,
+  localShapeComplete: boolean,
+): boolean {
+  if (!localShapeComplete) return false;
+  return completion.files.every((f) => existsSync(join(outputDir, f)));
+}
+
+/**
+ * The previous completion, but ONLY when it belongs to `repo` — else `null`.
+ *
+ * Two different repos can share a default output dir (`unsloth/X` and
+ * `bartowski/X` have the same slug), so a marker found on disk may describe
+ * ANOTHER repo's files. Prune eligibility and the marker union must treat
+ * such a foreign marker as no marker at all: repo B's sync must never delete
+ * repo A's marker-listed files nor carry them into repo B's marker.
+ */
+export function sameRepoCompletion(completion: DownloadCompletion | null, repo: string): DownloadCompletion | null {
+  return completion !== null && completion.repo === repo ? completion : null;
+}
+
+/**
+ * Revision the next marker may CLAIM.
+ *
+ * A `--glob` sync at a CHANGED revision hash-verifies only its selection, yet
+ * the marker union also carries previous-marker files — stamping the new sha
+ * would launder those unverified files into a marker that lets the next full
+ * run short-circuit forever. In that one case keep the OLD revision
+ * (conservative under-claim: the next full run sees a stale marker and still
+ * syncs + hash-verifies everything). A no-glob run verified everything it
+ * records, and a glob run with NO previous same-repo marker records only its
+ * own verified selection — both claim `remoteSha`; the latter corner degrades
+ * to legacy behavior because the full-run short-circuit also demands the
+ * local shape predicate ({@link canShortCircuitFullRun}).
+ */
+export function markerRevisionToClaim(
+  previous: DownloadCompletion | null,
+  remoteSha: string,
+  isGlobRun: boolean,
+): string {
+  return isGlobRun && previous !== null && previous.revision !== remoteSha ? previous.revision : remoteSha;
+}
+
+/**
  * Old-marker files to delete because the remote repo no longer has them.
  *
  * `remotePaths` must be EVERY path in the remote tree, not the selected

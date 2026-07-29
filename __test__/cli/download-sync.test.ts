@@ -8,9 +8,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 import type { DownloadCompletion } from '../../packages/cli/src/commands/download-marker.js';
 import {
   buildMarkerFiles,
+  canShortCircuitFullRun,
   computePruneList,
   fileUpToDate,
   isCompletionCurrent,
+  markerRevisionToClaim,
+  sameRepoCompletion,
 } from '../../packages/cli/src/commands/download-sync.js';
 
 const SHA = 'b'.repeat(40);
@@ -97,6 +100,91 @@ describe('isCompletionCurrent', () => {
     expect(isCompletionCurrent(completion, 'org/other', SHA)).toBe(false);
     expect(isCompletionCurrent(completion, 'org/model', 'c'.repeat(40))).toBe(false);
     expect(isCompletionCurrent(null, 'org/model', SHA)).toBe(false);
+  });
+});
+
+describe('canShortCircuitFullRun', () => {
+  let dir: string;
+  const completion: DownloadCompletion = {
+    repo: 'org/model',
+    revision: SHA,
+    files: ['config.json'],
+    completedAt: '2026-07-29T00:00:00.000Z',
+  };
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mlx-shortcircuit-test-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('denies when the local shape is incomplete even though every marker file exists (mutation: a glob-selection marker must not satisfy a full run)', () => {
+    // A `--glob "*.json"` run wrote a jsons-only marker; every marker file is
+    // on disk but the model has no weights. Dropping the shape gate makes a
+    // later full run print "already up to date" and never download weights.
+    writeFileSync(join(dir, 'config.json'), '{}');
+    expect(canShortCircuitFullRun(completion, dir, false)).toBe(false);
+  });
+
+  it('denies when a marker file is missing even though the shape is complete', () => {
+    expect(canShortCircuitFullRun(completion, dir, true)).toBe(false);
+  });
+
+  it('allows only when the shape is complete AND every marker file exists', () => {
+    writeFileSync(join(dir, 'config.json'), '{}');
+    expect(canShortCircuitFullRun(completion, dir, true)).toBe(true);
+  });
+});
+
+describe('sameRepoCompletion', () => {
+  const completion: DownloadCompletion = {
+    repo: 'unsloth/model',
+    revision: SHA,
+    files: ['model.safetensors'],
+    completedAt: '2026-07-29T00:00:00.000Z',
+  };
+
+  it('nulls a FOREIGN-repo marker (mutation: slug collision lets repo B prune repo A files)', () => {
+    // `unsloth/model` and `bartowski/model` share the default output dir slug;
+    // repo B's sync must treat repo A's marker as no marker at all.
+    expect(sameRepoCompletion(completion, 'bartowski/model')).toBeNull();
+  });
+
+  it('passes a same-repo marker through unchanged, and null through as null', () => {
+    expect(sameRepoCompletion(completion, 'unsloth/model')).toBe(completion);
+    expect(sameRepoCompletion(null, 'unsloth/model')).toBeNull();
+  });
+});
+
+describe('markerRevisionToClaim', () => {
+  const OLD = 'a'.repeat(40);
+  const NEW = 'b'.repeat(40);
+  const previous: DownloadCompletion = {
+    repo: 'org/model',
+    revision: OLD,
+    files: ['model.safetensors'],
+    completedAt: '2026-07-29T00:00:00.000Z',
+  };
+
+  it('glob sync at a CHANGED revision keeps the OLD revision (mutation: stamping the new sha launders unverified files into a current marker)', () => {
+    // The glob run verified only its selection; the union still carries
+    // rev-OLD files. Claiming NEW would let the next full run short-circuit
+    // forever with stale weights; under-claiming keeps it syncing.
+    expect(markerRevisionToClaim(previous, NEW, true)).toBe(OLD);
+  });
+
+  it('no-glob sync claims the remote revision — it verified everything it records', () => {
+    expect(markerRevisionToClaim(previous, NEW, false)).toBe(NEW);
+  });
+
+  it('glob run with NO previous marker claims the remote revision (selection-only marker)', () => {
+    expect(markerRevisionToClaim(null, NEW, true)).toBe(NEW);
+  });
+
+  it('glob run at an UNCHANGED revision claims it', () => {
+    expect(markerRevisionToClaim(previous, OLD, true)).toBe(OLD);
   });
 });
 

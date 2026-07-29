@@ -8,8 +8,21 @@ import { listFiles, downloadFileToCacheDir, modelInfo, type ListFileEntry } from
 
 import { resolveModelsDir } from '../config.js';
 import { ensureDir, formatBytes } from '../utils.js';
-import { readCompletion, writeCompletion, type DownloadCompletion } from './download-marker.js';
-import { buildMarkerFiles, computePruneList, fileUpToDate, isCompletionCurrent } from './download-sync.js';
+import {
+  DOWNLOAD_COMPLETE_MARKER,
+  readCompletion,
+  writeCompletion,
+  type DownloadCompletion,
+} from './download-marker.js';
+import {
+  buildMarkerFiles,
+  canShortCircuitFullRun,
+  computePruneList,
+  fileUpToDate,
+  isCompletionCurrent,
+  markerRevisionToClaim,
+  sameRepoCompletion,
+} from './download-sync.js';
 import { resolveHuggingFaceToken, setToken } from './hf-token.js';
 
 const DEFAULT_CACHE_DIR = join(homedir(), '.cache', 'huggingface');
@@ -717,11 +730,17 @@ export async function run(argv: string[]) {
       }
     } else if (markerCurrent && !force) {
       // Same revision as the last successful sync. For a whole-model run with
-      // every marker file still on disk there is nothing to do. A glob run
-      // (selection may not be satisfied by the marker) or missing files fall
-      // through — at an unchanged revision the size-only per-file skip is
-      // trustworthy, so the loop stays cheap.
-      if (!globPatterns?.length && completion!.files.every((f) => existsSync(join(outputDir, f)))) {
+      // every marker file still on disk AND a locally complete model shape
+      // there is nothing to do. The shape predicate is load-bearing: a
+      // selection-only marker from a `--glob` run must not satisfy a full
+      // run's short-circuit. A glob run (selection may not be satisfied by
+      // the marker), missing files, or an incomplete shape fall through — at
+      // an unchanged revision the size-only per-file skip is trustworthy, so
+      // the loop stays cheap.
+      if (
+        !globPatterns?.length &&
+        canShortCircuitFullRun(completion!, outputDir, isModelAlreadyDownloaded(outputDir, files))
+      ) {
         console.log(`Model already up to date (revision ${remoteSha.slice(0, 7)}).\n`);
         console.log('Use --force to re-verify every file against upstream.\n');
         return;
@@ -732,13 +751,28 @@ export async function run(argv: string[]) {
         console.log('Re-verifying every file against upstream (--force)...\n');
       } else if (completion === null) {
         console.log('No download marker found; verifying local files against upstream...\n');
+      } else if (completion.repo !== modelName) {
+        console.log(
+          `Directory holds a download marker for a different repo (${completion.repo}); verifying local files against upstream...\n`,
+        );
       } else {
         console.log(
           `Upstream revision changed (${completion.revision.slice(0, 7)} → ${remoteSha.slice(0, 7)}); syncing...\n`,
         );
       }
+      // An interrupted sync must not leave the OLD marker claiming a complete
+      // install at the previous revision to other marker readers (dashboard
+      // ownership checks, cold-tier fingerprints). Delete it up front; the
+      // in-memory `completion` keeps serving prune/union decisions, and a
+      // successful sync writes the fresh marker at the end.
+      await rm(join(outputDir, DOWNLOAD_COMPLETE_MARKER), { force: true });
     }
   }
+
+  // A marker describing a DIFFERENT repo (slug collision on the default
+  // output dir) must not influence anything downstream: repo B's sync must
+  // never prune repo A's marker-listed files nor union them into B's marker.
+  const previousCompletion = sameRepoCompletion(completion, modelName);
 
   await ensureDir(outputDir);
 
@@ -815,28 +849,39 @@ export async function run(argv: string[]) {
     }
   }
 
-  // Files the old marker recorded that the remote repo no longer has are
-  // stale garbage (e.g. shards of a superseded sharding layout) — a loader
-  // globbing the dir would read them. Only ever deletes old-marker entries.
-  if (completion !== null && remoteSha !== null) {
-    const pruneList = computePruneList(
-      completion.files,
-      allFiles.map((f) => f.path),
-      outputDir,
-    );
-    for (const rel of pruneList) {
-      console.log(`  Removing ${rel} (no longer in the upstream repo)`);
-      await rm(join(outputDir, rel), { force: true });
+  // Prune + marker write, invoked ONLY from a SUCCESS path. Pruning any
+  // earlier could destroy the only working copy: if upstream restructures
+  // (e.g. weights move into a subdir the non-recursive listing cannot see),
+  // the sync's verification fails — and by then an eager prune would already
+  // have deleted every old-marker shard.
+  const finalizeSync = async (): Promise<void> => {
+    if (remoteSha === null) return; // nothing trustworthy to pin — legacy run
+    // Files the old marker recorded that the remote repo no longer has are
+    // stale garbage (e.g. shards of a superseded sharding layout) — a loader
+    // globbing the dir would read them. Only ever deletes old-marker entries
+    // of THIS repo's marker.
+    if (previousCompletion !== null) {
+      const pruneList = computePruneList(
+        previousCompletion.files,
+        allFiles.map((f) => f.path),
+        outputDir,
+      );
+      for (const rel of pruneList) {
+        console.log(`  Removing ${rel} (no longer in the upstream repo)`);
+        try {
+          await rm(join(outputDir, rel), { force: true });
+        } catch (error) {
+          // A stubborn or foreign directory entry must not abort a download
+          // that already succeeded — the leftover is inert.
+          console.warn(`  Could not remove ${rel}: ${failureText(error)}`);
+        }
+      }
     }
-  }
-
-  const writeMarker = async (): Promise<void> => {
-    if (remoteSha === null) return; // nothing trustworthy to pin
     await writeCompletion(outputDir, {
       repo: modelName,
-      revision: remoteSha,
+      revision: markerRevisionToClaim(previousCompletion, remoteSha, Boolean(globPatterns?.length)),
       files: buildMarkerFiles(
-        completion,
+        previousCompletion,
         allFiles.map((f) => f.path),
         filesToDownload.map((f) => f.path),
         outputDir,
@@ -848,7 +893,7 @@ export async function run(argv: string[]) {
   // For GGUF downloads, skip strict verification (no config.json required in GGUF repos)
   const hasGgufFiles = weightFiles.some((f) => f.endsWith('.gguf'));
   if (hasGgufFiles) {
-    await writeMarker();
+    await finalizeSync();
     console.log(`\nDownload complete! ${weightFiles.length} file(s) saved to ${outputDir}\n`);
     console.log('To convert GGUF to MLX SafeTensors format:');
     for (const wf of weightFiles) {
@@ -864,7 +909,7 @@ export async function run(argv: string[]) {
     }
     // Glob filter matched non-weight files (e.g. imatrix, calibration data).
     // Skip model verification — user is downloading auxiliary files.
-    await writeMarker();
+    await finalizeSync();
     console.log(`\nDownload complete! ${filesToDownload.length} non-weight file(s) saved to ${outputDir}\n`);
   } else {
     console.log(`Format: Base model (needs MLX conversion)`);
@@ -873,7 +918,7 @@ export async function run(argv: string[]) {
 
     const success = await verifyDownload(outputDir, weightFiles);
     if (success) {
-      await writeMarker();
+      await finalizeSync();
       console.log('\nModel downloaded successfully!\n');
     } else {
       console.error('\nDownload incomplete. Please try again.\n');
