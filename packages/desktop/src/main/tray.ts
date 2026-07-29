@@ -14,7 +14,7 @@ import type { SupervisorSnapshot } from './supervisor/types.js';
 import { presentTray, type TrayPresentation } from './tray-view.js';
 
 export interface TrayActions {
-  openAdmin(): void;
+  openControlPanel(): void;
   startInference(): void;
   stopInference(): void;
   restartInference(): void;
@@ -73,10 +73,10 @@ export function createTray(options: TrayOptions): TrayController {
       ...(presentation.detail === null ? [] : [{ label: presentation.detail, enabled: false }]),
       { type: 'separator' },
       {
-        label: 'Open Admin…',
-        enabled: presentation.canOpenAdmin,
+        label: 'Open Control Panel…',
+        enabled: presentation.canOpenControlPanel,
         click: () => {
-          options.actions.openAdmin();
+          options.actions.openControlPanel();
         },
       },
       {

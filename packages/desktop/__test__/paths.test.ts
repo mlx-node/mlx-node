@@ -58,13 +58,13 @@ describe('resolveAppPaths', () => {
     }
   });
 
-  it('finds the admin entry beside it', () => {
+  it('finds the control panel entry beside it', () => {
     for (const layout of [DEV, PACKAGED]) {
-      expect(resolveAppPaths(layout).adminEntry).toBe(join(layout.appPath, 'dist/admin/index.js'));
+      expect(resolveAppPaths(layout).controlPanelEntry).toBe(join(layout.appPath, 'dist/control-panel/index.js'));
     }
-    // Two entries, never one file doing both jobs: the whole point of ADMIN is
+    // Two entries, never one file doing both jobs: the whole point of CONTROL PANEL is
     // that it does not load what INFERENCE loads.
-    expect(resolveAppPaths(DEV).adminEntry).not.toBe(resolveAppPaths(DEV).sidecarEntry);
+    expect(resolveAppPaths(DEV).controlPanelEntry).not.toBe(resolveAppPaths(DEV).sidecarEntry);
   });
 
   // `packages/core/index.cjs` checks `NAPI_RS_NATIVE_LIBRARY_PATH` first in
@@ -98,9 +98,9 @@ describe('resolveAppPaths', () => {
   // that does not exist fails silently: the window renders and never receives
   // its MessagePort.
   it('points at the CommonJS preload', () => {
-    const { adminPreload } = resolveAppPaths(DEV);
-    expect(adminPreload.endsWith('.cjs')).toBe(true);
-    expect(adminPreload).toBe(join(DEV.appPath, 'dist/preload/index.cjs'));
+    const { controlPanelPreload } = resolveAppPaths(DEV);
+    expect(controlPanelPreload.endsWith('.cjs')).toBe(true);
+    expect(controlPanelPreload).toBe(join(DEV.appPath, 'dist/preload/index.cjs'));
   });
 
   // `nativeImage` finds `iconTemplate@2x.png` by name, and the `Template` suffix

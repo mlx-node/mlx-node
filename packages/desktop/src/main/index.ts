@@ -1,5 +1,5 @@
 /**
- * MAIN: app lifecycle, and the wiring between the tray, the Admin window, the
+ * MAIN: app lifecycle, and the wiring between the tray, the Control Panel window, the
  * settings file and the INFERENCE supervisor.
  *
  * Nothing is decided here. Every rule that could be wrong lives in a module with
@@ -19,9 +19,9 @@
 import { engineEnvFor, LAUNCHER_ENGINE_POLICY } from '@mlx-node/server/host/env-policy';
 import { app, clipboard, Menu, screen, type MenuItemConstructorOptions, type WebContents } from 'electron';
 
-import { electronBrokerDeps } from './admin-child.js';
-import { createAdminBroker, type AdminBroker } from './broker.js';
-import { adminEnvOverrides, sidecarEnvOverrides } from './child-env.js';
+import { createControlPanelBroker, type ControlPanelBroker } from './broker.js';
+import { controlPanelEnvOverrides, sidecarEnvOverrides } from './child-env.js';
+import { electronBrokerDeps } from './control-panel-child.js';
 import { resolveAppPaths, type AppPaths } from './paths.js';
 import { installAppProtocol, registerAppScheme } from './protocol.js';
 import {
@@ -36,7 +36,7 @@ import { utilityChildTransport } from './supervisor/child-utility.js';
 import { createSupervisor, type Supervisor } from './supervisor/index.js';
 import { connectCommand } from './tray-view.js';
 import { createTray, type TrayController } from './tray.js';
-import { createAdminWindowManager, type AdminWindowManager } from './window.js';
+import { createControlPanelWindowManager, type ControlPanelWindowManager } from './window.js';
 
 /** Coalescing window for settings writes. Long enough that a drag is one write. */
 const SETTINGS_SAVE_DEBOUNCE_MS = 750;
@@ -58,12 +58,12 @@ let saveInFlight: Promise<void> = Promise.resolve();
 
 let supervisor: Supervisor | null = null;
 let tray: TrayController | null = null;
-let admin: AdminWindowManager | null = null;
-let broker: AdminBroker<WebContents> | null = null;
+let controlPanel: ControlPanelWindowManager | null = null;
+let broker: ControlPanelBroker<WebContents> | null = null;
 
 /**
  * "The app is exiting", as opposed to "a window is closing". Without the
- * distinction the Admin window's close handler hides the window during quit and
+ * distinction the Control Panel window's close handler hides the window during quit and
  * the app never exits — the user is trapped in something with no Dock icon to
  * force-quit from.
  */
@@ -115,12 +115,12 @@ function wire(): void {
     });
 
   app.on('second-instance', () => {
-    admin?.show();
+    controlPanel?.show();
   });
 
   // This handler must exist and must NOT quit. Electron's default, when nothing
   // is subscribed, is to quit once the last window closes — which for a menubar
-  // app means closing the Admin window kills the tray and the sidecar with it.
+  // app means closing the Control Panel window kills the tray and the sidecar with it.
   // The spike's `app.on('window-all-closed', () => app.quit())` was spike-only.
   app.on('window-all-closed', () => {
     // Deliberately empty: the tray is the app.
@@ -132,7 +132,7 @@ function wire(): void {
     // window open on every launch is not what a menubar app does. With a Dock
     // icon, clicking it must reopen the window, which is exactly this.
     if (!settings.showInDock) return;
-    admin?.show();
+    controlPanel?.show();
   });
 
   app.on('before-quit', (event) => {
@@ -140,7 +140,7 @@ function wire(): void {
     // through is what actually exits.
     if (shuttingDown) return;
     shuttingDown = true;
-    // Set BEFORE any window is asked to close, so the Admin window's close
+    // Set BEFORE any window is asked to close, so the Control Panel window's close
     // handler knows this one is real.
     quitting = true;
     event.preventDefault();
@@ -168,7 +168,7 @@ async function bootstrap(): Promise<void> {
   installAppProtocol(paths.wwwRoot);
 
   // An accessory app has no menu bar of its own, but the standard roles still
-  // carry the Edit key equivalents the Admin window needs — a text field with no
+  // carry the Edit key equivalents the Control Panel window needs — a text field with no
   // Cmd+C is the first thing a user notices. It also gives the Dock-visible mode
   // a real application menu instead of Electron's default.
   Menu.setApplicationMenu(
@@ -236,33 +236,33 @@ async function bootstrap(): Promise<void> {
     }
   });
 
-  broker = createAdminBroker<WebContents>({
+  broker = createControlPanelBroker<WebContents>({
     ...electronBrokerDeps({
-      entry: paths.adminEntry,
-      env: { ...process.env, ...adminEnvOverrides({ modelsDir: settings.modelsDir }) } as Record<string, string>,
+      entry: paths.controlPanelEntry,
+      env: { ...process.env, ...controlPanelEnvOverrides({ modelsDir: settings.modelsDir }) } as Record<string, string>,
       onLog: (stream, line) => {
-        if (stream === 'stderr') console.error(`[mlx] admin: ${line}`);
+        if (stream === 'stderr') console.error(`[mlx] control panel: ${line}`);
       },
     }),
     report: (event) => {
       if (event.type === 'brokered') return;
-      console.error(`[mlx] admin ${event.type}:`, event);
+      console.error(`[mlx] control panel ${event.type}:`, event);
     },
   });
 
-  admin = createAdminWindowManager({
-    preload: paths.adminPreload,
-    bounds: () => settings.adminWindow,
+  controlPanel = createControlPanelWindowManager({
+    preload: paths.controlPanelPreload,
+    bounds: () => settings.controlPanelWindow,
     workAreas: () => screen.getAllDisplays().map((display): Rect => display.workArea),
     isQuitting: () => quitting,
     onBounds: (bounds: WindowBounds) => {
-      settings = { ...settings, adminWindow: bounds };
+      settings = { ...settings, controlPanelWindow: bounds };
       scheduleSave();
     },
     // The renderer asked, so mint it a channel. Pull, not push: a transferred
     // port is consumed once, and a reload gets a fresh one because the old one
     // died with the old page.
-    onAdminReady: (contents) => {
+    onControlPanelReady: (contents) => {
       broker?.attach(contents);
     },
   });
@@ -271,7 +271,7 @@ async function bootstrap(): Promise<void> {
     iconPath: paths.trayIcon,
     showInDock: () => settings.showInDock,
     actions: {
-      openAdmin: () => admin?.show(),
+      openControlPanel: () => controlPanel?.show(),
       startInference: () => {
         void supervisor?.start().catch(reportInferenceFailure);
       },
@@ -310,7 +310,7 @@ async function bootstrap(): Promise<void> {
   // window on every start is indistinguishable from one that ignores the close
   // button — and without it, a first-time user gets a menubar icon they have no
   // reason to look for.
-  if (loaded.source === 'missing') admin.show();
+  if (loaded.source === 'missing') controlPanel.show();
 
   // Materialise the file whenever we did not read one. Without this "first run"
   // never ends — nothing else writes settings until the user moves the window or
@@ -393,9 +393,9 @@ async function shutdown(): Promise<void> {
     saveTimer = null;
   }
   await flushSettings();
-  admin?.dispose();
+  controlPanel?.dispose();
   tray?.dispose();
-  // Both awaited, and in parallel: ADMIN's shutdown drains in-flight downloads
+  // Both awaited, and in parallel: CONTROL PANEL's shutdown drains in-flight downloads
   // so a partial multi-GB `.staging` tree is not orphaned, and INFERENCE's frees
   // its temp root. Serialising them would spend two kill-grace periods against
   // one 10 s quit deadline.

@@ -27,7 +27,7 @@
  */
 const NATIVE_LIBRARY_PATH = 'NAPI_RS_NATIVE_LIBRARY_PATH';
 
-/** Read by `resolveModelsDir` (INFERENCE) and `defaultModelsDir` (ADMIN) alike. */
+/** Read by `resolveModelsDir` (INFERENCE) and `defaultModelsDir` (CONTROL PANEL) alike. */
 const MODELS_DIR = 'MLX_MODELS_DIR';
 
 export interface ChildEnvInput {
@@ -54,9 +54,9 @@ export function sidecarEnvOverrides(input: ChildEnvInput): Record<string, string
 }
 
 /**
- * ADMIN's overrides: the models directory and nothing else.
+ * CONTROL PANEL's overrides: the models directory and nothing else.
  *
- * Deliberately without {@link NATIVE_LIBRARY_PATH}. ADMIN does not link the
+ * Deliberately without {@link NATIVE_LIBRARY_PATH}. CONTROL PANEL does not link the
  * addon — that is the point of the three-process split — and handing it a
  * working path would make an accidental `@mlx-node/lm` import load silently
  * instead of failing loudly.
@@ -66,7 +66,7 @@ export function sidecarEnvOverrides(input: ChildEnvInput): Record<string, string
  * `defaultModelsDir` finds, and a user who moved their models in the UI would
  * see a catalog that does not match what is servable.
  */
-export function adminEnvOverrides(input: Pick<ChildEnvInput, 'modelsDir'>): Record<string, string> {
+export function controlPanelEnvOverrides(input: Pick<ChildEnvInput, 'modelsDir'>): Record<string, string> {
   return modelsDirEnv(input.modelsDir);
 }
 

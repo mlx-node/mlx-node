@@ -109,7 +109,7 @@ export function DownloadProgress({ id, onDone, onError, onCancelled }: DownloadP
       if (event.type === 'cancelled') cancelledCb.current?.();
     });
     return () => sub.close();
-    // `connection` rebinds the subscription after ADMIN restarts. The old
+    // `connection` rebinds the subscription after CONTROL PANEL restarts. The old
     // client's listener map was emptied when its port closed and its `close()`
     // is inert, so without this the card is permanently deaf — frozen mid
     // progress against a runtime that is already healthy again.

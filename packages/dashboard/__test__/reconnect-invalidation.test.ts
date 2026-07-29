@@ -3,9 +3,9 @@
  */
 
 /**
- * What a mounted page does when ADMIN dies and comes back.
+ * What a mounted page does when CONTROL PANEL dies and comes back.
  *
- * `broker.ts` goes to real trouble here: when the ADMIN utilityProcess exits it
+ * `broker.ts` goes to real trouble here: when the CONTROL PANEL utilityProcess exits it
  * respawns it and hands the SAME live renderer a replacement port, precisely so
  * the user does not have to think to reload. The renderer then dropped it on the
  * floor. `root.render` on an existing root matches on element type and key, so
@@ -59,7 +59,7 @@ describe('a replacement port revives what is already on screen', () => {
     page = await renderPage(createElement(Probe), (t) => t.includes('gen-1'));
     expect(page.text()).toBe('gen-1');
 
-    // ADMIN crashed and the broker handed this same live page a new port. No
+    // CONTROL PANEL crashed and the broker handed this same live page a new port. No
     // unmount, no navigation — exactly what the renderer receives in the app.
     disposers.push(stubApi({ '/probe': sequence({ v: 'gen-2' }) }));
 
@@ -69,7 +69,7 @@ describe('a replacement port revives what is already on screen', () => {
 
   it('clears a stuck E_UNAVAILABLE without navigating away', async () => {
     // Mount while the runtime is unreachable — the state a page lands in when
-    // it was open at the moment ADMIN died.
+    // it was open at the moment CONTROL PANEL died.
     disconnectDashboardApi();
     page = await renderPage(createElement(Probe), (t) => t.startsWith('ERR:'));
     expect(page.text()).toContain('ERR:');

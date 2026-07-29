@@ -8,11 +8,16 @@ import { describe, expect, it } from 'vite-plus/test';
 // path too. Imported rather than regex-matched so a rename over there fails to
 // compile here instead of quietly weakening the assertion.
 import { DASHBOARD_PORT_MESSAGE } from '../../dashboard/src/rpc/protocol.js';
-import { ADMIN_PORT_CHANNEL, ADMIN_READY_CHANNEL, ADMIN_URL, classifyNavigation } from '../src/main/window-policy.js';
+import {
+  CONTROL_PANEL_PORT_CHANNEL,
+  CONTROL_PANEL_READY_CHANNEL,
+  CONTROL_PANEL_URL,
+  classifyNavigation,
+} from '../src/main/window-policy.js';
 
 describe('classifyNavigation', () => {
   it('allows the SPA to route within itself', () => {
-    for (const url of [ADMIN_URL, 'app://mlx/sessions', 'app://mlx/sessions/abc-123?tab=metrics']) {
+    for (const url of [CONTROL_PANEL_URL, 'app://mlx/sessions', 'app://mlx/sessions/abc-123?tab=metrics']) {
       expect(classifyNavigation(url), url).toBe('allow');
     }
   });
@@ -63,8 +68,8 @@ describe('the preload contract', () => {
   const source = readFileSync(fileURLToPath(new URL('../src/preload/index.cts', import.meta.url)), 'utf8');
 
   it('hard-codes exactly the channel names main sends on', () => {
-    expect(source).toContain(`'${ADMIN_PORT_CHANNEL}'`);
-    expect(source).toContain(`'${ADMIN_READY_CHANNEL}'`);
+    expect(source).toContain(`'${CONTROL_PANEL_PORT_CHANNEL}'`);
+    expect(source).toContain(`'${CONTROL_PANEL_READY_CHANNEL}'`);
   });
 
   // Same constraint, the other half: a relative import compiles to a relative
@@ -92,7 +97,7 @@ describe('the preload contract', () => {
     expect(source).toContain(`window.postMessage(DASHBOARD_PORT_MESSAGE, '*', [port])`);
     // An object would satisfy `toContain` on the literal above while still never
     // matching the SPA's `event.data !== DASHBOARD_PORT_MESSAGE` check.
-    expect(source).not.toContain(`window.postMessage({ type: ADMIN_PORT_CHANNEL }`);
+    expect(source).not.toContain(`window.postMessage({ type: CONTROL_PANEL_PORT_CHANNEL }`);
   });
 
   /*
@@ -104,7 +109,7 @@ describe('the preload contract', () => {
    * listener is provably installed by then.
    */
   it('asks for a port itself, once the page scripts have run', () => {
-    expect(source).toContain(`ipcRenderer.send(ADMIN_READY_CHANNEL)`);
+    expect(source).toContain(`ipcRenderer.send(CONTROL_PANEL_READY_CHANNEL)`);
     expect(source).toContain(`document.addEventListener('DOMContentLoaded', requestPort, { once: true })`);
     // The `readyState` branch matters: a preload that only subscribes would miss
     // a document that had already finished parsing.

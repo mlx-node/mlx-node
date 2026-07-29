@@ -1,5 +1,5 @@
 /**
- * The Admin window's contract with its renderer: where it may navigate, and the
+ * The Control Panel window's contract with its renderer: where it may navigate, and the
  * two IPC channel names the preload hard-codes.
  *
  * Electron-free so both decisions are testable — `window.ts` holds the
@@ -10,8 +10,8 @@
 export const APP_SCHEME = 'app:';
 export const APP_HOST = 'mlx';
 
-/** What the Admin window loads. `BrowserRouter` deep links resolve under it — see `www.ts`. */
-export const ADMIN_URL = `${APP_SCHEME}//${APP_HOST}/`;
+/** What the Control Panel window loads. `BrowserRouter` deep links resolve under it — see `www.ts`. */
+export const CONTROL_PANEL_URL = `${APP_SCHEME}//${APP_HOST}/`;
 
 /**
  * MAIN → renderer, carrying one transferred `MessagePort` in `event.ports[0]`.
@@ -23,7 +23,7 @@ export const ADMIN_URL = `${APP_SCHEME}//${APP_HOST}/`;
  * receives its port. `window-policy.test.ts` reads the preload source and pins
  * both literals so a rename here cannot quietly break it.
  */
-export const ADMIN_PORT_CHANNEL = 'mlx:admin-port';
+export const CONTROL_PANEL_PORT_CHANNEL = 'mlx:control-panel-port';
 
 /**
  * Renderer → MAIN: "I am listening; send me a port."
@@ -34,7 +34,7 @@ export const ADMIN_PORT_CHANNEL = 'mlx:admin-port';
  * new channel. Letting the renderer ask makes reloads and slow starts ordinary,
  * and lets MAIN answer with a fresh `MessageChannelMain` every time.
  */
-export const ADMIN_READY_CHANNEL = 'mlx:admin-ready';
+export const CONTROL_PANEL_READY_CHANNEL = 'mlx:control-panel-ready';
 
 /**
  * `allow` — same-origin SPA navigation.

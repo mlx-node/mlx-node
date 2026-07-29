@@ -8,7 +8,7 @@
  * The Metrics page built `/metrics/overview?from=…&to=Date.now()` inside a
  * `useMemo`. React Router unmounts a route on navigation, so that memo re-ran on
  * every visit and minted a fresh key each time. Measured over CDP against the
- * real Admin window, every other tab was served from cache in 20-48ms while
+ * real Control Panel window, every other tab was served from cache in 20-48ms while
  * Metrics missed on every single visit and took 154ms — long enough to sit blank
  * and then flash a skeleton for one frame.
  *

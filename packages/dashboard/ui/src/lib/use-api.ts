@@ -59,7 +59,7 @@ export function useJson<T>(path: string): AsyncState<T> {
 
   // A reconnect hands the app a different runtime, so what is on screen
   // describes something that no longer exists. Without this in the deps a
-  // mounted hook never refetches — and one that errored while ADMIN was down
+  // mounted hook never refetches — and one that errored while CONTROL PANEL was down
   // stays stuck on that error even after the replacement port arrives.
   const connection = useSyncExternalStore(subscribeConnection, getConnectionGeneration, getConnectionGeneration);
 

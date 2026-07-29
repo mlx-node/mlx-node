@@ -1,5 +1,5 @@
 /**
- * ADMIN's one rule: a new port replaces the old one.
+ * CONTROL PANEL's one rule: a new port replaces the old one.
  *
  * The runtime outlives every port and the download manager outlives the window,
  * so a subscription opened by a page that has since reloaded stays registered
@@ -18,7 +18,7 @@ import { MessageChannel, type MessagePort } from 'node:worker_threads';
 import { bindEventTargetPort, type ApiCall, type ApiResponse, type DownloadEvent } from '@mlx-node/dashboard';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
-import { createAdminSession, type AdminSessionRuntime } from '../src/admin/session.js';
+import { createControlPanelSession, type ControlPanelSessionRuntime } from '../src/control-panel/session.js';
 
 const open: MessagePort[] = [];
 
@@ -32,7 +32,7 @@ function channel(): { host: MessagePort; peer: MessagePort } {
   return { host: port1, peer: port2 };
 }
 
-interface StubRuntime extends AdminSessionRuntime {
+interface StubRuntime extends ControlPanelSessionRuntime {
   calls: ApiCall[];
   /** One entry per `subscribe`, flipped to true when its unsubscribe runs. */
   released: boolean[];
@@ -90,7 +90,7 @@ function drain(port: MessagePort, ms = 120): Promise<unknown[]> {
 describe('attach', () => {
   it('serves calls on the attached port', async () => {
     const runtime = stubRuntime();
-    const session = createAdminSession({ runtime });
+    const session = createControlPanelSession({ runtime });
     const { host, peer } = channel();
     session.attach(bindEventTargetPort(host as never));
 
@@ -105,7 +105,7 @@ describe('attach', () => {
 
   it('releases the previous port’s subscriptions when a reload brings a new one', async () => {
     const runtime = stubRuntime();
-    const session = createAdminSession({ runtime });
+    const session = createControlPanelSession({ runtime });
 
     const first = channel();
     session.attach(bindEventTargetPort(first.host as never));
@@ -136,7 +136,7 @@ describe('attach', () => {
 
   it('stops delivering events to a replaced port', async () => {
     const runtime = stubRuntime();
-    const session = createAdminSession({ runtime });
+    const session = createControlPanelSession({ runtime });
 
     const first = channel();
     session.attach(bindEventTargetPort(first.host as never));
@@ -159,7 +159,7 @@ describe('attach', () => {
 describe('close', () => {
   it('releases the port and closes the runtime, once', async () => {
     const runtime = stubRuntime();
-    const session = createAdminSession({ runtime });
+    const session = createControlPanelSession({ runtime });
     const { host, peer } = channel();
     session.attach(bindEventTargetPort(host as never));
     peer.postMessage({ kind: 'subscribe', id: 1, jobId: 'job-a' });
@@ -174,7 +174,7 @@ describe('close', () => {
 
   it('refuses a port that arrives during shutdown', async () => {
     const runtime = stubRuntime();
-    const session = createAdminSession({ runtime });
+    const session = createControlPanelSession({ runtime });
     const closing = session.close();
 
     const { host, peer } = channel();
@@ -192,7 +192,7 @@ describe('close', () => {
 
   it('survives a serve whose dispose throws', async () => {
     const runtime = stubRuntime();
-    const session = createAdminSession({
+    const session = createControlPanelSession({
       runtime,
       serve: () => () => {
         throw new Error('port already gone');
@@ -202,7 +202,7 @@ describe('close', () => {
     session.attach(bindEventTargetPort(host as never));
 
     // A dispose that throws must not stop the next port from being installed,
-    // nor take the process down with it — an unhandled throw in ADMIN is exactly
+    // nor take the process down with it — an unhandled throw in CONTROL PANEL is exactly
     // what crash isolation is meant to contain, not to cause.
     expect(() => session.attach(bindEventTargetPort(channel().host as never))).not.toThrow();
     await expect(session.close()).resolves.toBeUndefined();

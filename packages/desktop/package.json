@@ -3,7 +3,7 @@
   "version": "0.0.8",
   "private": true,
   "productName": "mlx-node",
-  "description": "mlx-node macOS desktop app (Electron shell: tray, admin window, supervised inference sidecar)",
+  "description": "mlx-node macOS desktop app (Electron shell: tray, control panel window, supervised inference sidecar)",
   "homepage": "https://github.com/mlx-node/mlx-node",
   "bugs": {
     "url": "https://github.com/mlx-node/mlx-node/issues"

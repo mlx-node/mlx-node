@@ -51,11 +51,11 @@ export interface TrayPresentation {
   canCopyConnect: boolean;
   /**
    * Always true, and stated here rather than hard-coded in `tray.ts` so the rule
-   * is one a test can hold: Admin is where the crash reason, the trace file and
+   * is one a test can hold: Control Panel is where the crash reason, the trace file and
    * the logs are, so the moments it is most needed are exactly the ones where
    * inference is not running.
    */
-  canOpenAdmin: boolean;
+  canOpenControlPanel: boolean;
 }
 
 /**
@@ -94,7 +94,7 @@ export function presentTray(snapshot: SupervisorSnapshot): TrayPresentation {
     canStart: !isLive(snapshot.state),
     canStop: isLive(snapshot.state),
     canRestart: isLive(snapshot.state),
-    canOpenAdmin: true,
+    canOpenControlPanel: true,
     canCopyConnect: snapshot.state === 'running' && snapshot.url !== null,
     tooltip: detail === null ? `mlx-node — ${statusLabel}` : `mlx-node — ${statusLabel}\n${detail}`,
   };

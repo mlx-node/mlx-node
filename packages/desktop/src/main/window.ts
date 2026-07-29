@@ -1,5 +1,5 @@
 /**
- * The Admin `BrowserWindow`: create it, hide it, remember where it was, and
+ * The Control Panel `BrowserWindow`: create it, hide it, remember where it was, and
  * refuse to let the renderer take the shell anywhere.
  *
  * Every decision this file makes lives in `window-policy.ts` and `settings.ts`
@@ -11,7 +11,7 @@
 import { app, BrowserWindow, ipcMain, shell, type IpcMainEvent, type WebContents } from 'electron';
 
 import { clampBoundsToDisplays, type Rect, type WindowBounds } from './settings.js';
-import { ADMIN_READY_CHANNEL, ADMIN_URL, classifyNavigation } from './window-policy.js';
+import { CONTROL_PANEL_READY_CHANNEL, CONTROL_PANEL_URL, classifyNavigation } from './window-policy.js';
 
 /** Below this the dashboard's own layout collapses; the user cannot recover it by dragging. */
 const MIN_WIDTH = 720;
@@ -24,7 +24,7 @@ const MIN_HEIGHT = 480;
  */
 const BOUNDS_SAVE_DEBOUNCE_MS = 500;
 
-export interface AdminWindowOptions {
+export interface ControlPanelWindowOptions {
   /** Absolute path to `dist/preload/index.cjs`. */
   preload: string;
   /**
@@ -52,17 +52,17 @@ export interface AdminWindowOptions {
   /**
    * **The broker seam.** Called when the renderer says it is listening, with the
    * `WebContents` that asked. The implementation creates a `MessageChannelMain`,
-   * serves the ADMIN runtime on one end, and hands the other over with
-   * `contents.postMessage(ADMIN_PORT_CHANNEL, null, [port2])`.
+   * serves the CONTROL PANEL runtime on one end, and hands the other over with
+   * `contents.postMessage(CONTROL_PANEL_PORT_CHANNEL, null, [port2])`.
    *
    * Optional, and undefined until the broker exists: a window with no port
    * renders and stays empty, which is a visible, honest failure rather than a
    * crash at startup.
    */
-  onAdminReady?(contents: WebContents): void;
+  onControlPanelReady?(contents: WebContents): void;
 }
 
-export interface AdminWindowManager {
+export interface ControlPanelWindowManager {
   /** Create the window if it is gone, otherwise reveal the hidden one. */
   show(): void;
   /** The live window, or `null`. */
@@ -71,7 +71,7 @@ export interface AdminWindowManager {
   dispose(): void;
 }
 
-export function createAdminWindowManager(options: AdminWindowOptions): AdminWindowManager {
+export function createControlPanelWindowManager(options: ControlPanelWindowOptions): ControlPanelWindowManager {
   let win: BrowserWindow | null = null;
   let boundsTimer: NodeJS.Timeout | null = null;
   let disposed = false;
@@ -81,9 +81,9 @@ export function createAdminWindowManager(options: AdminWindowOptions): AdminWind
     // one window today, so this is cheap insurance rather than a live threat —
     // but the thing being handed out is a port to the runtime.
     if (win === null || win.isDestroyed() || event.sender !== win.webContents) return;
-    options.onAdminReady?.(event.sender);
+    options.onControlPanelReady?.(event.sender);
   };
-  ipcMain.on(ADMIN_READY_CHANNEL, onReady);
+  ipcMain.on(CONTROL_PANEL_READY_CHANNEL, onReady);
 
   function persistBounds(): void {
     if (boundsTimer !== null) clearTimeout(boundsTimer);
@@ -163,7 +163,7 @@ export function createAdminWindowManager(options: AdminWindowOptions): AdminWind
     });
 
     created.webContents.on('render-process-gone', (_event, details) => {
-      console.error(`[mlx] admin renderer gone: ${details.reason}`);
+      console.error(`[mlx] control panel renderer gone: ${details.reason}`);
       // Destroy rather than leave a blank frame: `show()` then rebuilds it, and
       // the reload also re-runs the port handshake.
       if (!created.isDestroyed()) created.destroy();
@@ -172,8 +172,8 @@ export function createAdminWindowManager(options: AdminWindowOptions): AdminWind
     // Neither awaited nor voided. A rejection here is THE packaged-app failure —
     // a blank window with nothing in any log — and under `app://` it is what a
     // missing hashed asset or an uninstalled protocol handler looks like.
-    created.loadURL(ADMIN_URL).catch((error: unknown) => {
-      console.error(`[mlx] admin window failed to load ${ADMIN_URL}:`, error);
+    created.loadURL(CONTROL_PANEL_URL).catch((error: unknown) => {
+      console.error(`[mlx] control panel window failed to load ${CONTROL_PANEL_URL}:`, error);
     });
 
     return created;
@@ -201,7 +201,7 @@ export function createAdminWindowManager(options: AdminWindowOptions): AdminWind
     dispose(): void {
       if (disposed) return;
       disposed = true;
-      ipcMain.removeListener(ADMIN_READY_CHANNEL, onReady);
+      ipcMain.removeListener(CONTROL_PANEL_READY_CHANNEL, onReady);
       if (boundsTimer !== null) {
         clearTimeout(boundsTimer);
         boundsTimer = null;

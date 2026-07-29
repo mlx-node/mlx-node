@@ -69,7 +69,9 @@ function Sidebar() {
         </span>
         <div className="leading-tight">
           <div className="text-foreground text-sm font-semibold">mlx-node</div>
-          <div className="text-muted-foreground text-[11px] font-medium tracking-[0.14em] uppercase">Agent</div>
+          <div className="text-muted-foreground text-[11px] font-medium tracking-[0.14em] uppercase">
+            Control Panel
+          </div>
         </div>
       </div>
 

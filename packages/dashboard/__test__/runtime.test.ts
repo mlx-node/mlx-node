@@ -299,7 +299,7 @@ describe('dashboard runtime — shutdown', () => {
   });
 });
 
-// A dead worker must never leave a caller waiting: the admin UI would show a
+// A dead worker must never leave a caller waiting: the control panel UI would show a
 // spinner forever and the supervisor's per-RPC timeouts would be the only thing
 // that noticed. Every unanswerable call comes back as a failure ENVELOPE.
 describe('dashboard runtime — worker death', () => {

@@ -11,7 +11,7 @@
  * stretches to its content and so never actually overflows. Metrics did not:
  * recharts positions a legend `absolute`, so an 18-model legend contributed
  * 117px to `main`'s scrollHeight without ever growing its box, and both drew a
- * bar. Measured over the Chrome DevTools Protocol against the real Admin window:
+ * bar. Measured over the Chrome DevTools Protocol against the real Control Panel window:
  *
  *   before   HTML  scrollH 2294 / clientH  800     <- bar 1
  *            MAIN  scrollH 2411 / clientH 2294     <- bar 2

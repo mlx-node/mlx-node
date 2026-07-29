@@ -1,7 +1,7 @@
 /**
  * A counter that ticks every time the app is handed a new RPC port.
  *
- * When ADMIN crashes, `broker.ts` respawns it and hands the SAME live page a
+ * When CONTROL PANEL crashes, `broker.ts` respawns it and hands the SAME live page a
  * replacement port — it goes to real trouble to do this, because a dashboard
  * that stays blank until the user thinks to reload is the failure that whole
  * restart path exists to prevent. But re-rendering the tree does not remount

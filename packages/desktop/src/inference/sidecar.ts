@@ -61,7 +61,7 @@ export function newSidecarAuthToken(): string {
  * auth posture and stops sending the wildcard at all.
  *
  * A NEW token per call, per process. It is never persisted and never leaves
- * this process: the Admin window talks to ADMIN over a transferred
+ * this process: the Control Panel window talks to CONTROL PANEL over a transferred
  * `MessagePort` and the supervisor polls `/health`, which is deliberately
  * carved out of the gate, so nothing outside needs it. Adding it to the `info`
  * reply would put a live secret into the supervisor's per-generation trace file
@@ -181,7 +181,7 @@ export class NoParentChannelError extends Error {
  * What the supervisor may ask the sidecar over the control channel.
  *
  * Deliberately not "anything the HTTP API can do". The sidecar's HTTP port is
- * the inference surface and the Admin window reaches it directly; this channel
+ * the inference surface and the Control Panel window reaches it directly; this channel
  * exists for the things a *supervisor* needs and an HTTP client cannot get —
  * what was discovered on disk, and an out-of-band model swap that runs under the
  * same drain/writer brackets the HTTP path uses.

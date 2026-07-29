@@ -1,14 +1,14 @@
-# Dashboard (Admin window)
+# Dashboard (Control Panel window)
 
 Browse local models, `mlx agent` sessions, inference metrics, and the
-paged-attention cold cache. It ships inside `@mlx-node/dashboard` and is the Admin
+paged-attention cold cache. It ships inside `@mlx-node/dashboard` and is the Control Panel
 window of the **mlx-node desktop app** — open it from the tray.
 
 **There is no `mlx dashboard` command and no HTTP server.** Both were removed once
 the app replaced them: the SPA is served from a custom `app://` scheme and speaks to
 the runtime over a MessagePort. That deletes a whole class of exposure rather than
 guarding it — there is no port to bind, nothing to firewall, and no `--host` that can
-put an unauthenticated admin API on a LAN.
+put an unauthenticated control panel API on a LAN.
 
 The dashboard still never links the native addon (no Metal init, instant start), and
 all data still comes from disk under `~/.mlx-node`.
@@ -16,11 +16,11 @@ all data still comes from disk under `~/.mlx-node`.
 ## Where it runs
 
 ```
-ADMIN  utilityProcess                       no native addon
+CONTROL PANEL  utilityProcess               no native addon
   createDashboardRuntime()
     main thread   DownloadManager + the RPC transport      async only
     worker thread DashboardDb + every synchronous FS walk
-  ⟵ MessagePort ⟶ Admin renderer   (MAIN brokers the port once, then leaves)
+  ⟵ MessagePort ⟶ Control Panel renderer   (MAIN brokers the port once, then leaves)
 ```
 
 `DashboardDb` and the synchronous filesystem walks own a `node:worker_threads`
@@ -155,7 +155,7 @@ class of bug is deleted rather than mitigated. What remains:
   loudly instead of returning HTML labelled `text/javascript`.
 - **Mutations are still the dangerous part** — model delete, cache clear, session
   delete — and they are reachable by anything that gets the port. The port is minted
-  by MAIN, transferred once to the Admin window it created, and consumed on receipt.
+  by MAIN, transferred once to the Control Panel window it created, and consumed on receipt.
 
 ## Known limitation
 

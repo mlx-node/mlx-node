@@ -104,12 +104,12 @@ describe('presentTray', () => {
       }
     });
 
-    // Admin is where the crash reason, the trace file and the logs are. The
+    // Control Panel is where the crash reason, the trace file and the logs are. The
     // moments it is most needed are precisely the ones where inference is dead,
     // so it is never disabled.
-    it('keeps Admin reachable in every state', () => {
+    it('keeps Control Panel reachable in every state', () => {
       for (const state of ALL_STATES) {
-        expect(presentTray(snapshot(state)).canOpenAdmin, state).toBe(true);
+        expect(presentTray(snapshot(state)).canOpenControlPanel, state).toBe(true);
       }
     });
   });

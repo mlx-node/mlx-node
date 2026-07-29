@@ -1,5 +1,5 @@
 /**
- * ADMIN: the dashboard runtime, in its own `utilityProcess`.
+ * CONTROL PANEL: the dashboard runtime, in its own `utilityProcess`.
  *
  * ## Why this is a process
  *
@@ -34,7 +34,7 @@ import { writeSync } from 'node:fs';
 
 import { bindEventEmitterPort, createDashboardRuntime } from '@mlx-node/dashboard';
 
-import { createAdminSession } from './session.js';
+import { createControlPanelSession } from './session.js';
 
 /**
  * `process.parentPort` in an Electron `utilityProcess`, structurally.
@@ -56,7 +56,7 @@ function logError(line: string): void {
 
 const parentPort = (process as unknown as { parentPort?: ParentPort }).parentPort;
 if (parentPort === undefined) {
-  logError('[mlx] dist/admin/index.js must be forked as an Electron utilityProcess');
+  logError('[mlx] dist/control-panel/index.js must be forked as an Electron utilityProcess');
   process.exit(78);
 }
 
@@ -114,7 +114,7 @@ const runtime = createDashboardRuntime({
     // routes now fail forever while this process stays perfectly healthy. The
     // broker sees no exit, so its restart budget never runs; reloading or
     // reopening the window re-attaches to this same dead runtime. Exiting is
-    // what hands the problem to `broker.ts`, which restarts ADMIN and
+    // what hands the problem to `broker.ts`, which restarts CONTROL PANEL and
     // re-brokers a fresh port to the window that is still open.
     //
     // `db-closed` is the normal witness of a clean close and must not trigger
@@ -123,7 +123,7 @@ const runtime = createDashboardRuntime({
   },
 });
 
-const session = createAdminSession({ runtime });
+const session = createControlPanelSession({ runtime });
 
 parentPort.on('message', (event) => {
   const port = event.ports.at(0);

@@ -1,10 +1,10 @@
 /**
- * The MessagePort hop, and the only code that runs in the Admin renderer's
+ * The MessagePort hop, and the only code that runs in the Control Panel renderer's
  * process outside the page itself.
  *
  * It exposes NOTHING. No `contextBridge`, no `ipcRenderer` handle, no helper
  * object on `window`. The SPA's entire capability is one `MessagePort` to the
- * ADMIN utilityProcess, and a port cannot be widened by the page that holds it —
+ * CONTROL PANEL utilityProcess, and a port cannot be widened by the page that holds it —
  * which is a much smaller thing to get right than an API surface.
  *
  * Two facts shape every line here:
@@ -24,9 +24,9 @@
 
 import { ipcRenderer, type IpcRendererEvent } from 'electron';
 
-/** Keep in sync with `ADMIN_PORT_CHANNEL` / `ADMIN_READY_CHANNEL` in `src/main/window-policy.ts`. */
-const ADMIN_PORT_CHANNEL = 'mlx:admin-port';
-const ADMIN_READY_CHANNEL = 'mlx:admin-ready';
+/** Keep in sync with `CONTROL_PANEL_PORT_CHANNEL` / `CONTROL_PANEL_READY_CHANNEL` in `src/main/window-policy.ts`. */
+const CONTROL_PANEL_PORT_CHANNEL = 'mlx:control-panel-port';
+const CONTROL_PANEL_READY_CHANNEL = 'mlx:control-panel-ready';
 
 /**
  * Keep in sync with `DASHBOARD_PORT_MESSAGE` in
@@ -43,7 +43,7 @@ const DASHBOARD_PORT_MESSAGE = 'mlx:dashboard-port';
 
 /** Ask MAIN for a port. Safe to call again: each request mints a fresh channel. */
 function requestPort(): void {
-  ipcRenderer.send(ADMIN_READY_CHANNEL);
+  ipcRenderer.send(CONTROL_PANEL_READY_CHANNEL);
 }
 
 /**
@@ -78,11 +78,11 @@ window.addEventListener('message', (event: MessageEvent) => {
   if (event.source !== window) return;
   const data: unknown = event.data;
   if (typeof data !== 'object' || data === null) return;
-  if ((data as { type?: unknown }).type !== ADMIN_READY_CHANNEL) return;
+  if ((data as { type?: unknown }).type !== CONTROL_PANEL_READY_CHANNEL) return;
   requestPort();
 });
 
-ipcRenderer.on(ADMIN_PORT_CHANNEL, (event: IpcRendererEvent) => {
+ipcRenderer.on(CONTROL_PANEL_PORT_CHANNEL, (event: IpcRendererEvent) => {
   const port = event.ports.at(0);
   if (port === undefined) return;
   // `'*'` rather than the real origin: a `targetOrigin` that fails to match is

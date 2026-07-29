@@ -1,7 +1,7 @@
 /**
- * MAIN's broker: one channel per handshake, and what happens when ADMIN dies.
+ * MAIN's broker: one channel per handshake, and what happens when CONTROL PANEL dies.
  *
- * Crash isolation is only real if the crash is handled. "ADMIN is a separate
+ * Crash isolation is only real if the crash is handled. "CONTROL PANEL is a separate
  * process so a dashboard bug cannot take down the tray" is worth nothing if the
  * result is a tray that survives next to a window that is permanently blank —
  * so the restart and the re-broker are as much a part of the design as the
@@ -11,8 +11,8 @@
 import { describe, expect, it } from 'vite-plus/test';
 
 import {
-  createAdminBroker,
-  type AdminChild,
+  createControlPanelBroker,
+  type ControlPanelChild,
   type BrokerDeps,
   type BrokerEvent,
   type BrokerPort,
@@ -31,11 +31,11 @@ interface TestPort extends BrokerPort {
   id: string;
   closed: boolean;
   /** Set once it has been transferred; a transferred port is no longer ours. */
-  handedTo: 'admin' | 'renderer' | null;
+  handedTo: 'control-panel' | 'renderer' | null;
 }
 
 interface Spawn {
-  child: AdminChild;
+  child: ControlPanelChild;
   killed: number;
   forceKilled: number;
   ports: TestPort[];
@@ -89,7 +89,7 @@ function harness(options: { spawnThrows?: boolean } = {}): Harness {
       }
     },
     deps: {
-      spawn(handlers): AdminChild {
+      spawn(handlers): ControlPanelChild {
         if (options.spawnThrows === true) throw new Error('fork failed');
         const record: Spawn = {
           killed: 0,
@@ -100,7 +100,7 @@ function harness(options: { spawnThrows?: boolean } = {}): Harness {
           child: {
             sendPort(port: BrokerPort): void {
               if (record.refuse) throw new Error('channel closed');
-              (port as TestPort).handedTo = 'admin';
+              (port as TestPort).handedTo = 'control-panel';
               record.ports.push(port as TestPort);
             },
             kill(): void {
@@ -138,9 +138,9 @@ function harness(options: { spawnThrows?: boolean } = {}): Harness {
 const renderer = (id = 'win'): Renderer => ({ id, alive: true, received: [] });
 
 describe('brokering', () => {
-  it('spawns ADMIN lazily, on the first handshake', () => {
+  it('spawns CONTROL PANEL lazily, on the first handshake', () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps);
+    const broker = createControlPanelBroker(h.deps);
     expect(h.spawns).toHaveLength(0);
     // A menubar app's resting state is a tray icon. Forking a process that owns a
     // SQLite worker thread and a 30 s rescan timer before anyone has opened the
@@ -149,9 +149,9 @@ describe('brokering', () => {
     expect(h.spawns).toHaveLength(1);
   });
 
-  it('hands the two ends of one channel to ADMIN and the renderer', () => {
+  it('hands the two ends of one channel to CONTROL PANEL and the renderer', () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps);
+    const broker = createControlPanelBroker(h.deps);
     const win = renderer();
     broker.attach(win);
 
@@ -166,7 +166,7 @@ describe('brokering', () => {
 
   it('mints a FRESH channel for every handshake', () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps);
+    const broker = createControlPanelBroker(h.deps);
     const win = renderer();
 
     broker.attach(win);
@@ -186,7 +186,7 @@ describe('brokering', () => {
 
   it('reuses the running child across handshakes', () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps);
+    const broker = createControlPanelBroker(h.deps);
     broker.attach(renderer('a'));
     broker.attach(renderer('b'));
     expect(h.spawns).toHaveLength(1);
@@ -194,9 +194,9 @@ describe('brokering', () => {
 });
 
 describe('a handshake that cannot be completed', () => {
-  it('closes both ends and kills the child when ADMIN refuses the port', () => {
+  it('closes both ends and kills the child when CONTROL PANEL refuses the port', () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps);
+    const broker = createControlPanelBroker(h.deps);
     h.spawns.length = 0;
     broker.attach(renderer());
     // Second attempt, with the channel gone underneath us.
@@ -215,25 +215,25 @@ describe('a handshake that cannot be completed', () => {
 
   it('closes only the renderer’s end when the renderer refuses it', () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps);
+    const broker = createControlPanelBroker(h.deps);
     const win = renderer();
     win.refuse = true;
     broker.attach(win);
 
     const [port1, port2] = h.ports;
     // port1 is already transferred and no longer ours to touch; closing port2 is
-    // what tells ADMIN, through its own `close` event, to release the
+    // what tells CONTROL PANEL, through its own `close` event, to release the
     // subscriptions this handshake opened.
     expect(port1.closed).toBe(false);
-    expect(port1.handedTo).toBe('admin');
+    expect(port1.handedTo).toBe('control-panel');
     expect(port2.closed).toBe(true);
     expect(h.spawns[0].killed).toBe(0);
     expect(h.events.at(-1)).toMatchObject({ type: 'broker-failed' });
   });
 
-  it('sends to ADMIN first, so a dead renderer never leaves a live port to nothing', () => {
+  it('sends to CONTROL PANEL first, so a dead renderer never leaves a live port to nothing', () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps);
+    const broker = createControlPanelBroker(h.deps);
     const win = renderer();
     win.refuse = true;
     broker.attach(win);
@@ -247,7 +247,7 @@ describe('a handshake that cannot be completed', () => {
 
   it('never throws out of attach, even when the fork itself fails', () => {
     const h = harness({ spawnThrows: true });
-    const broker = createAdminBroker(h.deps, { restart: { maxConsecutiveCrashes: 2, baseDelayMs: 1 } });
+    const broker = createControlPanelBroker(h.deps, { restart: { maxConsecutiveCrashes: 2, baseDelayMs: 1 } });
     const win = renderer();
 
     // `attach` runs inside an `ipcMain` handler. A throw there is an uncaught
@@ -259,16 +259,16 @@ describe('a handshake that cannot be completed', () => {
     expect(h.events.at(-1)).toMatchObject({ type: 'broker-failed', reason: expect.stringContaining('failed to fork') });
     // A fork that fails produces no `exit`, so the budget has to be driven from
     // the failure itself or nothing would ever retry — or give up.
-    expect(h.events.some((e) => e.type === 'admin-exited')).toBe(true);
+    expect(h.events.some((e) => e.type === 'control-panel-exited')).toBe(true);
     h.fire();
-    expect(h.events.some((e) => e.type === 'admin-gave-up')).toBe(true);
+    expect(h.events.some((e) => e.type === 'control-panel-gave-up')).toBe(true);
   });
 });
 
-describe('when ADMIN dies', () => {
+describe('when CONTROL PANEL dies', () => {
   it('reports it, restarts, and re-brokers to the window that is still open', () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps, { restart: { baseDelayMs: 10 } });
+    const broker = createControlPanelBroker(h.deps, { restart: { baseDelayMs: 10 } });
     const win = renderer();
     broker.attach(win);
     expect(win.received).toHaveLength(1);
@@ -276,7 +276,7 @@ describe('when ADMIN dies', () => {
     h.clock.now += 60_000;
     h.spawns[0].exit(1);
 
-    expect(h.events.at(-1)).toMatchObject({ type: 'admin-exited', code: 1, consecutiveCrashes: 1 });
+    expect(h.events.at(-1)).toMatchObject({ type: 'control-panel-exited', code: 1, consecutiveCrashes: 1 });
     expect(broker.running()).toBe(false);
 
     h.fire();
@@ -291,7 +291,7 @@ describe('when ADMIN dies', () => {
 
   it('does not re-broker to a window that has since been destroyed', () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps, { restart: { baseDelayMs: 10 } });
+    const broker = createControlPanelBroker(h.deps, { restart: { baseDelayMs: 10 } });
     const win = renderer();
     broker.attach(win);
 
@@ -308,7 +308,7 @@ describe('when ADMIN dies', () => {
 
   it('gives up after the budget and stops respawning', () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps, { restart: { maxConsecutiveCrashes: 3, baseDelayMs: 1 } });
+    const broker = createControlPanelBroker(h.deps, { restart: { maxConsecutiveCrashes: 3, baseDelayMs: 1 } });
     broker.attach(renderer());
 
     for (let crash = 0; crash < 3; crash += 1) {
@@ -316,8 +316,8 @@ describe('when ADMIN dies', () => {
       h.fire();
     }
 
-    expect(h.events.filter((e) => e.type === 'admin-gave-up')).toEqual([
-      { type: 'admin-gave-up', consecutiveCrashes: 3 },
+    expect(h.events.filter((e) => e.type === 'control-panel-gave-up')).toEqual([
+      { type: 'control-panel-gave-up', consecutiveCrashes: 3 },
     ]);
     expect(h.spawns).toHaveLength(3);
     expect(broker.running()).toBe(false);
@@ -325,7 +325,7 @@ describe('when ADMIN dies', () => {
 
   it('reports the give-up to a later handshake instead of silently doing nothing', () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps, { restart: { maxConsecutiveCrashes: 1, baseDelayMs: 1 } });
+    const broker = createControlPanelBroker(h.deps, { restart: { maxConsecutiveCrashes: 1, baseDelayMs: 1 } });
     broker.attach(renderer());
     h.spawns[0].exit(1);
     h.fire();
@@ -339,7 +339,7 @@ describe('when ADMIN dies', () => {
 
   it('earns a fresh budget after staying up', () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps, {
+    const broker = createControlPanelBroker(h.deps, {
       restart: { maxConsecutiveCrashes: 3, baseDelayMs: 1, healthyForMs: 10_000 },
     });
     broker.attach(renderer());
@@ -351,21 +351,21 @@ describe('when ADMIN dies', () => {
     expect(h.events.at(-2)).toMatchObject({ consecutiveCrashes: 2 });
 
     // This one ran long enough to prove it can. Measured from the fork, which is
-    // all the broker knows — ADMIN has no readiness handshake to measure from.
+    // all the broker knows — CONTROL PANEL has no readiness handshake to measure from.
     h.clock.now += 20_000;
     h.spawns[2].exit(1);
-    expect(h.events.at(-1)).toMatchObject({ type: 'admin-exited', consecutiveCrashes: 1 });
+    expect(h.events.at(-1)).toMatchObject({ type: 'control-panel-exited', consecutiveCrashes: 1 });
   });
 
   it('treats exit 0 as a crash', () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps, { restart: { baseDelayMs: 1 } });
+    const broker = createControlPanelBroker(h.deps, { restart: { baseDelayMs: 1 } });
     broker.attach(renderer());
     h.spawns[0].exit(0);
 
-    // Nothing asks ADMIN to stop except `dispose()`, so an exit of 0 means it
+    // Nothing asks CONTROL PANEL to stop except `dispose()`, so an exit of 0 means it
     // fell off the end of its entry — not that everything is fine.
-    expect(h.events.at(-1)).toMatchObject({ type: 'admin-exited', code: 0, consecutiveCrashes: 1 });
+    expect(h.events.at(-1)).toMatchObject({ type: 'control-panel-exited', code: 0, consecutiveCrashes: 1 });
     h.fire();
     expect(h.spawns).toHaveLength(2);
   });
@@ -374,12 +374,12 @@ describe('when ADMIN dies', () => {
 describe('dispose', () => {
   it('SIGTERMs and waits for the child to go', async () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps);
+    const broker = createControlPanelBroker(h.deps);
     broker.attach(renderer());
 
     const done = broker.dispose();
     expect(h.spawns[0].killed).toBe(1);
-    // Waiting is the point: ADMIN's shutdown drains in-flight downloads so a
+    // Waiting is the point: CONTROL PANEL's shutdown drains in-flight downloads so a
     // partial multi-GB `.staging` tree is not orphaned.
     let settled = false;
     void done.then(() => (settled = true));
@@ -393,7 +393,7 @@ describe('dispose', () => {
 
   it('escalates to SIGKILL after the grace period', async () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps);
+    const broker = createControlPanelBroker(h.deps);
     broker.attach(renderer());
 
     const done = broker.dispose();
@@ -404,7 +404,7 @@ describe('dispose', () => {
 
   it('resolves even if the exit event is never delivered', async () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps);
+    const broker = createControlPanelBroker(h.deps);
     broker.attach(renderer());
     const done = broker.dispose();
     h.fire();
@@ -415,7 +415,7 @@ describe('dispose', () => {
 
   it('does not respawn after disposal', async () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps, { restart: { baseDelayMs: 1 } });
+    const broker = createControlPanelBroker(h.deps, { restart: { baseDelayMs: 1 } });
     broker.attach(renderer());
     const done = broker.dispose();
     h.spawns[0].exit(0);
@@ -423,12 +423,12 @@ describe('dispose', () => {
     h.fire();
 
     expect(h.spawns).toHaveLength(1);
-    expect(h.events.some((e) => e.type === 'admin-exited')).toBe(false);
+    expect(h.events.some((e) => e.type === 'control-panel-exited')).toBe(false);
   });
 
   it('is idempotent and returns immediately with no child', async () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps);
+    const broker = createControlPanelBroker(h.deps);
     await broker.dispose();
     await broker.dispose();
     expect(h.spawns).toHaveLength(0);
@@ -436,7 +436,7 @@ describe('dispose', () => {
 
   it('ignores a handshake that arrives after disposal', async () => {
     const h = harness();
-    const broker = createAdminBroker(h.deps);
+    const broker = createControlPanelBroker(h.deps);
     await broker.dispose();
     const win = renderer();
     broker.attach(win);

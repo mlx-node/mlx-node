@@ -1,5 +1,5 @@
 /**
- * `BrokerDeps` over Electron — fork the ADMIN utilityProcess and mint channels.
+ * `BrokerDeps` over Electron — fork the CONTROL PANEL utilityProcess and mint channels.
  *
  * `import { MessageChannelMain, utilityProcess } from 'electron'` cannot resolve
  * outside an Electron process, so nothing here is reachable from a plain Node
@@ -9,27 +9,27 @@
 
 import { MessageChannelMain, utilityProcess, type WebContents } from 'electron';
 
-import type { AdminChild, BrokerDeps, BrokerPort } from './broker.js';
-import { ADMIN_PORT_CHANNEL } from './window-policy.js';
+import type { ControlPanelChild, BrokerDeps, BrokerPort } from './broker.js';
+import { CONTROL_PANEL_PORT_CHANNEL } from './window-policy.js';
 
-export interface AdminChildOptions {
-  /** Absolute path to `dist/admin/index.js`. */
+export interface ControlPanelChildOptions {
+  /** Absolute path to `dist/control-panel/index.js`. */
   entry: string;
   /** The child's complete environment. See `supervisor/env.ts` for why complete. */
   env: Readonly<Record<string, string>>;
-  /** Forwarded verbatim; ADMIN's stderr is the only place its faults surface. */
+  /** Forwarded verbatim; CONTROL PANEL's stderr is the only place its faults surface. */
   onLog(stream: 'stdout' | 'stderr', line: string): void;
 }
 
-export function electronBrokerDeps(options: AdminChildOptions): BrokerDeps<WebContents> {
+export function electronBrokerDeps(options: ControlPanelChildOptions): BrokerDeps<WebContents> {
   return {
-    spawn(events): AdminChild {
+    spawn(events): ControlPanelChild {
       const child = utilityProcess.fork(options.entry, [], {
         env: { ...options.env },
         stdio: 'pipe',
         // Its own entry in Activity Monitor and in crash reports, instead of an
         // anonymous "Helper (Plugin)" the user cannot attribute.
-        serviceName: 'mlx-admin',
+        serviceName: 'mlx-control-panel',
       });
 
       const log = (stream: 'stdout' | 'stderr', line: string): void => {
@@ -44,12 +44,12 @@ export function electronBrokerDeps(options: AdminChildOptions): BrokerDeps<WebCo
       child.on('error', (type: string, location: string) => {
         // A non-continuable V8 fault. Electron documents that `exit` follows, so
         // this only needs to be visible, not acted on.
-        options.onLog('stderr', `[mlx] admin fault: ${type} at ${location}`);
+        options.onLog('stderr', `[mlx] control panel fault: ${type} at ${location}`);
       });
 
       return {
         sendPort(port: BrokerPort): void {
-          // No `message` worth sending: the port IS the message, and the ADMIN
+          // No `message` worth sending: the port IS the message, and the CONTROL PANEL
           // entry reads `event.ports[0]` and ignores the rest.
           child.postMessage(null, [port as unknown as Electron.MessagePortMain]);
         },
@@ -78,7 +78,7 @@ export function electronBrokerDeps(options: AdminChildOptions): BrokerDeps<WebCo
     sendToRenderer(target: WebContents, port: BrokerPort): void {
       // Throws on a destroyed WebContents, which is what `broker.ts` treats as
       // "this renderer is gone" — do NOT soften it into a no-op.
-      target.postMessage(ADMIN_PORT_CHANNEL, null, [port as unknown as Electron.MessagePortMain]);
+      target.postMessage(CONTROL_PANEL_PORT_CHANNEL, null, [port as unknown as Electron.MessagePortMain]);
     },
 
     isRendererAlive(target: WebContents): boolean {

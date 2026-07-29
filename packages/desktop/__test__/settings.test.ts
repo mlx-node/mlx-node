@@ -47,7 +47,7 @@ describe('normalizeSettings', () => {
     expect(settings.showInDock).toBe(true);
     expect(settings.autoStartInference).toBe(DEFAULT_SETTINGS.autoStartInference);
     expect(settings.modelsDir).toBeNull();
-    expect(settings.adminWindow).toEqual(DEFAULT_SETTINGS.adminWindow);
+    expect(settings.controlPanelWindow).toEqual(DEFAULT_SETTINGS.controlPanelWindow);
   });
 
   it('keeps values the file does have', () => {
@@ -55,13 +55,13 @@ describe('normalizeSettings', () => {
       autoStartInference: false,
       showInDock: true,
       modelsDir: '/Volumes/models',
-      adminWindow: { width: 900, height: 700, x: 12, y: 34 },
+      controlPanelWindow: { width: 900, height: 700, x: 12, y: 34 },
     });
     expect(settings).toEqual({
       autoStartInference: false,
       showInDock: true,
       modelsDir: '/Volumes/models',
-      adminWindow: { width: 900, height: 700, x: 12, y: 34 },
+      controlPanelWindow: { width: 900, height: 700, x: 12, y: 34 },
     });
     expect(repaired).toEqual([]);
   });
@@ -90,42 +90,43 @@ describe('normalizeSettings', () => {
     expect(settings).not.toHaveProperty('theme');
   });
 
-  describe('adminWindow', () => {
+  describe('controlPanelWindow', () => {
     it('rejects a size below the minimum the dashboard can render', () => {
-      const { settings, repaired } = normalizeSettings({ adminWindow: { width: 200, height: 100 } });
-      expect(settings.adminWindow.width).toBe(DEFAULT_SETTINGS.adminWindow.width);
-      expect(settings.adminWindow.height).toBe(DEFAULT_SETTINGS.adminWindow.height);
-      expect(repaired).toEqual(['adminWindow.width', 'adminWindow.height']);
+      const { settings, repaired } = normalizeSettings({ controlPanelWindow: { width: 200, height: 100 } });
+      expect(settings.controlPanelWindow.width).toBe(DEFAULT_SETTINGS.controlPanelWindow.width);
+      expect(settings.controlPanelWindow.height).toBe(DEFAULT_SETTINGS.controlPanelWindow.height);
+      expect(repaired).toEqual(['controlPanelWindow.width', 'controlPanelWindow.height']);
     });
 
     // Geometry is integral pixels. Every one of these round-trips through JSON
     // as a number and none of them is a window size.
     it('rejects a non-integral size', () => {
       for (const width of [Number.NaN, Number.POSITIVE_INFINITY, 1180.5, '1180']) {
-        expect(normalizeSettings({ adminWindow: { width, height: 800 } }).settings.adminWindow.width).toBe(
-          DEFAULT_SETTINGS.adminWindow.width,
-        );
+        expect(
+          normalizeSettings({ controlPanelWindow: { width, height: 800 } }).settings.controlPanelWindow.width,
+        ).toBe(DEFAULT_SETTINGS.controlPanelWindow.width);
       }
     });
 
     // Half a position places the window somewhere the user never put it, which
     // reads as the app losing the setting.
     it('drops a half-written position', () => {
-      const { settings, repaired } = normalizeSettings({ adminWindow: { width: 900, height: 700, x: 12 } });
-      expect(settings.adminWindow).toMatchObject({ width: 900, height: 700, x: null, y: null });
-      expect(repaired).toEqual(['adminWindow.position']);
+      const { settings, repaired } = normalizeSettings({ controlPanelWindow: { width: 900, height: 700, x: 12 } });
+      expect(settings.controlPanelWindow).toMatchObject({ width: 900, height: 700, x: null, y: null });
+      expect(repaired).toEqual(['controlPanelWindow.position']);
     });
 
     it('accepts a negative position, which is a real place on a second display', () => {
       expect(
-        normalizeSettings({ adminWindow: { width: 900, height: 700, x: -1440, y: 200 } }).settings.adminWindow,
+        normalizeSettings({ controlPanelWindow: { width: 900, height: 700, x: -1440, y: 200 } }).settings
+          .controlPanelWindow,
       ).toEqual({ width: 900, height: 700, x: -1440, y: 200 });
     });
 
-    it('replaces a non-object adminWindow wholesale', () => {
-      const { settings, repaired } = normalizeSettings({ adminWindow: 'big' });
-      expect(settings.adminWindow).toEqual(DEFAULT_SETTINGS.adminWindow);
-      expect(repaired).toContain('adminWindow');
+    it('replaces a non-object controlPanelWindow wholesale', () => {
+      const { settings, repaired } = normalizeSettings({ controlPanelWindow: 'big' });
+      expect(settings.controlPanelWindow).toEqual(DEFAULT_SETTINGS.controlPanelWindow);
+      expect(repaired).toContain('controlPanelWindow');
     });
   });
 });
@@ -203,7 +204,7 @@ describe('saveSettings', () => {
       autoStartInference: false,
       showInDock: true,
       modelsDir: '/Volumes/models',
-      adminWindow: { width: 1000, height: 620, x: 40, y: 60 },
+      controlPanelWindow: { width: 1000, height: 620, x: 40, y: 60 },
     };
     await saveSettings(file, settings);
     expect((await loadSettings(file)).settings).toEqual(settings);
@@ -245,7 +246,7 @@ describe('clampBoundsToDisplays', () => {
 
   // The case this exists for: a window saved on an external monitor that is no
   // longer plugged in. Electron will happily place it there, and the app looks
-  // launched-but-broken — tray responsive, "Open Admin" doing nothing visible.
+  // launched-but-broken — tray responsive, "Open Control Panel" doing nothing visible.
   it('drops a position that is off every display', () => {
     const bounds = { width: 900, height: 700, x: 2600, y: 200 };
     expect(clampBoundsToDisplays(bounds, [primary])).toMatchObject({ width: 900, height: 700, x: null, y: null });

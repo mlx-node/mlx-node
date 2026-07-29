@@ -13,7 +13,7 @@ import { extname } from 'node:path';
 
 import { describe, expect, it } from 'vite-plus/test';
 
-import { adminEnvOverrides, sidecarEnvOverrides } from '../src/main/child-env.js';
+import { controlPanelEnvOverrides, sidecarEnvOverrides } from '../src/main/child-env.js';
 import { resolveAppPaths } from '../src/main/paths.js';
 
 const ADDON = '/Applications/mlx-node.app/Contents/Resources/native/mlx-core.darwin-arm64.node';
@@ -48,10 +48,10 @@ describe('sidecarEnvOverrides', () => {
   });
 });
 
-describe('adminEnvOverrides', () => {
-  it('never hands ADMIN a working addon path', () => {
-    const env = adminEnvOverrides({ modelsDir: '/models' });
-    // ADMIN does not link the addon — that is the point of the split. Handing it
+describe('controlPanelEnvOverrides', () => {
+  it('never hands CONTROL PANEL a working addon path', () => {
+    const env = controlPanelEnvOverrides({ modelsDir: '/models' });
+    // CONTROL PANEL does not link the addon — that is the point of the split. Handing it
     // a working path would make an accidental `@mlx-node/lm` import load
     // silently instead of failing loudly.
     expect(env).not.toHaveProperty('NAPI_RS_NATIVE_LIBRARY_PATH');
@@ -64,10 +64,10 @@ describe('adminEnvOverrides', () => {
     // their models in the UI would otherwise see a catalog that does not match
     // what is servable.
     const modelsDir = '/Volumes/ssd/models';
-    expect(adminEnvOverrides({ modelsDir }).MLX_MODELS_DIR).toBe(
+    expect(controlPanelEnvOverrides({ modelsDir }).MLX_MODELS_DIR).toBe(
       sidecarEnvOverrides({ nativeAddon: ADDON, modelsDir }).MLX_MODELS_DIR,
     );
-    expect(adminEnvOverrides({ modelsDir: null })).toEqual({});
+    expect(controlPanelEnvOverrides({ modelsDir: null })).toEqual({});
   });
 });
 

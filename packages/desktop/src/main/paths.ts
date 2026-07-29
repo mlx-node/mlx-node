@@ -52,14 +52,14 @@ export interface AppPaths {
    */
   sidecarEntry: string;
   /**
-   * The ADMIN utilityProcess's built JS entry — the dashboard runtime and its
+   * The CONTROL PANEL utilityProcess's built JS entry — the dashboard runtime and its
    * SQLite worker thread.
    *
    * Beside the sidecar entry and under the same rule about asar, for a different
    * reason: this one spawns a `node:worker_threads` worker, and `new Worker()`
    * takes a real path too.
    */
-  adminEntry: string;
+  controlPanelEntry: string;
   /**
    * The native addon, as a path to the **`.node` file itself**.
    *
@@ -84,8 +84,8 @@ export interface AppPaths {
   settingsFile: string;
   /** The menubar icon. `iconTemplate@2x.png` sits beside it and `nativeImage` finds it by name. */
   trayIcon: string;
-  /** Preload for the Admin window. `.cjs`: a sandboxed preload cannot be ESM. */
-  adminPreload: string;
+  /** Preload for the Control Panel window. `.cjs`: a sandboxed preload cannot be ESM. */
+  controlPanelPreload: string;
 }
 
 export function resolveAppPaths(layout: AppLayout): AppPaths {
@@ -97,7 +97,7 @@ export function resolveAppPaths(layout: AppLayout): AppPaths {
     // visible on the next window load with no copy step.
     wwwRoot: packaged ? join(resourcesPath, 'www') : join(appPath, '..', 'dashboard', 'web'),
     sidecarEntry: join(appPath, 'dist', 'inference', 'index.js'),
-    adminEntry: join(appPath, 'dist', 'admin', 'index.js'),
+    controlPanelEntry: join(appPath, 'dist', 'control-panel', 'index.js'),
     // Packaged, `scripts/package.ts` stages the addon and both metallibs into
     // `Contents/Resources/native` — they must stay in ONE directory, since MLX
     // loads mlx.metallib from beside the binary and paged_attn.metallib
@@ -109,6 +109,6 @@ export function resolveAppPaths(layout: AppLayout): AppPaths {
     traceDir: join(userData, 'traces'),
     settingsFile: join(userData, 'settings.json'),
     trayIcon: join(appPath, 'build', 'iconTemplate.png'),
-    adminPreload: join(appPath, 'dist', 'preload', 'index.cjs'),
+    controlPanelPreload: join(appPath, 'dist', 'preload', 'index.cjs'),
   };
 }

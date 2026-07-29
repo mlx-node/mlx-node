@@ -6,7 +6,7 @@
  * `@mlx-node/lm`, which dlopens `mlx-core.darwin-arm64.node` at module scope —
  * measured at ~29 MB RSS on the import alone, before a single model is read. That
  * is the whole reason this is a process rather than a module: MAIN supervises it,
- * ADMIN renders next to it, and neither pays for it.
+ * CONTROL PANEL renders next to it, and neither pays for it.
  *
  * Nothing is decided here. `sidecar.ts` holds the handshake, the request table
  * and the shutdown, against an interface a stub can satisfy, because a file that

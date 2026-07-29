@@ -19,7 +19,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 /**
- * Where the Admin window was last left.
+ * Where the Control Panel window was last left.
  *
  * `x`/`y` are nullable together: a window with a size but no position is
  * centred, which is the right first-run behaviour and the right fallback when a
@@ -47,7 +47,7 @@ export interface DesktopSettings {
   showInDock: boolean;
   /** Overrides the shared `$HOME/.mlx-node/models` discovery root. `null` = use the default. */
   modelsDir: string | null;
-  adminWindow: WindowBounds;
+  controlPanelWindow: WindowBounds;
 }
 
 /**
@@ -62,7 +62,7 @@ export const DEFAULT_SETTINGS: DesktopSettings = Object.freeze({
   autoStartInference: true,
   showInDock: false,
   modelsDir: null,
-  adminWindow: Object.freeze({ width: 1180, height: 800, x: null, y: null }),
+  controlPanelWindow: Object.freeze({ width: 1180, height: 800, x: null, y: null }),
 });
 
 export interface NormalizedSettings {
@@ -96,12 +96,13 @@ function pixel(value: unknown): number | null {
 
 function normalizeBounds(raw: unknown, repaired: string[]): WindowBounds {
   const source = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {};
-  if (raw !== undefined && (typeof raw !== 'object' || raw === null)) repaired.push('adminWindow');
+  if (raw !== undefined && (typeof raw !== 'object' || raw === null)) repaired.push('controlPanelWindow');
 
   const width = pixel(source.width);
   const height = pixel(source.height);
-  if (source.width !== undefined && (width === null || width < MIN_WIDTH)) repaired.push('adminWindow.width');
-  if (source.height !== undefined && (height === null || height < MIN_HEIGHT)) repaired.push('adminWindow.height');
+  if (source.width !== undefined && (width === null || width < MIN_WIDTH)) repaired.push('controlPanelWindow.width');
+  if (source.height !== undefined && (height === null || height < MIN_HEIGHT))
+    repaired.push('controlPanelWindow.height');
 
   const x = pixel(source.x);
   const y = pixel(source.y);
@@ -109,12 +110,12 @@ function normalizeBounds(raw: unknown, repaired: string[]): WindowBounds {
   // put it, which looks exactly like the app losing the setting.
   const positioned = x !== null && y !== null;
   if (!positioned && (source.x !== undefined || source.y !== undefined)) {
-    if (source.x !== null || source.y !== null) repaired.push('adminWindow.position');
+    if (source.x !== null || source.y !== null) repaired.push('controlPanelWindow.position');
   }
 
   return {
-    width: width !== null && width >= MIN_WIDTH ? width : DEFAULT_SETTINGS.adminWindow.width,
-    height: height !== null && height >= MIN_HEIGHT ? height : DEFAULT_SETTINGS.adminWindow.height,
+    width: width !== null && width >= MIN_WIDTH ? width : DEFAULT_SETTINGS.controlPanelWindow.width,
+    height: height !== null && height >= MIN_HEIGHT ? height : DEFAULT_SETTINGS.controlPanelWindow.height,
     x: positioned ? x : null,
     y: positioned ? y : null,
   };
@@ -144,7 +145,7 @@ export function normalizeSettings(raw: unknown): NormalizedSettings {
       ),
       showInDock: bool(source.showInDock, DEFAULT_SETTINGS.showInDock, 'showInDock', repaired),
       modelsDir: optionalString(source.modelsDir, 'modelsDir', repaired),
-      adminWindow: normalizeBounds(source.adminWindow, repaired),
+      controlPanelWindow: normalizeBounds(source.controlPanelWindow, repaired),
     },
     repaired,
   };
@@ -266,7 +267,7 @@ const MIN_VISIBLE_HEIGHT = 40;
  * This is not theoretical tidiness: a window saved on an external monitor at
  * `x: 2560` reopens completely off-screen once that monitor is unplugged, and
  * Electron will happily place it there. The app then looks launched-but-broken —
- * tray responsive, "Open Admin" doing nothing visible. Dropping the position
+ * tray responsive, "Open Control Panel" doing nothing visible. Dropping the position
  * falls back to centring on the primary display.
  */
 export function clampBoundsToDisplays(bounds: WindowBounds, workAreas: readonly Rect[]): WindowBounds {

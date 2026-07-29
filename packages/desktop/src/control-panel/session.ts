@@ -1,5 +1,5 @@
 /**
- * ADMIN's half of the connection: serve the dashboard runtime on whichever port
+ * CONTROL PANEL's half of the connection: serve the dashboard runtime on whichever port
  * MAIN last brokered.
  *
  * The runtime outlives every port. A window reload mints a fresh
@@ -22,12 +22,12 @@
 import { serveRuntimeOverPort, type RpcPort, type RpcRuntime } from '@mlx-node/dashboard';
 
 /** What the session needs of `DashboardRuntime` — the two RPC members plus shutdown. */
-export interface AdminSessionRuntime extends RpcRuntime {
+export interface ControlPanelSessionRuntime extends RpcRuntime {
   close(): Promise<void>;
 }
 
-export interface AdminSessionOptions {
-  runtime: AdminSessionRuntime;
+export interface ControlPanelSessionOptions {
+  runtime: ControlPanelSessionRuntime;
   /**
    * Test seam. Defaults to `serveRuntimeOverPort`, which is what makes only
    * `call` and `subscribe` reachable over the port — `close`, `drain` and
@@ -37,7 +37,7 @@ export interface AdminSessionOptions {
   serve?: (runtime: RpcRuntime, port: RpcPort) => () => void;
 }
 
-export interface AdminSession {
+export interface ControlPanelSession {
   /** Serve on `port`, releasing whatever was being served before. */
   attach(port: RpcPort): void;
   /** How many ports have been attached. */
@@ -53,7 +53,7 @@ export interface AdminSession {
   close(): Promise<void>;
 }
 
-export function createAdminSession(options: AdminSessionOptions): AdminSession {
+export function createControlPanelSession(options: ControlPanelSessionOptions): ControlPanelSession {
   const serve = options.serve ?? serveRuntimeOverPort;
   let release: (() => void) | null = null;
   let generation = 0;

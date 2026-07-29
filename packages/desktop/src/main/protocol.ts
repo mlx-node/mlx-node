@@ -1,5 +1,5 @@
 /**
- * The `app://` scheme that serves the Admin SPA out of the bundle.
+ * The `app://` scheme that serves the Control Panel SPA out of the bundle.
  *
  * The app has no TCP port for its own UI — that was the point of choosing a custom
  * protocol over a localhost server. Nothing to firewall, nothing another process

@@ -2202,10 +2202,10 @@ describe('dashboard api — cache trend scoping', () => {
 });
 
 /**
- * The join key a real Admin-window run actually uses.
+ * The join key a real Control Panel window run actually uses.
  *
  * Every other cache test hands the runtime an explicit `cacheRoot`, but nothing
- * in production supplies one — the app's Admin entry constructs the runtime with
+ * in production supplies one — the app's Control Panel entry constructs the runtime with
  * no cache root at all. So in production `ctx.cacheRoot` is `undefined` and the
  * scope root comes from
  * `coldCacheRoot(undefined)` → `defaultColdCacheDir()` → the `mlx-paged-v1`
@@ -2276,7 +2276,7 @@ describe('dashboard api — production cache root (no explicit cacheRoot)', () =
       sessionsRoot,
       tracesDir,
       modelsDir,
-      // Exactly what the app's Admin entry passes.
+      // Exactly what the app's Control Panel entry passes.
       cacheRoot: undefined,
     });
     defaultedApi = createTestClient(defaulted);

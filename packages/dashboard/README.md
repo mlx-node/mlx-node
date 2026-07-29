@@ -1,6 +1,6 @@
 # @mlx-node/dashboard
 
-The mlx-node Admin UI: browse local models, agent sessions, inference metrics, and
+The mlx-node Control Panel UI: browse local models, agent sessions, inference metrics, and
 the paged-attention cold cache. Rendered inside the mlx-node desktop app — there is
 no server and no port.
 

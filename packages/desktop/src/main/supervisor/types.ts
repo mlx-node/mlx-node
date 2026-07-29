@@ -170,7 +170,7 @@ export function parseChildMessage(message: unknown): ChildToSupervisor | null {
 export type Lifecycle = 'stopped' | 'starting' | 'running' | 'restarting' | 'failed';
 
 /**
- * What the tray and Admin show. `lying` is `running` plus the one fact that
+ * What the tray and Control Panel show. `lying` is `running` plus the one fact that
  * changes what the user should believe:
  *
  * A class-(b) failure — `mlx_array_eval` / `mlx_synchronize` / `mlx_clear_cache`
@@ -202,7 +202,7 @@ export interface ExitRecord {
   stderrTail: readonly string[];
 }
 
-/** Everything the tray and Admin need, in one object that cannot get out of sync. */
+/** Everything the tray and Control Panel need, in one object that cannot get out of sync. */
 export interface SupervisorSnapshot {
   state: SupervisorState;
   pid: number | undefined;

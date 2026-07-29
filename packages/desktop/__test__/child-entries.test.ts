@@ -1,7 +1,7 @@
 /**
  * Which of the three processes may map the native addon.
  *
- * INFERENCE must; MAIN and ADMIN must not. That split IS the three-process
+ * INFERENCE must; MAIN and CONTROL PANEL must not. That split IS the three-process
  * design — `mlx-core.darwin-arm64.node` is 61 MB of mapped Mach-O and ~29 MB of
  * RSS on the import alone, and a dashboard bug that took the tray and the
  * supervisor with it is the thing crash isolation is buying.
@@ -55,7 +55,7 @@ function specifiersOf(file: string): string[] {
  * Kept as its own bucket rather than dropped, because "erased" is not "allowed":
  * `@mlx-node/agent/catalog` needs `ModelType` off the model registry so its
  * family list cannot drift from the families that exist, and that edge is
- * legitimate — but it is one keyword away from mapping 61 MB into ADMIN, so the
+ * legitimate — but it is one keyword away from mapping 61 MB into CONTROL PANEL, so the
  * test names it explicitly instead of letting the walk fall silent about it.
  */
 function typeOnlySpecifiersOf(file: string): string[] {
@@ -158,8 +158,8 @@ function walk(entry: string): Walk {
 const reachesAddon = (packages: string[]): string[] =>
   packages.filter((name) => ADDON_PACKAGES.some((p) => name === p || name.startsWith(`${p}/`)));
 
-describe('ADMIN never links the native addon', () => {
-  const graph = walk(src('admin/index.ts'));
+describe('CONTROL PANEL never links the native addon', () => {
+  const graph = walk(src('control-panel/index.ts'));
 
   it('resolves every workspace specifier it walks through', () => {
     // Guards the guard. An unresolved specifier stops the walk there, and the
@@ -184,7 +184,7 @@ describe('ADMIN never links the native addon', () => {
    * cold-tier family list cannot name a family that does not exist. tsc erases
    * that import — the fresh-process probe below confirms nothing is mapped — but
    * "erased" is a property of the KEYWORD, not of the dependency, and deleting
-   * five characters would turn it into 61 MB in ADMIN. Asserting the exact set
+   * five characters would turn it into 61 MB in CONTROL PANEL. Asserting the exact set
    * means a second such edge, or this one turning real, has to be argued for
    * here rather than appearing silently.
    */
@@ -197,7 +197,7 @@ describe('ADMIN never links the native addon', () => {
     // `electron` is deliberately absent: `process.parentPort` is a global, and an
     // import of that specifier would make an addon-free entry look like an
     // Electron one to the walk above for a type that is erased anyway.
-    const specifiers = specifiersOf(src('admin/index.ts')).sort();
+    const specifiers = specifiersOf(src('control-panel/index.ts')).sort();
     expect(specifiers).toEqual(['./session.js', '@mlx-node/dashboard', 'node:fs']);
   });
 });
@@ -206,7 +206,7 @@ describe('INFERENCE is the one that does', () => {
   const graph = walk(src('inference/index.ts'));
 
   it('reaches the addon through @mlx-node/server/host', () => {
-    // The positive half. Without it, "ADMIN is addon-free" would also be
+    // The positive half. Without it, "CONTROL PANEL is addon-free" would also be
     // satisfied by an app in which nothing loads the addon at all — a sidecar
     // that starts, serves /health, and cannot run a model.
     expect(reachesAddon(graph.packages).length).toBeGreaterThan(0);
@@ -258,7 +258,7 @@ describe('observed in a real process', () => {
   });
 
   // Guards the guard: if the probe could not see a mapped addon, the assertion
-  // above would hold no matter what ADMIN imported.
+  // above would hold no matter what CONTROL PANEL imported.
   it.skipIf(!existsSync(serverHost))('the probe really does detect one', () => {
     expect(mapped(serverHost)).toBe('MAPPED');
   });

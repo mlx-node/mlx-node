@@ -368,7 +368,7 @@ mlx agent config             # edit which are enabled
 
 ## Dashboard
 
-`mlx dashboard` was **removed**. The dashboard is now the Admin window of the mlx-node
+`mlx dashboard` was **removed**. The dashboard is now the Control Panel window of the mlx-node
 desktop app, opened from the tray — it is served over `app://` and a MessagePort, so
 there is no port to bind and no unauthenticated HTTP surface to guard. See
 [docs/dashboard.md](dashboard.md).
