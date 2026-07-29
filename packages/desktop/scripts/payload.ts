@@ -17,11 +17,7 @@ import { join } from 'node:path';
  * Split them across directories and the addon loads fine and then produces
  * garbage or fails at first kernel dispatch — with no error naming a path.
  */
-export const NATIVE_FILES = [
-  'mlx-core.darwin-arm64.node',
-  'mlx.metallib',
-  'paged_attn.metallib',
-] as const;
+export const NATIVE_FILES = ['mlx-core.darwin-arm64.node', 'mlx.metallib', 'paged_attn.metallib'] as const;
 
 /** A floor, not a checksum: catches a truncated or placeholder artifact. */
 const MIN_BYTES: Record<string, number> = {

@@ -48,7 +48,19 @@ function matchRoute(route: Route, method: string, segments: string[]): Record<st
   for (let i = 0; i < route.segments.length; i++) {
     const pat = route.segments[i];
     if (pat.startsWith(':')) {
-      params[pat.slice(1)] = decodeURIComponent(segments[i]);
+      // `decodeURIComponent` throws a bare `URIError` on a malformed escape
+      // (`%`, `%zz`, a truncated `%E0%A4%A`). Raised as an `ApiError` instead so
+      // it lands as 400 rather than the 500 `toFailure` gives an unknown throw —
+      // this is client-supplied input, not an internal fault.
+      //
+      // Deliberately NOT `return null`: `segmentsMatch` skips param positions,
+      // so a null here would leave the path "matched" and answer a misleading
+      // 405 for what is really a malformed request.
+      try {
+        params[pat.slice(1)] = decodeURIComponent(segments[i]);
+      } catch {
+        throw ApiError.badRequest(`Malformed percent-escape in path segment "${segments[i]}"`);
+      }
     } else if (pat !== segments[i]) {
       return null;
     }

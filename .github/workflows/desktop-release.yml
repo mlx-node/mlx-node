@@ -162,9 +162,12 @@ jobs:
           echo "Found identity: ${IDENTITY%% (*} (…)"
 
       # Packages, rewrites the addon's LC_ID_DYLIB + code-signing identifier, then
-      # signs inside-out with @electron/osx-sign. The install-name rewrite is not
-      # cosmetic: the addon ships `/Users/<builder>/.../target/.../libmlx_core.dylib`
-      # otherwise, leaking a home directory to every user.
+      # signs inside-out with its own `codesign` calls — NOT with
+      # @electron/osx-sign, which decides what to sign by content-sniffing and
+      # chokes on this bundle's payload (see the comment in package.ts). The
+      # install-name rewrite is not cosmetic: the addon ships
+      # `/Users/<builder>/.../target/.../libmlx_core.dylib` otherwise, leaking a
+      # home directory to every user.
       #
       # `package.ts` writes out/package-result.json with the bundle path it
       # actually produced. Nothing here reconstructs that path: packager returns

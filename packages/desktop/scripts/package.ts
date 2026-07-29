@@ -238,11 +238,15 @@ if (sign) {
   }
 
   // Nested .app bundles (the Electron helpers) then the outer bundle, same order.
+  // The outer bundle is filtered out of the loop: `find` matches it too, and it
+  // is sealed explicitly below so it is unambiguously last. Without the filter
+  // it was re-sealed twice over — ~580 MB of redundant hashing per build.
   const bundles = execFileSync('bash', ['-c', `find ${JSON.stringify(appPath)} -name '*.app' -type d`], {
     encoding: 'utf-8',
   })
     .split('\n')
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter((bundle) => bundle !== appPath);
   for (const bundle of bundles.sort(byDepth)) {
     run('codesign', codesignArgs({ file: bundle, identity, entitlements }));
   }

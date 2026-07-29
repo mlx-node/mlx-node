@@ -99,6 +99,40 @@ afterEach(async () => {
 });
 
 describe('dashboard runtime — call', () => {
+  /**
+   * `call` documents that it never rejects, and route matching decodes each
+   * `:param` with `decodeURIComponent` — which throws on a malformed escape.
+   * The ownership check that triggers that decode used to run BEFORE the try,
+   * so a caller got a bare `URIError` instead of the envelope everything else
+   * produces.
+   *
+   * Both threads are asserted deliberately: fixing only the main-thread branch
+   * leaves the worker-owned leg rejecting, and this suite has a habit of going
+   * green for the wrong reason. So is the `%25` control — a well-formed escape
+   * must stay an ordinary miss, or a blanket "reject anything with a %" would
+   * pass the first two assertions.
+   */
+  it('returns a failure envelope, never a rejection, for a malformed percent-escape', async () => {
+    // Worker-owned route.
+    await expect(runtime.call({ method: 'GET', path: '/api/sessions/%' })).resolves.toMatchObject({
+      ok: false,
+      code: 'E_BAD_REQUEST',
+      status: 400,
+    });
+    // Main-owned route, same shape.
+    await expect(runtime.call({ method: 'DELETE', path: '/api/downloads/%' })).resolves.toMatchObject({
+      ok: false,
+      code: 'E_BAD_REQUEST',
+      status: 400,
+    });
+    // Control: `%25` decodes cleanly to `%`, so this is a plain miss.
+    await expect(runtime.call({ method: 'GET', path: '/api/sessions/%25' })).resolves.toMatchObject({
+      ok: false,
+      code: 'E_NOT_FOUND',
+      status: 404,
+    });
+  });
+
   it('answers an API call with the route body, no socket involved', async () => {
     const res = await runtime.call({ method: 'GET', path: '/api/health' });
     expect(res.status).toBe(200);

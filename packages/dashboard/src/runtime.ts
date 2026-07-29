@@ -179,18 +179,24 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
       if (!isApiPath(url.pathname)) {
         return failure('E_NOT_FOUND', `No route matches ${c.method} ${url.pathname}`);
       }
-      // Ownership is data on the route, never a path list here. An unmatched
-      // request has no owner and is answered locally — its 405/404 needs no
-      // context, and a garbage path never costs a round trip.
-      if (routeThreadFor(c.method, url.pathname) === 'worker') {
-        return await worker.call({
-          method: c.method,
-          path: c.path,
-          body: c.body,
-          ...(c.bodyError !== undefined ? { bodyError: c.bodyError } : {}),
-        });
-      }
       try {
+        // Ownership is data on the route, never a path list here. An unmatched
+        // request has no owner and is answered locally — its 405/404 needs no
+        // context, and a garbage path never costs a round trip.
+        //
+        // INSIDE the try: deciding the owner runs the same route matcher, which
+        // decodes each `:param`. A malformed escape threw from here, above the
+        // catch, so `call` rejected instead of answering — breaking the contract
+        // the catch below exists to keep. `worker.call` returns envelopes rather
+        // than throwing, so nesting it changes nothing else.
+        if (routeThreadFor(c.method, url.pathname) === 'worker') {
+          return await worker.call({
+            method: c.method,
+            path: c.path,
+            body: c.body,
+            ...(c.bodyError !== undefined ? { bodyError: c.bodyError } : {}),
+          });
+        }
         return await dispatchMain(context, {
           method: c.method,
           pathname: url.pathname,
@@ -201,8 +207,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
       } catch (err) {
         // `dispatchMain` converts handler throws itself; this catches a fault in
         // matching (e.g. `decodeURIComponent` on a malformed `%` escape) so the
-        // documented "never rejects" contract holds for every caller. The HTTP
-        // adapter keeps its own 500 path for the same case.
+        // documented "never rejects" contract holds for every caller.
         return toFailure(err);
       }
     },
