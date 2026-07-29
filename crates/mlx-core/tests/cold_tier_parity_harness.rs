@@ -884,7 +884,21 @@ fn prepare_cold_root() -> ColdRoot {
         }
         _ => {
             let path = std::env::temp_dir().join(format!("mlx-cold-parity-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&path);
+            // Wipe it ONLY on the first gate in this process.
+            //
+            // The path is pid-scoped, so a second gate in the same binary
+            // computes the SAME one — and the tier manager installed by the
+            // first gate holds a DESCRIPTOR for that directory, not its name.
+            // Unlinking and recreating the pathname therefore leaves the live
+            // manager pointed at an unlinked directory, where every name lookup
+            // is ENOENT: the second gate stores nothing, restores nothing, and
+            // fails at "cold restore did not engage" while the real fault is
+            // this line. Sharing the root across gates is what the module doc
+            // already assumes — the cold keys are content-derived, so different
+            // prompts occupy disjoint chains.
+            if mlx_core::cold_tier::installed_cold_cache_root() != Some(path.as_path()) {
+                let _ = fs::remove_dir_all(&path);
+            }
             fs::create_dir_all(&path).expect("create cold-cache temp root");
             ColdRoot::Created(path)
         }
@@ -1379,8 +1393,56 @@ where
 mod harness_tests {
     use super::{
         DEFAULT_BLOCK_SIZE, expected_checkpoint_ladder, ladder_capture_prompt,
-        ladder_restore_prompt,
+        ladder_restore_prompt, prepare_cold_root,
     };
+
+    /// A second gate in the same binary must not replace the tier directory the
+    /// first gate's manager is already holding open.
+    ///
+    /// `ColdRoot::Created` is `temp_dir()/mlx-cold-parity-{pid}`, so both gates
+    /// compute the SAME path, and `prepare_cold_root` used to `remove_dir_all`
+    /// it unconditionally. The live manager holds a DESCRIPTOR, not a name: once
+    /// that directory is unlinked, every `openat`/`renameat`/`unlinkat`/`statat`
+    /// through it returns ENOENT (measured; `fsync` and `getdents` still work,
+    /// which is why it fails quietly). The second gate then stores nothing,
+    /// restores nothing, and trips "cold restore did not engage" — blaming the
+    /// restore path for a setup fault two functions away.
+    ///
+    /// Asserted on the INODE rather than on existence, because the broken
+    /// version left a directory at the same pathname; only the identity differs.
+    ///
+    /// Costs microseconds and needs no checkpoint, so unlike the gates it guards
+    /// it runs on the ordinary `cargo test` leg — where those gates never run at
+    /// all (`ci.yml` names only the qwen3 and qwen3_5 cold-tier binaries, both
+    /// single-gate, so nothing in CI exercises two gates in one process).
+    #[test]
+    fn preparing_the_root_twice_keeps_the_same_directory() {
+        use std::os::unix::fs::MetadataExt;
+
+        let first = prepare_cold_root();
+        let ino_first = std::fs::metadata(first.path())
+            .expect("tier root must exist after the first prepare")
+            .ino();
+
+        // Second gate in the same process.
+        let second = prepare_cold_root();
+        let ino_second = std::fs::metadata(second.path())
+            .expect("tier root must exist after the second prepare")
+            .ino();
+
+        assert_eq!(
+            first.path(),
+            second.path(),
+            "both gates must resolve the same pid-scoped root, or this test is not exercising \
+             the shared-root case at all"
+        );
+        assert_eq!(
+            ino_first, ino_second,
+            "the second prepare replaced the tier directory ({ino_first} -> {ino_second}): the \
+             manager installed by the first gate still holds a descriptor for the unlinked one, \
+             so every cache write and read in the second gate fails with ENOENT"
+        );
+    }
 
     /// The fixture's whole R-independence argument rests on the two prompts
     /// parting company far enough before the end that instance 2's chain

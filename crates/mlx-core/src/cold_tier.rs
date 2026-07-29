@@ -151,6 +151,20 @@ pub fn install_cold_capture_budget(blocks: usize, budget: std::time::Duration) -
 /// cache is installed while the tier is DISABLED. A harness that believed that
 /// would run its whole gate and fail with "restore did not engage", pointing
 /// the reader at the restore path instead of at the setup that never opened.
+/// The root [`install_cold_cache_root`] opened the tier at, if it has been
+/// opened by an install at all.
+///
+/// Exists so a caller that would otherwise (re)create its root directory can
+/// tell that a live manager is already holding a DESCRIPTOR for that path.
+/// Deleting and recreating the same pathname leaves the manager pointed at an
+/// unlinked directory, and on unix every name lookup there fails with ENOENT —
+/// `openat`, `renameat`, `unlinkat`, `statat` — while `fsync` and `getdents`
+/// still succeed. The cache then stores nothing and restores nothing, and the
+/// pathname check alone cannot see it.
+pub fn installed_cold_cache_root() -> Option<&'static Path> {
+    INSTALLED_ROOT.get().map(PathBuf::as_path)
+}
+
 pub fn install_cold_cache_root(parent: &Path) -> bool {
     if let Some(installed) = INSTALLED_ROOT.get() {
         // Only this function ever sets `INSTALLED_ROOT`, and it does so only
