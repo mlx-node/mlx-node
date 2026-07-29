@@ -22,8 +22,10 @@ function hubError(statusCode: number): Error {
 }
 
 describe('isRetriableFetchError', () => {
-  it('retries what the server says is its own fault, and a rate limit', () => {
-    for (const status of [500, 502, 503, 504, 429]) {
+  it('retries what the server says is its own fault, a rate limit, and a request timeout', () => {
+    // 408 rides with 429/5xx: RFC 9110 §15.5.9 makes it transient by
+    // definition, and nothing in @huggingface/hub@2.13.2 retries it for us.
+    for (const status of [500, 502, 503, 504, 429, 408]) {
       expect([status, isRetriableFetchError(hubError(status))]).toEqual([status, true]);
     }
   });
@@ -79,10 +81,30 @@ describe('isRetriableFetchError', () => {
     expect(isRetriableFetchError('fetch failed')).toBe(true);
     expect(isRetriableFetchError('Api error with status 503. URL: https://hf.co/x')).toBe(true);
     expect(isRetriableFetchError('Api error with status 500. URL: https://hf.co/x')).toBe(true);
+    expect(isRetriableFetchError('Api error with status 408. URL: https://hf.co/x')).toBe(true);
     // …and the status is still honoured through the text, so a permanent
     // answer stays permanent even after being flattened.
     expect(isRetriableFetchError('Api error with status 403. URL: https://hf.co/x')).toBe(false);
     expect(isRetriableFetchError('Api error with status 404. URL: https://hf.co/x')).toBe(false);
+  });
+
+  it('cannot honour a status the hub client deleted, and retries instead', () => {
+    // Documents a REAL looseness rather than an aspiration. `createApiError`
+    // (@huggingface/hub@2.13.2, src/error.ts:15-26) writes the "Api error with
+    // status N" prefix and then, when the body is `application/json`, replaces
+    // the ENTIRE message with `json.error || json.message`, keeping only the
+    // `. URL: …` trailer. Combined with WebBlob/XetBlob aborting on
+    // `error.message` (a bare string), a JSON-bodied 403 on the content GET
+    // arrives with no status anywhere and takes the default-retry branch.
+    //
+    // Not fixable without pattern-matching server prose — the allowlist this
+    // predicate exists to avoid — and it errs toward retrying, which is the
+    // safe direction. Pinned so it is a known cost, not a surprise.
+    expect(isRetriableFetchError('Invalid credentials in Authorization header. URL: https://hf.co/x')).toBe(true);
+    // The same status DOES stay permanent on the error-OBJECT path, which
+    // keeps `statusCode` — so this is a property of the flattening, not of the
+    // predicate's view of 403.
+    expect(isRetriableFetchError(hubError(403))).toBe(false);
   });
 
   it('retries transport failures that are not spelled "fetch failed"', () => {

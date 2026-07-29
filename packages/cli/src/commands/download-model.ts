@@ -34,11 +34,36 @@ const PERMANENT_FS_CODES = new Set([
 
 /**
  * A hub error flattened to text; see {@link isRetriableFetchError}.
+ *
+ * Only matches when the failing response had a NON-JSON body. `createApiError`
+ * (`@huggingface/hub@2.13.2`, `src/error.ts:9-26`) builds this exact prefix and
+ * then REPLACES the whole message with `json.error || json.message` whenever
+ * the response is `application/json`, keeping only a `. URL: …` trailer. The
+ * status is not recoverable from that text — it survives only on the error
+ * OBJECT, which the blob-stream path throws away. So a JSON-bodied failure on
+ * the content GET reaches the default-retry branch regardless of its status.
+ * That is a known looseness, not an oversight: it errs toward retrying, which
+ * is the safe direction here (see the harm asymmetry below).
  */
 const FLATTENED_STATUS = /^Api error with status (\d{3})\b/;
 
+/**
+ * 408 is transient by definition (RFC 9110 §15.5.9 — the server did not get a
+ * complete request in time, and "the client MAY repeat that request"), so it
+ * belongs with 429 and 5xx rather than with the settled 4xx answers.
+ *
+ * Included as hardening, not as a fix for an observed failure: nothing in
+ * `@huggingface/hub@2.13.2` filters, branches on, or internally retries 408
+ * (its only repeat-a-request logic is a one-shot 403 token refresh in
+ * `XetBlob.ts:307`), so if a CDN ever emits one it lands here and aborts a
+ * multi-GB download for free. Costs one comparison.
+ *
+ * 425 Too Early is deliberately NOT here: it requires TLS 0-RTT early data,
+ * which this client never sends. Adding it would be speculation, and the
+ * default-retry branch already covers anything unmodelled.
+ */
 function isRetriableStatus(status: number): boolean {
-  return status >= 500 || status === 429;
+  return status >= 500 || status === 429 || status === 408;
 }
 
 /**
@@ -69,9 +94,18 @@ function isRetriableStatus(status: number): boolean {
  * The harm is asymmetric: retrying something hopeless costs 7 s of backoff,
  * refusing to retry something transient costs the whole download.
  *
- * Never retried: 4xx other than 429 (401/403 is no token or no access, 404 is
- * the wrong repo or revision) and the filesystem refusals above. Those are
- * settled answers, and repeating them only buries the message the user needs.
+ * Never retried: 4xx other than 429 and 408 (401/403 is no token or no access,
+ * 404 is the wrong repo or revision) and the filesystem refusals above. Those
+ * are settled answers, and repeating them only buries the message the user
+ * needs.
+ *
+ * That last paragraph holds for the ERROR-OBJECT shape, which keeps its
+ * `statusCode`. It does NOT hold for the flattened-string shape when the
+ * response body was JSON: the hub client overwrites the message with the
+ * server's own text and the status is gone, so such a failure takes the
+ * default-retry branch whatever it was. See {@link FLATTENED_STATUS}. Closing
+ * that would mean pattern-matching human-readable server prose, which is the
+ * allowlist this function exists to avoid.
  */
 export function isRetriableFetchError(error: unknown): boolean {
   if (typeof error === 'string') {
