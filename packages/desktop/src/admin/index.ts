@@ -60,6 +60,47 @@ if (parentPort === undefined) {
   process.exit(78);
 }
 
+/**
+ * Set before any deliberate teardown, so a worker death during it is read as
+ * part of the teardown rather than as a crash.
+ *
+ * The runtime's own `closing` latch is not enough: it flips inside
+ * `worker.close()`, which runs AFTER `drain()`. A worker that dies during the
+ * drain phase therefore still reports `worker-down`, and reacting to that by
+ * exiting would abort the in-flight download shutdown that drain exists to
+ * perform — orphaning a partial multi-GB `.staging` tree.
+ */
+let shuttingDown = false;
+
+/** Distinct from the clean `0` so a crash report says which path exited. */
+const EXIT_WORKER_DOWN = 70;
+
+/**
+ * Close the runtime, then leave. Shared by the signal handlers and `worker-down`.
+ *
+ * Only reachable after module init — from a signal, or from the worker's async
+ * `error`/`exit` events — so `session` below is always assigned by the time this
+ * runs. Do not call it during construction.
+ */
+function teardown(code: number): void {
+  shuttingDown = true;
+  // A close that hangs must not park the process: MAIN's kill grace period
+  // would end up doing this anyway, and a slow exit is worse than an abrupt one
+  // because the broker cannot restart what has not exited.
+  const cap = setTimeout(() => process.exit(code), 5_000);
+  cap.unref();
+  void session
+    .close()
+    .catch((error: unknown) => {
+      logError(
+        `[mlx] dashboard runtime did not close cleanly: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    })
+    .then(() => {
+      process.exit(code);
+    });
+}
+
 const runtime = createDashboardRuntime({
   // Below MAIN's 10 s quit deadline, so a worker that will not answer is
   // terminated by the runtime rather than by the app running out of time.
@@ -68,6 +109,17 @@ const runtime = createDashboardRuntime({
     // The database worker dying is invisible from the UI: every worker-thread
     // route just starts failing. Say so where the crash report can see it.
     logError(`[mlx] dashboard db worker: ${JSON.stringify(event)}`);
+
+    // `down` is a write-once latch with no respawn, so 12 of the 16 dashboard
+    // routes now fail forever while this process stays perfectly healthy. The
+    // broker sees no exit, so its restart budget never runs; reloading or
+    // reopening the window re-attaches to this same dead runtime. Exiting is
+    // what hands the problem to `broker.ts`, which restarts ADMIN and
+    // re-brokers a fresh port to the window that is still open.
+    //
+    // `db-closed` is the normal witness of a clean close and must not trigger
+    // this.
+    if (event.type === 'worker-down' && !shuttingDown) teardown(EXIT_WORKER_DOWN);
   },
 });
 
@@ -83,15 +135,6 @@ parentPort.on('message', (event) => {
 
 for (const signal of ['SIGTERM', 'SIGINT'] as const) {
   process.on(signal, () => {
-    void session
-      .close()
-      .catch((error: unknown) => {
-        logError(
-          `[mlx] dashboard runtime did not close cleanly: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      })
-      .then(() => {
-        process.exit(0);
-      });
+    teardown(0);
   });
 }

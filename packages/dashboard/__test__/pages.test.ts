@@ -47,7 +47,6 @@ import { toast } from 'sonner';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import type { DownloadEvent } from '../src/download.js';
-
 import {
   renderPage,
   sequence,

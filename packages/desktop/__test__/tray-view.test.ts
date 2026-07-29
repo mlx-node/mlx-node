@@ -8,10 +8,12 @@
  * that renders that as "running" tells the user the one thing that is not true.
  */
 
+import { execFileSync } from 'node:child_process';
+
 import { describe, expect, it } from 'vite-plus/test';
 
 import type { SupervisorSnapshot, SupervisorState } from '../src/main/supervisor/types.js';
-import { presentTray } from '../src/main/tray-view.js';
+import { connectCommand, presentTray } from '../src/main/tray-view.js';
 
 function snapshot(state: SupervisorState, over: Partial<SupervisorSnapshot> = {}): SupervisorSnapshot {
   return {
@@ -179,5 +181,52 @@ describe('presentTray', () => {
       expect(detail).not.toContain('\n');
       expect(detail).toContain('first second third');
     });
+  });
+});
+
+/**
+ * Handing another client the endpoint.
+ *
+ * Every inference route is gated, so the URL on its own is not a capability — a
+ * client given only the URL gets 401 for everything. The token reaches MAIN with
+ * the ready handshake and leaves it only here, as a whole command, so the secret
+ * is never drawn into a menu row where a screenshot would catch it.
+ */
+describe('connect command', () => {
+  it('is offered only while a child is actually serving', () => {
+    // Not `starting`: the URL exists there but the token has not arrived yet, so
+    // the command would be built from a null. Not `restarting`: the token is
+    // cleared on every respawn, so it would already be stale.
+    expect(presentTray(snapshot('running')).canCopyConnect).toBe(true);
+    for (const state of ALL_STATES.filter((s) => s !== 'running')) {
+      expect(presentTray(snapshot(state)).canCopyConnect).toBe(false);
+    }
+    expect(presentTray(snapshot('running', { url: null })).canCopyConnect).toBe(false);
+  });
+
+  it('carries the credential in the environment, never in the URL', () => {
+    const command = connectCommand('http://127.0.0.1:51423', 'sekrit-token');
+    expect(command).toContain("ANTHROPIC_BASE_URL='http://127.0.0.1:51423'");
+    expect(command).toContain("ANTHROPIC_AUTH_TOKEN='sekrit-token'");
+    // A token in a query string lands in referrers and proxy logs.
+    expect(command).not.toContain('?');
+    expect(command).not.toContain('sekrit-token@');
+  });
+
+  it('quotes a token that would otherwise break out of the command', () => {
+    const evil = String.raw`a'; echo PWNED; b`;
+    const command = connectCommand('http://127.0.0.1:1', evil);
+    // Run the real command with `claude` swapped for something that just prints
+    // the variable it was handed. If the quoting were wrong, bash would either
+    // fail to parse or execute the injected `echo`.
+    const script = command.replace(/ claude$/u, String.raw` sh -c 'printf %s "$ANTHROPIC_AUTH_TOKEN"'`);
+    const out = execFileSync('bash', ['-c', script]).toString();
+
+    // Exact round-trip IS the proof. Had the quoting let the payload out, bash
+    // would have run the injected `echo` and stdout would carry its output on
+    // its own line instead of the literal token. (Asserting the absence of
+    // "PWNED" would be wrong here — the token itself contains that text.)
+    expect(out).toBe(evil);
+    expect(out.split('\n')).toHaveLength(1);
   });
 });

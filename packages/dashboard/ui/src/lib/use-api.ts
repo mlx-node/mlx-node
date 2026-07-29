@@ -12,9 +12,10 @@
  * instead, which deliberately does NOT collapse the layout.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 
 import { getJson } from './api';
+import { getConnectionGeneration, subscribeConnection } from './connection';
 import { readCache, writeCache } from './json-cache';
 
 export interface AsyncState<T> {
@@ -56,6 +57,12 @@ export function useJson<T>(path: string): AsyncState<T> {
     setRequest((current) => ({ ...current, nonce: current.nonce + 1, fetching: true }));
   }, []);
 
+  // A reconnect hands the app a different runtime, so what is on screen
+  // describes something that no longer exists. Without this in the deps a
+  // mounted hook never refetches — and one that errored while ADMIN was down
+  // stays stuck on that error even after the replacement port arrives.
+  const connection = useSyncExternalStore(subscribeConnection, getConnectionGeneration, getConnectionGeneration);
+
   const { nonce } = request;
   useEffect(() => {
     let active = true;
@@ -86,7 +93,7 @@ export function useJson<T>(path: string): AsyncState<T> {
     return () => {
       active = false;
     };
-  }, [path, nonce]);
+  }, [path, nonce, connection]);
 
   return {
     data: request.data,

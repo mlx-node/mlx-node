@@ -282,9 +282,34 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
 
   // Attach AFTER `createServer` so the wrapper sees every incoming request,
   // including the `GET /v1/models` a client fires on startup.
+  //
+  // By this point the socket is bound and `ctrlRef.current` is wired, so the
+  // endpoint already answers real requests. `attachLogger` opens with a
+  // synchronous `mkdirSync`, which throws on an unwritable `--log-dir`; without
+  // this rollback the rejection would strand a fully working inference server
+  // with no handle left to close it. Every caller in this repo exits the
+  // process on failure, so the leak is only reachable by an in-process
+  // embedder — which is exactly who this module is for.
   let logger: Logger | null = null;
   if (opts.logDir !== undefined) {
-    logger = (opts.attachLogger ?? defaultAttachLogger)(server.server, opts.logDir);
+    try {
+      logger = (opts.attachLogger ?? defaultAttachLogger)(server.server, opts.logDir);
+    } catch (err) {
+      // Mirror `close()`'s order and its independent guards, and rethrow the
+      // ORIGINAL failure — a secondary close error must not mask the EACCES
+      // that actually explains what went wrong.
+      try {
+        await server.close();
+      } catch {
+        /* already down, or a socket refused to die; fall through */
+      }
+      try {
+        await pagedConfigOverrides.cleanup();
+      } catch {
+        /* the startup sweep of the next host will reclaim it */
+      }
+      throw err;
+    }
   }
 
   const address = server.server.address();

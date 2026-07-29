@@ -184,10 +184,16 @@ describe('isLoopbackHttpUrl', () => {
 
 describe('parseChildMessage', () => {
   it('reads the three messages the contract defines', () => {
-    expect(parseChildMessage({ kind: 'mlx:ready', url: 'http://127.0.0.1:1' })).toEqual({
+    expect(parseChildMessage({ kind: 'mlx:ready', url: 'http://127.0.0.1:1', authToken: 'tok' })).toEqual({
       kind: 'mlx:ready',
       url: 'http://127.0.0.1:1',
+      authToken: 'tok',
     });
+    // Fail closed. Every inference route is gated, so a handshake with no token
+    // describes an endpoint MAIN could advertise but nothing could ever use;
+    // ignoring it surfaces as a readiness timeout with a reason, rather than a
+    // running server whose Copy Connect Command is silently broken.
+    expect(parseChildMessage({ kind: 'mlx:ready', url: 'http://127.0.0.1:1' })).toBeNull();
     expect(parseChildMessage({ kind: 'mlx:response', id: 4, ok: true, value: 9 })).toEqual({
       kind: 'mlx:response',
       id: 4,

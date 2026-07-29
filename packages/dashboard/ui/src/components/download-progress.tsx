@@ -1,8 +1,9 @@
 import { subscribeDownload } from '@/lib/api';
+import { getConnectionGeneration, subscribeConnection } from '@/lib/connection';
 import { formatBytes } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import { AlertCircle, CheckCircle2, Loader2 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 
 type Phase = 'connecting' | 'running' | 'done' | 'error';
 
@@ -54,6 +55,7 @@ export interface DownloadProgressProps {
  */
 export function DownloadProgress({ id, onDone, onError, onCancelled }: DownloadProgressProps) {
   const [state, setState] = useState<ProgressState>(INITIAL);
+  const connection = useSyncExternalStore(subscribeConnection, getConnectionGeneration, getConnectionGeneration);
   const doneCb = useRef(onDone);
   const errorCb = useRef(onError);
   const cancelledCb = useRef(onCancelled);
@@ -107,7 +109,11 @@ export function DownloadProgress({ id, onDone, onError, onCancelled }: DownloadP
       if (event.type === 'cancelled') cancelledCb.current?.();
     });
     return () => sub.close();
-  }, [id]);
+    // `connection` rebinds the subscription after ADMIN restarts. The old
+    // client's listener map was emptied when its port closed and its `close()`
+    // is inert, so without this the card is permanently deaf — frozen mid
+    // progress against a runtime that is already healthy again.
+  }, [id, connection]);
 
   const { phase, totalBytes, receivedBytes, fileCount, fileIndex, currentFile, message } = state;
   const fraction =

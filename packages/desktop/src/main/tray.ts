@@ -18,6 +18,8 @@ export interface TrayActions {
   startInference(): void;
   stopInference(): void;
   restartInference(): void;
+  /** Put a ready-to-paste command carrying the URL and the token on the clipboard. */
+  copyConnectCommand(): void;
   setShowInDock(next: boolean): void;
   quit(): void;
 }
@@ -75,6 +77,17 @@ export function createTray(options: TrayOptions): TrayController {
         enabled: presentation.canOpenAdmin,
         click: () => {
           options.actions.openAdmin();
+        },
+      },
+      {
+        // The URL alone is not a capability — every inference route is gated —
+        // so a user pointing Claude Code or Codex at this server needs the
+        // token too. Copying a whole command rather than showing the secret in
+        // a menu row keeps it off the screen and out of a screenshot.
+        label: 'Copy Connect Command',
+        enabled: presentation.canCopyConnect,
+        click: () => {
+          options.actions.copyConnectCommand();
         },
       },
       { type: 'separator' },

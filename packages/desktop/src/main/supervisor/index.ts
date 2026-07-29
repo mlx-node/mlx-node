@@ -147,6 +147,16 @@ export interface Supervisor {
   /** Send one request. Never hangs: rejects with {@link SidecarRequestError} instead. */
   request<T = unknown>(payload: unknown, opts?: RequestOptions): Promise<T>;
   snapshot(): SupervisorSnapshot;
+  /**
+   * The running child's bearer token, or `null` when nothing is serving.
+   *
+   * Every inference route is gated, so the advertised URL on its own is not a
+   * capability — a client given only the URL gets 401 for everything. This is
+   * the one way out of the process, kept off {@link SupervisorSnapshot} on
+   * purpose so a live credential is never broadcast to listeners, drawn into
+   * the tray, or stringified into a diagnostic.
+   */
+  connectionToken(): string | null;
   /** Subscribe. Returns the unsubscribe. A throwing listener cannot break the supervisor. */
   on(listener: SupervisorListener): () => void;
   /** Stop and release everything. Idempotent. */
@@ -175,6 +185,16 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
   let becameReady = false;
   let readyAtMs = 0;
   let url: string | null = null;
+  /**
+   * The current child's bearer token, in memory only.
+   *
+   * Deliberately NOT on `SupervisorSnapshot`. The snapshot is broadcast to every
+   * listener, rendered into the tray, and stringified whole in diagnostics — any
+   * of which would put a live credential somewhere it outlives the process. It
+   * is reachable only through {@link Supervisor.connectionToken}, whose one
+   * caller hands it straight to the clipboard.
+   */
+  let authToken: string | null = null;
   let health: HealthProbe | null = null;
   let nativeErrors: NativeError[] = [];
   let traceFile: string | null = null;
@@ -408,6 +428,7 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
         return;
       }
       url = message.url;
+      authToken = message.authToken;
       emitState();
       pollUntilServing();
       return;
@@ -433,6 +454,10 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
     // spawn cannot leave the supervisor parked in `starting` forever.
     abortReason = `failed to spawn: ${error.message}`;
     if (child === null) {
+      // `assessExit` only reads `abortReason` when the intent is `abort`, so
+      // without this the synthesised exit is judged as an ordinary early death
+      // and the crash report loses the only line explaining what happened.
+      intent = 'abort';
       onExit({ code: null, signal: null });
       return;
     }
@@ -481,6 +506,10 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
     // but reporting a child that is already gone as running is exactly the kind
     // of lie this component exists to avoid.
     child = null;
+    // The credential dies with the child. Dropped here rather than only on the
+    // next spawn so it is not sitting in memory for however long the supervisor
+    // stays stopped.
+    authToken = null;
     await waitForStdioDrain();
 
     clearGenTimers();
@@ -566,6 +595,9 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
     becameReady = false;
     readyAtMs = 0;
     url = null;
+    // A token belongs to one child. Clearing it here means a copied connect
+    // command cannot silently keep pointing at a generation that is gone.
+    authToken = null;
     health = null;
     nativeErrors = [];
     stderrTail = [];
@@ -573,31 +605,51 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
     stdoutEnded = true;
     stderrEnded = true;
 
-    // A fresh trace file per generation, so `lying` clears when the child does
-    // and a restart is not judged by the previous child's corruption.
-    mkdirSync(opts.traceDir, { recursive: true });
-    traceFile = join(opts.traceDir, `inference-${generation}.trace.log`);
-    watcher = watchTraceFile(traceFile, {
-      intervalMs: timings.tracePollMs,
-      onError: recordSwallowed,
-    });
+    // Everything from here to the transport call can throw SYNCHRONOUSLY, and
+    // an escape leaves the supervisor wedged in `starting` with no child, no
+    // readiness timer (it is armed below, after the call) and a start waiter
+    // nothing can settle — the Start action is then dead for the process's
+    // lifetime. Worse, `spawn()` is also called from the restart timer, where
+    // there is no caller at all and the throw becomes an uncaughtException on
+    // MAIN's event loop.
+    //
+    // `mkdirSync` is the reachable one today: EACCES, EROFS, ENOSPC, or a plain
+    // file sitting at `traceDir` all throw. `utilityProcess.fork` cannot throw
+    // in the shipped configuration, but `nodeChildTransport` — the documented
+    // escape hatch — does, on an ENOTDIR `cwd` or a NUL byte in the env.
+    try {
+      // A fresh trace file per generation, so `lying` clears when the child does
+      // and a restart is not judged by the previous child's corruption.
+      mkdirSync(opts.traceDir, { recursive: true });
+      traceFile = join(opts.traceDir, `inference-${generation}.trace.log`);
+      watcher = watchTraceFile(traceFile, {
+        intervalMs: timings.tracePollMs,
+        onError: recordSwallowed,
+      });
 
-    setLifecycle('starting');
+      setLifecycle('starting');
 
-    child = opts.transport(
-      {
-        modulePath: opts.entry,
-        args: opts.args ?? [],
-        env: buildChildEnv({
-          baseEnv,
-          enginePolicyEnv: opts.enginePolicyEnv ?? {},
-          ...(opts.env !== undefined ? { overrides: opts.env } : {}),
-          traceFile,
-        }),
-        ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
-      },
-      { onMessage, onExit, onError },
-    );
+      child = opts.transport(
+        {
+          modulePath: opts.entry,
+          args: opts.args ?? [],
+          env: buildChildEnv({
+            baseEnv,
+            enginePolicyEnv: opts.enginePolicyEnv ?? {},
+            ...(opts.env !== undefined ? { overrides: opts.env } : {}),
+            traceFile,
+          }),
+          ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+        },
+        { onMessage, onExit, onError },
+      );
+    } catch (error) {
+      // Route it through the same path a failed spawn already takes, so the
+      // restart budget, the crash report and the start waiters all see it.
+      child = null;
+      onError(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
 
     attachLineReader(child.stdout, 'stdout');
     attachLineReader(child.stderr, 'stderr');
@@ -646,6 +698,14 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
       // Nothing to kill: either never started, already dead, or parked in the
       // restart backoff whose timer we just cancelled.
       if (lifecycle !== 'stopped') setLifecycle('stopped');
+      // A `start()` from before the backoff is still pending here, and the
+      // contract on `start()` says it rejects when stopped before it becomes
+      // ready. Without this it never settles: the caller hangs forever, and if
+      // a later generation does reach ready, `markReady` resolves the
+      // cancelled start too — reporting success for a start the user stopped.
+      // `restart()` is safe because it awaits `stop()` before creating its own
+      // waiter.
+      rejectStartWaiters(new Error('inference sidecar stopped before it became ready'));
       return Promise.resolve();
     }
     const waiter = new Promise<void>((resolve) => {
@@ -693,6 +753,11 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
       });
     },
     snapshot,
+    // Gated on the lifecycle as well as the field: `running` is the only state
+    // in which there is something on the other end to authenticate against, and
+    // handing back a token for anything else invites a connect command that
+    // looks valid and is not.
+    connectionToken: () => (lifecycle === 'running' ? authToken : null),
     on(listener: SupervisorListener): () => void {
       listeners.add(listener);
       return () => listeners.delete(listener);

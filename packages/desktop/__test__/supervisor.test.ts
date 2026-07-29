@@ -10,7 +10,7 @@
  * `utilityProcess` delivers them.
  */
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -353,6 +353,118 @@ describe('restart budget', () => {
     expect(supervisor.snapshot().state).toBe('stopped');
     await sleep(700);
     expect(supervisor.snapshot()).toMatchObject({ state: 'stopped', generation: 1 });
+  });
+
+  /**
+   * The test above is deliberately not enough. It voids the start promise, so it
+   * passes while leaving that promise pending forever — `stop()` on the
+   * `child === null` branch used to return without settling the waiters at all.
+   *
+   * `start()` documents that it "rejects if the supervisor gives up, or if it is
+   * stopped before it gets there", and the branch that runs during restart
+   * backoff was the one place that broke it.
+   */
+  it('rejects a start that was still pending when stop() landed mid-backoff', async () => {
+    const { supervisor } = makeSupervisor({ mode: 'crash-now', restart: { baseDelayMs: 500 } });
+    const starting = supervisor.start();
+    // Nothing may observe it before the assertion; an unhandled rejection would
+    // fail the run on its own terms rather than on this test's.
+    starting.catch(() => {});
+
+    await waitFor(supervisor, (s) => s.state === 'restarting', 'the backoff');
+    await supervisor.stop();
+
+    // `settleWithin` races on resolution, so a rejecting promise has to be
+    // folded to a resolution first — otherwise the helper rethrows and the test
+    // fails for the very outcome it is asserting.
+    expect(
+      await settleWithin(
+        starting.catch(() => undefined),
+        500,
+      ),
+    ).toBe('settled');
+    await expect(starting).rejects.toThrow(/stopped before it became ready/);
+  });
+
+  /**
+   * The sharper half of the same bug. A start waiter left pending is not just a
+   * hang: if a LATER generation reaches ready, `markReady` resolves it too, so a
+   * start the user explicitly stopped reports success — attributed to a
+   * different child than the one it asked for.
+   */
+  it('does not resolve a stopped start when a later generation becomes ready', async () => {
+    const { supervisor } = makeSupervisor({ mode: 'crash-now', restart: { baseDelayMs: 500 } });
+    const cancelled = supervisor.start();
+    cancelled.catch(() => {});
+
+    await waitFor(supervisor, (s) => s.state === 'restarting', 'the backoff');
+    await supervisor.stop();
+    await expect(cancelled).rejects.toThrow();
+
+    // A healthy child this time. The cancelled promise must stay rejected.
+    const { supervisor: healthy } = makeSupervisor({});
+    await healthy.start();
+    expect(healthy.snapshot().state).toBe('running');
+    await expect(cancelled).rejects.toThrow(/stopped before it became ready/);
+  });
+});
+
+describe('the connection token', () => {
+  /**
+   * The token is what makes the advertised URL usable at all: every inference
+   * route is gated, so a client handed only the URL gets 401 for everything. It
+   * rides the ready handshake and is reachable only through this accessor.
+   */
+  it('is available once serving and never appears in the snapshot', async () => {
+    const { supervisor } = makeSupervisor();
+    expect(supervisor.connectionToken()).toBeNull();
+
+    await supervisor.start();
+    expect(supervisor.connectionToken()).toBe('fixture-token');
+
+    // A live credential must not ride the snapshot: it is broadcast to every
+    // listener, drawn into the tray, and stringified whole in diagnostics.
+    expect(JSON.stringify(supervisor.snapshot())).not.toContain('fixture-token');
+  });
+
+  it('is cleared when the child goes away', async () => {
+    const { supervisor } = makeSupervisor();
+    await supervisor.start();
+    expect(supervisor.connectionToken()).toBe('fixture-token');
+
+    await supervisor.stop();
+    // Stale would be worse than absent: a copied connect command that still
+    // looks valid but authenticates against a process that no longer exists.
+    expect(supervisor.connectionToken()).toBeNull();
+  });
+});
+
+describe('a spawn that throws synchronously', () => {
+  /**
+   * `spawn()` sets `starting` and then does real work — `mkdirSync(traceDir)`,
+   * then the transport call — none of which was guarded. A throw escaped past
+   * `start()`'s own `.catch` (a synchronous throw is not a rejection), left the
+   * lifecycle wedged in `starting` with no child and no readiness timer, and
+   * from the restart timer became an uncaughtException on MAIN's event loop.
+   *
+   * `mkdirSync` is the reachable one: a plain file sitting where `traceDir`
+   * should be is enough, no stub transport required.
+   */
+  it('reports a failed spawn instead of throwing out of start()', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mlx-supervisor-trace-'));
+    // A FILE where the trace directory has to be: mkdirSync throws EEXIST.
+    writeFileSync(join(dir, 'trace'), 'not a directory');
+
+    const { supervisor } = makeSupervisor({ traceDir: join(dir, 'trace') } as HarnessOptions);
+
+    await expect(supervisor.start()).rejects.toThrow();
+    expect(supervisor.snapshot().state).not.toBe('starting');
+    // The reason has to survive: `assessExit` only reads `abortReason` when the
+    // intent is `abort`, so without that the crash report loses the one line
+    // that explains what happened.
+    expect(supervisor.snapshot().lastExit?.reason ?? '').toContain('failed to spawn');
+
+    rmSync(dir, { recursive: true, force: true });
   });
 });
 

@@ -240,6 +240,17 @@ export interface SidecarDeps {
   /** Build the real host. Rejecting here is fatal — see {@link runSidecar}. */
   createHost(): Promise<SidecarHost>;
   /**
+   * The bearer token `createHost` was configured with.
+   *
+   * It travels with the ready handshake because the URL alone is not a
+   * capability any more: every inference route is gated, so a client handed
+   * only the URL gets 401 for everything. MAIN keeps it in memory to hand to
+   * whoever the user points at this server — it is never written to disk, never
+   * logged, and deliberately still absent from the `info` reply, which is the
+   * one sidecar response the supervisor stores per generation.
+   */
+  authToken: string;
+  /**
    * Register the graceful-stop handler. `utilityProcess.kill()` is SIGTERM on
    * POSIX and takes no argument, so SIGTERM is the only stop signal that reaches
    * a sidecar in production; the entry also wires SIGINT so a hand-run
@@ -345,7 +356,7 @@ export async function runSidecar(deps: SidecarDeps): Promise<void> {
   // `server.address().port` — the socket's own answer — and the supervisor polls
   // `/health` on exactly what arrives here, so any adjustment made in passing
   // would point the readiness probe at a port nothing is listening on.
-  channel.post({ kind: 'mlx:ready', url: started.url });
+  channel.post({ kind: 'mlx:ready', url: started.url, authToken: deps.authToken });
 }
 
 /** `SupervisorToChild`, parsed rather than cast. Anything else is ignored. */

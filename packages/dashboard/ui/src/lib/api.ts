@@ -16,6 +16,7 @@
 import type { DownloadEvent } from '../../../src/download.js';
 import { createRpcClient, type RpcClient, type RpcClientOptions } from '../../../src/rpc/client.js';
 import type { RpcPort } from '../../../src/rpc/port.js';
+import { bumpConnectionGeneration } from './connection';
 import { clearCache } from './json-cache';
 
 /**
@@ -59,6 +60,9 @@ export function connectDashboardApi(port: RpcPort, opts?: RpcClientOptions): voi
   // a test — so anything held from before it is not stale, it is about
   // something else entirely.
   clearCache();
+  // `clearCache` only reaches future mounts. This is what tells the hooks
+  // already on screen that they are bound to a runtime that no longer exists.
+  bumpConnectionGeneration();
   client = createRpcClient(port, opts);
 }
 

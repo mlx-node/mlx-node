@@ -262,9 +262,9 @@ describe('parseMachOPaths', () => {
     // The other half of the same rule: a path that says nothing about Mach-O
     // must still be picked up when the DESCRIPTION does. Without this, testing
     // only the path would pass the assertion above for the wrong reason.
-    expect(parseMachOPaths('Contents/Resources/native/addon.node: Mach-O 64-bit dynamically linked shared library arm64\n')).toStrictEqual([
-      'Contents/Resources/native/addon.node',
-    ]);
+    expect(
+      parseMachOPaths('Contents/Resources/native/addon.node: Mach-O 64-bit dynamically linked shared library arm64\n'),
+    ).toStrictEqual(['Contents/Resources/native/addon.node']);
   });
 
   it('ignores lines that are not Mach-O, and lines with no colon at all', () => {

@@ -42,6 +42,14 @@ export interface TrayPresentation {
   canStop: boolean;
   canRestart: boolean;
   /**
+   * Whether there is a live endpoint to hand another client.
+   *
+   * Only in `running`: the token belongs to one child and is cleared on every
+   * respawn, so offering the copy while restarting would put a command on the
+   * clipboard that is already stale. `starting` has a URL but no token yet.
+   */
+  canCopyConnect: boolean;
+  /**
    * Always true, and stated here rather than hard-coded in `tray.ts` so the rule
    * is one a test can hold: Admin is where the crash reason, the trace file and
    * the logs are, so the moments it is most needed are exactly the ones where
@@ -87,6 +95,7 @@ export function presentTray(snapshot: SupervisorSnapshot): TrayPresentation {
     canStop: isLive(snapshot.state),
     canRestart: isLive(snapshot.state),
     canOpenAdmin: true,
+    canCopyConnect: snapshot.state === 'running' && snapshot.url !== null,
     tooltip: detail === null ? `mlx-node — ${statusLabel}` : `mlx-node — ${statusLabel}\n${detail}`,
   };
 }
@@ -168,4 +177,22 @@ function describe(snapshot: SupervisorSnapshot): Described {
       };
     }
   }
+}
+
+/**
+ * A ready-to-paste shell command pointing a client at this server.
+ *
+ * Environment variables rather than a URL query string: a token in a query
+ * string ends up in referrers, proxy logs and shell history as part of the URL
+ * itself. `ANTHROPIC_AUTH_TOKEN` is sent as a header by the client, which is
+ * also the only form the server's gate accepts.
+ *
+ * Single-quoted with embedded quotes escaped, so a token containing shell
+ * metacharacters cannot turn a paste into something else. base64url tokens
+ * never contain a quote today; relying on that would make this fragile the day
+ * the token format changes.
+ */
+export function connectCommand(url: string, token: string): string {
+  const quote = (value: string): string => `'${value.replaceAll("'", String.raw`'\''`)}'`;
+  return `ANTHROPIC_BASE_URL=${quote(url)} ANTHROPIC_AUTH_TOKEN=${quote(token)} claude`;
 }

@@ -17,7 +17,7 @@
  */
 
 import { engineEnvFor, LAUNCHER_ENGINE_POLICY } from '@mlx-node/server/host/env-policy';
-import { app, Menu, screen, type MenuItemConstructorOptions, type WebContents } from 'electron';
+import { app, clipboard, Menu, screen, type MenuItemConstructorOptions, type WebContents } from 'electron';
 
 import { electronBrokerDeps } from './admin-child.js';
 import { createAdminBroker, type AdminBroker } from './broker.js';
@@ -34,6 +34,7 @@ import {
 } from './settings.js';
 import { utilityChildTransport } from './supervisor/child-utility.js';
 import { createSupervisor, type Supervisor } from './supervisor/index.js';
+import { connectCommand } from './tray-view.js';
 import { createTray, type TrayController } from './tray.js';
 import { createAdminWindowManager, type AdminWindowManager } from './window.js';
 
@@ -52,6 +53,8 @@ let paths: AppPaths | null = null;
 let settings: DesktopSettings = DEFAULT_SETTINGS;
 let saveTimer: NodeJS.Timeout | null = null;
 let saveDirty = false;
+/** Tail of the settings-write queue. One writer at a time — see `flushSettings`. */
+let saveInFlight: Promise<void> = Promise.resolve();
 
 let supervisor: Supervisor | null = null;
 let tray: TrayController | null = null;
@@ -94,10 +97,22 @@ function wire(): void {
   // so awaiting `ready` at module scope waits on an event that cannot fire until
   // the await returns. Verified on Electron 43.2.0 — the process hangs with no
   // output and has to be SIGTERMed. The `void` is deliberate.
-  void app.whenReady().then(bootstrap, (error: unknown) => {
-    console.error('[mlx] failed to start:', error);
-    app.exit(1);
-  });
+  //
+  // `.then(bootstrap).catch(…)`, NOT `.then(bootstrap, onRejected)`. The
+  // two-argument form only observes a rejection from `whenReady()` itself —
+  // which is resolve-only, so that handler could never run — and lets every
+  // fault inside `bootstrap` escape as an unhandled rejection. Electron's
+  // default handler shows a dialog and does NOT exit, so a bootstrap that
+  // threw before the tray existed left an invisible process only Activity
+  // Monitor could kill. `.then(bootstrap)` adopts bootstrap's promise, so the
+  // `.catch` sees faults from both.
+  void app
+    .whenReady()
+    .then(bootstrap)
+    .catch((error: unknown) => {
+      console.error('[mlx] failed to start:', error);
+      app.exit(1);
+    });
 
   app.on('second-instance', () => {
     admin?.show();
@@ -266,6 +281,15 @@ async function bootstrap(): Promise<void> {
       restartInference: () => {
         void supervisor?.restart().catch(reportInferenceFailure);
       },
+      copyConnectCommand: () => {
+        const endpoint = supervisor?.snapshot().url;
+        const token = supervisor?.connectionToken();
+        // The menu item is disabled unless running, but a crash between the
+        // render and the click is entirely possible — and half a command on the
+        // clipboard is worse than none.
+        if (endpoint === undefined || endpoint === null || token === undefined || token === null) return;
+        clipboard.writeText(connectCommand(endpoint, token));
+      },
       setShowInDock: (next: boolean) => {
         settings = { ...settings, showInDock: next };
         applyDockPolicy(next);
@@ -330,16 +354,37 @@ function scheduleSave(): void {
   saveTimer.unref();
 }
 
-async function flushSettings(): Promise<void> {
-  if (!saveDirty || paths === null) return;
+/**
+ * Flush pending settings, serialized against any write already in flight.
+ *
+ * Two writes must never overlap: `saveSettings` names its temp file after the
+ * pid alone, so a second concurrent write reuses the same path and the loser's
+ * `rename` fails ENOENT. Measured over 300 rounds of two overlapping saves,
+ * that produced a spurious "could not save settings" every time and silently
+ * kept the OLDER value 2.5% of the time.
+ *
+ * Returning `saveInFlight` when there is nothing new is what lets `shutdown()`
+ * await a write the debounce timer started microseconds earlier — the timer
+ * clears `saveDirty` before its I/O, so a plain early return told shutdown the
+ * work was done while it was still in the syscall.
+ */
+function flushSettings(): Promise<void> {
+  if (!saveDirty || paths === null) return saveInFlight;
   saveDirty = false;
-  try {
-    await saveSettings(paths.settingsFile, settings);
-  } catch (error) {
-    // A settings write that fails is a lost preference, not a reason to refuse
-    // to quit.
-    console.error('[mlx] could not save settings:', error);
-  }
+  const file = paths.settingsFile;
+  // Snapshot: the queued write must persist what made it dirty, not whatever
+  // `settings` happens to hold once the queue reaches it.
+  const snapshot = settings;
+  saveInFlight = saveInFlight.then(async () => {
+    try {
+      await saveSettings(file, snapshot);
+    } catch (error) {
+      // A settings write that fails is a lost preference, not a reason to
+      // refuse to quit.
+      console.error('[mlx] could not save settings:', error);
+    }
+  });
+  return saveInFlight;
 }
 
 async function shutdown(): Promise<void> {

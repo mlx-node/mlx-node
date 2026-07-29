@@ -43,9 +43,14 @@ const channel = (() => {
   }
 })();
 
+// Hoisted so the token the host is gated with is the same one the handshake
+// carries. Calling `sidecarHostOptions()` twice would mint two.
+const hostOptions = sidecarHostOptions();
+
 void runSidecar({
   channel,
-  createHost: () => createInferenceHost(sidecarHostOptions()),
+  createHost: () => createInferenceHost(hostOptions),
+  authToken: hostOptions.authToken,
   onStopSignal: (handler) => {
     // SIGTERM is what `utilityProcess.kill()` sends and the only stop signal
     // production ever produces. SIGINT is here for the hand-run reproduction

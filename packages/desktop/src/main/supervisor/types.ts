@@ -114,14 +114,15 @@ export type SupervisorToChild = { kind: 'mlx:request'; id: number; payload: unkn
 
 /** Sidecar → supervisor. */
 export type ChildToSupervisor =
-  | { kind: 'mlx:ready'; url: string }
+  | { kind: 'mlx:ready'; url: string; authToken: string }
   | { kind: 'mlx:response'; id: number; ok: true; value: unknown }
   | { kind: 'mlx:response'; id: number; ok: false; error: string };
 
 /**
  * The contract the sidecar entry module must satisfy:
  *
- *  1. post `{ kind: 'mlx:ready', url }` once its HTTP server is listening, with
+ *  1. post `{ kind: 'mlx:ready', url, authToken }` once its HTTP server is
+ *     listening, with
  *     the port it ACTUALLY bound — the supervisor does not pre-assign one,
  *     because `pickFreePort` is racy by its own documentation and the child's
  *     bound socket is the only authority;
@@ -137,7 +138,8 @@ export function parseChildMessage(message: unknown): ChildToSupervisor | null {
   if (typeof message !== 'object' || message === null) return null;
   const record = message as Record<string, unknown>;
   if (record.kind === 'mlx:ready') {
-    return typeof record.url === 'string' ? { kind: 'mlx:ready', url: record.url } : null;
+    if (typeof record.url !== 'string' || typeof record.authToken !== 'string') return null;
+    return { kind: 'mlx:ready', url: record.url, authToken: record.authToken };
   }
   if (record.kind === 'mlx:response') {
     if (typeof record.id !== 'number') return null;

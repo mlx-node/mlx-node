@@ -41,7 +41,7 @@ if (MODE === 'no-ready') {
   // Alive, listening to nothing, announcing nothing.
   setInterval(() => {}, 60_000);
 } else if (MODE === 'remote-url') {
-  post({ kind: 'mlx:ready', url: 'http://example.com:8080' });
+  post({ kind: 'mlx:ready', url: 'http://example.com:8080', authToken: 'fixture-token' });
   setInterval(() => {}, 60_000);
 } else {
   const status = process.env.MLX_TEST_HEALTH ?? 'ok';
@@ -70,7 +70,7 @@ if (MODE === 'no-ready') {
     res.writeHead(404).end();
   });
   server.listen(0, '127.0.0.1', () => {
-    post({ kind: 'mlx:ready', url: `http://127.0.0.1:${server.address().port}` });
+    post({ kind: 'mlx:ready', url: `http://127.0.0.1:${server.address().port}`, authToken: 'fixture-token' });
   });
 
   if (MODE !== 'ignore-sigterm') {

@@ -29,6 +29,9 @@ import {
   type SidecarHost,
 } from '../src/inference/sidecar.js';
 
+/** Stand-in for the per-process CSPRNG token the real entry mints. */
+const TEST_AUTH_TOKEN = 'test-sidecar-token';
+
 const servers: Server[] = [];
 
 afterEach(async () => {
@@ -106,6 +109,7 @@ function harness(createHost: () => Promise<SidecarHost>): Harness {
     deps: {
       channel,
       createHost,
+      authToken: TEST_AUTH_TOKEN,
       onStopSignal: (handler) => {
         stopHandler = handler;
       },

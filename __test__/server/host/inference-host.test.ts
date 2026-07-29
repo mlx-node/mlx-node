@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -83,6 +84,30 @@ async function start(opts: InferenceHostOptions): Promise<InferenceHost> {
   });
   hosts.push(host);
   return host;
+}
+
+/** A port nothing is listening on, released before it is handed back. */
+async function pickFreePort(): Promise<number> {
+  const probe = createNetServer();
+  const port = await new Promise<number>((resolve, reject) => {
+    probe.on('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const address = probe.address();
+      resolve(address !== null && typeof address === 'object' ? address.port : 0);
+    });
+  });
+  await new Promise<void>((resolve) => probe.close(() => resolve()));
+  return port;
+}
+
+/** Resolves if `port` can be bound; rejects EADDRINUSE if something holds it. */
+async function bindThenRelease(port: number): Promise<void> {
+  const probe = createNetServer();
+  await new Promise<void>((resolve, reject) => {
+    probe.on('error', reject);
+    probe.listen(port, '127.0.0.1', () => resolve());
+  });
+  await new Promise<void>((resolve) => probe.close(() => resolve()));
 }
 
 /** Temp roots this process' host machinery owns, by the pid-scoped name. */
@@ -169,6 +194,40 @@ describe('createInferenceHost — binding and health', () => {
     expect((await fetch(url)).status).toBe(200);
     await host.close({ timeoutMs: 0 });
     await expect(fetch(url)).rejects.toThrow();
+  });
+
+  /**
+   * The socket is bound and the controller is wired several statements before
+   * `attachLogger` runs, and `attachLogger` opens with a synchronous `mkdirSync`
+   * that throws on an unwritable `--log-dir`. Without rollback the rejection
+   * strands a fully working inference endpoint that no one holds a handle to:
+   * `createInferenceHost` never returned, so the only `close()` is unreachable.
+   *
+   * An explicit port is the whole point — with `port: 0` the kernel picks one,
+   * nothing reports it back on the failure path, and the leak is unobservable.
+   */
+  it('releases the bound port when attachLogger throws', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    const port = await pickFreePort();
+
+    await expect(
+      createInferenceHost({
+        modelsDir,
+        port,
+        disableStore: true,
+        sweepOrphanTempRoots: false,
+        loadModel: async () => fakeModel(),
+        logDir: join(tmpdir(), 'mlx-host-logdir-never-created'),
+        attachLogger: () => {
+          throw new Error('mkdirSync failed: EACCES');
+        },
+      }),
+      // The ORIGINAL failure, not a secondary error from the rollback itself.
+    ).rejects.toThrow('mkdirSync failed: EACCES');
+
+    // The real assertion: the port is genuinely free again. Re-binding it would
+    // fail EADDRINUSE if the rollback had not closed the server.
+    await expect(bindThenRelease(port)).resolves.toBeUndefined();
   });
 });
 
