@@ -797,12 +797,21 @@ async fn lfm2_paged_vs_flat_prefix_reuse_parity() {
 /// byte ramble. Measured spans on this checkpoint: `raw_text` 501-1817 B
 /// against a 77-125 B answer, i.e. up to 23x more text to match by accident.
 ///
-/// So: assert against the span AFTER the final `</think>`, which is the answer
-/// the model actually commits to, and fall back to the whole decode only when
-/// that span is empty — which is exactly branches (A) and (B) above, where
-/// there is no committed answer to read and the verbatim decode is all the
-/// evidence that exists. `raw_text` is empty ONLY when `num_tokens == 0`,
-/// which IS a real failure and stays fatal.
+/// So: assert against the span after `</think>`, which is the answer the model
+/// actually commits to, and fall back to the whole decode only when that span
+/// is empty — which is exactly branches (A) and (B) above, where there is no
+/// committed answer to read and the verbatim decode is all the evidence that
+/// exists. `raw_text` is empty ONLY when `num_tokens == 0`, which IS a real
+/// failure and stays fatal.
+///
+/// FIRST occurrence, matching the engine rather than inventing a second rule.
+/// `finalize.rs:171` ("keep everything after the FIRST occurrence verbatim")
+/// and `tools/mod.rs:990-992` both use `find` and both say why: `</think>` is
+/// a special token, so the first text match is the real boundary, and content
+/// after it may mention `</think>` literally — on which `rfind` splits at the
+/// later occurrence and throws the answer away. A test helper that split at
+/// the last one would assert against a boundary the product never uses, and
+/// would fail on a correct answer that quotes the tag.
 ///
 /// Measured on real weights (all five probe call sites, one run): every turn
 /// emitted a literal `</think>` with a 77-125 B answer after it, and every
@@ -811,7 +820,7 @@ async fn lfm2_paged_vs_flat_prefix_reuse_parity() {
 /// not fire. See [`answer_surface_prefers_the_committed_answer`] for the
 /// masking case this closes.
 fn answer_surface(r: &mlx_core::engine::types::ChatResult) -> &str {
-    match r.raw_text.rsplit_once("</think>") {
+    match r.raw_text.split_once("</think>") {
         Some((_, after)) if !after.trim().is_empty() => after,
         _ => &r.raw_text,
     }
@@ -880,12 +889,21 @@ fn answer_surface_prefers_the_committed_answer() {
     let empty_tail = with_raw("<think> the sum is 18</think>\n  \n");
     assert_eq!(answer_surface(&empty_tail), empty_tail.raw_text);
 
-    // A `<think>` that reopens: the LAST close is the one that bounds the
-    // answer. `rsplit_once` is what makes this hold — `split_once` would take
-    // the first close and hand back the second think block as the "answer".
-    let reopened =
-        with_raw("<think> 18</think> draft\n<think> on reflection, 31</think>\n\nAnswer: 31");
-    assert_eq!(answer_surface(&reopened).trim(), "Answer: 31");
+    // The FIRST close is the boundary, matching `finalize.rs:171` and
+    // `tools/mod.rs:990-992`. The engine's own stated reason is that committed
+    // content may mention `</think>` literally; splitting at the last one then
+    // discards the answer and fails a correct turn — the exact flake class this
+    // file exists to remove. `split_once` is what makes this hold.
+    let quotes_the_tag = with_raw(
+        "<think> 7 + 11</think>\n\nThe sum is 18. Everything before the </think> marker was \
+         scratch work.",
+    );
+    assert!(
+        answer_surface(&quotes_the_tag).contains("18"),
+        "answer_surface split at a `</think>` the model QUOTED inside its answer and threw the \
+         answer away: {:?}",
+        answer_surface(&quotes_the_tag),
+    );
 
     // `num_tokens == 0` stays fatal by being empty rather than by panicking
     // here: an empty surface fails every `.contains` at the call site.
