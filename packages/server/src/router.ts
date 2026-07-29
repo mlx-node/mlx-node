@@ -136,6 +136,7 @@ export async function routeRequest(
       responseRetentionSec,
       idleSweeper,
       modelWorkCoordinator,
+      resolveModel,
     );
     return;
   }

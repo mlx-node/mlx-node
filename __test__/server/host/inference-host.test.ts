@@ -231,6 +231,105 @@ describe('createInferenceHost — binding and health', () => {
   });
 });
 
+/**
+ * Nothing is resident at boot — `createInferenceHost` only DISCOVERS. The first
+ * request that names a model is what loads it, which is the contract `mlx serve`
+ * documents ("lazily loads a model on the first request that names one") and the
+ * only reason the host can return before a 27 GB materialization.
+ *
+ * That hook reached the Anthropic endpoints and not the OpenAI one, so the very
+ * first `/v1/responses` 404'd against a `/v1/models` list that advertised the
+ * model — and for a client id that only exists as an alias, it 404'd forever.
+ */
+describe('createInferenceHost — lazy load on the first request', () => {
+  /** Counts loads and answers with a stand-in; no weights are ever read. */
+  function countingHost(): {
+    loads: string[];
+    start: (over?: Partial<InferenceHostOptions>) => Promise<InferenceHost>;
+  } {
+    const loads: string[] = [];
+    return {
+      loads,
+      start: async (over = {}) => {
+        const modelsDir = await makeModelsDir(['alpha', 'beta']);
+        return start({
+          modelsDir,
+          model: 'beta',
+          loadModel: async (path: string) => {
+            loads.push(path);
+            return fakeModel();
+          },
+          ...over,
+        });
+      },
+    };
+  }
+
+  /**
+   * A fake model has no `resetCaches`, so a resolved request dies later in
+   * dispatch with a 500. That is the point: 404 means the name was never
+   * resolved, anything else means the lazy hook ran. Asserting "not 404" alone
+   * would be too weak, so the load count and the registry are checked too.
+   */
+  async function post(host: InferenceHost, path: string, model: string): Promise<{ status: number; body: string }> {
+    const res = await fetch(`${host.url}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model, input: 'hi', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }),
+    });
+    return { status: res.status, body: await res.text() };
+  }
+
+  it('resolves the bound model for a first-ever POST /v1/responses', async () => {
+    const { loads, start: startHost } = countingHost();
+    const host = await startHost();
+    expect(host.server.registry.list()).toHaveLength(0);
+
+    const res = await post(host, '/v1/responses', 'beta');
+
+    expect(res.status).not.toBe(404);
+    expect(res.body).not.toContain('not_found_error');
+    expect(loads).toHaveLength(1);
+    expect(host.server.registry.get('beta')).toBeDefined();
+  });
+
+  // The half a "preload the bound model at boot" fix would not cover.
+  it('resolves a discovered model that is not the bound one', async () => {
+    const { loads, start: startHost } = countingHost();
+    const host = await startHost();
+
+    const res = await post(host, '/v1/responses', 'alpha');
+
+    expect(res.status).not.toBe(404);
+    expect(loads).toHaveLength(1);
+    expect(host.server.registry.get('alpha')).toBeDefined();
+  });
+
+  // An OpenAI/Codex client names an id that exists nowhere on disk. The resolver
+  // aliases it onto the resident model; without it this 404s forever, not just
+  // on the first request.
+  it('aliases an unknown client model id, as the Anthropic path does', async () => {
+    const { start: startHost } = countingHost();
+    const host = await startHost();
+
+    const viaResponses = await post(host, '/v1/responses', 'gpt-5-codex');
+    expect(viaResponses.status).not.toBe(404);
+    expect(host.server.registry.get('gpt-5-codex')).toBeDefined();
+  });
+
+  // The control: the Anthropic path already behaved. If this ever regresses the
+  // comparison above stops meaning anything.
+  it('still resolves for POST /v1/messages', async () => {
+    const { loads, start: startHost } = countingHost();
+    const host = await startHost();
+
+    const res = await post(host, '/v1/messages', 'beta');
+
+    expect(res.status).not.toBe(404);
+    expect(loads).toHaveLength(1);
+  });
+});
+
 describe('createInferenceHost — a network-reachable bind must be gated', () => {
   /**
    * Every route but the `/health` carve-out runs inference, so an

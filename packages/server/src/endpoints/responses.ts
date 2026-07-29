@@ -1691,6 +1691,8 @@ export async function handleCreateResponse(
   responseRetentionSec?: number,
   idleSweeper?: IdleSweeper | null,
   modelWorkCoordinator?: ModelWorkCoordinator,
+  /** Lazy-load hook. See the call site below and `ServerConfig.resolveModel`. */
+  resolveModel?: (name: string) => Promise<void>,
 ): Promise<void> {
   const handlerStartedAt = Date.now();
 
@@ -1765,6 +1767,37 @@ export async function handleCreateResponse(
     }
   }
   const effectiveRetentionSec = requestedRetentionSec ?? responseRetentionSec;
+
+  // Lazy load, exactly as the Anthropic endpoints do. Nothing is resident at
+  // boot — `createInferenceHost` only discovers — so without this the very
+  // first `/v1/responses` 404s against a `/v1/models` list that advertises the
+  // model, and a client id that exists only as an alias 404s forever.
+  //
+  // Placement is pinned on both sides. AFTER the pure validation above, so a
+  // 400 cannot burn a 30 s load or evict the resident model. BEFORE
+  // `registry.get` below, and therefore before the dispatch lease, which needs
+  // a registered name.
+  if (resolveModel) {
+    // Errors serialize through the OpenAI envelope here. Letting them reach
+    // the outer `createHandler` catch would be right for this endpoint by
+    // accident and wrong for the Anthropic one — `messages.ts` has the mirror
+    // of this note for the opposite reason.
+    try {
+      // Suspension OUTSIDE the writer lock, per `load-model.ts`: a load that
+      // parks in `acquireWrite()` must already be covered, or the drain timer
+      // armed by the previous request fires mid-materialization. `messages.ts`
+      // nests these the other way round, which is safe only because
+      // `withSuspendedDrains` is a counter rather than a mutex.
+      const load = (): Promise<void> =>
+        modelWorkCoordinator
+          ? modelWorkCoordinator.withModelLoad(() => resolveModel(body.model), 'responses')
+          : resolveModel(body.model);
+      await (idleSweeper ? idleSweeper.withSuspendedDrains(load) : load());
+    } catch (err) {
+      sendInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
+      return;
+    }
+  }
 
   // Look up model
   const model = registry.get(body.model);
