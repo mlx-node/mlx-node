@@ -1,0 +1,73 @@
+import { readFile, rename, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
+/**
+ * Filename of the completion marker written after a successful download.
+ * MUST stay byte-identical to the dashboard's marker constant
+ * (`packages/dashboard/src/models.ts` `DOWNLOAD_COMPLETE_MARKER`): both tools
+ * read and write the same file so each recognizes the other's installs. The
+ * CLI must not import the dashboard package, so the value is duplicated and a
+ * contract test (`__test__/cli/download-marker.test.ts`) pins the two together.
+ */
+export const DOWNLOAD_COMPLETE_MARKER = '.mlx-download-complete.json';
+
+/** Contents of {@link DOWNLOAD_COMPLETE_MARKER}: the pinned snapshot a dir holds. */
+export interface DownloadCompletion {
+  /** HuggingFace repo the checkpoint came from. */
+  repo: string;
+  /** The exact commit sha the whole download was pinned to (one snapshot). */
+  revision: string;
+  /** Repo-relative paths of every file this tool downloaded or verified. */
+  files: string[];
+  /** ISO timestamp of the last successful download/sync. */
+  completedAt: string;
+}
+
+/**
+ * Parse the completion marker in `dir`, or `null` when absent or invalid in
+ * any way. Never throws: a corrupt marker must degrade to "no marker" (a sync
+ * pass), not crash the download command.
+ */
+export async function readCompletion(dir: string): Promise<DownloadCompletion | null> {
+  let raw: string;
+  try {
+    raw = await readFile(join(dir, DOWNLOAD_COMPLETE_MARKER), 'utf8');
+  } catch {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object') return null;
+  const marker = parsed as Record<string, unknown>;
+  if (
+    typeof marker.repo !== 'string' ||
+    typeof marker.revision !== 'string' ||
+    typeof marker.completedAt !== 'string' ||
+    !Array.isArray(marker.files) ||
+    !marker.files.every((file) => typeof file === 'string')
+  ) {
+    return null;
+  }
+  return {
+    repo: marker.repo,
+    revision: marker.revision,
+    files: marker.files as string[],
+    completedAt: marker.completedAt,
+  };
+}
+
+/**
+ * Write the marker atomically (temp file + rename in the same directory), so
+ * a crash mid-write can never leave a truncated marker that would then parse
+ * as garbage on the next run.
+ */
+export async function writeCompletion(dir: string, completion: DownloadCompletion): Promise<void> {
+  const finalPath = join(dir, DOWNLOAD_COMPLETE_MARKER);
+  const tmpPath = `${finalPath}.tmp`;
+  await writeFile(tmpPath, `${JSON.stringify(completion, null, 2)}\n`);
+  await rename(tmpPath, finalPath);
+}
