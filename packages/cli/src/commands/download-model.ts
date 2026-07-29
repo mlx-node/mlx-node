@@ -18,20 +18,77 @@ const MAX_FETCH_ATTEMPTS = 4;
 /** Base backoff; attempt N waits `BASE << (N - 1)` ms (1s, 2s, 4s). */
 const RETRY_BASE_MS = 1_000;
 
+/** Node errno values no retry can fix: the LOCAL filesystem said no. */
+const PERMANENT_FS_CODES = new Set([
+  'ENOSPC', // disk full
+  'EDQUOT', // over quota
+  'EACCES', // not permitted
+  'EPERM',
+  'EROFS', // read-only filesystem
+  'EISDIR',
+  'ENOTDIR',
+  'ENAMETOOLONG',
+  'EFBIG',
+  'EXDEV',
+]);
+
 /**
- * Whether a failed fetch is worth repeating.
+ * A hub error flattened to text; see {@link isRetriableFetchError}.
+ */
+const FLATTENED_STATUS = /^Api error with status (\d{3})\b/;
+
+function isRetriableStatus(status: number): boolean {
+  return status >= 500 || status === 429;
+}
+
+/**
+ * Whether a failed download step is worth repeating.
  *
- * Retries a SERVER's admission that it failed (5xx) and an explicit rate limit
- * (429), plus a transport error, which surfaces with no status at all. Anything
- * else — 401/403 (no token, or no access to a gated repo), 404 (wrong repo or
- * revision) — is a settled answer, and repeating it only delays the message the
- * user needs.
+ * Three shapes reach here, because the hub client does not normalize them:
+ *
+ *  - A `HubApiError` with a numeric `statusCode`. This is what CI hit (a 500
+ *    from the Xet CDN), thrown by `createApiError` and carried out through the
+ *    stream's async-iterator `pull`, so the object survives intact.
+ *  - A bare STRING. `WebBlob.stream()` and `XetBlob.stream()` abort their
+ *    writable with `error.message` rather than the error, so a failure on the
+ *    content GET — the multi-GB shard itself — arrives with no type at all
+ *    (verified: `typeof e === 'string'`, `e instanceof Error === false`). A
+ *    predicate that only understands `Error` refuses to retry the single most
+ *    important case, so the status is read back out of the text.
+ *  - A plain `Error` with a Node errno and no status. This is BOTH a transport
+ *    failure and a local filesystem failure, which is why the errno matters:
+ *    `downloadFileToCacheDir` mkdirs, streams to `<blob>.incomplete`, renames,
+ *    then symlinks, and wraps none of it.
+ *
+ * Unknown status-less failures default to RETRY, deliberately. The transport
+ * failure space is open-ended and library-version-dependent — `fetch` rejects
+ * `TypeError: fetch failed` on connect but `TypeError: terminated` on a
+ * mid-body reset, and a timeout is a `DOMException` with a NUMERIC code — so an
+ * allowlist of known network errors turns every unmodelled one into a hard
+ * abort of a 30 GB download, which is the failure this retry exists to prevent.
+ * The harm is asymmetric: retrying something hopeless costs 7 s of backoff,
+ * refusing to retry something transient costs the whole download.
+ *
+ * Never retried: 4xx other than 429 (401/403 is no token or no access, 404 is
+ * the wrong repo or revision) and the filesystem refusals above. Those are
+ * settled answers, and repeating them only buries the message the user needs.
  */
 export function isRetriableFetchError(error: unknown): boolean {
-  const status = (error as { statusCode?: unknown } | null)?.statusCode;
-  if (typeof status === 'number') return status >= 500 || status === 429;
-  // No status: a transport-level failure (socket reset, DNS, TLS, timeout).
-  return error instanceof Error;
+  if (typeof error === 'string') {
+    const status = FLATTENED_STATUS.exec(error);
+    return status ? isRetriableStatus(Number(status[1])) : true;
+  }
+  if (!(error instanceof Error)) return false;
+
+  const status = (error as { statusCode?: unknown }).statusCode;
+  if (typeof status === 'number') return isRetriableStatus(status);
+
+  const code = (error as NodeJS.ErrnoException).code;
+  // EMFILE/ENFILE ("too many open files") are deliberately absent: those do
+  // clear on their own, so they stay retriable.
+  if (typeof code === 'string' && PERMANENT_FS_CODES.has(code)) return false;
+
+  return true;
 }
 
 /**
@@ -45,9 +102,13 @@ export function isRetriableFetchError(error: unknown): boolean {
  *   HubApiError: Api error with status 500
  *     data: { message: 'Key service error: Timeout occurred while creating a new object' }
  *
- * The retry is cheap and safe to repeat: `downloadFileToCacheDir` is
- * content-addressed, so a re-attempt resumes from the cache rather than
- * re-fetching what already landed.
+ * Safe to repeat, but NOT free: `downloadFileToCacheDir` short-circuits on a
+ * blob that is already COMPLETE, so finished files are never re-fetched — a
+ * PARTIAL one is not resumed. It reopens `<blob>.incomplete` with `'w'`
+ * (truncating it) and re-issues the GET without a Range header, so an
+ * interrupted shard restarts from byte 0. That is what bounds the attempts at
+ * {@link MAX_FETCH_ATTEMPTS} rather than retrying indefinitely, and it is why
+ * a local disk-full failure must not be retried at all.
  */
 export async function withRetries<T>(what: string, attempt: () => Promise<T>): Promise<T> {
   for (let n = 1; ; n++) {

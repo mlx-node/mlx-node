@@ -43,6 +43,56 @@ describe('isRetriableFetchError', () => {
     expect(isRetriableFetchError(undefined)).toBe(false);
     expect(isRetriableFetchError(null)).toBe(false);
   });
+
+  it('does NOT retry a local filesystem refusal', () => {
+    // `downloadFileToCacheDir` mkdirs, streams to `<blob>.incomplete`, renames
+    // and symlinks, wrapping none of it — so a full or unwritable cache volume
+    // surfaces here as a plain Error carrying a Node errno and NO status.
+    // Retrying is worse than useless: `.incomplete` is reopened with 'w' and
+    // the GET carries no Range header, so each attempt re-downloads the shard
+    // from byte 0 into the same full disk before reporting the real error.
+    for (const [code, syscall] of [
+      ['ENOSPC', 'write'],
+      ['EDQUOT', 'write'],
+      ['EACCES', 'mkdir'],
+      ['EPERM', 'rename'],
+      ['EROFS', 'mkdir'],
+    ] as const) {
+      const err = Object.assign(new Error(`${code}: failed, ${syscall}`), { code, syscall, errno: -1 });
+      expect([code, isRetriableFetchError(err)]).toEqual([code, false]);
+    }
+  });
+
+  it('still retries an errno that clears on its own', () => {
+    // The over-correction guard on the list above: "too many open files" is a
+    // transient local condition, not a refusal.
+    const err = Object.assign(new Error('EMFILE: too many open files'), { code: 'EMFILE' });
+    expect(isRetriableFetchError(err)).toBe(true);
+  });
+
+  it('retries a content-GET failure that arrives as a bare string', () => {
+    // `WebBlob.stream()` / `XetBlob.stream()` abort their writable with
+    // `error.message`, not the error — so a failure on the shard download
+    // itself reaches us with no type (measured: `typeof e === 'string'`,
+    // `e instanceof Error === false`). Reading only `Error` would refuse to
+    // retry the single case this whole retry exists for.
+    expect(isRetriableFetchError('fetch failed')).toBe(true);
+    expect(isRetriableFetchError('Api error with status 503. URL: https://hf.co/x')).toBe(true);
+    expect(isRetriableFetchError('Api error with status 500. URL: https://hf.co/x')).toBe(true);
+    // …and the status is still honoured through the text, so a permanent
+    // answer stays permanent even after being flattened.
+    expect(isRetriableFetchError('Api error with status 403. URL: https://hf.co/x')).toBe(false);
+    expect(isRetriableFetchError('Api error with status 404. URL: https://hf.co/x')).toBe(false);
+  });
+
+  it('retries transport failures that are not spelled "fetch failed"', () => {
+    // Naming known network errors is a trap: `fetch` rejects `TypeError: fetch
+    // failed` on connect/DNS but `TypeError: terminated` on a mid-body socket
+    // reset — the dominant multi-GB shard failure — and an `AbortSignal.timeout`
+    // rejection is a DOMException whose `code` is a NUMBER, not an errno.
+    expect(isRetriableFetchError(new TypeError('terminated'))).toBe(true);
+    expect(isRetriableFetchError(new DOMException('aborted due to timeout', 'TimeoutError'))).toBe(true);
+  });
 });
 
 describe('withRetries', () => {
@@ -87,6 +137,19 @@ describe('withRetries', () => {
     await assertion;
     // Bounded: the last failure is rethrown, not swallowed into a hang.
     expect(attempt).toHaveBeenCalledTimes(4);
+  });
+
+  it('does not sleep three times before reporting a full disk', async () => {
+    // The user-visible cost of getting the predicate wrong: 7s of backoff and
+    // three more doomed multi-GB downloads before the real cause is printed.
+    const attempt = vi.fn(async () => {
+      throw Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+    });
+    const settled = withRetries('model-00001-of-00009.safetensors', attempt);
+    void vi.runAllTimersAsync();
+    await expect(settled).rejects.toMatchObject({ code: 'ENOSPC' });
+    expect(attempt).toHaveBeenCalledTimes(1);
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it('fails a permanent error on the FIRST attempt, with no backoff', async () => {
