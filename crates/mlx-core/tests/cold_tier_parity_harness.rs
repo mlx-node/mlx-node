@@ -775,34 +775,48 @@ impl ColdRoot {
     }
 }
 
-/// Fail loudly when the capture turns can reach the prompt's END.
+/// Fail loudly when a SINGLE capture turn can reach the prompt's END.
 ///
 /// This is the invariant the whole `restore_prompt` fixture rests on and the
 /// one that silently rotted: a turn anchors ONE sidecar, at the deepest rung it
-/// reached, so if the capture turns between them cover the full prompt, the
-/// only sidecar written sits at the deepest rung — the one a diverged restore
-/// prompt can never name — and instance 2 restores zero. That surfaces as
-/// "restore did not engage", pointing the reader at the restore path, when the
-/// cause is that nothing shallow was ever written.
+/// reached, so a turn that covers the full prompt writes only the deepest rung
+/// — the one a diverged restore prompt can never name — and instance 2 restores
+/// zero. That surfaces as "restore did not engage", pointing the reader at the
+/// restore path, when the cause is that nothing shallow was ever written.
 ///
 /// Checked against the LADDER rather than the raw block count because the
 /// deepest rung, not the prompt's end, is what a restore can address.
+///
+/// The bound is on ONE turn, not on all of them together — see the comment in
+/// the body for why the cumulative form rejected working fixtures.
 fn assert_capture_reach_leaves_room(spec: &ColdTierParitySpec, ladder: &[u32], prompt_tokens: u32) {
     let Some(&deepest) = ladder.last() else {
         return;
     };
-    let turns = spec.capture_warmup_turns + 1;
-    let reach_tokens = (turns * CAPTURE_BLOCKS_PER_TURN) as u32 * spec.block_size;
+    // The FIRST turn's reach, not the cumulative reach of all of them.
+    //
+    // Reach ratchets across turns — `paged_kv_cache_adapter.rs` charges the
+    // budget only for blocks it actually enqueues (`outcome.enqueued`), while
+    // already-persisted blocks are re-walked for free — so turn N reaches
+    // roughly `N x CAPTURE_BLOCKS_PER_TURN`. But each turn anchors its sidecar
+    // at the deepest rung ITS OWN reach allows, under a key derived from that
+    // boundary, so the turns write DISTINCT shallow rungs rather than
+    // overwriting one. Turn 1 landing below `deepest` is therefore what
+    // guarantees a shallow sidecar exists.
+    //
+    // The cumulative form this replaces was strictly stronger, and wrong in the
+    // rejecting direction: with `capture_warmup_turns >= 6` it fires on a
+    // fixture whose shallow rungs are on disk and restorable.
+    let reach_tokens = CAPTURE_BLOCKS_PER_TURN as u32 * spec.block_size;
     assert!(
         reach_tokens < deepest,
-        "[{}] FIXTURE, not a product fault: {} capture turn(s) x {} blocks x {} tok = {} tok of \
-         reach, which covers this prompt's deepest ladder rung ({} tok of {} prompt tok). One \
-         turn writes ONE sidecar at the deepest rung it reaches, so the shallow rungs instance 2 \
-         needs are never written and the restore necessarily finds nothing. Lengthen the capture \
-         prompt, or lower CAPTURE_BLOCKS_PER_TURN / capture_warmup_turns — do NOT relax the \
-         restore assertions below, which would leave this gate green against a real regression.",
+        "[{}] FIXTURE, not a product fault: one capture turn reaches {} blocks x {} tok = {} tok, \
+         which already covers this prompt's deepest ladder rung ({} tok of {} prompt tok). That \
+         turn anchors its ONE sidecar at the deepest rung, so the shallow rungs instance 2 needs \
+         after its prompt diverges are never written and the restore necessarily finds nothing. \
+         Lengthen the capture prompt or lower CAPTURE_BLOCKS_PER_TURN — do NOT relax the restore \
+         assertions below, which would leave this gate green against a real regression.",
         spec.family,
-        turns,
         CAPTURE_BLOCKS_PER_TURN,
         spec.block_size,
         reach_tokens,
@@ -838,22 +852,31 @@ const CAPTURE_BLOCKS_PER_TURN: usize = 12;
 /// deadline is a real hang, not a slow runner.
 const CAPTURE_BUDGET_MS: u64 = 60_000;
 
-/// Fix the tier root BEFORE any model load. The manager is a process-global
-/// `OnceLock` initialized once from this env, so a later change is ignored.
+/// Fix the tier root and the capture budget BEFORE any model load. Both are
+/// process-global `OnceLock`s resolved on first use, so a later change is
+/// silently ignored.
 ///
-/// Same for the capture budget: `cold_capture_budget()` is a `OnceLock` read on
-/// first use, so it has to be pinned here, ahead of every model load.
+/// Set through `install_*` rather than `std::env::set_var`. Every caller is an
+/// `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]` and the body
+/// runs ON a pool worker, so at least three other threads are alive here;
+/// `--test-threads=1` serializes test CASES, not runtime threads, so it never
+/// made `setenv` safe. The installers write the `OnceLock` directly, which is
+/// thread-safe, and they RETURN whether they won — turning "the harness thinks
+/// it pinned a depth but the run used the default" from a silent wrong-green
+/// into an assertion.
 fn prepare_cold_root() -> ColdRoot {
-    // SAFETY: same contract as the root below — set before any model load, and
-    // `#[ignore]` + `--test-threads=1` keep this the sole toucher in-process.
-    unsafe {
-        std::env::set_var(
-            "MLX_COLD_CAPTURE_BLOCKS_PER_TURN",
-            CAPTURE_BLOCKS_PER_TURN.to_string(),
-        );
-        std::env::set_var("MLX_COLD_CAPTURE_BUDGET_MS", CAPTURE_BUDGET_MS.to_string());
-    }
-    match std::env::var("MLX_COLD_CACHE_DIR") {
+    assert!(
+        mlx_core::cold_tier::install_cold_capture_budget(
+            CAPTURE_BLOCKS_PER_TURN,
+            std::time::Duration::from_millis(CAPTURE_BUDGET_MS),
+        ),
+        "the capture budget was already resolved before the harness pinned it, so this run used \
+         the {}-block DEFAULT and the ladder arithmetic below is meaningless. Something loaded a \
+         model or touched the cold tier before prepare_cold_root().",
+        128,
+    );
+
+    let root = match std::env::var("MLX_COLD_CACHE_DIR") {
         Ok(dir) if !dir.trim().is_empty() => {
             let path = PathBuf::from(dir);
             fs::create_dir_all(&path).expect("create caller-supplied MLX_COLD_CACHE_DIR");
@@ -863,13 +886,16 @@ fn prepare_cold_root() -> ColdRoot {
             let path = std::env::temp_dir().join(format!("mlx-cold-parity-{}", std::process::id()));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).expect("create cold-cache temp root");
-            // SAFETY: set before any model load and thus before any thread
-            // reads the env or the process-global tier; `#[ignore]` +
-            // `--test-threads=1` keep this the sole toucher in the process.
-            unsafe { std::env::set_var("MLX_COLD_CACHE_DIR", &path) };
             ColdRoot::Created(path)
         }
-    }
+    };
+    assert!(
+        mlx_core::cold_tier::install_cold_cache_root(root.path()),
+        "the cold tier was already opened before the harness pinned its root, so this run wrote \
+         to the DEFAULT location instead of {}",
+        root.path().display(),
+    );
+    root
 }
 
 /// Run the three-instance cold-tier restart-parity gate for one family.

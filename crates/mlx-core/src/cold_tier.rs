@@ -22,6 +22,9 @@ use crate::models::qwen3_5::gdn_checkpoint_store::GDN_PREFIX_CHECKPOINT_LIMIT;
 
 static GLOBAL: OnceLock<Option<Arc<ColdCacheManager>>> = OnceLock::new();
 
+/// Per-turn capture budget, resolved once. See [`cold_capture_budget`].
+static BUDGET: OnceLock<(usize, std::time::Duration)> = OnceLock::new();
+
 /// Overrides the cold-tier parent directory (primarily for tests). Read
 /// once on first `global_cold_cache()` call; an empty value means the
 /// default root (`~/.mlx-node/cache/paged/v1`).
@@ -66,7 +69,6 @@ const DEFAULT_CAPTURE_BUDGET_MS: u64 = 250;
 /// this is a TURN-TAIL bound (how much of the prompt one turn is willing to pay
 /// to persist). Conflating them is what made the old rate move with `Tw`.
 pub fn cold_capture_budget() -> (usize, std::time::Duration) {
-    static BUDGET: OnceLock<(usize, std::time::Duration)> = OnceLock::new();
     *BUDGET.get_or_init(|| {
         let blocks = std::env::var(CAPTURE_BLOCKS_ENV)
             .ok()
@@ -103,6 +105,32 @@ fn open_managed_cold_cache(parent: &Path) -> Option<Arc<ColdCacheManager>> {
     ColdCacheManager::open_default_at(parent.join(MANAGED_SUBDIR))
         .ok()
         .map(Arc::new)
+}
+
+/// Pin the capture budget directly, for integration tests that need a specific
+/// walk depth. Returns `false` if the budget was already resolved.
+///
+/// Exists so a test harness does not have to call `std::env::set_var`. Both
+/// values here are read through a `OnceLock` on first use, so a harness that
+/// wanted to force them had to write the process environment — and every
+/// caller is an `#[tokio::test(flavor = "multi_thread")]`, whose worker pool is
+/// already running when the test body executes. Serializing test CASES with
+/// `--test-threads=1` does not retire those threads, so the write never
+/// satisfied the Unix contract for `setenv` and was undefined behaviour that
+/// could manifest as unrelated flakiness.
+///
+/// The `bool` matters as much as the safety: a `set` that loses the race is
+/// exactly the silent no-op where the harness believes it pinned a depth and
+/// the run used the 128-block default instead. Callers must assert on it.
+pub fn install_cold_capture_budget(blocks: usize, budget: std::time::Duration) -> bool {
+    BUDGET.set((blocks, budget)).is_ok()
+}
+
+/// Pin the cold-tier root directly; the [`install_cold_capture_budget`]
+/// rationale applies verbatim. Returns `false` if the tier was already opened,
+/// in which case the caller's root is NOT in effect.
+pub fn install_cold_cache_root(parent: &Path) -> bool {
+    GLOBAL.set(open_managed_cold_cache(parent)).is_ok()
 }
 
 /// Counter snapshot of the global tier for Rust-side consumers (per-turn

@@ -826,6 +826,42 @@ fn answer_surface(r: &mlx_core::engine::types::ChatResult) -> &str {
     }
 }
 
+/// Whether `haystack` states `number` as a number, rather than merely
+/// containing its digits inside a longer run.
+///
+/// `str::contains("18")` is satisfied by `318`, `1.18`, and `2018`. Over the
+/// fallback surface — the whole 500-1800 B decode, which is what the two
+/// no-committed-answer branches degrade to — that is a weak enough oracle to
+/// pass on reasoning that never reached the right total. Requiring a
+/// non-digit on both sides costs nothing and removes the whole class.
+///
+/// Deliberately only NUMERIC boundaries, not `\b`: the measured answers write
+/// `\boxed{18}`, `= 18**.` and `is 18.`, all of which must keep matching, and
+/// a full word boundary buys nothing extra here.
+///
+/// A decimal point counts as part of the number on either side, so `1.18` and
+/// `18.5` are rejected while a sentence-final `is 18.` is not. That case is
+/// not hypothetical — it is what the unit test caught in the first version of
+/// this function, which only looked at digits.
+fn states_number(haystack: &str, number: &str) -> bool {
+    haystack.match_indices(number).any(|(at, _)| {
+        let mut before = haystack[..at].chars().rev();
+        // A leading `.` only disqualifies as part of a decimal — `1.18` — so a
+        // bare `.18` is rejected too, and a sentence boundary is not.
+        let joined_left = matches!(before.next(), Some(c) if c.is_ascii_digit() || c == '.');
+
+        let mut after = haystack[at + number.len()..].chars();
+        let joined_right = match after.next() {
+            Some(c) if c.is_ascii_digit() => true,
+            // `18.5` continues; `is 18.` ends.
+            Some('.') => after.next().is_some_and(|c| c.is_ascii_digit()),
+            _ => false,
+        };
+
+        !joined_left && !joined_right
+    })
+}
+
 /// Pins [`answer_surface`] against the way it can go blind, and against the
 /// way tightening it could go wrong.
 ///
@@ -906,8 +942,55 @@ fn answer_surface_prefers_the_committed_answer() {
     );
 
     // `num_tokens == 0` stays fatal by being empty rather than by panicking
-    // here: an empty surface fails every `.contains` at the call site.
+    // here: an empty surface fails every assertion at the call site.
     assert!(answer_surface(&with_raw("")).is_empty());
+}
+
+/// Pins [`states_number`], which is what the probe reads the surface WITH.
+///
+/// Matters most on the fallback surface: when no answer was committed, the
+/// oracle is the whole 500-1800 B decode, and a bare substring test over that
+/// much text is where an accidental match lives.
+#[test]
+fn states_number_rejects_digits_inside_a_longer_number() {
+    // The measured answer shapes. All five must keep matching, or the
+    // tightening has broken a correct run instead of a wrong one.
+    for good in [
+        "The sum of amber (7) and cobalt (11) is **7 + 11 = 18**. \n\n**Answer:** \\boxed{18}",
+        "The sum of amber (7) and cobalt (11) is 7 + 11 = 18. \n\n**Answer:** \\boxed{18}",
+        "the answer is 18",
+        "18",
+        "(18)",
+    ] {
+        assert!(states_number(good, "18"), "rejected a stated 18: {good:?}");
+    }
+
+    // THE MUTATION THIS EXISTS FOR: digits of 18 inside a longer number.
+    for bad in [
+        "318",
+        "1.18",
+        ".18",
+        "2018",
+        "180",
+        "18.5 is not it",
+        "x=118",
+    ] {
+        assert!(!states_number(bad, "18"), "accepted a non-answer: {bad:?}");
+    }
+
+    // A wrong total that merely contains the right digits is now rejected,
+    // which is the whole point over the fallback surface.
+    assert!(!states_number("the total is 3118", "18"));
+    // …but a wrong total sitting NEXT to a correct statement still passes, and
+    // that is fine: the probe asks whether the number was stated, not whether
+    // the model also said other things.
+    assert!(states_number("first I get 318, correcting to 18", "18"));
+
+    // Multi-occurrence: one standalone hit anywhere is enough.
+    assert!(states_number("318 ... 18", "18"));
+    // Single digits get the same treatment — turn 1 asserts on "7".
+    assert!(states_number("amber is 7.", "7"));
+    assert!(!states_number("amber is 77.", "7"));
 }
 
 /// Memory-probe config: budget 128 force-closes a looping `<think>`;
@@ -971,7 +1054,7 @@ async fn lfm2_paged_delta_memory_probe_parity() {
         r1_paged.cached_tokens, r1_paged.finish_reason, r1_paged.text,
     );
     assert!(
-        answer_surface(&r1_paged).contains('7'),
+        states_number(answer_surface(&r1_paged), "7"),
         "paged turn 1 could not even recall the just-planted value: {:?}",
         r1_paged.raw_text,
     );
@@ -1058,14 +1141,14 @@ async fn lfm2_paged_delta_memory_probe_parity() {
     // pre-fix corrupted continuation (empty flat attention KV) cannot
     // produce it.
     assert!(
-        answer_surface(&r2_paged).contains("18"),
+        states_number(answer_surface(&r2_paged), "18"),
         "paged delta turn 2 lost the turn-1 context: expected the sum 18 in {:?}",
         r2_paged.raw_text,
     );
     // Answer-level parity with the forced-flat control (byte parity is
     // pinned at short lengths by tests (a)/(c) — see the header).
     assert!(
-        answer_surface(&r2_flat).contains("18"),
+        states_number(answer_surface(&r2_flat), "18"),
         "flat control turn 2 disagrees with the paged answer (expected 18) on the SAME \
          context: finish={} num_tokens={} raw_text={:?}",
         r2_flat.finish_reason,
@@ -1111,12 +1194,12 @@ async fn lfm2_paged_delta_memory_probe_parity() {
         r3_paged.cached_tokens,
     );
     assert!(
-        answer_surface(&r3_paged).contains("31"),
+        states_number(answer_surface(&r3_paged), "31"),
         "paged delta turn 3 lost accumulated context: expected the sum 31 in {:?}",
         r3_paged.raw_text,
     );
     assert!(
-        answer_surface(&r3_flat).contains("31"),
+        states_number(answer_surface(&r3_flat), "31"),
         "flat control turn 3 disagrees with the paged answer (expected 31) on the SAME \
          context: finish={} num_tokens={} raw_text={:?}",
         r3_flat.finish_reason,
@@ -1128,6 +1211,111 @@ async fn lfm2_paged_delta_memory_probe_parity() {
         "[PASS] lfm2 paged-delta memory probe: paged answers correct (18, 31), flat control \
          agrees; paged cached {} -> {}",
         r2_paged.cached_tokens, r3_paged.cached_tokens,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test (d2): the same memory probe driven entirely on the FLAT path, through
+// `chat_session_continue`.
+//
+// THE COVERAGE HOLE THIS FILLS. Test (d) above rebuilds its flat control with
+// `chat_session_start` — deliberately, because two independent greedy decodes
+// diverge on this checkpoint and made the comparison a second lottery rather
+// than a control. The side effect is that (d) no longer drives the flat
+// warm-continue path with a CONTENT-sensitive prompt. What remains is test (c),
+// which does exercise flat `chat_session_continue` but asserts flat == paged on
+// "Say hi in one short word." — a prompt whose answer does not depend on turn-1
+// context, so a regression that corrupted flat continuation in the same way on
+// both arms would satisfy it.
+//
+// This closes that with a SINGLE-ARM content assertion: the flat path alone
+// must still derive 18 and 31 from context it can only have through its live
+// conv + attention caches. No cross-arm comparison, so no greedy lottery; no
+// finish_reason, num_tokens, or byte-equality assertion, so nothing here varies
+// with the runner. Same oracle as (d) — see [`answer_surface`].
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real LFM2 checkpoint"]
+async fn lfm2_flat_delta_memory_probe_content() {
+    let Some(src) = resolve_source_model() else {
+        return;
+    };
+
+    let flat_dir = match clone_model_dir(&src, "lfm2-flat-memprobe-cont", false) {
+        Ok(p) => p,
+        Err(e) => panic!("failed to clone model dir for flat path: {e}"),
+    };
+    let flat_model = Lfm2Model::load_from_dir(&flat_dir.to_string_lossy())
+        .await
+        .expect("failed to load flat-path LFM2 model");
+
+    let r1 = flat_model
+        .chat_session_start(
+            vec![user_message(
+                "Here are values to remember: amber = 7 and cobalt = 11. What is amber?",
+            )],
+            Some(memory_probe_chat_config()),
+        )
+        .await
+        .expect("flat turn 1 chat_session_start failed");
+    eprintln!(
+        "[flat-mem-probe] turn1: finish={} text={:?}",
+        r1.finish_reason, r1.text,
+    );
+
+    let r2 = flat_model
+        .chat_session_continue(
+            "Add amber and cobalt together. What is the sum?".to_string(),
+            None,
+            None,
+            Some(memory_probe_chat_config()),
+        )
+        .await
+        .expect("flat turn 2 chat_session_continue failed");
+    eprintln!(
+        "[flat-mem-probe] turn2: cached={} text={:?}",
+        r2.cached_tokens, r2.text,
+    );
+    assert!(
+        states_number(answer_surface(&r2), "18"),
+        "flat warm-continue turn 2 lost the turn-1 context: expected the sum 18 in {:?}",
+        r2.raw_text,
+    );
+
+    let r3 = flat_model
+        .chat_session_continue(
+            "One more value: jade = 13. What is amber + cobalt + jade in total?".to_string(),
+            None,
+            None,
+            Some(memory_probe_chat_config()),
+        )
+        .await
+        .expect("flat turn 3 chat_session_continue failed");
+    eprintln!(
+        "[flat-mem-probe] turn3: cached={} text={:?}",
+        r3.cached_tokens, r3.text,
+    );
+    assert!(
+        states_number(answer_surface(&r3), "31"),
+        "flat warm-continue turn 3 lost accumulated context: expected the sum 31 in {:?}",
+        r3.raw_text,
+    );
+
+    // Reachability: a 0 here would mean the "continue" turns silently
+    // re-prefilled from scratch, in which case the answers above prove nothing
+    // about the flat caches this test exists to exercise.
+    assert!(
+        r2.cached_tokens > 0 && r3.cached_tokens > r2.cached_tokens,
+        "flat deltas did not warm-continue (cached {} -> {}); the content assertions above did \
+         not exercise the live flat conv + attention caches",
+        r2.cached_tokens,
+        r3.cached_tokens,
+    );
+
+    eprintln!(
+        "[PASS] lfm2 FLAT warm-continue memory probe: answers correct (18, 31); cached {} -> {}",
+        r2.cached_tokens, r3.cached_tokens,
     );
 }
 
