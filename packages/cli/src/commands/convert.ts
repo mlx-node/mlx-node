@@ -56,13 +56,17 @@ Quantization Arguments:
                         with per-layer overrides. NOT mlx-lm-loadable.
   --q-mxfp              Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
                         With --q-recipe unsloth, selects the fixed Unsloth
-                        Qwen3.5 MXFP map: early FFNs=mxfp4; final eight FFNs,
-                        attention q/k/v/o, GDN qkv/z/out, and lm_head=mxfp8;
-                        embeddings, routers, GDN a/b, vision, MTP, norms, and
-                        recurrent tensors stay bf16. AWQ imatrix pre-scaling
-                        is applied when --imatrix-path is provided. Without it,
-                        the fixed class map is unchanged but quality may be
-                        lower. --q-bits/--q-group-size do not alter this map.
+                        family map after backend validation. Qwen3.5/3.6:
+                        early FFNs=mxfp4; final eight FFNs, attention q/k/v/o,
+                        GDN qkv/z/out, and lm_head=mxfp8. SafeTensors
+                        Gemma-4-26B-A4B MoE:
+                        all dense/expert FFNs=mxfp4 and attention q/k/v/o=mxfp8.
+                        Gemma routers, embeddings/head, vision, norms, and all
+                        other tensors stay bf16. AWQ imatrix pre-scaling is
+                        applied when --imatrix-path is provided; it does not
+                        invent expert AWQ. Without it, the fixed class map is
+                        unchanged but quality may be lower. --q-bits/
+                        --q-group-size do not alter this map.
 
                         With other recipes (or no recipe), applies after the
                         recipe predicate: any 8-bit affine decision becomes
@@ -91,13 +95,15 @@ Quantization Arguments:
                         The fixed --q-mxfp / --q-mode nvfp4 maps may omit it;
                         AWQ pre-scaling is then skipped and quality may be lower.
                         A matching imatrix remains preferred when available.
-                        Add --q-mxfp for the fixed Qwen3.5 MXFP class map
+                        Add --q-mxfp for the verified Qwen hybrid or SafeTensors
+                        Gemma4 MoE fixed class map
                         (NVFP4 translated to MXFP4, FP8 translated to MXFP8).
-                        Use --q-mode nvfp4 for the fixed DGX weight map: early
-                        FFNs=nvfp4; final eight FFNs, attention/GDN high
-                        classes, and lm_head=fp8_e4m3 (raw E4M3 weights with
-                        per-output float scales); the same protected classes
-                        stay bf16. Both DGX classes run with A16 activations:
+                        Use --q-mode nvfp4 for the fixed DGX weight map. Qwen
+                        uses early FFNs=nvfp4 and final-eight FFNs +
+                        attention/GDN/head=fp8_e4m3; Gemma4 MoE uses every
+                        dense/expert FFN=nvfp4 and only attention
+                        q/k/v/o=fp8_e4m3. Protected classes stay bf16. Both DGX
+                        classes run with A16 activations:
                         NVFP4 uses standard MLX weight-only quantized matmul;
                         plain FP8 reconstructs bf16 weights at load. This does
                         not preserve Unsloth's calibrated W4A4/W8A8 execution,
@@ -338,7 +344,7 @@ export async function run(argv: string[]) {
         process.exit(1);
       }
       console.warn(
-        'Warning: no --imatrix-path was provided. If backend Qwen family/shape validation selects the requested fixed MXFP4/MXFP8 or NVFP4/plain-FP8 map, AWQ pre-scaling will be skipped and quality may be lower; unsupported inputs will be rejected.',
+        'Warning: no --imatrix-path was provided. If backend validation selects the requested fixed Qwen hybrid or exact SafeTensors Gemma4 MoE MXFP4/MXFP8 or NVFP4/plain-FP8 map, AWQ pre-scaling will be skipped and quality may be lower; unsupported inputs will be rejected.',
       );
     }
     // The nvidia recipe is a data-free port with a fixed format map: it reads
@@ -385,10 +391,10 @@ export async function run(argv: string[]) {
   const usesOfficialUnslothNvfp4 = quantRecipe === 'unsloth' && quantMode === 'nvfp4';
   const fixedUnslothSummary = (lowFormat: 'mxfp4' | 'nvfp4') => {
     const highFormat = lowFormat === 'nvfp4' ? 'fp8_e4m3' : 'mxfp8';
-    return `fixed Unsloth ${lowFormat === 'nvfp4' ? 'DGX/NVFP4 weight' : 'MXFP'} map (early FFN=${lowFormat}; final 8 FFN + attention/GDN/head=${highFormat}; protected classes=bf16)`;
+    return `fixed Unsloth ${lowFormat === 'nvfp4' ? 'DGX/NVFP4 weight' : 'MXFP'} map (Qwen: early FFN=${lowFormat}, final 8 FFN + attention/GDN/head=${highFormat}; Gemma4 MoE: all dense/expert FFN=${lowFormat}, attention q/k/v/o=${highFormat}; protected classes=bf16)`;
   };
   const requestedFixedUnslothSummary = (lowFormat: 'mxfp4' | 'nvfp4') =>
-    `requested ${fixedUnslothSummary(lowFormat)}; backend verifies Qwen family/shape`;
+    `requested ${fixedUnslothSummary(lowFormat)}; backend verifies Qwen hybrid or exact SafeTensors Gemma4 MoE family/shape`;
   // Render the `Quantize:` line body shared by the GGUF and SafeTensors paths.
   // `qGsLabel` carries the group-size text (the GGUF path never reaches sym8,
   // so it always passes `group_size=N`); `mtp` is `'off'` on the GGUF path,

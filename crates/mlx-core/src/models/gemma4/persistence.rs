@@ -26,11 +26,12 @@ use super::model::{Gemma4Draft, Gemma4Inner, Gemma4Model, warmup_forward};
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
     PerLayerMode, PerLayerQuant, is_mxfp8_checkpoint, is_quantized_checkpoint,
-    try_build_kquant_quantized_linear, try_build_kquant_quantized_switch_linear,
-    try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
-    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
-    try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
-    try_build_quantized_linear, try_build_quantized_switch_linear, try_build_sym8_quantized_linear,
+    try_build_fp8_e4m3_quantized_linear, try_build_kquant_quantized_linear,
+    try_build_kquant_quantized_switch_linear, try_build_mxfp4_quantized_linear,
+    try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
+    try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
+    try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
+    try_build_quantized_switch_linear, try_build_sym8_quantized_linear,
 };
 
 /// Conventional in-checkpoint location for an external Gemma4 speculative
@@ -1365,12 +1366,7 @@ fn build_gemma_ql(
         PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
         PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
-        PerLayerMode::Fp8E4m3 => {
-            return Err(Error::from_reason(format!(
-                "gemma4 layer '{prefix}' resolved to fp8_e4m3, but plain per-output \
-                 E4M3 storage is supported only by Qwen3.5 DGX artifacts"
-            )));
-        }
+        PerLayerMode::Fp8E4m3 => try_build_fp8_e4m3_quantized_linear(params, prefix)?,
         PerLayerMode::Affine => {
             try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
         }
@@ -1397,7 +1393,8 @@ fn build_gemma_qsl(
         PerLayerMode::Fp8E4m3 => {
             return Err(Error::from_reason(format!(
                 "gemma4 expert layer '{prefix}' resolved to fp8_e4m3, but plain \
-                 per-output E4M3 storage is supported only by Qwen3.5 DGX artifacts"
+                 per-output E4M3 storage is supported only for 2-D attention/linear \
+                 tensors; Gemma4 experts must use the upstream NVFP4 low class"
             )));
         }
         PerLayerMode::Affine => {
@@ -5494,7 +5491,7 @@ mod tests {
     }
 
     #[test]
-    fn gemma_ql_and_qsl_reject_plain_fp8_storage_before_packed_dispatch() {
+    fn gemma_ql_accepts_plain_fp8_while_qsl_keeps_experts_fail_closed() {
         let dense_prefix = "layers.0.self_attn.q_proj";
         let dense_params = HashMap::from([
             (
@@ -5527,14 +5524,11 @@ mod tests {
             mode: PerLayerMode::Fp8E4m3,
             input_amax: None,
         };
-        let err = build_gemma_ql(&dense_params, dense_prefix, explicit_fp8)
-            .err()
-            .expect("Gemma plain-FP8 QL is unsupported");
-        assert!(
-            err.reason.contains("supported only by Qwen3.5"),
-            "{}",
-            err.reason
-        );
+        let ql = build_gemma_ql(&dense_params, dense_prefix, explicit_fp8)
+            .expect("well-formed Gemma plain-FP8 QL must load")
+            .expect("plain-FP8 sidecars must build a QL");
+        assert_eq!(ql.mode(), crate::quant::fp8_weight::FP8_E4M3_MODE);
+        assert_eq!(ql.get_weight().dtype().unwrap(), DType::Uint8);
 
         let expert_prefix = "layers.0.experts.gate_up_proj";
         let expert_params = HashMap::from([
@@ -5557,9 +5551,9 @@ mod tests {
         );
         let err = build_gemma_qsl(&expert_params, expert_prefix, explicit_fp8)
             .err()
-            .expect("Gemma plain-FP8 QSL is unsupported");
+            .expect("Gemma expert plain-FP8 QSL must remain unsupported");
         assert!(
-            err.reason.contains("supported only by Qwen3.5"),
+            err.reason.contains("experts must use the upstream NVFP4"),
             "{}",
             err.reason
         );

@@ -6068,7 +6068,7 @@ mod tests {
                     "affine",
                     is_qwen35_hybrid,
                 ),
-                Some(crate::convert::OfficialUnslothRecipeKind::Mxfp)
+                Some(crate::convert::OfficialUnslothRecipeKind::QwenMxfp)
             );
             assert_eq!(
                 crate::convert::select_official_unsloth_recipe(
@@ -6077,7 +6077,7 @@ mod tests {
                     "nvfp4",
                     is_qwen35_hybrid,
                 ),
-                Some(crate::convert::OfficialUnslothRecipeKind::Nvfp4)
+                Some(crate::convert::OfficialUnslothRecipeKind::QwenNvfp4)
             );
         }
 

@@ -47,9 +47,10 @@ mlx convert --input ./model --output ./model-bf16 --dtype bf16
 mlx convert --input ./model --output ./model-q --quantize --q-recipe mixed_4_6
 ```
 
-### Unsloth MXFP and DGX tensor-class recipes for Qwen3.5
+### Unsloth MXFP and DGX tensor-class recipes for Qwen3.5 and SafeTensors Gemma4 MoE
 
-For verified dense and MoE Qwen3.5/Qwen3.6-family checkpoints, the fixed
+For verified dense and MoE Qwen3.5/Qwen3.6-family checkpoints and the exact
+SafeTensors Gemma-4-26B-A4B MoE shape, the fixed
 [Unsloth class map](https://unsloth.ai/docs/models/qwen3.6#nvfp4) is
 available in two forms. The Apple map translates FP8-class weights to MXFP8;
 the DGX map retains NVFP4 weight storage and stores plain E4M3 FP8 weights with
@@ -68,20 +69,31 @@ mlx convert -m qwen3_5_moe -q --q-recipe unsloth --q-mxfp \
 # DGX weight variant: retain NVFP4
 mlx convert -m qwen3_5_moe -q --q-mode nvfp4 --q-recipe unsloth \
   -i ./qwen3.5-35b-a3b -o ./qwen3.5-35b-a3b-unsloth-nvfp4-mlx
+
+# Gemma4 MoE Apple MXFP variant
+mlx convert -m gemma4 -q --q-recipe unsloth --q-mxfp \
+  -i ./gemma-4-26b-a4b-it -o ./gemma-4-26b-a4b-it-unsloth-mxfp4-mlx
+
+# Gemma4 MoE DGX weight variant
+mlx convert -m gemma4 -q --q-mode nvfp4 --q-recipe unsloth \
+  -i ./gemma-4-26b-a4b-it -o ./gemma-4-26b-a4b-it-unsloth-nvfp4-mlx
 ```
 
-Early FFNs use MXFP4 4/32 with `--q-mxfp`, or NVFP4 4/16 with
-`--q-mode nvfp4`. The final eight FFNs, attention q/k/v/o, GDN qkv/z/out, and
-`lm_head` use MXFP8 8/32 on Apple and `fp8_e4m3` (raw E4M3 `[N,K]` weights +
-BF16 `[N,1]` dequant scales, extended to `[E,N,K]` / `[E,N,1]` for experts) in
-the DGX artifact. Runtime activations remain A16 for both DGX weight classes:
+For Qwen, early FFNs use the low class; the final eight FFNs, attention
+q/k/v/o, GDN qkv/z/out, and `lm_head` use the high class. For Gemma4 MoE, every
+dense and expert FFN uses the low class, attention q/k/v/o uses the high class,
+and there is no final-eight or `lm_head` exception. The low class is MXFP4 4/32
+with `--q-mxfp`, or NVFP4 4/16 with `--q-mode nvfp4`; the high class is MXFP8
+8/32 on Apple or `fp8_e4m3` (raw E4M3 `[N,K]` weights + BF16 `[N,1]` dequant
+scales) in the DGX artifact. Runtime activations remain A16 for both DGX weight classes:
 NVFP4 uses standard MLX weight-only quantized matmul, while plain FP8 weights
 are reconstructed to BF16 once at load. This is a data-free tensor-class and
 serialized-weight-format port when no imatrix is supplied. It does not include
 Unsloth's calibrated NVFP4 global scales, W4A4/W8A8 activation execution, or
 calibrated FP8 KV-cache scales, and it does not claim upstream numerical or
-performance parity. Embeddings, routers, GDN a/b, vision, MTP,
-norms, and recurrent parameters remain BF16. Plain affine Unsloth alone keeps
+performance parity. Embeddings, routers, GDN a/b, vision/audio, MTP,
+norms, recurrent parameters, and other unmatched tensors remain BF16. Gemma
+expert imatrix pre-scaling is not inferred from flat GGUF statistics. Plain affine Unsloth alone keeps
 the legacy Dynamic 2.0 recipe.
 
 ### NVIDIA modelopt recipe (data-free MXFP4 port)
