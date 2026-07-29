@@ -301,4 +301,83 @@ describe('attachLogger', () => {
     expect('x-api-key' in row.reqHeaders).toBe(false);
     expect(row.reqHeaders['content-type']).toBe('application/json');
   });
+
+  /*
+   * A request that finishes after `close()` has ended the log streams writes
+   * from its own `finish` handler. `write()` after `end()` reports
+   * `ERR_STREAM_WRITE_AFTER_END` asynchronously, as an `error` event — the
+   * `try`/`catch` around each write cannot see it, and with no listener the
+   * event is fatal. The host closes the server first so this is rare, but the
+   * forced-close path still emits `res.on('close')` a tick later, so the
+   * listener is the thing that has to hold.
+   *
+   * The window is `writableEnded && !destroyed`. Once `end()` finishes
+   * flushing, `destroyed` is set and Node drops the error silently, which is
+   * why this deliberately does NOT await `close()` — awaiting it would test
+   * the harmless case and pass with the listeners removed.
+   */
+  it('survives a request completing while close() is still flushing', async () => {
+    const logDir = makeTmpDir();
+    const port = await pickFreePort();
+
+    let release: (() => void) | null = null;
+    const srv = createServer((req, res) => {
+      if (req.url === '/big') {
+        // Captured verbatim into `requests.ndjson`, so this response is what
+        // puts megabytes into the stream's queue and holds `end()` flushing
+        // long enough for the second request's write to land inside the
+        // window. Without it `end()` completes first, the stream is
+        // `destroyed`, and Node discards the error instead of throwing —
+        // which would make this test pass with the listeners removed.
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        const chunk = `data: ${'x'.repeat(64 * 1024)}\n\n`;
+        for (let i = 0; i < 128; i++) res.write(chunk);
+        res.end();
+        return;
+      }
+      release = () => res.writeHead(200).end('{}');
+    });
+    const logger = attachLogger(srv, logDir);
+
+    // Registered after `attachLogger`, so for `/big` the logger's own `finish`
+    // listener — and its multi-MB write — has already run when this fires.
+    srv.on('request', (req, res) => {
+      if (req.url !== '/big') return;
+      res.on('finish', () => {
+        void logger.close();
+        release?.();
+      });
+    });
+    await new Promise<void>((resolve) => srv.listen(port, '127.0.0.1', resolve));
+
+    const inFlight = postJson(port, { ping: 1 });
+    while (release === null) await new Promise((r) => setTimeout(r, 5));
+
+    // An uncaught `error` would end the whole run rather than fail this
+    // assertion, so it is captured instead: the handler makes the
+    // would-be-fatal event observable without letting it be fatal.
+    const fatal: string[] = [];
+    const onUncaught = (err: Error): void => {
+      fatal.push((err as NodeJS.ErrnoException).code ?? err.message);
+    };
+    process.on('uncaughtException', onUncaught);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const req = httpRequest({ host: '127.0.0.1', port, method: 'GET', path: '/big' }, (res) => {
+          res.on('data', () => {});
+          res.on('end', () => resolve());
+        });
+        req.on('error', reject);
+        req.end();
+      });
+      await inFlight;
+      // Let the streams' async error events land.
+      await new Promise((r) => setTimeout(r, 200));
+    } finally {
+      process.off('uncaughtException', onUncaught);
+    }
+    await closeServer(srv);
+
+    expect(fatal).toEqual([]);
+  });
 });

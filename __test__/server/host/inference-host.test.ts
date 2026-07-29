@@ -611,6 +611,39 @@ describe('createInferenceHost — paged-override temp roots', () => {
     expect(await newTempRoots(before)).toHaveLength(0);
   });
 
+  /*
+   * The logger records a request from that request's own `finish` handler, so
+   * ending the log streams while the server is still serving drops exactly the
+   * completion lines a verbose shutdown exists to capture — and, because the
+   * write lands after `end()`, can take the process down with an uncaught
+   * `ERR_STREAM_WRITE_AFTER_END`.
+   *
+   * `srv.listening` is the observable: it is false only once `server.close()`
+   * has run, so asserting on it at logger-close time pins the order rather
+   * than the wording of any comment.
+   */
+  it('closes the HTTP server before ending the log streams', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    const logDir = await mkdtemp(join(tmpdir(), 'mlx-host-log-'));
+    scratchDirs.push(logDir);
+
+    let listeningWhenLoggerClosed: boolean | null = null;
+    const host = await start({
+      modelsDir,
+      logDir,
+      attachLogger: (srv) => ({
+        logDir,
+        close: async () => {
+          listeningWhenLoggerClosed = srv.listening;
+        },
+      }),
+    });
+
+    await host.close({ timeoutMs: 0 });
+
+    expect(listeningWhenLoggerClosed).toBe(false);
+  });
+
   it('is idempotent — a second close() neither throws nor re-runs disposal', async () => {
     const modelsDir = await makeModelsDir(['alpha']);
     const host = await start({ modelsDir });

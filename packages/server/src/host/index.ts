@@ -25,15 +25,17 @@
  * ## Ownership
  *
  * The returned host owns, and disposes on {@link InferenceHost.close}:
- *   1. the verbose request logger (when `logDir` is set),
- *   2. the HTTP server,
+ *   1. the HTTP server,
+ *   2. the verbose request logger (when `logDir` is set),
  *   3. the `PagedConfigOverrideManager`'s temp root.
  *
- * In that order, matching `mlx launch claude`'s historical shutdown: the
- * logger is flushed before the server's close grace period so its tail lands
- * on disk, and the temp root goes last because a still-draining request may
- * still be reading a cloned config. Each step is independently guarded — one
- * failing disposer must not strand the ones after it.
+ * The server goes first because the logger records a request from that
+ * request's own `finish`/`close` handler. Ending the log streams while a
+ * request is still draining loses exactly the completion lines a verbose
+ * shutdown exists to capture. The temp root goes last because a
+ * still-draining request may still be reading a cloned config. Each step is
+ * independently guarded — one failing disposer must not strand the ones
+ * after it.
  */
 
 import type { Server } from 'node:http';
@@ -350,21 +352,26 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
 
     close(closeOpts?: CloseOptions): Promise<void> {
       closePromise ??= (async (): Promise<void> => {
-        // Every step is independently guarded: a logger that fails to flush
-        // must still leave the server closed, and a server that fails to
-        // close must still leave the temp root reclaimed. The temp root is
-        // the only one of the three that leaks OUTSIDE this process.
+        // Every step is independently guarded: a server that fails to close
+        // must still leave the log streams ended and the temp root
+        // reclaimed. The temp root is the only one of the three that leaks
+        // OUTSIDE this process.
+        try {
+          await server.close(closeOpts);
+        } catch {
+          /* already down, or a socket refused to die; fall through */
+        }
+        // Only once nothing is still serving. The logger writes a request's
+        // record from that request's `finish` handler, so ending the streams
+        // first both drops the record and — with no `error` listener — makes
+        // the write fatal. `attachLogger` guards the second half; this
+        // ordering is what preserves the first.
         if (logger !== null) {
           try {
             await logger.close();
           } catch {
             /* logging is best effort; never block shutdown */
           }
-        }
-        try {
-          await server.close(closeOpts);
-        } catch {
-          /* already down, or a socket refused to die; fall through */
         }
         try {
           await pagedConfigOverrides.cleanup();

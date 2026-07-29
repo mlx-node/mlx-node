@@ -229,15 +229,28 @@ function buildRequestBodySummary(reqBody: string): string {
 }
 
 /**
- * Attach request/response capture to `server`. The caller is responsible
- * for calling `close()` before `server.close()` completes so the tail of
- * the streams is flushed to disk.
+ * Attach request/response capture to `server`. Call `close()` AFTER
+ * `server.close()` resolves: the completion listeners below fire when a
+ * response finishes, so ending the streams first drops the tail of every
+ * request still in flight.
  */
 export function attachLogger(server: Server, logDir: string): Logger {
   mkdirSync(logDir, { recursive: true });
 
   const reqLog = createWriteStream(join(logDir, 'requests.ndjson'), { flags: 'a' });
   const pretty = createWriteStream(join(logDir, 'session.log'), { flags: 'a' });
+
+  // A write that lands after `end()` reports `ERR_STREAM_WRITE_AFTER_END`
+  // asynchronously, as an `error` event — the `try`/`catch` around each
+  // `write()` below cannot see it. With no listener that event is fatal, so
+  // a request completing during shutdown would take the process down instead
+  // of finishing the graceful close. Ordering close correctly is what keeps
+  // the record intact; these listeners are what keep a lost log line from
+  // being lethal when the ordering cannot help — the forced-close path emits
+  // `res.on('close')` a tick after `server.close()` has already resolved.
+  const discardStreamError = (): void => {};
+  reqLog.on('error', discardStreamError);
+  pretty.on('error', discardStreamError);
 
   const writePretty = (line: string): void => {
     try {
