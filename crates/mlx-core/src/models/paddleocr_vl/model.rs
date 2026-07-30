@@ -23,7 +23,7 @@ use crate::sampling::{
     sample, sample_and_logprobs,
 };
 use crate::stream::{DeviceType, Stream, StreamContext};
-use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+use crate::tokenizer::{ChatMessage, MultimodalContentOrder, Qwen3Tokenizer};
 use crate::utils::safetensors::SafeTensorsFile;
 use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
 use napi::{Env, Status, bindgen_prelude::*};
@@ -335,8 +335,13 @@ impl VLModelInner {
         let per_image_token_counts =
             image_token_counts(grid_thw.as_ref(), vision_config.spatial_merge_size)?;
         let template_messages = template_messages(&messages, per_image_token_counts.len())?;
-        let template_tokens =
-            tokenizer.apply_chat_template_sync(&template_messages, Some(true), None, None)?;
+        let template_tokens = tokenizer.apply_chat_template_sync_with_content_order(
+            &template_messages,
+            Some(true),
+            None,
+            None,
+            MultimodalContentOrder::ImagesThenText,
+        )?;
         let token_ids = expand_paddle_image_tokens(
             &template_tokens,
             &per_image_token_counts,
@@ -867,8 +872,13 @@ impl VLModelInner {
             )?;
             let template_messages =
                 template_messages(&item.messages, per_image_token_counts.len())?;
-            let template_tokens =
-                tokenizer.apply_chat_template_sync(&template_messages, Some(true), None, None)?;
+            let template_tokens = tokenizer.apply_chat_template_sync_with_content_order(
+                &template_messages,
+                Some(true),
+                None,
+                None,
+                MultimodalContentOrder::ImagesThenText,
+            )?;
             let token_ids = expand_paddle_image_tokens(
                 &template_tokens,
                 &per_image_token_counts,

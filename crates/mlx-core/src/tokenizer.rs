@@ -1039,6 +1039,29 @@ impl Qwen3Tokenizer {
         bos_token: &str,
         eos_token: &str,
     ) -> std::result::Result<String, String> {
+        Self::render_chat_template_jinja2_with_content_order(
+            template_str,
+            messages,
+            tools,
+            add_generation_prompt,
+            enable_thinking,
+            bos_token,
+            eos_token,
+            MultimodalContentOrder::TextThenMedia,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_chat_template_jinja2_with_content_order(
+        template_str: &str,
+        messages: &[ChatMessage],
+        tools: Option<&[ToolDefinition]>,
+        add_generation_prompt: bool,
+        enable_thinking: Option<bool>,
+        bos_token: &str,
+        eos_token: &str,
+        content_order: MultimodalContentOrder,
+    ) -> std::result::Result<String, String> {
         let mut env = Environment::new();
 
         // Add the tojson filter that Qwen3's template uses
@@ -1232,8 +1255,15 @@ impl Qwen3Tokenizer {
         });
 
         // Convert messages to JSON-serializable format (already sanitized by caller)
-        let messages_value: Vec<serde_json::Value> =
-            messages.iter().map(serialize_message_for_jinja).collect();
+        let messages_value: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|message| match content_order {
+                MultimodalContentOrder::TextThenMedia => serialize_message_for_jinja(message),
+                MultimodalContentOrder::ImagesThenText => {
+                    serialize_message_for_jinja_with_order(message, content_order)
+                }
+            })
+            .collect();
 
         // Build context for Jinja2 template
         // Note: enable_thinking defaults to true to allow model to think naturally.
@@ -1447,6 +1477,28 @@ impl Qwen3Tokenizer {
         tools: Option<&[ToolDefinition]>,
         enable_thinking: Option<bool>,
     ) -> Result<Vec<u32>> {
+        self.apply_chat_template_sync_with_content_order(
+            messages,
+            add_generation_prompt,
+            tools,
+            enable_thinking,
+            MultimodalContentOrder::TextThenMedia,
+        )
+    }
+
+    /// Render through the checkpoint template while preserving a
+    /// model-specific ordering of structured multimodal content parts.
+    ///
+    /// This is intentionally an ordering policy only: the checkpoint Jinja
+    /// template still owns every role marker and wire-format token.
+    pub(crate) fn apply_chat_template_sync_with_content_order(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: Option<bool>,
+        tools: Option<&[ToolDefinition]>,
+        enable_thinking: Option<bool>,
+        content_order: MultimodalContentOrder,
+    ) -> Result<Vec<u32>> {
         let add_prompt = add_generation_prompt.unwrap_or(true);
 
         // Sanitize messages before formatting (prevents injection in all paths)
@@ -1464,7 +1516,7 @@ impl Qwen3Tokenizer {
             .chat_template
             .as_deref()
             .ok_or_else(|| Error::from_reason(MISSING_CHAT_TEMPLATE_ERROR))?;
-        let formatted = Self::render_chat_template_jinja2(
+        let formatted = Self::render_chat_template_jinja2_with_content_order(
             chat_template,
             &sanitized,
             tools,
@@ -1472,6 +1524,7 @@ impl Qwen3Tokenizer {
             enable_thinking,
             &bos_str,
             &eos_str,
+            content_order,
         )
         .map_err(Error::from_reason)?;
 
@@ -1532,6 +1585,19 @@ impl Qwen3Tokenizer {
     }
 }
 
+/// Ordering policy for structured multimodal content parts handed to a
+/// checkpoint-provided Jinja template.
+///
+/// The default preserves the generic serializer's existing text-before-media
+/// behavior. PaddleOCR-VL was trained with image placeholders before the
+/// instruction and opts into [`MultimodalContentOrder::ImagesThenText`] at its
+/// adapter boundary. Audio remains after text in both modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MultimodalContentOrder {
+    TextThenMedia,
+    ImagesThenText,
+}
+
 /// Serialize a single `ChatMessage` into the shape Jinja chat templates
 /// expect.
 ///
@@ -1547,6 +1613,13 @@ impl Qwen3Tokenizer {
 /// `msg.images` is `#[serde(skip)]` so a direct `serde_json::to_value(msg)`
 /// would drop images entirely, which is why this helper exists.
 pub(crate) fn serialize_message_for_jinja(msg: &ChatMessage) -> serde_json::Value {
+    serialize_message_for_jinja_with_order(msg, MultimodalContentOrder::TextThenMedia)
+}
+
+fn serialize_message_for_jinja_with_order(
+    msg: &ChatMessage,
+    content_order: MultimodalContentOrder,
+) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("role".to_string(), serde_json::json!(msg.role));
 
@@ -1555,25 +1628,36 @@ pub(crate) fn serialize_message_for_jinja(msg: &ChatMessage) -> serde_json::Valu
 
     if (has_images || has_audio) && msg.role == "user" {
         let mut parts: Vec<serde_json::Value> = Vec::new();
-        if !msg.content.is_empty() {
-            parts.push(serde_json::json!({ "type": "text", "text": msg.content }));
-        }
-        // Image parts first, then audio parts — matching mlx-vlm's
-        // `_format_list_with_image` ordering (image content followed by
-        // appended audio messages). The Gemma 4 chat template emits a single
-        // `<|image|>` / `<|audio|>` placeholder per part; the per-modality
-        // token expanders (`expand_image_tokens` / `expand_audio_tokens`)
-        // grow them into their full spans during prefill.
-        if let Some(images) = msg.images.as_ref() {
-            for _ in images {
-                parts.push(serde_json::json!({ "type": "image" }));
+        let push_text = |parts: &mut Vec<serde_json::Value>| {
+            if !msg.content.is_empty() {
+                parts.push(serde_json::json!({ "type": "text", "text": msg.content }));
+            }
+        };
+        let push_images = |parts: &mut Vec<serde_json::Value>| {
+            if let Some(images) = msg.images.as_ref() {
+                for _ in images {
+                    parts.push(serde_json::json!({ "type": "image" }));
+                }
+            }
+        };
+        let push_audio = |parts: &mut Vec<serde_json::Value>| {
+            if let Some(clips) = msg.audio.as_ref() {
+                for _ in clips {
+                    parts.push(serde_json::json!({ "type": "audio" }));
+                }
+            }
+        };
+        match content_order {
+            MultimodalContentOrder::TextThenMedia => {
+                push_text(&mut parts);
+                push_images(&mut parts);
+            }
+            MultimodalContentOrder::ImagesThenText => {
+                push_images(&mut parts);
+                push_text(&mut parts);
             }
         }
-        if let Some(clips) = msg.audio.as_ref() {
-            for _ in clips {
-                parts.push(serde_json::json!({ "type": "audio" }));
-            }
-        }
+        push_audio(&mut parts);
         obj.insert("content".to_string(), serde_json::Value::Array(parts));
     } else {
         obj.insert("content".to_string(), serde_json::json!(msg.content));
@@ -1856,6 +1940,40 @@ mod tests {
         assert_eq!(parts[0]["type"], "text");
         assert_eq!(parts[0]["text"], "Describe this.");
         assert_eq!(parts[1]["type"], "image");
+    }
+
+    #[test]
+    fn images_then_text_policy_preserves_paddleocr_content_part_order() {
+        let msg = user_mm_msg("Read this.", 2, 1);
+        let v =
+            serialize_message_for_jinja_with_order(&msg, MultimodalContentOrder::ImagesThenText);
+        let parts = v["content"].as_array().expect("content is an array");
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0]["type"], "image");
+        assert_eq!(parts[1]["type"], "image");
+        assert_eq!(parts[2]["type"], "text");
+        assert_eq!(parts[2]["text"], "Read this.");
+        assert_eq!(parts[3]["type"], "audio");
+    }
+
+    #[test]
+    fn model_template_observes_images_then_text_policy() {
+        let msg = user_msg("Read this.", 2);
+        let template = r#"{% for part in messages[0].content %}{% if part.type == "image" %}I|{% elif part.type == "text" %}T:{{ part.text }}|{% endif %}{% endfor %}"#;
+
+        let rendered = Qwen3Tokenizer::render_chat_template_jinja2_with_content_order(
+            template,
+            &[msg],
+            None,
+            false,
+            None,
+            "",
+            "",
+            MultimodalContentOrder::ImagesThenText,
+        )
+        .expect("template renders");
+
+        assert_eq!(rendered, "I|I|T:Read this.|");
     }
 
     #[test]
