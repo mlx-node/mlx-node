@@ -109,7 +109,7 @@ describe('mlx convert GGUF validation', () => {
   it('rejects --gguf-kquant combined with --imatrix-path for .gguf input upfront', async () => {
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     vi.spyOn(console, 'log').mockImplementation(() => {});
-    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+    const _exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
       throw new Error(`process.exit(${code})`);
     }) as never);
 
