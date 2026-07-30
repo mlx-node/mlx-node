@@ -405,11 +405,11 @@ pub(crate) struct Gemma4Inner {
     /// cleared after a warm text save even though the live media KV remains;
     /// `media_session_context` is the persistent source of truth.
     pub(crate) cached_audio_key: Option<u64>,
-    /// Ordered absolute image-placeholder positions and their raw-image hashes
-    /// for the media lineage currently represented by the live/persisted paged
-    /// request. Text continuations preserve this sidecar so every later
-    /// registration uses the same image-aware per-block keys instead of
-    /// republishing image K/V under token-only hashes.
+    /// Ordered absolute image-placeholder positions paired with all four words
+    /// of their SHA-256 image digest for the media lineage currently represented
+    /// by the live/persisted paged request. Text continuations preserve this
+    /// sidecar so every later registration uses the same image-aware per-block
+    /// keys instead of republishing image K/V under token-only hashes.
     cached_paged_image_token_positions: Vec<(u32, u64)>,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache).
     ///
@@ -1103,6 +1103,69 @@ struct Gemma4VlmTurnPreparation {
     layer_kinds: Vec<Gemma4LayerKind>,
     extra_keys_per_block: Vec<Vec<u64>>,
     publish_prefix_checkpoints: bool,
+}
+
+/// Explicit capture identity for Gemma4's out-of-pool sliding state.
+///
+/// Text turns still source their prompt length from the generic paged lifecycle,
+/// but VLM turns bypass that lifecycle entirely. Carrying the VLM prompt length
+/// and ordered image positions here prevents media capture from accidentally
+/// reading the text-only `paged_turn_prompt_len` ambient field (which is zero on
+/// this path) or stale image lineage from a prior turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Gemma4SlidingColdCaptureContext<'a> {
+    prompt_len: u32,
+    image_token_positions: &'a [(u32, u64)],
+    media: Gemma4SlidingColdCaptureMedia,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gemma4SlidingColdCaptureMedia {
+    Text,
+    PureImage,
+}
+
+impl<'a> Gemma4SlidingColdCaptureContext<'a> {
+    fn text(prompt_len: u32, image_token_positions: &'a [(u32, u64)]) -> Self {
+        Self {
+            prompt_len,
+            image_token_positions,
+            media: Gemma4SlidingColdCaptureMedia::Text,
+        }
+    }
+
+    fn pure_image(prompt_len: u32, image_token_positions: &'a [(u32, u64)]) -> Self {
+        Self {
+            prompt_len,
+            image_token_positions,
+            media: Gemma4SlidingColdCaptureMedia::PureImage,
+        }
+    }
+
+    /// First boundary this capture mode may persist.
+    ///
+    /// Text behavior stays byte-for-byte conservative: a generic text turn that
+    /// still carries image lineage remains unsupported, matching the old blanket
+    /// media guard. A native pure-image turn must anchor strictly after every
+    /// expanded image placeholder. `checked_add` makes an unrepresentable
+    /// exclusive endpoint fail closed.
+    fn minimum_safe_boundary(self) -> Option<u32> {
+        match self.media {
+            Gemma4SlidingColdCaptureMedia::Text => {
+                self.image_token_positions.is_empty().then_some(0)
+            }
+            Gemma4SlidingColdCaptureMedia::PureImage => self
+                .image_token_positions
+                .iter()
+                .map(|(position, _)| *position)
+                .max()?
+                .checked_add(1),
+        }
+    }
+}
+
+const fn gemma4_sliding_cold_sidecar_matches_prefix(boundary: u32, cached_prefix_len: u32) -> bool {
+    boundary > 0 && boundary == cached_prefix_len
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2665,45 +2728,47 @@ impl Gemma4Inner {
         )? {
             let hit_prefix_len = hit.prefix_len;
             if require_exact_checkpoint && hit_prefix_len != cached_prefix_len {
+                // A partial in-memory checkpoint cannot back image K/V, but it
+                // must not hide an exact sidecar the adapter just restored from
+                // SSD. Reset the partial state and continue to the cold-sidecar
+                // probe below; if that also misses, the VLM resolver restarts
+                // the whole prepared request cold.
                 self.caches = Some(init_caches_for_config(&self.config));
+            } else {
+                self.caches = Some(hit.caches);
+                let state = if hit_prefix_len == cached_prefix_len {
+                    "prefix_checkpoint"
+                } else {
+                    "partial_prefix_checkpoint"
+                };
+                if trace_enabled {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] gemma4 sliding_prefix_prepare_done state={} cached_prefix_tokens={} primed_prefix_tokens={} replay_delta_tokens={} prefix_lookup_ms={:.1} elapsed_ms={:.1}",
+                        state,
+                        cached_prefix_len,
+                        hit_prefix_len,
+                        cached_prefix_len.saturating_sub(hit_prefix_len),
+                        prefix_lookup_start.map(elapsed_ms).unwrap_or(0.0),
+                        prepare_start.map(elapsed_ms).unwrap_or(0.0)
+                    ));
+                }
                 return Ok(Gemma4SlidingPrefixPreparation {
-                    state: "image_checkpoint_miss",
-                    primed_prefix_len: 0,
+                    state,
+                    primed_prefix_len: hit_prefix_len,
                 });
             }
-            self.caches = Some(hit.caches);
-            let state = if hit_prefix_len == cached_prefix_len {
-                "prefix_checkpoint"
-            } else {
-                "partial_prefix_checkpoint"
-            };
-            if trace_enabled {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] gemma4 sliding_prefix_prepare_done state={} cached_prefix_tokens={} primed_prefix_tokens={} replay_delta_tokens={} prefix_lookup_ms={:.1} elapsed_ms={:.1}",
-                    state,
-                    cached_prefix_len,
-                    hit_prefix_len,
-                    cached_prefix_len.saturating_sub(hit_prefix_len),
-                    prefix_lookup_start.map(elapsed_ms).unwrap_or(0.0),
-                    prepare_start.map(elapsed_ms).unwrap_or(0.0)
-                ));
-            }
-            return Ok(Gemma4SlidingPrefixPreparation {
-                state,
-                primed_prefix_len: hit_prefix_len,
-            });
         }
 
         // Every in-memory source has missed. Before paying a full decoder
         // replay over the reused prefix, install the sliding state the SSD
         // cold tier restored alongside this turn's paged K/V — if it restored
-        // any. Media turns never install (see
-        // `capture_gemma4_sliding_cold_sidecar`: they also never capture, and
-        // `require_exact_checkpoint` marks exactly the image-lineage turns).
-        if !require_exact_checkpoint
-            && let Some(preparation) =
-                self.install_gemma4_sliding_cold_sidecar(cached_prefix_len)?
-        {
+        // any. `install_gemma4_sliding_cold_sidecar` accepts only a sidecar at
+        // EXACTLY `cached_prefix_len`, so it is also a valid exact checkpoint
+        // for an image-lineage turn. A missing/misaligned image sidecar falls
+        // through with `primed_prefix_len == 0`; the VLM resolver then discards
+        // the global-only hit and restarts cold rather than replaying image
+        // placeholder ids.
+        if let Some(preparation) = self.install_gemma4_sliding_cold_sidecar(cached_prefix_len)? {
             if trace_enabled {
                 write_inference_trace(format_args!(
                     "[MLX_TRACE] gemma4 sliding_prefix_prepare_done state={} cached_prefix_tokens={} primed_prefix_tokens={} replay_delta_tokens={} elapsed_ms={:.1}",
@@ -2746,7 +2811,7 @@ impl Gemma4Inner {
     /// `ColdTierWalk::restore_extend` guarantees the sidecar backs EXACTLY the
     /// prefix the adapter reported, so no boundary re-derivation is needed —
     /// but every structural precondition is re-checked here anyway (group,
-    /// layout equality against this config's geometry, boundary within the
+    /// layout equality against this config's geometry, boundary equal to the
     /// reported prefix). A contract slip must degrade to a MISS, i.e. a return
     /// of `None` that falls through to the caller's full replay, never to
     /// state installed at the wrong offset.
@@ -2768,10 +2833,12 @@ impl Gemma4Inner {
             return Ok(None);
         }
         let boundary = sidecar.layout.boundary_tokens;
-        // The walk reconciles the prefix and the state together, so a sidecar
-        // reaching PAST the prefix it was handed back with is a broken
-        // contract, not a deeper opportunity: refuse it.
-        if boundary == 0 || boundary > cached_prefix_len {
+        // The walk reconciles the prefix and the state together, so the two
+        // boundaries must be identical. Accepting a shallower sidecar would
+        // create a global/sliding split-brain state; on an image turn it would
+        // also invite replay across real vision embeddings. Refuse every
+        // mismatch and let the caller restart cold.
+        if !gemma4_sliding_cold_sidecar_matches_prefix(boundary, cached_prefix_len) {
             return Ok(None);
         }
         let Some(geometry) = sliding_sidecar::geometry(&self.config) else {
@@ -2830,13 +2897,31 @@ impl Gemma4Inner {
     /// 2 × min(B, window) × kv_heads × head_dim` elements — hundreds of MiB on
     /// a real checkpoint — and the writer queue is bounded.
     ///
-    /// Media turns are skipped outright in v1. Their per-block keys are
-    /// image-aware (so a text prompt could never select an image-derived
-    /// sidecar), but `gemma4_vlm_prefix_policy` additionally forbids resuming
-    /// INSIDE an expanded image run, and this capture does not model that
-    /// rule; refusing is the fail-closed answer.
-    fn capture_gemma4_sliding_cold_sidecar(&self) {
+    /// Pure-image turns use the same payload and image-aware key chain as their
+    /// global K/V blocks, but apply one additional conservative rule: `B` must
+    /// be at or after the complete expanded image run. This is stricter than the
+    /// causal E2B warm-path policy (which can use an exact checkpoint inside an
+    /// image run), deliberately: the first durable media implementation shares
+    /// one fail-closed rule with unified bidirectional vision and never resumes
+    /// from a half-image boundary.
+    fn capture_gemma4_sliding_cold_sidecar(&self, context: Gemma4SlidingColdCaptureContext<'_>) {
         crate::cold_tier::cold_sidecar_counters().record_capture_reached();
+        let media = match context.media {
+            Gemma4SlidingColdCaptureMedia::Text => "text",
+            Gemma4SlidingColdCaptureMedia::PureImage => "image",
+        };
+        let Some(minimum_safe_boundary) = context.minimum_safe_boundary() else {
+            crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
+            if inference_trace_enabled() {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_skipped reason=unsupported_media_capture_context media={} prompt_tokens={} image_tokens={}",
+                    media,
+                    context.prompt_len,
+                    context.image_token_positions.len(),
+                ));
+            }
+            return;
+        };
         let Some(adapter) = self.paged_adapter.as_ref() else {
             return;
         };
@@ -2847,10 +2932,6 @@ impl Gemma4Inner {
             return;
         };
         if policy.group() != mlx_paged_attn::ColdGroup::SlidingWindow {
-            return;
-        }
-        // v1: text-only. See the doc comment.
-        if !self.cached_paged_image_token_positions.is_empty() {
             return;
         }
         let Some(geometry) = sliding_sidecar::geometry(&self.config) else {
@@ -2892,12 +2973,12 @@ impl Gemma4Inner {
         // reach no further, and under the unclamped ceiling got back nothing at
         // all whenever `prompt_len` was block-aligned.
         let reachable_blocks =
-            gemma4_cold_restore_reachable_boundary(self.paged_turn_prompt_len, block_size) as usize
+            gemma4_cold_restore_reachable_boundary(context.prompt_len, block_size) as usize
                 / block_size as usize;
         let chain_blocks = gemma4_sliding_cold_capture_ceiling_blocks(
             adapter.cold_captured_blocks(),
             request_tokens.len(),
-            self.paged_turn_prompt_len,
+            context.prompt_len,
             block_size,
         );
         if chain_blocks == 0 {
@@ -2913,7 +2994,7 @@ impl Gemma4Inner {
                     adapter.cold_captured_blocks(),
                     full_blocks,
                     reachable_blocks,
-                    self.paged_turn_prompt_len,
+                    context.prompt_len,
                     block_size,
                     request_tokens.len()
                 ));
@@ -2923,7 +3004,7 @@ impl Gemma4Inner {
         let extra_keys_per_block = engine::build_paged_extra_keys(
             request_tokens.len(),
             block_size,
-            &self.cached_paged_image_token_positions,
+            context.image_token_positions,
         );
 
         // Every representable boundary an in-memory checkpoint backs, deepest
@@ -2936,6 +3017,7 @@ impl Gemma4Inner {
             block_size,
             chain_blocks,
             &extra_keys_per_block,
+            minimum_safe_boundary,
         );
         if candidates.is_empty() {
             // The one silent way this whole feature stays inert: a capture needs
@@ -2961,8 +3043,16 @@ impl Gemma4Inner {
             // instead of looking like a working cache.
             crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
             if inference_trace_enabled() {
+                let reason = if context.media == Gemma4SlidingColdCaptureMedia::PureImage {
+                    "no_exact_checkpoint_after_complete_image"
+                } else {
+                    "no_representable_checkpoint_at_or_below_chain_reach"
+                };
                 write_inference_trace(format_args!(
-                    "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_skipped reason=no_representable_checkpoint_at_or_below_chain_reach chain_reach_tokens={} chain_blocks={} block_size={} window={} request_tokens={} prompt_boundary={} prefix_checkpoints={} retained={:?} anchor_rungs={:?}",
+                    "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_skipped reason={} media={} minimum_safe_boundary={} chain_reach_tokens={} chain_blocks={} block_size={} window={} request_tokens={} prompt_boundary={} prefix_checkpoints={} retained={:?} anchor_rungs={:?}",
+                    reason,
+                    media,
+                    minimum_safe_boundary,
                     chain_blocks as u64 * block_size as u64,
                     chain_blocks,
                     block_size,
@@ -3069,7 +3159,17 @@ impl Gemma4Inner {
             .manager
             .enqueue_sidecar_before(sidecar, std::time::Instant::now() + sidecar_wait)
         {
-            Ok(true) => crate::cold_tier::cold_sidecar_counters().record_enqueued(),
+            Ok(true) => {
+                crate::cold_tier::cold_sidecar_counters().record_enqueued();
+                if context.media == Gemma4SlidingColdCaptureMedia::PureImage
+                    && inference_trace_enabled()
+                {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_enqueued media=image boundary_tokens={} last_image_exclusive={}",
+                        boundary, minimum_safe_boundary,
+                    ));
+                }
+            }
             // The bounded writer queue stayed full for the whole capture
             // budget. Nothing is written and nothing failed, so this turn is
             // otherwise indistinguishable from a successful capture.
@@ -3110,6 +3210,7 @@ impl Gemma4Inner {
         block_size: u32,
         chain_blocks: usize,
         extra_keys_per_block: &[Vec<u64>],
+        minimum_safe_boundary: u32,
     ) -> Vec<(u32, &'a [Option<RotatingKVCacheSnapshot>])> {
         let ceiling = (chain_blocks as u64).saturating_mul(block_size as u64);
         let ceiling = u32::try_from(ceiling).unwrap_or(u32::MAX);
@@ -3121,7 +3222,8 @@ impl Gemma4Inner {
             .chain(self.sliding_prefix_checkpoints.iter());
         for checkpoint in candidates {
             let boundary = checkpoint.prefix_len;
-            if boundary > ceiling
+            if boundary < minimum_safe_boundary
+                || boundary > ceiling
                 || checkpoint.block_size != block_size
                 || !sliding_sidecar::boundary_is_representable(geometry, boundary, block_size)
                 || found.iter().any(|(seen, _)| *seen == boundary)
@@ -3502,14 +3604,25 @@ impl Gemma4Inner {
             && last_image_exclusive
                 .is_some_and(|last_image_exclusive| cached_prefix_len >= last_image_exclusive);
         if image_span_fully_cached {
+            let last_image_exclusive =
+                last_image_exclusive.expect("fully cached image span has an endpoint");
             tracing::info!(
                 target: "mlx_core::inference",
                 event = "vlm_vision_tower_skip",
                 model = "gemma4",
                 cached_prefix_tokens = cached_prefix_len,
+                last_image_exclusive,
                 suffix_tokens = prompt_len - cached_prefix_len,
                 "skipping Gemma4 vision tower because the image span is fully cached"
             );
+            if inference_trace_enabled() {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] gemma4 vlm_vision_tower_skip cached_prefix_tokens={} last_image_exclusive={} suffix_tokens={}",
+                    cached_prefix_len,
+                    last_image_exclusive,
+                    prompt_len - cached_prefix_len,
+                ));
+            }
             let suffix = prompt.slice_axis(1, cached_prefix_len as i64, prompt_len as i64)?;
             return self
                 .embed_tokens
@@ -3852,6 +3965,27 @@ impl Gemma4Inner {
             };
 
             if keep_live_ok {
+                // `finalize_turn_keep_live_per_block` has now published and
+                // offered the image-aware GLOBAL K/V chain to the SSD writer.
+                // Only after that succeeds may the out-of-pool sliding half be
+                // offered, keyed from the same tokens/image positions. Carry the
+                // VLM prompt length explicitly: this path bypasses the generic
+                // text backend's `paged_turn_prompt_len` writer.
+                if new_image_key.is_some()
+                    && new_audio_key.is_none()
+                    && !image_token_positions.is_empty()
+                {
+                    let prompt_len = u32::try_from(expanded_tokens.len()).map_err(|_| {
+                        Error::from_reason("Gemma4 VLM prompt length exceeds u32 at finalize")
+                    })?;
+                    self.capture_gemma4_sliding_cold_sidecar(
+                        Gemma4SlidingColdCaptureContext::pure_image(
+                            prompt_len,
+                            image_token_positions,
+                        ),
+                    );
+                }
+
                 // Publish history FIRST: the checkpoint reads its length, and
                 // the next delta's prefix restore matches against it.
                 self.cached_token_history = full_history;
@@ -7034,7 +7168,10 @@ impl PagedBackend for Gemma4Inner {
         // finalize failed: the K/V chain the sidecar would anchor on was not
         // published, so nothing could ever select it.
         if finalize_error.is_none() {
-            self.capture_gemma4_sliding_cold_sidecar();
+            self.capture_gemma4_sliding_cold_sidecar(Gemma4SlidingColdCaptureContext::text(
+                self.paged_turn_prompt_len,
+                &self.cached_paged_image_token_positions,
+            ));
         }
         if release_pending && let Some(adapter) = self.paged_adapter.as_mut() {
             finalize_error = finalize_error.or(adapter.release_request().err());
@@ -10437,6 +10574,47 @@ mod tests {
         assert!(unified_after_image.unified_boundary_safe);
         assert!(unified_after_image.require_exact_checkpoint);
         assert!(!unified_after_image.may_replay_leading_text);
+    }
+
+    #[test]
+    fn gemma4_sliding_cold_capture_context_is_fail_closed_for_media() {
+        let image_positions = [(47, 0xAAAA), (32, 0xBBBB), (79, 0xAAAA)];
+
+        assert_eq!(
+            Gemma4SlidingColdCaptureContext::text(128, &[]).minimum_safe_boundary(),
+            Some(0),
+            "the existing text-only capture has no media floor"
+        );
+        assert_eq!(
+            Gemma4SlidingColdCaptureContext::text(128, &image_positions).minimum_safe_boundary(),
+            None,
+            "a generic text turn carrying image lineage must remain unsupported"
+        );
+        assert_eq!(
+            Gemma4SlidingColdCaptureContext::pure_image(128, &[]).minimum_safe_boundary(),
+            None,
+            "a pure-image label without image positions must not capture"
+        );
+        assert_eq!(
+            Gemma4SlidingColdCaptureContext::pure_image(128, &image_positions)
+                .minimum_safe_boundary(),
+            Some(80),
+            "the floor must sit after the complete image run even if positions arrive unsorted"
+        );
+        assert_eq!(
+            Gemma4SlidingColdCaptureContext::pure_image(u32::MAX, &[(u32::MAX, 0xAAAA)],)
+                .minimum_safe_boundary(),
+            None,
+            "an unrepresentable exclusive image endpoint must fail closed"
+        );
+    }
+
+    #[test]
+    fn gemma4_restored_sliding_sidecar_must_match_the_effective_prefix_exactly() {
+        assert!(!gemma4_sliding_cold_sidecar_matches_prefix(0, 0));
+        assert!(!gemma4_sliding_cold_sidecar_matches_prefix(16, 32));
+        assert!(gemma4_sliding_cold_sidecar_matches_prefix(32, 32));
+        assert!(!gemma4_sliding_cold_sidecar_matches_prefix(48, 32));
     }
 
     #[test]
@@ -14310,6 +14488,7 @@ mod tests {
             block_size,
             4,
             &extra_keys_per_block,
+            0,
         );
         let &(selected_boundary, snapshots) = selected
             .first()
@@ -14354,9 +14533,109 @@ mod tests {
                     block_size,
                     1,
                     &extra_keys_per_block,
+                    0,
                 )
                 .is_empty(),
             "boundary 32 must not be selected when the chain reaches only 16 tokens"
+        );
+    }
+
+    /// The durable image path is deliberately stricter than same-process E2B
+    /// reuse: the selected checkpoint must be after the complete expanded image
+    /// run and carry the exact image-aware block hash.
+    #[test]
+    fn test_gemma4_image_capture_requires_after_image_exact_checkpoint() {
+        let cfg = sliding_capture_config();
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(inner) => inner,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        let geometry = sliding_sidecar::geometry(&inner.config).expect("hybrid config geometry");
+        let block_size = 16u32;
+        let boundary = 48u32;
+        let request_tokens: Vec<u32> = (8000..8064).collect();
+        let image_positions: Vec<(u32, u64)> =
+            (20..40).map(|position| (position, 0xAAAA)).collect();
+        let last_image_exclusive = 40u32;
+        let extra_keys_per_block =
+            engine::build_paged_extra_keys(request_tokens.len(), block_size, &image_positions);
+        let final_block_hash = super::compute_gemma4_paged_prefix_block_hash_with_keys(
+            &request_tokens,
+            boundary,
+            block_size,
+            &extra_keys_per_block,
+            0,
+        )
+        .expect("image-aware prefix hash");
+
+        inner.sliding_prompt_boundary_checkpoint = Some(super::Gemma4SlidingPrefixCheckpoint {
+            prefix_len: boundary,
+            block_size,
+            final_block_hash,
+            protected_image_prompt_boundary: true,
+            cold_anchor_rung: false,
+            tokens: request_tokens[..boundary as usize].to_vec(),
+            snapshots: sliding_capture_snapshots(&inner.config, boundary),
+        });
+
+        let selected = inner.find_gemma4_sliding_capture_checkpoints(
+            &geometry,
+            &request_tokens,
+            block_size,
+            4,
+            &extra_keys_per_block,
+            last_image_exclusive,
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(selected_boundary, _)| *selected_boundary)
+                .collect::<Vec<_>>(),
+            vec![boundary],
+            "an exact checkpoint after the complete image run must be selectable"
+        );
+
+        assert!(
+            inner
+                .find_gemma4_sliding_capture_checkpoints(
+                    &geometry,
+                    &request_tokens,
+                    block_size,
+                    4,
+                    &extra_keys_per_block,
+                    boundary + 1,
+                )
+                .is_empty(),
+            "a checkpoint before the conservative image floor must be refused"
+        );
+
+        let changed_image_positions: Vec<(u32, u64)> =
+            (20..40).map(|position| (position, 0xBBBB)).collect();
+        let changed_extra_keys = engine::build_paged_extra_keys(
+            request_tokens.len(),
+            block_size,
+            &changed_image_positions,
+        );
+        assert!(
+            inner
+                .find_gemma4_sliding_capture_checkpoints(
+                    &geometry,
+                    &request_tokens,
+                    block_size,
+                    4,
+                    &changed_extra_keys,
+                    last_image_exclusive,
+                )
+                .is_empty(),
+            "the same tokens with a different image hash must not select the checkpoint"
         );
     }
 
@@ -14434,6 +14713,7 @@ mod tests {
             block_size,
             chain_blocks,
             &extra_keys_per_block,
+            0,
         );
         let boundaries: Vec<u32> = candidates.iter().map(|(boundary, _)| *boundary).collect();
         assert_eq!(

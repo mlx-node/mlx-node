@@ -246,8 +246,8 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) vision_cache: VisionCache,
     pub(crate) cached_token_history: Vec<u32>,
     pub(crate) cached_image_key: Option<u64>,
-    /// Absolute expanded-token positions paired with their per-image content
-    /// hashes for the live paged request. Retained across text continuations
+    /// Absolute expanded-token positions paired with all four per-image digest
+    /// words for the live paged request. Retained across text continuations
     /// so image-conditioned blocks keep the same prefix-cache identity.
     pub(crate) cached_paged_image_token_positions: Vec<(u32, u64)>,
     pub(crate) cached_rope_deltas: Option<i32>,

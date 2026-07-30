@@ -5984,10 +5984,17 @@ impl PagedKVCacheAdapter {
 ///
 /// # Algorithm
 ///
-/// For each entry `(token_pos, image_hash)` in `token_image_positions`:
+/// For each entry `(token_pos, image_identity_word)` in
+/// `token_image_positions`:
 /// 1. Compute `block_idx = token_pos / block_size`.
 /// 2. Compute `pos_within_block = token_pos % block_size`.
-/// 3. Append `[image_hash, pos_within_block as u64]` to `out[block_idx]`.
+/// 3. Append `[image_identity_word, pos_within_block as u64]` to
+///    `out[block_idx]`.
+///
+/// Production VLM callers flatten every 256-bit image digest into four ordered
+/// words at each placeholder position before calling this low-level helper.
+/// Keeping the carrier word-sized preserves the generic paged API while the
+/// resulting block hash still receives the full digest.
 ///
 /// Blocks with no image tokens get an empty `Vec<u64>` — equivalent to
 /// passing `&[]` to `hash_tokens`, which is what text-only callers do
@@ -6041,8 +6048,9 @@ impl PagedKVCacheAdapter {
 ///
 /// # Parameters
 ///
-/// * `token_image_positions` — `(absolute_token_position, image_hash)`
-///   pairs. Positions outside `[0, num_blocks * block_size)` are
+/// * `token_image_positions` — `(absolute_token_position, image_identity_word)`
+///   pairs. A production image placeholder contributes four consecutive pairs,
+///   one per digest word. Positions outside `[0, num_blocks * block_size)` are
 ///   silently skipped (defensive: a paged request's block_table covers
 ///   exactly that range, so out-of-range positions cannot affect any
 ///   block hash). Callers should validate upstream and not rely on this

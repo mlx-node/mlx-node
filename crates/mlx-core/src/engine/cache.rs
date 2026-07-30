@@ -1,9 +1,53 @@
 //! Prefix-cache verification and post-turn cache-state persistence,
 //! plus the multimodal (image) cache-key helpers.
 
-use std::hash::{DefaultHasher, Hash, Hasher};
+use sha2::{Digest, Sha256};
 
 use crate::transformer::paged_kv_cache_adapter::PagedTurnPlan;
+
+const IMAGE_PAYLOAD_DIGEST_DOMAIN_V1: &[u8] = b"mlx-node:image-payload-digest:v1\0";
+const IMAGE_SET_HOT_LINEAGE_DOMAIN_V1: &[u8] = b"mlx-node:image-set-hot-lineage:v1\0";
+
+/// Stable image-bearing `extra_keys` layout marker (`IMGKEY01` in LE bytes).
+///
+/// Bump this when the word layout emitted by [`build_paged_extra_keys`] changes.
+const IMAGE_BLOCK_EXTRA_KEYS_FORMAT_V1: u64 = u64::from_le_bytes(*b"IMGKEY01");
+
+/// Image preprocessing semantics marker (`PREPR001` in LE bytes).
+///
+/// Bump this whenever raw-payload decoding, resizing, placeholder expansion, or
+/// vision-embedding semantics change in a way that can alter cached K/V state.
+/// Keeping it at the image-bearing block-key seam invalidates durable entries
+/// across such changes without perturbing text-only keys.
+const IMAGE_KV_PREPROCESSING_SEMANTICS_V1: u64 = u64::from_le_bytes(*b"PREPR001");
+
+/// Stable, collision-resistant identity of one raw image payload.
+///
+/// Persistent paged-prefix keys carry all 256 bits. The compact `u64` image-set
+/// key returned alongside these digests is only for same-process hot lineage.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ImageCacheDigest([u8; 32]);
+
+impl ImageCacheDigest {
+    fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    fn extra_key_words(self) -> [u64; 4] {
+        let mut words = [0u64; 4];
+        for (word, bytes) in words.iter_mut().zip(self.0.chunks_exact(8)) {
+            *word = u64::from_le_bytes(bytes.try_into().expect("SHA-256 word is 8 bytes"));
+        }
+        words
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_word(word: u64) -> Self {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&word.to_le_bytes());
+        Self(bytes)
+    }
+}
 
 /// Load-bearing typed error prefix used when `chat_session_continue_sync`
 /// rejects an image parameter because images are changing mid-session.
@@ -72,36 +116,48 @@ pub(crate) fn resolve_vlm_paged_prefix(
     })
 }
 
-/// Hash raw image bytes to a u64 key for cache lookup.
-fn hash_image_bytes(bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
+/// Hash raw image bytes with an explicitly versioned, process-stable digest.
+fn hash_image_payload(bytes: &[u8]) -> ImageCacheDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(IMAGE_PAYLOAD_DIGEST_DOMAIN_V1);
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    ImageCacheDigest(hasher.finalize().into())
 }
 
-/// Compute the combined image-set key and one content hash per raw image.
+fn hash_image_payloads<T: AsRef<[u8]>>(all_images: &[T]) -> Vec<ImageCacheDigest> {
+    all_images
+        .iter()
+        .map(|image| hash_image_payload(image.as_ref()))
+        .collect()
+}
+
+/// Compute a compact hot-lineage key and one stable digest per raw image.
 ///
 /// The returned vector preserves input order and is the identity used by
 /// image-aware paged-prefix cache keys. The first tuple field combines that same
-/// vector for the live-session image key. Each raw image is hashed exactly once:
-/// callers needing both identities must use this helper instead of computing the
-/// combined and per-image keys independently.
-pub(crate) fn compute_image_cache_keys<T: AsRef<[u8]>>(all_images: &[T]) -> (u64, Vec<u64>) {
-    let per_image_hashes = all_images
-        .iter()
-        .map(|image| hash_image_bytes(image.as_ref()))
-        .collect::<Vec<_>>();
-    (combine_image_hashes(&per_image_hashes), per_image_hashes)
+/// vector for same-process live-session lineage only. Durable block keys must
+/// use the full per-image digests. Each raw image is hashed exactly once.
+pub(crate) fn compute_image_cache_keys<T: AsRef<[u8]>>(
+    all_images: &[T],
+) -> (u64, Vec<ImageCacheDigest>) {
+    let per_image_digests = hash_image_payloads(all_images);
+    (combine_image_hashes(&per_image_digests), per_image_digests)
 }
 
-/// Combine individual image hashes into a single cache key.
+/// Combine image digests into a compact, deterministic hot-lineage key.
+///
+/// This key is intentionally not used by persistent block identity.
 /// Order matters: different orderings of the same images produce different keys.
-fn combine_image_hashes(hashes: &[u64]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    for h in hashes {
-        h.hash(&mut hasher);
+fn combine_image_hashes(digests: &[ImageCacheDigest]) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(IMAGE_SET_HOT_LINEAGE_DOMAIN_V1);
+    hasher.update((digests.len() as u64).to_le_bytes());
+    for digest in digests {
+        hasher.update(digest.as_bytes());
     }
-    hasher.finish()
+    let combined: [u8; 32] = hasher.finalize().into();
+    u64::from_le_bytes(combined[..8].try_into().expect("SHA-256 prefix is 8 bytes"))
 }
 
 /// Compute a combined cache key from raw image bytes.
@@ -109,30 +165,31 @@ pub(crate) fn compute_image_cache_key(all_images: &[Vec<u8>]) -> u64 {
     compute_image_cache_keys(all_images).0
 }
 
-/// Associate every expanded image-placeholder token with its source image hash.
+/// Associate every expanded image-placeholder token with its source digest.
 ///
 /// Qwen-style VLM preprocessing expands each logical image into a known number
-/// of placeholder tokens. The counts and hashes are both ordered exactly like
+/// of placeholder tokens. The counts and digests are both ordered exactly like
 /// the raw image list. This helper walks the already-expanded prompt in absolute
-/// token order and emits the `(token_position, image_hash)` input expected by
-/// `compute_per_block_image_extra_keys`, assigning the first image's hash to its
-/// first `count` placeholders, then the second image's hash, and so on.
+/// token order and emits all four digest words at every placeholder position.
+/// The flattened `(token_position, digest_word)` representation preserves the
+/// existing paged-adapter side-channel type while ensuring persistent block
+/// keys receive the complete 256-bit identity.
 ///
 /// The placeholder token id is an argument so this generic cache module does
 /// not depend on a Qwen model constant. The mapping rejects ambiguous metadata:
-/// there must be one positive token count per image hash, and the total count
+/// there must be one positive token count per image digest, and the total count
 /// must exactly equal the number of placeholder ids in `expanded_tokens`.
 pub(crate) fn map_expanded_image_token_positions(
     expanded_tokens: &[u32],
     image_token_id: u32,
     per_image_token_counts: &[usize],
-    per_image_hashes: &[u64],
+    per_image_digests: &[ImageCacheDigest],
 ) -> Result<Vec<(u32, u64)>, String> {
-    if per_image_token_counts.len() != per_image_hashes.len() {
+    if per_image_token_counts.len() != per_image_digests.len() {
         return Err(format!(
-            "image metadata cardinality mismatch: {} token counts for {} image hashes",
+            "image metadata cardinality mismatch: {} token counts for {} image digests",
             per_image_token_counts.len(),
-            per_image_hashes.len(),
+            per_image_digests.len(),
         ));
     }
 
@@ -160,25 +217,36 @@ pub(crate) fn map_expanded_image_token_positions(
         ));
     }
 
-    let ordered_hashes = per_image_token_counts
+    let ordered_digests = per_image_token_counts
         .iter()
         .copied()
-        .zip(per_image_hashes.iter().copied())
-        .flat_map(|(count, image_hash)| std::iter::repeat_n(image_hash, count));
+        .zip(per_image_digests.iter().copied())
+        .flat_map(|(count, image_digest)| std::iter::repeat_n(image_digest, count));
     expanded_tokens
         .iter()
         .enumerate()
         .filter(|(_, token)| **token == image_token_id)
-        .zip(ordered_hashes)
-        .map(|((token_position, _), image_hash)| {
+        .zip(ordered_digests)
+        .map(|((token_position, _), image_digest)| {
             let token_position = u32::try_from(token_position).map_err(|_| {
                 format!(
                     "expanded image placeholder position {token_position} exceeds the u32 cache-key range",
                 )
             })?;
-            Ok((token_position, image_hash))
+            Ok((token_position, image_digest))
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()
+        .map(|positions| {
+            positions
+                .into_iter()
+                .flat_map(|(token_position, image_digest)| {
+                    image_digest
+                        .extra_key_words()
+                        .into_iter()
+                        .map(move |word| (token_position, word))
+                })
+                .collect()
+        })
 }
 
 /// Build per-block extra_keys for the paged adapter's prefix-cache walk.
@@ -212,11 +280,19 @@ pub(crate) fn build_paged_extra_keys(
     // The adapter's per-block API tolerates an over-long vec by indexing
     // only what it needs, so erring high is safe.
     let num_blocks = total_tokens.div_ceil(block_size_us);
-    crate::transformer::paged_kv_cache_adapter::compute_per_block_image_extra_keys(
-        token_image_positions,
-        num_blocks,
-        block_size,
-    )
+    let mut per_block =
+        crate::transformer::paged_kv_cache_adapter::compute_per_block_image_extra_keys(
+            token_image_positions,
+            num_blocks,
+            block_size,
+        );
+    for extra_keys in &mut per_block {
+        if !extra_keys.is_empty() {
+            extra_keys.insert(0, IMAGE_KV_PREPROCESSING_SEMANTICS_V1);
+            extra_keys.insert(0, IMAGE_BLOCK_EXTRA_KEYS_FORMAT_V1);
+        }
+    }
+    per_block
 }
 
 /// Direct-ownership version of `save_cache_state` for dedicated-thread models.
@@ -422,13 +498,31 @@ pub(crate) fn verify_cache_prefix_direct(
 #[cfg(test)]
 mod image_cache_identity_tests {
     use super::{
-        combine_image_hashes, compute_image_cache_key, compute_image_cache_keys,
-        map_expanded_image_token_positions, resolve_vlm_paged_prefix,
+        IMAGE_BLOCK_EXTRA_KEYS_FORMAT_V1, IMAGE_KV_PREPROCESSING_SEMANTICS_V1, ImageCacheDigest,
+        build_paged_extra_keys, combine_image_hashes, compute_image_cache_key,
+        compute_image_cache_keys, map_expanded_image_token_positions, resolve_vlm_paged_prefix,
         vlm_prefix_requires_cold_restart,
     };
     use crate::transformer::paged_kv_cache_adapter::{PagedTurnPlan, PagedTurnPlanReason};
+    use mlx_paged_attn::{ColdCacheFingerprint, ColdCacheKey, ColdGroup};
 
     const IMAGE_TOKEN_ID: u32 = 248_056;
+
+    fn digest(word: u64) -> ImageCacheDigest {
+        ImageCacheDigest::from_test_word(word)
+    }
+
+    fn cold_key(extra_keys: &[u64]) -> ColdCacheKey {
+        ColdCacheKey::chain(
+            ColdGroup::Kv,
+            ColdCacheFingerprint::from_components([b"image-cache-test".as_slice()]),
+            None,
+            &[1, IMAGE_TOKEN_ID, 2, 3],
+            extra_keys,
+            0,
+            0,
+        )
+    }
 
     #[test]
     fn image_kv_candidate_requires_cold_restart_without_gdn_sidecar() {
@@ -479,26 +573,34 @@ mod image_cache_identity_tests {
     }
 
     #[test]
-    fn per_image_hashes_are_content_stable_and_preserve_order() {
+    fn image_payload_digest_is_version_pinned_and_content_sensitive() {
         let image_a: &[u8] = &[1, 2, 3, 4];
-        let image_b: &[u8] = &[9, 8, 7];
+        let changed: &[u8] = &[1, 2, 3, 5];
 
-        let (_, first) = compute_image_cache_keys(&[image_a, image_b]);
-        let (_, same_bytes_new_slices) =
-            compute_image_cache_keys(&[&[1, 2, 3, 4][..], &[9, 8, 7][..]]);
-        let (_, reversed) = compute_image_cache_keys(&[image_b, image_a]);
+        let (_, first) = compute_image_cache_keys(&[image_a]);
+        let (_, same_bytes_new_slice) = compute_image_cache_keys(&[&[1, 2, 3, 4][..]]);
+        let (_, changed_digest) = compute_image_cache_keys(&[changed]);
 
-        assert_eq!(first, same_bytes_new_slices);
-        assert_ne!(first[0], first[1]);
-        assert_eq!(reversed, vec![first[1], first[0]]);
+        assert_eq!(first, same_bytes_new_slice);
+        assert_ne!(first, changed_digest);
+        assert_eq!(
+            first[0].0,
+            [
+                0x45, 0x42, 0x12, 0xd9, 0x36, 0xe6, 0x52, 0x67, 0xe4, 0xf0, 0x29, 0x71, 0xff, 0x94,
+                0x74, 0x9f, 0xf2, 0x7c, 0x13, 0xfb, 0x7c, 0x76, 0x31, 0xa0, 0xbc, 0x33, 0x39, 0x6a,
+                0x6a, 0x53, 0xbd, 0x09,
+            ],
+            "the versioned SHA-256 derivation is part of the durable cache ABI",
+        );
     }
 
     #[test]
-    fn combined_key_reuses_per_image_hash_basis_and_is_order_sensitive() {
+    fn image_order_changes_hot_lineage_and_preserves_ordered_digests() {
         let images = vec![vec![1, 2, 3], vec![4, 5, 6]];
         let (combined, individual) = compute_image_cache_keys(&images);
         assert_eq!(combined, combine_image_hashes(&individual));
         assert_eq!(compute_image_cache_key(&images), combined);
+        assert_eq!(combined, 0xe6e1_07bd_8bfe_ed56);
 
         let reversed = vec![images[1].clone(), images[0].clone()];
         let (reversed_combined, reversed_individual) = compute_image_cache_keys(&reversed);
@@ -510,7 +612,7 @@ mod image_cache_identity_tests {
     }
 
     #[test]
-    fn expanded_placeholders_map_to_each_image_hash_in_prompt_order() {
+    fn expanded_placeholders_carry_every_digest_word_in_prompt_order() {
         let expanded_tokens = [
             1,
             IMAGE_TOKEN_ID,
@@ -525,20 +627,29 @@ mod image_cache_identity_tests {
             &expanded_tokens,
             IMAGE_TOKEN_ID,
             &[2, 3],
-            &[0xAAAA, 0xBBBB],
+            &[digest(0xAAAA), digest(0xBBBB)],
         )
         .expect("valid expanded image metadata");
 
-        assert_eq!(
-            positions,
-            vec![
-                (1, 0xAAAA),
-                (2, 0xAAAA),
-                (4, 0xBBBB),
-                (5, 0xBBBB),
-                (6, 0xBBBB),
-            ],
-        );
+        let expected_positions = [1u32, 2, 4, 5, 6];
+        let expected_digests = [
+            digest(0xAAAA),
+            digest(0xAAAA),
+            digest(0xBBBB),
+            digest(0xBBBB),
+            digest(0xBBBB),
+        ];
+        let expected = expected_positions
+            .into_iter()
+            .zip(expected_digests)
+            .flat_map(|(position, digest)| {
+                digest
+                    .extra_key_words()
+                    .into_iter()
+                    .map(move |word| (position, word))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(positions, expected);
     }
 
     #[test]
@@ -547,11 +658,11 @@ mod image_cache_identity_tests {
             &[1, IMAGE_TOKEN_ID],
             IMAGE_TOKEN_ID,
             &[1, 1],
-            &[0xAAAA],
+            &[digest(0xAAAA)],
         )
-        .expect_err("counts and hashes must have identical cardinality");
+        .expect_err("counts and digests must have identical cardinality");
 
-        assert!(error.contains("2 token counts for 1 image hashes"));
+        assert!(error.contains("2 token counts for 1 image digests"));
     }
 
     #[test]
@@ -560,7 +671,7 @@ mod image_cache_identity_tests {
             &[1, IMAGE_TOKEN_ID, 200],
             IMAGE_TOKEN_ID,
             &[2],
-            &[0xAAAA],
+            &[digest(0xAAAA)],
         )
         .expect_err("metadata requiring two placeholders must reject one placeholder");
         assert!(too_few.contains("prompt contains 1, image metadata requires 2"));
@@ -569,7 +680,7 @@ mod image_cache_identity_tests {
             &[1, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 200],
             IMAGE_TOKEN_ID,
             &[1],
-            &[0xAAAA],
+            &[digest(0xAAAA)],
         )
         .expect_err("metadata requiring one placeholder must reject two placeholders");
         assert!(too_many.contains("prompt contains 2, image metadata requires 1"));
@@ -577,10 +688,92 @@ mod image_cache_identity_tests {
 
     #[test]
     fn expanded_placeholder_mapping_rejects_zero_count_images() {
-        let error = map_expanded_image_token_positions(&[1, 200], IMAGE_TOKEN_ID, &[0], &[0xAAAA])
-            .expect_err("an image hash without an expanded token span is ambiguous");
+        let error =
+            map_expanded_image_token_positions(&[1, 200], IMAGE_TOKEN_ID, &[0], &[digest(0xAAAA)])
+                .expect_err("an image digest without an expanded token span is ambiguous");
 
         assert!(error.contains("zero expanded tokens for image 0"));
+    }
+
+    #[test]
+    fn durable_image_keys_bind_full_digest_and_placeholder_position() {
+        let (_, digests) = compute_image_cache_keys(&[&[1, 2, 3, 4][..]]);
+        let at_one = map_expanded_image_token_positions(
+            &[1, IMAGE_TOKEN_ID, 2, 3],
+            IMAGE_TOKEN_ID,
+            &[1],
+            &digests,
+        )
+        .unwrap();
+        let at_two = map_expanded_image_token_positions(
+            &[1, 2, IMAGE_TOKEN_ID, 3],
+            IMAGE_TOKEN_ID,
+            &[1],
+            &digests,
+        )
+        .unwrap();
+        let extra_at_one = build_paged_extra_keys(4, 16, &at_one);
+        let extra_at_two = build_paged_extra_keys(4, 16, &at_two);
+
+        assert_eq!(
+            &extra_at_one[0][..2],
+            &[
+                IMAGE_BLOCK_EXTRA_KEYS_FORMAT_V1,
+                IMAGE_KV_PREPROCESSING_SEMANTICS_V1,
+            ],
+        );
+        assert_eq!(extra_at_one[0].len(), 2 + 4 * 2);
+        let carried_digest = extra_at_one[0][2..]
+            .chunks_exact(2)
+            .flat_map(|pair| pair[0].to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(carried_digest.as_slice(), digests[0].as_bytes());
+        assert!(
+            extra_at_one[0][2..]
+                .chunks_exact(2)
+                .all(|pair| pair[1] == 1),
+            "every digest word must be bound to the placeholder position",
+        );
+        assert_ne!(extra_at_one, extra_at_two);
+        assert_ne!(cold_key(&extra_at_one[0]), cold_key(&extra_at_two[0]));
+
+        let (_, changed_digests) = compute_image_cache_keys(&[&[1, 2, 3, 5][..]]);
+        let changed_positions = map_expanded_image_token_positions(
+            &[1, IMAGE_TOKEN_ID, 2, 3],
+            IMAGE_TOKEN_ID,
+            &[1],
+            &changed_digests,
+        )
+        .unwrap();
+        let changed_extra = build_paged_extra_keys(4, 16, &changed_positions);
+        assert_ne!(extra_at_one, changed_extra);
+        assert_ne!(cold_key(&extra_at_one[0]), cold_key(&changed_extra[0]));
+    }
+
+    #[test]
+    fn durable_image_keys_preserve_image_order() {
+        let (_, ordered_digests) = compute_image_cache_keys(&[&[1, 2, 3][..], &[4, 5, 6][..]]);
+        let (_, reversed_digests) = compute_image_cache_keys(&[&[4, 5, 6][..], &[1, 2, 3][..]]);
+        let expanded = [IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 7, 8];
+        let ordered_positions = map_expanded_image_token_positions(
+            &expanded,
+            IMAGE_TOKEN_ID,
+            &[1, 1],
+            &ordered_digests,
+        )
+        .unwrap();
+        let reversed_positions = map_expanded_image_token_positions(
+            &expanded,
+            IMAGE_TOKEN_ID,
+            &[1, 1],
+            &reversed_digests,
+        )
+        .unwrap();
+        let ordered_extra = build_paged_extra_keys(expanded.len(), 16, &ordered_positions);
+        let reversed_extra = build_paged_extra_keys(expanded.len(), 16, &reversed_positions);
+
+        assert_ne!(ordered_extra, reversed_extra);
+        assert_ne!(cold_key(&ordered_extra[0]), cold_key(&reversed_extra[0]));
     }
 
     #[test]
@@ -588,6 +781,14 @@ mod image_cache_identity_tests {
         let positions = map_expanded_image_token_positions(&[1, 200], IMAGE_TOKEN_ID, &[], &[])
             .expect("empty image metadata must preserve the text-only baseline");
         assert!(positions.is_empty());
+
+        let extra_keys = build_paged_extra_keys(16, 16, &positions);
+        assert_eq!(extra_keys, vec![Vec::<u64>::new()]);
+        assert_eq!(
+            cold_key(&extra_keys[0]),
+            cold_key(&[]),
+            "text-only ColdCacheKey derivation must remain byte-identical",
+        );
     }
 }
 
