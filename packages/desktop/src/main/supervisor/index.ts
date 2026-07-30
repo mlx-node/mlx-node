@@ -301,12 +301,22 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
     emitState();
   }
 
-  function attachLineReader(stream: NodeJS.ReadableStream | null, streamName: 'stdout' | 'stderr'): void {
+  function attachLineReader(
+    stream: NodeJS.ReadableStream | null,
+    streamName: 'stdout' | 'stderr',
+    streamGeneration: number,
+  ): void {
     if (stream === null) return;
     if (streamName === 'stdout') stdoutEnded = false;
     else stderrEnded = false;
     let buffered = '';
     stream.on('data', (chunk: Buffer | string) => {
+      // Same-generation data remains valuable after `exit` while
+      // waitForStdioDrain is collecting the crash tail. Once a replacement
+      // exists, however, this listener belongs to an old pipe: do not append
+      // even a partial line to its buffer, emit it, or mutate the replacement's
+      // stderr/native-error state.
+      if (generation !== streamGeneration) return;
       buffered += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
       const lines = buffered.split('\n');
       buffered = lines.pop() ?? '';
@@ -320,11 +330,13 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
       }
     });
     stream.on('end', () => {
+      if (generation !== streamGeneration) return;
       if (streamName === 'stdout') stdoutEnded = true;
       else stderrEnded = true;
     });
     stream.on('error', () => {
       // A pipe torn down under a dying child is not an event worth reporting.
+      if (generation !== streamGeneration) return;
       if (streamName === 'stdout') stdoutEnded = true;
       else stderrEnded = true;
     });
@@ -679,8 +691,8 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
       return;
     }
 
-    attachLineReader(child.stdout, 'stdout');
-    attachLineReader(child.stderr, 'stderr');
+    attachLineReader(child.stdout, 'stdout', spawnedGeneration);
+    attachLineReader(child.stderr, 'stderr', spawnedGeneration);
 
     genTimer(() => {
       abort(

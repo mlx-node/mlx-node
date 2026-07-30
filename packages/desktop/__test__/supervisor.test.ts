@@ -13,6 +13,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vite-plus/test';
@@ -557,16 +558,18 @@ describe('spawn failure', () => {
     expect(supervisor.snapshot().lastExit?.reason).toContain('failed to spawn');
   });
 
-  it('ignores the old real exit after an error timeout has spawned a replacement', async () => {
+  it('ignores old transport and pipe events after an error timeout spawns a replacement', async () => {
     type Events = Parameters<ChildTransport>[1];
-    const spawns: { events: Events; pid: number }[] = [];
+    const spawns: { events: Events; pid: number; stdout: PassThrough; stderr: PassThrough }[] = [];
     const transport: ChildTransport = (_spec, events) => {
       const pid = 10_000 + spawns.length;
-      spawns.push({ events, pid });
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      spawns.push({ events, pid, stdout, stderr });
       return {
         pid,
-        stdout: null,
-        stderr: null,
+        stdout,
+        stderr,
         postMessage: () => {},
         kill: () => events.onExit({ code: 0, signal: null }),
         forceKill: () => events.onExit({ code: null, signal: 'SIGKILL' }),
@@ -575,12 +578,16 @@ describe('spawn failure', () => {
     const { supervisor } = makeSupervisor({
       transport,
       restart: { maxConsecutiveCrashes: 3, baseDelayMs: 1, maxDelayMs: 1 },
-      timings: { readyTimeoutMs: 5_000, stdioFlushMs: 5 },
+      timings: { readyTimeoutMs: 5_000, stdioFlushMs: 20 },
     });
 
     const starting = supervisor.start();
     starting.catch(() => {});
     expect(spawns).toHaveLength(1);
+    // No newline yet: generation 1's reader must retain this as its own local
+    // partial while the synthetic-exit path times out its stdio drain.
+    spawns[0].stderr.write('native_error context=stale detail="old');
+    expect(supervisor.snapshot().nativeErrors).toEqual([]);
 
     // child_process may never send exit after this; the supervisor therefore
     // synthesizes one and uses it to advance the restart state machine.
@@ -612,8 +619,36 @@ describe('spawn failure', () => {
       reason: expect.stringContaining('failed to spawn'),
     });
 
-    await supervisor.stop();
+    // The old stderr listener also survives its bounded drain. Its data must
+    // not complete the generation-1 partial into generation 2's crash tail or
+    // native-error state.
+    spawns[0].stderr.write(' child"\n');
+    expect(supervisor.snapshot()).toMatchObject({ state: 'starting', generation: 2, nativeErrors: [] });
+
+    // Nor may old end/error events mark generation 2's still-open pipes as
+    // drained. Stop generation 2 while both of its streams remain open and
+    // prove the stop stays pending until those exact streams end.
+    spawns[0].stdout.emit('end');
+    spawns[0].stderr.emit('error', new Error('old pipe failed'));
+    let stopSettled = false;
+    const stopping = supervisor.stop();
+    void stopping.then(() => {
+      stopSettled = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(stopSettled).toBe(false);
+
+    spawns[1].stdout.end();
+    spawns[1].stderr.end();
+    await stopping;
+    expect(supervisor.snapshot().lastExit?.stderrTail.join('\n')).not.toContain('old child');
     await expect(starting).rejects.toThrow(/stopped/);
+
+    for (const spawn of spawns) {
+      spawn.stdout.destroy();
+      spawn.stderr.destroy();
+    }
   });
 });
 
