@@ -1997,7 +1997,10 @@ describe('ChatSession', () => {
 
       // Turn 1: image start whose assistant reply carries exactly one ok
       // tool call — the legal pre-state for a tool-result dispatch.
-      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
+      chatSessionStart.mockResolvedValueOnce({
+        ...makeChatResultWithSingleToolCall('first-call', 'c1'),
+        thinking: 'Need pwd',
+      } as ChatResult);
       await session.send('describe', { images: [imgA] });
       expect(session.turns).toBe(1);
       expect(session.hasImages).toBe(true);
@@ -2023,7 +2026,12 @@ describe('ChatSession', () => {
       expect(replayMessages).toEqual([
         { role: 'system', content: 'You are helpful.' },
         { role: 'user', content: 'describe', images: [imgA] },
-        { role: 'assistant', content: 'first-call', toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }] },
+        {
+          role: 'assistant',
+          content: 'first-call',
+          reasoningContent: 'Need pwd',
+          toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }],
+        },
         { role: 'tool', content: 'tool-out', toolCallId: 'c1', isError: undefined },
       ]);
 
@@ -2111,7 +2119,10 @@ describe('ChatSession', () => {
         if (startCalls === 1) {
           // Turn-1 image start whose reply carries one ok tool call.
           yield { text: 'A', done: false };
-          yield finalChunkWithSingleToolCall('describe-reply', 'c1');
+          yield {
+            ...finalChunkWithSingleToolCall('describe-reply', 'c1'),
+            thinking: 'Need pwd',
+          } satisfies ChatStreamFinal;
           return;
         }
         // Tool-result replay.
@@ -2156,7 +2167,12 @@ describe('ChatSession', () => {
       expect(startHistories[1]).toEqual([
         { role: 'system', content: 'You are helpful.' },
         { role: 'user', content: 'describe', images: [imgA] },
-        { role: 'assistant', content: 'describe-reply', toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }] },
+        {
+          role: 'assistant',
+          content: 'describe-reply',
+          reasoningContent: 'Need pwd',
+          toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }],
+        },
         { role: 'tool', content: 'tool-out', toolCallId: 'c1', isError: undefined },
       ]);
 

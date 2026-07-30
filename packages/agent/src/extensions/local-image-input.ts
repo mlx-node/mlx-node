@@ -18,7 +18,7 @@
  * existing text-model placeholder reaches inference.
  */
 
-import { readFile, stat } from 'node:fs/promises';
+import { open } from 'node:fs/promises';
 import { extname, isAbsolute } from 'node:path';
 
 import type {
@@ -79,23 +79,43 @@ export async function attachStandaloneLocalImage(event: InputEvent, ctx: Extensi
   if (path === undefined) return { action: 'continue' };
 
   try {
-    const metadata = await stat(path);
-    if (!metadata.isFile() || metadata.size === 0 || metadata.size > MAX_LOCAL_IMAGE_BYTES) {
-      return { action: 'continue' };
-    }
+    // Open once so validation and reading stay bound to the same inode if
+    // the pathname is replaced. FileHandle.readFile() is intentionally not
+    // used: it may allocate from a file that grew after stat(). The exact,
+    // positional loop below caps allocation at the validated size.
+    const file = await open(path, 'r');
+    try {
+      const metadata = await file.stat();
+      if (!metadata.isFile() || metadata.size === 0 || metadata.size > MAX_LOCAL_IMAGE_BYTES) {
+        return { action: 'continue' };
+      }
 
-    const bytes = await readFile(path);
-    if (bytes.byteLength === 0 || bytes.byteLength > MAX_LOCAL_IMAGE_BYTES) {
-      return { action: 'continue' };
-    }
-    const mimeType = detectImageMimeType(bytes);
-    if (mimeType === undefined) return { action: 'continue' };
+      const bytes = Buffer.allocUnsafe(metadata.size);
+      let offset = 0;
+      while (offset < bytes.byteLength) {
+        const { bytesRead } = await file.read(bytes, offset, bytes.byteLength - offset, offset);
+        if (bytesRead === 0) return { action: 'continue' };
+        offset += bytesRead;
+      }
 
-    return {
-      action: 'transform',
-      text: event.text,
-      images: [{ type: 'image', mimeType, data: bytes.toString('base64') }],
-    };
+      // Reject same-inode growth after fstat without ever allocating or
+      // reading more than one byte beyond the validated size.
+      const overflowProbe = Buffer.allocUnsafe(1);
+      if ((await file.read(overflowProbe, 0, 1, metadata.size)).bytesRead !== 0) {
+        return { action: 'continue' };
+      }
+
+      const mimeType = detectImageMimeType(bytes);
+      if (mimeType === undefined) return { action: 'continue' };
+
+      return {
+        action: 'transform',
+        text: event.text,
+        images: [{ type: 'image', mimeType, data: bytes.toString('base64') }],
+      };
+    } finally {
+      await file.close();
+    }
   } catch {
     // Missing, unreadable, or racing files remain ordinary user text.
     return { action: 'continue' };

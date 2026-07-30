@@ -1,6 +1,6 @@
-import { mkdir, mkdtemp, open, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, rename, rm, truncate, writeFile, type FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import type {
   ExtensionAPI,
@@ -9,7 +9,7 @@ import type {
   InputEvent,
   InputEventResult,
 } from '@earendil-works/pi-coding-agent';
-import { afterEach, describe, expect, it } from 'vite-plus/test';
+import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { attachStandaloneLocalImage, createLocalImageInputExtension } from '../src/extensions/local-image-input.js';
 
@@ -36,6 +36,7 @@ function context(
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(createdDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
@@ -122,6 +123,50 @@ describe('local image input extension', () => {
     await expect(attachStandaloneLocalImage(input(invalid), context())).resolves.toEqual({
       action: 'continue',
     });
+  });
+
+  it('reads from the validated handle when the pathname is replaced after fstat', async () => {
+    const path = await imageFile('replace-race.png');
+    const replacement = join(dirname(path), 'replacement.png');
+    const replacementBytes = Buffer.concat([PNG_BYTES, Buffer.from('replacement')]);
+    await writeFile(replacement, replacementBytes);
+
+    const probe = await open(path, 'r');
+    const fileHandlePrototype = Object.getPrototypeOf(probe) as FileHandle;
+    await probe.close();
+    const originalStat = Object.getOwnPropertyDescriptor(fileHandlePrototype, 'stat')?.value as FileHandle['stat'];
+    const statSpy = vi.spyOn(fileHandlePrototype, 'stat').mockImplementationOnce(async function (this: FileHandle) {
+      const metadata = await originalStat.call(this);
+      await rename(replacement, path);
+      return metadata;
+    });
+
+    const result = await attachStandaloneLocalImage(input(path), context());
+
+    expect(statSpy).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({
+      action: 'transform',
+      text: path,
+      images: [{ type: 'image', mimeType: 'image/png', data: PNG_BYTES.toString('base64') }],
+    });
+  });
+
+  it('rejects same-inode growth after fstat without reading the enlarged file', async () => {
+    const path = await imageFile('growth-race.png');
+    const probe = await open(path, 'r');
+    const fileHandlePrototype = Object.getPrototypeOf(probe) as FileHandle;
+    await probe.close();
+    const originalStat = Object.getOwnPropertyDescriptor(fileHandlePrototype, 'stat')?.value as FileHandle['stat'];
+    const statSpy = vi.spyOn(fileHandlePrototype, 'stat').mockImplementationOnce(async function (this: FileHandle) {
+      const metadata = await originalStat.call(this);
+      await truncate(path, 20 * 1024 * 1024 + 1);
+      return metadata;
+    });
+
+    await expect(attachStandaloneLocalImage(input(path), context())).resolves.toEqual({
+      action: 'continue',
+    });
+    expect(statSpy).toHaveBeenCalledTimes(1);
   });
 
   it('does not read an image larger than the local attachment cap', async () => {
