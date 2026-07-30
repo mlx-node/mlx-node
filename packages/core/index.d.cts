@@ -1525,12 +1525,6 @@ export declare class Qwen3Model {
   validateParameters(params: Record<string, MxArray>): void;
 }
 
-/** Ordering policy for structured multimodal content parts handed to a checkpoint-provided Jinja template. */
-export declare const enum MultimodalContentOrder {
-  TextThenMedia = 'textThenMedia',
-  ImagesThenText = 'imagesThenText',
-}
-
 /** Qwen3 Tokenizer class with NAPI bindings */
 export declare class Qwen3Tokenizer {
   /**
@@ -1619,7 +1613,7 @@ export declare class Qwen3Tokenizer {
    * * `enable_thinking` - Optional flag to enable thinking mode (<think> tags)
    * * `content_order` - Optional structured multimodal content ordering
    * * `existing_image_placeholder` - Optional model marker that suppresses
-   * synthetic image parts when it is already present in sanitized text
+   *   synthetic image parts when it is already present in sanitized text
    *
    * # Returns
    * Encoded token IDs ready for model input
@@ -3689,6 +3683,21 @@ export interface ModelConfig {
   visionStartTokenId: number;
   visionEndTokenId: number;
   eosTokenId: number;
+}
+
+/**
+ * Ordering policy for structured multimodal content parts handed to a
+ * checkpoint-provided Jinja template.
+ *
+ * The default preserves the generic serializer's existing text-before-media
+ * behavior. PaddleOCR-VL and Qianfan-OCR were trained with image placeholders
+ * before the instruction and opt into
+ * [`MultimodalContentOrder::ImagesThenText`] at their adapter boundaries.
+ * Audio remains after text in both modes.
+ */
+export declare const enum MultimodalContentOrder {
+  TextThenMedia = 'textThenMedia',
+  ImagesThenText = 'imagesThenText',
 }
 
 /** Result from document orientation classification. */
