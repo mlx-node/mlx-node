@@ -819,10 +819,24 @@ impl QianfanOCRInner {
 
         // --- Step 10: Decode and parse ---
         let raw_decoded = self.tokenizer.decode_sync(&generated_tokens, true)?;
-        let cleaned = raw_decoded.trim().to_string();
-
-        let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
-        let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
+        let include_reasoning = crate::engine::resolve_include_reasoning(&config);
+        let thinking_enabled = crate::engine::resolve_enable_thinking(&config).unwrap_or(true);
+        let (text, tool_calls, thinking) = crate::engine::parse_thinking_and_tools(
+            &raw_decoded,
+            &generated_tokens,
+            thinking_enabled,
+            self.tokenizer.think_end_id(),
+            self.tokenizer.think_end_str(),
+            true,
+        );
+        let public_raw_text = crate::engine::raw_text_with_reasoning_suppressed(
+            &raw_decoded,
+            &generated_tokens,
+            thinking_enabled,
+            self.tokenizer.think_end_id(),
+            self.tokenizer.think_end_str(),
+            false,
+        );
 
         // Promote finish_reason to "tool_calls" when valid tool calls are parsed
         if tool_calls.iter().any(|tc| tc.status == "ok") {
@@ -865,17 +879,24 @@ impl QianfanOCRInner {
             &generated_tokens,
             self.tokenizer.think_end_id(),
         );
+        let thinking = if include_reasoning { thinking } else { None };
+        let raw_text = if include_reasoning {
+            raw_decoded
+        } else {
+            public_raw_text.clone()
+        };
 
         Ok(ChatResult {
             text: text.trim().to_string(),
             tool_calls,
             thinking,
-            thinking_enabled: crate::engine::resolve_enable_thinking(&config).unwrap_or(true),
+            thinking_enabled,
             num_tokens: generated_tokens.len() as u32,
             prompt_tokens: prefill_token_count as u32,
             reasoning_tokens,
             finish_reason,
-            raw_text: raw_decoded,
+            raw_text,
+            public_raw_text: Some(public_raw_text),
             cached_tokens: cached_tokens as u32,
             performance,
         })
@@ -932,6 +953,8 @@ impl QianfanOCRInner {
                 .unwrap_or(crate::sampling::DEFAULT_NGRAM_SIZE);
             let reuse_cache = config.reuse_cache.unwrap_or(true);
             let report_perf = config.report_performance.unwrap_or(false);
+            let include_reasoning = crate::engine::resolve_include_reasoning(&config);
+            let thinking_enabled = crate::engine::resolve_enable_thinking(&config).unwrap_or(true);
 
             let generation_start = if report_perf {
                 Some(std::time::Instant::now())
@@ -1011,6 +1034,11 @@ impl QianfanOCRInner {
             let mut generated_tokens: Vec<u32> =
                 Vec::with_capacity(crate::engine::generated_capacity_hint(max_new_tokens));
             let mut finish_reason = "length".to_string();
+            let mut reasoning_tracker = crate::engine::ReasoningTracker::new(
+                thinking_enabled,
+                config.thinking_token_budget,
+                self.tokenizer.think_end_id(),
+            );
 
             // Stateful decoder for correct multi-byte/CJK streaming
             let mut decode_stream = self.tokenizer.inner().decode_stream(true);
@@ -1030,6 +1058,7 @@ impl QianfanOCRInner {
                     finish_reason = "stop".to_string();
                     break;
                 }
+                let is_reasoning = reasoning_tracker.observe_token(token_value);
 
                 // Decode and emit BEFORE repetition check so the
                 // triggering token is streamed to clients
@@ -1042,21 +1071,25 @@ impl QianfanOCRInner {
                 );
                 streamed_text_len += token_text.len();
 
-                emit(ChatStreamChunk {
-                    text: token_text,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    thinking_enabled: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: None,
-                });
+                if include_reasoning || !is_reasoning {
+                    emit(ChatStreamChunk {
+                        text: token_text,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        thinking_enabled: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        public_raw_text: None,
+                        text_authoritative: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(is_reasoning),
+                    });
+                }
 
                 // Check repetition cutoff (after emit so token is streamed)
                 if let Some(reason) = check_repetition_cutoff(
@@ -1140,9 +1173,22 @@ impl QianfanOCRInner {
 
             // Final chunk
             let raw_decoded = self.tokenizer.decode_sync(&generated_tokens, true)?;
-            let cleaned = raw_decoded.trim().to_string();
-            let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
-            let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
+            let (text, tool_calls, thinking) = crate::engine::parse_thinking_and_tools(
+                &raw_decoded,
+                &generated_tokens,
+                thinking_enabled,
+                self.tokenizer.think_end_id(),
+                self.tokenizer.think_end_str(),
+                true,
+            );
+            let public_raw_text = crate::engine::raw_text_with_reasoning_suppressed(
+                &raw_decoded,
+                &generated_tokens,
+                thinking_enabled,
+                self.tokenizer.think_end_id(),
+                self.tokenizer.think_end_str(),
+                false,
+            );
 
             // Promote finish_reason to "tool_calls" when valid tool calls parsed
             if tool_calls.iter().any(|tc| tc.status == "ok") {
@@ -1186,6 +1232,12 @@ impl QianfanOCRInner {
                 &generated_tokens,
                 self.tokenizer.think_end_id(),
             );
+            let thinking = if include_reasoning { thinking } else { None };
+            let raw_text = if include_reasoning {
+                raw_decoded
+            } else {
+                public_raw_text.clone()
+            };
 
             emit(ChatStreamChunk {
                 text: text.trim().to_string(),
@@ -1193,13 +1245,13 @@ impl QianfanOCRInner {
                 finish_reason: Some(finish_reason),
                 tool_calls: Some(tool_calls),
                 thinking,
-                thinking_enabled: Some(
-                    crate::engine::resolve_enable_thinking(&config).unwrap_or(true),
-                ),
+                thinking_enabled: Some(thinking_enabled),
                 num_tokens: Some(generated_tokens.len() as u32),
                 prompt_tokens: Some(prefill_token_count as u32),
                 reasoning_tokens: Some(reasoning_tokens),
-                raw_text: Some(raw_decoded),
+                raw_text: Some(raw_text),
+                public_raw_text: Some(public_raw_text),
+                text_authoritative: Some(true),
                 // Start path: report the matched prefix length. Zero on a miss or disabled
                 // reuse, equal to the matched prefix length on a hit.
                 cached_tokens: Some(cached_tokens as u32),
@@ -2357,6 +2409,7 @@ mod tests {
             reasoning_tokens: 0,
             finish_reason: "stop".to_string(),
             raw_text: "Hello".to_string(),
+            public_raw_text: None,
             cached_tokens: 0,
             performance: None,
         };

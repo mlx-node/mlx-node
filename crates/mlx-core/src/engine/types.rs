@@ -163,6 +163,12 @@ pub struct ChatResult {
     pub reasoning_tokens: u32,
     pub finish_reason: String,
     pub raw_text: String,
+    /// Reasoning-redacted raw output computed from the same token-aware
+    /// boundary as `raw_text`. Session wrappers may request full reasoning
+    /// internally for deterministic replay, then expose this safe view to a
+    /// caller that set `includeReasoning: false`.
+    #[napi(ts_type = "string | undefined")]
+    pub public_raw_text: Option<String>,
     /// Number of prompt tokens served from the reused KV-cache prefix.
     ///
     /// When the native prefix-cache machinery successfully matches the new
@@ -193,6 +199,14 @@ pub struct ChatStreamChunk {
     pub prompt_tokens: Option<u32>,
     pub reasoning_tokens: Option<u32>,
     pub raw_text: Option<String>,
+    /// Reasoning-redacted counterpart to `raw_text` on terminal chunks.
+    #[napi(ts_type = "string | undefined")]
+    pub public_raw_text: Option<String>,
+    /// Whether terminal `text` is the authoritative parsed assistant content.
+    /// Generic emitters set true; Gemma streams visible content exclusively as
+    /// deltas and set false so session history commits the accumulated text.
+    #[napi(ts_type = "boolean | undefined")]
+    pub text_authoritative: Option<bool>,
     /// Number of prompt tokens served from the reused KV-cache prefix on
     /// this turn. Populated on the terminal chunk (`done == true`) only;
     /// `None` on mid-stream delta chunks.

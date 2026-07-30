@@ -2309,6 +2309,13 @@ export interface ChatResult {
   finishReason: string;
   rawText: string;
   /**
+   * Reasoning-redacted raw output computed from the same token-aware
+   * boundary as `raw_text`. Session wrappers may request full reasoning
+   * internally for deterministic replay, then expose this safe view to a
+   * caller that set `includeReasoning: false`.
+   */
+  publicRawText?: string | undefined;
+  /**
    * Number of prompt tokens served from the reused KV-cache prefix.
    *
    * When the native prefix-cache machinery successfully matches the new
@@ -2347,6 +2354,14 @@ export interface ChatStreamChunk {
   promptTokens?: number;
   reasoningTokens?: number;
   rawText?: string;
+  /** Reasoning-redacted counterpart to `raw_text` on terminal chunks. */
+  publicRawText?: string | undefined;
+  /**
+   * Whether terminal `text` is the authoritative parsed assistant content.
+   * Generic emitters set true; Gemma streams visible content exclusively as
+   * deltas and set false so session history commits the accumulated text.
+   */
+  textAuthoritative?: boolean | undefined;
   /**
    * Number of prompt tokens served from the reused KV-cache prefix on
    * this turn. Populated on the terminal chunk (`done == true`) only;

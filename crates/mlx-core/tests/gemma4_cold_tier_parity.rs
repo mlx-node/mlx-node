@@ -496,6 +496,7 @@ mod tests {
             reasoning_tokens: 0,
             finish_reason: "stop".to_string(),
             raw_text: "ok".to_string(),
+            public_raw_text: None,
             cached_tokens,
             performance: None,
         }

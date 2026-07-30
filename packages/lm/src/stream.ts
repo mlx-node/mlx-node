@@ -39,6 +39,17 @@ export interface ChatStreamFinal {
   reasoningTokens: number;
   rawText: string;
   /**
+   * Native token-aware reasoning-redacted raw output. ChatSession uses this
+   * when it captures full reasoning internally for deterministic replay while
+   * keeping `includeReasoning: false` private to the caller.
+   */
+  publicRawText?: string;
+  /**
+   * Whether terminal `text` is the complete parsed assistant content.
+   * Gemma emits visible content exclusively as deltas and sets false.
+   */
+  textAuthoritative?: boolean;
+  /**
    * Number of prompt tokens served from the reused KV-cache prefix on
    * this turn. Mirrors the `cachedTokens` field on the non-streaming
    * `ChatResult` so session-aware streaming consumers can observe
@@ -293,6 +304,8 @@ export async function* _runChatStream(
           // fabricated `0`.
           const chunkWithCached = chunk as ChatStreamChunk & {
             cachedTokens?: number;
+            publicRawText?: string;
+            textAuthoritative?: boolean;
           };
           const finalEvent: ChatStreamFinal = {
             text: chunk.text,
@@ -309,6 +322,12 @@ export async function* _runChatStream(
           };
           if (typeof chunkWithCached.cachedTokens === "number") {
             finalEvent.cachedTokens = chunkWithCached.cachedTokens;
+          }
+          if (typeof chunkWithCached.publicRawText === "string") {
+            finalEvent.publicRawText = chunkWithCached.publicRawText;
+          }
+          if (typeof chunkWithCached.textAuthoritative === "boolean") {
+            finalEvent.textAuthoritative = chunkWithCached.textAuthoritative;
           }
           yield finalEvent;
           return;
@@ -526,6 +545,10 @@ export function makeStreamingModel<
   ) => SessionCapableModel;
 
   class StreamingModelImpl extends Base {
+    supportsReplayReasoningCapture(): boolean {
+      return true;
+    }
+
     static async load(
       modelPath: string,
       ...rest: unknown[]

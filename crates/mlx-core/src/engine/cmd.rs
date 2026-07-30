@@ -761,6 +761,7 @@ mod mock_backend_tests {
                 reasoning_tokens: 0,
                 finish_reason: "stop".to_string(),
                 raw_text: "PAGED_COMPLETE".to_string(),
+                public_raw_text: None,
                 cached_tokens: 0,
                 performance: None,
             })))
@@ -784,6 +785,7 @@ mod mock_backend_tests {
                 reasoning_tokens: 0,
                 finish_reason: "stop".to_string(),
                 raw_text: "SPECULATIVE_COMPLETE".to_string(),
+                public_raw_text: None,
                 cached_tokens: 0,
                 performance: None,
             })))

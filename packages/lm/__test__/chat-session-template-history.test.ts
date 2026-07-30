@@ -4,7 +4,9 @@ import { describe, expect, it } from 'vitest';
 import { ChatSession, type SessionCapableModel } from '../src/chat-session.js';
 import type { ChatStreamEvent } from '../src/stream.js';
 
-function chatResult(overrides: Partial<ChatResult> = {}): ChatResult {
+type TestChatResult = ChatResult & { publicRawText?: string };
+
+function chatResult(overrides: Partial<TestChatResult> = {}): TestChatResult {
   return {
     text: 'assistant reply',
     toolCalls: [],
@@ -37,8 +39,13 @@ class RecordingModel implements SessionCapableModel {
     messages: ChatMessage[];
     config: ChatConfig | null | undefined;
   }> = [];
+  readonly continueStreamCalls: Array<{
+    messages: ChatMessage[];
+    config: ChatConfig | null | undefined;
+  }> = [];
   readonly results: ChatResult[] = [];
   readonly startStreamRuns: Array<ChatStreamEvent[] | Error> = [];
+  readonly continueStreamRuns: Array<ChatStreamEvent[] | Error> = [];
   readonly promptTokenCounts: number[] = [];
   readonly templateTools: Array<ToolDefinition[] | null | undefined> = [];
 
@@ -58,6 +65,10 @@ class RecordingModel implements SessionCapableModel {
       pagedBlockCapacity: 256,
       pagedBlockSize: 16,
     };
+  }
+
+  supportsReplayReasoningCapture(): boolean {
+    return true;
   }
 
   async chatSessionStart(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult> {
@@ -80,8 +91,12 @@ class RecordingModel implements SessionCapableModel {
     return this.nextStartStream();
   }
 
-  chatStreamSessionContinue(): AsyncGenerator<ChatStreamEvent> {
-    return this.emptyStream();
+  chatStreamSessionContinue(
+    messages: ChatMessage[],
+    config?: ChatConfig | null,
+  ): AsyncGenerator<ChatStreamEvent> {
+    this.continueStreamCalls.push({ messages, config });
+    return this.nextContinueStream();
   }
 
   chatStreamSessionContinueTool(): AsyncGenerator<ChatStreamEvent> {
@@ -102,6 +117,12 @@ class RecordingModel implements SessionCapableModel {
 
   private async *nextStartStream(): AsyncGenerator<ChatStreamEvent> {
     const run = this.startStreamRuns.shift() ?? [];
+    if (run instanceof Error) throw run;
+    for (const event of run) yield event;
+  }
+
+  private async *nextContinueStream(): AsyncGenerator<ChatStreamEvent> {
+    const run = this.continueStreamRuns.shift() ?? [];
     if (run instanceof Error) throw run;
     for (const event of run) yield event;
   }
@@ -171,6 +192,102 @@ describe('ChatSession template-rendered continuation history', () => {
     expect(model.continueCalls[0]?.config?.tools).toEqual(tools);
   });
 
+  it('keeps hidden reasoning in sync replay history while redacting the public result', async () => {
+    const model = new RecordingModel();
+    model.results.push(
+      chatResult({
+        text: 'first',
+        thinking: 'private chain',
+        rawText: '<think>private chain</think>first',
+        publicRawText: 'first',
+      }),
+      chatResult({ text: 'second', thinking: 'next chain', publicRawText: 'second' }),
+    );
+    const session = new ChatSession(model);
+
+    const first = await session.send('one', {
+      config: { reasoningEffort: 'high', includeReasoning: false },
+    });
+    await session.send('two', {
+      config: { reasoningEffort: 'high', includeReasoning: false },
+    });
+
+    expect(first.thinking).toBeUndefined();
+    expect(first.rawText).toBe('first');
+    expect(model.startCalls[0]?.config?.includeReasoning).toBe(true);
+    expect(model.continueCalls[0]?.messages).toEqual([
+      { role: 'user', content: 'one' },
+      {
+        role: 'assistant',
+        content: 'first',
+        reasoningContent: 'private chain',
+        thinkingEnabled: true,
+      },
+      { role: 'user', content: 'two' },
+    ]);
+  });
+
+  it('filters captured reasoning deltas but retains terminal reasoning for stream replay', async () => {
+    const model = new RecordingModel();
+    model.startStreamRuns.push([
+      { text: 'private chain', done: false, isReasoning: true },
+      { text: 'answer', done: false, isReasoning: false },
+      {
+        text: 'answer',
+        done: true,
+        finishReason: 'stop',
+        toolCalls: [],
+        thinking: 'private chain',
+        thinkingEnabled: true,
+        numTokens: 4,
+        promptTokens: 10,
+        reasoningTokens: 2,
+        rawText: '<think>private chain</think>answer',
+        publicRawText: 'answer',
+        textAuthoritative: true,
+      },
+    ]);
+    model.results.push(chatResult({ text: 'next', thinking: undefined }));
+    const session = new ChatSession(model);
+
+    const events: ChatStreamEvent[] = [];
+    for await (const event of session.sendStream('one', {
+      config: { reasoningEffort: 'high', includeReasoning: false },
+    })) {
+      events.push(event);
+    }
+    await session.send('two');
+
+    expect(events).toEqual([
+      { text: 'answer', done: false, isReasoning: false },
+      {
+        text: 'answer',
+        done: true,
+        finishReason: 'stop',
+        toolCalls: [],
+        thinking: null,
+        thinkingEnabled: true,
+        numTokens: 4,
+        promptTokens: 10,
+        reasoningTokens: 2,
+        rawText: 'answer',
+        publicRawText: 'answer',
+        textAuthoritative: true,
+      },
+    ]);
+    expect(model.startStreamCalls[0]?.config?.includeReasoning).toBe(true);
+    expect(model.continueCalls[0]?.messages).toEqual([
+      { role: 'user', content: 'one' },
+      {
+        role: 'assistant',
+        content: 'answer',
+        reasoningContent: 'private chain',
+        thinkingEnabled: true,
+      },
+      { role: 'user', content: 'two' },
+    ]);
+  });
+
   it('passes the declaring assistant call and structured tool result to the template', async () => {
     const model = new RecordingModel();
     const toolCall: ToolCallResult = {
@@ -212,6 +329,129 @@ describe('ChatSession template-rendered continuation history', () => {
       },
     ]);
     expect(model.continueToolCalls[0]?.config?.tools).toEqual(tools);
+  });
+
+  it('fails closed when a capture-capable model omits the safe raw field', async () => {
+    const model = new RecordingModel();
+    model.results.push(
+      chatResult({
+        text: 'visible answer',
+        thinking: 'private chain',
+        rawText: '<think>private chain</think>visible answer',
+      }),
+    );
+    const session = new ChatSession(model);
+
+    const result = await session.send('one', {
+      config: { reasoningEffort: 'high', includeReasoning: false },
+    });
+
+    expect(result.thinking).toBeUndefined();
+    expect(result.rawText).toBe('visible answer');
+  });
+
+  it('uses authoritative empty terminal text when replaying a streamed tool-only turn', async () => {
+    const model = new RecordingModel();
+    const toolCall: ToolCallResult = {
+      id: 'call_stream',
+      name: 'lookup',
+      arguments: { query: 'mlx' },
+      status: 'ok',
+      rawContent: '<tool_call>{"name":"lookup","arguments":{"query":"mlx"}}</tool_call>',
+    };
+    model.results.push(chatResult({ text: 'ready', thinking: undefined }));
+    model.continueStreamRuns.push([
+      {
+        text: '<tool_call>{"name":"lookup","arguments":{"query":"mlx"}}</tool_call>',
+        done: false,
+      },
+      {
+        text: '',
+        done: true,
+        finishReason: 'tool_calls',
+        toolCalls: [toolCall],
+        thinking: null,
+        thinkingEnabled: true,
+        numTokens: 8,
+        promptTokens: 12,
+        reasoningTokens: 0,
+        rawText: toolCall.rawContent,
+        textAuthoritative: true,
+      },
+    ]);
+    model.results.push(chatResult({ text: 'done', thinking: undefined }));
+    const session = new ChatSession(model);
+
+    await session.send('begin', { config: { tools } });
+    for await (const _event of session.sendStream('look this up')) {
+      // Consume the successful streamed tool-call turn.
+    }
+    await session.sendToolResult('call_stream', 'result');
+
+    expect(model.continueToolCalls[0]?.messages).toEqual([
+      { role: 'user', content: 'begin' },
+      {
+        role: 'assistant',
+        content: 'ready',
+        thinkingEnabled: true,
+      },
+      { role: 'user', content: 'look this up' },
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 'call_stream', name: 'lookup', arguments: '{"query":"mlx"}' }],
+        thinkingEnabled: true,
+      },
+      {
+        role: 'tool',
+        content: 'result',
+        toolCallId: 'call_stream',
+        isError: undefined,
+      },
+    ]);
+  });
+
+  it('retains accumulated Gemma-like visible text when terminal text is not authoritative', async () => {
+    const model = new RecordingModel();
+    const toolCall: ToolCallResult = {
+      id: 'call_gemma',
+      name: 'lookup',
+      arguments: { query: 'mlx' },
+      status: 'ok',
+      rawContent: '<|tool_call>call:lookup{query:mlx}<tool_call|>',
+    };
+    model.results.push(chatResult({ text: 'ready', thinking: undefined }));
+    model.continueStreamRuns.push([
+      { text: 'I will look it up.', done: false, isReasoning: false },
+      {
+        text: 'non-authoritative terminal text',
+        done: true,
+        finishReason: 'tool_calls',
+        toolCalls: [toolCall],
+        thinking: null,
+        thinkingEnabled: true,
+        numTokens: 8,
+        promptTokens: 12,
+        reasoningTokens: 0,
+        rawText: toolCall.rawContent,
+        textAuthoritative: false,
+      },
+    ]);
+    model.results.push(chatResult({ text: 'done', thinking: undefined }));
+    const session = new ChatSession(model);
+
+    await session.send('begin', { config: { tools } });
+    for await (const _event of session.sendStream('look this up')) {
+      // Consume the successful Gemma-like mixed text/tool turn.
+    }
+    await session.sendToolResult('call_gemma', 'result');
+
+    expect(model.continueToolCalls[0]?.messages[3]).toEqual({
+      role: 'assistant',
+      content: 'I will look it up.',
+      toolCalls: [{ id: 'call_gemma', name: 'lookup', arguments: '{"query":"mlx"}' }],
+      thinkingEnabled: true,
+    });
   });
 });
 

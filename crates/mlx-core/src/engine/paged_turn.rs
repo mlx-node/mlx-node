@@ -708,6 +708,7 @@ mod tests {
                 reasoning_tokens: args.reasoning_tokens,
                 finish_reason: args.finish_reason,
                 raw_text,
+                public_raw_text: None,
                 performance: args.performance,
                 cached_tokens: 0,
             })

@@ -936,6 +936,8 @@ macro_rules! decode_loop {
                             prompt_tokens: None,
                             reasoning_tokens: None,
                             raw_text: None,
+                            public_raw_text: None,
+                            text_authoritative: None,
                             cached_tokens: None,
                             performance: None,
                             is_reasoning: Some(_is_reasoning),

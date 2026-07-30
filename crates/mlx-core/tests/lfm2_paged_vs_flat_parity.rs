@@ -918,6 +918,7 @@ fn answer_surface_prefers_the_committed_answer() {
             reasoning_tokens: 0,
             finish_reason: "stop".to_string(),
             raw_text: raw.to_string(),
+            public_raw_text: None,
             cached_tokens: 0,
             performance: None,
         }

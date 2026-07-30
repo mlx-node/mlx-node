@@ -225,14 +225,19 @@ pub(crate) fn finalize_chat_result(
         finish_reason
     };
 
-    let raw_text = raw_text_with_reasoning_suppressed(
+    let public_raw_text = raw_text_with_reasoning_suppressed(
         &text,
         generated_tokens,
         thinking_enabled,
         think_end_id,
         think_end_str,
-        include_reasoning,
+        false,
     );
+    let raw_text = if include_reasoning {
+        text
+    } else {
+        public_raw_text.clone()
+    };
 
     Ok(ChatResult {
         text: clean_text,
@@ -249,6 +254,7 @@ pub(crate) fn finalize_chat_result(
         reasoning_tokens,
         finish_reason,
         raw_text,
+        public_raw_text: Some(public_raw_text),
         // Callers that reused a cached prefix overwrite this via their own
         // `cached_prefix_len as u32` after this function returns. Defaulting
         // to zero keeps the behavior of callers that do not (yet) thread

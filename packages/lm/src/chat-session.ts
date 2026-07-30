@@ -259,6 +259,70 @@ function countOkToolCalls(toolCalls: readonly ToolCallResult[] | undefined): num
 }
 
 /**
+ * Select the assistant text committed after a successful stream.
+ *
+ * Default emitters expose parsed text on the terminal event, so an empty
+ * value is authoritative for a tool-only turn and must not fall back to raw
+ * streamed tool markup. Gemma's channel-aware emitter instead sends visible
+ * text as deltas and an empty terminal value for ordinary no-tool replies, so
+ * retain the accumulated visible text in that distinct shape.
+ */
+function selectCommittedStreamText(
+  finalText: string | null,
+  accumulatedVisible: string,
+  terminalTextAuthoritative: boolean | undefined,
+): string {
+  if (finalText == null) return accumulatedVisible;
+  if (terminalTextAuthoritative === true) return finalText;
+  if (terminalTextAuthoritative === false) return accumulatedVisible;
+  if (finalText !== '') return finalText;
+  return accumulatedVisible;
+}
+
+type ReplayCaptureResult = ChatResult & { publicRawText?: string };
+type ReplayCaptureStreamEvent = ChatStreamEvent & {
+  publicRawText?: string;
+  textAuthoritative?: boolean;
+};
+
+/** Mirror the native default used by `resolve_include_reasoning`. */
+function includesReasoning(config: ChatConfig): boolean {
+  return config.includeReasoning ?? config.reasoningEffort !== 'none';
+}
+
+/**
+ * Session history must retain reasoning even when the caller hides it. Ask
+ * native finalization for the full parsed turn without mutating the committed
+ * request config; the public view is redacted again below.
+ */
+function withReplayReasoning(config: ChatConfig, model: SessionCapableModel): ChatConfig {
+  if (includesReasoning(config)) return config;
+  if (model.supportsReplayReasoningCapture?.() !== true) return config;
+  // A zero-budget "none" turn cannot produce a reasoning body worth
+  // replaying. Preserve the caller's native suppression flag for this common
+  // short-generation path (for example title generation).
+  if (config.reasoningEffort === 'none' && (config.thinkingTokenBudget ?? 0) <= 0) {
+    return config;
+  }
+  return { ...config, includeReasoning: true };
+}
+
+function publicChatResult(result: ChatResult, config: ChatConfig): ChatResult {
+  if (includesReasoning(config)) return result;
+  const safeRaw = (result as ReplayCaptureResult).publicRawText;
+  return { ...result, thinking: undefined, rawText: safeRaw ?? result.text };
+}
+
+function publicStreamEvent(event: ChatStreamEvent, config: ChatConfig): ChatStreamEvent | null {
+  if (includesReasoning(config)) return event;
+  if (!event.done) {
+    return event.isReasoning === true ? null : event;
+  }
+  const safeRaw = (event as ReplayCaptureStreamEvent).publicRawText;
+  return { ...event, thinking: null, rawText: safeRaw ?? event.text };
+}
+
+/**
  * Structural interface matched by every generative model wrapper
  * (`Qwen35Model`, `Qwen35MoeModel`, `Lfm2Model`, `Gemma4Model`,
  * `Qwen3Model`, and the Qianfan-OCR VLM wrapper). `ChatSession<M>` is
@@ -302,6 +366,12 @@ export interface SessionCapableModel {
    * known to be available.
    */
   supportsImages?(): boolean;
+  /**
+   * Whether this bundled wrapper can capture full reasoning internally while
+   * returning a privacy-safe public result. Third-party implementations omit
+   * this capability and keep their original `includeReasoning` config.
+   */
+  supportsReplayReasoningCapture?(): boolean;
   chatSessionStart(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
   chatSessionContinue(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
   chatSessionContinueTool(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
@@ -787,7 +857,10 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const constrainedConfig = await this.constrainToContextCapacity(pendingHistory, mergedConfig);
       let result: ChatResult;
       try {
-        result = await this.model.chatSessionContinue(pendingHistory, constrainedConfig);
+        result = await this.model.chatSessionContinue(
+          pendingHistory,
+          withReplayReasoning(constrainedConfig, this.model),
+        );
       } catch (err) {
         if (!isMediaHeldRestartError(err)) {
           this.needsFullReplay = true;
@@ -807,7 +880,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       this.turnCount++;
       this.commitActiveTools(constrainedConfig);
       this.recordToolCallFanout(result.toolCalls);
-      return result;
+      return publicChatResult(result, constrainedConfig);
     } finally {
       this.inFlight = false;
     }
@@ -865,6 +938,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let accumulated = '';
       let accumulatedVisible = '';
       let finalRaw: string | null = null;
+      let finalTextAuthoritative: boolean | undefined;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
       let finalThinking: string | null = null;
       let finalThinkingEnabled = false;
@@ -877,13 +951,14 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         try {
           for await (const event of this.model.chatStreamSessionContinue(
             pendingHistory,
-            constrainedConfig,
+            withReplayReasoning(constrainedConfig, this.model),
             opts.signal,
           )) {
             if (event.done) {
               if (event.finishReason !== 'error') {
                 sawFinal = true;
                 finalRaw = event.text;
+                finalTextAuthoritative = (event as ReplayCaptureStreamEvent).textAuthoritative;
                 finalToolCalls = event.toolCalls;
                 finalThinking = event.thinking;
                 finalThinkingEnabled = event.thinkingEnabled;
@@ -894,7 +969,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
                 accumulatedVisible += event.text;
               }
             }
-            yield event;
+            const publicEvent = publicStreamEvent(event, constrainedConfig);
+            if (publicEvent !== null) yield publicEvent;
           }
         } catch (err) {
           // The native session holds media KV (gemma4 after an image/audio
@@ -933,7 +1009,12 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         if (sawFinal && !delegated) {
           this.history.push(pendingUser);
           this.history.push(
-            buildAssistantMessage(finalRaw || accumulatedVisible, finalToolCalls, finalThinking, finalThinkingEnabled),
+            buildAssistantMessage(
+              selectCommittedStreamText(finalRaw, accumulatedVisible, finalTextAuthoritative),
+              finalToolCalls,
+              finalThinking,
+              finalThinkingEnabled,
+            ),
           );
           this.turnCount++;
           this.commitActiveTools(constrainedConfig);
@@ -1013,7 +1094,10 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         return await this.replayToolResultThroughStartPath(toolMsg, constrainedConfig);
       }
       try {
-        const result = await this.model.chatSessionContinueTool(pendingHistory, constrainedConfig);
+        const result = await this.model.chatSessionContinueTool(
+          pendingHistory,
+          withReplayReasoning(constrainedConfig, this.model),
+        );
         this.history.push({ role: 'tool', content, toolCallId, isError });
         this.history.push(
           buildAssistantMessage(result.text, result.toolCalls, result.thinking, result.thinkingEnabled),
@@ -1021,7 +1105,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         this.turnCount++;
         this.commitActiveTools(constrainedConfig);
         this.recordToolCallFanout(result.toolCalls);
-        return result;
+        return publicChatResult(result, constrainedConfig);
       } catch (err) {
         if (!isMediaHeldRestartError(err)) {
           this.needsFullReplay = true;
@@ -1108,6 +1192,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let accumulated = '';
       let accumulatedVisible = '';
       let finalRaw: string | null = null;
+      let finalTextAuthoritative: boolean | undefined;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
       let finalThinking: string | null = null;
       let finalThinkingEnabled = false;
@@ -1120,13 +1205,14 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         try {
           for await (const event of this.model.chatStreamSessionContinueTool(
             pendingHistory,
-            constrainedConfig,
+            withReplayReasoning(constrainedConfig, this.model),
             signal,
           )) {
             if (event.done) {
               if (event.finishReason !== 'error') {
                 sawFinal = true;
                 finalRaw = event.text;
+                finalTextAuthoritative = (event as ReplayCaptureStreamEvent).textAuthoritative;
                 finalToolCalls = event.toolCalls;
                 finalThinking = event.thinking;
                 finalThinkingEnabled = event.thinkingEnabled;
@@ -1137,7 +1223,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
                 accumulatedVisible += event.text;
               }
             }
-            yield event;
+            const publicEvent = publicStreamEvent(event, constrainedConfig);
+            if (publicEvent !== null) yield publicEvent;
           }
         } catch (err) {
           // The native session holds media KV (gemma4 after an image/audio
@@ -1168,7 +1255,12 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         if (sawFinal && !delegated) {
           this.history.push({ role: 'tool', content, toolCallId, isError });
           this.history.push(
-            buildAssistantMessage(finalRaw || accumulatedVisible, finalToolCalls, finalThinking, finalThinkingEnabled),
+            buildAssistantMessage(
+              selectCommittedStreamText(finalRaw, accumulatedVisible, finalTextAuthoritative),
+              finalToolCalls,
+              finalThinking,
+              finalThinkingEnabled,
+            ),
           );
           this.turnCount++;
           this.commitActiveTools(constrainedConfig);
@@ -1307,7 +1399,10 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const mergedConfig = this.mergeConfig(config);
       const historySnapshot = this.history.slice();
       const constrainedConfig = await this.constrainToContextCapacity(historySnapshot, mergedConfig);
-      const result = await this.model.chatSessionStart(historySnapshot, constrainedConfig);
+      const result = await this.model.chatSessionStart(
+        historySnapshot,
+        withReplayReasoning(constrainedConfig, this.model),
+      );
       this.history.push(buildAssistantMessage(result.text, result.toolCalls, result.thinking, result.thinkingEnabled));
       this.turnCount++;
       this.needsFullReplay = false;
@@ -1315,7 +1410,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       this.lastAudioKey = this.computeTrailingAudioKey();
       this.commitActiveTools(constrainedConfig);
       this.recordToolCallFanout(result.toolCalls);
-      return result;
+      return publicChatResult(result, constrainedConfig);
     } finally {
       this.inFlight = false;
     }
@@ -1350,15 +1445,21 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let accumulated = '';
       let accumulatedVisible = '';
       let finalRaw: string | null = null;
+      let finalTextAuthoritative: boolean | undefined;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
       let finalThinking: string | null = null;
       let finalThinkingEnabled = false;
       try {
-        for await (const event of this.model.chatStreamSessionStart(historySnapshot, constrainedConfig, signal)) {
+        for await (const event of this.model.chatStreamSessionStart(
+          historySnapshot,
+          withReplayReasoning(constrainedConfig, this.model),
+          signal,
+        )) {
           if (event.done) {
             if (event.finishReason !== 'error') {
               sawFinal = true;
               finalRaw = event.text;
+              finalTextAuthoritative = (event as ReplayCaptureStreamEvent).textAuthoritative;
               finalToolCalls = event.toolCalls;
               finalThinking = event.thinking;
               finalThinkingEnabled = event.thinkingEnabled;
@@ -1369,7 +1470,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
               accumulatedVisible += event.text;
             }
           }
-          yield event;
+          const publicEvent = publicStreamEvent(event, constrainedConfig);
+          if (publicEvent !== null) yield publicEvent;
         }
       } finally {
         // finally runs on normal completion, mid-stream throw, caller
@@ -1379,7 +1481,12 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // the primed state is left intact so the caller can retry.
         if (sawFinal) {
           this.history.push(
-            buildAssistantMessage(finalRaw || accumulatedVisible, finalToolCalls, finalThinking, finalThinkingEnabled),
+            buildAssistantMessage(
+              selectCommittedStreamText(finalRaw, accumulatedVisible, finalTextAuthoritative),
+              finalToolCalls,
+              finalThinking,
+              finalThinkingEnabled,
+            ),
           );
           this.turnCount++;
           this.needsFullReplay = false;
@@ -1666,7 +1773,10 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // (e.g. the assistant reply below) don't retroactively mutate
       // what the native side / any mock observed as its `messages`
       // argument.
-      const result = await this.model.chatSessionStart(this.history.slice(), constrainedConfig);
+      const result = await this.model.chatSessionStart(
+        this.history.slice(),
+        withReplayReasoning(constrainedConfig, this.model),
+      );
       this.history.push(buildAssistantMessage(result.text, result.toolCalls, result.thinking, result.thinkingEnabled));
       this.turnCount++;
       this.needsFullReplay = false;
@@ -1681,7 +1791,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       this.lastAudioKey = this.computeTrailingAudioKey();
       this.commitActiveTools(constrainedConfig);
       this.recordToolCallFanout(result.toolCalls);
-      return result;
+      return publicChatResult(result, constrainedConfig);
     } catch (err) {
       // Roll back: drop the tentative user push so history stays
       // consistent with turnCount.
@@ -1744,6 +1854,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     let accumulated = '';
     let accumulatedVisible = '';
     let finalRaw: string | null = null;
+    let finalTextAuthoritative: boolean | undefined;
     let finalToolCalls: readonly ToolCallResult[] | undefined;
     let finalThinking: string | null = null;
     let finalThinkingEnabled = false;
@@ -1751,11 +1862,16 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     // the rationale.
     const historySnapshot = this.history.slice();
     try {
-      for await (const event of this.model.chatStreamSessionStart(historySnapshot, constrainedConfig, signal)) {
+      for await (const event of this.model.chatStreamSessionStart(
+        historySnapshot,
+        withReplayReasoning(constrainedConfig, this.model),
+        signal,
+      )) {
         if (event.done) {
           if (event.finishReason !== 'error') {
             sawFinal = true;
             finalRaw = event.text;
+            finalTextAuthoritative = (event as ReplayCaptureStreamEvent).textAuthoritative;
             finalToolCalls = event.toolCalls;
             finalThinking = event.thinking;
             finalThinkingEnabled = event.thinkingEnabled;
@@ -1766,7 +1882,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
             accumulatedVisible += event.text;
           }
         }
-        yield event;
+        const publicEvent = publicStreamEvent(event, constrainedConfig);
+        if (publicEvent !== null) yield publicEvent;
       }
     } finally {
       // finally runs in ALL termination paths: normal completion,
@@ -1779,7 +1896,12 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // naturally — finally runs first, then the error continues up.
       if (sawFinal) {
         this.history.push(
-          buildAssistantMessage(finalRaw || accumulatedVisible, finalToolCalls, finalThinking, finalThinkingEnabled),
+          buildAssistantMessage(
+            selectCommittedStreamText(finalRaw, accumulatedVisible, finalTextAuthoritative),
+            finalToolCalls,
+            finalThinking,
+            finalThinkingEnabled,
+          ),
         );
         this.turnCount++;
         this.needsFullReplay = false;
