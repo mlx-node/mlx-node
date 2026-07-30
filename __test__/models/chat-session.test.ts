@@ -2001,7 +2001,10 @@ describe('ChatSession', () => {
         ...makeChatResultWithSingleToolCall('first-call', 'c1'),
         thinking: 'Need pwd',
       } as ChatResult);
-      await session.send('describe', { images: [imgA] });
+      await session.send('describe', {
+        images: [imgA],
+        config: { reasoningEffort: 'high' },
+      });
       expect(session.turns).toBe(1);
       expect(session.hasImages).toBe(true);
       expect(session.pendingUnresolvedToolCallCount).toBe(1);
@@ -2010,7 +2013,9 @@ describe('ChatSession', () => {
       // tool-result delta with the typed prefix. The session must catch
       // it and replay through chatSessionStart.
       chatSessionContinueTool.mockRejectedValueOnce(mediaHeldError());
-      const result = await session.sendToolResult('c1', 'tool-out');
+      const result = await session.sendToolResult('c1', 'tool-out', {
+        config: { reasoningEffort: 'low' },
+      });
 
       // Resolves with the replayed reply — no throw.
       expect(result.text).toBe('start-reply');
@@ -2030,6 +2035,7 @@ describe('ChatSession', () => {
           role: 'assistant',
           content: 'first-call',
           reasoningContent: 'Need pwd',
+          thinkingEnabled: true,
           toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }],
         },
         { role: 'tool', content: 'tool-out', toolCallId: 'c1', isError: undefined },
@@ -2046,6 +2052,34 @@ describe('ChatSession', () => {
       const followUp = await session.send('and now?');
       expect(followUp.text).toBe('continue-reply');
       expect(session.turns).toBe(3);
+    });
+
+    it('sendToolResult(): preserves a disabled historical thinking mode during an enabled replay', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      const session = new ChatSession(model);
+
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
+      await session.send('describe', {
+        images: [imgA],
+        config: { reasoningEffort: 'none' },
+      });
+
+      chatSessionContinueTool.mockRejectedValueOnce(mediaHeldError());
+      await session.sendToolResult('c1', 'tool-out', {
+        config: { reasoningEffort: 'high' },
+      });
+
+      expect(chatSessionStart.mock.calls[1][0]).toEqual([
+        { role: 'user', content: 'describe', images: [imgA] },
+        {
+          role: 'assistant',
+          content: 'first-call',
+          thinkingEnabled: false,
+          toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }],
+        },
+        { role: 'tool', content: 'tool-out', toolCallId: 'c1', isError: undefined },
+      ]);
+      expect(chatSessionStart.mock.calls[1][1]?.reasoningEffort).toBe('high');
     });
 
     it('sendToolResult(): preserves isError through the cold replay', async () => {
@@ -2143,14 +2177,21 @@ describe('ChatSession', () => {
       const session = new ChatSession(model, { system: 'You are helpful.' });
 
       // Turn 1: streamed image start emits a single ok tool call.
-      for await (const _e of session.sendStream('describe', { images: [imgA] })) void _e;
+      for await (const _e of session.sendStream('describe', {
+        images: [imgA],
+        config: { reasoningEffort: 'high' },
+      }))
+        void _e;
       expect(session.turns).toBe(1);
       expect(session.hasImages).toBe(true);
       expect(session.pendingUnresolvedToolCallCount).toBe(1);
 
       // Tool result: media-held rejection → transparent replay.
       const events: ChatStreamEvent[] = [];
-      for await (const e of session.sendToolResultStream('c1', 'tool-out')) events.push(e);
+      for await (const e of session.sendToolResultStream('c1', 'tool-out', {
+        config: { reasoningEffort: 'low' },
+      }))
+        events.push(e);
 
       // The replayed reply was yielded; no duplicate / partial emission of
       // the failed delta (the failed tool continue produced no chunk).
@@ -2171,6 +2212,7 @@ describe('ChatSession', () => {
           role: 'assistant',
           content: 'describe-reply',
           reasoningContent: 'Need pwd',
+          thinkingEnabled: true,
           toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }],
         },
         { role: 'tool', content: 'tool-out', toolCallId: 'c1', isError: undefined },
@@ -2183,6 +2225,60 @@ describe('ChatSession', () => {
       // inFlight cleared — a follow-up streams cleanly.
       for await (const _e of session.sendStream('and now?')) void _e;
       expect(session.turns).toBe(3);
+    });
+
+    it('sendToolResultStream(): preserves a disabled historical thinking mode during an enabled replay', async () => {
+      const startHistories: ChatMessage[][] = [];
+      const chatStreamSessionStart = vi.fn(async function* (
+        messages: ChatMessage[],
+        _config?: ChatConfig | null,
+      ): AsyncGenerator<ChatStreamEvent> {
+        startHistories.push(messages);
+        if (startHistories.length === 1) {
+          yield finalChunkWithSingleToolCall('first-call', 'c1');
+          return;
+        }
+        yield finalChunk('replayed-reply');
+      });
+      const chatStreamSessionContinueTool = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        throw mediaHeldError();
+        // eslint-disable-next-line no-unreachable
+        yield finalChunk('unreachable');
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool,
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      for await (const _e of session.sendStream('describe', {
+        images: [imgA],
+        config: { reasoningEffort: 'low' },
+      }))
+        void _e;
+      for await (const _e of session.sendToolResultStream('c1', 'tool-out', {
+        config: { reasoningEffort: 'high' },
+      }))
+        void _e;
+
+      expect(startHistories[1]).toEqual([
+        { role: 'user', content: 'describe', images: [imgA] },
+        {
+          role: 'assistant',
+          content: 'first-call',
+          thinkingEnabled: false,
+          toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }],
+        },
+        { role: 'tool', content: 'tool-out', toolCallId: 'c1', isError: undefined },
+      ]);
+      expect(chatStreamSessionStart.mock.calls[1][1]?.reasoningEffort).toBe('high');
     });
 
     it('sendToolResultStream(): a non-prefix tool throw still propagates (no replay)', async () => {
