@@ -19,6 +19,7 @@
 import { engineEnvFor, LAUNCHER_ENGINE_POLICY } from '@mlx-node/server/host/env-policy';
 import { app, clipboard, Menu, screen, type MenuItemConstructorOptions, type WebContents } from 'electron';
 
+import { DESKTOP_QUIT_DEADLINE_MS } from '../control-panel/shutdown-timings.js';
 import { createControlPanelBroker, type ControlPanelBroker } from './broker.js';
 import { controlPanelEnvOverrides, sidecarEnvOverrides } from './child-env.js';
 import { electronBrokerDeps } from './control-panel-child.js';
@@ -40,14 +41,6 @@ import { createControlPanelWindowManager, type ControlPanelWindowManager } from 
 
 /** Coalescing window for settings writes. Long enough that a drag is one write. */
 const SETTINGS_SAVE_DEBOUNCE_MS = 750;
-
-/**
- * Hard cap on shutdown. `supervisor.dispose()` is already bounded (SIGTERM,
- * then SIGKILL after a grace period), but a menubar app that cannot be quit is
- * the worst possible failure — the user's only remaining option is Force Quit,
- * which skips the sidecar's own SIGTERM handler and leaves its temp root behind.
- */
-const QUIT_DEADLINE_MS = 10_000;
 
 let paths: AppPaths | null = null;
 let settings: DesktopSettings = DEFAULT_SETTINGS;
@@ -144,7 +137,7 @@ function wire(): void {
     // handler knows this one is real.
     quitting = true;
     event.preventDefault();
-    void withDeadline(shutdown(), QUIT_DEADLINE_MS)
+    void withDeadline(shutdown(), DESKTOP_QUIT_DEADLINE_MS)
       .catch((error: unknown) => {
         console.error('[mlx] shutdown failed:', error);
       })
@@ -404,7 +397,7 @@ async function shutdown(): Promise<void> {
   // Both awaited, and in parallel: CONTROL PANEL's shutdown drains in-flight downloads
   // so a partial multi-GB `.staging` tree is not orphaned, and INFERENCE's frees
   // its temp root. Serialising them would spend two kill-grace periods against
-  // one 10 s quit deadline.
+  // one whole-app quit deadline.
   await Promise.all([broker?.dispose(), supervisor?.dispose()]);
 }
 

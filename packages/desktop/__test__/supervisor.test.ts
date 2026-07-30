@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
+import { DESKTOP_QUIT_DEADLINE_MS } from '../src/control-panel/shutdown-timings.js';
 import { SIDECAR_HOST_CLOSE_TIMEOUT_MS } from '../src/inference/sidecar.js';
 import { nodeChildTransport } from '../src/main/supervisor/child-node.js';
 import {
@@ -185,9 +186,9 @@ describe('shutdown timing', () => {
   it('reserves cleanup time after the child host exhausts its HTTP drain budget', () => {
     // At equality both timers race: the parent may SIGKILL before the child's
     // forced socket teardown can flush request logs and remove the paged-config
-    // temp root. Keep a material margin within MAIN's 10 s quit deadline.
+    // temp root. Keep a material margin within MAIN's whole-app quit deadline.
     expect(DEFAULT_TIMINGS.killGraceMs - SIDECAR_HOST_CLOSE_TIMEOUT_MS).toBeGreaterThanOrEqual(2_000);
-    expect(DEFAULT_TIMINGS.killGraceMs).toBeLessThan(10_000);
+    expect(DEFAULT_TIMINGS.killGraceMs).toBeLessThan(DESKTOP_QUIT_DEADLINE_MS);
   });
 });
 
@@ -554,6 +555,65 @@ describe('spawn failure', () => {
 
     await expect(supervisor.start()).rejects.toThrow(/gave up/);
     expect(supervisor.snapshot().lastExit?.reason).toContain('failed to spawn');
+  });
+
+  it('ignores the old real exit after an error timeout has spawned a replacement', async () => {
+    type Events = Parameters<ChildTransport>[1];
+    const spawns: { events: Events; pid: number }[] = [];
+    const transport: ChildTransport = (_spec, events) => {
+      const pid = 10_000 + spawns.length;
+      spawns.push({ events, pid });
+      return {
+        pid,
+        stdout: null,
+        stderr: null,
+        postMessage: () => {},
+        kill: () => events.onExit({ code: 0, signal: null }),
+        forceKill: () => events.onExit({ code: null, signal: 'SIGKILL' }),
+      };
+    };
+    const { supervisor } = makeSupervisor({
+      transport,
+      restart: { maxConsecutiveCrashes: 3, baseDelayMs: 1, maxDelayMs: 1 },
+      timings: { readyTimeoutMs: 5_000, stdioFlushMs: 5 },
+    });
+
+    const starting = supervisor.start();
+    starting.catch(() => {});
+    expect(spawns).toHaveLength(1);
+
+    // child_process may never send exit after this; the supervisor therefore
+    // synthesizes one and uses it to advance the restart state machine.
+    spawns[0].events.onError(new Error('spawn ENOENT'));
+    const replacement = await waitFor(
+      supervisor,
+      (s) => s.generation === 2 && s.pid !== undefined,
+      'the replacement spawn',
+    );
+    expect(replacement).toMatchObject({
+      state: 'starting',
+      pid: spawns[1].pid,
+      consecutiveCrashes: 1,
+    });
+
+    // Electron documents that the real exit does follow error. Deliver that
+    // old event only after generation 2 reset the global per-child fields.
+    // Without a generation fence this immediately clears the replacement
+    // handle and starts assessing the old exit with generation 2's state.
+    spawns[0].events.onExit({ code: 7, signal: null });
+    expect(supervisor.snapshot()).toMatchObject({
+      state: 'starting',
+      generation: 2,
+      pid: spawns[1].pid,
+      consecutiveCrashes: 1,
+    });
+    expect(supervisor.snapshot().lastExit).toMatchObject({
+      code: null,
+      reason: expect.stringContaining('failed to spawn'),
+    });
+
+    await supervisor.stop();
+    await expect(starting).rejects.toThrow(/stopped/);
   });
 });
 

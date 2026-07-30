@@ -104,7 +104,7 @@ export const DEFAULT_TIMINGS: SupervisorTimings = Object.freeze({
   healthRequestTimeoutMs: 2_000,
   requestTimeoutMs: 60_000,
   // 5 s for the sidecar host's HTTP drain, then 3 s for log flush + temp-root
-  // cleanup. Still below MAIN's independent 10 s whole-app quit deadline.
+  // cleanup. Still below MAIN's independent whole-app quit deadline.
   killGraceMs: 8_000,
   stdioFlushMs: 50,
   tracePollMs: 1_000,
@@ -598,6 +598,7 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
 
   function spawn(): void {
     generation += 1;
+    const spawnedGeneration = generation;
     intent = 'run';
     abortReason = null;
     becameReady = false;
@@ -649,7 +650,26 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
           }),
           ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
         },
-        { onMessage, onExit, onError },
+        {
+          // A transport error can be followed by no exit at all, so onError
+          // synthesizes one after a deadline. Electron may still deliver the
+          // real exit later — even after that synthetic exit has restarted the
+          // supervisor and `exitHandled` belongs to a replacement child.
+          // Bind every callback to the generation that owns the transport so
+          // a stale event can never mutate the replacement's global state.
+          onMessage: (message) => {
+            if (generation !== spawnedGeneration || exitHandled) return;
+            onMessage(message);
+          },
+          onExit: (exit) => {
+            if (generation !== spawnedGeneration) return;
+            onExit(exit);
+          },
+          onError: (error) => {
+            if (generation !== spawnedGeneration) return;
+            onError(error);
+          },
+        },
       );
     } catch (error) {
       // Route it through the same path a failed spawn already takes, so the

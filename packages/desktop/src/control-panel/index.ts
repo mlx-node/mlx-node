@@ -35,6 +35,7 @@ import { writeSync } from 'node:fs';
 import { bindEventEmitterPort, createDashboardRuntime } from '@mlx-node/dashboard';
 
 import { createControlPanelSession } from './session.js';
+import { CONTROL_PANEL_PROCESS_EXIT_CAP_MS, CONTROL_PANEL_WORKER_SHUTDOWN_STEP_MS } from './shutdown-timings.js';
 
 /**
  * `process.parentPort` in an Electron `utilityProcess`, structurally.
@@ -84,10 +85,11 @@ const EXIT_WORKER_DOWN = 70;
  */
 function teardown(code: number): void {
   shuttingDown = true;
-  // A close that hangs must not park the process: MAIN's kill grace period
-  // would end up doing this anyway, and a slow exit is worse than an abrupt one
-  // because the broker cannot restart what has not exited.
-  const cap = setTimeout(() => process.exit(code), 5_000);
+  // `runtime.close()` spends up to one worker deadline draining ingest, then a
+  // SECOND worker deadline closing SQLite/terminating the thread. The enclosing
+  // cap includes both sequential phases plus cleanup margin; MAIN's still-larger
+  // broker grace is the next backstop.
+  const cap = setTimeout(() => process.exit(code), CONTROL_PANEL_PROCESS_EXIT_CAP_MS);
   cap.unref();
   void session
     .close()
@@ -102,9 +104,9 @@ function teardown(code: number): void {
 }
 
 const runtime = createDashboardRuntime({
-  // Below MAIN's 10 s quit deadline, so a worker that will not answer is
-  // terminated by the runtime rather than by the app running out of time.
-  shutdownTimeoutMs: 4_000,
+  // One budget per sequential worker phase. The process/broker/app caps are
+  // derived from this in `shutdown-timings.ts`.
+  shutdownTimeoutMs: CONTROL_PANEL_WORKER_SHUTDOWN_STEP_MS,
   onLifecycle: (event) => {
     // The database worker dying is invisible from the UI: every worker-thread
     // route just starts failing. Say so where the crash report can see it.

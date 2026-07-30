@@ -31,6 +31,7 @@
  * makes no decisions.
  */
 
+import { CONTROL_PANEL_BROKER_KILL_GRACE_MS } from '../control-panel/shutdown-timings.js';
 import { DEFAULT_RESTART_POLICY, nextCrashCount, planRestart, type RestartPolicy } from './supervisor/state.js';
 
 /** One end of a `MessageChannelMain`, as much of it as the broker touches. */
@@ -122,14 +123,12 @@ export interface BrokerOptions {
   killGraceMs?: number;
 }
 
-const DEFAULT_KILL_GRACE_MS = 5_000;
-
 export function createControlPanelBroker<Target>(
   deps: BrokerDeps<Target>,
   options: BrokerOptions = {},
 ): ControlPanelBroker<Target> {
   const policy: RestartPolicy = { ...DEFAULT_RESTART_POLICY, ...options.restart };
-  const killGraceMs = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
+  const killGraceMs = options.killGraceMs ?? CONTROL_PANEL_BROKER_KILL_GRACE_MS;
 
   let child: ControlPanelChild | null = null;
   let generation = 0;

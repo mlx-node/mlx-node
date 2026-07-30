@@ -10,6 +10,7 @@
 
 import { describe, expect, it } from 'vite-plus/test';
 
+import { CONTROL_PANEL_BROKER_KILL_GRACE_MS } from '../src/control-panel/shutdown-timings.js';
 import {
   createControlPanelBroker,
   type ControlPanelChild,
@@ -343,9 +344,7 @@ describe('when CONTROL PANEL dies', () => {
 
     expect(h.spawns[1].killed).toBe(0);
     expect(h.spawns[1].forceKilled).toBe(0);
-    expect(h.events.filter((event) => event.type === 'control-panel-exited')).toHaveLength(
-      exitsBeforeStaleDelivery,
-    );
+    expect(h.events.filter((event) => event.type === 'control-panel-exited')).toHaveLength(exitsBeforeStaleDelivery);
     expect(broker.running()).toBe(true);
   });
 
@@ -455,6 +454,21 @@ describe('when CONTROL PANEL dies', () => {
 });
 
 describe('dispose', () => {
+  it('uses a default grace longer than the CONTROL PANEL process shutdown cap', async () => {
+    const h = harness();
+    const broker = createControlPanelBroker(h.deps);
+    broker.attach(renderer());
+
+    const done = broker.dispose();
+    expect(h.timers.map((timer) => timer.ms)).toEqual([
+      CONTROL_PANEL_BROKER_KILL_GRACE_MS,
+      CONTROL_PANEL_BROKER_KILL_GRACE_MS * 2,
+    ]);
+
+    h.spawns[0].exit(0);
+    await done;
+  });
+
   it('SIGTERMs and waits for the child to go', async () => {
     const h = harness();
     const broker = createControlPanelBroker(h.deps);
