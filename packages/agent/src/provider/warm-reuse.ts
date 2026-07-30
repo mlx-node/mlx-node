@@ -18,19 +18,20 @@
  * the reused prefix and skip the corresponding re-prefill.
  *
  * Fields accessed: `inFlight`, `history`, `lastImagesKey`, `lastAudioKey`, `turnCount`,
- * `unresolvedOkToolCallCount`, `needsFullReplay`. These are TypeScript `private` fields on
- * `ChatSession` (compile-time only) — at runtime they are ordinary
- * properties. The cast through {@link ChatSessionWarmReuseInternals}
- * gives this helper a typed view of the instance without relaxing the
- * class's `private` declarations. The field names MUST stay in sync
- * with `packages/lm/src/chat-session.ts`; a mismatch would silently
- * skip the intended state wipe — the drift test in
+ * `unresolvedOkToolCallCount`, `needsFullReplay`, `defaultConfig`, `activeTools`.
+ * These are TypeScript `private` fields on `ChatSession` (compile-time
+ * only) — at runtime they are ordinary properties. The cast through
+ * {@link ChatSessionWarmReuseInternals} gives this helper a typed view
+ * of the instance without relaxing the class's `private` declarations.
+ * The field names MUST stay in sync with
+ * `packages/lm/src/chat-session.ts`; a mismatch would silently skip
+ * the intended state wipe — the drift test in
  * `packages/agent/__test__/warm-reuse.test.ts` checks every name in
  * {@link WARM_REUSE_TOUCHED_FIELDS} against a real `ChatSession`
  * instance.
  */
 
-import type { ChatSession, SessionCapableModel } from '@mlx-node/lm';
+import type { ChatConfig, ChatSession, SessionCapableModel } from '@mlx-node/lm';
 
 /**
  * Private structural view of the `ChatSession` JS-side state that the
@@ -47,6 +48,8 @@ interface ChatSessionWarmReuseInternals {
   turnCount: number;
   unresolvedOkToolCallCount: number | null;
   needsFullReplay: boolean;
+  defaultConfig?: ChatConfig;
+  activeTools: ChatConfig['tools'];
 }
 
 /**
@@ -63,6 +66,8 @@ const WARM_REUSE_TOUCHED_FIELD_SET: Record<keyof ChatSessionWarmReuseInternals, 
   turnCount: true,
   unresolvedOkToolCallCount: true,
   needsFullReplay: true,
+  defaultConfig: true,
+  activeTools: true,
 };
 
 /**
@@ -113,4 +118,8 @@ export async function resetPreservingNativeCacheForWarmReuse<M extends SessionCa
   internals.turnCount = 0;
   internals.unresolvedOkToolCallCount = null;
   internals.needsFullReplay = false;
+  // Tools are conversation state. A provider replay can switch to an
+  // unrelated history, so restore constructor defaults exactly like
+  // ChatSession.reset() instead of leaking the prior committed overlay.
+  internals.activeTools = internals.defaultConfig?.tools;
 }

@@ -22,17 +22,17 @@
  * native cache is correct there and only there.
  *
  * Fields accessed: `inFlight`, `history`, `lastImagesKey`, `lastAudioKey`, `turnCount`,
- * `unresolvedOkToolCallCount`, `needsFullReplay`. These are TypeScript `private` fields on
- * `ChatSession` (compile-time only) — at runtime they are ordinary
- * properties. The cast through {@link ChatSessionWarmReuseInternals}
- * gives this helper a typed view of the instance without relaxing the
- * class's `private` declarations. The field names MUST stay in sync
- * with `packages/lm/src/chat-session.ts`; a mismatch would silently
- * skip the intended state wipe and is covered by the chat-session
- * unit tests that exercise this path through the endpoint handler.
+ * `unresolvedOkToolCallCount`, `needsFullReplay`, `defaultConfig`, `activeTools`.
+ * These are TypeScript `private` fields on `ChatSession` (compile-time
+ * only) — at runtime they are ordinary properties. The cast through
+ * {@link ChatSessionWarmReuseInternals} gives this helper a typed view
+ * of the instance without relaxing the class's `private` declarations.
+ * The field names MUST stay in sync with
+ * `packages/lm/src/chat-session.ts`; a mismatch would silently skip
+ * the intended state wipe and is covered by the warm-reuse unit tests.
  */
 
-import type { ChatSession, SessionCapableModel } from '@mlx-node/lm';
+import type { ChatConfig, ChatSession, SessionCapableModel } from '@mlx-node/lm';
 
 /**
  * Private structural view of the `ChatSession` JS-side state that the
@@ -49,6 +49,8 @@ interface ChatSessionWarmReuseInternals {
   turnCount: number;
   unresolvedOkToolCallCount: number | null;
   needsFullReplay: boolean;
+  defaultConfig?: ChatConfig;
+  activeTools: ChatConfig['tools'];
 }
 
 /**
@@ -89,4 +91,8 @@ export async function resetPreservingNativeCacheForWarmReuse<M extends SessionCa
   internals.turnCount = 0;
   internals.unresolvedOkToolCallCount = null;
   internals.needsFullReplay = false;
+  // Tools are conversation state. A warm-any lease may belong to an
+  // unrelated request, so restore constructor defaults exactly like
+  // ChatSession.reset() instead of leaking the prior committed overlay.
+  internals.activeTools = internals.defaultConfig?.tools;
 }
