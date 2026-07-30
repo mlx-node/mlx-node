@@ -34,7 +34,7 @@ import {
 } from './settings.js';
 import { utilityChildTransport } from './supervisor/child-utility.js';
 import { createSupervisor, type Supervisor } from './supervisor/index.js';
-import { connectCommand } from './tray-view.js';
+import { claudeConnectCommand, codexConnectCommand } from './tray-view.js';
 import { createTray, type TrayController } from './tray.js';
 import { createControlPanelWindowManager, type ControlPanelWindowManager } from './window.js';
 
@@ -270,6 +270,16 @@ async function bootstrap(): Promise<void> {
     },
   });
 
+  const copyClientCommand = (build: (endpoint: string, token: string) => string): void => {
+    const endpoint = supervisor?.snapshot().url;
+    const token = supervisor?.connectionToken();
+    // The menu items are disabled unless running, but a crash between the
+    // render and the click is entirely possible — and half a command on the
+    // clipboard is worse than none.
+    if (endpoint === undefined || endpoint === null || token === undefined || token === null) return;
+    clipboard.writeText(build(endpoint, token));
+  };
+
   tray = createTray({
     iconPath: paths.trayIcon,
     showInDock: () => settings.showInDock,
@@ -284,15 +294,8 @@ async function bootstrap(): Promise<void> {
       restartInference: () => {
         void supervisor?.restart().catch(reportInferenceFailure);
       },
-      copyConnectCommand: () => {
-        const endpoint = supervisor?.snapshot().url;
-        const token = supervisor?.connectionToken();
-        // The menu item is disabled unless running, but a crash between the
-        // render and the click is entirely possible — and half a command on the
-        // clipboard is worse than none.
-        if (endpoint === undefined || endpoint === null || token === undefined || token === null) return;
-        clipboard.writeText(connectCommand(endpoint, token));
-      },
+      copyClaudeConnectCommand: () => copyClientCommand(claudeConnectCommand),
+      copyCodexConnectCommand: () => copyClientCommand(codexConnectCommand),
       setShowInDock: (next: boolean) => {
         settings = { ...settings, showInDock: next };
         applyDockPolicy(next);

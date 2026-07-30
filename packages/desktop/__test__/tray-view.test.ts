@@ -13,7 +13,7 @@ import { execFileSync } from 'node:child_process';
 import { describe, expect, it } from 'vite-plus/test';
 
 import type { SupervisorSnapshot, SupervisorState } from '../src/main/supervisor/types.js';
-import { connectCommand, presentTray } from '../src/main/tray-view.js';
+import { claudeConnectCommand, codexConnectCommand, presentTray } from '../src/main/tray-view.js';
 
 function snapshot(state: SupervisorState, over: Partial<SupervisorSnapshot> = {}): SupervisorSnapshot {
   return {
@@ -192,7 +192,7 @@ describe('presentTray', () => {
  * the ready handshake and leaves it only here, as a whole command, so the secret
  * is never drawn into a menu row where a screenshot would catch it.
  */
-describe('connect command', () => {
+describe('connect commands', () => {
   it('is offered only while a child is actually serving', () => {
     // Not `starting`: the URL exists there but the token has not arrived yet, so
     // the command would be built from a null. Not `restarting`: the token is
@@ -204,17 +204,18 @@ describe('connect command', () => {
     expect(presentTray(snapshot('running', { url: null })).canCopyConnect).toBe(false);
   });
 
-  it('carries the credential in the environment, never in the URL', () => {
-    const command = connectCommand('http://127.0.0.1:51423', 'sekrit-token');
+  it('builds a Claude Code command with the credential in the environment, never in the URL', () => {
+    const command = claudeConnectCommand('http://127.0.0.1:51423', 'sekrit-token');
     expect(command).toContain("ANTHROPIC_BASE_URL='http://127.0.0.1:51423'");
     expect(command).toContain("ANTHROPIC_AUTH_TOKEN='sekrit-token'");
+    expect(command).toMatch(/ claude$/u);
     // A token in a query string lands in referrers and proxy logs.
     expect(command).not.toContain('?');
     expect(command).not.toContain('sekrit-token@');
   });
 
   it('does not let an inherited ANTHROPIC_API_KEY override the bearer token', () => {
-    const command = connectCommand('http://127.0.0.1:51423', 'sekrit-token');
+    const command = claudeConnectCommand('http://127.0.0.1:51423', 'sekrit-token');
     const script = command.replace(
       / claude$/u,
       ` sh -c 'printf "%s|%s" "\${ANTHROPIC_API_KEY+x}" "$ANTHROPIC_AUTH_TOKEN"'`,
@@ -231,7 +232,7 @@ describe('connect command', () => {
 
   it('quotes a token that would otherwise break out of the command', () => {
     const evil = String.raw`a'; echo PWNED; b`;
-    const command = connectCommand('http://127.0.0.1:1', evil);
+    const command = claudeConnectCommand('http://127.0.0.1:1', evil);
     // Run the real command with `claude` swapped for something that just prints
     // the variable it was handed. If the quoting were wrong, bash would either
     // fail to parse or execute the injected `echo`.
@@ -244,5 +245,43 @@ describe('connect command', () => {
     // "PWNED" would be wrong here — the token itself contains that text.)
     expect(out).toBe(evil);
     expect(out.split('\n')).toHaveLength(1);
+  });
+
+  it('builds a Codex custom Responses provider at the server v1 root', () => {
+    const command = codexConnectCommand('http://127.0.0.1:51423', 'sekrit-token');
+    expect(command).toContain("MLX_NODE_API_KEY='sekrit-token' codex -m mlx-node");
+    expect(command).toContain(`-c 'model_provider="mlx-node"'`);
+    expect(command).toContain(`-c 'model_providers.mlx-node.name="MLX-Node"'`);
+    expect(command).toContain(`-c 'model_providers.mlx-node.base_url="http://127.0.0.1:51423/v1"'`);
+    expect(command).toContain(`-c 'model_providers.mlx-node.env_key="MLX_NODE_API_KEY"'`);
+    expect(command).toContain(`-c 'model_providers.mlx-node.wire_api="responses"'`);
+    expect(command).not.toContain('ANTHROPIC_');
+    expect(command).not.toContain('claude');
+  });
+
+  it('round-trips the Codex credential and config as separate shell arguments', () => {
+    const evil = String.raw`a'; echo PWNED; b`;
+    const command = codexConnectCommand('http://127.0.0.1:51423', evil);
+    const script = command.replace(
+      / codex /u,
+      String.raw` sh -c 'printf "%s\n" "$MLX_NODE_API_KEY"; printf "%s\n" "$@"' -- `,
+    );
+    const lines = execFileSync('bash', ['-c', script]).toString().trimEnd().split('\n');
+
+    expect(lines).toEqual([
+      evil,
+      '-m',
+      'mlx-node',
+      '-c',
+      'model_provider="mlx-node"',
+      '-c',
+      'model_providers.mlx-node.name="MLX-Node"',
+      '-c',
+      'model_providers.mlx-node.base_url="http://127.0.0.1:51423/v1"',
+      '-c',
+      'model_providers.mlx-node.env_key="MLX_NODE_API_KEY"',
+      '-c',
+      'model_providers.mlx-node.wire_api="responses"',
+    ]);
   });
 });

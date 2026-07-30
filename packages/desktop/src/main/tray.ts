@@ -18,8 +18,10 @@ export interface TrayActions {
   startInference(): void;
   stopInference(): void;
   restartInference(): void;
-  /** Put a ready-to-paste command carrying the URL and the token on the clipboard. */
-  copyConnectCommand(): void;
+  /** Put a ready-to-paste Claude Code command carrying the URL and token on the clipboard. */
+  copyClaudeConnectCommand(): void;
+  /** Put a ready-to-paste Codex command carrying the URL and token on the clipboard. */
+  copyCodexConnectCommand(): void;
   setShowInDock(next: boolean): void;
   quit(): void;
 }
@@ -79,15 +81,22 @@ export function createTray(options: TrayOptions): TrayController {
           options.actions.openControlPanel();
         },
       },
+      // The URL alone is not a capability — every inference route is gated —
+      // so both commands carry the token too. Client-specific rows matter:
+      // Claude Code reads Anthropic environment variables while Codex requires
+      // a custom Responses API provider.
       {
-        // The URL alone is not a capability — every inference route is gated —
-        // so a user pointing Claude Code or Codex at this server needs the
-        // token too. Copying a whole command rather than showing the secret in
-        // a menu row keeps it off the screen and out of a screenshot.
-        label: 'Copy Connect Command',
+        label: 'Copy Claude Code Command',
         enabled: presentation.canCopyConnect,
         click: () => {
-          options.actions.copyConnectCommand();
+          options.actions.copyClaudeConnectCommand();
+        },
+      },
+      {
+        label: 'Copy Codex Command',
+        enabled: presentation.canCopyConnect,
+        click: () => {
+          options.actions.copyCodexConnectCommand();
         },
       },
       { type: 'separator' },

@@ -180,24 +180,49 @@ function describe(snapshot: SupervisorSnapshot): Described {
 }
 
 /**
- * A ready-to-paste shell command pointing a client at this server.
- *
- * Environment variables rather than a URL query string: a token in a query
- * string ends up in referrers, proxy logs and shell history as part of the URL
- * itself. `ANTHROPIC_AUTH_TOKEN` is sent as a header by the client, which is
- * accepted by the server's gate.
+ * Single-quoted with embedded quotes escaped, so a URL or token containing
+ * shell metacharacters cannot turn a paste into something else. base64url
+ * tokens never contain a quote today; relying on that would make both client
+ * launchers fragile the day the token format changes.
+ */
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", String.raw`'\''`)}'`;
+}
+
+/**
+ * A ready-to-paste Claude Code command pointing at this server.
  *
  * An inherited `ANTHROPIC_API_KEY` must be removed, not emptied: Claude Code
  * sends it as `x-api-key` alongside the bearer token, and the server
  * intentionally checks `x-api-key` first. `env -u` scopes the removal to this
  * command instead of mutating the user's shell.
- *
- * Single-quoted with embedded quotes escaped, so a token containing shell
- * metacharacters cannot turn a paste into something else. base64url tokens
- * never contain a quote today; relying on that would make this fragile the day
- * the token format changes.
  */
-export function connectCommand(url: string, token: string): string {
-  const quote = (value: string): string => `'${value.replaceAll("'", String.raw`'\''`)}'`;
-  return `env -u ANTHROPIC_API_KEY ANTHROPIC_BASE_URL=${quote(url)} ANTHROPIC_AUTH_TOKEN=${quote(token)} claude`;
+export function claudeConnectCommand(url: string, token: string): string {
+  return `env -u ANTHROPIC_API_KEY ANTHROPIC_BASE_URL=${shellQuote(url)} ANTHROPIC_AUTH_TOKEN=${shellQuote(token)} claude`;
+}
+
+/**
+ * A ready-to-paste Codex command pointing at this server's Responses API.
+ *
+ * Codex does not use the Anthropic environment variables. Its supported
+ * connection surface is a custom model provider: `base_url` selects the
+ * OpenAI-compatible `/v1` root and `env_key` names the variable whose value
+ * Codex sends as bearer authentication. Command-line config overrides keep the
+ * mlx-node provider scoped to this invocation instead of modifying the user's
+ * `~/.codex/config.toml`.
+ */
+export function codexConnectCommand(url: string, token: string): string {
+  const baseUrl = `${url.replace(/\/+$/u, '')}/v1`;
+  const config = (key: string, value: string): string => `-c ${shellQuote(`${key}=${JSON.stringify(value)}`)}`;
+
+  return [
+    `MLX_NODE_API_KEY=${shellQuote(token)}`,
+    'codex',
+    '-m mlx-node',
+    config('model_provider', 'mlx-node'),
+    config('model_providers.mlx-node.name', 'MLX-Node'),
+    config('model_providers.mlx-node.base_url', baseUrl),
+    config('model_providers.mlx-node.env_key', 'MLX_NODE_API_KEY'),
+    config('model_providers.mlx-node.wire_api', 'responses'),
+  ].join(' ');
 }
