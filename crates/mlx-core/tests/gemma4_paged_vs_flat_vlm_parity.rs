@@ -40,7 +40,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use image::{DynamicImage, GenericImageView, ImageFormat};
-use mlx_core::engine::types::ChatConfig;
+use mlx_core::engine::types::{ChatConfig, ChatResult};
 use mlx_core::models::gemma4::model::Gemma4Model;
 use mlx_core::tokenizer::ChatMessage;
 use napi::bindgen_prelude::Uint8Array;
@@ -156,6 +156,30 @@ fn user_message(content: &str) -> ChatMessage {
         is_error: None,
         reasoning_content: None,
         thinking_enabled: None,
+        images: None,
+        audio: None,
+    }
+}
+
+fn assistant_message(result: &ChatResult) -> ChatMessage {
+    ChatMessage {
+        role: "assistant".to_string(),
+        content: result.text.clone(),
+        tool_calls: (!result.tool_calls.is_empty()).then(|| {
+            result
+                .tool_calls
+                .iter()
+                .map(|call| mlx_core::tokenizer::ToolCall {
+                    id: Some(call.id.clone()),
+                    name: call.name.clone(),
+                    arguments: call.arguments.to_string(),
+                })
+                .collect()
+        }),
+        tool_call_id: None,
+        is_error: None,
+        reasoning_content: result.thinking.clone(),
+        thinking_enabled: Some(result.thinking_enabled),
         images: None,
         audio: None,
     }
@@ -381,12 +405,15 @@ async fn gemma4_paged_vlm_continue_preserves_image_context() {
         .expect("paged(image) chat_session_start failed");
     assert!(r1.num_tokens > 0, "image turn produced zero tokens: {r1:?}");
 
-    // Turn 2: text-only continue must extend the live image-bearing prefix.
+    // Turn 2: replay the complete transcript, including the historical image,
+    // so exact prompt/media verification can extend the live prefix.
     let cont = paged_model
         .chat_session_continue(
-            "Answer in one word: is there text?".to_string(),
-            None,
-            None,
+            vec![
+                user_message_with_image(PROMPT, &image),
+                assistant_message(&r1),
+                user_message("Answer in one word: is there text?"),
+            ],
             Some(correctness_chat_config(48)),
         )
         .await

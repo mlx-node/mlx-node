@@ -38,7 +38,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mlx_core::engine::types::ChatConfig;
+use mlx_core::engine::types::{ChatConfig, ChatResult};
 use mlx_core::models::qwen3_5::model::Qwen3_5Model;
 use mlx_core::tokenizer::ChatMessage;
 use napi::bindgen_prelude::Uint8Array;
@@ -83,6 +83,30 @@ fn user_msg(content: &str, image: Option<&[u8]>) -> ChatMessage {
         reasoning_content: None,
         thinking_enabled: None,
         images: image.map(|b| vec![Uint8Array::new(b.to_vec())]),
+        audio: None,
+    }
+}
+
+fn assistant_msg(result: &ChatResult) -> ChatMessage {
+    ChatMessage {
+        role: "assistant".to_string(),
+        content: result.text.clone(),
+        tool_calls: (!result.tool_calls.is_empty()).then(|| {
+            result
+                .tool_calls
+                .iter()
+                .map(|call| mlx_core::tokenizer::ToolCall {
+                    id: Some(call.id.clone()),
+                    name: call.name.clone(),
+                    arguments: call.arguments.to_string(),
+                })
+                .collect()
+        }),
+        tool_call_id: None,
+        is_error: None,
+        reasoning_content: result.thinking.clone(),
+        thinking_enabled: Some(result.thinking_enabled),
+        images: None,
         audio: None,
     }
 }
@@ -140,9 +164,11 @@ async fn run_two_turns(m: &Qwen3_5Model, image: &[u8]) -> (Digest, String, Diges
 
     let t2 = m
         .chat_session_continue(
-            "Answer in one word: is there text?".to_string(),
-            None,
-            None,
+            vec![
+                user_msg("Describe this image briefly.", Some(image)),
+                assistant_msg(&t1),
+                user_msg("Answer in one word: is there text?", None),
+            ],
             Some(cfg(48)),
         )
         .await

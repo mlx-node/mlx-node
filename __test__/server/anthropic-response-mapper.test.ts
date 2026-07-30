@@ -25,6 +25,7 @@ function makeChatResult(overrides: Record<string, unknown> = {}) {
       error?: string;
     }[],
     thinking: undefined as string | undefined,
+    thinkingEnabled: true,
     numTokens: 10,
     promptTokens: 5,
     reasoningTokens: 0,

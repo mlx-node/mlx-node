@@ -145,6 +145,30 @@ fn user_message(content: &str) -> ChatMessage {
     }
 }
 
+fn assistant_message(result: &ChatResult) -> ChatMessage {
+    ChatMessage {
+        role: "assistant".to_string(),
+        content: result.text.clone(),
+        tool_calls: (!result.tool_calls.is_empty()).then(|| {
+            result
+                .tool_calls
+                .iter()
+                .map(|call| mlx_core::tokenizer::ToolCall {
+                    id: Some(call.id.clone()),
+                    name: call.name.clone(),
+                    arguments: call.arguments.to_string(),
+                })
+                .collect()
+        }),
+        tool_call_id: None,
+        is_error: None,
+        reasoning_content: result.thinking.clone(),
+        thinking_enabled: Some(result.thinking_enabled),
+        images: None,
+        audio: None,
+    }
+}
+
 /// Assert the DSpark run byte-matches the AR reference AND actually ran
 /// DSpark cycles (not a silent AR fallback), then print the headline stats.
 fn assert_matches_ar(label: &str, dspark: &ChatResult, ar: &ChatResult) {
@@ -341,9 +365,11 @@ async fn dspark_stop_mid_block_then_delta_turn() {
     );
     let ar2 = model
         .chat_session_continue(
-            FOLLOW_UP.to_string(),
-            None,
-            None,
+            vec![
+                user_message(PROMPT),
+                assistant_message(&ar1),
+                user_message(FOLLOW_UP),
+            ],
             Some(chat_config(64, false)),
         )
         .await
@@ -359,9 +385,11 @@ async fn dspark_stop_mid_block_then_delta_turn() {
 
     let sp2 = model
         .chat_session_continue(
-            FOLLOW_UP.to_string(),
-            None,
-            None,
+            vec![
+                user_message(PROMPT),
+                assistant_message(&sp1),
+                user_message(FOLLOW_UP),
+            ],
             Some(chat_config(64, true)),
         )
         .await

@@ -412,6 +412,8 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
             return Err(e);
         }
     };
+    result.thinking_enabled =
+        crate::engine::params::resolve_enable_thinking(args.config).unwrap_or(true);
     // cached_tokens overwrite stays in the engine (AFTER finalize — the
     // override must not fill it): it reports the matched prefix length;
     // for delta turns the warm-continue effective_cached_prefix_len covers
@@ -700,6 +702,7 @@ mod tests {
                 text: String::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                thinking_enabled: args.thinking_enabled,
                 num_tokens: args.generated_tokens.len() as u32,
                 prompt_tokens: args.prompt_tokens,
                 reasoning_tokens: args.reasoning_tokens,

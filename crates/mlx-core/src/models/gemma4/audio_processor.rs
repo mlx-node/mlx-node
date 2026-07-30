@@ -200,11 +200,9 @@ pub fn frames_from_pcm(pcm: &[f32], samples_per_token: usize) -> Result<MxArray>
 /// supplies the frame count for each placeholder in order. Non-placeholder
 /// tokens pass through unchanged.
 ///
-/// When the prompt carries no `audio_token_id` placeholder but clips are
-/// supplied (the template-less manual prompt formatter emits none), each clip's
-/// span is inserted after BOS, in clip order. An `Err` is returned only for a
-/// genuine placeholder/clip-count mismatch (some placeholders present, but their
-/// count differs from `n_frames_per_audio.len()`).
+/// The placeholder count must exactly match the supplied clips. Prompt
+/// structure belongs to the checkpoint template, so this processor never
+/// inserts fallback spans at an invented position.
 pub fn expand_audio_tokens(
     tokens: &[u32],
     n_frames_per_audio: &[usize],
@@ -213,29 +211,6 @@ pub fn expand_audio_tokens(
     eoa_token_id: u32,
 ) -> Result<Vec<u32>> {
     let placeholder_count = tokens.iter().filter(|&&t| t == audio_token_id).count();
-
-    // The template-less prompt formatter emits no <|audio|> placeholder, so when
-    // clips are supplied without one, insert each clip's span after BOS (mirrors
-    // expand_image_tokens). Each clip becomes boa + audio_token × n_frames + eoa,
-    // in clip order.
-    if placeholder_count == 0 && !n_frames_per_audio.is_empty() {
-        if tokens.is_empty() {
-            return Ok(Vec::new());
-        }
-        let total_frames: usize = n_frames_per_audio.iter().sum();
-        let mut result =
-            Vec::with_capacity(tokens.len() + total_frames + 2 * n_frames_per_audio.len());
-        result.push(tokens[0]); // BOS
-        for &n_frames in n_frames_per_audio {
-            result.push(boa_token_id);
-            for _ in 0..n_frames {
-                result.push(audio_token_id);
-            }
-            result.push(eoa_token_id);
-        }
-        result.extend_from_slice(&tokens[1..]);
-        return Ok(result);
-    }
 
     if placeholder_count != n_frames_per_audio.len() {
         return Err(Error::from_reason(format!(
@@ -360,32 +335,11 @@ mod tests {
     }
 
     #[test]
-    fn expand_audio_no_placeholder_inserts_spans_after_bos() {
-        // Single clip: no <|audio|> placeholder but a 3-frame clip is supplied,
-        // so the span is inserted after BOS (tokens[0] = 2 here).
+    fn expand_audio_no_placeholder_with_clip_errors() {
         let tokens: Vec<u32> = vec![2, 10, 11];
-        let out = expand_audio_tokens(&tokens, &[3], 258881, 256000, 258883).unwrap();
-        assert_eq!(out, vec![2, 256000, 258881, 258881, 258881, 258883, 10, 11]);
-        assert_eq!(out[0], 2, "BOS preserved at position 0");
-        assert_eq!(
-            out.iter().filter(|&&t| t == 258881).count(),
-            3,
-            "audio-token count equals total frames"
-        );
-
-        // Two clips: spans inserted after BOS in clip order (1 frame, then 2).
-        let tokens: Vec<u32> = vec![2, 9];
-        let out = expand_audio_tokens(&tokens, &[1, 2], 258881, 256000, 258883).unwrap();
-        assert_eq!(
-            out,
-            vec![2, 256000, 258881, 258883, 256000, 258881, 258881, 258883, 9]
-        );
-        assert_eq!(out[0], 2, "BOS preserved at position 0");
-        assert_eq!(
-            out.iter().filter(|&&t| t == 258881).count(),
-            3,
-            "audio-token count equals total frames"
-        );
+        let error = expand_audio_tokens(&tokens, &[3], 258881, 256000, 258883)
+            .expect_err("missing checkpoint-template audio placeholder must fail");
+        assert!(error.to_string().contains("0 audio placeholder(s)"));
     }
 
     /// Build a minimal RIFF/WAVE byte stream for testing.

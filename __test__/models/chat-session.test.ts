@@ -33,6 +33,7 @@ function makeChatResult(text: string): ChatResult {
     rawText: text,
     toolCalls: [],
     thinking: null,
+    thinkingEnabled: true,
     numTokens: 1,
     promptTokens: 1,
     reasoningTokens: 0,
@@ -73,6 +74,7 @@ function finalChunk(text: string, finishReason: string = 'stop'): ChatStreamFina
     finishReason,
     toolCalls: [],
     thinking: null,
+    thinkingEnabled: true,
     numTokens: 2,
     promptTokens: 1,
     reasoningTokens: 0,
@@ -91,20 +93,11 @@ function makeMockModel() {
     async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> => makeChatResult('start-reply'),
   );
   const chatSessionContinue = vi.fn(
-    async (
-      _userMessage: string,
-      _images: Uint8Array[] | null,
-      _audio: Uint8Array[] | null,
-      _config?: ChatConfig | null,
-    ): Promise<ChatResult> => makeChatResult('continue-reply'),
+    async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> =>
+      makeChatResult('continue-reply'),
   );
   const chatSessionContinueTool = vi.fn(
-    async (
-      _toolCallId: string,
-      _content: string,
-      _config?: ChatConfig | null,
-      _isError?: boolean | null,
-    ): Promise<ChatResult> => makeChatResult('tool-reply'),
+    async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> => makeChatResult('tool-reply'),
   );
   const chatStreamSessionStart = vi.fn(async function* (
     _messages: ChatMessage[],
@@ -115,20 +108,17 @@ function makeMockModel() {
     yield finalChunk('start-reply');
   });
   const chatStreamSessionContinue = vi.fn(async function* (
-    _userMessage: string,
-    _images: Uint8Array[] | null,
-    _audio: Uint8Array[] | null,
+    _messages: ChatMessage[],
     _config?: ChatConfig | null,
+    _signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent> {
     yield { text: 'cont', done: false };
     yield finalChunk('cont-reply');
   });
   const chatStreamSessionContinueTool = vi.fn(async function* (
-    _toolCallId: string,
-    _content: string,
+    _messages: ChatMessage[],
     _config?: ChatConfig | null,
     _signal?: AbortSignal,
-    _isError?: boolean | null,
   ): AsyncGenerator<ChatStreamEvent> {
     yield { text: 'tool', done: false };
     yield finalChunk('tool-reply');
@@ -191,7 +181,7 @@ describe('ChatSession', () => {
       expect(messages).toEqual([{ role: 'user', content: 'Hello' }]);
     });
 
-    it('routes turn N through chatSessionContinue with images=null', async () => {
+    it('routes turn N through chatSessionContinue with full template history', async () => {
       const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
       const session = new ChatSession(model);
 
@@ -203,16 +193,12 @@ describe('ChatSession', () => {
       expect(chatSessionContinue).toHaveBeenCalledTimes(2);
       expect(session.turns).toBe(3);
 
-      expect(chatSessionContinue.mock.calls[0][0]).toBe('Second');
-      expect(chatSessionContinue.mock.calls[0][1]).toBeNull();
-      // arg[2] is the new audio param; delta continues never carry audio.
-      expect(chatSessionContinue.mock.calls[0][2]).toBeNull();
-      expect(chatSessionContinue.mock.calls[1][0]).toBe('Third');
-      expect(chatSessionContinue.mock.calls[1][1]).toBeNull();
-      expect(chatSessionContinue.mock.calls[1][2]).toBeNull();
+      expect(chatSessionContinue.mock.calls[0][0].at(-1)).toEqual({ role: 'user', content: 'Second' });
+      expect(chatSessionContinue.mock.calls[1][0].at(-1)).toEqual({ role: 'user', content: 'Third' });
+      expect(chatSessionContinue.mock.calls[1][0]).toHaveLength(5);
 
       for (const call of chatSessionContinue.mock.calls) {
-        expect(call[3]?.reuseCache).toBe(true);
+        expect(call[1]?.reuseCache).toBe(true);
       }
     });
 
@@ -224,19 +210,17 @@ describe('ChatSession', () => {
       await session.send('Second', { config: { reuseCache: false } });
 
       expect(chatSessionStart.mock.calls[0][1]?.reuseCache).toBe(true);
-      expect(chatSessionContinue.mock.calls[0][3]?.reuseCache).toBe(true);
+      expect(chatSessionContinue.mock.calls[0][1]?.reuseCache).toBe(true);
     });
 
     // Regression guard for the Phase 3b audio-surface ABI shift. The
     // shared chat surface inserts an `audio` positional argument between
     // `images` and `config`. A QianfanOCR-shaped model (handwritten NAPI
     // methods, not the `chat_napi_surface!` macro) must carry the SAME
-    // positional ABI as the macro families, or the delta path would push
-    // the caller's `config` into the audio slot and silently drop it. We
-    // model the native binding as a positional recorder (it only knows
-    // arguments by index) and assert `config` lands in slot 3, never the
-    // audio slot.
-    it('delivers (userMessage, images, audio, config) to a Qianfan-shaped continue without dropping config', async () => {
+    // full-history ABI as the macro families. We model the native binding
+    // as a positional recorder and assert the transcript and config keep
+    // the same two-argument shape.
+    it('delivers (messages, config) to a Qianfan-shaped continue without dropping config', async () => {
       const continueArgs: unknown[][] = [];
       const qianfanShaped: SessionCapableModel = {
         chatSessionStart: vi.fn(
@@ -268,23 +252,21 @@ describe('ChatSession', () => {
         defaultConfig: { maxNewTokens: 7 },
       });
 
-      // Turn 0 routes through start; turn 1 takes the cheap delta path.
+      // Turn 0 routes through start; turn 1 rerenders the full history.
       await session.send('First');
       await session.send('Second');
 
       expect(continueArgs).toHaveLength(1);
-      const [userMessage, images, audio, config] = continueArgs[0];
-      expect(userMessage).toBe('Second');
-      expect(images).toBeNull();
-      // audio MUST be the third positional argument and null on a delta —
-      // if the ABI were the pre-fix shape, `config` would land here.
-      expect(audio).toBeNull();
-      // config MUST land in slot 3, fully intact (not shifted into audio).
+      const [messages, config] = continueArgs[0];
+      expect(messages).toEqual([
+        { role: 'user', content: 'First' },
+        { role: 'assistant', content: 'start-reply', thinkingEnabled: true },
+        { role: 'user', content: 'Second' },
+      ]);
       expect(config).toBeDefined();
       expect((config as ChatConfig | undefined)?.maxNewTokens).toBe(7);
       expect((config as ChatConfig | undefined)?.reuseCache).toBe(true);
-      // No stray fifth positional argument.
-      expect(continueArgs[0]).toHaveLength(4);
+      expect(continueArgs[0]).toHaveLength(2);
     });
 
     it('merges defaultConfig and per-call config (per-call wins)', async () => {
@@ -390,7 +372,7 @@ describe('ChatSession', () => {
       expect(messages[0].images).toEqual([imgA]);
     });
 
-    it('text continue after image start stays on the cheap delta path', async () => {
+    it('text continue after image start supplies the complete multimodal history', async () => {
       const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
       const session = new ChatSession(model);
 
@@ -399,7 +381,16 @@ describe('ChatSession', () => {
 
       expect(chatSessionStart).toHaveBeenCalledTimes(1);
       expect(chatSessionContinue).toHaveBeenCalledTimes(1);
-      expect(chatSessionContinue.mock.calls[0][1]).toBeNull();
+      expect(chatSessionContinue.mock.calls[0][0][0]).toEqual({
+        role: 'user',
+        content: 'describe',
+        images: [imgA],
+      });
+      expect(chatSessionContinue.mock.calls[0][0].at(-1)).toEqual({
+        role: 'user',
+        content: 'follow-up question',
+      });
+      expect(chatSessionContinue.mock.calls[0][1]?.reuseCache).toBe(true);
       // Image key sticks around since we never cleared it.
       expect(session.hasImages).toBe(true);
     });
@@ -444,10 +435,11 @@ describe('ChatSession', () => {
         {
           role: 'assistant',
           content: 'start-reply',
+          thinkingEnabled: true,
           toolCalls: [{ id: 'call-1', name: 'tool_fn', arguments: '{}' }],
         },
-        { role: 'tool', content: 'tool-output', toolCallId: 'call-1' },
-        { role: 'assistant', content: 'tool-reply' },
+        { role: 'tool', content: 'tool-output', toolCallId: 'call-1', isError: undefined },
+        { role: 'assistant', content: 'tool-reply', thinkingEnabled: true },
         { role: 'user', content: 'describe B', images: [imgB] },
       ]);
       // Three successful turns: initial send, tool result, restart send.
@@ -598,9 +590,9 @@ describe('ChatSession', () => {
       expect(recoveryMessages).toEqual([
         { role: 'system', content: 'You are helpful.' },
         { role: 'user', content: 'describe A', images: [imgA] },
-        { role: 'assistant', content: 'start-reply' },
+        { role: 'assistant', content: 'start-reply', thinkingEnabled: true },
         { role: 'user', content: 'text follow-up' },
-        { role: 'assistant', content: 'continue-reply' },
+        { role: 'assistant', content: 'continue-reply', thinkingEnabled: true },
         { role: 'user', content: 'describe B again', images: [imgB] },
       ]);
       // One successful turn after the rollback (the recovery).
@@ -862,17 +854,14 @@ describe('ChatSession', () => {
       expect(result.text).toBe('tool-reply');
 
       expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
-      expect(chatSessionContinueTool.mock.calls[0][0]).toBe('call-42');
-      expect(chatSessionContinueTool.mock.calls[0][1]).toBe('{"status":"ok"}');
-      // The third native arg is the merged `config` (config precedes
-      // `isError` at the NAPI boundary so the trailing-optional shape
-      // accepts pre-feature 3-arg callers without InvalidArg).
-      expect(chatSessionContinueTool.mock.calls[0][2]?.reuseCache).toBe(true);
-      // The fourth arg is the structured `isError` signal — defaults to
-      // `null` when the caller omits it (we coerce `undefined` to `null`
-      // at the wrapper boundary so the NAPI binding sees a stable
-      // shape).
-      expect(chatSessionContinueTool.mock.calls[0][3]).toBeNull();
+      const [messages, config] = chatSessionContinueTool.mock.calls[0];
+      expect(messages.at(-1)).toEqual({
+        role: 'tool',
+        content: '{"status":"ok"}',
+        toolCallId: 'call-42',
+        isError: undefined,
+      });
+      expect(config?.reuseCache).toBe(true);
       expect(session.turns).toBe(2);
       // Tool-reply has no further outstanding calls.
       expect(session.pendingUnresolvedToolCallCount).toBeNull();
@@ -880,16 +869,9 @@ describe('ChatSession', () => {
 
     it('forwards isError=true through to the native binding', async () => {
       // Pin the structured tool-error plumbing: when the caller passes
-      // `isError: true`, the wrapper MUST forward it as the fourth
-      // positional argument to the native `chatSessionContinueTool`
-      // call so the renderer can inject the wire-format
-      // `[tool error]` marker. The history entry MUST also carry the
-      // structured flag so cold-replay (image-change restart,
-      // `startFromHistory*`, server-side `SessionRegistry`
-      // cache-miss rebuild) re-renders the marker consistently. The
-      // assertion is at the native binding boundary so the test
-      // covers BOTH the JS-side argument plumbing and the
-      // history-append shape without needing a loaded model.
+      // `isError: true`, the wrapper MUST preserve it on the structured
+      // tool message. The model-provided template decides how to render
+      // that flag on both warm continuation and cold replay.
       const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
       chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'call-err'));
       const session = new ChatSession(model);
@@ -899,22 +881,18 @@ describe('ChatSession', () => {
 
       await session.sendToolResult('call-err', '{"error":"boom"}', { isError: true });
       expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
-      expect(chatSessionContinueTool.mock.calls[0][0]).toBe('call-err');
-      expect(chatSessionContinueTool.mock.calls[0][1]).toBe('{"error":"boom"}');
-      // The fourth native arg is the structured `isError` signal — `true`
-      // must pass through verbatim (not coerced to `null` like the omit
-      // case). `config` precedes it at index [2].
-      expect(chatSessionContinueTool.mock.calls[0][3]).toBe(true);
+      expect(chatSessionContinueTool.mock.calls[0][0].at(-1)).toEqual({
+        role: 'tool',
+        content: '{"error":"boom"}',
+        toolCallId: 'call-err',
+        isError: true,
+      });
     });
 
     it('forwards isError=true through to the streaming native binding', async () => {
       // Streaming counterpart to the non-streaming `isError=true`
-      // assertion above. Mirrors the wire-format invariant: the fifth
-      // positional arg of `chatStreamSessionContinueTool` must carry
-      // the structured flag so the streaming renderer injects the
-      // same `[tool error]` marker as the non-streaming path. `config`
-      // sits at index [2] and `signal` at [3]; `isError` is the
-      // trailing-optional fifth arg.
+      // assertion above: the full transcript must carry the same
+      // structured flag to the model template.
       const { model, chatSessionStart, chatStreamSessionContinueTool } = makeMockModel();
       chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'call-err'));
       const session = new ChatSession(model);
@@ -927,37 +905,32 @@ describe('ChatSession', () => {
         events.push(ev);
       }
       expect(chatStreamSessionContinueTool).toHaveBeenCalledTimes(1);
-      expect(chatStreamSessionContinueTool.mock.calls[0][0]).toBe('call-err');
-      expect(chatStreamSessionContinueTool.mock.calls[0][1]).toBe('{"error":"boom"}');
-      // `signal` (index [3]) precedes `isError` (index [4]) at the
-      // wrapper boundary — mirrors the native NAPI ordering where
-      // the trailing-optional `isError` follows the required callback
-      // so pre-feature 4-arg callers still type-check.
-      expect(chatStreamSessionContinueTool.mock.calls[0][4]).toBe(true);
+      expect(chatStreamSessionContinueTool.mock.calls[0][0].at(-1)).toEqual({
+        role: 'tool',
+        content: '{"error":"boom"}',
+        toolCallId: 'call-err',
+        isError: true,
+      });
       // The stream still terminates normally on the mock — confirms the
       // history-append commit branch ran (sawFinal === true).
       expect(events.at(-1)?.done).toBe(true);
     });
 
-    it('defaults isError to null when the caller omits it', async () => {
-      // Default semantics: `isError` is optional and the wrapper
-      // coerces `undefined` to `null` at the NAPI boundary so the
-      // binding sees a stable shape. This pins the "no marker"
-      // pre-feature behavior against accidental flag-inference drift.
+    it('leaves isError undefined when the caller omits it', async () => {
+      // Omission stays structural rather than being rewritten into prompt
+      // text; the loaded template receives an absent flag.
       const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
       chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'call-ok'));
       const session = new ChatSession(model);
 
       await session.send('fire the tool call');
       await session.sendToolResult('call-ok', '{"status":"ok"}');
-      // `isError` omitted → coerced to `null` at index [3], not `undefined`.
-      expect(chatSessionContinueTool.mock.calls[0][3]).toBeNull();
+      expect(chatSessionContinueTool.mock.calls[0][0].at(-1)?.isError).toBeUndefined();
     });
 
-    it('forwards isError=false unchanged (still no marker, but explicit)', async () => {
-      // `Some(false)` is the same wire output as `None` per the
-      // renderer's contract — but the wrapper must NOT silently fold
-      // `false` into `null` because the structured channel is the
+    it('forwards isError=false unchanged', async () => {
+      // The wrapper must not silently fold `false` into an absent value
+      // because the structured channel is the
       // authoritative source-of-truth and callers may legitimately
       // pass an explicit `false` to disambiguate from "not set".
       const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
@@ -966,7 +939,7 @@ describe('ChatSession', () => {
 
       await session.send('fire the tool call');
       await session.sendToolResult('call-ok', '{"status":"ok"}', { isError: false });
-      expect(chatSessionContinueTool.mock.calls[0][3]).toBe(false);
+      expect(chatSessionContinueTool.mock.calls[0][0].at(-1)?.isError).toBe(false);
     });
 
     it('accepts the opts-bag without isError (backward compat with { config } only)', async () => {
@@ -977,7 +950,7 @@ describe('ChatSession', () => {
       // landed `{ config }` in the `isError` slot and crashed at the
       // native NAPI boundary (Option<bool>). This pins the opts-bag
       // contract: `{ config }` alone is a valid call shape and
-      // `isError` defaults to `null` at the native boundary.
+      // `isError` stays absent in the structured tool message.
       const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
       chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
       const session = new ChatSession(model);
@@ -985,11 +958,8 @@ describe('ChatSession', () => {
       await session.send('fire');
       await session.sendToolResult('c1', 'out', { config: { reuseCache: false } });
       expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
-      // The merged config sits at index [2] and still forces reuseCache: true.
-      expect(chatSessionContinueTool.mock.calls[0][2]?.reuseCache).toBe(true);
-      // `isError` was omitted → coerced to `null` at the NAPI boundary,
-      // landing in the trailing-optional [3] slot.
-      expect(chatSessionContinueTool.mock.calls[0][3]).toBeNull();
+      expect(chatSessionContinueTool.mock.calls[0][1]?.reuseCache).toBe(true);
+      expect(chatSessionContinueTool.mock.calls[0][0].at(-1)?.isError).toBeUndefined();
     });
 
     it('rejects sendToolResult when no outstanding tool call exists', async () => {
@@ -1041,11 +1011,9 @@ describe('ChatSession', () => {
 
       await session.send('fire'); // establishes outstanding call 'c1'
       await session.sendToolResult('c1', 'out', { config: { reuseCache: false } });
-      // The third positional native arg is the merged `ChatConfig` —
       // `mergeConfig` always forces `reuseCache: true` regardless of the
-      // caller-supplied value (the session path is a cache-reuse op by
-      // construction).
-      expect(chatSessionContinueTool.mock.calls[0][2]?.reuseCache).toBe(true);
+      // caller-supplied value.
+      expect(chatSessionContinueTool.mock.calls[0][1]?.reuseCache).toBe(true);
     });
 
     it('clears inFlight on exception and replays the retry from preserved history', async () => {
@@ -1072,7 +1040,12 @@ describe('ChatSession', () => {
       expect(chatSessionStart).toHaveBeenCalledTimes(2);
       expect(chatSessionStart.mock.calls[1][0]).toEqual([
         { role: 'user', content: 'fire' },
-        { role: 'assistant', content: 'first-call', toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }] },
+        {
+          role: 'assistant',
+          content: 'first-call',
+          thinkingEnabled: true,
+          toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }],
+        },
         { role: 'tool', content: 'out2', toolCallId: 'c1', isError: undefined },
       ]);
     });
@@ -1306,10 +1279,10 @@ describe('ChatSession', () => {
       expect(chatStreamSessionStart).toHaveBeenCalledTimes(1);
       expect(chatStreamSessionContinue).toHaveBeenCalledTimes(2);
       expect(session.turns).toBe(3);
-      expect(chatStreamSessionContinue.mock.calls[0][0]).toBe('Second');
-      expect(chatStreamSessionContinue.mock.calls[0][1]).toBeNull();
-      expect(chatStreamSessionContinue.mock.calls[1][0]).toBe('Third');
-      expect(chatStreamSessionContinue.mock.calls[1][1]).toBeNull();
+      expect(chatStreamSessionContinue.mock.calls[0][0].at(-1)).toEqual({ role: 'user', content: 'Second' });
+      expect(chatStreamSessionContinue.mock.calls[1][0].at(-1)).toEqual({ role: 'user', content: 'Third' });
+      expect(chatStreamSessionContinue.mock.calls[0][1]?.reuseCache).toBe(true);
+      expect(chatStreamSessionContinue.mock.calls[1][1]?.reuseCache).toBe(true);
     });
 
     it('rejects concurrent sendStream calls', async () => {
@@ -1564,7 +1537,7 @@ describe('ChatSession', () => {
       expect(recoveryMessages).toEqual([
         { role: 'system', content: 'You are helpful.' },
         { role: 'user', content: 'describe A', images: [imgA] },
-        { role: 'assistant', content: 'describe-A-reply' },
+        { role: 'assistant', content: 'describe-A-reply', thinkingEnabled: true },
         { role: 'user', content: 'describe B again', images: [imgB] },
       ]);
       // Exactly one successful turn after the rollback (the recovery).
@@ -1776,7 +1749,7 @@ describe('ChatSession', () => {
       expect(replayMessages).toEqual([
         { role: 'system', content: 'You are helpful.' },
         { role: 'user', content: 'describe', images: [imgA] },
-        { role: 'assistant', content: 'start-reply' },
+        { role: 'assistant', content: 'start-reply', thinkingEnabled: true },
         { role: 'user', content: 'what about the top-right?' },
       ]);
 
@@ -1874,7 +1847,7 @@ describe('ChatSession', () => {
       expect(startHistories[1]).toEqual([
         { role: 'system', content: 'You are helpful.' },
         { role: 'user', content: 'describe', images: [imgA] },
-        { role: 'assistant', content: 'describe-reply' },
+        { role: 'assistant', content: 'describe-reply', thinkingEnabled: true },
         { role: 'user', content: 'what about the top-right?' },
       ]);
 
@@ -1947,7 +1920,7 @@ describe('ChatSession', () => {
       const recoveryMessages = (model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0][0];
       expect(recoveryMessages).toEqual([
         { role: 'user', content: 'describe', images: [imgA] },
-        { role: 'assistant', content: 'describe-reply' },
+        { role: 'assistant', content: 'describe-reply', thinkingEnabled: true },
         { role: 'user', content: 'recover', images: [imgA] },
       ]);
       expect(session.turns).toBe(1);
@@ -2058,7 +2031,10 @@ describe('ChatSession', () => {
       const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
       const session = new ChatSession(model);
 
-      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
+      chatSessionStart.mockResolvedValueOnce({
+        ...makeChatResultWithSingleToolCall('first-call', 'c1'),
+        thinkingEnabled: false,
+      });
       await session.send('describe', {
         images: [imgA],
         config: { reasoningEffort: 'none' },
@@ -2130,7 +2106,12 @@ describe('ChatSession', () => {
       expect(chatSessionStart).toHaveBeenCalledTimes(2);
       expect(chatSessionStart.mock.calls[1][0]).toEqual([
         { role: 'user', content: 'describe', images: [imgA] },
-        { role: 'assistant', content: 'first-call', toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }] },
+        {
+          role: 'assistant',
+          content: 'first-call',
+          thinkingEnabled: true,
+          toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }],
+        },
         { role: 'tool', content: 'retry', toolCallId: 'c1', isError: undefined },
       ]);
     });
@@ -2235,7 +2216,10 @@ describe('ChatSession', () => {
       ): AsyncGenerator<ChatStreamEvent> {
         startHistories.push(messages);
         if (startHistories.length === 1) {
-          yield finalChunkWithSingleToolCall('first-call', 'c1');
+          yield {
+            ...finalChunkWithSingleToolCall('first-call', 'c1'),
+            thinkingEnabled: false,
+          };
           return;
         }
         yield finalChunk('replayed-reply');
@@ -2402,7 +2386,12 @@ describe('ChatSession', () => {
       expect(chatSessionStart.mock.calls[0][0]).toEqual([
         { role: 'system', content: 'You are helpful.' },
         { role: 'user', content: 'describe', images: [imgA] },
-        { role: 'assistant', content: 'describe-reply', toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }] },
+        {
+          role: 'assistant',
+          content: 'describe-reply',
+          thinkingEnabled: true,
+          toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }],
+        },
         { role: 'tool', content: 'tool-out', toolCallId: 'c1', isError: undefined },
       ]);
     });
@@ -2447,7 +2436,12 @@ describe('ChatSession', () => {
       expect(chatSessionStart.mock.calls[2][0]).toEqual([
         { role: 'system', content: 'You are helpful.' },
         { role: 'user', content: 'describe', images: [imgA] },
-        { role: 'assistant', content: 'first-call', toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }] },
+        {
+          role: 'assistant',
+          content: 'first-call',
+          thinkingEnabled: true,
+          toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }],
+        },
         { role: 'tool', content: 'tool-out', toolCallId: 'c1', isError: undefined },
       ]);
     });
@@ -2479,8 +2473,13 @@ describe('ChatSession', () => {
       expect(sawDone).toBe(true);
       expect(session.turns).toBe(2);
       expect(chatStreamSessionContinueTool).toHaveBeenCalledTimes(1);
-      expect(chatStreamSessionContinueTool.mock.calls[0][0]).toBe('c1');
-      expect(chatStreamSessionContinueTool.mock.calls[0][1]).toBe('tool-out');
+      expect(chatStreamSessionContinueTool.mock.calls[0][0].at(-1)).toEqual({
+        role: 'tool',
+        content: 'tool-out',
+        toolCallId: 'c1',
+        isError: undefined,
+      });
+      expect(chatStreamSessionContinueTool.mock.calls[0][1]?.reuseCache).toBe(true);
     });
 
     it('does NOT advance turnCount on caller break', async () => {
@@ -3203,7 +3202,7 @@ describe('ChatSession', () => {
       await session.send('first');
       await session.send('second');
 
-      expect(mock.chatSessionContinue.mock.calls[0]?.[3]?.maxNewTokens).toBe(49);
+      expect(mock.chatSessionContinue.mock.calls[0]?.[1]?.maxNewTokens).toBe(49);
     });
 
     it('preserves the native default when an omitted output budget fits', async () => {

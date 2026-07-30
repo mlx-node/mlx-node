@@ -239,6 +239,12 @@ pub(crate) fn finalize_chat_result(
         text: clean_text,
         tool_calls,
         thinking,
+        // The session core overwrites this with the effective Jinja kwarg
+        // (`resolve_enable_thinking(config).unwrap_or(true)`) after the
+        // family finalizer returns. Keeping the decode-time value here makes
+        // direct/non-session callers conservative and fully initializes the
+        // shared result type.
+        thinking_enabled,
         num_tokens,
         prompt_tokens,
         reasoning_tokens,

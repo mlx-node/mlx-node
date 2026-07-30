@@ -94,6 +94,7 @@ function createCountingModel(tokenCount: number): SessionCapableModel & {
   const result: ChatResult = {
     text: 'unexpected',
     toolCalls: [],
+    thinkingEnabled: true,
     numTokens: 0,
     promptTokens: 0,
     reasoningTokens: 0,
@@ -102,7 +103,16 @@ function createCountingModel(tokenCount: number): SessionCapableModel & {
     cachedTokens: 0,
   };
   async function* stream() {
-    yield { done: true, text: '', finishReason: 'stop', toolCalls: [], numTokens: 0, promptTokens: 0, rawText: '' };
+    yield {
+      done: true,
+      text: '',
+      finishReason: 'stop',
+      toolCalls: [],
+      thinkingEnabled: true,
+      numTokens: 0,
+      promptTokens: 0,
+      rawText: '',
+    };
   }
   const chatSessionStart = vi.fn().mockResolvedValue(result);
   const chatStreamSessionStart = vi.fn(() => stream());

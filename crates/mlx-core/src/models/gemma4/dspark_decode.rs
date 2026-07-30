@@ -2067,6 +2067,19 @@ pub(crate) mod tests {
                 audio: None,
             }
         }
+        fn assistant(result: &crate::engine::types::ChatResult) -> crate::tokenizer::ChatMessage {
+            crate::tokenizer::ChatMessage {
+                role: "assistant".to_string(),
+                content: result.text.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+                is_error: None,
+                reasoning_content: result.thinking.clone(),
+                thinking_enabled: Some(result.thinking_enabled),
+                images: None,
+                audio: None,
+            }
+        }
         fn assert_offsets_match_history(inner: &Gemma4Inner, label: &str) {
             let h = inner.cached_token_history.len() as i32;
             let mask = dspark_shared_slot_mask(&inner.config);
@@ -2095,9 +2108,7 @@ pub(crate) mod tests {
         assert_offsets_match_history(&inner, "ar_turn1");
         let ar2 = crate::engine::session::session_continue(
             &mut inner,
-            FOLLOW_UP.to_string(),
-            None,
-            None,
+            vec![user(PROMPT), assistant(&ar1), user(FOLLOW_UP)],
             cfg(false),
         )
         .expect("AR turn 2 failed");
@@ -2129,9 +2140,7 @@ pub(crate) mod tests {
 
         let sp2 = crate::engine::session::session_continue(
             &mut inner,
-            FOLLOW_UP.to_string(),
-            None,
-            None,
+            vec![user(PROMPT), assistant(&sp1), user(FOLLOW_UP)],
             cfg(true),
         )
         .expect("DSpark turn 2 failed");

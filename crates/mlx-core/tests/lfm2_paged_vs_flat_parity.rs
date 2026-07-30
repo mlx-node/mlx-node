@@ -30,7 +30,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mlx_core::engine::types::ChatConfig;
+use mlx_core::engine::types::{ChatConfig, ChatResult};
 use mlx_core::models::lfm2::model::Lfm2Model;
 use mlx_core::tokenizer::ChatMessage;
 
@@ -153,15 +153,25 @@ fn user_message(content: &str) -> ChatMessage {
     }
 }
 
-fn assistant_message(content: &str) -> ChatMessage {
+fn assistant_message(result: &ChatResult) -> ChatMessage {
     ChatMessage {
         role: "assistant".to_string(),
-        content: content.to_string(),
-        tool_calls: None,
+        content: result.text.clone(),
+        tool_calls: (!result.tool_calls.is_empty()).then(|| {
+            result
+                .tool_calls
+                .iter()
+                .map(|call| mlx_core::tokenizer::ToolCall {
+                    id: Some(call.id.clone()),
+                    name: call.name.clone(),
+                    arguments: call.arguments.to_string(),
+                })
+                .collect()
+        }),
         tool_call_id: None,
         is_error: None,
-        reasoning_content: None,
-        thinking_enabled: None,
+        reasoning_content: result.thinking.clone(),
+        thinking_enabled: Some(result.thinking_enabled),
         images: None,
         audio: None,
     }
@@ -508,7 +518,7 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
         .chat_session_start(
             vec![
                 user_message(user1),
-                assistant_message(&r1.raw_text),
+                assistant_message(&r1),
                 user_message(user2),
             ],
             Some(parity_chat_config(MAX_NEW_TURN2)),
@@ -561,7 +571,7 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
         .chat_session_start(
             vec![
                 user_message(user1),
-                assistant_message(&f1.raw_text),
+                assistant_message(&f1),
                 user_message(user2),
             ],
             Some(parity_chat_config(MAX_NEW_TURN2)),
@@ -586,7 +596,7 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
         .chat_session_start(
             vec![
                 user_message(user1),
-                assistant_message(&r1.raw_text),
+                assistant_message(&r1),
                 user_message(user2),
             ],
             Some(parity_chat_config(MAX_NEW_TURN2)),
@@ -689,11 +699,25 @@ async fn lfm2_paged_vs_flat_prefix_reuse_parity() {
 
     let user2 = "And in another word?";
     let r2_flat = flat_model
-        .chat_session_continue(user2.to_string(), None, None, Some(parity_chat_config(32)))
+        .chat_session_continue(
+            vec![
+                user_message(prompt1),
+                assistant_message(&r1_flat),
+                user_message(user2),
+            ],
+            Some(parity_chat_config(32)),
+        )
         .await
         .expect("turn 2 flat chat_session_continue failed");
     let r2_paged = paged_model
-        .chat_session_continue(user2.to_string(), None, None, Some(parity_chat_config(32)))
+        .chat_session_continue(
+            vec![
+                user_message(prompt1),
+                assistant_message(&r1_paged),
+                user_message(user2),
+            ],
+            Some(parity_chat_config(32)),
+        )
         .await
         .expect("turn 2 paged chat_session_continue failed");
 
@@ -888,6 +912,7 @@ fn answer_surface_prefers_the_committed_answer() {
             text: String::new(),
             tool_calls: Vec::new(),
             thinking: None,
+            thinking_enabled: true,
             num_tokens: 1,
             prompt_tokens: 0,
             reasoning_tokens: 0,
@@ -1132,7 +1157,7 @@ async fn lfm2_paged_delta_memory_probe_parity() {
         .chat_session_start(
             vec![
                 user_message(prompt1),
-                assistant_message(&r1_paged.raw_text),
+                assistant_message(&r1_paged),
                 user_message(user2),
             ],
             Some(memory_probe_chat_config()),
@@ -1141,9 +1166,11 @@ async fn lfm2_paged_delta_memory_probe_parity() {
         .expect("turn 2 flat control chat_session_start failed");
     let r2_paged = paged_model
         .chat_session_continue(
-            user2.to_string(),
-            None,
-            None,
+            vec![
+                user_message(prompt1),
+                assistant_message(&r1_paged),
+                user_message(user2),
+            ],
             Some(memory_probe_chat_config()),
         )
         .await
@@ -1188,9 +1215,9 @@ async fn lfm2_paged_delta_memory_probe_parity() {
         .chat_session_start(
             vec![
                 user_message(prompt1),
-                assistant_message(&r1_paged.raw_text),
+                assistant_message(&r1_paged),
                 user_message(user2),
-                assistant_message(&r2_paged.raw_text),
+                assistant_message(&r2_paged),
                 user_message(user3),
             ],
             Some(memory_probe_chat_config()),
@@ -1199,9 +1226,13 @@ async fn lfm2_paged_delta_memory_probe_parity() {
         .expect("turn 3 flat control chat_session_start failed");
     let r3_paged = paged_model
         .chat_session_continue(
-            user3.to_string(),
-            None,
-            None,
+            vec![
+                user_message(prompt1),
+                assistant_message(&r1_paged),
+                user_message(user2),
+                assistant_message(&r2_paged),
+                user_message(user3),
+            ],
             Some(memory_probe_chat_config()),
         )
         .await
@@ -1274,13 +1305,11 @@ async fn lfm2_flat_delta_memory_probe_content() {
         .await
         .expect("failed to load flat-path LFM2 model");
 
+    let user1 = "Here are values to remember: amber = 7 and cobalt = 11. What is amber?";
+    let user2 = "Add amber and cobalt together. What is the sum?";
+    let user3 = "One more value: jade = 13. What is amber + cobalt + jade in total?";
     let r1 = flat_model
-        .chat_session_start(
-            vec![user_message(
-                "Here are values to remember: amber = 7 and cobalt = 11. What is amber?",
-            )],
-            Some(memory_probe_chat_config()),
-        )
+        .chat_session_start(vec![user_message(user1)], Some(memory_probe_chat_config()))
         .await
         .expect("flat turn 1 chat_session_start failed");
     eprintln!(
@@ -1290,9 +1319,11 @@ async fn lfm2_flat_delta_memory_probe_content() {
 
     let r2 = flat_model
         .chat_session_continue(
-            "Add amber and cobalt together. What is the sum?".to_string(),
-            None,
-            None,
+            vec![
+                user_message(user1),
+                assistant_message(&r1),
+                user_message(user2),
+            ],
             Some(memory_probe_chat_config()),
         )
         .await
@@ -1309,9 +1340,13 @@ async fn lfm2_flat_delta_memory_probe_content() {
 
     let r3 = flat_model
         .chat_session_continue(
-            "One more value: jade = 13. What is amber + cobalt + jade in total?".to_string(),
-            None,
-            None,
+            vec![
+                user_message(user1),
+                assistant_message(&r1),
+                user_message(user2),
+                assistant_message(&r2),
+                user_message(user3),
+            ],
             Some(memory_probe_chat_config()),
         )
         .await
@@ -1494,7 +1529,7 @@ async fn lfm2_paged_prefill_bridge_cache_hit_ab_probe() {
         .chat_session_start(
             vec![
                 user_message(user1),
-                assistant_message(&r1.raw_text),
+                assistant_message(&r1),
                 user_message(user2),
             ],
             Some(parity_chat_config(32)),

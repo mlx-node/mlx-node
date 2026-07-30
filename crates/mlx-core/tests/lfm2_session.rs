@@ -21,7 +21,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use mlx_core::engine::types::{ChatConfig, ChatStreamChunk};
+use mlx_core::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use mlx_core::models::lfm2::model::Lfm2Model;
 use mlx_core::tokenizer::ChatMessage;
 
@@ -69,6 +69,81 @@ fn user_message(content: &str) -> ChatMessage {
     }
 }
 
+fn assistant_message(result: &ChatResult) -> ChatMessage {
+    ChatMessage {
+        role: "assistant".to_string(),
+        content: result.text.clone(),
+        tool_calls: (!result.tool_calls.is_empty()).then(|| {
+            result
+                .tool_calls
+                .iter()
+                .map(|call| mlx_core::tokenizer::ToolCall {
+                    id: Some(call.id.clone()),
+                    name: call.name.clone(),
+                    arguments: call.arguments.to_string(),
+                })
+                .collect()
+        }),
+        tool_call_id: None,
+        is_error: None,
+        reasoning_content: result.thinking.clone(),
+        thinking_enabled: Some(result.thinking_enabled),
+        images: None,
+        audio: None,
+    }
+}
+
+fn assistant_message_from_chunk(chunk: &ChatStreamChunk) -> ChatMessage {
+    ChatMessage {
+        role: "assistant".to_string(),
+        content: chunk.text.clone(),
+        tool_calls: chunk.tool_calls.as_ref().and_then(|calls| {
+            let converted = calls
+                .iter()
+                .map(|call| mlx_core::tokenizer::ToolCall {
+                    id: Some(call.id.clone()),
+                    name: call.name.clone(),
+                    arguments: call.arguments.to_string(),
+                })
+                .collect::<Vec<_>>();
+            (!converted.is_empty()).then_some(converted)
+        }),
+        tool_call_id: None,
+        is_error: None,
+        reasoning_content: chunk.thinking.clone(),
+        thinking_enabled: chunk.thinking_enabled,
+        images: None,
+        audio: None,
+    }
+}
+
+fn copy_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    messages
+        .iter()
+        .map(|message| ChatMessage {
+            role: message.role.clone(),
+            content: message.content.clone(),
+            tool_calls: message.tool_calls.clone(),
+            tool_call_id: message.tool_call_id.clone(),
+            is_error: message.is_error,
+            reasoning_content: message.reasoning_content.clone(),
+            thinking_enabled: message.thinking_enabled,
+            images: message.images.as_ref().map(|images| {
+                images
+                    .iter()
+                    .map(|image| napi::bindgen_prelude::Uint8Array::new(image.to_vec()))
+                    .collect()
+            }),
+            audio: message.audio.as_ref().map(|audio| {
+                audio
+                    .iter()
+                    .map(|clip| napi::bindgen_prelude::Uint8Array::new(clip.to_vec()))
+                    .collect()
+            }),
+        })
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_LFM2_MODEL_PATH pointing to a real LFM2 checkpoint"]
 async fn lfm2_session_path_keeps_ttft_flat_across_turns() {
@@ -101,11 +176,12 @@ async fn lfm2_session_path_keeps_ttft_flat_across_turns() {
 
     // --- Turn 1: chat_session_start establishes a clean session ---
     let turn1_cfg = chat_config_default(64);
-    let turn1_messages = vec![user_message("Say hi in one short word.")];
+    let mut history = vec![user_message("Say hi in one short word.")];
     let r1 = model
-        .chat_session_start(turn1_messages, Some(turn1_cfg))
+        .chat_session_start(copy_messages(&history), Some(turn1_cfg))
         .await
         .expect("turn 1 chat_session_start failed");
+    history.push(assistant_message(&r1));
     let turn1 = TurnSnapshot {
         ttft_ms: r1
             .performance
@@ -131,10 +207,12 @@ async fn lfm2_session_path_keeps_ttft_flat_across_turns() {
     for (idx, next_user) in user_followups.iter().enumerate() {
         let turn_idx = idx + 2;
         let cfg = chat_config_default(64);
+        history.push(user_message(next_user));
         let result = model
-            .chat_session_continue((*next_user).to_string(), None, None, Some(cfg))
+            .chat_session_continue(copy_messages(&history), Some(cfg))
             .await
             .expect("delta chat failed");
+        history.push(assistant_message(&result));
         let ttft = result
             .performance
             .as_ref()
@@ -309,13 +387,14 @@ async fn lfm2_stream_session_path_keeps_ttft_flat_across_turns() {
 
     // --- Turn 1: chat_stream_session_start ---
     let turn1_cfg = chat_config_default(64);
-    let turn1_messages = vec![user_message("Say hi in one short word.")];
+    let mut history = vec![user_message("Say hi in one short word.")];
     let (_handle1, rx1) = model
-        .chat_stream_session_start_for_test(turn1_messages, Some(turn1_cfg))
+        .chat_stream_session_start_for_test(copy_messages(&history), Some(turn1_cfg))
         .expect("turn 1 chat_stream_session_start dispatch failed");
     let (chunks1, ttft1, done1) = drain_stream_turn(rx1).await;
     assert!(done1, "turn 1 stream didn't reach done=true");
     let final1 = chunks1.last().expect("turn 1 had no chunks");
+    history.push(assistant_message_from_chunk(final1));
     let turn1 = TurnSnapshot {
         ttft_ms: ttft1,
         prompt_tokens: final1.prompt_tokens.unwrap_or(0),
@@ -345,12 +424,14 @@ async fn lfm2_stream_session_path_keeps_ttft_flat_across_turns() {
     for (idx, next_user) in user_followups.iter().enumerate() {
         let turn_idx = idx + 2;
         let cfg = chat_config_default(64);
+        history.push(user_message(next_user));
         let (_handle, rx) = model
-            .chat_stream_session_continue_for_test((*next_user).to_string(), None, Some(cfg))
+            .chat_stream_session_continue_for_test(copy_messages(&history), Some(cfg))
             .expect("delta stream dispatch failed");
         let (chunks, ttft, done) = drain_stream_turn(rx).await;
         assert!(done, "turn {turn_idx} stream didn't reach done=true");
         let last = chunks.last().expect("turn had no chunks");
+        history.push(assistant_message_from_chunk(last));
         let finish_reason = last
             .finish_reason
             .as_deref()
@@ -499,21 +580,23 @@ async fn lfm2_stream_session_cancellation_preserves_cache_for_next_turn() {
         max_new_tokens: Some(128),
         ..chat_config_default(128)
     };
-    let turn1_messages = vec![user_message("Count slowly to twenty.")];
+    let mut history = vec![user_message("Count slowly to twenty.")];
     let (handle1, mut rx1) = model
-        .chat_stream_session_start_for_test(turn1_messages, Some(turn1_cfg))
+        .chat_stream_session_start_for_test(copy_messages(&history), Some(turn1_cfg))
         .expect("turn 1 chat_stream_session_start dispatch failed");
 
     // Collect a few chunks, then cancel.
     let mut collected = 0;
     let mut saw_done = false;
     let mut finish_reason: Option<String> = None;
+    let mut final_chunk: Option<ChatStreamChunk> = None;
     let mut cancelled_at_chunk: Option<usize> = None;
     while let Some(result) = rx1.recv().await {
         let chunk = result.expect("stream error during cancel test");
         if chunk.done {
             saw_done = true;
             finish_reason = chunk.finish_reason.clone();
+            final_chunk = Some(chunk);
             break;
         }
         collected += 1;
@@ -542,12 +625,12 @@ async fn lfm2_stream_session_cancellation_preserves_cache_for_next_turn() {
     // Turn 2: attempt a follow-up continue. The cache was saved with
     // the partial generated tokens so this MUST succeed.
     let turn2_cfg = chat_config_default(32);
+    history.push(assistant_message_from_chunk(
+        final_chunk.as_ref().expect("terminal chunk missing"),
+    ));
+    history.push(user_message("What number were you on?"));
     let (_handle2, rx2) = model
-        .chat_stream_session_continue_for_test(
-            "What number were you on?".to_string(),
-            None,
-            Some(turn2_cfg),
-        )
+        .chat_stream_session_continue_for_test(history, Some(turn2_cfg))
         .expect("follow-up continue after cancel failed to dispatch");
     let (chunks2, _ttft2, done2) = drain_stream_turn(rx2).await;
     assert!(
@@ -590,21 +673,25 @@ async fn lfm2_session_continue_rejects_images_with_restart_prefix() {
     // Prime the session with a plain text-only start so the delta path
     // has a live cache to reject against.
     let turn1_cfg = chat_config_default(32);
-    let turn1_messages = vec![user_message("Say hi in one short word.")];
-    let _ = model
-        .chat_session_start(turn1_messages, Some(turn1_cfg))
+    let mut history = vec![user_message("Say hi in one short word.")];
+    let turn1 = model
+        .chat_session_start(copy_messages(&history), Some(turn1_cfg))
         .await
         .expect("turn 1 chat_session_start failed");
+    history.push(assistant_message(&turn1));
 
     // Dummy image bytes — the rejection fires before any image
     // processing, so they don't need to be a valid image payload.
     let dummy_image: napi::bindgen_prelude::Uint8Array =
         napi::bindgen_prelude::Uint8Array::new(vec![0u8; 16]);
-    let images = Some(vec![dummy_image]);
+    let images = vec![dummy_image];
 
     let cfg = chat_config_default(32);
+    let mut pending = user_message("What now?");
+    pending.images = Some(images);
+    history.push(pending);
     let err = model
-        .chat_session_continue("What now?".to_string(), images, None, Some(cfg))
+        .chat_session_continue(history, Some(cfg))
         .await
         .expect_err("chat_session_continue with images should error");
     let msg = err.reason.clone();
@@ -635,20 +722,27 @@ async fn lfm2_session_continue_tool_round_trips() {
     // Start a session so the tool-result delta has a live cache to
     // prefill on top of.
     let turn1_cfg = chat_config_default(32);
-    let turn1_messages = vec![user_message("Say hi in one short word.")];
-    let _ = model
-        .chat_session_start(turn1_messages, Some(turn1_cfg))
+    let mut history = vec![user_message("Say hi in one short word.")];
+    let turn1 = model
+        .chat_session_start(copy_messages(&history), Some(turn1_cfg))
         .await
         .expect("turn 1 chat_session_start failed");
+    history.push(assistant_message(&turn1));
+    history.push(ChatMessage {
+        role: "tool".to_string(),
+        content: "result content".to_string(),
+        tool_calls: None,
+        tool_call_id: Some("dummy_id".to_string()),
+        is_error: None,
+        reasoning_content: None,
+        thinking_enabled: None,
+        images: None,
+        audio: None,
+    });
 
     let tool_cfg = chat_config_default(32);
     let result = model
-        .chat_session_continue_tool(
-            "dummy_id".to_string(),
-            "result content".to_string(),
-            Some(tool_cfg),
-            None,
-        )
+        .chat_session_continue_tool(history, Some(tool_cfg))
         .await
         .expect("chat_session_continue_tool failed");
 
@@ -704,7 +798,7 @@ async fn lfm2_session_continue_errors_before_start() {
     // Without a prior chat_session_start, continue must error out.
     let cfg = chat_config_default(16);
     let err = model
-        .chat_session_continue("hi".to_string(), None, None, Some(cfg))
+        .chat_session_continue(vec![user_message("hi")], Some(cfg))
         .await
         .expect_err("chat_session_continue without a session should error");
     let msg = err.reason.clone();
@@ -935,21 +1029,25 @@ async fn lfm2_stream_session_continue_rejects_images_with_restart_prefix() {
     // Prime the session with a plain text-only start so the streaming
     // delta path has a live cache to reject against.
     let turn1_cfg = chat_config_default(32);
-    let turn1_messages = vec![user_message("Say hi in one short word.")];
-    let _ = model
-        .chat_session_start(turn1_messages, Some(turn1_cfg))
+    let mut history = vec![user_message("Say hi in one short word.")];
+    let turn1 = model
+        .chat_session_start(copy_messages(&history), Some(turn1_cfg))
         .await
         .expect("turn 1 chat_session_start failed");
+    history.push(assistant_message(&turn1));
 
     // Dummy image bytes — the rejection fires before any image
     // processing, so they don't need to be a valid image payload.
     let dummy_image: napi::bindgen_prelude::Uint8Array =
         napi::bindgen_prelude::Uint8Array::new(vec![0u8; 16]);
-    let images = Some(vec![dummy_image]);
+    let images = vec![dummy_image];
 
     let cfg = chat_config_default(32);
+    let mut pending = user_message("what about this");
+    pending.images = Some(images);
+    history.push(pending);
     let (_handle, mut rx) = model
-        .chat_stream_session_continue_for_test("what about this".to_string(), images, Some(cfg))
+        .chat_stream_session_continue_for_test(history, Some(cfg))
         .expect("chat_stream_session_continue_for_test dispatch failed");
 
     // The first message on the stream MUST be the typed rejection error.

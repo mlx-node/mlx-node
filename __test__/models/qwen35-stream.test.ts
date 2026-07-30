@@ -32,6 +32,7 @@ function fakeNativeMethod(numTokens: number) {
           finishReason: 'eos',
           toolCalls: [],
           thinking: 'some thinking',
+          thinkingEnabled: true,
           numTokens,
           rawText: 'raw final text',
         } as ChatStreamChunk);
@@ -83,6 +84,7 @@ describe.sequential('_runChatStream bridge', () => {
           done: true,
           finishReason: 'stop',
           toolCalls: [],
+          thinkingEnabled: true,
           numTokens: 2,
           rawText: 'done',
         } as ChatStreamChunk);
@@ -130,6 +132,7 @@ describe.sequential('_runChatStream bridge', () => {
       finishReason: 'eos',
       toolCalls: [],
       thinking: 'some thinking',
+      thinkingEnabled: true,
       numTokens: 2,
       promptTokens: 0,
       reasoningTokens: 0,
@@ -162,6 +165,7 @@ describe.sequential('_runChatStream bridge', () => {
           finishReason: 'stop',
           toolCalls: [],
           thinking: null,
+          thinkingEnabled: true,
           numTokens: 1,
           rawText: 'done',
           cachedTokens: 17,
@@ -200,7 +204,13 @@ describe.sequential('_runChatStream bridge', () => {
         for (let i = 0; i < 100; i++) {
           callback(null, { text: `t${i}`, done: false } as ChatStreamChunk);
         }
-        callback(null, { text: '', done: true, finishReason: 'length', numTokens: 100 } as ChatStreamChunk);
+        callback(null, {
+          text: '',
+          done: true,
+          finishReason: 'length',
+          thinkingEnabled: true,
+          numTokens: 100,
+        } as ChatStreamChunk);
       }, 0);
 
       return Promise.resolve(handle);

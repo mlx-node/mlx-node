@@ -2497,7 +2497,7 @@ impl Qwen35MoeInner {
         let processed = img_proc.process_many(&image_refs)?;
         let per_image_token_counts =
             compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
-        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
+        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts)?;
         self.preflight_paged_context(expanded_tokens.len(), &mut p)?;
         let (image_cache_key, per_image_hashes) = engine::compute_image_cache_keys(images);
         let image_token_positions = engine::map_expanded_image_token_positions(
@@ -2852,7 +2852,7 @@ impl Qwen35MoeInner {
         let processed = img_proc.process_many(&image_refs)?;
         let per_image_token_counts =
             compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
-        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
+        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts)?;
         self.preflight_paged_context(expanded_tokens.len(), &mut p)?;
         let (image_cache_key, per_image_hashes) = engine::compute_image_cache_keys(images);
         let image_token_positions = engine::map_expanded_image_token_positions(
@@ -3023,6 +3023,7 @@ impl Qwen35MoeInner {
                             finish_reason: None,
                             tool_calls: None,
                             thinking: None,
+                            thinking_enabled: None,
                             num_tokens: None,
                             prompt_tokens: None,
                             reasoning_tokens: None,
@@ -3169,6 +3170,7 @@ impl Qwen35MoeInner {
                         finish_reason: None,
                         tool_calls: None,
                         thinking: None,
+                        thinking_enabled: None,
                         num_tokens: None,
                         prompt_tokens: None,
                         reasoning_tokens: None,
@@ -3214,6 +3216,7 @@ impl Qwen35MoeInner {
                 finish_reason: Some(result.finish_reason.clone()),
                 tool_calls: Some(result.tool_calls.clone()),
                 thinking: result.thinking.clone(),
+                thinking_enabled: Some(result.thinking_enabled),
                 num_tokens: Some(result.num_tokens),
                 prompt_tokens: Some(result.prompt_tokens),
                 reasoning_tokens: Some(result.reasoning_tokens),
@@ -3954,6 +3957,7 @@ impl Qwen35MoeInner {
                         finish_reason: None,
                         tool_calls: None,
                         thinking: None,
+                        thinking_enabled: None,
                         num_tokens: None,
                         prompt_tokens: None,
                         reasoning_tokens: None,
@@ -4001,6 +4005,7 @@ impl Qwen35MoeInner {
                 finish_reason: Some(result.finish_reason.clone()),
                 tool_calls: Some(result.tool_calls.clone()),
                 thinking: result.thinking.clone(),
+                thinking_enabled: Some(result.thinking_enabled),
                 num_tokens: Some(result.num_tokens),
                 prompt_tokens: Some(result.prompt_tokens),
                 reasoning_tokens: Some(result.reasoning_tokens),
@@ -4152,6 +4157,7 @@ impl Qwen35MoeInner {
                         finish_reason: None,
                         tool_calls: None,
                         thinking: None,
+                        thinking_enabled: None,
                         num_tokens: None,
                         prompt_tokens: None,
                         reasoning_tokens: None,
@@ -4680,6 +4686,7 @@ impl Qwen35MoeInner {
                         finish_reason: None,
                         tool_calls: None,
                         thinking: None,
+                        thinking_enabled: None,
                         num_tokens: None,
                         prompt_tokens: None,
                         reasoning_tokens: None,
@@ -4734,6 +4741,9 @@ impl Qwen35MoeInner {
                 finish_reason: Some(finish_reason),
                 tool_calls: Some(tool_calls),
                 thinking,
+                thinking_enabled: Some(
+                    crate::engine::resolve_enable_thinking(&config).unwrap_or(true),
+                ),
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
@@ -5347,6 +5357,7 @@ impl Qwen35MoeInner {
                         finish_reason: None,
                         tool_calls: None,
                         thinking: None,
+                        thinking_enabled: None,
                         num_tokens: None,
                         prompt_tokens: None,
                         reasoning_tokens: None,
@@ -5396,6 +5407,9 @@ impl Qwen35MoeInner {
                 finish_reason: Some(finish_reason),
                 tool_calls: Some(tool_calls),
                 thinking,
+                thinking_enabled: Some(
+                    crate::engine::resolve_enable_thinking(&config).unwrap_or(true),
+                ),
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
@@ -8872,8 +8886,7 @@ impl Qwen3_5MoeModel {
     #[doc(hidden)]
     pub fn chat_stream_session_continue_for_test(
         &self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
+        messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
     ) -> Result<(
         ChatStreamHandle,
@@ -8886,9 +8899,7 @@ impl Qwen3_5MoeModel {
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
         self.thread
             .send(Qwen35MoeCmd::Chat(ChatCmd::StreamSessionContinue {
-                user_message,
-                images,
-                audio: None,
+                messages,
                 config,
                 stream_tx,
                 cancelled: cancelled_inner,
@@ -8984,8 +8995,8 @@ crate::models::chat_napi::chat_napi_surface! {
     thread: direct,
     image_guard: none,
     ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
-    ts_stream_continue: "userMessage: string, images: Uint8Array[] | null | undefined, audio: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
-    ts_stream_continue_tool: "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined",
+    ts_stream_continue: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue_tool: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
 }
 
 /// Run the MoE eager layer stack over `[1, T]` ids and return the

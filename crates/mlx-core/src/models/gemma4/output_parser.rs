@@ -11,11 +11,9 @@
 //!   strips them defensively if it ever sees them so they never leak through
 //!   as user-visible content.
 //!
-//! The tool-call arguments are **NOT** JSON. They use Gemma4's own DSL — see
-//! [`crate::models::gemma4::model::json_args_to_gemma4_dsl`] for the reverse
-//! direction. This module owns the inverse parser; `parse_gemma4_dsl_args`
-//! MUST be the inverse of `json_args_to_gemma4_dsl` for any fixture that
-//! passes through the encoder.
+//! The tool-call arguments are **NOT** JSON. They use Gemma4's own DSL.
+//! This module parses generated output; the checkpoint chat template owns
+//! the reverse direction when an assistant tool call is replayed.
 //!
 //! Two entry points:
 //!
@@ -107,14 +105,11 @@ impl std::error::Error for DslParseError {}
 
 /// Parse Gemma4's `{k:v,k:v,...}` argument DSL into a JSON `Value`.
 ///
-/// Inverse of [`crate::models::gemma4::model::json_args_to_gemma4_dsl`].
-/// Accepts input with or without surrounding braces — `json_args_to_gemma4_dsl`
-/// emits the inner pairs only, so callers of this function typically pass
-/// the inner slice. Both shapes round-trip.
+/// Accepts input with or without surrounding braces because checkpoint
+/// templates in the wild may emit either shape.
 pub(crate) fn parse_gemma4_dsl_args(s: &str) -> Result<Value, DslParseError> {
     let trimmed = s.trim();
-    // The encoder emits the inner (`k:v,k:v`) form without braces — accept
-    // either shape transparently.
+    // Accept either the inner (`k:v,k:v`) form or a braced object.
     let inner = trimmed
         .strip_prefix('{')
         .and_then(|t| t.strip_suffix('}'))
@@ -1184,7 +1179,6 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::gemma4::model::json_args_to_gemma4_dsl_for_test;
 
     #[test]
     fn parse_plain_text_no_markers() {
@@ -1392,28 +1386,6 @@ mod tests {
         let args = parsed.tool_calls[0].arguments.as_object().unwrap();
         assert_eq!(args.get("location").and_then(|v| v.as_str()), Some("Paris"));
         assert_eq!(args.get("units").and_then(|v| v.as_str()), Some("celsius"));
-    }
-
-    #[test]
-    fn dsl_args_roundtrip_with_encoder() {
-        let fixtures = [
-            r#"{"command":"ls -R"}"#,
-            r#"{"location":"Paris","units":"celsius"}"#,
-            r#"{"count":5,"active":true,"meta":null}"#,
-            r#"{"path":"/a/b.txt","edits":[{"oldText":"foo","newText":"bar"}]}"#,
-            r#"{"tags":["x","y","z"]}"#,
-        ];
-        for raw in fixtures {
-            let dsl = json_args_to_gemma4_dsl_for_test(raw);
-            let parsed = parse_gemma4_dsl_args(&dsl)
-                .unwrap_or_else(|e| panic!("failed to parse {:?}: {}", dsl, e));
-            let original: Value = serde_json::from_str(raw).unwrap();
-            assert_eq!(
-                parsed, original,
-                "roundtrip mismatch for fixture {:?}: DSL={:?}",
-                raw, dsl
-            );
-        }
     }
 
     #[test]

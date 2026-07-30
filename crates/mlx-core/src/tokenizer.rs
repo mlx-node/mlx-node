@@ -125,15 +125,9 @@ pub struct ChatMessage {
     /// Authoritative, structured signal of tool-call failure. Set to
     /// `Some(true)` when the caller (e.g. the Anthropic
     /// `tool_result.is_error === true` translator) wants the model to
-    /// treat the tool output as an error. The renderer prepends a short
-    /// `[tool error]` prefix to `content` when emitting the wire-format
-    /// tool response so the model receives a clear text-level cue, but
-    /// the original `content` stays byte-for-byte intact in the
-    /// structured form — no JSON wrapping, no in-band marker that could
-    /// collide with a successful tool result whose literal content
-    /// happens to start with the same prefix.
-    ///
-    /// `None` / `Some(false)` produce the unmarked wire format.
+    /// treat the tool output as an error. It is exposed to the model's
+    /// chat template as `message.is_error`; Rust never rewrites `content`
+    /// or invents a model-facing error marker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
     /// Reasoning content for thinking mode (used with <think> tags)
@@ -187,38 +181,6 @@ impl std::fmt::Debug for ChatMessage {
     }
 }
 
-/// Marker prepended to a tool-role message's wire content when
-/// [`ChatMessage::is_error`] is `Some(true)`.
-///
-/// The marker is a **model-facing cue** — a short, conventional prefix
-/// that gives the model a clear text-level signal that the tool result
-/// represents an error. The structured `is_error` field on the message
-/// is the authoritative source of truth; the marker is purely a
-/// presentation choice for what reaches the model's prompt.
-///
-/// This constant is shared by every renderer (the Jinja serializer used
-/// by the cold-start path, the ChatML fallback formatter, and the
-/// per-variant `chat_session_continue_tool` delta builders) so the
-/// marker stays consistent across all entry points.
-pub const TOOL_ERROR_MARKER: &str = "[tool error] ";
-
-/// Apply [`TOOL_ERROR_MARKER`] to `content` when `is_error == Some(true)`.
-///
-/// Used by every wire-format renderer that consumes a tool-role
-/// `ChatMessage`: the Jinja serializer ([`serialize_message_for_jinja`])
-/// for the cold-start replay path, the ChatML fallback formatter, and
-/// each per-variant `chat_session_continue_tool` delta builder.
-///
-/// Returning `Cow<str>` keeps the unmarked path (the overwhelmingly
-/// common case) free of allocations.
-pub fn apply_tool_error_marker(content: &str, is_error: Option<bool>) -> std::borrow::Cow<'_, str> {
-    if is_error == Some(true) {
-        std::borrow::Cow::Owned(format!("{TOOL_ERROR_MARKER}{content}"))
-    } else {
-        std::borrow::Cow::Borrowed(content)
-    }
-}
-
 /// Qwen3 Tokenizer class with NAPI bindings
 #[napi]
 pub struct Qwen3Tokenizer {
@@ -233,6 +195,9 @@ pub struct Qwen3Tokenizer {
     /// The actual think-end string (e.g., `"</think>"` or `"</longcat_think>"`).
     think_end_str: Option<String>,
 }
+
+const MISSING_CHAT_TEMPLATE_ERROR: &str = "Model-provided chat template not found: expected \
+`chat_template` in tokenizer_config.json or chat_template.jinja next to tokenizer.json";
 
 #[napi]
 impl Qwen3Tokenizer {
@@ -328,7 +293,7 @@ impl Qwen3Tokenizer {
                 eprintln!("Warning: {}", warning);
                 let _ = warning; // Suppress unused warning in release builds
             }
-            return Some(Self::patch_preserve_thinking(template));
+            return Some(template.to_owned());
         }
 
         // Second: try standalone chat_template.jinja file (used by Gemma4 HF snapshots)
@@ -341,68 +306,10 @@ impl Qwen3Tokenizer {
                 eprintln!("Warning: {}", warning);
                 let _ = warning;
             }
-            return Some(Self::patch_preserve_thinking(&template));
+            return Some(template);
         }
 
         None
-    }
-
-    /// Rewrite chat-template reasoning gates so our `preserve_thinking=true`
-    /// context variable takes effect.
-    ///
-    /// The stock Qwen3.5 template gates `<think>…</think>` rendering on prior assistant
-    /// turns with `{%- if loop.index0 > ns.last_query_index %}`. `ns.last_query_index`
-    /// jumps forward when a fresh top-level user message arrives, so the moment a user
-    /// appends a follow-up, every prior assistant turn flips into the else branch and
-    /// silently drops its `<think>` block on re-render. That breaks the token-level
-    /// prefix equality that `verify_cache_prefix_direct` needs for tier-2 warm-session
-    /// reuse — a 19-turn agent session observed a 151s / 180s cold re-prefill on each
-    /// such boundary (see `.logging/requests.ndjson`, turns 11 and 16).
-    ///
-    /// We already pass `preserve_thinking=true` into the Jinja context
-    /// (`render_chat_template_jinja2`), but the shipped template never reads the
-    /// variable. Rather than fork the template per model, patch the gate at load time
-    /// so `preserve_thinking` wins regardless of `last_query_index`:
-    ///
-    ///   `loop.index0 > ns.last_query_index`
-    ///     → `preserve_thinking or loop.index0 > ns.last_query_index`
-    ///
-    /// Gemma4 needs one additional stabilization. With `enable_thinking=false`, its
-    /// generation prompt ends in an explicit empty thought channel:
-    ///
-    /// ```text
-    /// <|channel>thought\n<channel|>
-    /// ```
-    ///
-    /// The stock history branch only emits a thought channel when
-    /// `reasoning_content` is non-empty, so replaying that completed assistant turn
-    /// drops the empty channel and diverges at the first generated token. Patch the
-    /// exact stock Gemma4 gate to (a) replay the empty disable-thinking channel only
-    /// when that historical assistant started a fresh model turn, and (b) retain
-    /// non-empty reasoning across a later user turn, just like the Qwen3.5 patch.
-    /// A tool-result continuation deliberately has no second `<|turn>model` prefix,
-    /// so it must not receive a second empty thought channel either. Per-message
-    /// `thinking_enabled` wins over the current request setting; the latter remains
-    /// a compatibility fallback for histories created before provenance existed.
-    ///
-    /// Both rewrites are idempotent and exact-pattern scoped. Templates that contain
-    /// neither stock gate (LFM2, legacy ChatML, custom templates) pass through
-    /// byte-for-byte.
-    fn patch_preserve_thinking(template: &str) -> String {
-        const GEMMA4_STOCK_GATE: &str = "{%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}\n    {%- if thinking_text and loop.index0 > ns_turn.last_user_idx and message.get('tool_calls') -%}\n        {{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}\n    {%- endif -%}";
-        const GEMMA4_STABLE_GATE: &str = "{%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}\n    {%- set historical_thinking_enabled = message.get('thinking_enabled') -%}\n    {%- if preserve_thinking and thinking_text and message['role'] == 'assistant' -%}\n        {{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}\n    {%- elif preserve_thinking and message['role'] == 'assistant' and not continue_same_model_turn and ((historical_thinking_enabled is boolean and not historical_thinking_enabled) or (historical_thinking_enabled is undefined and not enable_thinking)) -%}\n        {{- '<|channel>thought\\n<channel|>' -}}\n    {%- elif thinking_text and loop.index0 > ns_turn.last_user_idx and message.get('tool_calls') -%}\n        {{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}\n    {%- endif -%}";
-
-        let mut patched = template.to_string();
-        if !patched.contains("preserve_thinking or loop.index0 > ns.last_query_index") {
-            patched = patched.replace(
-                "loop.index0 > ns.last_query_index",
-                "preserve_thinking or loop.index0 > ns.last_query_index",
-            );
-        }
-        if !patched.contains("historical_thinking_enabled") {
-            patched = patched.replace(GEMMA4_STOCK_GATE, GEMMA4_STABLE_GATE);
-        }
-        patched
     }
 
     /// Neutralize the HuggingFace `{% generation %}` / `{% endgeneration %}`
@@ -967,22 +874,18 @@ impl Qwen3Tokenizer {
                     // Sanitize messages before formatting (prevents injection in all paths)
                     let sanitized: Vec<ChatMessage> = Self::sanitize_messages(&messages);
 
-                    // Use Jinja2 rendering if template exists, fallback to ChatML otherwise
-                    let formatted = if let Some(chat_template) = chat_template {
-                        Self::render_chat_template_jinja2(
-                            &chat_template,
-                            &sanitized,
-                            tools.as_deref(),
-                            add_prompt,
-                            enable_thinking,
-                            &bos_str,
-                            &eos_str,
-                        )
-                        .map_err(Error::from_reason)?
-                    } else {
-                        // Fallback to simple ChatML when no template in tokenizer_config.json
-                        Self::format_chatml_presanitized(&sanitized, add_prompt)
-                    };
+                    let chat_template = chat_template
+                        .ok_or_else(|| Error::from_reason(MISSING_CHAT_TEMPLATE_ERROR))?;
+                    let formatted = Self::render_chat_template_jinja2(
+                        &chat_template,
+                        &sanitized,
+                        tools.as_deref(),
+                        add_prompt,
+                        enable_thinking,
+                        &bos_str,
+                        &eos_str,
+                    )
+                    .map_err(Error::from_reason)?;
 
                     Self::encode_internal(&tokenizer, formatted, Some(false)) // Don't add extra special tokens
                 })
@@ -1053,34 +956,6 @@ impl Qwen3Tokenizer {
     /// by the jinja rendering path.
     pub(crate) fn sanitize_messages_public(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         Self::sanitize_messages(messages)
-    }
-
-    /// Format messages using simple ChatML format (fallback when no template).
-    /// Expects pre-sanitized messages (call sanitize_messages first).
-    fn format_chatml_presanitized(messages: &[ChatMessage], add_generation_prompt: bool) -> String {
-        let mut formatted = String::new();
-
-        for msg in messages {
-            // For tool-role messages flagged with the structured
-            // `is_error` field, prepend the model-facing error marker
-            // to the wire content. The structured field stays
-            // authoritative; this rendering step is purely a model cue.
-            let content = if msg.role == "tool" {
-                apply_tool_error_marker(&msg.content, msg.is_error)
-            } else {
-                std::borrow::Cow::Borrowed(msg.content.as_str())
-            };
-            formatted.push_str(&format!(
-                "<|im_start|>{}\n{}<|im_end|>\n",
-                msg.role, content
-            ));
-        }
-
-        if add_generation_prompt {
-            formatted.push_str("<|im_start|>assistant\n");
-        }
-
-        formatted
     }
 
     /// Validate and normalize a ChatML role.
@@ -1585,7 +1460,6 @@ impl Qwen3Tokenizer {
         // Sanitize messages before formatting (prevents injection in all paths)
         let sanitized: Vec<ChatMessage> = Self::sanitize_messages(messages);
 
-        // Use Jinja2 rendering if template exists, fallback to ChatML otherwise
         let bos_str = self
             .bos_token_id
             .and_then(|id| self.tokenizer.id_to_token(id))
@@ -1594,21 +1468,20 @@ impl Qwen3Tokenizer {
             .tokenizer
             .id_to_token(self.eos_token_id)
             .unwrap_or_default();
-        let formatted = if let Some(chat_template) = &self.chat_template {
-            Self::render_chat_template_jinja2(
-                chat_template,
-                &sanitized,
-                tools,
-                add_prompt,
-                enable_thinking,
-                &bos_str,
-                &eos_str,
-            )
-            .map_err(Error::from_reason)?
-        } else {
-            // Fallback to simple ChatML when no template in tokenizer_config.json
-            Self::format_chatml_presanitized(&sanitized, add_prompt)
-        };
+        let chat_template = self
+            .chat_template
+            .as_deref()
+            .ok_or_else(|| Error::from_reason(MISSING_CHAT_TEMPLATE_ERROR))?;
+        let formatted = Self::render_chat_template_jinja2(
+            chat_template,
+            &sanitized,
+            tools,
+            add_prompt,
+            enable_thinking,
+            &bos_str,
+            &eos_str,
+        )
+        .map_err(Error::from_reason)?;
 
         // Encode the formatted text (don't add extra special tokens)
         let encoding = Self::encode_internal(&self.tokenizer, formatted, Some(false))?;
@@ -1688,21 +1561,10 @@ pub(crate) fn serialize_message_for_jinja(msg: &ChatMessage) -> serde_json::Valu
     let has_images = msg.images.as_ref().is_some_and(|imgs| !imgs.is_empty());
     let has_audio = msg.audio.as_ref().is_some_and(|clips| !clips.is_empty());
 
-    // For tool-role messages flagged with the structured `is_error`
-    // field, prepend the model-facing error marker to the wire content
-    // before the template sees it. The structured field stays the
-    // source of truth — this only affects what the model reads in its
-    // prompt context.
-    let rendered_content: std::borrow::Cow<'_, str> = if msg.role == "tool" {
-        apply_tool_error_marker(&msg.content, msg.is_error)
-    } else {
-        std::borrow::Cow::Borrowed(msg.content.as_str())
-    };
-
     if (has_images || has_audio) && msg.role == "user" {
         let mut parts: Vec<serde_json::Value> = Vec::new();
-        if !rendered_content.is_empty() {
-            parts.push(serde_json::json!({ "type": "text", "text": rendered_content.as_ref() }));
+        if !msg.content.is_empty() {
+            parts.push(serde_json::json!({ "type": "text", "text": msg.content }));
         }
         // Image parts first, then audio parts — matching mlx-vlm's
         // `_format_list_with_image` ordering (image content followed by
@@ -1722,10 +1584,7 @@ pub(crate) fn serialize_message_for_jinja(msg: &ChatMessage) -> serde_json::Valu
         }
         obj.insert("content".to_string(), serde_json::Value::Array(parts));
     } else {
-        obj.insert(
-            "content".to_string(),
-            serde_json::json!(rendered_content.as_ref()),
-        );
+        obj.insert("content".to_string(), serde_json::json!(msg.content));
     }
 
     if let Some(tool_calls) = &msg.tool_calls {
@@ -1758,6 +1617,9 @@ pub(crate) fn serialize_message_for_jinja(msg: &ChatMessage) -> serde_json::Valu
 
     if let Some(tool_call_id) = &msg.tool_call_id {
         obj.insert("tool_call_id".to_string(), serde_json::json!(tool_call_id));
+    }
+    if let Some(is_error) = msg.is_error {
+        obj.insert("is_error".to_string(), serde_json::json!(is_error));
     }
 
     if let Some(reasoning) = &msg.reasoning_content {
@@ -1798,6 +1660,104 @@ fn encoding_to_uint32_array<'env>(
 mod tests {
     use super::*;
     use minijinja::{Environment, context};
+
+    struct TestModelDir(std::path::PathBuf);
+
+    impl TestModelDir {
+        fn new(label: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "mlx-tokenizer-{label}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ));
+            std::fs::create_dir_all(&path).expect("create tokenizer test directory");
+            Self(path)
+        }
+
+        fn tokenizer_path(&self) -> std::path::PathBuf {
+            self.0.join("tokenizer.json")
+        }
+
+        fn write_minimal_tokenizer(&self) {
+            let tokenizer_json = r#"{
+                "version": "1.0",
+                "truncation": null,
+                "padding": null,
+                "added_tokens": [],
+                "normalizer": null,
+                "pre_tokenizer": { "type": "Whitespace" },
+                "post_processor": null,
+                "decoder": null,
+                "model": {
+                    "type": "WordLevel",
+                    "vocab": { "<unk>": 0, "hello": 1 },
+                    "unk_token": "<unk>"
+                }
+            }"#;
+            std::fs::write(self.tokenizer_path(), tokenizer_json).expect("write tokenizer fixture");
+        }
+    }
+
+    impl Drop for TestModelDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn loads_embedded_model_template_verbatim() {
+        let dir = TestModelDir::new("embedded-template");
+        let template =
+            "{%- if loop.index0 > ns.last_query_index -%}\n{{ message.content }}\n{%- endif -%}";
+        let config = serde_json::json!({ "chat_template": template });
+        std::fs::write(
+            dir.0.join("tokenizer_config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+
+        let loaded =
+            Qwen3Tokenizer::load_chat_template(dir.tokenizer_path().to_string_lossy().as_ref());
+        assert_eq!(loaded.as_deref(), Some(template));
+    }
+
+    #[test]
+    fn loads_standalone_model_template_verbatim() {
+        let dir = TestModelDir::new("standalone-template");
+        let template = "{%- generation -%}\n{{ message.content }}\n{%- endgeneration -%}\n";
+        std::fs::write(dir.0.join("chat_template.jinja"), template).unwrap();
+
+        let loaded =
+            Qwen3Tokenizer::load_chat_template(dir.tokenizer_path().to_string_lossy().as_ref());
+        assert_eq!(loaded.as_deref(), Some(template));
+    }
+
+    #[test]
+    fn apply_chat_template_sync_rejects_missing_model_template() {
+        let dir = TestModelDir::new("missing-template");
+        dir.write_minimal_tokenizer();
+        let tokenizer = Qwen3Tokenizer::from_file(&dir.tokenizer_path()).unwrap();
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        }];
+
+        let error = tokenizer
+            .apply_chat_template_sync(&messages, Some(true), None, None)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(MISSING_CHAT_TEMPLATE_ERROR),
+            "unexpected error: {error}",
+        );
+    }
 
     fn user_msg(content: &str, num_images: usize) -> ChatMessage {
         let images = if num_images > 0 {
@@ -2124,518 +2084,6 @@ mod tests {
         assert!(
             user_turn.contains("What is this?"),
             "user text missing from user turn after sanitize: {user_turn}",
-        );
-    }
-
-    /// Minimal slice of the stock Qwen3.5 chat template — just the
-    /// last-query-index scan and the assistant `<think>` gate. Used by
-    /// the preserve-thinking regression tests to verify the fix does what
-    /// we say it does on the exact expression we rewrite at load time,
-    /// without the noise of the full 7 KB template.
-    ///
-    /// Simplification vs. the shipped template: the tool-response check
-    /// `content.startswith('<tool_response>')` is dropped — miniJinja's
-    /// string-method bridge lives in `render_chat_template_jinja2` and we
-    /// want these tests self-contained. All test fixtures use plain
-    /// user text that never matches that branch anyway.
-    const QWEN35_GATE_SLICE: &str = "{%- set ns = namespace(last_query_index=-1) %}\n{%- for message in messages %}\n    {%- if message.role == \"user\" %}\n        {%- set ns.last_query_index = loop.index0 %}\n    {%- endif %}\n{%- endfor %}\n{%- for message in messages %}\n    {%- set content = message.content|trim %}\n    {%- if message.role == \"user\" %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- endif %}\n        {%- set reasoning_content = reasoning_content|trim %}\n        {%- if loop.index0 > ns.last_query_index %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content + '<|im_end|>\\n' }}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}";
-
-    /// Minimal stock Gemma4 reasoning gate embedded in a small turn renderer.
-    /// The history branch intentionally has the upstream bug: an assistant
-    /// with no reasoning omits the empty thought channel that the generation
-    /// prompt emits when thinking is disabled.
-    const GEMMA4_GATE_SLICE: &str = "{%- set ns_turn = namespace(last_user_idx=-1) -%}\n{%- for i in range(messages | length) -%}\n    {%- if messages[i]['role'] == 'user' -%}\n        {%- set ns_turn.last_user_idx = i -%}\n    {%- endif -%}\n{%- endfor -%}\n{%- for message in messages -%}\n    {%- if message['role'] == 'user' -%}\n        {{- '<|turn>user\\n' + message['content'] + '<turn|>\\n' -}}\n    {%- elif message['role'] == 'assistant' -%}\n        {{- '<|turn>model\\n' -}}\n    {%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}\n    {%- if thinking_text and loop.index0 > ns_turn.last_user_idx and message.get('tool_calls') -%}\n        {{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}\n    {%- endif -%}\n        {%- for tool_call in message.get('tool_calls', []) -%}\n            {{- '<|tool_call>call:' + tool_call['function']['name'] + '{}<tool_call|>' -}}\n        {%- endfor -%}\n        {{- message['content'] -}}\n    {%- endif -%}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    {{- '<|turn>model\\n' -}}\n    {%- if not enable_thinking -%}\n        {{- '<|channel>thought\\n<channel|>' -}}\n    {%- endif -%}\n{%- endif -%}";
-
-    /// Build the Jinja env the same way `render_chat_template_jinja2` does
-    /// (minus the string-method bridge, which this slice doesn't need).
-    /// Keeps the fix tests rendering through the SAME `tojson` filter
-    /// production uses, so any future filter drift trips these tests too.
-    fn jinja_env() -> Environment<'static> {
-        let mut env = Environment::new();
-        env.add_filter("tojson", |value: minijinja::Value| -> String {
-            serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
-        });
-        env
-    }
-
-    #[test]
-    fn patch_preserve_thinking_rewrites_qwen35_gate() {
-        let patched = Qwen3Tokenizer::patch_preserve_thinking(QWEN35_GATE_SLICE);
-        assert!(
-            patched.contains("preserve_thinking or loop.index0 > ns.last_query_index"),
-            "patched template missing preserve_thinking clause:\n{patched}",
-        );
-        // The stock gate (without the new disjunct) must be gone — any
-        // leftover copy would still drop <think> on old assistants.
-        let stock_occurrences = patched.matches("loop.index0 > ns.last_query_index").count();
-        let preserve_occurrences = patched.matches("preserve_thinking or").count();
-        assert_eq!(
-            stock_occurrences, preserve_occurrences,
-            "every `loop.index0 > ns.last_query_index` must be prefixed with `preserve_thinking or`",
-        );
-    }
-
-    #[test]
-    fn patch_preserve_thinking_is_idempotent() {
-        let once = Qwen3Tokenizer::patch_preserve_thinking(QWEN35_GATE_SLICE);
-        let twice = Qwen3Tokenizer::patch_preserve_thinking(&once);
-        assert_eq!(
-            once, twice,
-            "patching twice must be a no-op so `preserve_thinking` never gets nested",
-        );
-    }
-
-    #[test]
-    fn patch_preserve_thinking_is_idempotent_for_gemma4() {
-        let once = Qwen3Tokenizer::patch_preserve_thinking(GEMMA4_GATE_SLICE);
-        let twice = Qwen3Tokenizer::patch_preserve_thinking(&once);
-        assert_eq!(
-            once, twice,
-            "Gemma4's stabilization must only be applied once"
-        );
-        assert!(once.contains("historical_thinking_enabled"));
-        assert!(once.contains("not continue_same_model_turn"));
-        assert!(once.contains("preserve_thinking and thinking_text"));
-    }
-
-    #[test]
-    fn patch_preserve_thinking_passthrough_on_unrelated_templates() {
-        // Templates that don't carry either recognized reasoning gate (LFM2 /
-        // minimal ChatML) must survive verbatim — no `replace` call is
-        // allowed to silently corrupt their control flow.
-        let custom = "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}";
-        assert_eq!(Qwen3Tokenizer::patch_preserve_thinking(custom), custom);
-    }
-
-    /// The exact regression from the Gemma4 agent tool loop: turn 1's
-    /// no-thinking generation prompt places an empty thought channel in KV,
-    /// then turn 2 replays the assistant tool call. The replayed assistant
-    /// prefix must contain that same channel byte-for-byte.
-    #[test]
-    fn gemma4_no_thinking_tool_call_replay_matches_generated_prefix() {
-        let template = Qwen3Tokenizer::patch_preserve_thinking(GEMMA4_GATE_SLICE);
-        let user = ChatMessage {
-            role: "user".to_string(),
-            content: "read it".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            is_error: None,
-            reasoning_content: None,
-            thinking_enabled: None,
-            images: None,
-            audio: None,
-        };
-        let first_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            std::slice::from_ref(&user),
-            None,
-            true,
-            Some(false),
-            "",
-            "",
-        )
-        .unwrap();
-
-        let generated_tool_call = "<|tool_call>call:read{}<tool_call|>";
-        let replay = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            &[
-                user,
-                ChatMessage {
-                    role: "assistant".to_string(),
-                    content: String::new(),
-                    tool_calls: Some(vec![ToolCall {
-                        id: Some("call_1".to_string()),
-                        name: "read".to_string(),
-                        arguments: "{}".to_string(),
-                    }]),
-                    tool_call_id: None,
-                    is_error: None,
-                    reasoning_content: None,
-                    thinking_enabled: Some(false),
-                    images: None,
-                    audio: None,
-                },
-            ],
-            None,
-            false,
-            Some(true),
-            "",
-            "",
-        )
-        .unwrap();
-
-        assert_eq!(
-            replay,
-            format!("{first_prompt}{generated_tool_call}"),
-            "the next full-history replay must extend the cached generation prefix exactly",
-        );
-    }
-
-    /// A mode change on the current request must not rewrite older KV. Real
-    /// historical reasoning wins over the current no-thinking fallback, even
-    /// for a final assistant response with no tool call and after a new user
-    /// turn has moved `last_user_idx` past that assistant.
-    #[test]
-    fn gemma4_real_reasoning_survives_no_thinking_mode_change_without_tool_call() {
-        let template = Qwen3Tokenizer::patch_preserve_thinking(GEMMA4_GATE_SLICE);
-        let user = ChatMessage {
-            role: "user".to_string(),
-            content: "question".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            is_error: None,
-            reasoning_content: None,
-            thinking_enabled: None,
-            images: None,
-            audio: None,
-        };
-        let first_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            std::slice::from_ref(&user),
-            None,
-            true,
-            Some(true),
-            "",
-            "",
-        )
-        .unwrap();
-        let generated = "<|channel>thought\nkept reasoning\n<channel|>final answer";
-        let replay = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            &[
-                user,
-                ChatMessage {
-                    role: "assistant".to_string(),
-                    content: "final answer".to_string(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    is_error: None,
-                    reasoning_content: Some("kept reasoning".to_string()),
-                    thinking_enabled: Some(true),
-                    images: None,
-                    audio: None,
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: "follow-up".to_string(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    is_error: None,
-                    reasoning_content: None,
-                    thinking_enabled: None,
-                    images: None,
-                    audio: None,
-                },
-            ],
-            None,
-            true,
-            Some(false),
-            "",
-            "",
-        )
-        .unwrap();
-
-        assert!(
-            replay.starts_with(&format!("{first_prompt}{generated}")),
-            "historical reasoning must extend its original generated prefix even when the current request disables thinking:\nfirst={first_prompt:?}\nreplay={replay:?}",
-        );
-    }
-
-    /// An enabled-thinking turn may legitimately emit no reasoning channel.
-    /// A later disabled-thinking request must not retroactively insert the
-    /// empty channel used by its own generation prompt into that history.
-    #[test]
-    fn gemma4_enabled_thinking_without_reasoning_survives_mode_change() {
-        let template = Qwen3Tokenizer::patch_preserve_thinking(GEMMA4_GATE_SLICE);
-        let user = ChatMessage {
-            role: "user".to_string(),
-            content: "answer directly".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            is_error: None,
-            reasoning_content: None,
-            thinking_enabled: None,
-            images: None,
-            audio: None,
-        };
-        let first_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            std::slice::from_ref(&user),
-            None,
-            true,
-            Some(true),
-            "",
-            "",
-        )
-        .unwrap();
-        let generated = "direct answer";
-        let replay = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            &[
-                user,
-                ChatMessage {
-                    role: "assistant".to_string(),
-                    content: generated.to_string(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    is_error: None,
-                    reasoning_content: None,
-                    thinking_enabled: Some(true),
-                    images: None,
-                    audio: None,
-                },
-            ],
-            None,
-            false,
-            Some(false),
-            "",
-            "",
-        )
-        .unwrap();
-
-        assert_eq!(
-            replay,
-            format!("{first_prompt}{generated}"),
-            "historical enabled-thinking provenance must suppress the current request's empty channel",
-        );
-    }
-
-    /// Exercise the same invariant through the exact stock template used by
-    /// the local Gemma-4-12B agent checkpoint. The file is an optional local
-    /// fixture, matching the existing Gemma4 template tests below; CI without
-    /// model artifacts skips it.
-    #[test]
-    fn gemma4_stock_template_no_thinking_replay_extends_cached_prefix() {
-        let path = "/Users/brooklyn/workspace/github/mlx-node/.cache/models/Gemma-4-12B-IT-q4-mlx/chat_template.jinja";
-        let Ok(stock) = std::fs::read_to_string(path) else {
-            return;
-        };
-        let template = Qwen3Tokenizer::patch_preserve_thinking(&stock);
-        assert!(
-            template.contains("historical_thinking_enabled"),
-            "the stock Gemma4 gate was not recognized"
-        );
-
-        let user = ChatMessage {
-            role: "user".to_string(),
-            content: "Read Cargo.toml.".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            is_error: None,
-            reasoning_content: None,
-            thinking_enabled: None,
-            images: None,
-            audio: None,
-        };
-        let first_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            std::slice::from_ref(&user),
-            None,
-            true,
-            Some(false),
-            "<bos>",
-            "<eos>",
-        )
-        .unwrap();
-        let generated_tool_call = "<|tool_call>call:read{path:<|\"|>Cargo.toml<|\"|>}<tool_call|>";
-        let replay = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            &[
-                user,
-                ChatMessage {
-                    role: "assistant".to_string(),
-                    content: String::new(),
-                    tool_calls: Some(vec![ToolCall {
-                        id: Some("call_1".to_string()),
-                        name: "read".to_string(),
-                        arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
-                    }]),
-                    tool_call_id: None,
-                    is_error: None,
-                    reasoning_content: None,
-                    thinking_enabled: Some(false),
-                    images: None,
-                    audio: None,
-                },
-            ],
-            None,
-            false,
-            Some(false),
-            "<bos>",
-            "<eos>",
-        )
-        .unwrap();
-
-        assert!(
-            replay.starts_with(&format!("{first_prompt}{generated_tool_call}")),
-            "stock Gemma4 replay diverged from the cached no-thinking prefix:\nfirst={first_prompt:?}\nreplay={replay:?}",
-        );
-    }
-
-    /// Gemma4 renders a tool result and the following assistant response in
-    /// one continuous model turn. Replaying the final assistant must append
-    /// its generated text directly; inserting another disabled-thinking
-    /// channel at that continuation point breaks the cached prefix.
-    #[test]
-    fn gemma4_stock_tool_result_final_continuation_has_no_second_thought_channel() {
-        let path = "/Users/brooklyn/workspace/github/mlx-node/.cache/models/Gemma-4-12B-IT-q4-mlx/chat_template.jinja";
-        let Ok(stock) = std::fs::read_to_string(path) else {
-            return;
-        };
-        let template = Qwen3Tokenizer::patch_preserve_thinking(&stock);
-        let messages = |with_final: bool| {
-            let mut messages = vec![
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: "Read Cargo.toml.".to_string(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    is_error: None,
-                    reasoning_content: None,
-                    thinking_enabled: None,
-                    images: None,
-                    audio: None,
-                },
-                ChatMessage {
-                    role: "assistant".to_string(),
-                    content: String::new(),
-                    tool_calls: Some(vec![ToolCall {
-                        id: Some("call_1".to_string()),
-                        name: "read".to_string(),
-                        arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
-                    }]),
-                    tool_call_id: None,
-                    is_error: None,
-                    reasoning_content: None,
-                    thinking_enabled: Some(false),
-                    images: None,
-                    audio: None,
-                },
-                ChatMessage {
-                    role: "tool".to_string(),
-                    content: "package contents".to_string(),
-                    tool_calls: None,
-                    tool_call_id: Some("call_1".to_string()),
-                    is_error: Some(false),
-                    reasoning_content: None,
-                    thinking_enabled: None,
-                    images: None,
-                    audio: None,
-                },
-            ];
-            if with_final {
-                messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: "Done.".to_string(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    is_error: None,
-                    reasoning_content: None,
-                    thinking_enabled: Some(false),
-                    images: None,
-                    audio: None,
-                });
-            }
-            messages
-        };
-
-        let continuation_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            &messages(false),
-            None,
-            true,
-            Some(false),
-            "<bos>",
-            "<eos>",
-        )
-        .unwrap();
-        let completed_replay = Qwen3Tokenizer::render_chat_template_jinja2(
-            &template,
-            &messages(true),
-            None,
-            false,
-            Some(false),
-            "<bos>",
-            "<eos>",
-        )
-        .unwrap();
-
-        assert_eq!(
-            completed_replay,
-            format!("{continuation_prompt}Done.<turn|>\n"),
-            "tool-result continuation must not gain a second empty thought channel",
-        );
-    }
-
-    /// Reproduces the turn-15 → turn-16 divergence from
-    /// `.logging/requests.ndjson`: same assistant ChatMessage, rendered
-    /// once as the end-of-turn cache state (no new user yet) and once as
-    /// the next-turn echo (new user appended). The stock Qwen3.5 gate
-    /// drops the prior assistant's `<think>` on the second render,
-    /// breaking the byte-equal prefix `verify_cache_prefix_direct`
-    /// expects. The patch must restore parity.
-    #[test]
-    fn preserve_thinking_keeps_think_block_when_new_user_turn_appended() {
-        let env = jinja_env();
-
-        let patched = Qwen3Tokenizer::patch_preserve_thinking(QWEN35_GATE_SLICE);
-        let build = |messages: Vec<serde_json::Value>, preserve: bool| {
-            let mut env = env.clone();
-            env.add_template("chat", &patched).unwrap();
-            let tmpl = env.get_template("chat").unwrap();
-            tmpl.render(context! {
-                messages => messages,
-                preserve_thinking => preserve,
-            })
-            .unwrap()
-        };
-
-        let assistant = serde_json::json!({
-            "role": "assistant",
-            "content": "Done.",
-            "reasoning_content": "step-by-step reasoning",
-        });
-        let msgs_end_of_turn = vec![
-            serde_json::json!({ "role": "user", "content": "Hi" }),
-            assistant.clone(),
-        ];
-        let msgs_new_user_appended = vec![
-            serde_json::json!({ "role": "user", "content": "Hi" }),
-            assistant.clone(),
-            serde_json::json!({ "role": "user", "content": "Follow-up?" }),
-        ];
-
-        // Patched template + preserve_thinking=true: the assistant turn
-        // must render identically in both contexts, so the warm cache
-        // carries over to the follow-up turn byte-for-byte.
-        let r_before = build(msgs_end_of_turn.clone(), true);
-        let r_after = build(msgs_new_user_appended.clone(), true);
-
-        let extract_assistant = |rendered: &str| -> String {
-            let start = rendered.find("<|im_start|>assistant").unwrap();
-            let end_rel = rendered[start..].find("<|im_end|>").unwrap();
-            rendered[start..start + end_rel + "<|im_end|>\n".len()].to_string()
-        };
-
-        assert_eq!(
-            extract_assistant(&r_before),
-            extract_assistant(&r_after),
-            "with preserve_thinking=true the echoed assistant turn must match the end-of-turn render",
-        );
-        assert!(
-            extract_assistant(&r_after).contains("<think>\nstep-by-step reasoning\n</think>"),
-            "echoed assistant turn must keep the <think> block intact",
-        );
-
-        // Control: with preserve_thinking=false (the stock behavior we
-        // used to ship before the patch propagated) the `<think>` block
-        // gets dropped when a new user arrives — which is exactly the
-        // miss we observed on turn 16.
-        let r_after_stock = build(msgs_new_user_appended, false);
-        assert!(
-            !extract_assistant(&r_after_stock).contains("<think>"),
-            "stock gate (preserve_thinking=false) should drop <think> when a new user turn appends — sanity check on the control",
         );
     }
 
@@ -3119,10 +2567,6 @@ mod tests {
 
     #[test]
     fn function_call_arg_order_survives_jinja_round_trip() {
-        let mut env = jinja_env();
-        let patched = Qwen3Tokenizer::patch_preserve_thinking(QWEN35_GATE_SLICE);
-        env.add_template("chat", &patched).unwrap();
-
         // Args string exactly as pi-mono would echo it back — note
         // `path` first, matching the tool schema's `required` order
         // and whatever the model emitted on the prior turn.
@@ -3323,14 +2767,7 @@ mod tests {
         );
     }
 
-    // ----- Tool-error marker tests -----
-    //
-    // These guard the structured `is_error` channel on `ChatMessage`. The
-    // structured field is the authoritative failure signal; the rendered
-    // wire content carries a `[tool error]` prefix purely as a model cue,
-    // so the `content` field itself stays byte-for-byte intact and
-    // successful tool results whose literal text happens to start with
-    // the marker cannot be confused with errored ones on read-back.
+    // ----- Structured tool-error tests -----
 
     fn tool_msg_with_error(content: &str, is_error: Option<bool>) -> ChatMessage {
         ChatMessage {
@@ -3347,143 +2784,35 @@ mod tests {
     }
 
     #[test]
-    fn apply_tool_error_marker_prepends_only_for_some_true() {
-        // Some(true) prepends; None / Some(false) pass through unchanged.
-        // The marker is the single shared constant — keep tests in sync
-        // with the constant so any rename trips the suite, not the
-        // models silently.
-        let payload = "boom: connection refused";
-        let marked = apply_tool_error_marker(payload, Some(true));
-        assert_eq!(marked, format!("{TOOL_ERROR_MARKER}{payload}"));
-        let unmarked_none = apply_tool_error_marker(payload, None);
-        assert_eq!(unmarked_none, payload);
-        let unmarked_false = apply_tool_error_marker(payload, Some(false));
-        assert_eq!(unmarked_false, payload);
-    }
-
-    #[test]
-    fn apply_tool_error_marker_borrows_on_pass_through() {
-        // The unmarked branch returns a `Cow::Borrowed` to keep the hot
-        // (non-error) path free of allocations.
-        let payload = "{\"temperature\": 72}";
-        let cow = apply_tool_error_marker(payload, None);
-        assert!(matches!(cow, std::borrow::Cow::Borrowed(_)));
-        let cow_false = apply_tool_error_marker(payload, Some(false));
-        assert!(matches!(cow_false, std::borrow::Cow::Borrowed(_)));
-        let cow_err = apply_tool_error_marker(payload, Some(true));
-        assert!(matches!(cow_err, std::borrow::Cow::Owned(_)));
-    }
-
-    #[test]
-    fn jinja_serializer_injects_marker_for_errored_tool_message() {
-        // The Jinja serializer is the cold-start path's wire-format
-        // renderer (consumed by `chatSessionStart`). When the structured
-        // `is_error` flag is set, the rendered `content` field that the
-        // template sees must carry the `[tool error]` cue.
+    fn jinja_serializer_exposes_error_without_rewriting_content() {
         let msg = tool_msg_with_error("boom", Some(true));
         let v = serialize_message_for_jinja(&msg);
         assert_eq!(v["role"], "tool");
-        assert_eq!(
-            v["content"]
-                .as_str()
-                .expect("tool-role content is a flat string"),
-            format!("{TOOL_ERROR_MARKER}boom")
-        );
+        assert_eq!(v["content"], "boom");
+        assert_eq!(v["is_error"], true);
+        assert_eq!(v["tool_call_id"], "call_xyz");
     }
 
     #[test]
-    fn jinja_serializer_skips_marker_when_is_error_is_none() {
-        // No flag → no marker, even if the literal content happens to
-        // begin with the marker text (the collision case Codex flagged).
-        let suspicious = format!("{TOOL_ERROR_MARKER}this is a successful payload");
-        let msg = tool_msg_with_error(&suspicious, None);
+    fn jinja_serializer_omits_absent_error_without_rewriting_content() {
+        let msg = tool_msg_with_error("[tool error] literal payload", None);
         let v = serialize_message_for_jinja(&msg);
-        assert_eq!(
-            v["content"]
-                .as_str()
-                .expect("tool-role content is a flat string"),
-            suspicious,
-            "successful tool_result whose text resembles the marker must round-trip verbatim",
-        );
+        assert_eq!(v["content"], "[tool error] literal payload");
+        assert!(v.get("is_error").is_none());
     }
 
     #[test]
-    fn jinja_serializer_skips_marker_when_is_error_is_some_false() {
+    fn jinja_serializer_exposes_explicit_false_without_rewriting_content() {
         let msg = tool_msg_with_error("ok", Some(false));
         let v = serialize_message_for_jinja(&msg);
-        assert_eq!(v["content"].as_str().unwrap(), "ok");
-    }
-
-    #[test]
-    fn jinja_serializer_keeps_tool_call_id_alongside_marker() {
-        // The marker channel must coexist with `tool_call_id` — the
-        // structured field is the parallel addition that motivated this
-        // change.
-        let msg = tool_msg_with_error("boom", Some(true));
-        let v = serialize_message_for_jinja(&msg);
-        assert_eq!(v["tool_call_id"], "call_xyz");
-        assert_eq!(
-            v["content"].as_str().unwrap(),
-            format!("{TOOL_ERROR_MARKER}boom"),
-        );
-    }
-
-    #[test]
-    fn jinja_serializer_does_not_mark_non_tool_roles() {
-        // Defensive: the marker is reserved for `role == "tool"`. A
-        // user / assistant / system message with `is_error: Some(true)`
-        // (an unusual but possible direct construction) must not get
-        // the prefix — the field's contract is "errored tool result",
-        // and applying it to a user message would silently corrupt the
-        // turn the template renders.
-        for role in &["user", "assistant", "system"] {
-            let mut msg = tool_msg_with_error("hello", Some(true));
-            msg.role = (*role).to_string();
-            msg.tool_call_id = None;
-            let v = serialize_message_for_jinja(&msg);
-            assert_eq!(
-                v["content"].as_str().unwrap(),
-                "hello",
-                "role={role} must not receive the tool-error marker",
-            );
-        }
-    }
-
-    #[test]
-    fn format_chatml_presanitized_injects_marker_for_errored_tool_message() {
-        // The fallback ChatML formatter is the no-template path. The
-        // marker must apply equally there.
-        let msgs = vec![tool_msg_with_error("boom", Some(true))];
-        let rendered = Qwen3Tokenizer::format_chatml_presanitized(&msgs, false);
-        assert!(
-            rendered.contains(&format!("{TOOL_ERROR_MARKER}boom")),
-            "ChatML fallback formatter must inject the marker:\n{rendered}",
-        );
-    }
-
-    #[test]
-    fn format_chatml_presanitized_skips_marker_when_unflagged() {
-        // The hot (successful) path must remain byte-equal to the
-        // pre-feature output: same content, no prefix.
-        let msgs = vec![tool_msg_with_error("ok", None)];
-        let rendered = Qwen3Tokenizer::format_chatml_presanitized(&msgs, false);
-        assert!(
-            !rendered.contains(TOOL_ERROR_MARKER),
-            "ChatML fallback must not inject the marker on unflagged messages:\n{rendered}",
-        );
-        assert!(
-            rendered.contains("ok"),
-            "content must still appear:\n{rendered}"
-        );
+        assert_eq!(v["content"], "ok");
+        assert_eq!(v["is_error"], false);
     }
 
     #[test]
     fn sanitize_messages_preserves_is_error() {
-        // The structured field must round-trip through sanitization the
-        // same way `tool_call_id` does — otherwise the marker injection
-        // would never see the flag for any caller that passes messages
-        // through `sanitize_messages_public` first (which is every
-        // production caller).
+        // The structured field must round-trip through sanitization so the
+        // checkpoint template, rather than Rust, decides how to present it.
         let original = vec![
             tool_msg_with_error("boom", Some(true)),
             tool_msg_with_error("ok-explicit", Some(false)),

@@ -41,7 +41,7 @@ All language wrappers share a uniform `ChatSession<M>` surface (`send` / `sendSt
 The pipeline is exposed as `StructureV3Pipeline` from `@mlx-node/vlm`:
 
 ```typescript
-import { StructureV3Pipeline } from '@mlx-node/vlm';
+import { StructureV3Pipeline } from "@mlx-node/vlm";
 const pipeline = await StructureV3Pipeline.load(modelDir);
 const result = await pipeline.analyze(imageBuffer);
 ```
@@ -50,24 +50,24 @@ const result = await pipeline.analyze(imageBuffer);
 
 `ChatSession<M>` (`packages/lm/src/chat-session.ts`) is the cross-model chat wrapper. It holds a `SessionCapableModel` and exposes:
 
-- `send(message)` / `sendStream(message)` — chat turn (delta path when KV is reusable)
-- `sendToolResult(...)` / `sendToolResultStream(...)` — feed back a tool result; always uses `chatSessionContinueTool`
+- `send(message)` / `sendStream(message)` — chat turn rendered from the checkpoint template
+- `sendToolResult(...)` / `sendToolResultStream(...)` — feed back a structured tool result through the same template path
 - `reset()` — clear conversation
 - `primeHistory(history)` / `startFromHistory(history)` / `startFromHistoryStream(history)` — server-side cold-start replay
 - `applyChatTemplate(history)` — apply tokenizer chat template (e.g. for token counting)
 - `hasBlockPagedCache?()` — paged-cache routing hint
 
-Turn 0 (and any turn whose image set changed) dispatches through `chatSessionStart` with the full rebuilt history. Later turns take the cheap `chatSessionContinue` delta path that reuses the live KV cache. Tool-result turns always use `chatSessionContinueTool`.
+Every role-aware turn sends the full structured history to native code. The checkpoint-provided chat template renders that history, and native KV reuse is allowed only when the rendered token sequence exactly extends the committed cache. A template mismatch safely falls back to full prefill; Rust never manufactures user/tool wire-format strings.
 
 All generative wrappers (Qwen3, Qwen3.5 Dense, Qwen3.5 MoE, Gemma4, LFM2.5, and the VLM `QianfanOCRModel`) structurally satisfy `SessionCapableModel` — any of them can be passed to `new ChatSession(model)`.
 
 ## Streaming
 
 ```typescript
-import { loadSession } from '@mlx-node/lm';
+import { loadSession } from "@mlx-node/lm";
 
-const session = await loadSession('./models/Qwen3.5-0.8B');
-for await (const event of session.sendStream('Hello!')) {
+const session = await loadSession("./models/Qwen3.5-0.8B");
+for await (const event of session.sendStream("Hello!")) {
   if (!event.done) process.stdout.write(event.text);
 }
 ```
@@ -84,15 +84,20 @@ Gemma4 supports two external-draft speculative decoding variants behind one load
 Pass `draftModelPath` when loading an external draft:
 
 ```typescript
-import { loadSession } from '@mlx-node/lm';
+import { loadSession } from "@mlx-node/lm";
 
-const session = await loadSession('./models/gemma-4-12b-it', {
-  draftModelPath: './models/dspark_gemma4_12b_block7',
+const session = await loadSession("./models/gemma-4-12b-it", {
+  draftModelPath: "./models/dspark_gemma4_12b_block7",
 });
 // The attached draft flips hasMtpWeights(), so ChatSession auto-enables the
 // speculative path; pass `enableMtp: false` per call to opt out.
-const result = await session.send('Give a simple recipe for pancakes.', { config: { temperature: 0 } });
-console.log(result.performance?.mtpCycles, result.performance?.mtpMeanAcceptedTokensTotal);
+const result = await session.send("Give a simple recipe for pancakes.", {
+  config: { temperature: 0 },
+});
+console.log(
+  result.performance?.mtpCycles,
+  result.performance?.mtpMeanAcceptedTokensTotal,
+);
 ```
 
 For a self-contained checkpoint, place the draft's `config.json` and

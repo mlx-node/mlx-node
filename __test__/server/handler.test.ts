@@ -202,6 +202,7 @@ function makeChatResult(overrides: Partial<ChatResult> = {}): ChatResult {
   return {
     text: 'Hello!',
     toolCalls: [] as ToolCallResult[],
+    thinkingEnabled: true,
     numTokens: 5,
     promptTokens: 10,
     reasoningTokens: 0,
@@ -508,6 +509,7 @@ describe('createHandler', () => {
             finishReason: 'stop',
             toolCalls: [],
             thinking: null,
+            thinkingEnabled: true,
             numTokens: 1,
             promptTokens: 100,
             reasoningTokens: 0,
@@ -564,6 +566,7 @@ describe('createHandler', () => {
             finishReason: 'stop',
             toolCalls: [],
             thinking: null,
+            thinkingEnabled: true,
             numTokens: 1,
             promptTokens: 3,
             reasoningTokens: 0,
@@ -1946,9 +1949,13 @@ describe('createHandler', () => {
       // the real outstanding id.
       expect(chatSessionStart).toHaveBeenCalledTimes(1);
       expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
-      const [callId, content] = chatSessionContinueTool.mock.calls[0] as [string, string, unknown];
-      expect(callId).toBe('call_single');
-      expect(content).toBe('{"temp":68}');
+      const [messages] = chatSessionContinueTool.mock.calls[0];
+      expect(messages.at(-1)).toEqual({
+        role: 'tool',
+        content: '{"temp":68}',
+        toolCallId: 'call_single',
+        isError: undefined,
+      });
     });
 
     it('returns 400 on forged function_call_output against a plain assistant turn (hot path)', async () => {

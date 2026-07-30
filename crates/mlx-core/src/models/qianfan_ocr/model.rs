@@ -37,7 +37,6 @@ use crate::array::{MxArray, synchronize_and_clear_cache};
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use crate::model_thread::{ResponseTx, StreamTx};
 use crate::models::qianfan_ocr::bridge::InternVLBridge;
-use crate::models::qianfan_ocr::chat::format_qianfan_chat;
 use crate::models::qianfan_ocr::config::{InternVisionConfig, QianfanOCRConfig, Qwen3LMConfig};
 use crate::models::qianfan_ocr::language::InternVLLanguageModel;
 use crate::models::qianfan_ocr::persistence::load_qianfan_ocr_weights;
@@ -53,6 +52,11 @@ use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 use crate::tools;
 use crate::transformer::kv_cache::KVCache;
 use crate::utils::safetensors::SafeTensorsFile;
+
+/// Processor marker emitted once per image content part by Qianfan-OCR's
+/// model-provided Jinja template. The vision processor replaces it with the
+/// checkpoint-configured image span after template rendering.
+const QIANFAN_IMAGE_TEMPLATE_PLACEHOLDER: &str = "<image>";
 
 // ============================================================================
 // QianfanOCRInner — dedicated-thread owned state
@@ -109,35 +113,18 @@ pub(crate) enum QianfanOCRCmd {
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
     },
-    /// Continue an existing session by appending a user turn. See
-    /// [`QianfanOCRInner::chat_session_continue_sync`] — builds a raw
-    /// ChatML delta from `user_message`, tokenizes it, and prefills on
-    /// top of the live caches.
-    ///
-    /// `images` is an opt-in guard parameter: non-empty input is rejected
-    /// with an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error so
-    /// the TS `ChatSession` layer can route image-changes back through a
-    /// fresh `chat_session_start`.
+    /// Continue an existing session by rendering the caller's full history
+    /// with the model-provided chat template. Prefix verification decides
+    /// whether the live cache can serve the rendered extension.
     ChatSessionContinue {
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
+        messages: Vec<ChatMessage>,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
     },
-    /// Continue an existing session with a tool-result delta. See
-    /// [`QianfanOCRInner::chat_session_continue_tool_sync`] — builds a
-    /// ChatML `<tool_response>` delta and prefills on top of the live
-    /// caches.
-    ///
-    /// `is_error` is the structured tool-error signal threaded through
-    /// from the NAPI surface. When `Some(true)`, the renderer prepends
-    /// the shared [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<tool_response>` wrapper. `None` / `Some(false)` produce the
-    /// pre-feature byte-equal output.
+    /// Tool-result continuation. Tool structure lives in `messages` and is
+    /// rendered exclusively by the model-provided chat template.
     ChatSessionContinueTool {
-        tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
+        messages: Vec<ChatMessage>,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
     },
@@ -150,25 +137,16 @@ pub(crate) enum QianfanOCRCmd {
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
     },
-    /// Streaming session-continue: same semantics as
-    /// [`ChatSessionContinue`](Self::ChatSessionContinue) but streams
-    /// token deltas through `stream_tx`. Carries the same opt-in
-    /// `images` guard parameter.
+    /// Streaming session-continue over a full template-rendered history.
     ChatStreamSessionContinue {
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
+        messages: Vec<ChatMessage>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
     },
-    /// Streaming tool-result continuation: same semantics as
-    /// [`ChatSessionContinueTool`](Self::ChatSessionContinueTool) but
-    /// streams token deltas through `stream_tx`. Carries the same
-    /// structured `is_error` signal.
+    /// Streaming tool-result continuation over a full history.
     ChatStreamSessionContinueTool {
-        tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
+        messages: Vec<ChatMessage>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -204,26 +182,18 @@ pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOC
             let _ = reply.send(inner.chat_session_start_sync(messages, config));
         }
         QianfanOCRCmd::ChatSessionContinue {
-            user_message,
-            images,
+            messages,
             config,
             reply,
         } => {
-            let _ = reply.send(inner.chat_session_continue_sync(user_message, images, config));
+            let _ = reply.send(inner.chat_session_continue_sync(messages, config));
         }
         QianfanOCRCmd::ChatSessionContinueTool {
-            tool_call_id,
-            content,
-            is_error,
+            messages,
             config,
             reply,
         } => {
-            let _ = reply.send(inner.chat_session_continue_tool_sync(
-                tool_call_id,
-                content,
-                is_error,
-                config,
-            ));
+            let _ = reply.send(inner.chat_session_continue_tool_sync(messages, config));
         }
         QianfanOCRCmd::ChatStreamSessionStart {
             messages,
@@ -234,36 +204,20 @@ pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOC
             inner.chat_stream_session_start_sync(messages, config, stream_tx, cancelled);
         }
         QianfanOCRCmd::ChatStreamSessionContinue {
-            user_message,
-            images,
+            messages,
             config,
             stream_tx,
             cancelled,
         } => {
-            inner.chat_stream_session_continue_sync(
-                user_message,
-                images,
-                config,
-                stream_tx,
-                cancelled,
-            );
+            inner.chat_stream_session_continue_sync(messages, config, stream_tx, cancelled);
         }
         QianfanOCRCmd::ChatStreamSessionContinueTool {
-            tool_call_id,
-            content,
-            is_error,
+            messages,
             config,
             stream_tx,
             cancelled,
         } => {
-            inner.chat_stream_session_continue_tool_sync(
-                tool_call_id,
-                content,
-                is_error,
-                config,
-                stream_tx,
-                cancelled,
-            );
+            inner.chat_stream_session_continue_tool_sync(messages, config, stream_tx, cancelled);
         }
         QianfanOCRCmd::Generate {
             input_ids,
@@ -351,6 +305,43 @@ impl QianfanOCRInner {
             .unwrap_or(0)
     }
 
+    /// Render the complete conversation exclusively through the tokenizer's
+    /// model-provided chat template, then expand the abstract image markers
+    /// emitted by that template into model-configured visual-token spans.
+    fn render_prompt_tokens(
+        &self,
+        messages: &[ChatMessage],
+        config: &ChatConfig,
+        num_patches_list: &[u32],
+    ) -> Result<Vec<u32>> {
+        if !self.tokenizer.has_chat_template() {
+            return Err(Error::from_reason(
+                "Qianfan-OCR requires a model-provided chat template in \
+                 tokenizer_config.json or chat_template.jinja; no template was found",
+            ));
+        }
+
+        let template_tokens = self.tokenizer.apply_chat_template_sync(
+            messages,
+            Some(true),
+            config.tools.as_deref(),
+            crate::engine::resolve_enable_thinking(config),
+        )?;
+        let placeholder_tokens = self
+            .tokenizer
+            .encode_sync(QIANFAN_IMAGE_TEMPLATE_PLACEHOLDER, Some(false))?;
+
+        expand_qianfan_image_placeholders(
+            &template_tokens,
+            &placeholder_tokens,
+            num_patches_list,
+            self.config.num_image_token() as usize,
+            self.config.img_start_token_id as u32,
+            self.config.img_context_token_id as u32,
+            self.config.img_end_token_id as u32,
+        )
+    }
+
     /// Core synchronous chat implementation with optional EOS override
     /// (runs on the model thread).
     ///
@@ -395,7 +386,6 @@ impl QianfanOCRInner {
         let ngram_size = config
             .ngram_size
             .unwrap_or(crate::sampling::DEFAULT_NGRAM_SIZE);
-        let enable_thinking = crate::engine::resolve_enable_thinking(&config).unwrap_or(false);
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
@@ -414,19 +404,9 @@ impl QianfanOCRInner {
         let processed_images = processor.process_many(&image_refs)?;
 
         let num_patches_list: Vec<u32> = processed_images.iter().map(|p| p.num_tiles).collect();
-        let num_image_token = self.config.num_image_token() as u32;
-
-        // --- Step 2: Format chat template ---
-        let prompt = format_qianfan_chat(
-            &messages,
-            &num_patches_list,
-            num_image_token,
-            enable_thinking,
-            config.tools.as_deref(),
-        )?;
-
-        // --- Step 3: Tokenize ---
-        let token_ids = self.tokenizer.encode_sync(&prompt, Some(false))?;
+        // --- Step 2: Render the checkpoint's template and expand only the
+        // processor-owned image markers it emitted. ---
+        let token_ids = self.render_prompt_tokens(&messages, &config, &num_patches_list)?;
         let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
 
         // --- Step 4: Vision encoding ---
@@ -458,9 +438,12 @@ impl QianfanOCRInner {
         };
 
         // --- Step 5: Prefix matching for KV cache reuse ---
-        let prefix_len = if reuse_cache && image_bytes.is_empty() {
-            // Only reuse cache for text-only; images need full re-prefill
-            // since IMG_CONTEXT token IDs don't capture image content
+        let current_image_key = if image_bytes.is_empty() {
+            None
+        } else {
+            Some(crate::engine::compute_image_cache_key(&image_bytes))
+        };
+        let prefix_len = if reuse_cache && current_image_key == self.cached_image_key {
             compute_prefix_match(&token_ids, &self.cached_token_history)
         } else {
             0
@@ -675,11 +658,7 @@ impl QianfanOCRInner {
             // Track image state so the session delta path's guard 4
             // (cached_image_key.is_some()) correctly rejects delta
             // continuations that would collide with prior image context.
-            self.cached_image_key = if image_bytes.is_empty() {
-                None
-            } else {
-                Some(crate::engine::compute_image_cache_key(&image_bytes))
-            };
+            self.cached_image_key = current_image_key;
         } else {
             // Not reusing — clear metadata to prevent stale prefix matches
             self.cached_token_history.clear();
@@ -689,7 +668,7 @@ impl QianfanOCRInner {
 
         // --- Step 10: Decode and parse ---
         let raw_decoded = self.tokenizer.decode_sync(&generated_tokens, true)?;
-        let cleaned = raw_decoded.replace("<|im_end|>", "").trim().to_string();
+        let cleaned = raw_decoded.trim().to_string();
 
         let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
         let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
@@ -740,12 +719,13 @@ impl QianfanOCRInner {
             text: text.trim().to_string(),
             tool_calls,
             thinking,
+            thinking_enabled: crate::engine::resolve_enable_thinking(&config).unwrap_or(true),
             num_tokens: generated_tokens.len() as u32,
             prompt_tokens: prefill_token_count as u32,
             reasoning_tokens,
             finish_reason,
             raw_text: raw_decoded,
-            cached_tokens: 0,
+            cached_tokens: clamped_prefix as u32,
             performance,
         })
     }
@@ -799,7 +779,6 @@ impl QianfanOCRInner {
             let ngram_size = config
                 .ngram_size
                 .unwrap_or(crate::sampling::DEFAULT_NGRAM_SIZE);
-            let enable_thinking = crate::engine::resolve_enable_thinking(&config).unwrap_or(false);
             let reuse_cache = config.reuse_cache.unwrap_or(true);
             let report_perf = config.report_performance.unwrap_or(false);
 
@@ -817,17 +796,9 @@ impl QianfanOCRInner {
             let processed_images = processor.process_many(&image_refs)?;
 
             let num_patches_list: Vec<u32> = processed_images.iter().map(|p| p.num_tiles).collect();
-            let num_image_token = self.config.num_image_token() as u32;
-
-            // --- Format and tokenize ---
-            let prompt = format_qianfan_chat(
-                &messages,
-                &num_patches_list,
-                num_image_token,
-                enable_thinking,
-                config.tools.as_deref(),
-            )?;
-            let token_ids = self.tokenizer.encode_sync(&prompt, Some(false))?;
+            // --- Render the checkpoint's template and expand the
+            // processor-owned image markers. ---
+            let token_ids = self.render_prompt_tokens(&messages, &config, &num_patches_list)?;
             let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
 
             // --- Vision encoding ---
@@ -852,7 +823,12 @@ impl QianfanOCRInner {
             };
 
             // --- Prefill (with cache reuse support) ---
-            let prefix_len = if reuse_cache && image_bytes.is_empty() {
+            let current_image_key = if image_bytes.is_empty() {
+                None
+            } else {
+                Some(crate::engine::compute_image_cache_key(&image_bytes))
+            };
+            let prefix_len = if reuse_cache && current_image_key == self.cached_image_key {
                 compute_prefix_match(&token_ids, &self.cached_token_history)
             } else {
                 0
@@ -1003,6 +979,7 @@ impl QianfanOCRInner {
                     finish_reason: None,
                     tool_calls: None,
                     thinking: None,
+                    thinking_enabled: None,
                     num_tokens: None,
                     prompt_tokens: None,
                     reasoning_tokens: None,
@@ -1084,11 +1061,7 @@ impl QianfanOCRInner {
                 self.cached_token_history = full_history;
                 self.cached_cache_offset = self.get_cache_offset();
                 // Track image state — mirrors the non-streaming save block.
-                self.cached_image_key = if image_bytes.is_empty() {
-                    None
-                } else {
-                    Some(crate::engine::compute_image_cache_key(&image_bytes))
-                };
+                self.cached_image_key = current_image_key;
             } else {
                 self.cached_token_history.clear();
                 self.cached_cache_offset = 0;
@@ -1097,7 +1070,7 @@ impl QianfanOCRInner {
 
             // Final chunk
             let raw_decoded = self.tokenizer.decode_sync(&generated_tokens, true)?;
-            let cleaned = raw_decoded.replace("<|im_end|>", "").trim().to_string();
+            let cleaned = raw_decoded.trim().to_string();
             let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
             let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
 
@@ -1150,6 +1123,9 @@ impl QianfanOCRInner {
                 finish_reason: Some(finish_reason),
                 tool_calls: Some(tool_calls),
                 thinking,
+                thinking_enabled: Some(
+                    crate::engine::resolve_enable_thinking(&config).unwrap_or(true),
+                ),
                 num_tokens: Some(generated_tokens.len() as u32),
                 prompt_tokens: Some(prefill_token_count as u32),
                 reasoning_tokens: Some(reasoning_tokens),
@@ -1182,10 +1158,8 @@ impl QianfanOCRInner {
     /// ChatML wire format applies directly — stopping on `<|im_end|>` keeps
     /// the cached history on a clean delta boundary for the session
     /// continuation paths.
-    fn im_end_id(&self) -> Result<u32> {
-        self.tokenizer
-            .im_end_id()
-            .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))
+    fn session_eos_id(&self) -> u32 {
+        self.tokenizer.get_eos_token_id()
     }
 
     /// Start a new chat session.
@@ -1219,7 +1193,7 @@ impl QianfanOCRInner {
 
         // Resolve `<|im_end|>` up front so session_continue can rely on the
         // cached history always terminating on a clean ChatML boundary.
-        let im_end_id = self.im_end_id()?;
+        let im_end_id = self.session_eos_id();
 
         // Full reset: the session-start path always begins from a clean
         // state. This matches the documented contract that the session is
@@ -1230,93 +1204,40 @@ impl QianfanOCRInner {
         self.chat_turn_sync_core(messages, config, im_end_id)
     }
 
-    /// Continue an existing chat session with a user turn.
+    /// Continue a session from the caller's complete structured history.
     ///
-    /// Builds a ChatML wire-format delta (`\n<|im_start|>user\n...
-    /// <|im_end|>\n<|im_start|>assistant\n`), tokenizes it, and prefills
-    /// on top of the live caches via [`Self::chat_tokens_delta_sync`].
-    ///
-    /// Text-only on the delta path: callers that need to change the
-    /// image set must restart the session via
-    /// [`Self::chat_session_start_sync`]. The `images` parameter is an
-    /// opt-in guard that returns an
-    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error when
-    /// non-empty, letting the TS `ChatSession` layer pattern-match the
-    /// prefix and route image-changes through a fresh session start.
+    /// The full history is rendered by the checkpoint template. The core
+    /// verifies that the rendered prompt strictly extends the committed token
+    /// history before reusing the live cache, and otherwise performs a safe
+    /// full prefill.
     pub(crate) fn chat_session_continue_sync(
         &mut self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
+        messages: Vec<ChatMessage>,
         config: ChatConfig,
     ) -> Result<ChatResult> {
-        // Guard 1: text-only delta path.
-        if images.as_ref().is_some_and(|v| !v.is_empty()) {
-            return Err(Error::from_reason(format!(
-                "{}chat_session_continue is text-only; start a new session with chat_session_start to change the image",
-                crate::engine::IMAGE_CHANGE_RESTART_PREFIX
-            )));
+        if config.reuse_cache == Some(false) {
+            return Err(Error::from_reason(
+                "chat_session_continue requires reuse_cache=true (leave as None or set to true)",
+            ));
         }
-
-        let tokenizer = self.tokenizer.clone();
-
-        // Subject the session path to the same role/content injection
-        // sanitization as the legacy chat path so all entry points stay
-        // uniform.
-        let synthetic = crate::engine::build_synthetic_user_message(&user_message);
-        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
-        let sanitized_user = &sanitized[0].content;
-
-        let enable_thinking = crate::engine::resolve_enable_thinking(&config);
-        let delta_text =
-            crate::engine::build_chatml_continue_delta_text(sanitized_user, enable_thinking);
-        let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
-
-        self.chat_tokens_delta_sync(delta_tokens, config)
+        let eos_id = self.session_eos_id();
+        self.chat_turn_sync_core(messages, config, eos_id)
     }
 
-    /// Continue an existing chat session with a tool-result turn.
-    ///
-    /// Builds a ChatML `<tool_response>`-wrapped delta from `content` and
-    /// prefills it on top of the live session caches. The `tool_call_id`
-    /// is intentionally dropped from the wire format — Qwen3.5's chat
-    /// template identifies tool responses by position and wrapper tags,
-    /// not an explicit id. Callers may still log it for bookkeeping.
-    ///
-    /// Text-only; delegates to [`Self::chat_tokens_delta_sync`] which
-    /// inherits the same text-only-delta invariant (errors if the
-    /// session currently holds image state).
-    ///
-    /// `is_error` is forwarded verbatim to
-    /// [`crate::engine::build_chatml_tool_delta_text`]:
-    /// `Some(true)` injects the shared
-    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<tool_response>` wrapper; `None` / `Some(false)` keep the
-    /// pre-feature byte-equal output.
+    /// Tool-result continuation uses the same complete-history template path;
+    /// the model template alone decides how tool messages are represented.
     pub(crate) fn chat_session_continue_tool_sync(
         &mut self,
-        tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
+        messages: Vec<ChatMessage>,
         config: ChatConfig,
     ) -> Result<ChatResult> {
-        let tokenizer = self.tokenizer.clone();
-
-        let enable_thinking = crate::engine::resolve_enable_thinking(&config);
-        let delta_text = crate::engine::build_chatml_tool_delta_text(
-            &tool_call_id,
-            &content,
-            enable_thinking,
-            is_error,
-        );
-        let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
-
-        self.chat_tokens_delta_sync(delta_tokens, config)
+        self.chat_session_continue_sync(messages, config)
     }
 
     /// Prefill a pre-tokenized delta on top of the existing KV caches and
-    /// run the decode loop. Text-only session primitive used by
-    /// [`Self::chat_session_continue_sync`] and
-    /// [`Self::chat_session_continue_tool_sync`].
+    /// run the decode loop. This is a private low-level token primitive; the
+    /// role-aware session API always re-renders complete structured history
+    /// through the checkpoint template.
     ///
     /// Uses `<|im_end|>` as the eos token so the cached history continues
     /// to end on a clean ChatML boundary for the next turn.
@@ -1363,7 +1284,7 @@ impl QianfanOCRInner {
         // Session path: use `<|im_end|>` as eos, NOT config.eos_token_id.
         // This keeps the cached history aligned on a clean ChatML
         // boundary for the next `chat_session_continue*` call.
-        let eos_token_id = self.im_end_id()?;
+        let eos_token_id = self.session_eos_id();
 
         // Clamp a nonpositive budget to 0 so the `Vec::with_capacity(.. as
         // usize)` below never sees a negative `i32` (`-1 as usize` would
@@ -1569,7 +1490,7 @@ impl QianfanOCRInner {
 
         // Decode + tool/thinking parsing
         let raw_decoded = self.tokenizer.decode_sync(&generated_tokens, true)?;
-        let cleaned = raw_decoded.replace("<|im_end|>", "").trim().to_string();
+        let cleaned = raw_decoded.trim().to_string();
 
         let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
         let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
@@ -1619,6 +1540,7 @@ impl QianfanOCRInner {
             text: text.trim().to_string(),
             tool_calls,
             thinking,
+            thinking_enabled: crate::engine::resolve_enable_thinking(&config).unwrap_or(true),
             num_tokens: generated_tokens.len() as u32,
             prompt_tokens: prefill_token_count as u32,
             reasoning_tokens,
@@ -1657,13 +1579,7 @@ impl QianfanOCRInner {
             return;
         }
 
-        let im_end_id = match self.im_end_id() {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = stream_tx.send(Err(e));
-                return;
-            }
-        };
+        let im_end_id = self.session_eos_id();
 
         // Full reset: the session always starts clean.
         self.reset_caches_sync();
@@ -1674,8 +1590,7 @@ impl QianfanOCRInner {
     /// Streaming variant of [`Self::chat_session_continue_sync`].
     pub(crate) fn chat_stream_session_continue_sync(
         &mut self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
+        messages: Vec<ChatMessage>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -1688,77 +1603,27 @@ impl QianfanOCRInner {
             return;
         }
 
-        if images.as_ref().is_some_and(|v| !v.is_empty()) {
+        if config.reuse_cache == Some(false) {
             crate::engine::send_stream_error(
                 &stream_tx,
-                &format!(
-                    "{}chat_stream_session_continue is text-only; start a new session with chat_stream_session_start to change the image",
-                    crate::engine::IMAGE_CHANGE_RESTART_PREFIX
-                ),
+                "chat_stream_session_continue requires reuse_cache=true (leave as None or set to true)",
             );
             return;
         }
 
-        let tokenizer = self.tokenizer.clone();
-
-        let synthetic = crate::engine::build_synthetic_user_message(&user_message);
-        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
-        let sanitized_user = &sanitized[0].content;
-
-        let enable_thinking = crate::engine::resolve_enable_thinking(&config);
-        let delta_text =
-            crate::engine::build_chatml_continue_delta_text(sanitized_user, enable_thinking);
-
-        let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = stream_tx.send(Err(e));
-                return;
-            }
-        };
-
-        self.chat_stream_tokens_delta_sync(delta_tokens, config, stream_tx, cancelled);
+        let eos_id = self.session_eos_id();
+        self.chat_turn_stream_core(messages, config, stream_tx, cancelled, eos_id);
     }
 
-    /// Streaming variant of [`Self::chat_session_continue_tool_sync`].
-    /// `is_error` is forwarded verbatim to the wire-format renderer;
-    /// see the non-streaming entry point for the marker semantics.
+    /// Streaming tool-result continuation over the full structured history.
     pub(crate) fn chat_stream_session_continue_tool_sync(
         &mut self,
-        tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
+        messages: Vec<ChatMessage>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
     ) {
-        if cancelled.load(Ordering::Relaxed) {
-            crate::engine::send_stream_error(
-                &stream_tx,
-                "chat_stream_session_continue_tool cancelled before start",
-            );
-            return;
-        }
-
-        let tokenizer = self.tokenizer.clone();
-
-        let enable_thinking = crate::engine::resolve_enable_thinking(&config);
-        let delta_text = crate::engine::build_chatml_tool_delta_text(
-            &tool_call_id,
-            &content,
-            enable_thinking,
-            is_error,
-        );
-
-        let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = stream_tx.send(Err(e));
-                return;
-            }
-        };
-
-        self.chat_stream_tokens_delta_sync(delta_tokens, config, stream_tx, cancelled);
+        self.chat_stream_session_continue_sync(messages, config, stream_tx, cancelled);
     }
 
     /// Streaming analog of [`Self::chat_tokens_delta_sync`]: prefill the
@@ -1846,7 +1711,7 @@ impl QianfanOCRInner {
             sender.call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking);
         };
 
-        let eos_token_id = self.im_end_id()?;
+        let eos_token_id = self.session_eos_id();
 
         // Clamp a nonpositive budget to 0 so the `Vec::with_capacity(.. as
         // usize)` below never sees a negative `i32` (`-1 as usize` would
@@ -1991,6 +1856,7 @@ impl QianfanOCRInner {
                 finish_reason: None,
                 tool_calls: None,
                 thinking: None,
+                thinking_enabled: None,
                 num_tokens: None,
                 prompt_tokens: None,
                 reasoning_tokens: None,
@@ -2071,7 +1937,7 @@ impl QianfanOCRInner {
 
         // Final chunk
         let raw_decoded = self.tokenizer.decode_sync(&generated_tokens, true)?;
-        let cleaned = raw_decoded.replace("<|im_end|>", "").trim().to_string();
+        let cleaned = raw_decoded.trim().to_string();
         let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
         let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
 
@@ -2122,6 +1988,7 @@ impl QianfanOCRInner {
             finish_reason: Some(finish_reason),
             tool_calls: Some(tool_calls),
             thinking,
+            thinking_enabled: Some(crate::engine::resolve_enable_thinking(&config).unwrap_or(true)),
             num_tokens: Some(generated_tokens.len() as u32),
             prompt_tokens: Some(prefill_token_count as u32),
             reasoning_tokens: Some(reasoning_tokens),
@@ -2338,11 +2205,9 @@ impl QianfanOCRModel {
 
     /// Start a new chat session.
     ///
-    /// Runs the full chat template once, decodes until `<|im_end|>`,
-    /// and leaves the KV caches on a clean turn boundary so subsequent
-    /// `chatSessionContinue` / `chatSessionContinueTool` calls can
-    /// append a raw ChatML delta on top without re-rendering the chat
-    /// template.
+    /// Renders the complete structured conversation through the checkpoint
+    /// template, decodes until `<|im_end|>`, and preserves KV state for an
+    /// exact-prefix check against the next complete template render.
     ///
     /// Qianfan-OCR is always a VLM (InternViT + Qwen3 language model), so
     /// this entry point accepts images in `messages` without the text-only
@@ -2369,43 +2234,16 @@ impl QianfanOCRModel {
         .await
     }
 
-    /// Continue an existing chat session with a new user message.
-    ///
-    /// Appends a raw ChatML user/assistant delta to the session's cached
-    /// KV state, then decodes the model reply. Stops on `<|im_end|>` so
-    /// the cache remains on a clean turn boundary for the next turn.
-    ///
-    /// Requires a live session started via `chatSessionStart`. Errors
-    /// if the session is empty or if `config.reuse_cache` is
-    /// explicitly set to `false`.
-    ///
-    /// `images` is an opt-in guard parameter: when non-empty the native
-    /// side returns an error whose message begins with
-    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-    /// `ChatSession` layer can catch the prefix and route image-changes
-    /// back through a fresh `chatSessionStart` uniformly across all
-    /// model backends. Qianfan-OCR is a VLM but the continue path cannot
-    /// splice new vision features into a live KV cache — image changes
-    /// always require a fresh session start.
-    ///
-    /// `audio` exists only to keep this method's positional ABI aligned
-    /// with the shared chat surface every other family exposes (the
-    /// `chat_napi_surface!` macro inserts `audio` between `images` and
-    /// `config`). Qianfan-OCR has no audio support, so a non-empty
-    /// `audio` is rejected at the boundary with the shared no-audio
-    /// error; `None` / empty is a complete no-op and audio is never
-    /// threaded into the model thread.
-    #[napi(
-        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, audio: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined"
-    )]
+    /// Continue from the caller's complete conversation history. The
+    /// checkpoint's chat template is rendered again and exact prefix matching
+    /// decides whether the live cache can be reused.
+    #[napi]
     pub async fn chat_session_continue(
         &self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        audio: Option<Vec<Uint8Array>>,
+        messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
-        reject_unsupported_audio(audio.as_deref())?;
+        reject_unsupported_audio_in_messages(&messages)?;
 
         let thread = self.thread.as_ref().ok_or_else(|| {
             Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
@@ -2414,37 +2252,22 @@ impl QianfanOCRModel {
         let config = config.unwrap_or_default();
 
         crate::model_thread::send_and_await(thread, |reply| QianfanOCRCmd::ChatSessionContinue {
-            user_message,
-            images,
+            messages,
             config,
             reply,
         })
         .await
     }
 
-    /// Continue an existing chat session with a tool-result turn.
-    ///
-    /// Builds a ChatML `<tool_response>` delta from `tool_call_id` and
-    /// `content` and prefills it on top of the live session caches, then
-    /// decodes the model reply. Stops on `<|im_end|>` so the cache stays
-    /// on a clean turn boundary for the next turn.
-    ///
-    /// `is_error` is the structured tool-error signal. When `Some(true)`,
-    /// the renderer prepends the shared
-    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<tool_response>` wrapper so the model receives a clear text-level
-    /// cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
-    /// pre-feature output.
-    ///
-    /// Requires a live session started via `chatSessionStart`.
+    /// Tool-result continuation over a full history. Tool representation is
+    /// owned entirely by the model-provided template.
     #[napi]
     pub async fn chat_session_continue_tool(
         &self,
-        tool_call_id: String,
-        content: String,
+        messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
-        is_error: Option<bool>,
     ) -> Result<ChatResult> {
+        reject_unsupported_audio_in_messages(&messages)?;
         let thread = self.thread.as_ref().ok_or_else(|| {
             Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
         })?;
@@ -2453,9 +2276,7 @@ impl QianfanOCRModel {
 
         crate::model_thread::send_and_await(thread, |reply| {
             QianfanOCRCmd::ChatSessionContinueTool {
-                tool_call_id,
-                content,
-                is_error,
+                messages,
                 config,
                 reply,
             }
@@ -2503,24 +2324,17 @@ impl QianfanOCRModel {
         Ok(ChatStreamHandle { cancelled })
     }
 
-    /// Streaming variant of `chatSessionContinue`.
-    ///
-    /// `audio` mirrors the non-streaming entry point: it exists only to
-    /// keep the positional ABI aligned with the shared chat surface, and
-    /// a non-empty value is rejected at the boundary with the shared
-    /// no-audio error. `None` / empty is a complete no-op.
+    /// Streaming continuation over a complete conversation history.
     #[napi(
-        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, audio: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
+        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
     pub async fn chat_stream_session_continue(
         &self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        audio: Option<Vec<Uint8Array>>,
+        messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
-        reject_unsupported_audio(audio.as_deref())?;
+        reject_unsupported_audio_in_messages(&messages)?;
 
         let thread = self.thread.as_ref().ok_or_else(|| {
             Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
@@ -2534,8 +2348,7 @@ impl QianfanOCRModel {
             tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
 
         thread.send(QianfanOCRCmd::ChatStreamSessionContinue {
-            user_message,
-            images,
+            messages,
             config,
             stream_tx,
             cancelled: cancelled_inner,
@@ -2551,23 +2364,17 @@ impl QianfanOCRModel {
         Ok(ChatStreamHandle { cancelled })
     }
 
-    /// Streaming variant of `chatSessionContinueTool`.
-    ///
-    /// `is_error` mirrors the non-streaming entry point — when
-    /// `Some(true)`, the renderer prepends the shared
-    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<tool_response>` wrapper.
+    /// Streaming tool-result continuation over a complete history.
     #[napi(
-        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined"
+        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
     )]
     pub async fn chat_stream_session_continue_tool(
         &self,
-        tool_call_id: String,
-        content: String,
+        messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-        is_error: Option<bool>,
     ) -> Result<ChatStreamHandle> {
+        reject_unsupported_audio_in_messages(&messages)?;
         let thread = self.thread.as_ref().ok_or_else(|| {
             Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
         })?;
@@ -2580,9 +2387,7 @@ impl QianfanOCRModel {
             tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
 
         thread.send(QianfanOCRCmd::ChatStreamSessionContinueTool {
-            tool_call_id,
-            content,
-            is_error,
+            messages,
             config,
             stream_tx,
             cancelled: cancelled_inner,
@@ -2807,6 +2612,13 @@ fn load_qianfan_ocr_inner_from_dir(model_path: &str) -> Result<(QianfanOCRInner,
             tokenizer_path.display()
         )));
     };
+    if !tokenizer.has_chat_template() {
+        return Err(Error::from_reason(format!(
+            "Qianfan-OCR model at {} is missing a model-provided chat template; \
+             add chat_template.jinja or tokenizer_config.json.chat_template",
+            Path::new(model_path).display()
+        )));
+    }
 
     info!(
         "Qianfan-OCR model loaded: vision={} layers, LM={} layers, {} total weights",
@@ -2835,6 +2647,63 @@ fn load_qianfan_ocr_inner_from_dir(model_path: &str) -> Result<(QianfanOCRInner,
         cached_cache_offset: 0,
     };
     Ok((inner, weight_bytes))
+}
+
+/// Expand the abstract image markers emitted by the model's chat template.
+///
+/// Conversation structure and marker placement come from Jinja. This
+/// processor step only substitutes each marker with the visual-token span
+/// required by the checkpoint's image encoder.
+fn expand_qianfan_image_placeholders(
+    template_tokens: &[u32],
+    placeholder_tokens: &[u32],
+    num_patches_list: &[u32],
+    image_tokens_per_patch: usize,
+    image_start_id: u32,
+    image_context_id: u32,
+    image_end_id: u32,
+) -> Result<Vec<u32>> {
+    if placeholder_tokens.is_empty() {
+        return Err(Error::from_reason(
+            "Qianfan-OCR tokenizer encoded the template image marker to an empty sequence",
+        ));
+    }
+
+    let mut expanded = Vec::with_capacity(template_tokens.len());
+    let mut token_index = 0usize;
+    let mut image_index = 0usize;
+
+    while token_index < template_tokens.len() {
+        if template_tokens[token_index..].starts_with(placeholder_tokens) {
+            let patches = num_patches_list.get(image_index).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Qianfan-OCR chat template emitted more image markers than the {} supplied image(s)",
+                    num_patches_list.len()
+                ))
+            })?;
+            let context_tokens = (*patches as usize)
+                .checked_mul(image_tokens_per_patch)
+                .ok_or_else(|| Error::from_reason("Qianfan-OCR image token count overflow"))?;
+
+            expanded.push(image_start_id);
+            expanded.extend(std::iter::repeat_n(image_context_id, context_tokens));
+            expanded.push(image_end_id);
+            image_index += 1;
+            token_index += placeholder_tokens.len();
+        } else {
+            expanded.push(template_tokens[token_index]);
+            token_index += 1;
+        }
+    }
+
+    if image_index != num_patches_list.len() {
+        return Err(Error::from_reason(format!(
+            "Qianfan-OCR chat template emitted {image_index} image marker(s) for {} supplied image(s)",
+            num_patches_list.len()
+        )));
+    }
+
+    Ok(expanded)
 }
 
 /// Merge vision features into text embeddings at image placeholder positions.
@@ -2981,6 +2850,22 @@ mod tests {
     use crate::models::qianfan_ocr::config::QianfanOCRConfig;
 
     #[test]
+    fn image_expansion_preserves_template_placement() {
+        let expanded =
+            expand_qianfan_image_placeholders(&[7, 90, 91, 8], &[90, 91], &[2], 3, 10, 11, 12)
+                .unwrap();
+        assert_eq!(expanded, vec![7, 10, 11, 11, 11, 11, 11, 11, 12, 8]);
+    }
+
+    #[test]
+    fn image_expansion_rejects_template_image_count_mismatch() {
+        let err =
+            expand_qianfan_image_placeholders(&[7, 90, 91, 8], &[90, 91], &[1, 1], 2, 10, 11, 12)
+                .expect_err("one marker cannot represent two images");
+        assert!(err.reason.contains("emitted 1 image marker"));
+    }
+
+    #[test]
     fn test_config_defaults_work() {
         let config = QianfanOCRConfig::default();
         assert_eq!(config.model_type, "internvl_chat");
@@ -3001,6 +2886,7 @@ mod tests {
             text: "Hello".to_string(),
             tool_calls: vec![],
             thinking: None,
+            thinking_enabled: true,
             num_tokens: 1,
             prompt_tokens: 0,
             reasoning_tokens: 0,

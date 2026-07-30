@@ -40,6 +40,7 @@ function makeFinal(overrides: Partial<ChatStreamFinal> = {}): ChatStreamFinal {
     finishReason: 'stop',
     toolCalls: [],
     thinking: null,
+    thinkingEnabled: true,
     numTokens: 7,
     promptTokens: 100,
     reasoningTokens: 0,

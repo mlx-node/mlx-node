@@ -153,6 +153,11 @@ pub struct ChatResult {
     pub text: String,
     pub tool_calls: Vec<ToolCallResult>,
     pub thinking: Option<String>,
+    /// Effective `enable_thinking` boolean passed to the model-provided
+    /// chat template for this turn. This is replay provenance and is
+    /// intentionally distinct from the family's decode-time
+    /// [`ThinkingSetup`](crate::engine::ThinkingSetup).
+    pub thinking_enabled: bool,
     pub num_tokens: u32,
     pub prompt_tokens: u32,
     pub reasoning_tokens: u32,
@@ -180,6 +185,10 @@ pub struct ChatStreamChunk {
     pub finish_reason: Option<String>,
     pub tool_calls: Option<Vec<ToolCallResult>>,
     pub thinking: Option<String>,
+    /// Effective template `enable_thinking` value. Present on the terminal
+    /// chunk only; incremental text/reasoning chunks leave it unset.
+    #[napi(ts_type = "boolean | undefined")]
+    pub thinking_enabled: Option<bool>,
     pub num_tokens: Option<u32>,
     pub prompt_tokens: Option<u32>,
     pub reasoning_tokens: Option<u32>,

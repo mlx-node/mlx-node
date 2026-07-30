@@ -4472,7 +4472,7 @@ impl Qwen35Inner {
         let processed = img_proc.process_many(&image_refs)?;
         let per_image_token_counts =
             compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
-        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
+        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts)?;
         self.preflight_paged_context(expanded_tokens.len(), &mut p)?;
         let (image_cache_key, per_image_hashes) = engine::compute_image_cache_keys(images);
         let image_token_positions = engine::map_expanded_image_token_positions(
@@ -4840,7 +4840,7 @@ impl Qwen35Inner {
         let processed = img_proc.process_many(&image_refs)?;
         let per_image_token_counts =
             compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
-        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
+        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts)?;
         self.preflight_paged_context(expanded_tokens.len(), &mut p)?;
         let (image_cache_key, per_image_hashes) = engine::compute_image_cache_keys(images);
         let image_token_positions = engine::map_expanded_image_token_positions(
@@ -5011,6 +5011,7 @@ impl Qwen35Inner {
                             finish_reason: None,
                             tool_calls: None,
                             thinking: None,
+                            thinking_enabled: None,
                             num_tokens: None,
                             prompt_tokens: None,
                             reasoning_tokens: None,
@@ -5160,6 +5161,7 @@ impl Qwen35Inner {
                         finish_reason: None,
                         tool_calls: None,
                         thinking: None,
+                        thinking_enabled: None,
                         num_tokens: None,
                         prompt_tokens: None,
                         reasoning_tokens: None,
@@ -5205,6 +5207,7 @@ impl Qwen35Inner {
                 finish_reason: Some(result.finish_reason.clone()),
                 tool_calls: Some(result.tool_calls.clone()),
                 thinking: result.thinking.clone(),
+                thinking_enabled: Some(result.thinking_enabled),
                 num_tokens: Some(result.num_tokens),
                 prompt_tokens: Some(result.prompt_tokens),
                 reasoning_tokens: Some(result.reasoning_tokens),
@@ -5606,6 +5609,7 @@ impl Qwen35Inner {
                         finish_reason: None,
                         tool_calls: None,
                         thinking: None,
+                        thinking_enabled: None,
                         num_tokens: None,
                         prompt_tokens: None,
                         reasoning_tokens: None,
@@ -5694,6 +5698,7 @@ impl Qwen35Inner {
                 finish_reason: Some(result.finish_reason.clone()),
                 tool_calls: Some(result.tool_calls.clone()),
                 thinking: result.thinking.clone(),
+                thinking_enabled: Some(result.thinking_enabled),
                 num_tokens: Some(result.num_tokens),
                 prompt_tokens: Some(result.prompt_tokens),
                 reasoning_tokens: Some(result.reasoning_tokens),
@@ -6003,6 +6008,7 @@ impl Qwen35Inner {
                         finish_reason: None,
                         tool_calls: None,
                         thinking: None,
+                        thinking_enabled: None,
                         num_tokens: None,
                         prompt_tokens: None,
                         reasoning_tokens: None,
@@ -6405,6 +6411,7 @@ impl Qwen35Inner {
                         finish_reason: None,
                         tool_calls: None,
                         thinking: None,
+                        thinking_enabled: None,
                         num_tokens: None,
                         prompt_tokens: None,
                         reasoning_tokens: None,
@@ -6454,6 +6461,9 @@ impl Qwen35Inner {
                 finish_reason: Some(finish_reason),
                 tool_calls: Some(tool_calls),
                 thinking,
+                thinking_enabled: Some(
+                    crate::engine::resolve_enable_thinking(&config).unwrap_or(true),
+                ),
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
@@ -6924,6 +6934,7 @@ impl Qwen35Inner {
                         finish_reason: None,
                         tool_calls: None,
                         thinking: None,
+                        thinking_enabled: None,
                         num_tokens: None,
                         prompt_tokens: None,
                         reasoning_tokens: None,
@@ -6978,6 +6989,9 @@ impl Qwen35Inner {
                 finish_reason: Some(finish_reason),
                 tool_calls: Some(tool_calls),
                 thinking,
+                thinking_enabled: Some(
+                    crate::engine::resolve_enable_thinking(&config).unwrap_or(true),
+                ),
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
@@ -10507,8 +10521,7 @@ impl Qwen3_5Model {
     #[doc(hidden)]
     pub fn chat_stream_session_continue_for_test(
         &self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
+        messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
     ) -> Result<(
         ChatStreamHandle,
@@ -10521,9 +10534,7 @@ impl Qwen3_5Model {
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
         self.thread
             .send(Qwen35Cmd::Chat(ChatCmd::StreamSessionContinue {
-                user_message,
-                images,
-                audio: None,
+                messages,
                 config,
                 stream_tx,
                 cancelled: cancelled_inner,
@@ -10683,8 +10694,8 @@ crate::models::chat_napi::chat_napi_surface! {
     thread: direct,
     image_guard: none,
     ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
-    ts_stream_continue: "userMessage: string, images: Uint8Array[] | null | undefined, audio: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
-    ts_stream_continue_tool: "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined",
+    ts_stream_continue: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue_tool: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
 }
 
 /// Default prefill chunk size (tokens per chunk).
@@ -11236,17 +11247,22 @@ pub(crate) fn expanded_image_prompt_len(
         .iter()
         .filter(|&&token| token == IMAGE_TOKEN_ID as u32)
         .count();
-    if existing == 0 || existing == per_image_token_counts.len() {
+    if existing == per_image_token_counts.len() {
         return tokens
             .len()
             .checked_add(total)
             .and_then(|len| len.checked_sub(existing))
             .ok_or_else(|| Error::from_reason("expanded image prompt length overflow"));
     }
+    if existing == total {
+        return Ok(tokens.len());
+    }
 
-    // Already-expanded or malformed/unknown placeholder shapes are passed
-    // through unchanged by `inject_image_placeholders`.
-    Ok(tokens.len())
+    Err(image_placeholder_shape_error(
+        existing,
+        per_image_token_counts.len(),
+        total,
+    ))
 }
 
 /// CPU-only prompt planner shared by the dense and MoE NAPI wrappers.
@@ -11269,7 +11285,7 @@ pub(crate) fn plan_expanded_image_prompt_len(
 /// `IMAGE_TOKEN_ID` placeholders — one per vision patch, in the order
 /// produced by the chat template.
 ///
-/// Three input shapes are accepted:
+/// Two input shapes are accepted:
 ///
 /// 1. **Template emitted one `<|image_pad|>` per image** (the proper
 ///    Qwen VLM shape, produced by
@@ -11282,32 +11298,28 @@ pub(crate) fn plan_expanded_image_prompt_len(
 /// 2. **Template already emitted the fully expanded count** (non-Qwen
 ///    templates that inline the full patch run). Pass through unchanged.
 ///
-/// 3. **Template emitted zero placeholders** (non-VLM template, or a
-///    VLM template that silently drops vision markers). Splice the
-///    total count right after BOS as a last-resort fallback. Vision
-///    tokens land outside the user turn; this usually still produces
-///    sensible output for simple prompts but M-RoPE position IDs are
-///    suboptimal.
+///
+/// Missing or mismatched markers are rejected. The checkpoint's chat
+/// template owns marker placement; inserting a fallback run after BOS would
+/// move vision tokens outside the user turn and produce invalid M-RoPE
+/// positions.
 pub(crate) fn inject_image_placeholders(
     tokens: &[u32],
     per_image_token_counts: &[usize],
-) -> Vec<u32> {
-    let total: usize = per_image_token_counts.iter().sum();
+) -> Result<Vec<u32>> {
+    let total = per_image_token_counts
+        .iter()
+        .try_fold(0usize, |sum, count| {
+            sum.checked_add(*count)
+                .ok_or_else(|| Error::from_reason("expanded image prompt length overflow"))
+        })?;
     if total == 0 {
-        return tokens.to_vec();
+        return Ok(tokens.to_vec());
     }
     let existing = tokens
         .iter()
         .filter(|&&t| t == IMAGE_TOKEN_ID as u32)
         .count();
-
-    if existing == 0 {
-        // Case 3 — fallback splice after BOS.
-        let mut new_tokens = tokens.to_vec();
-        let placeholders: Vec<u32> = vec![IMAGE_TOKEN_ID as u32; total];
-        new_tokens.splice(1..1, placeholders);
-        return new_tokens;
-    }
 
     if existing == per_image_token_counts.len() {
         // Case 1 — one placeholder per image; expand each in place to
@@ -11322,21 +11334,45 @@ pub(crate) fn inject_image_placeholders(
                         new_tokens.extend(std::iter::repeat_n(IMAGE_TOKEN_ID as u32, count));
                     }
                     None => {
-                        // More placeholders than images — preserve as-is
-                        // and let `get_rope_index` surface the mismatch.
-                        new_tokens.push(t);
+                        unreachable!("placeholder count was validated before expansion");
                     }
                 }
             } else {
                 new_tokens.push(t);
             }
         }
-        return new_tokens;
+        return Ok(new_tokens);
     }
 
-    // Case 2 (existing == total) or unknown shape — return as-is.
-    // `get_rope_index` will surface any mismatch.
-    tokens.to_vec()
+    if existing == total {
+        // Case 2 — the checkpoint template already emitted one marker per
+        // vision patch.
+        return Ok(tokens.to_vec());
+    }
+
+    Err(image_placeholder_shape_error(
+        existing,
+        per_image_token_counts.len(),
+        total,
+    ))
+}
+
+fn image_placeholder_shape_error(
+    existing: usize,
+    image_count: usize,
+    expanded_count: usize,
+) -> Error {
+    if existing == 0 {
+        Error::from_reason(format!(
+            "model chat template emitted no image placeholder tokens for {image_count} image(s); \
+expected {image_count} unexpanded marker(s) or {expanded_count} already-expanded marker(s)"
+        ))
+    } else {
+        Error::from_reason(format!(
+            "model chat template emitted {existing} image placeholder token(s) for {image_count} \
+image(s); expected {image_count} unexpanded marker(s) or {expanded_count} already-expanded marker(s)"
+        ))
+    }
 }
 
 /// Compute M-RoPE position IDs for VLM
@@ -11454,14 +11490,11 @@ pub(crate) fn get_rope_index(
         //      per image and `inject_image_placeholders` expands each
         //      marker in place. Per-run length must match its grid.
         //
-        //  (b) 1 big run whose length equals the grids' total —
-        //      the fallback layout for chat templates that emit no
-        //      `<|image_pad|>` markers, where
-        //      `inject_image_placeholders` crams every image's tokens
-        //      into a single splice after BOS. No text gap sits between
-        //      images in this layout, so the position walk collapses
-        //      consecutive sub-runs into one contiguous span without
-        //      emitting any interior text.
+        //  (b) 1 big run whose length equals the grids' total — a
+        //      checkpoint template may emit the fully expanded markers
+        //      as one contiguous span. No text gap sits between images
+        //      in this layout, so the position walk collapses consecutive
+        //      sub-runs into one span without emitting interior text.
         //
         // We canonicalise both into a `per_image_offsets: Vec<(start,
         // grid_info)>` list of length `num_images` and feed it to the
@@ -11489,11 +11522,10 @@ pub(crate) fn get_rope_index(
                 .map(|((start, _), info)| (*start, info))
                 .collect()
         } else if image_runs.len() == 1 {
-            // Case (b): fallback splice — synthesise per-image start
-            // offsets by walking `image_token_info` lengths from the
-            // single run's start. Total was already validated against
-            // `total_expected_tokens` above, so this just distributes
-            // the shared span across the grids.
+            // Case (b): already-expanded contiguous span — synthesise
+            // per-image start offsets by walking `image_token_info`
+            // lengths from the single run's start. Total was already
+            // validated above.
             let big_start = image_runs[0].0;
             let mut offsets = Vec::with_capacity(num_images);
             let mut cursor = big_start;
@@ -12677,7 +12709,7 @@ mod image_placeholder_tests {
         // Expected: BOS, USER, <|image_pad|>×5, TEXT  (vision wrapper stays
         // INSIDE the user turn instead of getting spliced after BOS).
         let tokens = vec![BOS, USER, IMG, TEXT];
-        let out = inject_image_placeholders(&tokens, &[5]);
+        let out = inject_image_placeholders(&tokens, &[5]).unwrap();
         assert_eq!(out, vec![BOS, USER, IMG, IMG, IMG, IMG, IMG, TEXT]);
     }
 
@@ -12686,34 +12718,37 @@ mod image_placeholder_tests {
         // Two images with different grid sizes — each placeholder must be
         // replaced by its own image's count, not the other way around.
         let tokens = vec![BOS, IMG, TEXT, IMG];
-        let out = inject_image_placeholders(&tokens, &[2, 3]);
+        let out = inject_image_placeholders(&tokens, &[2, 3]).unwrap();
         assert_eq!(out, vec![BOS, IMG, IMG, TEXT, IMG, IMG, IMG]);
     }
 
     #[test]
     fn empty_counts_is_passthrough() {
         let tokens = vec![BOS, USER, TEXT];
-        let out = inject_image_placeholders(&tokens, &[]);
+        let out = inject_image_placeholders(&tokens, &[]).unwrap();
         assert_eq!(out, tokens);
     }
 
     #[test]
-    fn fallback_splices_total_after_bos_when_template_emitted_none() {
-        // Case 3: template didn't emit any placeholder. Fallback splice
-        // preserved for non-VLM templates / silent vision-dropping
-        // templates.
+    fn rejects_template_that_emits_no_image_markers() {
         let tokens = vec![BOS, USER, TEXT];
-        let out = inject_image_placeholders(&tokens, &[3]);
-        assert_eq!(out, vec![BOS, IMG, IMG, IMG, USER, TEXT]);
+        let error = inject_image_placeholders(&tokens, &[3]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("model chat template emitted no image placeholder tokens"),
+            "unexpected error: {error}",
+        );
+        assert!(expanded_image_prompt_len(&tokens, &[3]).is_err());
     }
 
     #[test]
     fn fully_expanded_input_passes_through_unchanged() {
         // Case 2: template already emitted the full 5-token run. `existing`
         // (5) != `per_image.len()` (1) so the "one-per-image" branch
-        // doesn't fire; total (5) matches so no fallback splice either.
+        // doesn't fire; total (5) matches, so the input is preserved.
         let tokens = vec![BOS, USER, IMG, IMG, IMG, IMG, IMG, TEXT];
-        let out = inject_image_placeholders(&tokens, &[5]);
+        let out = inject_image_placeholders(&tokens, &[5]).unwrap();
         assert_eq!(out, tokens);
     }
 
@@ -12722,8 +12757,24 @@ mod image_placeholder_tests {
         // Regression guard: every non-IMG token must survive in its
         // original relative order.
         let tokens = vec![BOS, USER, 10, 11, IMG, 12, 13];
-        let out = inject_image_placeholders(&tokens, &[4]);
+        let out = inject_image_placeholders(&tokens, &[4]).unwrap();
         assert_eq!(out, vec![BOS, USER, 10, 11, IMG, IMG, IMG, IMG, 12, 13]);
+    }
+
+    #[test]
+    fn rejects_mismatched_image_marker_count() {
+        let tokens = vec![BOS, IMG, IMG, TEXT];
+        let error = inject_image_placeholders(&tokens, &[3]).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("emitted 2 image placeholder token(s)"),
+            "unexpected error: {message}",
+        );
+        assert!(
+            message.contains("expected 1 unexpanded marker(s) or 3 already-expanded marker(s)"),
+            "unexpected error: {message}",
+        );
+        assert!(expanded_image_prompt_len(&tokens, &[3]).is_err());
     }
 
     #[test]
@@ -12732,15 +12783,13 @@ mod image_placeholder_tests {
             (vec![BOS, USER, IMG, TEXT], vec![5]),
             (vec![BOS, IMG, TEXT, IMG], vec![2, 3]),
             (vec![BOS, USER, TEXT], Vec::new()),
-            (vec![BOS, USER, TEXT], vec![3]),
             (vec![BOS, USER, IMG, IMG, IMG, IMG, IMG, TEXT], vec![5]),
-            // Unknown placeholder shape is deliberately passed through.
-            (vec![BOS, IMG, IMG, TEXT], vec![3]),
         ];
 
         for (tokens, counts) in cases {
             let planned = expanded_image_prompt_len(&tokens, &counts).expect("plan prompt length");
-            let expanded = inject_image_placeholders(&tokens, &counts);
+            let expanded =
+                inject_image_placeholders(&tokens, &counts).expect("expand image placeholders");
             assert_eq!(
                 planned,
                 expanded.len(),
@@ -13005,15 +13054,11 @@ mod rope_index_tests {
     }
 
     #[test]
-    fn multi_image_fallback_single_contiguous_run_is_accepted() {
-        // Fallback case (b): chat template emits zero `<|image_pad|>`
-        // markers and `inject_image_placeholders` crams every image's
-        // tokens into a single splice after BOS. For N images with
-        // distinct grids, the prompt carries ONE big contiguous run of
-        // `sum(per_image_counts)` image tokens. This is a legitimate
-        // fallback layout: the path synthesises per-image sub-run offsets
-        // from the shared span and emits correct M-RoPE positions for each
-        // image (rather than rejecting it as a "run layout mismatch").
+    fn multi_image_already_expanded_single_contiguous_run_is_accepted() {
+        // A checkpoint template may emit one fully expanded contiguous
+        // run whose length is `sum(per_image_counts)`. The path
+        // synthesises per-image sub-run offsets from the shared span and
+        // emits correct M-RoPE positions for each image.
         let _g = mlx_lock().lock().unwrap();
         // Two 1×2×2 grids → 4 image tokens each, 8 total.
         let mut tokens = vec![TEXT_A];
@@ -13021,7 +13066,7 @@ mod rope_index_tests {
         tokens.push(TEXT_B);
         let (ids, grid) = mk_inputs(&tokens, &[(1, 4, 4), (1, 4, 4)]);
         let (pos, _) = get_rope_index(&ids, grid.as_ref(), 2, IMG)
-            .expect("fallback single-run layout for two images must be accepted");
+            .expect("already-expanded single-run layout for two images must be accepted");
         let (t, _, _) = extract_positions(&pos);
         assert_eq!(t.len(), tokens.len(), "every token must have a position");
         // Leading text at 0.
@@ -13033,11 +13078,10 @@ mod rope_index_tests {
     }
 
     #[test]
-    fn multi_image_fallback_with_distinct_grids_preserves_per_image_offsets() {
-        // Same fallback shape but with DIFFERENT grid sizes per image —
-        // the synthesised sub-run offsets must distribute the shared
-        // span correctly (image[0] consumes its own count tokens,
-        // image[1] starts right after).
+    fn multi_image_already_expanded_distinct_grids_preserve_per_image_offsets() {
+        // Same already-expanded shape but with different grid sizes per
+        // image. The synthesised sub-run offsets must distribute the
+        // shared span correctly.
         let _g = mlx_lock().lock().unwrap();
         // image 0: 1×2×2 → 4 tokens. image 1: 1×4×4 → 16 tokens. Total 20.
         let mut tokens = vec![TEXT_A];
@@ -13045,7 +13089,7 @@ mod rope_index_tests {
         tokens.push(TEXT_B);
         let (ids, grid) = mk_inputs(&tokens, &[(1, 4, 4), (1, 8, 8)]);
         let (pos, _) = get_rope_index(&ids, grid.as_ref(), 2, IMG)
-            .expect("fallback layout with distinct per-image grids must succeed");
+            .expect("already-expanded layout with distinct per-image grids must succeed");
         let (t, _, _) = extract_positions(&pos);
         assert_eq!(t.len(), tokens.len());
         assert_eq!(t[0], 0);

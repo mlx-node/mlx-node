@@ -5,7 +5,6 @@
 //! and Qwen3 language model.
 
 pub mod bridge;
-pub mod chat;
 pub mod config;
 pub mod language;
 pub mod model;

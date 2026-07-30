@@ -19,11 +19,10 @@ import type { SessionCapableModel } from '@mlx-node/lm';
  * changes always require a fresh session start, which the high-level
  * `ChatSession` wrapper handles via its `lastImagesKey` check.
  *
- * Unlike the LM families, Qianfan-OCR does NOT record its model path
- * (`recordModelPath: false`) and therefore exposes no
- * `applyChatTemplate` — preserving its historical surface.
+ * Qianfan-OCR records its model path so `applyChatTemplate` uses the exact
+ * tokenizer/template asset required by native inference and token counting.
  */
-export class QianfanOCRModel extends makeStreamingModel(QianfanOCRModelNative, { recordModelPath: false }) {}
+export class QianfanOCRModel extends makeStreamingModel(QianfanOCRModelNative, { recordModelPath: true }) {}
 
 // -------------------------------------------------------------------
 // Compile-time conformance check

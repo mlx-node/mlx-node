@@ -291,6 +291,7 @@ impl DefaultStreamEmitter {
                 finish_reason: None,
                 tool_calls: None,
                 thinking: None,
+                thinking_enabled: None,
                 num_tokens: None,
                 prompt_tokens: None,
                 reasoning_tokens: None,
@@ -337,6 +338,7 @@ impl StreamEmitter for DefaultStreamEmitter {
             finish_reason: Some(result.finish_reason.clone()),
             tool_calls: Some(result.tool_calls.clone()),
             thinking: result.thinking.clone(),
+            thinking_enabled: Some(result.thinking_enabled),
             num_tokens: Some(result.num_tokens),
             prompt_tokens: Some(result.prompt_tokens),
             reasoning_tokens: Some(result.reasoning_tokens),
@@ -604,14 +606,12 @@ pub(crate) struct WholeTurnArgs<'a> {
 ///
 /// # Implementer checklist (new family)
 ///
-/// REQUIRED — no default body; a new family MUST implement all 13
+/// REQUIRED — no default body; a new family MUST implement all 11
 /// methods + the `Decode` associated type:
 ///   * `tokenizer` — cloned handle or "not loaded" error
 ///   * `family_name` — stable tag for profiler/errors (e.g. `"lfm2"`)
 ///   * `session_eos_id` — session stop-token id
 ///   * `thinking_setup` — resolve thinking-mode state from config
-///   * `render_continue_delta` — ChatML user continue-delta
-///   * `render_tool_delta` — tool-result delta
 ///   * `cached_token_history` — committed session history slice
 ///   * `reset_caches` — clear caches + session state (by `ResetScope`)
 ///   * `verify_cache_prefix` — all-or-nothing reusable-prefix length
@@ -732,13 +732,10 @@ pub(crate) trait ChatBackend {
     /// Render + tokenize the fresh-turn prompt from the request
     /// messages.
     ///
-    /// Default = the jinja chat-template path every ChatML family uses
+    /// Default = the checkpoint-provided Jinja chat-template path
     /// (`apply_chat_template_sync` with `add_generation_prompt = true`,
-    /// the request tools, and `resolve_enable_thinking`). Gemma4's
-    /// override adds its manual `<|turn>` wire-format fallback for
-    /// template-less checkpoints plus the
-    /// `enable_thinking=true`-without-template error; template-bearing
-    /// checkpoints take the same default path.
+    /// the request tools, and `resolve_enable_thinking`). Missing templates
+    /// fail closed; model wire formats are never reconstructed in Rust.
     fn render_prompt(
         &self,
         tok: &Qwen3Tokenizer,
@@ -751,71 +748,6 @@ pub(crate) trait ChatBackend {
             config.tools.as_deref(),
             resolve_enable_thinking(config),
         )
-    }
-
-    /// Render + tokenize the ChatML continue-delta for a session user
-    /// turn: sanitize via `Qwen3Tokenizer::sanitize_messages_public`,
-    /// render via
-    /// [`crate::engine::params::build_chatml_continue_delta_text`], then
-    /// `encode_sync` (LFM2 forces the no-`<think>` prefix variant;
-    /// Gemma4 renders its own turn format).
-    ///
-    /// The `config` parameter resolves the delta's `<think>\n` prefix
-    /// from `resolve_enable_thinking(&config)`. lfm2 ignores it (its
-    /// template never injects the prefix).
-    ///
-    /// Default body is the ChatML pipeline: sanitize the synthetic user
-    /// turn, render via
-    /// [`crate::engine::params::build_chatml_continue_delta_text`] with
-    /// the template-resolved thinking prefix, then `encode_sync` without
-    /// auto-prepending BOS. Families whose wire delta differs (gemma4
-    /// turn-format; lfm2's hardcoded no-`<think>` prefix) override.
-    fn render_continue_delta(
-        &self,
-        tok: &Qwen3Tokenizer,
-        user_message: &str,
-        config: &ChatConfig,
-    ) -> Result<Vec<u32>> {
-        let synthetic = crate::engine::params::build_synthetic_user_message(user_message);
-        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
-        let sanitized_user = &sanitized[0].content;
-        let enable_thinking = resolve_enable_thinking(config);
-        let delta_text = crate::engine::params::build_chatml_continue_delta_text(
-            sanitized_user,
-            enable_thinking,
-        );
-        tok.encode_sync(&delta_text, Some(false))
-    }
-
-    /// Render + tokenize the tool-result delta. ==
-    /// [`crate::engine::params::build_chatml_tool_delta_text`] +
-    /// `encode_sync` in `chat_session_continue_tool_sync` (LFM2 builds
-    /// its plain `<|im_start|>tool` block inline instead).
-    ///
-    /// The `config` parameter is used for the same
-    /// `resolve_enable_thinking` reason as
-    /// [`ChatBackend::render_continue_delta`].
-    ///
-    /// Default body is the ChatML tool-delta pipeline:
-    /// [`crate::engine::params::build_chatml_tool_delta_text`] +
-    /// `encode_sync`. lfm2 overrides with its plain (no-`<tool_response>`)
-    /// delta; gemma4 with its turn-format delta.
-    fn render_tool_delta(
-        &self,
-        tok: &Qwen3Tokenizer,
-        tool_call_id: &str,
-        content: &str,
-        is_error: Option<bool>,
-        config: &ChatConfig,
-    ) -> Result<Vec<u32>> {
-        let enable_thinking = resolve_enable_thinking(config);
-        let delta_text = crate::engine::params::build_chatml_tool_delta_text(
-            tool_call_id,
-            content,
-            enable_thinking,
-            is_error,
-        );
-        tok.encode_sync(&delta_text, Some(false))
     }
 
     /// The session's committed token history.

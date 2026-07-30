@@ -116,6 +116,7 @@ function makeChatResult(overrides: Partial<ChatResult> = {}): ChatResult {
   return {
     text: 'Hello!',
     toolCalls: [] as ToolCallResult[],
+    thinkingEnabled: true,
     numTokens: 10,
     promptTokens: 5,
     reasoningTokens: 0,
@@ -1040,6 +1041,7 @@ describe('handleCreateMessage', () => {
             finishReason: 'stop',
             toolCalls: [],
             thinking: null,
+            thinkingEnabled: true,
             numTokens: 1,
             promptTokens: 3,
             reasoningTokens: 0,

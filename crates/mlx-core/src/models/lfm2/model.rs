@@ -7,6 +7,7 @@ use tracing::info;
 
 use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
+use crate::engine::ThinkingPolicy;
 use crate::engine::backend::{
     ChatBackend, DecodeStep, PagedBackend, PagedPrefix, PagedTurnSetup, ResetScope, SaveStateArgs,
     TurnOutput, TurnSetup, WholeTurnArgs,
@@ -14,9 +15,6 @@ use crate::engine::backend::{
 use crate::engine::cmd::ChatCmd;
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::engine::types::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
-use crate::engine::{
-    ThinkingPolicy, build_chatml_continue_delta_text, build_synthetic_user_message,
-};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::profiling::PerformanceMetrics;
 use crate::stream::{Stream, StreamContext};
@@ -210,27 +208,6 @@ fn conv_state_reusable(
         && cached_prefix_len == cached_token_history.len()
         && plan.len() >= cached_prefix_len
         && plan[..cached_prefix_len] == cached_token_history[..]
-}
-
-/// Build the LFM2 wire-format delta text for a tool-result turn.
-///
-/// LFM2's chat template renders tool-role messages as plain
-/// `<|im_start|>tool\n{content}<|im_end|>` blocks — no
-/// `<tool_response>` wrapping (unlike Qwen3.5). Leading `\n` closes
-/// the cached `<|im_end|>` line, then we open the `tool` turn, close
-/// it, and open an assistant turn ready for generation. No
-/// `<think>\n` prefix because LFM2's template never injects one.
-///
-/// `is_error` is the structured tool-error signal. When `Some(true)`,
-/// the shared [`crate::tokenizer::TOOL_ERROR_MARKER`] is prepended to
-/// `content` via [`crate::tokenizer::apply_tool_error_marker`]; `None`
-/// / `Some(false)` leave the wire bytes free of any marker.
-///
-/// Lifted into a free function so the wire-format choice can be pinned
-/// by pure-string unit tests that don't need a loaded LFM2 model.
-pub(crate) fn build_lfm2_tool_delta_text(content: &str, is_error: Option<bool>) -> String {
-    let rendered_content = crate::tokenizer::apply_tool_error_marker(content, is_error);
-    format!("\n<|im_start|>tool\n{rendered_content}<|im_end|>\n<|im_start|>assistant\n")
 }
 
 /// Paged decode stepper for lfm2 / lfm2_moe (the paged analog of the FLAT
@@ -936,43 +913,6 @@ impl ChatBackend for Lfm2Inner {
     // `resolve_enable_thinking`) is correct for lfm2 (its template itself
     // ignores `enable_thinking`).
 
-    fn render_continue_delta(
-        &self,
-        tok: &Qwen3Tokenizer,
-        user_message: &str,
-        _config: &ChatConfig,
-    ) -> Result<Vec<u32>> {
-        // Sanitize the delta with the same role/content injection
-        // protection the fresh-prompt path applies.
-        let synthetic = build_synthetic_user_message(user_message);
-        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
-        let sanitized_user = &sanitized[0].content;
-
-        // LFM2's chat template does NOT inject `<think>\n` after the
-        // assistant opener — the model emits `<think>` tags on its own
-        // when reasoning. Always suppress the prefix by passing
-        // `Some(false)` to the shared builder so the delta stays
-        // template-equivalent with the LFM2 jinja output (`config` is
-        // deliberately ignored — it only matters for qwen3.5).
-        let delta_text = build_chatml_continue_delta_text(sanitized_user, Some(false));
-        tok.encode_sync(&delta_text, Some(false))
-    }
-
-    fn render_tool_delta(
-        &self,
-        tok: &Qwen3Tokenizer,
-        _tool_call_id: &str,
-        content: &str,
-        is_error: Option<bool>,
-        _config: &ChatConfig,
-    ) -> Result<Vec<u32>> {
-        // LFM2-specific plain tool delta — no `<tool_response>` wrapper,
-        // `tool_call_id` dropped (LFM2's template identifies tool
-        // responses positionally). See [`build_lfm2_tool_delta_text`].
-        let delta_text = build_lfm2_tool_delta_text(content, is_error);
-        tok.encode_sync(&delta_text, Some(false))
-    }
-
     fn cached_token_history(&self) -> &[u32] {
         &self.cached_token_history
     }
@@ -1677,8 +1617,7 @@ impl Lfm2Model {
     #[doc(hidden)]
     pub fn chat_stream_session_continue_for_test(
         &self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
+        messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
     ) -> Result<(
         ChatStreamHandle,
@@ -1690,9 +1629,7 @@ impl Lfm2Model {
         let (stream_tx, stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
         self.thread.send(ChatCmd::StreamSessionContinue {
-            user_message,
-            images,
-            audio: None,
+            messages,
             config,
             stream_tx,
             cancelled: cancelled_inner,
@@ -1759,8 +1696,8 @@ crate::models::chat_napi::chat_napi_surface! {
     thread: direct,
     image_guard: text_only,
     ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
-    ts_stream_continue: "userMessage: string, images: Uint8Array[] | null | undefined, audio: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
-    ts_stream_continue_tool: "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined",
+    ts_stream_continue: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue_tool: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
 }
 
 #[cfg(test)]
@@ -1966,83 +1903,6 @@ mod conv_state_reuse_tests {
             &history_after_turn2,
             history_after_turn2.len()
         ));
-    }
-}
-
-#[cfg(test)]
-mod tool_delta_marker_tests {
-    //! Guard the structured `is_error` channel on LFM2's tool-result
-    //! wire format. The shared
-    //! [`crate::tokenizer::TOOL_ERROR_MARKER`] must be injected inside
-    //! the `<|im_start|>tool` block only when the caller passes
-    //! `Some(true)`. `None` and `Some(false)` keep the output
-    //! byte-equal to the pre-feature behavior — guarding both the hot
-    //! (successful) path and the explicit-false path against
-    //! accidental drift.
-
-    use super::build_lfm2_tool_delta_text;
-    use crate::tokenizer::TOOL_ERROR_MARKER;
-
-    #[test]
-    fn injects_marker_when_is_error_true() {
-        let payload = "boom: connection refused";
-        let rendered = build_lfm2_tool_delta_text(payload, Some(true));
-        let expected_inner = format!("{TOOL_ERROR_MARKER}{payload}");
-        assert!(
-            rendered.contains(&expected_inner),
-            "expected error marker inside <|im_start|>tool block; got:\n{rendered}",
-        );
-        // Wrapper integrity stays correct on the marked path so we
-        // don't ship a malformed delta that only the unflagged path
-        // renders right.
-        assert!(
-            rendered.contains("<|im_start|>tool\n"),
-            "tool block opener missing"
-        );
-        assert!(rendered.contains("<|im_end|>"), "im_end closer missing");
-        assert!(
-            rendered.contains("<|im_start|>assistant\n"),
-            "assistant opener missing"
-        );
-    }
-
-    #[test]
-    fn skips_marker_when_is_error_none() {
-        let payload = "{\"temperature\": 72}";
-        let rendered = build_lfm2_tool_delta_text(payload, None);
-        assert!(
-            !rendered.contains(TOOL_ERROR_MARKER),
-            "marker leaked into unflagged delta:\n{rendered}",
-        );
-        assert!(
-            rendered.contains(payload),
-            "original content missing from delta:\n{rendered}",
-        );
-    }
-
-    #[test]
-    fn skips_marker_when_is_error_some_false() {
-        let payload = "ok";
-        let rendered = build_lfm2_tool_delta_text(payload, Some(false));
-        assert!(
-            !rendered.contains(TOOL_ERROR_MARKER),
-            "marker leaked into Some(false) delta:\n{rendered}",
-        );
-    }
-
-    #[test]
-    fn does_not_remark_content_that_resembles_marker() {
-        // The structured channel removes the collision concern: a
-        // successful tool result whose literal content begins with the
-        // marker text must NOT double-prefix the marker on its way
-        // through the renderer.
-        let suspicious = format!("{TOOL_ERROR_MARKER}this is a successful payload");
-        let rendered = build_lfm2_tool_delta_text(&suspicious, None);
-        let occurrences = rendered.matches(TOOL_ERROR_MARKER).count();
-        assert_eq!(
-            occurrences, 1,
-            "marker count should be 1 (the original literal); got {occurrences} in:\n{rendered}",
-        );
     }
 }
 

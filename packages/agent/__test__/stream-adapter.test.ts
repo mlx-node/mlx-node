@@ -55,6 +55,7 @@ function finalEvent(overrides: Partial<ChatStreamFinal> = {}): ChatStreamFinal {
     finishReason: 'stop',
     toolCalls: [],
     thinking: null,
+    thinkingEnabled: true,
     numTokens: 4,
     promptTokens: 20,
     reasoningTokens: 0,

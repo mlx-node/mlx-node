@@ -23,7 +23,7 @@ use crate::sampling::{
     sample, sample_and_logprobs,
 };
 use crate::stream::{DeviceType, Stream, StreamContext};
-use crate::tokenizer::Qwen3Tokenizer;
+use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 use crate::utils::safetensors::SafeTensorsFile;
 use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
 use napi::{Env, Status, bindgen_prelude::*};
@@ -74,6 +74,127 @@ pub(crate) enum VLModelCmd {
 pub(crate) struct SendableVLMBatchItem {
     pub messages: Vec<VLMChatMessage>,
     pub images: Option<Vec<Vec<u8>>>,
+}
+
+fn template_messages(messages: &[VLMChatMessage], image_count: usize) -> Result<Vec<ChatMessage>> {
+    let first_user = messages
+        .iter()
+        .position(|message| message.role == ChatRole::User);
+    if image_count > 0 && first_user.is_none() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "PaddleOCR-VL images require at least one user message",
+        ));
+    }
+
+    Ok(messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| ChatMessage {
+            role: match &message.role {
+                ChatRole::User => "user",
+                ChatRole::Assistant => "assistant",
+                ChatRole::System => "system",
+                ChatRole::Tool => "tool",
+            }
+            .to_string(),
+            content: message.content.clone(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: (Some(index) == first_user && image_count > 0).then(|| {
+                (0..image_count)
+                    .map(|_| Uint8Array::new(Vec::new()))
+                    .collect()
+            }),
+            audio: None,
+        })
+        .collect())
+}
+
+fn image_token_counts(grid_thw: Option<&MxArray>, spatial_merge_size: i32) -> Result<Vec<usize>> {
+    let Some(grid) = grid_thw else {
+        return Ok(Vec::new());
+    };
+    grid.eval();
+    let grid_data = grid.to_int32()?;
+    if grid_data.len() % 3 != 0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "PaddleOCR-VL image grid must contain triples, got {} value(s)",
+                grid_data.len()
+            ),
+        ));
+    }
+    let merge_factor = spatial_merge_size
+        .checked_mul(spatial_merge_size)
+        .filter(|factor| *factor > 0)
+        .ok_or_else(|| Error::new(Status::InvalidArg, "invalid spatial_merge_size"))?;
+
+    grid_data
+        .chunks_exact(3)
+        .map(|grid| {
+            let tokens = grid[0]
+                .checked_mul(grid[1])
+                .and_then(|value| value.checked_mul(grid[2]))
+                .and_then(|value| value.checked_div(merge_factor))
+                .ok_or_else(|| Error::new(Status::InvalidArg, "invalid PaddleOCR-VL image grid"))?;
+            usize::try_from(tokens).map_err(|_| {
+                Error::new(
+                    Status::InvalidArg,
+                    "PaddleOCR-VL image grid produced a negative token count",
+                )
+            })
+        })
+        .collect()
+}
+
+/// Expand one template-emitted image token per image into the visual sequence
+/// length produced by the image processor. The template remains authoritative
+/// for placement and surrounding framing.
+fn expand_paddle_image_tokens(
+    template_tokens: &[u32],
+    per_image_token_counts: &[usize],
+    image_token_id: u32,
+) -> Result<Vec<u32>> {
+    let mut image_index = 0usize;
+    let extra = per_image_token_counts
+        .iter()
+        .map(|count| count.saturating_sub(1))
+        .sum::<usize>();
+    let mut expanded = Vec::with_capacity(template_tokens.len().saturating_add(extra));
+
+    for &token in template_tokens {
+        if token == image_token_id {
+            let count = per_image_token_counts.get(image_index).ok_or_else(|| {
+                Error::new(
+                    Status::InvalidArg,
+                    format!(
+                        "PaddleOCR-VL chat template emitted more image markers than the {} supplied image(s)",
+                        per_image_token_counts.len()
+                    ),
+                )
+            })?;
+            expanded.extend(std::iter::repeat_n(image_token_id, *count));
+            image_index += 1;
+        } else {
+            expanded.push(token);
+        }
+    }
+
+    if image_index != per_image_token_counts.len() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "PaddleOCR-VL chat template emitted {image_index} image marker(s) for {} supplied image(s)",
+                per_image_token_counts.len()
+            ),
+        ));
+    }
+    Ok(expanded)
 }
 
 // ---------------------------------------------------------------------------
@@ -143,9 +264,16 @@ impl VLModelInner {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::GenericFailure,
-                "Tokenizer not set. Use set_tokenizer() first.",
+                "PaddleOCR-VL requires tokenizer.json and a model-provided chat template",
             )
         })?;
+        if !tokenizer.has_chat_template() {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "PaddleOCR-VL requires a model-provided chat template in \
+                 tokenizer_config.json or chat_template.jinja; no template was found",
+            ));
+        }
 
         // Merge passed config with defaults
         let default_config = VLMChatConfig::default();
@@ -204,30 +332,16 @@ impl VLModelInner {
             (None, None)
         };
 
-        // Count image tokens
-        let num_image_tokens = if let Some(ref grid) = grid_thw {
-            grid.eval();
-            let grid_data = grid.to_int32()?;
-            let spatial_merge_size = vision_config.spatial_merge_size;
-            let merge_factor = spatial_merge_size * spatial_merge_size;
-            let mut total = 0i32;
-            for i in 0..(grid_data.len() / 3) {
-                let t = grid_data[i * 3];
-                let h = grid_data[i * 3 + 1];
-                let w = grid_data[i * 3 + 2];
-                total += (t * h * w) / merge_factor;
-            }
-            Some(total as usize)
-        } else {
-            None
-        };
-
-        // Format messages with image placeholders
-        let formatted =
-            crate::models::paddleocr_vl::chat::format_vlm_chat(&messages, num_image_tokens);
-
-        // Encode the text
-        let token_ids = tokenizer.encode_sync(&formatted, None)?;
+        let per_image_token_counts =
+            image_token_counts(grid_thw.as_ref(), vision_config.spatial_merge_size)?;
+        let template_messages = template_messages(&messages, per_image_token_counts.len())?;
+        let template_tokens =
+            tokenizer.apply_chat_template_sync(&template_messages, Some(true), None, None)?;
+        let token_ids = expand_paddle_image_tokens(
+            &template_tokens,
+            &per_image_token_counts,
+            self.config.image_token_id as u32,
+        )?;
         let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
 
         // Build generation config
@@ -264,7 +378,7 @@ impl VLModelInner {
         result.tokens.eval();
         let tokens_vec = result.tokens.to_uint32()?;
         let text = tokenizer.decode_sync(&tokens_vec, true)?;
-        let text = text.replace("<|im_end|>", "").trim().to_string();
+        let text = text.trim().to_string();
 
         Ok(VLMChatResult {
             text,
@@ -641,9 +755,16 @@ impl VLModelInner {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
                 Status::GenericFailure,
-                "Tokenizer not set. Use set_tokenizer() first.",
+                "PaddleOCR-VL requires tokenizer.json and a model-provided chat template",
             )
         })?;
+        if !tokenizer.has_chat_template() {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "PaddleOCR-VL requires a model-provided chat template in \
+                 tokenizer_config.json or chat_template.jinja; no template was found",
+            ));
+        }
 
         if batch.is_empty() {
             return Ok(Vec::new());
@@ -740,28 +861,20 @@ impl VLModelInner {
                 (None, None)
             };
 
-            let num_image_tokens = if let Some(ref grid) = grid_thw {
-                grid.eval();
-                let grid_data = grid.to_int32()?;
-                let spatial_merge_size = model_config.vision_config.spatial_merge_size;
-                let merge_factor = spatial_merge_size * spatial_merge_size;
-                let mut total = 0i32;
-                for i in 0..(grid_data.len() / 3) {
-                    let t = grid_data[i * 3];
-                    let h = grid_data[i * 3 + 1];
-                    let w = grid_data[i * 3 + 2];
-                    total += (t * h * w) / merge_factor;
-                }
-                Some(total as usize)
-            } else {
-                None
-            };
-
-            let formatted = crate::models::paddleocr_vl::chat::format_vlm_chat(
-                &item.messages,
-                num_image_tokens,
+            let per_image_token_counts = image_token_counts(
+                grid_thw.as_ref(),
+                model_config.vision_config.spatial_merge_size,
+            )?;
+            let template_messages =
+                template_messages(&item.messages, per_image_token_counts.len())?;
+            let template_tokens =
+                tokenizer.apply_chat_template_sync(&template_messages, Some(true), None, None)?;
+            let token_ids = expand_paddle_image_tokens(
+                &template_tokens,
+                &per_image_token_counts,
+                model_config.image_token_id as u32,
             );
-            let token_ids = tokenizer.encode_sync(&formatted, None)?;
+            let token_ids = token_ids?;
             let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
 
             all_input_ids.push(input_ids);
@@ -783,7 +896,7 @@ impl VLModelInner {
             result.tokens.eval();
             let tokens_vec = result.tokens.to_uint32()?;
             let text = tokenizer.decode_sync(&tokens_vec, true)?;
-            let text = text.replace("<|im_end|>", "").trim().to_string();
+            let text = text.trim().to_string();
 
             chat_results.push(VLMChatResult {
                 text,
@@ -2167,20 +2280,28 @@ fn build_vlmodel_inner_from_weights(
                 Some(Arc::new(tokenizer))
             }
             Err(e) => {
-                info!(
-                    "    Could not load tokenizer: {}. Use setTokenizer() to set manually.",
-                    e
-                );
-                None
+                return Err(Error::from_reason(format!(
+                    "Failed to load PaddleOCR-VL tokenizer from {}: {e}",
+                    tokenizer_path.display()
+                )));
             }
         }
     } else {
-        info!(
-            "    No tokenizer.json found at {:?}. Use setTokenizer() to set manually.",
-            tokenizer_path
-        );
-        None
+        return Err(Error::from_reason(format!(
+            "PaddleOCR-VL tokenizer not found: {}",
+            tokenizer_path.display()
+        )));
     };
+    if !tokenizer
+        .as_ref()
+        .is_some_and(|tokenizer| tokenizer.has_chat_template())
+    {
+        return Err(Error::from_reason(format!(
+            "PaddleOCR-VL model at {} is missing a model-provided chat template; \
+             add chat_template.jinja or tokenizer_config.json.chat_template",
+            Path::new(model_path).display()
+        )));
+    }
 
     info!("PaddleOCR-VL model built successfully");
     info!("   Vision: {} layers loaded", vision_model.num_layers());
@@ -2197,6 +2318,46 @@ fn build_vlmodel_inner_from_weights(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn template_messages_attach_images_to_first_user() {
+        let messages = vec![
+            VLMChatMessage {
+                role: ChatRole::System,
+                content: "system".to_string(),
+            },
+            VLMChatMessage {
+                role: ChatRole::User,
+                content: "read".to_string(),
+            },
+        ];
+        let converted = template_messages(&messages, 2).unwrap();
+        assert!(converted[0].images.is_none());
+        assert_eq!(converted[1].images.as_ref().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn template_messages_reject_images_without_user_turn() {
+        let messages = vec![VLMChatMessage {
+            role: ChatRole::System,
+            content: "system".to_string(),
+        }];
+        let err = template_messages(&messages, 1).expect_err("images need a user turn");
+        assert!(err.reason.contains("at least one user message"));
+    }
+
+    #[test]
+    fn image_expansion_uses_template_marker_positions() {
+        let expanded = expand_paddle_image_tokens(&[1, 42, 2, 42, 3], &[2, 3], 42).unwrap();
+        assert_eq!(expanded, vec![1, 42, 42, 2, 42, 42, 42, 3]);
+    }
+
+    #[test]
+    fn image_expansion_rejects_marker_count_mismatch() {
+        let err = expand_paddle_image_tokens(&[1, 42, 2], &[2, 3], 42)
+            .expect_err("one marker cannot represent two images");
+        assert!(err.reason.contains("emitted 1 image marker"));
+    }
 
     #[test]
     fn test_model_creation() {

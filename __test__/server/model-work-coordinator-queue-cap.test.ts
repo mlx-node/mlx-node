@@ -25,6 +25,7 @@ function makeChatResult(overrides: Partial<ChatResult> = {}): ChatResult {
   return {
     text: 'ok',
     toolCalls: [],
+    thinkingEnabled: true,
     numTokens: 1,
     promptTokens: 1,
     reasoningTokens: 0,

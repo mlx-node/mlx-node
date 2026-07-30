@@ -12,6 +12,7 @@
 
 import { loadModel, Qwen3Model, createToolDefinition } from '@mlx-node/lm';
 import type { ToolCallResult } from '@mlx-node/lm';
+import type { ChatMessage } from '@mlx-node/core';
 import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
 
 import { createTempModel, TINY_TEST_CONFIG } from '../test-model-utils';
@@ -86,9 +87,19 @@ describe.sequential('Qwen3 Chat Session API', () => {
       expect(first.numTokens).toBeGreaterThan(0);
 
       // Turn 2: continue with the same session
-      const second = await model.chatSessionContinue('Follow-up question', null, null, {
-        maxNewTokens: 10,
-      });
+      const second = await model.chatSessionContinue(
+        [
+          { role: 'user', content: 'Hi' },
+          {
+            role: 'assistant',
+            content: first.text,
+            reasoningContent: first.thinking,
+            thinkingEnabled: first.thinkingEnabled,
+          },
+          { role: 'user', content: 'Follow-up question' },
+        ],
+        { maxNewTokens: 10 },
+      );
       expect(second).toBeDefined();
       expect(second.numTokens).toBeGreaterThan(0);
       // Prompt tokens for the continue must be at least as large as the
@@ -101,14 +112,14 @@ describe.sequential('Qwen3 Chat Session API', () => {
       await model.chatSessionStart([{ role: 'user', content: 'Hi' }], { maxNewTokens: 5 });
 
       const fakeImage = new Uint8Array([0, 1, 2, 3]);
-      await expect(model.chatSessionContinue('Caption this', [fakeImage], null)).rejects.toThrow(
-        /IMAGE_CHANGE_REQUIRES_SESSION_RESTART/,
-      );
+      await expect(
+        model.chatSessionContinue([{ role: 'user', content: 'Caption this', images: [fakeImage] }]),
+      ).rejects.toThrow(/IMAGE_CHANGE_REQUIRES_SESSION_RESTART/);
     });
 
     it('should error when chatSessionContinue is called without an active session', async () => {
       model.resetCaches();
-      await expect(model.chatSessionContinue('No session first', null, null)).rejects.toThrow();
+      await expect(model.chatSessionContinue([{ role: 'user', content: 'No session first' }])).rejects.toThrow();
     });
   });
 
@@ -285,12 +296,17 @@ describe.sequential('Qwen3 Chat Session API', () => {
       // Round-trip a tool-result delta. The content does not need to match
       // a real tool schema — we only care that the cache hoist-and-save-back
       // path completes cleanly.
-      const r2 = await model.chatSessionContinueTool(
-        'call_test_123',
-        '{"result": 42}',
-        { maxNewTokens: 16, temperature: 0 },
-        null,
-      );
+      const toolHistory: ChatMessage[] = [
+        { role: 'user', content: 'call a tool' },
+        {
+          role: 'assistant',
+          content: r1.text,
+          reasoningContent: r1.thinking,
+          thinkingEnabled: r1.thinkingEnabled,
+        },
+        { role: 'tool', toolCallId: 'call_test_123', content: '{"result": 42}' },
+      ];
+      const r2 = await model.chatSessionContinueTool(toolHistory, { maxNewTokens: 16, temperature: 0 });
       expect(r2).toBeDefined();
       expect(r2.numTokens).toBeGreaterThan(0);
       expect(typeof r2.rawText).toBe('string');
@@ -298,10 +314,19 @@ describe.sequential('Qwen3 Chat Session API', () => {
 
       // After the tool result, the next user continue should still work —
       // proves the cache is consistent across delta turns.
-      const r3 = await model.chatSessionContinue('ok, thanks', null, null, {
-        maxNewTokens: 16,
-        temperature: 0,
-      });
+      const r3 = await model.chatSessionContinue(
+        [
+          ...toolHistory,
+          {
+            role: 'assistant',
+            content: r2.text,
+            reasoningContent: r2.thinking,
+            thinkingEnabled: r2.thinkingEnabled,
+          },
+          { role: 'user', content: 'ok, thanks' },
+        ],
+        { maxNewTokens: 16, temperature: 0 },
+      );
       expect(r3).toBeDefined();
       expect(r3.numTokens).toBeGreaterThan(0);
     });

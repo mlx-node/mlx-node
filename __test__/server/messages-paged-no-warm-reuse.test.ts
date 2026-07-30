@@ -106,6 +106,7 @@ function makeChatResult(overrides: Partial<ChatResult> = {}): ChatResult {
   return {
     text: 'Hello!',
     toolCalls: [] as ToolCallResult[],
+    thinkingEnabled: true,
     numTokens: 10,
     promptTokens: 5,
     reasoningTokens: 0,

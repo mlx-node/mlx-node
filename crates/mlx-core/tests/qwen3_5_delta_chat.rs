@@ -21,9 +21,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use mlx_core::engine::types::ChatConfig;
+use mlx_core::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use mlx_core::models::qwen3_5::model::Qwen3_5Model;
-use mlx_core::tokenizer::ChatMessage;
+use mlx_core::tokenizer::{ChatMessage, ToolCall};
 
 /// Clone `src` into a fresh `target/`-rooted dir with the weight files
 /// symlinked and `config.json` patched to `use_block_paged_cache=false`,
@@ -132,6 +132,95 @@ fn user_message(content: &str) -> ChatMessage {
     }
 }
 
+#[derive(Clone)]
+struct AssistantTurn {
+    text: String,
+    tool_calls: Option<Vec<ToolCall>>,
+    thinking: Option<String>,
+    thinking_enabled: bool,
+}
+
+fn replay_tool_calls(tool_calls: &[mlx_core::tools::ToolCallResult]) -> Option<Vec<ToolCall>> {
+    (!tool_calls.is_empty()).then(|| {
+        tool_calls
+            .iter()
+            .map(|call| ToolCall {
+                id: Some(call.id.clone()),
+                name: call.name.clone(),
+                arguments: call.arguments.to_string(),
+            })
+            .collect()
+    })
+}
+
+fn assistant_turn_from_result(result: &ChatResult) -> AssistantTurn {
+    AssistantTurn {
+        text: result.text.clone(),
+        tool_calls: replay_tool_calls(&result.tool_calls),
+        thinking: result.thinking.clone(),
+        thinking_enabled: result.thinking_enabled,
+    }
+}
+
+fn assistant_turn_from_chunk(chunk: &ChatStreamChunk) -> AssistantTurn {
+    assert!(chunk.done, "assistant replay requires a terminal chunk");
+    AssistantTurn {
+        text: chunk.text.clone(),
+        tool_calls: replay_tool_calls(chunk.tool_calls.as_deref().unwrap_or_default()),
+        thinking: chunk.thinking.clone(),
+        thinking_enabled: chunk
+            .thinking_enabled
+            .expect("terminal stream chunk missing thinking_enabled provenance"),
+    }
+}
+
+fn assistant_message(turn: &AssistantTurn) -> ChatMessage {
+    ChatMessage {
+        role: "assistant".to_string(),
+        content: turn.text.clone(),
+        tool_calls: turn.tool_calls.clone(),
+        tool_call_id: None,
+        is_error: None,
+        reasoning_content: turn.thinking.clone(),
+        thinking_enabled: Some(turn.thinking_enabled),
+        images: None,
+        audio: None,
+    }
+}
+
+fn transcript_with_next_user(
+    user_turns: &[String],
+    assistant_turns: &[AssistantTurn],
+    next_user: &str,
+) -> Vec<ChatMessage> {
+    assert_eq!(
+        user_turns.len(),
+        assistant_turns.len(),
+        "every historical user turn must have an assistant reply",
+    );
+    let mut messages = Vec::with_capacity(user_turns.len() * 2 + 1);
+    for (user, assistant) in user_turns.iter().zip(assistant_turns) {
+        messages.push(user_message(user));
+        messages.push(assistant_message(assistant));
+    }
+    messages.push(user_message(next_user));
+    messages
+}
+
+fn tool_message(tool_call_id: &str, content: &str, is_error: Option<bool>) -> ChatMessage {
+    ChatMessage {
+        role: "tool".to_string(),
+        content: content.to_string(),
+        tool_calls: None,
+        tool_call_id: Some(tool_call_id.to_string()),
+        is_error,
+        reasoning_content: None,
+        thinking_enabled: None,
+        images: None,
+        audio: None,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3.5 Dense checkpoint"]
 async fn session_path_keeps_ttft_flat_across_turns() {
@@ -192,22 +281,26 @@ async fn session_path_keeps_ttft_flat_across_turns() {
 
     // --- Turns 2..=4: chat_session_continue (delta path) ---
     //
-    // The session state is owned entirely by the model thread — the
-    // caller just passes plain user strings. `chat_session_continue_sync`
-    // builds the ChatML delta, tokenizes it, and prefills on top of the
-    // live caches. No template rendering, no prefix matching.
+    // The caller replays the complete structured history. The model-provided
+    // template renders it, and the session engine reuses the exact cached token
+    // prefix while prefilling only the newly rendered suffix.
     let user_followups = [
         "And in another word?",
         "Any synonym?",
         "One more, different?",
     ];
     let mut snapshots: Vec<TurnSnapshot> = vec![turn1.clone()];
+    let mut user_turns = vec!["Say hi in one short word.".to_string()];
+    let mut assistant_turns = vec![assistant_turn_from_result(&r1)];
 
     for (idx, next_user) in user_followups.iter().enumerate() {
         let turn_idx = idx + 2;
         let cfg = chat_config_default(64);
         let result = model
-            .chat_session_continue((*next_user).to_string(), None, None, Some(cfg))
+            .chat_session_continue(
+                transcript_with_next_user(&user_turns, &assistant_turns, next_user),
+                Some(cfg),
+            )
             .await
             .expect("delta chat failed");
         let ttft = result
@@ -231,6 +324,8 @@ async fn session_path_keeps_ttft_flat_across_turns() {
             "unexpected finish_reason: {}",
             result.finish_reason
         );
+        user_turns.push((*next_user).to_string());
+        assistant_turns.push(assistant_turn_from_result(&result));
     }
 
     // --- Structural assertions ---------------------------------------
@@ -436,12 +531,17 @@ async fn stream_session_path_keeps_ttft_flat_across_turns() {
         "One more, different?",
     ];
     let mut snapshots: Vec<TurnSnapshot> = vec![turn1.clone()];
+    let mut user_turns = vec!["Say hi in one short word.".to_string()];
+    let mut assistant_turns = vec![assistant_turn_from_chunk(final1)];
 
     for (idx, next_user) in user_followups.iter().enumerate() {
         let turn_idx = idx + 2;
         let cfg = chat_config_default(64);
         let (_handle, rx) = model
-            .chat_stream_session_continue_for_test((*next_user).to_string(), None, Some(cfg))
+            .chat_stream_session_continue_for_test(
+                transcript_with_next_user(&user_turns, &assistant_turns, next_user),
+                Some(cfg),
+            )
             .expect("delta stream dispatch failed");
         let (chunks, ttft, done) = drain_stream_turn(rx).await;
         assert!(done, "turn {turn_idx} stream didn't reach done=true");
@@ -467,6 +567,8 @@ async fn stream_session_path_keeps_ttft_flat_across_turns() {
             ttft_ms: ttft,
             prompt_tokens: last.prompt_tokens.unwrap_or(0),
         });
+        user_turns.push((*next_user).to_string());
+        assistant_turns.push(assistant_turn_from_chunk(last));
     }
 
     // --- Structural assertions ---
@@ -551,11 +653,13 @@ async fn stream_session_cancellation_preserves_cache_for_next_turn() {
     let mut saw_done = false;
     let mut finish_reason: Option<String> = None;
     let mut cancelled_at_chunk: Option<usize> = None;
+    let mut terminal1: Option<ChatStreamChunk> = None;
     while let Some(result) = rx1.recv().await {
         let chunk = result.expect("stream error during cancel test");
         if chunk.done {
             saw_done = true;
             finish_reason = chunk.finish_reason.clone();
+            terminal1 = Some(chunk);
             break;
         }
         collected += 1;
@@ -593,10 +697,14 @@ async fn stream_session_cancellation_preserves_cache_for_next_turn() {
     // the partial generated tokens so this MUST succeed — the session
     // is still consistent, just with a partial previous reply.
     let turn2_cfg = chat_config_default(32);
+    let terminal1 = terminal1.expect("cancelled turn missing terminal chunk");
     let (_handle2, rx2) = model
         .chat_stream_session_continue_for_test(
-            "What number were you on?".to_string(),
-            None,
+            transcript_with_next_user(
+                &["Count slowly to twenty.".to_string()],
+                &[assistant_turn_from_chunk(&terminal1)],
+                "What number were you on?",
+            ),
             Some(turn2_cfg),
         )
         .expect("follow-up continue after cancel failed to dispatch");
@@ -659,11 +767,12 @@ async fn session_continue_rejects_images_with_restart_prefix() {
     // processing, so they don't need to be a valid image payload.
     let dummy_image: napi::bindgen_prelude::Uint8Array =
         napi::bindgen_prelude::Uint8Array::new(vec![0u8; 16]);
-    let images = Some(vec![dummy_image]);
+    let mut invalid_media_message = user_message("What now?");
+    invalid_media_message.images = Some(vec![dummy_image]);
 
     let cfg = chat_config_default(32);
     let err = model
-        .chat_session_continue("What now?".to_string(), images, None, Some(cfg))
+        .chat_session_continue(vec![invalid_media_message], Some(cfg))
         .await
         .expect_err("chat_session_continue with images should error");
     let msg = err.reason.clone();
@@ -695,7 +804,7 @@ async fn session_continue_tool_round_trips() {
     // prefill on top of.
     let turn1_cfg = chat_config_default(32);
     let turn1_messages = vec![user_message("Say hi in one short word.")];
-    let _ = model
+    let first = model
         .chat_session_start(turn1_messages, Some(turn1_cfg))
         .await
         .expect("turn 1 chat_session_start failed");
@@ -703,10 +812,12 @@ async fn session_continue_tool_round_trips() {
     let tool_cfg = chat_config_default(32);
     let result = model
         .chat_session_continue_tool(
-            "dummy_id".to_string(),
-            "result content".to_string(),
+            vec![
+                user_message("Say hi in one short word."),
+                assistant_message(&assistant_turn_from_result(&first)),
+                tool_message("dummy_id", "result content", None),
+            ],
             Some(tool_cfg),
-            None,
         )
         .await
         .expect("chat_session_continue_tool failed");
@@ -1121,10 +1232,12 @@ async fn cancel_midcycle_then_continue_mtp_keeps_session_usable() {
 
     let mut n_mtp = 0usize;
     let mut turn1_finish_reason = None;
+    let mut turn1_terminal: Option<ChatStreamChunk> = None;
     while let Some(result) = rx.recv().await {
         let chunk = result.expect("turn 1 stream error");
         if chunk.done {
-            turn1_finish_reason = chunk.finish_reason;
+            turn1_finish_reason = chunk.finish_reason.clone();
+            turn1_terminal = Some(chunk);
             break;
         }
         n_mtp += 1;
@@ -1165,10 +1278,17 @@ async fn cancel_midcycle_then_continue_mtp_keeps_session_usable() {
         include_reasoning: Some(true),
         ..chat_config_default(1)
     };
+    let turn1_terminal = turn1_terminal.expect("turn 1 missing terminal stream chunk");
     let (_h2, rx2) = model
         .chat_stream_session_continue_for_test(
-            "Repeat back, in order, every number you listed so far.".to_string(),
-            None,
+            transcript_with_next_user(
+                &[
+                    "Count slowly upward, one number per step: 1 2 3 4 5 and keep going."
+                        .to_string(),
+                ],
+                &[assistant_turn_from_chunk(&turn1_terminal)],
+                "Repeat back, in order, every number you listed so far.",
+            ),
             Some(turn2_cfg),
         )
         .expect("turn 2 continue dispatch failed");
@@ -1268,11 +1388,15 @@ async fn desync_heal_reprefills_to_uncancelled() {
                 Some(cfg1),
             )
             .expect("turn 1 dispatch failed");
+        let mut turn1_terminal: Option<ChatStreamChunk> = None;
         while let Some(r) = rx.recv().await {
-            if r.expect("turn 1 stream error").done {
+            let chunk = r.expect("turn 1 stream error");
+            if chunk.done {
+                turn1_terminal = Some(chunk);
                 break;
             }
         }
+        let turn1_terminal = turn1_terminal.expect("turn 1 missing terminal stream chunk");
         let (committed, desynced0, reprefills_before, _) = model.mtp_flat_state_for_test().await;
         assert!(
             !desynced0,
@@ -1293,8 +1417,14 @@ async fn desync_heal_reprefills_to_uncancelled() {
         };
         let (_h2, rx2) = model
             .chat_stream_session_continue_for_test(
-                "Repeat back, in order, every number you listed so far.".to_string(),
-                None,
+                transcript_with_next_user(
+                    &[
+                        "Count slowly upward, one number per step: 1 2 3 4 5 and keep going."
+                            .to_string(),
+                    ],
+                    &[assistant_turn_from_chunk(&turn1_terminal)],
+                    "Repeat back, in order, every number you listed so far.",
+                ),
                 Some(cfg2),
             )
             .expect("turn 2 dispatch failed");

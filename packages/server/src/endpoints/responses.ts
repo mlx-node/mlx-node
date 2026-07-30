@@ -1401,10 +1401,11 @@ async function runSessionNonStreaming(
 
   // Hot path — session's KV cache is already warmed for this chain.
   // Single-message continuations whose role is `user` or `tool` take
-  // the cheap delta paths (`send` / `sendToolResult`). Any other single
+  // the session paths (`send` / `sendToolResult`), which render the full
+  // transcript and reuse KV on an exact token-prefix match. Any other single
   // role (`assistant`, `system`) is still accepted by `mapRequest` —
   // `reconstructMessagesFromChain` + `primeHistory` tolerate a tail of
-  // either — but the chat-session delta API has no entry point for
+  // either — but the high-level chat-session API has no entry point for
   // them, so fall through to reset + cold re-prime against the fully
   // rebuilt history. Returning 500 here would regress the pre-session-
   // API full-history path, making valid continuation payloads fail
@@ -2517,7 +2518,7 @@ export async function handleCreateResponse(
           // removed on hit so overlapping requests against the same prior id
           // cannot race on the same single-flight ChatSession).
           //
-          // Hot-path eligibility gate: the chat-session delta API only
+          // Hot-path eligibility gate: the high-level chat-session API only
           // serves a SINGLE `user` or `tool` continuation message — the
           // `send` / `sendToolResult` entry points cover exactly that
           // shape. A single `assistant` / `system` continuation cannot
@@ -2526,7 +2527,7 @@ export async function handleCreateResponse(
           // still VALID — it just routes through `runSession*`'s
           // `session.turns === 0` fall-through (`primeHistory` +
           // `startFromHistory*`) instead of the `send` / `sendToolResult`
-          // delta path. Crucially, a tier-1 HIT on this branch is still
+          // session continuation path. Crucially, a tier-1 HIT on this branch is still
           // useful: `resetPreservingNativeCacheForWarmReuse(session)` keeps
           // the warm native KV cache, and the subsequent
           // `chat_session_start_sync` -> `verify_cache_prefix_direct`

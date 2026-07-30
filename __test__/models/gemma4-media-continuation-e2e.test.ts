@@ -7,32 +7,32 @@ import { beforeAll, describe, expect, it } from 'vite-plus/test';
 /**
  * Media -> text continuation parity (Gemma 4).
  *
- * A text follow-up may warm-continue only after a PURE-IMAGE turn. The vision
- * finalizer keeps the global paged KV live and arms
- * `media_session_continuable` only when the physical sliding-anchor checkpoint
- * stored successfully. Image identity is part of every affected paged block
- * key, so a positive `cachedTokens` value proves reuse of the exact ordered
- * image lineage rather than a token-only placeholder match.
+ * Every follow-up re-renders the complete structured transcript through the
+ * checkpoint-provided chat template. Native code reuses the live media KV only
+ * when that rendered token stream exactly extends the cached token history.
  *
  * KV sharing does not make an image turn ineligible. E2B's
  * `SharedOnSliding` alias slots intentionally own no private K/V and are skipped
  * by checkpoint readiness/storage; their physical non-shared sliding anchors
  * carry the state for both layers. Both standard SigLIP images (E2B) and unified
- * bidirectional-vision images therefore warm-continue on faithful live K/V.
+ * bidirectional-vision images may therefore reuse faithful live K/V when the
+ * template-rendered transcript is also an exact token-prefix extension.
  *
  * Audio and mixed-media identity is not represented in the per-block keys yet.
  * Those turns deliberately use `skip_lookup` with a zero cache-hit ceiling, do
  * not publish reusable prefix checkpoints, and leave the continuation marker
- * off. The native text delta then returns the typed restart error; `ChatSession`
- * catches it before any token is emitted and cold-replays the complete history.
+ * off. A complete template-rendered follow-up therefore cold-prefills.
+ *
+ * Gemma's template deliberately strips reasoning from prior plain assistant
+ * messages. A thinking image turn therefore does not reproduce the raw
+ * generated token history when it is re-rendered for turn 2. That exact-prefix
+ * mismatch must cold-prefill (`cachedTokens == 0`) rather than extending stale
+ * KV with a Rust-built delimiter suffix.
  *
  * ## What this file asserts
  *
- *  - NON-UNIFIED and UNIFIED image: `cachedTokens > 0` plus a coherent answer.
- *    E2B additionally pins its known byte-exact warm-vs-cold golden. Unified
- *    image does not require byte equality: its cache-hit and full-prefill
- *    kernels can differ by a deterministic ~1-ULP BF16 reduction-order drift
- *    that flips a near-tie argmax while preserving a coherent answer.
+ *  - NON-UNIFIED and UNIFIED image: `cachedTokens == 0` plus a coherent answer.
+ *    E2B additionally pins byte-exact equality with a direct cold replay.
  *  - AUDIO: `cachedTokens == 0`, proving the follow-up used the deliberate cold
  *    replay, plus exact FINAL-answer parity against a direct cold replay of the
  *    same history after resetting the loaded model.
@@ -58,10 +58,22 @@ function hasWeights(dir: string): boolean {
   return existsSync(resolve(dir, 'model.safetensors')) || existsSync(resolve(dir, 'model.safetensors.index.json'));
 }
 
+function hasChatTemplate(dir: string): boolean {
+  if (existsSync(resolve(dir, 'chat_template.jinja'))) return true;
+  const tokenizerConfig = resolve(dir, 'tokenizer_config.json');
+  if (!existsSync(tokenizerConfig)) return false;
+  try {
+    const parsed = JSON.parse(readFileSync(tokenizerConfig, 'utf8')) as { chat_template?: unknown };
+    return typeof parsed.chat_template === 'string' && parsed.chat_template.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 function findFirst(dirs: string[]): string | null {
   for (const d of dirs) {
     const abs = resolve(process.cwd(), d);
-    if (existsSync(resolve(abs, 'config.json')) && hasWeights(abs)) return abs;
+    if (existsSync(resolve(abs, 'config.json')) && hasWeights(abs) && hasChatTemplate(abs)) return abs;
   }
   return null;
 }
@@ -69,12 +81,16 @@ function findFirst(dirs: string[]): string | null {
 const SYSTEM = 'You are a helpful assistant. Be concise.';
 
 const unifiedModelPath =
-  process.env.GEMMA4_UNIFIED_MODEL_PATH && hasWeights(process.env.GEMMA4_UNIFIED_MODEL_PATH)
+  process.env.GEMMA4_UNIFIED_MODEL_PATH &&
+  hasWeights(process.env.GEMMA4_UNIFIED_MODEL_PATH) &&
+  hasChatTemplate(process.env.GEMMA4_UNIFIED_MODEL_PATH)
     ? process.env.GEMMA4_UNIFIED_MODEL_PATH
     : findFirst(['.cache/models/gemma-4-12b-it']);
 
 const imageModelPath =
-  process.env.GEMMA4_NONUNIFIED_MODEL_PATH && hasWeights(process.env.GEMMA4_NONUNIFIED_MODEL_PATH)
+  process.env.GEMMA4_NONUNIFIED_MODEL_PATH &&
+  hasWeights(process.env.GEMMA4_NONUNIFIED_MODEL_PATH) &&
+  hasChatTemplate(process.env.GEMMA4_NONUNIFIED_MODEL_PATH)
     ? process.env.GEMMA4_NONUNIFIED_MODEL_PATH
     : findFirst(['.cache/models/gemma-4-e2b-it', '.cache/models/gemma-4-e2b-it-mlx']);
 
@@ -150,11 +166,11 @@ async function coldReplayTurn2(
   return { rawText: r.rawText, text: r.text, numTokens: r.numTokens };
 }
 
-// -- NON-UNIFIED image continuation (e2b, KV-shared): alias slots are skipped
-//    while their physical sliding anchors checkpoint the image-feature K/V, so
-//    the media->text follow-up warm-continues on the exact image lineage. --
+// -- NON-UNIFIED image continuation (e2b, KV-shared). A checkpoint without a
+//    model-provided template is intentionally excluded: production fails closed
+//    for that checkpoint instead of manufacturing a Gemma prompt in Rust. --
 describe.skipIf(!imageModelPath || !imageExists)(
-  'Gemma 4 — WARM non-unified image->text continuation parity (KV-shared)',
+  'Gemma 4 — template-driven non-unified image->text continuation parity (KV-shared)',
   () => {
     let model: SessionCapableModel;
 
@@ -163,7 +179,7 @@ describe.skipIf(!imageModelPath || !imageExists)(
       model = (await loadModel(imageModelPath)) as unknown as SessionCapableModel;
     }, 300_000);
 
-    it('warm text delta reuses the exact image lineage and matches the cold final answer', async () => {
+    it('re-rendered text follow-up matches the cold final answer', async () => {
       const images = [readBytes(imagePath)];
       const prompt1 = 'Describe this image.';
       const prompt2 = 'What is the main color?';
@@ -173,27 +189,25 @@ describe.skipIf(!imageModelPath || !imageExists)(
       const turn1 = await streamTurn(session, prompt1, { images }, 48);
       expect(turn1.rawText.length).toBeGreaterThan(0);
 
-      // E2B is KV-shared (`num_kv_shared_layers=20`), but only the alias slots
-      // lack private K/V. Their physical sliding anchors store the checkpoint;
-      // the exact image hash + ordered positions keep the live global blocks on
-      // the same image-aware lineage for this delta.
-      const warm = await streamTurn(session, prompt2, {}, maxNew);
+      const replayed = await streamTurn(session, prompt2, {}, maxNew);
       await session.reset();
 
       const cold = await coldReplayTurn2(model, { images }, prompt1, turn1.parsedText, prompt2, maxNew);
 
       // eslint-disable-next-line no-console
-      console.log('[gemma4-cont-image] warm:', JSON.stringify(warm.parsedText), 'cold:', JSON.stringify(cold.text));
-      // The delta path reports the full prior history reused by construction.
-      // The image-aware block keys and exact-position gate make this a stronger
-      // signal than a token-only prefix hit.
-      expect(warm.cachedTokens ?? 0).toBeGreaterThan(0);
-      expect(warm.parsedText.trim()).toBe(cold.text.trim());
-      expect(warm.rawText).toBe(cold.rawText);
-      expect(warm.numTokens).toBe(cold.numTokens);
-      expect(warm.finishReason === 'stop' || warm.finishReason === 'length').toBe(true);
-      expect(warm.numTokens).toBeGreaterThan(0);
-      const words = warm.parsedText.trim().split(/\s+/).filter(Boolean);
+      console.log(
+        '[gemma4-cont-image] replayed:',
+        JSON.stringify(replayed.parsedText),
+        'cold:',
+        JSON.stringify(cold.text),
+      );
+      expect(replayed.cachedTokens ?? 0).toBe(0);
+      expect(replayed.parsedText.trim()).toBe(cold.text.trim());
+      expect(replayed.rawText).toBe(cold.rawText);
+      expect(replayed.numTokens).toBe(cold.numTokens);
+      expect(replayed.finishReason === 'stop' || replayed.finishReason === 'length').toBe(true);
+      expect(replayed.numTokens).toBeGreaterThan(0);
+      const words = replayed.parsedText.trim().split(/\s+/).filter(Boolean);
       expect(words.length).toBeGreaterThan(3);
       // No degenerate single-token loop.
       const counts = new Map<string, number>();
@@ -226,9 +240,8 @@ describe.skipIf(!unifiedModelPath || !audioExists)('Gemma 4 — COLD audio->text
     const replayed = await streamTurn(session, prompt2, {}, maxNew);
     await session.reset();
 
-    // The native media guard rejected the delta before emitting tokens and the
-    // TS session replayed full history. Audio/mixed preparation deliberately
-    // disables cache lookup, so the replay must report zero cached tokens.
+    // Audio/mixed preparation deliberately disables cache lookup, so the
+    // complete template-rendered follow-up must report zero cached tokens.
     expect(replayed.cachedTokens ?? 0).toBe(0);
 
     const cold = await coldReplayTurn2(model, { audio }, prompt1, turn1.parsedText, prompt2, maxNew);
@@ -247,28 +260,11 @@ describe.skipIf(!unifiedModelPath || !audioExists)('Gemma 4 — COLD audio->text
   });
 });
 
-// -- UNIFIED image continuation: warm continues. The 12B is non-KV-shared
-//    (`num_kv_shared_layers=0`), so every sliding layer stores real K/V -> the
-//    finalize stored/live gate arms the marker and the text delta hits
-//    `state="live"`. The warm delta routes through the GENERIC causal text path
-//    (no bidirectional overlay — the overlay only makes the IMAGE span
-//    bidirectional during prefill, a no-op over text queries in both the warm
-//    and cold paths; control-flow verified), so it is numerically faithful.
-//
-//    Strict warm==cold byte parity is NOT asserted here (it does not hold). The
-//    only warm-vs-cold difference is a deterministic ~1-ULP BF16
-//    cache-hit-kernel reduction-order drift (the documented
-//    `paged_decode_long_context_1ulp` class): the warm decode reads the live
-//    image-span KV through the paged cache-hit kernel while the cold decode runs
-//    a flat full-prompt prefill, and the tiny reduction-order delta flips one
-//    early near-tie argmax that cascades into a different-but-coherent tail. On
-//    this prompt the warm/cold final answers share the prefix "...the main
-//    subject of the image" then diverge on a single token (" provided" vs "."),
-//    both coherently analyzing the same image ("Trunch Parish Council"). So the
-//    unified block asserts the FAITHFUL-warm contract (cachedTokens>0 + the same
-//    coherence checks the e2b warm block uses) rather than byte parity. Exact
-//    final-answer equality is asserted only for audio's cold-vs-cold replay. --
-describe.skipIf(!unifiedModelPath || !imageExists)('Gemma 4 — WARM unified image->text continuation', () => {
+// -- UNIFIED image continuation. The live image checkpoint remains available,
+//    but a template-rendered turn may use it only after an exact token-prefix
+//    match. The stock template strips turn-1 reasoning from a prior plain
+//    assistant message, so this fixture must take the safe cold path. --
+describe.skipIf(!unifiedModelPath || !imageExists)('Gemma 4 — template-driven unified image->text continuation', () => {
   let model: SessionCapableModel;
 
   beforeAll(async () => {
@@ -276,7 +272,7 @@ describe.skipIf(!unifiedModelPath || !imageExists)('Gemma 4 — WARM unified ima
     model = (await loadModel(unifiedModelPath)) as unknown as SessionCapableModel;
   }, 300_000);
 
-  it('warm text delta after a unified image turn continues on live KV and answers coherently', async () => {
+  it('cold-prefills when the template-rendered history does not match live KV', async () => {
     const images = [readBytes(imagePath)];
     const prompt1 = 'Describe this image.';
     const prompt2 = 'What is the main subject?';
@@ -285,18 +281,15 @@ describe.skipIf(!unifiedModelPath || !imageExists)('Gemma 4 — WARM unified ima
     const session = new ChatSession(model, { system: SYSTEM });
     const turn1 = await streamTurn(session, prompt1, { images }, 48);
     expect(turn1.rawText.length).toBeGreaterThan(0);
-    const warm = await streamTurn(session, prompt2, {}, maxNew);
+    const replayed = await streamTurn(session, prompt2, {}, maxNew);
     await session.reset();
 
     // eslint-disable-next-line no-console
-    console.log('[gemma4-cont-unified] warm:', JSON.stringify(warm.parsedText));
-    // The warm delta continued on the live unified-image KV (did NOT cold-restart).
-    expect(warm.cachedTokens ?? 0).toBeGreaterThan(0);
-    // Coherence (byte parity is ill-posed under the ~1-ULP cache-hit-kernel drift
-    // above): a coherent, non-degenerate answer with a clean finish.
-    expect(warm.finishReason === 'stop' || warm.finishReason === 'length').toBe(true);
-    expect(warm.numTokens).toBeGreaterThan(0);
-    const words = warm.parsedText.trim().split(/\s+/).filter(Boolean);
+    console.log('[gemma4-cont-unified] replayed:', JSON.stringify(replayed.parsedText));
+    expect(replayed.cachedTokens ?? 0).toBe(0);
+    expect(replayed.finishReason === 'stop' || replayed.finishReason === 'length').toBe(true);
+    expect(replayed.numTokens).toBeGreaterThan(0);
+    const words = replayed.parsedText.trim().split(/\s+/).filter(Boolean);
     expect(words.length).toBeGreaterThan(3);
     // No degenerate single-token loop.
     const counts = new Map<string, number>();

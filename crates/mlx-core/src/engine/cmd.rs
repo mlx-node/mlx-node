@@ -42,29 +42,18 @@ pub(crate) enum ChatCmd {
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
     },
-    /// Continue an existing session by appending a user turn.
-    ///
-    /// `images` is the opt-in guard parameter: non-empty input is
-    /// rejected with an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-
-    /// prefixed error so the TS `ChatSession` layer can route
-    /// image-changes back through a fresh session start uniformly
-    /// across model backends.
+    /// Continue an existing session from the complete structured
+    /// conversation. The loaded chat template renders the history and the
+    /// session core reuses only an exact cached token prefix.
     SessionContinue {
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        audio: Option<Vec<Uint8Array>>,
+        messages: Vec<ChatMessage>,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
     },
-    /// Continue an existing session with a tool-result delta.
-    ///
-    /// `is_error` is the structured tool-error signal threaded through
-    /// from the NAPI surface; `Some(true)` injects the shared
-    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] into the rendered delta.
+    /// Continue an existing session from a complete structured
+    /// conversation ending in a tool-role message.
     SessionContinueTool {
-        tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
+        messages: Vec<ChatMessage>,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
     },
@@ -79,12 +68,9 @@ pub(crate) enum ChatCmd {
     },
     /// Streaming session-continue: same semantics as
     /// [`SessionContinue`](Self::SessionContinue) but streams token
-    /// deltas through `stream_tx`. Carries the same opt-in `images`
-    /// guard parameter.
+    /// deltas through `stream_tx`.
     StreamSessionContinue {
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        audio: Option<Vec<Uint8Array>>,
+        messages: Vec<ChatMessage>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -93,9 +79,7 @@ pub(crate) enum ChatCmd {
     /// [`SessionContinueTool`](Self::SessionContinueTool) but streams
     /// token deltas through `stream_tx`.
     StreamSessionContinueTool {
-        tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
+        messages: Vec<ChatMessage>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -213,34 +197,18 @@ pub(crate) fn handle_chat_cmd<B: ChatBackend>(backend: &mut B, cmd: ChatCmd) {
             let _ = reply.send(session::session_start(backend, messages, config));
         }
         ChatCmd::SessionContinue {
-            user_message,
-            images,
-            audio,
+            messages,
             config,
             reply,
         } => {
-            let _ = reply.send(session::session_continue(
-                backend,
-                user_message,
-                images,
-                audio,
-                config,
-            ));
+            let _ = reply.send(session::session_continue(backend, messages, config));
         }
         ChatCmd::SessionContinueTool {
-            tool_call_id,
-            content,
-            is_error,
+            messages,
             config,
             reply,
         } => {
-            let _ = reply.send(session::session_continue_tool(
-                backend,
-                tool_call_id,
-                content,
-                is_error,
-                config,
-            ));
+            let _ = reply.send(session::session_continue_tool(backend, messages, config));
         }
         ChatCmd::StreamSessionStart {
             messages,
@@ -251,39 +219,21 @@ pub(crate) fn handle_chat_cmd<B: ChatBackend>(backend: &mut B, cmd: ChatCmd) {
             session::session_start_stream(backend, messages, config, &stream_tx, &cancelled);
         }
         ChatCmd::StreamSessionContinue {
-            user_message,
-            images,
-            audio,
+            messages,
             config,
             stream_tx,
             cancelled,
         } => {
-            session::session_continue_stream(
-                backend,
-                user_message,
-                images,
-                audio,
-                config,
-                &stream_tx,
-                &cancelled,
-            );
+            session::session_continue_stream(backend, messages, config, &stream_tx, &cancelled);
         }
         ChatCmd::StreamSessionContinueTool {
-            tool_call_id,
-            content,
-            is_error,
+            messages,
             config,
             stream_tx,
             cancelled,
         } => {
             session::session_continue_tool_stream(
-                backend,
-                tool_call_id,
-                content,
-                is_error,
-                config,
-                &stream_tx,
-                &cancelled,
+                backend, messages, config, &stream_tx, &cancelled,
             );
         }
         ChatCmd::ResetCaches { reply } => {
@@ -412,8 +362,7 @@ mod mock_backend_tests {
         TurnOutput, TurnSetup, WholeTurnArgs,
     };
     use crate::engine::params::{
-        ChatParams, ModelGenerationDefaults, apply_generation_defaults,
-        build_chatml_continue_delta_text, build_chatml_tool_delta_text, extract_chat_params,
+        ChatParams, ModelGenerationDefaults, apply_generation_defaults, extract_chat_params,
         resolve_enable_thinking,
     };
     use crate::engine::plan::{
@@ -480,6 +429,14 @@ mod mock_backend_tests {
         std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("fixture dir: {e}"));
         let path = dir.join("tokenizer.json");
         std::fs::write(&path, json).unwrap_or_else(|e| panic!("fixture write: {e}"));
+        let template = r#"{% for message in messages %}{{ message.role }} {% if message.get('reasoning_content') %}{{ message.reasoning_content }} </think> {% endif %}{{ message.content }} {% endfor %}{% if add_generation_prompt %}assistant {% endif %}"#;
+        let tokenizer_config = serde_json::json!({ "chat_template": template });
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            serde_json::to_vec(&tokenizer_config)
+                .unwrap_or_else(|e| panic!("fixture template serialize: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("fixture template write: {e}"));
         let tok =
             Qwen3Tokenizer::from_file(&path).unwrap_or_else(|e| panic!("fixture tokenizer: {e}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -698,31 +655,6 @@ mod mock_backend_tests {
             )
         }
 
-        fn render_continue_delta(
-            &self,
-            tok: &Qwen3Tokenizer,
-            user_message: &str,
-            _config: &ChatConfig,
-        ) -> Result<Vec<u32>> {
-            // qwen3.5-style continue delta, no-think variant for
-            // deterministic fixture tokens.
-            let delta_text = build_chatml_continue_delta_text(user_message, Some(false));
-            tok.encode_sync(&delta_text, Some(false))
-        }
-
-        fn render_tool_delta(
-            &self,
-            tok: &Qwen3Tokenizer,
-            tool_call_id: &str,
-            content: &str,
-            is_error: Option<bool>,
-            _config: &ChatConfig,
-        ) -> Result<Vec<u32>> {
-            let delta_text =
-                build_chatml_tool_delta_text(tool_call_id, content, Some(false), is_error);
-            tok.encode_sync(&delta_text, Some(false))
-        }
-
         fn cached_token_history(&self) -> &[u32] {
             &self.history
         }
@@ -812,6 +744,7 @@ mod mock_backend_tests {
                 text: "PAGED_COMPLETE".to_string(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                thinking_enabled: true,
                 num_tokens: 1,
                 prompt_tokens: 1,
                 reasoning_tokens: 0,
@@ -834,6 +767,7 @@ mod mock_backend_tests {
                 text: "SPECULATIVE_COMPLETE".to_string(),
                 tool_calls: Vec::new(),
                 thinking: None,
+                thinking_enabled: true,
                 num_tokens: 1,
                 prompt_tokens: 1,
                 reasoning_tokens: 0,
@@ -976,6 +910,44 @@ mod mock_backend_tests {
         }]
     }
 
+    fn assistant_message(result: &ChatResult) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: result.text.clone(),
+            tool_calls: (!result.tool_calls.is_empty()).then(|| {
+                result
+                    .tool_calls
+                    .iter()
+                    .map(|call| crate::tokenizer::ToolCall {
+                        id: Some(call.id.clone()),
+                        name: call.name.clone(),
+                        arguments: call.arguments.to_string(),
+                    })
+                    .collect()
+            }),
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: result.thinking.clone(),
+            thinking_enabled: Some(result.thinking_enabled),
+            images: None,
+            audio: None,
+        }
+    }
+
+    fn tool_message(tool_call_id: &str, content: &str, is_error: Option<bool>) -> ChatMessage {
+        ChatMessage {
+            role: "tool".to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.to_string()),
+            is_error,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        }
+    }
+
     /// Send a sync command through `handle_chat_cmd` and read the
     /// oneshot reply (plain test thread — no Tokio runtime needed for
     /// `blocking_recv`).
@@ -1059,10 +1031,11 @@ mod mock_backend_tests {
 
         // --- turn 2: SessionContinue ---
         let h1_len = backend.history.len();
+        let mut messages = user_messages("hello world");
+        messages.push(assistant_message(&r1));
+        messages.extend(user_messages("again"));
         let r2 = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
-            user_message: "again".to_string(),
-            images: None,
-            audio: None,
+            messages,
             config: greedy_config(),
             reply,
         })
@@ -1072,46 +1045,50 @@ mod mock_backend_tests {
         assert_eq!(r2.num_tokens, 4);
         assert_eq!(
             r2.cached_tokens as usize, h1_len,
-            "delta turn reports the full prior history as reused"
+            "the exact rendered prefix reports the full prior history as reused"
         );
-        // The delta path prefilled ONLY the rendered delta, not the
-        // full history.
-        let delta2 = backend.prefill_calls[1].clone();
-        assert!(!delta2.is_empty());
-        assert!(delta2.len() < backend.history.len());
-        assert_eq!(r2.prompt_tokens as usize, h1_len + delta2.len());
-        // History grew: prior + delta + generated, again dropping the
-        // trailing <|im_end|> on this EOS stop.
+        // The complete transcript was rendered through the model template.
+        // Exact prefix verification allowed the backend to prefill only the
+        // new suffix while retaining Fresh-turn semantics.
+        let suffix2 = backend.prefill_calls[1].clone();
+        assert!(!suffix2.is_empty());
+        assert!(suffix2.len() < backend.history.len());
+        assert_eq!(r2.prompt_tokens as usize, h1_len + suffix2.len());
+        // History grew: prior + verified suffix + generated, again dropping
+        // the trailing <|im_end|> on this EOS stop.
         let expected_h2: Vec<u32> = expected_h1
             .iter()
             .copied()
-            .chain(delta2.iter().copied())
+            .chain(suffix2.iter().copied())
             .chain([TOK_WORLD, TOK_THINK_END, TOK_OK])
             .collect();
         assert_eq!(backend.history, expected_h2);
         assert_eq!(
             backend.history.len(),
             backend.save_calls[1].cache_cursor,
-            "post-turn invariant holds across a warm delta turn too"
+            "post-turn invariant holds across a warm full-history turn too"
         );
         assert_eq!(
             backend.begin_decode_turns[1],
             TurnSnapshot {
-                is_delta: true,
-                total_seq_len: h1_len + delta2.len(),
+                is_delta: false,
+                total_seq_len: h1_len + suffix2.len(),
                 reuse_cache: true,
             }
         );
-        assert!(backend.save_calls[1].is_delta);
-        // No reset on the delta path.
+        assert!(!backend.save_calls[1].is_delta);
+        // The exact prefix match avoids a cache reset.
         assert_eq!(backend.reset_calls.len(), 1);
 
         // --- turn 3: SessionContinueTool ---
         let h2_len = backend.history.len();
+        let mut messages = user_messages("hello world");
+        messages.push(assistant_message(&r1));
+        messages.extend(user_messages("again"));
+        messages.push(assistant_message(&r2));
+        messages.push(tool_message("call_1", "ok", None));
         let r3 = run_sync(&mut backend, |reply| ChatCmd::SessionContinueTool {
-            tool_call_id: "call_1".to_string(),
-            content: "ok".to_string(),
-            is_error: None,
+            messages,
             config: greedy_config(),
             reply,
         })
@@ -1120,9 +1097,10 @@ mod mock_backend_tests {
         assert_eq!(r3.finish_reason, "stop");
         assert_eq!(r3.num_tokens, 4);
         assert_eq!(r3.cached_tokens as usize, h2_len);
-        let delta3 = backend.prefill_calls[2].clone();
-        assert!(backend.history.len() > h2_len + delta3.len());
-        assert!(backend.begin_decode_turns[2].is_delta);
+        let suffix3 = backend.prefill_calls[2].clone();
+        assert!(backend.history.len() > h2_len + suffix3.len());
+        assert!(!backend.begin_decode_turns[2].is_delta);
+        assert!(!backend.save_calls[2].is_delta);
 
         // --- ResetCaches ---
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1309,11 +1287,9 @@ mod mock_backend_tests {
     #[test]
     fn delta_guards_reject_bad_sessions() {
         // Uninitialized session → typed error.
-        let mut backend = MockBackend::new(vec![]);
+        let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_IM_END]]);
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
-            user_message: "hi".to_string(),
-            images: None,
-            audio: None,
+            messages: user_messages("hi"),
             config: greedy_config(),
             reply,
         })
@@ -1340,11 +1316,18 @@ mod mock_backend_tests {
         assert!(backend.reset_calls.is_empty());
         assert!(backend.prefill_calls.is_empty());
 
+        run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config: greedy_config(),
+            reply,
+        })
+        .expect("session setup for media guards failed");
+
         // Image-bearing continue → typed restart-prefix error.
+        let mut messages = user_messages("hi");
+        messages[0].images = Some(vec![Uint8Array::new(vec![1, 2, 3])]);
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
-            user_message: "hi".to_string(),
-            images: Some(vec![Uint8Array::new(vec![1, 2, 3])]),
-            audio: None,
+            messages,
             config: greedy_config(),
             reply,
         })
@@ -1357,10 +1340,10 @@ mod mock_backend_tests {
         );
 
         // Audio-bearing continue → typed restart-prefix error (mirrors images).
+        let mut messages = user_messages("hi");
+        messages[0].audio = Some(vec![Uint8Array::new(vec![1, 2, 3])]);
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
-            user_message: "hi".to_string(),
-            images: None,
-            audio: Some(vec![Uint8Array::new(vec![1, 2, 3])]),
+            messages,
             config: greedy_config(),
             reply,
         })
@@ -1777,12 +1760,13 @@ mod mock_backend_tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         let (stream_tx, mut stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let mut messages = user_messages("hello");
+        messages.push(assistant_message(&r1));
+        messages.extend(user_messages("again"));
         handle_chat_cmd(
             &mut backend,
             ChatCmd::StreamSessionContinue {
-                user_message: "again".to_string(),
-                images: None,
-                audio: None,
+                messages,
                 config: greedy_config(),
                 stream_tx,
                 cancelled,
@@ -1820,9 +1804,7 @@ mod mock_backend_tests {
         handle_chat_cmd(
             &mut backend,
             ChatCmd::StreamSessionContinue {
-                user_message: "hi".to_string(),
-                images: None,
-                audio: None,
+                messages: user_messages("hi"),
                 config: greedy_config(),
                 stream_tx,
                 cancelled,
@@ -1834,7 +1816,7 @@ mod mock_backend_tests {
         let err = first.expect_err("uninitialized streaming continue must fail");
         assert_eq!(
             err.reason,
-            "chat_stream_tokens_delta requires an initialized session \
+            "chat_stream_session_continue requires an initialized session \
              (call chatStreamSessionStart first)",
         );
     }
@@ -2004,37 +1986,41 @@ mod mock_backend_tests {
     }
 
     #[test]
-    fn delta_turn_uses_live_session_media_when_planning_speculation() {
+    fn role_aware_continue_ignores_stale_session_media_when_planning_speculation() {
         let mut backend = MockBackend::new(vec![
             vec![TOK_HELLO, TOK_IM_END],
             vec![TOK_WORLD, TOK_IM_END],
         ]);
-        run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+        let first = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
             messages: user_messages("hello"),
             config: greedy_config(),
             reply,
         })
         .unwrap_or_else(|e| panic!("session setup failed: {}", e.reason));
 
-        // Target supports an image-bearing prefix, but the declared
-        // proposer supports context_media = NONE. The delta carries no new
-        // images; it must still fall back to exact AR because the live
-        // context is multimodal.
+        // Stale backend media state must not override the complete transcript
+        // supplied by a role-aware continuation. This request is text-only,
+        // so speculative decoding remains eligible.
         backend.speculative_complete_knob = true;
         backend.session_media_knob = MediaCapabilities::IMAGES;
         let mut config = greedy_config();
         config.enable_mtp = Some(true);
+        let mut messages = user_messages("hello");
+        messages.push(assistant_message(&first));
+        messages.extend(user_messages("world"));
         let result = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
-            user_message: "world".to_string(),
-            images: None,
-            audio: None,
+            messages,
             config,
             reply,
         })
-        .unwrap_or_else(|e| panic!("media-context delta failed: {}", e.reason));
+        .unwrap_or_else(|e| panic!("full-history continuation failed: {}", e.reason));
 
-        assert_ne!(result.text, "SPECULATIVE_COMPLETE");
-        assert_eq!(backend.prefill_calls.len(), 2, "delta must use exact AR");
+        assert_eq!(result.text, "SPECULATIVE_COMPLETE");
+        assert_eq!(
+            backend.prefill_calls.len(),
+            1,
+            "continuation must derive media from the supplied transcript"
+        );
     }
 
     #[test]

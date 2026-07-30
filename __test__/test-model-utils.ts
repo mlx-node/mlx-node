@@ -11,7 +11,7 @@
 
 import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import {
   createRandomQwen35Checkpoint,
@@ -156,7 +156,22 @@ function makeCleanup(tempDir: string, label: string): () => void {
 
 function maybeCopyTokenizer(tempDir: string, options: CreateTempModelOptions | undefined): void {
   if (options?.skipTokenizer) return;
-  copyFileSync(findTokenizerPath(), join(tempDir, 'tokenizer.json'));
+  const tokenizerPath = findTokenizerPath();
+  copyFileSync(tokenizerPath, join(tempDir, 'tokenizer.json'));
+
+  // Chat is template-driven: a tokenizer.json without its checkpoint-owned
+  // template is not a complete chat fixture. Preserve whichever Hugging Face
+  // template source the cached checkpoint provides.
+  let copiedTemplate = false;
+  for (const name of ['tokenizer_config.json', 'chat_template.jinja']) {
+    const source = join(dirname(tokenizerPath), name);
+    if (!existsSync(source)) continue;
+    copyFileSync(source, join(tempDir, name));
+    copiedTemplate = true;
+  }
+  if (!copiedTemplate) {
+    throw new Error(`Tokenizer fixture at ${tokenizerPath} has no model-provided chat template`);
+  }
 }
 
 /**

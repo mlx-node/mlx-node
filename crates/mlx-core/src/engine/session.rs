@@ -90,51 +90,65 @@ pub(crate) fn session_start<B: ChatBackend>(
     ))
 }
 
-/// Generic `chat_session_continue_sync`: build the family's
-/// continue-delta via [`ChatBackend::render_continue_delta`] and run it
-/// through the delta path.
+/// Generic role-aware session continuation.
 ///
-/// `images` / `audio` are the opt-in guard parameters shared by every
-/// family: non-empty input is rejected with the
-/// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix so the TS
-/// `ChatSession` layer can route an image/audio change back through a
-/// fresh session start (the continue/delta path is text-only).
+/// The caller supplies the complete structured conversation, including
+/// the pending user message. The model-provided chat template renders that
+/// full history, then the normal fresh-turn prefix verifier either reuses
+/// the exact cached token prefix and prefills only the suffix, or resets and
+/// safely replays the full prompt. No Rust-side wire-format delta is
+/// synthesized.
 pub(crate) fn session_continue<B: ChatBackend>(
     backend: &mut B,
-    user_message: String,
-    images: Option<Vec<Uint8Array>>,
-    audio: Option<Vec<Uint8Array>>,
+    messages: Vec<ChatMessage>,
     config: ChatConfig,
 ) -> Result<ChatResult> {
-    if images.as_ref().is_some_and(|v| !v.is_empty()) {
+    if config.reuse_cache == Some(false) {
         return Err(Error::from_reason(format!(
-            "{IMAGE_CHANGE_RESTART_PREFIX} chat_session_continue is text-only; start a new session with chat_session_start to change the image",
+            "chat_session_continue requires reuse_cache=true (leave as None or set to true). \
+             The session API only makes sense with cache reuse enabled.",
         )));
     }
-    if audio.as_ref().is_some_and(|v| !v.is_empty()) {
-        return Err(Error::from_reason(format!(
-            "{IMAGE_CHANGE_RESTART_PREFIX} chat_session_continue is text-only; start a new session with chat_session_start to change the audio",
-        )));
+    if !backend.has_live_session() {
+        return Err(Error::from_reason(
+            "chat_session_continue requires an initialized session (call chatSessionStart first)",
+        ));
     }
-    let tokenizer = backend.tokenizer()?;
-    let delta_tokens = backend.render_continue_delta(&tokenizer, &user_message, &config)?;
-    tokens_delta(backend, delta_tokens, config)
+    expect_sync_result(chat_turn_core(
+        backend,
+        TurnInput::Fresh { messages },
+        config,
+        None,
+    ))
 }
 
-/// Generic `chat_session_continue_tool_sync`: build the family's
-/// tool-result delta via [`ChatBackend::render_tool_delta`] and run it
-/// through the delta path.
+/// Generic role-aware tool-result continuation.
+///
+/// Like [`session_continue`], the caller supplies the complete history,
+/// now ending in the pending tool-role message. The loaded chat template is
+/// the sole authority for tool-call/result layout.
 pub(crate) fn session_continue_tool<B: ChatBackend>(
     backend: &mut B,
-    tool_call_id: String,
-    content: String,
-    is_error: Option<bool>,
+    messages: Vec<ChatMessage>,
     config: ChatConfig,
 ) -> Result<ChatResult> {
-    let tokenizer = backend.tokenizer()?;
-    let delta_tokens =
-        backend.render_tool_delta(&tokenizer, &tool_call_id, &content, is_error, &config)?;
-    tokens_delta(backend, delta_tokens, config)
+    if config.reuse_cache == Some(false) {
+        return Err(Error::from_reason(
+            "chat_session_continue_tool requires reuse_cache=true (leave as None or set to true). \
+             The session API only makes sense with cache reuse enabled.",
+        ));
+    }
+    if !backend.has_live_session() {
+        return Err(Error::from_reason(
+            "chat_session_continue_tool requires an initialized session (call chatSessionStart first)",
+        ));
+    }
+    expect_sync_result(chat_turn_core(
+        backend,
+        TurnInput::Fresh { messages },
+        config,
+        None,
+    ))
 }
 
 /// Generic `chat_tokens_delta_sync`: prefill a pre-tokenized delta on
@@ -194,9 +208,7 @@ pub(crate) fn session_start_stream<B: ChatBackend>(
 /// Streaming twin of [`session_continue`].
 pub(crate) fn session_continue_stream<B: ChatBackend>(
     backend: &mut B,
-    user_message: String,
-    images: Option<Vec<Uint8Array>>,
-    audio: Option<Vec<Uint8Array>>,
+    messages: Vec<ChatMessage>,
     config: ChatConfig,
     sink: &dyn ChunkSink,
     cancelled: &AtomicBool,
@@ -207,41 +219,33 @@ pub(crate) fn session_continue_stream<B: ChatBackend>(
         )));
         return;
     }
-    if images.as_ref().is_some_and(|v| !v.is_empty()) {
-        sink.send(Err(Error::from_reason(format!(
-            "{IMAGE_CHANGE_RESTART_PREFIX} chat_stream_session_continue is text-only; start a new session with chat_stream_session_start to change the image",
-        ))));
+    if config.reuse_cache == Some(false) {
+        sink.send(Err(Error::from_reason(
+            "chat_stream_session_continue requires reuse_cache=true (leave as None or set to true). \
+             The session API only makes sense with cache reuse enabled.",
+        )));
         return;
     }
-    if audio.as_ref().is_some_and(|v| !v.is_empty()) {
-        sink.send(Err(Error::from_reason(format!(
-            "{IMAGE_CHANGE_RESTART_PREFIX} chat_stream_session_continue is text-only; start a new session with chat_stream_session_start to change the audio",
-        ))));
+    if !backend.has_live_session() {
+        sink.send(Err(Error::from_reason(
+            "chat_stream_session_continue requires an initialized session (call chatStreamSessionStart first)",
+        )));
         return;
     }
-    let tokenizer = match backend.tokenizer() {
-        Ok(t) => t,
-        Err(e) => {
-            sink.send(Err(e));
-            return;
-        }
-    };
-    let delta_tokens = match backend.render_continue_delta(&tokenizer, &user_message, &config) {
-        Ok(t) => t,
-        Err(e) => {
-            sink.send(Err(e));
-            return;
-        }
-    };
-    tokens_delta_stream(backend, delta_tokens, config, sink, cancelled);
+    if let Err(e) = chat_turn_core(
+        backend,
+        TurnInput::Fresh { messages },
+        config,
+        Some(StreamingHooks { sink, cancelled }),
+    ) {
+        sink.send(Err(e));
+    }
 }
 
 /// Streaming twin of [`session_continue_tool`].
 pub(crate) fn session_continue_tool_stream<B: ChatBackend>(
     backend: &mut B,
-    tool_call_id: String,
-    content: String,
-    is_error: Option<bool>,
+    messages: Vec<ChatMessage>,
     config: ChatConfig,
     sink: &dyn ChunkSink,
     cancelled: &AtomicBool,
@@ -252,22 +256,27 @@ pub(crate) fn session_continue_tool_stream<B: ChatBackend>(
         )));
         return;
     }
-    let tokenizer = match backend.tokenizer() {
-        Ok(t) => t,
-        Err(e) => {
-            sink.send(Err(e));
-            return;
-        }
-    };
-    let delta_tokens =
-        match backend.render_tool_delta(&tokenizer, &tool_call_id, &content, is_error, &config) {
-            Ok(t) => t,
-            Err(e) => {
-                sink.send(Err(e));
-                return;
-            }
-        };
-    tokens_delta_stream(backend, delta_tokens, config, sink, cancelled);
+    if config.reuse_cache == Some(false) {
+        sink.send(Err(Error::from_reason(
+            "chat_stream_session_continue_tool requires reuse_cache=true (leave as None or set to true). \
+             The session API only makes sense with cache reuse enabled.",
+        )));
+        return;
+    }
+    if !backend.has_live_session() {
+        sink.send(Err(Error::from_reason(
+            "chat_stream_session_continue_tool requires an initialized session (call chatStreamSessionStart first)",
+        )));
+        return;
+    }
+    if let Err(e) = chat_turn_core(
+        backend,
+        TurnInput::Fresh { messages },
+        config,
+        Some(StreamingHooks { sink, cancelled }),
+    ) {
+        sink.send(Err(e));
+    }
 }
 
 /// Streaming twin of [`tokens_delta`].
@@ -477,6 +486,12 @@ fn chat_turn_core<B: ChatBackend>(
     // report_performance. Everything below reads the RESOLVED params,
     // never raw config.
     let p = backend.resolve_params(&config);
+    // Replay provenance is the effective boolean handed to the model's
+    // Jinja template, not the family's decode-time ThinkingSetup. Those
+    // differ for Gemma4 (`ThinkingPolicy::None`) and LFM2
+    // (`AlwaysOnBudgetFromEffort`).
+    let template_thinking_enabled =
+        crate::engine::params::resolve_enable_thinking(&config).unwrap_or(true);
     backend.set_cache_owner_id(&p.cache_owner_id, p.cache_root_owner_id.as_deref());
     let reuse_cache = p.reuse_cache;
     let report_perf = p.report_performance;
@@ -491,10 +506,9 @@ fn chat_turn_core<B: ChatBackend>(
     let admitted_media = execution.media.admitted();
 
     // --- template/render: full prompt tokens for this turn ---
-    // Fresh: family render hook (default = the jinja chat-template path,
-    // gemma4 adds its manual `<|turn>` fallback). Delta: cached history +
-    // delta (the delta paths skip the template entirely — the caller owns
-    // cache coherence by construction).
+    // Fresh: render the complete structured transcript through the
+    // checkpoint-provided Jinja template. Raw token deltas are an explicit
+    // low-level path and skip template rendering by construction.
     let (tokens, images, audio, is_delta, prior_cached_len) = match &input {
         TurnInput::Fresh { messages } => {
             // Pre-render image guard — TS `ChatSession` restart-routing
@@ -889,6 +903,7 @@ fn chat_turn_core<B: ChatBackend>(
         prompt_tokens: reported_prompt_tokens,
         reasoning_tokens,
     })?;
+    result.thinking_enabled = template_thinking_enabled;
     // cached_tokens overwrite stays in the session core (AFTER the
     // finalize hook — overrides must not fill it): fresh turns report
     // the matched prefix length from `verify_cache_prefix`; delta turns

@@ -78,11 +78,9 @@ macro_rules! chat_napi_surface {
 
             /// Start a new chat session.
             ///
-            /// Runs the full jinja chat template once, decodes until the
-            /// family's session stop token, and leaves the KV caches on a
-            /// clean turn boundary so subsequent `chatSessionContinue` /
-            /// `chatSessionContinueTool` calls can append a raw delta on
-            /// top without re-rendering the chat template.
+            /// Renders the complete conversation through the loaded chat
+            /// template, decodes until the family's session stop token, and
+            /// preserves the resulting KV state for exact-prefix reuse.
             #[napi]
             pub async fn chat_session_start(
                 &self,
@@ -104,35 +102,24 @@ macro_rules! chat_napi_surface {
                 .await
             }
 
-            /// Continue an existing chat session with a new user message.
-            ///
-            /// Appends a raw user/assistant delta to the session's cached
-            /// KV state, then decodes the assistant reply, stopping on the
-            /// family's session boundary token.
-            ///
-            /// `images` is an opt-in guard parameter: when non-empty the
-            /// native side returns an error whose message begins with
-            /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-            /// `ChatSession` layer can route image-changes back through a
-            /// fresh `chatSessionStart`.
-            #[napi(
-                ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, audio: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined"
-            )]
+            /// Continue an existing chat session from the complete
+            /// structured conversation. The loaded model template is the
+            /// sole authority for the rendered suffix; native cache reuse
+            /// occurs only when the new render strictly extends the saved
+            /// token history.
+            #[napi]
             pub async fn chat_session_continue(
                 &self,
-                user_message: String,
-                images: ::std::option::Option<::std::vec::Vec<::napi::bindgen_prelude::Uint8Array>>,
-                audio: ::std::option::Option<::std::vec::Vec<::napi::bindgen_prelude::Uint8Array>>,
+                messages: ::std::vec::Vec<$crate::tokenizer::ChatMessage>,
                 config: ::std::option::Option<$crate::engine::types::ChatConfig>,
             ) -> ::napi::Result<$crate::engine::types::ChatResult> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
+                $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
                 $crate::model_thread::send_and_await(thread, |reply| {
                     <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
                         $crate::engine::cmd::ChatCmd::SessionContinue {
-                            user_message,
-                            images,
-                            audio,
+                            messages,
                             config,
                             reply,
                         },
@@ -141,32 +128,21 @@ macro_rules! chat_napi_surface {
                 .await
             }
 
-            /// Continue an existing chat session with a tool-result turn.
-            ///
-            /// Builds the family's tool-result delta from `content` and
-            /// prefills it on top of the live session caches, then decodes
-            /// the assistant reply.
-            ///
-            /// `is_error` is the structured tool-error signal. When
-            /// `Some(true)`, the renderer prepends the shared
-            /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-            /// rendered tool block.
+            /// Continue an existing chat session from a complete
+            /// structured conversation ending in a tool-role message.
             #[napi]
             pub async fn chat_session_continue_tool(
                 &self,
-                tool_call_id: String,
-                content: String,
+                messages: ::std::vec::Vec<$crate::tokenizer::ChatMessage>,
                 config: ::std::option::Option<$crate::engine::types::ChatConfig>,
-                is_error: ::std::option::Option<bool>,
             ) -> ::napi::Result<$crate::engine::types::ChatResult> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
+                $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
                 $crate::model_thread::send_and_await(thread, |reply| {
                     <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
                         $crate::engine::cmd::ChatCmd::SessionContinueTool {
-                            tool_call_id,
-                            content,
-                            is_error,
+                            messages,
                             config,
                             reply,
                         },
@@ -191,14 +167,16 @@ macro_rules! chat_napi_surface {
                 let config = config.unwrap_or_default();
 
                 let plumbing = $crate::engine::napi_glue::start_chat_stream(callback);
-                thread.send(<$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
-                    $crate::engine::cmd::ChatCmd::StreamSessionStart {
-                        messages,
-                        config,
-                        stream_tx: plumbing.stream_tx,
-                        cancelled: plumbing.cancelled,
-                    },
-                ))?;
+                thread.send(
+                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
+                        $crate::engine::cmd::ChatCmd::StreamSessionStart {
+                            messages,
+                            config,
+                            stream_tx: plumbing.stream_tx,
+                            cancelled: plumbing.cancelled,
+                        },
+                    ),
+                )?;
 
                 Ok(plumbing.handle)
             }
@@ -207,9 +185,7 @@ macro_rules! chat_napi_surface {
             #[napi(ts_args_type = $ts_stream_continue)]
             pub async fn chat_stream_session_continue(
                 &self,
-                user_message: String,
-                images: ::std::option::Option<::std::vec::Vec<::napi::bindgen_prelude::Uint8Array>>,
-                audio: ::std::option::Option<::std::vec::Vec<::napi::bindgen_prelude::Uint8Array>>,
+                messages: ::std::vec::Vec<$crate::tokenizer::ChatMessage>,
                 config: ::std::option::Option<$crate::engine::types::ChatConfig>,
                 callback: ::napi::threadsafe_function::ThreadsafeFunction<
                     $crate::engine::types::ChatStreamChunk,
@@ -217,55 +193,50 @@ macro_rules! chat_napi_surface {
                 >,
             ) -> ::napi::Result<$crate::engine::types::ChatStreamHandle> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
+                $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
 
                 let plumbing = $crate::engine::napi_glue::start_chat_stream(callback);
-                thread.send(<$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
-                    $crate::engine::cmd::ChatCmd::StreamSessionContinue {
-                        user_message,
-                        images,
-                        audio,
-                        config,
-                        stream_tx: plumbing.stream_tx,
-                        cancelled: plumbing.cancelled,
-                    },
-                ))?;
+                thread.send(
+                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
+                        $crate::engine::cmd::ChatCmd::StreamSessionContinue {
+                            messages,
+                            config,
+                            stream_tx: plumbing.stream_tx,
+                            cancelled: plumbing.cancelled,
+                        },
+                    ),
+                )?;
 
                 Ok(plumbing.handle)
             }
 
             /// Streaming variant of `chatSessionContinueTool`.
-            ///
-            /// `is_error` mirrors the non-streaming entry point — when
-            /// `Some(true)`, the renderer prepends the shared
-            /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the rendered
-            /// tool block.
             #[napi(ts_args_type = $ts_stream_continue_tool)]
             pub async fn chat_stream_session_continue_tool(
                 &self,
-                tool_call_id: String,
-                content: String,
+                messages: ::std::vec::Vec<$crate::tokenizer::ChatMessage>,
                 config: ::std::option::Option<$crate::engine::types::ChatConfig>,
                 callback: ::napi::threadsafe_function::ThreadsafeFunction<
                     $crate::engine::types::ChatStreamChunk,
                     (),
                 >,
-                is_error: ::std::option::Option<bool>,
             ) -> ::napi::Result<$crate::engine::types::ChatStreamHandle> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
+                $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
 
                 let plumbing = $crate::engine::napi_glue::start_chat_stream(callback);
-                thread.send(<$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
-                    $crate::engine::cmd::ChatCmd::StreamSessionContinueTool {
-                        tool_call_id,
-                        content,
-                        is_error,
-                        stream_tx: plumbing.stream_tx,
-                        cancelled: plumbing.cancelled,
-                        config,
-                    },
-                ))?;
+                thread.send(
+                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
+                        $crate::engine::cmd::ChatCmd::StreamSessionContinueTool {
+                            messages,
+                            stream_tx: plumbing.stream_tx,
+                            cancelled: plumbing.cancelled,
+                            config,
+                        },
+                    ),
+                )?;
 
                 Ok(plumbing.handle)
             }

@@ -142,12 +142,16 @@ describe('Gemma4Model(config) stub (round-5 Finding B)', () => {
 
   it('rejects chatSessionContinue with a "not initialized" error', async () => {
     const stub = new Gemma4ModelNative(stubConfig());
-    await expect(stub.chatSessionContinue('hi', null, null, null)).rejects.toThrow(/not initialized/i);
+    await expect(stub.chatSessionContinue([{ role: 'user', content: 'hi' }], null)).rejects.toThrow(
+      /not initialized/i,
+    );
   });
 
   it('rejects chatSessionContinueTool with a "not initialized" error', async () => {
     const stub = new Gemma4ModelNative(stubConfig());
-    await expect(stub.chatSessionContinueTool('tool_123', '{"ok":true}')).rejects.toThrow(/not initialized/i);
+    await expect(
+      stub.chatSessionContinueTool([{ role: 'tool', toolCallId: 'tool_123', content: '{"ok":true}' }]),
+    ).rejects.toThrow(/not initialized/i);
   });
 
   it('rejects chatStreamSessionStart with a "not initialized" error', async () => {
@@ -163,14 +167,20 @@ describe('Gemma4Model(config) stub (round-5 Finding B)', () => {
 
   it('rejects chatStreamSessionContinue with a "not initialized" error', async () => {
     const stub = new Gemma4ModelNative(stubConfig());
-    await expect(stub.chatStreamSessionContinue('hi', null, null, null, () => {})).rejects.toThrow(/not initialized/i);
+    await expect(
+      stub.chatStreamSessionContinue([{ role: 'user', content: 'hi' }], null, () => {}),
+    ).rejects.toThrow(/not initialized/i);
   });
 
   it('rejects chatStreamSessionContinueTool with a "not initialized" error', async () => {
     const stub = new Gemma4ModelNative(stubConfig());
-    await expect(stub.chatStreamSessionContinueTool('tool_123', '{"ok":true}', null, () => {}, null)).rejects.toThrow(
-      /not initialized/i,
-    );
+    await expect(
+      stub.chatStreamSessionContinueTool(
+        [{ role: 'tool', toolCallId: 'tool_123', content: '{"ok":true}' }],
+        null,
+        () => {},
+      ),
+    ).rejects.toThrow(/not initialized/i);
   });
 
   it('resetCaches is a silent no-op on the stub', () => {

@@ -931,6 +931,7 @@ macro_rules! decode_loop {
                             finish_reason: None,
                             tool_calls: None,
                             thinking: None,
+                            thinking_enabled: None,
                             num_tokens: None,
                             prompt_tokens: None,
                             reasoning_tokens: None,

@@ -44,7 +44,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mlx_core::engine::types::ChatConfig;
+use mlx_core::engine::types::{ChatConfig, ChatResult};
 use mlx_core::models::qwen3::persistence::load_with_thread as qwen3_load_with_thread;
 use mlx_core::tokenizer::ChatMessage;
 
@@ -178,6 +178,30 @@ fn user_message(content: &str) -> ChatMessage {
         is_error: None,
         reasoning_content: None,
         thinking_enabled: None,
+        images: None,
+        audio: None,
+    }
+}
+
+fn assistant_message(result: &ChatResult) -> ChatMessage {
+    ChatMessage {
+        role: "assistant".to_string(),
+        content: result.text.clone(),
+        tool_calls: (!result.tool_calls.is_empty()).then(|| {
+            result
+                .tool_calls
+                .iter()
+                .map(|call| mlx_core::tokenizer::ToolCall {
+                    id: Some(call.id.clone()),
+                    name: call.name.clone(),
+                    arguments: call.arguments.to_string(),
+                })
+                .collect()
+        }),
+        tool_call_id: None,
+        is_error: None,
+        reasoning_content: result.thinking.clone(),
+        thinking_enabled: Some(result.thinking_enabled),
         images: None,
         audio: None,
     }
@@ -378,18 +402,22 @@ async fn qwen3_paged_vs_flat_prefix_reuse_parity() {
     let user2 = "And in another word?";
     let r2_flat = flat_model
         .chat_session_continue(
-            user2.to_string(),
-            None,
-            None,
+            vec![
+                user_message(prompt1),
+                assistant_message(&r1_flat),
+                user_message(user2),
+            ],
             Some(parity_chat_config(WARM_MAX_NEW)),
         )
         .await
         .expect("turn 2 flat chat_session_continue failed");
     let r2_paged = paged_model
         .chat_session_continue(
-            user2.to_string(),
-            None,
-            None,
+            vec![
+                user_message(prompt1),
+                assistant_message(&r1_paged),
+                user_message(user2),
+            ],
             Some(parity_chat_config(WARM_MAX_NEW)),
         )
         .await

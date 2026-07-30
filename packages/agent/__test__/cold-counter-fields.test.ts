@@ -244,6 +244,7 @@ describe('cold-tier counters end to end', () => {
           finishReason: 'stop',
           toolCalls: [],
           thinking: null,
+          thinkingEnabled: true,
           numTokens: 2,
           promptTokens: 4,
           reasoningTokens: 0,

@@ -46,7 +46,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use image::{DynamicImage, GenericImageView, ImageFormat};
-use mlx_core::engine::types::ChatConfig;
+use mlx_core::engine::types::{ChatConfig, ChatResult};
 use mlx_core::models::qwen3_5::model::Qwen3_5Model;
 use mlx_core::tokenizer::ChatMessage;
 use napi::bindgen_prelude::Uint8Array;
@@ -169,15 +169,25 @@ fn user_message(content: &str) -> ChatMessage {
     }
 }
 
-fn assistant_message(content: &str) -> ChatMessage {
+fn assistant_message(result: &ChatResult) -> ChatMessage {
     ChatMessage {
         role: "assistant".to_string(),
-        content: content.to_string(),
-        tool_calls: None,
+        content: result.text.clone(),
+        tool_calls: (!result.tool_calls.is_empty()).then(|| {
+            result
+                .tool_calls
+                .iter()
+                .map(|call| mlx_core::tokenizer::ToolCall {
+                    id: Some(call.id.clone()),
+                    name: call.name.clone(),
+                    arguments: call.arguments.to_string(),
+                })
+                .collect()
+        }),
         tool_call_id: None,
         is_error: None,
-        reasoning_content: None,
-        thinking_enabled: None,
+        reasoning_content: result.thinking.clone(),
+        thinking_enabled: Some(result.thinking_enabled),
         images: None,
         audio: None,
     }
@@ -430,7 +440,7 @@ async fn qwen3_5_paged_vlm_image_prefix_cache_lifecycle() {
     let followup = "Name one visible detail.";
     let same_history = vec![
         user_message_with_image(PROMPT, &image_a),
-        assistant_message(&first.text),
+        assistant_message(&first),
         user_message(followup),
     ];
     let replay = model
@@ -450,9 +460,13 @@ async fn qwen3_5_paged_vlm_image_prefix_cache_lifecycle() {
     let continuation = "Now answer with a short noun.";
     let continued = model
         .chat_session_continue(
-            continuation.to_string(),
-            None,
-            None,
+            vec![
+                user_message_with_image(PROMPT, &image_a),
+                assistant_message(&first),
+                user_message(followup),
+                assistant_message(&replay),
+                user_message(continuation),
+            ],
             Some(cache_lifecycle_chat_config_for_owner("owner-a")),
         )
         .await
@@ -468,11 +482,11 @@ async fn qwen3_5_paged_vlm_image_prefix_cache_lifecycle() {
     let final_question = "Confirm in one word.";
     let extended_history_a = vec![
         user_message_with_image(PROMPT, &image_a),
-        assistant_message(&first.text),
+        assistant_message(&first),
         user_message(followup),
-        assistant_message(&replay.text),
+        assistant_message(&replay),
         user_message(continuation),
-        assistant_message(&continued.text),
+        assistant_message(&continued),
         user_message(final_question),
     ];
     let after_text = model
@@ -492,11 +506,11 @@ async fn qwen3_5_paged_vlm_image_prefix_cache_lifecycle() {
     // to reuse, but the cache chain must stop at the first image-bearing block.
     let extended_history_b = vec![
         user_message_with_image(PROMPT, &image_b),
-        assistant_message(&first.text),
+        assistant_message(&first),
         user_message(followup),
-        assistant_message(&replay.text),
+        assistant_message(&replay),
         user_message(continuation),
-        assistant_message(&continued.text),
+        assistant_message(&continued),
         user_message(final_question),
     ];
     let changed = model
@@ -578,9 +592,11 @@ async fn qwen3_5_paged_vlm_continue_preserves_image_context() {
     // reuse the saved image-expanded prefix (cached_tokens > 0).
     let r2 = paged_model
         .chat_session_continue(
-            "Answer in one word: what is in the image?".to_string(),
-            None,
-            None,
+            vec![
+                user_message_with_image(PROMPT, &image),
+                assistant_message(&r1),
+                user_message("Answer in one word: what is in the image?"),
+            ],
             Some(correctness_chat_config(48)),
         )
         .await

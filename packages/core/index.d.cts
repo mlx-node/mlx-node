@@ -195,50 +195,24 @@ export declare class Gemma4Model {
   /**
    * Start a new chat session.
    *
-   * Runs the full jinja chat template once, decodes until the
-   * family's session stop token, and leaves the KV caches on a
-   * clean turn boundary so subsequent `chatSessionContinue` /
-   * `chatSessionContinueTool` calls can append a raw delta on
-   * top without re-rendering the chat template.
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Continue an existing chat session with a new user message.
-   *
-   * Appends a raw user/assistant delta to the session's cached
-   * KV state, then decodes the assistant reply, stopping on the
-   * family's session boundary token.
-   *
-   * `images` is an opt-in guard parameter: when non-empty the
-   * native side returns an error whose message begins with
-   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can route image-changes back through a
-   * fresh `chatSessionStart`.
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only when the new render strictly extends the saved
+   * token history.
    */
-  chatSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null | undefined,
-  ): Promise<ChatResult>;
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Continue an existing chat session with a tool-result turn.
-   *
-   * Builds the family's tool-result delta from `content` and
-   * prefills it on top of the live session caches, then decodes
-   * the assistant reply.
-   *
-   * `is_error` is the structured tool-error signal. When
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * rendered tool block.
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
    */
-  chatSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
-  ): Promise<ChatResult>;
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -247,26 +221,15 @@ export declare class Gemma4Model {
   ): Promise<ChatStreamHandle>;
   /** Streaming variant of `chatSessionContinue`. */
   chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
+    messages: ChatMessage[],
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the rendered
-   * tool block.
-   */
+  /** Streaming variant of `chatSessionContinueTool`. */
   chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
+    messages: ChatMessage[],
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
 }
 
@@ -553,50 +516,24 @@ export declare class Lfm2Model {
   /**
    * Start a new chat session.
    *
-   * Runs the full jinja chat template once, decodes until the
-   * family's session stop token, and leaves the KV caches on a
-   * clean turn boundary so subsequent `chatSessionContinue` /
-   * `chatSessionContinueTool` calls can append a raw delta on
-   * top without re-rendering the chat template.
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Continue an existing chat session with a new user message.
-   *
-   * Appends a raw user/assistant delta to the session's cached
-   * KV state, then decodes the assistant reply, stopping on the
-   * family's session boundary token.
-   *
-   * `images` is an opt-in guard parameter: when non-empty the
-   * native side returns an error whose message begins with
-   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can route image-changes back through a
-   * fresh `chatSessionStart`.
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only when the new render strictly extends the saved
+   * token history.
    */
-  chatSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null | undefined,
-  ): Promise<ChatResult>;
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Continue an existing chat session with a tool-result turn.
-   *
-   * Builds the family's tool-result delta from `content` and
-   * prefills it on top of the live session caches, then decodes
-   * the assistant reply.
-   *
-   * `is_error` is the structured tool-error signal. When
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * rendered tool block.
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
    */
-  chatSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
-  ): Promise<ChatResult>;
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -605,26 +542,15 @@ export declare class Lfm2Model {
   ): Promise<ChatStreamHandle>;
   /** Streaming variant of `chatSessionContinue`. */
   chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
+    messages: ChatMessage[],
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the rendered
-   * tool block.
-   */
+  /** Streaming variant of `chatSessionContinueTool`. */
   chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
+    messages: ChatMessage[],
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
 }
 
@@ -1108,11 +1034,9 @@ export declare class QianfanOCRModel {
   /**
    * Start a new chat session.
    *
-   * Runs the full chat template once, decodes until `<|im_end|>`,
-   * and leaves the KV caches on a clean turn boundary so subsequent
-   * `chatSessionContinue` / `chatSessionContinueTool` calls can
-   * append a raw ChatML delta on top without re-rendering the chat
-   * template.
+   * Renders the complete structured conversation through the checkpoint
+   * template, decodes until `<|im_end|>`, and preserves KV state for an
+   * exact-prefix check against the next complete template render.
    *
    * Qianfan-OCR is always a VLM (InternViT + Qwen3 language model), so
    * this entry point accepts images in `messages` without the text-only
@@ -1120,97 +1044,33 @@ export declare class QianfanOCRModel {
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Continue an existing chat session with a new user message.
-   *
-   * Appends a raw ChatML user/assistant delta to the session's cached
-   * KV state, then decodes the model reply. Stops on `<|im_end|>` so
-   * the cache remains on a clean turn boundary for the next turn.
-   *
-   * Requires a live session started via `chatSessionStart`. Errors
-   * if the session is empty or if `config.reuse_cache` is
-   * explicitly set to `false`.
-   *
-   * `images` is an opt-in guard parameter: when non-empty the native
-   * side returns an error whose message begins with
-   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can catch the prefix and route image-changes
-   * back through a fresh `chatSessionStart` uniformly across all
-   * model backends. Qianfan-OCR is a VLM but the continue path cannot
-   * splice new vision features into a live KV cache — image changes
-   * always require a fresh session start.
-   *
-   * `audio` exists only to keep this method's positional ABI aligned
-   * with the shared chat surface every other family exposes (the
-   * `chat_napi_surface!` macro inserts `audio` between `images` and
-   * `config`). Qianfan-OCR has no audio support, so a non-empty
-   * `audio` is rejected at the boundary with the shared no-audio
-   * error; `None` / empty is a complete no-op and audio is never
-   * threaded into the model thread.
+   * Continue from the caller's complete conversation history. The
+   * checkpoint's chat template is rendered again and exact prefix matching
+   * decides whether the live cache can be reused.
    */
-  chatSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null | undefined,
-  ): Promise<ChatResult>;
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Continue an existing chat session with a tool-result turn.
-   *
-   * Builds a ChatML `<tool_response>` delta from `tool_call_id` and
-   * `content` and prefills it on top of the live session caches, then
-   * decodes the model reply. Stops on `<|im_end|>` so the cache stays
-   * on a clean turn boundary for the next turn.
-   *
-   * `is_error` is the structured tool-error signal. When `Some(true)`,
-   * the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * `<tool_response>` wrapper so the model receives a clear text-level
-   * cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
-   * pre-feature output.
-   *
-   * Requires a live session started via `chatSessionStart`.
+   * Tool-result continuation over a full history. Tool representation is
+   * owned entirely by the model-provided template.
    */
-  chatSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
-  ): Promise<ChatResult>;
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinue`.
-   *
-   * `audio` mirrors the non-streaming entry point: it exists only to
-   * keep the positional ABI aligned with the shared chat surface, and
-   * a non-empty value is rejected at the boundary with the shared
-   * no-audio error. `None` / empty is a complete no-op.
-   */
+  /** Streaming continuation over a complete conversation history. */
   chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
+    messages: ChatMessage[],
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * `<tool_response>` wrapper.
-   */
+  /** Streaming tool-result continuation over a complete history. */
   chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
+    messages: ChatMessage[],
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
 }
 
@@ -1303,50 +1163,24 @@ export declare class Qwen35Model {
   /**
    * Start a new chat session.
    *
-   * Runs the full jinja chat template once, decodes until the
-   * family's session stop token, and leaves the KV caches on a
-   * clean turn boundary so subsequent `chatSessionContinue` /
-   * `chatSessionContinueTool` calls can append a raw delta on
-   * top without re-rendering the chat template.
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Continue an existing chat session with a new user message.
-   *
-   * Appends a raw user/assistant delta to the session's cached
-   * KV state, then decodes the assistant reply, stopping on the
-   * family's session boundary token.
-   *
-   * `images` is an opt-in guard parameter: when non-empty the
-   * native side returns an error whose message begins with
-   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can route image-changes back through a
-   * fresh `chatSessionStart`.
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only when the new render strictly extends the saved
+   * token history.
    */
-  chatSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null | undefined,
-  ): Promise<ChatResult>;
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Continue an existing chat session with a tool-result turn.
-   *
-   * Builds the family's tool-result delta from `content` and
-   * prefills it on top of the live session caches, then decodes
-   * the assistant reply.
-   *
-   * `is_error` is the structured tool-error signal. When
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * rendered tool block.
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
    */
-  chatSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
-  ): Promise<ChatResult>;
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -1355,26 +1189,15 @@ export declare class Qwen35Model {
   ): Promise<ChatStreamHandle>;
   /** Streaming variant of `chatSessionContinue`. */
   chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
+    messages: ChatMessage[],
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the rendered
-   * tool block.
-   */
+  /** Streaming variant of `chatSessionContinueTool`. */
   chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
+    messages: ChatMessage[],
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
 }
 export type Qwen3_5Model = Qwen35Model;
@@ -1455,50 +1278,24 @@ export declare class Qwen35MoeModel {
   /**
    * Start a new chat session.
    *
-   * Runs the full jinja chat template once, decodes until the
-   * family's session stop token, and leaves the KV caches on a
-   * clean turn boundary so subsequent `chatSessionContinue` /
-   * `chatSessionContinueTool` calls can append a raw delta on
-   * top without re-rendering the chat template.
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Continue an existing chat session with a new user message.
-   *
-   * Appends a raw user/assistant delta to the session's cached
-   * KV state, then decodes the assistant reply, stopping on the
-   * family's session boundary token.
-   *
-   * `images` is an opt-in guard parameter: when non-empty the
-   * native side returns an error whose message begins with
-   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can route image-changes back through a
-   * fresh `chatSessionStart`.
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only when the new render strictly extends the saved
+   * token history.
    */
-  chatSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null | undefined,
-  ): Promise<ChatResult>;
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Continue an existing chat session with a tool-result turn.
-   *
-   * Builds the family's tool-result delta from `content` and
-   * prefills it on top of the live session caches, then decodes
-   * the assistant reply.
-   *
-   * `is_error` is the structured tool-error signal. When
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * rendered tool block.
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
    */
-  chatSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
-  ): Promise<ChatResult>;
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -1507,26 +1304,15 @@ export declare class Qwen35MoeModel {
   ): Promise<ChatStreamHandle>;
   /** Streaming variant of `chatSessionContinue`. */
   chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
+    messages: ChatMessage[],
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the rendered
-   * tool block.
-   */
+  /** Streaming variant of `chatSessionContinueTool`. */
   chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
+    messages: ChatMessage[],
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
 }
 export type Qwen3_5MoeModel = Qwen35MoeModel;
@@ -1656,50 +1442,24 @@ export declare class Qwen3Model {
   /**
    * Start a new chat session.
    *
-   * Runs the full jinja chat template once, decodes until the
-   * family's session stop token, and leaves the KV caches on a
-   * clean turn boundary so subsequent `chatSessionContinue` /
-   * `chatSessionContinueTool` calls can append a raw delta on
-   * top without re-rendering the chat template.
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Continue an existing chat session with a new user message.
-   *
-   * Appends a raw user/assistant delta to the session's cached
-   * KV state, then decodes the assistant reply, stopping on the
-   * family's session boundary token.
-   *
-   * `images` is an opt-in guard parameter: when non-empty the
-   * native side returns an error whose message begins with
-   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can route image-changes back through a
-   * fresh `chatSessionStart`.
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only when the new render strictly extends the saved
+   * token history.
    */
-  chatSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null | undefined,
-  ): Promise<ChatResult>;
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Continue an existing chat session with a tool-result turn.
-   *
-   * Builds the family's tool-result delta from `content` and
-   * prefills it on top of the live session caches, then decodes
-   * the assistant reply.
-   *
-   * `is_error` is the structured tool-error signal. When
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * rendered tool block.
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
    */
-  chatSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
-  ): Promise<ChatResult>;
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -1708,26 +1468,15 @@ export declare class Qwen3Model {
   ): Promise<ChatStreamHandle>;
   /** Streaming variant of `chatSessionContinue`. */
   chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
+    messages: ChatMessage[],
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the rendered
-   * tool block.
-   */
+  /** Streaming variant of `chatSessionContinueTool`. */
   chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
+    messages: ChatMessage[],
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
   /**
    * Load a pretrained model from disk
@@ -2169,17 +1918,11 @@ export declare class TextRecModel {
   recognizeCrop(rgbData: Uint8Array, width: number, height: number): RecResult;
 }
 
-/** Result from VLM chat */
 export declare class VlmChatResult {
-  /** Get the response text */
   get text(): string;
-  /** Get the generated tokens */
   get tokens(): MxArray;
-  /** Get the log probabilities */
   get logprobs(): MxArray;
-  /** Get the finish reason */
   get finishReason(): 'stop' | 'length' | 'repetition';
-  /** Get the number of tokens generated */
   get numTokens(): number;
 }
 export type VLMChatResult = VlmChatResult;
@@ -2519,15 +2262,9 @@ export interface ChatMessage {
    * Authoritative, structured signal of tool-call failure. Set to
    * `Some(true)` when the caller (e.g. the Anthropic
    * `tool_result.is_error === true` translator) wants the model to
-   * treat the tool output as an error. The renderer prepends a short
-   * `[tool error]` prefix to `content` when emitting the wire-format
-   * tool response so the model receives a clear text-level cue, but
-   * the original `content` stays byte-for-byte intact in the
-   * structured form — no JSON wrapping, no in-band marker that could
-   * collide with a successful tool result whose literal content
-   * happens to start with the same prefix.
-   *
-   * `None` / `Some(false)` produce the unmarked wire format.
+   * treat the tool output as an error. It is exposed to the model's
+   * chat template as `message.is_error`; Rust never rewrites `content`
+   * or invents a model-facing error marker.
    */
   isError?: boolean;
   /** Reasoning content for thinking mode (used with <think> tags) */
@@ -2554,6 +2291,13 @@ export interface ChatResult {
   text: string;
   toolCalls: Array<ToolCallResult>;
   thinking?: string;
+  /**
+   * Effective `enable_thinking` boolean passed to the model-provided
+   * chat template for this turn. This is replay provenance and is
+   * intentionally distinct from the family's decode-time
+   * [`ThinkingSetup`](crate::engine::ThinkingSetup).
+   */
+  thinkingEnabled: boolean;
   numTokens: number;
   promptTokens: number;
   reasoningTokens: number;
@@ -2574,15 +2318,11 @@ export interface ChatResult {
   performance?: PerformanceMetrics;
 }
 
-/** Chat message role (lowercase values matching standard convention) */
+/** Chat message role (lowercase values matching standard convention). */
 export declare const enum ChatRole {
-  /** User message */
   User = 'user',
-  /** Assistant response */
   Assistant = 'assistant',
-  /** System prompt */
   System = 'system',
-  /** Tool response */
   Tool = 'tool',
 }
 
@@ -2593,6 +2333,11 @@ export interface ChatStreamChunk {
   finishReason?: string;
   toolCalls?: Array<ToolCallResult>;
   thinking?: string;
+  /**
+   * Effective template `enable_thinking` value. Present on the terminal
+   * chunk only; incremental text/reasoning chunks leave it unset.
+   */
+  thinkingEnabled?: boolean | undefined;
   numTokens?: number;
   promptTokens?: number;
   reasoningTokens?: number;
@@ -4972,51 +4717,32 @@ export interface VisionConfig {
   spatialMergeSize: number;
 }
 
-/** A batch item for VLM batch inference */
 export interface VlmBatchItem {
-  /** Chat messages for this item */
   messages: Array<VlmChatMessage>;
-  /** Encoded image buffers for this item (one image per item for OCR) */
   images?: Array<Buffer>;
 }
 
-/** Configuration for VLM chat */
 export interface VlmChatConfig {
-  /** Encoded image buffers to process (PNG/JPEG bytes) */
   images?: Array<Buffer>;
-  /** Maximum number of new tokens to generate (default: 512) */
   maxNewTokens?: number;
-  /** Sampling temperature (0 = greedy, higher = more random) (default: 0.0 for OCR) */
   temperature?: number;
-  /** Top-k sampling (default: 0) */
   topK?: number;
-  /** Top-p (nucleus) sampling (default: 1.0) */
   topP?: number;
-  /** Repetition penalty (default: 1.5) */
   repetitionPenalty?: number;
-  /**
-   * Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
-   * token that appeared at least once in context. Matches OpenAI API semantics.
-   */
   presencePenalty?: number;
-  /** Number of recent tokens to consider for presence penalty (default: 20) */
   presenceContextSize?: number;
-  /**
-   * Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
-   * logits of each token in context. Matches OpenAI API semantics.
-   */
   frequencyPenalty?: number;
-  /** Number of recent tokens to consider for frequency penalty (default: 20) */
   frequencyContextSize?: number;
-  /** Whether to return log probabilities (default: false) */
   returnLogprobs?: boolean;
 }
 
-/** A chat message with optional image */
+/**
+ * A chat message with textual content. Images are supplied through
+ * [`VLMChatConfig`] and attached to the first user content part before the
+ * model template is rendered.
+ */
 export interface VlmChatMessage {
-  /** Role of the message sender */
   role: ChatRole;
-  /** Text content of the message */
   content: string;
 }
 
