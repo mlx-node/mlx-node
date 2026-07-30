@@ -245,14 +245,25 @@ export default function Cache() {
         </Card>
       ) : (
         <>
+          {/*
+            Every bar in this grid is `h-[1lh]` — one line box of the font its own
+            wrapper carries. StatTile renders `value` inside `text-3xl leading-none`
+            and `sub` inside `text-sm`, so the bars measure 30px and 20px without
+            any call site restating those numbers, and they stay right if the type
+            scale moves. The fixed heights they replace did not match the text
+            (`h-8` is 2px over the value, `h-4` 4px under the sub-line), so all four
+            tiles grew as the request landed and took the charts below with them.
+            The meter is the exception and needs no `1lh`: UsageMeter is itself
+            `h-2`, so the bar already stands in its exact box.
+          */}
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             <StatTile
               label="Usage"
               icon={HardDrive}
-              value={cache.loading ? <Skeleton className="h-8 w-24" /> : formatBytes(totalBytes)}
+              value={cache.loading ? <Skeleton className="h-[1lh] w-24" /> : formatBytes(totalBytes)}
               sub={
                 cache.loading ? (
-                  <Skeleton className="h-4 w-32" />
+                  <Skeleton className="h-[1lh] w-32" />
                 ) : (
                   // Over half the tier's bytes can be sidecars, so the split is
                   // spelled out rather than folded into one opaque total.
@@ -275,10 +286,10 @@ export default function Cache() {
             <StatTile
               label="Objects"
               icon={Database}
-              value={cache.loading ? <Skeleton className="h-8 w-16" /> : formatCount(objects)}
+              value={cache.loading ? <Skeleton className="h-[1lh] w-16" /> : formatCount(objects)}
               sub={
                 cache.loading ? (
-                  <Skeleton className="h-4 w-40" />
+                  <Skeleton className="h-[1lh] w-40" />
                 ) : (
                   `${formatCount(blocks)} prefix block${blocks === 1 ? '' : 's'} · ${formatCount(sidecars)} state sidecar${sidecars === 1 ? '' : 's'}`
                 )
@@ -287,10 +298,10 @@ export default function Cache() {
             <StatTile
               label="Hit rate"
               icon={Percent}
-              value={cache.loading ? <Skeleton className="h-8 w-16" /> : formatRate(trendTotals.hits, lookups)}
+              value={cache.loading ? <Skeleton className="h-[1lh] w-16" /> : formatRate(trendTotals.hits, lookups)}
               sub={
                 cache.loading ? (
-                  <Skeleton className="h-4 w-32" />
+                  <Skeleton className="h-[1lh] w-32" />
                 ) : hasTrend ? (
                   `${formatCount(trendTotals.hits)} hits · ${formatCount(trendTotals.misses)} misses · this cache only`
                 ) : refusals > 0 ? (
@@ -309,7 +320,7 @@ export default function Cache() {
               icon={Clock}
               value={
                 cache.loading ? (
-                  <Skeleton className="h-8 w-20" />
+                  <Skeleton className="h-[1lh] w-20" />
                 ) : disk?.oldestMtime != null ? (
                   formatRelativeTime(disk.oldestMtime)
                 ) : (
@@ -318,7 +329,7 @@ export default function Cache() {
               }
               sub={
                 cache.loading ? (
-                  <Skeleton className="h-4 w-28" />
+                  <Skeleton className="h-[1lh] w-28" />
                 ) : disk?.newestMtime != null ? (
                   `newest ${formatRelativeTime(disk.newestMtime)}`
                 ) : (
@@ -695,11 +706,22 @@ function HealthStat({
         {Icon !== undefined && <Icon className={cn('size-3.5', alarm && 'text-destructive')} aria-hidden />}
         {label}
       </p>
-      {loading ? (
-        <Skeleton className="h-6 w-16" />
-      ) : (
-        <p className={cn('text-xl leading-none font-semibold', alarm && 'text-destructive')}>{value}</p>
-      )}
+      {/*
+        The value keeps its own wrapper while loading rather than being replaced
+        by a bare bar, so the placeholder stands in the box the number will occupy
+        instead of one that merely looks similar: `1lh` resolves against this
+        element's own line-height, which is what `text-xl leading-none` sets. The
+        `h-6` bar it replaces was 4px taller than that line, and this card renders
+        eight of these in a two-row grid, so both rows and everything under them
+        stepped down when the request landed.
+
+        A `div` rather than the `<p>` it was, for the same reason StatTile's value
+        is one: a paragraph may not contain the bar's `div`, and under preflight
+        the two elements produce the identical box anyway.
+      */}
+      <div className={cn('text-xl leading-none font-semibold', alarm && 'text-destructive')}>
+        {loading ? <Skeleton className="h-[1lh] w-16" /> : value}
+      </div>
       <p className="text-muted-foreground text-xs">{hint}</p>
     </div>
   );

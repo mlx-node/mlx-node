@@ -17,6 +17,8 @@
  * environment stays `node` for every other suite.
  */
 
+import { MessageChannel } from 'node:worker_threads';
+
 import { categoryLabels, truncateMiddle } from '@/lib/chart';
 import type {
   CacheResponse,
@@ -41,16 +43,21 @@ import Models from '@/pages/models';
 import Overview from '@/pages/overview';
 import SessionDetail from '@/pages/session-detail';
 import Sessions from '@/pages/sessions';
-import { createElement } from 'react';
+import { act, createElement } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { toast } from 'sonner';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
+import type { DownloadEvent } from '../src/download.js';
+import { serveRuntimeOverPort } from '../src/rpc/host.js';
+import { bindEventTargetPort } from '../src/rpc/port.js';
+import type { ApiCall } from '../src/runtime.js';
+import { connectDashboardApi, disconnectDashboardApi } from '../ui/src/lib/api.js';
 import {
   renderPage,
   sequence,
+  stubApi,
   stubChartMetrics,
-  stubFetch,
   TICK_CHAR_PX,
   TICK_LINE_PX,
   type RenderedPage,
@@ -158,14 +165,14 @@ function emptyCacheFixture(): CacheResponse {
 }
 
 let mounted: RenderedPage | undefined;
-let restoreFetch: (() => void) | undefined;
+let restoreApi: (() => void) | undefined;
 let restoreMetrics: (() => void) | undefined;
 
 afterEach(() => {
   mounted?.unmount();
   mounted = undefined;
-  restoreFetch?.();
-  restoreFetch = undefined;
+  restoreApi?.();
+  restoreApi = undefined;
   restoreMetrics?.();
   restoreMetrics = undefined;
 });
@@ -183,7 +190,7 @@ async function mount(
   routes: Record<string, unknown>,
   settledWhen: string,
 ): Promise<string> {
-  restoreFetch = stubFetch(routes);
+  restoreApi = stubApi(routes);
   mounted = await renderPage(element, (text) => text.includes(settledWhen));
   return mounted.text();
 }
@@ -535,7 +542,7 @@ describe('Cache page', () => {
   it('labels the evict confirmation in objects, matching the count it shows', async () => {
     // 9a: the dialog counted OBJECTS while its title said "blocks". Radix
     // portals the content to document.body, so read from there.
-    restoreFetch = stubFetch({ '/cache': cacheFixture() });
+    restoreApi = stubApi({ '/cache': cacheFixture() });
     mounted = await renderPage(createElement(Cache), (text) => text.includes('mlx-paged-v1'));
     const evict = [...mounted.container.querySelectorAll('button')].find((b) => b.textContent?.includes('Evict older'));
     expect(evict).toBeDefined();
@@ -630,7 +637,7 @@ describe('Overview page', () => {
     // bar. `percentInt` caps it at 99 so the bar and the label agree.
     const nearlyFull = cacheFixture();
     nearlyFull.disk = { ...nearlyFull.disk, totalBytes: 9_999_999, quotaBytes: 10_000_000 };
-    restoreFetch = stubFetch(overviewRoutes(nearlyFull));
+    restoreApi = stubApi(overviewRoutes(nearlyFull));
     mounted = await renderPage(createElement(MemoryRouter, null, createElement(Overview)), (text) =>
       text.includes('of 9.5 MB'),
     );
@@ -761,7 +768,7 @@ describe('Metrics page — per-model bar charts', () => {
    */
   async function mountMetrics(models: string[], options: { tickLinePx?: number } = {}): Promise<RenderedPage> {
     restoreMetrics = stubChartMetrics(options);
-    restoreFetch = stubFetch({ '/metrics/overview': metricsFixture(models) });
+    restoreApi = stubApi({ '/metrics/overview': metricsFixture(models) });
     mounted = await renderPage(createElement(Metrics), (text) => text.includes('qwen3-8b'));
     return mounted;
   }
@@ -1020,63 +1027,59 @@ describe('Models page — the Install affordance', () => {
     return { id: 'job-1', repo: REPO, state: 'running', receivedBytes: 0, totalBytes: 1024, ...overrides };
   }
 
-  /** URLs of every stream {@link stubEventSource} was asked to open. */
+  /** Job ids every mounted card subscribed to, in order. */
   let openedStreams: string[] = [];
-  let restoreSse: (() => void) | undefined;
 
-  /** Deliver one SSE frame to every open stream, as the server would. */
-  let emitSse: (type: string, payload: Record<string, unknown>) => void = () => {};
+  /** Deliver one download event to every open subscription, as the runtime would. */
+  let emitDownload: (type: string, payload: Record<string, unknown>) => void = () => {};
 
   /**
-   * happy-dom ships no `EventSource`, and hydrating a running job mounts
-   * `DownloadProgress`, which opens one. The stand-in records the URL and, unlike
-   * a pure no-op, can DELIVER frames — a terminal frame is the only way to reach
-   * what the page does when a job settles from the stream rather than from a
-   * request it made itself, which no request-level assertion can observe.
+   * Stand in for the runtime's download subscribe. Hydrating a running job mounts
+   * `DownloadProgress`, which subscribes; this records the job id it named and,
+   * unlike a pure no-op, can DELIVER events — a terminal event is the only way to
+   * reach what the page does when a job settles from the subscription rather than
+   * from a request it made itself, which no call-level assertion can observe.
+   *
+   * The events travel the real port, so a test that emits one has to let the hop
+   * land ({@link settle}) before asserting.
    */
-  function stubEventSource(): void {
-    openedStreams = [];
-    const listeners: Array<{ type: string; fn: (ev: MessageEvent<string>) => void }> = [];
-    const holder = globalThis as unknown as { EventSource?: unknown };
-    const previous = holder.EventSource;
-    holder.EventSource = class {
-      constructor(url: string) {
-        openedStreams.push(url);
-      }
-      addEventListener(type: string, fn: (ev: MessageEvent<string>) => void): void {
-        listeners.push({ type, fn });
-      }
-      close(): void {}
+  function downloadSubscribeStub(): (jobId: string, listener: (event: DownloadEvent) => void) => () => void {
+    const listeners = new Set<(event: DownloadEvent) => void>();
+    emitDownload = (type, payload) => {
+      // Safe to iterate live: an unsubscribe can only follow the port hop this
+      // emit starts, never interleave with it.
+      for (const listener of listeners) listener({ type, ...payload } as unknown as DownloadEvent);
     };
-    emitSse = (type, payload) => {
-      // `subscribeSSE` registers one handler per named event and parses `ev.data`,
-      // so a frame must carry its JSON exactly as the wire does.
-      const ev = { data: JSON.stringify({ type, ...payload }) } as MessageEvent<string>;
-      for (const l of listeners) {
-        if (l.type === type) l.fn(ev);
-      }
-    };
-    restoreSse = () => {
-      holder.EventSource = previous;
-      emitSse = () => {};
+    return (jobId, listener) => {
+      openedStreams.push(jobId);
+      listeners.add(listener);
+      return () => listeners.delete(listener);
     };
   }
 
   /**
    * Install the route stub behind a recorder. A dismiss has no rendered
    * consequence on this page — it is a `DELETE` and nothing else — so these
-   * tests have to read the requests, not only the DOM.
+   * tests have to read the calls, not only the DOM.
    */
   function recordRequests(routes: Record<string, unknown>): Array<{ method: string; url: string }> {
-    restoreFetch = stubFetch(routes);
-    const stubbed = globalThis.fetch;
     const calls: Array<{ method: string; url: string }> = [];
-    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-      calls.push({ method: init?.method ?? 'GET', url });
-      return stubbed(input, init);
-    }) as typeof globalThis.fetch;
+    openedStreams = [];
+    restoreApi = stubApi(routes, {
+      onCall: (call) => calls.push({ method: call.method, url: call.path }),
+      subscribe: downloadSubscribeStub(),
+    });
     return calls;
+  }
+
+  /** Let a port hop (and the render it causes) land. */
+  async function settle(): Promise<void> {
+    const { act } = await import('react');
+    for (let i = 0; i < 10; i++) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    }
   }
 
   /** How many times the page fetched `path` — a refetch is otherwise invisible. */
@@ -1092,18 +1095,13 @@ describe('Models page — the Install affordance', () => {
   async function mountModels(): Promise<void> {
     mounted = await renderPage(createElement(Models), (text) => text.includes('Qwen3.6-27B'));
     // The hydration effect fires once `/downloads` lands, which is after the
-    // catalog text the settle condition waits on; give it and its requests room.
-    const { act } = await import('react');
-    for (let i = 0; i < 10; i++) {
-      await act(async () => {
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      });
-    }
+    // catalog text the settle condition waits on; give it and its calls room.
+    await settle();
   }
 
   afterEach(() => {
-    restoreSse?.();
-    restoreSse = undefined;
+    emitDownload = () => {};
+    openedStreams = [];
   });
 
   it('offers Install for a recommended model that is simply absent', async () => {
@@ -1164,7 +1162,6 @@ describe('Models page — the Install affordance', () => {
     // and call nothing back, unlike `done`/`error`, so the card sat on a stopped
     // job beside a live Cancel button with nothing to correct it: no query polls
     // and `downloads` is never reloaded.
-    stubEventSource();
     const failed = vi.spyOn(toast, 'error');
     try {
       recordRequests({
@@ -1174,10 +1171,8 @@ describe('Models page — the Install affordance', () => {
       await mountModels();
       expect(buttonLabels()).toContain('Cancel');
 
-      const { act } = await import('react');
-      await act(async () => {
-        emitSse('cancelled', { id: 'job-run' });
-      });
+      emitDownload('cancelled', { id: 'job-run' });
+      await settle();
       expect(buttonLabels()).toContain('Install');
       expect(buttonLabels()).not.toContain('Cancel');
       // A cancel is not a failure, and whoever issued it already saw their own
@@ -1279,13 +1274,122 @@ describe('Models page — the Install affordance', () => {
   it('still hydrates a running job, and never dismisses it', async () => {
     // The over-correction guard. A dismiss loop that reaches a live job would
     // cancel a multi-GB download that is still running.
-    stubEventSource();
     const calls = recordRequests(catalogRoutes({}, [downloadJob({ id: 'job-run', state: 'running' })]));
     await mountModels();
-    expect(openedStreams).toEqual(['/api/downloads/job-run/events']);
+    expect(openedStreams).toEqual(['job-run']);
     expect(buttonLabels()).toContain('Cancel');
     expect(buttonLabels()).not.toContain('Install');
     expect(dismissed(calls)).toEqual([]);
+  });
+
+  it('drops a stale active card when a replacement runtime omits the job', async () => {
+    recordRequests(catalogRoutes({}, [downloadJob({ id: 'job-old', state: 'running' })]));
+    await mountModels();
+    expect(buttonLabels()).toContain('Cancel');
+
+    // CONTROL PANEL restarted and handed the same mounted tree a new port. The
+    // replacement runtime has no download registry entry for the old process's
+    // job, so its GET is authoritative absence.
+    const oldRuntime = restoreApi!;
+    let newRuntime: (() => void) | undefined;
+    try {
+      newRuntime = stubApi(catalogRoutes({}, []), { subscribe: downloadSubscribeStub() });
+      restoreApi = newRuntime;
+      await settle();
+
+      expect(buttonLabels()).toContain('Install');
+      expect(buttonLabels()).not.toContain('Cancel');
+    } finally {
+      newRuntime?.();
+      restoreApi = undefined;
+      oldRuntime();
+    }
+  });
+
+  it('replaces a stale job id when the replacement runtime has a new job for the same repo', async () => {
+    recordRequests(catalogRoutes({}, [downloadJob({ id: 'job-old', state: 'running' })]));
+    await mountModels();
+    expect(openedStreams).toContain('job-old');
+
+    const oldRuntime = restoreApi!;
+    let newRuntime: (() => void) | undefined;
+    try {
+      openedStreams = [];
+      newRuntime = stubApi(catalogRoutes({}, [downloadJob({ id: 'job-new', state: 'running' })]), {
+        subscribe: downloadSubscribeStub(),
+      });
+      restoreApi = newRuntime;
+      await settle();
+
+      // DownloadProgress may briefly rebind the old id on the connection bump,
+      // but the authoritative snapshot must replace it with the new runtime's id.
+      expect(openedStreams.at(-1)).toBe('job-new');
+      expect(buttonLabels()).toContain('Cancel');
+    } finally {
+      newRuntime?.();
+      restoreApi = undefined;
+      oldRuntime();
+    }
+  });
+
+  it('keeps a current-generation POST result when an older concurrent downloads GET lands later', async () => {
+    let resolveDownloads!: (body: DownloadsResponse) => void;
+    const olderDownloads = new Promise<DownloadsResponse>((resolve) => {
+      resolveDownloads = resolve;
+    });
+    const subscriptions: string[] = [];
+    const routes = catalogRoutes({});
+    const { port1, port2 } = new MessageChannel();
+    port1.unref();
+    port2.unref();
+    const dispose = serveRuntimeOverPort(
+      {
+        call: async (call: ApiCall) => {
+          const path = call.path.replace(/^\/api/u, '');
+          if (call.method === 'GET' && path === '/downloads') {
+            return { ok: true as const, status: 200, body: await olderDownloads };
+          }
+          if (call.method === 'POST' && path === '/downloads') {
+            return { ok: true as const, status: 202, body: { id: 'job-local', repo: REPO } };
+          }
+          if (call.method === 'GET' && Object.hasOwn(routes, path)) {
+            return { ok: true as const, status: 200, body: routes[path] };
+          }
+          return { ok: false as const, status: 404, code: 'E_NOT_FOUND', message: `no stub for ${path}` };
+        },
+        subscribe: (jobId) => {
+          subscriptions.push(jobId);
+          return () => {};
+        },
+      },
+      bindEventTargetPort(port2),
+    );
+    connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+    restoreApi = () => {
+      disconnectDashboardApi();
+      dispose();
+      port1.close();
+      port2.close();
+    };
+
+    mounted = await renderPage(createElement(Models), (text) => text.includes('Qwen3.6-27B'));
+    const install = [...mounted.container.querySelectorAll('button')].find((button) =>
+      button.textContent?.includes('Install'),
+    );
+    expect(install).toBeDefined();
+    await act(async () => {
+      install!.click();
+    });
+    await settle();
+    expect(subscriptions).toContain('job-local');
+    expect(buttonLabels()).toContain('Cancel');
+
+    // This GET began before the POST and therefore cannot disprove the job the
+    // POST just returned, even though its response happens to arrive afterward.
+    resolveDownloads({ jobs: [] });
+    await settle();
+    expect(buttonLabels()).toContain('Cancel');
+    expect(buttonLabels()).not.toContain('Install');
   });
 
   it('hydrates a job that is mid-publish, and never dismisses it', async () => {
@@ -1298,10 +1402,9 @@ describe('Models page — the Install affordance', () => {
     // renames the model into place, so an unhydrated card offers Install for a
     // model that is installing, subscribes to nothing, and — since neither query
     // polls — never learns the job finished.
-    stubEventSource();
     const calls = recordRequests(catalogRoutes({}, [downloadJob({ id: 'job-commit', state: 'committing' })]));
     await mountModels();
-    expect(openedStreams).toEqual(['/api/downloads/job-commit/events']);
+    expect(openedStreams).toEqual(['job-commit']);
     expect(buttonLabels()).not.toContain('Install');
     expect(dismissed(calls)).toEqual([]);
   });
@@ -1309,7 +1412,6 @@ describe('Models page — the Install affordance', () => {
   it('offers no Cancel for a publish the server refuses to cancel', async () => {
     // `cancel()` rejects a `committing` job outright, so the route 404s and the
     // button can only ever raise "Failed to cancel download".
-    stubEventSource();
     recordRequests(catalogRoutes({}, [downloadJob({ id: 'job-commit', state: 'committing' })]));
     await mountModels();
     expect(buttonLabels()).not.toContain('Cancel');

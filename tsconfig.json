@@ -11,11 +11,15 @@
     { "path": "./packages/server" },
     { "path": "./packages/dashboard" },
     { "path": "./packages/dashboard/ui" },
+    { "path": "./packages/desktop" },
     { "path": "./examples" },
     { "path": "./__test__" },
     { "path": "./packages/agent/__test__" },
     { "path": "./packages/cli/__test__" },
     { "path": "./packages/dashboard/__test__" },
+    { "path": "./packages/desktop/__test__" },
+    { "path": "./packages/desktop/scripts" },
+    { "path": "./packages/internal-tools" },
     { "path": "./packages/privacy/__test__" }
   ],
   "compilerOptions": {

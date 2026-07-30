@@ -1096,6 +1096,7 @@ export class DownloadManager {
       repo,
       revision,
       files: files.map((file) => file.path),
+      scope: 'full',
       completedAt: new Date().toISOString(),
     };
     await writeFile(join(stagingDir, DOWNLOAD_COMPLETE_MARKER), `${JSON.stringify(marker, null, 2)}\n`);

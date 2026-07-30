@@ -1,0 +1,44 @@
+{
+  "name": "@mlx-node/desktop",
+  "version": "0.0.8",
+  "private": true,
+  "productName": "mlx-node",
+  "description": "mlx-node macOS desktop app (Electron shell: tray, control panel window, supervised inference sidecar)",
+  "homepage": "https://github.com/mlx-node/mlx-node",
+  "bugs": {
+    "url": "https://github.com/mlx-node/mlx-node/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mlx-node/mlx-node.git",
+    "directory": "packages/desktop"
+  },
+  "type": "module",
+  "main": "dist/main/index.js",
+  "engines": {
+    "node": ">= 22.19.0"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "icons": "oxnode build/make-icons.ts",
+    "package": "oxnode scripts/package.ts",
+    "spike:electron": "electron spike/main.mjs",
+    "spike:node": "node spike/workload.mjs",
+    "start": "electron ."
+  },
+  "dependencies": {
+    "@mlx-node/dashboard": "workspace:*",
+    "@mlx-node/lm": "workspace:*",
+    "@mlx-node/server": "workspace:*"
+  },
+  "devDependencies": {
+    "@electron/notarize": "3.1.1",
+    "@electron/osx-sign": "2.6.0",
+    "@electron/packager": "20.0.4",
+    "@napi-rs/image": "1.14.0",
+    "@types/node": "catalog:",
+    "electron": "43.2.0",
+    "vite-plus": "catalog:"
+  }
+}

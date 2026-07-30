@@ -1,20 +1,22 @@
-/** `mlx launch claude` — start a local Anthropic-compatible server and spawn Claude Code pointed at it. */
+/** `mlx launch claude` — start a local inference host and spawn Claude Code pointed at it. */
 
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { accessSync, constants as fsConstants } from 'node:fs';
-import { createServer as netCreateServer } from 'node:net';
 import { constants as osConstants } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { loadModel, PagedConfigOverrideManager, QWEN35_PAGED_MODEL_TYPES } from '@mlx-node/lm';
-import { createServer } from '@mlx-node/server';
-
-import { resolveMlxNodeHome, resolveModelsDir } from '../../config.js';
-import { discoverModels } from './discover.js';
-import { attachLogger, resolveLogDir, type Logger } from './logger.js';
-import { makeSwapController } from './swap.js';
+import {
+  createInferenceHost,
+  LAUNCHER_ENGINE_POLICY,
+  ModelNotFoundError,
+  NoModelsDiscoveredError,
+  resolveLogDir,
+  resolveMlxNodeHome,
+  type InferenceHostOptions,
+} from '@mlx-node/server/host';
 
 function printHelp(): void {
   console.log(`
@@ -25,7 +27,10 @@ Usage:
 
 Options:
   --port <n>         Port for the local server (default: auto-pick a free port)
-  --host <h>         Host to bind (default: 127.0.0.1)
+  --host <h>         Host to bind (default: 127.0.0.1). The server requires a
+                     per-launch token that only the spawned \`claude\` is given,
+                     so a non-loopback bind is reachable but not usable by
+                     anyone else on the network.
   --models-dir <dir> Directory to discover models from
                      (default: ~/.mlx-node/models; overridable via
                      MLX_MODELS_DIR env or ~/.mlx-node/config.json)
@@ -83,26 +88,6 @@ Examples:
 `);
 }
 
-async function pickFreePort(): Promise<number> {
-  // Bind to port 0, read the assigned port, close immediately. Racy in theory
-  // (another process could grab the port before we listen), but acceptable
-  // for a developer-local CLI.
-  return await new Promise<number>((resolve, reject) => {
-    const probe = netCreateServer();
-    probe.unref();
-    probe.once('error', reject);
-    probe.listen(0, '127.0.0.1', () => {
-      const addr = probe.address();
-      if (addr && typeof addr === 'object') {
-        const port = addr.port;
-        probe.close(() => resolve(port));
-      } else {
-        probe.close(() => reject(new Error('could not determine free port')));
-      }
-    });
-  });
-}
-
 function findClaudeOnPath(): string | null {
   const pathEnv = process.env.PATH ?? '';
   for (const dir of pathEnv.split(delimiter)) {
@@ -131,6 +116,101 @@ function envFlagEnabled(value: string | undefined): boolean {
   }
 }
 
+/** The flag surface `mlx launch claude` maps onto {@link InferenceHostOptions}. */
+export interface LaunchClaudeFlags {
+  port?: number;
+  host?: string;
+  modelsDir?: string;
+  model?: string;
+  logDir?: string;
+  /**
+   * The per-launch secret. Not a flag — {@link run} generates it and hands the
+   * same value to the host and to the spawned `claude`. Optional only so the
+   * pure mapping stays callable from a test without one.
+   */
+  authToken?: string;
+}
+
+/**
+ * A fresh secret for one `mlx launch claude` run, shared with exactly one
+ * child process and never written down.
+ *
+ * The pre-auth launcher passed the constant `mlx-node-local` to Claude Code and
+ * configured no token on the host at all, so the string was decorative: every
+ * route was open to any local process, and to any web page the user's browser
+ * was showing (`Access-Control-Allow-Origin: *` was the default with no token,
+ * which made the replies readable cross-origin as well).
+ */
+function newLaunchAuthToken(): string {
+  return randomBytes(32).toString('base64url');
+}
+
+/**
+ * Map parsed flags onto host options, applying this launcher's policy.
+ *
+ * Exported and kept pure so the one thing the shared-host extraction could
+ * silently drop — the 2048-token paged-prefill chunk `mlx launch claude` has
+ * always applied to bound the cold-prefill memory peak — is assertable without
+ * spawning `claude` or loading a model.
+ */
+export function launchClaudeHostOptions(flags: LaunchClaudeFlags): InferenceHostOptions {
+  return {
+    port: flags.port,
+    host: flags.host,
+    modelsDir: flags.modelsDir,
+    model: flags.model,
+    logDir: flags.logDir,
+    authToken: flags.authToken,
+    // Launcher policy, not an engine default: the shared native var still
+    // reads 0 as "disable chunking", and a value already set in the user's
+    // shell wins (see `applyEnginePolicy`).
+    enginePolicy: LAUNCHER_ENGINE_POLICY,
+  };
+}
+
+/**
+ * Build the environment the spawned `claude` runs under.
+ *
+ * Exported and pure because the one rule here that is not obvious was measured
+ * rather than assumed, and a regression would look like "every request 401s"
+ * with nothing in the code to point at.
+ *
+ * Measured against Claude Code 2.1.220, sending both variables at a local
+ * base URL:
+ *
+ *   ANTHROPIC_AUTH_TOKEN only  → `authorization: Bearer <token>`
+ *   + ANTHROPIC_API_KEY        → `authorization: Bearer <token>`
+ *                                `x-api-key: <the user's own key>`
+ *
+ * The gate reads `x-api-key` FIRST (Anthropic clients send it, and checking it
+ * first stops an injected `authorization` shadowing a caller's real key), so an
+ * inherited `ANTHROPIC_API_KEY` would beat our bearer and 401 the whole
+ * session. It is therefore dropped, not overwritten: the child is pointed at
+ * loopback and has no reason to hold a key for api.anthropic.com — one that
+ * `--verbose` would then write into the request log on disk.
+ */
+export function claudeChildEnv(
+  parent: NodeJS.ProcessEnv,
+  opts: { baseUrl: string; model: string; authToken: string },
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...parent,
+    ANTHROPIC_BASE_URL: opts.baseUrl,
+    ANTHROPIC_AUTH_TOKEN: opts.authToken,
+    ANTHROPIC_MODEL: opts.model,
+    // NOTE: intentionally NOT setting ANTHROPIC_SMALL_FAST_MODEL /
+    // ANTHROPIC_DEFAULT_HAIKU_MODEL. Claude Code falls back to
+    // `claude-haiku-*` for subagents + title generation; the swap
+    // controller aliases any unknown name to the current resident
+    // so those calls always follow whatever model the user picked
+    // via `/model`.
+  };
+  // `delete`, not `= undefined`: `spawn` skipping undefined values is an
+  // implementation detail of `child_process`, and this must not depend on it.
+  delete env.ANTHROPIC_API_KEY;
+  return env;
+}
+
 export async function run(argv: string[]): Promise<void> {
   const parsed = parseArgs({
     args: argv,
@@ -153,46 +233,31 @@ export async function run(argv: string[]): Promise<void> {
     return;
   }
 
-  // Bound paged-prefill memory peak by chunking the prompt. Keep this as a
-  // launcher default, not a Rust default: the shared native env var still uses
-  // 0 as "disable chunking", and non-Claude callers may want single-shot
-  // behavior. 2048 matches the mlx-lm / mlx-vlm default and reduces per-chunk
-  // overhead versus the previous 1024 default for long Qwen dense contexts.
-  // Respect any user-provided value (set in shell). The MLX env var is read via
-  // OnceLock on first paged-prefill call, so setting `process.env` here before
-  // model load is sufficient.
-  if (process.env.MLX_PAGED_PREFILL_CHUNK_SIZE == null) {
-    process.env.MLX_PAGED_PREFILL_CHUNK_SIZE = '2048';
-  }
-
-  const modelsDir = resolveModelsDir(args['models-dir']);
-  const discovered = await discoverModels(modelsDir);
-  if (discovered.length === 0) {
-    console.error(`No models discovered under ${modelsDir}.`);
-    console.error('Run: mlx download model --model Qwen/Qwen3.5-9B');
-    process.exit(1);
-  }
-
-  // Which discovered model becomes Claude Code's "Custom model" slot.
-  // Precedence: --model flag > ANTHROPIC_MODEL env > discovered[0] (alphabetical).
-  const requestedModel = args.model ?? process.env.ANTHROPIC_MODEL;
-  const defaultModel = requestedModel != null ? discovered.find((m) => m.name === requestedModel) : undefined;
-  if (requestedModel != null && !defaultModel) {
-    console.error(`Model "${requestedModel}" not found under ${modelsDir}.`);
-    console.error('Discovered models:');
-    for (const m of discovered) console.error(`  - ${m.name}`);
-    process.exit(1);
-  }
-  const boundModel = defaultModel ?? discovered[0];
-
   const portArg = args.port != null ? Number(args.port) : undefined;
   if (portArg !== undefined && (!Number.isInteger(portArg) || portArg <= 0)) {
     console.error(`Invalid --port: ${String(args.port)}`);
     process.exit(1);
   }
-  const port = portArg ?? (await pickFreePort());
-  const host = args.host ?? '127.0.0.1';
 
+  // Resolve the verbose log directory BEFORE the host starts, because the
+  // native trace file path has to be in the environment before the first
+  // model load. `--log-dir` implies `--verbose`.
+  const traceRequested = envFlagEnabled(process.env.MLX_INFERENCE_TRACE);
+  const verbose = args.verbose || args['log-dir'] != null || process.env.MLX_LOG_DIR != null || traceRequested;
+  let logDir: string | undefined;
+  if (verbose) {
+    logDir = resolveLogDir(args['log-dir'], resolveMlxNodeHome());
+    if (
+      traceRequested &&
+      (process.env.MLX_INFERENCE_TRACE_FILE == null || process.env.MLX_INFERENCE_TRACE_FILE.trim() === '')
+    ) {
+      process.env.MLX_INFERENCE_TRACE_FILE = join(logDir, 'inference-trace.log');
+    }
+  }
+
+  // Checked BEFORE the host starts: a missing `claude` is the single most
+  // likely failure here, and standing a server up just to tear it down would
+  // load the paged-override machinery for nothing.
   const claudeBin = findClaudeOnPath();
   if (!claudeBin) {
     console.error('Could not find `claude` on PATH.');
@@ -200,68 +265,43 @@ export async function run(argv: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // The swap controller needs the registry from the server instance, but the
-  // server needs the controller's callbacks at construction. Bridge via a
-  // late-bound holder: the callbacks capture `ctrlRef.current` by closure.
-  const ctrlRef: { current: ReturnType<typeof makeSwapController> | null } = {
-    current: null,
-  };
-  const server = await createServer({
-    port,
-    host,
-    resolveModel: (name) => ctrlRef.current!.resolveModel(name),
-    listModels: () => ctrlRef.current!.listModels(),
-  });
-  // Wrap loadModel so Qwen3.5 dense / MoE checkpoints get
-  // `use_block_paged_cache: true` injected via a temp-dir clone with
-  // patched config.json. The shared LM manager owns an isolated temp root;
-  // this launcher's historical Qwen3.5-only policy is kept explicit while
-  // agent hosts can select the full chat-family policy.
-  const pagedConfigOverrides = new PagedConfigOverrideManager({
-    modelTypes: QWEN35_PAGED_MODEL_TYPES,
-  });
-  const loadModelPagedAware = async (path: string) => loadModel(await pagedConfigOverrides.resolve(path));
-  ctrlRef.current = makeSwapController(discovered, server.registry, loadModelPagedAware, boundModel.name);
+  const authToken = newLaunchAuthToken();
 
-  // Verbose logging: attach AFTER `createServer` so we wrap every
-  // incoming request (including `GET /v1/models` which claude fires
-  // on startup). `--log-dir` implies `--verbose`.
-  const traceRequested = envFlagEnabled(process.env.MLX_INFERENCE_TRACE);
-  const verbose = args.verbose || args['log-dir'] != null || process.env.MLX_LOG_DIR != null || traceRequested;
-  let logger: Logger | null = null;
-  if (verbose) {
-    const logDir = resolveLogDir(args['log-dir'], resolveMlxNodeHome());
-    if (
-      traceRequested &&
-      (process.env.MLX_INFERENCE_TRACE_FILE == null || process.env.MLX_INFERENCE_TRACE_FILE.trim() === '')
-    ) {
-      process.env.MLX_INFERENCE_TRACE_FILE = join(logDir, 'inference-trace.log');
+  const host = await createInferenceHost(
+    launchClaudeHostOptions({
+      port: portArg,
+      host: args.host,
+      modelsDir: args['models-dir'],
+      model: args.model,
+      logDir,
+      authToken,
+    }),
+  ).catch((err: unknown) => {
+    if (err instanceof NoModelsDiscoveredError) {
+      console.error(err.message);
+      console.error('Run: mlx download model --model Qwen/Qwen3.5-9B');
+      process.exit(1);
     }
-    logger = attachLogger(server.server, logDir);
-  }
+    if (err instanceof ModelNotFoundError) {
+      console.error(err.message);
+      console.error('Discovered models:');
+      for (const name of err.available) console.error(`  - ${name}`);
+      process.exit(1);
+    }
+    throw err;
+  });
 
   console.log(
-    `[mlx] models dir: ${modelsDir} | listening on http://${host}:${port} | discovered ${discovered.length} model(s) | default: ${boundModel.name}`,
+    `[mlx] models dir: ${host.modelsDir} | listening on ${host.url} | discovered ${host.models.length} model(s) | default: ${host.boundModel}`,
   );
-  if (logger) {
-    console.log(`[mlx] verbose logging → ${logger.logDir}`);
-    console.log(`[mlx] tail -f "${join(logger.logDir, 'session.log')}"`);
+  if (host.logDir !== null) {
+    console.log(`[mlx] verbose logging → ${host.logDir}`);
+    console.log(`[mlx] tail -f "${join(host.logDir, 'session.log')}"`);
   }
 
   const child = spawn(claudeBin, claudeArgs, {
     stdio: 'inherit',
-    env: {
-      ...process.env,
-      ANTHROPIC_BASE_URL: `http://${host}:${port}`,
-      ANTHROPIC_AUTH_TOKEN: 'mlx-node-local',
-      ANTHROPIC_MODEL: boundModel.name,
-      // NOTE: intentionally NOT setting ANTHROPIC_SMALL_FAST_MODEL /
-      // ANTHROPIC_DEFAULT_HAIKU_MODEL. Claude Code falls back to
-      // `claude-haiku-*` for subagents + title generation; the swap
-      // controller aliases any unknown name to the current resident
-      // so those calls always follow whatever model the user picked
-      // via `/model`.
-    },
+    env: claudeChildEnv(process.env, { baseUrl: host.url, model: host.boundModel, authToken }),
   });
 
   let shuttingDown = false;
@@ -269,20 +309,10 @@ export async function run(argv: string[]): Promise<void> {
   const shutdown = async (exitCode: number): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
-    if (logger) {
-      try {
-        await logger.close();
-      } catch {
-        /* ignore */
-      }
-    }
+    // `close()` guards each disposer internally, but a rejection here would
+    // otherwise skip `process.exit` and hang the launcher on a live handle.
     try {
-      await server.close();
-    } catch {
-      /* ignore */
-    }
-    try {
-      await pagedConfigOverrides.cleanup();
+      await host.close();
     } catch {
       /* ignore */
     }
@@ -345,7 +375,7 @@ export function computeExitCode(code: number | null, signal: NodeJS.Signals | nu
  *
  * Tracks termination via a caller-supplied `hasChildExited` predicate
  * because `subprocess.killed` flips to true the moment the *signal* is
- * sent, not when the child terminates — making it useless as an
+ * sent, not when the child terminated — making it useless as an
  * "is the child gone yet?" check.
  */
 export function makeChildKillEscalation(opts: {

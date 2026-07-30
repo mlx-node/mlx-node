@@ -199,6 +199,45 @@
       0 2px 4px -2px color-mix(in oklch, black 12%, transparent),
       0 16px 40px -12px color-mix(in oklch, black 20%, transparent);
   }
+  /* A skeleton holds its space immediately but stays invisible for ~140ms.
+     Everything the dashboard fetches is a local RPC to a sibling process, so
+     most answers land in a few tens of milliseconds — well inside that window.
+     Painting a grey bar for 30ms and replacing it is a flash: strictly worse
+     than having shown nothing, because the eye is drawn to the change rather
+     than to the content. Past ~140ms the wait is real and worth explaining, so
+     the bar fades up and starts breathing.
+
+     The hold is opacity, never `display`, so the box is laid out from the first
+     frame either way. That is the half that stops the page jumping: the space
+     is committed before anyone knows whether it will be filled by a bar or by
+     the content itself.
+
+     `forwards` on the reveal holds it opaque through the gap before the pulse's
+     own delay expires; the pulse then wins simply by being later in the list,
+     and starts at the same opacity the reveal left behind. */
+  @keyframes skeleton-reveal {
+    to {
+      opacity: 1;
+    }
+  }
+  @keyframes skeleton-pulse {
+    50% {
+      opacity: 0.55;
+    }
+  }
+  [data-slot='skeleton'] {
+    opacity: 0;
+    animation:
+      skeleton-reveal 220ms ease-out 140ms forwards,
+      skeleton-pulse 1.6s ease-in-out 360ms infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    [data-slot='skeleton'] {
+      opacity: 1;
+      animation: none;
+    }
+  }
+
   /* Subtle monochrome sheen for the logo tile / primary chips / buttons. Pair
      with `text-primary-foreground` (not `text-white`) so it flips with the theme:
      dark tile + light ink in light mode, light tile + dark ink in dark mode. */

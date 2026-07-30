@@ -1,11 +1,15 @@
 import { existsSync, mkdtempSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { MessageChannel } from 'node:worker_threads';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import { clearColdCache, evictOlderThan, scanColdCache } from '../src/cache.js';
-import { mutate } from '../ui/src/lib/api.js';
+import { serveRuntimeOverPort } from '../src/rpc/host.js';
+import { bindEventTargetPort } from '../src/rpc/port.js';
+import type { ApiCall } from '../src/runtime.js';
+import { connectDashboardApi, disconnectDashboardApi, mutate } from '../ui/src/lib/api.js';
 import { coldObjectCounts, evictPreview, histogramObjectTotal } from '../ui/src/lib/cold-tier.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -274,15 +278,24 @@ describe('symlinked cold-cache root (Finding 3)', () => {
 // This pins the client contract for both the clear and evict request bodies.
 describe('cache DELETE request body (Cache page → mutate)', () => {
   it('sends {all:true} for clear and {olderThanDays} for evict, and no body for undefined', async () => {
-    const calls: Array<{ method: string; body?: unknown }> = [];
-    const original = globalThis.fetch;
-    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
-      calls.push({ method: init?.method ?? 'GET', body: init?.body });
-      return new Response(JSON.stringify({ removed: 0, freedBytes: 0 }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }) as typeof fetch;
+    // Driven over a real port pair, so what is asserted is the `ApiCall` that
+    // actually reaches the runtime after a structured clone — not an intermediate
+    // the client happens to build.
+    const calls: ApiCall[] = [];
+    const { port1, port2 } = new MessageChannel();
+    port1.unref();
+    port2.unref();
+    const dispose = serveRuntimeOverPort(
+      {
+        call: async (call: ApiCall) => {
+          calls.push(call);
+          return { ok: true, status: 200, body: { removed: 0, freedBytes: 0 } };
+        },
+        subscribe: () => () => {},
+      },
+      bindEventTargetPort(port2),
+    );
+    connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
 
     try {
       // The bodies cache.tsx constructs per action kind.
@@ -291,13 +304,17 @@ describe('cache DELETE request body (Cache page → mutate)', () => {
       // The OLD clear-all body: an omitted payload the server rejects.
       await mutate('DELETE', '/cache', undefined);
     } finally {
-      globalThis.fetch = original;
+      disconnectDashboardApi();
+      dispose();
     }
 
     expect(calls).toHaveLength(3);
-    expect(JSON.parse(calls[0].body as string)).toEqual({ all: true });
-    expect(JSON.parse(calls[1].body as string)).toEqual({ olderThanDays: 7 });
-    expect(calls[2].body).toBeUndefined();
+    expect(calls[0]).toEqual({ method: 'DELETE', path: '/api/cache', body: { all: true } });
+    expect(calls[1]).toEqual({ method: 'DELETE', path: '/api/cache', body: { olderThanDays: 7 } });
+    // An omitted body must not become `{}` or `null` on the way across: the
+    // handler's ambiguous-body 400 is what distinguishes it from a real clear-all.
+    expect(calls[2]).toEqual({ method: 'DELETE', path: '/api/cache' });
+    expect('body' in calls[2]).toBe(false);
   });
 });
 

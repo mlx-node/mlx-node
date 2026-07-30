@@ -12,6 +12,8 @@ import { join } from 'node:path';
  */
 export const DOWNLOAD_COMPLETE_MARKER = '.mlx-download-complete.json';
 
+export type DownloadScope = 'full' | 'partial';
+
 /** Contents of {@link DOWNLOAD_COMPLETE_MARKER}: the pinned snapshot a dir holds. */
 export interface DownloadCompletion {
   /** HuggingFace repo the checkpoint came from. */
@@ -20,6 +22,11 @@ export interface DownloadCompletion {
   revision: string;
   /** Repo-relative paths of every file this tool downloaded or verified. */
   files: string[];
+  /**
+   * Whether the marker covers a full-model run. Missing means `full` for
+   * compatibility with dashboard and CLI markers written before this field.
+   */
+  scope?: DownloadScope;
   /** ISO timestamp of the last successful download/sync. */
   completedAt: string;
 }
@@ -49,7 +56,8 @@ export async function readCompletion(dir: string): Promise<DownloadCompletion | 
     typeof marker.revision !== 'string' ||
     typeof marker.completedAt !== 'string' ||
     !Array.isArray(marker.files) ||
-    !marker.files.every((file) => typeof file === 'string')
+    !marker.files.every((file) => typeof file === 'string') ||
+    (marker.scope !== undefined && marker.scope !== 'full' && marker.scope !== 'partial')
   ) {
     return null;
   }
@@ -57,8 +65,18 @@ export async function readCompletion(dir: string): Promise<DownloadCompletion | 
     repo: marker.repo,
     revision: marker.revision,
     files: marker.files as string[],
+    scope: marker.scope as DownloadScope | undefined,
     completedAt: marker.completedAt,
   };
+}
+
+/**
+ * Preserve a valid marker's ownership while a sync is in progress, but make
+ * it ineligible for any "already complete/current" gate until finalization
+ * atomically publishes a new full or partial result.
+ */
+export function markCompletionPartial(completion: DownloadCompletion): DownloadCompletion {
+  return { ...completion, scope: 'partial' };
 }
 
 /**

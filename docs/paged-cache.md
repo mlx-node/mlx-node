@@ -253,14 +253,26 @@ on-disk format change**. The window floor previously made the sidecar inert: gem
 real window is 1024 and typical chat prompts are shorter, so nothing was ever backed
 while capture still wrote K/V blocks no restore could read back.
 
-Capture additionally refuses any non-bf16 cache (the snapshot type promises no dtype)
-and any media turn (v1), and never anchors deeper than the K/V chain actually reached
-(`PagedKVCacheAdapter::cold_captured_blocks`). It also only anchors where an
+Capture additionally refuses any non-bf16 cache (the snapshot type promises no
+dtype). Text capture still refuses inherited media lineage. A native pure-image
+capture is allowed only after global K/V capture succeeds, and only at a complete,
+block-aligned checkpoint at or beyond the expanded image run; audio and mixed-media
+turns remain disabled. Capture never anchors deeper than the K/V chain actually
+reached (`PagedKVCacheAdapter::cold_captured_blocks`). It also only anchors where an
 in-memory checkpoint already sits — and that chain reach lags the prompt badly,
 because `capture_chain` stops at the first block the bounded writer queue refuses.
 Measured on `Gemma-4-12B-IT-nvidia-mxfp-mlx` with an ~8.1k-token prompt under
 `mlx agent`, it advanced ~34 blocks (544 tokens) per turn, reaching 1136 tokens by
 turn 2 of an 8128-token prompt boundary — 508 blocks.
+
+Image-bearing block identity is a versioned SHA-256 digest of the raw payload.
+Every expanded placeholder contributes all four digest words plus its position to
+the block's `extra_keys`, preceded by an image-key layout marker and a preprocessing
+semantics marker. Later blocks inherit that identity through the parent hash chain.
+Text-only blocks retain empty `extra_keys`, so their cold keys are unchanged. The
+raw image must still be supplied after restart to reconstruct the digest, expansion
+length and positions; once the exact global/sliding pair is restored beyond the
+image span, the vision tower is skipped.
 
 ### The cold anchor rungs
 
@@ -350,16 +362,18 @@ so the chain's reach finds an anchor from turn 1 and deepens
 usable anchor traces `sliding_cold_sidecar_capture_skipped` (now carrying `retained=`
 and `anchor_rungs=`) rather than looking like a working cache.
 
-For gemma4 the sidecar is an **optimization, not a correctness prerequisite**, and
-that is precisely what licenses scaling the boundary: a sliding window is a
-_windowed_ state, so when the sidecar is absent — or is only representable shallower
-than the K/V prefix — `run_sliding_only_prefill` reconstructs the missing rows from
-token ids exactly, and the sidecar only buys back that replay. Contrast qwen3_5:
-a GDN recurrent state is a running summary of every preceding token, valid ONLY at
-the exact boundary it was produced at, and recomputing it is mathematically
-equivalent but not bit-identical (see below). That asymmetry is the whole reason the
-scaled axis is gemma4's alone — `ColdSidecarPolicy::new` stays unscaled and qwen3_5 /
-qwen3_5_moe are untouched.
+For a text-only gemma4 prefix the sidecar is an **optimization, not a correctness
+prerequisite**, and that is precisely what licenses scaling the boundary: a sliding
+window is a _windowed_ state, so when the sidecar is absent
+`run_sliding_only_prefill` reconstructs the missing rows from token ids exactly.
+An image-crossing prefix is different: its placeholder ids cannot reconstruct the
+vision embeddings, so restore accepts only a sidecar whose boundary exactly equals
+the effective global K/V prefix; otherwise the prepared request restarts cold.
+Contrast qwen3_5: a GDN recurrent state is a running summary of every preceding
+token, valid ONLY at the exact boundary it was produced at, and recomputing it is
+mathematically equivalent but not bit-identical (see below). That asymmetry is the
+whole reason the scaled axis is gemma4's alone — `ColdSidecarPolicy::new` stays
+unscaled and qwen3_5 / qwen3_5_moe are untouched.
 
 ### qwen3_5's GDN recurrent-state sidecar
 

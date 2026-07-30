@@ -2807,6 +2807,10 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             }
             _ => None,
         };
+        if let Some(kind) = official_unsloth_kind {
+            validate_gemma4_official_unsloth_shapes(&converted_tensors, kind)
+                .map_err(Error::from_reason)?;
+        }
 
         if is_privacy_filter {
             // Privacy-filter has a dedicated predicate: quantize attention
@@ -4349,14 +4353,22 @@ fn is_qwen35_hybrid_checkpoint(
         && has_qwen35_hybrid_weight_shape(weight_keys)
 }
 
-/// Which fixed Unsloth tensor-class map to emit. Apple translates the source
-/// classes to MXFP4/MXFP8; DGX preserves NVFP4 and plain per-output E4M3 FP8.
+/// Which verified fixed Unsloth tensor-class map to emit.
+///
+/// The family is part of the variant so the builder cannot accidentally apply
+/// Qwen's final-eight FFN promotion to Gemma4. Apple translates the upstream
+/// NVFP4/FP8 classes to MXFP4/MXFP8; DGX preserves NVFP4 and plain per-output
+/// E4M3 FP8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OfficialUnslothRecipeKind {
-    /// Translate the upstream NVFP4 class to MLX MXFP4 (4/32).
-    Mxfp,
-    /// Preserve the DGX NVFP4 (4/16) + plain E4M3 FP8 weight classes.
-    Nvfp4,
+    /// Qwen3.5/3.6 hybrid map, translated to MXFP4/MXFP8.
+    QwenMxfp,
+    /// Qwen3.5/3.6 hybrid map, preserving NVFP4/plain E4M3 FP8.
+    QwenNvfp4,
+    /// Gemma4 MoE map, translated to MXFP4/MXFP8.
+    Gemma4MoeMxfp,
+    /// Gemma4 MoE map, preserving NVFP4/plain E4M3 FP8.
+    Gemma4MoeNvfp4,
 }
 
 /// User-facing warning for a verified fixed Unsloth map without calibration.
@@ -4403,9 +4415,10 @@ pub(crate) fn validate_unsloth_imatrix_after_selection(
     }
     Err(
         "unsloth without --imatrix-path is supported only for a verified Qwen3.5/Qwen3.6 \
-         hybrid checkpoint using the fixed --q-mxfp or --q-mode nvfp4 class map; \
-         family/shape validation did not select a fixed map, so refusing to fall back \
-         to legacy Dynamic 2.0 without AWQ calibration"
+         hybrid or Gemma4 MoE SafeTensors checkpoint using the fixed --q-mxfp or \
+         --q-mode nvfp4 class map; family/requested-model/shape validation did not \
+         select a fixed map, so refusing to fall back to legacy Dynamic 2.0 without \
+         AWQ calibration"
             .to_string(),
     )
 }
@@ -4423,12 +4436,84 @@ pub(crate) fn select_official_unsloth_recipe(
         return None;
     }
     if quant_mxfp {
-        Some(OfficialUnslothRecipeKind::Mxfp)
+        Some(OfficialUnslothRecipeKind::QwenMxfp)
     } else if quant_mode == "nvfp4" {
-        Some(OfficialUnslothRecipeKind::Nvfp4)
+        Some(OfficialUnslothRecipeKind::QwenNvfp4)
     } else {
         None
     }
+}
+
+/// Require the post-sanitize tensor classes of the verified
+/// `unsloth/gemma-4-26B-A4B-it-NVFP4` recipe: standard attention, the dense
+/// language-model MLP, split/stacked Gemma experts, and the router.
+///
+/// Gemma4's `attention_k_eq_v` layers legitimately omit some `v_proj`
+/// tensors, so q/k/o are the mandatory attention signature and v is mapped
+/// when present.
+pub(crate) fn has_gemma4_moe_weight_shape(weight_keys: &[String]) -> bool {
+    let language_layer_keys = weight_keys.iter().filter(|key| {
+        key.strip_prefix("language_model.model.layers.")
+            .and_then(|rest| rest.split_once('.'))
+            .is_some_and(|(layer, _)| layer.parse::<usize>().is_ok_and(|layer| layer < 30))
+    });
+    let count = |suffixes: &[&str]| {
+        language_layer_keys
+            .clone()
+            .filter(|key| suffixes.iter().any(|suffix| key.ends_with(suffix)))
+            .count()
+    };
+
+    count(&[".self_attn.q_proj.weight"]) == 30
+        && count(&[".self_attn.k_proj.weight"]) == 30
+        && count(&[".self_attn.v_proj.weight"]) == 25
+        && count(&[".self_attn.o_proj.weight"]) == 30
+        && count(&[".mlp.gate_proj.weight"]) == 30
+        && count(&[".mlp.up_proj.weight"]) == 30
+        && count(&[".mlp.down_proj.weight"]) == 30
+        && count(&[".experts.switch_glu.gate_proj.weight"]) == 30
+        && count(&[".experts.switch_glu.up_proj.weight"]) == 30
+        && count(&[".experts.switch_glu.down_proj.weight"]) == 30
+        && count(&[".router.proj.weight"]) == 30
+}
+
+/// Verify the exact SafeTensors Gemma4 MoE family supported by the upstream
+/// recipe. Root config, nested text config, requested sanitizer, MoE flag, and
+/// sanitized tensor inventory must all agree. Unified/audio and text-only
+/// wrappers are intentionally not inferred from aliases: the published recipe
+/// this map mirrors is the `gemma4` conditional-generation checkpoint.
+fn is_gemma4_moe_checkpoint(
+    config: &serde_json::Value,
+    requested_model_type: Option<&str>,
+    weight_keys: &[String],
+) -> bool {
+    let config_family = config.get("model_type").and_then(|value| value.as_str());
+    let text_family = config
+        .get("text_config")
+        .and_then(|value| value.get("model_type"))
+        .and_then(|value| value.as_str());
+    let is_moe = crate::engine::persistence::get_config_bool(
+        config,
+        config.get("text_config"),
+        &["enable_moe_block"],
+        false,
+    );
+    let text_config = config.get("text_config");
+    let exact_published_shape = text_config.is_some_and(|text| {
+        text.get("num_hidden_layers").and_then(|v| v.as_i64()) == Some(30)
+            && text.get("num_experts").and_then(|v| v.as_i64()) == Some(128)
+            && text.get("hidden_size").and_then(|v| v.as_i64()) == Some(2816)
+            && text.get("intermediate_size").and_then(|v| v.as_i64()) == Some(2112)
+            && text.get("moe_intermediate_size").and_then(|v| v.as_i64()) == Some(704)
+            && text.get("attention_k_eq_v").and_then(|v| v.as_bool()) == Some(true)
+    });
+
+    config_family == Some("gemma4")
+        && text_family == Some("gemma4_text")
+        && requested_model_type == Some("gemma4")
+        && is_moe
+        && exact_published_shape
+        && has_gemma4_moe_weight_shape(weight_keys)
 }
 
 /// Select and validate the SafeTensors fixed Unsloth class map from the input
@@ -4448,25 +4533,52 @@ fn select_and_validate_official_unsloth_recipe(
     weight_keys: &[String],
 ) -> std::result::Result<Option<OfficialUnslothRecipeKind>, String> {
     let is_qwen35_hybrid = is_qwen35_hybrid_checkpoint(config, requested_model_type, weight_keys);
-    let official_kind =
-        select_official_unsloth_recipe(recipe, quant_mxfp, quant_mode, is_qwen35_hybrid);
+    let is_gemma4_moe = is_gemma4_moe_checkpoint(config, requested_model_type, weight_keys);
+    let requests_fixed_map = recipe == "unsloth" && (quant_mxfp || quant_mode == "nvfp4");
+    let config_declares_gemma4 =
+        config.get("model_type").and_then(|value| value.as_str()) == Some("gemma4");
+    let requested_gemma4 = requested_model_type == Some("gemma4");
+    if requests_fixed_map
+        && (config_declares_gemma4 || requested_gemma4)
+        && !is_gemma4_moe
+        && !is_qwen35_hybrid
+    {
+        return Err(
+            "Gemma4 fixed Unsloth map validation failed: only the verified \
+             gemma-4-26B-A4B MoE SafeTensors shape is supported, and input config, \
+             requested --model-type gemma4, MoE dimensions, and the complete sanitized \
+             180-MLP/115-attention/30-router tensor inventory must agree. Refusing to \
+             fall back to the legacy Qwen Dynamic 2.0 predicate even though an imatrix \
+             was provided."
+                .to_string(),
+        );
+    }
+    let official_kind = if is_qwen35_hybrid {
+        select_official_unsloth_recipe(recipe, quant_mxfp, quant_mode, true)
+    } else if recipe == "unsloth" && is_gemma4_moe && quant_mxfp {
+        Some(OfficialUnslothRecipeKind::Gemma4MoeMxfp)
+    } else if recipe == "unsloth" && is_gemma4_moe && quant_mode == "nvfp4" {
+        Some(OfficialUnslothRecipeKind::Gemma4MoeNvfp4)
+    } else {
+        None
+    };
     validate_unsloth_imatrix_after_selection(recipe, imatrix_path, official_kind)?;
     Ok(official_kind)
 }
 
-/// Build the fixed Unsloth tensor-class map for Qwen3.5 hybrid models.
+/// Build a verified fixed Unsloth tensor-class map.
 ///
-/// Selected for verified Qwen hybrids under either `--q-mxfp` (early FFNs use
-/// MXFP4) or `--q-mode nvfp4` (early FFNs use NVFP4). The existing
+/// Selected for verified Qwen hybrids or Gemma4 MoE SafeTensors under either
+/// `--q-mxfp` or `--q-mode nvfp4`. The existing
 /// [`build_unsloth_recipe`] remains unchanged for plain affine and as the safe
-/// fallback for non-Qwen/ambiguous inputs. AWQ pre-scaling is unchanged.
+/// fallback for unverified/ambiguous inputs. AWQ pre-scaling is unchanged.
 ///
-/// The language-model depth is inferred from the weight keys. FFNs in the final
-/// eight transformer layers use the selected high format: MXFP8 for `Mxfp`,
-/// plain per-output E4M3 FP8 for `Nvfp4`. Earlier FFNs use MXFP4 or NVFP4,
-/// respectively. Attention, GDN qkv/z/out, and lm_head use the same selected
-/// high format at every depth. Embeddings, router gates, split GDN a/b, vision,
-/// MTP, norms, and recurrent parameters remain BF16.
+/// Qwen keeps its final-eight FFN promotion. Gemma mirrors the published
+/// `unsloth/gemma-4-26B-A4B-it-NVFP4` class map instead: every language-model
+/// attention q/k/v/o projection uses the high format; every dense MLP and
+/// sanitized `experts.switch_glu` gate/up/down projection uses the low format
+/// at every depth. Gemma router, embeddings, vision/audio, norms, head, and all
+/// other tensors remain BF16.
 pub(crate) fn build_official_unsloth_recipe(
     weight_keys: &[String],
     kind: OfficialUnslothRecipeKind,
@@ -4486,6 +4598,14 @@ pub(crate) fn build_official_unsloth_recipe(
         .map(|max_layer| max_layer + 1)
         .unwrap_or(0);
     let final_eight_start = num_layers.saturating_sub(8);
+    let is_qwen = matches!(
+        kind,
+        OfficialUnslothRecipeKind::QwenMxfp | OfficialUnslothRecipeKind::QwenNvfp4
+    );
+    let use_mxfp = matches!(
+        kind,
+        OfficialUnslothRecipeKind::QwenMxfp | OfficialUnslothRecipeKind::Gemma4MoeMxfp
+    );
 
     Box::new(move |key: &str| -> QuantDecision {
         let mxfp8 = || QuantDecision::Custom {
@@ -4508,14 +4628,42 @@ pub(crate) fn build_official_unsloth_recipe(
             group_size: 16,
             mode: "nvfp4".to_string(),
         };
-        let low_ffn = || match kind {
-            OfficialUnslothRecipeKind::Mxfp => mxfp4(),
-            OfficialUnslothRecipeKind::Nvfp4 => nvfp4(),
-        };
-        let high = || match kind {
-            OfficialUnslothRecipeKind::Mxfp => mxfp8(),
-            OfficialUnslothRecipeKind::Nvfp4 => fp8_e4m3(),
-        };
+        let low_ffn = || if use_mxfp { mxfp4() } else { nvfp4() };
+        let high = || if use_mxfp { mxfp8() } else { fp8_e4m3() };
+
+        if !is_qwen {
+            // Gemma's fixed map is language-model-only. Requiring the exact
+            // post-sanitize prefix prevents identically named vision/audio
+            // projections from being swept into the recipe.
+            if !key.starts_with("language_model.model.layers.") {
+                return QuantDecision::Skip;
+            }
+            if !should_quantize(key, /* embed_quantizable */ false) || is_router_gate(key) {
+                return QuantDecision::Skip;
+            }
+
+            let is_attention = key.contains(".self_attn.q_proj")
+                || key.contains(".self_attn.k_proj")
+                || key.contains(".self_attn.v_proj")
+                || key.contains(".self_attn.o_proj");
+            if is_attention {
+                return high();
+            }
+
+            let is_dense_mlp = key.contains(".mlp.")
+                && (key.contains("gate_proj")
+                    || key.contains("up_proj")
+                    || key.contains("down_proj"));
+            let is_expert = key.contains(".experts.switch_glu.")
+                && (key.contains("gate_proj")
+                    || key.contains("up_proj")
+                    || key.contains("down_proj"));
+            if is_dense_mlp || is_expert {
+                return low_ffn();
+            }
+
+            return QuantDecision::Skip;
+        }
 
         // Fail closed for side modules and embeddings, even when a nested key
         // contains a projection name that would otherwise match below.
@@ -4572,6 +4720,69 @@ pub(crate) fn build_official_unsloth_recipe(
 
         QuantDecision::Skip
     })
+}
+
+/// Validate the physical tensor geometry of the published Gemma4 MoE class
+/// map before quantization starts. Name/config gates alone are insufficient:
+/// a wrong-rank expert or an unaligned input dimension would otherwise be
+/// silently skipped by the generic emission gate, producing a mixed checkpoint
+/// that no longer matches the claimed fixed recipe.
+fn validate_gemma4_official_unsloth_shapes(
+    weights: &HashMap<String, MxArray>,
+    kind: OfficialUnslothRecipeKind,
+) -> std::result::Result<(), String> {
+    if !matches!(
+        kind,
+        OfficialUnslothRecipeKind::Gemma4MoeMxfp | OfficialUnslothRecipeKind::Gemma4MoeNvfp4
+    ) {
+        return Ok(());
+    }
+
+    let weight_keys = weights.keys().cloned().collect::<Vec<_>>();
+    let predicate = build_official_unsloth_recipe(&weight_keys, kind);
+    let mut low_count = 0usize;
+    let mut high_count = 0usize;
+    for (key, weight) in weights {
+        let QuantDecision::Custom { mode, .. } = predicate(key) else {
+            continue;
+        };
+        let is_expert = key.contains(".experts.switch_glu.");
+        let expected_rank = if is_expert { 3 } else { 2 };
+        let rank = weight
+            .ndim()
+            .map_err(|error| format!("failed to inspect Gemma4 tensor '{key}': {error}"))?;
+        if rank != expected_rank {
+            return Err(format!(
+                "Gemma4 fixed Unsloth map tensor '{key}' must be rank {expected_rank}, got rank \
+                 {rank}; refusing to emit a partial fixed-map checkpoint"
+            ));
+        }
+        let shape = weight
+            .shape()
+            .map_err(|error| format!("failed to inspect Gemma4 tensor '{key}': {error}"))?;
+        let input_dim = *shape
+            .last()
+            .ok_or_else(|| format!("Gemma4 fixed Unsloth map tensor '{key}' has an empty shape"))?;
+        if input_dim <= 0 || input_dim % 32 != 0 {
+            return Err(format!(
+                "Gemma4 fixed Unsloth map tensor '{key}' has input dimension {input_dim}; \
+                 the verified MXFP4/NVFP4 recipe requires K % 32 == 0"
+            ));
+        }
+
+        if mode == "mxfp4" || mode == "nvfp4" {
+            low_count += 1;
+        } else if mode == "mxfp8" || mode == crate::quant::fp8_weight::FP8_E4M3_MODE {
+            high_count += 1;
+        }
+    }
+    if (low_count, high_count) != (180, 115) {
+        return Err(format!(
+            "Gemma4 fixed Unsloth map selected {low_count} low-format and {high_count} \
+             high-format tensors; expected exactly 180 MLP/expert and 115 attention tensors"
+        ));
+    }
+    Ok(())
 }
 
 /// Build the "nvidia" quantization recipe for Qwen3.5/3.6 hybrid models.
@@ -9881,7 +10092,7 @@ mod tests {
         ]);
         let weight_keys = weights.keys().cloned().collect::<Vec<_>>();
         let predicate =
-            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::Nvfp4);
+            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::QwenNvfp4);
 
         let first_overrides =
             quantize_weights_with_recipe_pub(&mut weights, 4, 16, "nvfp4", &*predicate, false)
@@ -13087,11 +13298,11 @@ mod tests {
     fn official_unsloth_selector_is_exact() {
         assert_eq!(
             select_official_unsloth_recipe("unsloth", true, "affine", true),
-            Some(OfficialUnslothRecipeKind::Mxfp)
+            Some(OfficialUnslothRecipeKind::QwenMxfp)
         );
         assert_eq!(
             select_official_unsloth_recipe("unsloth", false, "nvfp4", true),
-            Some(OfficialUnslothRecipeKind::Nvfp4)
+            Some(OfficialUnslothRecipeKind::QwenNvfp4)
         );
         assert_eq!(
             select_official_unsloth_recipe("unsloth", false, "affine", true),
@@ -13148,8 +13359,10 @@ mod tests {
         );
 
         for kind in [
-            OfficialUnslothRecipeKind::Mxfp,
-            OfficialUnslothRecipeKind::Nvfp4,
+            OfficialUnslothRecipeKind::QwenMxfp,
+            OfficialUnslothRecipeKind::QwenNvfp4,
+            OfficialUnslothRecipeKind::Gemma4MoeMxfp,
+            OfficialUnslothRecipeKind::Gemma4MoeNvfp4,
         ] {
             validate_unsloth_imatrix_after_selection("unsloth", None, Some(kind))
                 .expect("a verified fixed map may run without an imatrix");
@@ -13273,6 +13486,299 @@ mod tests {
         ));
     }
 
+    fn gemma4_moe_test_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "enable_moe_block": true,
+                "num_hidden_layers": 30,
+                "num_experts": 128,
+                "hidden_size": 2816,
+                "intermediate_size": 2112,
+                "moe_intermediate_size": 704,
+                "attention_k_eq_v": true
+            }
+        })
+    }
+
+    fn gemma4_moe_test_keys() -> Vec<String> {
+        let mut keys = Vec::new();
+        for layer in 0..30 {
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                keys.push(format!(
+                    "language_model.model.layers.{layer}.mlp.{proj}.weight"
+                ));
+                keys.push(format!(
+                    "language_model.model.layers.{layer}.experts.switch_glu.{proj}.weight"
+                ));
+            }
+            for proj in ["q_proj", "k_proj", "o_proj"] {
+                keys.push(format!(
+                    "language_model.model.layers.{layer}.self_attn.{proj}.weight"
+                ));
+            }
+            if layer < 25 {
+                keys.push(format!(
+                    "language_model.model.layers.{layer}.self_attn.v_proj.weight"
+                ));
+            }
+            keys.push(format!(
+                "language_model.model.layers.{layer}.router.proj.weight"
+            ));
+        }
+        keys
+    }
+
+    #[test]
+    fn unsloth_gemma4_moe_selector_requires_config_requested_model_and_shape_agreement() {
+        let config = gemma4_moe_test_config();
+        let keys = gemma4_moe_test_keys();
+        assert!(has_gemma4_moe_weight_shape(&keys));
+        assert!(is_gemma4_moe_checkpoint(&config, Some("gemma4"), &keys));
+
+        assert_eq!(
+            select_and_validate_official_unsloth_recipe(
+                "unsloth",
+                None,
+                true,
+                "affine",
+                &config,
+                Some("gemma4"),
+                &keys,
+            )
+            .expect("verified Gemma4 MoE MXFP selector"),
+            Some(OfficialUnslothRecipeKind::Gemma4MoeMxfp),
+        );
+        assert_eq!(
+            select_and_validate_official_unsloth_recipe(
+                "unsloth",
+                None,
+                false,
+                "nvfp4",
+                &config,
+                Some("gemma4"),
+                &keys,
+            )
+            .expect("verified Gemma4 MoE DGX selector"),
+            Some(OfficialUnslothRecipeKind::Gemma4MoeNvfp4),
+        );
+
+        let dense_config = serde_json::json!({
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "enable_moe_block": false,
+                "num_hidden_layers": 30,
+                "num_experts": 128,
+                "hidden_size": 2816,
+                "intermediate_size": 2112,
+                "moe_intermediate_size": 704,
+                "attention_k_eq_v": true
+            }
+        });
+        let unified_config = serde_json::json!({
+            "model_type": "gemma4_unified",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "enable_moe_block": true,
+                "num_hidden_layers": 30,
+                "num_experts": 128,
+                "hidden_size": 2816,
+                "intermediate_size": 2112,
+                "moe_intermediate_size": 704,
+                "attention_k_eq_v": true
+            }
+        });
+        let mut incomplete = keys.clone();
+        incomplete.retain(|key| !key.contains("experts.switch_glu.up_proj"));
+
+        for (bad_config, requested, bad_keys) in [
+            (&dense_config, Some("gemma4"), keys.as_slice()),
+            (&config, Some("qwen3_5_moe"), keys.as_slice()),
+            (&config, None, keys.as_slice()),
+            (&config, Some("gemma4"), incomplete.as_slice()),
+        ] {
+            assert!(
+                !is_gemma4_moe_checkpoint(bad_config, requested, bad_keys),
+                "mismatched Gemma4 selector inputs must fail closed: \
+                 config={bad_config}, requested={requested:?}"
+            );
+            let err = select_and_validate_official_unsloth_recipe(
+                "unsloth",
+                Some("imatrix.gguf"),
+                true,
+                "affine",
+                bad_config,
+                requested,
+                bad_keys,
+            )
+            .expect_err("an imatrix must not authorize Gemma's legacy Qwen fallback");
+            assert!(
+                err.contains("Gemma4 fixed Unsloth map validation failed"),
+                "unexpected error: {err}"
+            );
+        }
+
+        assert_eq!(
+            select_and_validate_official_unsloth_recipe(
+                "unsloth",
+                Some("imatrix.gguf"),
+                true,
+                "affine",
+                &unified_config,
+                Some("gemma4_unified"),
+                &keys,
+            )
+            .expect("calibrated Gemma4 unified must retain the legacy fallback"),
+            None,
+        );
+        let err = select_and_validate_official_unsloth_recipe(
+            "unsloth",
+            None,
+            true,
+            "affine",
+            &unified_config,
+            Some("gemma4_unified"),
+            &keys,
+        )
+        .expect_err("unverified Gemma4 unified must not bypass the no-imatrix gate");
+        assert!(
+            err.contains("family/requested-model/shape validation did not select a fixed map"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn unsloth_gemma4_moe_fixed_maps_emit_exact_upstream_module_classes() {
+        // The verified 30-layer 26B-A4B inventory has:
+        // - 90 dense MLP + 90 sanitized expert projections = 180 low modules;
+        // - q/k/o in all 30 layers + v in 25 (k_eq_v omits five) = 115 high.
+        let mut weight_keys = Vec::new();
+        for layer in 0..30 {
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                weight_keys.push(format!(
+                    "language_model.model.layers.{layer}.mlp.{proj}.weight"
+                ));
+                weight_keys.push(format!(
+                    "language_model.model.layers.{layer}.experts.switch_glu.{proj}.weight"
+                ));
+            }
+            for proj in ["q_proj", "k_proj", "o_proj"] {
+                weight_keys.push(format!(
+                    "language_model.model.layers.{layer}.self_attn.{proj}.weight"
+                ));
+            }
+            if layer < 25 {
+                weight_keys.push(format!(
+                    "language_model.model.layers.{layer}.self_attn.v_proj.weight"
+                ));
+            }
+            weight_keys.push(format!(
+                "language_model.model.layers.{layer}.router.proj.weight"
+            ));
+            weight_keys.push(format!(
+                "language_model.model.layers.{layer}.input_layernorm.weight"
+            ));
+        }
+        weight_keys.extend(
+            [
+                "language_model.model.embed_tokens.weight",
+                "language_model.lm_head.weight",
+                "vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight",
+                "embed_vision.embedding_projection.weight",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+
+        for (kind, low_mode, high_mode) in [
+            (OfficialUnslothRecipeKind::Gemma4MoeMxfp, "mxfp4", "mxfp8"),
+            (
+                OfficialUnslothRecipeKind::Gemma4MoeNvfp4,
+                "nvfp4",
+                crate::quant::fp8_weight::FP8_E4M3_MODE,
+            ),
+        ] {
+            let predicate = build_official_unsloth_recipe(&weight_keys, kind);
+            let mut low = 0;
+            let mut high = 0;
+            let mut skipped = 0;
+            for key in &weight_keys {
+                match predicate(key) {
+                    QuantDecision::Custom { mode, .. } if mode == low_mode => low += 1,
+                    QuantDecision::Custom { mode, .. } if mode == high_mode => high += 1,
+                    QuantDecision::Skip => skipped += 1,
+                    other => panic!("{kind:?}: unexpected decision for {key}: {other:?}"),
+                }
+            }
+            assert_eq!(low, 180, "{kind:?}: all dense/expert MLPs stay low");
+            assert_eq!(high, 115, "{kind:?}: only q/k/v/o attention is high");
+            assert_eq!(
+                skipped, 64,
+                "{kind:?}: routers/norms/side modules stay bf16"
+            );
+
+            // Unlike Qwen, Gemma has no final-eight promotion.
+            assert!(
+                matches!(
+                    predicate("language_model.model.layers.29.mlp.down_proj.weight"),
+                    QuantDecision::Custom { mode, .. } if mode == low_mode
+                ),
+                "{kind:?}: final Gemma FFN must remain in the low class"
+            );
+        }
+    }
+
+    fn gemma4_moe_shape_test_weights() -> HashMap<String, MxArray> {
+        gemma4_moe_test_keys()
+            .into_iter()
+            .filter(|key| !key.ends_with(".router.proj.weight"))
+            .map(|key| {
+                let shape: &[i64] = if key.contains(".experts.switch_glu.") {
+                    &[2, 3, 32]
+                } else {
+                    &[3, 32]
+                };
+                (
+                    key,
+                    MxArray::zeros(shape, Some(DType::BFloat16))
+                        .expect("synthetic Gemma4 recipe weight"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unsloth_gemma4_moe_shape_preflight_rejects_rank_or_alignment_mismatch() {
+        for kind in [
+            OfficialUnslothRecipeKind::Gemma4MoeMxfp,
+            OfficialUnslothRecipeKind::Gemma4MoeNvfp4,
+        ] {
+            let good = gemma4_moe_shape_test_weights();
+            validate_gemma4_official_unsloth_shapes(&good, kind)
+                .expect("published Gemma4 module ranks and K alignment must pass");
+
+            let mut bad_rank = gemma4_moe_shape_test_weights();
+            bad_rank.insert(
+                "language_model.model.layers.0.experts.switch_glu.gate_proj.weight".into(),
+                MxArray::zeros(&[3, 32], Some(DType::BFloat16)).unwrap(),
+            );
+            let err = validate_gemma4_official_unsloth_shapes(&bad_rank, kind)
+                .expect_err("2-D expert storage must reject");
+            assert!(err.contains("must be rank 3"), "{err}");
+
+            let mut bad_alignment = gemma4_moe_shape_test_weights();
+            bad_alignment.insert(
+                "language_model.model.layers.0.self_attn.q_proj.weight".into(),
+                MxArray::zeros(&[3, 48], Some(DType::BFloat16)).unwrap(),
+            );
+            let err = validate_gemma4_official_unsloth_shapes(&bad_alignment, kind)
+                .expect_err("K % 32 mismatch must reject");
+            assert!(err.contains("K % 32"), "{err}");
+        }
+    }
+
     #[test]
     fn non_qwen_unsloth_mxfp_preserves_legacy_affine_only_head() {
         let is_qwen35_hybrid = is_qwen35_hybrid_checkpoint(
@@ -13313,7 +13819,7 @@ mod tests {
         .map(str::to_string)
         .collect::<Vec<_>>();
         let predicate =
-            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::Mxfp);
+            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::QwenMxfp);
 
         let mxfp4 = || QuantDecision::Custom {
             bits: 4,
@@ -13377,7 +13883,7 @@ mod tests {
         .map(str::to_string)
         .collect::<Vec<_>>();
         let predicate =
-            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::Mxfp);
+            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::QwenMxfp);
 
         for family in ["switch_mlp", "experts", "shared_expert"] {
             for suffix in ["gate_proj", "up_proj", "down_proj"] {
@@ -13427,7 +13933,7 @@ mod tests {
         .map(str::to_string)
         .collect::<Vec<_>>();
         let predicate =
-            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::Nvfp4);
+            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::QwenNvfp4);
 
         let nvfp4 = || QuantDecision::Custom {
             bits: 4,

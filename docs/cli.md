@@ -1,6 +1,6 @@
 # CLI (`@mlx-node/cli`)
 
-The `mlx` binary is built from `packages/cli/` and exposes the top-level commands `download`, `convert`, `calibrate`, `launch`, `agent`, and `dashboard`.
+The `mlx` binary is built from `packages/cli/` and exposes the top-level commands `download`, `convert`, `calibrate`, `redact`, `serve`, `launch`, and `agent`.
 
 ## `mlx download`
 
@@ -14,8 +14,10 @@ The command resolves the repo's current revision on HuggingFace and pins the
 whole download to that commit. A successful download writes a
 `.mlx-download-complete.json` marker into the output directory (the same
 marker the dashboard reads and writes) recording the repo, the pinned
-revision, and the downloaded file list. Re-running the command then syncs
-instead of skipping blindly:
+revision, the downloaded file list, and whether the selection was full or
+partial. Glob-filtered runs stay marked partial so neither the CLI nor the
+dashboard can mistake one selected shard for a complete model. Re-running the
+command then syncs instead of skipping blindly:
 
 - marker matches the current upstream revision and every recorded file is on
   disk → "Model already up to date", nothing is touched;
@@ -74,9 +76,10 @@ mlx convert --input ./model --output ./model-bf16 --dtype bf16
 mlx convert --input ./model --output ./model-q --quantize --q-recipe mixed_4_6
 ```
 
-### Unsloth MXFP and DGX tensor-class recipes for Qwen3.5
+### Unsloth MXFP and DGX tensor-class recipes for Qwen3.5 and SafeTensors Gemma4 MoE
 
-For verified dense and MoE Qwen3.5/Qwen3.6-family checkpoints, the fixed
+For verified dense and MoE Qwen3.5/Qwen3.6-family checkpoints and the exact
+SafeTensors Gemma-4-26B-A4B MoE shape, the fixed
 [Unsloth class map](https://unsloth.ai/docs/models/qwen3.6#nvfp4) is
 available in two forms. The Apple map translates FP8-class weights to MXFP8;
 the DGX map retains NVFP4 weight storage and stores plain E4M3 FP8 weights with
@@ -95,20 +98,31 @@ mlx convert -m qwen3_5_moe -q --q-recipe unsloth --q-mxfp \
 # DGX weight variant: retain NVFP4
 mlx convert -m qwen3_5_moe -q --q-mode nvfp4 --q-recipe unsloth \
   -i ./qwen3.5-35b-a3b -o ./qwen3.5-35b-a3b-unsloth-nvfp4-mlx
+
+# Gemma4 MoE Apple MXFP variant
+mlx convert -m gemma4 -q --q-recipe unsloth --q-mxfp \
+  -i ./gemma-4-26b-a4b-it -o ./gemma-4-26b-a4b-it-unsloth-mxfp4-mlx
+
+# Gemma4 MoE DGX weight variant
+mlx convert -m gemma4 -q --q-mode nvfp4 --q-recipe unsloth \
+  -i ./gemma-4-26b-a4b-it -o ./gemma-4-26b-a4b-it-unsloth-nvfp4-mlx
 ```
 
-Early FFNs use MXFP4 4/32 with `--q-mxfp`, or NVFP4 4/16 with
-`--q-mode nvfp4`. The final eight FFNs, attention q/k/v/o, GDN qkv/z/out, and
-`lm_head` use MXFP8 8/32 on Apple and `fp8_e4m3` (raw E4M3 `[N,K]` weights +
-BF16 `[N,1]` dequant scales, extended to `[E,N,K]` / `[E,N,1]` for experts) in
-the DGX artifact. Runtime activations remain A16 for both DGX weight classes:
+For Qwen, early FFNs use the low class; the final eight FFNs, attention
+q/k/v/o, GDN qkv/z/out, and `lm_head` use the high class. For Gemma4 MoE, every
+dense and expert FFN uses the low class, attention q/k/v/o uses the high class,
+and there is no final-eight or `lm_head` exception. The low class is MXFP4 4/32
+with `--q-mxfp`, or NVFP4 4/16 with `--q-mode nvfp4`; the high class is MXFP8
+8/32 on Apple or `fp8_e4m3` (raw E4M3 `[N,K]` weights + BF16 `[N,1]` dequant
+scales) in the DGX artifact. Runtime activations remain A16 for both DGX weight classes:
 NVFP4 uses standard MLX weight-only quantized matmul, while plain FP8 weights
 are reconstructed to BF16 once at load. This is a data-free tensor-class and
 serialized-weight-format port when no imatrix is supplied. It does not include
 Unsloth's calibrated NVFP4 global scales, W4A4/W8A8 activation execution, or
 calibrated FP8 KV-cache scales, and it does not claim upstream numerical or
-performance parity. Embeddings, routers, GDN a/b, vision, MTP,
-norms, and recurrent parameters remain BF16. Plain affine Unsloth alone keeps
+performance parity. Embeddings, routers, GDN a/b, vision/audio, MTP,
+norms, recurrent parameters, and other unmatched tensors remain BF16. Gemma
+expert imatrix pre-scaling is not inferred from flat GGUF statistics. Plain affine Unsloth alone keeps
 the legacy Dynamic 2.0 recipe.
 
 ### NVIDIA modelopt recipe (data-free MXFP4 port)
@@ -305,9 +319,36 @@ at `~/.cache/nvidia-calib/cnn_nemotron_v2_calib.jsonl`. Running on a non-nvidia
 (no mxfp8 attn/GDN) model calibrates 0 projections and leaves `config.json`
 unchanged.
 
+## `mlx serve`
+
+Runs the shared inference host (`@mlx-node/server/host`) in the foreground: discovers every model under the models dir, binds an Anthropic/OpenAI-compatible HTTP endpoint, and lazily loads a model on the first request that names one. At most one model stays resident; requesting another swaps it.
+
+```bash
+mlx serve                                        # auto-picked free port
+mlx serve --port 8080
+mlx serve --port 0                               # ephemeral port, printed on startup
+mlx serve --port 8080 --model qwen3.5-9b         # pin the default model
+mlx serve --host 0.0.0.0 --auth-token "$(openssl rand -hex 16)"
+mlx serve --verbose                              # capture every HTTP turn to a log dir
+```
+
+| Flag                 | Meaning                                                                                                           |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `--port <n>`         | Port to bind. Omitted ⇒ a free port is picked. `0` ⇒ ephemeral, real port printed                                 |
+| `--host <h>`         | Bind address (default `127.0.0.1`). Non-loopback exposes local models — pair with `--auth-token`                  |
+| `--models-dir <dir>` | Discovery root (default `~/.mlx-node/models`; also `MLX_MODELS_DIR`, `~/.mlx-node/config.json`)                   |
+| `--model <name>`     | Default model. Falls back to `ANTHROPIC_MODEL`, then the first discovered model                                   |
+| `--auth-token <tok>` | Required on every route except `/health`, as `x-api-key` or `Authorization: Bearer`. Also `MLX_SERVER_AUTH_TOKEN` |
+| `-v, --verbose`      | Write every request/response to a log dir                                                                         |
+| `--log-dir <dir>`    | Override the log directory (implies `--verbose`)                                                                  |
+
+`GET /health` is unauthenticated and reports readiness (`ok` / `loading` / `degraded` / `error`), uptime, pid, resident models, and the last load's outcome — the same body `ServerInstance.health()` returns.
+
+Like `mlx launch claude`, it applies the launcher engine policy (`MLX_PAGED_PREFILL_CHUNK_SIZE=2048`) unless the variable is already set in the environment.
+
 ## `mlx launch claude`
 
-Launches the local `@mlx-node/server` and spawns Claude Code against it — the entry point for using MLX-Node as a Claude Code backend. The "serve" terminology in commit messages refers to internal server components only; there is no `mlx serve` command.
+Launches the same inference host as `mlx serve` and spawns Claude Code against it — the entry point for using MLX-Node as a Claude Code backend. Use `mlx serve` when you want the server without a Claude Code child (for example to point another client at it, or to reproduce a wedged sidecar in a terminal).
 
 ## `mlx agent`
 
@@ -366,28 +407,9 @@ mlx agent config             # edit which are enabled
 
 `mlx agent update` is intentionally blocked (it maps to pi's npm self-update, which would fight the installed `@mlx-node/cli`); update `@mlx-node/cli` through your package manager instead. `mlx agent -h`/`--help` prints the mlx options above and then pi's full flag list. `mlx agent --version`/`-v` and `mlx agent --export <session>` are answered by pi directly — no local model needed, so the first-run wizard stays out — and `--version` prints the embedded pi version, not `@mlx-node/cli`'s (`mlx --version`).
 
-## `mlx dashboard`
+## Dashboard
 
-Starts the local web dashboard (`@mlx-node/dashboard`) for browsing local models,
-`mlx agent` sessions, inference metrics, and the paged-attention cold cache. It is a
-separate viewer process that never links the native addon — all data comes from disk
-under `~/.mlx-node`. Requires Node.js ≥ 22.19.
-
-```bash
-mlx dashboard                       # start on 127.0.0.1:6590, open a browser
-mlx dashboard --port 8080           # pick a port
-mlx dashboard --no-open             # do not launch a browser
-```
-
-| Flag           | Default                    | Purpose                                                             |
-| -------------- | -------------------------- | ------------------------------------------------------------------- |
-| `--port`       | `6590`                     | Port to listen on (`0` = ephemeral)                                 |
-| `--host`       | `127.0.0.1`                | Host to bind; a non-loopback host prints a no-auth exposure warning |
-| `--no-open`    | (opens a browser)          | Do not open a browser                                               |
-| `--db`         | `~/.mlx-node/dashboard.db` | Override the disposable SQLite index path                           |
-| `--models-dir` | `~/.mlx-node/models`       | Directory to read local models from                                 |
-
-Binds `127.0.0.1` by default with no authentication; mutating requests are guarded by
-a local-origin check. See [docs/dashboard.md](dashboard.md) for pages, data sources,
-`persistPagedCache` (qwen3-dense-only cold restore), the `MLX_AGENT_METRICS` kill
-switch, `MLX_COLD_CACHE_DIR`, and the security model.
+`mlx dashboard` was **removed**. The dashboard is now the Control Panel window of the mlx-node
+desktop app, opened from the tray — it is served over `app://` and a MessagePort, so
+there is no port to bind and no unauthenticated HTTP surface to guard. See
+[docs/dashboard.md](dashboard.md).

@@ -101,6 +101,10 @@ describe('isCompletionCurrent', () => {
     expect(isCompletionCurrent(completion, 'org/model', 'c'.repeat(40))).toBe(false);
     expect(isCompletionCurrent(null, 'org/model', SHA)).toBe(false);
   });
+
+  it('rejects a partial/in-progress marker even when repo and revision match', () => {
+    expect(isCompletionCurrent({ ...completion, scope: 'partial' }, 'org/model', SHA)).toBe(false);
+  });
 });
 
 describe('canShortCircuitFullRun', () => {
@@ -135,6 +139,11 @@ describe('canShortCircuitFullRun', () => {
   it('allows only when the shape is complete AND every marker file exists', () => {
     writeFileSync(join(dir, 'config.json'), '{}');
     expect(canShortCircuitFullRun(completion, dir, true)).toBe(true);
+  });
+
+  it('denies a partial glob marker even when its files happen to look loadable', () => {
+    writeFileSync(join(dir, 'config.json'), '{}');
+    expect(canShortCircuitFullRun({ ...completion, scope: 'partial' }, dir, true)).toBe(false);
   });
 });
 
@@ -192,16 +201,16 @@ describe('computePruneList', () => {
   it('returns only old-marker files gone from the REMOTE (not merely unselected)', () => {
     const previous = ['config.json', 'old-shard.safetensors', 'kept.safetensors'];
     const remote = ['config.json', 'kept.safetensors', 'new-shard.safetensors'];
-    expect(computePruneList(previous, remote, '/out')).toEqual(['old-shard.safetensors']);
+    expect(computePruneList(previous, remote, '/out', false)).toEqual(['old-shard.safetensors']);
   });
 
   it('never lists files absent from the old marker (mutation: pruning by disk scan would delete user files)', () => {
-    expect(computePruneList([], ['config.json'], '/out')).toEqual([]);
+    expect(computePruneList([], ['config.json'], '/out', false)).toEqual([]);
   });
 
   it('drops traversal and absolute entries instead of deleting outside outputDir', () => {
     const previous = ['../escape.txt', '/etc/passwd', 'sub/../../escape2.txt', ''];
-    expect(computePruneList(previous, [], '/out')).toEqual([]);
+    expect(computePruneList(previous, [], '/out', false)).toEqual([]);
   });
 
   it('never prunes nested paths — the non-recursive listing cannot prove they are gone', () => {
@@ -209,7 +218,13 @@ describe('computePruneList', () => {
     // CLI lists non-recursively, so `sub/gone.gguf` being absent from the
     // CLI's remote list proves nothing. Mutation caught: pruning nested
     // entries deletes files still upstream that the CLI can never re-fetch.
-    expect(computePruneList(['sub/gone.gguf'], [], '/out')).toEqual([]);
+    expect(computePruneList(['sub/gone.gguf'], [], '/out', false)).toEqual([]);
+  });
+
+  it('never prunes during a narrow glob sync, even when a previous weight disappeared upstream', () => {
+    const previous = ['config.json', 'model-old.safetensors'];
+    const remote = ['config.json', 'model-new.safetensors', 'tokenizer.json'];
+    expect(computePruneList(previous, remote, '/out', true)).toEqual([]);
   });
 });
 
@@ -234,7 +249,7 @@ describe('buildMarkerFiles', () => {
     };
     const remote = ['model-Q8.gguf', 'model-Q4.gguf', 'config.json', 'deleted-locally.gguf'];
     const selected = ['model-Q4.gguf', 'config.json'];
-    expect(buildMarkerFiles(previous, remote, selected, dir)).toEqual([
+    expect(buildMarkerFiles(previous, remote, selected, dir, false)).toEqual([
       'config.json',
       'model-Q4.gguf',
       'model-Q8.gguf',
@@ -242,7 +257,10 @@ describe('buildMarkerFiles', () => {
   });
 
   it('with no previous marker returns just the sorted selection', () => {
-    expect(buildMarkerFiles(null, ['b.json', 'a.json'], ['b.json', 'a.json'], dir)).toEqual(['a.json', 'b.json']);
+    expect(buildMarkerFiles(null, ['b.json', 'a.json'], ['b.json', 'a.json'], dir, false)).toEqual([
+      'a.json',
+      'b.json',
+    ]);
   });
 
   it('keeps a nested previous file on disk even when absent from the non-recursive remote list', () => {
@@ -257,7 +275,7 @@ describe('buildMarkerFiles', () => {
       files: ['sub/nested.json'],
       completedAt: '2026-07-29T00:00:00.000Z',
     };
-    expect(buildMarkerFiles(previous, ['config.json'], ['config.json'], dir)).toEqual([
+    expect(buildMarkerFiles(previous, ['config.json'], ['config.json'], dir, false)).toEqual([
       'config.json',
       'sub/nested.json',
     ]);
@@ -270,6 +288,20 @@ describe('buildMarkerFiles', () => {
       files: ['sub/nested.json'],
       completedAt: '2026-07-29T00:00:00.000Z',
     };
-    expect(buildMarkerFiles(previous, ['config.json'], ['config.json'], dir)).toEqual(['config.json']);
+    expect(buildMarkerFiles(previous, ['config.json'], ['config.json'], dir, false)).toEqual(['config.json']);
+  });
+
+  it('keeps disappeared previous weights in a glob marker so the next full sync can prune them safely', () => {
+    writeFileSync(join(dir, 'model-old.safetensors'), 'x');
+    const previous: DownloadCompletion = {
+      repo: 'org/model',
+      revision: SHA,
+      files: ['model-old.safetensors'],
+      completedAt: '2026-07-29T00:00:00.000Z',
+    };
+    expect(buildMarkerFiles(previous, ['config.json', 'model-new.safetensors'], ['config.json'], dir, true)).toEqual([
+      'config.json',
+      'model-old.safetensors',
+    ]);
   });
 });

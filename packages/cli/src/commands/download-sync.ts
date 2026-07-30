@@ -58,7 +58,12 @@ export async function fileUpToDate(destPath: string, file: ListFileEntry): Promi
 
 /** Does the marker prove `repo` is already synced to `remoteSha`? */
 export function isCompletionCurrent(completion: DownloadCompletion | null, repo: string, remoteSha: string): boolean {
-  return completion !== null && completion.repo === repo && completion.revision === remoteSha;
+  return (
+    completion !== null &&
+    completion.scope !== 'partial' &&
+    completion.repo === repo &&
+    completion.revision === remoteSha
+  );
 }
 
 /**
@@ -77,7 +82,7 @@ export function canShortCircuitFullRun(
   outputDir: string,
   localShapeComplete: boolean,
 ): boolean {
-  if (!localShapeComplete) return false;
+  if (completion.scope === 'partial' || !localShapeComplete) return false;
   return completion.files.every((f) => existsSync(join(outputDir, f)));
 }
 
@@ -133,7 +138,16 @@ export function markerRevisionToClaim(
  * it would delete a file that is still upstream and that the CLI's own
  * non-recursive selection could never re-download.
  */
-export function computePruneList(previousFiles: string[], remotePaths: string[], outputDir: string): string[] {
+export function computePruneList(
+  previousFiles: string[],
+  remotePaths: string[],
+  outputDir: string,
+  isGlobRun: boolean,
+): string[] {
+  // A glob run verifies only its selection. Even when a disappeared old file
+  // is proven absent remotely, deleting it here can break the old checkpoint
+  // without downloading the replacement files outside the narrow selection.
+  if (isGlobRun) return [];
   const remote = new Set(remotePaths);
   const root = resolve(outputDir);
   const out: string[] = [];
@@ -150,8 +164,11 @@ export function computePruneList(previousFiles: string[], remotePaths: string[],
 
 /**
  * File list for the next marker: the current selection plus every previous
- * marker file that is still on the remote AND still on disk. A `--glob` run
- * must not shrink the marker and forget files a previous full run downloaded.
+ * marker file that is still on disk and either remains remote or cannot be
+ * judged by this run. A `--glob` run preserves all previous on-disk entries:
+ * it intentionally does not prune, and the next full sync still needs those
+ * entries in the marker so it can remove files proven stale after replacements
+ * have been synchronized.
  *
  * Previous NESTED entries (path containing '/') skip the remote check: they
  * can come from a dashboard-written marker (recursive listing), so the CLI's
@@ -164,12 +181,13 @@ export function buildMarkerFiles(
   remotePaths: string[],
   selectedPaths: string[],
   outputDir: string,
+  isGlobRun: boolean,
 ): string[] {
   const files = new Set(selectedPaths);
   if (previous !== null) {
     const remote = new Set(remotePaths);
     for (const file of previous.files) {
-      const provenOnRemote = file.includes('/') || remote.has(file);
+      const provenOnRemote = isGlobRun || file.includes('/') || remote.has(file);
       if (provenOnRemote && existsSync(join(outputDir, file))) files.add(file);
     }
   }

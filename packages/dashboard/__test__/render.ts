@@ -13,8 +13,17 @@
  * docblock — the repo-wide default environment is `node` and stays that way.
  */
 
+import { MessageChannel } from 'node:worker_threads';
+
 import { act, type ReactElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
+
+import { failure } from '../src/api/errors.js';
+import type { DownloadEvent } from '../src/download.js';
+import { serveRuntimeOverPort } from '../src/rpc/host.js';
+import { bindEventTargetPort } from '../src/rpc/port.js';
+import type { ApiCall } from '../src/runtime.js';
+import { connectDashboardApi, disconnectDashboardApi } from '../ui/src/lib/api.js';
 
 declare global {
   /** React's own flag for "an `act()`-aware environment"; see react-dom docs. */
@@ -31,9 +40,9 @@ export interface RenderedPage {
 }
 
 /**
- * Route table for the stubbed `fetch`: API path (as the SPA spells it, e.g.
- * `/cache`) → JSON body. An unlisted path resolves 404, which the pages render
- * as their error state rather than hanging forever.
+ * Route table for the stubbed API: path as the SPA spells it (e.g. `/cache`) →
+ * JSON body. An unlisted path answers 404, which the pages render as their error
+ * state rather than hanging forever.
  */
 export type ApiStub = Record<string, unknown>;
 
@@ -57,29 +66,45 @@ export function sequence(...bodies: unknown[]): unknown {
 }
 
 /**
- * Install a `globalThis.fetch` that answers from `routes`. Returns a disposer.
- * Query strings are ignored when matching, so `/metrics/overview?from=…` hits
- * the `/metrics/overview` entry.
+ * Serve `routes` to the SPA over a real MessagePort, and connect `ui/src/lib/api`
+ * to it. Returns a disposer.
+ *
+ * There is no `fetch` left to stub: the SPA speaks the RPC protocol over an
+ * injected port. Stubbing at the PORT rather than at the api module is what keeps
+ * the real client, the real envelope and a real structured-clone hop inside the
+ * test — a stub that replaced `getJson` would assert against nothing but itself.
+ *
+ * Query strings are ignored when matching, so `/metrics/overview?from=…` hits the
+ * `/metrics/overview` entry.
+ *
+ * A real port also supplies for free what the old `fetch` stub had to fake: a
+ * reply arrives on a MACROTASK, never the microtask queue. A harness that flushed
+ * a fixed number of microtasks would appear to work right up until the machine is
+ * loaded — {@link renderPage} waits on a caller-named condition instead, and the
+ * port is what makes that wait test the real hop rather than an accident of
+ * timing.
  */
-export function stubFetch(routes: ApiStub): () => void {
-  const previous = globalThis.fetch;
-  const requestPath = (input: RequestInfo | URL): string => {
-    if (typeof input === 'string') return input;
-    if (input instanceof URL) return input.pathname;
-    return input.url;
-  };
-  // Deliberately resolved on a MACROTASK, not via Promise.resolve(). A real
-  // fetch never settles on the microtask queue, and a stub that does lets a
-  // harness which flushes a fixed number of microtasks appear to work — right
-  // up until the machine is loaded and the same tests start failing. Forcing
-  // the slower, truthful hop makes {@link renderPage}'s condition wait the
-  // thing the tests actually depend on, rather than an accident of timing.
-  const respond = (body: unknown, status: number): Promise<Response> =>
-    new Promise((resolve) => {
-      setTimeout(() => {
-        resolve(new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }));
-      }, 0);
-    });
+export interface ApiStubOptions {
+  /**
+   * Every call the SPA made, in order. Some behaviour has no rendered
+   * consequence at all — dismissing a settled job is a `DELETE` and nothing else
+   * — so a test has to be able to read the calls, not only the DOM.
+   */
+  onCall?: (call: ApiCall) => void;
+  /**
+   * Stand in for the runtime's download subscribe, returning the unsubscribe
+   * exactly as the real one does. Unlike the default no-op it can DELIVER
+   * events, which is the only way to reach what a page does when a job settles
+   * from its subscription rather than from a request the page made itself.
+   */
+  subscribe?: (jobId: string, listener: (event: DownloadEvent) => void) => () => void;
+}
+
+export function stubApi(routes: ApiStub, options: ApiStubOptions = {}): () => void {
+  const { port1, port2 } = new MessageChannel();
+  // Never hold the runner open on the channel's account.
+  port1.unref();
+  port2.unref();
   const served = new Map<string, number>();
   const bodyFor = (path: string): unknown => {
     const body = routes[path];
@@ -89,15 +114,24 @@ export function stubFetch(routes: ApiStub): () => void {
     served.set(path, nth + 1);
     return bodies[Math.min(nth, bodies.length - 1)];
   };
-  globalThis.fetch = ((input: RequestInfo | URL): Promise<Response> => {
-    const path = requestPath(input)
-      .split('?')[0]
-      .replace(/^\/api/, '');
-    if (!Object.hasOwn(routes, path)) return respond({ error: `no stub for ${path}` }, 404);
-    return respond(bodyFor(path), 200);
-  }) as typeof globalThis.fetch;
+  const dispose = serveRuntimeOverPort(
+    {
+      call: (call: ApiCall) => {
+        options.onCall?.(call);
+        const path = call.path.split('?')[0].replace(/^\/api/, '');
+        if (!Object.hasOwn(routes, path)) return Promise.resolve(failure('E_NOT_FOUND', `no stub for ${path}`));
+        return Promise.resolve({ ok: true as const, status: 200, body: bodyFor(path) });
+      },
+      subscribe: options.subscribe ?? (() => () => {}),
+    },
+    bindEventTargetPort(port2),
+  );
+  connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
   return () => {
-    globalThis.fetch = previous;
+    disconnectDashboardApi();
+    dispose();
+    port1.close();
+    port2.close();
   };
 }
 

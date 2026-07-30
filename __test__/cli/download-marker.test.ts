@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import {
   DOWNLOAD_COMPLETE_MARKER,
+  markCompletionPartial,
   readCompletion,
   writeCompletion,
   type DownloadCompletion,
@@ -63,5 +64,12 @@ describe('download marker', () => {
   it('CONTRACT: a CLI-written marker is accepted by the dashboard readCompletion', async () => {
     await writeCompletion(dir, completion);
     expect(dashboardReadCompletion(dir)).toEqual(completion);
+  });
+
+  it('marks an existing completion partial without losing its ownership identity', async () => {
+    const partial = markCompletionPartial(completion);
+    await writeCompletion(dir, partial);
+    expect(await readCompletion(dir)).toEqual({ ...completion, scope: 'partial' });
+    expect(dashboardReadCompletion(dir)).toEqual({ ...completion, scope: 'partial' });
   });
 });

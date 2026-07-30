@@ -24,6 +24,7 @@ import type { InlineExtension } from '@earendil-works/pi-coding-agent';
 import { coldCacheDrain } from '@mlx-node/core';
 import { PagedConfigOverrideManager } from '@mlx-node/lm';
 
+import { createLocalImageInputExtension } from './extensions/local-image-input.js';
 import { createPermissionGateExtension } from './extensions/permission-gate.js';
 import { createSubagentExtension } from './extensions/subagent.js';
 import { createTerminalTitleExtension } from './extensions/terminal-title.js';
@@ -140,6 +141,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
     await pi.main(opts.argv, {
       extensionFactories: [
         createMlxProviderExtension(opts.models, modelHost),
+        createLocalImageInputExtension(),
         createPermissionGateExtension(),
         ...(subagentsEnabled ? [createSubagentExtension()] : []),
         ...(opts.traceLogFile !== undefined ? [createTraceNoticeExtension(opts.traceLogFile)] : []),

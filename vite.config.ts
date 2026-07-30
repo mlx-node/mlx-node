@@ -73,6 +73,13 @@ export default defineConfig({
       '@mlx-node/agent': resolve(__dirname, './packages/agent/src/index.ts'),
       '@mlx-node/privacy': resolve(__dirname, './packages/privacy/src/index.ts'),
       '@mlx-node/trl': resolve(__dirname, './packages/trl/src/index.ts'),
+      // Subpaths MUST precede the bare '@mlx-node/server' entry, longest
+      // first: alias matching is prefix-based and first-match-wins, so the
+      // bare key would otherwise rewrite `@mlx-node/server/host` to
+      // `.../src/index.ts/host`.
+      '@mlx-node/server/host/env-policy': resolve(__dirname, './packages/server/src/host/env-policy.ts'),
+      '@mlx-node/server/host/paths': resolve(__dirname, './packages/server/src/host/paths.ts'),
+      '@mlx-node/server/host': resolve(__dirname, './packages/server/src/host/index.ts'),
       '@mlx-node/server': resolve(__dirname, './packages/server/src/index.ts'),
       '@mlx-node/dashboard': resolve(__dirname, './packages/dashboard/src/index.ts'),
       // The dashboard SPA's own `@/…` alias (packages/dashboard/ui/vite.config.ts),

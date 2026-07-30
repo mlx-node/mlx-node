@@ -204,6 +204,13 @@ jobs:
           path: packages/core/
       - name: Run tests
         run: |
+          # `yarn mlx` runs the CLI from source, but the CLI imports
+          # `@mlx-node/server/host/paths`, and that export map resolves into
+          # `dist/`. A fresh runner has no `dist/`, so the first `yarn mlx` below
+          # cannot resolve it until TypeScript is built. The `yarn build:ts` in
+          # one matrix leg's own command runs too late — and the `cargo test` leg
+          # never builds TS at all.
+          yarn build:ts
           yarn mlx download model --output .cache/models/qwen3-0.6b
           yarn mlx convert --input .cache/models/qwen3-0.6b -d bf16 --output .cache/models/qwen3-0.6b-mlx-bf16
           yarn mlx download dataset
@@ -384,6 +391,10 @@ jobs:
             echo "::notice::Skipping gemma4 QAT leg on ${{ github.event_name }} (PR opt-in only; gated HF repo)."
             exit 0
           fi
+          # Same reason as the `test` job: `yarn mlx` needs @mlx-node/server's
+          # `dist/` to exist before it can resolve. The `yarn build:ts` further
+          # down only runs on the `ts` leg, and only after these downloads.
+          yarn build:ts
           src=".cache/models/${{ matrix.slug }}"
           out=".cache/models/${{ matrix.slug }}-mlx-bf16"
           yarn mlx download model -m "${{ matrix.model }}" --output "$src"

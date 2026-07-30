@@ -5,15 +5,12 @@ import { join, resolve, dirname } from 'node:path';
 import { parseArgs } from 'node:util';
 
 import { listFiles, downloadFileToCacheDir, modelInfo, type ListFileEntry } from '@huggingface/hub';
+// Leaf subpath on purpose: `@mlx-node/server/host` would dlopen the native
+// addon, and downloading a model must work before any of that is needed.
+import { resolveModelsDir } from '@mlx-node/server/host/paths';
 
-import { resolveModelsDir } from '../config.js';
 import { ensureDir, formatBytes } from '../utils.js';
-import {
-  DOWNLOAD_COMPLETE_MARKER,
-  readCompletion,
-  writeCompletion,
-  type DownloadCompletion,
-} from './download-marker.js';
+import { markCompletionPartial, readCompletion, writeCompletion, type DownloadCompletion } from './download-marker.js';
 import {
   buildMarkerFiles,
   canShortCircuitFullRun,
@@ -755,17 +752,21 @@ export async function run(argv: string[]) {
         console.log(
           `Directory holds a download marker for a different repo (${completion.repo}); verifying local files against upstream...\n`,
         );
+      } else if (completion.scope === 'partial') {
+        console.log('Partial or interrupted download marker found; verifying local files against upstream...\n');
       } else {
         console.log(
           `Upstream revision changed (${completion.revision.slice(0, 7)} → ${remoteSha.slice(0, 7)}); syncing...\n`,
         );
       }
-      // An interrupted sync must not leave the OLD marker claiming a complete
-      // install at the previous revision to other marker readers (dashboard
-      // ownership checks, cold-tier fingerprints). Delete it up front; the
-      // in-memory `completion` keeps serving prune/union decisions, and a
-      // successful sync writes the fresh marker at the end.
-      await rm(join(outputDir, DOWNLOAD_COMPLETE_MARKER), { force: true });
+      // Keep downloader ownership if this sync fails, while preventing the
+      // old marker from satisfying CLI/dashboard completion gates during the
+      // in-place update. The final marker write below replaces this atomically.
+      // A marker for another repo is left untouched until success: this run
+      // must not claim ownership of a slug-colliding directory up front.
+      if (completion !== null && completion.repo === modelName) {
+        await writeCompletion(outputDir, markCompletionPartial(completion));
+      }
     }
   }
 
@@ -865,6 +866,7 @@ export async function run(argv: string[]) {
         previousCompletion.files,
         allFiles.map((f) => f.path),
         outputDir,
+        Boolean(globPatterns?.length),
       );
       for (const rel of pruneList) {
         console.log(`  Removing ${rel} (no longer in the upstream repo)`);
@@ -885,7 +887,9 @@ export async function run(argv: string[]) {
         allFiles.map((f) => f.path),
         filesToDownload.map((f) => f.path),
         outputDir,
+        Boolean(globPatterns?.length),
       ),
+      scope: globPatterns?.length ? 'partial' : 'full',
       completedAt: new Date().toISOString(),
     });
   };

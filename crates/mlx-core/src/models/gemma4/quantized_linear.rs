@@ -378,6 +378,50 @@ pub fn try_build_nvfp4_quantized_linear(
     ))
 }
 
+/// Build the plain per-output E4M3 correctness fallback used by the fixed
+/// Gemma4 DGX attention map.
+///
+/// Storage is strict: Uint8 `[N,K]` E4M3 bytes + floating `[N,1]` dequant
+/// scales, with no affine `.biases`. The weight is reconstructed to BF16 once
+/// at load and forward uses ordinary A16 matmul. Experts deliberately do not
+/// use this path; their upstream class is NVFP4.
+pub fn try_build_fp8_e4m3_quantized_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+) -> Result<Option<QuantizedLinear>> {
+    let weight_key = format!("{key_prefix}.weight");
+    let scales_key = format!("{key_prefix}.scales");
+    let weight = params.get(&weight_key);
+    let scales = params.get(&scales_key);
+    let (weight, scales) = match (weight, scales) {
+        (None, None) => return Ok(None),
+        (Some(_), None) => {
+            return Err(Error::from_reason(format!(
+                "plain FP8 layer '{key_prefix}': .weight present but mandatory .scales missing"
+            )));
+        }
+        (None, Some(_)) => {
+            return Err(Error::from_reason(format!(
+                "plain FP8 layer '{key_prefix}': .scales present but .weight missing"
+            )));
+        }
+        (Some(weight), Some(scales)) => (weight, scales),
+    };
+    if params.contains_key(&format!("{key_prefix}.biases")) {
+        return Err(Error::from_reason(format!(
+            "plain FP8 layer '{key_prefix}': unexpected .biases sidecar"
+        )));
+    }
+    let dequant_weight =
+        crate::quant::fp8_weight::validate_and_dequantize(weight, scales, 2, key_prefix)?;
+    Ok(Some(QuantizedLinear::new_fp8_e4m3(
+        weight.clone(),
+        scales.clone(),
+        dequant_weight,
+        None,
+    )))
+}
+
 /// Try to build an affine QuantizedLinear from weight/scales/biases keys.
 pub fn try_build_quantized_linear(
     params: &HashMap<String, MxArray>,
@@ -541,7 +585,7 @@ pub fn try_build_kquant_quantized_linear(
     )))
 }
 
-/// QuantizedLinear: Linear layer using quantized_matmul for efficient inference.
+/// Linear layer backed by a serialized quantized weight format.
 ///
 /// The sym8 surface (fields `w_i8`/`s_w`, `new_sym8`, `forward_sym8`, the
 /// `mode == "sym8"` dispatch) is a gemma4-local copy of the dense Qwen3.5
@@ -549,6 +593,8 @@ pub fn try_build_kquant_quantized_linear(
 /// calling the same family-agnostic `int8_gemm` kernels. The two copies MUST
 /// NOT drift: same M-boundary (M <= 2 -> W8A16 qmv, M >= 3 -> W8A8 gemm),
 /// linear bias added AFTER the kernel, result narrowed to bf16 inside C++.
+/// Plain `fp8_e4m3` is the non-native exception: it keeps raw Uint8 checkpoint
+/// storage, reconstructs BF16 once at load, and uses ordinary A16 matmul.
 pub struct QuantizedLinear {
     weight: MxArray,
     scales: MxArray,
@@ -557,6 +603,9 @@ pub struct QuantizedLinear {
     group_size: i32,
     bits: i32,
     mode: String,
+    // Reconstructed BF16 `[N,K]` weight for the plain E4M3 correctness
+    // fallback. `Some` iff mode == fp8_e4m3.
+    fp8_dequant_weight: Option<MxArray>,
     // sym8 kernel operands (`Some` iff `mode == "sym8"`): `w_i8` is the opaque
     // contiguous [K,N] int8 weight (pre-transposed at load), `s_w` is the f32
     // [N] per-output-channel scale. Consumed by `int8_w8a16_qmv` (M <= 2,
@@ -607,6 +656,30 @@ impl QuantizedLinear {
             group_size,
             bits,
             mode,
+            fp8_dequant_weight: None,
+            w_i8: None,
+            s_w: None,
+        }
+    }
+
+    /// Construct a plain E4M3 storage-backed linear with a load-time BF16
+    /// reconstruction. The raw Uint8 tensor remains visible through
+    /// `get_weight()` so storage identity is never confused with MXFP8.
+    pub fn new_fp8_e4m3(
+        weight: MxArray,
+        scales: MxArray,
+        dequant_weight: MxArray,
+        bias: Option<MxArray>,
+    ) -> Self {
+        Self {
+            weight,
+            scales,
+            biases: None,
+            bias,
+            group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
+            bits: crate::quant::fp8_weight::FP8_E4M3_BITS,
+            mode: crate::quant::fp8_weight::FP8_E4M3_MODE.to_string(),
+            fp8_dequant_weight: Some(dequant_weight),
             w_i8: None,
             s_w: None,
         }
@@ -629,6 +702,7 @@ impl QuantizedLinear {
             group_size: SYM8_GROUP_SIZE,
             bits: SYM8_BITS,
             mode: SYM8_MODE.to_string(),
+            fp8_dequant_weight: None,
             w_i8: Some(w_kn),
             s_w: Some(s_w),
         }
@@ -726,6 +800,19 @@ impl QuantizedLinear {
             return self.forward_sym8(x);
         }
 
+        if self.mode == crate::quant::fp8_weight::FP8_E4M3_MODE {
+            let weight = self.fp8_dequant_weight.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "plain FP8 QuantizedLinear missing load-time BF16 reconstruction",
+                )
+            })?;
+            let mut result = x.matmul(&weight.transpose(Some(&[1, 0]))?)?;
+            if let Some(ref b) = self.bias {
+                result = result.add(b)?;
+            }
+            return Ok(result);
+        }
+
         // MLX promotes affine QMM to FP32 when a BF16 activation is paired
         // with GGUF Q4_0's sidecars (including their exact load-time FP32
         // widening). Restore the model's activation dtype at the projection
@@ -741,9 +828,21 @@ impl QuantizedLinear {
     }
 
     /// Quantization mode discriminator string ("affine", "mxfp8", "mxfp4",
-    /// "nvfp4", or "sym8").
+    /// "nvfp4", "fp8_e4m3", or "sym8").
     pub fn mode(&self) -> &str {
         &self.mode
+    }
+
+    /// Additional model-owned bytes created by the plain-E4M3 correctness
+    /// fallback and not represented by the serialized checkpoint tensors.
+    ///
+    /// The raw Uint8 weight and BF16 scales are already counted through the
+    /// loader's params map; only the reconstructed BF16 weight is extra.
+    pub(crate) fn reconstructed_fp8_weight_bytes(&self) -> u64 {
+        self.fp8_dequant_weight
+            .as_ref()
+            .map(|weight| weight.nbytes() as u64)
+            .unwrap_or(0)
     }
 
     /// Test-scope accessor for the sym8 operands
@@ -756,6 +855,87 @@ impl QuantizedLinear {
             (Some(w), Some(s)) => Some((&self.weight, w, s)),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod plain_fp8_weight_tests {
+    use super::*;
+
+    fn params(prefix: &str) -> HashMap<String, MxArray> {
+        let source = MxArray::from_float32(
+            &[
+                0.0, 0.5, -1.0, 2.0, -0.25, 1.5, 0.75, -2.5, 1.0, -0.5, 0.25, 3.0,
+            ],
+            &[3, 4],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let (weight, scales) =
+            crate::quant::fp8_weight::quantize_per_output_channel(&source, prefix).unwrap();
+        HashMap::from([
+            (format!("{prefix}.weight"), weight),
+            (format!("{prefix}.scales"), scales),
+        ])
+    }
+
+    #[test]
+    fn plain_fp8_builder_reconstructs_bf16_and_forward_is_a16_matmul() {
+        let p = params("proj");
+        let ql = try_build_fp8_e4m3_quantized_linear(&p, "proj")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ql.mode(), crate::quant::fp8_weight::FP8_E4M3_MODE);
+        assert_eq!(ql.get_weight().dtype().unwrap(), DType::Uint8);
+        assert_eq!(
+            ql.reconstructed_fp8_weight_bytes(),
+            3 * 4 * std::mem::size_of::<u16>() as u64,
+            "the resident-byte delta must count the reconstructed BF16 weight"
+        );
+
+        let x = MxArray::from_float32(&[1.0, -0.5, 0.25, 2.0], &[1, 4])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let got = ql.forward(&x).unwrap();
+        let dequant = crate::quant::fp8_weight::validate_and_dequantize(
+            p.get("proj.weight").unwrap(),
+            p.get("proj.scales").unwrap(),
+            2,
+            "proj",
+        )
+        .unwrap();
+        let want = x
+            .matmul(&dequant.transpose(Some(&[1, 0])).unwrap())
+            .unwrap();
+        got.eval();
+        want.eval();
+        assert_eq!(
+            got.to_uint16_native().unwrap(),
+            want.to_uint16_native().unwrap()
+        );
+    }
+
+    #[test]
+    fn plain_fp8_builder_fails_loud_on_incomplete_or_malformed_storage() {
+        let mut missing_scales = params("proj");
+        missing_scales.remove("proj.scales");
+        assert!(try_build_fp8_e4m3_quantized_linear(&missing_scales, "proj").is_err());
+
+        let mut wrong_weight_dtype = params("proj");
+        let bad = wrong_weight_dtype["proj.weight"]
+            .from_fp8(DType::BFloat16)
+            .unwrap();
+        wrong_weight_dtype.insert("proj.weight".into(), bad);
+        assert!(try_build_fp8_e4m3_quantized_linear(&wrong_weight_dtype, "proj").is_err());
+
+        let mut wrong_scale_shape = params("proj");
+        wrong_scale_shape.insert(
+            "proj.scales".into(),
+            MxArray::from_float32(&[1.0, 1.0, 1.0], &[3]).unwrap(),
+        );
+        assert!(try_build_fp8_e4m3_quantized_linear(&wrong_scale_shape, "proj").is_err());
     }
 }
 

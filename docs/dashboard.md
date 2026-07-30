@@ -1,41 +1,58 @@
-# Dashboard (`mlx dashboard`)
+# Dashboard (Control Panel window)
 
-A local web dashboard for browsing models, agent sessions, inference metrics, and
-the paged-attention cold cache. It ships inside `@mlx-node/dashboard` and starts
-with `mlx dashboard`.
+Browse local models, `mlx agent` sessions, inference metrics, and the
+paged-attention cold cache. It ships inside `@mlx-node/dashboard` and is the Control Panel
+window of the **mlx-node desktop app** — open it from the tray.
 
-The dashboard is a **separate viewer process**. It never links the native addon
-(no Metal init, instant start). All data comes from disk under `~/.mlx-node`;
-live-ish behavior is polling + SSE. Requires Node.js ≥ 22.19.
+**There is no `mlx dashboard` command and no HTTP server.** Both were removed once
+the app replaced them: the SPA is served from a custom `app://` scheme and speaks to
+the runtime over a MessagePort. That deletes a whole class of exposure rather than
+guarding it — there is no port to bind, nothing to firewall, and no `--host` that can
+put an unauthenticated control panel API on a LAN.
 
-```bash
-mlx dashboard                       # start on 127.0.0.1:6590, open a browser
-mlx dashboard --port 8080           # pick a port
-mlx dashboard --no-open             # do not launch a browser
-mlx dashboard --host 0.0.0.0        # bind elsewhere (LOUD warning; no auth)
-mlx dashboard --db ./scratch.db     # override the SQLite index path
-mlx dashboard --models-dir ./models # read local models from a specific dir
+The dashboard still never links the native addon (no Metal init, instant start), and
+all data still comes from disk under `~/.mlx-node`.
+
+## Where it runs
+
+```
+CONTROL PANEL  utilityProcess               no native addon
+  createDashboardRuntime()
+    main thread   DownloadManager + the RPC transport      async only
+    worker thread DashboardDb + every synchronous FS walk
+  ⟵ MessagePort ⟶ Control Panel renderer   (MAIN brokers the port once, then leaves)
 ```
 
-| Flag           | Default                    | Purpose                                                               |
-| -------------- | -------------------------- | --------------------------------------------------------------------- |
-| `--port`       | `6590`                     | Port to listen on (`0` = ephemeral)                                   |
-| `--host`       | `127.0.0.1`                | Host to bind; any non-loopback host prints a no-auth exposure warning |
-| `--no-open`    | (opens a browser)          | Do not open the dashboard in a browser                                |
-| `--db`         | `~/.mlx-node/dashboard.db` | Override the disposable SQLite index path                             |
-| `--models-dir` | `~/.mlx-node/models`       | Directory to read local models from                                   |
-| `-h`, `--help` | —                          | Print help                                                            |
+`DashboardDb` and the synchronous filesystem walks own a `node:worker_threads`
+worker, because `node:sqlite` and drizzle are synchronous: a trivial call issued
+during a 1.5 s query used to wait 1449 ms. With the split, a download-progress call
+made during a heavy query returns in 0.2 ms instead of 296 ms.
+
+Route ownership is data on the route (`mainRoute` / `workerRoute`), so a new route
+cannot silently land on the wrong thread. Only the four download routes stay on the
+transport thread, because network I/O and progress events are what must never stall.
+
+## Using it as a library
+
+```ts
+import { createDashboardRuntime } from '@mlx-node/dashboard';
+import { serveRuntimeOverPort } from '@mlx-node/dashboard';
+
+const runtime = createDashboardRuntime({ modelsDir, dbPath });
+// `call({method, path})` is the whole API surface; it never rejects for an API
+// failure, it returns a `{ok:false, status, code, message}` envelope.
+```
 
 ## Pages
 
-| Page           | Content                                                                                                 | Actions                                                          |
-| -------------- | ------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| Overview       | Stat tiles (models/disk, sessions, tokens 7d, cache size + hit rate), recent sessions, active downloads | —                                                                |
-| Models         | Local table: name, family, quant, size, ctx window                                                      | delete; install from the recommended catalog (live SSE progress) |
-| Sessions       | Table with search + filters (cwd, model, date)                                                          | open, rename (idle only, see below), delete, copy resume command |
-| Session detail | Transcript (collapsible tool calls) + per-turn tokens / tok-s chips + charts                            | —                                                                |
-| Metrics        | Tokens/day (in/out/cached), tok/s + TTFT per model, MTP acceptance, model share                         | date range                                                       |
-| Cache          | Cold-tier disk usage vs quota, entry count + age histogram, hit/miss trend                              | clear all, evict older-than-N-days                               |
+| Page           | Content                                                                                                 | Actions                                                                  |
+| -------------- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Overview       | Stat tiles (models/disk, sessions, tokens 7d, cache size + hit rate), recent sessions, active downloads | —                                                                        |
+| Models         | Local table: name, family, quant, size, ctx window                                                      | delete; install from the recommended catalog (live port-pushed progress) |
+| Sessions       | Table with search + filters (cwd, model, date)                                                          | open, rename (idle only, see below), delete, copy resume command         |
+| Session detail | Transcript (collapsible tool calls) + per-turn tokens / tok-s chips + charts                            | —                                                                        |
+| Metrics        | Tokens/day (in/out/cached), tok/s + TTFT per model, MTP acceptance, model share                         | date range                                                               |
+| Cache          | Cold-tier disk usage vs quota, entry count + age histogram, hit/miss trend                              | clear all, evict older-than-N-days                                       |
 
 ## Data sources
 
@@ -123,26 +140,22 @@ restored on a hot-cache miss before falling back to a normal prefill.
 
 ## Security model
 
-- Binds `127.0.0.1` by default. Binding any other host prints a loud warning: the
-  dashboard has **no authentication** and exposes local models, sessions, and cache
-  to anyone who can reach the address.
-- **No auth.** Mutating (non-GET/HEAD) requests are guarded by a local-origin check:
-  under the default loopback bind the `Host` header must name a loopback host
-  (optionally with the server port), and any present `Origin` must be an `http`
-  loopback origin. An explicit non-loopback `--host` bind intentionally widens the
-  accepted `Host` set to that bound interface's address(es) — the no-auth exposure
-  noted above — while still rejecting a rebound foreign host. This blocks drive-by
-  CSRF / DNS-rebinding against the loopback port. GET/HEAD (static assets + read
-  endpoints) are unguarded.
-- Destructive ops (delete model/session, clear/evict cache) require UI confirmation
-  and resolve paths strictly inside their managed roots before any removal.
-- The per-model **size on disk** shown in the Models table (and the delete-confirmation
-  "(X GB)" hint) is a **best-effort, display-only estimate**, not a security boundary:
-  the directory walk no-follows the final component but traverses lexical paths, so a
-  concurrent symlink swap of an ancestor directory in the user's own local store could
-  redirect sizing onto an external tree. The worst outcome is a wrong size number —
-  deletion never uses the size, only the path-checked model name — and a fully robust
-  defense would need descriptor-relative traversal that `node:fs` does not expose.
+The HTTP attack surface no longer exists. There is no listening socket, so there is
+nothing to bind, nothing to firewall, and no host/origin guard to get wrong — the
+class of bug is deleted rather than mitigated. What remains:
+
+- **The renderer is sandboxed** (`contextIsolation: true`, `nodeIntegration: false`,
+  `sandbox: true`) and reaches the runtime only through a transferred MessagePort.
+- **A strict CSP ships as a response header** on `app://`. `script-src` is `'self'`
+  with no `unsafe-inline` and no `unsafe-eval`; `connect-src` is `'self'` only,
+  because the SPA speaks over a port and has no reason to reach the network at all.
+  The scheme is registered with `bypassCSP: false`, or the header would be decorative.
+- **`app://` serves only inside the bundle.** A miss under `/assets/` returns 404
+  rather than falling back to `index.html`, so a stale or mis-copied bundle fails
+  loudly instead of returning HTML labelled `text/javascript`.
+- **Mutations are still the dangerous part** — model delete, cache clear, session
+  delete — and they are reachable by anything that gets the port. The port is minted
+  by MAIN, transferred once to the Control Panel window it created, and consumed on receipt.
 
 ## Known limitation
 
@@ -151,25 +164,31 @@ not time-series lines**, because `/api/metrics/overview` returns per-model aggre
 rather than per-day-per-model rows. A future follow-up would add a daily-bucketed
 per-model query to plot true trends over time.
 
-## HTTP API
+## API
 
-Read-only `GET` endpoints plus a few guarded mutations. `GET /health` returns
-`{ status, modelsDir, sessionsRoot, tracesDir }`.
+The same route table, addressed the same way, over a MessagePort instead of HTTP.
+`runtime.call({ method, path })` is the whole surface; it **never rejects for an API
+failure**, it returns `{ok: true, status, body}` or `{ok: false, status, code, message}`.
+That envelope is structured-clonable by design — it is what makes the port transport
+cheap, and it gives code written against the in-process runtime an identical signature
+over a port.
 
-| Route                       | Method       | Purpose                                                       |
-| --------------------------- | ------------ | ------------------------------------------------------------- |
-| `/api/models`               | GET          | Local models: name, path, family, quant, size, ctx window     |
-| `/api/models/:name`         | DELETE       | Delete a model dir (path-checked)                             |
-| `/api/catalog`              | GET          | Recommended catalog + installed/installable state             |
-| `/api/downloads`            | GET / POST   | List active jobs / start a catalog download                   |
-| `/api/downloads/:id/events` | GET (SSE)    | Per-file + byte progress, resume-aware                        |
-| `/api/sessions`             | GET          | Indexed session list; search + filters                        |
-| `/api/sessions/:id`         | GET          | Transcript (active branch) + per-turn usage                   |
-| `/api/sessions/:id`         | PATCH/DELETE | Rename (refused while active, see below) / delete file + rows |
-| `/api/sessions/:id/metrics` | GET          | Joined trace metrics for the session                          |
-| `/api/metrics/overview`     | GET          | Aggregates: tokens/day, tok/s + TTFT, MTP acceptance, share   |
-| `/api/cache`                | GET / DELETE | Cold-tier scan / clear all or evict older-than-N-days         |
-| `/api/ingest`               | POST         | Trigger an incremental rescan                                 |
+`GET /health` returns `{ status, modelsDir, sessionsRoot, tracesDir }`.
+
+| Route                       | Method       | Purpose                                                                    |
+| --------------------------- | ------------ | -------------------------------------------------------------------------- |
+| `/api/models`               | GET          | Local models: name, path, family, quant, size, ctx window                  |
+| `/api/models/:name`         | DELETE       | Delete a model dir (path-checked)                                          |
+| `/api/catalog`              | GET          | Recommended catalog + installed/installable state                          |
+| `/api/downloads`            | GET / POST   | List active jobs / start a catalog download                                |
+| `/api/downloads/:id/events` | GET          | Not served over the port — use `runtime.subscribe(jobId, fn)`; answers 503 |
+| `/api/sessions`             | GET          | Indexed session list; search + filters                                     |
+| `/api/sessions/:id`         | GET          | Transcript (active branch) + per-turn usage                                |
+| `/api/sessions/:id`         | PATCH/DELETE | Rename (refused while active, see below) / delete file + rows              |
+| `/api/sessions/:id/metrics` | GET          | Joined trace metrics for the session                                       |
+| `/api/metrics/overview`     | GET          | Aggregates: tokens/day, tok/s + TTFT, MTP acceptance, share                |
+| `/api/cache`                | GET / DELETE | Cold-tier scan / clear all or evict older-than-N-days                      |
+| `/api/ingest`               | POST         | Trigger an incremental rescan                                              |
 
 **Rename is durable but idle-only.** A rename appends a `session_info` entry to the
 pi session JSONL (the source of truth) — it is _not_ stored index-only, because the

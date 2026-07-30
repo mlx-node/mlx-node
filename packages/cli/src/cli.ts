@@ -19,9 +19,9 @@ Commands:
   convert            Convert model weights to MLX format
   calibrate          Calibrate FP8 activation amax for --q-recipe nvidia models
   redact             Redact PII from text using a privacy-filter model
+  serve              Serve local models over an Anthropic/OpenAI-compatible API
   launch claude      Start a local server and spawn Claude Code pointed at it
   agent              Start the local coding agent (pi-based, fully offline)
-  dashboard          Start the local web dashboard
 
 Options:
   -h, --help         Show this help message
@@ -33,10 +33,10 @@ Examples:
   mlx convert -i ~/.mlx-node/models/qwen3-0.6b -o ~/.mlx-node/models/qwen3-0.6b-mlx -d bf16
   mlx calibrate -i ./qwen3.6-27b-nvidia-mxfp4-mlx --dataset ~/.cache/nvidia-calib/cnn_nemotron_v2_calib.jsonl
   mlx redact -m .cache/models/privacy-filter -i input.txt -o redacted.txt
+  mlx serve --port 8080
   mlx launch claude
   mlx agent
   mlx agent -c
-  mlx dashboard
 `);
 }
 
@@ -88,8 +88,8 @@ async function main() {
       break;
     }
 
-    case 'dashboard': {
-      const { run } = await import('./commands/dashboard.js');
+    case 'serve': {
+      const { run } = await import('./commands/serve.js');
       await run(args.slice(1));
       break;
     }

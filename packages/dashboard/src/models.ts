@@ -78,6 +78,11 @@ export interface DownloadCompletion {
   revision: string;
   /** Repo-relative paths of every file published into the final dir. */
   files: string[];
+  /**
+   * Whether the marker describes a full-model run. Missing means `full` for
+   * compatibility with markers written before selection scope was recorded.
+   */
+  scope?: 'full' | 'partial';
   /** ISO timestamp of the atomic publish. */
   completedAt: string;
 }
@@ -102,8 +107,8 @@ export function isWeightFile(path: string): boolean {
  * installed, hiding the retry.
  */
 export function isModelInstalled(modelDir: string): boolean {
-  const marker = asObject(readMarkerFile(modelDir));
-  if (marker === undefined || !Array.isArray(marker.files)) return false;
+  const marker = readCompletion(modelDir);
+  if (marker === undefined || marker.scope === 'partial') return false;
   const files = marker.files;
   // A loadable checkpoint needs a config AND a weight; a marker missing either
   // describes a hollow/one-sided publish that must NOT read as installed.
@@ -212,11 +217,18 @@ export function readCompletion(finalDir: string): DownloadCompletion | undefined
     typeof marker.revision !== 'string' ||
     typeof marker.completedAt !== 'string' ||
     !Array.isArray(marker.files) ||
-    !marker.files.every((file) => typeof file === 'string')
+    !marker.files.every((file) => typeof file === 'string') ||
+    (marker.scope !== undefined && marker.scope !== 'full' && marker.scope !== 'partial')
   ) {
     return undefined;
   }
-  return { repo: marker.repo, revision: marker.revision, files: marker.files, completedAt: marker.completedAt };
+  return {
+    repo: marker.repo,
+    revision: marker.revision,
+    files: marker.files,
+    scope: marker.scope as DownloadCompletion['scope'],
+    completedAt: marker.completedAt,
+  };
 }
 
 /**
@@ -732,9 +744,10 @@ export function deleteLocalModel(modelsDir: string, name: string): void {
 
 /**
  * Default models directory, mirroring `resolveModelsDir` in
- * `packages/cli/src/config.ts`: `MLX_MODELS_DIR` env → `modelsDir` field of
- * `~/.mlx-node/config.json` → `~/.mlx-node/models`. Unlike the CLI helper this
- * never creates the directory — a viewer only reads.
+ * `@mlx-node/server/host/paths` (`packages/server/src/host/paths.ts`):
+ * `MLX_MODELS_DIR` env → `modelsDir` field of `~/.mlx-node/config.json` →
+ * `~/.mlx-node/models`. Unlike that helper this never creates the directory —
+ * a viewer only reads.
  */
 export function defaultModelsDir(): string {
   const envDir = process.env.MLX_MODELS_DIR;

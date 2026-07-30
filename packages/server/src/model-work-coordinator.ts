@@ -1,3 +1,24 @@
+import type { ModelLoadRecord } from './health.js';
+
+/**
+ * Render a thrown value for {@link ModelLoadRecord.error}.
+ *
+ * Deliberately avoids `String(unknown)`: a rejection carrying a plain object
+ * would render as the useless `[object Object]` in the one field a supervisor
+ * reads to find out why the model would not load.
+ */
+function describeLoadFailure(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  if (error == null) return 'unknown error';
+  try {
+    return JSON.stringify(error) ?? 'unknown error';
+  } catch {
+    // Circular structure, or a `toJSON` that throws.
+    return 'unknown error';
+  }
+}
+
 /**
  * Result of a `withModelLoad` call that surfaces who actually drove the load
  * vs. who merely parked behind one that was already in flight. Callers use
@@ -42,16 +63,70 @@ export interface ModelLoadOutcome<T> {
  */
 export class ModelWorkCoordinator {
   private activeReaders = 0;
-  private writerActive = false;
-  private waitingWriters = 0;
+  private writerHeld = false;
+  private queuedWriters = 0;
   private readonly readerWaiters: Array<() => void> = [];
   private readonly writerWaiters: Array<() => void> = [];
+  /**
+   * Most recent settled load bracket. Retained here because the coordinator
+   * is the ONE place that brackets every load: a `resolveModel` failure in
+   * `/v1/messages` becomes a 500 and is otherwise dropped on the floor, so a
+   * supervisor polling `/health` afterwards had no way to learn what went
+   * wrong. See {@link ModelLoadRecord} for the "successful no-op overwrites
+   * an earlier failure" caveat.
+   */
+  private lastLoadRecord: ModelLoadRecord | null = null;
 
-  async withModelLoad<T>(fn: () => Promise<T> | T): Promise<T> {
+  /** Read-only: `true` while a load holds the exclusive writer slot. */
+  get writerActive(): boolean {
+    return this.writerHeld;
+  }
+
+  /** Read-only: loads parked in `acquireWrite()` waiting for the slot. */
+  get waitingWriters(): number {
+    return this.queuedWriters;
+  }
+
+  /** Read-only: outcome of the most recent settled load bracket, or `null`. */
+  get lastLoad(): ModelLoadRecord | null {
+    return this.lastLoadRecord;
+  }
+
+  /**
+   * Record a settled bracket. Called from the `finally` of both load
+   * wrappers so a throw is captured just as reliably as a success.
+   */
+  private recordLoad(label: string | undefined, startedAt: number, error: unknown, ok: boolean): void {
+    this.lastLoadRecord = {
+      label: label ?? null,
+      startedAt,
+      finishedAt: Date.now(),
+      ok,
+      error: ok ? null : describeLoadFailure(error),
+    };
+  }
+
+  /**
+   * @param label Optional identifier (normally the model name) stamped into
+   *   {@link lastLoad} so `/health` can name what was being loaded.
+   */
+  async withModelLoad<T>(fn: () => Promise<T> | T, label?: string): Promise<T> {
     await this.acquireWrite();
+    // Measured from lock acquisition, not from arrival: `startedAt` is meant
+    // to answer "how long has the actual materialization been running",
+    // which is what a supervisor deciding whether to wait needs.
+    const startedAt = Date.now();
+    let ok = false;
+    let failure: unknown;
     try {
-      return await fn();
+      const result = await fn();
+      ok = true;
+      return result;
+    } catch (err) {
+      failure = err;
+      throw err;
     } finally {
+      this.recordLoad(label, startedAt, failure, ok);
       this.releaseWrite();
     }
   }
@@ -69,24 +144,31 @@ export class ModelWorkCoordinator {
    * 60-second cold-load does not look like 60 seconds of own work for
    * every concurrent request.
    */
-  async withModelLoadInstrumented<T>(fn: () => Promise<T> | T): Promise<ModelLoadOutcome<T>> {
+  async withModelLoadInstrumented<T>(fn: () => Promise<T> | T, label?: string): Promise<ModelLoadOutcome<T>> {
     // `owner` MUST be decided synchronously, before any await, so the
     // signal reflects coordinator state at arrival rather than after
     // any peer transition. The wait/own split is measured around the
     // actual phase boundaries (lock acquisition, fn completion) so the
     // two intervals partition cleanly instead of both reporting total
     // elapsed time — see `ModelLoadOutcome` for the contract.
-    const owner = !this.writerActive && this.waitingWriters === 0;
+    const owner = !this.writerHeld && this.queuedWriters === 0;
     const arrivedAt = Date.now();
     await this.acquireWrite();
     const lockAcquiredAt = Date.now();
+    let ok = false;
+    let failure: unknown;
     try {
       const result = await fn();
+      ok = true;
       const fnDoneAt = Date.now();
       const waitMs = Math.max(0, lockAcquiredAt - arrivedAt);
       const ownMs = Math.max(0, fnDoneAt - lockAcquiredAt);
       return { result, owner, waitMs, ownMs };
+    } catch (err) {
+      failure = err;
+      throw err;
     } finally {
+      this.recordLoad(label, lockAcquiredAt, failure, ok);
       this.releaseWrite();
     }
   }
@@ -101,7 +183,7 @@ export class ModelWorkCoordinator {
   }
 
   private acquireRead(): Promise<void> {
-    if (!this.writerActive && this.waitingWriters === 0) {
+    if (!this.writerHeld && this.queuedWriters === 0) {
       this.activeReaders += 1;
       return Promise.resolve();
     }
@@ -114,16 +196,16 @@ export class ModelWorkCoordinator {
   }
 
   private acquireWrite(): Promise<void> {
-    this.waitingWriters += 1;
-    if (!this.writerActive && this.activeReaders === 0) {
-      this.waitingWriters -= 1;
-      this.writerActive = true;
+    this.queuedWriters += 1;
+    if (!this.writerHeld && this.activeReaders === 0) {
+      this.queuedWriters -= 1;
+      this.writerHeld = true;
       return Promise.resolve();
     }
     return new Promise<void>((resolve) => {
       this.writerWaiters.push(() => {
-        this.waitingWriters -= 1;
-        this.writerActive = true;
+        this.queuedWriters -= 1;
+        this.writerHeld = true;
         resolve();
       });
     });
@@ -136,17 +218,17 @@ export class ModelWorkCoordinator {
   }
 
   private releaseWrite(): void {
-    this.writerActive = false;
+    this.writerHeld = false;
     this.drain();
   }
 
   private drain(): void {
-    if (this.writerActive) return;
+    if (this.writerHeld) return;
     if (this.activeReaders === 0 && this.writerWaiters.length > 0) {
       this.writerWaiters.shift()?.();
       return;
     }
-    if (this.waitingWriters === 0 && this.readerWaiters.length > 0) {
+    if (this.queuedWriters === 0 && this.readerWaiters.length > 0) {
       const readers = this.readerWaiters.splice(0);
       for (const resolve of readers) resolve();
     }

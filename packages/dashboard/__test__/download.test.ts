@@ -597,6 +597,37 @@ describe('DownloadManager', () => {
     expect(job.receivedBytes).toBe(job.totalBytes);
   });
 
+  it('does not short-circuit a current partial CLI marker; downloads and publishes the full model', async () => {
+    mkdirSync(finalDir(), { recursive: true });
+    writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(finalDir(), 'model.safetensors'), Buffer.alloc(300, 0xab));
+    writeFileSync(
+      join(finalDir(), DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({
+        repo: REPO,
+        revision: hub.sha,
+        files: ['config.json', 'model.safetensors'],
+        scope: 'partial',
+        completedAt: 'x',
+      }),
+    );
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    const id = manager.start(REPO);
+    await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
+
+    expect(hub.downloaded).toEqual(expect.arrayContaining(['config.json', 'model.safetensors']));
+    expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12));
+    const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
+      scope?: string;
+    };
+    expect(marker.scope).toBe('full');
+  });
+
   // Finding #4: a complete install of a DIFFERENT revision (same slug) must NOT
   // short-circuit to `done` at the new revision's byte total — the job must download
   // the resolved revision and let publish's owned-swap replace the stale one.

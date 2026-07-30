@@ -1,0 +1,11 @@
+# Phase 0 spike output — JSONL token streams, tens of MB per run.
+spike/.spike-logs/
+
+# Packaging staging + packager output. `out` is already ignored repo-wide, but
+# being explicit here keeps the build products discoverable to a reader.
+out/
+
+# `iconutil` input only: 10 PNGs that make-icons.ts regenerates and that carry no
+# information `icon.icns` does not already hold. The .icns itself IS committed —
+# packagers reference it directly.
+build/icon.iconset/

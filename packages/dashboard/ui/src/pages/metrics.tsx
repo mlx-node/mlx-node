@@ -12,6 +12,7 @@ import {
   categoryLabels,
 } from '@/lib/chart';
 import { formatCount, formatNumber, formatRate } from '@/lib/format';
+import { stableNow } from '@/lib/stable-now';
 import type {
   MetricsOverviewResponse,
   ModelShareRow,
@@ -92,7 +93,11 @@ export default function Metrics() {
   const [rangeKey, setRangeKey] = useState('30');
   const range = useMemo(() => {
     const days = RANGE_OPTIONS.find((o) => o.value === rangeKey)?.days ?? 30;
-    const to = Date.now();
+    // `stableNow`, not `Date.now`: this value ends up in the request path, which
+    // is the cache key, and this `useMemo` re-runs on every mount because the
+    // router unmounts the route on navigation. A raw timestamp made the key
+    // unique per visit, so this page alone could never be served from cache.
+    const to = stableNow();
     return { from: to - days * DAY_MS, to };
   }, [rangeKey]);
 

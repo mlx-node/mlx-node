@@ -318,7 +318,7 @@ fn probe_vision_memory() -> VisionMemorySnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct VisionFeatureCacheKey {
-    image_hash: u64,
+    image_hash: engine::ImageCacheDigest,
     grid_thw: [i32; 3],
 }
 
@@ -744,8 +744,8 @@ pub(crate) struct Qwen35Inner {
     pub(crate) vision_cache: VisionCache,
     pub(crate) cached_token_history: Vec<u32>,
     pub(crate) cached_image_key: Option<u64>,
-    /// Absolute expanded-token positions paired with their per-image content
-    /// hashes for the live paged request. These keys must remain attached to
+    /// Absolute expanded-token positions paired with all four per-image digest
+    /// words for the live paged request. These keys must remain attached to
     /// the image-conditioned prefix when a later text turn extends it and
     /// re-finalizes the request in the shared prefix cache.
     pub(crate) cached_paged_image_token_positions: Vec<(u32, u64)>,
@@ -11678,7 +11678,7 @@ struct VisionCacheMiss {
 
 fn plan_vision_image_requests(
     grid_data: &[i32],
-    per_image_hashes: &[u64],
+    per_image_hashes: &[engine::ImageCacheDigest],
     total_patches: i64,
     spatial_merge_size: i32,
 ) -> Result<Vec<VisionImageRequest>> {
@@ -11692,7 +11692,7 @@ fn plan_vision_image_requests(
         return Err(Error::new(
             Status::InvalidArg,
             format!(
-                "vision grid/hash cardinality mismatch: {} grid values for {} image hashes",
+                "vision grid/digest cardinality mismatch: {} grid values for {} image digests",
                 grid_data.len(),
                 per_image_hashes.len()
             ),
@@ -11849,7 +11849,7 @@ fn projected_vision_feature_bytes(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn vlm_prepare_vision_features(
     input_ids: &MxArray,
-    per_image_hashes: &[u64],
+    per_image_hashes: &[engine::ImageCacheDigest],
     pre_processed: &ProcessedImages,
     vision_encoder: &Qwen3_5VisionEncoder,
     spatial_merge_size: i32,
@@ -12307,9 +12307,13 @@ pub(crate) fn vlm_prepare_vision_features(
 mod vision_feature_cache_tests {
     use super::*;
 
+    fn digest(word: u64) -> engine::ImageCacheDigest {
+        engine::ImageCacheDigest::from_test_word(word)
+    }
+
     fn key(image_hash: u64, grid_thw: [i32; 3]) -> VisionFeatureCacheKey {
         VisionFeatureCacheKey {
-            image_hash,
+            image_hash: digest(image_hash),
             grid_thw,
         }
     }
@@ -12362,8 +12366,9 @@ mod vision_feature_cache_tests {
 
     #[test]
     fn plans_per_image_ranges_and_rejects_invalid_geometry() {
-        let planned = plan_vision_image_requests(&[1, 4, 4, 2, 2, 4], &[10, 20], 32, 2)
-            .expect("valid image geometry");
+        let planned =
+            plan_vision_image_requests(&[1, 4, 4, 2, 2, 4], &[digest(10), digest(20)], 32, 2)
+                .expect("valid image geometry");
         assert_eq!(planned[0].patch_start, 0);
         assert_eq!(planned[0].patch_count, 16);
         assert_eq!(planned[0].feature_count, 4);
@@ -12371,10 +12376,10 @@ mod vision_feature_cache_tests {
         assert_eq!(planned[1].patch_count, 16);
         assert_eq!(planned[1].feature_count, 4);
 
-        assert!(plan_vision_image_requests(&[1, 4, 4], &[1, 2], 16, 2).is_err());
-        assert!(plan_vision_image_requests(&[1, 3, 4], &[1], 12, 2).is_err());
-        assert!(plan_vision_image_requests(&[1, 4, 4], &[1], 15, 2).is_err());
-        assert!(plan_vision_image_requests(&[0, 4, 4], &[1], 0, 2).is_err());
+        assert!(plan_vision_image_requests(&[1, 4, 4], &[digest(1), digest(2)], 16, 2).is_err());
+        assert!(plan_vision_image_requests(&[1, 3, 4], &[digest(1)], 12, 2).is_err());
+        assert!(plan_vision_image_requests(&[1, 4, 4], &[digest(1)], 15, 2).is_err());
+        assert!(plan_vision_image_requests(&[0, 4, 4], &[digest(1)], 0, 2).is_err());
     }
 
     #[test]

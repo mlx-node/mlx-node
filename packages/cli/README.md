@@ -1,8 +1,8 @@
 # @mlx-node/cli
 
-Command-line tool for downloading models and datasets from HuggingFace Hub, converting model weights, running the fully-local `mlx agent`, and launching the `mlx dashboard`, for use with `@mlx-node/*` packages.
+Command-line tool for downloading models and datasets from HuggingFace Hub, converting model weights, redacting PII, serving local models, launching Claude Code, and running the fully-local `mlx agent`, for use with `@mlx-node/*` packages.
 
-Top-level commands: `download`, `convert`, `calibrate`, `agent`, `dashboard`, `launch`. See [docs/cli.md](https://github.com/mlx-node/mlx-node/blob/main/docs/cli.md) for `agent`, `calibrate`, and `launch`, and [docs/dashboard.md](https://github.com/mlx-node/mlx-node/blob/main/docs/dashboard.md) for the dashboard.
+Top-level commands: `download`, `convert`, `calibrate`, `redact`, `serve`, `launch`, `agent`. See [docs/cli.md](https://github.com/mlx-node/mlx-node/blob/main/docs/cli.md) for the CLI guide.
 
 ## Requirements
 
@@ -34,12 +34,14 @@ mlx download model --model Qwen/Qwen3-0.6B
 Downloads to `.cache/models/<model-slug>` by default, pinned to the repo's
 current revision. A successful download writes a `.mlx-download-complete.json`
 marker (shared with the dashboard) recording the repo, revision, and file
-list. Re-running the command checks the upstream revision: when nothing
-changed it exits with "already up to date"; when the repo was updated it
-re-downloads only the files whose content hash changed and removes files the
-repo no longer has — no need to delete the directory first. Use `--force` to
-re-verify every file even when the local copy looks current. If the revision
-cannot be resolved (offline), the previous local-only checks apply. Note:
+list. Glob-filtered markers are explicitly partial, so a selected shard cannot
+be mistaken for a complete dashboard install. Re-running the command checks the
+upstream revision: when nothing changed it exits with "already up to date";
+when the repo was updated it re-downloads only the files whose content hash
+changed and removes files the repo no longer has — no need to delete the
+directory first. Use `--force` to re-verify every file even when the local copy
+looks current. If the revision cannot be resolved (offline), the previous
+local-only checks apply. Note:
 `--force` without `--glob` on a GGUF directory holding only some quantization
 variants downloads all remaining variants, and the marker makes the directory
 dashboard-managed — a dashboard install into it may replace the contents
@@ -192,8 +194,9 @@ mlx convert -i ./model -o ./model-q3 -q --q-bits 3 --q-recipe unsloth --imatrix-
 mlx convert -i ./model -o ./model-q4 -q --q-bits 4 --q-recipe unsloth --imatrix-path ./imatrix.gguf
 ```
 
-For verified Qwen3.5/Qwen3.6-family checkpoints, select the fixed [Unsloth
-class map](https://unsloth.ai/docs/models/qwen3.6#nvfp4) with either
+For verified Qwen3.5/Qwen3.6-family checkpoints or the exact SafeTensors
+Gemma-4-26B-A4B MoE shape, select the fixed [Unsloth class
+map](https://unsloth.ai/docs/models/qwen3.6#nvfp4) with either
 `--q-mxfp` (NVFP4 → MXFP4, FP8 → MXFP8) or `--q-mode nvfp4` (the DGX
 weight map, retaining NVFP4 and storing FP8 classes as plain per-output E4M3). An imatrix is optional
 for these two fixed maps: when omitted, AWQ pre-scaling is skipped and quality
@@ -208,6 +211,14 @@ mlx convert -i ./model -o ./model-unsloth-mxfp4 -q \
 
 mlx convert -i ./model -o ./model-unsloth-nvfp4 -q \
   --q-recipe unsloth --q-mode nvfp4
+
+mlx convert -m gemma4 -i ./gemma-4-26b-a4b-it \
+  -o ./gemma-4-26b-a4b-it-unsloth-mxfp4 -q \
+  --q-recipe unsloth --q-mxfp
+
+mlx convert -m gemma4 -i ./gemma-4-26b-a4b-it \
+  -o ./gemma-4-26b-a4b-it-unsloth-nvfp4 -q \
+  --q-recipe unsloth --q-mode nvfp4
 ```
 
 The two fixed maps share tensor-class boundaries but preserve different weight
@@ -221,11 +232,16 @@ does not include Unsloth's calibrated NVFP4 global scales, W4A4/W8A8 activation
 execution, or calibrated FP8 KV-cache scales, and does not claim upstream
 numerical or performance parity.
 
-| Weight class                                                                     | `--q-mxfp` | `--q-mode nvfp4`                 |
-| -------------------------------------------------------------------------------- | ---------- | -------------------------------- |
-| FFN `gate_proj` / `up_proj` / `down_proj`, except the final 8 transformer layers | MXFP4 4/32 | NVFP4 4/16                       |
-| Final 8 FFNs; attention q/k/v/o; GDN qkv/z/out; `lm_head`                        | MXFP8 8/32 | E4M3 FP8 + per-output BF16 scale |
-| Embeddings; routers; GDN a/b; vision; MTP; norms; recurrent parameters           | BF16       | BF16                             |
+| Weight class                                                                                 | `--q-mxfp` | `--q-mode nvfp4`                 |
+| -------------------------------------------------------------------------------------------- | ---------- | -------------------------------- |
+| Qwen FFNs except the final 8; all Gemma4 dense/expert FFNs                                   | MXFP4 4/32 | NVFP4 4/16                       |
+| Qwen final 8 FFNs, attention, GDN qkv/z/out, head; Gemma4 attention q/k/v/o                  | MXFP8 8/32 | E4M3 FP8 + per-output BF16 scale |
+| Embeddings; routers; Qwen GDN a/b; vision/audio; MTP; norms; recurrent and unmatched tensors | BF16       | BF16                             |
+
+Gemma4 has no final-eight or `lm_head` exception. Its stacked experts remain
+in the low NVFP4/MXFP4 class; plain FP8 is accepted only for the rank-2
+attention weights. Flat GGUF imatrix statistics are not treated as an invented
+expert-axis calibration rule.
 
 Per-tensor bit assignments (N = `--q-bits`):
 
@@ -242,19 +258,6 @@ Per-tensor bit assignments (N = `--q-bits`):
 | `linear_attn.out_proj`      | 8 affine | Worst tensor (KLD ~6.0) — kept 8-bit for MTP/AR parity     |
 | `linear_attn.in_proj_a/b`   | 8 affine | Split GDN low-rank projs — kept 8-bit for MTP/AR parity    |
 | GDN params (`A_log`, etc.)  | bf16     | Recurrent state params, errors compound over time          |
-
-### Dashboard
-
-Start the local web dashboard (browse models, agent sessions, inference metrics, and
-the paged-attention cold cache):
-
-```bash
-mlx dashboard                 # start on 127.0.0.1:6590 and open a browser
-mlx dashboard --no-open       # start without a browser
-mlx dashboard --port 8080     # pick a port
-```
-
-Binds `127.0.0.1` with no authentication. See [docs/dashboard.md](https://github.com/mlx-node/mlx-node/blob/main/docs/dashboard.md) for flags, pages, and the security model. Requires Node.js ≥ 22.19.
 
 ## Examples
 

@@ -16,6 +16,7 @@ import {
   sendNotFound,
 } from './errors.js';
 import type { PublicModelEntry } from './handler.js';
+import { toMinimalHealth, type ServerHealth } from './health.js';
 import type { IdleSweeper } from './idle-sweeper.js';
 import type { ModelWorkCoordinator } from './model-work-coordinator.js';
 import type { ModelRegistry } from './registry.js';
@@ -24,6 +25,33 @@ import type { ResponsesAPIRequest } from './types.js';
 
 /** Max request body size (10 MB). */
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
+
+/**
+ * The request's pathname, parsed against a CONSTANT base.
+ *
+ * Never against `Host`. That header is attacker-controlled text on every
+ * request — `Host: [` makes `new URL()` throw `ERR_INVALID_URL`, and a throw
+ * from an async request listener is an unhandled rejection, which under Node's
+ * default `--unhandled-rejections=throw` takes the whole process down. One
+ * malformed byte from any client that can reach the socket was enough to end
+ * inference. A pathname does not depend on the authority anyway, so a fixed
+ * base is both safer and equivalent: an absolute-form request URI
+ * (`GET http://host/v1/models HTTP/1.1`, legal in HTTP/1.1) still wins over
+ * the base and yields the same path it always did.
+ *
+ * `req.url` itself is guarded too, for the same reason rather than a known
+ * input: this function's contract is that no request can make it throw.
+ */
+export function requestPathname(req: IncomingMessage): string {
+  const raw = req.url ?? '/';
+  try {
+    return new URL(raw, 'http://localhost').pathname;
+  } catch {
+    const cut = raw.search(/[?#]/);
+    const path = cut === -1 ? raw : raw.slice(0, cut);
+    return path.startsWith('/') ? path : '/';
+  }
+}
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -43,6 +71,22 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
+/**
+ * Trailing options bag. Added as an object rather than two more positional
+ * parameters — `routeRequest` already carries nine, and the two knobs here
+ * are unrelated to each other.
+ */
+export interface RouteExtras {
+  /** Builds the `/health` body. Omitted ⇒ the legacy constant `{ status: 'ok' }`. */
+  health?: () => ServerHealth;
+  /**
+   * Whether the caller presented a valid token. Only consulted by `/health`,
+   * which is the one route reachable without one. `true` when no token is
+   * configured at all, so an unprotected server keeps serving the full body.
+   */
+  authenticated?: boolean;
+}
+
 export async function routeRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -53,9 +97,9 @@ export async function routeRequest(
   resolveModel?: (name: string) => Promise<void>,
   listModels?: () => PublicModelEntry[],
   modelWorkCoordinator?: ModelWorkCoordinator,
+  extras?: RouteExtras,
 ): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-  const path = url.pathname;
+  const path = requestPathname(req);
 
   if (path === '/v1/models') {
     if (req.method !== 'GET') {
@@ -92,6 +136,7 @@ export async function routeRequest(
       responseRetentionSec,
       idleSweeper,
       modelWorkCoordinator,
+      resolveModel,
     );
     return;
   }
@@ -139,8 +184,23 @@ export async function routeRequest(
   }
 
   if (path === '/health' || path === '/v1/health') {
+    // Deliberately NOT bracketed by `idleSweeper.beginRequest/endRequest`
+    // and free of any native call: a supervisor polling on an interval must
+    // not keep pushing the drain timer out, nor touch the MLX allocator.
+    // Every field is read from plain JavaScript state.
+    const health = extras?.health?.();
+    if (health === undefined) {
+      // No reporter wired (a bare `createHandler` mounted by hand): keep the
+      // historical constant so existing consumers are unaffected.
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok' }));
+      return;
+    }
+    // Unauthenticated pollers get liveness only. `models.resident` leaks
+    // project names and local paths, so it stays behind the token.
+    const body = extras?.authenticated === false ? toMinimalHealth(health) : health;
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok' }));
+    res.end(JSON.stringify(body));
     return;
   }
 

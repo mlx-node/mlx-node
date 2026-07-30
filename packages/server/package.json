@@ -21,6 +21,18 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./host": {
+      "types": "./dist/host/index.d.ts",
+      "import": "./dist/host/index.js"
+    },
+    "./host/env-policy": {
+      "types": "./dist/host/env-policy.d.ts",
+      "import": "./dist/host/env-policy.js"
+    },
+    "./host/paths": {
+      "types": "./dist/host/paths.d.ts",
+      "import": "./dist/host/paths.js"
     }
   },
   "scripts": {

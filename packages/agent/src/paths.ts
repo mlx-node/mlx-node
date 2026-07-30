@@ -2,8 +2,9 @@
  * `$HOME/.mlx-node` layout helpers owned by the agent.
  *
  * The agent must not import `@mlx-node/cli` (wrong dependency direction), so
- * the small home-directory layout it needs lives here. Mirrors the CLI's
- * `resolveMlxNodeHome()` (`packages/cli/src/config.ts`).
+ * the small home-directory layout it needs lives here. Mirrors
+ * `resolveMlxNodeHome()` in `@mlx-node/server/host/paths`
+ * (`packages/server/src/host/paths.ts`).
  */
 
 import { homedir } from 'node:os';

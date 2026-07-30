@@ -16,6 +16,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { mutate } from '@/lib/api';
+import { getConnectionGeneration, subscribeConnection } from '@/lib/connection';
 import { formatBytes, formatCount, formatNumber } from '@/lib/format';
 import type {
   CancelDownloadResponse,
@@ -41,7 +42,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { toast } from 'sonner';
 
 function errMessage(err: unknown): string {
@@ -67,6 +68,14 @@ function isTerminalJob(state: DownloadJob['state']): boolean {
 interface ActiveJob {
   id: string;
   committing: boolean;
+  /** Runtime generation that produced this id; ids do not survive a reconnect. */
+  connection: number;
+  /**
+   * A POST result is newer than the GET that was already in flight when the
+   * user clicked Install. Server entries, by contrast, are reconciled exactly
+   * against the next authoritative snapshot.
+   */
+  source: 'local' | 'server';
 }
 
 function QuantBadge({ quant }: { quant: string | null }) {
@@ -84,15 +93,97 @@ function QuantBadge({ quant }: { quant: string | null }) {
   );
 }
 
+/**
+ * The column set of the local-models table, rendered by the loading branch and
+ * the loaded branch from this one definition.
+ *
+ * Both branches need it, and they must never disagree. A header that only the
+ * loaded branch renders is not a cosmetic difference: it appears out of nowhere
+ * when the request lands and pushes every row down by its own 40px, which is the
+ * jump this page was reported for. Sharing the markup is what makes the two
+ * branches structurally incapable of drifting apart again.
+ */
+function LocalModelsHead() {
+  return (
+    <TableHeader>
+      <TableRow>
+        <TableHead>Name</TableHead>
+        <TableHead>Family</TableHead>
+        <TableHead>Quantization</TableHead>
+        <TableHead className="text-right">Size</TableHead>
+        <TableHead className="text-right">Context</TableHead>
+        <TableHead className="w-0" />
+      </TableRow>
+    </TableHeader>
+  );
+}
+
+/**
+ * Three placeholder rows in the real table, under the real header.
+ *
+ * Three because a working install carries a handful of checkpoints, and because
+ * a fresh one resolves to the empty state below rather than to rows — three rows
+ * sit within half a row of that empty state's own height, so both outcomes land
+ * near the space held for them. The exact length cannot be known before the
+ * response arrives and that residual is unavoidable; what is fixed here is the
+ * header and the per-row box.
+ *
+ * Every bar is `h-[1lh]` — one line box of the text of the very cell it sits in
+ * — and the last cell reserves the delete button's `size-9`, which is what
+ * actually sets the row height (36px of button beats 20px of text inside the
+ * cell's `p-2`). Sized bars rather than full-width ones because this table uses
+ * the browser's automatic column algorithm, so the columns are solved from their
+ * content: a row of full-width bars would widen every column and then snap back.
+ */
+function LocalModelsSkeletonRows() {
+  return (
+    <TableBody>
+      {Array.from({ length: 3 }).map((_, i) => (
+        <TableRow key={i}>
+          <TableCell className="max-w-[22rem] truncate font-medium">
+            <Skeleton className="h-[1lh] w-52" />
+          </TableCell>
+          <TableCell className="text-muted-foreground">
+            <Skeleton className="h-[1lh] w-20" />
+          </TableCell>
+          <TableCell>
+            <Skeleton className="h-[1lh] w-16" />
+          </TableCell>
+          <TableCell className="text-right tabular-nums">
+            <Skeleton className="ml-auto h-[1lh] w-14" />
+          </TableCell>
+          <TableCell className="text-muted-foreground text-right tabular-nums">
+            <Skeleton className="ml-auto h-[1lh] w-14" />
+          </TableCell>
+          <TableCell className="text-right">
+            <Skeleton className="ml-auto size-9" />
+          </TableCell>
+        </TableRow>
+      ))}
+    </TableBody>
+  );
+}
+
 export default function Models() {
   const models = useJson<ModelsResponse>('/models');
   const catalog = useJson<CatalogResponse>('/catalog');
   const downloads = useJson<DownloadsResponse>('/downloads');
+  const connection = useSyncExternalStore(subscribeConnection, getConnectionGeneration, getConnectionGeneration);
 
   const [pendingDelete, setPendingDelete] = useState<LocalModel | null>(null);
   const [deleting, setDeleting] = useState(false);
   /** repo → active download job (seeded from the server, added on install). */
   const [active, setActive] = useState<Record<string, ActiveJob>>({});
+  // `useJson` is stale-while-revalidate: on a connection bump it intentionally
+  // keeps the old body on screen until the replacement runtime answers. Remember
+  // that exact object so the reconciliation effect below does not mistake it for
+  // the new runtime's authoritative download registry.
+  const seenConnection = useRef(connection);
+  const staleDownloads = useRef<DownloadsResponse | undefined>(undefined);
+  if (seenConnection.current !== connection) {
+    seenConnection.current = connection;
+    staleDownloads.current = downloads.data;
+  }
   // Destructured, and that is load-bearing: `models`/`catalog` are new objects on
   // every render, so naming THEM in the effect's deps below would re-run it every
   // render — a dismiss/reload loop. `reload` is a `useCallback(…, [])`, so it is
@@ -101,20 +192,38 @@ export default function Models() {
   const { reload: reloadCatalog } = catalog;
 
   useEffect(() => {
-    const jobs = downloads.data?.jobs;
+    const snapshot = downloads.data;
+    const jobs = snapshot?.jobs;
     if (jobs === undefined) return;
-    // Every NONTERMINAL job — the exact complement of the dismiss loop below, and
-    // deliberately not `state === 'running'`: `committing` is a job that is still
-    // installing a model. Its catalog snapshot was read before the publish renamed
-    // the model into place, so leaving it unhydrated offers Install for a model
-    // that is being installed, subscribes to nothing, and — neither query polls —
-    // never learns the job finished. The card would sit on a stale "absent" and
-    // the settled job would be retained server-side until the next mount.
+    // On a reconnect, the first render still carries the previous runtime's
+    // stale-while-revalidate body. It is neither authoritative presence nor
+    // authoritative absence for this connection.
+    if (snapshot === staleDownloads.current) return;
+
+    // Every NONTERMINAL job — the exact complement of the dismiss loop below.
+    // Start from the authoritative snapshot rather than merging it into `prev`:
+    // job ids belong to one runtime, so omission removes a dead runtime's card
+    // and the same repo under a new id must replace it.
     setActive((prev) => {
-      const next = { ...prev };
+      const next: Record<string, ActiveJob> = {};
       for (const job of jobs) {
         if (isTerminalJob(job.state)) continue;
-        if (next[job.repo] === undefined) next[job.repo] = { id: job.id, committing: job.state === 'committing' };
+        next[job.repo] = {
+          id: job.id,
+          committing: job.state === 'committing',
+          connection,
+          source: 'server',
+        };
+      }
+      // The GET above begins in the hook's mount/reconnect effect. A user can
+      // click Install while it is in flight and receive a POST result before
+      // that older snapshot arrives. Preserve only those locally-started jobs
+      // from THIS connection; all server-hydrated and prior-runtime entries are
+      // governed by the snapshot.
+      for (const [repo, job] of Object.entries(prev)) {
+        if (job.source === 'local' && job.connection === connection && next[repo]?.id !== job.id) {
+          next[repo] = job;
+        }
       }
       return next;
     });
@@ -158,12 +267,20 @@ export default function Models() {
       reloadModels();
       reloadCatalog();
     }
-  }, [downloads.data, reloadModels, reloadCatalog]);
+  }, [downloads.data, connection, reloadModels, reloadCatalog]);
 
   const install = async (repo: string): Promise<void> => {
+    const startedConnection = connection;
     try {
       const res = await mutate<DownloadStartResponse>('POST', '/downloads', { repo });
-      setActive((prev) => ({ ...prev, [repo]: { id: res.id, committing: false } }));
+      // A late response from the client that was just replaced cannot name a
+      // job in the new runtime. `connectDashboardApi` normally rejects it while
+      // closing the old client; this is the final generation guard.
+      if (getConnectionGeneration() !== startedConnection) return;
+      setActive((prev) => ({
+        ...prev,
+        [repo]: { id: res.id, committing: false, connection: startedConnection, source: 'local' },
+      }));
     } catch (err) {
       toast.error('Failed to start download', { description: errMessage(err) });
     }
@@ -279,10 +396,22 @@ export default function Models() {
         <StatTile
           label="Installed"
           icon={Package}
-          value={models.loading ? <Skeleton className="h-8 w-12" /> : formatCount(localModels.length)}
+          value={models.loading ? <Skeleton className="h-[1lh] w-12" /> : formatCount(localModels.length)}
           sub={
             models.loading ? (
-              <Skeleton className="h-4 w-24" />
+              // Two lines, because the loaded sub is two lines: the directory
+              // below is drawn whenever the server names one, which is every
+              // case except an unconfigured install. Reserving one line here
+              // would leave the tile 22px short and shove the table below it
+              // down the moment the response lands — and the response is what
+              // says whether the second line exists at all, so the shape has to
+              // be guessed. Guess the common one.
+              <>
+                <Skeleton className="block h-[1lh] w-24" />
+                <span className="mt-0.5 block font-mono text-[11px]">
+                  <Skeleton className="h-[1lh] w-40 max-w-full" />
+                </span>
+              </>
             ) : (
               <>
                 <span className="block">{formatBytes(totalBytes)} on disk</span>
@@ -300,10 +429,10 @@ export default function Models() {
         <StatTile
           label="Recommended"
           icon={Download}
-          value={catalog.loading ? <Skeleton className="h-8 w-12" /> : formatCount(catalogItems.length)}
+          value={catalog.loading ? <Skeleton className="h-[1lh] w-12" /> : formatCount(catalogItems.length)}
           sub={
             catalog.loading ? (
-              <Skeleton className="h-4 w-28" />
+              <Skeleton className="h-[1lh] w-28" />
             ) : (
               // Count `present` (loadable on disk, incl. a renamed dashboard
               // install / a CLI install), matching what each card labels
@@ -351,11 +480,10 @@ export default function Models() {
               {models.error.message}
             </div>
           ) : models.loading ? (
-            <div className="space-y-3">
-              {Array.from({ length: 4 }).map((_, i) => (
-                <Skeleton key={i} className="h-10 w-full" />
-              ))}
-            </div>
+            <Table>
+              <LocalModelsHead />
+              <LocalModelsSkeletonRows />
+            </Table>
           ) : localModels.length === 0 ? (
             <div className="text-muted-foreground flex flex-col items-center gap-2 py-10 text-sm">
               <Inbox className="size-6" aria-hidden />
@@ -363,16 +491,7 @@ export default function Models() {
             </div>
           ) : (
             <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Name</TableHead>
-                  <TableHead>Family</TableHead>
-                  <TableHead>Quantization</TableHead>
-                  <TableHead className="text-right">Size</TableHead>
-                  <TableHead className="text-right">Context</TableHead>
-                  <TableHead className="w-0" />
-                </TableRow>
-              </TableHeader>
+              <LocalModelsHead />
               <TableBody>
                 {localModels.map((model) => (
                   <TableRow key={model.name}>
@@ -423,7 +542,7 @@ export default function Models() {
       ) : catalog.loading ? (
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
           {Array.from({ length: 3 }).map((_, i) => (
-            <Skeleton key={i} className="h-44 w-full rounded-xl" />
+            <CatalogCardSkeleton key={i} />
           ))}
         </div>
       ) : (
@@ -466,6 +585,51 @@ export default function Models() {
         </DialogContent>
       </Dialog>
     </div>
+  );
+}
+
+/**
+ * A placeholder that is a real {@link CatalogCard} with its text taken out:
+ * same `Card`/`CardHeader`/`CardContent` wrappers, same `gap-4`, same padding,
+ * same install button box — only the leaves are grey.
+ *
+ * It replaces one fixed 176px block, a height that stood for nothing in
+ * particular. The card these stand in for measures 170px (24px of `py-6`, a 16px
+ * `leading-none` title, `gap-1.5`, a 20px description line, `gap-4`, a 16px
+ * `text-xs` meta row, `space-y-3`, the 36px button, 24px of `py-6`) and grows
+ * another 20px the moment a description wraps to a second line, so no constant
+ * was ever going to be right. Built from the same wrappers there is no constant
+ * to get wrong: the height is whatever the loaded card computes to.
+ *
+ * Three of them because the served catalog holds exactly three visible entries.
+ * One residual is left standing: the single `isDefault` entry carries a badge
+ * that makes its title row 6px taller, and grid items stretch, so the row it
+ * lands in grows by that much. Painting a badge on all three to absorb it would
+ * claim a default on cards that have none.
+ */
+function CatalogCardSkeleton() {
+  return (
+    <Card className="gap-4">
+      <CardHeader>
+        <div className="flex items-start justify-between gap-2">
+          <CardTitle className="text-base">
+            <Skeleton className="h-[1lh] w-40" />
+          </CardTitle>
+        </div>
+        <CardDescription>
+          <Skeleton className="h-[1lh] w-full" />
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="mt-auto space-y-3">
+        <div className="flex items-center justify-between gap-2 text-xs">
+          <Skeleton className="h-[1lh] w-48" />
+          <Skeleton className="h-[1lh] w-12" />
+        </div>
+        {/* The button box, not a button: `h-9` is what `Button`'s default size
+            resolves to, and it is the tallest thing in the card's content. */}
+        <Skeleton className="h-9 w-full" />
+      </CardContent>
+    </Card>
   );
 }
 

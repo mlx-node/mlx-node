@@ -196,12 +196,12 @@ describe('deleteLocalModel', () => {
 
 describe('isModelInstalled', () => {
   /** Write a completion marker listing `files` into `<modelsDir>/<name>`. */
-  function writeMarker(name: string, files: string[]): string {
+  function writeMarker(name: string, files: string[], scope?: 'full' | 'partial'): string {
     const dir = join(modelsDir, name);
     mkdirSync(dir, { recursive: true });
     writeFileSync(
       join(dir, DOWNLOAD_COMPLETE_MARKER),
-      JSON.stringify({ repo: 'owner/repo', revision: 'a'.repeat(40), files, completedAt: 'x' }),
+      JSON.stringify({ repo: 'owner/repo', revision: 'a'.repeat(40), files, scope, completedAt: 'x' }),
     );
     return dir;
   }
@@ -211,6 +211,14 @@ describe('isModelInstalled', () => {
     writeFileSync(join(dir, 'config.json'), Buffer.alloc(4));
     writeFileSync(join(dir, 'model.safetensors'), Buffer.alloc(8));
     expect(isModelInstalled(dir)).toBe(true);
+  });
+
+  it('does not install a partial glob marker even when config and one weight are present', () => {
+    const dir = writeMarker('partial-glob', ['config.json', 'model-00001-of-00002.safetensors'], 'partial');
+    writeFileSync(join(dir, 'config.json'), Buffer.alloc(4));
+    writeFileSync(join(dir, 'model-00001-of-00002.safetensors'), Buffer.alloc(8));
+    expect(isModelInstalled(dir)).toBe(false);
+    expect(isDownloaderOwned(dir)).toBe(true);
   });
 
   it('is NOT installed for a one-sided marker listing only config.json (Finding G2)', () => {
@@ -424,6 +432,23 @@ describe('isDownloaderOwned', () => {
     const owned = join(modelsDir, 'owned');
     writeOwnedMarker(owned);
     expect(isDownloaderOwned(owned)).toBe(true);
+  });
+
+  it('keeps a partial or interrupted CLI marker downloader-owned', () => {
+    const owned = join(modelsDir, 'partial-owned');
+    mkdirSync(owned, { recursive: true });
+    writeFileSync(
+      join(owned, DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({
+        repo: 'owner/repo',
+        revision: 'a'.repeat(40),
+        files: ['config.json'],
+        scope: 'partial',
+        completedAt: 'x',
+      }),
+    );
+    expect(isDownloaderOwned(owned)).toBe(true);
+    expect(isModelInstalled(owned)).toBe(false);
   });
 
   it('is false for a regular marker that is not the full shape we write', () => {

@@ -19,7 +19,9 @@ describe('createServer config validation', () => {
   // throws synchronously before the `httpCreateServer` / `listen` call,
   // so the returned promise rejects before any socket is opened. Kept
   // here as a safety net in case a test falls through.
-  let openedServers: Array<{ close: () => Promise<void> }> = [];
+  // `close()` now resolves with a `CloseResult` (forced / streamsAborted /
+  // durationMs) rather than `void`; this safety net only needs it to settle.
+  let openedServers: Array<{ close: () => Promise<unknown> }> = [];
 
   beforeEach(() => {
     openedServers = [];
