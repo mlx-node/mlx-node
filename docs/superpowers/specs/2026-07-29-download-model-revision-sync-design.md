@@ -31,8 +31,10 @@ that idea to the CLI.
 
 ## Non-goals
 
-- No recursive remote listing (would newly pull e.g. `original/*.safetensors`
-  full checkpoints on many repos). Root-only listing stays.
+- No automatic download of untracked nested checkpoints such as
+  `original/*.safetensors`. The remote truth listing is recursive so previously
+  marked nested sidecars can be verified, while fresh default selection stays
+  root-only.
 - No byte-range resume, no staging directory, no dashboard UI changes.
 - No change to `mlx download dataset`.
 
@@ -60,7 +62,7 @@ outputDir exists?
               size matches               → hash local vs remote oid
                                             equal → skip, differ → download
             prune: files listed in OLD completion.files that are no longer
-                   in the remote selection → delete (marker-scoped only)
+                   in the recursive remote tree → delete (full runs only)
             write new marker
 ```
 
@@ -69,7 +71,8 @@ outputDir exists?
 - Filename: `.mlx-download-complete.json` in the model output dir — identical
   to the dashboard's `DOWNLOAD_COMPLETE_MARKER`
   (`packages/dashboard/src/models.ts:71`).
-- Shape: `{ repo: string, revision: string, files: string[], completedAt: string }`
+- Shape:
+  `{ repo: string, revision: string, files: string[], scope?: "full" | "partial", completedAt: string }`
   — identical to the dashboard's `DownloadCompletion`
   (`packages/dashboard/src/models.ts:74-83`).
 - New CLI module `packages/cli/src/commands/download-marker.ts` exporting the
@@ -82,11 +85,16 @@ outputDir exists?
 - The marker is written on every success branch: default safetensors path,
   GGUF branch (`download-model.ts:780-788`), and glob branch (`:789-797`),
   after the branch's existing verification passes.
+- Glob results and in-progress syncs use `scope: "partial"`; CLI/dashboard
+  completion gates reject them while ownership checks continue to accept them.
+- A marker naming another repo refuses the output directory. A marker-less
+  legacy full sync removes only superseded standard top-level SafeTensors
+  artifacts before publishing the new revision.
 
 ### Revision resolution
 
 - `resolveRemoteRevision(repo, accessToken)` calls `modelInfo({ name,
-  additionalFields: ['sha'] })` from `@huggingface/hub`, wrapped in the
+additionalFields: ['sha'] })` from `@huggingface/hub`, wrapped in the
   existing `withRetries`. Result must match `/^[0-9a-f]{40}$/i`; otherwise
   return `null`.
 - `null` (offline, 401 on gated repo, API change) → print a warning
@@ -113,7 +121,7 @@ outputDir exists?
 - Hashing runs only inside a sync pass (revision mismatch / no marker /
   `--force`) and only for size-matching files, so steady-state runs never
   read weight bytes.
-- If the root-tree listing does not carry oid/lfs info for a file, fetch it
+- If the recursive tree listing does not carry oid/lfs info for a file, fetch it
   via `pathsInfo({ paths, expand: true })` for the size-matching candidates
   only (implementation detail; verify what `listFiles` returns).
 - The existing size-only `isLocalCopyComplete` fast-skip (`:501-509`, used at
@@ -124,9 +132,11 @@ outputDir exists?
 
 ### Prune
 
-- After all downloads succeed, delete files that appear in the OLD
-  `completion.files` but not in the new remote selection.
-- Only marker-listed files are ever deleted. No marker → nothing is deleted.
+- After all downloads succeed, a full run deletes files that appear in the OLD
+  `completion.files` but not in the recursive remote tree. Glob runs never
+  prune.
+- With no marker, only superseded standard top-level SafeTensors artifacts are
+  eligible, and only when the remote has a replacement SafeTensors layout.
 - Paths are resolved inside `outputDir` and must not escape it
   (reject entries containing `..` or absolute paths).
 

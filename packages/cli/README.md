@@ -41,7 +41,12 @@ when the repo was updated it re-downloads only the files whose content hash
 changed and removes files the repo no longer has — no need to delete the
 directory first. Use `--force` to re-verify every file even when the local copy
 looks current. If the revision cannot be resolved (offline), the previous
-local-only checks apply. Note:
+local-only checks apply. Full syncs recursively verify nested files already
+tracked by a CLI/dashboard marker while fresh downloads keep the root-only
+default selection. A directory marked for another repo is refused; use
+`--output` to choose a distinct path. Marker-less legacy directories also drop
+superseded standard top-level SafeTensors layouts before the new revision is
+certified. Note:
 `--force` without `--glob` on a GGUF directory holding only some quantization
 variants downloads all remaining variants, and the marker makes the directory
 dashboard-managed — a dashboard install into it may replace the contents

@@ -7,8 +7,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import type { DownloadCompletion } from '../../packages/cli/src/commands/download-marker.js';
 import {
+  assertCompletionRepoCompatible,
   buildMarkerFiles,
   canShortCircuitFullRun,
+  computeLegacyWeightPruneList,
   computePruneList,
   fileUpToDate,
   isCompletionCurrent,
@@ -167,6 +169,26 @@ describe('sameRepoCompletion', () => {
   });
 });
 
+describe('assertCompletionRepoCompatible', () => {
+  const completion: DownloadCompletion = {
+    repo: 'unsloth/model',
+    revision: SHA,
+    files: ['model.safetensors'],
+    completedAt: '2026-07-29T00:00:00.000Z',
+  };
+
+  it('accepts a marker for the requested repo and a marker-less directory', () => {
+    expect(() => assertCompletionRepoCompatible(completion, 'unsloth/model', '/models/model')).not.toThrow();
+    expect(() => assertCompletionRepoCompatible(null, 'unsloth/model', '/models/model')).not.toThrow();
+  });
+
+  it('refuses a same-basename directory owned by another repo', () => {
+    expect(() => assertCompletionRepoCompatible(completion, 'bartowski/model', '/models/model')).toThrow(
+      /owned by "unsloth\/model".*--output/,
+    );
+  });
+});
+
 describe('markerRevisionToClaim', () => {
   const OLD = 'a'.repeat(40);
   const NEW = 'b'.repeat(40);
@@ -213,18 +235,44 @@ describe('computePruneList', () => {
     expect(computePruneList(previous, [], '/out', false)).toEqual([]);
   });
 
-  it('never prunes nested paths — the non-recursive listing cannot prove they are gone', () => {
-    // The marker is shared with the dashboard, which lists RECURSIVELY; the
-    // CLI lists non-recursively, so `sub/gone.gguf` being absent from the
-    // CLI's remote list proves nothing. Mutation caught: pruning nested
-    // entries deletes files still upstream that the CLI can never re-fetch.
-    expect(computePruneList(['sub/gone.gguf'], [], '/out', false)).toEqual([]);
+  it('prunes nested marker entries proven absent by the recursive remote listing', () => {
+    expect(computePruneList(['mtp/weights.safetensors'], [], '/out', false)).toEqual(['mtp/weights.safetensors']);
   });
 
   it('never prunes during a narrow glob sync, even when a previous weight disappeared upstream', () => {
     const previous = ['config.json', 'model-old.safetensors'];
     const remote = ['config.json', 'model-new.safetensors', 'tokenizer.json'];
     expect(computePruneList(previous, remote, '/out', true)).toEqual([]);
+  });
+});
+
+describe('computeLegacyWeightPruneList', () => {
+  it('removes a superseded single-file weight before certifying a new sharded layout', () => {
+    const local = ['config.json', 'model.safetensors', 'adapter.safetensors'];
+    const remote = [
+      'config.json',
+      'model.safetensors.index.json',
+      'model-00001-of-00002.safetensors',
+      'model-00002-of-00002.safetensors',
+    ];
+    expect(computeLegacyWeightPruneList(local, remote, '/out', false)).toEqual(['model.safetensors']);
+  });
+
+  it('removes superseded shards and their index before certifying a single-file layout', () => {
+    const local = [
+      'model.safetensors.index.json',
+      'model-00001-of-00002.safetensors',
+      'model-00002-of-00002.safetensors',
+    ];
+    expect(computeLegacyWeightPruneList(local, ['config.json', 'model.safetensors'], '/out', false)).toEqual(local);
+  });
+
+  it('does not delete adapters, user files, glob-unselected files, or files for non-safetensors repos', () => {
+    const local = ['adapter.safetensors', 'README.md', 'model.safetensors'];
+    expect(computeLegacyWeightPruneList(local, ['config.json', 'model.gguf'], '/out', false)).toEqual([]);
+    expect(
+      computeLegacyWeightPruneList(local, ['config.json', 'model-00001-of-00001.safetensors'], '/out', true),
+    ).toEqual([]);
   });
 });
 
@@ -263,10 +311,7 @@ describe('buildMarkerFiles', () => {
     ]);
   });
 
-  it('keeps a nested previous file on disk even when absent from the non-recursive remote list', () => {
-    // A dashboard-written marker (recursive listing) can record nested paths
-    // the CLI's non-recursive listing never sees; a CLI sync must not forget
-    // them while they still exist locally.
+  it('keeps a recursively listed nested file after verifying it at the new revision', () => {
     mkdirSync(join(dir, 'sub'));
     writeFileSync(join(dir, 'sub', 'nested.json'), 'x');
     const previous: DownloadCompletion = {
@@ -275,13 +320,15 @@ describe('buildMarkerFiles', () => {
       files: ['sub/nested.json'],
       completedAt: '2026-07-29T00:00:00.000Z',
     };
-    expect(buildMarkerFiles(previous, ['config.json'], ['config.json'], dir, false)).toEqual([
+    expect(buildMarkerFiles(previous, ['config.json', 'sub/nested.json'], ['config.json'], dir, false)).toEqual([
       'config.json',
       'sub/nested.json',
     ]);
   });
 
-  it('drops a nested previous file that is no longer on disk', () => {
+  it('drops a nested previous file that is absent upstream even if stale bytes remain on disk', () => {
+    mkdirSync(join(dir, 'sub'));
+    writeFileSync(join(dir, 'sub', 'nested.json'), 'stale');
     const previous: DownloadCompletion = {
       repo: 'org/model',
       revision: SHA,

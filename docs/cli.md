@@ -27,10 +27,21 @@ command then syncs instead of skipping blindly:
   ones the old marker recorded) are removed;
 - `--force` runs that hash-verify sync even when the marker looks current.
 
+Full syncs list the remote tree recursively so nested files already recorded
+by a CLI/dashboard marker are verified or removed before the revision advances.
+Fresh downloads keep the historical root-only default selection, avoiding
+unrelated checkpoints under directories such as `original/`.
+
 There is no need to `rm -rf` a model directory to pick up an upstream update —
 re-running the command (or `--force`) is enough. When the revision cannot be
 resolved (offline, missing auth on a gated repo), the command warns and falls
 back to the previous local-only completeness checks.
+
+An output directory carrying a marker for another HuggingFace repo is refused;
+choose a distinct path with `--output`. For marker-less directories created by
+older CLIs, a successful full sync removes only superseded standard top-level
+SafeTensors layouts (for example, an old `model.safetensors` replaced by
+shards) before publishing the new marker.
 
 Note that `--force` without `--glob` on a GGUF directory holding only some
 quantization variants downloads all remaining variants, and that the marker

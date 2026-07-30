@@ -5,12 +5,25 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import {
+  isDefaultModelDownloadPath,
   isGgufRepoComplete,
   isGlobMatchedSetComplete,
   isGlobVariantPresent,
   isLocalCopyComplete,
   isModelAlreadyDownloaded,
 } from '../../packages/cli/src/commands/download-model.js';
+
+describe('isDefaultModelDownloadPath', () => {
+  it('keeps fresh full downloads root-only while re-verifying previously tracked nested sidecars', () => {
+    expect(isDefaultModelDownloadPath('model.safetensors', new Set())).toBe(true);
+    expect(isDefaultModelDownloadPath('original/model.safetensors', new Set())).toBe(false);
+    expect(isDefaultModelDownloadPath('mtp/weights.safetensors', new Set(['mtp/weights.safetensors']))).toBe(true);
+  });
+
+  it('does not admit unrelated root files', () => {
+    expect(isDefaultModelDownloadPath('README.md', new Set())).toBe(false);
+  });
+});
 
 describe('isModelAlreadyDownloaded', () => {
   let dir: string;

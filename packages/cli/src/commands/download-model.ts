@@ -12,8 +12,10 @@ import { resolveModelsDir } from '@mlx-node/server/host/paths';
 import { ensureDir, formatBytes } from '../utils.js';
 import { markCompletionPartial, readCompletion, writeCompletion, type DownloadCompletion } from './download-marker.js';
 import {
+  assertCompletionRepoCompatible,
   buildMarkerFiles,
   canShortCircuitFullRun,
+  computeLegacyWeightPruneList,
   computePruneList,
   fileUpToDate,
   isCompletionCurrent,
@@ -282,19 +284,40 @@ function matchesAnyGlob(filename: string, patterns: RegExp[]): boolean {
  * half-walked one. `listFiles` is paginated, so a 5xx can land part-way through
  * a large repo's walk.
  */
-async function getModelFiles(modelName: string, accessToken?: string, globPatterns?: string[], revision?: string) {
-  return withRetries(`listing ${modelName}`, () => listModelFilesOnce(modelName, accessToken, globPatterns, revision));
+async function getModelFiles(
+  modelName: string,
+  accessToken?: string,
+  globPatterns?: string[],
+  revision?: string,
+  previouslyTrackedPaths?: string[],
+) {
+  return withRetries(`listing ${modelName}`, () =>
+    listModelFilesOnce(modelName, accessToken, globPatterns, revision, previouslyTrackedPaths),
+  );
 }
 
-async function listModelFilesOnce(modelName: string, accessToken?: string, globPatterns?: string[], revision?: string) {
+async function listModelFilesOnce(
+  modelName: string,
+  accessToken?: string,
+  globPatterns?: string[],
+  revision?: string,
+  previouslyTrackedPaths?: string[],
+) {
   let totalSize = 0;
   const filesToDownload: ListFileEntry[] = [];
   const allFiles: ListFileEntry[] = [];
 
   // Compile glob patterns if provided
   const globs = globPatterns?.map(globToRegex);
+  const tracked = new Set(previouslyTrackedPaths);
 
-  for await (const file of listFiles({ repo: { type: 'model', name: modelName }, accessToken, revision })) {
+  for await (const file of listFiles({
+    repo: { type: 'model', name: modelName },
+    accessToken,
+    revision,
+    recursive: true,
+  })) {
+    if (file.type === 'directory') continue;
     allFiles.push(file);
 
     if (globs) {
@@ -304,22 +327,18 @@ async function listModelFilesOnce(modelName: string, accessToken?: string, globP
       if (matchesAnyGlob(basename, globs) || matchesAnyGlob(file.path, globs)) {
         filesToDownload.push(file);
         if (file.size) totalSize += file.size;
-      } else if (CORE_FILES.includes(basename)) {
+      } else if (CORE_FILES.includes(file.path)) {
         // Always include core config/tokenizer files
         filesToDownload.push(file);
         if (file.size) totalSize += file.size;
       }
     } else {
-      // Default behavior: download model files
-      if (
-        CORE_FILES.includes(file.path) ||
-        file.path.endsWith('.safetensors') ||
-        file.path.endsWith('.json') ||
-        file.path.endsWith('.pdiparams') ||
-        file.path.endsWith('.yml') ||
-        file.path.endsWith('.gguf') ||
-        file.path.endsWith('.jinja')
-      ) {
+      // The recursive listing supplies complete remote truth for nested marker
+      // entries, but a fresh full run retains the historical root-only
+      // selection (some repos carry another full checkpoint under original/).
+      // Nested files already tracked by a dashboard/CLI marker are included so
+      // a full sync verifies them before advancing the revision.
+      if (isDefaultModelDownloadPath(file.path, tracked)) {
         filesToDownload.push(file);
         if (file.size) {
           totalSize += file.size;
@@ -329,6 +348,21 @@ async function listModelFilesOnce(modelName: string, accessToken?: string, globP
   }
 
   return { totalSize, filesToDownload, allFiles };
+}
+
+/** Root-default selection plus nested files already claimed by a prior marker. */
+export function isDefaultModelDownloadPath(path: string, previouslyTracked: ReadonlySet<string>): boolean {
+  if (previouslyTracked.has(path)) return true;
+  if (path.includes('/')) return false;
+  return (
+    CORE_FILES.includes(path) ||
+    path.endsWith('.safetensors') ||
+    path.endsWith('.json') ||
+    path.endsWith('.pdiparams') ||
+    path.endsWith('.yml') ||
+    path.endsWith('.gguf') ||
+    path.endsWith('.jinja')
+  );
 }
 
 /**
@@ -652,20 +686,22 @@ export async function run(argv: string[]) {
 
   let cachedManifest: { totalSize: number; filesToDownload: ListFileEntry[]; allFiles: ListFileEntry[] } | null = null;
   let completion: DownloadCompletion | null = null;
+  let existingTopLevelFiles: string[] = [];
   // Content-hash verification is needed exactly when local files might be
   // STALE: the dir predates this run and either no current marker proves it
   // matches `remoteSha`, or the user forced a re-verify. A fresh dir or a
   // current-marker dir only ever needs the cheap size check.
   let verifyContent = false;
   if (existsSync(outputDir)) {
-    const files = await readdir(outputDir);
-    const hasGguf = files.some((f) => f.endsWith('.gguf'));
+    existingTopLevelFiles = await readdir(outputDir);
+    const hasGguf = existingTopLevelFiles.some((f) => f.endsWith('.gguf'));
     completion = await readCompletion(outputDir);
+    assertCompletionRepoCompatible(completion, modelName, outputDir);
     const markerCurrent = remoteSha !== null && isCompletionCurrent(completion, modelName, remoteSha);
     if (remoteSha === null) {
       // Legacy local-only behavior, byte-for-byte: without a resolvable
       // upstream revision there is nothing to compare against.
-      if (isModelAlreadyDownloaded(outputDir, files)) {
+      if (isModelAlreadyDownloaded(outputDir, existingTopLevelFiles)) {
         console.log('Model already downloaded!\n');
         console.log('To re-download, delete the output directory first:');
         console.log(`   rm -rf ${outputDir}\n`);
@@ -680,14 +716,14 @@ export async function run(argv: string[]) {
         console.log('Fetching file list from HuggingFace...\n');
         cachedManifest = await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns);
         const remoteBasenames = cachedManifest.allFiles.map((f) => f.path.split('/').pop() ?? f.path);
-        if (isGgufRepoComplete(files, remoteBasenames)) {
+        if (isGgufRepoComplete(existingTopLevelFiles, remoteBasenames)) {
           console.log('GGUF file(s) already downloaded!\n');
           console.log('To re-download, delete the output directory first:');
           console.log(`   rm -rf ${outputDir}\n`);
           return;
         }
         const missing = cachedManifest.allFiles.filter(
-          (f) => f.path.endsWith('.gguf') && !files.includes(f.path.split('/').pop() ?? f.path),
+          (f) => f.path.endsWith('.gguf') && !existingTopLevelFiles.includes(f.path.split('/').pop() ?? f.path),
         );
         if (missing.length > 0) {
           console.log(`Detected ${missing.length} missing GGUF file(s); resuming download...`);
@@ -701,13 +737,13 @@ export async function run(argv: string[]) {
       // local hit" (`isGlobVariantPresent`) does not prove the whole
       // glob-matched set is present, so completeness is checked against
       // the remote manifest before declaring "already downloaded".
-      if (hasGguf && globPatterns?.length && isGlobVariantPresent(files, globPatterns)) {
+      if (hasGguf && globPatterns?.length && isGlobVariantPresent(existingTopLevelFiles, globPatterns)) {
         if (cachedManifest === null) {
           console.log('Fetching file list from HuggingFace...\n');
           cachedManifest = await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns);
         }
         const remoteBasenames = cachedManifest.allFiles.map((f) => f.path.split('/').pop() ?? f.path);
-        if (isGlobMatchedSetComplete(files, remoteBasenames, globPatterns)) {
+        if (isGlobMatchedSetComplete(existingTopLevelFiles, remoteBasenames, globPatterns)) {
           console.log('Matched files already downloaded!\n');
           console.log('To re-download, delete the output directory first:');
           console.log(`   rm -rf ${outputDir}\n`);
@@ -715,7 +751,7 @@ export async function run(argv: string[]) {
         }
         const missing = cachedManifest.filesToDownload.filter((f) => {
           const basename = f.path.split('/').pop() ?? f.path;
-          return !files.includes(basename);
+          return !existingTopLevelFiles.includes(basename);
         });
         if (missing.length > 0) {
           console.log(`Detected ${missing.length} missing file(s); resuming download...`);
@@ -736,7 +772,7 @@ export async function run(argv: string[]) {
       // the loop stays cheap.
       if (
         !globPatterns?.length &&
-        canShortCircuitFullRun(completion!, outputDir, isModelAlreadyDownloaded(outputDir, files))
+        canShortCircuitFullRun(completion!, outputDir, isModelAlreadyDownloaded(outputDir, existingTopLevelFiles))
       ) {
         console.log(`Model already up to date (revision ${remoteSha.slice(0, 7)}).\n`);
         console.log('Use --force to re-verify every file against upstream.\n');
@@ -748,10 +784,6 @@ export async function run(argv: string[]) {
         console.log('Re-verifying every file against upstream (--force)...\n');
       } else if (completion === null) {
         console.log('No download marker found; verifying local files against upstream...\n');
-      } else if (completion.repo !== modelName) {
-        console.log(
-          `Directory holds a download marker for a different repo (${completion.repo}); verifying local files against upstream...\n`,
-        );
       } else if (completion.scope === 'partial') {
         console.log('Partial or interrupted download marker found; verifying local files against upstream...\n');
       } else {
@@ -762,17 +794,15 @@ export async function run(argv: string[]) {
       // Keep downloader ownership if this sync fails, while preventing the
       // old marker from satisfying CLI/dashboard completion gates during the
       // in-place update. The final marker write below replaces this atomically.
-      // A marker for another repo is left untouched until success: this run
-      // must not claim ownership of a slug-colliding directory up front.
+      // A foreign marker was refused above, before any mutation.
       if (completion !== null && completion.repo === modelName) {
         await writeCompletion(outputDir, markCompletionPartial(completion));
       }
     }
   }
 
-  // A marker describing a DIFFERENT repo (slug collision on the default
-  // output dir) must not influence anything downstream: repo B's sync must
-  // never prune repo A's marker-listed files nor union them into B's marker.
+  // Foreign markers were refused before mutation. This still narrows null to
+  // genuinely marker-less/invalid legacy directories for finalization.
   const previousCompletion = sameRepoCompletion(completion, modelName);
 
   await ensureDir(outputDir);
@@ -784,7 +814,14 @@ export async function run(argv: string[]) {
     console.log('Fetching file list from HuggingFace...\n');
   }
   const { totalSize, filesToDownload, allFiles } =
-    cachedManifest ?? (await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns, remoteSha ?? undefined));
+    cachedManifest ??
+    (await getModelFiles(
+      modelName,
+      HUGGINGFACE_TOKEN,
+      globPatterns,
+      remoteSha ?? undefined,
+      previousCompletion?.files,
+    ));
 
   if (filesToDownload.length === 0) {
     console.error('No files matched the given criteria.\n');
@@ -852,44 +889,37 @@ export async function run(argv: string[]) {
 
   // Prune + marker write, invoked ONLY from a SUCCESS path. Pruning any
   // earlier could destroy the only working copy: if upstream restructures
-  // (e.g. weights move into a subdir the non-recursive listing cannot see),
-  // the sync's verification fails — and by then an eager prune would already
-  // have deleted every old-marker shard.
+  // the recursive download/verification must finish before old artifacts are
+  // removed.
   const finalizeSync = async (): Promise<void> => {
     if (remoteSha === null) return; // nothing trustworthy to pin — legacy run
     // Files the old marker recorded that the remote repo no longer has are
     // stale garbage (e.g. shards of a superseded sharding layout) — a loader
     // globbing the dir would read them. Only ever deletes old-marker entries
     // of THIS repo's marker.
-    if (previousCompletion !== null) {
-      const pruneList = computePruneList(
-        previousCompletion.files,
-        allFiles.map((f) => f.path),
-        outputDir,
-        Boolean(globPatterns?.length),
-      );
-      for (const rel of pruneList) {
-        console.log(`  Removing ${rel} (no longer in the upstream repo)`);
-        try {
-          await rm(join(outputDir, rel), { force: true });
-        } catch (error) {
-          // A stubborn or foreign directory entry must not abort a download
-          // that already succeeded — the leftover is inert.
-          console.warn(`  Could not remove ${rel}: ${failureText(error)}`);
-        }
-      }
+    const remotePaths = allFiles.map((f) => f.path);
+    const isGlobRun = Boolean(globPatterns?.length);
+    const pruneList =
+      previousCompletion !== null
+        ? computePruneList(previousCompletion.files, remotePaths, outputDir, isGlobRun)
+        : computeLegacyWeightPruneList(existingTopLevelFiles, remotePaths, outputDir, isGlobRun);
+    for (const rel of pruneList) {
+      console.log(`  Removing ${rel} (no longer in the upstream repo)`);
+      // A stale standard weight can take precedence over the newly downloaded
+      // layout. If removal fails, abort before certifying this revision.
+      await rm(join(outputDir, rel), { force: true });
     }
     await writeCompletion(outputDir, {
       repo: modelName,
-      revision: markerRevisionToClaim(previousCompletion, remoteSha, Boolean(globPatterns?.length)),
+      revision: markerRevisionToClaim(previousCompletion, remoteSha, isGlobRun),
       files: buildMarkerFiles(
         previousCompletion,
-        allFiles.map((f) => f.path),
+        remotePaths,
         filesToDownload.map((f) => f.path),
         outputDir,
-        Boolean(globPatterns?.length),
+        isGlobRun,
       ),
-      scope: globPatterns?.length ? 'partial' : 'full',
+      scope: isGlobRun ? 'partial' : 'full',
       completedAt: new Date().toISOString(),
     });
   };

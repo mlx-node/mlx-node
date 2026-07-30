@@ -6,6 +6,25 @@ import type { ListFileEntry } from '@huggingface/hub';
 
 import type { DownloadCompletion } from './download-marker.js';
 
+const STANDARD_SHARD_RE = /^(?:model-|model\.safetensors-).+-of-.+\.safetensors$/;
+
+function isStandardTopLevelWeightArtifact(path: string): boolean {
+  if (path.includes('/') || path.includes('\\')) return false;
+  return (
+    path === 'model.safetensors' ||
+    path === 'weights.safetensors' ||
+    path === 'model.safetensors.index.json' ||
+    STANDARD_SHARD_RE.test(path)
+  );
+}
+
+function isSafeOutputRelativePath(outputDir: string, rel: string): boolean {
+  if (rel.length === 0 || isAbsolute(rel)) return false;
+  const root = resolve(outputDir);
+  const abs = resolve(root, rel);
+  return abs !== root && abs.startsWith(root + sep);
+}
+
 /** Streaming hex digest of a file's raw bytes (no git header). */
 async function hashFile(path: string, algo: 'sha1' | 'sha256'): Promise<string> {
   const hash = createHash(algo);
@@ -89,14 +108,29 @@ export function canShortCircuitFullRun(
 /**
  * The previous completion, but ONLY when it belongs to `repo` — else `null`.
  *
- * Two different repos can share a default output dir (`unsloth/X` and
- * `bartowski/X` have the same slug), so a marker found on disk may describe
- * ANOTHER repo's files. Prune eligibility and the marker union must treat
- * such a foreign marker as no marker at all: repo B's sync must never delete
- * repo A's marker-listed files nor carry them into repo B's marker.
+ * The run boundary rejects a foreign-repo marker. This remains defensive for
+ * marker-less/invalid legacy directories and any future caller.
  */
 export function sameRepoCompletion(completion: DownloadCompletion | null, repo: string): DownloadCompletion | null {
   return completion !== null && completion.repo === repo ? completion : null;
+}
+
+/**
+ * A completion marker is ownership metadata, not a hint. Reusing a
+ * same-basename output directory for another repo would mix both repos' files
+ * and then publish a false identity for the resulting checkpoint.
+ */
+export function assertCompletionRepoCompatible(
+  completion: DownloadCompletion | null,
+  repo: string,
+  outputDir: string,
+): void {
+  if (completion !== null && completion.repo !== repo) {
+    throw new Error(
+      `Refusing to download "${repo}" into "${outputDir}": the directory is owned by "${completion.repo}". ` +
+        'Choose a distinct directory with --output.',
+    );
+  }
 }
 
 /**
@@ -130,13 +164,8 @@ export function markerRevisionToClaim(
  * ever eligible (no marker ⇒ nothing is deleted), and entries that are
  * absolute, empty, or resolve outside `outputDir` are dropped, never deleted.
  *
- * Nested entries (any path containing '/') are NEVER eligible either: the CLI
- * lists the repo non-recursively, while the marker is shared with the
- * dashboard, whose listing IS recursive — so a dashboard-written marker can
- * record `sub/dir/file.json` that the CLI's `remotePaths` can never contain.
- * Absence from a listing that cannot see the file proves nothing; pruning on
- * it would delete a file that is still upstream and that the CLI's own
- * non-recursive selection could never re-download.
+ * Full CLI listings are recursive, matching the dashboard, so nested entries
+ * are eligible once their absence is proven against the complete remote tree.
  */
 export function computePruneList(
   previousFiles: string[],
@@ -149,17 +178,34 @@ export function computePruneList(
   // without downloading the replacement files outside the narrow selection.
   if (isGlobRun) return [];
   const remote = new Set(remotePaths);
-  const root = resolve(outputDir);
   const out: string[] = [];
   for (const rel of previousFiles) {
     if (remote.has(rel)) continue;
-    if (rel.includes('/')) continue;
-    if (rel.length === 0 || isAbsolute(rel)) continue;
-    const abs = resolve(root, rel);
-    if (abs === root || !abs.startsWith(root + sep)) continue;
+    if (!isSafeOutputRelativePath(outputDir, rel)) continue;
     out.push(rel);
   }
   return out;
+}
+
+/**
+ * Marker-less directories from older CLIs have no manifest to prune against.
+ * On a full sync, remove only the standard top-level safetensors artifacts
+ * that influence loader selection and are proven absent from a remote tree
+ * that itself contains a standard safetensors layout. User/adapter files and
+ * GGUF/Paddle-only repos are left untouched.
+ */
+export function computeLegacyWeightPruneList(
+  localPaths: string[],
+  remotePaths: string[],
+  outputDir: string,
+  isGlobRun: boolean,
+): string[] {
+  if (isGlobRun) return [];
+  const remote = new Set(remotePaths);
+  if (!remotePaths.some(isStandardTopLevelWeightArtifact)) return [];
+  return localPaths.filter(
+    (rel) => isStandardTopLevelWeightArtifact(rel) && !remote.has(rel) && isSafeOutputRelativePath(outputDir, rel),
+  );
 }
 
 /**
@@ -170,11 +216,8 @@ export function computePruneList(
  * entries in the marker so it can remove files proven stale after replacements
  * have been synchronized.
  *
- * Previous NESTED entries (path containing '/') skip the remote check: they
- * can come from a dashboard-written marker (recursive listing), so the CLI's
- * non-recursive `remotePaths` can never contain them and the check could never
- * pass — presence on disk alone decides, so a CLI sync does not silently
- * forget the dashboard's nested files.
+ * Full listings are recursive, so top-level and nested previous entries use
+ * the same remote-presence proof.
  */
 export function buildMarkerFiles(
   previous: DownloadCompletion | null,
@@ -187,7 +230,7 @@ export function buildMarkerFiles(
   if (previous !== null) {
     const remote = new Set(remotePaths);
     for (const file of previous.files) {
-      const provenOnRemote = isGlobRun || file.includes('/') || remote.has(file);
+      const provenOnRemote = isGlobRun || remote.has(file);
       if (provenOnRemote && existsSync(join(outputDir, file))) files.add(file);
     }
   }
