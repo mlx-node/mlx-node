@@ -38,10 +38,18 @@ const NON_GENERATIVE: ReadonlySet<ModelType> = new Set<ModelType>(['harrier', 'q
 interface FamilyTraits {
   /**
    * Whether the family emits `<think>` reasoning (drives pi's thinking
-   * levels): true for qwen3 / qwen3_5 / qwen3_5_moe / lfm2 / lfm2_moe,
-   * false for the instruct-only gemma4.
+   * levels): true for qwen3 / qwen3_5 / qwen3_5_moe / gemma4 / lfm2 /
+   * lfm2_moe. Gemma4 routes its `<|channel>thought` protocol through its
+   * family stream parser rather than the generic `<think>` tracker, but the
+   * user-facing level still controls the prompt's `<|think|>` capability.
    */
   reasoning: boolean;
+  /**
+   * Optional family-specific projection of Pi's thinking controls. Gemma4's
+   * prompt protocol has two modes rather than four distinct effort levels:
+   * minimal disables `<|think|>` and high enables it.
+   */
+  thinkingLevelMap?: ProviderModelConfig['thinkingLevelMap'];
   /**
    * Context-window fallback when `config.json` carries no
    * `max_position_embeddings` at either nesting level. Values are the
@@ -50,6 +58,11 @@ interface FamilyTraits {
    * (`LFM2_CONFIGS[*].maxPositionEmbeddings` in `packages/lm`).
    */
   fallbackContextWindow: number;
+}
+
+interface DiscoveryMetadata {
+  contextWindow: number;
+  supportsImages: boolean;
 }
 
 /**
@@ -62,7 +75,16 @@ const FAMILY_TRAITS: Record<string, FamilyTraits> = {
   qwen3: { reasoning: true, fallbackContextWindow: 40960 },
   qwen3_5: { reasoning: true, fallbackContextWindow: 262144 },
   qwen3_5_moe: { reasoning: true, fallbackContextWindow: 262144 },
-  gemma4: { reasoning: false, fallbackContextWindow: 131072 },
+  gemma4: {
+    reasoning: true,
+    thinkingLevelMap: {
+      minimal: 'minimal',
+      low: null,
+      medium: null,
+      high: 'high',
+    },
+    fallbackContextWindow: 131072,
+  },
   lfm2: { reasoning: true, fallbackContextWindow: 128000 },
   lfm2_moe: { reasoning: true, fallbackContextWindow: 128000 },
 };
@@ -71,29 +93,55 @@ function positiveInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
 }
 
+function nonEmptyRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) && Object.keys(value).length > 0;
+}
+
 /**
- * Read the trained context window from `<modelPath>/config.json`:
+ * Read cheap discovery metadata from `<modelPath>/config.json`.
+ *
+ * The trained context window comes from:
  * root `max_position_embeddings` first (qwen3, lfm2), then
  * `text_config.max_position_embeddings` (qwen3_5, qwen3_5_moe, gemma4
- * unified), else the family fallback. `detectModelType` already parsed
- * this file, so a read/parse failure here (e.g. a racing rewrite) lands
- * on the fallback instead of dropping the model.
+ * unified), else the family fallback.
+ *
+ * Image support is advertised only when a family with a native multimodal
+ * implementation carries its valid, non-empty vision marker: `vision_config`
+ * for Qwen, and either `vision_config` or `unified_vision_config` for Gemma.
+ * This lets Pi's model picker and `--list-models` expose checkpoint capability
+ * without loading weights. The first resident load remains authoritative and
+ * reconciles this optimistic config-level advertisement via
+ * `session.supportsImages()` (for example, when conversion stripped an
+ * incompatible vision tower).
+ *
+ * `detectModelType` already parsed this file, so a read/parse failure here
+ * (e.g. a racing rewrite) lands on the context fallback and text-only input
+ * instead of dropping the model or guessing a positive capability.
  */
-async function readContextWindow(modelPath: string, fallback: number): Promise<number> {
+async function readDiscoveryMetadata(
+  modelPath: string,
+  modelType: ModelType,
+  fallbackContextWindow: number,
+): Promise<DiscoveryMetadata> {
   try {
     const raw = await readFile(join(modelPath, 'config.json'), 'utf-8');
     const config = JSON.parse(raw) as Record<string, unknown>;
     const root = positiveInteger(config.max_position_embeddings);
-    if (root !== undefined) return root;
     const textConfig = config.text_config;
-    if (typeof textConfig === 'object' && textConfig !== null && !Array.isArray(textConfig)) {
-      const nested = positiveInteger((textConfig as Record<string, unknown>).max_position_embeddings);
-      if (nested !== undefined) return nested;
-    }
+    const nested = nonEmptyRecord(textConfig) ? positiveInteger(textConfig.max_position_embeddings) : undefined;
+    const hasVisionConfig = nonEmptyRecord(config.vision_config);
+    const supportsImages =
+      modelType === 'gemma4'
+        ? hasVisionConfig || nonEmptyRecord(config.unified_vision_config)
+        : (modelType === 'qwen3_5' || modelType === 'qwen3_5_moe') && hasVisionConfig;
+
+    return {
+      contextWindow: root ?? nested ?? fallbackContextWindow,
+      supportsImages,
+    };
   } catch {
-    // fall through to the family fallback
+    return { contextWindow: fallbackContextWindow, supportsImages: false };
   }
-  return fallback;
 }
 
 /**
@@ -142,14 +190,15 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
     }
 
     const name = basename(full);
-    const contextWindow = await readContextWindow(full, traits.fallbackContextWindow);
+    const { contextWindow, supportsImages } = await readDiscoveryMetadata(full, modelType, traits.fallbackContextWindow);
     out.push({
       discovered: { name, path: full, modelType },
       piModel: {
         id: name,
         name,
         reasoning: traits.reasoning,
-        input: ['text'],
+        thinkingLevelMap: traits.thinkingLevelMap,
+        input: supportsImages ? ['text', 'image'] : ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow,
         maxTokens: preset.maxOutputTokens,
