@@ -1030,8 +1030,28 @@ fn find_earliest_marker<'a>(buf: &str, markers: &'a [&'static str]) -> Option<(u
 /// rather than having it silently dropped.
 fn parse_tool_call_body(raw: &str) -> ToolCallResult {
     let trimmed = raw.trim();
+    // Some Gemma4 generations restart a tool call after first emitting a
+    // malformed outer body, for example:
+    //
+    // `[]<|channel>thought\n<channel|><|tool_call>call:bash{command:ls}`
+    //
+    // We are already inside the outer `<|tool_call>` block here, so the nested
+    // opener would otherwise become part of the tool name. Recover only when
+    // the restart is before the first argument `{` and its trimmed suffix has
+    // the canonical `call:` prefix. A marker-like string inside the argument
+    // DSL is therefore preserved as literal tool input.
+    let first_args = trimmed.find('{').unwrap_or(trimmed.len());
+    let before_args = &trimmed[..first_args];
+    let mut recovered = None;
+    for (marker_idx, _) in before_args.match_indices(TOOL_CALL_OPEN) {
+        let suffix = trimmed[marker_idx + TOOL_CALL_OPEN.len()..].trim_start();
+        if suffix.starts_with("call:") {
+            recovered = Some(suffix);
+        }
+    }
+    let body = recovered.unwrap_or(trimmed);
     // Expected shape: `call:NAME{...}`
-    let after_call = trimmed.strip_prefix("call:").unwrap_or(trimmed);
+    let after_call = body.strip_prefix("call:").unwrap_or(body);
     // Split at the first `{` — everything before is the name, everything
     // between that `{` and its matching `}` is the argument DSL.
     let (name, args_region) = match after_call.find('{') {
@@ -1174,6 +1194,44 @@ mod tests {
         assert_eq!(tc.status, "ok");
         let args = tc.arguments.as_object().unwrap();
         assert_eq!(args.get("command").and_then(|v| v.as_str()), Some("ls"));
+    }
+
+    #[test]
+    fn parse_tool_call_recovers_nested_restart_before_arguments() {
+        let raw_body = concat!(
+            "[]<|channel>thought\n",
+            "<channel|><|tool_call>call:bash{command:<|\"|>ls -F<|\"|>}",
+        );
+        let parsed = parse_gemma4_output(&format!("<|tool_call>{raw_body}<tool_call|><turn|>"));
+
+        assert_eq!(parsed.text, "");
+        assert!(parsed.thinking.is_none());
+        assert_eq!(parsed.tool_calls.len(), 1);
+        let tc = &parsed.tool_calls[0];
+        assert_eq!(tc.name, "bash");
+        assert_eq!(tc.status, "ok");
+        assert_eq!(
+            tc.arguments.get("command").and_then(Value::as_str),
+            Some("ls -F"),
+        );
+        assert_eq!(tc.raw_content, raw_body);
+    }
+
+    #[test]
+    fn parse_tool_call_keeps_nested_marker_inside_arguments_literal() {
+        let command = "printf '<|tool_call>call:not-a-tool'";
+        let raw_body = "call:bash{command:<|\"|>printf '<|tool_call>call:not-a-tool'<|\"|>}";
+        let parsed = parse_gemma4_output(&format!("<|tool_call>{raw_body}<tool_call|>"));
+
+        assert_eq!(parsed.tool_calls.len(), 1);
+        let tc = &parsed.tool_calls[0];
+        assert_eq!(tc.name, "bash");
+        assert_eq!(tc.status, "ok");
+        assert_eq!(
+            tc.arguments.get("command").and_then(Value::as_str),
+            Some(command),
+        );
+        assert_eq!(tc.raw_content, raw_body);
     }
 
     #[test]
@@ -1402,6 +1460,41 @@ mod tests {
 
         // The aggregated accessor reports the same list.
         assert_eq!(parser.tool_calls().len(), 1);
+    }
+
+    #[test]
+    fn stream_parser_recovers_nested_tool_call_restart_across_feeds() {
+        let raw_body = concat!(
+            "[]<|channel>thought\n",
+            "<channel|><|tool_call>call:bash{command:<|\"|>ls -F<|\"|>}",
+        );
+        let mut parser = Gemma4StreamParser::new();
+        let mut all = Vec::new();
+        all.extend(parser.feed("<|tool_call>[]<|channel>thought\n<channel|><|too"));
+        all.extend(parser.feed("l_call>call:bash{command:<|\"|>ls -F<|\"|>}<tool_"));
+        all.extend(parser.feed("call|><turn|>"));
+        all.extend(parser.flush());
+
+        let emitted_calls: Vec<_> = all
+            .iter()
+            .filter_map(|segment| {
+                if let StreamSegment::ToolCall(call) = segment {
+                    Some(call)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(emitted_calls.len(), 1);
+        assert_eq!(parser.tool_calls().len(), 1);
+        let tc = &parser.tool_calls()[0];
+        assert_eq!(tc.name, "bash");
+        assert_eq!(tc.status, "ok");
+        assert_eq!(
+            tc.arguments.get("command").and_then(Value::as_str),
+            Some("ls -F"),
+        );
+        assert_eq!(tc.raw_content, raw_body);
     }
 
     #[test]

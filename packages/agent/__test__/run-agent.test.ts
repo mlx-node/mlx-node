@@ -131,7 +131,7 @@ describe('runAgent', () => {
       expect(typeof named.factory).toBe('function');
       return named.name;
     });
-    expect(names).toEqual(['mlx-provider', 'mlx-permission-gate', 'mlx-terminal-title']);
+    expect(names).toEqual(['mlx-provider', 'mlx-local-image-input', 'mlx-permission-gate', 'mlx-terminal-title']);
   });
 
   it('adds subagents only for a real parent model session', async () => {
@@ -141,7 +141,13 @@ describe('runAgent', () => {
     const names = calls[0]!.extensionFactories.map((entry) =>
       typeof entry === 'function' ? '<anonymous>' : entry.name,
     );
-    expect(names).toEqual(['mlx-provider', 'mlx-permission-gate', 'mlx-subagent', 'mlx-terminal-title']);
+    expect(names).toEqual([
+      'mlx-provider',
+      'mlx-local-image-input',
+      'mlx-permission-gate',
+      'mlx-subagent',
+      'mlx-terminal-title',
+    ]);
   });
 
   it('adds a TUI trace notice only when the CLI supplies a log path', async () => {
@@ -159,6 +165,7 @@ describe('runAgent', () => {
     );
     expect(names).toEqual([
       'mlx-provider',
+      'mlx-local-image-input',
       'mlx-permission-gate',
       'mlx-subagent',
       'mlx-trace-notice',
