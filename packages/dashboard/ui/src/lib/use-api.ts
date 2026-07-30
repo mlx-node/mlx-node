@@ -29,8 +29,9 @@ export interface AsyncState<T> {
 }
 
 interface Request<T> {
-  /** The path this state describes, so a path change can be detected in render. */
+  /** The path and runtime generation this state describes, detected in render. */
   path: string;
+  connection: number;
   /** Bumped by `reload()`; keys the effect so the same path can be refetched. */
   nonce: number;
   data: T | undefined;
@@ -38,30 +39,29 @@ interface Request<T> {
   fetching: boolean;
 }
 
-function begin<T>(path: string, nonce: number): Request<T> {
-  return { path, nonce, data: readCache<T>(path)?.value, error: undefined, fetching: true };
+function begin<T>(path: string, nonce: number, connection: number): Request<T> {
+  return { path, connection, nonce, data: readCache<T>(path)?.value, error: undefined, fetching: true };
 }
 
 export function useJson<T>(path: string): AsyncState<T> {
-  const [request, setRequest] = useState<Request<T>>(() => begin<T>(path, 0));
+  // A reconnect hands the app a different runtime, so what is on screen
+  // describes something that no longer exists. The shared cache is cleared
+  // before this ticks, but mounted state must be reinitialized separately.
+  const connection = useSyncExternalStore(subscribeConnection, getConnectionGeneration, getConnectionGeneration);
+  const [request, setRequest] = useState<Request<T>>(() => begin<T>(path, 0, connection));
 
   // Adjusting state during render, rather than in an effect keyed on `path`.
-  // An effect commits the old path's data first and repaints, so switching a
-  // filter would flash the previous query's rows for a frame before the
-  // skeleton — the exact stutter this hook exists to remove. React discards
-  // this render and immediately re-runs with the new state, so nothing reaches
-  // the screen in between.
-  if (request.path !== path) setRequest(begin<T>(path, request.nonce));
+  // An effect commits the old path or runtime's data first and repaints, so a
+  // filter change would flash the previous query and a reconnect would present
+  // retired runtime data as current. React discards this render and immediately
+  // re-runs with the new state, so nothing stale reaches the screen in between.
+  if (request.path !== path || request.connection !== connection) {
+    setRequest(begin<T>(path, request.nonce, connection));
+  }
 
   const reload = useCallback(() => {
     setRequest((current) => ({ ...current, nonce: current.nonce + 1, fetching: true }));
   }, []);
-
-  // A reconnect hands the app a different runtime, so what is on screen
-  // describes something that no longer exists. Without this in the deps a
-  // mounted hook never refetches — and one that errored while CONTROL PANEL was down
-  // stays stuck on that error even after the replacement port arrives.
-  const connection = useSyncExternalStore(subscribeConnection, getConnectionGeneration, getConnectionGeneration);
 
   const { nonce } = request;
   useEffect(() => {

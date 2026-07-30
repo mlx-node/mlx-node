@@ -41,6 +41,14 @@ function Probe(): ReturnType<typeof createElement> {
   return createElement('div', null, data?.v ?? 'pending');
 }
 
+/** Makes the pre-response state observable instead of waiting until it settles. */
+function StateProbe(): ReturnType<typeof createElement> {
+  const { data, error, loading, refreshing } = useJson<{ v: string }>('/probe');
+  if (error !== undefined) return createElement('div', null, `ERR:${error.message}`);
+  const phase = loading ? 'LOADING' : refreshing ? 'REFRESHING' : 'IDLE';
+  return createElement('div', null, `${phase}:${data?.v ?? 'pending'}`);
+}
+
 let page: RenderedPage | undefined;
 let disposers: (() => void)[] = [];
 
@@ -113,6 +121,34 @@ describe('a replacement port revives what is already on screen', () => {
 
     await waitForText(page, 'recovered');
     expect(page.text()).toBe('recovered');
+  });
+
+  it('removes retired data while the replacement runtime is still answering', async () => {
+    const old = connectControlledApi();
+    page = await renderPage(createElement(StateProbe), (text) => text === 'LOADING:pending');
+
+    await act(async () => {
+      old.respond({ v: 'gen-1' });
+      await Promise.resolve();
+    });
+    expect(page.text()).toBe('IDLE:gen-1');
+
+    let replacement: ControlledApi | undefined;
+    await act(async () => {
+      replacement = connectControlledApi();
+      await Promise.resolve();
+    });
+
+    // The new call is deliberately withheld. Clearing only the shared cache
+    // would leave the mounted request at IDLE:gen-1 until this call settled.
+    expect(replacement?.posted.map((message) => message.kind)).toEqual(['call']);
+    expect(page.text()).toBe('LOADING:pending');
+
+    await act(async () => {
+      replacement?.respond({ v: 'gen-2' });
+      await Promise.resolve();
+    });
+    expect(page.text()).toBe('IDLE:gen-2');
   });
 
   it('does not let an authoritative result from the retired runtime repopulate the cache', async () => {
