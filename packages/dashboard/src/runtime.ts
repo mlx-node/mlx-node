@@ -78,8 +78,13 @@ export interface DashboardRuntime {
    * reachable only through {@link call}.
    */
   readonly context: MainApiContext;
-  /** Answer one API call. Never rejects for an API failure — see `ApiResponse`. */
-  call(call: ApiCall): Promise<ApiResponse>;
+  /**
+   * Answer one API call. Never rejects for an API failure — see `ApiResponse`.
+   * An optional signal withdraws worker work that has not started yet; a handler
+   * already running is allowed to finish rather than being interrupted halfway
+   * through a mutation.
+   */
+  call(call: ApiCall, signal?: AbortSignal): Promise<ApiResponse>;
   /** Subscribe to a download job's progress events; returns the unsubscribe. */
   subscribe(jobId: string, listener: (event: DownloadEvent) => void): () => void;
   /** Run (and await) an incremental rescan, serialized with every other ingest. */
@@ -168,7 +173,10 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     tracesDir,
     cacheRoot,
     context,
-    async call(c: ApiCall): Promise<ApiResponse> {
+    async call(c: ApiCall, signal?: AbortSignal): Promise<ApiResponse> {
+      if (signal?.aborted) {
+        return failure('E_UNAVAILABLE', 'Dashboard request was cancelled before it started');
+      }
       let url: URL;
       try {
         // A constant, trusted base: only the path + query of `c.path` are used.
@@ -190,12 +198,18 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
         // the catch below exists to keep. `worker.call` returns envelopes rather
         // than throwing, so nesting it changes nothing else.
         if (routeThreadFor(c.method, url.pathname) === 'worker') {
-          return await worker.call({
-            method: c.method,
-            path: c.path,
-            body: c.body,
-            ...(c.bodyError !== undefined ? { bodyError: c.bodyError } : {}),
-          });
+          return await worker.call(
+            {
+              method: c.method,
+              path: c.path,
+              body: c.body,
+              ...(c.bodyError !== undefined ? { bodyError: c.bodyError } : {}),
+            },
+            signal,
+          );
+        }
+        if (signal?.aborted) {
+          return failure('E_UNAVAILABLE', 'Dashboard request was cancelled before it started');
         }
         return await dispatchMain(context, {
           method: c.method,

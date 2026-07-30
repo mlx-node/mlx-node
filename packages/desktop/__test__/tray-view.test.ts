@@ -213,6 +213,22 @@ describe('connect command', () => {
     expect(command).not.toContain('sekrit-token@');
   });
 
+  it('does not let an inherited ANTHROPIC_API_KEY override the bearer token', () => {
+    const command = connectCommand('http://127.0.0.1:51423', 'sekrit-token');
+    const script = command.replace(
+      / claude$/u,
+      ` sh -c 'printf "%s|%s" "\${ANTHROPIC_API_KEY+x}" "$ANTHROPIC_AUTH_TOKEN"'`,
+    );
+    const out = execFileSync('bash', ['-c', script], {
+      env: { ...process.env, ANTHROPIC_API_KEY: 'sk-ant-the-users-own-key' },
+    }).toString();
+
+    // Claude Code sends both `x-api-key` and `authorization` when both
+    // variables are present. The server intentionally reads `x-api-key` first,
+    // so the key must be absent rather than merely set to an empty string.
+    expect(out).toBe('|sekrit-token');
+  });
+
   it('quotes a token that would otherwise break out of the command', () => {
     const evil = String.raw`a'; echo PWNED; b`;
     const command = connectCommand('http://127.0.0.1:1', evil);

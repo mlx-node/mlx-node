@@ -17,6 +17,8 @@
  * environment stays `node` for every other suite.
  */
 
+import { MessageChannel } from 'node:worker_threads';
+
 import { categoryLabels, truncateMiddle } from '@/lib/chart';
 import type {
   CacheResponse,
@@ -41,12 +43,16 @@ import Models from '@/pages/models';
 import Overview from '@/pages/overview';
 import SessionDetail from '@/pages/session-detail';
 import Sessions from '@/pages/sessions';
-import { createElement } from 'react';
+import { act, createElement } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { toast } from 'sonner';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import type { DownloadEvent } from '../src/download.js';
+import { serveRuntimeOverPort } from '../src/rpc/host.js';
+import { bindEventTargetPort } from '../src/rpc/port.js';
+import type { ApiCall } from '../src/runtime.js';
+import { connectDashboardApi, disconnectDashboardApi } from '../ui/src/lib/api.js';
 import {
   renderPage,
   sequence,
@@ -1274,6 +1280,116 @@ describe('Models page — the Install affordance', () => {
     expect(buttonLabels()).toContain('Cancel');
     expect(buttonLabels()).not.toContain('Install');
     expect(dismissed(calls)).toEqual([]);
+  });
+
+  it('drops a stale active card when a replacement runtime omits the job', async () => {
+    recordRequests(catalogRoutes({}, [downloadJob({ id: 'job-old', state: 'running' })]));
+    await mountModels();
+    expect(buttonLabels()).toContain('Cancel');
+
+    // CONTROL PANEL restarted and handed the same mounted tree a new port. The
+    // replacement runtime has no download registry entry for the old process's
+    // job, so its GET is authoritative absence.
+    const oldRuntime = restoreApi!;
+    let newRuntime: (() => void) | undefined;
+    try {
+      newRuntime = stubApi(catalogRoutes({}, []), { subscribe: downloadSubscribeStub() });
+      restoreApi = newRuntime;
+      await settle();
+
+      expect(buttonLabels()).toContain('Install');
+      expect(buttonLabels()).not.toContain('Cancel');
+    } finally {
+      newRuntime?.();
+      restoreApi = undefined;
+      oldRuntime();
+    }
+  });
+
+  it('replaces a stale job id when the replacement runtime has a new job for the same repo', async () => {
+    recordRequests(catalogRoutes({}, [downloadJob({ id: 'job-old', state: 'running' })]));
+    await mountModels();
+    expect(openedStreams).toContain('job-old');
+
+    const oldRuntime = restoreApi!;
+    let newRuntime: (() => void) | undefined;
+    try {
+      openedStreams = [];
+      newRuntime = stubApi(catalogRoutes({}, [downloadJob({ id: 'job-new', state: 'running' })]), {
+        subscribe: downloadSubscribeStub(),
+      });
+      restoreApi = newRuntime;
+      await settle();
+
+      // DownloadProgress may briefly rebind the old id on the connection bump,
+      // but the authoritative snapshot must replace it with the new runtime's id.
+      expect(openedStreams.at(-1)).toBe('job-new');
+      expect(buttonLabels()).toContain('Cancel');
+    } finally {
+      newRuntime?.();
+      restoreApi = undefined;
+      oldRuntime();
+    }
+  });
+
+  it('keeps a current-generation POST result when an older concurrent downloads GET lands later', async () => {
+    let resolveDownloads!: (body: DownloadsResponse) => void;
+    const olderDownloads = new Promise<DownloadsResponse>((resolve) => {
+      resolveDownloads = resolve;
+    });
+    const subscriptions: string[] = [];
+    const routes = catalogRoutes({});
+    const { port1, port2 } = new MessageChannel();
+    port1.unref();
+    port2.unref();
+    const dispose = serveRuntimeOverPort(
+      {
+        call: async (call: ApiCall) => {
+          const path = call.path.replace(/^\/api/u, '');
+          if (call.method === 'GET' && path === '/downloads') {
+            return { ok: true as const, status: 200, body: await olderDownloads };
+          }
+          if (call.method === 'POST' && path === '/downloads') {
+            return { ok: true as const, status: 202, body: { id: 'job-local', repo: REPO } };
+          }
+          if (call.method === 'GET' && Object.hasOwn(routes, path)) {
+            return { ok: true as const, status: 200, body: routes[path] };
+          }
+          return { ok: false as const, status: 404, code: 'E_NOT_FOUND', message: `no stub for ${path}` };
+        },
+        subscribe: (jobId) => {
+          subscriptions.push(jobId);
+          return () => {};
+        },
+      },
+      bindEventTargetPort(port2),
+    );
+    connectDashboardApi(bindEventTargetPort(port1));
+    restoreApi = () => {
+      disconnectDashboardApi();
+      dispose();
+      port1.close();
+      port2.close();
+    };
+
+    mounted = await renderPage(createElement(Models), (text) => text.includes('Qwen3.6-27B'));
+    const install = [...mounted.container.querySelectorAll('button')].find((button) =>
+      button.textContent?.includes('Install'),
+    );
+    expect(install).toBeDefined();
+    await act(async () => {
+      install!.click();
+    });
+    await settle();
+    expect(subscriptions).toContain('job-local');
+    expect(buttonLabels()).toContain('Cancel');
+
+    // This GET began before the POST and therefore cannot disprove the job the
+    // POST just returned, even though its response happens to arrive afterward.
+    resolveDownloads({ jobs: [] });
+    await settle();
+    expect(buttonLabels()).toContain('Cancel');
+    expect(buttonLabels()).not.toContain('Install');
   });
 
   it('hydrates a job that is mid-publish, and never dismisses it', async () => {

@@ -25,6 +25,12 @@ export type RpcRuntime = Pick<DashboardRuntime, 'call' | 'subscribe'>;
 export function serveRuntimeOverPort(runtime: RpcRuntime, port: RpcPort): () => void {
   /** Live subscriptions, keyed by the subscribe request's id. */
   const subscriptions = new Map<number, () => void>();
+  /**
+   * Calls owned by this renderer connection. The controller is deliberately
+   * host-local: AbortSignal is not structured-clonable, so `cancel` carries only
+   * the RPC id and the host turns it back into a signal for the runtime.
+   */
+  const calls = new Map<number, AbortController>();
 
   const post = (reply: RpcReply): void => {
     try {
@@ -67,6 +73,22 @@ export function serveRuntimeOverPort(runtime: RpcRuntime, port: RpcPort): () => 
     for (const unsubscribe of all) unsubscribe();
   };
 
+  const cancelCall = (id: number): void => {
+    const controller = calls.get(id);
+    if (controller === undefined) return;
+    calls.delete(id);
+    // Abort dispatch is synchronous. If the database client is already live,
+    // its listener posts the second-port withdrawal before `abort()` returns;
+    // if runtime.call has not begun, its pre-aborted check prevents the post.
+    controller.abort();
+  };
+
+  const cancelAll = (): void => {
+    const all = [...calls.values()];
+    calls.clear();
+    for (const controller of all) controller.abort();
+  };
+
   const detach = port.listen({
     onMessage(data: unknown): void {
       // A malformed payload is dropped, never thrown: this runs inside the port's
@@ -76,17 +98,36 @@ export function serveRuntimeOverPort(runtime: RpcRuntime, port: RpcPort): () => 
       switch (data.kind) {
         case 'call': {
           const id = data.id;
+          // A duplicate id from a malformed peer must not orphan the earlier
+          // mutation. Cancel it before assigning the id to the replacement.
+          cancelCall(id);
+          const controller = new AbortController();
+          calls.set(id, controller);
           // `runtime.call` documents that it never rejects; the catch is here so
           // that a broken contract costs one failure envelope instead of a caller
           // hanging until its deadline.
           void Promise.resolve()
-            .then(() => runtime.call(data.call))
+            .then(() => runtime.call(data.call, controller.signal))
             .then(
-              (response) => postResponse(id, response),
-              (err: unknown) => postResponse(id, toFailure(err)),
+              (response) => {
+                // Missing or different means this call was cancelled, or a
+                // duplicate id has since replaced it. Either way its late reply
+                // belongs to no live renderer request.
+                if (calls.get(id) !== controller) return;
+                calls.delete(id);
+                postResponse(id, response);
+              },
+              (err: unknown) => {
+                if (calls.get(id) !== controller) return;
+                calls.delete(id);
+                postResponse(id, toFailure(err));
+              },
             );
           return;
         }
+        case 'cancel':
+          cancelCall(data.id);
+          return;
         case 'subscribe': {
           const id = data.id;
           // A duplicate id from a misbehaving peer would otherwise orphan the
@@ -106,8 +147,10 @@ export function serveRuntimeOverPort(runtime: RpcRuntime, port: RpcPort): () => 
       }
     },
     onClose(): void {
-      // The peer is gone but the subscriptions it opened are still registered on
-      // the download manager, which outlives the window.
+      // The peer is gone. Its subscriptions otherwise leak on the long-lived
+      // download manager, and its queued calls otherwise remain able to mutate
+      // state after the renderer has disappeared.
+      cancelAll();
       releaseAll();
     },
   });
@@ -117,6 +160,7 @@ export function serveRuntimeOverPort(runtime: RpcRuntime, port: RpcPort): () => 
     if (disposed) return;
     disposed = true;
     detach();
+    cancelAll();
     releaseAll();
     port.close();
   };

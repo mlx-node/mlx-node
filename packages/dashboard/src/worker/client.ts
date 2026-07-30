@@ -18,9 +18,12 @@ import type { DbWorkerBoot, DbWorkerBootstrap, MainToWorker, WorkerToMain } from
 /**
  * A reply, or why none is coming: `undeliverable` means the request never left
  * this thread (the structured clone algorithm refused it — a caller-side fault),
- * `down` means the worker cannot answer.
+ * `down` means the worker cannot answer, and `aborted` means an upstream caller
+ * withdrew the request before this client got its reply.
  */
-type SendResult = { ok: true; reply: WorkerToMain } | { ok: false; why: 'undeliverable' | 'down'; reason: string };
+type SendResult =
+  | { ok: true; reply: WorkerToMain }
+  | { ok: false; why: 'undeliverable' | 'down' | 'aborted'; reason: string };
 
 export type DbWorkerLifecycle =
   /** The worker closed the SQLite handle. Ordered AFTER `downloads.shutdown()`. */
@@ -62,7 +65,12 @@ export interface DbWorkerCall {
 }
 
 export interface DbWorkerClient {
-  call(request: DbWorkerCall): Promise<ApiResponse>;
+  /**
+   * Withdraw a call that has not started when `signal` aborts. A call already
+   * executing is left intact; interrupting a filesystem/database mutation
+   * halfway through would be less safe than letting it reach its commit point.
+   */
+  call(request: DbWorkerCall, signal?: AbortSignal): Promise<ApiResponse>;
   ingest(): Promise<IngestSummary>;
   /** Await the worker's ingest chain; the database stays open. */
   drain(): Promise<void>;
@@ -183,10 +191,15 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
     build: (id: number) => MainToWorker,
     ms: number = requestTimeoutMs,
     withdrawOnTimeout = false,
+    signal?: AbortSignal,
   ): Promise<SendResult> => {
     if (down !== null) return Promise.resolve({ ok: false, why: 'down', reason: down });
+    if (signal?.aborted) {
+      return Promise.resolve({ ok: false, why: 'aborted', reason: 'request was cancelled before it was posted' });
+    }
     const id = nextId++;
     return new Promise<SendResult>((resolve) => {
+      let onAbort: (() => void) | undefined;
       // `goDown` clears the whole map before invoking the settlers, so this
       // cannot be a `pending.delete(id)` check — it would swallow that path.
       let settled = false;
@@ -194,9 +207,21 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (onAbort !== undefined) signal?.removeEventListener('abort', onAbort);
         pending.delete(id);
         syncRef();
         resolve(result);
+      };
+      const withdraw = (): void => {
+        // A dedicated port makes this actionable even while the main request
+        // queue is blocked; db-worker drains it synchronously at pickup.
+        try {
+          withdrawals.port1.postMessage(id);
+        } catch {
+          // Shutdown closes this port only after pending requests are settled,
+          // but tolerate a close/abort race: the worker is being torn down, so
+          // there is no live queue left whose mutation can be withdrawn.
+        }
       };
       // Never the reason the process stays up: `syncRef` already refs the worker
       // for exactly as long as this request is outstanding.
@@ -204,12 +229,25 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
         // Withdrawn BEFORE the caller is told, so the two can never disagree in
         // the direction that matters: by the time anyone reads `E_UNAVAILABLE`,
         // the request is already retractable-or-started, never merely queued.
-        if (withdrawOnTimeout) withdrawals.port1.postMessage(id);
+        if (withdrawOnTimeout) withdraw();
         settle({ ok: false, why: 'down', reason: `timed out after ${ms}ms` });
       }, ms);
       timer.unref?.();
       pending.set(id, settle);
       syncRef();
+      if (signal !== undefined) {
+        onAbort = () => {
+          // Same ordering as the timeout: cross the worker boundary before the
+          // host-side runtime call settles.
+          withdraw();
+          settle({ ok: false, why: 'aborted', reason: 'request was cancelled' });
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        // Close the check→listen race. In particular, do not post below when a
+        // signal became aborted while its listener was being installed.
+        if (signal.aborted) onAbort();
+      }
+      if (settled) return;
       try {
         worker.postMessage(build(id));
       } catch (err) {
@@ -224,7 +262,7 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
   let closed: Promise<void> | null = null;
 
   return {
-    async call(request: DbWorkerCall): Promise<ApiResponse> {
+    async call(request: DbWorkerCall, signal?: AbortSignal): Promise<ApiResponse> {
       const result = await send(
         (id) => ({
           kind: 'call',
@@ -236,6 +274,7 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
         }),
         requestTimeoutMs,
         true,
+        signal,
       );
       if (!result.ok) {
         return result.why === 'undeliverable'

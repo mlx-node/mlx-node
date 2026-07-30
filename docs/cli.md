@@ -1,6 +1,6 @@
 # CLI (`@mlx-node/cli`)
 
-The `mlx` binary is built from `packages/cli/` and exposes the top-level commands `download`, `convert`, `calibrate`, `launch`, `agent`, and `dashboard`.
+The `mlx` binary is built from `packages/cli/` and exposes the top-level commands `download`, `convert`, `calibrate`, `redact`, `serve`, `launch`, and `agent`.
 
 ## `mlx download`
 

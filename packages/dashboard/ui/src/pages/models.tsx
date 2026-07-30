@@ -16,6 +16,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { mutate } from '@/lib/api';
+import { getConnectionGeneration, subscribeConnection } from '@/lib/connection';
 import { formatBytes, formatCount, formatNumber } from '@/lib/format';
 import type {
   CancelDownloadResponse,
@@ -41,7 +42,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { toast } from 'sonner';
 
 function errMessage(err: unknown): string {
@@ -67,6 +68,14 @@ function isTerminalJob(state: DownloadJob['state']): boolean {
 interface ActiveJob {
   id: string;
   committing: boolean;
+  /** Runtime generation that produced this id; ids do not survive a reconnect. */
+  connection: number;
+  /**
+   * A POST result is newer than the GET that was already in flight when the
+   * user clicked Install. Server entries, by contrast, are reconciled exactly
+   * against the next authoritative snapshot.
+   */
+  source: 'local' | 'server';
 }
 
 function QuantBadge({ quant }: { quant: string | null }) {
@@ -159,11 +168,22 @@ export default function Models() {
   const models = useJson<ModelsResponse>('/models');
   const catalog = useJson<CatalogResponse>('/catalog');
   const downloads = useJson<DownloadsResponse>('/downloads');
+  const connection = useSyncExternalStore(subscribeConnection, getConnectionGeneration, getConnectionGeneration);
 
   const [pendingDelete, setPendingDelete] = useState<LocalModel | null>(null);
   const [deleting, setDeleting] = useState(false);
   /** repo → active download job (seeded from the server, added on install). */
   const [active, setActive] = useState<Record<string, ActiveJob>>({});
+  // `useJson` is stale-while-revalidate: on a connection bump it intentionally
+  // keeps the old body on screen until the replacement runtime answers. Remember
+  // that exact object so the reconciliation effect below does not mistake it for
+  // the new runtime's authoritative download registry.
+  const seenConnection = useRef(connection);
+  const staleDownloads = useRef<DownloadsResponse | undefined>(undefined);
+  if (seenConnection.current !== connection) {
+    seenConnection.current = connection;
+    staleDownloads.current = downloads.data;
+  }
   // Destructured, and that is load-bearing: `models`/`catalog` are new objects on
   // every render, so naming THEM in the effect's deps below would re-run it every
   // render — a dismiss/reload loop. `reload` is a `useCallback(…, [])`, so it is
@@ -172,20 +192,38 @@ export default function Models() {
   const { reload: reloadCatalog } = catalog;
 
   useEffect(() => {
-    const jobs = downloads.data?.jobs;
+    const snapshot = downloads.data;
+    const jobs = snapshot?.jobs;
     if (jobs === undefined) return;
-    // Every NONTERMINAL job — the exact complement of the dismiss loop below, and
-    // deliberately not `state === 'running'`: `committing` is a job that is still
-    // installing a model. Its catalog snapshot was read before the publish renamed
-    // the model into place, so leaving it unhydrated offers Install for a model
-    // that is being installed, subscribes to nothing, and — neither query polls —
-    // never learns the job finished. The card would sit on a stale "absent" and
-    // the settled job would be retained server-side until the next mount.
+    // On a reconnect, the first render still carries the previous runtime's
+    // stale-while-revalidate body. It is neither authoritative presence nor
+    // authoritative absence for this connection.
+    if (snapshot === staleDownloads.current) return;
+
+    // Every NONTERMINAL job — the exact complement of the dismiss loop below.
+    // Start from the authoritative snapshot rather than merging it into `prev`:
+    // job ids belong to one runtime, so omission removes a dead runtime's card
+    // and the same repo under a new id must replace it.
     setActive((prev) => {
-      const next = { ...prev };
+      const next: Record<string, ActiveJob> = {};
       for (const job of jobs) {
         if (isTerminalJob(job.state)) continue;
-        if (next[job.repo] === undefined) next[job.repo] = { id: job.id, committing: job.state === 'committing' };
+        next[job.repo] = {
+          id: job.id,
+          committing: job.state === 'committing',
+          connection,
+          source: 'server',
+        };
+      }
+      // The GET above begins in the hook's mount/reconnect effect. A user can
+      // click Install while it is in flight and receive a POST result before
+      // that older snapshot arrives. Preserve only those locally-started jobs
+      // from THIS connection; all server-hydrated and prior-runtime entries are
+      // governed by the snapshot.
+      for (const [repo, job] of Object.entries(prev)) {
+        if (job.source === 'local' && job.connection === connection && next[repo]?.id !== job.id) {
+          next[repo] = job;
+        }
       }
       return next;
     });
@@ -229,12 +267,20 @@ export default function Models() {
       reloadModels();
       reloadCatalog();
     }
-  }, [downloads.data, reloadModels, reloadCatalog]);
+  }, [downloads.data, connection, reloadModels, reloadCatalog]);
 
   const install = async (repo: string): Promise<void> => {
+    const startedConnection = connection;
     try {
       const res = await mutate<DownloadStartResponse>('POST', '/downloads', { repo });
-      setActive((prev) => ({ ...prev, [repo]: { id: res.id, committing: false } }));
+      // A late response from the client that was just replaced cannot name a
+      // job in the new runtime. `connectDashboardApi` normally rejects it while
+      // closing the old client; this is the final generation guard.
+      if (getConnectionGeneration() !== startedConnection) return;
+      setActive((prev) => ({
+        ...prev,
+        [repo]: { id: res.id, committing: false, connection: startedConnection, source: 'local' },
+      }));
     } catch (err) {
       toast.error('Failed to start download', { description: errMessage(err) });
     }

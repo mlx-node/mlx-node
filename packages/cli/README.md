@@ -1,8 +1,8 @@
 # @mlx-node/cli
 
-Command-line tool for downloading models and datasets from HuggingFace Hub, converting model weights, and running the fully-local `mlx agent`, for use with `@mlx-node/*` packages.
+Command-line tool for downloading models and datasets from HuggingFace Hub, converting model weights, redacting PII, serving local models, launching Claude Code, and running the fully-local `mlx agent`, for use with `@mlx-node/*` packages.
 
-Top-level commands: `download`, `convert`, `calibrate`, `agent`, `launch`. See [docs/cli.md](https://github.com/mlx-node/mlx-node/blob/main/docs/cli.md) for `agent`, `calibrate`, and `launch`.
+Top-level commands: `download`, `convert`, `calibrate`, `redact`, `serve`, `launch`, `agent`. See [docs/cli.md](https://github.com/mlx-node/mlx-node/blob/main/docs/cli.md) for the CLI guide.
 
 ## Requirements
 

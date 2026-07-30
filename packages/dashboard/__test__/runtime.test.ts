@@ -6,12 +6,16 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { MessageChannel } from 'node:worker_threads';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import type { MainApiContext, WorkerApiContext } from '../src/api/context.js';
 import { dispatchMain, dispatchWorker, routeThreadFor } from '../src/api/dispatch.js';
 import { ROUTES } from '../src/api/routes.js';
+import { createRpcClient } from '../src/rpc/client.js';
+import { serveRuntimeOverPort } from '../src/rpc/host.js';
+import { bindEventTargetPort } from '../src/rpc/port.js';
 import { createDashboardRuntime, type DashboardRuntime, type RuntimeLifecycleEvent } from '../src/runtime.js';
 import { startDbWorker } from '../src/worker/client.js';
 
@@ -458,5 +462,91 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
 
     await withDeadline(patient.close(), 10_000);
     expect(existsSync(doomed)).toBe(false);
+  });
+
+  it('does not post a pre-aborted call or poison the next worker request id', async () => {
+    const spared = transcriptOf('rt-3');
+    const control = transcriptOf('rt-4');
+    expect(existsSync(spared)).toBe(true);
+    expect(existsSync(control)).toBe(true);
+
+    const worker = client(30_000);
+    const controller = new AbortController();
+    controller.abort();
+    const cancelled = await withDeadline(
+      worker.call({ method: 'DELETE', path: '/api/sessions/rt-3' }, controller.signal),
+      10_000,
+    );
+    expect(cancelled).not.toBe('HUNG');
+    const failed = cancelled as Exclude<typeof cancelled, 'HUNG'>;
+    expect(failed.status).toBe(503);
+    expect(failed.ok ? '' : failed.code).toBe('E_UNAVAILABLE');
+
+    // A normal call immediately after the pre-aborted one proves both that the
+    // first was never posted and that cancellation did not occupy/corrupt a
+    // request id in the worker's ordered protocol.
+    const deleted = await withDeadline(worker.call({ method: 'DELETE', path: '/api/sessions/rt-4' }), 10_000);
+    expect(deleted).not.toBe('HUNG');
+    expect((deleted as Exclude<typeof deleted, 'HUNG'>).status).toBe(200);
+
+    await withDeadline(worker.close(), 10_000);
+    expect(existsSync(spared)).toBe(true);
+    expect(existsSync(control)).toBe(false);
+  });
+
+  it('does not execute a deletion after the renderer RPC deadline reports failure', async () => {
+    const doomed = transcriptOf('rt-2');
+    expect(existsSync(doomed)).toBe(true);
+
+    const { port1, port2 } = new MessageChannel();
+    port1.unref();
+    port2.unref();
+    const dispose = serveRuntimeOverPort(runtime, bindEventTargetPort(port2));
+    // The call is posted before this zero-delay timer can run, but the timer
+    // expires before the fresh worker can finish its boot ingest and reach the
+    // queued DELETE. This is the renderer's shorter deadline racing the worker's
+    // independent 60 s deadline — the production defect, end to end.
+    const renderer = createRpcClient(bindEventTargetPort(port1), { timeoutMs: 0 });
+
+    try {
+      const res = await withDeadline(renderer.call({ method: 'DELETE', path: '/api/sessions/rt-2' }), 10_000);
+      expect(res).not.toBe('HUNG');
+      const failed = res as Exclude<typeof res, 'HUNG'>;
+      expect(failed.status).toBe(503);
+      expect(failed.ok ? '' : failed.code).toBe('E_UNAVAILABLE');
+
+      // A later message on the same port is a deterministic FIFO barrier: when
+      // its main-thread response arrives, the host has already processed the
+      // preceding cancel and `AbortController.abort()` has synchronously posted
+      // the database worker's dedicated-port withdrawal.
+      const barrierId = 999;
+      const barrier = new Promise<void>((resolve) => {
+        const onMessage = (message: unknown): void => {
+          if (
+            typeof message !== 'object' ||
+            message === null ||
+            (message as { kind?: unknown }).kind !== 'response' ||
+            (message as { id?: unknown }).id !== barrierId
+          ) {
+            return;
+          }
+          port1.off('message', onMessage);
+          resolve();
+        };
+        port1.on('message', onMessage);
+      });
+      port1.postMessage({
+        kind: 'call',
+        id: barrierId,
+        call: { method: 'GET', path: '/api/downloads' },
+      });
+      expect(await withDeadline(barrier, 10_000)).not.toBe('HUNG');
+
+      await runtime.close();
+      expect(existsSync(doomed)).toBe(true);
+    } finally {
+      renderer.close();
+      dispose();
+    }
   });
 });

@@ -29,6 +29,12 @@ export const DASHBOARD_PORT_MESSAGE = 'mlx:dashboard-port';
 
 export type RpcRequest =
   | { kind: 'call'; id: number; call: ApiCall }
+  /**
+   * Withdraw a call whose renderer-side deadline expired. Never answered: the
+   * renderer enqueues this before settling its transport failure, and it exists
+   * only to stop still-queued work from acting after that failure is reported.
+   */
+  | { kind: 'cancel'; id: number }
   /** Open a download-progress subscription; `id` tags every event that follows. */
   | { kind: 'subscribe'; id: number; jobId: string }
   /** Close the subscription opened under `id`. Never answered. */
@@ -50,6 +56,8 @@ export function isRpcRequest(value: unknown): value is RpcRequest {
   switch (msg.kind) {
     case 'call':
       return typeof msg.call === 'object' && msg.call !== null;
+    case 'cancel':
+      return true;
     case 'subscribe':
       return typeof msg.jobId === 'string';
     case 'unsubscribe':

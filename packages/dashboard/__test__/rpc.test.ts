@@ -65,18 +65,22 @@ interface Stub {
   /** How many `runtime.subscribe` registrations are still live. */
   liveSubscriptions(): number;
   calls: ApiCall[];
+  signals: Array<AbortSignal | undefined>;
 }
 
-function stubRuntime(answer?: (call: ApiCall) => ApiResponse | Promise<ApiResponse>): Stub {
+function stubRuntime(answer?: (call: ApiCall, signal?: AbortSignal) => ApiResponse | Promise<ApiResponse>): Stub {
   const subscribers = new Map<number, { jobId: string; listener: (event: DownloadEvent) => void }>();
   let nextKey = 1;
   const calls: ApiCall[] = [];
+  const signals: Array<AbortSignal | undefined> = [];
   return {
     calls,
+    signals,
     runtime: {
-      async call(call: ApiCall): Promise<ApiResponse> {
+      async call(call: ApiCall, signal?: AbortSignal): Promise<ApiResponse> {
         calls.push(call);
-        return (await answer?.(call)) ?? { ok: true, status: 200, body: { echo: call.path } };
+        signals.push(signal);
+        return (await answer?.(call, signal)) ?? { ok: true, status: 200, body: { echo: call.path } };
       },
       subscribe(jobId: string, listener: (event: DownloadEvent) => void): () => void {
         const key = nextKey++;
@@ -330,6 +334,31 @@ describe('rpc request/response', () => {
 });
 
 describe('rpc never hangs a caller', () => {
+  it('enqueues cancellation before settling a renderer-side deadline', async () => {
+    const order: string[] = [];
+    const client = createRpcClient(
+      {
+        postMessage(message: unknown): void {
+          order.push((message as { kind: string }).kind);
+        },
+        listen: () => () => {},
+        close: () => {},
+      },
+      { timeoutMs: 0 },
+    );
+
+    try {
+      const res = await client.call({ method: 'DELETE', path: '/api/sessions/doomed' }).then((response) => {
+        order.push('settled');
+        return response;
+      });
+      expect(res).toMatchObject({ ok: false, code: 'E_UNAVAILABLE' });
+      expect(order).toEqual(['call', 'cancel', 'settled']);
+    } finally {
+      client.close();
+    }
+  });
+
   it('settles a request the peer never answers, at the deadline', async () => {
     const stub = stubRuntime(() => new Promise<ApiResponse>(() => {})); // never resolves
     const { client } = connected(stub, { timeoutMs: 50 });
@@ -337,6 +366,11 @@ describe('rpc never hangs a caller', () => {
     const res = await within(client.call({ method: 'GET', path: '/api/models' }));
     expect(res).toMatchObject({ ok: false, code: 'E_UNAVAILABLE', status: 503 });
     expect(res).not.toBe('HUNG');
+    await flush();
+    // The host correlated `cancel` to this connection's call and propagated it
+    // as an AbortSignal instead of leaving the runtime operation orphaned.
+    expect(stub.signals).toHaveLength(1);
+    expect(stub.signals[0]?.aborted).toBe(true);
   });
 
   it('ignores a reply that arrives after the deadline instead of settling twice', async () => {
@@ -398,6 +432,8 @@ describe('rpc never hangs a caller', () => {
     client.close();
 
     expect(await within(inflight, 1000)).toMatchObject({ ok: false, code: 'E_UNAVAILABLE' });
+    await flush();
+    expect(stub.signals[0]?.aborted).toBe(true);
   });
 
   it('settles a request whose body cannot be cloned, instead of waiting out the deadline', async () => {

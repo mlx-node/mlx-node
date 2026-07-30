@@ -185,7 +185,12 @@ function describe(snapshot: SupervisorSnapshot): Described {
  * Environment variables rather than a URL query string: a token in a query
  * string ends up in referrers, proxy logs and shell history as part of the URL
  * itself. `ANTHROPIC_AUTH_TOKEN` is sent as a header by the client, which is
- * also the only form the server's gate accepts.
+ * accepted by the server's gate.
+ *
+ * An inherited `ANTHROPIC_API_KEY` must be removed, not emptied: Claude Code
+ * sends it as `x-api-key` alongside the bearer token, and the server
+ * intentionally checks `x-api-key` first. `env -u` scopes the removal to this
+ * command instead of mutating the user's shell.
  *
  * Single-quoted with embedded quotes escaped, so a token containing shell
  * metacharacters cannot turn a paste into something else. base64url tokens
@@ -194,5 +199,5 @@ function describe(snapshot: SupervisorSnapshot): Described {
  */
 export function connectCommand(url: string, token: string): string {
   const quote = (value: string): string => `'${value.replaceAll("'", String.raw`'\''`)}'`;
-  return `ANTHROPIC_BASE_URL=${quote(url)} ANTHROPIC_AUTH_TOKEN=${quote(token)} claude`;
+  return `env -u ANTHROPIC_API_KEY ANTHROPIC_BASE_URL=${quote(url)} ANTHROPIC_AUTH_TOKEN=${quote(token)} claude`;
 }

@@ -53,16 +53,27 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
   /** Set once no further reply can arrive; every later call fails fast instead of waiting out its deadline. */
   let down: string | null = null;
 
-  const goDown = (reason: string): void => {
+  const goDown = (reason: string, withdrawPending = false): void => {
     down ??= reason;
     // Drain by swapping the map out first: settling a caller can re-enter
     // `call()`, and that call must see `down` and fail fast rather than land in a
     // collection we are mid-iteration over.
-    const waiting = [...pending.values()];
+    const waiting = [...pending.entries()];
     pending.clear();
     listeners.clear();
-    for (const entry of waiting) {
+    for (const [id, entry] of waiting) {
       clearTimeout(entry.timer);
+      if (withdrawPending) {
+        try {
+          // Post before settling: a renderer reconnect/close must not report
+          // failure while leaving a destructive call merely queued on the old
+          // runtime connection.
+          port.postMessage({ kind: 'cancel', id } satisfies RpcRequest);
+        } catch {
+          // Closing the port below still makes the host abort every call owned
+          // by this connection.
+        }
+      }
       entry.settle(failure('E_UNAVAILABLE', `Dashboard runtime is unavailable: ${down}`));
     }
   };
@@ -104,8 +115,19 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
       const id = nextId++;
       return new Promise<ApiResponse>((resolve) => {
         const timer = setTimeout(() => {
-          // Drop the entry BEFORE settling so a reply that arrives late is
-          // ignored rather than resolving an already-settled promise.
+          // Enqueue cancellation across the RPC boundary BEFORE settling. On
+          // this live MessagePort it stays ordered after the call; the host turns
+          // the id into an AbortSignal, and the runtime forwards that through
+          // the worker's dedicated withdrawal port. The host may process it
+          // after this callback returns, so this promises ordering, not an ack.
+          try {
+            post({ kind: 'cancel', id });
+          } catch {
+            // The peer is gone. Its port-close path aborts every call belonging
+            // to this connection; the local deadline must still settle.
+          }
+          // Drop the entry before resolving so a reply that was already in
+          // flight cannot settle the promise twice.
           pending.delete(id);
           resolve(failure('E_UNAVAILABLE', `Dashboard runtime did not answer within ${timeoutMs}ms`));
         }, timeoutMs);
@@ -161,7 +183,7 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
       if (closed) return;
       closed = true;
       detach();
-      goDown('the client was closed');
+      goDown('the client was closed', true);
       port.close();
     },
   };
