@@ -805,6 +805,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       this.history.push(pendingUser);
       this.history.push(buildAssistantMessage(result.text, result.toolCalls, result.thinking, result.thinkingEnabled));
       this.turnCount++;
+      this.commitActiveTools(constrainedConfig);
       this.recordToolCallFanout(result.toolCalls);
       return result;
     } finally {
@@ -935,6 +936,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
             buildAssistantMessage(finalRaw || accumulatedVisible, finalToolCalls, finalThinking, finalThinkingEnabled),
           );
           this.turnCount++;
+          this.commitActiveTools(constrainedConfig);
           this.recordToolCallFanout(finalToolCalls);
         } else if (!delegated) {
           // Qwen commits cancelled/failed delta tokens to its native cached
@@ -1017,6 +1019,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           buildAssistantMessage(result.text, result.toolCalls, result.thinking, result.thinkingEnabled),
         );
         this.turnCount++;
+        this.commitActiveTools(constrainedConfig);
         this.recordToolCallFanout(result.toolCalls);
         return result;
       } catch (err) {
@@ -1168,6 +1171,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
             buildAssistantMessage(finalRaw || accumulatedVisible, finalToolCalls, finalThinking, finalThinkingEnabled),
           );
           this.turnCount++;
+          this.commitActiveTools(constrainedConfig);
           this.recordToolCallFanout(finalToolCalls);
         } else if (!delegated) {
           this.needsFullReplay = true;
@@ -1309,6 +1313,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       this.needsFullReplay = false;
       this.lastImagesKey = this.computeTrailingImagesKey();
       this.lastAudioKey = this.computeTrailingAudioKey();
+      this.commitActiveTools(constrainedConfig);
       this.recordToolCallFanout(result.toolCalls);
       return result;
     } finally {
@@ -1380,6 +1385,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           this.needsFullReplay = false;
           this.lastImagesKey = this.computeTrailingImagesKey();
           this.lastAudioKey = this.computeTrailingAudioKey();
+          this.commitActiveTools(constrainedConfig);
           this.recordToolCallFanout(finalToolCalls);
         }
       }
@@ -1492,10 +1498,24 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   }
 
   /**
+   * Persist the effective tools only when their turn commits successfully.
+   * Preflights and failed/abandoned turns intentionally never call this.
+   */
+  private commitActiveTools(config: ChatConfig): void {
+    if (config.tools !== undefined) {
+      this.activeTools = config.tools;
+    }
+  }
+
+  /**
    * Merge default + per-call config and force `reuseCache: true`.
    * The session path is a session-reuse operation by construction —
    * `reuseCache: false` on the continue path would wipe the very
    * cache the delta depends on.
+   *
+   * Tool resolution here is side-effect free because public capacity
+   * preflights use this same merge path. Successful turn commit sites call
+   * {@link commitActiveTools} after native inference finishes.
    *
    * MTP auto-default: if neither `defaultConfig` nor `overlay`
    * sets `enableMtp` AND the underlying model exposes
@@ -1515,8 +1535,6 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     };
     if (merged.tools === undefined && this.activeTools !== undefined) {
       merged.tools = this.activeTools;
-    } else if (merged.tools !== undefined) {
-      this.activeTools = merged.tools;
     }
     if (
       merged.enableMtp === undefined &&
@@ -1656,6 +1674,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // turn to be mis-detected as a change and replayed twice.
       this.lastImagesKey = this.computeTrailingImagesKey();
       this.lastAudioKey = this.computeTrailingAudioKey();
+      this.commitActiveTools(constrainedConfig);
       this.recordToolCallFanout(result.toolCalls);
       return result;
     } catch (err) {
@@ -1768,6 +1787,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // turn to be mis-detected as a change and replayed twice.
         this.lastImagesKey = this.computeTrailingImagesKey();
         this.lastAudioKey = this.computeTrailingAudioKey();
+        this.commitActiveTools(constrainedConfig);
         this.recordToolCallFanout(finalToolCalls);
       } else {
         // Roll back: drop the tentative user push so history stays

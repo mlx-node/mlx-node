@@ -358,8 +358,9 @@ impl StreamEmitter for DefaultStreamEmitter {
 /// `skip_special_tokens` flag (Gemma4 decodes with
 /// `decode_sync(generated_tokens, false)` so its `output_parser` sees
 /// the channel/tool-call DSL markers, then runs
-/// `parse_gemma4_output` + `promote_channel_only_output` instead of the
-/// Hermes `<tool_call>`/`<think>` parse).
+/// `parse_gemma4_output_with_open_channel` +
+/// `promote_channel_only_output` instead of the Hermes
+/// `<tool_call>`/`<think>` parse).
 pub(crate) struct FinalizeArgs<'a> {
     pub tokenizer: &'a Qwen3Tokenizer,
     pub generated_tokens: &'a [u32],
@@ -630,7 +631,7 @@ pub(crate) struct WholeTurnArgs<'a> {
 ///   - decode/stop: `extra_eos_ids`, `eos_before_emit`,
 ///     `wired_limit_bytes`
 ///   - streaming: `stream_skip_special_tokens`, `stream_emitter`,
-///     `stream_delta_prompt_tokens`, `text_delta_media_guard`
+///     `stream_delta_prompt_tokens`
 ///   - profiling/perf: `profiler_label`, `augment_performance`
 ///   - specialized executors selected by the resolved plan:
 ///     `run_paged_turn`, `run_speculative_turn`, `run_multimodal_turn`
@@ -657,9 +658,8 @@ pub(crate) trait ChatBackend {
     fn set_cache_owner_id(&mut self, _owner_id: &str, _root_owner_id: Option<&str>) {}
 
     /// Session stop-token id. == the `<|im_end|>` resolution in
-    /// `chat_session_start_sync` / `chat_tokens_delta_sync`
-    /// (`tokenizer.im_end_id().ok_or(..)`) for the ChatML families;
-    /// Gemma4 resolves `<end_of_turn>` instead.
+    /// the session entries (`tokenizer.im_end_id().ok_or(..)`) for the
+    /// ChatML families; Gemma4 resolves `<end_of_turn>` instead.
     ///
     /// Documented accepted drift: this hook cannot know the entry point,
     /// so the streaming-start twins lose the per-entry wording
@@ -890,12 +890,12 @@ pub(crate) trait ChatBackend {
     /// `tools::parse_tool_calls`). A family override owns the WHOLE
     /// pipeline including the raw-text decode's skip-special flag — see
     /// [`FinalizeArgs`] for the Gemma4 mapping (raw decode_sync(..,
-    /// false) → `output_parser::parse_gemma4_output` +
+    /// false) → `output_parser::parse_gemma4_output_with_open_channel` +
     /// `promote_channel_only_output`).
     ///
-    /// The session core overwrites `result.cached_tokens` AFTER this
-    /// hook returns (fresh-hit / delta prior-len accounting), so
-    /// overrides need not (and must not) fill it.
+    /// The session core overwrites `result.cached_tokens` AFTER this hook
+    /// returns with the full-history prefix hit, so overrides need not
+    /// (and must not) fill it.
     fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
         finalize_chat_result(
             args.tokenizer,
@@ -963,41 +963,6 @@ pub(crate) trait ChatBackend {
     /// for the full mapping).
     fn stream_emitter(&self) -> Box<dyn StreamEmitter> {
         Box::new(DefaultStreamEmitter)
-    }
-
-    /// Text-delta-on-image-session guard policy. `Some(message)`
-    /// rejects the delta turn with that error; `None` lets it proceed.
-    ///
-    /// `entry_fn` is the entry point's wire name:
-    /// `"chat_tokens_delta_sync"` on the sync twin,
-    /// `"chat_stream_tokens_delta"` on the streaming twin.
-    ///
-    /// Default is a per-kind defensive guard: reject when the live session
-    /// holds any media kind the target does not actually have available.
-    /// Media-capable families that accept text deltas (qwen3.5's
-    /// sticky-image-key contract) keep the default.
-    ///
-    /// Gemma4's override REJECTS despite declaring image capability
-    /// whenever `cached_image_key.is_some()`, with the typed prefix the
-    /// TS `ChatSession` restart routing matches on:
-    /// `format!("{IMAGE_CHANGE_RESTART_PREFIX}{entry_fn} is text-only;
-    /// session currently holds image state")`.
-    fn text_delta_media_guard(&self, entry_fn: &'static str) -> Option<String> {
-        let session_media = self.session_media();
-        let unsupported = session_media.difference(self.execution_plan().media.available);
-        if !unsupported.is_empty() {
-            let media_state = match (unsupported.images, unsupported.audio) {
-                (true, true) => "image/audio",
-                (true, false) => "image",
-                (false, true) => "audio",
-                (false, false) => unreachable!("guarded by !unsupported.is_empty()"),
-            };
-            Some(format!(
-                "{entry_fn} is text-only; session currently holds {media_state} state"
-            ))
-        } else {
-            None
-        }
     }
 
     /// Byte budget for the turn's `WiredLimitContext`, or `None` for NO
@@ -1096,30 +1061,22 @@ pub(crate) trait ChatBackend {
         full_len as u32
     }
 
-    /// Whether a live session exists for the delta-continuation guard
-    /// ("requires an initialized session (call chatSessionStart
-    /// first)").
+    /// Whether a live session exists for the role-aware continuation guard
+    /// ("requires an initialized session (call chatSessionStart first)").
     ///
     /// The families check different state: lfm2 tests
     /// `!cached_token_history.is_empty()` (the default here); qwen3.5
-    /// tests `self.caches.is_some()`. Gemma4's override folds BOTH of its
-    /// delta guards (empty history AND `caches.is_none()`) into one
-    /// check; the engine then emits a single guard message naming
-    /// `chatSessionStart` — the minor message drift vs gemma4's two
-    /// distinct messages (one of which names `chatStreamSessionStart`) is
-    /// an accepted change.
+    /// tests `self.caches.is_some()`. Gemma4's override requires both
+    /// non-empty history and initialized caches.
     fn has_live_session(&self) -> bool {
         !self.cached_token_history().is_empty()
     }
 
     /// Media kinds currently represented by the live session's cache state.
     ///
-    /// Feeds the default [`ChatBackend::text_delta_media_guard`] policy
-    /// and the request planner's `context_media` fact on delta turns. Returning
-    /// the specific kinds instead of a boolean prevents speculation from
-    /// mistaking an empty current-turn input for a text-only live context.
-    /// Families that need a different delta policy override the guard hook
-    /// itself. Default covers families that never track media state.
+    /// Family-specific prefix verification and specialized cache save paths
+    /// use this to keep media-derived state aligned with token history.
+    /// Default covers families that never track media state.
     fn session_media(&self) -> MediaCapabilities {
         MediaCapabilities::NONE
     }

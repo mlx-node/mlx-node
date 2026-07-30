@@ -7,7 +7,7 @@
 //! reuse_cache guard → tokenizer → resolve_params
 //!   → pre-render image guard → render_prompt
 //!   → resolve TurnPlan → optional multimodal/paged/speculative executor
-//!   → verify_cache_prefix → reset-or-delta split → prefill
+//!   → verify_cache_prefix → reset-or-reuse split → prefill
 //!   → first-token sample (apply_all_penalties + sampling::sample)
 //!   → eval_caches → begin_decode → run_decode_loop → end_decode
 //!   → save_cache_state → finalize_turn (+ cached_tokens overwrite)
@@ -15,7 +15,7 @@
 //!
 //! Everywhere families genuinely differ, the difference is a
 //! [`ChatBackend`] hook (documented on the trait), never a branch on
-//! family. The 8 public entry points (4 sync + 4 streaming twins) are
+//! family. The 6 public entry points (3 sync + 3 streaming twins) are
 //! thin guard wrappers around the core.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,17 +37,6 @@ use crate::engine::plan::{MediaCapabilities, MediaInputs, TurnPath, TurnPlan, Tu
 use crate::engine::types::{ChatConfig, ChatResult};
 use crate::stream::{DeviceType, Stream};
 use crate::tokenizer::ChatMessage;
-
-/// What kind of turn the core is running.
-enum TurnInput {
-    /// Fresh prompt rendered from messages (session-start). Runs the
-    /// full verify-prefix / reset-or-delta split.
-    Fresh { messages: Vec<ChatMessage> },
-    /// Pre-tokenized delta appended on top of the live caches
-    /// (session-continue / tool / raw tokens-delta). Strict extension
-    /// by construction — skips prefix verification.
-    Delta { delta_tokens: Vec<u32> },
-}
 
 /// Streaming context handed to [`chat_turn_core`] by the streaming
 /// twins: the chunk sink plus the cancel flag. Only `.load(Relaxed)` is
@@ -82,12 +71,7 @@ pub(crate) fn session_start<B: ChatBackend>(
             "chat_session_start requires reuse_cache=true (pass ChatConfig { reuse_cache: Some(true), .. } or leave as None). The session API only makes sense with cache reuse enabled.",
         ));
     }
-    expect_sync_result(chat_turn_core(
-        backend,
-        TurnInput::Fresh { messages },
-        config,
-        None,
-    ))
+    expect_sync_result(chat_turn_core(backend, messages, config, None))
 }
 
 /// Generic role-aware session continuation.
@@ -104,22 +88,17 @@ pub(crate) fn session_continue<B: ChatBackend>(
     config: ChatConfig,
 ) -> Result<ChatResult> {
     if config.reuse_cache == Some(false) {
-        return Err(Error::from_reason(format!(
+        return Err(Error::from_reason(
             "chat_session_continue requires reuse_cache=true (leave as None or set to true). \
              The session API only makes sense with cache reuse enabled.",
-        )));
+        ));
     }
     if !backend.has_live_session() {
         return Err(Error::from_reason(
             "chat_session_continue requires an initialized session (call chatSessionStart first)",
         ));
     }
-    expect_sync_result(chat_turn_core(
-        backend,
-        TurnInput::Fresh { messages },
-        config,
-        None,
-    ))
+    expect_sync_result(chat_turn_core(backend, messages, config, None))
 }
 
 /// Generic role-aware tool-result continuation.
@@ -143,28 +122,7 @@ pub(crate) fn session_continue_tool<B: ChatBackend>(
             "chat_session_continue_tool requires an initialized session (call chatSessionStart first)",
         ));
     }
-    expect_sync_result(chat_turn_core(
-        backend,
-        TurnInput::Fresh { messages },
-        config,
-        None,
-    ))
-}
-
-/// Generic `chat_tokens_delta_sync`: prefill a pre-tokenized delta on
-/// top of the live caches and decode the reply.
-pub(crate) fn tokens_delta<B: ChatBackend>(
-    backend: &mut B,
-    delta_tokens: Vec<u32>,
-    config: ChatConfig,
-) -> Result<ChatResult> {
-    delta_guards(backend, &delta_tokens, &config, DeltaEntry::Sync)?;
-    expect_sync_result(chat_turn_core(
-        backend,
-        TurnInput::Delta { delta_tokens },
-        config,
-        None,
-    ))
+    expect_sync_result(chat_turn_core(backend, messages, config, None))
 }
 
 // =====================================================================
@@ -197,7 +155,7 @@ pub(crate) fn session_start_stream<B: ChatBackend>(
     }
     if let Err(e) = chat_turn_core(
         backend,
-        TurnInput::Fresh { messages },
+        messages,
         config,
         Some(StreamingHooks { sink, cancelled }),
     ) {
@@ -234,7 +192,7 @@ pub(crate) fn session_continue_stream<B: ChatBackend>(
     }
     if let Err(e) = chat_turn_core(
         backend,
-        TurnInput::Fresh { messages },
+        messages,
         config,
         Some(StreamingHooks { sink, cancelled }),
     ) {
@@ -271,35 +229,7 @@ pub(crate) fn session_continue_tool_stream<B: ChatBackend>(
     }
     if let Err(e) = chat_turn_core(
         backend,
-        TurnInput::Fresh { messages },
-        config,
-        Some(StreamingHooks { sink, cancelled }),
-    ) {
-        sink.send(Err(e));
-    }
-}
-
-/// Streaming twin of [`tokens_delta`].
-pub(crate) fn tokens_delta_stream<B: ChatBackend>(
-    backend: &mut B,
-    delta_tokens: Vec<u32>,
-    config: ChatConfig,
-    sink: &dyn ChunkSink,
-    cancelled: &AtomicBool,
-) {
-    if cancelled.load(Ordering::Relaxed) {
-        sink.send(Err(Error::from_reason(
-            "chat_stream_tokens_delta cancelled before start",
-        )));
-        return;
-    }
-    if let Err(e) = delta_guards(backend, &delta_tokens, &config, DeltaEntry::Stream) {
-        sink.send(Err(e));
-        return;
-    }
-    if let Err(e) = chat_turn_core(
-        backend,
-        TurnInput::Delta { delta_tokens },
+        messages,
         config,
         Some(StreamingHooks { sink, cancelled }),
     ) {
@@ -311,81 +241,6 @@ pub(crate) fn tokens_delta_stream<B: ChatBackend>(
 // Shared guards / helpers
 // =====================================================================
 
-/// Which NAPI entry point invoked the delta path — selects the guard
-/// message wording. The sync and streaming delta twins emit DIFFERENT
-/// strings (sync names `chat_tokens_delta_sync` / `chatSessionStart`,
-/// streaming names `chat_stream_tokens_delta` / `chatStreamSessionStart`);
-/// this selector reproduces both.
-#[derive(Clone, Copy)]
-enum DeltaEntry {
-    Sync,
-    Stream,
-}
-
-impl DeltaEntry {
-    /// The entry point's wire name as it appears in guard messages.
-    fn fn_name(self) -> &'static str {
-        match self {
-            DeltaEntry::Sync => "chat_tokens_delta_sync",
-            DeltaEntry::Stream => "chat_stream_tokens_delta",
-        }
-    }
-
-    /// The session-start method named in the "no live session" guard.
-    fn start_name(self) -> &'static str {
-        match self {
-            DeltaEntry::Sync => "chatSessionStart",
-            DeltaEntry::Stream => "chatStreamSessionStart",
-        }
-    }
-}
-
-/// The four delta-path guards shared by `chat_tokens_delta_sync` /
-/// `chat_stream_tokens_delta_sync` on every family; wording per
-/// [`DeltaEntry`].
-///
-/// gemma4's two distinct live-session checks (empty history vs
-/// `caches.is_none()`, the latter AFTER the image guard) fold into the
-/// single `has_live_session` check here — see the
-/// [`ChatBackend::has_live_session`] rustdoc.
-fn delta_guards<B: ChatBackend>(
-    backend: &B,
-    delta_tokens: &[u32],
-    config: &ChatConfig,
-    entry: DeltaEntry,
-) -> Result<()> {
-    if config.reuse_cache == Some(false) {
-        return Err(Error::from_reason(format!(
-            "{} requires reuse_cache to be enabled; \
-             the delta path operates on session state by construction",
-            entry.fn_name(),
-        )));
-    }
-    if !backend.has_live_session() {
-        return Err(Error::from_reason(format!(
-            "{} requires an initialized session (call {} first)",
-            entry.fn_name(),
-            entry.start_name(),
-        )));
-    }
-    if delta_tokens.is_empty() {
-        return Err(Error::from_reason(format!(
-            "{} requires a non-empty delta",
-            entry.fn_name(),
-        )));
-    }
-    // Family policy hook. Default: text-only families reject deltas while
-    // the session holds image state (lfm2's defensive guard);
-    // image-capable families accept text deltas on image sessions by
-    // design (qwen3.5's sticky image-key contract — see
-    // `save_cache_state_after_delta`). Gemma4 overrides to REJECT with
-    // the typed restart prefix despite being image-capable.
-    if let Some(message) = backend.text_delta_media_guard(entry.fn_name()) {
-        return Err(Error::from_reason(message));
-    }
-    Ok(())
-}
-
 /// Unwrap the core's sync-path result. `Ok(None)` means a whole-turn
 /// executor returned [`TurnOutput::Streamed`] with no sink attached —
 /// a family-impl contract violation, surfaced as an error rather than
@@ -396,6 +251,26 @@ fn expect_sync_result(out: Result<Option<ChatResult>>) -> Result<ChatResult> {
             "specialized executor returned TurnOutput::Streamed on the sync (sink-less) path",
         )
     })
+}
+
+/// Invalidate every live-session signal after the generic flat executor has
+/// started mutating physical cache state and then fails.
+///
+/// `PrefixMiss` is intentionally insufficient here: Qwen3.5 dense/MoE preserve
+/// their committed token history across that turn-internal reset so a
+/// successful full re-prefill can overwrite it at commit time. On an aborted
+/// re-prefill, retaining that history would let the next full-history request
+/// prefix-hit empty or partially advanced physical caches. The explicit
+/// command reset is the shared fail-closed contract.
+fn fail_closed_flat_turn<B: ChatBackend, T>(backend: &mut B, turn_error: Error) -> Result<T> {
+    if let Err(reset_error) = backend.reset_caches(ResetScope::Command) {
+        tracing::error!(
+            "generic flat turn failed ({}) and session invalidation also failed ({})",
+            turn_error.reason,
+            reset_error.reason,
+        );
+    }
+    Err(turn_error)
 }
 
 /// Map a specialized executor's outcome into the core's return shape.
@@ -470,7 +345,7 @@ fn extract_audio_from_messages(messages: &[ChatMessage]) -> Vec<Vec<u8>> {
 /// [`TurnOutput::Streamed`]).
 fn chat_turn_core<B: ChatBackend>(
     backend: &mut B,
-    input: TurnInput,
+    messages: Vec<ChatMessage>,
     config: ChatConfig,
     streaming: Option<StreamingHooks<'_>>,
 ) -> Result<Option<ChatResult>> {
@@ -506,71 +381,52 @@ fn chat_turn_core<B: ChatBackend>(
     let admitted_media = execution.media.admitted();
 
     // --- template/render: full prompt tokens for this turn ---
-    // Fresh: render the complete structured transcript through the
-    // checkpoint-provided Jinja template. Raw token deltas are an explicit
-    // low-level path and skip template rendering by construction.
-    let (tokens, images, audio, is_delta, prior_cached_len) = match &input {
-        TurnInput::Fresh { messages } => {
-            // Pre-render image guard — TS `ChatSession` restart-routing
-            // contract: a text-only backend MUST reject an image-bearing
-            // fresh turn with the typed
-            // `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error,
-            // and that rejection MUST happen BEFORE `render_prompt`.
-            // `serialize_message_for_jinja` represents image user
-            // content as an array, so a text-only family's chat
-            // template could otherwise fail with an UNTYPED template
-            // error first, breaking the prefix routing. Vision-capable
-            // backends with image capability — including
-            // gemma4's unconditional policy, whose "no vision support"
-            // error surfaces from inside the multimodal executor) skip the
-            // rejection, render normally, and route through the
-            // multimodal executor below with these exact extracted
-            // images (single extraction — no drift).
-            let images = extract_images_from_messages(messages);
-            if !images.is_empty() && !admitted_media.images {
-                return Err(Error::from_reason(format!(
-                    "{IMAGE_CHANGE_RESTART_PREFIX} this model is text-only; image messages are not supported",
-                )));
-            }
-            // Audio mirrors the image guard: a fresh audio-bearing turn against
-            // a model with no audio support is rejected with the typed
-            // restart prefix before `render_prompt`. Every non-audio family
-            // rejects here and image-only / text-only flows stay byte-identical.
-            let audio = extract_audio_from_messages(messages);
-            if !audio.is_empty() && !admitted_media.audio {
-                return Err(Error::from_reason(format!(
-                    "{IMAGE_CHANGE_RESTART_PREFIX} this model has no audio support; audio messages are not supported",
-                )));
-            }
-            let tokens = backend.render_prompt(&tokenizer, messages, &config)?;
-            (tokens, images, audio, false, 0usize)
-        }
-        TurnInput::Delta { delta_tokens } => {
-            let prior = backend.cached_token_history().len();
-            let mut full = backend.cached_token_history().to_vec();
-            full.extend_from_slice(delta_tokens);
-            (full, Vec::new(), Vec::new(), true, prior)
-        }
-    };
+    // Every public session entry receives the complete structured
+    // transcript and renders it through the checkpoint-provided Jinja
+    // template. Rust never synthesizes a model-specific wire-format delta.
+    //
+    // Pre-render image guard — TS `ChatSession` restart-routing contract:
+    // a text-only backend MUST reject an image-bearing turn with the typed
+    // `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error, and that
+    // rejection MUST happen BEFORE `render_prompt`.
+    // `serialize_message_for_jinja` represents image user content as an
+    // array, so a text-only family's chat template could otherwise fail
+    // with an UNTYPED template error first, breaking the prefix routing.
+    // Vision-capable backends with image capability — including gemma4's
+    // unconditional policy, whose "no vision support" error surfaces from
+    // inside the multimodal executor — skip the rejection, render normally,
+    // and route through the multimodal executor below with these exact
+    // extracted images (single extraction — no drift).
+    let images = extract_images_from_messages(&messages);
+    if !images.is_empty() && !admitted_media.images {
+        return Err(Error::from_reason(format!(
+            "{IMAGE_CHANGE_RESTART_PREFIX} this model is text-only; image messages are not supported",
+        )));
+    }
+    // Audio mirrors the image guard: an audio-bearing turn against a model
+    // with no audio support is rejected with the typed restart prefix before
+    // `render_prompt`. Every non-audio family rejects here and image-only /
+    // text-only flows stay byte-identical.
+    let audio = extract_audio_from_messages(&messages);
+    if !audio.is_empty() && !admitted_media.audio {
+        return Err(Error::from_reason(format!(
+            "{IMAGE_CHANGE_RESTART_PREFIX} this model has no audio support; audio messages are not supported",
+        )));
+    }
+    let tokens = backend.render_prompt(&tokenizer, &messages, &config)?;
 
     let media = MediaInputs {
         images: &images,
         audio: &audio,
     };
     let input_media = media.capabilities();
-    // A fresh request fully describes its own context; stale state from a
-    // previous session must not constrain the new plan. A delta has no raw
-    // media input but may continue over media already encoded in live KV, so
-    // ask the backend for the exact media kinds represented there.
-    let context_media = if is_delta {
-        backend.session_media()
-    } else {
-        MediaCapabilities::NONE
-    };
+    // A full-history request describes its own context; stale state from a
+    // previous session must not constrain the new plan.
+    let context_media = MediaCapabilities::NONE;
     let turn_plan = TurnPlan::resolve(
         execution,
         TurnRequest {
-            is_delta,
+            is_delta: false,
             input_media,
             context_media,
             speculative_requested: p.enable_mtp,
@@ -617,65 +473,39 @@ fn chat_turn_core<B: ChatBackend>(
     };
     let mut first_token_instant: Option<Instant> = None;
 
-    // verify_cache_prefix → reset-or-delta split.
+    // verify_cache_prefix → reset-or-reuse split.
     //
-    // Fresh turns: `verify_cache_prefix` returns 0 or the full cached
-    // length (all-or-nothing contract — see the trait rustdoc). A
-    // strict-extend hit (`0 < hit < tokens.len()`) prefills only the
-    // tail; everything else — miss AND exact-match — resets and
-    // re-prefills the full prompt. Exact-match-as-miss is deliberate:
-    // lfm2's short-conv state and qwen3.5's GDN recurrent state have no
-    // safe "rewind by one" primitive (lfm2 routes it via its strict
-    // `< tokens.len()` check; qwen3.5 via its zero-delta guard).
-    //
-    // Delta turns: strict extension by construction — the live caches
-    // already hold the prior history; prefill exactly the delta tail.
+    // `verify_cache_prefix` returns 0 or the full cached length
+    // (all-or-nothing contract — see the trait rustdoc). A strict-extend
+    // hit (`0 < hit < tokens.len()`) prefills only the tail; everything
+    // else — miss AND exact-match — resets and re-prefills the full prompt.
+    // Exact-match-as-miss is deliberate: lfm2's short-conv state and
+    // qwen3.5's GDN recurrent state have no safe "rewind by one" primitive
+    // (lfm2 routes it via its strict `< tokens.len()` check; qwen3.5 via its
+    // zero-delta guard).
     //
     // A prior eager-MTP turn that stopped mid-cycle leaves the flat trunk
     // advanced past `cached_token_history` (`flat_caches_desynced`). The
-    // GDN recurrent layers can't rewind, so neither a fresh prefix-reuse
-    // nor a delta-extend onto that trunk is safe — both heal by discarding
-    // the trunk and re-prefilling the whole conversation (`tokens` already
-    // == saved history ++ any delta).
+    // GDN recurrent layers can't rewind, so prefix reuse onto that trunk is
+    // unsafe; heal by discarding it and re-prefilling the rendered history.
     let desynced = backend.flat_caches_desynced();
-    let (prefill_tokens, cached_prefix_len) = match &input {
-        TurnInput::Fresh { .. } => {
-            let hit = if desynced {
-                0
-            } else {
-                backend.verify_cache_prefix(&tokens, reuse_cache)
-            };
-            if hit > 0 && hit < tokens.len() {
-                tracing::info!(
-                    "Cache reuse: {} cached tokens, {} new tokens to prefill",
-                    hit,
-                    tokens.len() - hit,
-                );
-                (tokens[hit..].to_vec(), hit)
-            } else {
-                backend.reset_caches(ResetScope::PrefixMiss)?;
-                (tokens.clone(), 0)
-            }
-        }
-        // `cached_prefix_len` stays 0 on the delta path: the delta tail
-        // is the only freshly-prefilled span, so there is no separately
-        // reused prefix to report here. The REPORTED reuse is
-        // `prior_cached_len` — see `cached_tokens_for_result`.
-        TurnInput::Delta { delta_tokens } => {
-            if desynced {
-                backend.reset_caches(ResetScope::PrefixMiss)?;
-                (tokens.clone(), 0usize)
-            } else {
-                (delta_tokens.clone(), 0usize)
-            }
-        }
-    };
-    // A desynced delta turn re-prefilled the whole conversation, reusing
-    // nothing — report 0 cached, not the stale `prior_cached_len`.
-    let cached_tokens_for_result: u32 = if is_delta && !desynced {
-        prior_cached_len as u32
+    let hit = if desynced {
+        0
     } else {
-        cached_prefix_len as u32
+        backend.verify_cache_prefix(&tokens, reuse_cache)
+    };
+    let (prefill_tokens, cached_prefix_len) = if hit > 0 && hit < tokens.len() {
+        tracing::info!(
+            "Cache reuse: {} cached tokens, {} new tokens to prefill",
+            hit,
+            tokens.len() - hit,
+        );
+        (tokens[hit..].to_vec(), hit)
+    } else {
+        if let Err(error) = backend.reset_caches(ResetScope::PrefixMiss) {
+            return fail_closed_flat_turn(backend, error);
+        }
+        (tokens.clone(), 0)
     };
 
     let prompt_token_count = tokens.len();
@@ -693,7 +523,7 @@ fn chat_turn_core<B: ChatBackend>(
         .map(|bytes| crate::stream::WiredLimitContext::new(bytes, vec![generation_stream]));
 
     let mut profiler = DecodeProfiler::new(
-        backend.profiler_label(is_delta, streaming.is_some()),
+        backend.profiler_label(false, streaming.is_some()),
         backend.family_name(),
     );
     profiler.set_prompt_tokens(prefill_tokens.len() as u32);
@@ -719,104 +549,109 @@ fn chat_turn_core<B: ChatBackend>(
     let mut emitter: Option<Box<dyn StreamEmitter>> =
         streaming.as_ref().map(|_| backend.stream_emitter());
 
-    // --- prefill ---
-    profiler.begin_prefill();
-    let last_logits = backend.prefill(&prefill_tokens, generation_stream)?;
-    profiler.end_prefill();
+    // From prefill onward, every fallible operation runs inside one error
+    // boundary. The temporary closure ensures a decode stepper borrowing the
+    // backend is dropped before fail-closed invalidation borrows it again.
+    let flat_turn_result: Result<()> = (|| {
+        // --- prefill ---
+        profiler.begin_prefill();
+        let last_logits = backend.prefill(&prefill_tokens, generation_stream)?;
+        profiler.end_prefill();
 
-    // --- first-token sample ---
-    let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
-    let y = crate::sampling::sample(&last_logits, p.sampling_config)?;
-    y.eval();
+        // --- first-token sample ---
+        let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
+        let y = crate::sampling::sample(&last_logits, p.sampling_config)?;
+        y.eval();
 
-    // --- eval caches post-prefill ---
-    backend.eval_caches()?;
+        // --- eval caches post-prefill ---
+        backend.eval_caches()?;
 
-    if report_perf {
-        first_token_instant = Some(Instant::now());
-    }
-
-    // --- decode ---
-    // The stepper mutably borrows the backend for the whole loop; scope
-    // it so `save_cache_state` below can borrow again.
-    {
-        let turn_setup = TurnSetup {
-            params: &p,
-            is_delta,
-            // The generic flow is text-only; image turns routed through
-            // the multimodal executor above.
-            has_images: false,
-            total_seq_len: tokens.len(),
-        };
-        let mut step = backend.begin_decode(&turn_setup)?;
-        // Decode-path relabel — see
-        // `DecodeStep::profiler_relabel`.
-        if let Some(label) = step.profiler_relabel() {
-            profiler.set_label(label);
+        if report_perf {
+            first_token_instant = Some(Instant::now());
         }
-        let streaming_ctx = match (streaming.as_ref(), emitter.as_mut()) {
-            (Some(s), Some(em)) => Some(StreamingCtx {
-                callback: s.sink,
-                cancelled: s.cancelled,
-                decode_stream: &mut decode_stream,
-                tokenizer: tokenizer.inner(),
-                streamed_text_len: &mut streamed_text_len,
-                last_is_reasoning: &mut last_is_reasoning,
-                emitter: em.as_mut(),
-            }),
-            _ => None,
-        };
-        run_decode_loop(
-            &mut step,
-            DecodeLoopArgs {
-                y,
-                params: &p,
-                reasoning_tracker: &mut reasoning_tracker,
-                profiler: &mut profiler,
-                max_new_tokens,
-                eos_id,
-                extra_eos_ids: &extra_eos_ids,
-                eos_before_emit,
-                generated_tokens: &mut generated_tokens,
-                token_history: &mut token_history,
-                finish_reason: &mut finish_reason,
-                first_token_instant: &mut first_token_instant,
-                report_perf,
-                generation_stream,
-            },
-            streaming_ctx,
-        )?;
-        // Record the final committed token's K/V on a LENGTH exit. The
-        // shared decode loop's forward gate (`step_idx + 1 < max_new_tokens
-        // && !is_terminal`) skips the last token's forward, so a pure-KV
-        // flat stepper (qwen3 / gemma4) ends one token SHORTER than the
-        // keep-all-on-length history its `save_cache_state` persists; one
-        // extra discard-logits forward closes that gap so the saved cache
-        // equals the saved history. LENGTH exits ONLY — an EOS / cancel /
-        // repetition final token is a boundary marker the next delta
-        // re-renders, and `save_cache_state` drops it. Default no-op for
-        // lfm2 (conv state can't re-run a forward — it drops-last instead)
-        // and any family whose flat stepper doesn't override it; the MTP
-        // cores bypass this flow and the paged flow materializes in
-        // `run_paged_turn`.
-        if finish_reason == "length"
-            && let Some(&last_token) = generated_tokens.last()
+
+        // --- decode ---
+        // The stepper mutably borrows the backend for the whole loop; scope
+        // it so `save_cache_state` below can borrow again.
         {
-            step.materialize_final(last_token)?;
+            let turn_setup = TurnSetup {
+                params: &p,
+                is_delta: false,
+                // The generic flow is text-only; image turns routed through
+                // the multimodal executor above.
+                has_images: false,
+                total_seq_len: tokens.len(),
+            };
+            let mut step = backend.begin_decode(&turn_setup)?;
+            // Decode-path relabel — see
+            // `DecodeStep::profiler_relabel`.
+            if let Some(label) = step.profiler_relabel() {
+                profiler.set_label(label);
+            }
+            let streaming_ctx = match (streaming.as_ref(), emitter.as_mut()) {
+                (Some(s), Some(em)) => Some(StreamingCtx {
+                    callback: s.sink,
+                    cancelled: s.cancelled,
+                    decode_stream: &mut decode_stream,
+                    tokenizer: tokenizer.inner(),
+                    streamed_text_len: &mut streamed_text_len,
+                    last_is_reasoning: &mut last_is_reasoning,
+                    emitter: em.as_mut(),
+                }),
+                _ => None,
+            };
+            run_decode_loop(
+                &mut step,
+                DecodeLoopArgs {
+                    y,
+                    params: &p,
+                    reasoning_tracker: &mut reasoning_tracker,
+                    profiler: &mut profiler,
+                    max_new_tokens,
+                    eos_id,
+                    extra_eos_ids: &extra_eos_ids,
+                    eos_before_emit,
+                    generated_tokens: &mut generated_tokens,
+                    token_history: &mut token_history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant: &mut first_token_instant,
+                    report_perf,
+                    generation_stream,
+                },
+                streaming_ctx,
+            )?;
+            // Record the final committed token's K/V on a LENGTH exit. The
+            // shared decode loop's forward gate (`step_idx + 1 < max_new_tokens
+            // && !is_terminal`) skips the last token's forward, so a pure-KV
+            // flat stepper (qwen3 / gemma4) ends one token SHORTER than the
+            // keep-all-on-length history its `save_cache_state` persists; one
+            // extra discard-logits forward closes that gap so the saved cache
+            // equals the saved history. LENGTH exits ONLY — an EOS / cancel /
+            // repetition final token is a boundary marker the next delta
+            // re-renders, and `save_cache_state` drops it. Default no-op for
+            // lfm2 (conv state can't re-run a forward — it drops-last instead)
+            // and any family whose flat stepper doesn't override it; the MTP
+            // cores bypass this flow and the paged flow materializes in
+            // `run_paged_turn`.
+            if finish_reason == "length"
+                && let Some(&last_token) = generated_tokens.last()
+            {
+                step.materialize_final(last_token)?;
+            }
+            // Fallible post-loop hook. Runs while the stepper (and any guards
+            // it holds) is still alive, before `save_cache_state` below.
+            step.end_decode()?;
         }
-        // Fallible post-loop hook (currently a no-op for every family —
-        // see `DecodeStep::end_decode`). Runs while the
-        // stepper (and any guards it holds) is still alive, BEFORE
-        // `save_cache_state` below. On Err the turn aborts here: the
-        // stepper drops (its guards fire) and NO session state is
-        // saved.
-        step.end_decode()?;
+        Ok(())
+    })();
+    if let Err(error) = flat_turn_result {
+        return fail_closed_flat_turn(backend, error);
     }
 
     // --- save cache state ---
     backend.save_cache_state(SaveStateArgs {
         reuse_cache,
-        is_delta,
+        is_delta: false,
         has_images: false,
         generated_tokens: &generated_tokens,
         finish_reason: &finish_reason,
@@ -877,21 +712,10 @@ fn chat_turn_core<B: ChatBackend>(
         }
     }
 
-    // Streaming delta turns report the family's `prompt_tokens` choice
-    // on the terminal chunk: qwen3_5/MoE report the delta count,
-    // lfm2/qwen3 override to the full length. Sync results always carry
-    // the full history+delta length — no family diverges there.
-    let reported_prompt_tokens: u32 = if is_delta && streaming.is_some() {
-        let delta_len = prompt_token_count - prior_cached_len;
-        backend.stream_delta_prompt_tokens(prompt_token_count, delta_len)
-    } else {
-        prompt_token_count as u32
-    };
-
     // Family finalize hook. Default = the ChatML `finalize_chat_result`
     // pipeline; gemma4 overrides with its raw decode + output_parser
     // pipeline.
-    let mut result = backend.finalize_turn(FinalizeArgs {
+    let finalized = backend.finalize_turn(FinalizeArgs {
         tokenizer: &tokenizer,
         generated_tokens: &generated_tokens,
         finish_reason,
@@ -900,15 +724,18 @@ fn chat_turn_core<B: ChatBackend>(
         performance,
         include_reasoning: p.include_reasoning,
         thinking_enabled: thinking.enabled,
-        prompt_tokens: reported_prompt_tokens,
+        prompt_tokens: prompt_token_count as u32,
         reasoning_tokens,
-    })?;
+    });
+    let mut result = match finalized {
+        Ok(result) => result,
+        Err(error) => return fail_closed_flat_turn(backend, error),
+    };
     result.thinking_enabled = template_thinking_enabled;
     // cached_tokens overwrite stays in the session core (AFTER the
-    // finalize hook — overrides must not fill it): fresh turns report
-    // the matched prefix length from `verify_cache_prefix`; delta turns
-    // report the full prior history length reused by construction.
-    result.cached_tokens = cached_tokens_for_result;
+    // finalize hook — overrides must not fill it): report the matched
+    // prefix length from `verify_cache_prefix`.
+    result.cached_tokens = cached_prefix_len as u32;
 
     if let (Some(s), Some(em)) = (streaming.as_ref(), emitter.as_mut()) {
         // Terminal done-chunk via the emitter. Family emitters (gemma4)

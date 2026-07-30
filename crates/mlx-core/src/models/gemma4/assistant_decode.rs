@@ -884,6 +884,7 @@ mod tests {
         // the length exit and emit ~12 chunks.
         let mut config = tiny_turn_config(Some(1), 12);
         config.include_reasoning = Some(true);
+        config.reasoning_effort = Some("high".to_string());
 
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sink = CancelAfterSink {
@@ -931,6 +932,11 @@ mod tests {
             terminal.finish_reason.as_deref(),
             Some("cancelled"),
             "sink-raised cancel must finish the turn as cancelled"
+        );
+        assert_eq!(
+            terminal.thinking_enabled,
+            Some(true),
+            "assistant terminal chunk must report effective template thinking provenance"
         );
         let n = terminal.num_tokens.expect("terminal must carry num_tokens") as usize;
         assert!(

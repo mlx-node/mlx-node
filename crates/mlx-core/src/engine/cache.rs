@@ -360,10 +360,10 @@ pub(crate) fn save_cache_state_direct<C>(
     }
 }
 
-/// Commit session state after a text-only delta continuation.
+/// Commit session state after a model-specific text-only suffix continuation.
 ///
-/// The delta path (`chat_tokens_delta_sync` / `chat_stream_tokens_delta_sync`)
-/// appends a text delta on top of the live KV caches without touching the
+/// A specialized model path may append a text suffix on top of live KV caches
+/// without touching the
 /// image attention state baked in by the preceding prefill. The "current
 /// turn is text-only" signal (`has_images == false`) MUST NOT be conflated
 /// with "the session has no image context" — the KV caches still encode
@@ -795,13 +795,11 @@ mod image_cache_identity_tests {
 #[cfg(test)]
 mod save_cache_state_after_delta_tests {
     //! Guards the sticky-`cached_image_key` invariant on the text-only
-    //! delta path. Calling `save_cache_state_direct(has_images: false,
-    //! ...)` after a delta continuation would clear `cached_image_key`
+    //! specialized suffix path. Calling `save_cache_state_direct(has_images:
+    //! false, ...)` after such a continuation would clear `cached_image_key`
     //! even though the live KV cache still encodes the prior prefill's
     //! image attention state — contradicting the TS `ChatSession` routing
-    //! contract (warm cache across text-only follow-ups) and making the
-    //! delta path fail with a cryptic "chat_tokens_delta_sync is
-    //! text-only; session currently holds image state" on the next turn.
+    //! contract (warm cache across text-only follow-ups).
     //! [`save_cache_state_after_delta`] preserves the key instead.
     use super::{save_cache_state_after_delta, save_cache_state_direct};
 

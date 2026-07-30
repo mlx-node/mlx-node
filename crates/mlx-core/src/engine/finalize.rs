@@ -10,10 +10,9 @@ use crate::tools;
 
 /// Report a guard-violation error through the stream channel.
 ///
-/// Used by the streaming session entry points (`chat_stream_session_*`
-/// and `chat_stream_tokens_delta_sync`) to surface pre-decode guard
-/// failures — text-only violations, missing tokenizer special tokens,
-/// reuse_cache=false, empty delta, etc.
+/// Used by the streaming session entry points (`chat_stream_session_*`) to
+/// surface pre-decode guard failures — text-only violations, missing
+/// tokenizer special tokens, reuse_cache=false, etc.
 ///
 /// Sends an `Err(napi::Error::from_reason(message))` item into the
 /// mpsc so the NAPI forwarding task invokes the TS callback with

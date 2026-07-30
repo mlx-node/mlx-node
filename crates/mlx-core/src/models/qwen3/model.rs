@@ -1219,14 +1219,14 @@ impl Qwen3Inner {
         let mut all_finish_reasons = Vec::with_capacity(num_prompts);
         let mut all_token_counts = Vec::with_capacity(num_prompts);
 
-        for prompt_idx in 0..num_prompts {
+        for lightweight_prompt in &lightweight_prompts {
             let mut prompt_finish_reasons = Vec::with_capacity(group_size_usize);
             let mut prompt_token_counts = Vec::with_capacity(group_size_usize);
 
             for _group_idx in 0..group_size {
                 // Reconstruct lightweight text-only messages for each call.
                 // `generate_sync` renders the model-provided chat template.
-                let msgs = lightweight_prompts[prompt_idx]
+                let msgs = lightweight_prompt
                     .iter()
                     .map(|m| ChatMessage {
                         role: m.role.clone(),

@@ -40,7 +40,7 @@ use crate::models::qianfan_ocr::bridge::InternVLBridge;
 use crate::models::qianfan_ocr::config::{InternVisionConfig, QianfanOCRConfig, Qwen3LMConfig};
 use crate::models::qianfan_ocr::language::InternVLLanguageModel;
 use crate::models::qianfan_ocr::persistence::load_qianfan_ocr_weights;
-use crate::models::qianfan_ocr::processing::QianfanImageProcessor;
+use crate::models::qianfan_ocr::processing::{ProcessedImage, QianfanImageProcessor};
 use crate::models::qianfan_ocr::vision::InternViTModel;
 use crate::models::qwen3_5::model::extract_images_from_messages;
 use crate::sampling::{
@@ -57,6 +57,75 @@ use crate::utils::safetensors::SafeTensorsFile;
 /// model-provided Jinja template. The vision processor replaces it with the
 /// checkpoint-configured image span after template rendering.
 const QIANFAN_IMAGE_TEMPLATE_PLACEHOLDER: &str = "<image>";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QianfanPrefillPlan {
+    prefix_len: usize,
+    clamped_prefix: usize,
+    suffix_requires_image_features: bool,
+}
+
+struct PreparedQianfanPrompt {
+    token_ids: Vec<u32>,
+    prefill_embeds: MxArray,
+    current_image_key: Option<u64>,
+    num_patches_list: Vec<u32>,
+    cached_tokens: usize,
+}
+
+fn qianfan_session_state_is_live(
+    cached_token_history: &[u32],
+    cached_cache_offset: i32,
+    kv_cache_offsets: &[i32],
+) -> bool {
+    let Ok(expected_offset) = i32::try_from(cached_token_history.len()) else {
+        return false;
+    };
+    expected_offset > 0
+        && cached_cache_offset == expected_offset
+        && !kv_cache_offsets.is_empty()
+        && kv_cache_offsets
+            .iter()
+            .all(|offset| *offset == expected_offset)
+}
+
+fn reusable_qianfan_patch_counts(
+    image_count: usize,
+    current_image_key: Option<u64>,
+    cached_image_key: Option<u64>,
+    cached_num_patches_list: Option<&[u32]>,
+) -> Option<Vec<u32>> {
+    if image_count == 0 {
+        return Some(Vec::new());
+    }
+    (current_image_key.is_some() && current_image_key == cached_image_key)
+        .then_some(cached_num_patches_list)
+        .flatten()
+        .filter(|counts| counts.len() == image_count)
+        .map(<[u32]>::to_vec)
+}
+
+fn plan_qianfan_prefill(
+    token_ids: &[u32],
+    cached_token_history: &[u32],
+    reuse_cache: bool,
+    image_key_matches: bool,
+    image_context_token_id: u32,
+) -> QianfanPrefillPlan {
+    let prefix_len = if reuse_cache && image_key_matches {
+        compute_prefix_match(token_ids, cached_token_history)
+    } else {
+        0
+    };
+    let clamped_prefix = prefix_len.min(token_ids.len().saturating_sub(1));
+    let suffix_requires_image_features =
+        token_ids[clamped_prefix..].contains(&image_context_token_id);
+    QianfanPrefillPlan {
+        prefix_len,
+        clamped_prefix,
+        suffix_requires_image_features,
+    }
+}
 
 // ============================================================================
 // QianfanOCRInner — dedicated-thread owned state
@@ -90,6 +159,11 @@ pub(crate) struct QianfanOCRInner {
     /// the TS `ChatSession` layer watches for changes and routes
     /// image-swap turns back through a fresh `chat_session_start`.
     pub(crate) cached_image_key: Option<u64>,
+    /// Per-image dynamic-tiling counts associated with `cached_image_key`.
+    /// These let a same-image continuation reproduce the template's expanded
+    /// token sequence and verify the reusable prefix before decoding or
+    /// processing the historical image bytes again.
+    pub(crate) cached_num_patches_list: Option<Vec<u32>>,
     /// Cache offset from the most recent call (number of tokens
     /// committed to the KV cache). Mirrors `kv_caches[0].get_offset()`
     /// at the end of the previous turn and is used by the session
@@ -283,6 +357,7 @@ impl QianfanOCRInner {
         self.kv_caches = None;
         self.cached_token_history.clear();
         self.cached_image_key = None;
+        self.cached_num_patches_list = None;
         self.cached_cache_offset = 0;
     }
 
@@ -303,6 +378,163 @@ impl QianfanOCRInner {
             .and_then(|caches| caches.first())
             .map(|c| c.get_offset())
             .unwrap_or(0)
+    }
+
+    fn has_live_session(&self) -> bool {
+        let Some(caches) = self.kv_caches.as_deref() else {
+            return false;
+        };
+        let offsets: Vec<i32> = caches.iter().map(KVCache::get_offset).collect();
+        qianfan_session_state_is_live(
+            &self.cached_token_history,
+            self.cached_cache_offset,
+            &offsets,
+        )
+    }
+
+    fn process_chat_images(&self, image_bytes: &[Vec<u8>]) -> Result<Vec<ProcessedImage>> {
+        let processor = QianfanImageProcessor::new(&self.config);
+        let image_refs: Vec<&[u8]> = image_bytes.iter().map(Vec::as_slice).collect();
+        processor.process_many(&image_refs)
+    }
+
+    fn encode_chat_images(
+        &self,
+        processed_images: &[ProcessedImage],
+        generation_stream: Stream,
+    ) -> Result<MxArray> {
+        let all_pixels = stack_processed_images(processed_images)?;
+        let vit_out = {
+            let _ctx = StreamContext::new(generation_stream);
+            self.vision.forward(&all_pixels)?
+        };
+        let bridge_out = {
+            let _ctx = StreamContext::new(generation_stream);
+            self.bridge.forward(&vit_out)?
+        };
+        let bridge_shape = bridge_out.shape()?;
+        bridge_out.reshape(&[bridge_shape[0] * bridge_shape[1], bridge_shape[2]])
+    }
+
+    /// Prepare the template-rendered prompt and only the embeddings that the
+    /// LM still needs to prefill. Same-image continuations first reproduce
+    /// image-token expansion from cached patch counts, then prefix-match. If
+    /// every image-context token is already covered by the reusable prefix,
+    /// historical images never reach the decoder, processor, ViT, or bridge.
+    fn prepare_chat_prefill(
+        &mut self,
+        messages: &[ChatMessage],
+        config: &ChatConfig,
+        reuse_cache: bool,
+        generation_stream: Stream,
+    ) -> Result<PreparedQianfanPrompt> {
+        let image_bytes = extract_images_from_messages(messages);
+        let current_image_key =
+            (!image_bytes.is_empty()).then(|| crate::engine::compute_image_cache_key(&image_bytes));
+        let image_key_matches = current_image_key == self.cached_image_key;
+
+        let mut processed_images: Option<Vec<ProcessedImage>> = None;
+        let mut num_patches_list = if let Some(counts) = reusable_qianfan_patch_counts(
+            image_bytes.len(),
+            current_image_key,
+            self.cached_image_key,
+            self.cached_num_patches_list.as_deref(),
+        ) {
+            counts
+        } else {
+            let processed = self.process_chat_images(&image_bytes)?;
+            let counts = processed.iter().map(|image| image.num_tiles).collect();
+            processed_images = Some(processed);
+            counts
+        };
+
+        let mut token_ids = self.render_prompt_tokens(messages, config, &num_patches_list)?;
+        let mut plan = plan_qianfan_prefill(
+            &token_ids,
+            &self.cached_token_history,
+            reuse_cache,
+            image_key_matches,
+            self.config.img_context_token_id as u32,
+        );
+
+        // A cached patch plan is sufficient for prefix verification, but a
+        // suffix containing image-context positions still needs real visual
+        // features. Reprocess only in that case. Revalidate the deterministic
+        // counts defensively before using the cached expansion.
+        if plan.suffix_requires_image_features && processed_images.is_none() {
+            let processed = self.process_chat_images(&image_bytes)?;
+            let actual_counts: Vec<u32> = processed.iter().map(|image| image.num_tiles).collect();
+            if actual_counts != num_patches_list {
+                num_patches_list = actual_counts;
+                token_ids = self.render_prompt_tokens(messages, config, &num_patches_list)?;
+                // The cached visual KV was produced with a different image
+                // expansion. Even when the bytes hash identically, its
+                // lineage is no longer provable, so force a complete visual
+                // prefill instead of retaining a textual/image prefix.
+                plan = plan_qianfan_prefill(
+                    &token_ids,
+                    &self.cached_token_history,
+                    reuse_cache,
+                    false,
+                    self.config.img_context_token_id as u32,
+                );
+            }
+            processed_images = Some(processed);
+        }
+
+        if plan.prefix_len == 0 || !reuse_cache {
+            self.kv_caches = None;
+            self.init_kv_caches();
+        } else {
+            let cache_offset = self.get_cache_offset();
+            if cache_offset > plan.clamped_prefix as i32
+                && let Some(caches) = self.kv_caches.as_mut()
+            {
+                for cache in caches {
+                    cache.trim(plan.clamped_prefix as i32);
+                }
+            }
+        }
+
+        let prefill_embeds = if plan.suffix_requires_image_features {
+            let processed = processed_images.as_deref().ok_or_else(|| {
+                Error::from_reason(
+                    "Qianfan-OCR image-bearing prompt suffix has no processed image features",
+                )
+            })?;
+            let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
+            let text_embeds = {
+                let _ctx = StreamContext::new(generation_stream);
+                self.language_model.get_embeddings(&input_ids)?
+            };
+            let vision_features = self.encode_chat_images(processed, generation_stream)?;
+            let embed_dtype = text_embeds.dtype()?;
+            let vision_features = if vision_features.dtype()? != embed_dtype {
+                vision_features.astype(embed_dtype)?
+            } else {
+                vision_features
+            };
+            let merged_embeds = merge_vision_features(
+                &input_ids,
+                &text_embeds,
+                &vision_features,
+                self.config.img_context_token_id,
+            )?;
+            merged_embeds.slice_axis(1, plan.clamped_prefix as i64, token_ids.len() as i64)?
+        } else {
+            let suffix = &token_ids[plan.clamped_prefix..];
+            let input_ids = MxArray::from_uint32(suffix, &[1, suffix.len() as i64])?;
+            let _ctx = StreamContext::new(generation_stream);
+            self.language_model.get_embeddings(&input_ids)?
+        };
+
+        Ok(PreparedQianfanPrompt {
+            token_ids,
+            prefill_embeds,
+            current_image_key,
+            num_patches_list,
+            cached_tokens: plan.clamped_prefix,
+        })
     }
 
     /// Render the complete conversation exclusively through the tokenizer's
@@ -353,11 +585,24 @@ impl QianfanOCRInner {
     /// `eos_token_id` is the caller-supplied stop-on token id
     /// (`<|im_end|>` for ChatML boundaries) so the cached history ends on
     /// a clean delimiter that subsequent `chat_session_continue_*` calls
-    /// can append a raw delta on top of.
+    /// can verify before prefilling the newly rendered suffix.
     ///
-    /// Only called from [`Self::chat_session_start_sync`]; there is no
-    /// longer a non-session entry point.
+    /// Only called by the session start/continue surface; there is no longer a
+    /// non-session chat entry point.
     fn chat_turn_sync_core(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        config: ChatConfig,
+        eos_token_id: u32,
+    ) -> Result<ChatResult> {
+        let result = self.chat_turn_sync_core_inner(messages, config, eos_token_id);
+        if result.is_err() {
+            self.reset_caches_sync();
+        }
+        result
+    }
+
+    fn chat_turn_sync_core_inner(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
@@ -395,113 +640,16 @@ impl QianfanOCRInner {
             None
         };
 
-        // Extract images from messages (CPU bound)
-        let image_bytes = extract_images_from_messages(&messages);
-
-        // --- Step 1: Process images ---
-        let processor = QianfanImageProcessor::new(&self.config);
-        let image_refs: Vec<&[u8]> = image_bytes.iter().map(|b| &b[..]).collect();
-        let processed_images = processor.process_many(&image_refs)?;
-
-        let num_patches_list: Vec<u32> = processed_images.iter().map(|p| p.num_tiles).collect();
-        // --- Step 2: Render the checkpoint's template and expand only the
-        // processor-owned image markers it emitted. ---
-        let token_ids = self.render_prompt_tokens(&messages, &config, &num_patches_list)?;
-        let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
-
-        // --- Step 4: Vision encoding ---
         let generation_stream = Stream::new(DeviceType::Gpu);
-        let vision_features = if !processed_images.is_empty() {
-            // Stack all tiles from all images: [total_tiles, H, W, C]
-            let all_pixels = stack_processed_images(&processed_images)?;
-
-            let vit_out = {
-                let _ctx = StreamContext::new(generation_stream);
-                self.vision.forward(&all_pixels)?
-            };
-
-            // Bridge: pixel shuffle + MLP projection
-            let bridge_out = {
-                let _ctx = StreamContext::new(generation_stream);
-                self.bridge.forward(&vit_out)?
-            };
-
-            // bridge_out: [total_tiles, tokens_per_tile, llm_hidden]
-            // Flatten to [total_visual_tokens, llm_hidden]
-            let bridge_shape = bridge_out.shape()?;
-            let total_tiles = bridge_shape[0];
-            let tokens_per_tile = bridge_shape[1];
-            let hidden = bridge_shape[2];
-            Some(bridge_out.reshape(&[total_tiles * tokens_per_tile, hidden])?)
-        } else {
-            None
-        };
-
-        // --- Step 5: Prefix matching for KV cache reuse ---
-        let current_image_key = if image_bytes.is_empty() {
-            None
-        } else {
-            Some(crate::engine::compute_image_cache_key(&image_bytes))
-        };
-        let prefix_len = if reuse_cache && current_image_key == self.cached_image_key {
-            compute_prefix_match(&token_ids, &self.cached_token_history)
-        } else {
-            0
-        };
-
-        if prefix_len == 0 || !reuse_cache {
-            // Full reset for fresh generation
-            self.kv_caches = None;
-            self.init_kv_caches();
-        }
-        // Trim happens below after we know seq_len — see clamped_prefix
-
-        // --- Step 6: Prefill ---
-        let merged_embeds = if let Some(ref vf) = vision_features {
-            let text_embeds = {
-                let _ctx = StreamContext::new(generation_stream);
-                self.language_model.get_embeddings(&input_ids)?
-            };
-            let embed_dtype = text_embeds.dtype()?;
-            let vf_cast = if vf.dtype()? != embed_dtype {
-                vf.astype(embed_dtype)?
-            } else {
-                vf.clone()
-            };
-            merge_vision_features(
-                &input_ids,
-                &text_embeds,
-                &vf_cast,
-                self.config.img_context_token_id,
-            )?
-        } else {
-            let _ctx = StreamContext::new(generation_stream);
-            self.language_model.get_embeddings(&input_ids)?
-        };
-
-        // Clamp prefix to seq_len-1 so there's always at least 1 token to
-        // forward for logits. Handles the full-prefix-hit case where
-        // prefix_len == seq_len (identical prompt resent).
-        let seq_len = merged_embeds.shape()?[1];
-        let clamped_prefix = prefix_len.min(seq_len.saturating_sub(1) as usize);
-
-        // Trim KV cache to clamped_prefix to discard stale suffix tokens
-        if clamped_prefix > 0 && reuse_cache {
-            let cache_offset = self.get_cache_offset();
-            if cache_offset > clamped_prefix as i32
-                && let Some(caches) = self.kv_caches.as_mut()
-            {
-                for c in caches.iter_mut() {
-                    c.trim(clamped_prefix as i32);
-                }
-            }
-        }
-
-        let prefill_embeds = if clamped_prefix > 0 {
-            merged_embeds.slice_axis(1, clamped_prefix as i64, seq_len)?
-        } else {
-            merged_embeds
-        };
+        let prepared =
+            self.prepare_chat_prefill(&messages, &config, reuse_cache, generation_stream)?;
+        let PreparedQianfanPrompt {
+            token_ids,
+            prefill_embeds,
+            current_image_key,
+            num_patches_list,
+            cached_tokens,
+        } = prepared;
 
         let mut cache = self.kv_caches.take();
         let prefill_result: Result<MxArray> = {
@@ -655,15 +803,16 @@ impl QianfanOCRInner {
             full_history.extend_from_slice(&generated_tokens[..forwarded]);
             self.cached_token_history = full_history;
             self.cached_cache_offset = self.get_cache_offset();
-            // Track image state so the session delta path's guard 4
-            // (cached_image_key.is_some()) correctly rejects delta
-            // continuations that would collide with prior image context.
+            // Image identity and processor metadata are published together;
+            // a matching hash never observes patch counts from another turn.
             self.cached_image_key = current_image_key;
+            self.cached_num_patches_list = Some(num_patches_list);
         } else {
             // Not reusing — clear metadata to prevent stale prefix matches
             self.cached_token_history.clear();
             self.cached_cache_offset = 0;
             self.cached_image_key = None;
+            self.cached_num_patches_list = None;
         }
 
         // --- Step 10: Decode and parse ---
@@ -725,7 +874,7 @@ impl QianfanOCRInner {
             reasoning_tokens,
             finish_reason,
             raw_text: raw_decoded,
-            cached_tokens: clamped_prefix as u32,
+            cached_tokens: cached_tokens as u32,
             performance,
         })
     }
@@ -788,98 +937,16 @@ impl QianfanOCRInner {
                 None
             };
 
-            let image_bytes = extract_images_from_messages(&messages);
-
-            // --- Process images ---
-            let processor = QianfanImageProcessor::new(&self.config);
-            let image_refs: Vec<&[u8]> = image_bytes.iter().map(|b| &b[..]).collect();
-            let processed_images = processor.process_many(&image_refs)?;
-
-            let num_patches_list: Vec<u32> = processed_images.iter().map(|p| p.num_tiles).collect();
-            // --- Render the checkpoint's template and expand the
-            // processor-owned image markers. ---
-            let token_ids = self.render_prompt_tokens(&messages, &config, &num_patches_list)?;
-            let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
-
-            // --- Vision encoding ---
             let generation_stream = Stream::new(DeviceType::Gpu);
-            let vision_features = if !processed_images.is_empty() {
-                let all_pixels = stack_processed_images(&processed_images)?;
-                let vit_out = {
-                    let _ctx = StreamContext::new(generation_stream);
-                    self.vision.forward(&all_pixels)?
-                };
-                let bridge_out = {
-                    let _ctx = StreamContext::new(generation_stream);
-                    self.bridge.forward(&vit_out)?
-                };
-                let bridge_shape = bridge_out.shape()?;
-                let total_tiles = bridge_shape[0];
-                let tokens_per_tile = bridge_shape[1];
-                let hidden = bridge_shape[2];
-                Some(bridge_out.reshape(&[total_tiles * tokens_per_tile, hidden])?)
-            } else {
-                None
-            };
-
-            // --- Prefill (with cache reuse support) ---
-            let current_image_key = if image_bytes.is_empty() {
-                None
-            } else {
-                Some(crate::engine::compute_image_cache_key(&image_bytes))
-            };
-            let prefix_len = if reuse_cache && current_image_key == self.cached_image_key {
-                compute_prefix_match(&token_ids, &self.cached_token_history)
-            } else {
-                0
-            };
-
-            if prefix_len == 0 || !reuse_cache {
-                self.kv_caches = None;
-                self.init_kv_caches();
-            }
-
-            let merged_embeds = if let Some(ref vf) = vision_features {
-                let text_embeds = {
-                    let _ctx = StreamContext::new(generation_stream);
-                    self.language_model.get_embeddings(&input_ids)?
-                };
-                let embed_dtype = text_embeds.dtype()?;
-                let vf_cast = if vf.dtype()? != embed_dtype {
-                    vf.astype(embed_dtype)?
-                } else {
-                    vf.clone()
-                };
-                merge_vision_features(
-                    &input_ids,
-                    &text_embeds,
-                    &vf_cast,
-                    self.config.img_context_token_id,
-                )?
-            } else {
-                let _ctx = StreamContext::new(generation_stream);
-                self.language_model.get_embeddings(&input_ids)?
-            };
-
-            let seq_len = merged_embeds.shape()?[1];
-            let clamped_prefix = prefix_len.min(seq_len.saturating_sub(1) as usize);
-
-            if clamped_prefix > 0 && reuse_cache {
-                let cache_offset = self.get_cache_offset();
-                if cache_offset > clamped_prefix as i32
-                    && let Some(caches) = self.kv_caches.as_mut()
-                {
-                    for c in caches.iter_mut() {
-                        c.trim(clamped_prefix as i32);
-                    }
-                }
-            }
-
-            let prefill_embeds = if clamped_prefix > 0 {
-                merged_embeds.slice_axis(1, clamped_prefix as i64, seq_len)?
-            } else {
-                merged_embeds
-            };
+            let prepared =
+                self.prepare_chat_prefill(&messages, &config, reuse_cache, generation_stream)?;
+            let PreparedQianfanPrompt {
+                token_ids,
+                prefill_embeds,
+                current_image_key,
+                num_patches_list,
+                cached_tokens,
+            } = prepared;
 
             let mut cache = self.kv_caches.take();
             let prefill_result: Result<MxArray> = {
@@ -1060,12 +1127,13 @@ impl QianfanOCRInner {
                 full_history.extend_from_slice(&generated_tokens[..forwarded]);
                 self.cached_token_history = full_history;
                 self.cached_cache_offset = self.get_cache_offset();
-                // Track image state — mirrors the non-streaming save block.
                 self.cached_image_key = current_image_key;
+                self.cached_num_patches_list = Some(num_patches_list);
             } else {
                 self.cached_token_history.clear();
                 self.cached_cache_offset = 0;
                 self.cached_image_key = None;
+                self.cached_num_patches_list = None;
             }
 
             // Final chunk
@@ -1130,10 +1198,9 @@ impl QianfanOCRInner {
                 prompt_tokens: Some(prefill_token_count as u32),
                 reasoning_tokens: Some(reasoning_tokens),
                 raw_text: Some(raw_decoded),
-                // Start path: report the matched prefix length
-                // (`clamped_prefix`). Zero on a miss or disabled
+                // Start path: report the matched prefix length. Zero on a miss or disabled
                 // reuse, equal to the matched prefix length on a hit.
-                cached_tokens: Some(clamped_prefix as u32),
+                cached_tokens: Some(cached_tokens as u32),
                 performance,
                 is_reasoning: None,
             });
@@ -1142,6 +1209,7 @@ impl QianfanOCRInner {
         })();
 
         if let Err(e) = result {
+            self.reset_caches_sync();
             // Propagate errors through the same stream; the tokio pump task
             // in `QianfanOCRModel::chat_stream` forwards them to the JS
             // callback's error channel.
@@ -1168,8 +1236,9 @@ impl QianfanOCRInner {
     /// with `<|im_end|>` as the stop token so the decode loop leaves the
     /// caches on a clean ChatML boundary that subsequent
     /// [`Self::chat_session_continue_sync`] /
-    /// [`Self::chat_session_continue_tool_sync`] calls can append a raw
-    /// delta on top of.
+    /// [`Self::chat_session_continue_tool_sync`] calls can extend by
+    /// re-rendering the complete structured history through the model
+    /// template.
     ///
     /// Vision-capable: `messages` may carry images (they will be decoded
     /// through the InternViT → bridge pipeline inside `chat_turn_sync_core`,
@@ -1179,8 +1248,7 @@ impl QianfanOCRInner {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
     ) -> Result<ChatResult> {
-        // Mirror the symmetric guard in `chat_tokens_delta_sync`. The
-        // session API only makes sense with cache reuse enabled: if we
+        // The session API only makes sense with cache reuse enabled: if we
         // silently accept `reuse_cache = false`, the post-decode save
         // block wipes the caches we just populated, and the next
         // `chat_session_continue` call fails with a cryptic guard error.
@@ -1220,6 +1288,11 @@ impl QianfanOCRInner {
                 "chat_session_continue requires reuse_cache=true (leave as None or set to true)",
             ));
         }
+        if !self.has_live_session() {
+            return Err(Error::from_reason(
+                "chat_session_continue requires an initialized session (call chatSessionStart first)",
+            ));
+        }
         let eos_id = self.session_eos_id();
         self.chat_turn_sync_core(messages, config, eos_id)
     }
@@ -1232,327 +1305,6 @@ impl QianfanOCRInner {
         config: ChatConfig,
     ) -> Result<ChatResult> {
         self.chat_session_continue_sync(messages, config)
-    }
-
-    /// Prefill a pre-tokenized delta on top of the existing KV caches and
-    /// run the decode loop. This is a private low-level token primitive; the
-    /// role-aware session API always re-renders complete structured history
-    /// through the checkpoint template.
-    ///
-    /// Uses `<|im_end|>` as the eos token so the cached history continues
-    /// to end on a clean ChatML boundary for the next turn.
-    pub(crate) fn chat_tokens_delta_sync(
-        &mut self,
-        delta_tokens: Vec<u32>,
-        config: ChatConfig,
-    ) -> Result<ChatResult> {
-        // --- Five guards (mirrors Gemma4/Qwen3). ---
-        // The delta path is a session-reuse operation by construction: it
-        // prefills on top of the existing caches. `reuse_cache = Some(false)`
-        // would make the post-decode save block wipe those caches +
-        // `cached_token_history`, making the delta turn both depend on
-        // and then destroy the session. Reject early so no state is
-        // mutated.
-        if config.reuse_cache == Some(false) {
-            return Err(Error::from_reason(
-                "chat_tokens_delta_sync requires reuse_cache to be enabled; \
-                 the delta path operates on session state by construction",
-            ));
-        }
-        if self.cached_token_history.is_empty() {
-            return Err(Error::from_reason(
-                "chat_tokens_delta_sync requires an initialized session (call chatSessionStart first)",
-            ));
-        }
-        if delta_tokens.is_empty() {
-            return Err(Error::from_reason(
-                "chat_tokens_delta_sync requires at least one delta token",
-            ));
-        }
-        if self.cached_image_key.is_some() {
-            return Err(Error::from_reason(format!(
-                "{}chat_tokens_delta_sync cannot be called while image state is cached; call chatSessionStart with the new images instead",
-                crate::engine::IMAGE_CHANGE_RESTART_PREFIX
-            )));
-        }
-        if self.kv_caches.is_none() {
-            return Err(Error::from_reason(
-                "chat_tokens_delta_sync requires live KV caches; call chatSessionStart first",
-            ));
-        }
-
-        // Session path: use `<|im_end|>` as eos, NOT config.eos_token_id.
-        // This keeps the cached history aligned on a clean ChatML
-        // boundary for the next `chat_session_continue*` call.
-        let eos_token_id = self.session_eos_id();
-
-        // Clamp a nonpositive budget to 0 so the `Vec::with_capacity(.. as
-        // usize)` below never sees a negative `i32` (`-1 as usize` would
-        // request `usize::MAX`); the `0..max_new_tokens` loop then emits 0.
-        let max_new_tokens = config.max_new_tokens.unwrap_or(512).max(0);
-        let temperature = config.temperature.unwrap_or(0.0);
-        let top_k = config.top_k.unwrap_or(0);
-        let top_p = config.top_p.unwrap_or(1.0);
-        let min_p = config.min_p.unwrap_or(0.0);
-        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
-        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
-        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
-        let presence_context_size = config.presence_context_size.unwrap_or(20);
-        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
-        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-        let max_consecutive_tokens = config
-            .max_consecutive_tokens
-            .unwrap_or(crate::sampling::DEFAULT_MAX_CONSECUTIVE_TOKENS);
-        let max_ngram_repeats = config
-            .max_ngram_repeats
-            .unwrap_or(crate::sampling::DEFAULT_MAX_NGRAM_REPEATS);
-        let ngram_size = config
-            .ngram_size
-            .unwrap_or(crate::sampling::DEFAULT_NGRAM_SIZE);
-        let report_perf = config.report_performance.unwrap_or(false);
-
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
-        // Capture the full prior-cached length BEFORE appending the
-        // delta. The delta path reuses the entire cached prefix by
-        // construction (it's a strict extension of
-        // `cached_token_history`), so `prior_cached_len` IS the token
-        // count skipped by the warm cache and must be surfaced on
-        // `ChatResult.cached_tokens` below. Without this, every Qianfan
-        // OCR delta turn misreports as a MISS (`cached_tokens = 0`),
-        // blocking the `/v1/responses` `prefix_hit` promotion.
-        let prior_cached_len = self.cached_token_history.len();
-
-        // Build the full token history = cached_history + delta. Used as
-        // penalty context AND the snapshot saved back into
-        // `cached_token_history` at the end.
-        let mut all_tokens: Vec<u32> =
-            Vec::with_capacity(self.cached_token_history.len() + delta_tokens.len());
-        all_tokens.extend_from_slice(&self.cached_token_history);
-        all_tokens.extend_from_slice(&delta_tokens);
-
-        let prefill_token_count = all_tokens.len();
-
-        // Text-only prefill of the delta on top of the existing caches.
-        let generation_stream = Stream::new(DeviceType::Gpu);
-        let input_ids = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
-        let merged_embeds = {
-            let _ctx = StreamContext::new(generation_stream);
-            self.language_model.get_embeddings(&input_ids)?
-        };
-
-        let mut cache = self.kv_caches.take();
-        let prefill_result: Result<MxArray> = {
-            let _ctx = StreamContext::new(generation_stream);
-            self.language_model
-                .forward_from_embeddings(&merged_embeds, &mut cache)
-        };
-        self.kv_caches = cache;
-        let prefill_logits = prefill_result?;
-
-        prefill_logits.eval();
-        synchronize_and_clear_cache();
-
-        // Last logits for first sampled token
-        let prefill_seq = prefill_logits.shape()?[1];
-        let mut last_logits = prefill_logits
-            .slice_axis(1, prefill_seq - 1, prefill_seq)?
-            .squeeze(Some(&[0, 1]))?;
-
-        let sampling_config = SamplingConfig {
-            temperature: Some(temperature),
-            top_k: Some(top_k),
-            top_p: Some(top_p),
-            min_p: Some(min_p),
-        };
-
-        if repetition_penalty != 1.0 {
-            last_logits = apply_repetition_penalty(
-                &last_logits,
-                &all_tokens,
-                repetition_penalty,
-                Some(repetition_context_size),
-            )?;
-        }
-        if presence_penalty != 0.0 {
-            last_logits = apply_presence_penalty(
-                &last_logits,
-                &all_tokens,
-                presence_penalty,
-                Some(presence_context_size),
-            )?;
-        }
-        if frequency_penalty != 0.0 {
-            last_logits = apply_frequency_penalty(
-                &last_logits,
-                &all_tokens,
-                frequency_penalty,
-                Some(frequency_context_size),
-            )?;
-        }
-
-        let mut token = sample(&last_logits, Some(sampling_config))?;
-        token.eval();
-
-        let first_token_instant = generation_start.map(|_| std::time::Instant::now());
-
-        let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(crate::engine::generated_capacity_hint(max_new_tokens));
-        let mut finish_reason = "length".to_string();
-
-        for step in 0..max_new_tokens {
-            let token_value = token.item_at_int32(0)? as u32;
-            generated_tokens.push(token_value);
-            all_tokens.push(token_value);
-
-            if token_value == eos_token_id {
-                finish_reason = "stop".to_string();
-                break;
-            }
-
-            if let Some(reason) = check_repetition_cutoff(
-                &generated_tokens,
-                max_consecutive_tokens,
-                max_ngram_repeats,
-                ngram_size,
-            ) {
-                finish_reason = reason.to_string();
-                break;
-            }
-
-            let token_2d = token.reshape(&[1, 1])?;
-            let mut cache = self.kv_caches.take();
-            let step_result: Result<MxArray> = {
-                let _ctx = StreamContext::new(generation_stream);
-                self.language_model.forward(&token_2d, &mut cache)
-            };
-            self.kv_caches = cache;
-            let logits = step_result?;
-
-            let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
-
-            if repetition_penalty != 1.0 {
-                next_logits = apply_repetition_penalty(
-                    &next_logits,
-                    &all_tokens,
-                    repetition_penalty,
-                    Some(repetition_context_size),
-                )?;
-            }
-            if presence_penalty != 0.0 {
-                next_logits = apply_presence_penalty(
-                    &next_logits,
-                    &all_tokens,
-                    presence_penalty,
-                    Some(presence_context_size),
-                )?;
-            }
-            if frequency_penalty != 0.0 {
-                next_logits = apply_frequency_penalty(
-                    &next_logits,
-                    &all_tokens,
-                    frequency_penalty,
-                    Some(frequency_context_size),
-                )?;
-            }
-
-            token = sample(&next_logits, Some(sampling_config))?;
-            token.eval();
-
-            if (step + 1) % 256 == 0 {
-                synchronize_and_clear_cache();
-            }
-        }
-
-        // Sync token history with cache state (same drop-last idiom as
-        // `chat_turn_sync_core`: terminal stop/repetition tokens were sampled
-        // but never forwarded into the cache).
-        let forwarded = if finish_reason == "stop" || finish_reason == "repetition" {
-            generated_tokens.len().saturating_sub(1)
-        } else {
-            generated_tokens.len()
-        };
-        let mut full_history =
-            Vec::with_capacity(self.cached_token_history.len() + delta_tokens.len() + forwarded);
-        full_history.extend_from_slice(&self.cached_token_history);
-        full_history.extend_from_slice(&delta_tokens);
-        full_history.extend_from_slice(&generated_tokens[..forwarded]);
-        self.cached_token_history = full_history;
-        self.cached_cache_offset = self.get_cache_offset();
-        // The delta path is text-only (guarded above); the image key
-        // invariant is preserved by construction, but we still explicitly
-        // leave it as-is (always None here, because guard 4 rejected
-        // any `Some(_)` state on entry).
-
-        // Decode + tool/thinking parsing
-        let raw_decoded = self.tokenizer.decode_sync(&generated_tokens, true)?;
-        let cleaned = raw_decoded.trim().to_string();
-
-        let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
-        let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
-
-        if tool_calls.iter().any(|tc| tc.status == "ok") {
-            finish_reason = "tool_calls".to_string();
-        }
-
-        let performance =
-            if let (Some(gen_start), Some(first_tok)) = (generation_start, first_token_instant) {
-                let generation_end = std::time::Instant::now();
-                let prefill_toks = prefill_token_count as f64;
-                let gen_toks = generated_tokens.len() as f64;
-                let ttft_ms = first_tok.duration_since(gen_start).as_secs_f64() * 1000.0;
-                let decode_ms = generation_end.duration_since(first_tok).as_secs_f64() * 1000.0;
-                Some(crate::profiling::PerformanceMetrics {
-                    ttft_ms,
-                    prefill_tokens_per_second: if ttft_ms > 0.0 {
-                        prefill_toks / (ttft_ms / 1000.0)
-                    } else {
-                        0.0
-                    },
-                    decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
-                        (gen_toks - 1.0) / (decode_ms / 1000.0)
-                    } else {
-                        0.0
-                    },
-                    // Qianfan-OCR has no MTP heads — acceptance stays None.
-                    mtp_mean_accepted_tokens: None,
-                    mtp_mean_accepted_tokens_total: None,
-                    mtp_acceptance_by_position: None,
-                    mtp_cycles: None,
-                    mtp_mean_depth: None,
-                    profile_phases: None,
-                })
-            } else {
-                None
-            };
-
-        let reasoning_tokens = tools::count_reasoning_tokens(
-            &thinking,
-            &generated_tokens,
-            self.tokenizer.think_end_id(),
-        );
-
-        Ok(ChatResult {
-            text: text.trim().to_string(),
-            tool_calls,
-            thinking,
-            thinking_enabled: crate::engine::resolve_enable_thinking(&config).unwrap_or(true),
-            num_tokens: generated_tokens.len() as u32,
-            prompt_tokens: prefill_token_count as u32,
-            reasoning_tokens,
-            finish_reason,
-            raw_text: raw_decoded,
-            // Delta path reuses the full cached prefix by construction
-            // (strict extension of `cached_token_history`). Report it
-            // so the server endpoint can promote `X-Session-Cache` to
-            // `prefix_hit` on warm-cache continuations.
-            cached_tokens: prior_cached_len as u32,
-            performance,
-        })
     }
 
     /// Streaming variant of [`Self::chat_session_start_sync`].
@@ -1610,6 +1362,13 @@ impl QianfanOCRInner {
             );
             return;
         }
+        if !self.has_live_session() {
+            crate::engine::send_stream_error(
+                &stream_tx,
+                "chat_stream_session_continue requires an initialized session (call chatStreamSessionStart first)",
+            );
+            return;
+        }
 
         let eos_id = self.session_eos_id();
         self.chat_turn_stream_core(messages, config, stream_tx, cancelled, eos_id);
@@ -1624,385 +1383,6 @@ impl QianfanOCRInner {
         cancelled: Arc<AtomicBool>,
     ) {
         self.chat_stream_session_continue_sync(messages, config, stream_tx, cancelled);
-    }
-
-    /// Streaming analog of [`Self::chat_tokens_delta_sync`]: prefill the
-    /// caller-provided delta tokens on top of the existing KV caches and
-    /// stream the reply through `stream_tx`.
-    ///
-    /// Applies the same five guards as the non-streaming path (routed via
-    /// `send_stream_error` so they surface as an error-item rather than a
-    /// fake done chunk). Uses `<|im_end|>` as the eos token so the cached
-    /// history continues to end on a clean ChatML boundary.
-    pub(crate) fn chat_stream_tokens_delta_sync(
-        &mut self,
-        delta_tokens: Vec<u32>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        if cancelled.load(Ordering::Relaxed) {
-            crate::engine::send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta cancelled before start",
-            );
-            return;
-        }
-
-        if config.reuse_cache == Some(false) {
-            crate::engine::send_stream_error(
-                &stream_tx,
-                "chat_tokens_delta_sync requires reuse_cache to be enabled; \
-                 the delta path operates on session state by construction",
-            );
-            return;
-        }
-        if self.cached_token_history.is_empty() {
-            crate::engine::send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta requires an initialized session (call chatStreamSessionStart first)",
-            );
-            return;
-        }
-        if delta_tokens.is_empty() {
-            crate::engine::send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta requires at least one delta token",
-            );
-            return;
-        }
-        if self.cached_image_key.is_some() {
-            crate::engine::send_stream_error(
-                &stream_tx,
-                &format!(
-                    "{}chat_stream_tokens_delta cannot be called while image state is cached; call chatStreamSessionStart with the new images instead",
-                    crate::engine::IMAGE_CHANGE_RESTART_PREFIX
-                ),
-            );
-            return;
-        }
-        if self.kv_caches.is_none() {
-            crate::engine::send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta requires live KV caches; call chatStreamSessionStart first",
-            );
-            return;
-        }
-
-        let result =
-            self.chat_stream_tokens_delta_sync_inner(delta_tokens, config, &stream_tx, &cancelled);
-        if let Err(e) = result {
-            let _ = stream_tx.send(Err(e));
-        }
-    }
-
-    /// Inner body of [`Self::chat_stream_tokens_delta_sync`]: prefill
-    /// delta tokens on top of the live caches, then run the streaming
-    /// decode loop.
-    fn chat_stream_tokens_delta_sync_inner(
-        &mut self,
-        delta_tokens: Vec<u32>,
-        config: ChatConfig,
-        stream_tx: &StreamTx<ChatStreamChunk>,
-        cancelled: &Arc<AtomicBool>,
-    ) -> Result<()> {
-        let sender = StreamSender(stream_tx.clone());
-        let emit = |chunk: ChatStreamChunk| {
-            sender.call(Ok(chunk), ThreadsafeFunctionCallMode::NonBlocking);
-        };
-
-        let eos_token_id = self.session_eos_id();
-
-        // Clamp a nonpositive budget to 0 so the `Vec::with_capacity(.. as
-        // usize)` below never sees a negative `i32` (`-1 as usize` would
-        // request `usize::MAX`); the `0..max_new_tokens` loop then emits 0.
-        let max_new_tokens = config.max_new_tokens.unwrap_or(512).max(0);
-        let temperature = config.temperature.unwrap_or(0.0);
-        let top_k = config.top_k.unwrap_or(0);
-        let top_p = config.top_p.unwrap_or(1.0);
-        let min_p = config.min_p.unwrap_or(0.0);
-        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
-        let repetition_context_size = config.repetition_context_size.unwrap_or(256);
-        let presence_penalty = config.presence_penalty.unwrap_or(0.0);
-        let presence_context_size = config.presence_context_size.unwrap_or(20);
-        let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
-        let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-        let max_consecutive_tokens = config
-            .max_consecutive_tokens
-            .unwrap_or(crate::sampling::DEFAULT_MAX_CONSECUTIVE_TOKENS);
-        let max_ngram_repeats = config
-            .max_ngram_repeats
-            .unwrap_or(crate::sampling::DEFAULT_MAX_NGRAM_REPEATS);
-        let ngram_size = config
-            .ngram_size
-            .unwrap_or(crate::sampling::DEFAULT_NGRAM_SIZE);
-        let report_perf = config.report_performance.unwrap_or(false);
-
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
-        // Build full token history = cached_history + delta.
-        // Capture `prior_cached_len` BEFORE the extend — the delta path
-        // reuses the full prior history by construction, so this is the
-        // authoritative `cached_tokens` value reported on the terminal
-        // ChatStreamChunk.
-        let prior_cached_len = self.cached_token_history.len() as u32;
-        let mut all_tokens: Vec<u32> =
-            Vec::with_capacity(self.cached_token_history.len() + delta_tokens.len());
-        all_tokens.extend_from_slice(&self.cached_token_history);
-        all_tokens.extend_from_slice(&delta_tokens);
-
-        let prefill_token_count = all_tokens.len();
-
-        // Text-only prefill of the delta on top of the existing caches.
-        let generation_stream = Stream::new(DeviceType::Gpu);
-        let input_ids = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
-        let merged_embeds = {
-            let _ctx = StreamContext::new(generation_stream);
-            self.language_model.get_embeddings(&input_ids)?
-        };
-
-        let mut cache = self.kv_caches.take();
-        let prefill_result: Result<MxArray> = {
-            let _ctx = StreamContext::new(generation_stream);
-            self.language_model
-                .forward_from_embeddings(&merged_embeds, &mut cache)
-        };
-        self.kv_caches = cache;
-        let prefill_logits = prefill_result?;
-
-        prefill_logits.eval();
-        synchronize_and_clear_cache();
-
-        let prefill_seq = prefill_logits.shape()?[1];
-        let mut last_logits = prefill_logits
-            .slice_axis(1, prefill_seq - 1, prefill_seq)?
-            .squeeze(Some(&[0, 1]))?;
-
-        let sampling_config = SamplingConfig {
-            temperature: Some(temperature),
-            top_k: Some(top_k),
-            top_p: Some(top_p),
-            min_p: Some(min_p),
-        };
-
-        if repetition_penalty != 1.0 {
-            last_logits = apply_repetition_penalty(
-                &last_logits,
-                &all_tokens,
-                repetition_penalty,
-                Some(repetition_context_size),
-            )?;
-        }
-        if presence_penalty != 0.0 {
-            last_logits = apply_presence_penalty(
-                &last_logits,
-                &all_tokens,
-                presence_penalty,
-                Some(presence_context_size),
-            )?;
-        }
-        if frequency_penalty != 0.0 {
-            last_logits = apply_frequency_penalty(
-                &last_logits,
-                &all_tokens,
-                frequency_penalty,
-                Some(frequency_context_size),
-            )?;
-        }
-
-        let mut token = sample(&last_logits, Some(sampling_config))?;
-        token.eval();
-
-        let first_token_instant = generation_start.map(|_| std::time::Instant::now());
-
-        let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(crate::engine::generated_capacity_hint(max_new_tokens));
-        let mut finish_reason = "length".to_string();
-
-        // Stateful decoder for correct multi-byte/CJK streaming.
-        let mut decode_stream = self.tokenizer.inner().decode_stream(true);
-        let mut streamed_text_len: usize = 0;
-
-        for step in 0..max_new_tokens {
-            if cancelled.load(Ordering::Relaxed) {
-                finish_reason = "cancelled".to_string();
-                break;
-            }
-            let token_value = token.item_at_int32(0)? as u32;
-            generated_tokens.push(token_value);
-            all_tokens.push(token_value);
-
-            if token_value == eos_token_id {
-                finish_reason = "stop".to_string();
-                break;
-            }
-
-            let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
-                &mut decode_stream,
-                self.tokenizer.inner(),
-                token_value,
-                &generated_tokens,
-                streamed_text_len,
-            );
-            streamed_text_len += token_text.len();
-
-            emit(ChatStreamChunk {
-                text: token_text,
-                done: false,
-                finish_reason: None,
-                tool_calls: None,
-                thinking: None,
-                thinking_enabled: None,
-                num_tokens: None,
-                prompt_tokens: None,
-                reasoning_tokens: None,
-                raw_text: None,
-                cached_tokens: None,
-                performance: None,
-                is_reasoning: None,
-            });
-
-            if let Some(reason) = check_repetition_cutoff(
-                &generated_tokens,
-                max_consecutive_tokens,
-                max_ngram_repeats,
-                ngram_size,
-            ) {
-                finish_reason = reason.to_string();
-                break;
-            }
-
-            let token_2d = token.reshape(&[1, 1])?;
-            let mut cache = self.kv_caches.take();
-            let step_result: Result<MxArray> = {
-                let _ctx = StreamContext::new(generation_stream);
-                self.language_model.forward(&token_2d, &mut cache)
-            };
-            self.kv_caches = cache;
-            let logits = step_result?;
-
-            let mut next_logits = logits.squeeze(Some(&[0, 1]))?;
-
-            if repetition_penalty != 1.0 {
-                next_logits = apply_repetition_penalty(
-                    &next_logits,
-                    &all_tokens,
-                    repetition_penalty,
-                    Some(repetition_context_size),
-                )?;
-            }
-            if presence_penalty != 0.0 {
-                next_logits = apply_presence_penalty(
-                    &next_logits,
-                    &all_tokens,
-                    presence_penalty,
-                    Some(presence_context_size),
-                )?;
-            }
-            if frequency_penalty != 0.0 {
-                next_logits = apply_frequency_penalty(
-                    &next_logits,
-                    &all_tokens,
-                    frequency_penalty,
-                    Some(frequency_context_size),
-                )?;
-            }
-
-            token = sample(&next_logits, Some(sampling_config))?;
-            token.eval();
-
-            if (step + 1) % 256 == 0 {
-                synchronize_and_clear_cache();
-            }
-        }
-
-        // Save token history with the drop-last idiom (matches
-        // non-streaming path).
-        let forwarded = if finish_reason == "stop" || finish_reason == "repetition" {
-            generated_tokens.len().saturating_sub(1)
-        } else {
-            generated_tokens.len()
-        };
-        let mut full_history =
-            Vec::with_capacity(self.cached_token_history.len() + delta_tokens.len() + forwarded);
-        full_history.extend_from_slice(&self.cached_token_history);
-        full_history.extend_from_slice(&delta_tokens);
-        full_history.extend_from_slice(&generated_tokens[..forwarded]);
-        self.cached_token_history = full_history;
-        self.cached_cache_offset = self.get_cache_offset();
-
-        // Final chunk
-        let raw_decoded = self.tokenizer.decode_sync(&generated_tokens, true)?;
-        let cleaned = raw_decoded.trim().to_string();
-        let (text_after_thinking, thinking) = tools::parse_thinking(&cleaned);
-        let (text, tool_calls) = tools::parse_tool_calls(&text_after_thinking);
-
-        if tool_calls.iter().any(|tc| tc.status == "ok") {
-            finish_reason = "tool_calls".to_string();
-        }
-
-        let performance =
-            if let (Some(gen_start), Some(first_tok)) = (generation_start, first_token_instant) {
-                let generation_end = std::time::Instant::now();
-                let prefill_toks = prefill_token_count as f64;
-                let gen_toks = generated_tokens.len() as f64;
-                let ttft_ms = first_tok.duration_since(gen_start).as_secs_f64() * 1000.0;
-                let decode_ms = generation_end.duration_since(first_tok).as_secs_f64() * 1000.0;
-                Some(crate::profiling::PerformanceMetrics {
-                    ttft_ms,
-                    prefill_tokens_per_second: if ttft_ms > 0.0 {
-                        prefill_toks / (ttft_ms / 1000.0)
-                    } else {
-                        0.0
-                    },
-                    decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
-                        (gen_toks - 1.0) / (decode_ms / 1000.0)
-                    } else {
-                        0.0
-                    },
-                    // Qianfan-OCR has no MTP heads — acceptance stays None.
-                    mtp_mean_accepted_tokens: None,
-                    mtp_mean_accepted_tokens_total: None,
-                    mtp_acceptance_by_position: None,
-                    mtp_cycles: None,
-                    mtp_mean_depth: None,
-                    profile_phases: None,
-                })
-            } else {
-                None
-            };
-
-        let reasoning_tokens = tools::count_reasoning_tokens(
-            &thinking,
-            &generated_tokens,
-            self.tokenizer.think_end_id(),
-        );
-
-        emit(ChatStreamChunk {
-            text: text.trim().to_string(),
-            done: true,
-            finish_reason: Some(finish_reason),
-            tool_calls: Some(tool_calls),
-            thinking,
-            thinking_enabled: Some(crate::engine::resolve_enable_thinking(&config).unwrap_or(true)),
-            num_tokens: Some(generated_tokens.len() as u32),
-            prompt_tokens: Some(prefill_token_count as u32),
-            reasoning_tokens: Some(reasoning_tokens),
-            raw_text: Some(raw_decoded),
-            // Delta path reuses the full prior history by construction
-            // — report `prior_cached_len` (captured before the
-            // `self.cached_token_history` extend above) as the
-            // authoritative cached-prefix length.
-            cached_tokens: Some(prior_cached_len),
-            performance,
-            is_reasoning: None,
-        });
-
-        Ok(())
     }
 
     /// Low-level token generation given pre-tokenized input.
@@ -2031,6 +1411,7 @@ impl QianfanOCRInner {
         // generate() always does fresh generation — clear cached metadata
         self.cached_token_history.clear();
         self.cached_image_key = None;
+        self.cached_num_patches_list = None;
         self.cached_cache_offset = 0;
 
         // Prefill
@@ -2553,6 +1934,32 @@ fn load_qianfan_ocr_inner_from_dir(model_path: &str) -> Result<(QianfanOCRInner,
 
     let config = parse_config_json(&raw);
 
+    // Validate the tokenizer and the checkpoint-owned template before loading
+    // weights or constructing the vision/language stacks. Qianfan has no Rust
+    // wire-format fallback: an incompatible checkpoint should fail quickly,
+    // before doing the expensive model build.
+    let tokenizer_path = path.join("tokenizer.json");
+    let tokenizer = if tokenizer_path.exists() {
+        info!("  Loading tokenizer from {}", tokenizer_path.display());
+        Arc::new(Qwen3Tokenizer::load_from_file_sync(
+            tokenizer_path
+                .to_str()
+                .ok_or_else(|| Error::from_reason("Non-UTF-8 tokenizer path"))?,
+        )?)
+    } else {
+        return Err(Error::from_reason(format!(
+            "Tokenizer not found: {}",
+            tokenizer_path.display()
+        )));
+    };
+    if !tokenizer.has_chat_template() {
+        return Err(Error::from_reason(format!(
+            "Qianfan-OCR model at {} is missing a model-provided chat template; \
+             add chat_template.jinja or tokenizer_config.json.chat_template",
+            path.display()
+        )));
+    }
+
     info!(
         "Loading Qianfan-OCR model from: {} (vision: {} layers, LM: {} layers)",
         model_path, config.vision_config.num_hidden_layers, config.llm_config.num_hidden_layers
@@ -2597,29 +2004,6 @@ fn load_qianfan_ocr_inner_from_dir(model_path: &str) -> Result<(QianfanOCRInner,
     );
     let language_model = InternVLLanguageModel::build(&weights, "lm", &config.llm_config)?;
 
-    // --- Load tokenizer ---
-    let tokenizer_path = Path::new(model_path).join("tokenizer.json");
-    let tokenizer = if tokenizer_path.exists() {
-        info!("  Loading tokenizer from {}", tokenizer_path.display());
-        Arc::new(Qwen3Tokenizer::load_from_file_sync(
-            tokenizer_path
-                .to_str()
-                .ok_or_else(|| Error::from_reason("Non-UTF-8 tokenizer path"))?,
-        )?)
-    } else {
-        return Err(Error::from_reason(format!(
-            "Tokenizer not found: {}",
-            tokenizer_path.display()
-        )));
-    };
-    if !tokenizer.has_chat_template() {
-        return Err(Error::from_reason(format!(
-            "Qianfan-OCR model at {} is missing a model-provided chat template; \
-             add chat_template.jinja or tokenizer_config.json.chat_template",
-            Path::new(model_path).display()
-        )));
-    }
-
     info!(
         "Qianfan-OCR model loaded: vision={} layers, LM={} layers, {} total weights",
         config.vision_config.num_hidden_layers,
@@ -2644,6 +2028,7 @@ fn load_qianfan_ocr_inner_from_dir(model_path: &str) -> Result<(QianfanOCRInner,
         kv_caches: None,
         cached_token_history: Vec::new(),
         cached_image_key: None,
+        cached_num_patches_list: None,
         cached_cache_offset: 0,
     };
     Ok((inner, weight_bytes))
@@ -2863,6 +2248,58 @@ mod tests {
             expand_qianfan_image_placeholders(&[7, 90, 91, 8], &[90, 91], &[1, 1], 2, 10, 11, 12)
                 .expect_err("one marker cannot represent two images");
         assert!(err.reason.contains("emitted 1 image marker"));
+    }
+
+    #[test]
+    fn session_state_requires_history_and_live_kv() {
+        assert!(!qianfan_session_state_is_live(&[], 0, &[]));
+        assert!(!qianfan_session_state_is_live(&[1], 0, &[0]));
+        assert!(!qianfan_session_state_is_live(&[1], 1, &[]));
+        assert!(!qianfan_session_state_is_live(&[1], 1, &[1, 0]));
+        assert!(qianfan_session_state_is_live(&[1], 1, &[1, 1]));
+    }
+
+    #[test]
+    fn patch_counts_reuse_requires_matching_image_identity_and_count() {
+        let cached = [2, 4];
+        assert_eq!(
+            reusable_qianfan_patch_counts(2, Some(7), Some(7), Some(&cached)),
+            Some(vec![2, 4])
+        );
+        assert_eq!(
+            reusable_qianfan_patch_counts(2, Some(8), Some(7), Some(&cached)),
+            None
+        );
+        assert_eq!(
+            reusable_qianfan_patch_counts(1, Some(7), Some(7), Some(&cached)),
+            None
+        );
+        assert_eq!(
+            reusable_qianfan_patch_counts(0, None, Some(7), Some(&cached)),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn warm_prefix_covering_images_skips_image_work() {
+        let tokens = [10, 99, 99, 11, 20, 21];
+        let cached = [10, 99, 99, 11, 20];
+        let plan = plan_qianfan_prefill(&tokens, &cached, true, true, 99);
+        assert_eq!(plan.prefix_len, cached.len());
+        assert_eq!(plan.clamped_prefix, cached.len());
+        assert!(!plan.suffix_requires_image_features);
+    }
+
+    #[test]
+    fn image_work_is_required_on_prefix_or_image_identity_miss() {
+        let tokens = [10, 99, 99, 11, 20];
+        let prefix_before_image = plan_qianfan_prefill(&tokens, &[10], true, true, 99);
+        assert_eq!(prefix_before_image.prefix_len, 1);
+        assert!(prefix_before_image.suffix_requires_image_features);
+
+        let changed_image = plan_qianfan_prefill(&tokens, &tokens, true, false, 99);
+        assert_eq!(changed_image.prefix_len, 0);
+        assert!(changed_image.suffix_requires_image_features);
     }
 
     #[test]

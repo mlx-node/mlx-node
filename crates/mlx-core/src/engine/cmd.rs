@@ -536,9 +536,16 @@ mod mock_backend_tests {
         // ---- hook knobs (default off == ChatML defaults) ----
         /// Fail the stepper's `end_decode`.
         fail_end_decode_knob: bool,
+        /// Model Qwen3.5's turn-internal miss semantics: physical caches reset,
+        /// but committed history remains until a successful save overwrites it.
+        /// The explicit command reset must still clear both.
+        prefix_miss_preserves_history_knob: bool,
         /// Tag `finalize_turn`'s output so tests can prove the override
         /// (not the default pipeline) produced the result.
         finalize_marker_knob: bool,
+        /// Fail the family finalize hook after physical/session state was
+        /// saved, exercising the post-save transaction boundary.
+        fail_finalize_knob: bool,
         /// Extra stop ids returned from `extra_eos_ids`.
         extra_eos_knob: Vec<u32>,
         /// Force `report_performance = true` in `resolve_params`
@@ -593,7 +600,9 @@ mod mock_backend_tests {
                 eval_caches_calls: 0,
                 cache_cursor: Arc::new(AtomicUsize::new(0)),
                 fail_end_decode_knob: false,
+                prefix_miss_preserves_history_knob: false,
                 finalize_marker_knob: false,
+                fail_finalize_knob: false,
                 extra_eos_knob: Vec::new(),
                 force_report_perf_knob: false,
                 gen_defaults_knob: None,
@@ -660,7 +669,9 @@ mod mock_backend_tests {
         }
 
         fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
-            self.history.clear();
+            if scope == ResetScope::Command || !self.prefix_miss_preserves_history_knob {
+                self.history.clear();
+            }
             // Clearing the flat KV cache drops the physical cursor too.
             self.cache_cursor.store(0, Ordering::Relaxed);
             self.reset_calls.push(scope);
@@ -779,6 +790,9 @@ mod mock_backend_tests {
         }
 
         fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
+            if self.fail_finalize_knob {
+                return Err(Error::from_reason("mock finalization failed"));
+            }
             let mut result = crate::engine::finalize::finalize_chat_result(
                 args.tokenizer,
                 args.generated_tokens,
@@ -1285,7 +1299,7 @@ mod mock_backend_tests {
     }
 
     #[test]
-    fn delta_guards_reject_bad_sessions() {
+    fn session_guards_reject_bad_sessions() {
         // Uninitialized session → typed error.
         let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_IM_END]]);
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
@@ -1420,6 +1434,83 @@ mod mock_backend_tests {
         let _ = (h1, r1);
     }
 
+    /// Qwen3.5 preserves committed history across a turn-internal PrefixMiss
+    /// reset so a successful full re-prefill can replace it at commit. If that
+    /// re-prefill fails, the old history must not remain eligible for a prefix
+    /// hit against the now-empty physical caches. The generic error boundary
+    /// therefore performs a command-scope invalidation, and the next start
+    /// cold-prefills the complete template-rendered prompt.
+    #[test]
+    fn prefix_miss_prefill_error_fails_closed_before_retry() {
+        let mut backend = MockBackend::new(Vec::new());
+        backend.prefix_miss_preserves_history_knob = true;
+
+        let retry_messages = user_messages("hello world again");
+        let retry_prompt = backend
+            .tokenizer
+            .apply_chat_template_sync(&retry_messages, Some(true), None, None)
+            .unwrap_or_else(|e| panic!("retry probe render failed: {}", e.reason));
+        assert!(retry_prompt.len() > 4);
+
+        // Seed a Qwen3.5-shaped committed session whose history is a strict
+        // prefix of the later retry prompt.
+        let stale_prefix_len = retry_prompt.len() - 3;
+        backend.history = retry_prompt[..stale_prefix_len].to_vec();
+        backend
+            .cache_cursor
+            .store(stale_prefix_len, Ordering::Relaxed);
+
+        // This unrelated full history misses the stale prefix. PrefixMiss
+        // clears the physical cursor but deliberately preserves history; the
+        // scripted prefill then fails after advancing the cursor.
+        let err = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("different conversation"),
+            config: greedy_config(),
+            reply,
+        })
+        .expect_err("missing mock script must fail after prefill mutation");
+        assert!(
+            err.reason.contains("mock: no script left"),
+            "got: {}",
+            err.reason
+        );
+        assert_eq!(
+            backend.reset_calls,
+            vec![ResetScope::PrefixMiss, ResetScope::Command],
+            "the failed mutating turn must escalate from miss-reset to fail-closed invalidation"
+        );
+        assert!(
+            backend.history.is_empty(),
+            "command-scope abort must clear history preserved by PrefixMiss"
+        );
+        assert_eq!(
+            backend.cache_cursor.load(Ordering::Relaxed),
+            0,
+            "command-scope abort must clear the partially advanced physical cache"
+        );
+
+        // A retry that would have matched the stale prefix must now be cold:
+        // cached_tokens=0, a PrefixMiss reset, and the whole rendered prompt
+        // reaches prefill instead of only its three-token suffix.
+        backend.scripts.push_back(vec![TOK_OK, TOK_IM_END]);
+        let recovered = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: retry_messages,
+            config: greedy_config(),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("cold retry failed: {}", e.reason));
+        assert_eq!(recovered.cached_tokens, 0);
+        assert_eq!(backend.prefill_calls[1], retry_prompt);
+        assert_eq!(
+            backend.reset_calls,
+            vec![
+                ResetScope::PrefixMiss,
+                ResetScope::Command,
+                ResetScope::PrefixMiss
+            ]
+        );
+    }
+
     // ---- optional hook seams ----
 
     /// `end_decode` Err aborts the turn BEFORE `save_cache_state`:
@@ -1450,9 +1541,51 @@ mod mock_backend_tests {
             backend.history.is_empty(),
             "no session state may be persisted on the abort path"
         );
+        assert_eq!(
+            backend.reset_calls,
+            vec![ResetScope::PrefixMiss, ResetScope::Command],
+            "a post-prefill decode failure must invalidate the physical session"
+        );
+        assert_eq!(
+            backend.cache_cursor.load(Ordering::Relaxed),
+            0,
+            "decode failure must not leave partially advanced flat caches"
+        );
         // The decode itself ran (prefill happened) — only the post-loop
         // export failed.
         assert_eq!(backend.prefill_calls.len(), 1);
+    }
+
+    /// A family finalizer runs after `save_cache_state`, but the public turn is
+    /// not committed until it returns a result. Its error must therefore roll
+    /// back the just-published native history and physical cache together.
+    #[test]
+    fn finalize_error_invalidates_post_save_session_state() {
+        let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_IM_END]]);
+        backend.fail_finalize_knob = true;
+
+        let err = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config: greedy_config(),
+            reply,
+        })
+        .expect_err("finalize failure must abort the public turn");
+        assert!(
+            err.reason.contains("mock finalization failed"),
+            "got: {}",
+            err.reason
+        );
+        assert_eq!(
+            backend.save_calls.len(),
+            1,
+            "the regression must exercise failure after native save"
+        );
+        assert_eq!(
+            backend.reset_calls,
+            vec![ResetScope::PrefixMiss, ResetScope::Command]
+        );
+        assert!(backend.history.is_empty());
+        assert_eq!(backend.cache_cursor.load(Ordering::Relaxed), 0);
     }
 
     /// The `finalize_turn` override (not the default pipeline) produces
@@ -1736,11 +1869,11 @@ mod mock_backend_tests {
         assert_eq!(r.finish_reason, "stop");
     }
 
-    /// A STREAMING delta turn's terminal chunk reports the family's
-    /// `stream_delta_prompt_tokens` choice (default: the FULL
-    /// history+delta length, matching the sync delta result).
+    /// A streaming full-history continuation reports the complete rendered
+    /// prompt on its terminal chunk while still prefilling only the reusable
+    /// suffix.
     #[test]
-    fn streaming_delta_terminal_chunk_reports_full_prompt_tokens() {
+    fn streaming_continuation_reports_full_prompt_tokens() {
         let mut backend = MockBackend::new(vec![
             vec![TOK_HELLO, TOK_IM_END],
             vec![TOK_WORLD, TOK_IM_END],
@@ -1779,23 +1912,21 @@ mod mock_backend_tests {
         let last = chunks.last().unwrap_or_else(|| panic!("no chunks"));
         assert!(last.done);
 
-        let delta_len = backend.prefill_calls[1].len();
-        assert!(delta_len > 0 && delta_len < h1_len + delta_len);
+        let suffix_len = backend.prefill_calls[1].len();
+        assert!(suffix_len > 0 && suffix_len < h1_len + suffix_len);
         assert_eq!(
             last.prompt_tokens,
-            Some((h1_len + delta_len) as u32),
-            "streaming delta terminal chunk must report the FULL \
-             history+delta length (delta alone would be {delta_len})",
+            Some((h1_len + suffix_len) as u32),
+            "streaming terminal chunk must report the FULL rendered prompt \
+             (the newly-prefilled suffix alone would be {suffix_len})",
         );
         // cached_tokens still reports the full prior history.
         assert_eq!(last.cached_tokens, Some(h1_len as u32));
     }
 
-    /// The streaming delta guards name the streaming entry points; the
-    /// sync twin keeps the sync names (asserted in
-    /// `delta_guards_reject_bad_sessions`).
+    /// Streaming continuation guards name the streaming entry points.
     #[test]
-    fn streaming_delta_guard_strings_name_streaming_entry_points() {
+    fn streaming_continue_guard_names_streaming_entry_point() {
         let mut backend = MockBackend::new(vec![]);
 
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -2020,31 +2151,6 @@ mod mock_backend_tests {
             backend.prefill_calls.len(),
             1,
             "continuation must derive media from the supplied transcript"
-        );
-    }
-
-    #[test]
-    fn default_delta_guard_checks_live_media_per_kind() {
-        let mut backend = MockBackend::new(vec![]);
-        // This mock target advertises images (through the speculative knob),
-        // but not audio.
-        backend.speculative_complete_knob = true;
-        backend.session_media_knob = MediaCapabilities::IMAGES;
-        assert!(
-            backend
-                .text_delta_media_guard("chat_tokens_delta_sync")
-                .is_none(),
-            "an image-capable target may continue its image context",
-        );
-
-        backend.session_media_knob = MediaCapabilities::AUDIO;
-        assert_eq!(
-            backend.text_delta_media_guard("chat_tokens_delta_sync"),
-            Some(
-                "chat_tokens_delta_sync is text-only; session currently holds audio state"
-                    .to_string(),
-            ),
-            "image support must not silently admit an audio-derived context",
         );
     }
 

@@ -447,12 +447,11 @@ pub(crate) struct Gemma4Inner {
     paged_text_turn_context: MediaCapabilities,
     /// True only while a pure image turn left its
     /// global paged KV live AND a sliding history checkpoint remembered at the
-    /// full kept-live prefix, so a follow-up text delta can warm-continue on
+    /// full kept-live prefix, so a full-history continuation can reuse
     /// the live media KV causally. Set exclusively by
     /// `finalize_vision_turn_media_state` on the continuable branch; reset to
     /// `false` at every non-continuable point (`clear_reuse_state`, both vision
-    /// prefill-start blocks, the non-continuable finalize). When `false`, the
-    /// `text_delta_media_guard` rejects a media-session delta as today.
+    /// prefill-start blocks, the non-continuable finalize).
     media_session_continuable: bool,
     /// `PagedBackend::finalize_paged_turn` is infallible at the trait seam, but
     /// Gemma's per-block registration is not. Latch a failure here so the
@@ -3810,8 +3809,8 @@ impl Gemma4Inner {
     ///   sliding-history checkpoint actually `stored`, AND the adapter is
     ///   `live_for_continue`): the global paged KV is kept live (full blocks
     ///   registered for content-addressed reuse) and the marker is set so
-    ///   `text_delta_media_guard` lets the next text delta through. On that delta
-    ///   the global prefix is reused IN-PLACE (`continue_turn` keeps the block
+    ///   the next full-history text continuation may reuse the global prefix
+    ///   IN-PLACE (`continue_turn` keeps the block
     ///   table, `cachedTokens > 0`, only the new suffix is forwarded — it is NOT
     ///   re-walked) and the sliding caches resolve to `state="live"`
     ///   (`continued_live_prefix && gemma4_sliding_caches_ready_at`), so
@@ -3821,8 +3820,8 @@ impl Gemma4Inner {
     /// - **Non-continuable** (`reuse_cache=false`, a keep-live failure, or the
     ///   sliding checkpoint did not store / the adapter is not
     ///   `live_for_continue`): `release_request` only, keep history + media keys
-    ///   live so the guard is reachable and REJECTS (marker stays false) and the
-    ///   follow-up text delta cold-restarts. The vision core does NOT
+    ///   live (marker stays false), so the next full-history continuation's
+    ///   prefix verification forces a cold restart. The vision core does NOT
     ///   `reset_caches_sync` here, unlike the text/MoE path.
     ///
     /// ## Why `stored && live_for_continue` is the faithfulness gate
@@ -3985,9 +3984,9 @@ impl Gemma4Inner {
             ));
         }
 
-        // Non-continuable: release the global KV but keep history + media keys so
-        // a follow-up text delta reaches `text_delta_media_guard`, which rejects
-        // it (marker is false). Matches the vision core's prior behavior.
+        // Non-continuable: release the global KV but keep history + media keys
+        // so full-history prefix verification forces the next continuation to
+        // cold-restart (marker is false).
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
@@ -7675,76 +7674,6 @@ impl ChatBackend for Gemma4Inner {
         Box::new(Gemma4Emitter::new(
             self.output_starts_in_reasoning_channel(),
         ))
-    }
-
-    /// REJECT text deltas on media-holding sessions despite the declared
-    /// image capability: gemma4's prefix reuse is text-only, so
-    /// a delta on top of an image session would prefill on caches whose
-    /// positions include expanded image tokens the history bookkeeping
-    /// does not model. The message has NO space after the prefix:
-    /// `"{PREFIX}{entry_fn} is text-only; session currently holds image
-    /// state"`.
-    fn text_delta_media_guard(&self, entry_fn: &'static str) -> Option<String> {
-        // Warm-continue: a continuable pure image turn
-        // kept its global paged KV live + a sliding history checkpoint at the
-        // full prefix, so a text delta restores causally on the live media KV.
-        // The marker ALONE is insufficient: the live paged request must STILL
-        // exist (`is_live_for_continue()`), because the warm continue reads the
-        // adapter's live `block_table` directly. On a shared cross-session
-        // adapter another session may have run `reset_for_new_request` and
-        // released the request after this session armed the marker; then the
-        // text path would instead do a content-address prefix lookup over
-        // `[media-prefix + delta]` — which can hit stale media-feature K/V or
-        // unfaithfully re-prefill the media placeholders. Require both the
-        // marker AND a live request; otherwise fall through to the restart
-        // rejection so the TS floor cold-restarts (resend full history →
-        // faithful vision/audio prefill, no media-placeholder content lookup).
-        if self.media_session_continuable
-            && self
-                .paged_adapter
-                .as_ref()
-                .is_some_and(|adapter| adapter.is_live_for_continue())
-        {
-            return None;
-        }
-        // A continuable media session whose paged request is no longer live
-        // must cold-restart, not warm-continue against a released request.
-        // Gate on the marker (the media-held signal while a continuation is
-        // armed) and use the persistent media context so the image/audio
-        // diagnostic stays correct across repeated continuations, whose warm
-        // text saves cleared the raw `cached_image_key`/`cached_audio_key`.
-        if self.media_session_continuable {
-            let media_state = if self.session_media().audio {
-                "audio"
-            } else {
-                "image"
-            };
-            return Some(format!(
-                "{}{entry_fn} is text-only; session currently holds {media_state} state",
-                engine::IMAGE_CHANGE_RESTART_PREFIX
-            ));
-        }
-        // Non-continuable media hold: read `session_media()` (raw keys ∪
-        // persistent `media_session_context`), not the raw keys alone. A paged
-        // media prepare that fails AFTER a warm text continuation leaves the
-        // keys `None` (warm saves drop them) and the marker disarmed (the
-        // vision cores reset it ahead of the fallible prepare); the surviving
-        // context is then the only signal that the cached history still holds
-        // media-expanded positions a text-only prefill cannot rebuild.
-        let held = self.session_media();
-        if held.images {
-            Some(format!(
-                "{}{entry_fn} is text-only; session currently holds image state",
-                engine::IMAGE_CHANGE_RESTART_PREFIX
-            ))
-        } else if held.audio {
-            Some(format!(
-                "{}{entry_fn} is text-only; session currently holds audio state",
-                engine::IMAGE_CHANGE_RESTART_PREFIX
-            ))
-        } else {
-            None
-        }
     }
 
     // `augment_performance` deliberately NOT overridden: the default
@@ -13276,150 +13205,11 @@ mod tests {
         }
     }
 
-    /// Contract: a text delta on a media session is governed by BOTH the
-    /// `media_session_continuable` marker AND a still-live paged request
-    /// (`is_live_for_continue()`), not the raw media key and not the marker
-    /// alone. A continuable media turn warm-continues by reading the adapter's
-    /// live `block_table`; if the live request is gone (no adapter, or a
-    /// shared-adapter `reset_for_new_request` from another session), there is
-    /// no live block table to continue and the guard REJECTS with
-    /// `IMAGE_CHANGE_RESTART_PREFIX` so the TS floor cold-restarts. When the
-    /// marker is false (single-shot: unified image, `reuse_cache=false`, or a
-    /// downgraded finalize), the guard also REJECTS exactly as before. The
-    /// reject path is preserved for every non-continuable case.
-    ///
-    /// This test uses a `paged_tiny_config(Some(false))` `Gemma4Inner`, whose
-    /// `paged_adapter` is `None` (see the construction-gate test), so
-    /// `is_live_for_continue()` is `false`. It therefore exercises:
-    ///   - clean session (no media, marker false) → ALLOW,
-    ///   - media held + marker false → REJECT (both modalities),
-    ///   - media held + marker true but NOT live (the cross-session-released
-    ///     hazard) → REJECT, the leak-closing path.
-    ///
-    /// The marker-true AND live → ALLOW (warm-continue) path needs a live paged
-    /// request, which requires real Metal block allocation + a finalized turn
-    /// and is not cheaply constructible in a unit test; the single-session 12B
-    /// media-continuation e2e proves it instead.
-    ///
-    /// Constructs a `Gemma4Inner` (needs Metal — gracefully skips on a
-    /// no-Metal sandbox) and drives the guard directly by toggling the cached
-    /// media keys + the continuable marker.
-    #[test]
-    fn test_text_delta_after_audio_turn_rejected_like_image_turn() {
-        let cfg = paged_tiny_config(Some(false));
-        let mut inner = match super::Gemma4Inner::new(cfg) {
-            Ok(i) => i,
-            Err(err) => {
-                let msg = err.reason.to_string();
-                if msg.contains("No Metal device found") {
-                    eprintln!("skipping (no Metal device): {msg}");
-                    return;
-                }
-                panic!("unexpected Gemma4Inner::new failure: {msg}");
-            }
-        };
-
-        // `paged_tiny_config(Some(false))` builds no paged adapter, so the
-        // session is never live-for-continue — the precondition for the
-        // not-live reject assertions below.
-        assert!(
-            inner.paged_adapter.is_none(),
-            "paged_tiny_config(Some(false)) must leave paged_adapter None"
-        );
-
-        // Clean session: no media held, marker false, guard passes (None).
-        inner.cached_image_key = None;
-        inner.cached_audio_key = None;
-        inner.media_session_continuable = false;
-        assert!(
-            inner
-                .text_delta_media_guard("chat_session_continue")
-                .is_none(),
-            "clean session must not reject a text delta"
-        );
-
-        // Image turn held, NOT continuable (single-shot): text delta rejected
-        // with the restart prefix.
-        inner.cached_image_key = Some(42);
-        inner.cached_audio_key = None;
-        inner.media_session_continuable = false;
-        let image_reject = inner
-            .text_delta_media_guard("chat_session_continue")
-            .expect("text delta after non-continuable image turn must reject");
-        assert!(
-            image_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
-            "image-turn rejection must carry the restart prefix, got: {image_reject}"
-        );
-        assert!(
-            image_reject.contains("image state"),
-            "image-turn rejection must mention image state, got: {image_reject}"
-        );
-
-        // Audio turn held, NOT continuable: the audio branch must reject the
-        // SAME way as the image branch — same restart prefix.
-        inner.cached_image_key = None;
-        inner.cached_audio_key = Some(7);
-        inner.media_session_continuable = false;
-        let audio_reject = inner
-            .text_delta_media_guard("chat_session_continue")
-            .expect("text delta after non-continuable audio turn must reject");
-        assert!(
-            audio_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
-            "audio-turn rejection must carry the restart prefix, got: {audio_reject}"
-        );
-        assert!(
-            audio_reject.contains("audio state"),
-            "audio-turn rejection must mention audio state, got: {audio_reject}"
-        );
-
-        // Marker armed but NOT live (no live paged request — here no adapter
-        // at all; on a shared adapter this is the cross-session-released case):
-        // a continuable AUDIO session must REJECT, not warm-continue, because
-        // there is no live block_table to read. This is the leak-closing path.
-        inner.cached_image_key = None;
-        inner.cached_audio_key = Some(7);
-        inner.media_session_continuable = true;
-        let audio_not_live_reject = inner
-            .text_delta_media_guard("chat_session_continue")
-            .expect("continuable audio session with no live request must REJECT");
-        assert!(
-            audio_not_live_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
-            "not-live continuable audio rejection must carry the restart prefix, \
-             got: {audio_not_live_reject}"
-        );
-        assert!(
-            audio_not_live_reject.contains("audio state"),
-            "not-live continuable audio rejection must mention audio state, \
-             got: {audio_not_live_reject}"
-        );
-
-        // Same for a continuable non-unified IMAGE session with no live request.
-        inner.cached_image_key = Some(42);
-        inner.cached_audio_key = None;
-        inner.media_session_continuable = true;
-        let image_not_live_reject = inner
-            .text_delta_media_guard("chat_session_continue")
-            .expect("continuable image session with no live request must REJECT");
-        assert!(
-            image_not_live_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
-            "not-live continuable image rejection must carry the restart prefix, \
-             got: {image_not_live_reject}"
-        );
-        assert!(
-            image_not_live_reject.contains("image state"),
-            "not-live continuable image rejection must mention image state, \
-             got: {image_not_live_reject}"
-        );
-    }
-
     /// Paged/flat parity: a fresh (non-reuse) text-only `save_paged_history`
     /// must clear `cached_audio_key`, exactly as the flat `save_cache_state`
     /// does on a fresh turn. Without that clear, a text-only paged start over a
-    /// reused model whose prior turn was audio would leave `cached_audio_key`
-    /// stale, and the next text delta's `text_delta_media_guard` would wrongly
-    /// force an "audio state" restart on the text-only session. This pins the
-    /// fix: pre-fix the post-save key would stay `Some` and the guard would
-    /// return the audio-state restart string, failing both asserts below.
+    /// reused model whose prior turn was audio would leave stale media state
+    /// attached to the replacement session.
     #[test]
     fn test_text_only_paged_save_clears_stale_audio_key() {
         let cfg = paged_tiny_config(Some(false));
@@ -13456,23 +13246,14 @@ mod tests {
             "text-only paged save must clear the stale audio key"
         );
 
-        // Downstream effect: the next text delta is no longer rejected with an
-        // "audio state" restart — the guard returns None on the text-only
-        // session. Pre-fix this would be `Some("…holds audio state")`.
-        assert!(
-            inner
-                .text_delta_media_guard("chat_session_continue")
-                .is_none(),
-            "after a text-only paged save the guard must not force an audio restart"
-        );
+        assert_eq!(inner.session_media(), MediaCapabilities::NONE);
     }
 
     /// A warm text save over a pure-image session extends the same live
     /// media-derived KV. It must preserve the raw image identity and ordered
     /// placeholder sidecar so later text blocks keep the same image-aware block
     /// keys. Audio and mixed turns are deliberately cold/non-continuable and do
-    /// not enter this path. The no-adapter guard also proves the preserved image
-    /// context retains the existing restart wording across repeated saves.
+    /// not enter this path.
     #[test]
     fn test_media_context_survives_repeated_warm_text_saves() {
         let cfg = paged_tiny_config(Some(false));
@@ -13515,14 +13296,6 @@ mod tests {
                 "turn {turn} must preserve the image-derived context"
             );
             assert!(inner.media_session_continuable);
-
-            // This fixture has no adapter, so the guard must reject. Its
-            // unchanged error format should still name the image context.
-            let reject = inner
-                .text_delta_media_guard("chat_session_continue")
-                .expect("not-live image context must request a restart");
-            assert!(reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX));
-            assert!(reject.contains("image state"), "got: {reject}");
         }
     }
 
@@ -13604,12 +13377,6 @@ mod tests {
             inner.verify_cache_prefix(&delta_tokens, true),
             0,
             "invalidated media history must not seed a text-only prefix hit"
-        );
-        assert!(
-            inner
-                .text_delta_media_guard("chat_session_continue")
-                .is_none(),
-            "a fully invalidated session has no stale media state to guard"
         );
     }
 
@@ -13752,7 +13519,7 @@ mod tests {
         );
 
         // reset_caches_sync (which calls clear_reuse_state) resets the marker
-        // AND nulls caches → has_live_session() false → a delta cannot continue.
+        // AND nulls caches → has_live_session() false → continuation is rejected.
         inner.publish_media_session_context(None, Some(9));
         inner.paged_text_turn_context = MediaCapabilities::AUDIO;
         inner.media_session_continuable = true;
@@ -13768,14 +13535,7 @@ mod tests {
             "reset_caches_sync must clear the media key"
         );
         assert_eq!(inner.session_media(), MediaCapabilities::NONE);
-        // After reset, even toggling the marker can't allow a delta: the
-        // session is dead (no live caches), and the reset already cleared it.
-        assert!(
-            inner
-                .text_delta_media_guard("chat_session_continue")
-                .is_none(),
-            "post-reset session holds no media key → guard returns None (no media to reject)"
-        );
+        assert!(!inner.has_live_session());
     }
 
     /// Only pure image turns currently publish image-aware per-block keys.

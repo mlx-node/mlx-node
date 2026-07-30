@@ -950,14 +950,6 @@ impl Qwen3Tokenizer {
             .collect()
     }
 
-    /// `pub(crate)` wrapper around [`Self::sanitize_messages`] so other
-    /// modules (notably the Qwen3.5 session-continue path) can subject
-    /// user-supplied strings to the same role/content injection guard used
-    /// by the jinja rendering path.
-    pub(crate) fn sanitize_messages_public(messages: &[ChatMessage]) -> Vec<ChatMessage> {
-        Self::sanitize_messages(messages)
-    }
-
     /// Validate and normalize a ChatML role.
     ///
     /// Returns the validated role if it matches the whitelist, or "user" as a
@@ -2011,7 +2003,7 @@ mod tests {
             },
         ];
 
-        let sanitized = Qwen3Tokenizer::sanitize_messages_public(&original);
+        let sanitized = Qwen3Tokenizer::sanitize_messages(&original);
 
         assert_eq!(sanitized.len(), 2);
         let user = &sanitized[0];
@@ -2066,7 +2058,7 @@ mod tests {
             audio: None,
         }];
 
-        let sanitized = Qwen3Tokenizer::sanitize_messages_public(&msgs);
+        let sanitized = Qwen3Tokenizer::sanitize_messages(&msgs);
         let messages_value: Vec<serde_json::Value> =
             sanitized.iter().map(serialize_message_for_jinja).collect();
 
@@ -2818,7 +2810,7 @@ mod tests {
             tool_msg_with_error("ok-explicit", Some(false)),
             tool_msg_with_error("ok-default", None),
         ];
-        let sanitized = Qwen3Tokenizer::sanitize_messages_public(&original);
+        let sanitized = Qwen3Tokenizer::sanitize_messages(&original);
         assert_eq!(sanitized.len(), 3);
         assert_eq!(sanitized[0].is_error, Some(true));
         assert_eq!(sanitized[1].is_error, Some(false));

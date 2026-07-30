@@ -1054,12 +1054,6 @@ impl ChatBackend for Lfm2Inner {
     // text-only" pre-checks, which fire before any command is dispatched,
     // so the engine's typed pre-render rejection is a defense-in-depth
     // backstop.
-    //
-    // `text_delta_media_guard`: engine default — no declared media support
-    // plus `session_media()` with the parametrized strings
-    // ("chat_tokens_delta_sync is text-only; session currently holds
-    // image state" / the `chat_stream_tokens_delta` twin).
-    //
     // `extra_eos_ids` / `stream_skip_special_tokens` / `stream_emitter`
     // / `wired_limit_bytes` (usize::MAX) / `profiler_label` /
     // `has_live_session` (`!cached_token_history.is_empty()`): engine

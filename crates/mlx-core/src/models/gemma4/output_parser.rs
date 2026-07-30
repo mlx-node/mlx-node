@@ -15,10 +15,11 @@
 //! This module parses generated output; the checkpoint chat template owns
 //! the reverse direction when an assistant tool call is replayed.
 //!
-//! Two entry points:
+//! Two parsing surfaces:
 //!
-//! * [`parse_gemma4_output`] — offline parse of a completed decode string
-//!   (used by the non-streaming `ChatResult` construction sites).
+//! * [`parse_gemma4_output_with_open_channel`] — production offline parse of
+//!   a completed decode string, seeded with the rendered prompt's channel
+//!   state.
 //! * [`Gemma4StreamParser`] — incremental parser driven by the streaming
 //!   decode loop. It buffers bytes that might be the prefix of a delimiter
 //!   and surfaces segments as text / reasoning deltas (or, for tool calls,
@@ -412,6 +413,7 @@ pub(crate) struct Gemma4ParsedOutput {
 /// Offline parse of a complete decoded string. Invariant: whatever chain of
 /// markers the model emitted, this function returns cleaned text, joined
 /// thinking, and all parsed tool calls in order.
+#[cfg(test)]
 pub(crate) fn parse_gemma4_output(text: &str) -> Gemma4ParsedOutput {
     parse_gemma4_output_with_open_channel(text, false)
 }
