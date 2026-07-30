@@ -500,13 +500,15 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
   it('returns the real result when the worker sampled just before withdrawal arrived', async () => {
     const target = join(sessionsRoot, 'late-withdraw-target');
     writeFileSync(target, 'alive');
+    const gate = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2));
+    const controller = new AbortController();
 
     const worker = startDbWorker({
       workerUrl: new URL('./helpers/late-withdraw-db-worker.ts', import.meta.url),
-      // The fixture blocks for 1 s after its one withdrawal sample. Its 500 ms
-      // deadline lands deterministically inside that window, while this grace
-      // leaves enough time for the already-started result to win.
-      requestTimeoutMs: 500,
+      // This is only a hang backstop. The explicit abort below is the signal the
+      // renderer's 500 ms deadline drives through the RPC host, without making
+      // this worker-level race test depend on timer scheduling.
+      requestTimeoutMs: 30_000,
       shutdownTimeoutMs: 2_000,
       onLifecycle: (): void => {},
       dbPath: ':memory:',
@@ -517,15 +519,39 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
     });
 
     try {
-      // Warm worker startup so the race call reaches its sample well before the
-      // 500 ms deadline.
-      expect((await worker.call({ method: 'GET', path: '/ready' })).status).toBe(200);
+      const result = worker.call({ method: 'DELETE', path: '/race', body: gate.buffer }, controller.signal);
+      const waitForGateChange = async (expected: number): Promise<number> => {
+        const waiting = Atomics.waitAsync(gate, 0, expected);
+        if (waiting.async) await waiting.value;
+        return Atomics.load(gate, 0);
+      };
 
-      const result = await withDeadline(worker.call({ method: 'DELETE', path: '/race' }), 5_000);
-      expect(result).not.toBe('HUNG');
-      expect(result).toEqual({ ok: true, status: 200, body: { mutated: true } });
+      // Causal ordering, not elapsed-time luck:
+      //   worker sampled empty → renderer cancellation crosses withdrawal port
+      //   → parent releases worker → mutation returns its real result.
+      expect(await withDeadline(waitForGateChange(0), 5_000)).toBe(1);
+      // Abort dispatch is synchronous in the worker client: by the time this
+      // returns, the withdrawal has been posted on the independent port.
+      controller.abort();
+      expect(await withDeadline(waitForGateChange(1), 5_000)).toBe(2);
+      Atomics.store(gate, 1, 1);
+      Atomics.notify(gate, 1);
+
+      const settled = await withDeadline(result, 5_000);
+      expect(settled).not.toBe('HUNG');
+      expect(settled).toEqual({
+        ok: true,
+        status: 200,
+        body: { mutated: true, withdrawalArrivedAfterSample: true },
+      });
       expect(existsSync(target)).toBe(false);
     } finally {
+      // Always unblock the worker if an assertion above failed while it was at
+      // either gate before closing it. Abort first so its evidence loop can reach
+      // state 2 even when the assertion failed before the normal abort.
+      controller.abort();
+      Atomics.store(gate, 1, 1);
+      Atomics.notify(gate, 1);
       expect(await withDeadline(worker.close(), 10_000)).not.toBe('HUNG');
     }
   });
