@@ -178,8 +178,9 @@ mlx convert -i ./model -o ./model-q3 -q --q-bits 3 --q-recipe unsloth --imatrix-
 mlx convert -i ./model -o ./model-q4 -q --q-bits 4 --q-recipe unsloth --imatrix-path ./imatrix.gguf
 ```
 
-For verified Qwen3.5/Qwen3.6-family checkpoints, select the fixed [Unsloth
-class map](https://unsloth.ai/docs/models/qwen3.6#nvfp4) with either
+For verified Qwen3.5/Qwen3.6-family checkpoints or the exact SafeTensors
+Gemma-4-26B-A4B MoE shape, select the fixed [Unsloth class
+map](https://unsloth.ai/docs/models/qwen3.6#nvfp4) with either
 `--q-mxfp` (NVFP4 → MXFP4, FP8 → MXFP8) or `--q-mode nvfp4` (the DGX
 weight map, retaining NVFP4 and storing FP8 classes as plain per-output E4M3). An imatrix is optional
 for these two fixed maps: when omitted, AWQ pre-scaling is skipped and quality
@@ -194,6 +195,14 @@ mlx convert -i ./model -o ./model-unsloth-mxfp4 -q \
 
 mlx convert -i ./model -o ./model-unsloth-nvfp4 -q \
   --q-recipe unsloth --q-mode nvfp4
+
+mlx convert -m gemma4 -i ./gemma-4-26b-a4b-it \
+  -o ./gemma-4-26b-a4b-it-unsloth-mxfp4 -q \
+  --q-recipe unsloth --q-mxfp
+
+mlx convert -m gemma4 -i ./gemma-4-26b-a4b-it \
+  -o ./gemma-4-26b-a4b-it-unsloth-nvfp4 -q \
+  --q-recipe unsloth --q-mode nvfp4
 ```
 
 The two fixed maps share tensor-class boundaries but preserve different weight
@@ -207,11 +216,16 @@ does not include Unsloth's calibrated NVFP4 global scales, W4A4/W8A8 activation
 execution, or calibrated FP8 KV-cache scales, and does not claim upstream
 numerical or performance parity.
 
-| Weight class                                                                     | `--q-mxfp` | `--q-mode nvfp4` |
-| -------------------------------------------------------------------------------- | ---------- | ---------------- |
-| FFN `gate_proj` / `up_proj` / `down_proj`, except the final 8 transformer layers | MXFP4 4/32 | NVFP4 4/16       |
-| Final 8 FFNs; attention q/k/v/o; GDN qkv/z/out; `lm_head`                        | MXFP8 8/32 | E4M3 FP8 + per-output BF16 scale |
-| Embeddings; routers; GDN a/b; vision; MTP; norms; recurrent parameters           | BF16       | BF16             |
+| Weight class                                                                                | `--q-mxfp` | `--q-mode nvfp4`                 |
+| ------------------------------------------------------------------------------------------- | ---------- | -------------------------------- |
+| Qwen FFNs except the final 8; all Gemma4 dense/expert FFNs                                  | MXFP4 4/32 | NVFP4 4/16                       |
+| Qwen final 8 FFNs, attention, GDN qkv/z/out, head; Gemma4 attention q/k/v/o                | MXFP8 8/32 | E4M3 FP8 + per-output BF16 scale |
+| Embeddings; routers; Qwen GDN a/b; vision/audio; MTP; norms; recurrent and unmatched tensors | BF16       | BF16                             |
+
+Gemma4 has no final-eight or `lm_head` exception. Its stacked experts remain
+in the low NVFP4/MXFP4 class; plain FP8 is accepted only for the rank-2
+attention weights. Flat GGUF imatrix statistics are not treated as an invented
+expert-axis calibration rule.
 
 Per-tensor bit assignments (N = `--q-bits`):
 
