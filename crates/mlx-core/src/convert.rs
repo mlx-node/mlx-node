@@ -13595,7 +13595,6 @@ mod tests {
 
         for (bad_config, requested, bad_keys) in [
             (&dense_config, Some("gemma4"), keys.as_slice()),
-            (&unified_config, Some("gemma4_unified"), keys.as_slice()),
             (&config, Some("qwen3_5_moe"), keys.as_slice()),
             (&config, None, keys.as_slice()),
             (&config, Some("gemma4"), incomplete.as_slice()),
@@ -13620,6 +13619,34 @@ mod tests {
                 "unexpected error: {err}"
             );
         }
+
+        assert_eq!(
+            select_and_validate_official_unsloth_recipe(
+                "unsloth",
+                Some("imatrix.gguf"),
+                true,
+                "affine",
+                &unified_config,
+                Some("gemma4_unified"),
+                &keys,
+            )
+            .expect("calibrated Gemma4 unified must retain the legacy fallback"),
+            None,
+        );
+        let err = select_and_validate_official_unsloth_recipe(
+            "unsloth",
+            None,
+            true,
+            "affine",
+            &unified_config,
+            Some("gemma4_unified"),
+            &keys,
+        )
+        .expect_err("unverified Gemma4 unified must not bypass the no-imatrix gate");
+        assert!(
+            err.contains("family/requested-model/shape validation did not select a fixed map"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
