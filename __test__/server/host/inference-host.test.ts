@@ -197,6 +197,20 @@ describe('createInferenceHost — binding and health', () => {
     expect(host.health().status).toBe('ok');
   });
 
+  it('binds a bracketed IPv6 loopback without passing URL syntax to listen()', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    const host = await start({ modelsDir, host: '[::1]', port: 0 });
+
+    // Preserve the caller-facing spelling while binding the equivalent bare
+    // literal. Before normalization createServer forwarded `[::1]` to Node,
+    // which treated it as a hostname and rejected startup with ENOTFOUND.
+    expect(host.host).toBe('[::1]');
+    const address = host.server.server.address();
+    expect(address !== null && typeof address === 'object' ? address.address : null).toBe('::1');
+    expect(host.url).toBe(`http://[::1]:${host.port}`);
+    expect((await fetch(`${host.url}/health`)).status).toBe(200);
+  });
+
   it('stops answering once closed', async () => {
     const modelsDir = await makeModelsDir(['alpha']);
     const host = await start({ modelsDir });

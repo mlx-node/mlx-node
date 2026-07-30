@@ -20,6 +20,20 @@ export function bracketHost(host: string): string {
 }
 
 /**
+ * Convert the one bracketed bind form the host security policy accepts into
+ * the bare literal Node's `server.listen()` requires.
+ *
+ * Brackets belong to URL authorities, not socket bind addresses: passing
+ * `[::1]` to Node performs a DNS lookup and fails with `ENOTFOUND`. This is
+ * deliberately exact rather than a general bracket stripper. In particular,
+ * `[::]` and bracketed routable IPv6 text must not be turned into working
+ * wildcard/network binds by a helper intended only to repair loopback.
+ */
+export function normalizeLoopbackBindHost(host: string): string {
+  return host === '[::1]' ? '::1' : host;
+}
+
+/**
  * Build the URL a client should connect to for a `(host, port)` bind.
  *
  * A wildcard bind has no connectable literal host, so advertise the matching

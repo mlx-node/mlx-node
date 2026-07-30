@@ -47,7 +47,7 @@ import { createServer, resolveAuthToken, type CloseOptions, type ServerInstance 
 import { discoverModels, type DiscoveredModel } from './discover.js';
 import { applyEnginePolicy, type EnginePolicy } from './env-policy.js';
 import { attachLogger as defaultAttachLogger, type Logger } from './logger.js';
-import { hostUrl, isLoopbackBindHost, pickFreePort } from './net.js';
+import { hostUrl, isLoopbackBindHost, normalizeLoopbackBindHost, pickFreePort } from './net.js';
 import { resolveModelsDir } from './paths.js';
 import { makeSwapController } from './swap.js';
 import { hostTempDirPrefix, sweepOrphanHostTempRoots } from './temp-root.js';
@@ -231,6 +231,10 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   if (!isLoopbackBindHost(host) && resolveAuthToken(opts.authToken) === undefined) {
     throw new InsecureBindError(host);
   }
+  // `[::1]` is valid URL-authority spelling and the security predicate accepts
+  // it as loopback, but Node's listen host must be the bare literal. Normalize
+  // only after the reachability gate, and only the exact safe form.
+  const bindHost = normalizeLoopbackBindHost(host);
 
   // FIRST, before anything can touch the engine: the native side latches
   // these via `OnceLock` on first read, so a policy applied after a load has
@@ -284,7 +288,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
 
   const serverConfig = {
     port: requestedPort,
-    host,
+    host: bindHost,
     resolveModel: resolveHttpModel,
     listModels: () => ctrlRef.current!.listModels(),
     ...(opts.authToken !== undefined ? { authToken: opts.authToken } : {}),

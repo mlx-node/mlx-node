@@ -3,7 +3,13 @@ import type { AddressInfo } from 'node:net';
 
 import { describe, expect, it } from 'vite-plus/test';
 
-import { bracketHost, hostUrl, isLoopbackBindHost, pickFreePort } from '../../../packages/server/src/host/net.js';
+import {
+  bracketHost,
+  hostUrl,
+  isLoopbackBindHost,
+  normalizeLoopbackBindHost,
+  pickFreePort,
+} from '../../../packages/server/src/host/net.js';
 
 describe('bracketHost', () => {
   it('leaves IPv4 literals and hostnames untouched', () => {
@@ -44,6 +50,28 @@ describe('hostUrl', () => {
     expect(hostUrl('0.0.0.0', 1234)).toBe('http://127.0.0.1:1234');
     expect(hostUrl('', 1234)).toBe('http://127.0.0.1:1234');
     expect(hostUrl('::', 1234)).toBe('http://[::1]:1234');
+  });
+});
+
+describe('normalizeLoopbackBindHost', () => {
+  it('removes URL brackets from the exact IPv6 loopback bind', () => {
+    expect(normalizeLoopbackBindHost('[::1]')).toBe('::1');
+    expect(normalizeLoopbackBindHost('::1')).toBe('::1');
+  });
+
+  it('does not normalize unsafe or non-loopback inputs', () => {
+    for (const host of [
+      '[::]',
+      '[2001:db8::1]',
+      '[fe80::1%en0]',
+      '[::ffff:127.0.0.1]',
+      '::',
+      '2001:db8::1',
+      '0.0.0.0',
+      'my-mac.local',
+    ]) {
+      expect(normalizeLoopbackBindHost(host), host).toBe(host);
+    }
   });
 });
 
