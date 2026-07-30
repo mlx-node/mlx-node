@@ -50,3 +50,19 @@ export function endSSE(res: ServerResponse): void {
 export function activeSSEStreamCount(): number {
   return activeSSEResponses.size;
 }
+
+/**
+ * Number of active SSE streams among a caller-owned collection of responses.
+ *
+ * `createServer()` uses this to intersect the process-wide SSE registry with
+ * the responses accepted by one `node:http` Server. Keep the no-argument
+ * {@link activeSSEStreamCount} above for process-wide diagnostics and
+ * standalone `createHandler()` consumers.
+ */
+export function activeSSEStreamCountForResponses(responses: WeakSet<ServerResponse>): number {
+  let count = 0;
+  for (const response of activeSSEResponses) {
+    if (responses.has(response)) count += 1;
+  }
+  return count;
+}

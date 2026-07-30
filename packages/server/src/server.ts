@@ -2,7 +2,7 @@
 
 import { mkdir } from 'node:fs/promises';
 import { createServer as httpCreateServer } from 'node:http';
-import type { Server } from 'node:http';
+import type { Server, ServerResponse } from 'node:http';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,7 +15,7 @@ import { createIdleSweeper, DEFAULT_IDLE_CLEAR_CACHE_MS, parseIdleClearCacheEnv 
 import { runGuardedModelLoad, type LoadModelOptions } from './load-model.js';
 import { ModelWorkCoordinator } from './model-work-coordinator.js';
 import { ModelRegistry } from './registry.js';
-import { activeSSEStreamCount } from './streaming.js';
+import { activeSSEStreamCountForResponses } from './streaming.js';
 
 /** Cleanup interval for expired responses (ms). */
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -421,7 +421,19 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     authToken,
     health,
   });
-  const server = httpCreateServer(handler);
+  /**
+   * Responses owned by THIS HTTP server. The SSE registry is deliberately
+   * process-wide because `beginSSE` is also used by standalone handlers;
+   * shutdown accounting intersects it with this weak ownership set so one
+   * server cannot claim streams that another server leaves live. A WeakSet
+   * needs no second response cleanup lifecycle.
+   */
+  const ownedResponses = new WeakSet<ServerResponse>();
+  const server = httpCreateServer((req, res) => {
+    // Synchronous, before `handler` can reach either endpoint's `beginSSE`.
+    ownedResponses.add(res);
+    void handler(req, res);
+  });
 
   await new Promise<void>((resolve, reject) => {
     const onError = (err: Error) => {
@@ -475,8 +487,9 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
       const forceTimer = setTimeout(() => {
         forced = true;
         // Snapshot BEFORE destroying: `closeAllConnections()` fires each
-        // response's `'close'` event, which unregisters it from the set.
-        streamsAborted = activeSSEStreamCount();
+        // response's `'close'` event, which unregisters it from the global SSE
+        // registry used by the intersection.
+        streamsAborted = activeSSEStreamCountForResponses(ownedResponses);
         // Destroying the socket fires exactly the `res.on('close')` path a
         // client disconnect fires, so the endpoint's AbortController cancels
         // the native stream handle rather than leaking a running decode.

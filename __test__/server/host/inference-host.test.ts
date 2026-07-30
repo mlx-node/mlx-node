@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it } from 'vite-plus/test';
 import { isServingStatus } from '../../../packages/desktop/src/main/supervisor/state.js';
 import {
   createInferenceHost,
+  InferenceHostClosedError,
   InsecureBindError,
   LAUNCHER_ENGINE_POLICY,
   ModelNotFoundError,
@@ -70,6 +71,15 @@ async function makeModelsDir(names: string[]): Promise<string> {
 /** Stand-in for a materialized native model. Nothing here is ever invoked. */
 function fakeModel(): LoadableModel {
   return {} as unknown as LoadableModel;
+}
+
+/** Manually-controlled promise for lifecycle tests; resolving twice is harmless. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 async function start(opts: InferenceHostOptions): Promise<InferenceHost> {
@@ -549,6 +559,105 @@ describe('createInferenceHost — engine policy', () => {
 });
 
 describe('createInferenceHost — paged-override temp roots', () => {
+  it('waits for an active host load before reclaiming its paged config', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    const before = await ownTempRoots();
+    const entered = deferred();
+    const release = deferred();
+    let resolvedPath: string | null = null;
+
+    const host = await start({
+      modelsDir,
+      loadModel: async (path) => {
+        resolvedPath = path;
+        entered.resolve();
+        await release.promise;
+        throw new Error('late load failure');
+      },
+    });
+
+    const loading = host.loadModel('alpha');
+    await entered.promise;
+    expect(resolvedPath).not.toBeNull();
+    expect(existsSync(join(resolvedPath!, 'config.json'))).toBe(true);
+
+    const closing = host.close({ timeoutMs: 0 });
+    let closeSettled = false;
+    void closing.then(() => {
+      closeSettled = true;
+    });
+
+    try {
+      // `close()` has already flipped its synchronous admission latch, but
+      // must remain pending and preserve the clone while the admitted loader
+      // is still reading it.
+      await Promise.resolve();
+      expect(closeSettled).toBe(false);
+      expect(existsSync(join(resolvedPath!, 'config.json'))).toBe(true);
+      await expect(host.loadModel('alpha')).rejects.toBeInstanceOf(InferenceHostClosedError);
+    } finally {
+      release.resolve();
+    }
+
+    await expect(loading).rejects.toThrow('late load failure');
+    await expect(closing).resolves.toBeUndefined();
+    expect(await newTempRoots(before)).toHaveLength(0);
+    await expect(host.loadModel('alpha')).rejects.toBeInstanceOf(InferenceHostClosedError);
+  });
+
+  it('drains every concurrent host load admitted before close()', async () => {
+    const modelsDir = await makeModelsDir(['alpha', 'beta']);
+    const firstEntered = deferred();
+    const firstRelease = deferred();
+    const secondEntered = deferred();
+    const secondRelease = deferred();
+    let loadCount = 0;
+
+    const host = await start({
+      modelsDir,
+      loadModel: async () => {
+        const call = loadCount++;
+        if (call === 0) {
+          firstEntered.resolve();
+          await firstRelease.promise;
+        } else {
+          secondEntered.resolve();
+          await secondRelease.promise;
+        }
+        return fakeModel();
+      },
+    });
+
+    // The coordinator admits both synchronously, then parks beta behind
+    // alpha's writer. close() must retain both outer promises, not merely
+    // inspect whichever native loader happens to be active at that instant.
+    const first = host.loadModel('alpha');
+    const second = host.loadModel('beta');
+    await firstEntered.promise;
+    const closing = host.close({ timeoutMs: 0 });
+    let closeSettled = false;
+    void closing.then(() => {
+      closeSettled = true;
+    });
+
+    try {
+      firstRelease.resolve();
+      await first;
+      // Let the writer hand-off continuation run. Beta was admitted before
+      // close, so it must enter even though the shutdown latch is now closed.
+      await secondEntered.promise;
+      expect(closeSettled).toBe(false);
+    } finally {
+      firstRelease.resolve();
+      secondRelease.resolve();
+    }
+
+    await second;
+    await closing;
+    expect(loadCount).toBe(2);
+    expect(host.health().models.resident).toEqual(['beta']);
+  });
+
   it('names its temp root after this pid and removes it on close()', async () => {
     const modelsDir = await makeModelsDir(['alpha']);
     const before = await ownTempRoots();

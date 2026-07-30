@@ -1,3 +1,5 @@
+import { once } from 'node:events';
+import { request as httpRequest } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
 import type { SessionCapableModel } from '@mlx-node/lm';
@@ -170,6 +172,48 @@ describe('active SSE accounting', () => {
     const result = await instance.close({ timeoutMs: 200 });
     expect(result.streamsAborted).toBe(1);
     await stalled.body?.cancel().catch(() => {});
+  });
+
+  it('does not count a stream owned by another server', async () => {
+    const { instance: jsonServer, base: jsonBase } = await start();
+    const { instance: streamServer, base: streamBase } = await start();
+    const stalled = createStallModel();
+    streamServer.registry.register('stall-model', stalled.model);
+
+    // Server A has one incomplete JSON upload but no SSE. Keeping the request
+    // body open makes A's close hit its force deadline without involving a
+    // model or another application-level promise.
+    const requestArrived = once(jsonServer.server, 'request');
+    const jsonRequest = httpRequest(`${jsonBase}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    });
+    const jsonRequestClosed = new Promise<void>((resolve) => {
+      jsonRequest.once('error', () => resolve());
+      jsonRequest.once('close', () => resolve());
+    });
+    jsonRequest.write('{"model":');
+    await requestArrived;
+
+    // Server B owns the only process-wide SSE stream and remains live while A
+    // is forced closed.
+    const streamResponse = await openStream(streamBase, 'stall-model');
+    await stalled.entered;
+    expect(activeSSEStreamCount()).toBe(1);
+
+    const jsonClose = await jsonServer.close({ timeoutMs: 200 });
+    expect(jsonClose).toMatchObject({ forced: true, streamsAborted: 0 });
+    expect(activeSSEStreamCount()).toBe(1);
+
+    await jsonRequestClosed;
+
+    // B still owns and aborts its own stream later; A did not merely suppress
+    // the global count.
+    const streamClose = await streamServer.close({ timeoutMs: 200 });
+    expect(streamClose).toMatchObject({ forced: true, streamsAborted: 1 });
+    await stalled.sawAbort;
+    await streamResponse.body?.cancel().catch(() => {});
+    expect(activeSSEStreamCount()).toBe(0);
   });
 });
 

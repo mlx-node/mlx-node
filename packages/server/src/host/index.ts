@@ -96,6 +96,14 @@ export class ModelNotFoundError extends Error {
   }
 }
 
+/** Thrown when an out-of-band model load is requested after shutdown begins. */
+export class InferenceHostClosedError extends Error {
+  constructor() {
+    super('Inference host is closing or closed; model loads are no longer accepted.');
+    this.name = 'InferenceHostClosedError';
+  }
+}
+
 export interface InferenceHostOptions {
   /**
    * Port to bind. Omitted ⇒ a free port is picked up-front (so the URL is
@@ -191,12 +199,16 @@ export interface InferenceHost {
    * controller would otherwise treat it as an alias for the current resident,
    * which is right for Claude Code's hardcoded `claude-haiku-*` but wrong for
    * a supervisor that asked for a specific model.
+   *
+   * Calls admitted before {@link close} begins are allowed to finish. Calls
+   * made after shutdown begins reject with {@link InferenceHostClosedError}.
    */
   loadModel(name: string): Promise<void>;
   /**
-   * Dispose the logger, the HTTP server, and the temp root, in that order.
-   * Idempotent and memoized; individually guarded so one failure cannot
-   * strand the remaining steps.
+   * Stop accepting new HTTP and out-of-band load work, wait for every
+   * out-of-band load already admitted, then dispose the logger and temp root.
+   * Idempotent and memoized; disposal steps are individually guarded so one
+   * failure cannot strand the remaining steps.
    */
   close(opts?: CloseOptions): Promise<void>;
 }
@@ -319,6 +331,13 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
 
   const byName = new Map(models.map((m) => [m.name, m]));
 
+  // `closeStarted` is an admission latch, checked and flipped synchronously:
+  // once close() returns its promise no later out-of-band load can join this
+  // set. The operations themselves retain the normal coordinator/controller
+  // ordering; shutdown only observes their promises and never takes a lock
+  // they need, so queued swaps can drain without deadlocking against close.
+  let closeStarted = false;
+  const activeHostLoads = new Set<Promise<void>>();
   let closePromise: Promise<void> | null = null;
 
   return {
@@ -332,12 +351,15 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     server,
     health: () => server.health(),
 
-    async loadModel(name: string): Promise<void> {
+    loadModel(name: string): Promise<void> {
+      if (closeStarted) return Promise.reject(new InferenceHostClosedError());
       if (!byName.has(name)) {
-        throw new ModelNotFoundError(
-          name,
-          modelsDir,
-          models.map((m) => m.name),
+        return Promise.reject(
+          new ModelNotFoundError(
+            name,
+            modelsDir,
+            models.map((m) => m.name),
+          ),
         );
       }
       // Same nesting as `runGuardedModelLoad`: the drain suspension must be
@@ -345,13 +367,30 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       // while we are parked waiting for the lock. The HTTP path takes the
       // locks in this same order, so the two can never deadlock against each
       // other on the controller's internal serialization.
-      await server.withSuspendedDrains(async () => {
+      const operation = server.withSuspendedDrains(async () => {
         await server.modelWork.withModelLoad(() => controller.resolveModel(name), name);
       });
+      activeHostLoads.add(operation);
+      // Use a two-arm `then`, rather than an ignored `finally()` promise:
+      // cleanup must not manufacture an unhandled rejection when the caller
+      // legitimately observes a failed load through `operation`.
+      void operation.then(
+        () => activeHostLoads.delete(operation),
+        () => activeHostLoads.delete(operation),
+      );
+      return operation;
     },
 
     close(closeOpts?: CloseOptions): Promise<void> {
-      closePromise ??= (async (): Promise<void> => {
+      if (closePromise !== null) return closePromise;
+
+      // Flip the latch and snapshot in the same synchronous turn. Every call
+      // in the snapshot was fully admitted before shutdown; no later call can
+      // race into the set after this point.
+      closeStarted = true;
+      const admittedHostLoads = [...activeHostLoads];
+
+      closePromise = (async (): Promise<void> => {
         // Every step is independently guarded: a server that fails to close
         // must still leave the log streams ended and the temp root
         // reclaimed. The temp root is the only one of the three that leaks
@@ -361,6 +400,13 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
         } catch {
           /* already down, or a socket refused to die; fall through */
         }
+        // `server.close()` drains HTTP-owned loads, but an in-process caller
+        // can use `host.loadModel()` without opening a connection. Wait for
+        // all such calls admitted before the latch flipped, including swaps
+        // queued behind another load. `allSettled` preserves cleanup even if
+        // a loader rejects; the original operation still carries that error
+        // to its caller.
+        await Promise.allSettled(admittedHostLoads);
         // Only once nothing is still serving. The logger writes a request's
         // record from that request's `finish` handler, so ending the streams
         // first both drops the record and — with no `error` listener — makes
