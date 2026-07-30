@@ -122,6 +122,21 @@ const tools: ToolDefinition[] = [
   },
 ];
 
+const replacementTools: ToolDefinition[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'calculate',
+      description: 'Calculate a value',
+      parameters: {
+        type: 'object',
+        properties: '{"expression":{"type":"string"}}',
+        required: ['expression'],
+      },
+    },
+  },
+];
+
 describe('ChatSession template-rendered continuation history', () => {
   it('passes the complete replayable transcript and preserves thinking provenance', async () => {
     const model = new RecordingModel();
@@ -201,6 +216,31 @@ describe('ChatSession template-rendered continuation history', () => {
 });
 
 describe('ChatSession active tool transactionality', () => {
+  it('prefers committed tools over constructor defaults while keeping explicit overlays provisional', async () => {
+    const model = new RecordingModel();
+    model.results.push(chatResult(), chatResult(), chatResult());
+    const session = new ChatSession(model, {
+      defaultConfig: { tools },
+    });
+
+    await session.send('commit replacement tools', {
+      config: { tools: replacementTools },
+    });
+    await session.preflightPendingContextCapacity(
+      { role: 'user', content: 'preflight with constructor tools' },
+      { tools },
+    );
+    await session.send('reuse committed tools');
+    await session.send('explicit overlay still wins', {
+      config: { tools },
+    });
+
+    expect(model.templateTools).toEqual([replacementTools, tools, replacementTools, tools]);
+    expect(model.startCalls[0]?.config?.tools).toEqual(replacementTools);
+    expect(model.continueCalls[0]?.config?.tools).toEqual(replacementTools);
+    expect(model.continueCalls[1]?.config?.tools).toEqual(tools);
+  });
+
   it.each([
     {
       name: 'complete-history',

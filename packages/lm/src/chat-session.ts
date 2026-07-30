@@ -1533,7 +1533,12 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       ...overlay,
       reuseCache: true,
     };
-    if (merged.tools === undefined && this.activeTools !== undefined) {
+    // Tools are part of the committed conversation state. Constructor
+    // defaults seed that state, but must not overwrite a tool set committed by
+    // a later successful turn. A current-call overlay is the only higher
+    // precedence source; it remains provisional until a success site calls
+    // commitActiveTools().
+    if (overlay?.tools === undefined && this.activeTools !== undefined) {
       merged.tools = this.activeTools;
     }
     if (

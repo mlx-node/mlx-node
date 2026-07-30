@@ -1525,6 +1525,12 @@ export declare class Qwen3Model {
   validateParameters(params: Record<string, MxArray>): void;
 }
 
+/** Ordering policy for structured multimodal content parts handed to a checkpoint-provided Jinja template. */
+export declare const enum MultimodalContentOrder {
+  TextThenMedia = 'textThenMedia',
+  ImagesThenText = 'imagesThenText',
+}
+
 /** Qwen3 Tokenizer class with NAPI bindings */
 export declare class Qwen3Tokenizer {
   /**
@@ -1611,6 +1617,9 @@ export declare class Qwen3Tokenizer {
    * * `add_generation_prompt` - Whether to add assistant prompt at end (default: true)
    * * `tools` - Optional array of tool definitions for function calling
    * * `enable_thinking` - Optional flag to enable thinking mode (<think> tags)
+   * * `content_order` - Optional structured multimodal content ordering
+   * * `existing_image_placeholder` - Optional model marker that suppresses
+   * synthetic image parts when it is already present in sanitized text
    *
    * # Returns
    * Encoded token IDs ready for model input
@@ -1636,6 +1645,8 @@ export declare class Qwen3Tokenizer {
     addGenerationPrompt?: boolean | undefined | null,
     tools?: Array<ToolDefinition> | undefined | null,
     enableThinking?: boolean | undefined | null,
+    contentOrder?: MultimodalContentOrder | undefined | null,
+    existingImagePlaceholder?: string | undefined | null,
   ): Promise<Uint32Array>;
   /** Get vocabulary size */
   vocabSize(): number;

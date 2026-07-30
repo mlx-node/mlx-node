@@ -803,6 +803,7 @@ module.exports.getMemorySnapshot = nativeBinding.getMemorySnapshot;
 module.exports.getProfilingData = nativeBinding.getProfilingData;
 module.exports.isProfilingEnabled = nativeBinding.isProfilingEnabled;
 module.exports.memoryStats = nativeBinding.memoryStats;
+module.exports.MultimodalContentOrder = nativeBinding.MultimodalContentOrder;
 module.exports.OutputFormat = nativeBinding.OutputFormat;
 module.exports.parsePaddleResponse = nativeBinding.parsePaddleResponse;
 module.exports.parseToolCallsFromText = nativeBinding.parseToolCallsFromText;

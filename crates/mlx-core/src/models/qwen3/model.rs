@@ -3751,7 +3751,15 @@ impl Qwen3Model {
         })?;
 
         // Delegate to tokenizer which handles both simple ChatML and Jinja2 with tools
-        tokenizer.apply_chat_template(env, messages, add_generation_prompt, tools, enable_thinking)
+        tokenizer.apply_chat_template(
+            env,
+            messages,
+            add_generation_prompt,
+            tools,
+            enable_thinking,
+            None,
+            None,
+        )
     }
 }
 

@@ -48,7 +48,7 @@ use crate::sampling::{
     check_repetition_cutoff, sample,
 };
 use crate::stream::{DeviceType, Stream, StreamContext};
-use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+use crate::tokenizer::{ChatMessage, MultimodalContentOrder, Qwen3Tokenizer};
 use crate::tools;
 use crate::transformer::kv_cache::KVCache;
 use crate::utils::safetensors::SafeTensorsFile;
@@ -553,11 +553,13 @@ impl QianfanOCRInner {
             ));
         }
 
-        let template_tokens = self.tokenizer.apply_chat_template_sync(
+        let template_tokens = self.tokenizer.apply_chat_template_sync_with_content_order(
             messages,
             Some(true),
             config.tools.as_deref(),
             crate::engine::resolve_enable_thinking(config),
+            MultimodalContentOrder::ImagesThenText,
+            Some(QIANFAN_IMAGE_TEMPLATE_PLACEHOLDER),
         )?;
         let placeholder_tokens = self
             .tokenizer
@@ -2248,6 +2250,32 @@ mod tests {
             expand_qianfan_image_placeholders(&[7, 90, 91, 8], &[90, 91], &[1, 1], 2, 10, 11, 12)
                 .expect_err("one marker cannot represent two images");
         assert!(err.reason.contains("emitted 1 image marker"));
+    }
+
+    #[test]
+    fn image_expansion_preserves_multiple_manual_marker_order() {
+        let expanded = expand_qianfan_image_placeholders(
+            &[90, 91, 7, 90, 91],
+            &[90, 91],
+            &[1, 2],
+            1,
+            10,
+            11,
+            12,
+        )
+        .unwrap();
+        assert_eq!(expanded, vec![10, 11, 12, 7, 10, 11, 11, 12]);
+    }
+
+    #[test]
+    fn image_expansion_rejects_more_manual_markers_than_images() {
+        let err =
+            expand_qianfan_image_placeholders(&[90, 91, 7, 90, 91], &[90, 91], &[1], 2, 10, 11, 12)
+                .expect_err("two markers cannot represent one image");
+        assert!(
+            err.reason
+                .contains("more image markers than the 1 supplied image")
+        );
     }
 
     #[test]

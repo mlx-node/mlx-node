@@ -69,6 +69,28 @@ export type ChatStreamEvent = ChatStreamDelta | ChatStreamFinal;
 const modelPathsForTokenizers = new WeakMap<object, string>();
 const tokenizerPromises = new WeakMap<object, Promise<Qwen3Tokenizer>>();
 
+type TemplateContentOrder = "textThenMedia" | "imagesThenText";
+
+interface TemplateContentPolicy {
+  order: TemplateContentOrder;
+  /**
+   * When sanitized text already contains this model-owned placeholder, keep
+   * the message structured but do not synthesize additional image parts.
+   */
+  existingImagePlaceholder?: string;
+}
+
+interface PolicyAwareTokenizer {
+  applyChatTemplate(
+    messages: ChatMessage[],
+    addGenerationPrompt?: boolean | null,
+    tools?: ToolDefinition[] | null,
+    enableThinking?: boolean | null,
+    contentOrder?: TemplateContentOrder | null,
+    existingImagePlaceholder?: string | null,
+  ): Promise<Uint32Array>;
+}
+
 function getNativeIsReasoning(chunk: ChatStreamChunk): boolean | undefined {
   return typeof chunk.isReasoning === "boolean" ? chunk.isReasoning : undefined;
 }
@@ -83,6 +105,7 @@ async function applyChatTemplateFromModelPath(
   addGenerationPrompt?: boolean | null,
   tools?: ToolDefinition[] | null,
   enableThinking?: boolean | null,
+  contentPolicy?: TemplateContentPolicy,
 ): Promise<Uint32Array> {
   const modelPath = modelPathsForTokenizers.get(model);
   if (modelPath == null) {
@@ -98,11 +121,21 @@ async function applyChatTemplateFromModelPath(
     tokenizerPromises.set(model, tokenizerPromise);
   }
   const tokenizer = await tokenizerPromise;
-  return tokenizer.applyChatTemplate(
+  if (contentPolicy == null) {
+    return tokenizer.applyChatTemplate(
+      messages,
+      addGenerationPrompt,
+      tools,
+      enableThinking,
+    );
+  }
+  return (tokenizer as PolicyAwareTokenizer).applyChatTemplate(
     messages,
     addGenerationPrompt,
     tools,
     enableThinking,
+    contentPolicy.order,
+    contentPolicy.existingImagePlaceholder,
   );
 }
 
@@ -375,6 +408,12 @@ interface StreamingModelOptions {
    * only the factory's path-backed replacement.
    */
   applyTemplate?: boolean;
+  /**
+   * Model-specific ordering for structured multimodal content parts. The
+   * tokenizer applies this policy after sanitization while the checkpoint
+   * Jinja template continues to own all role and wire-format tokens.
+   */
+  templateContentPolicy?: TemplateContentPolicy;
 }
 
 /**
@@ -470,6 +509,7 @@ export function makeStreamingModel<
 } {
   const recordPath = opts.recordModelPath;
   const applyTemplate = opts.applyTemplate ?? recordPath;
+  const templateContentPolicy = opts.templateContentPolicy;
 
   // Capture the native callback-based methods before the subclass
   // overrides below shadow them on the prototype.
@@ -580,6 +620,7 @@ export function makeStreamingModel<
           addGenerationPrompt,
           tools,
           enableThinking,
+          templateContentPolicy,
         );
       },
     });
