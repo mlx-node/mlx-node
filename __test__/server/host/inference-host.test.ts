@@ -605,6 +605,60 @@ describe('createInferenceHost — paged-override temp roots', () => {
     await expect(host.loadModel('alpha')).rejects.toBeInstanceOf(InferenceHostClosedError);
   });
 
+  it('waits for an HTTP lazy load after forcing its request socket closed', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    const before = await ownTempRoots();
+    const entered = deferred();
+    const release = deferred();
+    let resolvedPath: string | null = null;
+
+    const host = await start({
+      modelsDir,
+      loadModel: async (path) => {
+        resolvedPath = path;
+        entered.resolve();
+        await release.promise;
+        throw new Error('late HTTP load failure');
+      },
+    });
+
+    // Token counting reaches the same lazy resolver without needing a real
+    // native chat session after the fake model is registered. Attach the
+    // rejection handler immediately: forced close intentionally destroys this
+    // socket before the endpoint can send headers.
+    const request = fetch(`${host.url}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'alpha',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    }).catch(() => null);
+
+    await entered.promise;
+    expect(resolvedPath).not.toBeNull();
+    const closing = host.close({ timeoutMs: 0 });
+    let closeSettled = false;
+    void closing.then(() => {
+      closeSettled = true;
+    });
+
+    try {
+      // `server.close()` can now finish because its timeout destroys the
+      // socket, but the discarded async handler is still parked in the native
+      // loader. Host close and override cleanup must continue to wait for it.
+      expect(await request).toBeNull();
+      await Promise.resolve();
+      expect(closeSettled).toBe(false);
+      expect(existsSync(join(resolvedPath!, 'config.json'))).toBe(true);
+    } finally {
+      release.resolve();
+    }
+
+    await closing;
+    expect(await newTempRoots(before)).toHaveLength(0);
+  });
+
   it('drains every concurrent host load admitted before close()', async () => {
     const modelsDir = await makeModelsDir(['alpha', 'beta']);
     const firstEntered = deferred();

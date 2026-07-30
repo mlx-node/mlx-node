@@ -96,7 +96,7 @@ export class ModelNotFoundError extends Error {
   }
 }
 
-/** Thrown when an out-of-band model load is requested after shutdown begins. */
+/** Thrown when a model load is requested after host shutdown reaches its admission boundary. */
 export class InferenceHostClosedError extends Error {
   constructor() {
     super('Inference host is closing or closed; model loads are no longer accepted.');
@@ -268,11 +268,24 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   // server needs the controller's callbacks at construction. Bridge via a
   // late-bound holder: the callbacks capture `ctrlRef.current` by closure.
   const ctrlRef: { current: ReturnType<typeof makeSwapController> | null } = { current: null };
+  let acceptingHttpModelLoads = true;
+  const activeHttpModelLoads = new Set<Promise<void>>();
+
+  const resolveHttpModel = (name: string): Promise<void> => {
+    if (!acceptingHttpModelLoads) return Promise.reject(new InferenceHostClosedError());
+    const operation = ctrlRef.current!.resolveModel(name);
+    activeHttpModelLoads.add(operation);
+    void operation.then(
+      () => activeHttpModelLoads.delete(operation),
+      () => activeHttpModelLoads.delete(operation),
+    );
+    return operation;
+  };
 
   const serverConfig = {
     port: requestedPort,
     host,
-    resolveModel: (name: string) => ctrlRef.current!.resolveModel(name),
+    resolveModel: resolveHttpModel,
     listModels: () => ctrlRef.current!.listModels(),
     ...(opts.authToken !== undefined ? { authToken: opts.authToken } : {}),
     ...(opts.storePath !== undefined ? { storePath: opts.storePath } : {}),
@@ -317,6 +330,12 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       } catch {
         /* already down, or a socket refused to die; fall through */
       }
+      // A forced close destroys sockets, not the async handler promises
+      // `http.createServer` discarded. Close resolver admission only after
+      // the server has finished its graceful window, then drain any lazy load
+      // that was already inside the controller before removing its temp files.
+      acceptingHttpModelLoads = false;
+      await Promise.allSettled(activeHttpModelLoads);
       try {
         await pagedConfigOverrides.cleanup();
       } catch {
@@ -400,13 +419,17 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
         } catch {
           /* already down, or a socket refused to die; fall through */
         }
-        // `server.close()` drains HTTP-owned loads, but an in-process caller
-        // can use `host.loadModel()` without opening a connection. Wait for
-        // all such calls admitted before the latch flipped, including swaps
-        // queued behind another load. `allSettled` preserves cleanup even if
-        // a loader rejects; the original operation still carries that error
-        // to its caller.
-        await Promise.allSettled(admittedHostLoads);
+        // A forced server close destroys request sockets but does not await
+        // the async handler promises. Stop any handler that has not reached
+        // the resolver from starting a late load, then snapshot resolver calls
+        // already inside the controller. Direct calls were closed and
+        // snapshotted synchronously above; both groups can now drain without
+        // shutdown holding a coordinator/controller lock they need.
+        acceptingHttpModelLoads = false;
+        const admittedHttpModelLoads = [...activeHttpModelLoads];
+        // `allSettled` preserves cleanup when either kind of loader rejects;
+        // the original operation still carries that error to its caller.
+        await Promise.allSettled([...admittedHostLoads, ...admittedHttpModelLoads]);
         // Only once nothing is still serving. The logger writes a request's
         // record from that request's `finish` handler, so ending the streams
         // first both drops the record and — with no `error` listener — makes
