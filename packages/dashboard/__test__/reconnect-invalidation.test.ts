@@ -24,10 +24,13 @@
  * refetches.
  */
 
-import { createElement } from 'react';
+import { act, createElement } from 'react';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
-import { disconnectDashboardApi } from '../ui/src/lib/api.js';
+import type { RpcPort, RpcPortEvents } from '../src/rpc/port.js';
+import type { RpcRequest } from '../src/rpc/protocol.js';
+import { connectDashboardApi, disconnectDashboardApi } from '../ui/src/lib/api.js';
+import { readCache } from '../ui/src/lib/json-cache.js';
 import { useJson } from '../ui/src/lib/use-api.js';
 import { renderPage, sequence, stubApi, type RenderedPage } from './render.js';
 
@@ -40,6 +43,38 @@ function Probe(): ReturnType<typeof createElement> {
 
 let page: RenderedPage | undefined;
 let disposers: (() => void)[] = [];
+
+interface ControlledApi {
+  posted: RpcRequest[];
+  respond(body: unknown): void;
+}
+
+/** A deterministic RpcPort whose authoritative replies are released by the test. */
+function connectControlledApi(): ControlledApi {
+  const posted: RpcRequest[] = [];
+  let events: RpcPortEvents | undefined;
+  connectDashboardApi(
+    {
+      postMessage(message: unknown): void {
+        posted.push(message as RpcRequest);
+      },
+      listen(next): () => void {
+        events = next;
+        return () => {};
+      },
+      close: () => {},
+    } satisfies RpcPort,
+    { onUnresponsive: () => {} },
+  );
+  return {
+    posted,
+    respond(body: unknown): void {
+      const call = posted.find((message) => message.kind === 'call');
+      if (call === undefined || call.kind !== 'call') throw new Error('controlled API has no pending call');
+      events?.onMessage({ kind: 'response', id: call.id, response: { ok: true, status: 200, body } });
+    },
+  };
+}
 
 afterEach(() => {
   page?.unmount();
@@ -78,6 +113,39 @@ describe('a replacement port revives what is already on screen', () => {
 
     await waitForText(page, 'recovered');
     expect(page.text()).toBe('recovered');
+  });
+
+  it('does not let an authoritative result from the retired runtime repopulate the cache', async () => {
+    const old = connectControlledApi();
+    page = await renderPage(createElement(Probe), (text) => text === 'pending');
+    expect(old.posted.map((message) => message.kind)).toEqual(['call']);
+
+    let replacement: ControlledApi | undefined;
+    await act(async () => {
+      replacement = connectControlledApi();
+      await Promise.resolve();
+    });
+    expect(old.posted.map((message) => message.kind)).toEqual(['call', 'cancel']);
+    expect(replacement?.posted.map((message) => message.kind)).toEqual(['call']);
+
+    // The replacement runtime wins first and owns both the visible state and
+    // the cache entry future mounts will seed from.
+    await act(async () => {
+      replacement?.respond({ v: 'gen-2' });
+      await Promise.resolve();
+    });
+    expect(page.text()).toBe('gen-2');
+    expect(readCache<{ v: string }>('/probe')?.value).toEqual({ v: 'gen-2' });
+
+    // Closing the old RpcClient does not discard authoritative work that had
+    // already started. Its late result must remain deliverable without being
+    // allowed to poison the replacement generation's cache.
+    await act(async () => {
+      old.respond({ v: 'gen-1-late' });
+      await Promise.resolve();
+    });
+    expect(page.text()).toBe('gen-2');
+    expect(readCache<{ v: string }>('/probe')?.value).toEqual({ v: 'gen-2' });
   });
 });
 

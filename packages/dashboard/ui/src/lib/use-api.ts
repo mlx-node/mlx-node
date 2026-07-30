@@ -68,6 +68,11 @@ export function useJson<T>(path: string): AsyncState<T> {
     let active = true;
     getJson<T>(path)
       .then((result) => {
+        // `RpcClient.close()` deliberately lets an in-flight call return its
+        // authoritative result. After a reconnect that result belongs to the
+        // retired runtime: it must update neither this hook nor the shared
+        // cache that future mounts seed from.
+        if (connection !== getConnectionGeneration()) return;
         // Cached before the `active` check, not after. A body that arrives once
         // the page has moved on is still the correct body for the path that
         // asked for it, and that case is the common one: click into a session,
