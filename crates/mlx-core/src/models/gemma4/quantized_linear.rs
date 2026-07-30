@@ -833,6 +833,18 @@ impl QuantizedLinear {
         &self.mode
     }
 
+    /// Additional model-owned bytes created by the plain-E4M3 correctness
+    /// fallback and not represented by the serialized checkpoint tensors.
+    ///
+    /// The raw Uint8 weight and BF16 scales are already counted through the
+    /// loader's params map; only the reconstructed BF16 weight is extra.
+    pub(crate) fn reconstructed_fp8_weight_bytes(&self) -> u64 {
+        self.fp8_dequant_weight
+            .as_ref()
+            .map(|weight| weight.nbytes() as u64)
+            .unwrap_or(0)
+    }
+
     /// Test-scope accessor for the sym8 operands
     /// `(w_nk [N,K] checkpoint, w_kn [K,N] kernel operand, s_w [N])`.
     /// Used by the routing/parity unit tests to call the reference kernels with
@@ -876,6 +888,11 @@ mod plain_fp8_weight_tests {
             .unwrap();
         assert_eq!(ql.mode(), crate::quant::fp8_weight::FP8_E4M3_MODE);
         assert_eq!(ql.get_weight().dtype().unwrap(), DType::Uint8);
+        assert_eq!(
+            ql.reconstructed_fp8_weight_bytes(),
+            3 * 4 * std::mem::size_of::<u16>() as u64,
+            "the resident-byte delta must count the reconstructed BF16 weight"
+        );
 
         let x = MxArray::from_float32(&[1.0, -0.5, 0.25, 2.0], &[1, 4])
             .unwrap()

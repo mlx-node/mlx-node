@@ -1421,7 +1421,7 @@ fn apply_weights(
     quant_group_size: i32,
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
-) -> Result<()> {
+) -> Result<u64> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
     let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
@@ -1455,9 +1455,18 @@ fn apply_weights(
     // validation-scope choice on its own path (sym8 there is validated on
     // the flat path only; paged is simply unvalidated) — a rationale that
     // does not transfer here.
+    let reconstructed_fp8_weight_bytes = std::cell::Cell::new(0u64);
     let try_build_ql = |prefix: &str| -> Result<Option<super::quantized_linear::QuantizedLinear>> {
         let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
-        build_gemma_ql(params, prefix, plq)
+        let quantized = build_gemma_ql(params, prefix, plq)?;
+        if let Some(linear) = quantized.as_ref() {
+            reconstructed_fp8_weight_bytes.set(
+                reconstructed_fp8_weight_bytes
+                    .get()
+                    .saturating_add(linear.reconstructed_fp8_weight_bytes()),
+            );
+        }
+        Ok(quantized)
     };
     // Helper for expert-batched (switch) quantized linears used by MoE layers.
     let try_build_qsl =
@@ -1925,7 +1934,7 @@ fn apply_weights(
     }
 
     info!("All weights applied successfully");
-    Ok(())
+    Ok(reconstructed_fp8_weight_bytes.get())
 }
 
 /// Apply vision weights to the inner model's vision tower and multimodal embedder.
@@ -2322,11 +2331,12 @@ impl Gemma4Inner {
     ///
     /// All weight loading happens synchronously (designed to run on the model thread).
     ///
-    /// Returns the constructed inner alongside a deterministic
-    /// weight-byte total (`sum(params.values().nbytes())`) for the
-    /// cache-limit coordinator. See `cache_limit.rs` module docs for
-    /// why this deterministic measurement is preferred over a
-    /// process-wide `get_active_memory()` delta.
+    /// Returns the constructed inner alongside a deterministic model-owned
+    /// weight-byte total for the cache-limit coordinator: checkpoint-backed
+    /// arrays plus any additional load-time weight reconstructions retained by
+    /// the model. See `cache_limit.rs` module docs for why this deterministic
+    /// measurement is preferred over a process-wide `get_active_memory()`
+    /// delta.
     ///
     /// `draft_model_path` optionally points at a draft checkpoint directory
     /// (DSpark or assistant — probed from its config.json) loaded alongside
@@ -2603,7 +2613,7 @@ impl Gemma4Inner {
         maybe_shard_ple_embedding(&mut inner, &mut params, path)?;
 
         // Apply weights
-        apply_weights(
+        let reconstructed_fp8_weight_bytes = apply_weights(
             &mut inner,
             &params,
             &config,
@@ -2763,15 +2773,20 @@ impl Gemma4Inner {
             inner.draft = Some(draft);
         }
 
-        // Deterministic weight-byte total for the cache-limit
-        // coordinator. Computed from the still-live `params` map
-        // before it is dropped at end-of-function.
-        // `saturating_add` guards against overflow on a corrupted
-        // checkpoint.
+        // Deterministic weight-byte total for the cache-limit coordinator.
+        // Start with the still-live checkpoint-backed `params` map before it
+        // is dropped at end-of-function, then fold in model-owned arrays that
+        // were created or moved outside that map. `saturating_add` guards
+        // against overflow on a corrupted checkpoint.
         let mut weight_bytes: u64 = params
             .values()
             .map(|a| a.nbytes() as u64)
             .fold(0u64, |acc, v| acc.saturating_add(v));
+        // Plain E4M3 linears retain their serialized Uint8 weight + scales
+        // (already counted through `params`) and also own a reconstructed BF16
+        // weight for the A16 matmul fallback. Count that additional resident
+        // array exactly once for every successfully installed linear.
+        weight_bytes = weight_bytes.saturating_add(reconstructed_fp8_weight_bytes);
         // The PLE shards were removed from `params` (their oversized source key
         // is gone) but are still model-owned resident weights. Count them too,
         // mirroring the materialize pass above; omitting their ~4GB would
@@ -4635,7 +4650,7 @@ mod tests {
         let assert_int8_rejected = |params: &HashMap<String, MxArray>, key: &str| {
             let err = match run(params) {
                 Err(e) => e,
-                Ok(()) => panic!("int8 '{key}' on a dense route must fail loud"),
+                Ok(_) => panic!("int8 '{key}' on a dense route must fail loud"),
             };
             let msg = format!("{err}");
             assert!(
@@ -4680,6 +4695,77 @@ mod tests {
         );
         params.insert("layers.0.router.proj.weight".into(), bf16_w(&[2, 16]));
         run(&params).expect("dense bf16 MoE weights must keep loading");
+    }
+
+    /// Plain E4M3 linears keep both their serialized Uint8 checkpoint tensors
+    /// and a reconstructed BF16 weight for the correctness fallback. The
+    /// loader must report the latter as an additional model-owned resident
+    /// allocation so cache-limit registration cannot over-grant the freelist.
+    #[test]
+    fn apply_weights_reports_plain_fp8_reconstruction_bytes() {
+        let config: Gemma4Config = serde_json::from_value(serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 64,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 64,
+            "intermediate_size": 64,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 64,
+            "use_block_paged_cache": false,
+        }))
+        .expect("minimal Gemma4Config");
+        let source = MxArray::from_float32(&vec![0.25f32; 64 * 64], &[64, 64])
+            .expect("from_float32")
+            .astype(DType::BFloat16)
+            .expect("bf16");
+        let expected_reconstruction_bytes = source.nbytes() as u64;
+        let (weight, scales) = crate::quant::fp8_weight::quantize_per_output_channel(
+            &source,
+            "layers.0.self_attn.q_proj",
+        )
+        .expect("plain FP8 fixture");
+        let params = HashMap::from([
+            ("layers.0.self_attn.q_proj.weight".to_string(), weight),
+            ("layers.0.self_attn.q_proj.scales".to_string(), scales),
+        ]);
+        let per_layer_quant = HashMap::from([(
+            "layers.0.self_attn.q_proj".to_string(),
+            PerLayerQuant {
+                bits: crate::quant::fp8_weight::FP8_E4M3_BITS,
+                group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
+                mode: PerLayerMode::Fp8E4m3,
+                input_amax: None,
+            },
+        )]);
+
+        let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
+        let reported = apply_weights(&mut inner, &params, &config, 4, 64, None, &per_layer_quant)
+            .expect("plain FP8 attention must load");
+        assert_eq!(
+            reported, expected_reconstruction_bytes,
+            "apply_weights must report the model-owned BF16 reconstruction"
+        );
+
+        let dense_params =
+            HashMap::from([("layers.0.self_attn.q_proj.weight".to_string(), source)]);
+        let mut dense_inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
+        assert_eq!(
+            apply_weights(
+                &mut dense_inner,
+                &dense_params,
+                &config,
+                4,
+                64,
+                None,
+                &HashMap::new(),
+            )
+            .expect("dense attention must load"),
+            0,
+            "checkpoint-backed dense weights must not be counted as extra allocations"
+        );
     }
 
     /// A quantized `lm_head` (2-bit affine, untied) must be installed as
