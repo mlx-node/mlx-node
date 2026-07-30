@@ -338,7 +338,7 @@ describe('dashboard runtime — worker death', () => {
     }
   });
 
-  it('closes on a bounded timeout when the worker answers nothing', async () => {
+  it('rejects an unconfirmed drain and still closes on a bounded timeout', async () => {
     const wedged = createDashboardRuntime({
       dbPath: ':memory:',
       sessionsRoot,
@@ -347,9 +347,43 @@ describe('dashboard runtime — worker death', () => {
       workerUrl: new URL('./helpers/wedged-db-worker.ts', import.meta.url),
       shutdownTimeoutMs: 200,
     });
-    // Two bounded steps (drain, then close) plus terminate: generous, but far
-    // below the point where "it hung" is indistinguishable from "it was slow".
-    expect(await withDeadline(wedged.close(), 10_000)).not.toBe('HUNG');
+    // The public drain promise must reject rather than claim the still-live
+    // worker reached its ingest fixpoint. This is the exact contract an
+    // in-process caller relies on before proceeding with its own shutdown.
+    const drained = await withDeadline(
+      wedged.drain().then(
+        () => 'RESOLVED' as const,
+        (error: unknown) => error,
+      ),
+      1_000,
+    );
+    expect(drained).not.toBe('HUNG');
+    expect(drained).not.toBe('RESOLVED');
+    expect(drained).toBeInstanceOf(Error);
+    expect((drained as Error).message).toContain('did not confirm drain');
+    expect((drained as Error).message).toContain('timed out after 200ms');
+
+    // `close()` reuses that rejected idempotent drain, but must still execute the
+    // worker's bounded close/terminate path. Generous cap, far below the point
+    // where "it hung" is indistinguishable from "it was slow".
+    const close = await withDeadline(
+      wedged.close().then(
+        () => 'RESOLVED' as const,
+        (error: unknown) => error,
+      ),
+      10_000,
+    );
+    expect(close).not.toBe('HUNG');
+    expect(close).not.toBe('RESOLVED');
+    // No cleanup failure: close preserves the original barrier error exactly.
+    expect(close).toBe(drained);
+
+    // `DashboardRuntime.close()` must still run the worker's bounded close path
+    // after the truthful drain failure. A later worker-owned call therefore
+    // fails fast rather than reaching the silent thread or waiting 60 seconds.
+    const after = await withDeadline(wedged.call({ method: 'GET', path: '/api/models' }), 1_000);
+    expect(after).not.toBe('HUNG');
+    expect((after as Exclude<typeof after, 'HUNG'>).status).toBe(503);
   });
 
   // The other half of "wedged": the thread stays ALIVE and simply never answers,
@@ -568,7 +602,10 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
     // expires before the fresh worker can finish its boot ingest and reach the
     // queued DELETE. This is the renderer's shorter deadline racing the worker's
     // independent 60 s deadline — the production defect, end to end.
-    const renderer = createRpcClient(bindEventTargetPort(port1), { timeoutMs: 0 });
+    const renderer = createRpcClient(bindEventTargetPort(port1), {
+      timeoutMs: 0,
+      onUnresponsive: () => port2.close(),
+    });
 
     try {
       const res = await withDeadline(renderer.call({ method: 'DELETE', path: '/api/sessions/rt-2' }), 10_000);

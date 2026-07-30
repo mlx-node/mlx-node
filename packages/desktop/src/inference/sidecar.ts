@@ -38,6 +38,16 @@ import { randomBytes } from 'node:crypto';
 export const SIDECAR_HOST_OPTIONS = Object.freeze({ port: 0, host: '127.0.0.1' });
 
 /**
+ * How long the inference host may drain HTTP requests before aborting them.
+ *
+ * Kept explicit at the process seam rather than relying on the server package's
+ * default: MAIN's supervisor must allow this whole interval PLUS time for
+ * `InferenceHost.close()` to flush its logger and remove the paged-config temp
+ * root before escalating SIGTERM to SIGKILL.
+ */
+export const SIDECAR_HOST_CLOSE_TIMEOUT_MS = 5_000;
+
+/**
  * A fresh secret for one sidecar process.
  *
  * 32 bytes from the CSPRNG. Not derived from the pid, the port or the clock:
@@ -91,7 +101,7 @@ export interface SidecarHost {
   logDir: string | null;
   health(): unknown;
   loadModel(name: string): Promise<void>;
-  close(): Promise<void>;
+  close(opts?: { timeoutMs?: number }): Promise<void>;
 }
 
 /**
@@ -295,7 +305,8 @@ export async function runSidecar(deps: SidecarDeps): Promise<void> {
     // `close()` disposes the verbose logger, the HTTP server and the paged-config
     // temp root. The temp root is the only one of the three that outlives this
     // process, so skipping it leaves work for the next host's startup sweep.
-    const closing = host === null ? Promise.resolve() : host.close();
+    const closing =
+      host === null ? Promise.resolve() : host.close({ timeoutMs: SIDECAR_HOST_CLOSE_TIMEOUT_MS });
     void closing
       .catch((error: unknown) => {
         deps.logError(`[mlx] inference host did not close cleanly: ${describe(error)}`);
@@ -345,7 +356,7 @@ export async function runSidecar(deps: SidecarDeps): Promise<void> {
     // `deps.exit` that does not end the process (a test, or a future caller)
     // would otherwise be left holding a listening socket it can no longer reach,
     // and announcing readiness for a process on its way out is worse.
-    await started.close().catch((error: unknown) => {
+    await started.close({ timeoutMs: SIDECAR_HOST_CLOSE_TIMEOUT_MS }).catch((error: unknown) => {
       deps.logError(`[mlx] inference host did not close cleanly: ${describe(error)}`);
     });
     return;

@@ -295,7 +295,7 @@ describe('cache DELETE request body (Cache page → mutate)', () => {
       },
       bindEventTargetPort(port2),
     );
-    connectDashboardApi(bindEventTargetPort(port1));
+    connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
 
     try {
       // The bodies cache.tsx constructs per action kind.

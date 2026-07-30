@@ -69,8 +69,12 @@ export interface BrokerDeps<Target> {
   /** Fork the CONTROL PANEL entry. `onExit` fires exactly once per child. */
   spawn(events: { onExit(code: number | null): void }): ControlPanelChild;
   createChannel(): { port1: BrokerPort; port2: BrokerPort };
-  /** Hand `port` to `target`. Throws if the renderer is gone. */
-  sendToRenderer(target: Target, port: BrokerPort): void;
+  /**
+   * Hand `port` and its broker generation to `target`. Throws if the renderer
+   * is gone. The generation returns with any recovery report so a delayed
+   * report cannot terminate the child serving a newer channel.
+   */
+  sendToRenderer(target: Target, port: BrokerPort, generation: number): void;
   /**
    * Is this renderer still there? Read before re-brokering after a restart: a
    * `WebContents` that has been destroyed since it asked must not be handed a
@@ -93,6 +97,12 @@ export interface ControlPanelBroker<Target> {
    * an unhandled rejection in MAIN.
    */
   attach(target: Target): void;
+  /**
+   * The renderer proved that the live child's transport stopped making
+   * progress. SIGTERM it, escalate to SIGKILL after `killGraceMs`, then let the
+   * ordinary exit path restart and re-broker. Idempotent per child.
+   */
+  recover(target: Target, expectedGeneration: number): void;
   /** How many channels have been minted. 1 after the first successful attach. */
   generation(): number;
   /** Whether a CONTROL PANEL child is currently up. */
@@ -129,6 +139,7 @@ export function createControlPanelBroker<Target>(
   /** When the current child was forked, for the crash-budget reset. */
   let spawnedAtMs = 0;
   let cancelRestart: (() => void) | null = null;
+  let recovery: { target: ControlPanelChild; cancelEscalation: () => void } | null = null;
   /**
    * The renderer that last asked. Kept so a child that comes back after a crash
    * can be re-brokered without the page having to notice and ask again — its
@@ -170,15 +181,21 @@ export function createControlPanelBroker<Target>(
   }
 
   function onExit(code: number | null): void {
+    const exited = child;
     child = null;
+    if (recovery?.target === exited) {
+      recovery.cancelEscalation();
+      recovery = null;
+    }
     const waiters = exitWaiters;
     exitWaiters = [];
     for (const waiter of waiters) waiter();
     if (disposed) return;
 
-    // Every CONTROL PANEL exit is a crash. Nothing asks it to stop except `dispose()`,
-    // which returns above — so unlike INFERENCE there is no intent to track, and
-    // an exit code of 0 means "it fell off the end of its entry", not "fine".
+    // Every non-disposal CONTROL PANEL exit consumes the crash budget. That
+    // includes a watchdog recovery: repeatedly wedging is a crash loop even
+    // though MAIN delivered the terminating signal. An exit code of 0 still
+    // does not make it healthy.
     consecutiveCrashes = nextCrashCount(policy, consecutiveCrashes, deps.now() - spawnedAtMs);
     deps.report({ type: 'control-panel-exited', code, consecutiveCrashes });
 
@@ -237,7 +254,7 @@ export function createControlPanelBroker<Target>(
     }
 
     try {
-      deps.sendToRenderer(target, port2);
+      deps.sendToRenderer(target, port2, generation);
     } catch (error) {
       // port1 is transferred and no longer ours to touch; port2 never left.
       closeQuietly(port2);
@@ -249,8 +266,44 @@ export function createControlPanelBroker<Target>(
     deps.report({ type: 'brokered', generation });
   }
 
+  function recover(target: Target, expectedGeneration: number): void {
+    if (disposed || !deps.isRendererAlive(target)) return;
+    // The report names the exact channel that observed the wedge. MAIN may have
+    // replaced that child/channel while the page → preload → IPC signal was
+    // queued; never resolve a stale report against whichever child is current.
+    if (expectedGeneration !== generation) return;
+    lastTarget = target;
+    const live = child;
+    if (live === null) {
+      // An exit may already have scheduled the replacement. If it did not,
+      // attach is the one path that knows how to spawn and broker safely.
+      if (cancelRestart === null) attach(target);
+      return;
+    }
+    if (recovery?.target === live) return;
+
+    // Install the escalation before SIGTERM: a test double (and some process
+    // wrappers) may report exit synchronously from `kill()`.
+    const cancelEscalation = deps.delay(() => {
+      if (child !== live) return;
+      try {
+        live.forceKill();
+      } catch {
+        // A raced exit is success; its onExit path owns the restart.
+      }
+    }, killGraceMs);
+    recovery = { target: live, cancelEscalation };
+    try {
+      live.kill();
+    } catch {
+      // Never throw out of an ipcMain handler. The scheduled escalation remains
+      // armed and will make a second, uncatchable attempt via SIGKILL.
+    }
+  }
+
   return {
     attach,
+    recover,
     generation: () => generation,
     running: () => child !== null,
     async dispose(): Promise<void> {
@@ -260,6 +313,10 @@ export function createControlPanelBroker<Target>(
       if (cancelRestart !== null) {
         cancelRestart();
         cancelRestart = null;
+      }
+      if (recovery !== null) {
+        recovery.cancelEscalation();
+        recovery = null;
       }
       const target = child;
       if (target === null) return;

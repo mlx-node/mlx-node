@@ -13,6 +13,10 @@
  * starts an acknowledged cancellation), and the payload being unclonable
  * (`postMessage` throws synchronously before the message ever leaves).
  *
+ * A MessagePort cannot kill its peer. The required `onUnresponsive` hook is the
+ * supervision seam: a generic caller with no way to tear down the peer cannot
+ * provide both a finite bound and the guarantee that queued mutations are dead.
+ *
  * No `node:` imports — this module runs in the renderer.
  */
 
@@ -29,10 +33,25 @@ import { isRpcReply, type RpcRequest } from './protocol.js';
  * result.
  */
 const DEFAULT_TIMEOUT_MS = 30_000;
+/** How long an acknowledged cancellation may take before the transport itself is declared wedged. */
+const DEFAULT_CANCELLATION_GRACE_MS = 5_000;
 
 export interface RpcClientOptions {
   /** Delay before requesting acknowledged cancellation. Defaults to 30 s. */
   timeoutMs?: number;
+  /**
+   * Hard bound after cancellation is requested. Expiry asks the supervisor to
+   * replace the whole transport. Defaults to 5 s.
+   */
+  cancellationGraceMs?: number;
+  /**
+   * Called synchronously when the cancellation grace expires. The desktop shell
+   * uses this to restart the supervised runtime whose transport stopped making
+   * progress. Old calls remain pending until the old port closes or returns an
+   * authoritative response. The hook must initiate peer teardown; locally
+   * closing this port is not a substitute for proving queued work is dead.
+   */
+  onUnresponsive(reason: string): void;
 }
 
 export interface RpcClient {
@@ -48,10 +67,18 @@ export interface RpcClient {
   close(): void;
 }
 
-export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): RpcClient {
+export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClient {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const cancellationGraceMs = opts.cancellationGraceMs ?? DEFAULT_CANCELLATION_GRACE_MS;
 
-  const pending = new Map<number, { settle: (response: ApiResponse) => void; timer: ReturnType<typeof setTimeout> }>();
+  const pending = new Map<
+    number,
+    {
+      settle: (response: ApiResponse) => void;
+      timer: ReturnType<typeof setTimeout>;
+      cancellationRequested: boolean;
+    }
+  >();
   const listeners = new Map<number, (event: DownloadEvent) => void>();
   let nextId = 1;
   /** Set once no further reply can arrive; every later call fails fast instead of waiting out its deadline. */
@@ -59,6 +86,7 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
 
   let closed = false;
   let portFinished = false;
+  let recoveryStarted = false;
   let detach = (): void => {};
 
   const finishClose = (): void => {
@@ -115,6 +143,51 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
     port.postMessage(request);
   };
 
+  const startRecovery = (reason: string): void => {
+    if (recoveryStarted || portFinished) return;
+    recoveryStarted = true;
+    closed = true;
+    down = `${reason}; runtime recovery is in progress`;
+    listeners.clear();
+    for (const entry of pending.values()) clearTimeout(entry.timer);
+    // Do NOT settle or locally close the port here. Posting the recovery signal
+    // is not proof that queued work is dead. The old process's port-close event
+    // is the teardown witness; until then only an authoritative original
+    // response may settle a call.
+    try {
+      opts.onUnresponsive(reason);
+    } catch {
+      // A recovery hook runs from a timer callback. It must not throw through
+      // the browser's event loop; the old call remains pending for a real
+      // response or a peer-close witness.
+    }
+  };
+
+  const requestCancellation = (
+    id: number,
+    entry: {
+      timer: ReturnType<typeof setTimeout>;
+      cancellationRequested: boolean;
+    },
+  ): void => {
+    if (entry.cancellationRequested) return;
+    entry.cancellationRequested = true;
+    clearTimeout(entry.timer);
+    try {
+      post({ kind: 'cancel', id });
+    } catch {
+      startRecovery('the cancellation request could not cross the message port');
+      return;
+    }
+    entry.timer = setTimeout(() => {
+      // A responsive host answers the ORIGINAL request with either its real
+      // result or an acknowledged withdrawal. Silence beyond this second
+      // deadline means the transport cannot be trusted to retire queued work.
+      if (pending.get(id) !== entry) return;
+      startRecovery('the runtime did not acknowledge cancellation before the recovery deadline');
+    }, cancellationGraceMs);
+  };
+
   return {
     call(apiCall: ApiCall): Promise<ApiResponse> {
       if (down !== null) {
@@ -123,19 +196,10 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
       const id = nextId++;
       return new Promise<ApiResponse>((resolve) => {
         const timer = setTimeout(() => {
-          // Start cancellation, but KEEP this request pending. The worker may
-          // have sampled its independent withdrawal port just before this
-          // message arrives; only its acknowledged skip or the real result of
-          // already-started work is authoritative.
-          try {
-            post({ kind: 'cancel', id });
-          } catch {
-            // This plain payload can only fail because the transport is going
-            // away. Do not turn that into an unacknowledged timeout: the
-            // authoritative response or the port's close event must settle it.
-          }
+          const entry = pending.get(id);
+          if (entry !== undefined) requestCancellation(id, entry);
         }, timeoutMs);
-        pending.set(id, { settle: resolve, timer });
+        pending.set(id, { settle: resolve, timer, cancellationRequested: false });
         try {
           post({ kind: 'call', id, call: apiCall });
         } catch (err) {
@@ -205,13 +269,8 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
       // listener and port until each receives an acknowledged skip or the real
       // result of already-started work.
       for (const [id, entry] of pending) {
-        clearTimeout(entry.timer);
-        try {
-          post({ kind: 'cancel', id });
-        } catch {
-          goDown('the cancellation request could not cross the message port; call outcome is unknown');
-          return;
-        }
+        requestCancellation(id, entry);
+        if (recoveryStarted) return;
       }
       finishClose();
     },

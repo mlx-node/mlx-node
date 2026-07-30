@@ -7,10 +7,11 @@ import { describe, expect, it } from 'vite-plus/test';
 // `rpc/protocol.js` but not this constant, and the SPA reaches it by relative
 // path too. Imported rather than regex-matched so a rename over there fails to
 // compile here instead of quietly weakening the assertion.
-import { DASHBOARD_PORT_MESSAGE } from '../../dashboard/src/rpc/protocol.js';
+import { DASHBOARD_PORT_MESSAGE, DASHBOARD_UNRESPONSIVE_MESSAGE } from '../../dashboard/src/rpc/protocol.js';
 import {
   CONTROL_PANEL_PORT_CHANNEL,
   CONTROL_PANEL_READY_CHANNEL,
+  CONTROL_PANEL_UNRESPONSIVE_CHANNEL,
   CONTROL_PANEL_URL,
   classifyNavigation,
 } from '../src/main/window-policy.js';
@@ -70,6 +71,8 @@ describe('the preload contract', () => {
   it('hard-codes exactly the channel names main sends on', () => {
     expect(source).toContain(`'${CONTROL_PANEL_PORT_CHANNEL}'`);
     expect(source).toContain(`'${CONTROL_PANEL_READY_CHANNEL}'`);
+    expect(source).toContain(`'${CONTROL_PANEL_UNRESPONSIVE_CHANNEL}'`);
+    expect(CONTROL_PANEL_UNRESPONSIVE_CHANNEL).toBe(DASHBOARD_UNRESPONSIVE_MESSAGE);
   });
 
   // Same constraint, the other half: a relative import compiles to a relative
@@ -86,18 +89,14 @@ describe('the preload contract', () => {
   });
 
   /*
-   * The page-facing half of the hop. The SPA compares `event.data` against
-   * `DASHBOARD_PORT_MESSAGE` — a bare string, not an envelope — and a mismatch is
-   * completely silent on both sides: the window renders its "Connecting to the
-   * mlx runtime…" placeholder forever and nothing is logged anywhere. That is
-   * exactly what the previous literal did.
+   * The page-facing half of the hop. The tag and broker generation travel
+   * together so a recovery report returns the identity of the exact channel
+   * that observed the wedge.
    */
-  it('posts the tag the SPA is listening for, as a bare string', () => {
+  it('posts the tag and validated broker generation the SPA is listening for', () => {
     expect(source).toContain(`'${DASHBOARD_PORT_MESSAGE}'`);
-    expect(source).toContain(`window.postMessage(DASHBOARD_PORT_MESSAGE, '*', [port])`);
-    // An object would satisfy `toContain` on the literal above while still never
-    // matching the SPA's `event.data !== DASHBOARD_PORT_MESSAGE` check.
-    expect(source).not.toContain(`window.postMessage({ type: CONTROL_PANEL_PORT_CHANNEL }`);
+    expect(source).toContain(`window.postMessage({ type: DASHBOARD_PORT_MESSAGE, generation }, '*', [port])`);
+    expect(source).toContain(`if (!isBrokerGeneration(generation))`);
   });
 
   /*
@@ -114,5 +113,11 @@ describe('the preload contract', () => {
     // The `readyState` branch matters: a preload that only subscribes would miss
     // a document that had already finished parsing.
     expect(source).toContain(`document.readyState === 'loading'`);
+  });
+
+  it('maps the page recovery message to MAIN without exposing ipcRenderer', () => {
+    expect(source).toContain(`type === CONTROL_PANEL_UNRESPONSIVE_CHANNEL && isBrokerGeneration(message.generation)`);
+    expect(source).toContain(`recoverRuntime(message.generation)`);
+    expect(source).toContain(`ipcRenderer.send(CONTROL_PANEL_UNRESPONSIVE_CHANNEL, generation)`);
   });
 });

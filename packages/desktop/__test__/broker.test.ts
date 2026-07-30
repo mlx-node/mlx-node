@@ -30,6 +30,8 @@ interface Renderer {
 interface TestPort extends BrokerPort {
   id: string;
   closed: boolean;
+  /** Generation MAIN sent beside this renderer-facing port. */
+  generation: number | null;
   /** Set once it has been transferred; a transferred port is no longer ours. */
   handedTo: 'control-panel' | 'renderer' | null;
 }
@@ -68,6 +70,7 @@ function harness(options: { spawnThrows?: boolean } = {}): Harness {
     const port: TestPort = {
       id: `p${(nextPort += 1)}`,
       closed: false,
+      generation: null,
       handedTo: null,
       close(): void {
         port.closed = true;
@@ -115,9 +118,10 @@ function harness(options: { spawnThrows?: boolean } = {}): Harness {
         return record.child;
       },
       createChannel: () => ({ port1: makePort(), port2: makePort() }),
-      sendToRenderer(target: Renderer, port: BrokerPort): void {
+      sendToRenderer(target: Renderer, port: BrokerPort, generation: number): void {
         if (target.refuse === true) throw new Error('WebContents destroyed');
         (port as TestPort).handedTo = 'renderer';
+        (port as TestPort).generation = generation;
         target.received.push(port as TestPort);
       },
       isRendererAlive: (target) => target.alive,
@@ -266,6 +270,85 @@ describe('a handshake that cannot be completed', () => {
 });
 
 describe('when CONTROL PANEL dies', () => {
+  it('kills, escalates, restarts, and re-brokers a child whose transport wedged', () => {
+    const h = harness();
+    const broker = createControlPanelBroker(h.deps, { restart: { baseDelayMs: 10 }, killGraceMs: 25 });
+    const win = renderer();
+    broker.attach(win);
+    const generation = broker.generation();
+
+    broker.recover(win, generation);
+    broker.recover(win, generation);
+    // Repeated reports from calls sharing one bad transport are coalesced.
+    expect(h.spawns[0].killed).toBe(1);
+    expect(h.timers.some((timer) => timer.ms === 25)).toBe(true);
+
+    h.fire();
+    expect(h.spawns[0].forceKilled).toBe(1);
+
+    h.spawns[0].exit(null);
+    h.fire();
+    expect(h.spawns).toHaveLength(2);
+    expect(win.received).toHaveLength(2);
+    expect(broker.running()).toBe(true);
+  });
+
+  it('cancels recovery escalation when SIGTERM succeeds', () => {
+    const h = harness();
+    const broker = createControlPanelBroker(h.deps, { restart: { baseDelayMs: 10 }, killGraceMs: 25 });
+    const win = renderer();
+    broker.attach(win);
+
+    broker.recover(win, broker.generation());
+    h.spawns[0].exit(null);
+    h.fire();
+
+    expect(h.spawns[0].forceKilled).toBe(0);
+    expect(h.spawns).toHaveLength(2);
+    expect(win.received).toHaveLength(2);
+  });
+
+  it('ignores an unresponsive report from a renderer that is already gone', () => {
+    const h = harness();
+    const broker = createControlPanelBroker(h.deps);
+    const win = renderer();
+    broker.attach(win);
+    win.alive = false;
+
+    broker.recover(win, broker.generation());
+
+    expect(h.spawns[0].killed).toBe(0);
+  });
+
+  it('ignores a queued recovery report after a replacement generation is brokered', () => {
+    const h = harness();
+    const broker = createControlPanelBroker(h.deps, { restart: { baseDelayMs: 10 } });
+    const win = renderer();
+    broker.attach(win);
+    const staleGeneration = broker.generation();
+    expect(win.received[0].generation).toBe(staleGeneration);
+
+    // Generation N's report is queued outside MAIN while that child exits and
+    // the ordinary restart path brokers N+1.
+    h.spawns[0].exit(1);
+    h.fire();
+    const replacementGeneration = broker.generation();
+    expect(replacementGeneration).toBeGreaterThan(staleGeneration);
+    expect(win.received.at(-1)?.generation).toBe(replacementGeneration);
+    const exitsBeforeStaleDelivery = h.events.filter((event) => event.type === 'control-panel-exited').length;
+
+    // Deliver the old report only now. Resolving it against the current `child`
+    // would kill the healthy replacement and consume another crash-budget slot.
+    broker.recover(win, staleGeneration);
+
+    expect(h.spawns[1].killed).toBe(0);
+    expect(h.spawns[1].forceKilled).toBe(0);
+    expect(h.events.filter((event) => event.type === 'control-panel-exited')).toHaveLength(
+      exitsBeforeStaleDelivery,
+    );
+    expect(broker.running()).toBe(true);
+  });
+
   it('reports it, restarts, and re-brokers to the window that is still open', () => {
     const h = harness();
     const broker = createControlPanelBroker(h.deps, { restart: { baseDelayMs: 10 } });

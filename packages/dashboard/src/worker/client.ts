@@ -73,7 +73,13 @@ export interface DbWorkerClient {
    */
   call(request: DbWorkerCall, signal?: AbortSignal): Promise<ApiResponse>;
   ingest(): Promise<IngestSummary>;
-  /** Await the worker's ingest chain; the database stays open. */
+  /**
+   * Await the worker's ingest chain; the database stays open.
+   * Rejects when a still-live worker cannot confirm the barrier within the
+   * shutdown budget — resolving without that acknowledgement would falsely
+   * report that queued ingest work had finished. A worker already known dead is
+   * vacuously drained because it can execute no future work.
+   */
   drain(): Promise<void>;
   /** Drain, close the database, end the thread. Idempotent and bounded. */
   close(): Promise<void>;
@@ -334,7 +340,17 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
       return result.reply.summary;
     },
     async drain(): Promise<void> {
-      await send((id) => ({ kind: 'drain', id }), opts.shutdownTimeoutMs);
+      const result = await send((id) => ({ kind: 'drain', id }), opts.shutdownTimeoutMs);
+      if (!result.ok) {
+        // `send` also uses `why: "down"` for its own deadline. Only the global
+        // latch proves exit/error already made future work impossible; a timeout
+        // while `down` is still null leaves the queued drain live and must reject.
+        if (result.why === 'down' && down !== null) return;
+        throw new Error(`Dashboard database worker did not confirm drain: ${result.reason}`);
+      }
+      if (result.reply.kind !== 'drained') {
+        throw new Error(`Unexpected worker reply "${result.reply.kind}" for a drain`);
+      }
     },
     close(): Promise<void> {
       closed ??= (async () => {

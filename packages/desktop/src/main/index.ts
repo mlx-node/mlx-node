@@ -265,6 +265,9 @@ async function bootstrap(): Promise<void> {
     onControlPanelReady: (contents) => {
       broker?.attach(contents);
     },
+    onControlPanelUnresponsive: (contents, expectedGeneration) => {
+      broker?.recover(contents, expectedGeneration);
+    },
   });
 
   tray = createTray({

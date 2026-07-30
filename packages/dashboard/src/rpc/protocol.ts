@@ -21,11 +21,19 @@ import type { ApiCall } from '../runtime.js';
  * The `window.postMessage` tag the preload uses to hand the SPA its port.
  *
  * A port cannot be `contextBridge`d, so the documented Electron hop is
- * `window.postMessage(TAG, '*', [port])` from the preload into the page. The tag
- * is here rather than in the shell because BOTH ends must agree on it and this is
- * the module that already defines what crosses the port.
+ * `window.postMessage({ type: TAG, generation }, '*', [port])` from the preload
+ * into the page. The tag is here rather than in the shell because BOTH ends must
+ * agree on it and this is the module that already defines what crosses the port.
  */
 export const DASHBOARD_PORT_MESSAGE = 'mlx:dashboard-port';
+
+/**
+ * Page → preload: the RPC transport missed its post-cancellation bound and the
+ * supervised CONTROL PANEL runtime must be replaced, not merely handed another
+ * port to the same wedged process. The envelope also carries the broker
+ * generation so MAIN can reject a delayed report after replacement.
+ */
+export const DASHBOARD_UNRESPONSIVE_MESSAGE = 'mlx:control-panel-unresponsive';
 
 export type RpcRequest =
   | { kind: 'call'; id: number; call: ApiCall }

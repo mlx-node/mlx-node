@@ -8,7 +8,7 @@
 
 import { MessageChannel, type MessagePort } from 'node:worker_threads';
 
-import { afterEach, describe, expect, it } from 'vite-plus/test';
+import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { failure, type ApiResponse } from '../src/api/errors.js';
 import type { DownloadEvent } from '../src/download.js';
@@ -104,7 +104,7 @@ function stubRuntime(answer?: (call: ApiCall, signal?: AbortSignal) => ApiRespon
 /** A live client/host pair over a real MessageChannel. */
 function connected(
   stub: Stub,
-  opts: { timeoutMs?: number } = {},
+  opts: { timeoutMs?: number; cancellationGraceMs?: number; onUnresponsive?(reason: string): void } = {},
 ): { client: RpcClient; dispose: () => void; hostPort: MessagePort; clientPort: MessagePort } {
   const { port1, port2 } = new MessageChannel();
   // Never hold the event loop open on a test channel's account.
@@ -113,7 +113,13 @@ function connected(
   // No cast: `node:worker_threads`' MessagePort satisfies `EventTargetPort`
   // structurally, which is the point of keeping that interface to four members.
   const dispose = serveRuntimeOverPort(stub.runtime, bindEventTargetPort(port2));
-  const client = createRpcClient(bindEventTargetPort(port1), opts);
+  const client = createRpcClient(bindEventTargetPort(port1), {
+    ...opts,
+    onUnresponsive(reason): void {
+      if (opts.onUnresponsive === undefined) port2.close();
+      else opts.onUnresponsive(reason);
+    },
+  });
   cleanups.push(() => {
     client.close();
     dispose();
@@ -336,6 +342,119 @@ describe('rpc request/response', () => {
 });
 
 describe('rpc never hangs a caller', () => {
+  it('takes down a transport that stays silent after cancellation without claiming the mutation was cancelled', async () => {
+    vi.useFakeTimers();
+    try {
+      const order: string[] = [];
+      let closes = 0;
+      let events: RpcPortEvents | undefined;
+      const client = createRpcClient(
+        {
+          postMessage(message: unknown): void {
+            order.push((message as { kind: string }).kind);
+          },
+          listen(next): () => void {
+            events = next;
+            return () => {
+              order.push('detached');
+            };
+          },
+          close(): void {
+            closes += 1;
+            order.push('closed');
+          },
+        },
+        {
+          timeoutMs: 100,
+          cancellationGraceMs: 50,
+          onUnresponsive: () => order.push('recover'),
+        },
+      );
+
+      const response = client.call({ method: 'DELETE', path: '/api/sessions/queued' }).then((result) => {
+        order.push('settled');
+        return result;
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(order).toEqual(['call', 'cancel']);
+
+      // The first deadline only requests withdrawal. The original response is
+      // still authoritative throughout the grace window.
+      await vi.advanceTimersByTimeAsync(49);
+      expect(order).toEqual(['call', 'cancel']);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(order).toEqual(['call', 'cancel', 'recover']);
+      expect(closes).toBe(0);
+
+      // Merely posting the recovery request is not proof that the queued
+      // mutation died. The old process's port close is that witness.
+      events!.onClose();
+      const result = await response;
+      expect(result).toMatchObject({ ok: false, code: 'E_UNAVAILABLE', status: 503 });
+      expect((result as { message: string }).message).toMatch(/outcome is unknown/i);
+      expect((result as { message: string }).message).not.toMatch(/cancellation acknowledged/i);
+      // Recovery is requested before the peer-death witness exposes the unknown
+      // outcome, and the suspect port is then retired.
+      expect(order).toEqual(['call', 'cancel', 'recover', 'detached', 'closed', 'settled']);
+      expect(closes).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds graceful close when its cancellation acknowledgement never arrives', async () => {
+    vi.useFakeTimers();
+    try {
+      const posted: RpcRequest[] = [];
+      let closes = 0;
+      let recoveries = 0;
+      let events: RpcPortEvents | undefined;
+      let settled = false;
+      const client = createRpcClient(
+        {
+          postMessage: (message) => posted.push(message as RpcRequest),
+          listen(next): () => void {
+            events = next;
+            return () => {};
+          },
+          close: () => {
+            closes += 1;
+          },
+        },
+        {
+          timeoutMs: 60_000,
+          cancellationGraceMs: 25,
+          onUnresponsive: () => {
+            recoveries += 1;
+          },
+        },
+      );
+
+      const pending = client.call({ method: 'POST', path: '/api/models/queued' }).then((result) => {
+        settled = true;
+        return result;
+      });
+      client.close();
+      expect(posted.map((message) => message.kind)).toEqual(['call', 'cancel']);
+      await vi.advanceTimersByTimeAsync(24);
+      expect(closes).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(recoveries).toBe(1);
+      expect(closes).toBe(0);
+      expect(settled).toBe(false);
+
+      events!.onClose();
+      const result = await pending;
+      expect(result).toMatchObject({ ok: false, code: 'E_UNAVAILABLE' });
+      expect((result as { message: string }).message).toMatch(/outcome is unknown/i);
+      expect(closes).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('keeps a timed-out call pending until cancellation is acknowledged', async () => {
     const order: string[] = [];
     let events: RpcPortEvents | undefined;
@@ -350,7 +469,7 @@ describe('rpc never hangs a caller', () => {
         },
         close: () => {},
       },
-      { timeoutMs: 0 },
+      { timeoutMs: 0, onUnresponsive: () => events?.onClose() },
     );
 
     try {
@@ -380,11 +499,9 @@ describe('rpc never hangs a caller', () => {
     const stub = stubRuntime(
       (_call, signal) =>
         new Promise<ApiResponse>((resolve) => {
-          signal?.addEventListener(
-            'abort',
-            () => resolve(failure('E_UNAVAILABLE', 'Cancellation acknowledged')),
-            { once: true },
-          );
+          signal?.addEventListener('abort', () => resolve(failure('E_UNAVAILABLE', 'Cancellation acknowledged')), {
+            once: true,
+          });
         }),
     );
     const { client } = connected(stub, { timeoutMs: 50 });
@@ -504,17 +621,20 @@ describe('rpc never hangs a caller', () => {
     const posted: RpcRequest[] = [];
     let detaches = 0;
     let closes = 0;
-    const client = createRpcClient({
-      postMessage(message: unknown): void {
-        posted.push(message as RpcRequest);
+    const client = createRpcClient(
+      {
+        postMessage(message: unknown): void {
+          posted.push(message as RpcRequest);
+        },
+        listen: () => () => {
+          detaches += 1;
+        },
+        close(): void {
+          closes += 1;
+        },
       },
-      listen: () => () => {
-        detaches += 1;
-      },
-      close(): void {
-        closes += 1;
-      },
-    });
+      { onUnresponsive: () => {} },
+    );
 
     const unsubscribe = client.subscribe('job', () => {});
     client.close();

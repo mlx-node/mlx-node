@@ -92,10 +92,14 @@ export interface DashboardRuntime {
   /**
    * Stop the periodic rescan, drain in-flight downloads and await any in-flight
    * ingest — everything that must finish while the database is still open.
-   * Idempotent; `close()` calls it for you.
+   * Idempotent; `close()` calls it for you. Rejects if the database worker cannot
+   * confirm that its ingest chain reached a fixpoint within the shutdown budget.
    */
   drain(): Promise<void>;
-  /** {@link drain} then close the SQLite handle and end the worker. Idempotent. */
+  /**
+   * {@link drain}, then close the SQLite handle and end the worker. Idempotent.
+   * A drain failure is reported only after the bounded worker teardown still runs.
+   */
   close(): Promise<void>;
 }
 
@@ -233,8 +237,28 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     },
     drain,
     async close(): Promise<void> {
-      await drain();
-      await worker.close();
+      // Even a failed drain must not leave the database worker alive. The drain
+      // rejection remains the caller-visible proof that shutdown was not clean,
+      // while close keeps its separate bounded teardown guarantee. Preserve both
+      // errors if teardown itself also fails; otherwise a terminate failure would
+      // hide the earlier unconfirmed ingest barrier.
+      let drainFailed = false;
+      let drainError: unknown;
+      try {
+        await drain();
+      } catch (error) {
+        drainFailed = true;
+        drainError = error;
+      }
+      try {
+        await worker.close();
+      } catch (closeError) {
+        if (drainFailed) {
+          throw new AggregateError([drainError, closeError], 'Dashboard runtime failed to drain and close cleanly');
+        }
+        throw closeError;
+      }
+      if (drainFailed) throw drainError;
     },
   };
 }

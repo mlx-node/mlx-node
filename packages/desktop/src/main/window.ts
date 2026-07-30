@@ -11,7 +11,12 @@
 import { app, BrowserWindow, ipcMain, shell, type IpcMainEvent, type WebContents } from 'electron';
 
 import { clampBoundsToDisplays, type Rect, type WindowBounds } from './settings.js';
-import { CONTROL_PANEL_READY_CHANNEL, CONTROL_PANEL_URL, classifyNavigation } from './window-policy.js';
+import {
+  CONTROL_PANEL_READY_CHANNEL,
+  CONTROL_PANEL_UNRESPONSIVE_CHANNEL,
+  CONTROL_PANEL_URL,
+  classifyNavigation,
+} from './window-policy.js';
 
 /** Below this the dashboard's own layout collapses; the user cannot recover it by dragging. */
 const MIN_WIDTH = 720;
@@ -53,13 +58,18 @@ export interface ControlPanelWindowOptions {
    * **The broker seam.** Called when the renderer says it is listening, with the
    * `WebContents` that asked. The implementation creates a `MessageChannelMain`,
    * serves the CONTROL PANEL runtime on one end, and hands the other over with
-   * `contents.postMessage(CONTROL_PANEL_PORT_CHANNEL, null, [port2])`.
+   * `contents.postMessage(CONTROL_PANEL_PORT_CHANNEL, generation, [port2])`.
    *
    * Optional, and undefined until the broker exists: a window with no port
    * renders and stays empty, which is a visible, honest failure rather than a
    * crash at startup.
    */
   onControlPanelReady?(contents: WebContents): void;
+  /**
+   * Called only for this window when its RPC transport misses the
+   * post-cancellation bound. The broker kills and replaces the runtime.
+   */
+  onControlPanelUnresponsive?(contents: WebContents, expectedGeneration: number): void;
 }
 
 export interface ControlPanelWindowManager {
@@ -83,7 +93,24 @@ export function createControlPanelWindowManager(options: ControlPanelWindowOptio
     if (win === null || win.isDestroyed() || event.sender !== win.webContents) return;
     options.onControlPanelReady?.(event.sender);
   };
+  const onUnresponsive = (event: IpcMainEvent, expectedGeneration: unknown): void => {
+    // Restarting the utility process is a larger capability than asking for a
+    // fresh port, so keep the same exact-sender boundary.
+    if (win === null || win.isDestroyed() || event.sender !== win.webContents) return;
+    // The generation is also an authority boundary: malformed input and a
+    // delayed report for a retired channel must never be resolved against the
+    // process that happens to be current now.
+    if (
+      typeof expectedGeneration !== 'number' ||
+      !Number.isSafeInteger(expectedGeneration) ||
+      expectedGeneration < 1
+    ) {
+      return;
+    }
+    options.onControlPanelUnresponsive?.(event.sender, expectedGeneration);
+  };
   ipcMain.on(CONTROL_PANEL_READY_CHANNEL, onReady);
+  ipcMain.on(CONTROL_PANEL_UNRESPONSIVE_CHANNEL, onUnresponsive);
 
   function persistBounds(): void {
     if (boundsTimer !== null) clearTimeout(boundsTimer);
@@ -202,6 +229,7 @@ export function createControlPanelWindowManager(options: ControlPanelWindowOptio
       if (disposed) return;
       disposed = true;
       ipcMain.removeListener(CONTROL_PANEL_READY_CHANNEL, onReady);
+      ipcMain.removeListener(CONTROL_PANEL_UNRESPONSIVE_CHANNEL, onUnresponsive);
       if (boundsTimer !== null) {
         clearTimeout(boundsTimer);
         boundsTimer = null;

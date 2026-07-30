@@ -126,7 +126,7 @@ export function stubApi(routes: ApiStub, options: ApiStubOptions = {}): () => vo
     },
     bindEventTargetPort(port2),
   );
-  connectDashboardApi(bindEventTargetPort(port1));
+  connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
   return () => {
     disconnectDashboardApi();
     dispose();

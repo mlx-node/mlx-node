@@ -75,10 +75,10 @@ export function electronBrokerDeps(options: ControlPanelChildOptions): BrokerDep
       return new MessageChannelMain();
     },
 
-    sendToRenderer(target: WebContents, port: BrokerPort): void {
+    sendToRenderer(target: WebContents, port: BrokerPort, generation: number): void {
       // Throws on a destroyed WebContents, which is what `broker.ts` treats as
       // "this renderer is gone" — do NOT soften it into a no-op.
-      target.postMessage(CONTROL_PANEL_PORT_CHANNEL, null, [port as unknown as Electron.MessagePortMain]);
+      target.postMessage(CONTROL_PANEL_PORT_CHANNEL, generation, [port as unknown as Electron.MessagePortMain]);
     },
 
     isRendererAlive(target: WebContents): boolean {

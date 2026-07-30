@@ -17,8 +17,14 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
+import { SIDECAR_HOST_CLOSE_TIMEOUT_MS } from '../src/inference/sidecar.js';
 import { nodeChildTransport } from '../src/main/supervisor/child-node.js';
-import { createSupervisor, type Supervisor, type SupervisorOptions } from '../src/main/supervisor/index.js';
+import {
+  createSupervisor,
+  DEFAULT_TIMINGS,
+  type Supervisor,
+  type SupervisorOptions,
+} from '../src/main/supervisor/index.js';
 import {
   SidecarRequestError,
   type ChildTransport,
@@ -172,6 +178,16 @@ describe('start-up', () => {
 
     const snapshot = await waitFor(supervisor, (s) => s.state === 'failed', 'give-up');
     expect(snapshot.lastExit?.stderrTail.join('\n')).toContain('MODULE_NOT_FOUND');
+  });
+});
+
+describe('shutdown timing', () => {
+  it('reserves cleanup time after the child host exhausts its HTTP drain budget', () => {
+    // At equality both timers race: the parent may SIGKILL before the child's
+    // forced socket teardown can flush request logs and remove the paged-config
+    // temp root. Keep a material margin within MAIN's 10 s quit deadline.
+    expect(DEFAULT_TIMINGS.killGraceMs - SIDECAR_HOST_CLOSE_TIMEOUT_MS).toBeGreaterThanOrEqual(2_000);
+    expect(DEFAULT_TIMINGS.killGraceMs).toBeLessThan(10_000);
   });
 });
 

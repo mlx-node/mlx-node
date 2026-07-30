@@ -24,6 +24,7 @@ import {
   resolveParentChannel,
   runSidecar,
   SIDECAR_HOST_OPTIONS,
+  SIDECAR_HOST_CLOSE_TIMEOUT_MS,
   sidecarHostOptions,
   type ParentChannel,
   type SidecarHost,
@@ -306,10 +307,12 @@ describe('shutdown', () => {
   it('closes the host and exits 0 on the stop signal', async () => {
     const host = await realHost();
     let closed = 0;
+    let closeOptions: { timeoutMs?: number } | undefined;
     const h = harness(async () => ({
       ...host,
-      close: async () => {
+      close: async (options) => {
         closed += 1;
+        closeOptions = options;
         await host.close();
       },
     }));
@@ -319,6 +322,10 @@ describe('shutdown', () => {
     await tick();
 
     expect(closed).toBe(1);
+    // The parent reserves a cleanup margin AFTER this bounded HTTP drain. If
+    // this silently falls back to the server default, the two values can drift
+    // back to equality and SIGKILL can interrupt logger/temp-root disposal.
+    expect(closeOptions).toEqual({ timeoutMs: SIDECAR_HOST_CLOSE_TIMEOUT_MS });
     // 0, and the supervisor does NOT read it as success: it decides clean-vs-crash
     // from the intent it recorded before the kill, because `utilityProcess.kill()`
     // reports 0 either way.

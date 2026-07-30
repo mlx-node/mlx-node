@@ -1,6 +1,6 @@
 /**
  * The Control Panel window's contract with its renderer: where it may navigate, and the
- * two IPC channel names the preload hard-codes.
+ * IPC channel names the preload hard-codes.
  *
  * Electron-free so both decisions are testable — `window.ts` holds the
  * `BrowserWindow` and nothing else.
@@ -14,7 +14,8 @@ export const APP_HOST = 'mlx';
 export const CONTROL_PANEL_URL = `${APP_SCHEME}//${APP_HOST}/`;
 
 /**
- * MAIN → renderer, carrying one transferred `MessagePort` in `event.ports[0]`.
+ * MAIN → renderer, carrying one transferred `MessagePort` in `event.ports[0]`
+ * and its positive broker generation as the IPC payload.
  *
  * **Duplicated as a string literal in `src/preload/index.cts`, which cannot
  * import it.** A sandboxed preload may `require` only `electron` and a handful
@@ -35,6 +36,15 @@ export const CONTROL_PANEL_PORT_CHANNEL = 'mlx:control-panel-port';
  * and lets MAIN answer with a fresh `MessageChannelMain` every time.
  */
 export const CONTROL_PANEL_READY_CHANNEL = 'mlx:control-panel-ready';
+
+/**
+ * Renderer → MAIN: the CONTROL PANEL transport failed to acknowledge
+ * cancellation within its hard bound.
+ *
+ * A fresh channel to the same process cannot recover a wedged event loop, so
+ * this signal enters the broker's supervised kill/restart path instead.
+ */
+export const CONTROL_PANEL_UNRESPONSIVE_CHANNEL = 'mlx:control-panel-unresponsive';
 
 /**
  * `allow` — same-origin SPA navigation.

@@ -77,7 +77,13 @@ export interface SupervisorTimings {
   healthRequestTimeoutMs: number;
   /** Default per-request RPC timeout; overridable per call. */
   requestTimeoutMs: number;
-  /** SIGTERM → SIGKILL escalation window. */
+  /**
+   * SIGTERM → SIGKILL escalation window.
+   *
+   * The default must remain longer than the sidecar host's 5 s HTTP drain
+   * budget: after forced connection teardown the child still has to flush its
+   * request logs and remove its paged-config temp root before it exits.
+   */
   killGraceMs: number;
   /**
    * How long to wait for stdout/stderr EOF after `exit` before reporting the
@@ -97,7 +103,9 @@ export const DEFAULT_TIMINGS: SupervisorTimings = Object.freeze({
   healthIntervalMs: 5_000,
   healthRequestTimeoutMs: 2_000,
   requestTimeoutMs: 60_000,
-  killGraceMs: 5_000,
+  // 5 s for the sidecar host's HTTP drain, then 3 s for log flush + temp-root
+  // cleanup. Still below MAIN's independent 10 s whole-app quit deadline.
+  killGraceMs: 8_000,
   stdioFlushMs: 50,
   tracePollMs: 1_000,
 });

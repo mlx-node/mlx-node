@@ -63,7 +63,7 @@ function stubUnansweredApi(): () => void {
   const { port1, port2 } = new MessageChannel();
   port1.unref();
   port2.unref();
-  connectDashboardApi(bindEventTargetPort(port1));
+  connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
   return () => {
     disconnectDashboardApi();
     port1.close();

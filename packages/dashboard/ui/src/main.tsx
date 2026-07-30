@@ -3,7 +3,7 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 
 import { bindEventTargetPort } from '../../src/rpc/port.js';
-import { DASHBOARD_PORT_MESSAGE } from '../../src/rpc/protocol.js';
+import { DASHBOARD_PORT_MESSAGE, DASHBOARD_UNRESPONSIVE_MESSAGE } from '../../src/rpc/protocol.js';
 import App from './App.tsx';
 import './index.css';
 
@@ -12,9 +12,10 @@ if (rootEl === null) throw new Error('#root element not found');
 const root = createRoot(rootEl);
 
 /**
- * The port arrives from the preload as `window.postMessage(TAG, '*', [port])` —
- * a MessagePort cannot cross `contextBridge`, so this hop is the documented way
- * in. The listener is registered during module evaluation, before React renders,
+ * The port arrives from the preload as
+ * `window.postMessage({ type: TAG, generation }, '*', [port])` — a MessagePort
+ * cannot cross `contextBridge`, so this hop is the documented way in. The
+ * listener is registered during module evaluation, before React renders,
  * because the main process sends the port once the page has loaded and a
  * listener attached later would simply miss it.
  *
@@ -23,10 +24,26 @@ const root = createRoot(rootEl);
  * whatever tag it carries.
  */
 window.addEventListener('message', (event: MessageEvent) => {
-  if (event.source !== window || event.data !== DASHBOARD_PORT_MESSAGE) return;
+  if (event.source !== window || typeof event.data !== 'object' || event.data === null) return;
+  const data = event.data as { type?: unknown; generation?: unknown };
+  if (
+    data.type !== DASHBOARD_PORT_MESSAGE ||
+    typeof data.generation !== 'number' ||
+    !Number.isSafeInteger(data.generation) ||
+    data.generation < 1
+  ) {
+    return;
+  }
   const port = event.ports[0];
   if (port === undefined) return;
-  connectDashboardApi(bindEventTargetPort(port));
+  const generation = data.generation;
+  connectDashboardApi(bindEventTargetPort(port), {
+    onUnresponsive(): void {
+      // The preload maps this narrow signal to MAIN's supervised restart path.
+      // Asking for another port would reconnect to the SAME wedged process.
+      window.postMessage({ type: DASHBOARD_UNRESPONSIVE_MESSAGE, generation }, '*');
+    },
+  });
   root.render(
     <StrictMode>
       <App />

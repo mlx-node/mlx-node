@@ -1364,7 +1364,7 @@ describe('Models page — the Install affordance', () => {
       },
       bindEventTargetPort(port2),
     );
-    connectDashboardApi(bindEventTargetPort(port1));
+    connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
     restoreApi = () => {
       disconnectDashboardApi();
       dispose();

@@ -61,7 +61,7 @@ function stubPendingApi(): () => void {
     { call: () => new Promise<never>(() => {}), subscribe: () => () => {} },
     bindEventTargetPort(port2),
   );
-  connectDashboardApi(bindEventTargetPort(port1));
+  connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
   return () => {
     disconnectDashboardApi();
     dispose();
