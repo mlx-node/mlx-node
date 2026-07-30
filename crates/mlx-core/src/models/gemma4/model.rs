@@ -25,7 +25,7 @@ use crate::models::gemma4::quantized_linear::LinearProj;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
-use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::transformer::paged_kv_cache_adapter::{
     ColdTierContext, PagedKVCacheAdapter, paged_attention_v2_aux_fits,
 };
@@ -187,16 +187,26 @@ fn emit_stream_delta(text: String, is_reasoning: bool, cb: &StreamSender<'_>) {
 /// `<|channel>thought\n...<channel|>`. Once a reasoning delta has been
 /// streamed to Anthropic SSE we cannot re-label that content as visible
 /// text, so keep leading channel bytes pending until a visible text/tool
-/// segment proves the channel was real reasoning. If generation ends
-/// with only that pending channel body, surface it as normal text.
+/// segment proves the channel was real reasoning. If an ambiguous,
+/// model-opened channel ends with only that pending body, surface it as
+/// normal text; a prompt-seeded channel is known reasoning even when
+/// generation truncates before its close marker.
 #[derive(Default)]
 struct Gemma4StreamDispatchState {
     pending_reasoning: String,
     visible_text_emitted: bool,
     tool_call_seen: bool,
+    starts_in_prompted_channel: bool,
 }
 
 impl Gemma4StreamDispatchState {
+    fn new(starts_in_prompted_channel: bool) -> Self {
+        Self {
+            starts_in_prompted_channel,
+            ..Self::default()
+        }
+    }
+
     fn dispatch_segments(
         &mut self,
         segments: Vec<super::output_parser::StreamSegment>,
@@ -237,7 +247,7 @@ impl Gemma4StreamDispatchState {
             return;
         }
         let text = std::mem::take(&mut self.pending_reasoning);
-        if self.visible_text_emitted || self.tool_call_seen {
+        if self.visible_text_emitted || self.tool_call_seen || self.starts_in_prompted_channel {
             emit_stream_delta(text, true, cb);
         } else {
             self.visible_text_emitted = true;
@@ -254,8 +264,12 @@ impl Gemma4StreamDispatchState {
     }
 }
 
-fn promote_channel_only_output(parsed: &mut super::output_parser::Gemma4ParsedOutput) {
-    if parsed.text.trim().is_empty()
+fn promote_channel_only_output(
+    parsed: &mut super::output_parser::Gemma4ParsedOutput,
+    starts_in_prompted_channel: bool,
+) {
+    if !starts_in_prompted_channel
+        && parsed.text.trim().is_empty()
         && parsed.tool_calls.is_empty()
         && parsed
             .thinking
@@ -273,18 +287,22 @@ fn promote_channel_only_output(parsed: &mut super::output_parser::Gemma4ParsedOu
 /// pending-reasoning buffering, channel-only promotion, empty-chunk
 /// filtering. `is_reasoning` / `include_reasoning` are deliberately
 /// ignored — Gemma4's reasoning labeling comes from the parser's channel
-/// markers, not the engine's `<think>`-token tracker (which never
-/// activates: [`ChatBackend::thinking_setup`] returns `enabled: false`).
+/// markers, not the engine's `<think>`-token tracker. Selectable thinking
+/// is enabled by the prompt's `<|think|>` capability token; the tracker
+/// stays disabled because Gemma4 closes reasoning with `<channel|>`, not
+/// a `</think>` token.
 struct Gemma4Emitter {
     parser: super::output_parser::Gemma4StreamParser,
     dispatch: Gemma4StreamDispatchState,
 }
 
 impl Gemma4Emitter {
-    fn new() -> Self {
+    fn new(starts_in_open_channel: bool) -> Self {
         Self {
-            parser: super::output_parser::Gemma4StreamParser::new(),
-            dispatch: Gemma4StreamDispatchState::default(),
+            parser: super::output_parser::Gemma4StreamParser::new_with_open_channel(
+                starts_in_open_channel,
+            ),
+            dispatch: Gemma4StreamDispatchState::new(starts_in_open_channel),
         }
     }
 }
@@ -509,6 +527,12 @@ pub(crate) struct Gemma4Inner {
     /// immediately-following fallible `save_paged_history` refuses to publish
     /// token/sliding history and lets the engine reset the failed session.
     paged_finalize_failed: bool,
+    /// True when this turn's rendered prompt ends inside
+    /// `<|channel>thought\n`. The generated suffix then begins at the
+    /// reasoning body, so both sync and streaming output parsers must start
+    /// in `Channel` rather than `Message`. Every render entry point overwrites
+    /// the latch before decode; the dedicated model thread serializes turns.
+    output_starts_in_reasoning_channel: AtomicBool,
     pub(crate) model_id: u64,
 }
 
@@ -1826,6 +1850,7 @@ impl Gemma4Inner {
             paged_text_turn_context: MediaCapabilities::NONE,
             media_session_continuable: false,
             paged_finalize_failed: false,
+            output_starts_in_reasoning_channel: AtomicBool::new(false),
             model_id,
         })
     }
@@ -4239,8 +4264,12 @@ impl Gemma4Inner {
             profile_phases: None,
         });
 
-        let mut parsed = super::output_parser::parse_gemma4_output(&raw_text);
-        promote_channel_only_output(&mut parsed);
+        let starts_in_prompted_channel = self.output_starts_in_reasoning_channel();
+        let mut parsed = super::output_parser::parse_gemma4_output_with_open_channel(
+            &raw_text,
+            starts_in_prompted_channel,
+        );
+        promote_channel_only_output(&mut parsed, starts_in_prompted_channel);
         let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
             "tool_calls".to_string()
         } else {
@@ -4317,8 +4346,11 @@ impl Gemma4Inner {
 
         let mut decode_stream = tokenizer.inner().decode_stream(false);
         let mut streamed_text_len = 0;
-        let mut stream_parser = super::output_parser::Gemma4StreamParser::new();
-        let mut stream_dispatch = Gemma4StreamDispatchState::default();
+        let starts_in_prompted_channel = self.output_starts_in_reasoning_channel();
+        let mut stream_parser = super::output_parser::Gemma4StreamParser::new_with_open_channel(
+            starts_in_prompted_channel,
+        );
+        let mut stream_dispatch = Gemma4StreamDispatchState::new(starts_in_prompted_channel);
 
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
             let last_logits = {
@@ -7316,6 +7348,26 @@ impl PagedBackend for Gemma4Inner {
     }
 }
 
+impl Gemma4Inner {
+    fn record_output_parser_prompt_state(
+        &self,
+        tok: &Qwen3Tokenizer,
+        rendered_tokens: &[u32],
+    ) -> Result<()> {
+        let open_channel = tok.encode_sync("<|channel>thought\n", Some(false))?;
+        self.output_starts_in_reasoning_channel.store(
+            !open_channel.is_empty() && rendered_tokens.ends_with(&open_channel),
+            Ordering::Relaxed,
+        );
+        Ok(())
+    }
+
+    fn output_starts_in_reasoning_channel(&self) -> bool {
+        self.output_starts_in_reasoning_channel
+            .load(Ordering::Relaxed)
+    }
+}
+
 impl ChatBackend for Gemma4Inner {
     fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
         self.tokenizer
@@ -7333,14 +7385,14 @@ impl ChatBackend for Gemma4Inner {
     }
 
     fn policy(&self) -> engine::ThinkingPolicy {
-        // Legacy gemma4 had NO think-budget machinery: its decode loops
-        // never tracked reasoning tokens (`reasoning_tokens: 0` on every
-        // result) and never forced `</think>`. `ThinkingPolicy::None`
-        // resolves to `{enabled:false, budget:None}`, keeping the
-        // engine's `ReasoningTracker` permanently outside a think block —
-        // the reasoning SEGMENTATION still happens downstream in
-        // `parse_gemma4_output` / `Gemma4StreamParser`, which key on
-        // `<|channel>` markers, not the tracker.
+        // Gemma4's selectable mode is a PROMPT capability (`<|think|>` in
+        // the first system turn), not a Qwen-style `<think>...</think>`
+        // decode region. Keep the generic tracker disabled: it has no
+        // `<channel|>` end-token support and enabling it would incorrectly
+        // classify every generated token as reasoning. Segmentation remains
+        // downstream in `parse_gemma4_output` / `Gemma4StreamParser`, keyed
+        // on `<|channel>` markers. Consequently Gemma4 still has no generic
+        // think-budget forcing and reports `reasoning_tokens: 0`.
         engine::ThinkingPolicy::None
     }
 
@@ -7399,9 +7451,10 @@ impl ChatBackend for Gemma4Inner {
     }
 
     /// Template default path == the engine default; template-less
-    /// checkpoints take gemma4's manual `<|turn>` wire-format fallback.
-    /// A single no-template `enable_thinking` error string covers all
-    /// entry points.
+    /// checkpoints take gemma4's manual `<|turn>` wire-format fallback,
+    /// including the canonical first-system-turn `<|think|>` capability
+    /// token when thinking is enabled and Gemma declaration-DSL tool schemas
+    /// when tools are supplied.
     fn render_prompt(
         &self,
         tok: &Qwen3Tokenizer,
@@ -7414,55 +7467,20 @@ impl ChatBackend for Gemma4Inner {
         // automatically). Fall back to manual Gemma4 format if no
         // template was loaded.
         if tok.has_chat_template() {
-            return tok.apply_chat_template_sync(
+            let tokens = tok.apply_chat_template_sync(
                 messages,
                 Some(true), // add_generation_prompt
                 config.tools.as_deref(),
                 enable_thinking, // None = template default
-            );
+            )?;
+            self.record_output_parser_prompt_state(tok, &tokens)?;
+            return Ok(tokens);
         }
-        // Manual fallback: thinking control requires a chat template
-        if enable_thinking == Some(true) {
-            return Err(Error::from_reason(
-                "enable_thinking=true requires a chat template (not found in tokenizer_config.json or chat_template.jinja)",
-            ));
-        }
-        // Manual Gemma4 format matching the canonical template.
-        // Role mapping: "assistant" → "model", "developer" → "system".
-        // Tool calls serialized as <|tool_call>call:name{args}<tool_call|>.
-        // Tool responses wrapped in <|tool_response>...<tool_response|>.
-        // BOS prepended explicitly (matching {{ bos_token }} in template).
-        let mut prompt_text = String::from("<bos>");
-        for msg in messages {
-            let role = match msg.role.as_str() {
-                "assistant" => "model",
-                "developer" => "system",
-                other => other,
-            };
-
-            // All roles (including "tool") use the same <|turn>role\n...<turn|>\n format.
-            // This matches the canonical tokenizer behavior verified against HF.
-            {
-                prompt_text.push_str(&format!("<|turn>{}\n", role));
-
-                // Emit tool calls for assistant/model messages
-                if let Some(ref tool_calls) = msg.tool_calls {
-                    for tc in tool_calls {
-                        prompt_text.push_str(&format!(
-                            "<|tool_call>call:{}{{{}}}<tool_call|>",
-                            tc.name,
-                            json_args_to_gemma4_dsl(&escape_gemma4_content(&tc.arguments))
-                        ));
-                    }
-                }
-
-                // Emit content (sanitized to prevent control-token injection)
-                prompt_text.push_str(&escape_gemma4_content(&msg.content));
-                prompt_text.push_str("<turn|>\n");
-            }
-        }
-        prompt_text.push_str("<|turn>model\n");
-        tok.encode_sync(&prompt_text, Some(false))
+        let prompt_text =
+            build_gemma4_manual_prompt_text(messages, config.tools.as_deref(), enable_thinking);
+        let tokens = tok.encode_sync(&prompt_text, Some(false))?;
+        self.record_output_parser_prompt_state(tok, &tokens)?;
+        Ok(tokens)
     }
 
     fn render_continue_delta(
@@ -7480,7 +7498,9 @@ impl ChatBackend for Gemma4Inner {
 
         let enable_thinking = engine::resolve_enable_thinking(config);
         let delta_text = build_gemma4_continue_delta_text(sanitized_user, enable_thinking);
-        tok.encode_sync(&delta_text, Some(false))
+        let tokens = tok.encode_sync(&delta_text, Some(false))?;
+        self.record_output_parser_prompt_state(tok, &tokens)?;
+        Ok(tokens)
     }
 
     fn render_tool_delta(
@@ -7492,9 +7512,30 @@ impl ChatBackend for Gemma4Inner {
         config: &ChatConfig,
     ) -> Result<Vec<u32>> {
         let enable_thinking = engine::resolve_enable_thinking(config);
+        // Gemma's response DSL names the called function, while the public
+        // continuation API carries only its opaque `call_<uuid>` id. The
+        // session API admits exactly one outstanding call, so recover its
+        // name from the committed token history. The stop `<turn|>` was
+        // dropped when that history was saved; the response block therefore
+        // appends directly after `<tool_call|>` inside the same model turn.
+        let history_text = tok.decode_sync(&self.cached_token_history, false)?;
+        let parsed = super::output_parser::parse_gemma4_output(&history_text);
+        let tool_name = parsed
+            .tool_calls
+            .iter()
+            .rev()
+            .find(|tool_call| tool_call.status == "ok")
+            .map(|tool_call| tool_call.name.as_str())
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Gemma4 tool result {tool_call_id:?} has no outstanding parsed tool call in the committed session history",
+                ))
+            })?;
         let delta_text =
-            build_gemma4_tool_delta_text(tool_call_id, content, enable_thinking, is_error);
-        tok.encode_sync(&delta_text, Some(false))
+            build_gemma4_tool_delta_text(tool_name, content, enable_thinking, is_error);
+        let tokens = tok.encode_sync(&delta_text, Some(false))?;
+        self.record_output_parser_prompt_state(tok, &tokens)?;
+        Ok(tokens)
     }
 
     fn cached_token_history(&self) -> &[u32] {
@@ -7718,8 +7759,12 @@ impl ChatBackend for Gemma4Inner {
     /// session core.
     fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
         let raw_text = args.tokenizer.decode_sync(args.generated_tokens, false)?;
-        let mut parsed = super::output_parser::parse_gemma4_output(&raw_text);
-        promote_channel_only_output(&mut parsed);
+        let starts_in_prompted_channel = self.output_starts_in_reasoning_channel();
+        let mut parsed = super::output_parser::parse_gemma4_output_with_open_channel(
+            &raw_text,
+            starts_in_prompted_channel,
+        );
+        promote_channel_only_output(&mut parsed, starts_in_prompted_channel);
         let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
             "tool_calls".to_string()
         } else {
@@ -7783,7 +7828,9 @@ impl ChatBackend for Gemma4Inner {
     }
 
     fn stream_emitter(&self) -> Box<dyn StreamEmitter> {
-        Box::new(Gemma4Emitter::new())
+        Box::new(Gemma4Emitter::new(
+            self.output_starts_in_reasoning_channel(),
+        ))
     }
 
     /// REJECT text deltas on media-holding sessions despite the declared
@@ -7910,6 +7957,366 @@ impl ChatBackend for Gemma4Inner {
     }
 }
 
+fn gemma4_dsl_string(value: &str) -> String {
+    format!("<|\"|>{value}<|\"|>")
+}
+
+fn format_gemma4_required_list(required: &[serde_json::Value]) -> String {
+    required
+        .iter()
+        .map(|value| match value.as_str() {
+            Some(value) => gemma4_dsl_string(value),
+            None => format_gemma4_value(value),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Format one JSON-Schema property using Gemma4's canonical declaration DSL.
+///
+/// The public `FunctionParameters` type exposes the subset used here:
+/// description, enum, array items, nullable, nested object properties /
+/// required, and type. Unknown annotation keys are intentionally ignored,
+/// matching the stock template's `standard_keys` filtering.
+fn format_gemma4_schema_property(value: &serde_json::Value) -> String {
+    let Some(object) = value.as_object() else {
+        return format!("type:{}", gemma4_dsl_string(""));
+    };
+    let schema_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let mut fields = Vec::new();
+
+    if let Some(description) = object
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+    {
+        fields.push(format!("description:{}", gemma4_dsl_string(description)));
+    }
+    if schema_type == "STRING"
+        && let Some(values) = object.get("enum").and_then(serde_json::Value::as_array)
+    {
+        fields.push(format!(
+            "enum:[{}]",
+            values
+                .iter()
+                .map(format_gemma4_value)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if schema_type == "ARRAY"
+        && let Some(items) = object.get("items").and_then(serde_json::Value::as_object)
+        && !items.is_empty()
+    {
+        fields.push(format!(
+            "items:{{{}}}",
+            format_gemma4_schema_property(&serde_json::Value::Object(items.clone()))
+        ));
+    }
+    if object
+        .get("nullable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        fields.push("nullable:true".to_string());
+    }
+    if schema_type == "OBJECT" {
+        if let Some(properties) = object
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+        {
+            fields.push(format!(
+                "properties:{{{}}}",
+                format_gemma4_schema_properties(properties)
+            ));
+        }
+        if let Some(required) = object.get("required").and_then(serde_json::Value::as_array)
+            && !required.is_empty()
+        {
+            fields.push(format!(
+                "required:[{}]",
+                format_gemma4_required_list(required)
+            ));
+        }
+    }
+    fields.push(format!("type:{}", gemma4_dsl_string(&schema_type)));
+    fields.join(",")
+}
+
+fn format_gemma4_schema_properties(
+    properties: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let mut properties = properties.iter().collect::<Vec<_>>();
+    properties.sort_by_key(|(name, _)| *name);
+    properties
+        .into_iter()
+        .map(|(name, value)| format!("{name}:{{{}}}", format_gemma4_schema_property(value)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_gemma4_tool_definition(tool: &ToolDefinition) -> String {
+    let function = &tool.function;
+    let mut declaration = format!(
+        "declaration:{}{{description:{}",
+        function.name,
+        gemma4_dsl_string(function.description.as_deref().unwrap_or_default())
+    );
+
+    if let Some(parameters) = &function.parameters {
+        let mut fields = Vec::new();
+        if let Some(properties) = parameters
+            .properties
+            .as_deref()
+            .and_then(|properties| serde_json::from_str::<serde_json::Value>(properties).ok())
+            .and_then(|properties| properties.as_object().cloned())
+            && !properties.is_empty()
+        {
+            fields.push(format!(
+                "properties:{{{}}}",
+                format_gemma4_schema_properties(&properties)
+            ));
+        }
+        if let Some(required) = parameters.required.as_deref()
+            && !required.is_empty()
+        {
+            fields.push(format!(
+                "required:[{}]",
+                required
+                    .iter()
+                    .map(|name| gemma4_dsl_string(name))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        if !parameters.r#type.is_empty() {
+            fields.push(format!(
+                "type:{}",
+                gemma4_dsl_string(&parameters.r#type.to_ascii_uppercase())
+            ));
+        }
+        declaration.push_str(",parameters:{");
+        declaration.push_str(&fields.join(","));
+        declaration.push('}');
+    }
+    declaration.push('}');
+    declaration
+}
+
+fn append_gemma4_tool_declarations(prompt: &mut String, tools: &[ToolDefinition]) {
+    for tool in tools {
+        prompt.push_str("<|tool>");
+        prompt.push_str(&format_gemma4_tool_definition(tool));
+        prompt.push_str("<tool|>");
+    }
+}
+
+fn append_gemma4_tool_response(
+    prompt: &mut String,
+    tool_name: &str,
+    content: &str,
+    is_error: Option<bool>,
+) {
+    let content = crate::tokenizer::apply_tool_error_marker(content, is_error);
+    let escaped = escape_gemma4_content(&content);
+    prompt.push_str("<|tool_response>response:");
+    prompt.push_str(tool_name);
+    prompt.push_str("{value:");
+    prompt.push_str(&gemma4_dsl_string(&escaped));
+    prompt.push_str("}<tool_response|>");
+}
+
+fn gemma4_tool_response_name<'a>(
+    tool_message: &ChatMessage,
+    tool_calls: &'a [crate::tokenizer::ToolCall],
+) -> &'a str {
+    let Some(tool_call_id) = tool_message.tool_call_id.as_deref() else {
+        return "unknown";
+    };
+    tool_calls
+        .iter()
+        .find(|tool_call| tool_call.id.as_deref() == Some(tool_call_id))
+        .map(|tool_call| tool_call.name.as_str())
+        .unwrap_or("unknown")
+}
+
+/// Render the template-less Gemma4 prompt.
+///
+/// Thinking-capable Gemma4 checkpoints use `<|think|>` as a capability
+/// instruction at the top of the FIRST system turn. It is not an assistant
+/// generation prefix and has no paired end token. Match the canonical Jinja
+/// shape:
+///
+/// * merge it into an existing leading system/developer turn; or
+/// * synthesize an otherwise-empty system turn before the first message.
+///
+/// Tool definitions share that first system turn in canonical Gemma DSL.
+/// When tools are present and thinking is disabled, the generation prompt's
+/// empty thought channel is replayed before a historical assistant tool call,
+/// preserving the exact cached prefix on the next agent step.
+///
+/// `None` retains the historical no-tools manual-fallback default (thinking
+/// off). In particular, the disabled no-tools path remains byte-identical so
+/// existing KV histories do not drift.
+fn build_gemma4_manual_prompt_text(
+    messages: &[ChatMessage],
+    tools: Option<&[ToolDefinition]>,
+    enable_thinking: Option<bool>,
+) -> String {
+    let thinking_enabled = enable_thinking == Some(true);
+    let tools = tools.filter(|tools| !tools.is_empty());
+    let has_tools = tools.is_some();
+    let leading_system = messages
+        .first()
+        .is_some_and(|message| matches!(message.role.as_str(), "system" | "developer"));
+
+    // BOS is explicit in the canonical Gemma4 template.
+    let mut prompt_text = String::from("<bos>");
+    if (thinking_enabled || has_tools) && !leading_system {
+        prompt_text.push_str("<|turn>system\n");
+        if thinking_enabled {
+            prompt_text.push_str("<|think|>\n");
+        }
+        if let Some(tools) = tools {
+            append_gemma4_tool_declarations(&mut prompt_text, tools);
+        }
+        prompt_text.push_str("<turn|>\n");
+    }
+
+    let mut previous_non_tool_was_assistant = false;
+    let mut tail_is_tool_call = false;
+    let mut tail_is_tool_response = false;
+
+    for (index, msg) in messages.iter().enumerate() {
+        // The canonical template consumes role=tool messages while
+        // forward-scanning the preceding assistant tool call. They never
+        // become standalone `<|turn>tool` turns.
+        if msg.role == "tool" {
+            continue;
+        }
+        let role = match msg.role.as_str() {
+            "assistant" => "model",
+            "developer" => "system",
+            other => other,
+        };
+        let continue_same_model_turn = role == "model" && previous_non_tool_was_assistant;
+        if !continue_same_model_turn {
+            prompt_text.push_str(&format!("<|turn>{role}\n"));
+        }
+
+        // A leading developer message maps to the same system turn as a
+        // leading system message. Do not create a second turn: canonical
+        // Gemma4 places the capability token before that message's content.
+        if thinking_enabled && index == 0 && role == "system" {
+            prompt_text.push_str("<|think|>\n");
+        }
+
+        if role == "model" {
+            if let Some(reasoning) = msg
+                .reasoning_content
+                .as_deref()
+                .filter(|reasoning| !reasoning.is_empty())
+            {
+                prompt_text.push_str("<|channel>thought\n");
+                prompt_text.push_str(reasoning);
+                prompt_text.push_str("\n<channel|>");
+            } else if has_tools
+                && !continue_same_model_turn
+                && !msg.thinking_enabled.unwrap_or(thinking_enabled)
+            {
+                // The tokenizer patch replays a disabled fresh model turn's
+                // empty channel before its historical tool call. A
+                // post-response assistant is a continuation of the same
+                // model turn and must not receive a second channel.
+                prompt_text.push_str("<|channel>thought\n<channel|>");
+            }
+        }
+
+        let tool_calls = msg.tool_calls.as_deref().unwrap_or_default();
+        for tc in tool_calls {
+            prompt_text.push_str(&format!(
+                "<|tool_call>call:{}{{{}}}<tool_call|>",
+                tc.name,
+                json_args_to_gemma4_dsl(&escape_gemma4_content(&tc.arguments))
+            ));
+        }
+
+        // OpenAI-style role=tool siblings are rendered immediately after the
+        // assistant call, inside the same model turn.
+        let mut emitted_tool_response = false;
+        if !tool_calls.is_empty() {
+            for tool_message in messages
+                .iter()
+                .skip(index + 1)
+                .take_while(|m| m.role == "tool")
+            {
+                append_gemma4_tool_response(
+                    &mut prompt_text,
+                    gemma4_tool_response_name(tool_message, tool_calls),
+                    &tool_message.content,
+                    tool_message.is_error,
+                );
+                emitted_tool_response = true;
+            }
+        }
+
+        prompt_text.push_str(&escape_gemma4_content(&msg.content));
+        if index == 0
+            && role == "system"
+            && let Some(tools) = tools
+        {
+            append_gemma4_tool_declarations(&mut prompt_text, tools);
+        }
+
+        let next_non_tool_role = messages
+            .iter()
+            .skip(index + 1)
+            .find(|message| message.role != "tool")
+            .map(|message| message.role.as_str());
+        let continues_into_next = role == "model"
+            && next_non_tool_role == Some("assistant")
+            && (tool_calls.is_empty() || emitted_tool_response);
+
+        tail_is_tool_call = !tool_calls.is_empty() && !emitted_tool_response;
+        tail_is_tool_response = emitted_tool_response;
+        if tail_is_tool_call {
+            // The stock template leaves the response block open while the
+            // external tool is outstanding.
+            prompt_text.push_str("<|tool_response>");
+        } else if continues_into_next {
+            // The following assistant item continues this same model turn.
+        } else if emitted_tool_response
+            && msg.content.trim().is_empty()
+            && next_non_tool_role.is_none()
+        {
+            // add_generation_prompt continues directly after this response.
+        } else {
+            prompt_text.push_str("<turn|>\n");
+            tail_is_tool_response = false;
+        }
+
+        previous_non_tool_was_assistant = msg.role == "assistant";
+    }
+
+    if !tail_is_tool_call && !tail_is_tool_response {
+        prompt_text.push_str("<|turn>model\n");
+        if has_tools && !thinking_enabled {
+            // The latest 26B canonical template primes disabled fresh model
+            // turns this way. Older template-less E2B/QAT checkpoints did not
+            // ship one canonical renderer; keep their established no-tools
+            // manual bytes unchanged while using the 26B protocol for the
+            // tool-aware path that needs its declaration/response grammar.
+            prompt_text.push_str("<|channel>thought\n<channel|>");
+        }
+    } else if tail_is_tool_response && thinking_enabled {
+        prompt_text.push_str("<|channel>thought\n");
+    }
+    prompt_text
+}
+
 /// Build the Gemma4 wire-format delta text for a session-continue turn.
 ///
 /// The cached history ends on `<turn|>` (because
@@ -7933,32 +8340,34 @@ fn build_gemma4_continue_delta_text(sanitized_user: &str, enable_thinking: Optio
 
 /// Build the Gemma4 wire-format delta text for a tool-result turn.
 ///
-/// Gemma4's chat template renders tool-role messages as plain
-/// `<|turn>tool\n{content}<turn|>` blocks — no `<tool_response>`
-/// wrapping (unlike Qwen3.5). The `tool_call_id` is NOT rendered:
-/// Gemma4 identifies tool responses positionally in the turn stream,
-/// not via an explicit id field.
+/// Gemma4's chat template renders the result directly after the outstanding
+/// call, inside the SAME model turn:
+/// `<|tool_response>response:{name}{value:...}<tool_response|>`.
+/// The caller resolves the opaque public call id back to `tool_name` from the
+/// committed session history before invoking this helper.
 ///
 /// Tool content is passed through [`escape_gemma4_content`] so
 /// malicious tool output containing Gemma4 delimiter tokens can't
-/// escape the tool turn and inject synthetic structure. The shared
+/// escape the response block and inject synthetic structure. The shared
 /// [`crate::tokenizer::TOOL_ERROR_MARKER`] (when `is_error == Some(true)`)
 /// is prepended BEFORE escaping so the marker text — which contains
 /// no Gemma4 delimiter tokens — passes through verbatim and the
 /// downstream escaping still protects any user content that follows.
 fn build_gemma4_tool_delta_text(
-    _tool_call_id: &str,
+    tool_name: &str,
     content: &str,
     enable_thinking: Option<bool>,
     is_error: Option<bool>,
 ) -> String {
-    // `enable_thinking` intentionally unused: see
-    // `build_gemma4_continue_delta_text` for why the raw delta path
-    // ignores reasoning mode.
-    let _ = enable_thinking;
-    let rendered_content = crate::tokenizer::apply_tool_error_marker(content, is_error);
-    let escaped = escape_gemma4_content(&rendered_content);
-    format!("\n<|turn>tool\n{escaped}<turn|>\n<|turn>model\n")
+    let mut delta = String::new();
+    append_gemma4_tool_response(&mut delta, tool_name, content, is_error);
+    if enable_thinking == Some(true) {
+        // Canonical add_generation_prompt continues an enabled post-tool
+        // turn by opening its reasoning channel. Disabled mode appends
+        // nothing here (in particular, no fresh-turn empty channel).
+        delta.push_str("<|channel>thought\n");
+    }
+    delta
 }
 
 #[napi]
@@ -10438,6 +10847,7 @@ mod tests {
     use super::*;
     use crate::engine::plan::{TurnPath, TurnPlan, TurnRequest};
     use crate::models::gemma4::output_parser::{StreamSegment, parse_gemma4_output};
+    use crate::tokenizer::{FunctionDefinition, FunctionParameters, ToolCall};
 
     #[test]
     fn prompt_holds_media_placeholders_detects_image_audio_and_text() {
@@ -12822,6 +13232,25 @@ mod tests {
     }
 
     #[test]
+    fn stream_dispatch_keeps_truncated_prompted_channel_as_reasoning() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender = StreamSender(&tx);
+        let mut state = Gemma4StreamDispatchState::new(true);
+
+        state.dispatch_segments(
+            vec![StreamSegment::Reasoning("unfinished plan".into())],
+            &sender,
+        );
+        assert!(rx.try_recv().is_err());
+
+        state.finish(&sender);
+        let chunk = rx.try_recv().unwrap().unwrap();
+        assert_eq!(chunk.text, "unfinished plan");
+        assert_eq!(chunk.is_reasoning, Some(true));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn stream_dispatch_keeps_reasoning_when_visible_text_follows() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sender = StreamSender(&tx);
@@ -12874,10 +13303,24 @@ mod tests {
     #[test]
     fn promote_channel_only_output_moves_thinking_to_text() {
         let mut parsed = parse_gemma4_output("<|channel>thought\nvisible answer<channel|>");
-        promote_channel_only_output(&mut parsed);
+        promote_channel_only_output(&mut parsed, false);
 
         assert_eq!(parsed.text, "visible answer");
         assert!(parsed.thinking.is_none());
+        assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn seeded_channel_truncation_is_not_promoted_to_visible_text() {
+        let mut parsed =
+            crate::models::gemma4::output_parser::parse_gemma4_output_with_open_channel(
+                "unfinished plan",
+                true,
+            );
+        promote_channel_only_output(&mut parsed, true);
+
+        assert!(parsed.text.is_empty());
+        assert_eq!(parsed.thinking.as_deref(), Some("unfinished plan"));
         assert!(parsed.tool_calls.is_empty());
     }
 
@@ -13217,31 +13660,232 @@ mod tests {
 
     #[test]
     fn test_gemma4_chat_manual_fallback_format() {
-        // When no chat template exists, manual format should:
-        // 1. Start with <bos>
-        // 2. Map "assistant" → "model"
-        // 3. End with <|turn>model\n
-        let messages = vec![
-            ("system", "You are helpful."),
-            ("user", "Hi"),
-            ("assistant", "Hello!"),
-            ("user", "Bye"),
+        let messages = [
+            manual_chat_message("system", "You are helpful."),
+            manual_chat_message("user", "Hi"),
+            manual_chat_message("assistant", "Hello!"),
+            manual_chat_message("user", "Bye"),
         ];
-        let mut prompt = String::from("<bos>");
-        for (role, content) in &messages {
-            let mapped = match *role {
-                "assistant" => "model",
-                other => other,
-            };
-            prompt.push_str(&format!("<|turn>{}\n{}<turn|>\n", mapped, content));
-        }
-        prompt.push_str("<|turn>model\n");
+        let prompt = build_gemma4_manual_prompt_text(&messages, None, Some(false));
+        assert_eq!(
+            build_gemma4_manual_prompt_text(&messages, None, None),
+            prompt,
+            "an unspecified mode must retain the historical manual-fallback default"
+        );
 
-        assert!(prompt.starts_with("<bos><|turn>"), "must start with <bos>");
-        assert!(prompt.contains("<|turn>system\nYou are helpful.<turn|>"));
-        assert!(prompt.contains("<|turn>model\nHello!<turn|>"));
-        assert!(!prompt.contains("<|turn>assistant"));
-        assert!(prompt.ends_with("<|turn>model\n"));
+        // Pin the full pre-feature no-thinking wire format. Selectable
+        // thinking must not invalidate existing cached histories.
+        assert_eq!(
+            prompt,
+            "<bos><|turn>system\nYou are helpful.<turn|>\n\
+             <|turn>user\nHi<turn|>\n\
+             <|turn>model\nHello!<turn|>\n\
+             <|turn>user\nBye<turn|>\n\
+             <|turn>model\n"
+        );
+        assert!(!prompt.contains("<|think|>"));
+    }
+
+    fn manual_chat_message(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        }
+    }
+
+    #[test]
+    fn gemma4_manual_fallback_enables_thinking_in_synthetic_system_turn() {
+        let messages = [manual_chat_message("user", "Think carefully.")];
+        let prompt = build_gemma4_manual_prompt_text(&messages, None, Some(true));
+
+        assert_eq!(
+            prompt,
+            "<bos><|turn>system\n<|think|>\n<turn|>\n\
+             <|turn>user\nThink carefully.<turn|>\n\
+             <|turn>model\n"
+        );
+        assert_eq!(prompt.matches("<|think|>").count(), 1);
+    }
+
+    #[test]
+    fn gemma4_manual_fallback_merges_thinking_into_leading_developer_turn() {
+        let messages = [
+            manual_chat_message("developer", "Use the tools."),
+            manual_chat_message("user", "Inspect the repo."),
+        ];
+        let prompt = build_gemma4_manual_prompt_text(&messages, None, Some(true));
+
+        assert_eq!(
+            prompt,
+            "<bos><|turn>system\n<|think|>\nUse the tools.<turn|>\n\
+             <|turn>user\nInspect the repo.<turn|>\n\
+             <|turn>model\n"
+        );
+        assert_eq!(prompt.matches("<|turn>system\n").count(), 1);
+    }
+
+    #[test]
+    fn gemma4_manual_fallback_keeps_tool_call_bytes_after_thinking_prefix() {
+        let mut assistant = manual_chat_message("assistant", "");
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: Some("call_1".to_string()),
+            name: "bash".to_string(),
+            arguments: r#"{"command":"pwd"}"#.to_string(),
+        }]);
+        let mut tool_result = manual_chat_message("tool", "/tmp/project");
+        tool_result.tool_call_id = Some("call_1".to_string());
+        let messages = [
+            manual_chat_message("user", "Run pwd."),
+            assistant,
+            tool_result,
+        ];
+
+        let disabled = build_gemma4_manual_prompt_text(&messages, None, Some(false));
+        let enabled = build_gemma4_manual_prompt_text(&messages, None, Some(true));
+        let stable_suffix = "<|turn>user\nRun pwd.<turn|>\n\
+                             <|turn>model\n<|tool_call>call:bash{command:<|\"|>pwd<|\"|>}<tool_call|>\
+                             <|tool_response>response:bash{value:<|\"|>/tmp/project<|\"|>}<tool_response|>";
+
+        assert_eq!(disabled, format!("<bos>{stable_suffix}"));
+        assert_eq!(
+            enabled,
+            format!("<bos><|turn>system\n<|think|>\n<turn|>\n{stable_suffix}<|channel>thought\n")
+        );
+    }
+
+    fn bash_tool_definition() -> ToolDefinition {
+        ToolDefinition {
+            r#type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "bash".to_string(),
+                description: Some("Execute a shell command".to_string()),
+                parameters: Some(FunctionParameters {
+                    r#type: "object".to_string(),
+                    properties: Some(
+                        serde_json::json!({
+                            "timeout": {
+                                "nullable": true,
+                                "description": "Timeout in seconds",
+                                "type": "integer"
+                            },
+                            "command": {
+                                "description": "Command to execute",
+                                "type": "string"
+                            }
+                        })
+                        .to_string(),
+                    ),
+                    required: Some(vec!["command".to_string()]),
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn gemma4_manual_fallback_renders_canonical_tool_declaration() {
+        let messages = [manual_chat_message("user", "Run pwd")];
+        let tools = [bash_tool_definition()];
+        let prompt = build_gemma4_manual_prompt_text(&messages, Some(&tools), Some(false));
+
+        assert_eq!(
+            prompt,
+            "<bos><|turn>system\n\
+             <|tool>declaration:bash{description:<|\"|>Execute a shell command<|\"|>,parameters:{properties:{command:{description:<|\"|>Command to execute<|\"|>,type:<|\"|>STRING<|\"|>},timeout:{description:<|\"|>Timeout in seconds<|\"|>,nullable:true,type:<|\"|>INTEGER<|\"|>}},required:[<|\"|>command<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n\
+             <|turn>user\nRun pwd<turn|>\n\
+             <|turn>model\n<|channel>thought\n<channel|>"
+        );
+    }
+
+    #[test]
+    fn gemma4_manual_tool_call_replay_extends_disabled_generation_prefix() {
+        let user = manual_chat_message("user", "Run pwd");
+        let tools = [bash_tool_definition()];
+        let first =
+            build_gemma4_manual_prompt_text(std::slice::from_ref(&user), Some(&tools), Some(false));
+        let generated = "<|tool_call>call:bash{command:<|\"|>pwd<|\"|>}<tool_call|>";
+
+        let mut assistant = manual_chat_message("assistant", "");
+        assistant.thinking_enabled = Some(false);
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: Some("call_1".to_string()),
+            name: "bash".to_string(),
+            arguments: r#"{"command":"pwd"}"#.to_string(),
+        }]);
+        let replay = build_gemma4_manual_prompt_text(&[user, assistant], Some(&tools), Some(false));
+
+        assert_eq!(
+            replay,
+            format!("{first}{generated}<|tool_response>"),
+            "unresolved history must extend the generated call with the canonical open response block"
+        );
+    }
+
+    #[test]
+    fn gemma4_manual_tool_replay_preserves_reasoning_before_call() {
+        let user = manual_chat_message("user", "Inspect.");
+        let tools = [bash_tool_definition()];
+        let first =
+            build_gemma4_manual_prompt_text(std::slice::from_ref(&user), Some(&tools), Some(true));
+        let generated = "<|channel>thought\nNeed pwd\n<channel|><|tool_call>call:bash{command:<|\"|>pwd<|\"|>}<tool_call|>";
+
+        let mut assistant = manual_chat_message("assistant", "");
+        assistant.thinking_enabled = Some(true);
+        assistant.reasoning_content = Some("Need pwd".to_string());
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: Some("call_1".to_string()),
+            name: "bash".to_string(),
+            arguments: r#"{"command":"pwd"}"#.to_string(),
+        }]);
+        let replay = build_gemma4_manual_prompt_text(&[user, assistant], Some(&tools), Some(true));
+
+        assert_eq!(
+            replay,
+            format!("{first}{generated}<|tool_response>"),
+            "thinking-enabled history must preserve the channel body before its tool call"
+        );
+    }
+
+    #[test]
+    fn gemma4_manual_resolved_tool_replay_maps_name_and_error_in_one_model_turn() {
+        let user = manual_chat_message("user", "Run it");
+        let tools = [bash_tool_definition()];
+        let first =
+            build_gemma4_manual_prompt_text(std::slice::from_ref(&user), Some(&tools), Some(false));
+        let generated = "<|tool_call>call:bash{command:<|\"|>false<|\"|>}<tool_call|>";
+
+        let mut assistant = manual_chat_message("assistant", "");
+        assistant.thinking_enabled = Some(false);
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: Some("call_bash".to_string()),
+            name: "bash".to_string(),
+            arguments: r#"{"command":"false"}"#.to_string(),
+        }]);
+        let mut tool_result = manual_chat_message("tool", "exit 1");
+        tool_result.tool_call_id = Some("call_bash".to_string());
+        tool_result.is_error = Some(true);
+        let replay = build_gemma4_manual_prompt_text(
+            &[user, assistant, tool_result],
+            Some(&tools),
+            Some(false),
+        );
+        let marked = format!("{}exit 1", crate::tokenizer::TOOL_ERROR_MARKER);
+
+        assert_eq!(
+            replay,
+            format!(
+                "{first}{generated}<|tool_response>response:bash{{value:{}}}<tool_response|>",
+                gemma4_dsl_string(&marked)
+            )
+        );
+        assert!(!replay.contains("<|turn>tool"));
+        assert!(!replay.ends_with("<|channel>thought\n<channel|>"));
     }
 
     #[test]
@@ -15747,15 +16391,12 @@ mod prefix_cache_decision_tests {
 #[cfg(test)]
 mod tool_delta_marker_tests {
     //! Guard the structured `is_error` channel on Gemma4's tool-result
-    //! wire format. The shared
+    //! response-block wire format. The shared
     //! [`crate::tokenizer::TOOL_ERROR_MARKER`] must be injected inside
-    //! the `<|turn>tool` block only when the caller passes
+    //! `<|tool_response>` only when the caller passes
     //! `Some(true)`. `None` and `Some(false)` keep the output
-    //! byte-equal to the pre-feature behavior — guarding both the hot
-    //! (successful) path and the explicit-false path against
-    //! accidental drift. The marker text contains no Gemma4 delimiter
-    //! tokens so the downstream `escape_gemma4_content` step is a
-    //! no-op on it.
+    //! unmarked. The marker text contains no Gemma4 delimiter tokens so
+    //! downstream escaping is a no-op on it.
 
     use super::build_gemma4_tool_delta_text;
     use crate::tokenizer::TOOL_ERROR_MARKER;
@@ -15765,17 +16406,12 @@ mod tool_delta_marker_tests {
         let payload = "boom: connection refused";
         let rendered = build_gemma4_tool_delta_text("call_fail", payload, None, Some(true));
         let expected_inner = format!("{TOOL_ERROR_MARKER}{payload}");
-        assert!(
-            rendered.contains(&expected_inner),
-            "expected error marker inside <|turn>tool block; got:\n{rendered}",
+        assert_eq!(
+            rendered,
+            format!(
+                "<|tool_response>response:call_fail{{value:<|\"|>{expected_inner}<|\"|>}}<tool_response|>"
+            )
         );
-        // Wrapper integrity stays correct on the marked path.
-        assert!(
-            rendered.contains("<|turn>tool\n"),
-            "tool block opener missing"
-        );
-        assert!(rendered.contains("<turn|>"), "turn closer missing");
-        assert!(rendered.contains("<|turn>model\n"), "model opener missing");
     }
 
     #[test]
@@ -15815,6 +16451,16 @@ mod tool_delta_marker_tests {
             occurrences, 1,
             "marker count should be 1 (the original literal); got {occurrences} in:\n{rendered}",
         );
+    }
+
+    #[test]
+    fn enabled_tool_delta_opens_reasoning_channel_but_disabled_does_not() {
+        let disabled = build_gemma4_tool_delta_text("bash", "ok", Some(false), None);
+        let enabled = build_gemma4_tool_delta_text("bash", "ok", Some(true), None);
+        let response = "<|tool_response>response:bash{value:<|\"|>ok<|\"|>}<tool_response|>";
+
+        assert_eq!(disabled, response);
+        assert_eq!(enabled, format!("{response}<|channel>thought\n"));
     }
 }
 
