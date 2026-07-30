@@ -67,8 +67,9 @@ export interface DbWorkerCall {
 export interface DbWorkerClient {
   /**
    * Withdraw a call that has not started when `signal` aborts. A call already
-   * executing is left intact; interrupting a filesystem/database mutation
-   * halfway through would be less safe than letting it reach its commit point.
+   * executing gets the opportunity to return its real result; if the worker
+   * produces neither result nor withdrawal acknowledgement by the hard bound,
+   * it is terminated before the outcome-unknown failure is returned.
    */
   call(request: DbWorkerCall, signal?: AbortSignal): Promise<ApiResponse>;
   ingest(): Promise<IngestSummary>;
@@ -88,8 +89,8 @@ function unavailableSummary(reason: string): IngestSummary {
 
 export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
   /**
-   * The withdrawal channel. A deadline settles the CALLER, but the request
-   * itself was posted the moment `send` ran and is sitting in the worker's
+   * The withdrawal channel. A deadline starts cancellation, but the request
+   * itself was posted the moment `send` ran and may be sitting in the worker's
    * message queue — so without this a timed-out `DELETE /api/models/:name`
    * answered the UI with `E_UNAVAILABLE` and then deleted the model anyway.
    *
@@ -124,6 +125,8 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
   /** Set once no further reply can arrive; every later send fails fast. */
   let down: string | null = null;
   let closing = false;
+  /** Specific safety reason to preserve across the terminate → exit event race. */
+  let forcedDownReason: string | null = null;
 
   // Never hold the process open on the worker's account — same reasoning as the
   // unref'd rescan timer: the transport decides how long the process lives. Ref
@@ -146,45 +149,42 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
     for (const settle of waiting) settle({ ok: false, why: 'down', reason: down });
   };
 
-  worker.on('error', (err: Error) => goDown(`dashboard database worker failed: ${err.message}`));
-  worker.on('exit', (code: number) => goDown(`dashboard database worker exited (code ${code})`));
+  worker.on('error', (err: Error) => {
+    // Once forced termination starts, only confirmed exit/terminate completion
+    // proves the worker can perform no future work. An error alone is not that
+    // witness, so preserve the outcome-unknown reason and wait for exit.
+    if (forcedDownReason === null) goDown(`dashboard database worker failed: ${err.message}`);
+  });
+  worker.on('exit', (code: number) => goDown(forcedDownReason ?? `dashboard database worker exited (code ${code})`));
 
   worker.on('message', (message: WorkerToMain) => {
     // The db-closed witness is reported even if nobody is waiting on the reply,
     // so a supervisor sees the handle go down in the right order.
     if (message.kind === 'closed') opts.onLifecycle({ type: 'db-closed' });
-    // Undefined means the request already settled — it timed out, or the worker
-    // was declared down. Dropping the late reply is the only correct move.
+    // Undefined means the request already settled or the worker was declared
+    // down. Dropping the late reply is the only correct move.
     // `settle` owns the map and ref bookkeeping, so nothing is done here.
     pending.get(message.id)?.({ ok: true, reply: message });
   });
 
   /**
    * Post one request and settle exactly once — on the reply, on a clone refusal,
-   * on the worker dying, or on `ms` elapsing.
+   * or once the worker is known down.
    *
-   * The deadline is inside `send` rather than racing outside it so that a
-   * timeout DROPS the `pending` entry. A worker that is alive but blocked emits
-   * neither `error` nor `exit`, so `goDown` never runs and nothing else would
-   * ever remove the entry: the caller's promise, its closure and the `worker.ref()`
-   * that `syncRef` took would all survive forever, once per periodic ingest.
+   * Non-call deadlines (ingest/drain/close) retain the old bounded settlement.
+   * A call deadline instead starts withdrawal and keeps the pending entry until
+   * the worker acknowledges the skipped handler, returns its real response, or
+   * is terminated and confirmed down after acknowledging neither.
    *
-   * A timeout deliberately does NOT call `goDown`. `down` is a latch, and
-   * latching it on one slow query would permanently fail every database route
-   * for a worker that was merely busy. The caller gets `E_UNAVAILABLE` and the
-   * next request gets a fresh chance.
+   * `withdrawOnTimeout` turns the deadline into a cancellation handshake for
+   * `call`. The worker answers either with `withdrawn` from the exact pre-handler
+   * gate (the handler never began) or with the call's real response (withdrawal
+   * lost the cross-port race). Only that acknowledgement/result settles the
+   * caller.
    *
-   * `withdrawOnTimeout` makes the deadline mean "it did not happen" rather than
-   * only "you are not getting an answer". Set for `call` — the routes that
-   * DELETE models, sessions and cache entries live there, and telling the UI a
-   * delete failed while the worker performs it later is worse than either
-   * outcome on its own. Left off for `drain` / `close`, whose whole purpose is
-   * to run, and for `ingest`, which is idempotent bookkeeping.
-   *
-   * Residual: a request the worker has ALREADY begun cannot be withdrawn, so a
-   * deadline that expires mid-query still reports failure for work that
-   * completes. What is closed is the dominant case — the request still queued
-   * behind whatever blocked the worker long enough to blow the deadline.
+   * A worker that acknowledges neither is terminated before callers are failed:
+   * reporting a timeout while leaving a queued destructive mutation alive is
+   * precisely the split-brain outcome this protocol exists to prevent.
    */
   const requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const send = (
@@ -200,6 +200,10 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
     const id = nextId++;
     return new Promise<SendResult>((resolve) => {
       let onAbort: (() => void) | undefined;
+      let posted = false;
+      let withdrawalReason: string | null = null;
+      let terminating = false;
+      let timer: ReturnType<typeof setTimeout>;
       // `goDown` clears the whole map before invoking the settlers, so this
       // cannot be a `pending.delete(id)` check — it would swallow that path.
       let settled = false;
@@ -212,35 +216,66 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
         syncRef();
         resolve(result);
       };
-      const withdraw = (): void => {
-        // A dedicated port makes this actionable even while the main request
-        // queue is blocked; db-worker drains it synchronously at pickup.
+      const terminateForMissingAck = (): void => {
+        if (settled || terminating) return;
+        terminating = true;
+        const reason = `worker terminated because the cancellation outcome for request ${id} remained unknown`;
+        forcedDownReason ??= reason;
+        // Wait for termination/exit before settling through goDown. Until then a
+        // live worker could still reach the queued mutation we are retracting.
+        void worker.terminate().then(() => goDown(forcedDownReason!)).catch(() => {
+          // A rejected terminate is not proof the worker stopped. Keep waiting
+          // for its real response or eventual error/exit rather than report a
+          // failure while it may still execute the request later.
+        });
+      };
+      const requestWithdrawal = (reason: string): void => {
+        if (settled || withdrawalReason !== null) return;
+        withdrawalReason = reason;
         try {
+          // The worker's pre-handler gate either samples this and acknowledges
+          // `withdrawn`, or misses it and returns the real call response.
           withdrawals.port1.postMessage(id);
         } catch {
-          // Shutdown closes this port only after pending requests are settled,
-          // but tolerate a close/abort race: the worker is being torn down, so
-          // there is no live queue left whose mutation can be withdrawn.
+          terminateForMissingAck();
         }
       };
       // Never the reason the process stays up: `syncRef` already refs the worker
       // for exactly as long as this request is outstanding.
-      const timer = setTimeout(() => {
-        // Withdrawn BEFORE the caller is told, so the two can never disagree in
-        // the direction that matters: by the time anyone reads `E_UNAVAILABLE`,
-        // the request is already retractable-or-started, never merely queued.
-        if (withdrawOnTimeout) withdraw();
-        settle({ ok: false, why: 'down', reason: `timed out after ${ms}ms` });
+      timer = setTimeout(() => {
+        if (!withdrawOnTimeout) {
+          settle({ ok: false, why: 'down', reason: `timed out after ${ms}ms` });
+          return;
+        }
+        if (withdrawalReason !== null) {
+          // An upstream deadline requested cancellation earlier. The worker has
+          // now consumed this request's full ordinary budget without producing
+          // either a response or the withdrawal acknowledgement.
+          terminateForMissingAck();
+          return;
+        }
+        requestWithdrawal(`timed out after ${ms}ms`);
+        if (settled || terminating) return;
+        // The ordinary deadline itself initiated withdrawal. Give its
+        // acknowledgement one bounded shutdown-sized grace period, then remove
+        // the worker before reporting failure.
+        timer = setTimeout(terminateForMissingAck, opts.shutdownTimeoutMs);
+        timer.unref?.();
       }, ms);
       timer.unref?.();
       pending.set(id, settle);
       syncRef();
       if (signal !== undefined) {
         onAbort = () => {
-          // Same ordering as the timeout: cross the worker boundary before the
-          // host-side runtime call settles.
-          withdraw();
-          settle({ ok: false, why: 'aborted', reason: 'request was cancelled' });
+          // A signal caught before the original post needs no handshake: there
+          // is no worker request to withdraw. Once posted, keep the caller
+          // pending until the worker acknowledges a skip or returns the real
+          // result of work that had already started.
+          if (!posted) {
+            settle({ ok: false, why: 'aborted', reason: 'request was cancelled before it was posted' });
+            return;
+          }
+          requestWithdrawal('request was cancelled');
         };
         signal.addEventListener('abort', onAbort, { once: true });
         // Close the check→listen race. In particular, do not post below when a
@@ -250,6 +285,7 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
       if (settled) return;
       try {
         worker.postMessage(build(id));
+        posted = true;
       } catch (err) {
         // A payload the structured clone algorithm refuses throws HERE, before
         // the worker ever sees it. Settling now is what keeps the caller from
@@ -280,6 +316,9 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
         return result.why === 'undeliverable'
           ? failure('E_BAD_REQUEST', `Request cannot cross the worker boundary: ${result.reason}`)
           : failure('E_UNAVAILABLE', `Dashboard database is unavailable: ${result.reason}`);
+      }
+      if (result.reply.kind === 'withdrawn') {
+        return failure('E_UNAVAILABLE', 'Dashboard database request was cancelled before it started');
       }
       if (result.reply.kind !== 'response') {
         return failure('E_INTERNAL', `Unexpected worker reply "${result.reply.kind}" for a call`);

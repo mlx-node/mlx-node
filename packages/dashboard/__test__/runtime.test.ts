@@ -361,13 +361,13 @@ describe('dashboard runtime — worker death', () => {
   //
   // Driven against `startDbWorker` rather than the runtime because the deadline
   // being asserted is the client's, and the runtime does not surface it.
-  it('settles ordinary calls on a deadline when the worker stays alive and silent', async () => {
-    const lifecycle: string[] = [];
+  it('terminates a silent worker before settling an unacknowledged call deadline', async () => {
+    const lifecycle: RuntimeLifecycleEvent[] = [];
     const client = startDbWorker({
       workerUrl: new URL('./helpers/wedged-db-worker.ts', import.meta.url),
       shutdownTimeoutMs: 200,
       requestTimeoutMs: 150,
-      onLifecycle: (event) => lifecycle.push(event.type),
+      onLifecycle: (event) => lifecycle.push(event),
       dbPath: ':memory:',
       modelsDir,
       sessionsRoot,
@@ -387,10 +387,13 @@ describe('dashboard runtime — worker death', () => {
       expect(ingest).not.toBe('HUNG');
       expect((ingest as Exclude<typeof ingest, 'HUNG'>).sessions.warnings).toHaveLength(1);
 
-      // A slow answer is not a dead thread: the deadline settles the CALLER and
-      // must not latch the client down, or one slow query would permanently
-      // disable every database route.
-      expect(lifecycle).not.toContain('worker-down');
+      // No cancellation acknowledgement and no real response means the worker
+      // cannot remain alive after the caller is failed: it could otherwise
+      // execute the queued mutation later.
+      const down = lifecycle.find((event) => event.type === 'worker-down');
+      expect(down).toMatchObject({ type: 'worker-down' });
+      expect(down?.type === 'worker-down' ? down.reason : '').toContain('cancellation outcome');
+      expect(down?.type === 'worker-down' ? down.reason : '').toContain('remained unknown');
       expect(await withDeadline(client.call({ method: 'GET', path: '/api/models' }), 5_000)).not.toBe('HUNG');
     } finally {
       expect(await withDeadline(client.close(), 10_000)).not.toBe('HUNG');
@@ -399,9 +402,9 @@ describe('dashboard runtime — worker death', () => {
 });
 
 /**
- * A deadline settles the CALLER, but the request was posted the moment `send`
- * ran and is sitting in the worker's message queue. Without a way to retract
- * it, a timed-out `DELETE` answered the UI `503 E_UNAVAILABLE` and then
+ * A deadline starts cancellation, but the request was posted the moment `send`
+ * ran and may be sitting in the worker's message queue. Without an acknowledged
+ * retraction, a timed-out `DELETE` answered the UI `503 E_UNAVAILABLE` and then
  * performed the deletion anyway — the user is told nothing happened, retries or
  * gives up, and the model / session / cache entry is gone regardless.
  *
@@ -494,6 +497,39 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
     expect(existsSync(control)).toBe(false);
   });
 
+  it('returns the real result when the worker sampled just before withdrawal arrived', async () => {
+    const target = join(sessionsRoot, 'late-withdraw-target');
+    writeFileSync(target, 'alive');
+
+    const worker = startDbWorker({
+      workerUrl: new URL('./helpers/late-withdraw-db-worker.ts', import.meta.url),
+      // The fixture blocks for 1 s after its one withdrawal sample. Its 500 ms
+      // deadline lands deterministically inside that window, while this grace
+      // leaves enough time for the already-started result to win.
+      requestTimeoutMs: 500,
+      shutdownTimeoutMs: 2_000,
+      onLifecycle: (): void => {},
+      dbPath: ':memory:',
+      modelsDir,
+      sessionsRoot,
+      tracesDir,
+      cacheRoot: undefined,
+    });
+
+    try {
+      // Warm worker startup so the race call reaches its sample well before the
+      // 500 ms deadline.
+      expect((await worker.call({ method: 'GET', path: '/ready' })).status).toBe(200);
+
+      const result = await withDeadline(worker.call({ method: 'DELETE', path: '/race' }), 5_000);
+      expect(result).not.toBe('HUNG');
+      expect(result).toEqual({ ok: true, status: 200, body: { mutated: true } });
+      expect(existsSync(target)).toBe(false);
+    } finally {
+      expect(await withDeadline(worker.close(), 10_000)).not.toBe('HUNG');
+    }
+  });
+
   it('does not execute a deletion after the renderer RPC deadline reports failure', async () => {
     const doomed = transcriptOf('rt-2');
     expect(existsSync(doomed)).toBe(true);
@@ -515,35 +551,11 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
       expect(failed.status).toBe(503);
       expect(failed.ok ? '' : failed.code).toBe('E_UNAVAILABLE');
 
-      // A later message on the same port is a deterministic FIFO barrier: when
-      // its main-thread response arrives, the host has already processed the
-      // preceding cancel and `AbortController.abort()` has synchronously posted
-      // the database worker's dedicated-port withdrawal.
-      const barrierId = 999;
-      const barrier = new Promise<void>((resolve) => {
-        const onMessage = (message: unknown): void => {
-          if (
-            typeof message !== 'object' ||
-            message === null ||
-            (message as { kind?: unknown }).kind !== 'response' ||
-            (message as { id?: unknown }).id !== barrierId
-          ) {
-            return;
-          }
-          port1.off('message', onMessage);
-          resolve();
-        };
-        port1.on('message', onMessage);
-      });
-      port1.postMessage({
-        kind: 'call',
-        id: barrierId,
-        call: { method: 'GET', path: '/api/downloads' },
-      });
-      expect(await withDeadline(barrier, 10_000)).not.toBe('HUNG');
-
-      await runtime.close();
+      // The failure itself is now the worker's acknowledgement that its exact
+      // pre-handler gate skipped the mutation; no event-loop delay or
+      // cross-channel ordering assumption is part of the proof.
       expect(existsSync(doomed)).toBe(true);
+      await runtime.close();
     } finally {
       renderer.close();
       dispose();

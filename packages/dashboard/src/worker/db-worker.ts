@@ -164,10 +164,13 @@ async function handle(message: MainToWorker): Promise<void> {
     case 'call':
       // Checked BEFORE the handler runs, and only for `call`: `drain` / `close`
       // are shutdown steps whose whole point is to run even when nobody is
-      // listening, and `ingest` is idempotent bookkeeping. No reply is posted
-      // for a withdrawn request — its caller settled long ago and the client
-      // drops replies it no longer has a pending entry for.
-      if (isWithdrawn(message.id)) return;
+      // listening, and `ingest` is idempotent bookkeeping. The acknowledgement
+      // is posted only when this exact gate skipped the handler; if cancellation
+      // lost the cross-port race, the real response remains authoritative.
+      if (isWithdrawn(message.id)) {
+        post({ kind: 'withdrawn', id: message.id });
+        return;
+      }
       post({ kind: 'response', id: message.id, response: await answerCall(message) });
       return;
     case 'ingest':

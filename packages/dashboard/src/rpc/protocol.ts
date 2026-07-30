@@ -30,9 +30,9 @@ export const DASHBOARD_PORT_MESSAGE = 'mlx:dashboard-port';
 export type RpcRequest =
   | { kind: 'call'; id: number; call: ApiCall }
   /**
-   * Withdraw a call whose renderer-side deadline expired. Never answered: the
-   * renderer enqueues this before settling its transport failure, and it exists
-   * only to stop still-queued work from acting after that failure is reported.
+   * Withdraw a call whose renderer-side deadline expired. Not answered on its
+   * own: the original call stays pending until the runtime returns either an
+   * acknowledged cancellation or the real result of work already started.
    */
   | { kind: 'cancel'; id: number }
   /** Open a download-progress subscription; `id` tags every event that follows. */

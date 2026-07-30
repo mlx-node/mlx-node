@@ -4,15 +4,17 @@
  *
  * The runtime outlives every port. A window reload mints a fresh
  * `MessageChannelMain` (see `src/main/broker.ts`), so this process can be handed
- * a second port while it is still serving the first, and the first is by then a
- * channel to a page that no longer exists. Nothing closes it for us: the RPC host
- * only learns about a peer going away through the port's own `close` event, and a
- * renderer that navigated does not always produce one.
+ * a second port while it is still serving the first. Nothing reliably closes the
+ * old port for us: the RPC host only learns about a peer going away through the
+ * port's own `close` event, and a renderer that navigated does not always produce
+ * one.
  *
  * That matters because a subscription registered by the old port stays on the
  * download manager, which lives for the life of the process — one leaked
  * listener per reload, each still receiving progress for a job nobody is
- * watching. So `attach` replaces rather than adds.
+ * watching. So `attach` replaces rather than adds: subscriptions are released
+ * immediately, while old calls keep their response path only until cancellation
+ * is acknowledged or already-started work reports its real result.
  *
  * Electron-free: an `RpcPort` is whatever `bindEventEmitterPort` /
  * `bindEventTargetPort` returns, so the tests drive this over a real
@@ -38,7 +40,7 @@ export interface ControlPanelSessionOptions {
 }
 
 export interface ControlPanelSession {
-  /** Serve on `port`, releasing whatever was being served before. */
+  /** Serve on `port`, retiring and draining whatever was being served before. */
   attach(port: RpcPort): void;
   /** How many ports have been attached. */
   generation(): number;

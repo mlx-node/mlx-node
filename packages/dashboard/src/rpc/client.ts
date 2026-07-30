@@ -8,10 +8,10 @@
  * unchanged over a port, and a transport fault arrives as a `code` the UI can
  * branch on instead of a bare rejection it can only stringify.
  *
- * Three independent things can stop a reply from arriving, and all three settle:
- * the peer closing (the port's `close` event), the peer wedging (the per-request
- * deadline), and the payload being unclonable (`postMessage` throws synchronously
- * before the message ever leaves).
+ * Three independent things can stop an ordinary reply from arriving: the peer
+ * closing (the port's `close` event), the peer wedging (the per-request deadline
+ * starts an acknowledged cancellation), and the payload being unclonable
+ * (`postMessage` throws synchronously before the message ever leaves).
  *
  * No `node:` imports — this module runs in the renderer.
  */
@@ -23,15 +23,15 @@ import type { RpcPort } from './port.js';
 import { isRpcReply, type RpcRequest } from './protocol.js';
 
 /**
- * Per-request deadline. The old HTTP transport had none — a hung server left a
- * `fetch` pending until the user gave up — so this is a new guarantee rather than
- * a preserved one, and it is generous: it exists to bound a wedged peer, not to
- * police slow queries.
+ * Per-request cancellation deadline. It is generous: its job is to detect a
+ * wedged peer, not police slow queries. Expiry does not itself assert failure —
+ * the original call stays pending for the runtime's acknowledged skip or real
+ * result.
  */
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 export interface RpcClientOptions {
-  /** Per-request deadline in ms. Defaults to 30 s. */
+  /** Delay before requesting acknowledged cancellation. Defaults to 30 s. */
   timeoutMs?: number;
 }
 
@@ -40,7 +40,11 @@ export interface RpcClient {
   call(call: ApiCall): Promise<ApiResponse>;
   /** Subscribe to a download job's progress events; returns the unsubscribe. */
   subscribe(jobId: string, listener: (event: DownloadEvent) => void): () => void;
-  /** Detach, settle every in-flight call, drop every subscription, close the port. Idempotent. */
+  /**
+   * Stop new work and subscriptions, then drain in-flight calls to an
+   * acknowledged cancellation or real result before closing the port.
+   * Idempotent.
+   */
   close(): void;
 }
 
@@ -53,32 +57,36 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
   /** Set once no further reply can arrive; every later call fails fast instead of waiting out its deadline. */
   let down: string | null = null;
 
-  const goDown = (reason: string, withdrawPending = false): void => {
-    down ??= reason;
+  let closed = false;
+  let portFinished = false;
+  let detach = (): void => {};
+
+  const finishClose = (): void => {
+    if (!closed || portFinished || pending.size > 0) return;
+    portFinished = true;
+    detach();
+    port.close();
+  };
+
+  const goDown = (reason: string): void => {
+    // Override a graceful local-close reason: losing the peer while calls are
+    // draining means their outcome is unknown, which is materially different
+    // from an acknowledged cancellation.
+    down = reason;
     // Drain by swapping the map out first: settling a caller can re-enter
     // `call()`, and that call must see `down` and fail fast rather than land in a
     // collection we are mid-iteration over.
-    const waiting = [...pending.entries()];
+    const waiting = [...pending.values()];
     pending.clear();
     listeners.clear();
-    for (const [id, entry] of waiting) {
+    for (const entry of waiting) {
       clearTimeout(entry.timer);
-      if (withdrawPending) {
-        try {
-          // Post before settling: a renderer reconnect/close must not report
-          // failure while leaving a destructive call merely queued on the old
-          // runtime connection.
-          port.postMessage({ kind: 'cancel', id } satisfies RpcRequest);
-        } catch {
-          // Closing the port below still makes the host abort every call owned
-          // by this connection.
-        }
-      }
       entry.settle(failure('E_UNAVAILABLE', `Dashboard runtime is unavailable: ${down}`));
     }
+    finishClose();
   };
 
-  const detach = port.listen({
+  detach = port.listen({
     onMessage(data: unknown): void {
       // A port is only as trusted as whoever holds the other end; a malformed
       // payload is dropped rather than allowed to throw out of the port's own
@@ -89,19 +97,19 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
         return;
       }
       const entry = pending.get(data.id);
-      // No entry means the request already timed out and settled. Dropping the
-      // late reply is what keeps a caller from being settled twice.
+      // No entry means the request already settled or the client went down.
+      // Dropping the late reply is what keeps a caller from being settled twice.
       if (entry === undefined) return;
       pending.delete(data.id);
       clearTimeout(entry.timer);
       entry.settle(data.response);
+      finishClose();
     },
     onClose(): void {
-      goDown('the message port was closed');
+      closed = true;
+      goDown('the message port was closed; call outcome is unknown');
     },
   });
-
-  let closed = false;
 
   const post = (request: RpcRequest): void => {
     port.postMessage(request);
@@ -115,21 +123,17 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
       const id = nextId++;
       return new Promise<ApiResponse>((resolve) => {
         const timer = setTimeout(() => {
-          // Enqueue cancellation across the RPC boundary BEFORE settling. On
-          // this live MessagePort it stays ordered after the call; the host turns
-          // the id into an AbortSignal, and the runtime forwards that through
-          // the worker's dedicated withdrawal port. The host may process it
-          // after this callback returns, so this promises ordering, not an ack.
+          // Start cancellation, but KEEP this request pending. The worker may
+          // have sampled its independent withdrawal port just before this
+          // message arrives; only its acknowledged skip or the real result of
+          // already-started work is authoritative.
           try {
             post({ kind: 'cancel', id });
           } catch {
-            // The peer is gone. Its port-close path aborts every call belonging
-            // to this connection; the local deadline must still settle.
+            // This plain payload can only fail because the transport is going
+            // away. Do not turn that into an unacknowledged timeout: the
+            // authoritative response or the port's close event must settle it.
           }
-          // Drop the entry before resolving so a reply that was already in
-          // flight cannot settle the promise twice.
-          pending.delete(id);
-          resolve(failure('E_UNAVAILABLE', `Dashboard runtime did not answer within ${timeoutMs}ms`));
         }, timeoutMs);
         pending.set(id, { settle: resolve, timer });
         try {
@@ -182,9 +186,34 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): Rpc
     close(): void {
       if (closed) return;
       closed = true;
-      detach();
-      goDown('the client was closed', true);
-      port.close();
+      down = 'the client was closed';
+
+      // Subscriptions have no terminal acknowledgement to wait for. Drop local
+      // delivery immediately and ask the host to release each registration
+      // while the old port remains alive for pending calls.
+      for (const id of listeners.keys()) {
+        try {
+          post({ kind: 'unsubscribe', id });
+        } catch {
+          // The close below/onClose path releases the host side.
+        }
+      }
+      listeners.clear();
+
+      // A graceful reconnect is not permission to guess the outcome of old
+      // mutations. Stop their timers, request cancellation, and retain both the
+      // listener and port until each receives an acknowledged skip or the real
+      // result of already-started work.
+      for (const [id, entry] of pending) {
+        clearTimeout(entry.timer);
+        try {
+          post({ kind: 'cancel', id });
+        } catch {
+          goDown('the cancellation request could not cross the message port; call outcome is unknown');
+          return;
+        }
+      }
+      finishClose();
     },
   };
 }

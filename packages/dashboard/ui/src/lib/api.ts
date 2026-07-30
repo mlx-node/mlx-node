@@ -66,7 +66,10 @@ export function connectDashboardApi(port: RpcPort, opts?: RpcClientOptions): voi
   client = createRpcClient(port, opts);
 }
 
-/** Drop the connection. Every in-flight call settles as a failure rather than hanging. */
+/**
+ * Drop the connection. In-flight calls drain to an acknowledged cancellation
+ * or their real result before the retired port closes.
+ */
 export function disconnectDashboardApi(): void {
   client?.close();
   clearCache();

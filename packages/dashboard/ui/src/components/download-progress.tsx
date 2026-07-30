@@ -110,9 +110,9 @@ export function DownloadProgress({ id, onDone, onError, onCancelled }: DownloadP
     });
     return () => sub.close();
     // `connection` rebinds the subscription after CONTROL PANEL restarts. The old
-    // client's listener map was emptied when its port closed and its `close()`
-    // is inert, so without this the card is permanently deaf — frozen mid
-    // progress against a runtime that is already healthy again.
+    // client's `close()` drops its listener immediately while keeping the port
+    // only long enough to drain in-flight calls, so without this the card is
+    // permanently deaf — frozen mid-progress against a healthy new runtime.
   }, [id, connection]);
 
   const { phase, totalBytes, receivedBytes, fileCount, fileIndex, currentFile, message } = state;

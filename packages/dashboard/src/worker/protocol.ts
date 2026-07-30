@@ -52,6 +52,8 @@ export type MainToWorker =
 
 export type WorkerToMain =
   | { kind: 'response'; id: number; response: ApiResponse }
+  /** The call was skipped before its handler began; this is the withdrawal acknowledgement. */
+  | { kind: 'withdrawn'; id: number }
   | { kind: 'ingested'; id: number; summary: IngestSummary }
   | { kind: 'drained'; id: number }
   /** Posted AFTER the SQLite handle is closed — the shutdown-ordering witness. */

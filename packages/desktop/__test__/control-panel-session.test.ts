@@ -134,6 +134,52 @@ describe('attach', () => {
     expect(reply).toMatchObject({ kind: 'response', id: 3 });
   });
 
+  it('keeps a replaced port alive until its in-flight call has an authoritative result', async () => {
+    const runtime = stubRuntime();
+    let oldSignal: AbortSignal | undefined;
+    let finishOld: ((response: ApiResponse) => void) | undefined;
+    runtime.call = (call: ApiCall, signal?: AbortSignal): Promise<ApiResponse> => {
+      runtime.calls.push(call);
+      if (call.path === '/api/sessions/already-started') {
+        oldSignal = signal;
+        return new Promise<ApiResponse>((resolve) => {
+          finishOld = resolve;
+        });
+      }
+      return Promise.resolve({ ok: true, status: 200, body: { path: call.path } });
+    };
+
+    const session = createControlPanelSession({ runtime });
+    const first = channel();
+    session.attach(bindEventTargetPort(first.host as never));
+    const oldReply = ask(first.peer, {
+      kind: 'call',
+      id: 1,
+      call: { method: 'DELETE', path: '/api/sessions/already-started' },
+    });
+    await settle();
+
+    const second = channel();
+    session.attach(bindEventTargetPort(second.host as never));
+
+    expect(oldSignal?.aborted).toBe(true);
+    expect(await Promise.race([oldReply.then(() => 'settled'), settle().then(() => 'pending')])).toBe('pending');
+
+    // Replacing the connection must not hold up unrelated work on the new one.
+    expect(
+      await ask(second.peer, { kind: 'call', id: 2, call: { method: 'GET', path: '/api/models' } }),
+    ).toMatchObject({ kind: 'response', id: 2 });
+
+    // Cancellation lost the race to a mutation that had already started. The
+    // retired connection stays alive long enough to report that real result.
+    finishOld!({ ok: true, status: 204, body: null });
+    expect(await oldReply).toEqual({
+      kind: 'response',
+      id: 1,
+      response: { ok: true, status: 204, body: null },
+    });
+  });
+
   it('stops delivering events to a replaced port', async () => {
     const runtime = stubRuntime();
     const session = createControlPanelSession({ runtime });

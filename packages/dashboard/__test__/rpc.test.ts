@@ -19,7 +19,9 @@ import {
   bindEventTargetPort,
   type EventEmitterPort,
   type EventTargetPort,
+  type RpcPortEvents,
 } from '../src/rpc/port.js';
+import type { RpcRequest } from '../src/rpc/protocol.js';
 import type { ApiCall } from '../src/runtime.js';
 
 const cleanups: Array<() => void> = [];
@@ -334,33 +336,57 @@ describe('rpc request/response', () => {
 });
 
 describe('rpc never hangs a caller', () => {
-  it('enqueues cancellation before settling a renderer-side deadline', async () => {
+  it('keeps a timed-out call pending until cancellation is acknowledged', async () => {
     const order: string[] = [];
+    let events: RpcPortEvents | undefined;
     const client = createRpcClient(
       {
         postMessage(message: unknown): void {
           order.push((message as { kind: string }).kind);
         },
-        listen: () => () => {},
+        listen(next): () => void {
+          events = next;
+          return () => {};
+        },
         close: () => {},
       },
       { timeoutMs: 0 },
     );
 
     try {
-      const res = await client.call({ method: 'DELETE', path: '/api/sessions/doomed' }).then((response) => {
+      let settled = false;
+      const response = client.call({ method: 'DELETE', path: '/api/sessions/doomed' }).then((res) => {
+        settled = true;
         order.push('settled');
-        return response;
+        return res;
       });
-      expect(res).toMatchObject({ ok: false, code: 'E_UNAVAILABLE' });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(order).toEqual(['call', 'cancel']);
+      expect(settled).toBe(false);
+
+      events!.onMessage({
+        kind: 'response',
+        id: 1,
+        response: failure('E_UNAVAILABLE', 'Cancellation acknowledged'),
+      });
+      expect(await response).toMatchObject({ ok: false, code: 'E_UNAVAILABLE' });
       expect(order).toEqual(['call', 'cancel', 'settled']);
     } finally {
       client.close();
     }
   });
 
-  it('settles a request the peer never answers, at the deadline', async () => {
-    const stub = stubRuntime(() => new Promise<ApiResponse>(() => {})); // never resolves
+  it('settles after the host acknowledges cancellation of an unanswered request', async () => {
+    const stub = stubRuntime(
+      (_call, signal) =>
+        new Promise<ApiResponse>((resolve) => {
+          signal?.addEventListener(
+            'abort',
+            () => resolve(failure('E_UNAVAILABLE', 'Cancellation acknowledged')),
+            { once: true },
+          );
+        }),
+    );
     const { client } = connected(stub, { timeoutMs: 50 });
 
     const res = await within(client.call({ method: 'GET', path: '/api/models' }));
@@ -373,7 +399,7 @@ describe('rpc never hangs a caller', () => {
     expect(stub.signals[0]?.aborted).toBe(true);
   });
 
-  it('ignores a reply that arrives after the deadline instead of settling twice', async () => {
+  it('returns the real reply when cancellation loses the race to started work', async () => {
     let answer: ((response: ApiResponse) => void) | undefined;
     const stub = stubRuntime(
       () =>
@@ -384,14 +410,12 @@ describe('rpc never hangs a caller', () => {
     const { client } = connected(stub, { timeoutMs: 50 });
 
     const first = client.call({ method: 'GET', path: '/api/models' });
-    expect(await within(first)).toMatchObject({ ok: false, code: 'E_UNAVAILABLE' });
+    expect(await within(first, 100)).toBe('HUNG');
 
-    // The late reply must not resurrect the settled request nor be mistaken for
-    // the answer to the NEXT one, which reuses neither its id nor its slot.
-    answer!({ ok: true, status: 200, body: 'late' });
-    await flush();
-    const second = await within(client.call({ method: 'GET', path: '/api/catalog' }), 500);
-    expect(second).toMatchObject({ ok: false, code: 'E_UNAVAILABLE' });
+    // The deadline requested cancellation, but this stub models a handler that
+    // had already started and therefore returns its authoritative result.
+    answer!({ ok: true, status: 200, body: 'completed' });
+    expect(await within(first, 1000)).toEqual({ ok: true, status: 200, body: 'completed' });
   });
 
   it('settles every in-flight request when the peer dies, well before any deadline', async () => {
@@ -410,6 +434,7 @@ describe('rpc never hangs a caller', () => {
     expect(settled).not.toBe('HUNG');
     for (const res of settled as ApiResponse[]) {
       expect(res).toMatchObject({ ok: false, code: 'E_UNAVAILABLE', status: 503 });
+      expect((res as { message: string }).message).toMatch(/call outcome is unknown/i);
     }
   });
 
@@ -423,17 +448,89 @@ describe('rpc never hangs a caller', () => {
     expect(res).toMatchObject({ ok: false, code: 'E_UNAVAILABLE', status: 503 });
   });
 
-  it('settles in-flight requests when the client itself closes', async () => {
-    const stub = stubRuntime(() => new Promise<ApiResponse>(() => {}));
+  it('keeps a closing client call pending until the runtime acknowledges cancellation', async () => {
+    let acknowledge: ((response: ApiResponse) => void) | undefined;
+    const stub = stubRuntime(
+      () =>
+        new Promise<ApiResponse>((resolve) => {
+          acknowledge = resolve;
+        }),
+    );
     const { client } = connected(stub, { timeoutMs: 60_000 });
 
     const inflight = client.call({ method: 'GET', path: '/a' });
     await flush();
     client.close();
-
-    expect(await within(inflight, 1000)).toMatchObject({ ok: false, code: 'E_UNAVAILABLE' });
     await flush();
+
     expect(stub.signals[0]?.aborted).toBe(true);
+    expect(await within(inflight, 100)).toBe('HUNG');
+    expect(await client.call({ method: 'GET', path: '/new' })).toMatchObject({
+      ok: false,
+      code: 'E_UNAVAILABLE',
+    });
+
+    acknowledge!(failure('E_UNAVAILABLE', 'Cancellation acknowledged'));
+    expect(await within(inflight, 1000)).toMatchObject({
+      ok: false,
+      code: 'E_UNAVAILABLE',
+      message: 'Cancellation acknowledged',
+    });
+  });
+
+  it('returns the real result when close cancellation loses the race to started work', async () => {
+    let finish: ((response: ApiResponse) => void) | undefined;
+    const stub = stubRuntime(
+      () =>
+        new Promise<ApiResponse>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const { client } = connected(stub, { timeoutMs: 60_000 });
+
+    const inflight = client.call({ method: 'DELETE', path: '/api/sessions/already-started' });
+    await flush();
+    client.close();
+    await flush();
+
+    expect(stub.signals[0]?.aborted).toBe(true);
+    expect(await within(inflight, 100)).toBe('HUNG');
+
+    finish!({ ok: true, status: 204, body: null });
+    expect(await within(inflight, 1000)).toEqual({ ok: true, status: 204, body: null });
+  });
+
+  it('closes immediately and idempotently when no calls are pending', async () => {
+    const posted: RpcRequest[] = [];
+    let detaches = 0;
+    let closes = 0;
+    const client = createRpcClient({
+      postMessage(message: unknown): void {
+        posted.push(message as RpcRequest);
+      },
+      listen: () => () => {
+        detaches += 1;
+      },
+      close(): void {
+        closes += 1;
+      },
+    });
+
+    const unsubscribe = client.subscribe('job', () => {});
+    client.close();
+    client.close();
+    unsubscribe();
+
+    expect(posted).toEqual([
+      { kind: 'subscribe', id: 1, jobId: 'job' },
+      { kind: 'unsubscribe', id: 1 },
+    ]);
+    expect(detaches).toBe(1);
+    expect(closes).toBe(1);
+    expect(await client.call({ method: 'GET', path: '/new' })).toMatchObject({
+      ok: false,
+      code: 'E_UNAVAILABLE',
+    });
   });
 
   it('settles a request whose body cannot be cloned, instead of waiting out the deadline', async () => {
