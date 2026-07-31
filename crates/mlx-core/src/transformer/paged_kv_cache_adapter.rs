@@ -1531,10 +1531,11 @@ pub struct PagedKVCacheAdapter {
     #[cfg(target_os = "macos")]
     varlen_prefill_inputs_cache: Option<VarlenPrefillInputsCache>,
 
-    /// Cached per-decode-token metadata for the MLX `paged_attention` bridge.
-    /// Decode calls every full-attention layer with the same active block table
-    /// and seq_len after `record_tokens(&[token])`; cache the small metadata
-    /// arrays across those layer calls.
+    /// Split-lifetime decode metadata for the MLX `paged_attention` bridge.
+    /// The materialized block table survives token-cursor changes until the
+    /// exact physical block-id sequence changes; `seq_lens` is immutable and
+    /// replaced for each new cursor so older lazy graphs retain their storage.
+    /// Same-token calls from later full-attention layers reuse both arrays.
     #[cfg(target_os = "macos")]
     decode_attention_inputs_cache: Option<DecodePagedAttentionInputsCache>,
 
@@ -1606,6 +1607,7 @@ struct VarlenPrefillInputsCache {
 
 #[cfg(target_os = "macos")]
 struct DecodePagedAttentionInputsCache {
+    physical_revision: u64,
     token_count: u32,
     block_count: u32,
     block_table: MxArray,
@@ -2883,9 +2885,7 @@ impl PagedKVCacheAdapter {
         self.request_tokens.extend_from_slice(tokens);
         block_table.set_num_tokens(new_total);
         #[cfg(target_os = "macos")]
-        {
-            self.clear_attention_inputs_caches();
-        }
+        self.clear_prefill_attention_inputs_cache();
         Ok(())
     }
 
@@ -2923,9 +2923,7 @@ impl PagedKVCacheAdapter {
         self.request_tokens.truncate(new_len as usize);
         block_table.set_num_tokens(new_len);
         #[cfg(target_os = "macos")]
-        {
-            self.clear_attention_inputs_caches();
-        }
+        self.clear_prefill_attention_inputs_cache();
         Ok(())
     }
 
@@ -3545,27 +3543,38 @@ impl PagedKVCacheAdapter {
         if recorded == 0 {
             return Err("gather_kv_for_decode_graph called before any tokens recorded".to_string());
         }
-        let block_ids = build_decode_block_ids(block_table);
-        if block_ids.is_empty() {
+        let recorded_i32 = i32::try_from(recorded).map_err(|_| {
+            format!("gather_kv_for_decode_graph: recorded token count {recorded} exceeds i32::MAX")
+        })?;
+        let physical_revision = block_table.physical_revision();
+        let block_count = u32::try_from(block_table.num_blocks()).map_err(|_| {
+            format!(
+                "gather_kv_for_decode_graph: too many blocks for i32 shape: {}",
+                block_table.num_blocks()
+            )
+        })?;
+        if block_count == 0 {
             return Err(
                 "gather_kv_for_decode_graph: active request has no allocated blocks".to_string(),
             );
         }
-        let block_count = u32::try_from(block_ids.len()).map_err(|_| {
-            format!(
-                "gather_kv_for_decode_graph: too many blocks for i32 shape: {}",
-                block_ids.len()
-            )
-        })?;
-        let pool_block_count = self.layer_kv_pool.num_blocks();
-        for (idx, &block_id) in block_ids.iter().enumerate() {
-            if block_id < 0 || block_id as u32 >= pool_block_count {
-                return Err(format!(
-                    "gather_kv_for_decode_graph: block_table[{idx}]={block_id} out of \
-                     range for pool block count {pool_block_count}"
-                ));
-            }
+
+        // Every later full-attention layer in this token observes the same
+        // cursor and exact physical table. A populated cache proves the arrays
+        // already passed content validation and synchronous materialization, so
+        // return before rebuilding/scanning the O(blocks) host vector.
+        if let Some(cache) = self.decode_attention_inputs_cache.as_ref()
+            && cache.token_count == recorded
+            && cache.physical_revision == physical_revision
+            && cache.block_count == block_count
+        {
+            return Ok((
+                cache.block_table.clone(),
+                cache.seq_lens.clone(),
+                cache.block_count,
+            ));
         }
+
         let max_seq_len = block_count
             .checked_mul(self.block_size)
             .ok_or_else(|| "gather_kv_for_decode_graph: max seq len overflow".to_string())?;
@@ -3577,25 +3586,49 @@ impl PagedKVCacheAdapter {
             ));
         }
 
-        if let Some(cache) = self.decode_attention_inputs_cache.as_ref()
-            && cache.token_count == recorded
-            && cache.block_count == block_count
-        {
-            return Ok((
-                cache.block_table.clone(),
-                cache.seq_lens.clone(),
-                cache.block_count,
-            ));
+        // Cursor advancement normally leaves the physical table unchanged for
+        // `block_size - 1` steps. Reuse its immutable materialized MxArray in
+        // that case; otherwise rebuild and validate the exact ID sequence.
+        let cached_block_table = self
+            .decode_attention_inputs_cache
+            .as_ref()
+            .filter(|cache| {
+                cache.physical_revision == physical_revision && cache.block_count == block_count
+            })
+            .map(|cache| cache.block_table.clone());
+        let (block_table_arr, rebuilt_block_table) = match cached_block_table {
+            Some(block_table_arr) => (block_table_arr, false),
+            None => {
+                let block_ids = build_decode_block_ids(block_table);
+                debug_assert_eq!(block_ids.len(), block_count as usize);
+                let pool_block_count = self.layer_kv_pool.num_blocks();
+                for (idx, &block_id) in block_ids.iter().enumerate() {
+                    if block_id < 0 || block_id as u32 >= pool_block_count {
+                        return Err(format!(
+                            "gather_kv_for_decode_graph: block_table[{idx}]={block_id} out of \
+                             range for pool block count {pool_block_count}"
+                        ));
+                    }
+                }
+                let array = MxArray::from_int32(&block_ids, &[1, block_count as i64])
+                    .map_err(|e| format!("gather_kv_for_decode_graph block_table: {e}"))?;
+                (array, true)
+            }
+        };
+        let seq_lens_arr = MxArray::from_int32(&[recorded_i32], &[1])
+            .map_err(|e| format!("gather_kv_for_decode_graph seq_lens: {e}"))?;
+        if rebuilt_block_table {
+            MxArray::eval_arrays(&[&block_table_arr, &seq_lens_arr])
+                .map_err(|e| format!("gather_kv_for_decode_graph metadata eval: {e}"))?;
+        } else {
+            // Never mutate the old scalar array in place: already-scheduled
+            // lazy attention graphs may still retain it as their context lens.
+            MxArray::eval_arrays(&[&seq_lens_arr])
+                .map_err(|e| format!("gather_kv_for_decode_graph seq_lens eval: {e}"))?;
         }
 
-        let block_table_arr = MxArray::from_int32(&block_ids, &[1, block_count as i64])
-            .map_err(|e| format!("gather_kv_for_decode_graph block_table: {e}"))?;
-        let seq_lens_arr = MxArray::from_int32(&[recorded as i32], &[1])
-            .map_err(|e| format!("gather_kv_for_decode_graph seq_lens: {e}"))?;
-        MxArray::eval_arrays(&[&block_table_arr, &seq_lens_arr])
-            .map_err(|e| format!("gather_kv_for_decode_graph metadata eval: {e}"))?;
-
         self.decode_attention_inputs_cache = Some(DecodePagedAttentionInputsCache {
+            physical_revision,
             token_count: recorded,
             block_count,
             block_table: block_table_arr,
@@ -10542,6 +10575,189 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decode_metadata_reuses_same_token_and_splits_cursor_lifetime() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!(
+                "skipping decode_metadata_reuses_same_token_and_splits_cursor_lifetime: \
+                 Metal unavailable"
+            );
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1]).unwrap();
+
+        let (block_1, seq_1, count_1) = adapter.decode_attention_inputs().unwrap();
+        let revision = adapter.block_table().unwrap().physical_revision();
+        let (block_1_again, seq_1_again, count_1_again) =
+            adapter.decode_attention_inputs().unwrap();
+        assert_eq!(block_1.as_raw_ptr(), block_1_again.as_raw_ptr());
+        assert_eq!(seq_1.as_raw_ptr(), seq_1_again.as_raw_ptr());
+        assert_eq!(count_1, count_1_again);
+
+        adapter.record_tokens(&[2]).unwrap();
+        let (block_2, seq_2, count_2) = adapter.decode_attention_inputs().unwrap();
+        assert_eq!(adapter.block_table().unwrap().physical_revision(), revision);
+        assert_eq!(block_1.as_raw_ptr(), block_2.as_raw_ptr());
+        assert_ne!(
+            seq_1.as_raw_ptr(),
+            seq_2.as_raw_ptr(),
+            "cursor advancement must replace, never mutate, seq_lens storage"
+        );
+        assert_eq!(seq_1.item_at_int32(0).unwrap(), 1);
+        assert_eq!(seq_2.item_at_int32(0).unwrap(), 2);
+        assert_eq!(count_1, count_2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decode_metadata_rebuilds_at_lazy_block_boundary() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!(
+                "skipping decode_metadata_rebuilds_at_lazy_block_boundary: Metal unavailable"
+            );
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        let (one_block, old_seq, old_count) = adapter.decode_attention_inputs().unwrap();
+        let old_revision = adapter.block_table().unwrap().physical_revision();
+
+        adapter.record_tokens(&[5]).unwrap();
+        let (two_blocks, new_seq, new_count) = adapter.decode_attention_inputs().unwrap();
+        assert_eq!(old_count, 1);
+        assert_eq!(new_count, 2);
+        assert_ne!(
+            adapter.block_table().unwrap().physical_revision(),
+            old_revision
+        );
+        assert_ne!(one_block.as_raw_ptr(), two_blocks.as_raw_ptr());
+        assert_ne!(old_seq.as_raw_ptr(), new_seq.as_raw_ptr());
+        assert_eq!(new_seq.item_at_int32(0).unwrap(), 5);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decode_metadata_rollback_retry_keeps_physical_table() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!(
+                "skipping decode_metadata_rollback_retry_keeps_physical_table: Metal unavailable"
+            );
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        adapter.record_tokens(&[5]).unwrap();
+        let (grown_table, seq_5, grown_count) = adapter.decode_attention_inputs().unwrap();
+        let grown_revision = adapter.block_table().unwrap().physical_revision();
+
+        adapter.rollback_last_tokens(1).unwrap();
+        let (rolled_back_table, seq_4, rolled_back_count) =
+            adapter.decode_attention_inputs().unwrap();
+        assert_eq!(
+            adapter.block_table().unwrap().physical_revision(),
+            grown_revision
+        );
+        assert_eq!(grown_count, 2, "lazy growth retains the second block");
+        assert_eq!(rolled_back_count, grown_count);
+        assert_eq!(grown_table.as_raw_ptr(), rolled_back_table.as_raw_ptr());
+        assert_ne!(seq_5.as_raw_ptr(), seq_4.as_raw_ptr());
+        assert_eq!(seq_4.item_at_int32(0).unwrap(), 4);
+
+        adapter.record_tokens(&[5]).unwrap();
+        let (retry_table, retry_seq, retry_count) = adapter.decode_attention_inputs().unwrap();
+        assert_eq!(
+            adapter.block_table().unwrap().physical_revision(),
+            grown_revision
+        );
+        assert_eq!(retry_count, grown_count);
+        assert_eq!(grown_table.as_raw_ptr(), retry_table.as_raw_ptr());
+        assert_ne!(seq_4.as_raw_ptr(), retry_seq.as_raw_ptr());
+        assert_eq!(retry_seq.item_at_int32(0).unwrap(), 5);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decode_metadata_physical_replacement_invalidates_block_array() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping decode_metadata_physical_replacement_invalidates_block_array: \
+                 Metal unavailable"
+            );
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let (old_table_array, _, _) = adapter.decode_attention_inputs().unwrap();
+        let old_id = old_table_array.item_at_int32(0).unwrap();
+        let old_revision = adapter.block_table().unwrap().physical_revision();
+
+        let replacement = allocator.lock().unwrap().allocate().unwrap();
+        let replacement_id = replacement.block_id as i32;
+        let old_block = adapter.block_table().unwrap().blocks()[0].clone();
+        assert!(
+            adapter
+                .block_table
+                .as_mut()
+                .unwrap()
+                .replace_block(0, replacement)
+        );
+        allocator.lock().unwrap().free(old_block);
+
+        let (new_table_array, _, _) = adapter.decode_attention_inputs().unwrap();
+        assert_ne!(
+            adapter.block_table().unwrap().physical_revision(),
+            old_revision
+        );
+        assert_ne!(old_table_array.as_raw_ptr(), new_table_array.as_raw_ptr());
+        assert_ne!(old_id, replacement_id);
+        assert_eq!(new_table_array.item_at_int32(0).unwrap(), replacement_id);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decode_metadata_reset_release_and_prefix_restore_never_reuse_stale_arrays() {
+        let allocator = new_allocator(8, 4);
+        let Some(pool) = maybe_test_pool(8, 4) else {
+            eprintln!(
+                "skipping decode_metadata_reset_release_and_prefix_restore_never_reuse_stale_arrays: \
+                 Metal unavailable"
+            );
+            return;
+        };
+        let mut adapter =
+            PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 4).unwrap();
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(tokens.len() as u32).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        let (first_request_table, _, _) = adapter.decode_attention_inputs().unwrap();
+        adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
+        adapter.release_request().unwrap();
+        assert!(adapter.decode_attention_inputs_cache.is_none());
+
+        adapter.reset_for_new_request(1).unwrap();
+        let prefix = adapter
+            .find_cached_prefix(&tokens, &[], 0, false)
+            .expect("restore registered prefix");
+        assert_eq!(prefix.cached_token_count, tokens.len() as u32);
+        let (restored_table, restored_seq, restored_count) =
+            adapter.decode_attention_inputs().unwrap();
+        assert_eq!(restored_count, 2);
+        assert_eq!(restored_seq.item_at_int32(0).unwrap(), tokens.len() as i32);
+        assert_ne!(
+            first_request_table.as_raw_ptr(),
+            restored_table.as_raw_ptr(),
+            "a new SequenceBlockTable must rematerialize even when IDs/revision match"
+        );
+    }
+
     /// Focused decode-metadata benchmark for the long-context, five-global-layer
     /// Gemma4 hot path. The first measurement calls the metadata builder five
     /// times at one token position (one call per global layer). The second
@@ -10549,7 +10765,7 @@ mod tests {
     /// remains unchanged, then repeats the same five-layer fanout.
     ///
     /// Run with:
-    /// `cargo test -p mlx-core benchmark_decode_attention_metadata_cache -- --ignored --exact --nocapture`
+    /// `cargo test --release -p mlx-core --lib transformer::paged_kv_cache_adapter::tests::benchmark_decode_attention_metadata_cache -- --ignored --exact --nocapture`
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "long-context metadata microbenchmark"]

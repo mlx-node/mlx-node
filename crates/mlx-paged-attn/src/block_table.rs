@@ -21,6 +21,13 @@ pub struct SequenceBlockTable {
 
     /// Block size (tokens per block)
     block_size: u32,
+
+    /// Monotonic identity of the physical block-id sequence. Token-cursor
+    /// changes deliberately do not affect this revision: consumers use it to
+    /// retain materialized block-table metadata while only `num_tokens`
+    /// advances. Any API that can add, replace, remove, or reorder physical
+    /// blocks must bump it before returning.
+    physical_revision: u64,
 }
 
 impl SequenceBlockTable {
@@ -31,12 +38,21 @@ impl SequenceBlockTable {
             blocks: Vec::new(),
             num_tokens: 0,
             block_size,
+            physical_revision: 0,
         }
+    }
+
+    fn bump_physical_revision(&mut self) {
+        self.physical_revision = self
+            .physical_revision
+            .checked_add(1)
+            .expect("SequenceBlockTable physical revision overflow");
     }
 
     /// Add a block to the sequence
     pub fn add_block(&mut self, block: Arc<PhysicalBlock>) {
         self.blocks.push(block);
+        self.bump_physical_revision();
     }
 
     /// Replace a block at the given index (for copy-on-write)
@@ -47,6 +63,7 @@ impl SequenceBlockTable {
     pub fn replace_block(&mut self, index: usize, block: Arc<PhysicalBlock>) -> bool {
         if index < self.blocks.len() {
             self.blocks[index] = block;
+            self.bump_physical_revision();
             true
         } else {
             false
@@ -73,9 +90,9 @@ impl SequenceBlockTable {
         &self.blocks
     }
 
-    /// Get mutable access to blocks
-    pub fn blocks_mut(&mut self) -> &mut Vec<Arc<PhysicalBlock>> {
-        &mut self.blocks
+    /// Revision of the exact physical block-id sequence.
+    pub fn physical_revision(&self) -> u64 {
+        self.physical_revision
     }
 
     /// Get the block IDs as a vector (for kernel dispatch)
@@ -86,11 +103,6 @@ impl SequenceBlockTable {
     /// Get the last block (for appending new tokens)
     pub fn last_block(&self) -> Option<&Arc<PhysicalBlock>> {
         self.blocks.last()
-    }
-
-    /// Get mutable access to the last block
-    pub fn last_block_mut(&mut self) -> Option<&mut Arc<PhysicalBlock>> {
-        self.blocks.last_mut()
     }
 
     /// Check if the last block is full
@@ -183,5 +195,33 @@ mod tests {
         assert_eq!(table.slot_index(31), (0, 31));
         assert_eq!(table.slot_index(32), (1, 0));
         assert_eq!(table.slot_index(50), (1, 18));
+    }
+
+    #[test]
+    fn physical_revision_tracks_only_physical_table_mutations() {
+        let mut allocator = BlockAllocator::new(4, 32);
+        let mut table = SequenceBlockTable::new(0, 32);
+        assert_eq!(table.physical_revision(), 0);
+
+        table.set_num_tokens(1);
+        assert_eq!(
+            table.physical_revision(),
+            0,
+            "cursor-only changes must preserve materialized block metadata"
+        );
+
+        let first = allocator.allocate().unwrap();
+        let replacement = allocator.allocate().unwrap();
+        table.add_block(first);
+        assert_eq!(table.physical_revision(), 1);
+        assert!(table.replace_block(0, replacement));
+        assert_eq!(table.physical_revision(), 2);
+
+        assert!(!table.replace_block(1, allocator.allocate().unwrap()));
+        assert_eq!(
+            table.physical_revision(),
+            2,
+            "a rejected replacement does not mutate physical identity"
+        );
     }
 }
