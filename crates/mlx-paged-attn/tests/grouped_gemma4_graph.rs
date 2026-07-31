@@ -90,3 +90,27 @@ fn grouped_d512_selector_boundaries_and_geometries_are_pinned() {
         selected(2, 16, 1, 1, 513)
     );
 }
+
+#[test]
+fn grouped_d512_graph_stripe_policy_matches_measured_boundaries() {
+    let stripes = |q_heads, kv_heads, context, override_stripes| unsafe {
+        mlx_sys::mlx_paged_grouped_d512_stripe_count_for_test(
+            q_heads,
+            kv_heads,
+            context,
+            override_stripes,
+        )
+    };
+
+    for (context, expected) in [(90_112, 64), (90_113, 128), (91_795, 128), (112_000, 128)] {
+        assert_eq!(stripes(16, 2, context, 0), expected);
+    }
+    assert_eq!(stripes(8, 1, 90_113, 0), 128, "Hq8/Hkv1 is unchanged");
+    assert_eq!(stripes(16, 1, 90_113, 0), 128, "Hq16/Hkv1 is unchanged");
+    assert_eq!(stripes(32, 4, 90_113, 0), 32, "Hkv4 is unchanged");
+    assert_eq!(
+        stripes(16, 2, 91_795, 32),
+        32,
+        "an explicit validated override remains authoritative"
+    );
+}

@@ -152,21 +152,56 @@ fn grouped_d512_stripe_override() -> Option<u32> {
     })
 }
 
+// Mirror the graph dispatcher and model-free diagnostics. A fixed-session A/B
+// measured Hq16/Hkv2 at 91,795 context for 512 generated tokens: 128 stripes
+// delivered 32.8416 tok/s versus 31.0484 for 64 (+5.78%, 3/3 paired wins); the
+// raw 112K sweep did not regress.
+const D512_HQ16_HKV2_WIDE_STRIPE_CONTEXT: u32 = 88 * 1024 + 1;
+
+fn grouped_d512_default_stripe_count(
+    max_context_len: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+) -> u32 {
+    let base_stripes = match max_context_len {
+        0..=4096 => 32,
+        4097..=8192 => 64,
+        _ => 128,
+    };
+    let stripes = (base_stripes / num_kv_heads.max(1)).max(4);
+    if (num_q_heads, num_kv_heads) == (16, 2)
+        && max_context_len >= D512_HQ16_HKV2_WIDE_STRIPE_CONTEXT
+    {
+        128
+    } else {
+        stripes
+    }
+}
+
+fn grouped_d512_resolved_stripe_count(
+    override_stripes: Option<u32>,
+    max_context_len: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+) -> u32 {
+    override_stripes.unwrap_or_else(|| {
+        grouped_d512_default_stripe_count(max_context_len, num_q_heads, num_kv_heads)
+    })
+}
+
 fn grouped_stripe_count(
     kind: GroupedPagedAttentionKind,
     max_context_len: u32,
+    num_q_heads: u32,
     num_kv_heads: u32,
 ) -> u32 {
     if kind == GroupedPagedAttentionKind::D512Staged {
-        if let Some(stripes) = grouped_d512_stripe_override() {
-            return stripes;
-        }
-        let base_stripes = match max_context_len {
-            0..=4096 => 32,
-            4097..=8192 => 64,
-            _ => 128,
-        };
-        return (base_stripes / num_kv_heads.max(1)).max(4);
+        return grouped_d512_resolved_stripe_count(
+            grouped_d512_stripe_override(),
+            max_context_len,
+            num_q_heads,
+            num_kv_heads,
+        );
     }
     match max_context_len {
         0..=4096 => 32,
@@ -641,13 +676,50 @@ mod grouped_selection_tests {
             (4_097, [64, 32, 16]),
             (8_193, [128, 64, 32]),
         ] {
-            for (kv_heads, expected) in [1, 2, 4].into_iter().zip(expected) {
+            for ((q_heads, kv_heads), expected) in
+                [(16, 1), (16, 2), (32, 4)].into_iter().zip(expected)
+            {
                 assert_eq!(
-                    grouped_stripe_count(GroupedPagedAttentionKind::D512Staged, context, kv_heads),
+                    grouped_stripe_count(
+                        GroupedPagedAttentionKind::D512Staged,
+                        context,
+                        q_heads,
+                        kv_heads,
+                    ),
                     expected
                 );
             }
         }
+    }
+
+    #[test]
+    fn d512_wide_stripe_policy_matches_graph_and_planner_boundaries() {
+        for (context, expected) in [(90_112, 64), (90_113, 128), (91_795, 128), (112_000, 128)] {
+            assert_eq!(
+                grouped_d512_resolved_stripe_count(None, context, 16, 2),
+                expected
+            );
+        }
+        assert_eq!(
+            grouped_d512_resolved_stripe_count(None, 90_113, 8, 1),
+            128,
+            "Hq8/Hkv1 is unchanged"
+        );
+        assert_eq!(
+            grouped_d512_resolved_stripe_count(None, 90_113, 16, 1),
+            128,
+            "Hq16/Hkv1 is unchanged"
+        );
+        assert_eq!(
+            grouped_d512_resolved_stripe_count(None, 90_113, 32, 4),
+            32,
+            "Hkv4 is unchanged"
+        );
+        assert_eq!(
+            grouped_d512_resolved_stripe_count(Some(32), 91_795, 16, 2),
+            32,
+            "an explicit validated override remains authoritative"
+        );
     }
 
     #[test]
@@ -1143,7 +1215,12 @@ pub unsafe fn dispatch_paged_attention_v2_raw_with_route(
         grouped_pipelines_supported(state, kind, params.num_heads, params.num_kv_heads)
     });
     let max_num_partitions = if let Some(kind) = grouped_kind.filter(|_| use_grouped) {
-        grouped_stripe_count(kind, params.max_seq_len, params.num_kv_heads)
+        grouped_stripe_count(
+            kind,
+            params.max_seq_len,
+            params.num_heads,
+            params.num_kv_heads,
+        )
     } else {
         params.max_seq_len.div_ceil(PARTITION_SIZE)
     };
@@ -1742,7 +1819,12 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
     // `effective_context_len`-derived `num_partitions` it computes
     // independently.
     let max_num_partitions = if let Some(kind) = grouped_kind.filter(|_| use_grouped) {
-        grouped_stripe_count(kind, params.max_seq_len, params.num_kv_heads)
+        grouped_stripe_count(
+            kind,
+            params.max_seq_len,
+            params.num_heads,
+            params.num_kv_heads,
+        )
     } else {
         params.max_seq_len.div_ceil(PARTITION_SIZE)
     };

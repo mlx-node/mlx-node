@@ -1381,6 +1381,15 @@ unsafe extern "C-unwind" {
         max_context_len: i32,
     ) -> i32;
 
+    /// Pure graph-dispatch stripe policy seam. A nonzero override mirrors the
+    /// validated environment override after parsing.
+    pub fn mlx_paged_grouped_d512_stripe_count_for_test(
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        max_context_len: i32,
+        override_stripes: u32,
+    ) -> u32;
+
     /// Compatibility selector for the original 16Q/1KV Gemma 4 route.
     /// selector_mode: 0=disabled, 1=auto, 2=force.
     pub fn mlx_paged_grouped_gemma4_shape_guard_for_test(

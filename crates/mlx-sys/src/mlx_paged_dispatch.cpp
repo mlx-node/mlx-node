@@ -39,6 +39,14 @@ namespace {
 // `crates/mlx-paged-attn/src/metal/paged_attention.rs`).
 constexpr uint32_t kPartitionSize = 512;
 
+// The first actual context in the auto route's 92K-ending bucket. A
+// fixed-session A/B measured Hq16/Hkv2 at 91,795 context for 512 generated
+// tokens: 128 stripes delivered 32.8416 tok/s versus 31.0484 for 64 (+5.78%,
+// 3/3 paired wins). The raw 112K sweep showed no regression. Keep this geometry
+// threshold mirrored in the Rust raw dispatcher and the model-free planner
+// diagnostics.
+constexpr int kD512Hq16Hkv2WideStripeContext = 88 * 1024 + 1;
+
 // `NUM_THREADS` and `NUM_WARPS` baked into the forked kernels. These
 // must agree with the `_nt256_nsl32` suffix in the kernel-name format
 // (see `crates/mlx-paged-attn/src/metal/state.rs`).
@@ -381,28 +389,52 @@ uint32_t grouped_d512_stripe_override() {
   return stripes;
 }
 
+uint32_t grouped_d512_default_stripe_count(
+    int max_context_len,
+    int num_q_heads,
+    int num_kv_heads) {
+  // Keep total stage-1 threadgroups approximately stable across the shipped
+  // D512 GQA layouts. The grid already has one x-dimension group per KV head,
+  // so using the single-KV 32/64/128 policy unchanged would over-dispatch
+  // Hkv2/Hkv4 by 2x/4x.
+  uint32_t base_stripes = 128;
+  if (max_context_len <= 4096) {
+    base_stripes = 32;
+  } else if (max_context_len <= 8192) {
+    base_stripes = 64;
+  }
+  const uint32_t kv_heads =
+      static_cast<uint32_t>(std::max(num_kv_heads, 1));
+  const uint32_t stripes = std::max(uint32_t{4}, base_stripes / kv_heads);
+  if (num_q_heads == 16 && num_kv_heads == 2 &&
+      max_context_len >= kD512Hq16Hkv2WideStripeContext) {
+    return 128;
+  }
+  return stripes;
+}
+
+uint32_t grouped_d512_resolved_stripe_count(
+    uint32_t override_stripes,
+    int max_context_len,
+    int num_q_heads,
+    int num_kv_heads) {
+  return override_stripes != 0
+      ? override_stripes
+      : grouped_d512_default_stripe_count(
+            max_context_len, num_q_heads, num_kv_heads);
+}
+
 uint32_t grouped_stripe_count(
     GroupedPagedAttentionKind kind,
     int max_context_len,
+    int num_q_heads,
     int num_kv_heads) {
   if (kind == GroupedPagedAttentionKind::D512Staged) {
-    if (const uint32_t override = grouped_d512_stripe_override();
-        override != 0) {
-      return override;
-    }
-    // Keep total stage-1 threadgroups approximately stable across the shipped
-    // D512 GQA layouts. The grid already has one x-dimension group per KV
-    // head, so using the single-KV 32/64/128 policy unchanged would
-    // over-dispatch Hkv2/Hkv4 by 2x/4x.
-    uint32_t base_stripes = 128;
-    if (max_context_len <= 4096) {
-      base_stripes = 32;
-    } else if (max_context_len <= 8192) {
-      base_stripes = 64;
-    }
-    const uint32_t kv_heads =
-        static_cast<uint32_t>(std::max(num_kv_heads, 1));
-    return std::max(uint32_t{4}, base_stripes / kv_heads);
+    return grouped_d512_resolved_stripe_count(
+        grouped_d512_stripe_override(),
+        max_context_len,
+        num_q_heads,
+        num_kv_heads);
   }
   // Power-of-two, block-size-aligned stripe counts. Representative long
   // contexts mirror MLX's vector 2-pass occupancy curve: 16K -> 256,
@@ -923,6 +955,15 @@ extern "C" int mlx_paged_grouped_d512_shape_guard_for_test(
       : 0;
 }
 
+extern "C" uint32_t mlx_paged_grouped_d512_stripe_count_for_test(
+    int num_q_heads,
+    int num_kv_heads,
+    int max_context_len,
+    uint32_t override_stripes) {
+  return grouped_d512_resolved_stripe_count(
+      override_stripes, max_context_len, num_q_heads, num_kv_heads);
+}
+
 extern "C" int mlx_paged_grouped_gemma4_shape_guard_for_test(
     int selector_mode,
     int query_rows,
@@ -1170,7 +1211,8 @@ void dispatch_paged_attention_v2_inner(
   // Generic V2 uses contiguous 512-token partitions. The grouped path uses
   // MLX-style strided stripes and its dedicated second pass.
   const uint32_t max_num_partitions = use_grouped
-      ? grouped_stripe_count(grouped_kind, max_context_len, num_kv_heads)
+      ? grouped_stripe_count(
+            grouped_kind, max_context_len, num_q_heads, num_kv_heads)
       : (static_cast<uint32_t>(max_context_len) + kPartitionSize - 1) /
           kPartitionSize;
 
@@ -1589,7 +1631,8 @@ void dispatch_paged_attention_varlen_v2_inner(
       grouped_pipelines_supported(
           device, grouped_kind, num_q_heads, num_kv_heads);
   const uint32_t max_num_partitions = use_grouped
-      ? grouped_stripe_count(grouped_kind, max_context_len, num_kv_heads)
+      ? grouped_stripe_count(
+            grouped_kind, max_context_len, num_q_heads, num_kv_heads)
       : (static_cast<uint32_t>(max_context_len) + kPartitionSize - 1) /
           kPartitionSize;
 

@@ -203,27 +203,50 @@ fn grouped_d512_measured_crossover(num_heads: i32, num_kv_heads: i32) -> Option<
     }
 }
 
-fn grouped_d512_planned_stripes(
-    selector: &str,
-    override_stripes: Option<u32>,
-    total_context: u32,
-    num_heads: i32,
-    num_kv_heads: i32,
-) -> Option<u32> {
-    let eligible = total_context > 512
-        && (selector == "force"
-            || (selector == "auto"
-                && grouped_d512_measured_crossover(num_heads, num_kv_heads)
-                    .is_some_and(|crossover| total_context >= crossover)));
-    if !eligible {
-        return None;
-    }
-    let base_stripes: u32 = match total_context {
+// Mirror both low-level dispatchers using actual context, not the rounded route
+// bucket. A fixed-session A/B measured Hq16/Hkv2 at 91,795 context for 512
+// generated tokens: 128 stripes delivered 32.8416 tok/s versus 31.0484 for 64
+// (+5.78%, 3/3 paired wins); the raw 112K sweep did not regress.
+const D512_HQ16_HKV2_WIDE_STRIPE_CONTEXT: u32 = 88 * 1024 + 1;
+
+fn grouped_d512_default_stripes(actual_context: u32, num_heads: i32, num_kv_heads: i32) -> u32 {
+    let base_stripes: u32 = match actual_context {
         0..=4_096 => 32,
         4_097..=8_192 => 64,
         _ => 128,
     };
-    override_stripes.or(Some((base_stripes / num_kv_heads.max(1) as u32).max(4)))
+    let stripes = (base_stripes / num_kv_heads.max(1) as u32).max(4);
+    if (num_heads, num_kv_heads) == (16, 2) && actual_context >= D512_HQ16_HKV2_WIDE_STRIPE_CONTEXT
+    {
+        128
+    } else {
+        stripes
+    }
+}
+
+fn grouped_d512_planned_stripes(
+    selector: &str,
+    override_stripes: Option<u32>,
+    actual_context: u32,
+    num_heads: i32,
+    num_kv_heads: i32,
+) -> Option<u32> {
+    let policy_context = decode_context_bucket_end(actual_context);
+    let eligible = actual_context > 512
+        && (selector == "force"
+            || (selector == "auto"
+                && grouped_d512_measured_crossover(num_heads, num_kv_heads)
+                    .is_some_and(|crossover| policy_context >= crossover)));
+    if !eligible {
+        return None;
+    }
+    override_stripes.or_else(|| {
+        Some(grouped_d512_default_stripes(
+            actual_context,
+            num_heads,
+            num_kv_heads,
+        ))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1266,7 +1289,7 @@ impl Gemma4Attention {
         ) && grouped_d512_planned_stripes(
             grouped_selector,
             grouped_stripe_override,
-            context_bucket_end,
+            total_ctx,
             self.num_heads,
             self.num_kv_heads,
         )
@@ -1285,7 +1308,7 @@ impl Gemma4Attention {
         let (grouped_paged_candidate, grouped_stripes) = grouped_d512_kernel_candidate(
             grouped_selector,
             grouped_stripe_override,
-            context_bucket_end,
+            total_ctx,
             query_dtype,
             cache_dtype,
             adapter.block_size(),
@@ -2347,14 +2370,14 @@ mod tests {
                 512,
                 true,
             ),
-            ("grouped_d512_staged", Some(64)),
+            ("grouped_d512_staged", Some(128)),
             "the capability-confirmed Hkv2 geometry must remain direct-paged at long context"
         );
         assert_eq!(
             grouped_d512_kernel_candidate(
                 "auto",
                 None,
-                decode_context_bucket_end(88 * 1024),
+                90_112,
                 DType::BFloat16,
                 Some(DType::BFloat16),
                 16,
@@ -2370,7 +2393,7 @@ mod tests {
             grouped_d512_kernel_candidate(
                 "auto",
                 None,
-                decode_context_bucket_end(88 * 1024 + 1),
+                90_113,
                 DType::BFloat16,
                 Some(DType::BFloat16),
                 16,
@@ -2379,15 +2402,49 @@ mod tests {
                 512,
                 true,
             ),
-            ("grouped_d512_staged", Some(64)),
+            ("grouped_d512_staged", Some(128)),
             "route stability intentionally enables the whole 92K-ending bucket"
         );
-        for (query_heads, kv_heads, expected_stripes) in [(16, 1, 128), (16, 2, 64), (32, 4, 32)] {
+        for context in [91_795, 112_000] {
             assert_eq!(
                 grouped_d512_kernel_candidate(
                     "auto",
                     None,
-                    92 * 1024,
+                    context,
+                    DType::BFloat16,
+                    Some(DType::BFloat16),
+                    16,
+                    16,
+                    2,
+                    512,
+                    true,
+                ),
+                ("grouped_d512_staged", Some(128)),
+                "the measured Hq16/Hkv2 long-context cases use wide stripes"
+            );
+        }
+        assert_eq!(
+            grouped_d512_kernel_candidate(
+                "auto",
+                Some(32),
+                91_795,
+                DType::BFloat16,
+                Some(DType::BFloat16),
+                16,
+                16,
+                2,
+                512,
+                true,
+            ),
+            ("grouped_d512_staged", Some(32)),
+            "an explicit validated override remains authoritative"
+        );
+        for (query_heads, kv_heads, expected_stripes) in [(16, 1, 128), (16, 2, 128), (32, 4, 32)] {
+            assert_eq!(
+                grouped_d512_kernel_candidate(
+                    "auto",
+                    None,
+                    90_113,
                     DType::BFloat16,
                     Some(DType::BFloat16),
                     16,
@@ -2397,7 +2454,7 @@ mod tests {
                     true,
                 ),
                 ("grouped_d512_staged", Some(expected_stripes)),
-                "qualified D512 geometry must select grouped at the measured crossover"
+                "qualified D512 geometries retain their mirrored defaults at the first eligible bucket"
             );
         }
         assert_eq!(
