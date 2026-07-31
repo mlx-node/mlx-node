@@ -595,6 +595,25 @@ pub fn try_build_kquant_quantized_linear(
 /// linear bias added AFTER the kernel, result narrowed to bf16 inside C++.
 /// Plain `fp8_e4m3` is the non-native exception: it keeps raw Uint8 checkpoint
 /// storage, reconstructs BF16 once at load, and uses ordinary A16 matmul.
+///
+/// The normal load path stores the pre-transposed `[K,N]` graph so decode
+/// forwards can pass it directly to matmul, mirroring `nn::Linear::weight_t`.
+/// `Source` is a compatibility fallback for the infallible public constructor:
+/// if building the transpose graph fails, construction still succeeds and the
+/// same error remains deferred until `forward()` as it was before the cache.
+enum PlainFp8Weight {
+    Transposed(MxArray),
+    Source(MxArray),
+}
+
+impl PlainFp8Weight {
+    fn nbytes(&self) -> u64 {
+        match self {
+            Self::Transposed(weight) | Self::Source(weight) => weight.nbytes() as u64,
+        }
+    }
+}
+
 pub struct QuantizedLinear {
     weight: MxArray,
     scales: MxArray,
@@ -603,9 +622,9 @@ pub struct QuantizedLinear {
     group_size: i32,
     bits: i32,
     mode: String,
-    // Reconstructed BF16 `[N,K]` weight for the plain E4M3 correctness
-    // fallback. `Some` iff mode == fp8_e4m3.
-    fp8_dequant_weight: Option<MxArray>,
+    // Reconstructed BF16 weight for the plain E4M3 correctness fallback.
+    // Normally the cached `[K,N]` transpose; `Some` iff mode == fp8_e4m3.
+    fp8_dequant_weight: Option<PlainFp8Weight>,
     // sym8 kernel operands (`Some` iff `mode == "sym8"`): `w_i8` is the opaque
     // contiguous [K,N] int8 weight (pre-transposed at load), `s_w` is the f32
     // [N] per-output-channel scale. Consumed by `int8_w8a16_qmv` (M <= 2,
@@ -671,6 +690,18 @@ impl QuantizedLinear {
         dequant_weight: MxArray,
         bias: Option<MxArray>,
     ) -> Self {
+        // Keep this constructor infallible for API compatibility. Validated
+        // checkpoint weights are 2-D, so the load path takes `Transposed`.
+        // For an invalid direct-constructor input, preserve the old behavior:
+        // retain the source and let `forward()` surface the transpose error.
+        let fp8_dequant_weight = if matches!(dequant_weight.ndim(), Ok(2)) {
+            match dequant_weight.transpose(Some(&[1, 0])) {
+                Ok(weight_t) => PlainFp8Weight::Transposed(weight_t),
+                Err(_) => PlainFp8Weight::Source(dequant_weight),
+            }
+        } else {
+            PlainFp8Weight::Source(dequant_weight)
+        };
         Self {
             weight,
             scales,
@@ -679,7 +710,7 @@ impl QuantizedLinear {
             group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
             bits: crate::quant::fp8_weight::FP8_E4M3_BITS,
             mode: crate::quant::fp8_weight::FP8_E4M3_MODE.to_string(),
-            fp8_dequant_weight: Some(dequant_weight),
+            fp8_dequant_weight: Some(fp8_dequant_weight),
             w_i8: None,
             s_w: None,
         }
@@ -806,7 +837,15 @@ impl QuantizedLinear {
                     "plain FP8 QuantizedLinear missing load-time BF16 reconstruction",
                 )
             })?;
-            let mut result = x.matmul(&weight.transpose(Some(&[1, 0]))?)?;
+            let fallback_weight_t;
+            let weight_t = match weight {
+                PlainFp8Weight::Transposed(weight_t) => weight_t,
+                PlainFp8Weight::Source(weight) => {
+                    fallback_weight_t = weight.transpose(Some(&[1, 0]))?;
+                    &fallback_weight_t
+                }
+            };
+            let mut result = x.matmul(weight_t)?;
             if let Some(ref b) = self.bias {
                 result = result.add(b)?;
             }
@@ -841,8 +880,17 @@ impl QuantizedLinear {
     pub(crate) fn reconstructed_fp8_weight_bytes(&self) -> u64 {
         self.fp8_dequant_weight
             .as_ref()
-            .map(|weight| weight.nbytes() as u64)
+            .map(PlainFp8Weight::nbytes)
             .unwrap_or(0)
+    }
+
+    /// Whether the plain-E4M3 reconstruction already has its `[K,N]` graph.
+    #[cfg(test)]
+    fn has_pretransposed_fp8_weight(&self) -> bool {
+        matches!(
+            self.fp8_dequant_weight.as_ref(),
+            Some(PlainFp8Weight::Transposed(_))
+        )
     }
 
     /// Test-scope accessor for the sym8 operands
@@ -888,6 +936,15 @@ mod plain_fp8_weight_tests {
             .unwrap();
         assert_eq!(ql.mode(), crate::quant::fp8_weight::FP8_E4M3_MODE);
         assert_eq!(ql.get_weight().dtype().unwrap(), DType::Uint8);
+        assert_eq!(
+            ql.get_weight().as_raw_ptr(),
+            p.get("proj.weight").unwrap().as_raw_ptr(),
+            "get_weight must keep exposing the raw Uint8 checkpoint array"
+        );
+        assert!(
+            ql.has_pretransposed_fp8_weight(),
+            "valid plain-FP8 linears must cache the [K,N] graph at load"
+        );
         assert_eq!(
             ql.reconstructed_fp8_weight_bytes(),
             3 * 4 * std::mem::size_of::<u16>() as u64,
@@ -936,6 +993,20 @@ mod plain_fp8_weight_tests {
             MxArray::from_float32(&[1.0, 1.0, 1.0], &[3]).unwrap(),
         );
         assert!(try_build_fp8_e4m3_quantized_linear(&wrong_scale_shape, "proj").is_err());
+    }
+
+    #[test]
+    fn plain_fp8_direct_constructor_defers_malformed_source() {
+        let ql = QuantizedLinear::new_fp8_e4m3(
+            MxArray::from_uint8(&[0], &[1]).unwrap(),
+            MxArray::from_float32(&[1.0], &[1]).unwrap(),
+            MxArray::from_float32(&[1.0], &[1]).unwrap(),
+            None,
+        );
+        assert!(
+            !ql.has_pretransposed_fp8_weight(),
+            "an invalid direct-constructor source must remain on the deferred-error fallback"
+        );
     }
 }
 
