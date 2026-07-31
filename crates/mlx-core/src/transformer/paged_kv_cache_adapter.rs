@@ -10452,6 +10452,105 @@ mod tests {
         );
     }
 
+    /// Focused decode-metadata benchmark for the long-context, five-global-layer
+    /// Gemma4 hot path. The first measurement calls the metadata builder five
+    /// times at one token position (one call per global layer). The second
+    /// advances the sequence one token at a time while the physical block table
+    /// remains unchanged, then repeats the same five-layer fanout.
+    ///
+    /// Run with:
+    /// `cargo test -p mlx-core benchmark_decode_attention_metadata_cache -- --ignored --exact --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "long-context metadata microbenchmark"]
+    fn benchmark_decode_attention_metadata_cache() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const BLOCK_SIZE: u32 = 16;
+        const NUM_BLOCKS: u32 = 5_738;
+        const GLOBAL_LAYERS: usize = 5;
+        const SAME_TOKEN_ROUNDS: usize = 1_000;
+        const ADVANCE_TOKENS: usize = 128;
+
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: BLOCK_SIZE,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 1,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(NUM_BLOCKS * BLOCK_SIZE),
+            max_batch_size: Some(1),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            NUM_BLOCKS,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(error) => {
+                eprintln!("skipping benchmark_decode_attention_metadata_cache: {error}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(NUM_BLOCKS, BLOCK_SIZE)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE).expect("adapter");
+        adapter.reset_for_new_request(0).expect("reset");
+        adapter
+            .allocate_suffix_blocks(NUM_BLOCKS * BLOCK_SIZE)
+            .expect("allocate long-context table");
+        let initial_tokens = NUM_BLOCKS * BLOCK_SIZE - ADVANCE_TOKENS as u32;
+        adapter
+            .record_tokens(&vec![1; initial_tokens as usize])
+            .expect("record initial context");
+        black_box(
+            adapter
+                .decode_attention_inputs()
+                .expect("warm metadata cache"),
+        );
+
+        let same_token_started = Instant::now();
+        for _ in 0..SAME_TOKEN_ROUNDS {
+            for _ in 0..GLOBAL_LAYERS {
+                black_box(
+                    adapter
+                        .decode_attention_inputs()
+                        .expect("same-token metadata"),
+                );
+            }
+        }
+        let same_token_elapsed = same_token_started.elapsed();
+
+        let advancing_started = Instant::now();
+        for token in 0..ADVANCE_TOKENS {
+            adapter
+                .record_tokens(&[token as u32])
+                .expect("advance decode cursor");
+            for _ in 0..GLOBAL_LAYERS {
+                black_box(
+                    adapter
+                        .decode_attention_inputs()
+                        .expect("advancing metadata"),
+                );
+            }
+        }
+        let advancing_elapsed = advancing_started.elapsed();
+
+        eprintln!(
+            "decode_attention_metadata_bench blocks={NUM_BLOCKS} same_token_calls={} \
+             same_token_total_ms={:.3} same_token_us_per_call={:.3} \
+             advancing_tokens={ADVANCE_TOKENS} advancing_total_ms={:.3} \
+             advancing_us_per_token={:.3}",
+            SAME_TOKEN_ROUNDS * GLOBAL_LAYERS,
+            same_token_elapsed.as_secs_f64() * 1_000.0,
+            same_token_elapsed.as_secs_f64() * 1_000_000.0
+                / (SAME_TOKEN_ROUNDS * GLOBAL_LAYERS) as f64,
+            advancing_elapsed.as_secs_f64() * 1_000.0,
+            advancing_elapsed.as_secs_f64() * 1_000_000.0 / ADVANCE_TOKENS as f64,
+        );
+    }
+
     #[test]
     fn test_prefill_block_table_marshalling_truncates_to_required_prefix() {
         let allocator = new_allocator(64, 4);
