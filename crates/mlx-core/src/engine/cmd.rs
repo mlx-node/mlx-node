@@ -774,14 +774,17 @@ mod mock_backend_tests {
             "mock"
         }
 
-        fn template_history_comparison_tokens(&self, tokens: &[u32]) -> Vec<u32> {
+        fn template_history_comparison_tokens<'a>(
+            &self,
+            tokens: &'a [u32],
+        ) -> std::borrow::Cow<'a, [u32]> {
             match self.comparison_media_token_id_knob {
                 Some(media_token_id) => crate::engine::collapse_cached_media_placeholder_runs(
                     tokens,
                     media_token_id,
                     &self.comparison_media_positions_knob,
                 ),
-                None => tokens.to_vec(),
+                None => std::borrow::Cow::Borrowed(tokens),
             }
         }
 

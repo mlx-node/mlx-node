@@ -7732,7 +7732,10 @@ impl ChatBackend for Gemma4Inner {
         )
     }
 
-    fn template_history_comparison_tokens(&self, tokens: &[u32]) -> Vec<u32> {
+    fn template_history_comparison_tokens<'a>(
+        &self,
+        tokens: &'a [u32],
+    ) -> std::borrow::Cow<'a, [u32]> {
         engine::collapse_cached_media_placeholder_runs(
             tokens,
             self.config.image_token_id.unwrap_or(258880) as u32,

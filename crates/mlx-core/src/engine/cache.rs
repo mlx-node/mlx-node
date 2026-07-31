@@ -1,6 +1,8 @@
 //! Prefix-cache verification and post-turn cache-state persistence,
 //! plus the multimodal (image) cache-key helpers.
 
+use std::borrow::Cow;
+
 use sha2::{Digest, Sha256};
 
 use crate::transformer::paged_kv_cache_adapter::PagedTurnPlan;
@@ -171,13 +173,13 @@ pub(crate) fn compute_image_cache_key(all_images: &[Vec<u8>]) -> u64 {
 /// Only positions named by `media_token_positions` are collapsed. Repeated
 /// occurrences of the same special token outside those positions (for
 /// example, model-generated output) remain byte-for-byte unchanged.
-pub(crate) fn collapse_cached_media_placeholder_runs(
-    tokens: &[u32],
+pub(crate) fn collapse_cached_media_placeholder_runs<'a>(
+    tokens: &'a [u32],
     media_token_id: u32,
     media_token_positions: &[(u32, u64)],
-) -> Vec<u32> {
+) -> Cow<'a, [u32]> {
     if media_token_positions.is_empty() {
-        return tokens.to_vec();
+        return Cow::Borrowed(tokens);
     }
 
     let positions = media_token_positions
@@ -198,7 +200,7 @@ pub(crate) fn collapse_cached_media_placeholder_runs(
             inside_marked_run = false;
         }
     }
-    collapsed
+    Cow::Owned(collapsed)
 }
 
 /// Associate every expanded image-placeholder token with its source digest.
@@ -648,8 +650,13 @@ mod image_cache_identity_tests {
             vec![10, IMAGE_TOKEN_ID, 20, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID],
             "the expanded cache span collapses, while unrecorded generated markers remain intact"
         );
+        let untouched = collapse_cached_media_placeholder_runs(&tokens, IMAGE_TOKEN_ID, &[]);
+        assert!(
+            matches!(untouched, std::borrow::Cow::Borrowed(_)),
+            "no sidecar must keep the comparison path allocation-free"
+        );
         assert_eq!(
-            collapse_cached_media_placeholder_runs(&tokens, IMAGE_TOKEN_ID, &[]),
+            untouched.as_ref(),
             tokens,
             "no sidecar means identity cannot safely rewrite any token"
         );

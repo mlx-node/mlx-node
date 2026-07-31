@@ -11,6 +11,7 @@
 //! expose `.call(napi::Result<ChatStreamChunk>, ThreadsafeFunctionCallMode)`,
 //! and the trait collapses that to a single `send`.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -1104,8 +1105,8 @@ pub(crate) trait ChatBackend {
     /// those recorded media positions before it can be compared with a fresh
     /// template render. The returned tokens never replace the real cache
     /// history; they are used only by the continuation verifier.
-    fn template_history_comparison_tokens(&self, tokens: &[u32]) -> Vec<u32> {
-        tokens.to_vec()
+    fn template_history_comparison_tokens<'a>(&self, tokens: &'a [u32]) -> Cow<'a, [u32]> {
+        Cow::Borrowed(tokens)
     }
 
     // ---- specialized whole-turn executors ----
