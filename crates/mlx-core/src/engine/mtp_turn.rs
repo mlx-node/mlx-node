@@ -1353,7 +1353,8 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // returns it alongside the verify logits, and it stays alive
     // for the rest of the decode loop as long as the cycle holds it.
     let chained_cycles_enabled: bool =
-        crate::models::qwen3_5::mtp_decode::mtp_chained_cycles_enabled();
+        crate::models::qwen3_5::mtp_decode::mtp_chained_cycles_enabled()
+            && step.chained_cycles_supported();
     let mut chained_hidden_opt: Option<MxArray> = None;
 
     // Adaptive MTP depth policy. When `mtp_adaptive_depth` is true

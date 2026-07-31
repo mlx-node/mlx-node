@@ -91,4 +91,20 @@ describe('makeStreamingModel template content policy', () => {
 
     expect(tokenizerMocks.applyChatTemplate).toHaveBeenCalledWith(messages, true, null, false);
   });
+
+  it('exposes raw assistant replay only for checkpoint templates that require it', async () => {
+    const DefaultModel = makeStreamingModel(NativeStreamingStub, {
+      recordModelPath: true,
+    });
+    const RawReplayModel = makeStreamingModel(NativeStreamingStub, {
+      recordModelPath: true,
+      replayAssistantRawText: true,
+    });
+
+    const defaultModel = await DefaultModel.load('/models/default');
+    const rawReplayModel = await RawReplayModel.load('/models/raw-replay');
+
+    expect(defaultModel.replaysAssistantRawText()).toBe(false);
+    expect(rawReplayModel.replaysAssistantRawText()).toBe(true);
+  });
 });

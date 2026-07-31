@@ -71,21 +71,11 @@ fn user_message(content: &str) -> ChatMessage {
 fn assistant_message(result: &ChatResult) -> ChatMessage {
     ChatMessage {
         role: "assistant".to_string(),
-        content: result.text.clone(),
-        tool_calls: (!result.tool_calls.is_empty()).then(|| {
-            result
-                .tool_calls
-                .iter()
-                .map(|call| mlx_core::tokenizer::ToolCall {
-                    id: Some(call.id.clone()),
-                    name: call.name.clone(),
-                    arguments: call.arguments.to_string(),
-                })
-                .collect()
-        }),
+        content: result.raw_text.clone(),
+        tool_calls: None,
         tool_call_id: None,
         is_error: None,
-        reasoning_content: result.thinking.clone(),
+        reasoning_content: None,
         thinking_enabled: Some(result.thinking_enabled),
         images: None,
         audio: None,

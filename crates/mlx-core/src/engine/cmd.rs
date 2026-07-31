@@ -573,6 +573,9 @@ mod mock_backend_tests {
         speculative_complete_knob: bool,
         /// Exact media represented by the mock's live session state.
         session_media_knob: MediaCapabilities,
+        /// Simulate an eager-MTP turn whose physical trunk advanced beyond
+        /// the committed token history.
+        flat_caches_desynced_knob: bool,
         /// `render_prompt` invocation counter (interior mutability — the
         /// hook takes `&self`). The pre-render image guard must reject
         /// text-only image turns with this still 0.
@@ -612,6 +615,7 @@ mod mock_backend_tests {
                 multimodal_calls: 0,
                 speculative_complete_knob: false,
                 session_media_knob: MediaCapabilities::NONE,
+                flat_caches_desynced_knob: false,
                 render_prompt_calls: AtomicUsize::new(0),
             }
         }
@@ -745,6 +749,14 @@ mod mock_backend_tests {
 
         fn session_media(&self) -> MediaCapabilities {
             self.session_media_knob
+        }
+
+        fn flat_caches_desynced(&self) -> bool {
+            self.flat_caches_desynced_knob
+        }
+
+        fn clear_flat_caches_desynced(&mut self) {
+            self.flat_caches_desynced_knob = false;
         }
 
         fn run_paged_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
@@ -1064,8 +1076,8 @@ mod mock_backend_tests {
             "the exact rendered prefix reports the full prior history as reused"
         );
         // The complete transcript was rendered through the model template.
-        // Exact prefix verification allowed the backend to prefill only the
-        // new suffix while retaining Fresh-turn semantics.
+        // Exact decoded-history verification allowed the backend to splice
+        // the template-authored suffix onto the committed token IDs.
         let suffix2 = backend.prefill_calls[1].clone();
         assert!(!suffix2.is_empty());
         assert!(suffix2.len() < backend.history.len());
@@ -1087,12 +1099,12 @@ mod mock_backend_tests {
         assert_eq!(
             backend.begin_decode_turns[1],
             TurnSnapshot {
-                is_delta: false,
+                is_delta: true,
                 total_seq_len: h1_len + suffix2.len(),
                 reuse_cache: true,
             }
         );
-        assert!(!backend.save_calls[1].is_delta);
+        assert!(backend.save_calls[1].is_delta);
         // The exact prefix match avoids a cache reset.
         assert_eq!(backend.reset_calls.len(), 1);
 
@@ -1115,8 +1127,8 @@ mod mock_backend_tests {
         assert_eq!(r3.cached_tokens as usize, h2_len);
         let suffix3 = backend.prefill_calls[2].clone();
         assert!(backend.history.len() > h2_len + suffix3.len());
-        assert!(!backend.begin_decode_turns[2].is_delta);
-        assert!(!backend.save_calls[2].is_delta);
+        assert!(backend.begin_decode_turns[2].is_delta);
+        assert!(backend.save_calls[2].is_delta);
 
         // --- ResetCaches ---
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1511,6 +1523,48 @@ mod mock_backend_tests {
                 ResetScope::PrefixMiss
             ]
         );
+    }
+
+    #[test]
+    fn desynced_live_continuation_reprefills_then_clears_flag_after_commit() {
+        let mut backend = MockBackend::new(vec![
+            vec![TOK_HELLO, TOK_IM_END],
+            vec![TOK_WORLD, TOK_IM_END],
+        ]);
+        let first = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config: greedy_config(),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("session setup failed: {}", e.reason));
+
+        let mut messages = user_messages("hello");
+        messages.push(assistant_message(&first));
+        messages.extend(user_messages("again"));
+        backend.flat_caches_desynced_knob = true;
+
+        let result = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
+            messages,
+            config: greedy_config(),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("desync heal failed: {}", e.reason));
+
+        assert_eq!(result.cached_tokens, 0, "desync must suppress prefix reuse");
+        assert_eq!(
+            backend.prefill_calls[1].len(),
+            result.prompt_tokens as usize,
+            "the healed turn must reprefill its complete reconstructed prompt",
+        );
+        assert_eq!(
+            backend.reset_calls,
+            vec![ResetScope::PrefixMiss, ResetScope::PrefixMiss],
+        );
+        assert!(
+            !backend.flat_caches_desynced_knob,
+            "the flag clears only after the healed turn commits",
+        );
+        assert!(backend.save_calls[1].is_delta);
     }
 
     // ---- optional hook seams ----

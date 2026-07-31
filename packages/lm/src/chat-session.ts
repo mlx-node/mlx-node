@@ -13,8 +13,10 @@
  *   - The session tracks its own `ChatMessage[]` history on the
  *     TypeScript side and passes the complete structured transcript
  *     on every turn. Native code renders that transcript with the
- *     checkpoint-provided chat template, then reuses KV only when the
- *     resulting token sequence exactly extends the committed cache.
+ *     checkpoint-provided chat template, verifies the completed history
+ *     against the committed cache, and appends the template-authored suffix
+ *     to the exact cached token IDs. Incompatible or edited history cold
+ *     replays the complete render.
  *
  *   - An image hash (`lastImagesKey`) tracks the images bound to the
  *     current cache. A `send()` call whose image set has changed
@@ -207,8 +209,10 @@ function toAssistantToolCalls(toolCalls: readonly ToolCallResult[] | undefined):
 
 /**
  * Build an assistant `ChatMessage` from a just-completed turn's
- * decoded text, tool-call list, reasoning body, and resolved thinking
- * mode. The assistant entry is appended to `this.history` after every
+ * decoded text, exact raw text, tool-call list, reasoning body, and resolved
+ * thinking mode. LFM2 replays the exact raw content because its checkpoint
+ * template does not consume structured reasoning; Qwen/Gemma retain their
+ * structured fields. The assistant entry is appended to `this.history` after every
  * successful turn and is later read back by the native
  * `chatSessionStart` cold-replay path (image-change mid-session
  * restart, `startFromHistory*`, server-side `SessionRegistry`
@@ -223,7 +227,16 @@ function buildAssistantMessage(
   toolCalls: readonly ToolCallResult[] | undefined,
   thinking: string | null | undefined,
   thinkingEnabled: boolean,
+  rawText: string | null | undefined,
+  replayRawText: boolean,
 ): ChatMessage {
+  if (replayRawText) {
+    return {
+      role: 'assistant',
+      content: rawText ?? text,
+      thinkingEnabled,
+    };
+  }
   const calls = toAssistantToolCalls(toolCalls);
   const message: ChatMessage = {
     role: 'assistant',
@@ -372,6 +385,12 @@ export interface SessionCapableModel {
    * this capability and keep their original `includeReasoning` config.
    */
   supportsReplayReasoningCapture?(): boolean;
+  /**
+   * Whether this model's checkpoint template expects historical reasoning
+   * embedded in `message.content` instead of the structured
+   * `reasoningContent` field.
+   */
+  replaysAssistantRawText?(): boolean;
   chatSessionStart(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
   chatSessionContinue(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
   chatSessionContinueTool(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
@@ -876,7 +895,16 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         return await this.runStartPath(userMessage, undefined, undefined, true, false, constrainedConfig);
       }
       this.history.push(pendingUser);
-      this.history.push(buildAssistantMessage(result.text, result.toolCalls, result.thinking, result.thinkingEnabled));
+      this.history.push(
+        buildAssistantMessage(
+          result.text,
+          result.toolCalls,
+          result.thinking,
+          result.thinkingEnabled,
+          result.rawText,
+          this.model.replaysAssistantRawText?.() === true,
+        ),
+      );
       this.turnCount++;
       this.commitActiveTools(constrainedConfig);
       this.recordToolCallFanout(result.toolCalls);
@@ -938,6 +966,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let accumulated = '';
       let accumulatedVisible = '';
       let finalRaw: string | null = null;
+      let finalReplayRaw: string | null = null;
       let finalTextAuthoritative: boolean | undefined;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
       let finalThinking: string | null = null;
@@ -958,6 +987,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
               if (event.finishReason !== 'error') {
                 sawFinal = true;
                 finalRaw = event.text;
+                finalReplayRaw = event.rawText;
                 finalTextAuthoritative = (event as ReplayCaptureStreamEvent).textAuthoritative;
                 finalToolCalls = event.toolCalls;
                 finalThinking = event.thinking;
@@ -1014,6 +1044,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
               finalToolCalls,
               finalThinking,
               finalThinkingEnabled,
+              finalReplayRaw,
+              this.model.replaysAssistantRawText?.() === true,
             ),
           );
           this.turnCount++;
@@ -1100,7 +1132,14 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         );
         this.history.push({ role: 'tool', content, toolCallId, isError });
         this.history.push(
-          buildAssistantMessage(result.text, result.toolCalls, result.thinking, result.thinkingEnabled),
+          buildAssistantMessage(
+            result.text,
+            result.toolCalls,
+            result.thinking,
+            result.thinkingEnabled,
+            result.rawText,
+            this.model.replaysAssistantRawText?.() === true,
+          ),
         );
         this.turnCount++;
         this.commitActiveTools(constrainedConfig);
@@ -1192,6 +1231,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let accumulated = '';
       let accumulatedVisible = '';
       let finalRaw: string | null = null;
+      let finalReplayRaw: string | null = null;
       let finalTextAuthoritative: boolean | undefined;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
       let finalThinking: string | null = null;
@@ -1212,6 +1252,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
               if (event.finishReason !== 'error') {
                 sawFinal = true;
                 finalRaw = event.text;
+                finalReplayRaw = event.rawText;
                 finalTextAuthoritative = (event as ReplayCaptureStreamEvent).textAuthoritative;
                 finalToolCalls = event.toolCalls;
                 finalThinking = event.thinking;
@@ -1260,6 +1301,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
               finalToolCalls,
               finalThinking,
               finalThinkingEnabled,
+              finalReplayRaw,
+              this.model.replaysAssistantRawText?.() === true,
             ),
           );
           this.turnCount++;
@@ -1403,7 +1446,16 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         historySnapshot,
         withReplayReasoning(constrainedConfig, this.model),
       );
-      this.history.push(buildAssistantMessage(result.text, result.toolCalls, result.thinking, result.thinkingEnabled));
+      this.history.push(
+        buildAssistantMessage(
+          result.text,
+          result.toolCalls,
+          result.thinking,
+          result.thinkingEnabled,
+          result.rawText,
+          this.model.replaysAssistantRawText?.() === true,
+        ),
+      );
       this.turnCount++;
       this.needsFullReplay = false;
       this.lastImagesKey = this.computeTrailingImagesKey();
@@ -1445,6 +1497,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let accumulated = '';
       let accumulatedVisible = '';
       let finalRaw: string | null = null;
+      let finalReplayRaw: string | null = null;
       let finalTextAuthoritative: boolean | undefined;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
       let finalThinking: string | null = null;
@@ -1459,6 +1512,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
             if (event.finishReason !== 'error') {
               sawFinal = true;
               finalRaw = event.text;
+              finalReplayRaw = event.rawText;
               finalTextAuthoritative = (event as ReplayCaptureStreamEvent).textAuthoritative;
               finalToolCalls = event.toolCalls;
               finalThinking = event.thinking;
@@ -1486,6 +1540,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
               finalToolCalls,
               finalThinking,
               finalThinkingEnabled,
+              finalReplayRaw,
+              this.model.replaysAssistantRawText?.() === true,
             ),
           );
           this.turnCount++;
@@ -1777,7 +1833,16 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         this.history.slice(),
         withReplayReasoning(constrainedConfig, this.model),
       );
-      this.history.push(buildAssistantMessage(result.text, result.toolCalls, result.thinking, result.thinkingEnabled));
+      this.history.push(
+        buildAssistantMessage(
+          result.text,
+          result.toolCalls,
+          result.thinking,
+          result.thinkingEnabled,
+          result.rawText,
+          this.model.replaysAssistantRawText?.() === true,
+        ),
+      );
       this.turnCount++;
       this.needsFullReplay = false;
       // The start path always re-renders the FULL preserved history, so the
@@ -1854,6 +1919,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     let accumulated = '';
     let accumulatedVisible = '';
     let finalRaw: string | null = null;
+    let finalReplayRaw: string | null = null;
     let finalTextAuthoritative: boolean | undefined;
     let finalToolCalls: readonly ToolCallResult[] | undefined;
     let finalThinking: string | null = null;
@@ -1871,6 +1937,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           if (event.finishReason !== 'error') {
             sawFinal = true;
             finalRaw = event.text;
+            finalReplayRaw = event.rawText;
             finalTextAuthoritative = (event as ReplayCaptureStreamEvent).textAuthoritative;
             finalToolCalls = event.toolCalls;
             finalThinking = event.thinking;
@@ -1901,6 +1968,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
             finalToolCalls,
             finalThinking,
             finalThinkingEnabled,
+            finalReplayRaw,
+            this.model.replaysAssistantRawText?.() === true,
           ),
         );
         this.turnCount++;

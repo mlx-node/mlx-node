@@ -433,6 +433,12 @@ interface StreamingModelOptions {
    * Jinja template continues to own all role and wire-format tokens.
    */
   templateContentPolicy?: TemplateContentPolicy;
+  /**
+   * Preserve the native raw assistant bytes in session history. LFM2's
+   * checkpoint template consumes reasoning inside `message.content` and does
+   * not read the structured `reasoning_content` field used by Qwen/Gemma.
+   */
+  replayAssistantRawText?: boolean;
 }
 
 /**
@@ -529,6 +535,7 @@ export function makeStreamingModel<
   const recordPath = opts.recordModelPath;
   const applyTemplate = opts.applyTemplate ?? recordPath;
   const templateContentPolicy = opts.templateContentPolicy;
+  const replayAssistantRawText = opts.replayAssistantRawText ?? false;
 
   // Capture the native callback-based methods before the subclass
   // overrides below shadow them on the prototype.
@@ -547,6 +554,10 @@ export function makeStreamingModel<
   class StreamingModelImpl extends Base {
     supportsReplayReasoningCapture(): boolean {
       return true;
+    }
+
+    replaysAssistantRawText(): boolean {
+      return replayAssistantRawText;
     }
 
     static async load(
@@ -675,6 +686,7 @@ export class Qwen35MoeModel extends makeStreamingModel(Qwen35MoeModelNative, {
 /** LFM2 model (text-only) — see {@link Qwen35Model} for the wrapper shape. */
 export class Lfm2Model extends makeStreamingModel(Lfm2ModelNative, {
   recordModelPath: true,
+  replayAssistantRawText: true,
 }) {}
 
 /** Gemma4 model (text-only) — see {@link Qwen35Model} for the wrapper shape. */

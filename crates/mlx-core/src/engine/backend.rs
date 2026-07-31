@@ -1499,6 +1499,16 @@ pub(crate) trait MtpStepper {
     /// == `MtpOps::committed_history_active`.
     fn committed_history_active(&self) -> bool;
 
+    /// Whether this turn may reuse the previous verify hidden to skip the
+    /// next main-model Step A forward.
+    ///
+    /// Most steppers can use the global chained-cycle policy directly.
+    /// Families whose chained path depends on a turn-local prompt seed can
+    /// return `false` when that seed is unavailable.
+    fn chained_cycles_supported(&self) -> bool {
+        true
+    }
+
     /// Optional profiler relabel for the MTP path (e.g.
     /// `"chat_compiled"`); `None` keeps the default family label. Read
     /// once at turn entry by the engine, mirroring the existing

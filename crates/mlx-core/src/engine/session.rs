@@ -47,6 +47,12 @@ struct StreamingHooks<'a> {
     cancelled: &'a AtomicBool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnKind {
+    Start,
+    Continue,
+}
+
 // =====================================================================
 // Sync entry points
 // =====================================================================
@@ -71,17 +77,23 @@ pub(crate) fn session_start<B: ChatBackend>(
             "chat_session_start requires reuse_cache=true (pass ChatConfig { reuse_cache: Some(true), .. } or leave as None). The session API only makes sense with cache reuse enabled.",
         ));
     }
-    expect_sync_result(chat_turn_core(backend, messages, config, None))
+    expect_sync_result(chat_turn_core(
+        backend,
+        messages,
+        config,
+        TurnKind::Start,
+        None,
+    ))
 }
 
 /// Generic role-aware session continuation.
 ///
 /// The caller supplies the complete structured conversation, including
 /// the pending user message. The model-provided chat template renders that
-/// full history, then the normal fresh-turn prefix verifier either reuses
-/// the exact cached token prefix and prefills only the suffix, or resets and
-/// safely replays the full prompt. No Rust-side wire-format delta is
-/// synthesized.
+/// full history. When the completed structured history exactly describes the
+/// live cache, the core preserves the committed token IDs and appends only
+/// the template-authored remainder; otherwise it resets and safely replays the
+/// full prompt.
 pub(crate) fn session_continue<B: ChatBackend>(
     backend: &mut B,
     messages: Vec<ChatMessage>,
@@ -98,14 +110,20 @@ pub(crate) fn session_continue<B: ChatBackend>(
             "chat_session_continue requires an initialized session (call chatSessionStart first)",
         ));
     }
-    expect_sync_result(chat_turn_core(backend, messages, config, None))
+    expect_sync_result(chat_turn_core(
+        backend,
+        messages,
+        config,
+        TurnKind::Continue,
+        None,
+    ))
 }
 
 /// Generic role-aware tool-result continuation.
 ///
 /// Like [`session_continue`], the caller supplies the complete history,
 /// now ending in the pending tool-role message. The loaded chat template is
-/// the sole authority for tool-call/result layout.
+/// the sole authority for the appended tool-call/result layout.
 pub(crate) fn session_continue_tool<B: ChatBackend>(
     backend: &mut B,
     messages: Vec<ChatMessage>,
@@ -122,7 +140,13 @@ pub(crate) fn session_continue_tool<B: ChatBackend>(
             "chat_session_continue_tool requires an initialized session (call chatSessionStart first)",
         ));
     }
-    expect_sync_result(chat_turn_core(backend, messages, config, None))
+    expect_sync_result(chat_turn_core(
+        backend,
+        messages,
+        config,
+        TurnKind::Continue,
+        None,
+    ))
 }
 
 // =====================================================================
@@ -157,6 +181,7 @@ pub(crate) fn session_start_stream<B: ChatBackend>(
         backend,
         messages,
         config,
+        TurnKind::Start,
         Some(StreamingHooks { sink, cancelled }),
     ) {
         sink.send(Err(e));
@@ -194,6 +219,7 @@ pub(crate) fn session_continue_stream<B: ChatBackend>(
         backend,
         messages,
         config,
+        TurnKind::Continue,
         Some(StreamingHooks { sink, cancelled }),
     ) {
         sink.send(Err(e));
@@ -231,6 +257,7 @@ pub(crate) fn session_continue_tool_stream<B: ChatBackend>(
         backend,
         messages,
         config,
+        TurnKind::Continue,
         Some(StreamingHooks { sink, cancelled }),
     ) {
         sink.send(Err(e));
@@ -332,6 +359,88 @@ fn extract_audio_from_messages(messages: &[ChatMessage]) -> Vec<Vec<u8>> {
     all_audio
 }
 
+fn media_capabilities_from_messages(messages: &[ChatMessage]) -> MediaCapabilities {
+    MediaCapabilities {
+        images: messages.iter().any(|message| {
+            message
+                .images
+                .as_ref()
+                .is_some_and(|images| !images.is_empty())
+        }),
+        audio: messages.iter().any(|message| {
+            message
+                .audio
+                .as_ref()
+                .is_some_and(|clips| !clips.is_empty())
+        }),
+    }
+}
+
+/// Reconstruct a live continuation from the exact committed token IDs plus
+/// the suffix authored by the checkpoint template.
+///
+/// Generated text is not a lossless token-history format: decoding and then
+/// re-encoding the same bytes may choose a different BPE segmentation, and a
+/// length-truncated reasoning turn has no closing tag for a template to
+/// reproduce. A full structured re-render can therefore describe the same
+/// conversation while failing the exact token-prefix check required by live
+/// KV reuse.
+///
+/// To keep the template authoritative, render both the completed history and
+/// the full history including the pending user/tool message. If the cached
+/// history decodes to an exact byte prefix of the template-rendered completed
+/// history, append the template-rendered remainder to the original cached
+/// token IDs. Any edited/incompatible history fails these checks and returns
+/// `None`, making the caller safely cold-replay the complete render.
+fn render_live_continuation<B: ChatBackend>(
+    backend: &B,
+    tokenizer: &crate::tokenizer::Qwen3Tokenizer,
+    messages: &[ChatMessage],
+    config: &ChatConfig,
+    full_tokens: &[u32],
+) -> Result<Option<Vec<u32>>> {
+    let Some((_pending, completed_history)) = messages.split_last() else {
+        return Ok(None);
+    };
+    let cached_tokens = backend.cached_token_history();
+    if completed_history.is_empty() || cached_tokens.is_empty() {
+        return Ok(None);
+    }
+    let history_media = media_capabilities_from_messages(completed_history);
+    if backend.session_media() != history_media {
+        return Ok(None);
+    }
+
+    let completed_tokens = tokenizer.apply_chat_template_sync(
+        completed_history,
+        Some(false),
+        config.tools.as_deref(),
+        crate::engine::params::resolve_enable_thinking(config),
+    )?;
+    let cached_text = tokenizer.decode_sync(cached_tokens, false)?;
+    let completed_text = tokenizer.decode_sync(&completed_tokens, false)?;
+    let full_text = tokenizer.decode_sync(full_tokens, false)?;
+
+    if !completed_text.starts_with(&cached_text) || !full_text.starts_with(&completed_text) {
+        return Ok(None);
+    }
+
+    let suffix_text = &full_text[cached_text.len()..];
+    let suffix_tokens = tokenizer.encode_sync(suffix_text, Some(false))?;
+    let mut continuation = Vec::with_capacity(cached_tokens.len() + suffix_tokens.len());
+    continuation.extend_from_slice(cached_tokens);
+    continuation.extend_from_slice(&suffix_tokens);
+
+    // Tokenizer decoders can normalize byte sequences. Only use the splice
+    // when the combined IDs still decode to the checkpoint template's exact
+    // full render; otherwise fall back to the ordinary cold replay.
+    if tokenizer.decode_sync(&continuation, false)? != full_text {
+        return Ok(None);
+    }
+
+    Ok(Some(continuation))
+}
+
 // =====================================================================
 // The turn core
 // =====================================================================
@@ -347,6 +456,7 @@ fn chat_turn_core<B: ChatBackend>(
     backend: &mut B,
     messages: Vec<ChatMessage>,
     config: ChatConfig,
+    turn_kind: TurnKind,
     streaming: Option<StreamingHooks<'_>>,
 ) -> Result<Option<ChatResult>> {
     // --- tokenizer + session EOS + thinking state ---
@@ -397,7 +507,49 @@ fn chat_turn_core<B: ChatBackend>(
     // inside the multimodal executor — skip the rejection, render normally,
     // and route through the multimodal executor below with these exact
     // extracted images (single extraction — no drift).
-    let images = extract_images_from_messages(&messages);
+    let pending_messages = match turn_kind {
+        TurnKind::Start => messages.as_slice(),
+        TurnKind::Continue => messages.last().map(std::slice::from_ref).unwrap_or(&[]),
+    };
+    let pending_media = media_capabilities_from_messages(pending_messages);
+    if pending_media.images && turn_kind == TurnKind::Continue {
+        return Err(Error::from_reason(format!(
+            "{IMAGE_CHANGE_RESTART_PREFIX} continuation messages cannot replace the media held by the live session",
+        )));
+    }
+    if pending_media.images && !admitted_media.images {
+        return Err(Error::from_reason(format!(
+            "{IMAGE_CHANGE_RESTART_PREFIX} this model is text-only; image messages are not supported",
+        )));
+    }
+    if pending_media.audio && turn_kind == TurnKind::Continue {
+        return Err(Error::from_reason(format!(
+            "{IMAGE_CHANGE_RESTART_PREFIX} continuation messages cannot replace the media held by the live session",
+        )));
+    }
+    if pending_media.audio && !admitted_media.audio {
+        return Err(Error::from_reason(format!(
+            "{IMAGE_CHANGE_RESTART_PREFIX} this model has no audio support; audio messages are not supported",
+        )));
+    }
+
+    let full_tokens = backend.render_prompt(&tokenizer, &messages, &config)?;
+    let live_continuation = if turn_kind == TurnKind::Continue {
+        render_live_continuation(backend, &tokenizer, &messages, &config, &full_tokens)?
+    } else {
+        None
+    };
+    let is_delta = live_continuation.is_some();
+    let tokens = live_continuation.unwrap_or(full_tokens);
+
+    // A successful live splice carries only a text suffix on top of existing
+    // session state. A cold replay must feed every historical media payload
+    // back through the model.
+    let images = if is_delta {
+        Vec::new()
+    } else {
+        extract_images_from_messages(&messages)
+    };
     if !images.is_empty() && !admitted_media.images {
         return Err(Error::from_reason(format!(
             "{IMAGE_CHANGE_RESTART_PREFIX} this model is text-only; image messages are not supported",
@@ -407,26 +559,33 @@ fn chat_turn_core<B: ChatBackend>(
     // with no audio support is rejected with the typed restart prefix before
     // `render_prompt`. Every non-audio family rejects here and image-only /
     // text-only flows stay byte-identical.
-    let audio = extract_audio_from_messages(&messages);
+    let audio = if is_delta {
+        Vec::new()
+    } else {
+        extract_audio_from_messages(&messages)
+    };
     if !audio.is_empty() && !admitted_media.audio {
         return Err(Error::from_reason(format!(
             "{IMAGE_CHANGE_RESTART_PREFIX} this model has no audio support; audio messages are not supported",
         )));
     }
-    let tokens = backend.render_prompt(&tokenizer, &messages, &config)?;
-
     let media = MediaInputs {
         images: &images,
         audio: &audio,
     };
     let input_media = media.capabilities();
-    // A full-history request describes its own context; stale state from a
-    // previous session must not constrain the new plan.
-    let context_media = MediaCapabilities::NONE;
+    // A live continuation adds no new media but may reuse image/audio state
+    // already encoded in the held caches. A cold full-history replay owns all
+    // current media itself.
+    let context_media = if is_delta {
+        backend.session_media()
+    } else {
+        MediaCapabilities::NONE
+    };
     let turn_plan = TurnPlan::resolve(
         execution,
         TurnRequest {
-            is_delta: false,
+            is_delta,
             input_media,
             context_media,
             speculative_requested: p.enable_mtp,
@@ -576,7 +735,7 @@ fn chat_turn_core<B: ChatBackend>(
         {
             let turn_setup = TurnSetup {
                 params: &p,
-                is_delta: false,
+                is_delta,
                 // The generic flow is text-only; image turns routed through
                 // the multimodal executor above.
                 has_images: false,
@@ -651,7 +810,7 @@ fn chat_turn_core<B: ChatBackend>(
     // --- save cache state ---
     backend.save_cache_state(SaveStateArgs {
         reuse_cache,
-        is_delta: false,
+        is_delta,
         has_images: false,
         generated_tokens: &generated_tokens,
         finish_reason: &finish_reason,

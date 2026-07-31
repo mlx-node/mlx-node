@@ -72,21 +72,13 @@ fn user_message(content: &str) -> ChatMessage {
 fn assistant_message(result: &ChatResult) -> ChatMessage {
     ChatMessage {
         role: "assistant".to_string(),
-        content: result.text.clone(),
-        tool_calls: (!result.tool_calls.is_empty()).then(|| {
-            result
-                .tool_calls
-                .iter()
-                .map(|call| mlx_core::tokenizer::ToolCall {
-                    id: Some(call.id.clone()),
-                    name: call.name.clone(),
-                    arguments: call.arguments.to_string(),
-                })
-                .collect()
-        }),
+        // LFM's checkpoint template consumes the verbatim assistant payload
+        // from `content`; it does not read structured reasoning/tool fields.
+        content: result.raw_text.clone(),
+        tool_calls: None,
         tool_call_id: None,
         is_error: None,
-        reasoning_content: result.thinking.clone(),
+        reasoning_content: None,
         thinking_enabled: Some(result.thinking_enabled),
         images: None,
         audio: None,
@@ -96,21 +88,11 @@ fn assistant_message(result: &ChatResult) -> ChatMessage {
 fn assistant_message_from_chunk(chunk: &ChatStreamChunk) -> ChatMessage {
     ChatMessage {
         role: "assistant".to_string(),
-        content: chunk.text.clone(),
-        tool_calls: chunk.tool_calls.as_ref().and_then(|calls| {
-            let converted = calls
-                .iter()
-                .map(|call| mlx_core::tokenizer::ToolCall {
-                    id: Some(call.id.clone()),
-                    name: call.name.clone(),
-                    arguments: call.arguments.to_string(),
-                })
-                .collect::<Vec<_>>();
-            (!converted.is_empty()).then_some(converted)
-        }),
+        content: chunk.raw_text.clone().unwrap_or_else(|| chunk.text.clone()),
+        tool_calls: None,
         tool_call_id: None,
         is_error: None,
-        reasoning_content: chunk.thinking.clone(),
+        reasoning_content: None,
         thinking_enabled: chunk.thinking_enabled,
         images: None,
         audio: None,

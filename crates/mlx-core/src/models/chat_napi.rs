@@ -105,8 +105,8 @@ macro_rules! chat_napi_surface {
             /// Continue an existing chat session from the complete
             /// structured conversation. The loaded model template is the
             /// sole authority for the rendered suffix; native cache reuse
-            /// occurs only when the new render strictly extends the saved
-            /// token history.
+            /// occurs only after the completed structured history is verified
+            /// against the saved token history.
             #[napi]
             pub async fn chat_session_continue(
                 &self,
@@ -114,6 +114,7 @@ macro_rules! chat_napi_surface {
                 config: ::std::option::Option<$crate::engine::types::ChatConfig>,
             ) -> ::napi::Result<$crate::engine::types::ChatResult> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
+                $crate::models::chat_napi::chat_napi_continuation_media_guard!(messages);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
                 $crate::model_thread::send_and_await(thread, |reply| {
@@ -137,6 +138,7 @@ macro_rules! chat_napi_surface {
                 config: ::std::option::Option<$crate::engine::types::ChatConfig>,
             ) -> ::napi::Result<$crate::engine::types::ChatResult> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
+                $crate::models::chat_napi::chat_napi_continuation_media_guard!(messages);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
                 $crate::model_thread::send_and_await(thread, |reply| {
@@ -193,6 +195,7 @@ macro_rules! chat_napi_surface {
                 >,
             ) -> ::napi::Result<$crate::engine::types::ChatStreamHandle> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
+                $crate::models::chat_napi::chat_napi_continuation_media_guard!(messages);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
 
@@ -223,6 +226,7 @@ macro_rules! chat_napi_surface {
                 >,
             ) -> ::napi::Result<$crate::engine::types::ChatStreamHandle> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
+                $crate::models::chat_napi::chat_napi_continuation_media_guard!(messages);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
 
@@ -323,6 +327,39 @@ macro_rules! chat_napi_image_guard {
     };
 }
 
+/// Reject media attached to the pending continuation message before template
+/// rendering or decoding. Historical media earlier in the full transcript is
+/// allowed: it belongs to the live session and may be replayed by a start path.
+/// Only a new trailing user/tool message carrying media requires the
+/// high-level session wrapper to restart.
+macro_rules! chat_napi_continuation_media_guard {
+    ($messages:ident) => {
+        if let Some(pending) = $messages.last() {
+            if pending
+                .images
+                .as_ref()
+                .is_some_and(|images| !images.is_empty())
+            {
+                return Err(::napi::Error::from_reason(format!(
+                    "{} chat session continuation cannot change images; start a new session",
+                    $crate::engine::IMAGE_CHANGE_RESTART_PREFIX
+                )));
+            }
+            if pending
+                .audio
+                .as_ref()
+                .is_some_and(|clips| !clips.is_empty())
+            {
+                return Err(::napi::Error::from_reason(format!(
+                    "{} chat session continuation cannot change audio; start a new session",
+                    $crate::engine::IMAGE_CHANGE_RESTART_PREFIX
+                )));
+            }
+        }
+    };
+}
+
+pub(crate) use chat_napi_continuation_media_guard;
 pub(crate) use chat_napi_image_guard;
 pub(crate) use chat_napi_surface;
 pub(crate) use chat_napi_thread_bind;

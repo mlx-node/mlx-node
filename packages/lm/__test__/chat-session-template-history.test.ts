@@ -23,6 +23,7 @@ function chatResult(overrides: Partial<TestChatResult> = {}): TestChatResult {
 }
 
 class RecordingModel implements SessionCapableModel {
+  replayAssistantRawText = false;
   readonly startCalls: Array<{
     messages: ChatMessage[];
     config: ChatConfig | null | undefined;
@@ -69,6 +70,10 @@ class RecordingModel implements SessionCapableModel {
 
   supportsReplayReasoningCapture(): boolean {
     return true;
+  }
+
+  replaysAssistantRawText(): boolean {
+    return this.replayAssistantRawText;
   }
 
   async chatSessionStart(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult> {
@@ -159,6 +164,33 @@ const replacementTools: ToolDefinition[] = [
 ];
 
 describe('ChatSession template-rendered continuation history', () => {
+  it('replays verbatim assistant content for templates without structured reasoning fields', async () => {
+    const model = new RecordingModel();
+    model.replayAssistantRawText = true;
+    model.results.push(
+      chatResult({
+        text: 'visible answer',
+        thinking: 'private chain',
+        rawText: '<think>private chain</think>visible answer',
+      }),
+      chatResult({ text: 'second', thinking: undefined }),
+    );
+    const session = new ChatSession(model);
+
+    await session.send('one');
+    await session.send('two');
+
+    expect(model.continueCalls[0]?.messages).toEqual([
+      { role: 'user', content: 'one' },
+      {
+        role: 'assistant',
+        content: '<think>private chain</think>visible answer',
+        thinkingEnabled: true,
+      },
+      { role: 'user', content: 'two' },
+    ]);
+  });
+
   it('passes the complete replayable transcript and preserves thinking provenance', async () => {
     const model = new RecordingModel();
     model.results.push(

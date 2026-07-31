@@ -9297,6 +9297,10 @@ pub(crate) struct DenseMtpStepper<'a> {
     /// Committed-history active iff the prompt tail's hiddens start at
     /// absolute position 0. == the closures' `use_committed`.
     use_committed: bool,
+    /// Chained verify-hidden reuse is only numerically stable when this turn
+    /// seeded the drafter with the full prompt. Warm suffix-only prefills have
+    /// no such seed and must retain Step A between cycles.
+    chained_cycles_supported: bool,
     /// Pre-verify snapshot of the main caches, taken in
     /// `snapshot_main_linear`, consumed by `rollback`. == the closures'
     /// `snap_cell`.
@@ -9358,6 +9362,10 @@ impl MtpStepper for DenseMtpStepper<'_> {
 
     fn committed_history_active(&self) -> bool {
         self.use_committed
+    }
+
+    fn chained_cycles_supported(&self) -> bool {
+        self.chained_cycles_supported
     }
 
     fn profiler_relabel(&self) -> Option<&'static str> {
@@ -9840,9 +9848,18 @@ impl MtpBackend for Qwen35Inner {
 
         // Committed-history is only correct when the prompt tail's hiddens
         // start at absolute position 0 (the eager drafter derives RoPE purely
-        // from the local cache offset). Continuation/delta turns
-        // (`position_base != 0`) fall back to v1 cycle-history.
-        let use_committed = setup.prompt_hidden_position_base == 0;
+        // from the local cache offset) AND the matching prompt seed is
+        // actually present. Cache-reuse continuations do not capture
+        // full-prompt hiddens; their default position base is still zero, so
+        // checking the base alone would falsely advertise an empty drafter
+        // cache as prompt-committed. Chained cycles would then skip the
+        // main-model anchor against that nonexistent history and could
+        // diverge from the full-reprefill heal. Seedless turns fall back to
+        // v1 cycle-history.
+        let has_prompt_seed = setup.prompt_hidden_position_base == 0
+            && setup.prompt_hidden.is_some()
+            && setup.prompt_hidden_ids.is_some_and(|ids| !ids.is_empty());
+        let use_committed = has_prompt_seed;
 
         // Auto-select the main-forward routing: the paged cores leave a paged
         // adapter on `self`, so `take()` moves it into the stepper for the turn
@@ -9864,6 +9881,7 @@ impl MtpBackend for Qwen35Inner {
             mtp_caches: Qwen3_5MTPModule::fresh_caches(&config),
             committed_len: 0,
             use_committed,
+            chained_cycles_supported: has_prompt_seed,
             snap: None,
             tape: Vec::new(),
             replay_err: None,
