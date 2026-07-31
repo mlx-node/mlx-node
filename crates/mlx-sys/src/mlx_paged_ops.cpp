@@ -1040,7 +1040,9 @@ void PagedAttention::eval_gpu(
       scale_,
       softcap_,
       sliding_window_,
-      to_paged_dtype(kv_dtype_));
+      to_paged_dtype(kv_dtype_),
+      static_cast<mlx::core::fast::paged::PagedAttentionRouteHint>(
+          route_hint_));
 }
 
 std::vector<array> PagedAttention::vjp(
@@ -1076,7 +1078,8 @@ bool PagedAttention::is_equivalent(const Primitive& other) const {
   return scale_ == o.scale_ && softcap_ == o.softcap_ &&
       block_size_ == o.block_size_ && num_q_heads_ == o.num_q_heads_ &&
       num_kv_heads_ == o.num_kv_heads_ && head_size_ == o.head_size_ &&
-      sliding_window_ == o.sliding_window_ && kv_dtype_ == o.kv_dtype_;
+      sliding_window_ == o.sliding_window_ && kv_dtype_ == o.kv_dtype_ &&
+      route_hint_ == o.route_hint_;
 }
 
 // =============================================================================
@@ -1201,6 +1204,48 @@ array paged_attention(
     int head_size,
     KvDtype kv_dtype,
     StreamOrDevice s_) {
+  return paged_attention_with_route_hint(
+      q,
+      k_pool,
+      v_pool,
+      block_table,
+      seq_lens,
+      k_scale,
+      v_scale,
+      scale,
+      softcap,
+      sliding_window,
+      block_size,
+      num_q_heads,
+      num_kv_heads,
+      head_size,
+      kv_dtype,
+      /*route_hint=*/0,
+      s_);
+}
+
+array paged_attention_with_route_hint(
+    const array& q,
+    const array& k_pool,
+    const array& v_pool,
+    const array& block_table,
+    const array& seq_lens,
+    const array& k_scale,
+    const array& v_scale,
+    float scale,
+    float softcap,
+    int sliding_window,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    KvDtype kv_dtype,
+    uint8_t route_hint,
+    StreamOrDevice s_) {
+  if (route_hint > 2) {
+    throw std::invalid_argument(
+        "paged_attention_with_route_hint: route_hint must be 0, 1, or 2");
+  }
   auto s = to_stream(s_);
 
   auto fallback = [](std::vector<array> /*inputs*/) -> std::vector<array> {
@@ -1251,7 +1296,8 @@ array paged_attention(
       num_kv_heads,
       head_size,
       sliding_window,
-      kv_dtype);
+      kv_dtype,
+      route_hint);
 
   return array(std::move(out_shape), out_dtype, primitive, std::move(inputs));
 }
@@ -1761,7 +1807,7 @@ extern "C" {
 /// Returns nullptr on bridge/factory validation errors; Rust callers keep the
 /// existing read_kv_range + SDPA path as fallback. The returned array is still
 /// lazy, so GPU dispatch errors surface later when MLX evaluates the graph.
-mlx_array* mlx_paged_attention_forward(
+mlx_array* mlx_paged_attention_forward_with_route(
     mlx_array* q_ptr,
     mlx_array* k_pool_ptr,
     mlx_array* v_pool_ptr,
@@ -1776,7 +1822,8 @@ mlx_array* mlx_paged_attention_forward(
     int num_q_heads,
     int num_kv_heads,
     int head_size,
-    uint8_t kv_dtype_raw) {
+    uint8_t kv_dtype_raw,
+    uint8_t route_hint) {
   if (!q_ptr || !k_pool_ptr || !v_pool_ptr || !block_table_ptr ||
       !seq_lens_ptr || !k_scale_ptr || !v_scale_ptr) {
     return nullptr;
@@ -1808,7 +1855,7 @@ mlx_array* mlx_paged_attention_forward(
     // zero-offset metadata arrays, and the factory validates that contract.
     auto q = contiguous(q_raw);
 
-    auto out = paged_attention(
+    auto out = paged_attention_with_route_hint(
         q,
         k_pool,
         v_pool,
@@ -1823,16 +1870,53 @@ mlx_array* mlx_paged_attention_forward(
         num_q_heads,
         num_kv_heads,
         head_size,
-        kv_dtype);
+        kv_dtype,
+        route_hint);
 
     return reinterpret_cast<mlx_array*>(new array(std::move(out)));
   } catch (const std::exception& e) {
-    mlx_trace_native_error("paged_attention_forward", e.what());
+    mlx_trace_native_error("paged_attention_forward_with_route", e.what());
     return nullptr;
   } catch (...) {
-    mlx_trace_native_error("paged_attention_forward", "unknown exception");
+    mlx_trace_native_error(
+        "paged_attention_forward_with_route", "unknown exception");
     return nullptr;
   }
+}
+
+mlx_array* mlx_paged_attention_forward(
+    mlx_array* q_ptr,
+    mlx_array* k_pool_ptr,
+    mlx_array* v_pool_ptr,
+    mlx_array* block_table_ptr,
+    mlx_array* seq_lens_ptr,
+    mlx_array* k_scale_ptr,
+    mlx_array* v_scale_ptr,
+    float scale,
+    float softcap,
+    int sliding_window,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    uint8_t kv_dtype_raw) {
+  return mlx_paged_attention_forward_with_route(
+      q_ptr,
+      k_pool_ptr,
+      v_pool_ptr,
+      block_table_ptr,
+      seq_lens_ptr,
+      k_scale_ptr,
+      v_scale_ptr,
+      scale,
+      softcap,
+      sliding_window,
+      block_size,
+      num_q_heads,
+      num_kv_heads,
+      head_size,
+      kv_dtype_raw,
+      /*route_hint=*/0);
 }
 
 /// Production FFI: emit a `PagedAttentionVarlen` MLX Custom primitive and
@@ -6575,6 +6659,7 @@ static int grouped_graph_parity_impl(
     int context_len,
     float attention_scale,
     int sliding_window,
+    uint8_t route_hint,
     const char* label) {
   using namespace mlx::core;
   using namespace mlx::core::fast;
@@ -6714,7 +6799,7 @@ static int grouped_graph_parity_impl(
 
     array out = [&]() {
       if (query_rows == 1) {
-        return paged_attention(
+        return paged_attention_with_route_hint(
             q,
             k_pool,
             v_pool,
@@ -6729,7 +6814,8 @@ static int grouped_graph_parity_impl(
             kNumQHeads,
             kNumKvHeads,
             kHeadSize,
-            KvDtype::Bf16);
+            KvDtype::Bf16,
+            route_hint);
       }
       const int32_t cu_values[2] = {0, 2};
       array cu_seqlens_q(cu_values, Shape{2}, int32);
@@ -6864,20 +6950,41 @@ int mlx_paged_grouped_qwen35_graph_parity(
       context_len,
       /*attention_scale=*/1.0f / 16.0f,
       /*sliding_window=*/73,
+      /*route_hint=*/0,
       "mlx_paged_grouped_qwen35_graph_parity");
 }
 
-/// Exact-shape graph parity for Gemma 4's staged D512/16Q/1KV route.
-int mlx_paged_grouped_gemma4_graph_parity(int context_len) {
+/// Runtime-geometry graph parity for the staged BF16 D512 route.
+int mlx_paged_grouped_d512_graph_parity(
+    int num_q_heads,
+    int num_kv_heads,
+    int context_len) {
+  const bool supported_heads =
+      (num_q_heads == 8 && num_kv_heads == 1) ||
+      (num_q_heads == 16 && num_kv_heads == 1) ||
+      (num_q_heads == 16 && num_kv_heads == 2) ||
+      (num_q_heads == 32 && num_kv_heads == 4);
+  if (!supported_heads) {
+    return -1;
+  }
   return grouped_graph_parity_impl(
       /*query_rows=*/1,
-      /*num_q_heads=*/16,
-      /*num_kv_heads=*/1,
+      num_q_heads,
+      num_kv_heads,
       /*head_size=*/512,
       context_len,
       /*attention_scale=*/1.0f,
       /*sliding_window=*/0,
-      "mlx_paged_grouped_gemma4_graph_parity");
+      /*route_hint=*/1,
+      "mlx_paged_grouped_d512_graph_parity");
+}
+
+/// Compatibility wrapper for the original Gemma 4 16Q/1KV parity probe.
+int mlx_paged_grouped_gemma4_graph_parity(int context_len) {
+  return mlx_paged_grouped_d512_graph_parity(
+      /*num_q_heads=*/16,
+      /*num_kv_heads=*/1,
+      context_len);
 }
 
 } // extern "C"

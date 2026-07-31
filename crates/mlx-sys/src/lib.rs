@@ -774,6 +774,30 @@ unsafe extern "C-unwind" {
         kv_dtype: u8,
     ) -> *mut mlx_array;
 
+    /// Route-hinted sibling of `mlx_paged_attention_forward`. Route 0 keeps
+    /// automatic selection, 1 requests the validated staged D512 kernel, and
+    /// 2 forces the generic V1/V2 implementation. The cache layout is
+    /// unchanged for every route.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_paged_attention_forward_with_route(
+        q: *mut mlx_array,
+        k_pool: *mut mlx_array,
+        v_pool: *mut mlx_array,
+        block_table: *mut mlx_array,
+        seq_lens: *mut mlx_array,
+        k_scale: *mut mlx_array,
+        v_scale: *mut mlx_array,
+        scale: f32,
+        softcap: f32,
+        sliding_window: i32,
+        block_size: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_size: i32,
+        kv_dtype: u8,
+        route_hint: u8,
+    ) -> *mut mlx_array;
+
     /// Emit the MLX C++ `paged_attention_varlen(...)` Custom primitive and
     /// return its lazy on-device output. `q` is flat over all query tokens;
     /// `cu_seqlens_q` maps those rows to the compact per-sequence rows in
@@ -1337,7 +1361,27 @@ unsafe extern "C-unwind" {
     pub fn mlx_paged_grouped_gemma4_test_probe_reset();
     pub fn mlx_paged_grouped_gemma4_test_probe_count() -> u64;
 
-    /// Pure selector guard for the BF16 D512/BS16/16Q/1KV Gemma 4 route.
+    /// Reset/read the geometry-based staged D512 route probe.
+    pub fn mlx_paged_grouped_d512_test_probe_reset();
+    pub fn mlx_paged_grouped_d512_test_probe_count() -> u64;
+
+    /// Return 1 when the staged D512 Metal pipelines and threadgroup limits
+    /// support this shipped Q/KV-head geometry, 0 when unsupported, and -1
+    /// when Metal capability probing fails. The caller must separately
+    /// enforce BF16, D512, BS16, q_len=1, and one sequence.
+    pub fn mlx_paged_grouped_d512_capability(num_q_heads: i32, num_kv_heads: i32) -> i32;
+
+    /// Pure selector guard for the supported BF16 D512/BS16 GQA layouts.
+    /// selector_mode: 0=disabled, 1=auto, 2=force.
+    pub fn mlx_paged_grouped_d512_shape_guard_for_test(
+        selector_mode: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        query_rows: i32,
+        max_context_len: i32,
+    ) -> i32;
+
+    /// Compatibility selector for the original 16Q/1KV Gemma 4 route.
     /// selector_mode: 0=disabled, 1=auto, 2=force.
     pub fn mlx_paged_grouped_gemma4_shape_guard_for_test(
         selector_mode: i32,
@@ -1345,8 +1389,16 @@ unsafe extern "C-unwind" {
         max_context_len: i32,
     ) -> i32;
 
-    /// Model-free graph-native numerical parity for the staged Gemma 4
-    /// D512/BS16/16Q/1KV kernel at the requested partial/boundary context.
+    /// Model-free graph-native numerical parity for the staged BF16
+    /// D512/BS16 kernel at the requested runtime geometry and context.
+    /// Returns 1 on success and -3 without Metal.
+    pub fn mlx_paged_grouped_d512_graph_parity(
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        context_len: i32,
+    ) -> i32;
+
+    /// Compatibility graph-parity probe for Gemma 4's 16Q/1KV layout.
     /// Returns 1 on success and -3 without Metal.
     pub fn mlx_paged_grouped_gemma4_graph_parity(context_len: i32) -> i32;
 }

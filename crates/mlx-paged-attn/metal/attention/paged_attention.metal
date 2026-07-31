@@ -1189,11 +1189,10 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
 
 // ========================================== Grouped GQA paged attention
 //
-// Long-context Qwen3.5/3.6 dense and MoE decode use 24Q/4KV or 16Q/2KV at
-// head_dim=256. Gemma 4 global attention uses 16Q/1KV at head_dim=512. All use
-// block_size=16. The generic kernel above launches one 256-thread threadgroup
-// per *query* head. Consequently every query head mapped to one KV head
-// traverses the same paged K/V range in independent threadgroups.
+// Long-context D256 and D512 GQA decode use block_size=16. The generic kernel
+// above launches one 256-thread threadgroup per *query* head. Consequently
+// every query head mapped to one KV head traverses the same paged K/V range in
+// independent threadgroups.
 //
 // This deliberately narrow two-pass specialization mirrors MLX's
 // `sdpa_vector_2pass_1/2` geometry: one threadgroup is keyed by a KV head and
@@ -1240,10 +1239,10 @@ template <int HEAD_SIZE, bool STAGE_KV>
   constexpr int OUTPUTS_PER_LANE = HEAD_SIZE / 32;
   constexpr int PAGE_ELEMENTS = HEAD_SIZE * BLOCK_SIZE;
 
-  // Gemma's D512/16Q/1KV group has exactly 512 threads and one physical page
-  // is 16 KiB. Cooperatively staging that page lets all 16 query-head SIMD
-  // groups reuse one global read. The D256 instantiation sets STAGE_KV=false;
-  // its one-element dead tile and all related control flow compile away.
+  // A D512 KV page is 16 KiB. Cooperatively staging that page lets every
+  // query-head SIMD group attached to this runtime KV head reuse one global
+  // read. The D256 instantiation sets STAGE_KV=false; its one-element dead
+  // tile and all related control flow compile away.
   threadgroup bfloat16_t kv_tile[STAGE_KV ? PAGE_ELEMENTS : 1];
 
   const int kv_head_idx = int(threadgroup_position_in_grid.x);

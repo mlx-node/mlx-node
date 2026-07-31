@@ -304,10 +304,10 @@ const std::string& paged_attention_v2_reduce_kernel_name(
 enum class GroupedPagedAttentionKind {
   None,
   Qwen35D256,
-  Gemma4D512,
+  D512Staged,
 };
 
-enum class GroupedGemma4Mode {
+enum class GroupedD512Mode {
   Disabled,
   Auto,
   Force,
@@ -322,7 +322,7 @@ const std::string& paged_attention_grouped_kernel_name(
   switch (kind) {
     case GroupedPagedAttentionKind::Qwen35D256:
       return qwen35;
-    case GroupedPagedAttentionKind::Gemma4D512:
+    case GroupedPagedAttentionKind::D512Staged:
       return gemma4;
     case GroupedPagedAttentionKind::None:
       throw std::logic_error("grouped paged-attention kernel requested for None");
@@ -339,7 +339,7 @@ const std::string& paged_attention_grouped_reduce_kernel_name(
   switch (kind) {
     case GroupedPagedAttentionKind::Qwen35D256:
       return qwen35;
-    case GroupedPagedAttentionKind::Gemma4D512:
+    case GroupedPagedAttentionKind::D512Staged:
       return gemma4;
     case GroupedPagedAttentionKind::None:
       throw std::logic_error("grouped paged-attention reducer requested for None");
@@ -347,12 +347,16 @@ const std::string& paged_attention_grouped_reduce_kernel_name(
   throw std::logic_error("invalid grouped paged-attention kind");
 }
 
-uint32_t grouped_gemma4_stripe_override() {
+uint32_t grouped_d512_stripe_override() {
   // Diagnostic-only A/B knob. The D512 reducer supports these power-of-two
   // stripe counts, including counts below one 32-SIMD reducer group. Ignore
   // malformed values rather than risking an invalid auxiliary layout.
   static const uint32_t stripes = []() {
-    const char* value = std::getenv("MLX_PAGED_GROUPED_GEMMA4_STRIPES");
+    const char* value = std::getenv("MLX_PAGED_GROUPED_D512_STRIPES");
+    if (value == nullptr) {
+      // Compatibility alias retained for existing Gemma 4 A/B scripts.
+      value = std::getenv("MLX_PAGED_GROUPED_GEMMA4_STRIPES");
+    }
     if (value == nullptr) {
       return uint32_t{0};
     }
@@ -379,24 +383,26 @@ uint32_t grouped_gemma4_stripe_override() {
 
 uint32_t grouped_stripe_count(
     GroupedPagedAttentionKind kind,
-    int max_context_len) {
-  if (kind == GroupedPagedAttentionKind::Gemma4D512) {
-    if (const uint32_t override = grouped_gemma4_stripe_override();
+    int max_context_len,
+    int num_kv_heads) {
+  if (kind == GroupedPagedAttentionKind::D512Staged) {
+    if (const uint32_t override = grouped_d512_stripe_override();
         override != 0) {
       return override;
     }
-    // Conservative diagnostic policy for Gemma's single global KV head.
-    // The D512 threadgroup already contains 16 SIMD groups (512 threads), so
-    // 32/64/128 stripes provide substantial occupancy without the Qwen path's
-    // 16K jump to 256 stripes. Root should A/B these boundaries before making
-    // the selector default-on or extending it beyond 16K.
+    // Keep total stage-1 threadgroups approximately stable across the shipped
+    // D512 GQA layouts. The grid already has one x-dimension group per KV
+    // head, so using the single-KV 32/64/128 policy unchanged would
+    // over-dispatch Hkv2/Hkv4 by 2x/4x.
+    uint32_t base_stripes = 128;
     if (max_context_len <= 4096) {
-      return 32;
+      base_stripes = 32;
+    } else if (max_context_len <= 8192) {
+      base_stripes = 64;
     }
-    if (max_context_len <= 8192) {
-      return 64;
-    }
-    return 128;
+    const uint32_t kv_heads =
+        static_cast<uint32_t>(std::max(num_kv_heads, 1));
+    return std::max(uint32_t{4}, base_stripes / kv_heads);
   }
   // Power-of-two, block-size-aligned stripe counts. Representative long
   // contexts mirror MLX's vector 2-pass occupancy curve: 16K -> 256,
@@ -430,25 +436,29 @@ bool grouped_qwen35_paged_attention_enabled() {
   return enabled;
 }
 
-GroupedGemma4Mode grouped_gemma4_paged_attention_mode() {
-  // Experimental and default-off until a model-level A/B establishes the
-  // short-context break-even. `1`/`auto` selects only the conservative
-  // 3K-16K window; `force` is a diagnostic correctness/benchmark override.
+GroupedD512Mode grouped_d512_paged_attention_mode() {
+  // Default-off until a model-level A/B establishes the crossover for each
+  // supported runtime geometry. `force` remains the correctness/benchmark
+  // override. Cache once because this is on the decode hot path.
   // Cache once because this runs on every global layer and decode token.
-  static const GroupedGemma4Mode mode = []() {
-    const char* value = std::getenv("MLX_PAGED_GROUPED_GEMMA4");
+  static const GroupedD512Mode mode = []() {
+    const char* value = std::getenv("MLX_PAGED_GROUPED_D512");
     if (value == nullptr) {
-      return GroupedGemma4Mode::Disabled;
+      // Compatibility alias retained for existing Gemma 4 deployments.
+      value = std::getenv("MLX_PAGED_GROUPED_GEMMA4");
+    }
+    if (value == nullptr) {
+      return GroupedD512Mode::Disabled;
     }
     const std::string setting(value);
     if (setting == "1" || setting == "on" || setting == "auto" ||
         setting == "true") {
-      return GroupedGemma4Mode::Auto;
+      return GroupedD512Mode::Auto;
     }
     if (setting == "force") {
-      return GroupedGemma4Mode::Force;
+      return GroupedD512Mode::Force;
     }
-    return GroupedGemma4Mode::Disabled;
+    return GroupedD512Mode::Disabled;
   }();
   return mode;
 }
@@ -503,8 +513,8 @@ bool use_grouped_qwen35_paged_attention(
       max_context_len);
 }
 
-bool grouped_gemma4_shape_matches(
-    GroupedGemma4Mode mode,
+bool grouped_d512_shape_matches(
+    GroupedD512Mode mode,
     KvDtype io_dtype,
     KvDtype cache_dtype,
     int num_seqs,
@@ -514,16 +524,26 @@ bool grouped_gemma4_shape_matches(
     int block_size,
     int query_rows,
     int max_context_len) {
+  const bool supported_heads =
+      (num_q_heads == 8 && num_kv_heads == 1) ||
+      (num_q_heads == 16 && num_kv_heads == 1) ||
+      (num_q_heads == 16 && num_kv_heads == 2) ||
+      (num_q_heads == 32 && num_kv_heads == 4);
   const bool exact_shape =
       io_dtype == KvDtype::Bf16 && cache_dtype == KvDtype::Bf16 &&
-      num_seqs == 1 && num_q_heads == 16 && num_kv_heads == 1 &&
+      num_seqs == 1 && supported_heads &&
       head_size == 512 && block_size == 16 && query_rows == 1 &&
       max_context_len > static_cast<int>(kPartitionSize);
-  if (!exact_shape || mode == GroupedGemma4Mode::Disabled) {
+  if (!exact_shape || mode == GroupedD512Mode::Disabled) {
     return false;
   }
-  return mode == GroupedGemma4Mode::Force ||
-      (max_context_len >= 3072 && max_context_len <= 16384);
+  if (mode == GroupedD512Mode::Force) {
+    return true;
+  }
+  // Preserve the former environment-Auto surface exactly. New geometries are
+  // enabled only by the measured per-dispatch route policy.
+  return num_q_heads == 16 && num_kv_heads == 1 &&
+      max_context_len >= 3072 && max_context_len <= 16384;
 }
 
 GroupedPagedAttentionKind select_grouped_paged_attention(
@@ -535,7 +555,27 @@ GroupedPagedAttentionKind select_grouped_paged_attention(
     int head_size,
     int block_size,
     int query_rows,
-    int max_context_len) {
+    int max_context_len,
+    PagedAttentionRouteHint route_hint =
+        PagedAttentionRouteHint::Auto) {
+  if (route_hint == PagedAttentionRouteHint::ForceGeneric) {
+    return GroupedPagedAttentionKind::None;
+  }
+  if (route_hint == PagedAttentionRouteHint::ForceD512Staged) {
+    return grouped_d512_shape_matches(
+               GroupedD512Mode::Force,
+               io_dtype,
+               cache_dtype,
+               num_seqs,
+               num_q_heads,
+               num_kv_heads,
+               head_size,
+               block_size,
+               query_rows,
+               max_context_len)
+        ? GroupedPagedAttentionKind::D512Staged
+        : GroupedPagedAttentionKind::None;
+  }
   if (use_grouped_qwen35_paged_attention(
           io_dtype,
           cache_dtype,
@@ -548,8 +588,8 @@ GroupedPagedAttentionKind select_grouped_paged_attention(
           max_context_len)) {
     return GroupedPagedAttentionKind::Qwen35D256;
   }
-  if (grouped_gemma4_shape_matches(
-          grouped_gemma4_paged_attention_mode(),
+  if (grouped_d512_shape_matches(
+          grouped_d512_paged_attention_mode(),
           io_dtype,
           cache_dtype,
           num_seqs,
@@ -559,7 +599,7 @@ GroupedPagedAttentionKind select_grouped_paged_attention(
           block_size,
           query_rows,
           max_context_len)) {
-    return GroupedPagedAttentionKind::Gemma4D512;
+    return GroupedPagedAttentionKind::D512Staged;
   }
   return GroupedPagedAttentionKind::None;
 }
@@ -699,10 +739,10 @@ bool grouped_pipelines_supported(
     static const GroupedPipelineLimits qwen35_limits =
         load_grouped_pipeline_limits(device, kind);
     limits_ptr = &qwen35_limits;
-  } else if (kind == GroupedPagedAttentionKind::Gemma4D512) {
-    static const GroupedPipelineLimits gemma4_limits =
+  } else if (kind == GroupedPagedAttentionKind::D512Staged) {
+    static const GroupedPipelineLimits d512_limits =
         load_grouped_pipeline_limits(device, kind);
-    limits_ptr = &gemma4_limits;
+    limits_ptr = &d512_limits;
   } else {
     return false;
   }
@@ -720,7 +760,7 @@ bool grouped_pipelines_supported(
     static std::once_flag qwen_warning_once;
     static std::once_flag gemma_warning_once;
     std::once_flag& warning_once =
-        kind == GroupedPagedAttentionKind::Gemma4D512
+        kind == GroupedPagedAttentionKind::D512Staged
         ? gemma_warning_once
         : qwen_warning_once;
     std::call_once(warning_once, [&]() {
@@ -760,14 +800,17 @@ void record_grouped_qwen35_route_for_test() {
   }
 }
 
-std::atomic<uint64_t>& grouped_gemma4_test_probe_counter() {
+std::atomic<uint64_t>& grouped_d512_test_probe_counter() {
   static std::atomic<uint64_t> counter{0};
   return counter;
 }
 
-bool grouped_gemma4_test_probe_enabled() {
+bool grouped_d512_test_probe_enabled() {
   static const bool enabled = []() {
-    const char* value = std::getenv("MLX_PAGED_GROUPED_GEMMA4_TEST_PROBE");
+    const char* value = std::getenv("MLX_PAGED_GROUPED_D512_TEST_PROBE");
+    if (value == nullptr) {
+      value = std::getenv("MLX_PAGED_GROUPED_GEMMA4_TEST_PROBE");
+    }
     return value != nullptr && std::string(value) == "1";
   }();
   return enabled;
@@ -776,9 +819,9 @@ bool grouped_gemma4_test_probe_enabled() {
 void record_grouped_route_for_test(GroupedPagedAttentionKind kind) {
   if (kind == GroupedPagedAttentionKind::Qwen35D256) {
     record_grouped_qwen35_route_for_test();
-  } else if (kind == GroupedPagedAttentionKind::Gemma4D512 &&
-             grouped_gemma4_test_probe_enabled()) {
-    grouped_gemma4_test_probe_counter().fetch_add(1, std::memory_order_relaxed);
+  } else if (kind == GroupedPagedAttentionKind::D512Staged &&
+             grouped_d512_test_probe_enabled()) {
+    grouped_d512_test_probe_counter().fetch_add(1, std::memory_order_relaxed);
   }
 }
 
@@ -792,12 +835,46 @@ extern "C" uint64_t mlx_paged_grouped_qwen35_test_probe_count() {
   return grouped_qwen35_test_probe_counter().load(std::memory_order_relaxed);
 }
 
+extern "C" void mlx_paged_grouped_d512_test_probe_reset() {
+  grouped_d512_test_probe_counter().store(0, std::memory_order_relaxed);
+}
+
+extern "C" uint64_t mlx_paged_grouped_d512_test_probe_count() {
+  return grouped_d512_test_probe_counter().load(std::memory_order_relaxed);
+}
+
 extern "C" void mlx_paged_grouped_gemma4_test_probe_reset() {
-  grouped_gemma4_test_probe_counter().store(0, std::memory_order_relaxed);
+  mlx_paged_grouped_d512_test_probe_reset();
 }
 
 extern "C" uint64_t mlx_paged_grouped_gemma4_test_probe_count() {
-  return grouped_gemma4_test_probe_counter().load(std::memory_order_relaxed);
+  return mlx_paged_grouped_d512_test_probe_count();
+}
+
+extern "C" int mlx_paged_grouped_d512_capability(
+    int num_q_heads,
+    int num_kv_heads) {
+  const bool supported_heads =
+      (num_q_heads == 8 && num_kv_heads == 1) ||
+      (num_q_heads == 16 && num_kv_heads == 1) ||
+      (num_q_heads == 16 && num_kv_heads == 2) ||
+      (num_q_heads == 32 && num_kv_heads == 4);
+  if (!supported_heads) {
+    return 0;
+  }
+  try {
+    auto stream = mlx::core::default_stream(mlx::core::Device::gpu);
+    auto& device = mlx::core::metal::device(stream.device);
+    return grouped_pipelines_supported(
+               device,
+               GroupedPagedAttentionKind::D512Staged,
+               num_q_heads,
+               num_kv_heads)
+        ? 1
+        : 0;
+  } catch (...) {
+    return -1;
+  }
 }
 
 extern "C" int mlx_paged_grouped_qwen35_shape_guard_for_test(
@@ -820,28 +897,42 @@ extern "C" int mlx_paged_grouped_qwen35_shape_guard_for_test(
       : 0;
 }
 
-extern "C" int mlx_paged_grouped_gemma4_shape_guard_for_test(
+extern "C" int mlx_paged_grouped_d512_shape_guard_for_test(
     int selector_mode,
+    int num_q_heads,
+    int num_kv_heads,
     int query_rows,
     int max_context_len) {
-  const GroupedGemma4Mode mode = selector_mode == 2
-      ? GroupedGemma4Mode::Force
+  const GroupedD512Mode mode = selector_mode == 2
+      ? GroupedD512Mode::Force
       : (selector_mode == 1
-             ? GroupedGemma4Mode::Auto
-             : GroupedGemma4Mode::Disabled);
-  return grouped_gemma4_shape_matches(
+             ? GroupedD512Mode::Auto
+             : GroupedD512Mode::Disabled);
+  return grouped_d512_shape_matches(
       mode,
       KvDtype::Bf16,
       KvDtype::Bf16,
       /*num_seqs=*/1,
-      /*num_q_heads=*/16,
-      /*num_kv_heads=*/1,
+      num_q_heads,
+      num_kv_heads,
       /*head_size=*/512,
       /*block_size=*/16,
       query_rows,
       max_context_len)
       ? 1
       : 0;
+}
+
+extern "C" int mlx_paged_grouped_gemma4_shape_guard_for_test(
+    int selector_mode,
+    int query_rows,
+    int max_context_len) {
+  return mlx_paged_grouped_d512_shape_guard_for_test(
+      selector_mode,
+      /*num_q_heads=*/16,
+      /*num_kv_heads=*/1,
+      query_rows,
+      max_context_len);
 }
 
 // =============================================================================
@@ -1059,7 +1150,8 @@ void dispatch_paged_attention_v2_inner(
     float softcapping,
     int sliding_window,
     KvDtype io_dtype,
-    KvDtype cache_dtype) {
+    KvDtype cache_dtype,
+    PagedAttentionRouteHint route_hint) {
   const GroupedPagedAttentionKind grouped_kind = select_grouped_paged_attention(
       io_dtype,
       cache_dtype,
@@ -1069,7 +1161,8 @@ void dispatch_paged_attention_v2_inner(
       head_size,
       block_size,
       /*query_rows=*/1,
-      max_context_len);
+      max_context_len,
+      route_hint);
   const bool use_grouped =
       grouped_kind != GroupedPagedAttentionKind::None &&
       grouped_pipelines_supported(
@@ -1077,7 +1170,7 @@ void dispatch_paged_attention_v2_inner(
   // Generic V2 uses contiguous 512-token partitions. The grouped path uses
   // MLX-style strided stripes and its dedicated second pass.
   const uint32_t max_num_partitions = use_grouped
-      ? grouped_stripe_count(grouped_kind, max_context_len)
+      ? grouped_stripe_count(grouped_kind, max_context_len, num_kv_heads)
       : (static_cast<uint32_t>(max_context_len) + kPartitionSize - 1) /
           kPartitionSize;
 
@@ -1283,7 +1376,8 @@ void dispatch_paged_attention_auto(
     float scale,
     float softcap,
     int sliding_window,
-    KvDtype kv_dtype) {
+    KvDtype kv_dtype,
+    PagedAttentionRouteHint route_hint) {
   // The Metal kernel masks K positions older than
   // `context_len - sliding_window` when sliding_window > 0. Negative
   // values are illegal (only 0 is a valid "no mask" sentinel).
@@ -1361,7 +1455,8 @@ void dispatch_paged_attention_auto(
         softcapping,
         sliding_window,
         io_dtype,
-        cache_dtype);
+        cache_dtype,
+        route_hint);
   }
 
   // Reference unused parameter so the compiler doesn't warn.
@@ -1494,7 +1589,7 @@ void dispatch_paged_attention_varlen_v2_inner(
       grouped_pipelines_supported(
           device, grouped_kind, num_q_heads, num_kv_heads);
   const uint32_t max_num_partitions = use_grouped
-      ? grouped_stripe_count(grouped_kind, max_context_len)
+      ? grouped_stripe_count(grouped_kind, max_context_len, num_kv_heads)
       : (static_cast<uint32_t>(max_context_len) + kPartitionSize - 1) /
           kPartitionSize;
 

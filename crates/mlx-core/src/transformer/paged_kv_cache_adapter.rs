@@ -100,6 +100,17 @@ pub(crate) enum PagedAttentionV2Layout {
     Varlen,
 }
 
+/// Compute-route request for graph-native single-token PagedAttention.
+///
+/// Every variant reads the same authoritative `LayerKVPool`; the hint changes
+/// only which validated compute primitive consumes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PagedDecodeRouteHint {
+    Auto = 0,
+    ForceD512Staged = 1,
+    ForceGeneric = 2,
+}
+
 pub(crate) fn paged_attention_v2_aux_fits(
     layout: PagedAttentionV2Layout,
     num_new_tokens: u32,
@@ -1547,6 +1558,20 @@ pub struct PagedKVCacheAdapter {
     /// mixed SDPA/varlen plan as lazy graph allocations change.
     #[cfg(target_os = "macos")]
     prefill_memory_snapshot_cache: Option<PrefillMemorySnapshotCache>,
+
+    /// Process-memory sample and failure/report latches for one coarse decode
+    /// context bucket. Unlike the per-token PagedAttention metadata, decode
+    /// routing must remain stable while all logical full-attention consumers
+    /// read the same physical pool. Sampling once per bucket also prevents
+    /// lazy allocations in an early layer from changing later layers' route.
+    #[cfg(target_os = "macos")]
+    decode_planning_cache: Option<DecodePlanningCache>,
+
+    /// Immutable staged-D512 pipeline/threadgroup capability for this pool's
+    /// geometry. The Metal probe itself is process-cached, but retaining the
+    /// result here removes even the FFI call from every layer/token.
+    #[cfg(target_os = "macos")]
+    grouped_d512_capability_cache: Option<(i32, Result<bool, String>)>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1612,6 +1637,16 @@ struct PrefillMemorySnapshotCache {
     snapshot: PagedPrefillMemorySnapshot,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct DecodePlanningCache {
+    context_bucket_end: u32,
+    snapshot: PagedPrefillMemorySnapshot,
+    sdpa_failed: bool,
+    reported_route_signature: Option<u64>,
+    fallback_reported: bool,
+}
+
 impl PagedKVCacheAdapter {
     #[cfg(target_os = "macos")]
     fn clear_prefill_attention_inputs_cache(&mut self) {
@@ -1627,6 +1662,11 @@ impl PagedKVCacheAdapter {
     }
 
     #[cfg(target_os = "macos")]
+    fn clear_decode_planning_cache(&mut self) {
+        self.decode_planning_cache = None;
+    }
+
+    #[cfg(target_os = "macos")]
     fn clear_attention_inputs_caches(&mut self) {
         self.clear_prefill_attention_inputs_cache();
         self.clear_decode_attention_inputs_cache();
@@ -1638,6 +1678,7 @@ impl PagedKVCacheAdapter {
             .iter_mut()
             .for_each(|slot| *slot = None);
         self.clear_attention_inputs_caches();
+        self.clear_decode_planning_cache();
         self.write_slot_mapping_cache = None;
     }
 
@@ -1716,6 +1757,10 @@ impl PagedKVCacheAdapter {
             write_slot_mapping_cache: None,
             #[cfg(target_os = "macos")]
             prefill_memory_snapshot_cache: None,
+            #[cfg(target_os = "macos")]
+            decode_planning_cache: None,
+            #[cfg(target_os = "macos")]
+            grouped_d512_capability_cache: None,
         })
     }
 
@@ -3579,6 +3624,27 @@ impl PagedKVCacheAdapter {
         scale: f32,
         softcap: f32,
     ) -> Result<MxArray, String> {
+        self.gather_kv_for_decode_graph_with_route(
+            layer_idx,
+            queries,
+            scale,
+            softcap,
+            PagedDecodeRouteHint::Auto,
+        )
+    }
+
+    /// Route-hinted graph-native decode attention. The hint is captured in the
+    /// lazy MLX primitive; it never changes pool ownership, block tables, or
+    /// sequence length.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn gather_kv_for_decode_graph_with_route(
+        &mut self,
+        layer_idx: u32,
+        queries: &MxArray,
+        scale: f32,
+        softcap: f32,
+        route_hint: PagedDecodeRouteHint,
+    ) -> Result<MxArray, String> {
         if self.block_table.is_none() {
             return Err(
                 "gather_kv_for_decode_graph called before reset_for_new_request".to_string(),
@@ -3620,7 +3686,7 @@ impl PagedKVCacheAdapter {
         let graph_softcap = if softcap == 1.0 { 0.0 } else { softcap };
 
         let raw = unsafe {
-            mlx_sys::mlx_paged_attention_forward(
+            mlx_sys::mlx_paged_attention_forward_with_route(
                 queries.as_raw_ptr(),
                 k_pool.as_raw_ptr(),
                 v_pool.as_raw_ptr(),
@@ -3636,6 +3702,7 @@ impl PagedKVCacheAdapter {
                 self.layer_kv_pool.config().num_kv_heads as i32,
                 self.layer_kv_pool.config().head_size as i32,
                 kv_dtype_raw,
+                route_hint as u8,
             )
         };
         if raw.is_null() {
@@ -3658,6 +3725,28 @@ impl PagedKVCacheAdapter {
         scale: f32,
         softcap: f32,
     ) -> Result<MxArray, String> {
+        self.gather_kv_for_decode_with_route(
+            layer_idx,
+            queries,
+            scale,
+            softcap,
+            PagedDecodeRouteHint::Auto,
+        )
+        .map(|(output, _)| output)
+    }
+
+    /// Synchronous raw-Metal fallback with the same compute-route hint as the
+    /// graph-native path. Returns whether the staged D512 kernel was actually
+    /// selected, allowing callers to report a truthful demotion or fallback.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn gather_kv_for_decode_with_route(
+        &mut self,
+        layer_idx: u32,
+        queries: &MxArray,
+        scale: f32,
+        softcap: f32,
+        route_hint: PagedDecodeRouteHint,
+    ) -> Result<(MxArray, bool), String> {
         // 1. Active request?
         if self.block_table.is_none() {
             return Err("gather_kv_for_decode called before reset_for_new_request".to_string());
@@ -3759,8 +3848,17 @@ impl PagedKVCacheAdapter {
         // - Block / context buffers are constructed and held inside
         //   `gather_attention` for the dispatch's lifetime.
         // - Pool key/value caches outlive `&self`.
+        let raw_route_hint = match route_hint {
+            PagedDecodeRouteHint::Auto => mlx_paged_attn::metal::PagedAttentionRouteHint::Auto,
+            PagedDecodeRouteHint::ForceD512Staged => {
+                mlx_paged_attn::metal::PagedAttentionRouteHint::ForceD512Staged
+            }
+            PagedDecodeRouteHint::ForceGeneric => {
+                mlx_paged_attn::metal::PagedAttentionRouteHint::ForceGeneric
+            }
+        };
         let output = unsafe {
-            self.layer_kv_pool.gather_attention(
+            self.layer_kv_pool.gather_attention_with_route(
                 layer_idx,
                 queries.as_raw_ptr(),
                 query_metal_dtype,
@@ -3772,14 +3870,17 @@ impl PagedKVCacheAdapter {
                 0,
                 k_scale,
                 v_scale,
+                raw_route_hint,
             )?
         };
+        let used_grouped_d512 = output.used_grouped_d512;
 
         // SAFETY: `to_mlx_array_view` materializes a fresh mlx_array wrapper
         // and retains the underlying Metal buffer. Ownership transfers to the
         // MxArray below.
         let raw = unsafe { output.to_mlx_array_view()? };
         MxArray::from_handle(raw, "gather_kv_for_decode")
+            .map(|output| (output, used_grouped_d512))
             .map_err(|e| format!("gather_kv_for_decode: failed to wrap output array: {e}"))
     }
 
@@ -4493,6 +4594,18 @@ impl PagedKVCacheAdapter {
     }
 
     #[cfg(not(target_os = "macos"))]
+    pub(crate) fn gather_kv_for_decode_graph_with_route(
+        &mut self,
+        _layer_idx: u32,
+        _queries: &MxArray,
+        _scale: f32,
+        _softcap: f32,
+        _route_hint: PagedDecodeRouteHint,
+    ) -> Result<MxArray, String> {
+        Err("gather_kv_for_decode_graph is only supported on macOS (Metal backend)".to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn gather_kv_for_decode(
         &mut self,
         _layer_idx: u32,
@@ -4500,6 +4613,18 @@ impl PagedKVCacheAdapter {
         _scale: f32,
         _softcap: f32,
     ) -> Result<MxArray, String> {
+        Err("gather_kv_for_decode is only supported on macOS (Metal backend)".to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn gather_kv_for_decode_with_route(
+        &mut self,
+        _layer_idx: u32,
+        _queries: &MxArray,
+        _scale: f32,
+        _softcap: f32,
+        _route_hint: PagedDecodeRouteHint,
+    ) -> Result<(MxArray, bool), String> {
         Err("gather_kv_for_decode is only supported on macOS (Metal backend)".to_string())
     }
 
@@ -5483,6 +5608,7 @@ impl PagedKVCacheAdapter {
         #[cfg(target_os = "macos")]
         {
             self.clear_attention_inputs_caches();
+            self.clear_decode_planning_cache();
         }
 
         Ok((prior_token_count, newly_allocated))
@@ -5518,6 +5644,64 @@ impl PagedKVCacheAdapter {
         self.layer_kv_pool.num_blocks()
     }
 
+    /// Number of physical full-attention K/V layers in the authoritative pool.
+    ///
+    /// Logical KV-sharing consumers are deliberately not represented here:
+    /// they alias one of these slots. Family routing code that estimates
+    /// compute scratch must count those logical consumers separately.
+    pub fn physical_layer_count(&self) -> usize {
+        self.layer_kv_pool.num_layers()
+    }
+
+    /// Probe immutable staged-D512 Metal capability for a Q/KV-head geometry.
+    ///
+    /// Dtype, head size, block size, query length, and sequence count remain
+    /// caller-side route inputs; this probe covers pipeline availability and
+    /// device threadgroup limits.
+    pub fn grouped_d512_decode_capability(
+        &mut self,
+        query_dtype: DType,
+        num_query_heads: i32,
+    ) -> Result<bool, String> {
+        if query_dtype != DType::BFloat16
+            || self.prefill_sdpa_cache_dtype() != Some(DType::BFloat16)
+            || self.block_size != 16
+            || self.layer_kv_pool.config().head_size != 512
+        {
+            return Ok(false);
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            if let Some((cached_heads, cached_result)) = self.grouped_d512_capability_cache.as_ref()
+                && *cached_heads == num_query_heads
+            {
+                return cached_result.clone();
+            }
+            let result = unsafe {
+                mlx_sys::mlx_paged_grouped_d512_capability(
+                    num_query_heads,
+                    self.layer_kv_pool.config().num_kv_heads as i32,
+                )
+            };
+            let result = match result {
+                1 => Ok(true),
+                0 => Ok(false),
+                other => Err(format!(
+                    "staged D512 capability probe failed with status {other}"
+                )),
+            };
+            self.grouped_d512_capability_cache = Some((num_query_heads, result.clone()));
+            result
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = num_query_heads;
+            Ok(false)
+        }
+    }
+
     /// Capture the process-local memory bounds used by cache-hit prefill.
     ///
     /// The snapshot is cached until the adapter's token cursor changes, so a
@@ -5534,6 +5718,115 @@ impl PagedKVCacheAdapter {
         #[cfg(not(target_os = "macos"))]
         {
             PagedPrefillMemorySnapshot::default()
+        }
+    }
+
+    /// Capture one process-memory sample for a coarse decode context bucket.
+    ///
+    /// The caller supplies the inclusive upper bound of the bucket it used for
+    /// scratch estimation. All layers and tokens in that bucket observe the
+    /// same sample, so lazy graph allocations cannot produce a mixed route.
+    pub fn decode_memory_snapshot(
+        &mut self,
+        context_bucket_end: u32,
+    ) -> PagedPrefillMemorySnapshot {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(cached) = self.decode_planning_cache
+                && cached.context_bucket_end == context_bucket_end
+            {
+                return cached.snapshot;
+            }
+            let snapshot = Self::probe_prefill_memory_snapshot(self);
+            self.decode_planning_cache = Some(DecodePlanningCache {
+                context_bucket_end,
+                snapshot,
+                sdpa_failed: false,
+                reported_route_signature: None,
+                fallback_reported: false,
+            });
+            snapshot
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = context_bucket_end;
+            PagedPrefillMemorySnapshot::default()
+        }
+    }
+
+    /// Whether graph-native SDPA already failed in this context bucket.
+    pub fn decode_sdpa_failed(&self, context_bucket_end: u32) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.decode_planning_cache.is_some_and(|cached| {
+                cached.context_bucket_end == context_bucket_end && cached.sdpa_failed
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = context_bucket_end;
+            false
+        }
+    }
+
+    /// Latch an SDPA construction/gather failure for the rest of this bucket.
+    pub fn mark_decode_sdpa_failed(&mut self, context_bucket_end: u32) {
+        #[cfg(target_os = "macos")]
+        if let Some(cached) = self.decode_planning_cache.as_mut()
+            && cached.context_bucket_end == context_bucket_end
+        {
+            cached.sdpa_failed = true;
+            cached.reported_route_signature = None;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        let _ = context_bucket_end;
+    }
+
+    /// Return true once for each distinct route signature in a decode bucket.
+    pub fn should_report_decode_route(&mut self, context_bucket_end: u32, signature: u64) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(cached) = self.decode_planning_cache.as_mut() else {
+                return true;
+            };
+            if cached.context_bucket_end != context_bucket_end {
+                return true;
+            }
+            if cached.reported_route_signature == Some(signature) {
+                return false;
+            }
+            cached.reported_route_signature = Some(signature);
+            true
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (context_bucket_end, signature);
+            true
+        }
+    }
+
+    /// Return true once when SDPA falls back in a decode bucket.
+    pub fn should_report_decode_fallback(&mut self, context_bucket_end: u32) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(cached) = self.decode_planning_cache.as_mut() else {
+                return true;
+            };
+            if cached.context_bucket_end != context_bucket_end || cached.fallback_reported {
+                return false;
+            }
+            cached.fallback_reported = true;
+            true
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = context_bucket_end;
+            true
         }
     }
 
@@ -10679,6 +10972,140 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_compute_routes_preserve_cached_prefix_authority_and_failed_gather_is_neutral() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(e) => {
+                eprintln!(
+                    "skipping test_compute_routes_preserve_cached_prefix_authority_and_failed_gather_is_neutral: {e}"
+                );
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let mut adapter =
+            PagedKVCacheAdapter::new(Arc::clone(&allocator), pool, 8).expect("adapter");
+
+        // Publish one fully initialized block, then attach it as an actual
+        // cross-request cache hit. The second request adds one token in a
+        // fresh suffix block so both cached and request-owned authority are
+        // represented in the snapshot below.
+        let cached_tokens: Vec<u32> = (1..=8).collect();
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&cached_tokens).unwrap();
+        let k = MxArray::zeros(&[8, 1, 64], Some(DType::Float16)).expect("K zeros");
+        let v = MxArray::ones(&[8, 1, 64], Some(DType::Float16)).expect("V ones");
+        match adapter.update_keys_values_native(0, &k, &v, 0) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!(
+                    "skipping test_compute_routes_preserve_cached_prefix_authority_and_failed_gather_is_neutral: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected initial native write failure: {e}"),
+        }
+        assert_eq!(adapter.register_full_blocks_for_reuse(&[], 0).unwrap(), 1);
+        adapter.release_request().unwrap();
+
+        let prompt_tokens: Vec<u32> = (1..=9).collect();
+        adapter.reset_for_new_request(2).unwrap();
+        let hit = adapter
+            .find_cached_prefix(&prompt_tokens, &[], 0, false)
+            .expect("cached prefix lookup");
+        assert_eq!(hit.cached_token_count, 8);
+        assert_eq!(hit.blocks.len(), 1);
+        assert!(Arc::ptr_eq(
+            &hit.blocks[0],
+            &adapter.block_table().unwrap().blocks()[0]
+        ));
+        adapter
+            .allocate_suffix_blocks(prompt_tokens.len() as u32)
+            .unwrap();
+        adapter.record_tokens(&prompt_tokens[8..]).unwrap();
+        let tail_k = MxArray::zeros(&[1, 1, 64], Some(DType::Float16)).expect("tail K zeros");
+        let tail_v = MxArray::ones(&[1, 1, 64], Some(DType::Float16)).expect("tail V ones");
+        adapter
+            .update_keys_values_native(0, &tail_k, &tail_v, 8)
+            .expect("tail native write");
+        drop(hit);
+
+        let authority_snapshot = |adapter: &PagedKVCacheAdapter| {
+            let table = adapter.block_table().expect("active block table");
+            (
+                adapter.cached_token_count(),
+                adapter.current_token_count(),
+                adapter.request_tokens().to_vec(),
+                table
+                    .blocks()
+                    .iter()
+                    .map(|block| {
+                        (
+                            block.block_id,
+                            Arc::as_ptr(block) as usize,
+                            block.get_ref_count(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                allocator.lock().unwrap().num_free_blocks(),
+            )
+        };
+        let authority_before = authority_snapshot(&adapter);
+        assert_eq!(authority_before.0, 8, "cached boundary must be one block");
+        assert_eq!(authority_before.1, 9);
+
+        // This is the deterministic pre-graph failure seam: the route asks
+        // for one more context token than the adapter has recorded. A router
+        // may recover by selecting paged attention, so the failed gather must
+        // not change logical cache ownership, block identity, or boundaries.
+        let gather_error = adapter
+            .gather_kv_for_prefill_sdpa(0, 10)
+            .err()
+            .expect("over-recorded gather must fail");
+        assert!(
+            gather_error.contains("recorded token count 9"),
+            "{gather_error}"
+        );
+        assert_eq!(authority_snapshot(&adapter), authority_before);
+
+        let (gathered_k, gathered_v) = adapter
+            .gather_kv_for_prefill_sdpa(0, 9)
+            .expect("graph-native SDPA gather after rejected attempt");
+        let gathered_k = gathered_k.to_float32().expect("gathered K values");
+        let gathered_v = gathered_v.to_float32().expect("gathered V values");
+        assert!(gathered_k.iter().all(|value| value.abs() < 0.01));
+        assert!(gathered_v.iter().all(|value| (*value - 1.0).abs() < 0.01));
+        assert_eq!(authority_snapshot(&adapter), authority_before);
+
+        let q = MxArray::zeros(&[1, 2, 64], Some(DType::Float16)).expect("Q zeros");
+        let scale = 1.0_f32 / (64.0_f32).sqrt();
+        let paged = adapter
+            .gather_kv_for_decode_graph(0, &q, scale, 1.0)
+            .expect("paged graph fallback after rejected gather");
+        let paged = paged.to_float32().expect("paged output values");
+        assert!(paged.iter().all(|value| (*value - 1.0).abs() < 0.05));
+        assert_eq!(authority_snapshot(&adapter), authority_before);
+
+        adapter.release_request().unwrap();
+    }
+
     /// **BF16 numerical correctness on Metal.** Production Qwen3.5 runs in
     /// BF16, so the gather path must route through the
     /// `paged_attention_bfloat16_t_cache_bfloat16_t_*` kernel rather than
@@ -11105,6 +11532,56 @@ mod tests {
         assert!(adapter.is_live_for_continue());
 
         // Cleanup.
+        adapter.release_request().unwrap();
+    }
+
+    #[test]
+    fn test_released_partial_tail_is_not_cross_request_reusable() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping test_released_partial_tail_is_not_cross_request_reusable: Metal unavailable"
+            );
+            return;
+        };
+
+        let tokens: Vec<u32> = (1..=7).collect();
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.allocate_suffix_blocks(tokens.len() as u32).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        let block_ids: Vec<u32> = adapter
+            .block_table()
+            .unwrap()
+            .blocks()
+            .iter()
+            .map(|block| block.block_id)
+            .collect();
+        assert_eq!(block_ids.len(), 2, "seven tokens require full + partial");
+        let full_block_id = block_ids[0];
+        let partial_block_id = block_ids[1];
+
+        assert_eq!(
+            adapter.register_full_blocks_for_reuse(&[], 0).unwrap(),
+            1,
+            "only the four-token full block may be published"
+        );
+        adapter.release_request().unwrap();
+
+        adapter.reset_for_new_request(2).unwrap();
+        let hit = adapter
+            .find_cached_prefix(&tokens, &[], 0, false)
+            .expect("cross-request lookup");
+        assert_eq!(hit.cached_token_count, 4);
+        assert_eq!(adapter.cached_token_count(), 4);
+        assert_eq!(hit.blocks.len(), 1);
+        assert_eq!(hit.blocks[0].block_id, full_block_id);
+        assert_ne!(
+            hit.blocks[0].block_id, partial_block_id,
+            "the released partial tail must never be authoritative for a cache hit"
+        );
+        assert_eq!(adapter.request_tokens(), &tokens[..4]);
+        assert_eq!(adapter.block_table().unwrap().num_tokens(), 4);
+        assert_eq!(adapter.block_table().unwrap().num_blocks(), 1);
         adapter.release_request().unwrap();
     }
 

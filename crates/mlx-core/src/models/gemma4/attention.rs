@@ -1,5 +1,4 @@
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::array::mask::create_causal_mask;
@@ -9,7 +8,7 @@ use crate::inference_trace::{
 };
 use crate::nn::{Linear, RMSNorm, RoPE};
 use crate::transformer::paged_kv_cache_adapter::{
-    PagedAttentionV2Layout, PagedKVCacheAdapter, PagedPrefillMemorySnapshot,
+    PagedAttentionV2Layout, PagedDecodeRouteHint, PagedKVCacheAdapter, PagedPrefillMemorySnapshot,
     paged_attention_v2_aux_fits, paged_attention_v2_partition_upper_bound,
 };
 use mlx_sys as sys;
@@ -60,12 +59,10 @@ struct LivePrefillHeadroom {
 const PREFILL_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024 * 1024;
 const PREFILL_HEADROOM_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Maximum compact K/V gathered for one full-attention layer by the automatic
-/// single-token decode route. Gemma4-12B has eight D=512/Hkv=1 global layers,
-/// so this caps the total lazy graph payload at roughly 512 MiB while keeping
-/// the physical paged pool authoritative. The estimate includes both selected
-/// block views and their contiguous copies. Larger contexts stay on the
-/// memory-bounded PagedAttention operator.
+const DECODE_CONTEXT_BUCKET_TOKENS: u32 = 4 * 1024;
+const DECODE_SDPA_CROSSOVER_TOKENS: u64 = 64 * 1024;
+const DECODE_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024 * 1024;
+const DECODE_HEADROOM_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PagedDecodeMode {
@@ -80,6 +77,75 @@ enum PagedDecodePath {
     PagedAttention,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PagedDecodeReason {
+    ExplicitSdpa,
+    ExplicitSdpaUnavailable,
+    ExplicitPaged,
+    DirectGroupedCandidate,
+    SdpaFailedInBucket,
+    GraphBackendUnavailable,
+    UnsupportedDtype,
+    UnsupportedGeometry,
+    BelowMeasuredCrossover,
+    UnknownHeadroom,
+    ScratchEstimateOverflow,
+    InsufficientHeadroom,
+    AutoSdpaFits,
+}
+
+impl PagedDecodeReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitSdpa => "explicit_sdpa",
+            Self::ExplicitSdpaUnavailable => "explicit_sdpa_unavailable",
+            Self::ExplicitPaged => "explicit_paged",
+            Self::DirectGroupedCandidate => "direct_grouped_candidate",
+            Self::SdpaFailedInBucket => "sdpa_failed_in_bucket",
+            Self::GraphBackendUnavailable => "graph_backend_unavailable",
+            Self::UnsupportedDtype => "unsupported_dtype",
+            Self::UnsupportedGeometry => "unsupported_geometry",
+            Self::BelowMeasuredCrossover => "below_measured_crossover",
+            Self::UnknownHeadroom => "unknown_headroom",
+            Self::ScratchEstimateOverflow => "scratch_estimate_overflow",
+            Self::InsufficientHeadroom => "insufficient_headroom",
+            Self::AutoSdpaFits => "auto_sdpa_fits",
+        }
+    }
+
+    fn signature(self) -> u64 {
+        self as u64
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PagedDecodePlan {
+    path: PagedDecodePath,
+    reason: PagedDecodeReason,
+    context_bucket_end: u64,
+    estimated_per_invocation_bytes: Option<u64>,
+    estimated_total_bytes: Option<u64>,
+    live_headroom_bytes: Option<u64>,
+    scratch_budget_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PagedDecodePolicyInput {
+    mode: PagedDecodeMode,
+    query_dtype: DType,
+    cache_dtype: Option<DType>,
+    context_bucket_end: u64,
+    num_query_heads: u64,
+    num_kv_heads: u64,
+    head_dim: u64,
+    block_size: u32,
+    logical_full_attention_invocations: u64,
+    graph_backend_available: bool,
+    direct_grouped_candidate: bool,
+    live_headroom_bytes: Option<u64>,
+    sdpa_failed_in_bucket: bool,
+}
+
 fn parse_paged_decode_mode(route: Option<&str>) -> PagedDecodeMode {
     match route.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
         None | Some("") | Some("auto") => PagedDecodeMode::Auto,
@@ -89,9 +155,9 @@ fn parse_paged_decode_mode(route: Option<&str>) -> PagedDecodeMode {
     }
 }
 
-fn resolve_paged_decode_mode(route: Option<&str>, grouped_gemma4: Option<&str>) -> PagedDecodeMode {
+fn resolve_paged_decode_mode(route: Option<&str>, grouped_d512: Option<&str>) -> PagedDecodeMode {
     let explicit = parse_paged_decode_mode(route);
-    let grouped_requested = parse_grouped_gemma4_selector(grouped_gemma4) != "off";
+    let grouped_requested = parse_grouped_d512_selector(grouped_d512) == "force";
     if grouped_requested && matches!(explicit, PagedDecodeMode::Auto) {
         PagedDecodeMode::ForcePagedAttention
     } else {
@@ -99,25 +165,27 @@ fn resolve_paged_decode_mode(route: Option<&str>, grouped_gemma4: Option<&str>) 
     }
 }
 
-/// Parse the selector exactly as both paged-attention dispatchers do. Keeping
-/// this deliberately case-sensitive and whitespace-sensitive prevents Rust
-/// route diagnostics from claiming that the grouped kernel is enabled while
-/// the C++/Rust Metal dispatcher treats the same process environment as off.
-fn parse_grouped_gemma4_selector(value: Option<&str>) -> &'static str {
+/// Parse the D512 escape hatch with the dispatchers' exact, case-sensitive
+/// values. The model router defaults to production Auto after its model-level
+/// crossover gate; an explicit unsupported value remains the rollback switch.
+fn parse_grouped_d512_selector(value: Option<&str>) -> &'static str {
     match value {
-        Some("1" | "on" | "auto" | "true") => "auto",
+        None | Some("1" | "on" | "auto" | "true") => "auto",
         Some("force") => "force",
         _ => "off",
     }
 }
 
-fn grouped_gemma4_diagnostic_config() -> (&'static str, Option<u32>) {
+fn grouped_d512_diagnostic_config() -> (&'static str, Option<u32>) {
     static CONFIG: OnceLock<(String, Option<u32>)> = OnceLock::new();
     let config = CONFIG.get_or_init(|| {
-        let selector_env = std::env::var("MLX_PAGED_GROUPED_GEMMA4").ok();
-        let selector = parse_grouped_gemma4_selector(selector_env.as_deref());
-        let stripes = std::env::var("MLX_PAGED_GROUPED_GEMMA4_STRIPES")
+        let selector_env = std::env::var("MLX_PAGED_GROUPED_D512")
             .ok()
+            .or_else(|| std::env::var("MLX_PAGED_GROUPED_GEMMA4").ok());
+        let selector = parse_grouped_d512_selector(selector_env.as_deref());
+        let stripes = std::env::var("MLX_PAGED_GROUPED_D512_STRIPES")
+            .ok()
+            .or_else(|| std::env::var("MLX_PAGED_GROUPED_GEMMA4_STRIPES").ok())
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| matches!(value, 4 | 8 | 16 | 32 | 64 | 128 | 256));
         (selector.to_string(), stripes)
@@ -125,26 +193,60 @@ fn grouped_gemma4_diagnostic_config() -> (&'static str, Option<u32>) {
     (config.0.as_str(), config.1)
 }
 
-fn grouped_gemma4_planned_stripes(
+fn grouped_d512_measured_crossover(num_heads: i32, num_kv_heads: i32) -> Option<u32> {
+    match (num_heads, num_kv_heads) {
+        // Two-run raw-Metal operator A/Bs at 91,765 and 112K cleared the
+        // >=10% gate for these shipped geometries. Hq8/Hkv1 was unstable
+        // (0.991x in one repeat) and therefore remains force-only.
+        (16, 1) | (16, 2) | (32, 4) => Some(92 * 1024),
+        _ => None,
+    }
+}
+
+fn grouped_d512_planned_stripes(
     selector: &str,
     override_stripes: Option<u32>,
     total_context: u32,
+    num_heads: i32,
+    num_kv_heads: i32,
 ) -> Option<u32> {
     let eligible = total_context > 512
         && (selector == "force"
-            || (selector == "auto" && (3_072..=16_384).contains(&total_context)));
+            || (selector == "auto"
+                && grouped_d512_measured_crossover(num_heads, num_kv_heads)
+                    .is_some_and(|crossover| total_context >= crossover)));
     if !eligible {
         return None;
     }
-    override_stripes.or(Some(match total_context {
+    let base_stripes: u32 = match total_context {
         0..=4_096 => 32,
         4_097..=8_192 => 64,
         _ => 128,
-    }))
+    };
+    override_stripes.or(Some((base_stripes / num_kv_heads.max(1) as u32).max(4)))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn grouped_gemma4_kernel_candidate(
+fn grouped_d512_geometry_supported(
+    query_dtype: DType,
+    cache_dtype: Option<DType>,
+    block_size: u32,
+    num_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+) -> bool {
+    query_dtype == DType::BFloat16
+        && cache_dtype == Some(DType::BFloat16)
+        && block_size == 16
+        && matches!(
+            (num_heads, num_kv_heads),
+            (8, 1) | (16, 1) | (16, 2) | (32, 4)
+        )
+        && head_dim == 512
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grouped_d512_kernel_candidate(
     selector: &str,
     override_stripes: Option<u32>,
     total_context: u32,
@@ -154,18 +256,38 @@ fn grouped_gemma4_kernel_candidate(
     num_heads: i32,
     num_kv_heads: i32,
     head_dim: i32,
+    capability_confirmed: bool,
 ) -> (&'static str, Option<u32>) {
-    let grouped_stripes = grouped_gemma4_planned_stripes(selector, override_stripes, total_context);
-    let exact_shape = query_dtype == DType::BFloat16
-        && cache_dtype == Some(DType::BFloat16)
-        && block_size == 16
-        && num_heads == 16
-        && num_kv_heads == 1
-        && head_dim == 512;
-    if exact_shape && grouped_stripes.is_some() {
-        ("grouped_gemma4_d512_staged", grouped_stripes)
+    let grouped_stripes = grouped_d512_planned_stripes(
+        selector,
+        override_stripes,
+        total_context,
+        num_heads,
+        num_kv_heads,
+    );
+    let exact_shape = grouped_d512_geometry_supported(
+        query_dtype,
+        cache_dtype,
+        block_size,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+    );
+    if exact_shape && capability_confirmed && grouped_stripes.is_some() {
+        ("grouped_d512_staged", grouped_stripes)
     } else {
         ("generic_v2", None)
+    }
+}
+
+fn paged_decode_route_hint(requested_paged_kernel: &str) -> PagedDecodeRouteHint {
+    if requested_paged_kernel == "grouped_d512_staged" {
+        PagedDecodeRouteHint::ForceD512Staged
+    } else {
+        // The model-level measured crossover is authoritative. Passing Auto
+        // here would let the lower-level environment selector independently
+        // re-enable grouped D512 below that crossover and make diagnostics lie.
+        PagedDecodeRouteHint::ForceGeneric
     }
 }
 
@@ -173,11 +295,14 @@ fn paged_decode_mode() -> PagedDecodeMode {
     static MODE: OnceLock<PagedDecodeMode> = OnceLock::new();
     *MODE.get_or_init(|| {
         let route = std::env::var("MLX_GEMMA4_PAGED_DECODE_ROUTE").ok();
-        let grouped = std::env::var("MLX_PAGED_GROUPED_GEMMA4").ok();
+        let grouped = std::env::var("MLX_PAGED_GROUPED_D512")
+            .ok()
+            .or_else(|| std::env::var("MLX_PAGED_GROUPED_GEMMA4").ok());
         resolve_paged_decode_mode(route.as_deref(), grouped.as_deref())
     })
 }
 
+#[cfg(test)]
 fn estimate_decode_sdpa_gather_bytes(
     total_context: u64,
     num_kv_heads: u64,
@@ -192,46 +317,159 @@ fn estimate_decode_sdpa_gather_bytes(
         .saturating_mul(4)
 }
 
-fn select_paged_decode_path(
-    mode: PagedDecodeMode,
-    query_dtype: DType,
-    cache_dtype: Option<DType>,
-    total_context: u64,
+fn decode_context_bucket_end(total_context: u32) -> u32 {
+    total_context
+        .max(1)
+        .div_ceil(DECODE_CONTEXT_BUCKET_TOKENS)
+        .saturating_mul(DECODE_CONTEXT_BUCKET_TOKENS)
+}
+
+fn checked_decode_sdpa_scratch(
+    context: u64,
+    num_query_heads: u64,
     num_kv_heads: u64,
     head_dim: u64,
-    graph_backend_available: bool,
-) -> (PagedDecodePath, u64) {
-    let effective_dtype = prefill_sdpa_effective_dtype(query_dtype, cache_dtype);
+    dtype_bytes: u64,
+    logical_invocations: u64,
+) -> Option<(u64, u64)> {
+    let gather = context
+        .checked_mul(num_kv_heads)?
+        .checked_mul(head_dim)?
+        .checked_mul(dtype_bytes)?
+        // K + V, plus contiguous copies of both selected block views.
+        .checked_mul(4)?;
+    let scores = context
+        .checked_mul(num_query_heads)?
+        .checked_mul(dtype_bytes)?;
+    let per_invocation = gather.checked_add(scores)?;
+    let aggregate = per_invocation
+        .checked_mul(logical_invocations)?
+        .checked_add(DECODE_FIXED_OVERHEAD_BYTES)?;
+    Some((per_invocation, aggregate))
+}
+
+fn decode_scratch_budget(live_headroom_bytes: u64) -> u64 {
+    // Subtract the reserve first, then multiply as quotient+remainder so the
+    // 90% safety factor itself cannot overflow.
+    let after_reserve = live_headroom_bytes.saturating_sub(DECODE_HEADROOM_RESERVE_BYTES);
+    (after_reserve / 10)
+        .saturating_mul(9)
+        .saturating_add((after_reserve % 10).saturating_mul(9) / 10)
+}
+
+fn logical_full_attention_invocation_count(config: &Gemma4Config) -> u64 {
+    (0..config.num_hidden_layers.max(0) as usize)
+        .filter(|&idx| config.is_global_layer(idx))
+        .count() as u64
+}
+
+fn select_paged_decode_plan(input: PagedDecodePolicyInput) -> PagedDecodePlan {
+    let effective_dtype = prefill_sdpa_effective_dtype(input.query_dtype, input.cache_dtype);
     let dtype_bytes = match effective_dtype {
         Some(DType::Float16 | DType::BFloat16) => 2,
         Some(DType::Float32) => 4,
         _ => 0,
     };
-    let estimated_gather_bytes =
-        estimate_decode_sdpa_gather_bytes(total_context, num_kv_heads, head_dim, dtype_bytes);
-    let sdpa_available = graph_backend_available && dtype_bytes == 2;
-
-    let path = match mode {
-        PagedDecodeMode::ForceSdpa if sdpa_available => PagedDecodePath::PagedPoolSdpa,
-        PagedDecodeMode::Auto
-        | PagedDecodeMode::ForceSdpa
-        | PagedDecodeMode::ForcePagedAttention => PagedDecodePath::PagedAttention,
+    let scratch = (dtype_bytes > 0).then(|| {
+        checked_decode_sdpa_scratch(
+            input.context_bucket_end,
+            input.num_query_heads,
+            input.num_kv_heads,
+            input.head_dim,
+            dtype_bytes,
+            input.logical_full_attention_invocations,
+        )
+    });
+    let (estimated_per_invocation_bytes, estimated_total_bytes) = match scratch {
+        Some(Some((per_invocation, total))) => (Some(per_invocation), Some(total)),
+        _ => (None, None),
     };
-    (path, estimated_gather_bytes)
-}
+    let scratch_budget_bytes = input.live_headroom_bytes.map(decode_scratch_budget);
+    let sdpa_constructible = input.graph_backend_available && dtype_bytes == 2;
 
-fn should_report_paged_decode_path(path: PagedDecodePath) -> bool {
-    static SDPA_REPORTED: AtomicBool = AtomicBool::new(false);
-    static PAGED_REPORTED: AtomicBool = AtomicBool::new(false);
-    match path {
-        PagedDecodePath::PagedPoolSdpa => !SDPA_REPORTED.swap(true, Ordering::Relaxed),
-        PagedDecodePath::PagedAttention => !PAGED_REPORTED.swap(true, Ordering::Relaxed),
+    let (path, reason) = match input.mode {
+        PagedDecodeMode::ForcePagedAttention => (
+            PagedDecodePath::PagedAttention,
+            PagedDecodeReason::ExplicitPaged,
+        ),
+        PagedDecodeMode::ForceSdpa if sdpa_constructible => (
+            PagedDecodePath::PagedPoolSdpa,
+            PagedDecodeReason::ExplicitSdpa,
+        ),
+        PagedDecodeMode::ForceSdpa => (
+            PagedDecodePath::PagedAttention,
+            PagedDecodeReason::ExplicitSdpaUnavailable,
+        ),
+        PagedDecodeMode::Auto if input.direct_grouped_candidate => (
+            PagedDecodePath::PagedAttention,
+            PagedDecodeReason::DirectGroupedCandidate,
+        ),
+        PagedDecodeMode::Auto if input.sdpa_failed_in_bucket => (
+            PagedDecodePath::PagedAttention,
+            PagedDecodeReason::SdpaFailedInBucket,
+        ),
+        PagedDecodeMode::Auto if !input.graph_backend_available => (
+            PagedDecodePath::PagedAttention,
+            PagedDecodeReason::GraphBackendUnavailable,
+        ),
+        PagedDecodeMode::Auto
+            if input.query_dtype != DType::BFloat16
+                || input.cache_dtype != Some(DType::BFloat16) =>
+        {
+            (
+                PagedDecodePath::PagedAttention,
+                PagedDecodeReason::UnsupportedDtype,
+            )
+        }
+        PagedDecodeMode::Auto
+            if input.block_size != 16
+                || input.num_query_heads != 16
+                || input.num_kv_heads != 2
+                || input.head_dim != 512
+                || input.logical_full_attention_invocations == 0 =>
+        {
+            (
+                PagedDecodePath::PagedAttention,
+                PagedDecodeReason::UnsupportedGeometry,
+            )
+        }
+        PagedDecodeMode::Auto if input.context_bucket_end < DECODE_SDPA_CROSSOVER_TOKENS => (
+            PagedDecodePath::PagedAttention,
+            PagedDecodeReason::BelowMeasuredCrossover,
+        ),
+        PagedDecodeMode::Auto if input.live_headroom_bytes.is_none() => (
+            PagedDecodePath::PagedAttention,
+            PagedDecodeReason::UnknownHeadroom,
+        ),
+        PagedDecodeMode::Auto if estimated_total_bytes.is_none() => (
+            PagedDecodePath::PagedAttention,
+            PagedDecodeReason::ScratchEstimateOverflow,
+        ),
+        PagedDecodeMode::Auto
+            if estimated_total_bytes
+                .zip(scratch_budget_bytes)
+                .is_some_and(|(estimate, budget)| estimate <= budget) =>
+        {
+            (
+                PagedDecodePath::PagedPoolSdpa,
+                PagedDecodeReason::AutoSdpaFits,
+            )
+        }
+        PagedDecodeMode::Auto => (
+            PagedDecodePath::PagedAttention,
+            PagedDecodeReason::InsufficientHeadroom,
+        ),
+    };
+
+    PagedDecodePlan {
+        path,
+        reason,
+        context_bucket_end: input.context_bucket_end,
+        estimated_per_invocation_bytes,
+        estimated_total_bytes,
+        live_headroom_bytes: input.live_headroom_bytes,
+        scratch_budget_bytes,
     }
-}
-
-fn should_report_paged_decode_fallback() -> bool {
-    static REPORTED: AtomicBool = AtomicBool::new(false);
-    !REPORTED.swap(true, Ordering::Relaxed)
 }
 
 fn parse_cache_hit_prefill_mode(
@@ -727,6 +965,10 @@ pub struct Gemma4Attention {
     num_heads: i32,
     num_kv_heads: i32,
     head_dim: i32,
+    /// Logical full-attention calls in one decoder pass. This includes
+    /// KV-shared aliases, because each alias runs its own Q/attention compute
+    /// even though it reuses an anchor's physical K/V slot.
+    logical_full_attention_invocations: u64,
     k_is_v: bool,
 }
 
@@ -739,6 +981,7 @@ impl Gemma4Attention {
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.effective_kv_heads(is_global);
         let head_dim = config.effective_head_dim(is_global);
+        let logical_full_attention_invocations = logical_full_attention_invocation_count(config);
         let has_bias = config.attention_bias;
 
         // K=V sharing only applies to global (full attention) layers.
@@ -808,6 +1051,7 @@ impl Gemma4Attention {
             num_heads,
             num_kv_heads,
             head_dim,
+            logical_full_attention_invocations,
             k_is_v,
         })
     }
@@ -1003,73 +1247,147 @@ impl Gemma4Attention {
         let mode = paged_decode_mode();
         let query_dtype = queries_bhtd.dtype()?;
         let cache_dtype = adapter.prefill_sdpa_cache_dtype();
-        let (planned_path, estimated_gather_bytes) = select_paged_decode_path(
-            mode,
-            query_dtype,
-            cache_dtype,
-            total_ctx as u64,
-            self.num_kv_heads as u64,
-            self.head_dim as u64,
-            crate::engine::persistence::compiled_forward_backend_available(),
-        );
         let configured_mode = match mode {
             PagedDecodeMode::Auto => "auto",
             PagedDecodeMode::ForceSdpa => "sdpa",
             PagedDecodeMode::ForcePagedAttention => "paged_attention",
         };
-        let (grouped_selector, grouped_stripe_override) = grouped_gemma4_diagnostic_config();
-        // The custom primitive is lazy, so this is the exact shape/env
-        // candidate rather than a claim that Metal pipeline-capability checks
-        // have already succeeded. The dispatcher can still fall back to V2 at
-        // evaluation time when the specialized pipeline is unavailable.
-        let (paged_kernel_candidate, grouped_stripes) = grouped_gemma4_kernel_candidate(
-            grouped_selector,
-            grouped_stripe_override,
-            total_ctx,
+        let context_bucket_end = decode_context_bucket_end(total_ctx);
+        let memory_snapshot = adapter.decode_memory_snapshot(context_bucket_end);
+        let live_headroom = live_prefill_headroom(memory_snapshot).selected_bytes;
+        let (grouped_selector, grouped_stripe_override) = grouped_d512_diagnostic_config();
+        let grouped_policy_eligible = grouped_d512_geometry_supported(
             query_dtype,
             cache_dtype,
             adapter.block_size(),
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
+        ) && grouped_d512_planned_stripes(
+            grouped_selector,
+            grouped_stripe_override,
+            context_bucket_end,
+            self.num_heads,
+            self.num_kv_heads,
+        )
+        .is_some();
+        let grouped_capability = grouped_policy_eligible
+            .then(|| adapter.grouped_d512_decode_capability(query_dtype, self.num_heads));
+        let grouped_capability_confirmed = matches!(grouped_capability, Some(Ok(true)));
+        let grouped_capability_error = grouped_capability
+            .as_ref()
+            .and_then(|result| result.as_ref().err())
+            .cloned();
+        let grouped_capability_probed = grouped_capability.is_some();
+        // The custom primitive is lazy, so this is the exact shape/env
+        // candidate after the immutable Metal capability probe, not a
+        // model/checkpoint identifier.
+        let (grouped_paged_candidate, grouped_stripes) = grouped_d512_kernel_candidate(
+            grouped_selector,
+            grouped_stripe_override,
+            context_bucket_end,
+            query_dtype,
+            cache_dtype,
+            adapter.block_size(),
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            grouped_capability_confirmed,
         );
+        let requested_paged_kernel =
+            if mode == PagedDecodeMode::ForcePagedAttention && grouped_selector != "force" {
+                "generic_v2"
+            } else {
+                grouped_paged_candidate
+            };
+        let requested_grouped_stripes = (requested_paged_kernel == "grouped_d512_staged")
+            .then_some(grouped_stripes)
+            .flatten();
+        let plan = select_paged_decode_plan(PagedDecodePolicyInput {
+            mode,
+            query_dtype,
+            cache_dtype,
+            context_bucket_end: u64::from(context_bucket_end),
+            num_query_heads: self.num_heads as u64,
+            num_kv_heads: self.num_kv_heads as u64,
+            head_dim: self.head_dim as u64,
+            block_size: adapter.block_size(),
+            logical_full_attention_invocations: self.logical_full_attention_invocations,
+            graph_backend_available: crate::engine::persistence::compiled_forward_backend_available(
+            ),
+            direct_grouped_candidate: grouped_paged_candidate != "generic_v2",
+            live_headroom_bytes: live_headroom,
+            sdpa_failed_in_bucket: adapter.decode_sdpa_failed(context_bucket_end),
+        });
+        let physical_full_attention_layers = adapter.physical_layer_count();
+        let estimated_per_invocation_mib = plan
+            .estimated_per_invocation_bytes
+            .map(|bytes| bytes as f64 / (1024.0 * 1024.0));
+        let estimated_total_scratch_mib = plan
+            .estimated_total_bytes
+            .map(|bytes| bytes as f64 / (1024.0 * 1024.0));
+        let live_headroom_mib = plan
+            .live_headroom_bytes
+            .map(|bytes| bytes as f64 / (1024.0 * 1024.0));
+        let scratch_budget_mib = plan
+            .scratch_budget_bytes
+            .map(|bytes| bytes as f64 / (1024.0 * 1024.0));
 
-        if planned_path == PagedDecodePath::PagedPoolSdpa {
+        let mut sdpa_fell_back = false;
+        if plan.path == PagedDecodePath::PagedPoolSdpa {
             match adapter.gather_kv_for_prefill_sdpa(paged_idx, total_ctx) {
                 Ok((keys, values)) => {
                     match scaled_dot_product_attention(queries_bhtd, &keys, &values, 1.0, None) {
                         Ok(output) => {
                             if paged_idx == 0
-                                && should_report_paged_decode_path(PagedDecodePath::PagedPoolSdpa)
+                                && adapter.should_report_decode_route(
+                                    context_bucket_end,
+                                    plan.reason.signature(),
+                                )
                             {
                                 tracing::info!(
                                     target: "mlx_core::inference",
                                     event = "gemma4_paged_decode_route",
                                     configured_mode,
                                     path = "paged_pool_sdpa",
+                                    route_reason = plan.reason.as_str(),
                                     physical_pool_authoritative = true,
-                                    paged_kernel_candidate,
+                                    requested_paged_kernel,
+                                    grouped_capability_probed,
+                                    grouped_capability_confirmed,
+                                    grouped_capability_error = ?grouped_capability_error,
                                     grouped_selector,
-                                    grouped_stripes,
+                                    grouped_stripes = ?requested_grouped_stripes,
                                     total_context_tokens = total_ctx,
+                                    context_bucket_end_tokens = plan.context_bucket_end,
                                     num_query_heads = self.num_heads,
                                     num_kv_heads = self.num_kv_heads,
                                     head_dim = self.head_dim,
-                                    estimated_gather_mib = estimated_gather_bytes as f64
-                                        / (1024.0 * 1024.0),
+                                    physical_full_attention_layers,
+                                    logical_full_attention_invocations =
+                                        self.logical_full_attention_invocations,
+                                    estimated_per_invocation_mib = ?estimated_per_invocation_mib,
+                                    estimated_total_scratch_mib = ?estimated_total_scratch_mib,
+                                    live_headroom_mib = ?live_headroom_mib,
+                                    scratch_budget_mib = ?scratch_budget_mib,
                                     "Gemma4 paged decode attention route selected"
                                 );
                             }
                             return output.astype(x.dtype()?);
                         }
                         Err(err) => {
-                            if paged_idx == 0 && should_report_paged_decode_fallback() {
+                            adapter.mark_decode_sdpa_failed(context_bucket_end);
+                            sdpa_fell_back = true;
+                            if adapter.should_report_decode_fallback(context_bucket_end) {
                                 tracing::warn!(
                                     target: "mlx_core::inference",
                                     event = "gemma4_paged_decode_fallback",
+                                    layer = paged_idx,
                                     configured_mode,
                                     failed_path = "paged_pool_sdpa",
                                     stage = "sdpa",
+                                    context_bucket_end_tokens = context_bucket_end,
+                                    physical_pool_authoritative = true,
                                     error = %err,
                                     "Gemma4 paged decode SDPA construction failed"
                                 );
@@ -1078,13 +1396,18 @@ impl Gemma4Attention {
                     }
                 }
                 Err(err) => {
-                    if paged_idx == 0 && should_report_paged_decode_fallback() {
+                    adapter.mark_decode_sdpa_failed(context_bucket_end);
+                    sdpa_fell_back = true;
+                    if adapter.should_report_decode_fallback(context_bucket_end) {
                         tracing::warn!(
                             target: "mlx_core::inference",
                             event = "gemma4_paged_decode_fallback",
+                            layer = paged_idx,
                             configured_mode,
                             failed_path = "paged_pool_sdpa",
                             stage = "paged_pool_gather",
+                            context_bucket_end_tokens = context_bucket_end,
+                            physical_pool_authoritative = true,
                             error = %err,
                             "Gemma4 paged decode compact K/V gather failed"
                         );
@@ -1098,40 +1421,92 @@ impl Gemma4Attention {
             self.num_heads as i64,
             self.head_dim as i64,
         ])?;
-        let attn_3d = match adapter.gather_kv_for_decode_graph(paged_idx, &queries_3d, 1.0, 1.0) {
+        let paged_route_hint = paged_decode_route_hint(requested_paged_kernel);
+        let mut graph_native_route = true;
+        let mut raw_used_grouped_d512 = false;
+        let attn_3d = match adapter.gather_kv_for_decode_graph_with_route(
+            paged_idx,
+            &queries_3d,
+            1.0,
+            1.0,
+            paged_route_hint,
+        ) {
             Ok(output) => output,
             Err(err) => {
-                if paged_idx == 0 && should_report_paged_decode_fallback() {
+                graph_native_route = false;
+                if adapter.should_report_decode_fallback(context_bucket_end) {
                     tracing::warn!(
                         target: "mlx_core::inference",
                         event = "gemma4_paged_decode_fallback",
+                        layer = paged_idx,
                         configured_mode,
                         failed_path = "paged_attention_graph",
                         stage = "graph_construction",
+                        context_bucket_end_tokens = context_bucket_end,
+                        physical_pool_authoritative = true,
                         error = %err,
                         "Gemma4 graph-native paged decode attention failed"
                     );
                 }
-                adapter
-                    .gather_kv_for_decode(paged_idx, &queries_3d, 1.0, 1.0)
-                    .map_err(napi::Error::from_reason)?
+                let (output, used_grouped) = adapter
+                    .gather_kv_for_decode_with_route(
+                        paged_idx,
+                        &queries_3d,
+                        1.0,
+                        1.0,
+                        paged_route_hint,
+                    )
+                    .map_err(napi::Error::from_reason)?;
+                raw_used_grouped_d512 = used_grouped;
+                output
             }
         };
-        if paged_idx == 0 && should_report_paged_decode_path(PagedDecodePath::PagedAttention) {
+        let effective_paged_reason = if sdpa_fell_back {
+            PagedDecodeReason::SdpaFailedInBucket
+        } else {
+            plan.reason
+        };
+        let selected_paged_backend = if !graph_native_route && raw_used_grouped_d512 {
+            "grouped_d512_staged_raw"
+        } else if !graph_native_route {
+            "generic_v2_raw"
+        } else if paged_route_hint == PagedDecodeRouteHint::ForceD512Staged {
+            "grouped_d512_staged"
+        } else {
+            "generic_v2"
+        };
+        if paged_idx == 0
+            && adapter.should_report_decode_route(
+                context_bucket_end,
+                (1 << 63) | effective_paged_reason.signature(),
+            )
+        {
             tracing::info!(
                 target: "mlx_core::inference",
                 event = "gemma4_paged_decode_route",
                 configured_mode,
                 path = "paged_attention",
+                route_reason = effective_paged_reason.as_str(),
                 physical_pool_authoritative = true,
-                paged_kernel_candidate,
+                requested_paged_kernel,
+                selected_paged_backend,
+                grouped_capability_probed,
+                grouped_capability_confirmed,
+                grouped_capability_error = ?grouped_capability_error,
                 grouped_selector,
-                grouped_stripes,
+                grouped_stripes = ?requested_grouped_stripes,
                 total_context_tokens = total_ctx,
+                context_bucket_end_tokens = plan.context_bucket_end,
                 num_query_heads = self.num_heads,
                 num_kv_heads = self.num_kv_heads,
                 head_dim = self.head_dim,
-                estimated_gather_mib = estimated_gather_bytes as f64 / (1024.0 * 1024.0),
+                physical_full_attention_layers,
+                logical_full_attention_invocations =
+                    self.logical_full_attention_invocations,
+                estimated_per_invocation_mib = ?estimated_per_invocation_mib,
+                estimated_total_scratch_mib = ?estimated_total_scratch_mib,
+                live_headroom_mib = ?live_headroom_mib,
+                scratch_budget_mib = ?scratch_budget_mib,
                 "Gemma4 paged decode attention route selected"
             );
         }
@@ -1832,8 +2207,46 @@ impl Gemma4Attention {
 mod tests {
     use super::*;
 
+    fn decode_policy_input() -> PagedDecodePolicyInput {
+        PagedDecodePolicyInput {
+            mode: PagedDecodeMode::Auto,
+            query_dtype: DType::BFloat16,
+            cache_dtype: Some(DType::BFloat16),
+            context_bucket_end: 65_536,
+            num_query_heads: 16,
+            num_kv_heads: 2,
+            head_dim: 512,
+            block_size: 16,
+            logical_full_attention_invocations: 8,
+            graph_backend_available: true,
+            direct_grouped_candidate: false,
+            live_headroom_bytes: Some(16 * 1024 * 1024 * 1024),
+            sdpa_failed_in_bucket: false,
+        }
+    }
+
     #[test]
-    fn gemma4_paged_decode_route_keeps_storage_paged_and_bounds_sdpa_gather() {
+    fn gemma4_paged_decode_route_is_geometry_memory_and_failure_gated() {
+        let shared_layout = Gemma4Config {
+            num_hidden_layers: 8,
+            layer_types: (0..8)
+                .map(|idx| {
+                    if idx % 2 == 0 {
+                        "sliding_attention".to_string()
+                    } else {
+                        "full_attention".to_string()
+                    }
+                })
+                .collect(),
+            num_kv_shared_layers: Some(4),
+            ..Gemma4Config::default()
+        };
+        assert_eq!(
+            logical_full_attention_invocation_count(&shared_layout),
+            4,
+            "shared global aliases execute attention and must contribute scratch even though only their anchors own physical pool slots"
+        );
+
         assert_eq!(parse_paged_decode_mode(None), PagedDecodeMode::Auto);
         assert_eq!(
             parse_paged_decode_mode(Some("sdpa")),
@@ -1849,15 +2262,15 @@ mod tests {
         );
         assert_eq!(
             resolve_paged_decode_mode(None, Some("1")),
-            PagedDecodeMode::ForcePagedAttention,
-            "the grouped-kernel diagnostic selector must reach physical paging"
+            PagedDecodeMode::Auto,
+            "automatic grouped dispatch participates in policy rather than masquerading as an explicit route"
         );
         assert_eq!(
             resolve_paged_decode_mode(Some("auto"), Some("force")),
             PagedDecodeMode::ForcePagedAttention
         );
         assert_eq!(
-            resolve_paged_decode_mode(Some("sdpa"), Some("1")),
+            resolve_paged_decode_mode(Some("sdpa"), Some("force")),
             PagedDecodeMode::ForceSdpa,
             "an explicit decode-route override wins over the grouped selector"
         );
@@ -1865,16 +2278,17 @@ mod tests {
             resolve_paged_decode_mode(None, Some("0")),
             PagedDecodeMode::Auto
         );
-        assert_eq!(parse_grouped_gemma4_selector(Some("force")), "force");
-        assert_eq!(parse_grouped_gemma4_selector(Some("auto")), "auto");
+        assert_eq!(parse_grouped_d512_selector(Some("force")), "force");
+        assert_eq!(parse_grouped_d512_selector(Some("auto")), "auto");
+        assert_eq!(parse_grouped_d512_selector(None), "auto");
         assert_eq!(
-            parse_grouped_gemma4_selector(Some(" FORCE ")),
+            parse_grouped_d512_selector(Some(" FORCE ")),
             "off",
             "route diagnostics must use the dispatcher's exact env syntax"
         );
 
         assert_eq!(
-            grouped_gemma4_kernel_candidate(
+            grouped_d512_kernel_candidate(
                 "force",
                 Some(16),
                 3_417,
@@ -1884,11 +2298,12 @@ mod tests {
                 16,
                 1,
                 512,
+                true,
             ),
-            ("grouped_gemma4_d512_staged", Some(16))
+            ("grouped_d512_staged", Some(16))
         );
         assert_eq!(
-            grouped_gemma4_kernel_candidate(
+            grouped_d512_kernel_candidate(
                 "off",
                 Some(16),
                 3_417,
@@ -1898,12 +2313,13 @@ mod tests {
                 16,
                 1,
                 512,
+                true,
             ),
             ("generic_v2", None),
             "a stripes override alone must not enable the grouped kernel"
         );
         assert_eq!(
-            grouped_gemma4_kernel_candidate(
+            grouped_d512_kernel_candidate(
                 "force",
                 Some(16),
                 3_417,
@@ -1913,93 +2329,194 @@ mod tests {
                 16,
                 1,
                 512,
+                true,
             ),
             ("generic_v2", None),
             "the diagnostic candidate must enforce the dispatcher's BF16 guard"
         );
-
-        let short = select_paged_decode_path(
-            PagedDecodeMode::Auto,
-            DType::BFloat16,
-            Some(DType::BFloat16),
-            3417,
-            1,
-            512,
-            true,
-        );
-        assert_eq!(short, (PagedDecodePath::PagedAttention, 13_996_032));
-
         assert_eq!(
-            select_paged_decode_path(
-                PagedDecodeMode::Auto,
+            grouped_d512_kernel_candidate(
+                "auto",
+                None,
+                94_208,
                 DType::BFloat16,
                 Some(DType::BFloat16),
-                16_384,
-                1,
+                16,
+                16,
+                2,
                 512,
                 true,
-            )
-            .0,
-            PagedDecodePath::PagedAttention,
-            "automatic decode must consume the physical paged pool directly"
+            ),
+            ("grouped_d512_staged", Some(64)),
+            "the capability-confirmed Hkv2 geometry must remain direct-paged at long context"
         );
         assert_eq!(
-            select_paged_decode_path(
-                PagedDecodeMode::Auto,
+            grouped_d512_kernel_candidate(
+                "auto",
+                None,
+                decode_context_bucket_end(88 * 1024),
                 DType::BFloat16,
                 Some(DType::BFloat16),
-                16_385,
-                1,
+                16,
+                16,
+                2,
                 512,
                 true,
-            )
-            .0,
-            PagedDecodePath::PagedAttention,
-            "long contexts must retain the custom paged operator"
+            ),
+            ("generic_v2", None),
+            "the complete bucket below the measured crossover stays generic"
         );
-        for (cache_dtype, graph_backend_available) in [(None, true), (Some(DType::BFloat16), false)]
-        {
+        assert_eq!(
+            grouped_d512_kernel_candidate(
+                "auto",
+                None,
+                decode_context_bucket_end(88 * 1024 + 1),
+                DType::BFloat16,
+                Some(DType::BFloat16),
+                16,
+                16,
+                2,
+                512,
+                true,
+            ),
+            ("grouped_d512_staged", Some(64)),
+            "route stability intentionally enables the whole 92K-ending bucket"
+        );
+        for (query_heads, kv_heads, expected_stripes) in [(16, 1, 128), (16, 2, 64), (32, 4, 32)] {
             assert_eq!(
-                select_paged_decode_path(
-                    PagedDecodeMode::Auto,
+                grouped_d512_kernel_candidate(
+                    "auto",
+                    None,
+                    92 * 1024,
                     DType::BFloat16,
-                    cache_dtype,
-                    3417,
-                    1,
+                    Some(DType::BFloat16),
+                    16,
+                    query_heads,
+                    kv_heads,
                     512,
-                    graph_backend_available,
-                )
-                .0,
-                PagedDecodePath::PagedAttention,
-                "FP8/unsupported cache layouts and non-Metal callers stay on paged attention"
+                    true,
+                ),
+                ("grouped_d512_staged", Some(expected_stripes)),
+                "qualified D512 geometry must select grouped at the measured crossover"
             );
         }
         assert_eq!(
-            select_paged_decode_path(
-                PagedDecodeMode::ForcePagedAttention,
+            grouped_d512_kernel_candidate(
+                "auto",
+                None,
+                112 * 1024,
                 DType::BFloat16,
                 Some(DType::BFloat16),
-                3417,
+                16,
+                8,
                 1,
                 512,
                 true,
-            )
-            .0,
-            PagedDecodePath::PagedAttention
+            ),
+            ("generic_v2", None),
+            "unstable Hq8/Hkv1 remains force-only"
         );
         assert_eq!(
-            select_paged_decode_path(
-                PagedDecodeMode::ForceSdpa,
-                DType::BFloat16,
-                Some(DType::BFloat16),
-                131_072,
-                1,
-                512,
-                true,
-            )
-            .0,
-            PagedDecodePath::PagedPoolSdpa,
-            "the explicit diagnostic override may exceed the automatic memory budget"
+            paged_decode_route_hint("generic_v2"),
+            PagedDecodeRouteHint::ForceGeneric,
+            "model-level generic decisions must not be overridden by low-level Auto"
+        );
+        assert_eq!(
+            paged_decode_route_hint("grouped_d512_staged"),
+            PagedDecodeRouteHint::ForceD512Staged
+        );
+
+        assert_eq!(decode_context_bucket_end(1), 4096);
+        assert_eq!(decode_context_bucket_end(4096), 4096);
+        assert_eq!(decode_context_bucket_end(4097), 8192);
+        assert_eq!(decode_context_bucket_end(91_765), 92 * 1024);
+
+        let mut input = decode_policy_input();
+        let exact_estimate = select_paged_decode_plan(input)
+            .estimated_total_bytes
+            .expect("eligible geometry has a finite estimate");
+        assert_eq!(exact_estimate, 4_378_853_376);
+        let exact_after_reserve = exact_estimate / 9 * 10;
+        assert_eq!(
+            decode_scratch_budget(DECODE_HEADROOM_RESERVE_BYTES + exact_after_reserve),
+            exact_estimate
+        );
+        input.live_headroom_bytes = Some(DECODE_HEADROOM_RESERVE_BYTES + exact_after_reserve);
+        let exact_fit = select_paged_decode_plan(input);
+        assert_eq!(exact_fit.path, PagedDecodePath::PagedPoolSdpa);
+        assert_eq!(exact_fit.reason, PagedDecodeReason::AutoSdpaFits);
+
+        input.live_headroom_bytes = Some(DECODE_HEADROOM_RESERVE_BYTES + exact_after_reserve - 1);
+        let one_byte_short = select_paged_decode_plan(input);
+        assert_eq!(one_byte_short.path, PagedDecodePath::PagedAttention);
+        assert_eq!(
+            one_byte_short.reason,
+            PagedDecodeReason::InsufficientHeadroom
+        );
+
+        input = decode_policy_input();
+        input.live_headroom_bytes = None;
+        assert_eq!(
+            select_paged_decode_plan(input).reason,
+            PagedDecodeReason::UnknownHeadroom
+        );
+
+        input = decode_policy_input();
+        input.query_dtype = DType::Float16;
+        assert_eq!(
+            select_paged_decode_plan(input).reason,
+            PagedDecodeReason::UnsupportedDtype
+        );
+        input = decode_policy_input();
+        input.num_kv_heads = 1;
+        assert_eq!(
+            select_paged_decode_plan(input).reason,
+            PagedDecodeReason::UnsupportedGeometry
+        );
+
+        input = decode_policy_input();
+        input.context_bucket_end = u64::MAX;
+        let overflow = select_paged_decode_plan(input);
+        assert_eq!(overflow.path, PagedDecodePath::PagedAttention);
+        assert_eq!(overflow.reason, PagedDecodeReason::ScratchEstimateOverflow);
+
+        input = decode_policy_input();
+        input.direct_grouped_candidate = true;
+        input.live_headroom_bytes = None;
+        let grouped = select_paged_decode_plan(input);
+        assert_eq!(grouped.path, PagedDecodePath::PagedAttention);
+        assert_eq!(grouped.reason, PagedDecodeReason::DirectGroupedCandidate);
+
+        input = decode_policy_input();
+        input.sdpa_failed_in_bucket = true;
+        assert_eq!(
+            select_paged_decode_plan(input).reason,
+            PagedDecodeReason::SdpaFailedInBucket
+        );
+
+        input = decode_policy_input();
+        input.mode = PagedDecodeMode::ForceSdpa;
+        input.direct_grouped_candidate = true;
+        input.live_headroom_bytes = None;
+        assert_eq!(
+            select_paged_decode_plan(input).reason,
+            PagedDecodeReason::ExplicitSdpa,
+            "an explicit diagnostic override bypasses automatic crossover and memory gates"
+        );
+        input.graph_backend_available = false;
+        assert_eq!(
+            select_paged_decode_plan(input).reason,
+            PagedDecodeReason::ExplicitSdpaUnavailable
+        );
+        input.mode = PagedDecodeMode::ForcePagedAttention;
+        assert_eq!(
+            select_paged_decode_plan(input).reason,
+            PagedDecodeReason::ExplicitPaged
+        );
+
+        assert_eq!(
+            estimate_decode_sdpa_gather_bytes(3417, 1, 512, 2),
+            13_996_032
         );
     }
 

@@ -122,6 +122,30 @@ mlx_array* mlx_paged_attention_forward(
   return nullptr;
 }
 
+mlx_array* mlx_paged_attention_forward_with_route(
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    float,
+    float,
+    int,
+    int,
+    int,
+    int,
+    int,
+    uint8_t,
+    uint8_t) {
+  return nullptr;
+}
+
+int mlx_paged_grouped_d512_capability(int, int) {
+  return 0;
+}
+
 mlx_array* mlx_paged_attention_varlen_forward(
     mlx_array*,
     mlx_array*,

@@ -1124,9 +1124,52 @@ impl LayerKVPool {
         k_scale: f32,
         v_scale: f32,
     ) -> Result<crate::metal::PagedAttentionOutput, String> {
+        unsafe {
+            self.gather_attention_with_route(
+                layer_idx,
+                queries,
+                query_dtype,
+                block_ids,
+                num_tokens_in_request,
+                num_query_heads,
+                scale,
+                softcap,
+                sliding_window,
+                k_scale,
+                v_scale,
+                crate::metal::PagedAttentionRouteHint::Auto,
+            )
+        }
+    }
+
+    /// Route-hinted sibling of [`Self::gather_attention`]. The hint affects
+    /// only the compute kernel; K/V buffers and block-table semantics are
+    /// identical.
+    ///
+    /// # Safety
+    /// The caller must uphold the same evaluated-query pointer, pool lifetime,
+    /// block-id, and token-count requirements as [`Self::gather_attention`].
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gather_attention_with_route(
+        &self,
+        layer_idx: u32,
+        queries: *mut mlx_sys::mlx_array,
+        query_dtype: crate::metal::MetalDtype,
+        block_ids: &[i32],
+        num_tokens_in_request: u32,
+        num_query_heads: u32,
+        scale: f32,
+        softcap: f32,
+        sliding_window: i32,
+        k_scale: f32,
+        v_scale: f32,
+        route_hint: crate::metal::PagedAttentionRouteHint,
+    ) -> Result<crate::metal::PagedAttentionOutput, String> {
         use crate::metal::{
             MetalState, MlxMetalBuffer, PagedAttentionParams, RawBufferInfo,
-            dispatch_paged_attention_auto, is_metal_extraction_supported, synchronize_mlx,
+            dispatch_paged_attention_auto_with_route, is_metal_extraction_supported,
+            synchronize_mlx,
         };
         use metal::MTLResourceOptions;
 
@@ -1251,7 +1294,7 @@ impl LayerKVPool {
         // bindings on the stack held until after the synchronous dispatch
         // returns; key_cache / value_cache live for the lifetime of the pool.
         unsafe {
-            dispatch_paged_attention_auto(
+            dispatch_paged_attention_auto_with_route(
                 &query_raw,
                 key_cache,
                 value_cache,
@@ -1261,6 +1304,7 @@ impl LayerKVPool {
                 &params,
                 io_dtype,
                 cache_dtype,
+                route_hint,
             )
         }
     }

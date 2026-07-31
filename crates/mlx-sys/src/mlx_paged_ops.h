@@ -132,7 +132,8 @@ class PagedAttention : public Custom {
       int num_kv_heads,
       int head_size,
       int sliding_window,
-      KvDtype kv_dtype)
+      KvDtype kv_dtype,
+      uint8_t route_hint = 0)
       : Custom(stream, std::move(fallback)),
         scale_(scale),
         softcap_(softcap),
@@ -141,7 +142,8 @@ class PagedAttention : public Custom {
         num_kv_heads_(num_kv_heads),
         head_size_(head_size),
         sliding_window_(sliding_window),
-        kv_dtype_(kv_dtype) {}
+        kv_dtype_(kv_dtype),
+        route_hint_(route_hint) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -173,7 +175,8 @@ class PagedAttention : public Custom {
         num_kv_heads_,
         head_size_,
         sliding_window_,
-        static_cast<uint8_t>(kv_dtype_));
+        static_cast<uint8_t>(kv_dtype_),
+        route_hint_);
   }
 
  private:
@@ -185,6 +188,7 @@ class PagedAttention : public Custom {
   int head_size_;
   int sliding_window_;
   KvDtype kv_dtype_;
+  uint8_t route_hint_;
 };
 
 // =============================================================================
@@ -272,6 +276,29 @@ array paged_attention(
     int num_kv_heads,
     int head_size,
     KvDtype kv_dtype,
+    StreamOrDevice s = {});
+
+/// Emit `PagedAttention` with an explicit compute-route hint:
+/// 0=automatic, 1=force the supported staged D512 kernel, 2=force generic.
+/// The hint affects only the compute kernel; the paged K/V layout and block
+/// table remain authoritative.
+array paged_attention_with_route_hint(
+    const array& q,
+    const array& k_pool,
+    const array& v_pool,
+    const array& block_table,
+    const array& seq_lens,
+    const array& k_scale,
+    const array& v_scale,
+    float scale,
+    float softcap,
+    int sliding_window,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    KvDtype kv_dtype,
+    uint8_t route_hint,
     StreamOrDevice s = {});
 
 /// Ragged-Q sibling of `PagedAttention`. Accepts a flat

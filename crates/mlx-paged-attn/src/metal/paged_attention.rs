@@ -114,43 +114,59 @@ const PARTITION_SIZE: u32 = 512;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GroupedPagedAttentionKind {
     Qwen35D256,
-    Gemma4D512,
+    D512Staged,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GroupedGemma4Mode {
+enum GroupedD512Mode {
     Disabled,
     Auto,
     Force,
 }
 
-fn grouped_gemma4_stripe_override_value(value: Option<&str>) -> Option<u32> {
+/// Per-dispatch compute route. This changes only which kernel reads the
+/// authoritative paged pool.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PagedAttentionRouteHint {
+    #[default]
+    Auto,
+    ForceD512Staged,
+    ForceGeneric,
+}
+
+fn grouped_d512_stripe_override_value(value: Option<&str>) -> Option<u32> {
     value
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| matches!(value, 4 | 8 | 16 | 32 | 64 | 128 | 256))
 }
 
-fn grouped_gemma4_stripe_override() -> Option<u32> {
+fn grouped_d512_stripe_override() -> Option<u32> {
     static STRIPES: OnceLock<Option<u32>> = OnceLock::new();
     *STRIPES.get_or_init(|| {
-        grouped_gemma4_stripe_override_value(
-            std::env::var("MLX_PAGED_GROUPED_GEMMA4_STRIPES")
+        grouped_d512_stripe_override_value(
+            std::env::var("MLX_PAGED_GROUPED_D512_STRIPES")
                 .ok()
+                .or_else(|| std::env::var("MLX_PAGED_GROUPED_GEMMA4_STRIPES").ok())
                 .as_deref(),
         )
     })
 }
 
-fn grouped_stripe_count(kind: GroupedPagedAttentionKind, max_context_len: u32) -> u32 {
-    if kind == GroupedPagedAttentionKind::Gemma4D512 {
-        if let Some(stripes) = grouped_gemma4_stripe_override() {
+fn grouped_stripe_count(
+    kind: GroupedPagedAttentionKind,
+    max_context_len: u32,
+    num_kv_heads: u32,
+) -> u32 {
+    if kind == GroupedPagedAttentionKind::D512Staged {
+        if let Some(stripes) = grouped_d512_stripe_override() {
             return stripes;
         }
-        return match max_context_len {
+        let base_stripes = match max_context_len {
             0..=4096 => 32,
             4097..=8192 => 64,
             _ => 128,
         };
+        return (base_stripes / num_kv_heads.max(1)).max(4);
     }
     match max_context_len {
         0..=4096 => 32,
@@ -176,21 +192,25 @@ fn grouped_qwen35_paged_attention_enabled() -> bool {
     })
 }
 
-fn grouped_gemma4_env_mode_value(value: Option<&str>) -> GroupedGemma4Mode {
+fn grouped_d512_env_mode_value(value: Option<&str>) -> GroupedD512Mode {
     match value {
-        Some("1" | "on" | "auto" | "true") => GroupedGemma4Mode::Auto,
-        Some("force") => GroupedGemma4Mode::Force,
-        _ => GroupedGemma4Mode::Disabled,
+        Some("1" | "on" | "auto" | "true") => GroupedD512Mode::Auto,
+        Some("force") => GroupedD512Mode::Force,
+        _ => GroupedD512Mode::Disabled,
     }
 }
 
-fn grouped_gemma4_paged_attention_mode() -> GroupedGemma4Mode {
-    // Default-off diagnostic selector. Cache once because raw dispatch is also
-    // used in token-level benchmarks and should not read the environment on
-    // every invocation.
-    static MODE: OnceLock<GroupedGemma4Mode> = OnceLock::new();
+fn grouped_d512_paged_attention_mode() -> GroupedD512Mode {
+    // Cache the generic setting once on the token hot path. The former
+    // Gemma-specific variable remains a compatibility alias.
+    static MODE: OnceLock<GroupedD512Mode> = OnceLock::new();
     *MODE.get_or_init(|| {
-        grouped_gemma4_env_mode_value(std::env::var("MLX_PAGED_GROUPED_GEMMA4").ok().as_deref())
+        grouped_d512_env_mode_value(
+            std::env::var("MLX_PAGED_GROUPED_D512")
+                .ok()
+                .or_else(|| std::env::var("MLX_PAGED_GROUPED_GEMMA4").ok())
+                .as_deref(),
+        )
     })
 }
 
@@ -253,8 +273,8 @@ fn use_grouped_qwen35_paged_attention(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn grouped_gemma4_shape_matches(
-    mode: GroupedGemma4Mode,
+fn grouped_d512_shape_matches(
+    mode: GroupedD512Mode,
     io_dtype: MetalDtype,
     cache_dtype: MetalDtype,
     num_seqs: u32,
@@ -265,17 +285,23 @@ fn grouped_gemma4_shape_matches(
     query_rows: u32,
     max_context_len: u32,
 ) -> bool {
+    let supported_heads = matches!(
+        (num_heads, num_kv_heads),
+        (8, 1) | (16, 1) | (16, 2) | (32, 4)
+    );
     let exact_shape = io_dtype == MetalDtype::BFloat16
         && cache_dtype == MetalDtype::BFloat16
         && num_seqs == 1
-        && (num_heads, num_kv_heads) == (16, 1)
+        && supported_heads
         && head_size == 512
         && block_size == 16
         && query_rows == 1
         && max_context_len > PARTITION_SIZE;
     exact_shape
-        && mode != GroupedGemma4Mode::Disabled
-        && (mode == GroupedGemma4Mode::Force || (3_072..=16_384).contains(&max_context_len))
+        && mode != GroupedD512Mode::Disabled
+        && (mode == GroupedD512Mode::Force
+            || ((num_heads, num_kv_heads) == (16, 1)
+                && (3_072..=16_384).contains(&max_context_len)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -289,7 +315,26 @@ fn select_grouped_paged_attention(
     block_size: u32,
     query_rows: u32,
     max_context_len: u32,
+    route_hint: PagedAttentionRouteHint,
 ) -> Option<GroupedPagedAttentionKind> {
+    if route_hint == PagedAttentionRouteHint::ForceGeneric {
+        return None;
+    }
+    if route_hint == PagedAttentionRouteHint::ForceD512Staged {
+        return grouped_d512_shape_matches(
+            GroupedD512Mode::Force,
+            io_dtype,
+            cache_dtype,
+            num_seqs,
+            num_heads,
+            num_kv_heads,
+            head_size,
+            block_size,
+            query_rows,
+            max_context_len,
+        )
+        .then_some(GroupedPagedAttentionKind::D512Staged);
+    }
     if use_grouped_qwen35_paged_attention(
         io_dtype,
         cache_dtype,
@@ -303,8 +348,8 @@ fn select_grouped_paged_attention(
     ) {
         return Some(GroupedPagedAttentionKind::Qwen35D256);
     }
-    if grouped_gemma4_shape_matches(
-        grouped_gemma4_paged_attention_mode(),
+    if grouped_d512_shape_matches(
+        grouped_d512_paged_attention_mode(),
         io_dtype,
         cache_dtype,
         num_seqs,
@@ -315,7 +360,7 @@ fn select_grouped_paged_attention(
         query_rows,
         max_context_len,
     ) {
-        return Some(GroupedPagedAttentionKind::Gemma4D512);
+        return Some(GroupedPagedAttentionKind::D512Staged);
     }
     None
 }
@@ -325,8 +370,8 @@ fn grouped_kernel_name(kind: GroupedPagedAttentionKind) -> &'static str {
         GroupedPagedAttentionKind::Qwen35D256 => {
             MetalState::paged_attention_grouped_qwen35_kernel_name()
         }
-        GroupedPagedAttentionKind::Gemma4D512 => {
-            MetalState::paged_attention_grouped_gemma4_kernel_name()
+        GroupedPagedAttentionKind::D512Staged => {
+            MetalState::paged_attention_grouped_d512_kernel_name()
         }
     }
 }
@@ -336,8 +381,8 @@ fn grouped_reduce_kernel_name(kind: GroupedPagedAttentionKind) -> &'static str {
         GroupedPagedAttentionKind::Qwen35D256 => {
             MetalState::paged_attention_grouped_qwen35_reduce_kernel_name()
         }
-        GroupedPagedAttentionKind::Gemma4D512 => {
-            MetalState::paged_attention_grouped_gemma4_reduce_kernel_name()
+        GroupedPagedAttentionKind::D512Staged => {
+            MetalState::paged_attention_grouped_d512_reduce_kernel_name()
         }
     }
 }
@@ -358,7 +403,7 @@ fn grouped_pipelines_supported(
     static GEMMA4_LIMITS: OnceLock<Option<(u64, u64)>> = OnceLock::new();
     let limits = match kind {
         GroupedPagedAttentionKind::Qwen35D256 => &QWEN35_LIMITS,
-        GroupedPagedAttentionKind::Gemma4D512 => &GEMMA4_LIMITS,
+        GroupedPagedAttentionKind::D512Staged => &GEMMA4_LIMITS,
     };
     let Some((stage_threads, reduce_threads)) = *limits.get_or_init(|| {
         let stage = match state.get_pipeline(grouped_kernel_name(kind)) {
@@ -401,7 +446,7 @@ fn grouped_pipelines_supported(
         static GEMMA4_WARNED: OnceLock<()> = OnceLock::new();
         let warned = match kind {
             GroupedPagedAttentionKind::Qwen35D256 => &QWEN35_WARNED,
-            GroupedPagedAttentionKind::Gemma4D512 => &GEMMA4_WARNED,
+            GroupedPagedAttentionKind::D512Staged => &GEMMA4_WARNED,
         };
         warned.get_or_init(|| {
             tracing::warn!(
@@ -418,7 +463,7 @@ fn grouped_pipelines_supported(
 }
 
 #[cfg(test)]
-mod grouped_qwen35_selection_tests {
+mod grouped_selection_tests {
     use super::*;
 
     #[test]
@@ -427,22 +472,19 @@ mod grouped_qwen35_selection_tests {
         assert!(grouped_qwen35_env_enabled_value(Some("1")));
         assert!(grouped_qwen35_env_enabled_value(Some("true")));
         assert!(!grouped_qwen35_env_enabled_value(Some("0")));
+        assert_eq!(grouped_d512_env_mode_value(None), GroupedD512Mode::Disabled);
         assert_eq!(
-            grouped_gemma4_env_mode_value(None),
-            GroupedGemma4Mode::Disabled
+            grouped_d512_env_mode_value(Some("1")),
+            GroupedD512Mode::Auto
         );
         assert_eq!(
-            grouped_gemma4_env_mode_value(Some("1")),
-            GroupedGemma4Mode::Auto
+            grouped_d512_env_mode_value(Some("force")),
+            GroupedD512Mode::Force
         );
-        assert_eq!(
-            grouped_gemma4_env_mode_value(Some("force")),
-            GroupedGemma4Mode::Force
-        );
-        assert_eq!(grouped_gemma4_stripe_override_value(Some("4")), Some(4));
-        assert_eq!(grouped_gemma4_stripe_override_value(Some("128")), Some(128));
-        assert_eq!(grouped_gemma4_stripe_override_value(Some("3")), None);
-        assert_eq!(grouped_gemma4_stripe_override_value(Some("oops")), None);
+        assert_eq!(grouped_d512_stripe_override_value(Some("4")), Some(4));
+        assert_eq!(grouped_d512_stripe_override_value(Some("128")), Some(128));
+        assert_eq!(grouped_d512_stripe_override_value(Some("3")), None);
+        assert_eq!(grouped_d512_stripe_override_value(Some("oops")), None);
     }
 
     #[test]
@@ -514,29 +556,129 @@ mod grouped_qwen35_selection_tests {
     }
 
     #[test]
-    fn exact_gemma4_shape_is_default_off_and_auto_is_bounded() {
-        let matches = |mode, query_rows, max_context_len| {
-            grouped_gemma4_shape_matches(
+    fn exact_d512_shapes_are_default_off_and_auto_is_bounded() {
+        let matches = |mode, num_heads, num_kv_heads, query_rows, max_context_len| {
+            grouped_d512_shape_matches(
                 mode,
                 MetalDtype::BFloat16,
                 MetalDtype::BFloat16,
                 1,
-                16,
-                1,
+                num_heads,
+                num_kv_heads,
                 512,
                 16,
                 query_rows,
                 max_context_len,
             )
         };
-        assert!(!matches(GroupedGemma4Mode::Disabled, 1, 3_458));
-        assert!(!matches(GroupedGemma4Mode::Auto, 1, 3_071));
-        assert!(matches(GroupedGemma4Mode::Auto, 1, 3_072));
-        assert!(matches(GroupedGemma4Mode::Auto, 1, 16_384));
-        assert!(!matches(GroupedGemma4Mode::Auto, 1, 16_385));
-        assert!(!matches(GroupedGemma4Mode::Force, 1, PARTITION_SIZE));
-        assert!(matches(GroupedGemma4Mode::Force, 1, PARTITION_SIZE + 1));
-        assert!(!matches(GroupedGemma4Mode::Force, 2, 3_458));
+        for (num_heads, num_kv_heads) in [(8, 1), (16, 1), (16, 2), (32, 4)] {
+            assert!(!matches(
+                GroupedD512Mode::Disabled,
+                num_heads,
+                num_kv_heads,
+                1,
+                3_458
+            ));
+            assert!(!matches(
+                GroupedD512Mode::Auto,
+                num_heads,
+                num_kv_heads,
+                1,
+                3_071
+            ));
+            assert_eq!(
+                matches(GroupedD512Mode::Auto, num_heads, num_kv_heads, 1, 3_072),
+                (num_heads, num_kv_heads) == (16, 1)
+            );
+            assert_eq!(
+                matches(GroupedD512Mode::Auto, num_heads, num_kv_heads, 1, 16_384),
+                (num_heads, num_kv_heads) == (16, 1)
+            );
+            assert!(!matches(
+                GroupedD512Mode::Auto,
+                num_heads,
+                num_kv_heads,
+                1,
+                16_385
+            ));
+            assert!(!matches(
+                GroupedD512Mode::Force,
+                num_heads,
+                num_kv_heads,
+                1,
+                PARTITION_SIZE
+            ));
+            assert!(matches(
+                GroupedD512Mode::Force,
+                num_heads,
+                num_kv_heads,
+                1,
+                PARTITION_SIZE + 1
+            ));
+            assert!(!matches(
+                GroupedD512Mode::Force,
+                num_heads,
+                num_kv_heads,
+                2,
+                3_458
+            ));
+        }
+        for (num_heads, num_kv_heads) in [(8, 2), (16, 4), (24, 4), (32, 2)] {
+            assert!(!matches(
+                GroupedD512Mode::Force,
+                num_heads,
+                num_kv_heads,
+                1,
+                8_193
+            ));
+        }
+    }
+
+    #[test]
+    fn d512_stripes_account_for_kv_head_parallelism() {
+        for (context, expected) in [
+            (4_096, [32, 16, 8]),
+            (4_097, [64, 32, 16]),
+            (8_193, [128, 64, 32]),
+        ] {
+            for (kv_heads, expected) in [1, 2, 4].into_iter().zip(expected) {
+                assert_eq!(
+                    grouped_stripe_count(GroupedPagedAttentionKind::D512Staged, context, kv_heads),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_route_hint_bypasses_environment_and_context_only() {
+        let select = |hint, num_heads, num_kv_heads, context| {
+            select_grouped_paged_attention(
+                MetalDtype::BFloat16,
+                MetalDtype::BFloat16,
+                1,
+                num_heads,
+                num_kv_heads,
+                512,
+                16,
+                1,
+                context,
+                hint,
+            )
+        };
+        assert_eq!(
+            select(PagedAttentionRouteHint::ForceD512Staged, 16, 2, 91_765),
+            Some(GroupedPagedAttentionKind::D512Staged)
+        );
+        assert_eq!(
+            select(PagedAttentionRouteHint::ForceGeneric, 16, 2, 8_193),
+            None
+        );
+        assert_eq!(
+            select(PagedAttentionRouteHint::ForceD512Staged, 16, 4, 91_765),
+            None,
+            "a route hint must not bypass geometry validation"
+        );
     }
 }
 
@@ -560,10 +702,13 @@ pub struct PagedAttentionOutput {
     /// silent generic fallback.
     #[doc(hidden)]
     pub used_grouped_qwen35: bool,
-    /// Whether this dispatch selected the experimental D512 16Q/1KV Gemma 4
-    /// grouped route.
+    /// Compatibility alias for callers that previously observed the
+    /// Gemma-specific D512 route bit.
     #[doc(hidden)]
     pub used_grouped_gemma4: bool,
+    /// Whether this dispatch selected the geometry-based staged D512 route.
+    #[doc(hidden)]
+    pub used_grouped_d512: bool,
 }
 
 impl PagedAttentionOutput {
@@ -915,6 +1060,7 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
         dtype: io_dtype,
         used_grouped_qwen35: false,
         used_grouped_gemma4: false,
+        used_grouped_d512: false,
     })
 }
 
@@ -935,6 +1081,38 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
     params: &PagedAttentionParams,
     io_dtype: MetalDtype,
     cache_dtype: MetalDtype,
+) -> Result<PagedAttentionOutput, String> {
+    unsafe {
+        dispatch_paged_attention_v2_raw_with_route(
+            queries,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lens,
+            params,
+            io_dtype,
+            cache_dtype,
+            PagedAttentionRouteHint::Auto,
+        )
+    }
+}
+
+/// Route-hinted sibling of [`dispatch_paged_attention_v2_raw`].
+///
+/// # Safety
+///
+/// Same requirements as V1.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dispatch_paged_attention_v2_raw_with_route(
+    queries: &RawBufferInfo,
+    key_cache: &Buffer,
+    value_cache: &Buffer,
+    block_tables: &Buffer,
+    context_lens: &Buffer,
+    params: &PagedAttentionParams,
+    io_dtype: MetalDtype,
+    cache_dtype: MetalDtype,
+    route_hint: PagedAttentionRouteHint,
 ) -> Result<PagedAttentionOutput, String> {
     let state = MetalState::get()?;
 
@@ -959,12 +1137,13 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         params.block_size,
         1,
         params.max_seq_len,
+        route_hint,
     );
     let use_grouped = grouped_kind.is_some_and(|kind| {
         grouped_pipelines_supported(state, kind, params.num_heads, params.num_kv_heads)
     });
     let max_num_partitions = if let Some(kind) = grouped_kind.filter(|_| use_grouped) {
-        grouped_stripe_count(kind, params.max_seq_len)
+        grouped_stripe_count(kind, params.max_seq_len, params.num_kv_heads)
     } else {
         params.max_seq_len.div_ceil(PARTITION_SIZE)
     };
@@ -1181,7 +1360,9 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         used_grouped_qwen35: use_grouped
             && grouped_kind == Some(GroupedPagedAttentionKind::Qwen35D256),
         used_grouped_gemma4: use_grouped
-            && grouped_kind == Some(GroupedPagedAttentionKind::Gemma4D512),
+            && grouped_kind == Some(GroupedPagedAttentionKind::D512Staged),
+        used_grouped_d512: use_grouped
+            && grouped_kind == Some(GroupedPagedAttentionKind::D512Staged),
     })
 }
 
@@ -1207,6 +1388,39 @@ pub unsafe fn dispatch_paged_attention_auto(
     io_dtype: MetalDtype,
     cache_dtype: MetalDtype,
 ) -> Result<PagedAttentionOutput, String> {
+    unsafe {
+        dispatch_paged_attention_auto_with_route(
+            queries,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lens,
+            max_context_len,
+            params,
+            io_dtype,
+            cache_dtype,
+            PagedAttentionRouteHint::Auto,
+        )
+    }
+}
+
+/// Route-hinted sibling of [`dispatch_paged_attention_auto`].
+///
+/// # Safety
+/// Same requirements as [`dispatch_paged_attention_auto`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dispatch_paged_attention_auto_with_route(
+    queries: &RawBufferInfo,
+    key_cache: &Buffer,
+    value_cache: &Buffer,
+    block_tables: &Buffer,
+    context_lens: &Buffer,
+    max_context_len: u32,
+    params: &PagedAttentionParams,
+    io_dtype: MetalDtype,
+    cache_dtype: MetalDtype,
+    route_hint: PagedAttentionRouteHint,
+) -> Result<PagedAttentionOutput, String> {
     if max_context_len <= PARTITION_SIZE {
         // SAFETY: Caller guarantees all buffer pointers are valid
         unsafe {
@@ -1224,7 +1438,7 @@ pub unsafe fn dispatch_paged_attention_auto(
     } else {
         // SAFETY: Caller guarantees all buffer pointers are valid
         unsafe {
-            dispatch_paged_attention_v2_raw(
+            dispatch_paged_attention_v2_raw_with_route(
                 queries,
                 key_cache,
                 value_cache,
@@ -1233,6 +1447,7 @@ pub unsafe fn dispatch_paged_attention_auto(
                 params,
                 io_dtype,
                 cache_dtype,
+                route_hint,
             )
         }
     }
@@ -1468,6 +1683,7 @@ pub unsafe fn dispatch_paged_attention_varlen_v1_raw(
         dtype: io_dtype,
         used_grouped_qwen35: false,
         used_grouped_gemma4: false,
+        used_grouped_d512: false,
     })
 }
 
@@ -1511,6 +1727,7 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
                 params.block_size,
                 params.total_queries,
                 params.max_seq_len,
+                PagedAttentionRouteHint::Auto,
             )
         })
         .flatten();
@@ -1525,7 +1742,7 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
     // `effective_context_len`-derived `num_partitions` it computes
     // independently.
     let max_num_partitions = if let Some(kind) = grouped_kind.filter(|_| use_grouped) {
-        grouped_stripe_count(kind, params.max_seq_len)
+        grouped_stripe_count(kind, params.max_seq_len, params.num_kv_heads)
     } else {
         params.max_seq_len.div_ceil(PARTITION_SIZE)
     };
@@ -1738,7 +1955,9 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         used_grouped_qwen35: use_grouped
             && grouped_kind == Some(GroupedPagedAttentionKind::Qwen35D256),
         used_grouped_gemma4: use_grouped
-            && grouped_kind == Some(GroupedPagedAttentionKind::Gemma4D512),
+            && grouped_kind == Some(GroupedPagedAttentionKind::D512Staged),
+        used_grouped_d512: use_grouped
+            && grouped_kind == Some(GroupedPagedAttentionKind::D512Staged),
     })
 }
 

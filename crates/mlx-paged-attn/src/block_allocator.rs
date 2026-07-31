@@ -2548,12 +2548,61 @@ mod tests {
         assert_eq!(b1.get_ref_count(), 2);
         assert_eq!(b2.get_ref_count(), 2);
 
+        // Snapshot every cache-authority table before the failed allocation.
+        // A no-candidate scan must be observationally neutral: in particular,
+        // it must not refresh any hit or disturb LRU ordering just because it
+        // inspected in-use entries while looking for an evictable block.
+        let mut prefix_cache_before: Vec<(u64, u32, usize)> = allocator
+            .prefix_cache
+            .iter()
+            .map(|(&hash, block)| (hash, block.block_id, Arc::as_ptr(block) as usize))
+            .collect();
+        prefix_cache_before.sort_unstable();
+        let identities_before = allocator.prefix_cache_identities.clone();
+        let block_hashes_before = allocator.block_hashes.clone();
+        let lru_before: Vec<u64> = allocator.lru_order.iter().copied().collect();
+        let mut allocated_before: Vec<(u32, usize)> = allocator
+            .allocated
+            .iter()
+            .map(|(&block_id, block)| (block_id, Arc::as_ptr(block) as usize))
+            .collect();
+        allocated_before.sort_unstable();
+        let free_before: Vec<u32> = allocator.free_blocks.iter().copied().collect();
+        let ref_counts_before = [b1.get_ref_count(), b2.get_ref_count()];
+
         // allocate must return None — there's nothing it can give us.
         assert!(
             allocator.allocate().is_none(),
             "allocate must return None when free pool is empty AND every \
              cache entry has a live request handle"
         );
+
+        let mut prefix_cache_after: Vec<(u64, u32, usize)> = allocator
+            .prefix_cache
+            .iter()
+            .map(|(&hash, block)| (hash, block.block_id, Arc::as_ptr(block) as usize))
+            .collect();
+        prefix_cache_after.sort_unstable();
+        let mut allocated_after: Vec<(u32, usize)> = allocator
+            .allocated
+            .iter()
+            .map(|(&block_id, block)| (block_id, Arc::as_ptr(block) as usize))
+            .collect();
+        allocated_after.sort_unstable();
+        assert_eq!(prefix_cache_after, prefix_cache_before);
+        assert_eq!(allocator.prefix_cache_identities, identities_before);
+        assert_eq!(allocator.block_hashes, block_hashes_before);
+        assert_eq!(
+            allocator.lru_order.iter().copied().collect::<Vec<_>>(),
+            lru_before,
+            "a failed allocation must not reorder cache hits"
+        );
+        assert_eq!(allocated_after, allocated_before);
+        assert_eq!(
+            allocator.free_blocks.iter().copied().collect::<Vec<_>>(),
+            free_before
+        );
+        assert_eq!([b1.get_ref_count(), b2.get_ref_count()], ref_counts_before);
     }
 
     /// `can_allocate` must count evictable cache-only blocks alongside
