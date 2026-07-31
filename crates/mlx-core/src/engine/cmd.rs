@@ -576,6 +576,8 @@ mod mock_backend_tests {
         session_media_knob: MediaCapabilities,
         /// Whether the supplied historical payloads match that media state.
         session_media_matches_payloads_knob: bool,
+        /// Last continuation flag supplied to `profiler_label`.
+        profiler_is_delta_seen: AtomicBool,
         /// Simulate an eager-MTP turn whose physical trunk advanced beyond
         /// the committed token history.
         flat_caches_desynced_knob: bool,
@@ -619,6 +621,7 @@ mod mock_backend_tests {
                 speculative_complete_knob: false,
                 session_media_knob: MediaCapabilities::NONE,
                 session_media_matches_payloads_knob: false,
+                profiler_is_delta_seen: AtomicBool::new(false),
                 flat_caches_desynced_knob: false,
                 render_prompt_calls: AtomicUsize::new(0),
             }
@@ -757,6 +760,12 @@ mod mock_backend_tests {
 
         fn session_media_matches_payloads(&self, _images: &[Vec<u8>], _audio: &[Vec<u8>]) -> bool {
             self.session_media_matches_payloads_knob
+        }
+
+        fn profiler_label(&self, is_delta: bool, _is_streaming: bool) -> &'static str {
+            self.profiler_is_delta_seen
+                .store(is_delta, Ordering::Relaxed);
+            "mock"
         }
 
         fn flat_caches_desynced(&self) -> bool {
@@ -1062,6 +1071,10 @@ mod mock_backend_tests {
             }
         );
         assert!(!backend.save_calls[0].is_delta);
+        assert!(
+            !backend.profiler_is_delta_seen.load(Ordering::Relaxed),
+            "fresh generic turns must use the fresh profiler label"
+        );
         assert_eq!(backend.save_calls[0].finish_reason, "stop");
         assert!(backend.save_calls[0].reuse_cache);
 
@@ -1113,6 +1126,10 @@ mod mock_backend_tests {
             }
         );
         assert!(backend.save_calls[1].is_delta);
+        assert!(
+            backend.profiler_is_delta_seen.load(Ordering::Relaxed),
+            "live generic continuations must use the delta profiler label"
+        );
         // The exact prefix match avoids a cache reset.
         assert_eq!(backend.reset_calls.len(), 1);
 

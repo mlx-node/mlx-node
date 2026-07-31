@@ -705,7 +705,7 @@ fn chat_turn_core<B: ChatBackend>(
         .map(|bytes| crate::stream::WiredLimitContext::new(bytes, vec![generation_stream]));
 
     let mut profiler = DecodeProfiler::new(
-        backend.profiler_label(false, streaming.is_some()),
+        backend.profiler_label(is_delta, streaming.is_some()),
         backend.family_name(),
     );
     profiler.set_prompt_tokens(prefill_tokens.len() as u32);
