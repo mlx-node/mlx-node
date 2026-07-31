@@ -400,6 +400,54 @@ pub(super) fn live_history_media_matches<B: ChatBackend>(
     backend.session_media_matches_payloads(&images, &audio)
 }
 
+/// Normalize only template-owned whitespace immediately adjacent to reasoning
+/// close markers, retaining a map from normalized byte boundaries back to the
+/// original text.
+///
+/// Checkpoint templates commonly render `\n</think>\n\n`, while the committed
+/// generated tokens can carry `</think>\n`. Those byte layouts describe the
+/// same reasoning boundary but are not prefix-equal. The boundary map lets the
+/// caller locate the real template suffix without weakening comparisons for
+/// ordinary user/assistant text.
+fn normalize_reasoning_boundaries(text: &str) -> (String, Vec<usize>) {
+    const THINK_END: &str = "</think>";
+
+    let bytes = text.as_bytes();
+    let mut omitted = vec![false; bytes.len()];
+    for (tag_start, _) in text.match_indices(THINK_END) {
+        let mut before = tag_start;
+        while before > 0 && bytes[before - 1].is_ascii_whitespace() {
+            before -= 1;
+            omitted[before] = true;
+        }
+
+        let mut after = tag_start + THINK_END.len();
+        while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+            omitted[after] = true;
+            after += 1;
+        }
+    }
+
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut source_boundaries = Vec::with_capacity(bytes.len() + 1);
+    source_boundaries.push(0);
+    for (index, &byte) in bytes.iter().enumerate() {
+        if omitted[index] {
+            *source_boundaries
+                .last_mut()
+                .expect("the initial boundary is always present") = index + 1;
+        } else {
+            normalized.push(byte);
+            source_boundaries.push(index + 1);
+        }
+    }
+
+    (
+        String::from_utf8(normalized).expect("removing ASCII whitespace preserves valid UTF-8"),
+        source_boundaries,
+    )
+}
+
 /// Reconstruct a live continuation from the exact committed token IDs plus
 /// the suffix authored by the checkpoint template.
 ///
@@ -411,11 +459,12 @@ pub(super) fn live_history_media_matches<B: ChatBackend>(
 /// KV reuse.
 ///
 /// To keep the template authoritative, render both the completed history and
-/// the full history including the pending user/tool message. If the cached
-/// history decodes to an exact byte prefix of the template-rendered completed
-/// history, append the template-rendered remainder to the original cached
-/// token IDs. Any edited/incompatible history fails these checks and returns
-/// `None`, making the caller safely cold-replay the complete render.
+/// the full history including the pending user/tool message. Compare the live
+/// history in the template's logical placeholder form and normalize only
+/// template-owned reasoning-boundary whitespace, then append the mapped
+/// template remainder to the original cached token IDs. Any edited or
+/// incompatible history fails these checks and returns `None`, making the
+/// caller safely cold-replay the complete render.
 fn render_live_continuation<B: ChatBackend>(
     backend: &B,
     tokenizer: &crate::tokenizer::Qwen3Tokenizer,
@@ -440,24 +489,35 @@ fn render_live_continuation<B: ChatBackend>(
         config.tools.as_deref(),
         crate::engine::params::resolve_enable_thinking(config),
     )?;
-    let cached_text = tokenizer.decode_sync(cached_tokens, false)?;
+    let cached_comparison_tokens = backend.template_history_comparison_tokens(cached_tokens);
+    let cached_text = tokenizer.decode_sync(&cached_comparison_tokens, false)?;
     let completed_text = tokenizer.decode_sync(&completed_tokens, false)?;
     let full_text = tokenizer.decode_sync(full_tokens, false)?;
+    let (cached_comparison_text, _) = normalize_reasoning_boundaries(&cached_text);
+    let (completed_comparison_text, _) = normalize_reasoning_boundaries(&completed_text);
+    let (full_comparison_text, full_source_boundaries) = normalize_reasoning_boundaries(&full_text);
 
-    if !completed_text.starts_with(&cached_text) || !full_text.starts_with(&completed_text) {
+    if !completed_comparison_text.starts_with(&cached_comparison_text)
+        || !full_comparison_text.starts_with(&completed_comparison_text)
+    {
         return Ok(None);
     }
 
-    let suffix_text = &full_text[cached_text.len()..];
+    let suffix_start = full_source_boundaries[cached_comparison_text.len()];
+    let suffix_text = &full_text[suffix_start..];
     let suffix_tokens = tokenizer.encode_sync(suffix_text, Some(false))?;
     let mut continuation = Vec::with_capacity(cached_tokens.len() + suffix_tokens.len());
     continuation.extend_from_slice(cached_tokens);
     continuation.extend_from_slice(&suffix_tokens);
 
     // Tokenizer decoders can normalize byte sequences. Only use the splice
-    // when the combined IDs still decode to the checkpoint template's exact
-    // full render; otherwise fall back to the ordinary cold replay.
-    if tokenizer.decode_sync(&continuation, false)? != full_text {
+    // when the combined IDs still decode to the same logical placeholder and
+    // reasoning-boundary form as the full template render; otherwise fall
+    // back to the ordinary cold replay.
+    let continuation_comparison_tokens = backend.template_history_comparison_tokens(&continuation);
+    let continuation_text = tokenizer.decode_sync(&continuation_comparison_tokens, false)?;
+    let (continuation_comparison_text, _) = normalize_reasoning_boundaries(&continuation_text);
+    if continuation_comparison_text != full_comparison_text {
         return Ok(None);
     }
 
@@ -927,4 +987,28 @@ fn chat_turn_core<B: ChatBackend>(
     }
 
     Ok(Some(result))
+}
+
+#[cfg(test)]
+mod continuation_comparison_tests {
+    use super::normalize_reasoning_boundaries;
+
+    #[test]
+    fn reasoning_boundary_normalization_maps_back_to_the_exact_suffix() {
+        let cached = "a</think>\n</think>\n\nbody for";
+        let full = "a\n</think>\n\n</think>\n\nbody for the<|im_end|>\n";
+        let (cached_normalized, _) = normalize_reasoning_boundaries(cached);
+        let (full_normalized, full_boundaries) = normalize_reasoning_boundaries(full);
+
+        assert!(full_normalized.starts_with(&cached_normalized));
+        let suffix_start = full_boundaries[cached_normalized.len()];
+        assert_eq!(&full[suffix_start..], " the<|im_end|>\n");
+    }
+
+    #[test]
+    fn reasoning_boundary_normalization_preserves_ordinary_whitespace() {
+        let (single_space, _) = normalize_reasoning_boundaries("hello world");
+        let (double_space, _) = normalize_reasoning_boundaries("hello  world");
+        assert_ne!(single_space, double_space);
+    }
 }

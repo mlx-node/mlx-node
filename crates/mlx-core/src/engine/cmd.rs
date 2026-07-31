@@ -578,6 +578,10 @@ mod mock_backend_tests {
         session_media_matches_payloads_knob: bool,
         /// Last continuation flag supplied to `profiler_label`.
         profiler_is_delta_seen: AtomicBool,
+        /// Optional media token and sidecar positions used to model a VLM's
+        /// expanded cached history during template comparison.
+        comparison_media_token_id_knob: Option<u32>,
+        comparison_media_positions_knob: Vec<(u32, u64)>,
         /// Simulate an eager-MTP turn whose physical trunk advanced beyond
         /// the committed token history.
         flat_caches_desynced_knob: bool,
@@ -622,6 +626,8 @@ mod mock_backend_tests {
                 session_media_knob: MediaCapabilities::NONE,
                 session_media_matches_payloads_knob: false,
                 profiler_is_delta_seen: AtomicBool::new(false),
+                comparison_media_token_id_knob: None,
+                comparison_media_positions_knob: Vec::new(),
                 flat_caches_desynced_knob: false,
                 render_prompt_calls: AtomicUsize::new(0),
             }
@@ -766,6 +772,17 @@ mod mock_backend_tests {
             self.profiler_is_delta_seen
                 .store(is_delta, Ordering::Relaxed);
             "mock"
+        }
+
+        fn template_history_comparison_tokens(&self, tokens: &[u32]) -> Vec<u32> {
+            match self.comparison_media_token_id_knob {
+                Some(media_token_id) => crate::engine::collapse_cached_media_placeholder_runs(
+                    tokens,
+                    media_token_id,
+                    &self.comparison_media_positions_knob,
+                ),
+                None => tokens.to_vec(),
+            }
         }
 
         fn flat_caches_desynced(&self) -> bool {
@@ -2220,6 +2237,59 @@ mod mock_backend_tests {
         assert!(
             !live_history_media_matches(&backend, &messages),
             "payload proof cannot override a modality mismatch"
+        );
+    }
+
+    #[test]
+    fn expanded_vlm_history_still_reuses_the_live_cache() {
+        let mut backend = MockBackend::new(vec![
+            vec![TOK_HELLO, TOK_IM_END],
+            vec![TOK_WORLD, TOK_IM_END],
+        ]);
+        let first = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config: greedy_config(),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("session setup failed: {}", e.reason));
+
+        let marker_position = backend
+            .history
+            .iter()
+            .position(|&token| token == TOK_HELLO)
+            .expect("the rendered prompt must contain the logical marker token");
+        backend.history.splice(
+            marker_position..=marker_position,
+            [TOK_HELLO, TOK_HELLO, TOK_HELLO],
+        );
+        backend
+            .cache_cursor
+            .store(backend.history.len(), Ordering::Relaxed);
+        backend.comparison_media_token_id_knob = Some(TOK_HELLO);
+        backend.comparison_media_positions_knob = (marker_position..marker_position + 3)
+            .map(|position| (position as u32, 0xA11C))
+            .collect();
+        let expanded_history_len = backend.history.len();
+
+        let mut messages = user_messages("hello");
+        messages.push(assistant_message(&first));
+        messages.extend(user_messages("world"));
+        let result = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
+            messages,
+            config: greedy_config(),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("expanded-history continuation failed: {}", e.reason));
+
+        assert_eq!(
+            result.cached_tokens as usize, expanded_history_len,
+            "the live expanded prefix must be reused instead of cold-replayed"
+        );
+        assert!(backend.begin_decode_turns[1].is_delta);
+        assert_eq!(
+            backend.reset_calls,
+            vec![ResetScope::PrefixMiss],
+            "only the original cold start may reset the cache"
         );
     }
 

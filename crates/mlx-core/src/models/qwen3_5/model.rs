@@ -10298,6 +10298,14 @@ impl ChatBackend for Qwen35Inner {
         qwen35_dense_session_media_matches_payloads(self.cached_image_key, images, audio)
     }
 
+    fn template_history_comparison_tokens(&self, tokens: &[u32]) -> Vec<u32> {
+        engine::collapse_cached_media_placeholder_runs(
+            tokens,
+            IMAGE_TOKEN_ID as u32,
+            &self.cached_paged_image_token_positions,
+        )
+    }
+
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         // Both SYNC and STREAMING turns take the paged core. The paged
         // cores self-handle MTP via the `eager_mtp_paged` arm

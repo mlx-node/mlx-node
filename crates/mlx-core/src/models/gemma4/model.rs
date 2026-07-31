@@ -517,6 +517,7 @@ const fn gemma4_media_continuable(has_image: bool, has_audio: bool) -> bool {
 }
 
 fn gemma4_session_media_matches_payloads(
+    media_session_continuable: bool,
     cached_image_key: Option<u64>,
     cached_audio_key: Option<u64>,
     images: &[Vec<u8>],
@@ -524,7 +525,11 @@ fn gemma4_session_media_matches_payloads(
 ) -> bool {
     let image_key = (!images.is_empty()).then(|| engine::compute_image_cache_key(images));
     let audio_key = (!audio.is_empty()).then(|| engine::compute_image_cache_key(audio));
-    cached_image_key == image_key && cached_audio_key == audio_key
+    media_session_continuable
+        && !images.is_empty()
+        && audio.is_empty()
+        && cached_image_key == image_key
+        && cached_audio_key == audio_key
 }
 
 const fn gemma4_vlm_prefix_checkpoint_eligible(
@@ -7719,10 +7724,19 @@ impl ChatBackend for Gemma4Inner {
 
     fn session_media_matches_payloads(&self, images: &[Vec<u8>], audio: &[Vec<u8>]) -> bool {
         gemma4_session_media_matches_payloads(
+            self.media_session_continuable,
             self.cached_image_key,
             self.cached_audio_key,
             images,
             audio,
+        )
+    }
+
+    fn template_history_comparison_tokens(&self, tokens: &[u32]) -> Vec<u32> {
+        engine::collapse_cached_media_placeholder_runs(
+            tokens,
+            self.config.image_token_id.unwrap_or(258880) as u32,
+            &self.cached_paged_image_token_positions,
         )
     }
 
@@ -10226,27 +10240,38 @@ mod tests {
         let audio_key = Some(engine::compute_image_cache_key(&audio));
 
         assert!(gemma4_session_media_matches_payloads(
+            true,
             image_key,
             None,
             &images,
             &[]
         ));
-        assert!(gemma4_session_media_matches_payloads(
-            image_key, audio_key, &images, &audio
+        assert!(!gemma4_session_media_matches_payloads(
+            false,
+            image_key,
+            None,
+            &images,
+            &[]
         ));
         assert!(!gemma4_session_media_matches_payloads(
+            true, image_key, audio_key, &images, &audio
+        ));
+        assert!(!gemma4_session_media_matches_payloads(
+            true,
             image_key,
             None,
             &[vec![1, 2, 4]],
             &[]
         ));
         assert!(!gemma4_session_media_matches_payloads(
+            true,
             None,
             audio_key,
             &[],
             &[vec![4, 5, 7]]
         ));
         assert!(!gemma4_session_media_matches_payloads(
+            true,
             None,
             None,
             &images,

@@ -1096,6 +1096,18 @@ pub(crate) trait ChatBackend {
         false
     }
 
+    /// Convert a live cached-history token stream to the logical form emitted
+    /// by the checkpoint chat template for comparison only.
+    ///
+    /// VLM backends expand one logical image marker into many placeholder
+    /// tokens before prefill. Their live history therefore needs to collapse
+    /// those recorded media positions before it can be compared with a fresh
+    /// template render. The returned tokens never replace the real cache
+    /// history; they are used only by the continuation verifier.
+    fn template_history_comparison_tokens(&self, tokens: &[u32]) -> Vec<u32> {
+        tokens.to_vec()
+    }
+
     // ---- specialized whole-turn executors ----
     //
     // The session calls exactly one executor selected by `TurnPlan::path`.
