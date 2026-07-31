@@ -5265,21 +5265,39 @@ impl PagedKVCacheAdapter {
     /// Returns the number of block Arc references that were freed (i.e.
     /// the number of blocks in the table at release time).
     pub fn release_request(&mut self) -> Result<u32, String> {
-        let Some(table) = self.block_table.take() else {
+        let Some(table) = self.block_table.as_ref() else {
+            // Idempotent release is also the last-resort cleanup path after a
+            // partially failed lifecycle transition. Never let graph arrays or
+            // request-shaped metadata outlive the request table they describe.
+            #[cfg(target_os = "macos")]
+            self.clear_native_graph_state();
             return Ok(0);
         };
 
         let blocks = table.blocks().to_vec();
         let count = blocks.len() as u32;
 
-        let mut guard = self
-            .allocator
-            .lock()
-            .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+        // Acquire the allocator before taking `block_table`. If locking fails,
+        // the live request remains intact and a caller can still inspect or
+        // retry its cleanup; only graph-native views are cleared because they
+        // must not survive a failed release boundary.
+        let allocator = Arc::clone(&self.allocator);
+        let mut guard = match allocator.lock() {
+            Ok(guard) => guard,
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                self.clear_native_graph_state();
+                return Err(format!("BlockAllocator mutex poisoned: {error}"));
+            }
+        };
         for block in blocks {
             guard.free(block);
         }
         drop(guard);
+        let _released_table = self
+            .block_table
+            .take()
+            .expect("release_request table remained present while allocator was locked");
 
         self.cached_token_count = 0;
         self.request_tokens.clear();
@@ -9235,6 +9253,78 @@ mod tests {
         let again = adapter.release_request().unwrap();
         assert_eq!(again, 0);
         assert_eq!(allocator.lock().unwrap().num_free_blocks(), initial_free);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn release_request_none_path_clears_stale_decode_metadata() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!(
+                "skipping release_request_none_path_clears_stale_decode_metadata: Metal unavailable"
+            );
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        adapter
+            .decode_attention_inputs()
+            .expect("populate decode metadata");
+        let stale = adapter
+            .decode_attention_inputs_cache
+            .take()
+            .expect("decode cache populated");
+
+        assert_eq!(adapter.release_request().unwrap(), 1);
+        // Recreate the historical bad state: no request table, but a stale
+        // graph metadata cache survived a prior failed cleanup.
+        adapter.decode_attention_inputs_cache = Some(stale);
+        assert_eq!(adapter.release_request().unwrap(), 0);
+        assert!(
+            adapter.decode_attention_inputs_cache.is_none(),
+            "idempotent release must repair stale request-shaped metadata"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn release_request_is_transactional_when_allocator_lock_is_poisoned() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping release_request_is_transactional_when_allocator_lock_is_poisoned: \
+                 Metal unavailable"
+            );
+            return;
+        };
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.allocate_suffix_blocks(4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        adapter
+            .decode_attention_inputs()
+            .expect("populate decode metadata");
+
+        let poison_allocator = Arc::clone(&allocator);
+        let poisoned = std::thread::spawn(move || {
+            let _guard = poison_allocator.lock().expect("lock before poison");
+            panic!("poison allocator for release regression");
+        })
+        .join();
+        assert!(poisoned.is_err());
+
+        let error = adapter
+            .release_request()
+            .expect_err("poisoned allocator must reject release");
+        assert!(error.contains("poisoned"), "unexpected error: {error}");
+        assert!(
+            adapter.block_table().is_some(),
+            "failed release must retain the live table transactionally"
+        );
+        assert_eq!(adapter.request_tokens(), &[1, 2, 3, 4]);
+        assert!(
+            adapter.decode_attention_inputs_cache.is_none(),
+            "failed release must still clear graph-native metadata"
+        );
     }
 
     #[test]
