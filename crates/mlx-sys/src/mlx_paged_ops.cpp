@@ -7025,7 +7025,7 @@ int mlx_paged_grouped_qwen35_graph_parity(
       "mlx_paged_grouped_qwen35_graph_parity");
 }
 
-/// Runtime-geometry graph parity for the staged BF16 D512 route.
+/// Runtime-geometry graph parity for the canonical direct-read BF16 D512 route.
 int mlx_paged_grouped_d512_graph_parity(
     int num_q_heads,
     int num_kv_heads,

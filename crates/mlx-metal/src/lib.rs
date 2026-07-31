@@ -299,6 +299,11 @@ impl ComputePipelineState {
     pub fn max_total_threads_per_threadgroup(&self) -> u64 {
         self.0.maxTotalThreadsPerThreadgroup() as u64
     }
+
+    #[inline]
+    pub fn static_threadgroup_memory_length(&self) -> u64 {
+        self.0.staticThreadgroupMemoryLength() as u64
+    }
 }
 
 #[derive(Clone)]

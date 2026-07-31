@@ -114,7 +114,7 @@ const PARTITION_SIZE: u32 = 512;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GroupedPagedAttentionKind {
     Qwen35D256,
-    D512Staged,
+    D512Direct,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,6 +130,8 @@ enum GroupedD512Mode {
 pub enum PagedAttentionRouteHint {
     #[default]
     Auto,
+    /// Legacy compatibility name for forcing the validated grouped D512
+    /// route. The canonical production pipeline now uses direct K/V reads.
     ForceD512Staged,
     ForceGeneric,
 }
@@ -195,7 +197,7 @@ fn grouped_stripe_count(
     num_q_heads: u32,
     num_kv_heads: u32,
 ) -> u32 {
-    if kind == GroupedPagedAttentionKind::D512Staged {
+    if kind == GroupedPagedAttentionKind::D512Direct {
         return grouped_d512_resolved_stripe_count(
             grouped_d512_stripe_override(),
             max_context_len,
@@ -368,7 +370,7 @@ fn select_grouped_paged_attention(
             query_rows,
             max_context_len,
         )
-        .then_some(GroupedPagedAttentionKind::D512Staged);
+        .then_some(GroupedPagedAttentionKind::D512Direct);
     }
     if use_grouped_qwen35_paged_attention(
         io_dtype,
@@ -395,7 +397,7 @@ fn select_grouped_paged_attention(
         query_rows,
         max_context_len,
     ) {
-        return Some(GroupedPagedAttentionKind::D512Staged);
+        return Some(GroupedPagedAttentionKind::D512Direct);
     }
     None
 }
@@ -405,7 +407,7 @@ fn grouped_kernel_name(kind: GroupedPagedAttentionKind) -> &'static str {
         GroupedPagedAttentionKind::Qwen35D256 => {
             MetalState::paged_attention_grouped_qwen35_kernel_name()
         }
-        GroupedPagedAttentionKind::D512Staged => {
+        GroupedPagedAttentionKind::D512Direct => {
             MetalState::paged_attention_grouped_d512_kernel_name()
         }
     }
@@ -416,7 +418,7 @@ fn grouped_reduce_kernel_name(kind: GroupedPagedAttentionKind) -> &'static str {
         GroupedPagedAttentionKind::Qwen35D256 => {
             MetalState::paged_attention_grouped_qwen35_reduce_kernel_name()
         }
-        GroupedPagedAttentionKind::D512Staged => {
+        GroupedPagedAttentionKind::D512Direct => {
             MetalState::paged_attention_grouped_d512_reduce_kernel_name()
         }
     }
@@ -438,7 +440,7 @@ fn grouped_pipelines_supported(
     static GEMMA4_LIMITS: OnceLock<Option<(u64, u64)>> = OnceLock::new();
     let limits = match kind {
         GroupedPagedAttentionKind::Qwen35D256 => &QWEN35_LIMITS,
-        GroupedPagedAttentionKind::D512Staged => &GEMMA4_LIMITS,
+        GroupedPagedAttentionKind::D512Direct => &GEMMA4_LIMITS,
     };
     let Some((stage_threads, reduce_threads)) = *limits.get_or_init(|| {
         let stage = match state.get_pipeline(grouped_kernel_name(kind)) {
@@ -481,7 +483,7 @@ fn grouped_pipelines_supported(
         static GEMMA4_WARNED: OnceLock<()> = OnceLock::new();
         let warned = match kind {
             GroupedPagedAttentionKind::Qwen35D256 => &QWEN35_WARNED,
-            GroupedPagedAttentionKind::D512Staged => &GEMMA4_WARNED,
+            GroupedPagedAttentionKind::D512Direct => &GEMMA4_WARNED,
         };
         warned.get_or_init(|| {
             tracing::warn!(
@@ -681,7 +683,7 @@ mod grouped_selection_tests {
             {
                 assert_eq!(
                     grouped_stripe_count(
-                        GroupedPagedAttentionKind::D512Staged,
+                        GroupedPagedAttentionKind::D512Direct,
                         context,
                         q_heads,
                         kv_heads,
@@ -740,7 +742,7 @@ mod grouped_selection_tests {
         };
         assert_eq!(
             select(PagedAttentionRouteHint::ForceD512Staged, 16, 2, 91_765),
-            Some(GroupedPagedAttentionKind::D512Staged)
+            Some(GroupedPagedAttentionKind::D512Direct)
         );
         assert_eq!(
             select(PagedAttentionRouteHint::ForceGeneric, 16, 2, 8_193),
@@ -778,7 +780,7 @@ pub struct PagedAttentionOutput {
     /// Gemma-specific D512 route bit.
     #[doc(hidden)]
     pub used_grouped_gemma4: bool,
-    /// Whether this dispatch selected the geometry-based staged D512 route.
+    /// Whether this dispatch selected the geometry-based grouped D512 route.
     #[doc(hidden)]
     pub used_grouped_d512: bool,
 }
@@ -1437,9 +1439,9 @@ pub unsafe fn dispatch_paged_attention_v2_raw_with_route(
         used_grouped_qwen35: use_grouped
             && grouped_kind == Some(GroupedPagedAttentionKind::Qwen35D256),
         used_grouped_gemma4: use_grouped
-            && grouped_kind == Some(GroupedPagedAttentionKind::D512Staged),
+            && grouped_kind == Some(GroupedPagedAttentionKind::D512Direct),
         used_grouped_d512: use_grouped
-            && grouped_kind == Some(GroupedPagedAttentionKind::D512Staged),
+            && grouped_kind == Some(GroupedPagedAttentionKind::D512Direct),
     })
 }
 
@@ -2037,9 +2039,9 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         used_grouped_qwen35: use_grouped
             && grouped_kind == Some(GroupedPagedAttentionKind::Qwen35D256),
         used_grouped_gemma4: use_grouped
-            && grouped_kind == Some(GroupedPagedAttentionKind::D512Staged),
+            && grouped_kind == Some(GroupedPagedAttentionKind::D512Direct),
         used_grouped_d512: use_grouped
-            && grouped_kind == Some(GroupedPagedAttentionKind::D512Staged),
+            && grouped_kind == Some(GroupedPagedAttentionKind::D512Direct),
     })
 }
 

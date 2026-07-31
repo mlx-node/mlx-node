@@ -1200,8 +1200,10 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
 // The grid z-axis is a large set of strided *logical-block* stripes. Each SIMD
 // computes all 16 QK scores in a page with two lanes per token, then every lane
 // owns HEAD_SIZE/32 output dimensions and vector-loads that dimension's
-// contiguous V[16] row. This preserves the native paged V layout while retaining MLX's
-// long-context parallelism, with no threadgroup staging or barriers.
+// contiguous V[16] row. This preserves the native paged V layout while
+// retaining MLX's long-context parallelism. Canonical production
+// instantiations use no threadgroup staging or barriers; a distinctly named
+// staged D512 variant remains available only for manual comparisons.
 //
 // The host dispatcher only selects the explicit BF16 D256 or D512, BS16
 // instantiations for their exact head layouts. Keeping this as a two-entry
@@ -1239,10 +1241,10 @@ template <int HEAD_SIZE, bool STAGE_KV>
   constexpr int OUTPUTS_PER_LANE = HEAD_SIZE / 32;
   constexpr int PAGE_ELEMENTS = HEAD_SIZE * BLOCK_SIZE;
 
-  // A D512 KV page is 16 KiB. Cooperatively staging that page lets every
-  // query-head SIMD group attached to this runtime KV head reuse one global
-  // read. The D256 instantiation sets STAGE_KV=false; its one-element dead
-  // tile and all related control flow compile away.
+  // A D512 KV page is 16 KiB. The retained staged comparison variant lets
+  // every query-head SIMD group attached to one KV head reuse a global read.
+  // The production D256 and D512 instantiations set STAGE_KV=false; their
+  // one-element dead tile and all related control flow compile away.
   threadgroup bfloat16_t kv_tile[STAGE_KV ? PAGE_ELEMENTS : 1];
 
   const int kv_head_idx = int(threadgroup_position_in_grid.x);
@@ -1588,7 +1590,40 @@ template <int HEAD_SIZE>
       uint simd_lid [[thread_index_in_simdgroup]]);
 
 instantiate_grouped_bfloat16_attention(256, false);
-instantiate_grouped_bfloat16_attention(512, true);
+instantiate_grouped_bfloat16_attention(512, false);
+
+// Rollback and parity-only D512 stage-1 variant. Production uses the canonical
+// host name above and barrier-free direct device reads. Keep cooperative
+// threadgroup staging available under a distinct name for manual A/B tests.
+template [[host_name(
+    "paged_attention_grouped_bfloat16_hs512_bs16_striped_staged")]]
+    [[kernel]] void
+    paged_attention_grouped_bfloat16_bs16_striped<512, true>(
+        device float *exp_sums [[buffer(0)]],
+        device float *max_logits [[buffer(1)]],
+        device bfloat16_t *tmp_out [[buffer(2)]],
+        device const bfloat16_t *q [[buffer(3)]],
+        device const bfloat16_t *k_cache [[buffer(4)]],
+        device const bfloat16_t *v_cache [[buffer(5)]],
+        const device float *__restrict__ k_scale [[buffer(6)]],
+        const device float *__restrict__ v_scale [[buffer(7)]],
+        const constant int &num_kv_heads [[buffer(8)]],
+        const constant float &scale [[buffer(9)]],
+        const constant float &softcapping [[buffer(10)]],
+        device const uint32_t *block_tables [[buffer(11)]],
+        device const uint32_t *context_lens [[buffer(12)]],
+        const constant int &max_num_blocks_per_seq [[buffer(13)]],
+        device const float *alibi_slopes [[buffer(14)]],
+        const constant int &q_stride [[buffer(15)]],
+        const constant int &kv_block_stride [[buffer(16)]],
+        const constant int &kv_head_stride [[buffer(17)]],
+        const constant int &sliding_window [[buffer(18)]],
+        uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+        uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+        uint3 thread_position_in_threadgroup
+            [[thread_position_in_threadgroup]],
+        uint3 threads_per_threadgroup [[threads_per_threadgroup]],
+        uint simd_lid [[thread_index_in_simdgroup]]);
 
 template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
           int PARTITION_SIZE = 0>

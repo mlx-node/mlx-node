@@ -312,7 +312,7 @@ const std::string& paged_attention_v2_reduce_kernel_name(
 enum class GroupedPagedAttentionKind {
   None,
   Qwen35D256,
-  D512Staged,
+  D512Direct,
 };
 
 enum class GroupedD512Mode {
@@ -330,7 +330,7 @@ const std::string& paged_attention_grouped_kernel_name(
   switch (kind) {
     case GroupedPagedAttentionKind::Qwen35D256:
       return qwen35;
-    case GroupedPagedAttentionKind::D512Staged:
+    case GroupedPagedAttentionKind::D512Direct:
       return gemma4;
     case GroupedPagedAttentionKind::None:
       throw std::logic_error("grouped paged-attention kernel requested for None");
@@ -347,7 +347,7 @@ const std::string& paged_attention_grouped_reduce_kernel_name(
   switch (kind) {
     case GroupedPagedAttentionKind::Qwen35D256:
       return qwen35;
-    case GroupedPagedAttentionKind::D512Staged:
+    case GroupedPagedAttentionKind::D512Direct:
       return gemma4;
     case GroupedPagedAttentionKind::None:
       throw std::logic_error("grouped paged-attention reducer requested for None");
@@ -429,7 +429,7 @@ uint32_t grouped_stripe_count(
     int max_context_len,
     int num_q_heads,
     int num_kv_heads) {
-  if (kind == GroupedPagedAttentionKind::D512Staged) {
+  if (kind == GroupedPagedAttentionKind::D512Direct) {
     return grouped_d512_resolved_stripe_count(
         grouped_d512_stripe_override(),
         max_context_len,
@@ -605,7 +605,7 @@ GroupedPagedAttentionKind select_grouped_paged_attention(
                block_size,
                query_rows,
                max_context_len)
-        ? GroupedPagedAttentionKind::D512Staged
+        ? GroupedPagedAttentionKind::D512Direct
         : GroupedPagedAttentionKind::None;
   }
   if (use_grouped_qwen35_paged_attention(
@@ -631,7 +631,7 @@ GroupedPagedAttentionKind select_grouped_paged_attention(
           block_size,
           query_rows,
           max_context_len)) {
-    return GroupedPagedAttentionKind::D512Staged;
+    return GroupedPagedAttentionKind::D512Direct;
   }
   return GroupedPagedAttentionKind::None;
 }
@@ -771,7 +771,7 @@ bool grouped_pipelines_supported(
     static const GroupedPipelineLimits qwen35_limits =
         load_grouped_pipeline_limits(device, kind);
     limits_ptr = &qwen35_limits;
-  } else if (kind == GroupedPagedAttentionKind::D512Staged) {
+  } else if (kind == GroupedPagedAttentionKind::D512Direct) {
     static const GroupedPipelineLimits d512_limits =
         load_grouped_pipeline_limits(device, kind);
     limits_ptr = &d512_limits;
@@ -792,7 +792,7 @@ bool grouped_pipelines_supported(
     static std::once_flag qwen_warning_once;
     static std::once_flag gemma_warning_once;
     std::once_flag& warning_once =
-        kind == GroupedPagedAttentionKind::D512Staged
+        kind == GroupedPagedAttentionKind::D512Direct
         ? gemma_warning_once
         : qwen_warning_once;
     std::call_once(warning_once, [&]() {
@@ -851,7 +851,7 @@ bool grouped_d512_test_probe_enabled() {
 void record_grouped_route_for_test(GroupedPagedAttentionKind kind) {
   if (kind == GroupedPagedAttentionKind::Qwen35D256) {
     record_grouped_qwen35_route_for_test();
-  } else if (kind == GroupedPagedAttentionKind::D512Staged &&
+  } else if (kind == GroupedPagedAttentionKind::D512Direct &&
              grouped_d512_test_probe_enabled()) {
     grouped_d512_test_probe_counter().fetch_add(1, std::memory_order_relaxed);
   }
@@ -899,7 +899,7 @@ extern "C" int mlx_paged_grouped_d512_capability(
     auto& device = mlx::core::metal::device(stream.device);
     return grouped_pipelines_supported(
                device,
-               GroupedPagedAttentionKind::D512Staged,
+               GroupedPagedAttentionKind::D512Direct,
                num_q_heads,
                num_kv_heads)
         ? 1

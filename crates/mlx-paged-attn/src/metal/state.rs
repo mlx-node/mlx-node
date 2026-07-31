@@ -251,10 +251,18 @@ impl MetalState {
         "paged_attention_grouped_bfloat16_hs256_striped_reduce"
     }
 
-    /// Geometry-based staged grouped paged kernel for BF16, D512, block size
-    /// 16, and the supported GQA layouts.
+    /// Geometry-based grouped paged kernel for BF16, D512, block size 16, and
+    /// the supported GQA layouts. The production specialization reads K/V
+    /// directly from device memory without threadgroup staging.
     pub fn paged_attention_grouped_d512_kernel_name() -> &'static str {
         "paged_attention_grouped_bfloat16_hs512_bs16_striped"
+    }
+
+    /// Cooperative-staging D512 variant retained for manual parity,
+    /// performance, and rollback comparisons. Production capability probing
+    /// does not select this pipeline.
+    pub fn paged_attention_grouped_d512_staged_kernel_name() -> &'static str {
+        "paged_attention_grouped_bfloat16_hs512_bs16_striped_staged"
     }
 
     /// D512 reducer paired with `paged_attention_grouped_d512_kernel_name`.

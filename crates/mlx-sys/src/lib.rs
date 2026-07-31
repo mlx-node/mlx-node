@@ -775,9 +775,10 @@ unsafe extern "C-unwind" {
     ) -> *mut mlx_array;
 
     /// Route-hinted sibling of `mlx_paged_attention_forward`. Route 0 keeps
-    /// automatic selection, 1 requests the validated staged D512 kernel, and
-    /// 2 forces the generic V1/V2 implementation. The cache layout is
-    /// unchanged for every route.
+    /// automatic selection, 1 requests the validated grouped D512 kernel, and
+    /// 2 forces the generic V1/V2 implementation. Route 1 retains its legacy
+    /// "staged" identifier but selects the canonical direct-read pipeline.
+    /// The cache layout is unchanged for every route.
     #[allow(clippy::too_many_arguments)]
     pub fn mlx_paged_attention_forward_with_route(
         q: *mut mlx_array,
@@ -1366,11 +1367,12 @@ unsafe extern "C-unwind" {
     pub fn mlx_paged_grouped_gemma4_test_probe_reset();
     pub fn mlx_paged_grouped_gemma4_test_probe_count() -> u64;
 
-    /// Reset/read the geometry-based staged D512 route probe.
+    /// Reset/read the geometry-based grouped D512 route probe.
     pub fn mlx_paged_grouped_d512_test_probe_reset();
     pub fn mlx_paged_grouped_d512_test_probe_count() -> u64;
 
-    /// Return 1 when the staged D512 Metal pipelines and threadgroup limits
+    /// Return 1 when the canonical direct-read D512 Metal pipeline, reducer,
+    /// and threadgroup limits
     /// support this shipped Q/KV-head geometry, 0 when unsupported, and -1
     /// when Metal capability probing fails. The caller must separately
     /// enforce BF16, D512, BS16, q_len=1, and one sequence.
@@ -1403,7 +1405,7 @@ unsafe extern "C-unwind" {
         max_context_len: i32,
     ) -> i32;
 
-    /// Model-free graph-native numerical parity for the staged BF16
+    /// Model-free graph-native numerical parity for the direct-read BF16
     /// D512/BS16 kernel at the requested runtime geometry and context.
     /// Returns 1 on success and -3 without Metal.
     pub fn mlx_paged_grouped_d512_graph_parity(

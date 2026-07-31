@@ -63,6 +63,7 @@ enum class KvDtype : uint8_t {
 /// authoritative paged K/V pool; it never changes cache layout or ownership.
 enum class PagedAttentionRouteHint : uint8_t {
   Auto = 0,
+  // Legacy ABI name for the canonical grouped D512 production route.
   ForceD512Staged = 1,
   ForceGeneric = 2,
 };

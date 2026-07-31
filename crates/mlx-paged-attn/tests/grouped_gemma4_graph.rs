@@ -1,4 +1,4 @@
-//! Model-free production-graph parity and selector coverage for the staged
+//! Model-free production-graph parity and selector coverage for the direct-read
 //! BF16 D512/BS16 grouped paged-decode kernel.
 
 #![cfg(all(target_os = "macos", mlx_node_metal_enabled))]
@@ -32,7 +32,7 @@ fn grouped_d512_graph_parity_across_geometries_and_stripe_boundaries() {
             }
             assert_eq!(
                 rc, 1,
-                "staged D512 graph parity failed for q={num_q_heads} \
+                "direct-read D512 graph parity failed for q={num_q_heads} \
                  kv={num_kv_heads} at context {context_len}"
             );
             assert!(

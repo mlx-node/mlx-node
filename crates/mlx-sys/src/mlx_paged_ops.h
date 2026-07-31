@@ -279,9 +279,10 @@ array paged_attention(
     StreamOrDevice s = {});
 
 /// Emit `PagedAttention` with an explicit compute-route hint:
-/// 0=automatic, 1=force the supported staged D512 kernel, 2=force generic.
-/// The hint affects only the compute kernel; the paged K/V layout and block
-/// table remain authoritative.
+/// 0=automatic, 1=force the supported grouped D512 kernel, 2=force generic.
+/// Route 1 retains its legacy "staged" identifier but selects the canonical
+/// direct-read pipeline. The hint affects only the compute kernel; the paged
+/// K/V layout and block table remain authoritative.
 array paged_attention_with_route_hint(
     const array& q,
     const array& k_pool,

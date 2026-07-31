@@ -107,6 +107,8 @@ pub(crate) enum PagedAttentionV2Layout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PagedDecodeRouteHint {
     Auto = 0,
+    // Legacy ABI name: forces the canonical grouped D512 production route,
+    // which now uses direct K/V reads.
     ForceD512Staged = 1,
     ForceGeneric = 2,
 }
@@ -1568,7 +1570,7 @@ pub struct PagedKVCacheAdapter {
     #[cfg(target_os = "macos")]
     decode_planning_cache: Option<DecodePlanningCache>,
 
-    /// Immutable staged-D512 pipeline/threadgroup capability for this pool's
+    /// Immutable grouped-D512 pipeline/threadgroup capability for this pool's
     /// geometry. The Metal probe itself is process-cached, but retaining the
     /// result here removes even the FFI call from every layer/token.
     #[cfg(target_os = "macos")]
@@ -3769,7 +3771,7 @@ impl PagedKVCacheAdapter {
     }
 
     /// Synchronous raw-Metal fallback with the same compute-route hint as the
-    /// graph-native path. Returns whether the staged D512 kernel was actually
+    /// graph-native path. Returns whether the grouped D512 kernel was actually
     /// selected, allowing callers to report a truthful demotion or fallback.
     #[cfg(target_os = "macos")]
     pub(crate) fn gather_kv_for_decode_with_route(
@@ -5704,7 +5706,7 @@ impl PagedKVCacheAdapter {
         self.layer_kv_pool.num_layers()
     }
 
-    /// Probe immutable staged-D512 Metal capability for a Q/KV-head geometry.
+    /// Probe immutable direct-read D512 Metal capability for a Q/KV-head geometry.
     ///
     /// Dtype, head size, block size, query length, and sequence count remain
     /// caller-side route inputs; this probe covers pipeline availability and
@@ -5739,7 +5741,7 @@ impl PagedKVCacheAdapter {
                 1 => Ok(true),
                 0 => Ok(false),
                 other => Err(format!(
-                    "staged D512 capability probe failed with status {other}"
+                    "grouped D512 capability probe failed with status {other}"
                 )),
             };
             self.grouped_d512_capability_cache = Some((num_query_heads, result.clone()));

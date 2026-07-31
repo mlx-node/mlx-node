@@ -297,14 +297,14 @@ fn grouped_d512_kernel_candidate(
         head_dim,
     );
     if exact_shape && capability_confirmed && grouped_stripes.is_some() {
-        ("grouped_d512_staged", grouped_stripes)
+        ("grouped_d512_direct", grouped_stripes)
     } else {
         ("generic_v2", None)
     }
 }
 
 fn paged_decode_route_hint(requested_paged_kernel: &str) -> PagedDecodeRouteHint {
-    if requested_paged_kernel == "grouped_d512_staged" {
+    if requested_paged_kernel == "grouped_d512_direct" {
         PagedDecodeRouteHint::ForceD512Staged
     } else {
         // The model-level measured crossover is authoritative. Passing Auto
@@ -1323,7 +1323,7 @@ impl Gemma4Attention {
             } else {
                 grouped_paged_candidate
             };
-        let requested_grouped_stripes = (requested_paged_kernel == "grouped_d512_staged")
+        let requested_grouped_stripes = (requested_paged_kernel == "grouped_d512_direct")
             .then_some(grouped_stripes)
             .flatten();
         let plan = select_paged_decode_plan(PagedDecodePolicyInput {
@@ -1490,11 +1490,11 @@ impl Gemma4Attention {
             plan.reason
         };
         let selected_paged_backend = if !graph_native_route && raw_used_grouped_d512 {
-            "grouped_d512_staged_raw"
+            "grouped_d512_direct_raw"
         } else if !graph_native_route {
             "generic_v2_raw"
         } else if paged_route_hint == PagedDecodeRouteHint::ForceD512Staged {
-            "grouped_d512_staged"
+            "grouped_d512_direct"
         } else {
             "generic_v2"
         };
@@ -2323,7 +2323,7 @@ mod tests {
                 512,
                 true,
             ),
-            ("grouped_d512_staged", Some(16))
+            ("grouped_d512_direct", Some(16))
         );
         assert_eq!(
             grouped_d512_kernel_candidate(
@@ -2370,7 +2370,7 @@ mod tests {
                 512,
                 true,
             ),
-            ("grouped_d512_staged", Some(128)),
+            ("grouped_d512_direct", Some(128)),
             "the capability-confirmed Hkv2 geometry must remain direct-paged at long context"
         );
         assert_eq!(
@@ -2402,7 +2402,7 @@ mod tests {
                 512,
                 true,
             ),
-            ("grouped_d512_staged", Some(128)),
+            ("grouped_d512_direct", Some(128)),
             "route stability intentionally enables the whole 92K-ending bucket"
         );
         for context in [91_795, 112_000] {
@@ -2419,7 +2419,7 @@ mod tests {
                     512,
                     true,
                 ),
-                ("grouped_d512_staged", Some(128)),
+                ("grouped_d512_direct", Some(128)),
                 "the measured Hq16/Hkv2 long-context cases use wide stripes"
             );
         }
@@ -2436,7 +2436,7 @@ mod tests {
                 512,
                 true,
             ),
-            ("grouped_d512_staged", Some(32)),
+            ("grouped_d512_direct", Some(32)),
             "an explicit validated override remains authoritative"
         );
         for (query_heads, kv_heads, expected_stripes) in [(16, 1, 128), (16, 2, 128), (32, 4, 32)] {
@@ -2453,7 +2453,7 @@ mod tests {
                     512,
                     true,
                 ),
-                ("grouped_d512_staged", Some(expected_stripes)),
+                ("grouped_d512_direct", Some(expected_stripes)),
                 "qualified D512 geometries retain their mirrored defaults at the first eligible bucket"
             );
         }
@@ -2479,7 +2479,7 @@ mod tests {
             "model-level generic decisions must not be overridden by low-level Auto"
         );
         assert_eq!(
-            paged_decode_route_hint("grouped_d512_staged"),
+            paged_decode_route_hint("grouped_d512_direct"),
             PagedDecodeRouteHint::ForceD512Staged
         );
 
