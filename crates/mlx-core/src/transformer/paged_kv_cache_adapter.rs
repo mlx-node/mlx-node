@@ -10857,6 +10857,124 @@ mod tests {
         );
     }
 
+    /// Release-only microbenchmark for the Gemma4 decode write fanout: one
+    /// token is written into each of five full-attention layer pools, then the
+    /// resulting graph is drained before the next token. This keeps the
+    /// factory/scheduling cost separate from the Metal drain while also
+    /// reporting the end-to-end total that decides whether a candidate is
+    /// worth keeping.
+    ///
+    /// Run with:
+    /// `cargo test --release -p mlx-core --lib transformer::paged_kv_cache_adapter::tests::benchmark_single_token_paged_kv_write_factory -- --ignored --exact --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "single-token paged KV write microbenchmark"]
+    fn benchmark_single_token_paged_kv_write_factory() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        const BLOCK_SIZE: u32 = 16;
+        const NUM_BLOCKS: u32 = 16;
+        const GLOBAL_LAYERS: u32 = 5;
+        const NUM_KV_HEADS: usize = 2;
+        const HEAD_SIZE: usize = 512;
+        const WARM_TOKENS: u32 = 16;
+        const MEASURED_TOKENS: u32 = 128;
+
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: BLOCK_SIZE,
+            num_kv_heads: NUM_KV_HEADS as u32,
+            head_size: HEAD_SIZE as u32,
+            num_layers: GLOBAL_LAYERS,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(NUM_BLOCKS * BLOCK_SIZE),
+            max_batch_size: Some(1),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            NUM_BLOCKS,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(error) => {
+                eprintln!("skipping benchmark_single_token_paged_kv_write_factory: {error}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(NUM_BLOCKS, BLOCK_SIZE)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE).expect("adapter");
+        let element_count = NUM_KV_HEADS * HEAD_SIZE;
+        let keys = MxArray::from_bfloat16(
+            &vec![0u16; element_count],
+            &[1, NUM_KV_HEADS as i64, HEAD_SIZE as i64],
+        )
+        .expect("keys");
+        let values = MxArray::from_bfloat16(
+            &vec![0u16; element_count],
+            &[1, NUM_KV_HEADS as i64, HEAD_SIZE as i64],
+        )
+        .expect("values");
+
+        // Pay one-time graph, Metal pipeline, and pool-view initialization
+        // outside the measurement. Drain every token, matching autoregressive
+        // decode rather than building an artificial many-token write chain.
+        adapter.reset_for_new_request(0).expect("warm reset");
+        for token_position in 0..WARM_TOKENS {
+            adapter
+                .record_tokens(&[token_position])
+                .expect("warm record token");
+            for layer_idx in 0..GLOBAL_LAYERS {
+                adapter
+                    .update_keys_values_native(black_box(layer_idx), &keys, &values, token_position)
+                    .expect("warm paged KV write");
+            }
+            adapter
+                .eval_pending_pool_writes()
+                .expect("warm paged KV drain");
+        }
+        adapter.release_request().expect("release warm request");
+
+        adapter.reset_for_new_request(1).expect("measured reset");
+        let total_started = Instant::now();
+        let mut factory_schedule_elapsed = Duration::ZERO;
+        let mut drain_elapsed = Duration::ZERO;
+        for token_position in 0..MEASURED_TOKENS {
+            adapter
+                .record_tokens(&[token_position])
+                .expect("measured record token");
+
+            let factory_schedule_started = Instant::now();
+            for layer_idx in 0..GLOBAL_LAYERS {
+                adapter
+                    .update_keys_values_native(black_box(layer_idx), &keys, &values, token_position)
+                    .expect("measured paged KV write");
+            }
+            factory_schedule_elapsed += factory_schedule_started.elapsed();
+
+            let drain_started = Instant::now();
+            adapter
+                .eval_pending_pool_writes()
+                .expect("measured paged KV drain");
+            drain_elapsed += drain_started.elapsed();
+        }
+        let total_elapsed = total_started.elapsed();
+        adapter.release_request().expect("release measured request");
+
+        eprintln!(
+            "single_token_paged_kv_write_bench tokens={MEASURED_TOKENS} \
+             global_layers={GLOBAL_LAYERS} factory_schedule_total_ms={:.3} \
+             factory_schedule_us_per_token={:.3} drain_total_ms={:.3} \
+             drain_us_per_token={:.3} total_ms={:.3} total_us_per_token={:.3}",
+            factory_schedule_elapsed.as_secs_f64() * 1_000.0,
+            factory_schedule_elapsed.as_secs_f64() * 1_000_000.0 / MEASURED_TOKENS as f64,
+            drain_elapsed.as_secs_f64() * 1_000.0,
+            drain_elapsed.as_secs_f64() * 1_000_000.0 / MEASURED_TOKENS as f64,
+            total_elapsed.as_secs_f64() * 1_000.0,
+            total_elapsed.as_secs_f64() * 1_000_000.0 / MEASURED_TOKENS as f64,
+        );
+    }
+
     #[test]
     fn test_prefill_block_table_marshalling_truncates_to_required_prefix() {
         let allocator = new_allocator(64, 4);
