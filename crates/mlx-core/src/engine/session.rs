@@ -400,21 +400,183 @@ pub(super) fn live_history_media_matches<B: ChatBackend>(
     backend.session_media_matches_payloads(&images, &audio)
 }
 
-/// Normalize only template-owned whitespace immediately adjacent to reasoning
-/// close markers, retaining a map from normalized byte boundaries back to the
-/// original text.
+const THINK_END: &str = "</think>";
+
+fn copy_message_with_reasoning(
+    message: &ChatMessage,
+    reasoning_content: Option<String>,
+) -> ChatMessage {
+    ChatMessage {
+        role: message.role.clone(),
+        content: message.content.clone(),
+        tool_calls: message.tool_calls.clone(),
+        tool_call_id: message.tool_call_id.clone(),
+        is_error: message.is_error,
+        reasoning_content,
+        thinking_enabled: message.thinking_enabled,
+        images: message.images.as_ref().map(|images| {
+            images
+                .iter()
+                .map(|image| Uint8Array::with_data_copied(image.as_ref()))
+                .collect()
+        }),
+        audio: message.audio.as_ref().map(|clips| {
+            clips
+                .iter()
+                .map(|clip| Uint8Array::with_data_copied(clip.as_ref()))
+                .collect()
+        }),
+    }
+}
+
+/// Locate close tags that were emitted from structured assistant reasoning.
+///
+/// The shadow render replaces each non-empty `reasoning_content` field with a
+/// unique sentinel. If the original and shadow renders differ only at those
+/// exact sentinel spans, the following `</think>` tags have role/template
+/// provenance. A template that transforms the reasoning field in any other way
+/// fails closed instead of authorizing a looser history comparison.
+fn structured_reasoning_boundary_ordinals(
+    tokenizer: &crate::tokenizer::Qwen3Tokenizer,
+    completed_history: &[ChatMessage],
+    config: &ChatConfig,
+) -> Result<Option<Vec<usize>>> {
+    let completed_template = tokenizer.render_chat_template_sync(
+        completed_history,
+        Some(false),
+        config.tools.as_deref(),
+        crate::engine::params::resolve_enable_thinking(config),
+    )?;
+    let salt = (0usize..)
+        .find(|salt| !completed_template.contains(&format!("__MLX_REASONING_PROVENANCE_{salt}_")))
+        .expect("an unbounded numeric salt must produce a unique sentinel");
+
+    let mut replacements = Vec::new();
+    let mut shadow_history = Vec::with_capacity(completed_history.len());
+    for (message_index, message) in completed_history.iter().enumerate() {
+        let replacement = message
+            .reasoning_content
+            .as_ref()
+            .filter(|reasoning| {
+                !reasoning.is_empty() && message.role.trim().eq_ignore_ascii_case("assistant")
+            })
+            .map(|reasoning| {
+                let sentinel = format!("__MLX_REASONING_PROVENANCE_{salt}_{message_index}__");
+                replacements.push((sentinel.clone(), reasoning.clone()));
+                sentinel
+            });
+        shadow_history.push(copy_message_with_reasoning(
+            message,
+            replacement.or_else(|| message.reasoning_content.clone()),
+        ));
+    }
+    if replacements.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let shadow_template = tokenizer.render_chat_template_sync(
+        &shadow_history,
+        Some(false),
+        config.tools.as_deref(),
+        crate::engine::params::resolve_enable_thinking(config),
+    )?;
+    let mut rendered_replacements = Vec::new();
+    for replacement in replacements {
+        match shadow_template.matches(&replacement.0).count() {
+            0 => {}
+            1 => rendered_replacements.push(replacement),
+            _ => return Ok(None),
+        }
+    }
+
+    let Some(boundary_positions) = locate_structured_reasoning_boundaries(
+        &completed_template,
+        &shadow_template,
+        &rendered_replacements,
+    ) else {
+        return Ok(None);
+    };
+    let all_tag_positions = completed_template
+        .match_indices(THINK_END)
+        .map(|(position, _)| position)
+        .collect::<Vec<_>>();
+    let mut ordinals = Vec::with_capacity(boundary_positions.len());
+    for position in boundary_positions {
+        let Ok(ordinal) = all_tag_positions.binary_search(&position) else {
+            return Ok(None);
+        };
+        ordinals.push(ordinal);
+    }
+    Ok(Some(ordinals))
+}
+
+fn locate_structured_reasoning_boundaries(
+    original: &str,
+    shadow: &str,
+    replacements: &[(String, String)],
+) -> Option<Vec<usize>> {
+    let mut original_cursor = 0usize;
+    let mut shadow_cursor = 0usize;
+    let mut boundaries = Vec::with_capacity(replacements.len());
+    for (sentinel, reasoning) in replacements {
+        let sentinel_offset = shadow[shadow_cursor..].find(sentinel)?;
+        let sentinel_start = shadow_cursor + sentinel_offset;
+        let common_prefix = &shadow[shadow_cursor..sentinel_start];
+        if !original[original_cursor..].starts_with(common_prefix) {
+            return None;
+        }
+        original_cursor += common_prefix.len();
+        shadow_cursor = sentinel_start + sentinel.len();
+
+        if !original[original_cursor..].starts_with(reasoning) {
+            return None;
+        }
+        original_cursor += reasoning.len();
+
+        let close_offset = shadow[shadow_cursor..].find(THINK_END)?;
+        let before_close = &shadow[shadow_cursor..shadow_cursor + close_offset];
+        if !original[original_cursor..].starts_with(before_close) {
+            return None;
+        }
+        original_cursor += before_close.len();
+        shadow_cursor += close_offset;
+        if !original[original_cursor..].starts_with(THINK_END)
+            || !shadow[shadow_cursor..].starts_with(THINK_END)
+        {
+            return None;
+        }
+        boundaries.push(original_cursor);
+        original_cursor += THINK_END.len();
+        shadow_cursor += THINK_END.len();
+    }
+    (original[original_cursor..] == shadow[shadow_cursor..]).then_some(boundaries)
+}
+
+/// Normalize whitespace only around reasoning-close tags whose structured
+/// assistant/template provenance was established above, retaining a map from
+/// normalized byte boundaries back to the original text.
 ///
 /// Checkpoint templates commonly render `\n</think>\n\n`, while the committed
 /// generated tokens can carry `</think>\n`. Those byte layouts describe the
-/// same reasoning boundary but are not prefix-equal. The boundary map lets the
-/// caller locate the real template suffix without weakening comparisons for
-/// ordinary user/assistant text.
-fn normalize_reasoning_boundaries(text: &str) -> (String, Vec<usize>) {
-    const THINK_END: &str = "</think>";
-
+/// same reasoning boundary but are not prefix-equal. Literal tags in user or
+/// ordinary assistant content are never selected.
+fn normalize_reasoning_boundaries(
+    text: &str,
+    reasoning_boundary_ordinals: &[usize],
+    require_all_boundaries: bool,
+) -> Option<(String, Vec<usize>)> {
     let bytes = text.as_bytes();
     let mut omitted = vec![false; bytes.len()];
-    for (tag_start, _) in text.match_indices(THINK_END) {
+    let selected = reasoning_boundary_ordinals
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut found = 0usize;
+    for (ordinal, (tag_start, _)) in text.match_indices(THINK_END).enumerate() {
+        if !selected.contains(&ordinal) {
+            continue;
+        }
+        found += 1;
         let mut before = tag_start;
         while before > 0 && bytes[before - 1].is_ascii_whitespace() {
             before -= 1;
@@ -426,6 +588,9 @@ fn normalize_reasoning_boundaries(text: &str) -> (String, Vec<usize>) {
             omitted[after] = true;
             after += 1;
         }
+    }
+    if require_all_boundaries && found != selected.len() {
+        return None;
     }
 
     let mut normalized = Vec::with_capacity(bytes.len());
@@ -442,10 +607,10 @@ fn normalize_reasoning_boundaries(text: &str) -> (String, Vec<usize>) {
         }
     }
 
-    (
+    Some((
         String::from_utf8(normalized).expect("removing ASCII whitespace preserves valid UTF-8"),
         source_boundaries,
-    )
+    ))
 }
 
 /// Reconstruct a live continuation from the exact committed token IDs plus
@@ -493,9 +658,26 @@ fn render_live_continuation<B: ChatBackend>(
     let cached_text = tokenizer.decode_sync(&cached_comparison_tokens, false)?;
     let completed_text = tokenizer.decode_sync(&completed_tokens, false)?;
     let full_text = tokenizer.decode_sync(full_tokens, false)?;
-    let (cached_comparison_text, _) = normalize_reasoning_boundaries(&cached_text);
-    let (completed_comparison_text, _) = normalize_reasoning_boundaries(&completed_text);
-    let (full_comparison_text, full_source_boundaries) = normalize_reasoning_boundaries(&full_text);
+    let Some(reasoning_boundary_ordinals) =
+        structured_reasoning_boundary_ordinals(tokenizer, completed_history, config)?
+    else {
+        return Ok(None);
+    };
+    let Some((cached_comparison_text, _)) =
+        normalize_reasoning_boundaries(&cached_text, &reasoning_boundary_ordinals, false)
+    else {
+        return Ok(None);
+    };
+    let Some((completed_comparison_text, _)) =
+        normalize_reasoning_boundaries(&completed_text, &reasoning_boundary_ordinals, true)
+    else {
+        return Ok(None);
+    };
+    let Some((full_comparison_text, full_source_boundaries)) =
+        normalize_reasoning_boundaries(&full_text, &reasoning_boundary_ordinals, true)
+    else {
+        return Ok(None);
+    };
 
     if !completed_comparison_text.starts_with(&cached_comparison_text)
         || !full_comparison_text.starts_with(&completed_comparison_text)
@@ -516,7 +698,11 @@ fn render_live_continuation<B: ChatBackend>(
     // back to the ordinary cold replay.
     let continuation_comparison_tokens = backend.template_history_comparison_tokens(&continuation);
     let continuation_text = tokenizer.decode_sync(&continuation_comparison_tokens, false)?;
-    let (continuation_comparison_text, _) = normalize_reasoning_boundaries(&continuation_text);
+    let Some((continuation_comparison_text, _)) =
+        normalize_reasoning_boundaries(&continuation_text, &reasoning_boundary_ordinals, true)
+    else {
+        return Ok(None);
+    };
     if continuation_comparison_text != full_comparison_text {
         return Ok(None);
     }
@@ -991,14 +1177,16 @@ fn chat_turn_core<B: ChatBackend>(
 
 #[cfg(test)]
 mod continuation_comparison_tests {
-    use super::normalize_reasoning_boundaries;
+    use super::{locate_structured_reasoning_boundaries, normalize_reasoning_boundaries};
 
     #[test]
     fn reasoning_boundary_normalization_maps_back_to_the_exact_suffix() {
         let cached = "a</think>\n</think>\n\nbody for";
         let full = "a\n</think>\n\n</think>\n\nbody for the<|im_end|>\n";
-        let (cached_normalized, _) = normalize_reasoning_boundaries(cached);
-        let (full_normalized, full_boundaries) = normalize_reasoning_boundaries(full);
+        let (cached_normalized, _) =
+            normalize_reasoning_boundaries(cached, &[0], true).expect("cached boundary exists");
+        let (full_normalized, full_boundaries) =
+            normalize_reasoning_boundaries(full, &[0], true).expect("full boundary exists");
 
         assert!(full_normalized.starts_with(&cached_normalized));
         let suffix_start = full_boundaries[cached_normalized.len()];
@@ -1007,8 +1195,58 @@ mod continuation_comparison_tests {
 
     #[test]
     fn reasoning_boundary_normalization_preserves_ordinary_whitespace() {
-        let (single_space, _) = normalize_reasoning_boundaries("hello world");
-        let (double_space, _) = normalize_reasoning_boundaries("hello  world");
+        let (single_space, _) = normalize_reasoning_boundaries("hello world", &[], true)
+            .expect("no boundaries required");
+        let (double_space, _) = normalize_reasoning_boundaries("hello  world", &[], true)
+            .expect("no boundaries required");
         assert_ne!(single_space, double_space);
+    }
+
+    #[test]
+    fn reasoning_boundary_normalization_preserves_literal_tags() {
+        let text = "user: a </think> b\nassistant: thought \n</think>\n\nanswer";
+        let (normalized, _) =
+            normalize_reasoning_boundaries(text, &[1], true).expect("assistant boundary exists");
+
+        assert!(
+            normalized.starts_with("user: a </think> b\n"),
+            "the unselected literal user tag and its whitespace must remain exact"
+        );
+        assert!(normalized.ends_with("assistant: thought</think>answer"));
+    }
+
+    #[test]
+    fn cached_prefix_may_end_before_a_proven_reasoning_boundary() {
+        assert_eq!(
+            normalize_reasoning_boundaries("assistant: partial thought", &[0], false)
+                .map(|(text, _)| text),
+            Some("assistant: partial thought".to_string())
+        );
+        assert!(
+            normalize_reasoning_boundaries("assistant: partial thought", &[0], true).is_none(),
+            "a complete template render must contain every proven boundary"
+        );
+    }
+
+    #[test]
+    fn structured_reasoning_locator_rejects_unexplained_render_changes() {
+        let replacements = vec![("__SENTINEL__".to_string(), "private".to_string())];
+        assert_eq!(
+            locate_structured_reasoning_boundaries(
+                "user literal </think>\nassistant private\n</think>\nanswer",
+                "user literal </think>\nassistant __SENTINEL__\n</think>\nanswer",
+                &replacements,
+            ),
+            Some(vec![40])
+        );
+        assert_eq!(
+            locate_structured_reasoning_boundaries(
+                "user edited </think>\nassistant private\n</think>\nanswer",
+                "user literal </think>\nassistant __SENTINEL__\n</think>\nanswer",
+                &replacements,
+            ),
+            None,
+            "any difference outside the structured reasoning substitution fails closed"
+        );
     }
 }

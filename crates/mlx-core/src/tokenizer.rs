@@ -1565,6 +1565,52 @@ impl Qwen3Tokenizer {
         content_order: MultimodalContentOrder,
         existing_image_placeholder: Option<&str>,
     ) -> Result<Vec<u32>> {
+        let formatted = self.render_chat_template_sync_with_content_order(
+            messages,
+            add_generation_prompt,
+            tools,
+            enable_thinking,
+            content_order,
+            existing_image_placeholder,
+        )?;
+
+        // Encode the formatted text (don't add extra special tokens)
+        let encoding = Self::encode_internal(&self.tokenizer, formatted, Some(false))?;
+        Ok(encoding.get_ids().to_vec())
+    }
+
+    /// Render the checkpoint chat template without tokenizing its output.
+    ///
+    /// Internal continuation verification uses this to locate structure that
+    /// came from typed message fields before an unknown-token fallback can
+    /// erase a provenance sentinel.
+    pub(crate) fn render_chat_template_sync(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: Option<bool>,
+        tools: Option<&[ToolDefinition]>,
+        enable_thinking: Option<bool>,
+    ) -> Result<String> {
+        self.render_chat_template_sync_with_content_order(
+            messages,
+            add_generation_prompt,
+            tools,
+            enable_thinking,
+            MultimodalContentOrder::TextThenMedia,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_chat_template_sync_with_content_order(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: Option<bool>,
+        tools: Option<&[ToolDefinition]>,
+        enable_thinking: Option<bool>,
+        content_order: MultimodalContentOrder,
+        existing_image_placeholder: Option<&str>,
+    ) -> Result<String> {
         let add_prompt = add_generation_prompt.unwrap_or(true);
 
         // Sanitize messages before formatting (prevents injection in all paths)
@@ -1582,7 +1628,7 @@ impl Qwen3Tokenizer {
             .chat_template
             .as_deref()
             .ok_or_else(|| Error::from_reason(MISSING_CHAT_TEMPLATE_ERROR))?;
-        let formatted = Self::render_chat_template_jinja2_with_content_order(
+        Self::render_chat_template_jinja2_with_content_order(
             chat_template,
             &sanitized,
             tools,
@@ -1593,11 +1639,7 @@ impl Qwen3Tokenizer {
             content_order,
             existing_image_placeholder,
         )
-        .map_err(Error::from_reason)?;
-
-        // Encode the formatted text (don't add extra special tokens)
-        let encoding = Self::encode_internal(&self.tokenizer, formatted, Some(false))?;
-        Ok(encoding.get_ids().to_vec())
+        .map_err(Error::from_reason)
     }
 }
 
