@@ -402,6 +402,13 @@ pub(super) fn live_history_media_matches<B: ChatBackend>(
 
 const THINK_END: &str = "</think>";
 
+#[derive(Debug, PartialEq, Eq)]
+struct StructuredReasoningBoundary {
+    ordinal: usize,
+    reasoning: String,
+    content: String,
+}
+
 fn copy_message_with_reasoning(
     message: &ChatMessage,
     reasoning_content: Option<String>,
@@ -440,7 +447,7 @@ fn structured_reasoning_boundary_ordinals(
     tokenizer: &crate::tokenizer::Qwen3Tokenizer,
     completed_history: &[ChatMessage],
     config: &ChatConfig,
-) -> Result<Option<Vec<usize>>> {
+) -> Result<Option<Vec<StructuredReasoningBoundary>>> {
     let completed_template = tokenizer.render_chat_template_sync(
         completed_history,
         Some(false),
@@ -462,7 +469,7 @@ fn structured_reasoning_boundary_ordinals(
             })
             .map(|reasoning| {
                 let sentinel = format!("__MLX_REASONING_PROVENANCE_{salt}_{message_index}__");
-                replacements.push((sentinel.clone(), reasoning.clone()));
+                replacements.push((sentinel.clone(), reasoning.clone(), message.content.clone()));
                 sentinel
             });
         shadow_history.push(copy_message_with_reasoning(
@@ -500,25 +507,31 @@ fn structured_reasoning_boundary_ordinals(
         .match_indices(THINK_END)
         .map(|(position, _)| position)
         .collect::<Vec<_>>();
-    let mut ordinals = Vec::with_capacity(boundary_positions.len());
-    for position in boundary_positions {
+    let mut boundaries = Vec::with_capacity(boundary_positions.len());
+    for (position, (_, reasoning, content)) in
+        boundary_positions.into_iter().zip(rendered_replacements)
+    {
         let Ok(ordinal) = all_tag_positions.binary_search(&position) else {
             return Ok(None);
         };
-        ordinals.push(ordinal);
+        boundaries.push(StructuredReasoningBoundary {
+            ordinal,
+            reasoning,
+            content,
+        });
     }
-    Ok(Some(ordinals))
+    Ok(Some(boundaries))
 }
 
 fn locate_structured_reasoning_boundaries(
     original: &str,
     shadow: &str,
-    replacements: &[(String, String)],
+    replacements: &[(String, String, String)],
 ) -> Option<Vec<usize>> {
     let mut original_cursor = 0usize;
     let mut shadow_cursor = 0usize;
     let mut boundaries = Vec::with_capacity(replacements.len());
-    for (sentinel, reasoning) in replacements {
+    for (sentinel, reasoning, _) in replacements {
         let sentinel_offset = shadow[shadow_cursor..].find(sentinel)?;
         let sentinel_start = shadow_cursor + sentinel_offset;
         let common_prefix = &shadow[shadow_cursor..sentinel_start];
@@ -550,6 +563,60 @@ fn locate_structured_reasoning_boundaries(
         shadow_cursor += THINK_END.len();
     }
     (original[original_cursor..] == shadow[shadow_cursor..]).then_some(boundaries)
+}
+
+/// Verify caller-owned reasoning/content bytes against the committed cache
+/// before any template-separator normalization.
+///
+/// A cached prefix may end before a later reasoning close (length exit), in
+/// which case the ordinary prefix comparison remains authoritative. Once a
+/// proven close tag is present, however, the structured message fields must
+/// match exactly. Leading assistant-content whitespace is rejected rather than
+/// ambiguously treating it as separator whitespace.
+fn cached_structured_reasoning_matches(
+    cached_text: &str,
+    boundaries: &[StructuredReasoningBoundary],
+) -> bool {
+    let tag_positions = cached_text
+        .match_indices(THINK_END)
+        .map(|(position, _)| position)
+        .collect::<Vec<_>>();
+    for boundary in boundaries {
+        let Some(&tag_start) = tag_positions.get(boundary.ordinal) else {
+            continue;
+        };
+        if boundary
+            .reasoning
+            .ends_with(|character: char| character.is_ascii_whitespace())
+        {
+            return false;
+        }
+        let before_tag = cached_text[..tag_start]
+            .trim_end_matches(|character: char| character.is_ascii_whitespace());
+        if !before_tag.ends_with(&boundary.reasoning) {
+            return false;
+        }
+        if !boundary.content.is_empty() {
+            let after_tag = &cached_text[tag_start + THINK_END.len()..];
+            let after_separator =
+                after_tag.trim_start_matches(|character: char| character.is_ascii_whitespace());
+            if boundary
+                .content
+                .starts_with(|character: char| character.is_ascii_whitespace())
+            {
+                return false;
+            }
+            let content_matches = if after_separator.len() >= boundary.content.len() {
+                after_separator.starts_with(&boundary.content)
+            } else {
+                boundary.content.starts_with(after_separator)
+            };
+            if !content_matches {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Normalize whitespace only around reasoning-close tags whose structured
@@ -658,11 +725,18 @@ fn render_live_continuation<B: ChatBackend>(
     let cached_text = tokenizer.decode_sync(&cached_comparison_tokens, false)?;
     let completed_text = tokenizer.decode_sync(&completed_tokens, false)?;
     let full_text = tokenizer.decode_sync(full_tokens, false)?;
-    let Some(reasoning_boundary_ordinals) =
+    let Some(reasoning_boundaries) =
         structured_reasoning_boundary_ordinals(tokenizer, completed_history, config)?
     else {
         return Ok(None);
     };
+    if !cached_structured_reasoning_matches(&cached_text, &reasoning_boundaries) {
+        return Ok(None);
+    }
+    let reasoning_boundary_ordinals = reasoning_boundaries
+        .iter()
+        .map(|boundary| boundary.ordinal)
+        .collect::<Vec<_>>();
     let Some((cached_comparison_text, _)) =
         normalize_reasoning_boundaries(&cached_text, &reasoning_boundary_ordinals, false)
     else {
@@ -1177,7 +1251,10 @@ fn chat_turn_core<B: ChatBackend>(
 
 #[cfg(test)]
 mod continuation_comparison_tests {
-    use super::{locate_structured_reasoning_boundaries, normalize_reasoning_boundaries};
+    use super::{
+        StructuredReasoningBoundary, cached_structured_reasoning_matches,
+        locate_structured_reasoning_boundaries, normalize_reasoning_boundaries,
+    };
 
     #[test]
     fn reasoning_boundary_normalization_maps_back_to_the_exact_suffix() {
@@ -1230,7 +1307,11 @@ mod continuation_comparison_tests {
 
     #[test]
     fn structured_reasoning_locator_rejects_unexplained_render_changes() {
-        let replacements = vec![("__SENTINEL__".to_string(), "private".to_string())];
+        let replacements = vec![(
+            "__SENTINEL__".to_string(),
+            "private".to_string(),
+            "answer".to_string(),
+        )];
         assert_eq!(
             locate_structured_reasoning_boundaries(
                 "user literal </think>\nassistant private\n</think>\nanswer",
@@ -1248,5 +1329,36 @@ mod continuation_comparison_tests {
             None,
             "any difference outside the structured reasoning substitution fails closed"
         );
+    }
+
+    #[test]
+    fn cached_reasoning_identity_rejects_message_owned_boundary_whitespace_edits() {
+        let cached = "assistant thought</think>\nanswer";
+        let exact = StructuredReasoningBoundary {
+            ordinal: 0,
+            reasoning: "thought".to_string(),
+            content: "answer continues beyond the cached prefix".to_string(),
+        };
+        assert!(cached_structured_reasoning_matches(cached, &[exact]));
+
+        let edited_reasoning = StructuredReasoningBoundary {
+            ordinal: 0,
+            reasoning: "thought ".to_string(),
+            content: "answer".to_string(),
+        };
+        assert!(!cached_structured_reasoning_matches(
+            cached,
+            &[edited_reasoning]
+        ));
+
+        let edited_content = StructuredReasoningBoundary {
+            ordinal: 0,
+            reasoning: "thought".to_string(),
+            content: " answer".to_string(),
+        };
+        assert!(!cached_structured_reasoning_matches(
+            cached,
+            &[edited_content]
+        ));
     }
 }
