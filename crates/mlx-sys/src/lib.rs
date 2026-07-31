@@ -967,6 +967,11 @@ unsafe extern "C-unwind" {
     /// rejected (safety check; eval-based bounds verification).
     pub fn mlx_paged_kv_write_factory_rejects_slot_mapping_out_of_range() -> i32;
 
+    /// Returns 1 iff the available single-slot factory path accepts the last
+    /// in-range slot and the negative skip sentinel, while rejecting the first
+    /// out-of-range slot with the runtime marker.
+    pub fn mlx_paged_kv_write_factory_single_slot_bounds_contract() -> i32;
+
     /// Assert the factory-side slot_mapping bounds guard's
     /// `std::invalid_argument` message contains the `[runtime]` marker
     /// (matching the eval_gpu-side guard for the same data-dependent
