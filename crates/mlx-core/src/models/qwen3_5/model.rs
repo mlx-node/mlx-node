@@ -879,6 +879,16 @@ const fn qwen35_dense_session_media(
     }
 }
 
+fn qwen35_dense_session_media_matches_payloads(
+    cached_image_key: Option<u64>,
+    images: &[Vec<u8>],
+    audio: &[Vec<u8>],
+) -> bool {
+    audio.is_empty()
+        && !images.is_empty()
+        && cached_image_key == Some(engine::compute_image_cache_key(images))
+}
+
 /// Make the resolved decoder authoritative for legacy Qwen3.5 whole-turn
 /// cores, which still derive their local `ChatParams` from a `ChatConfig`.
 fn apply_qwen35_dense_planned_decoder(config: &mut ChatConfig, decoder: DecoderPlan) -> bool {
@@ -10284,6 +10294,10 @@ impl ChatBackend for Qwen35Inner {
         )
     }
 
+    fn session_media_matches_payloads(&self, images: &[Vec<u8>], audio: &[Vec<u8>]) -> bool {
+        qwen35_dense_session_media_matches_payloads(self.cached_image_key, images, audio)
+    }
+
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         // Both SYNC and STREAMING turns take the paged core. The paged
         // cores self-handle MTP via the `eager_mtp_paged` arm
@@ -14060,6 +14074,33 @@ mod paged_construction_tests {
             qwen35_dense_session_media(false, false),
             MediaCapabilities::NONE
         );
+    }
+
+    #[test]
+    fn test_qwen35_session_media_payload_identity() {
+        let images = vec![vec![1, 2, 3]];
+        let cached_key = Some(engine::compute_image_cache_key(&images));
+
+        assert!(qwen35_dense_session_media_matches_payloads(
+            cached_key,
+            &images,
+            &[]
+        ));
+        assert!(!qwen35_dense_session_media_matches_payloads(
+            cached_key,
+            &[vec![1, 2, 4]],
+            &[]
+        ));
+        assert!(!qwen35_dense_session_media_matches_payloads(
+            cached_key,
+            &images,
+            &[vec![9]]
+        ));
+        assert!(!qwen35_dense_session_media_matches_payloads(
+            None,
+            &images,
+            &[]
+        ));
     }
 
     #[test]

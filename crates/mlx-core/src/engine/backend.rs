@@ -1085,6 +1085,17 @@ pub(crate) trait ChatBackend {
         MediaCapabilities::NONE
     }
 
+    /// Whether the supplied historical media payloads are the exact media
+    /// represented by the live session cache.
+    ///
+    /// The session core calls this only after the non-empty media kinds match
+    /// [`Self::session_media`]. Backends must opt in by comparing a cached
+    /// payload key or digest; the fail-closed default forces a cold replay
+    /// whenever identity cannot be proven.
+    fn session_media_matches_payloads(&self, _images: &[Vec<u8>], _audio: &[Vec<u8>]) -> bool {
+        false
+    }
+
     // ---- specialized whole-turn executors ----
     //
     // The session calls exactly one executor selected by `TurnPlan::path`.

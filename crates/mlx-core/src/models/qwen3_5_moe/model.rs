@@ -346,6 +346,16 @@ const fn qwen35_moe_session_media(
     }
 }
 
+fn qwen35_moe_session_media_matches_payloads(
+    cached_image_key: Option<u64>,
+    images: &[Vec<u8>],
+    audio: &[Vec<u8>],
+) -> bool {
+    audio.is_empty()
+        && !images.is_empty()
+        && cached_image_key == Some(engine::compute_image_cache_key(images))
+}
+
 /// Project the engine-selected decoder into the legacy MoE whole-turn config
 /// before that core re-extracts `ChatParams`.
 fn apply_qwen35_moe_planned_decoder(config: &mut ChatConfig, decoder: DecoderPlan) -> bool {
@@ -8170,6 +8180,10 @@ impl ChatBackend for Qwen35MoeInner {
         )
     }
 
+    fn session_media_matches_payloads(&self, images: &[Vec<u8>], audio: &[Vec<u8>]) -> bool {
+        qwen35_moe_session_media_matches_payloads(self.cached_image_key, images, audio)
+    }
+
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         // Unlike dense, the MoE execution plan does not admit speculative
         // decoding with paged attention. The autoregressive text+paged path
@@ -9786,6 +9800,33 @@ mod paged_construction_tests {
             qwen35_moe_session_media(false, false),
             MediaCapabilities::NONE
         );
+    }
+
+    #[test]
+    fn test_qwen35_moe_session_media_payload_identity() {
+        let images = vec![vec![1, 2, 3]];
+        let cached_key = Some(engine::compute_image_cache_key(&images));
+
+        assert!(qwen35_moe_session_media_matches_payloads(
+            cached_key,
+            &images,
+            &[]
+        ));
+        assert!(!qwen35_moe_session_media_matches_payloads(
+            cached_key,
+            &[vec![1, 2, 4]],
+            &[]
+        ));
+        assert!(!qwen35_moe_session_media_matches_payloads(
+            cached_key,
+            &images,
+            &[vec![9]]
+        ));
+        assert!(!qwen35_moe_session_media_matches_payloads(
+            None,
+            &images,
+            &[]
+        ));
     }
 
     #[test]

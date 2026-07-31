@@ -376,6 +376,30 @@ fn media_capabilities_from_messages(messages: &[ChatMessage]) -> MediaCapabiliti
     }
 }
 
+/// Verify that the caller-supplied completed transcript describes the exact
+/// media payloads encoded by the live cache.
+///
+/// Matching only modality presence is insufficient because chat templates
+/// render different image/audio byte payloads to the same placeholder tokens.
+/// Text-only histories need no payload proof; media histories fail closed
+/// unless the backend can match its stored cache key or digest.
+pub(super) fn live_history_media_matches<B: ChatBackend>(
+    backend: &B,
+    completed_history: &[ChatMessage],
+) -> bool {
+    let history_media = media_capabilities_from_messages(completed_history);
+    if backend.session_media() != history_media {
+        return false;
+    }
+    if history_media.is_empty() {
+        return true;
+    }
+
+    let images = extract_images_from_messages(completed_history);
+    let audio = extract_audio_from_messages(completed_history);
+    backend.session_media_matches_payloads(&images, &audio)
+}
+
 /// Reconstruct a live continuation from the exact committed token IDs plus
 /// the suffix authored by the checkpoint template.
 ///
@@ -406,8 +430,7 @@ fn render_live_continuation<B: ChatBackend>(
     if completed_history.is_empty() || cached_tokens.is_empty() {
         return Ok(None);
     }
-    let history_media = media_capabilities_from_messages(completed_history);
-    if backend.session_media() != history_media {
+    if !live_history_media_matches(backend, completed_history) {
         return Ok(None);
     }
 

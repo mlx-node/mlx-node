@@ -516,6 +516,17 @@ const fn gemma4_media_continuable(has_image: bool, has_audio: bool) -> bool {
     has_image && !has_audio
 }
 
+fn gemma4_session_media_matches_payloads(
+    cached_image_key: Option<u64>,
+    cached_audio_key: Option<u64>,
+    images: &[Vec<u8>],
+    audio: &[Vec<u8>],
+) -> bool {
+    let image_key = (!images.is_empty()).then(|| engine::compute_image_cache_key(images));
+    let audio_key = (!audio.is_empty()).then(|| engine::compute_image_cache_key(audio));
+    cached_image_key == image_key && cached_audio_key == audio_key
+}
+
 const fn gemma4_vlm_prefix_checkpoint_eligible(
     has_image: bool,
     has_audio: bool,
@@ -7706,6 +7717,15 @@ impl ChatBackend for Gemma4Inner {
         })
     }
 
+    fn session_media_matches_payloads(&self, images: &[Vec<u8>], audio: &[Vec<u8>]) -> bool {
+        gemma4_session_media_matches_payloads(
+            self.cached_image_key,
+            self.cached_audio_key,
+            images,
+            audio,
+        )
+    }
+
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         // The execution plan admits every text turn shape (fresh + delta,
         // sync + streaming) when the adapter is loaded. The generic paged
@@ -10197,6 +10217,42 @@ mod tests {
     use super::*;
     use crate::engine::plan::{TurnPath, TurnPlan, TurnRequest};
     use crate::models::gemma4::output_parser::{StreamSegment, parse_gemma4_output};
+
+    #[test]
+    fn test_gemma4_session_media_payload_identity() {
+        let images = vec![vec![1, 2, 3]];
+        let audio = vec![vec![4, 5, 6]];
+        let image_key = Some(engine::compute_image_cache_key(&images));
+        let audio_key = Some(engine::compute_image_cache_key(&audio));
+
+        assert!(gemma4_session_media_matches_payloads(
+            image_key,
+            None,
+            &images,
+            &[]
+        ));
+        assert!(gemma4_session_media_matches_payloads(
+            image_key, audio_key, &images, &audio
+        ));
+        assert!(!gemma4_session_media_matches_payloads(
+            image_key,
+            None,
+            &[vec![1, 2, 4]],
+            &[]
+        ));
+        assert!(!gemma4_session_media_matches_payloads(
+            None,
+            audio_key,
+            &[],
+            &[vec![4, 5, 7]]
+        ));
+        assert!(!gemma4_session_media_matches_payloads(
+            None,
+            None,
+            &images,
+            &[]
+        ));
+    }
 
     #[test]
     fn prompt_holds_media_placeholders_detects_image_audio_and_text() {

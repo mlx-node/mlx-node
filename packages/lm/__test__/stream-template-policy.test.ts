@@ -104,7 +104,7 @@ describe('makeStreamingModel template content policy', () => {
     const defaultModel = await DefaultModel.load('/models/default');
     const rawReplayModel = await RawReplayModel.load('/models/raw-replay');
 
-    expect(defaultModel.replaysAssistantRawText()).toBe(false);
-    expect(rawReplayModel.replaysAssistantRawText()).toBe(true);
+    expect(defaultModel.replaysAssistantRawText?.()).toBe(false);
+    expect(rawReplayModel.replaysAssistantRawText?.()).toBe(true);
   });
 });

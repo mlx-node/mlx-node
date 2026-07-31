@@ -369,6 +369,7 @@ mod mock_backend_tests {
         ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
         SpeculativePlan,
     };
+    use crate::engine::session::live_history_media_matches;
     use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
     use crate::stream::Stream;
     use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
@@ -573,6 +574,8 @@ mod mock_backend_tests {
         speculative_complete_knob: bool,
         /// Exact media represented by the mock's live session state.
         session_media_knob: MediaCapabilities,
+        /// Whether the supplied historical payloads match that media state.
+        session_media_matches_payloads_knob: bool,
         /// Simulate an eager-MTP turn whose physical trunk advanced beyond
         /// the committed token history.
         flat_caches_desynced_knob: bool,
@@ -615,6 +618,7 @@ mod mock_backend_tests {
                 multimodal_calls: 0,
                 speculative_complete_knob: false,
                 session_media_knob: MediaCapabilities::NONE,
+                session_media_matches_payloads_knob: false,
                 flat_caches_desynced_knob: false,
                 render_prompt_calls: AtomicUsize::new(0),
             }
@@ -749,6 +753,10 @@ mod mock_backend_tests {
 
         fn session_media(&self) -> MediaCapabilities {
             self.session_media_knob
+        }
+
+        fn session_media_matches_payloads(&self, _images: &[Vec<u8>], _audio: &[Vec<u8>]) -> bool {
+            self.session_media_matches_payloads_knob
         }
 
         fn flat_caches_desynced(&self) -> bool {
@@ -2170,6 +2178,32 @@ mod mock_backend_tests {
         .unwrap_or_else(|e| panic!("fresh speculative turn failed: {}", e.reason));
         assert_eq!(result.text, "SPECULATIVE_COMPLETE");
         assert!(backend.prefill_calls.is_empty());
+    }
+
+    #[test]
+    fn historical_media_requires_backend_payload_identity_proof() {
+        let mut backend = MockBackend::new(vec![]);
+        backend.session_media_knob = MediaCapabilities::IMAGES;
+
+        let mut messages = user_messages("hello");
+        messages[0].images = Some(vec![Uint8Array::new(vec![1, 2, 3])]);
+
+        assert!(
+            !live_history_media_matches(&backend, &messages),
+            "matching modality presence alone must not authorize live cache reuse"
+        );
+
+        backend.session_media_matches_payloads_knob = true;
+        assert!(
+            live_history_media_matches(&backend, &messages),
+            "an exact backend payload-key match may authorize live cache reuse"
+        );
+
+        messages[0].audio = Some(vec![Uint8Array::new(vec![4, 5, 6])]);
+        assert!(
+            !live_history_media_matches(&backend, &messages),
+            "payload proof cannot override a modality mismatch"
+        );
     }
 
     #[test]
