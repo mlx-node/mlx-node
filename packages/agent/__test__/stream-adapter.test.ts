@@ -254,6 +254,113 @@ describe('makeMlxStreamSimple', () => {
 
     expect(sharedModel.contextWindow).toBe(12288);
     expect(sharedModel.maxTokens).toBe(12288);
+    expect(session.configSeen?.maxNewTokens).toBe(MODEL.maxTokens);
+  });
+
+  it('honors composed model maxTokens when Pi omits the per-call limit', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent();
+      },
+    ]);
+    const overriddenModel = { ...MODEL, maxTokens: 512 };
+
+    await collect(makeMlxStreamSimple(makeFakeHost(session))(overriddenModel, CONTEXT));
+
+    expect(session.configSeen?.maxNewTokens).toBe(512);
+  });
+
+  it('keeps an explicit per-call maxTokens above composed model metadata', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent();
+      },
+    ]);
+    const overriddenModel = { ...MODEL, maxTokens: 512 };
+
+    await collect(makeMlxStreamSimple(makeFakeHost(session))(overriddenModel, CONTEXT, { maxTokens: 64 }));
+
+    expect(session.configSeen?.maxNewTokens).toBe(64);
+  });
+
+  it('keeps the family preset for invalid or hostile model maxTokens metadata', async () => {
+    const invalidValues: Array<{ label: string; value: unknown }> = [
+      { label: 'zero', value: 0 },
+      { label: 'negative', value: -1 },
+      { label: 'NaN', value: Number.NaN },
+      { label: 'positive infinity', value: Number.POSITIVE_INFINITY },
+      { label: 'negative infinity', value: Number.NEGATIVE_INFINITY },
+      { label: 'fractional', value: 1.5 },
+      { label: 'unsafe integer', value: Number.MAX_SAFE_INTEGER + 1 },
+      { label: 'numeric string', value: '512' },
+      { label: 'null', value: null },
+      { label: 'undefined', value: undefined },
+    ];
+
+    for (const { label, value } of invalidValues) {
+      const session = new FakeChatSession(
+        [
+          // eslint-disable-next-line @typescript-eslint/require-await
+          async function* () {
+            yield finalEvent();
+          },
+          // eslint-disable-next-line @typescript-eslint/require-await
+          async function* () {
+            yield finalEvent();
+          },
+        ],
+        [],
+        {
+          trainedWindowTokens: 262144,
+          effectiveWindowTokens: 12288,
+          pagedBlockCapacity: 768,
+          pagedBlockSize: 16,
+        },
+      );
+      const invalidModel = { ...MODEL, maxTokens: value } as unknown as Model<Api>;
+      const streamSimple = makeMlxStreamSimple(makeFakeHost(session));
+
+      await collect(streamSimple(invalidModel, CONTEXT));
+      expect(session.configSeen?.maxNewTokens, `${label}, first turn`).toBe(MODEL.maxTokens);
+
+      await collect(streamSimple(invalidModel, CONTEXT));
+      expect(session.configSeen?.maxNewTokens, `${label}, second turn`).toBe(MODEL.maxTokens);
+    }
+
+    const hostileSession = new FakeChatSession(
+      [
+        // eslint-disable-next-line @typescript-eslint/require-await
+        async function* () {
+          yield finalEvent();
+        },
+        // eslint-disable-next-line @typescript-eslint/require-await
+        async function* () {
+          yield finalEvent();
+        },
+      ],
+      [],
+      {
+        trainedWindowTokens: 262144,
+        effectiveWindowTokens: 12288,
+        pagedBlockCapacity: 768,
+        pagedBlockSize: 16,
+      },
+    );
+    const hostileModel = { ...MODEL };
+    Object.defineProperty(hostileModel, 'maxTokens', {
+      get() {
+        throw new Error('poisoned maxTokens getter');
+      },
+    });
+
+    const hostileStreamSimple = makeMlxStreamSimple(makeFakeHost(hostileSession));
+    await collect(hostileStreamSimple(hostileModel, CONTEXT));
+    expect(hostileSession.configSeen?.maxNewTokens).toBe(MODEL.maxTokens);
+
+    await collect(hostileStreamSimple(hostileModel, CONTEXT));
+    expect(hostileSession.configSeen?.maxNewTokens).toBe(MODEL.maxTokens);
   });
 
   it('publishes image capability and primes user/tool images with template-safe roles', async () => {

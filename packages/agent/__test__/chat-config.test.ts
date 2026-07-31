@@ -45,6 +45,33 @@ describe('buildChatConfig', () => {
     expect(config.topP).toBe(0.95);
   });
 
+  it('uses composed model maxTokens below a valid explicit option', () => {
+    expect(buildChatConfig('qwen3_5', undefined, undefined, undefined, undefined, 512).maxNewTokens).toBe(512);
+    expect(buildChatConfig('qwen3_5', { maxTokens: 64 }, undefined, undefined, undefined, 512).maxNewTokens).toBe(64);
+  });
+
+  it('falls through invalid explicit and model maxTokens values', () => {
+    const invalidValues = [
+      0,
+      -1,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      1.5,
+      Number.MAX_SAFE_INTEGER + 1,
+    ];
+    const presetMaxTokens = LAUNCH_PRESETS['qwen3_5']!.maxOutputTokens;
+
+    for (const invalid of invalidValues) {
+      expect(
+        buildChatConfig('qwen3_5', { maxTokens: invalid }, undefined, undefined, undefined, 512).maxNewTokens,
+      ).toBe(512);
+      expect(buildChatConfig('qwen3_5', undefined, undefined, undefined, undefined, invalid).maxNewTokens).toBe(
+        presetMaxTokens,
+      );
+    }
+  });
+
   it('does not override when the option is absent', () => {
     const config = buildChatConfig('qwen3_5', {}, undefined);
     expect(config.maxNewTokens).toBe(LAUNCH_PRESETS['qwen3_5']!.maxOutputTokens);

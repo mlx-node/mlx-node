@@ -67,6 +67,10 @@ export interface ResolvedReasoningMode {
   thinkingEnabled: boolean;
 }
 
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
 /**
  * Resolve Pi's thinking level once for both native config and persisted replay
  * provenance. Keeping these values together prevents a low/minimal turn from
@@ -87,6 +91,7 @@ export function buildChatConfig(
   tools: ToolDefinition[] | undefined,
   rootCacheOwnerId?: string,
   resolvedReasoning = resolveReasoningMode(options?.reasoning),
+  modelMaxTokens?: unknown,
 ): ChatConfig {
   const preset = launchPresetFor(modelType);
   if (!preset) {
@@ -111,7 +116,16 @@ export function buildChatConfig(
   // top-level session identity separate so a /new or /resume rotation updates
   // which branch the bounded GDN sidecar store protects from child eviction.
   if (rootCacheOwnerId !== undefined) config.cacheRootOwnerId = rootCacheOwnerId;
-  if (options?.maxTokens !== undefined) config.maxNewTokens = options.maxTokens;
+  const explicitMaxTokens = options?.maxTokens;
+  if (isPositiveSafeInteger(explicitMaxTokens)) {
+    // A valid per-call provider option is the topmost layer.
+    config.maxNewTokens = explicitMaxTokens;
+  } else if (isPositiveSafeInteger(modelMaxTokens)) {
+    // Normal Pi agent turns omit SimpleStreamOptions.maxTokens. Honor the
+    // composed Model metadata (including models.json modelOverrides) without
+    // allowing malformed/hostile metadata to replace the family preset.
+    config.maxNewTokens = modelMaxTokens;
+  }
   if (options?.temperature !== undefined) config.temperature = options.temperature;
   if (tools && tools.length > 0) config.tools = tools;
   // `reuseCache` is deliberately NOT set: ChatSession.mergeConfig forces it on.

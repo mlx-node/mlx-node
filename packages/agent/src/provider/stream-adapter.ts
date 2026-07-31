@@ -119,6 +119,16 @@ function safeString(read: () => string, fallback: string): string {
   }
 }
 
+/** Read numeric model metadata without trusting a user-configurable getter. */
+function readPositiveSafeInteger(read: () => unknown): number | undefined {
+  try {
+    const value = read();
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Publish the native model's load-time physical context limit onto pi's shared
  * model object. The parent session and every in-process subagent resolve this
@@ -130,12 +140,21 @@ function safeString(read: () => string, fallback: string): string {
  * discovery-time limit here, and never let metadata synchronization break an
  * otherwise valid inference turn.
  */
-function publishEffectiveContextWindow(model: Model<Api>, session: ChatSession): void {
+function publishEffectiveContextWindow(
+  model: Model<Api>,
+  session: ChatSession,
+  configuredModelMaxTokens: number | undefined,
+): void {
   try {
     const effective = Math.floor(session.contextLimits()?.effectiveWindowTokens ?? 0);
     if (!Number.isSafeInteger(effective) || effective <= 0) return;
     model.contextWindow = Math.min(model.contextWindow, effective);
-    model.maxTokens = Math.min(model.maxTokens, model.contextWindow);
+    // Use the already-validated snapshot. Reading the shared metadata here
+    // would let Math.min coerce invalid user configuration into a valid value
+    // that a later turn would then trust.
+    if (configuredModelMaxTokens !== undefined) {
+      model.maxTokens = Math.min(configuredModelMaxTokens, model.contextWindow);
+    }
   } catch {
     // Exact native preflight still protects capacity; keep serving the turn.
   }
@@ -345,7 +364,12 @@ export function makeMlxStreamSimple(
             // Telemetry snapshot is best-effort; never break inference.
           }
         }
-        publishEffectiveContextWindow(model, session);
+        // Snapshot the composed budget before publishing native context limits.
+        // The advisory publisher must not read this raw value itself:
+        // Math.min can coerce hostile metadata (for example "512" or Infinity)
+        // into a finite number that a later turn would then trust.
+        const configuredModelMaxTokens = readPositiveSafeInteger(() => model.maxTokens);
+        publishEffectiveContextWindow(model, session, configuredModelMaxTokens);
         const supportsImages = publishImageCapability(model, session);
         const discovered = host.modelInfo(model.id);
         if (!discovered) {
@@ -375,6 +399,7 @@ export function makeMlxStreamSimple(
             toolsToDefinitions(context.tools),
             rootCacheOwnerId,
             resolvedReasoning,
+            configuredModelMaxTokens,
           );
           for await (const event of session.startFromHistoryStream(config, signal)) {
             if (event.done) {
