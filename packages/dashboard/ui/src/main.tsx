@@ -52,5 +52,11 @@ window.addEventListener('message', (event: MessageEvent) => {
 });
 
 // Rendering the app before the port lands would make every page's first fetch
-// fail; this placeholder is what the window shows for the few ms in between.
-root.render(<div className="text-muted-foreground p-6 text-sm">Connecting to the mlx runtime…</div>);
+// fail. Keep the same screen index.html paints before this bundle executes, so
+// startup never flashes from a loader to an empty/unstyled placeholder.
+root.render(
+  <div className="mlx-boot" role="status" aria-live="polite">
+    <span className="mlx-boot__spinner" aria-hidden="true" />
+    <span>Starting mlx-node…</span>
+  </div>,
+);

@@ -23,6 +23,7 @@ import { DESKTOP_QUIT_DEADLINE_MS } from '../control-panel/shutdown-timings.js';
 import { createControlPanelBroker, type ControlPanelBroker } from './broker.js';
 import { controlPanelEnvOverrides, sidecarEnvOverrides } from './child-env.js';
 import { electronBrokerDeps } from './control-panel-child.js';
+import { createLaunchVisibility } from './launch-visibility.js';
 import { resolveAppPaths, type AppPaths } from './paths.js';
 import { installAppProtocol, registerAppScheme } from './protocol.js';
 import {
@@ -53,6 +54,7 @@ let supervisor: Supervisor | null = null;
 let tray: TrayController | null = null;
 let controlPanel: ControlPanelWindowManager | null = null;
 let broker: ControlPanelBroker<WebContents> | null = null;
+const launchVisibility = createLaunchVisibility();
 
 /**
  * "The app is exiting", as opposed to "a window is closing". Without the
@@ -108,7 +110,7 @@ function wire(): void {
     });
 
   app.on('second-instance', () => {
-    controlPanel?.show();
+    launchVisibility.activate();
   });
 
   // This handler must exist and must NOT quit. Electron's default, when nothing
@@ -120,12 +122,11 @@ function wire(): void {
   });
 
   app.on('activate', () => {
-    // With no Dock icon there is no gesture that produces this event, so the one
-    // activation that still arrives is the app's own launch — and popping the
-    // window open on every launch is not what a menubar app does. With a Dock
-    // icon, clicking it must reopen the window, which is exactly this.
-    if (!settings.showInDock) return;
-    controlPanel?.show();
+    // Finder re-activates an already-running accessory app rather than spawning
+    // a second instance. Ignoring this when the Dock icon is hidden leaves a live
+    // process with no window and no way for the user's explicit open gesture to
+    // succeed.
+    launchVisibility.activate();
   });
 
   app.on('before-quit', (event) => {
@@ -133,6 +134,7 @@ function wire(): void {
     // through is what actually exits.
     if (shuttingDown) return;
     shuttingDown = true;
+    launchVisibility.beginShutdown();
     // Set BEFORE any window is asked to close, so the Control Panel window's close
     // handler knows this one is real.
     quitting = true;
@@ -142,6 +144,7 @@ function wire(): void {
         console.error('[mlx] shutdown failed:', error);
       })
       .finally(() => {
+        if (launchVisibility.takeRelaunchRequest()) app.relaunch();
         app.quit();
       });
   });
@@ -262,6 +265,7 @@ async function bootstrap(): Promise<void> {
       broker?.recover(contents, expectedGeneration);
     },
   });
+  launchVisibility.ready(controlPanel);
 
   const copyClientCommand = (build: (endpoint: string, token: string) => string): void => {
     const endpoint = supervisor?.snapshot().url;
@@ -305,15 +309,9 @@ async function bootstrap(): Promise<void> {
   if (settings.autoStartInference) {
     void supervisor.start().catch(reportInferenceFailure);
   }
-  // Only on the very first launch. Otherwise a menubar app that reopens its
-  // window on every start is indistinguishable from one that ignores the close
-  // button — and without it, a first-time user gets a menubar icon they have no
-  // reason to look for.
-  if (loaded.source === 'missing') controlPanel.show();
-
-  // Materialise the file whenever we did not read one. Without this "first run"
-  // never ends — nothing else writes settings until the user moves the window or
-  // toggles something, so the window would reopen on every single launch.
+  // Materialise defaults whenever there was no usable file. Otherwise settings
+  // exist only in memory until the user happens to move the window or toggle a
+  // preference, and a crash before then silently loses the recovered state.
   // `unreadable` is excluded on purpose: we could not read that file, so we do
   // not get to replace it.
   if (loaded.source === 'missing' || loaded.source === 'corrupt') scheduleSave();

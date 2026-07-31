@@ -86,6 +86,16 @@ export function createControlPanelWindowManager(options: ControlPanelWindowOptio
   let boundsTimer: NodeJS.Timeout | null = null;
   let disposed = false;
 
+  function reveal(target: BrowserWindow): void {
+    if (target.isMinimized()) target.restore();
+    target.show();
+    target.focus();
+    // An accessory app has no Dock presence to activate it. Every caller of
+    // manager.show() represents an explicit launch, activation, or tray action,
+    // so bringing the requested window forward is the expected behaviour.
+    app.focus({ steal: true });
+  }
+
   const onReady = (event: IpcMainEvent): void => {
     // Any renderer can send on a channel; only ours may be answered. There is
     // one window today, so this is cheap insurance rather than a live threat —
@@ -100,11 +110,7 @@ export function createControlPanelWindowManager(options: ControlPanelWindowOptio
     // The generation is also an authority boundary: malformed input and a
     // delayed report for a retired channel must never be resolved against the
     // process that happens to be current now.
-    if (
-      typeof expectedGeneration !== 'number' ||
-      !Number.isSafeInteger(expectedGeneration) ||
-      expectedGeneration < 1
-    ) {
+    if (typeof expectedGeneration !== 'number' || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) {
       return;
     }
     options.onControlPanelUnresponsive?.(event.sender, expectedGeneration);
@@ -156,7 +162,7 @@ export function createControlPanelWindowManager(options: ControlPanelWindowOptio
     });
 
     created.once('ready-to-show', () => {
-      created.show();
+      reveal(created);
     });
 
     created.on('resize', persistBounds);
@@ -213,14 +219,7 @@ export function createControlPanelWindowManager(options: ControlPanelWindowOptio
         win = create();
         return;
       }
-      if (win.isMinimized()) win.restore();
-      win.show();
-      win.focus();
-      // With the Dock icon hidden the app is an "accessory" and showing a window
-      // does not bring it forward on its own. This only runs from an explicit
-      // user action — the tray menu, a second launch — so stealing focus is what
-      // was asked for.
-      app.focus({ steal: true });
+      reveal(win);
     },
     current(): BrowserWindow | null {
       return win !== null && !win.isDestroyed() ? win : null;
