@@ -3667,11 +3667,11 @@ fn should_quantize(key: &str, embed_quantizable: bool) -> bool {
 
     // Audio encoders/projectors are consumed by dense Conv2d/Linear loaders.
     // Qwen3-ASR quantizes only its Qwen text decoder (including the packed tied
-    // embedding); packing any audio-side weight would make the audio tower
-    // reinterpret uint32 storage as a dense matrix.
+    // embedding); packing any audio-tower weight would make the audio tower
+    // reinterpret uint32 storage as a dense matrix. Gemma's supported
+    // `embed_audio.embedding_projection` path is intentionally not excluded.
     if key.contains("audio_tower")
         || key.contains("audio_encoder")
-        || key.contains("embed_audio")
         || key.contains("multi_modal_projector")
     {
         return false;
