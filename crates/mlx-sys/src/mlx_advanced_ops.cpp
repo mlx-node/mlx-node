@@ -16,6 +16,26 @@ static array create_batched_causal_mask(
     int kv_len,
     int cache_idx);
 
+static array qwen_linear(
+    const array& x,
+    const array& weight,
+    const array* scales,
+    const array* biases,
+    int group_size,
+    int bits,
+    const std::string& mode
+) {
+  if (scales != nullptr) {
+    std::optional<array> quant_biases = biases == nullptr
+        ? std::nullopt
+        : std::optional<array>(*biases);
+    return quantized_matmul(
+        x, weight, *scales, quant_biases, true,
+        std::optional<int>(group_size), std::optional<int>(bits), mode);
+  }
+  return matmul(x, transpose(weight, {1, 0}));
+}
+
 // Helper: Apply one transformer block with OPTIMIZED KV cache
 // Uses pre-allocated buffers with slice_update for O(N) total instead of O(N²)
 /// Transformer block forward with array RoPE offsets for batched generation.
@@ -31,6 +51,9 @@ static array transformer_block_forward_cached(
     const array& w_q, const array& w_k, const array& w_v, const array& w_o,
     const array* q_norm_w, const array* k_norm_w,
     const array& w_gate, const array& w_up, const array& w_down,
+    const array* const* quant_scales,
+    const array* const* quant_biases,
+    int quant_group_size, int quant_bits, const std::string& quant_mode,
     // Config
     int n_heads, int n_kv_heads, int head_dim,
     float attn_scale, float rope_base, int rope_dims,
@@ -49,14 +72,19 @@ static array transformer_block_forward_cached(
   // === Self-Attention ===
   auto normed = fast::rms_norm(x, std::optional<array>(input_norm_w), norm_eps, {});
 
-  auto w_q_t = transpose(w_q, {1, 0});
-  auto w_k_t = transpose(w_k, {1, 0});
-  auto w_v_t = transpose(w_v, {1, 0});
-  auto w_o_t = transpose(w_o, {1, 0});
+  auto qs = [&](int index) -> const array* {
+    return quant_scales == nullptr ? nullptr : quant_scales[index];
+  };
+  auto qb = [&](int index) -> const array* {
+    return quant_biases == nullptr ? nullptr : quant_biases[index];
+  };
 
-  auto queries = matmul(normed, w_q_t);
-  auto keys = matmul(normed, w_k_t);
-  auto values = matmul(normed, w_v_t);
+  auto queries = qwen_linear(
+      normed, w_q, qs(0), qb(0), quant_group_size, quant_bits, quant_mode);
+  auto keys = qwen_linear(
+      normed, w_k, qs(1), qb(1), quant_group_size, quant_bits, quant_mode);
+  auto values = qwen_linear(
+      normed, w_v, qs(2), qb(2), quant_group_size, quant_bits, quant_mode);
 
   queries = reshape(queries, {batch, seq_len, n_heads, head_dim});
   keys = reshape(keys, {batch, seq_len, n_kv_heads, head_dim});
@@ -146,20 +174,18 @@ static array transformer_block_forward_cached(
 
   attn_output = transpose(attn_output, {0, 2, 1, 3});
   attn_output = reshape(attn_output, {batch, seq_len, n_heads * head_dim});
-  attn_output = matmul(attn_output, w_o_t);
+  attn_output = qwen_linear(attn_output, w_o, qs(3), qb(3), quant_group_size, quant_bits, quant_mode);
 
   auto h = x + attn_output;
 
   // === MLP ===
   auto mlp_input = fast::rms_norm(h, std::optional<array>(post_attn_norm_w), norm_eps, {});
-  auto w_gate_t = transpose(w_gate, {1, 0});
-  auto w_up_t = transpose(w_up, {1, 0});
-  auto w_down_t = transpose(w_down, {1, 0});
-
-  auto gate = matmul(mlp_input, w_gate_t);
-  auto up = matmul(mlp_input, w_up_t);
+  auto gate = qwen_linear(
+      mlp_input, w_gate, qs(4), qb(4), quant_group_size, quant_bits, quant_mode);
+  auto up = qwen_linear(
+      mlp_input, w_up, qs(5), qb(5), quant_group_size, quant_bits, quant_mode);
   auto activated = mlx::core::sigmoid(gate) * gate * up;  // SiLU(gate) * up
-  auto mlp_output = matmul(activated, w_down_t);
+  auto mlp_output = qwen_linear(activated, w_down, qs(6), qb(6), quant_group_size, quant_bits, quant_mode);
 
   auto output = h + mlp_output;
   // NOTE: Do NOT call eval() or synchronize() here - it would be called 28 times per forward!
@@ -580,6 +606,13 @@ void mlx_qwen3_forward_step(
     // Model weights
     mlx_array* embedding_weight_handle, // [vocab, hidden]
     mlx_array* const* layer_weights,    // [num_layers * 11]
+    mlx_array* const* layer_quant_scales, // [num_layers * 7] or null
+    mlx_array* const* layer_quant_biases, // [num_layers * 7] or null
+    mlx_array* embedding_quant_scales,  // null for dense embedding/head
+    mlx_array* embedding_quant_biases,  // nullable for non-affine modes
+    int quant_group_size,
+    int quant_bits,
+    const char* quant_mode,
     int num_layers,
     mlx_array* final_norm_weight_handle,
     mlx_array* lm_head_weight_handle,   // null if tied
@@ -610,6 +643,11 @@ void mlx_qwen3_forward_step(
     auto& rope_offsets = *reinterpret_cast<array*>(rope_offsets_handle);
     auto& left_padding = *reinterpret_cast<array*>(left_padding_handle);
     array* lm_head_w = lm_head_weight_handle ? reinterpret_cast<array*>(lm_head_weight_handle) : nullptr;
+    array* embedding_scales = embedding_quant_scales
+        ? reinterpret_cast<array*>(embedding_quant_scales) : nullptr;
+    array* embedding_biases = embedding_quant_biases
+        ? reinterpret_cast<array*>(embedding_quant_biases) : nullptr;
+    std::string quant_mode_str(quant_mode ? quant_mode : "affine");
 
     float attn_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     int rope_dims = head_dim;
@@ -634,7 +672,20 @@ void mlx_qwen3_forward_step(
     }
 
     // Embedding lookup
-    auto hidden = take(embedding_weight, input_ids, 0);
+    auto hidden = [&]() {
+        if (embedding_scales == nullptr) {
+            return take(embedding_weight, input_ids, 0);
+        }
+        auto gathered_weight = take(embedding_weight, input_ids, 0);
+        auto gathered_scales = take(*embedding_scales, input_ids, 0);
+        std::optional<array> gathered_biases = embedding_biases == nullptr
+            ? std::nullopt
+            : std::optional<array>(take(*embedding_biases, input_ids, 0));
+        return dequantize(
+            gathered_weight, gathered_scales, gathered_biases,
+            std::optional<int>(quant_group_size), std::optional<int>(quant_bits),
+            quant_mode_str);
+    }();
 
     // Process each layer with array offsets
     for (int i = 0; i < num_layers; i++) {
@@ -651,6 +702,17 @@ void mlx_qwen3_forward_step(
         auto& w_gate = *reinterpret_cast<array*>(layer_weights[base + 8]);
         auto& w_up = *reinterpret_cast<array*>(layer_weights[base + 9]);
         auto& w_down = *reinterpret_cast<array*>(layer_weights[base + 10]);
+        const array* scales[7] = {};
+        const array* biases[7] = {};
+        if (layer_quant_scales != nullptr) {
+            int quant_base = i * 7;
+            for (int j = 0; j < 7; j++) {
+                scales[j] = layer_quant_scales[quant_base + j]
+                    ? reinterpret_cast<array*>(layer_quant_scales[quant_base + j]) : nullptr;
+                biases[j] = layer_quant_biases != nullptr && layer_quant_biases[quant_base + j]
+                    ? reinterpret_cast<array*>(layer_quant_biases[quant_base + j]) : nullptr;
+            }
+        }
 
         // Each layer has its own cache index (all start at same value, advance independently)
         hidden = transformer_block_forward_cached(
@@ -658,6 +720,9 @@ void mlx_qwen3_forward_step(
             input_norm_w, post_attn_norm_w,
             w_q, w_k, w_v, w_o, q_norm_w, k_norm_w,
             w_gate, w_up, w_down,
+            layer_quant_scales == nullptr ? nullptr : scales,
+            layer_quant_biases == nullptr ? nullptr : biases,
+            quant_group_size, quant_bits, quant_mode_str,
             num_heads, num_kv_heads, head_dim,
             attn_scale, rope_theta, rope_dims,
             norm_eps, norm_eps,
@@ -672,7 +737,9 @@ void mlx_qwen3_forward_step(
     // NOTE: Do NOT call eval() or synchronize() here - MLX uses lazy evaluation
     // and the Rust code handles synchronization when needed (e.g., for sampling)
     if (tie_word_embeddings) {
-        auto logits = matmul(hidden, transpose(embedding_weight, {1, 0}));
+        auto logits = qwen_linear(
+            hidden, embedding_weight, embedding_scales, embedding_biases,
+            quant_group_size, quant_bits, quant_mode_str);
         *out_logits = reinterpret_cast<mlx_array*>(new array(std::move(logits)));
     } else {
         auto logits = matmul(hidden, transpose(*lm_head_w, {1, 0}));

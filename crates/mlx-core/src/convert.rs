@@ -1556,6 +1556,85 @@ pub(crate) mod recipe {
         }
     }
 
+    /// Qwen3-ASR. Hugging Face stores the full conditional-generation model
+    /// below a single `model.` prefix and its Conv2d kernels in PyTorch OIHW
+    /// layout. The runtime uses canonical prefix-free component names and MLX
+    /// OHWI kernels, so conversion performs exactly those two transforms.
+    ///
+    /// A previously converted checkpoint is already prefix-free. Treating the
+    /// removed prefix as the source-format witness makes this sanitizer
+    /// idempotent and avoids the shape heuristics that are ambiguous for the
+    /// square 480-channel Conv2d kernels.
+    pub(crate) struct Qwen3AsrRecipe;
+
+    impl ConversionRecipe for Qwen3AsrRecipe {
+        fn model_types(&self) -> &'static [&'static str] {
+            &["qwen3_asr"]
+        }
+
+        fn sanitize(
+            &self,
+            weights: HashMap<String, MxArray>,
+            _config: &serde_json::Value,
+            _target_dtype_str: &str,
+            tie_word_embeddings: bool,
+            verbose: bool,
+        ) -> Result<HashMap<String, MxArray>> {
+            let mut sanitized = HashMap::with_capacity(weights.len());
+            let mut transposed_conv_weights = 0usize;
+
+            for (source_key, array) in weights {
+                let (key, is_hf_layout) = match source_key.strip_prefix("model.") {
+                    Some(stripped) => (stripped, true),
+                    None => (source_key.as_str(), false),
+                };
+
+                if tie_word_embeddings && key == "lm_head.weight" {
+                    continue;
+                }
+
+                let is_audio_conv = matches!(
+                    key,
+                    "audio_tower.conv2d1.weight"
+                        | "audio_tower.conv2d2.weight"
+                        | "audio_tower.conv2d3.weight"
+                );
+                let array = if is_hf_layout && is_audio_conv {
+                    if array.ndim()? != 4 {
+                        return Err(Error::from_reason(format!(
+                            "Qwen3-ASR Conv2d weight '{source_key}' must be rank 4"
+                        )));
+                    }
+                    let transposed = array.transpose(Some(&[0, 2, 3, 1]))?;
+                    transposed.eval();
+                    transposed_conv_weights += 1;
+                    transposed
+                } else {
+                    array
+                };
+
+                if sanitized.insert(key.to_string(), array).is_some() {
+                    return Err(Error::from_reason(format!(
+                        "Qwen3-ASR conversion produced duplicate canonical tensor key '{key}'"
+                    )));
+                }
+            }
+
+            if verbose {
+                info!(
+                    "  Qwen3-ASR sanitize: kept {} tensors, transposed {} Conv2d kernels",
+                    sanitized.len(),
+                    transposed_conv_weights
+                );
+            }
+            Ok(sanitized)
+        }
+
+        fn embed_quantizable(&self) -> bool {
+            true
+        }
+    }
+
     /// openai/privacy-filter. Ships MLX-loadable safetensors already (identity
     /// sanitize) but manages its OWN quantization, so the generic quantize
     /// block must be suppressed.
@@ -1743,6 +1822,7 @@ pub(crate) mod recipe {
     /// the registry-consistency test; each entry MUST resolve via
     /// [`recipe_for`] (asserted in `recipe_registry_reproduces_inline_flags`).
     pub(crate) const CONVERTIBLE_MODEL_TYPES: &[&str] = &[
+        "qwen3_asr",
         "qwen3_5",
         "qwen3_5_moe",
         "lfm2",
@@ -1759,6 +1839,7 @@ pub(crate) mod recipe {
     /// dispatch keeps its own unknown-type error).
     pub(crate) fn recipe_for(model_type: &str) -> Option<Box<dyn ConversionRecipe>> {
         match model_type {
+            "qwen3_asr" => Some(Box::new(Qwen3AsrRecipe)),
             "qwen3_5" => Some(Box::new(Qwen35Recipe { is_moe: false })),
             "qwen3_5_moe" => Some(Box::new(Qwen35Recipe { is_moe: true })),
             "lfm2" | "lfm2_moe" => Some(Box::new(Lfm2Recipe)),
@@ -3326,6 +3407,18 @@ fn should_quantize(key: &str, embed_quantizable: bool) -> bool {
 
     // Exclude vision encoder weights (keep bf16 for quality)
     if key.contains("vision_tower") || key.contains("visual.") {
+        return false;
+    }
+
+    // Audio encoders/projectors are consumed by dense Conv2d/Linear loaders.
+    // Qwen3-ASR quantizes only its Qwen text decoder (including the packed tied
+    // embedding); packing any audio-side weight would make the audio tower
+    // reinterpret uint32 storage as a dense matrix.
+    if key.contains("audio_tower")
+        || key.contains("audio_encoder")
+        || key.contains("embed_audio")
+        || key.contains("multi_modal_projector")
+    {
         return false;
     }
 
@@ -7895,6 +7988,70 @@ mod tests {
         assert!(recipe::recipe_for("qwen3_5_moe").unwrap().sym8_supported());
     }
 
+    #[test]
+    fn qwen3_asr_recipe_canonicalizes_hf_keys_and_conv_layout() {
+        use recipe::ConversionRecipe;
+
+        let conv = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 1, 2, 2])
+            .expect("conv");
+        let embedding =
+            MxArray::from_float32(&[9.0, 10.0, 11.0, 12.0], &[2, 2]).expect("embedding");
+        let weights = HashMap::from([
+            ("model.audio_tower.conv2d1.weight".to_string(), conv),
+            (
+                "model.language_model.embed_tokens.weight".to_string(),
+                embedding,
+            ),
+        ]);
+
+        let out = recipe::Qwen3AsrRecipe
+            .sanitize(weights, &serde_json::json!({}), "bfloat16", true, false)
+            .expect("sanitize");
+
+        assert!(!out.keys().any(|key| key.starts_with("model.")));
+        let conv = &out["audio_tower.conv2d1.weight"];
+        assert_eq!(conv.shape().expect("shape").as_ref(), &[2, 2, 2, 1]);
+        assert_eq!(
+            conv.to_float32().expect("values").to_vec(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        );
+        assert!(out.contains_key("language_model.embed_tokens.weight"));
+    }
+
+    #[test]
+    fn qwen3_asr_recipe_is_idempotent_for_canonical_mlx_layout() {
+        use recipe::ConversionRecipe;
+
+        let canonical =
+            MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 2, 2, 1])
+                .expect("canonical conv");
+        let source_handle = canonical.as_raw_ptr();
+        let out = recipe::Qwen3AsrRecipe
+            .sanitize(
+                HashMap::from([("audio_tower.conv2d1.weight".to_string(), canonical)]),
+                &serde_json::json!({}),
+                "bfloat16",
+                true,
+                false,
+            )
+            .expect("sanitize");
+
+        let result = &out["audio_tower.conv2d1.weight"];
+        assert_eq!(result.shape().expect("shape").as_ref(), &[2, 2, 2, 1]);
+        assert_eq!(result.as_raw_ptr(), source_handle);
+        assert!(recipe::Qwen3AsrRecipe.embed_quantizable());
+        assert!(should_quantize(
+            "language_model.layers.0.mlp.gate_proj.weight",
+            true
+        ));
+        assert!(should_quantize("language_model.embed_tokens.weight", true));
+        assert!(!should_quantize("audio_tower.layers.0.fc1.weight", true));
+        assert!(!should_quantize(
+            "multi_modal_projector.linear_1.weight",
+            true
+        ));
+    }
+
     /// Byte-faithfulness gate for `Gemma4Recipe::sanitize`. Builds a tiny
     /// synthetic gemma4 tensor map and asserts the key invariants the transform
     /// must preserve: HF prefix strip + `language_model.model.` re-prefix, fused
@@ -10619,7 +10776,8 @@ mod tests {
             let err = quantize_weights(&mut weights, 4, 64, "affine", false)
                 .err()
                 .unwrap_or_else(|| panic!("{mode} bytes relabelled affine must be rejected"))
-                .reason;
+                .reason
+                .clone();
             assert!(err.contains(prefix), "{mode}: {err}");
             assert!(err.contains("affine storage"), "{mode}: {err}");
         }

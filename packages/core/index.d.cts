@@ -1317,6 +1317,35 @@ export declare class Qwen35MoeModel {
 }
 export type Qwen3_5MoeModel = Qwen35MoeModel;
 
+export declare class Qwen3AsrCapture {
+  get deviceName(): string;
+  get sampleRate(): number;
+  get channels(): number;
+  pause(): void;
+  resume(): void;
+  stop(): Promise<Qwen3AsrCaptureStats>;
+}
+
+export declare class Qwen3AsrModel {
+  static load(modelPath: string): Promise<Self>;
+  transcribe(audio: Float32Array, options?: Qwen3AsrTranscribeOptions | undefined | null): Promise<Qwen3AsrResult>;
+  createStream(options?: Qwen3AsrStreamOptions | undefined | null): Promise<Qwen3AsrStream>;
+}
+
+export declare class Qwen3AsrStream {
+  feed(samples: Float32Array): Promise<Qwen3AsrResult | undefined | null>;
+  finish(): Promise<Qwen3AsrResult>;
+  /**
+   * Start real-time microphone capture through RustAudio/CPAL. The Core
+   * Audio callback only converts/downmixes into a bounded lock-free ring;
+   * a separate worker drains that ring and feeds this streaming session.
+   */
+  startCapture(
+    options: Qwen3AsrCaptureOptions | undefined | null,
+    callback: (err: Error | null, arg: Qwen3AsrResult) => void,
+  ): Qwen3AsrCapture;
+}
+
 /**
  * Qwen3 Model with automatic differentiation support
  *
@@ -4249,6 +4278,91 @@ export interface Qwen35MoeGenerationResult {
   text: string;
   numTokens: number;
   finishReason: string;
+}
+
+export interface Qwen3AsrCaptureOptions {
+  /** Stable CPAL device identifier returned by `qwen3AsrInputDevices()`. */
+  deviceId?: string;
+  /** Input device name. Omit to use CPAL's default input device. */
+  deviceName?: string;
+  /** Lock-free callback ring capacity in seconds (default 10). */
+  ringSeconds?: number;
+  /** Amount drained from the ring into each model feed (default 100 ms). */
+  feedMilliseconds?: number;
+}
+
+export interface Qwen3AsrCaptureStats {
+  capturedFrames: number;
+  droppedFrames: number;
+}
+
+export interface Qwen3AsrInputDevice {
+  id: string;
+  name: string;
+  isDefault: boolean;
+  sampleRate: number;
+  channels: number;
+  sampleFormat: string;
+}
+
+export declare function qwen3AsrInputDevices(): Array<Qwen3AsrInputDevice>;
+
+export interface Qwen3AsrResult {
+  text: string;
+  /**
+   * Prefix that survived the stream's provisional-token rollback window.
+   * Equals `text` for a final or one-shot result.
+   */
+  stableText: string;
+  /**
+   * Trailing text that may be replaced by the next rolling decode.
+   * Empty for a final or one-shot result.
+   */
+  provisionalText: string;
+  language?: string;
+  tokenIds: Array<number>;
+  audioSeconds: number;
+  featureMs: number;
+  encoderMs: number;
+  prefillMs: number;
+  decodeMs: number;
+  totalMs: number;
+  tokensPerSecond: number;
+  realTimeFactor: number;
+  /**
+   * Streaming revisions increment whenever a rolling re-decode replaces
+   * previously provisional text. Zero for one-shot transcription.
+   */
+  revision: number;
+  isFinal: boolean;
+}
+
+export interface Qwen3AsrStreamOptions {
+  sampleRate?: number;
+  prompt?: string;
+  language?: string;
+  maxTokens?: number;
+  /** Minimum newly buffered audio before a rolling decode (default 2 s). */
+  chunkSeconds?: number;
+  /** Number of trailing tokens considered provisional (default 5). */
+  provisionalTokens?: number;
+}
+
+export interface Qwen3AsrTranscribeOptions {
+  /**
+   * Sampling rate of `audio`. Inputs are resampled to the checkpoint's
+   * native 16 kHz rate before feature extraction.
+   */
+  sampleRate?: number;
+  /** Optional domain/context prompt placed in the system turn. */
+  prompt?: string;
+  /**
+   * Language code (`en`, `zh`, ...) or canonical language name. Omit for
+   * automatic language detection.
+   */
+  language?: string;
+  /** Maximum number of newly generated tokens (default 256). */
+  maxTokens?: number;
 }
 
 /** Qwen3 model configuration */

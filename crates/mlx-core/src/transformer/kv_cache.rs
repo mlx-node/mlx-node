@@ -150,6 +150,14 @@ impl KVCache {
         self.values.as_ref()
     }
 
+    /// Consume the cache and transfer its backing arrays to a different
+    /// decoder implementation without cloning their reference-counted
+    /// handles. This is used when a dense prefill hands ownership to a fused
+    /// token-step kernel.
+    pub(crate) fn into_parts(self) -> (Option<MxArray>, Option<MxArray>, i32) {
+        (self.keys, self.values, self.offset)
+    }
+
     /// Set the cached keys directly (used by fused forward pass).
     pub fn set_keys(&mut self, keys: MxArray) {
         self.keys = Some(keys);

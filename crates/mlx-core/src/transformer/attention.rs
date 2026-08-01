@@ -1,4 +1,4 @@
-use crate::array::MxArray;
+use crate::array::{MxArray, scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::nn::{Linear, RMSNorm, RoPE};
 use crate::transformer::kv_cache::KVCache;
 use mlx_sys as sys;
@@ -110,6 +110,10 @@ impl Attention {
         mask: Option<&MxArray>,
         cache: Option<&mut KVCache>,
     ) -> Result<MxArray> {
+        if self.is_quantized() {
+            return self.forward_quantized(x, mask, cache);
+        }
+
         // Use fused C++ implementation for better performance
         // This reduces ~15 FFI calls to 3 (qkv + cache + output)
         let seq_len = x.shape_at(1)?;
@@ -207,6 +211,74 @@ impl Attention {
         MxArray::from_handle(handle, "fused_attention_output")
     }
 
+    /// Component path for packed projections. The dense path above passes raw
+    /// weights into a fused helper; doing that for a packed tensor would either
+    /// misinterpret its bytes or force a full dequantization. Keep every Q/K/V/O
+    /// projection on `Linear::forward`, which dispatches directly to MLX's
+    /// fused dequantize-matmul kernel.
+    fn forward_quantized(
+        &self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<MxArray> {
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+        let rope_offset = cache.as_ref().map(|cache| cache.get_offset()).unwrap_or(0);
+
+        let mut queries = self.q_proj.forward(x)?.reshape(&[
+            batch,
+            seq_len,
+            self.n_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let mut keys = self.k_proj.forward(x)?.reshape(&[
+            batch,
+            seq_len,
+            self.n_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let values = self.v_proj.forward(x)?.reshape(&[
+            batch,
+            seq_len,
+            self.n_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        if let Some(norm) = &self.q_norm {
+            queries = norm.forward(&queries)?;
+        }
+        if let Some(norm) = &self.k_norm {
+            keys = norm.forward(&keys)?;
+        }
+        queries = self
+            .rope
+            .forward(&queries.transpose(Some(&[0, 2, 1, 3]))?, Some(rope_offset))?;
+        keys = self
+            .rope
+            .forward(&keys.transpose(Some(&[0, 2, 1, 3]))?, Some(rope_offset))?;
+        let values = values.transpose(Some(&[0, 2, 1, 3]))?;
+
+        let (keys, values) = if let Some(cache) = cache {
+            cache.update_and_fetch(&keys, &values)?
+        } else {
+            (keys, values)
+        };
+        let kv_len = keys.shape_at(2)?;
+        let attended = if let Some(mask) = mask {
+            scaled_dot_product_attention(&queries, &keys, &values, self.scale, Some(mask))?
+        } else if seq_len > 1 && seq_len == kv_len {
+            scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale)?
+        } else {
+            scaled_dot_product_attention(&queries, &keys, &values, self.scale, None)?
+        };
+        let attended = attended.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
+            batch,
+            seq_len,
+            (self.n_heads * self.head_dim) as i64,
+        ])?;
+        self.o_proj.forward(&attended)
+    }
+
     // Weight setters for loading pretrained models
 
     pub fn set_q_proj_weight(&mut self, weight: &MxArray) -> Result<()> {
@@ -227,6 +299,29 @@ impl Attention {
     pub fn set_o_proj_weight(&mut self, weight: &MxArray) -> Result<()> {
         self.o_proj.set_weight(weight)?;
         Ok(())
+    }
+
+    pub(crate) fn q_proj_mut(&mut self) -> &mut Linear {
+        &mut self.q_proj
+    }
+
+    pub(crate) fn k_proj_mut(&mut self) -> &mut Linear {
+        &mut self.k_proj
+    }
+
+    pub(crate) fn v_proj_mut(&mut self) -> &mut Linear {
+        &mut self.v_proj
+    }
+
+    pub(crate) fn o_proj_mut(&mut self) -> &mut Linear {
+        &mut self.o_proj
+    }
+
+    pub(crate) fn is_quantized(&self) -> bool {
+        self.q_proj.is_quantized()
+            || self.k_proj.is_quantized()
+            || self.v_proj.is_quantized()
+            || self.o_proj.is_quantized()
     }
 
     pub fn set_q_norm_weight(&mut self, weight: &MxArray) -> Result<()> {

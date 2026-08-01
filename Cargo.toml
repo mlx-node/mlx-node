@@ -17,6 +17,7 @@ libc = "0.2"
 mimalloc-safe = { version = "0.1" }
 parquet = { version = "59", features = ["arrow"] }
 rand = "0.10"
+rustfft = "6.4.1"
 serde_json = { version = "1", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

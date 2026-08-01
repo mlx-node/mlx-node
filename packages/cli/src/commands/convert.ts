@@ -34,7 +34,9 @@ Optional Arguments:
   --config-dir <path>   Hugging Face config/tokenizer asset directory to copy
                         when converting a GGUF model
   --model-type, -m      Model type (auto-detected if not specified)
-                        Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_5, qwen3_5_moe, lfm2_moe, lfm2, qianfan-ocr, privacy-filter
+                        Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_asr,
+                        qwen3_5, qwen3_5_moe, lfm2_moe, lfm2, qianfan-ocr,
+                        privacy-filter
   --verbose, -v         Enable verbose logging
   --help, -h            Show this help message
 
@@ -150,6 +152,7 @@ Model Types:
   paddleocr-vl          PaddleOCR-VL weight sanitization
   qwen3_5               Qwen3.5 dense model (FP8 dequant, key remapping)
   qwen3_5_moe           Qwen3.5 MoE model (FP8 dequant, expert stacking)
+  qwen3_asr             Qwen3-ASR audio encoder + Qwen3 decoder
   lfm2_moe              LFM2 MoE model (MLP rename, conv transpose, expert stacking; affine quant only)
   lfm2                  LFM2 dense model (MLP rename, conv transpose; affine quant only)
   pp-lcnet-ori          PP-LCNet orientation classifier (Paddle -> SafeTensors)
@@ -172,6 +175,7 @@ GGUF Support:
 
 Examples:
   mlx convert -i .cache/models/qwen3-0.6b -o .cache/models/qwen3-0.6b-mlx
+  mlx convert -i .cache/models/qwen3-asr-1.7b-hf -o .cache/models/qwen3-asr-1.7b-mlx-mxfp4 -q --q-mode mxfp4
   mlx convert -i .cache/models/Qwen3.5-35B-A3B-FP8 -o .cache/models/Qwen3.5-35B-A3B-4bit -m qwen3_5_moe -q --q-bits 4
   mlx convert -m pp-lcnet-ori -i .cache/models/PP-LCNet -o ./models/PP-LCNet_x1_0_doc_ori/
   mlx convert -i model.gguf -o ./models/converted-mlx
@@ -612,6 +616,9 @@ export async function run(argv: string[]) {
       if (config.model_type === 'paddleocr_vl') {
         modelType = 'paddleocr-vl';
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
+      } else if (config.model_type === 'qwen3_asr') {
+        modelType = config.model_type;
+        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       } else if (config.model_type === 'qwen3_5_moe' || config.model_type === 'qwen3_5') {
         modelType = config.model_type;
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
@@ -654,6 +661,18 @@ export async function run(argv: string[]) {
     } catch {
       // config.json not found or invalid
     }
+  }
+
+  if (
+    modelType === 'qwen3_asr' &&
+    args.quantize &&
+    ((quantMode !== undefined && !['affine', 'mxfp4', 'mxfp8'].includes(quantMode)) ||
+      args['q-recipe'] !== undefined)
+  ) {
+    console.error(
+      'Error: Qwen3-ASR packed conversion supports uniform affine, mxfp4, or mxfp8 quantization; omit --q-recipe',
+    );
+    process.exit(1);
   }
 
   // Foreign weight formats (Paddle .pdparams/.pdiparams, PyTorch .pkl)

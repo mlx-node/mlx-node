@@ -21,6 +21,7 @@
   },
   "devDependencies": {
     "@ast-grep/napi": "^0.44.0",
+    "@mlx-node/asr": "workspace:*",
     "@mlx-node/cli": "workspace:*",
     "@mlx-node/internal-tools": "workspace:*",
     "@mlx-node/lm": "workspace:*",

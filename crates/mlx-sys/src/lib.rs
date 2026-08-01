@@ -673,8 +673,15 @@ unsafe extern "C-unwind" {
         // Input
         input_ids: *mut mlx_array, // [batch, seq_len]
         // Model weights
-        embedding_weight: *mut mlx_array,     // [vocab, hidden]
-        layer_weights: *const *mut mlx_array, // [num_layers * 11]
+        embedding_weight: *mut mlx_array,          // [vocab, hidden]
+        layer_weights: *const *mut mlx_array,      // [num_layers * 11]
+        layer_quant_scales: *const *mut mlx_array, // [num_layers * 7] or null
+        layer_quant_biases: *const *mut mlx_array, // [num_layers * 7] or null
+        embedding_quant_scales: *mut mlx_array,
+        embedding_quant_biases: *mut mlx_array,
+        quant_group_size: i32,
+        quant_bits: i32,
+        quant_mode: *const std::ffi::c_char,
         num_layers: i32,
         final_norm_weight: *mut mlx_array, // [hidden]
         lm_head_weight: *mut mlx_array,    // null if tied

@@ -52,7 +52,7 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 
 ### Model Inference
 
-- Qwen3, Qwen3.5 Dense / MoE, LFM2.5, Gemma4
+- Qwen3, Qwen3-ASR, Qwen3.5 Dense / MoE, LFM2.5, Gemma4
 - Multi-turn `ChatSession` with live KV cache reuse
 - Streaming generation via `sendStream()`
 - Tool calling and chat templates
@@ -421,6 +421,7 @@ MLX-Node uses a clean two-layer architecture: **Rust for compute**, **TypeScript
 | Package                             | Purpose                    | Use For                                            |
 | :---------------------------------- | :------------------------- | :------------------------------------------------- |
 | [`@mlx-node/lm`](./packages/lm)     | Model loading & inference  | Loading models, generating text, model configs     |
+| [`@mlx-node/asr`](./packages/asr)   | Speech recognition         | Qwen3-ASR offline, streaming, and CPAL capture     |
 | [`@mlx-node/trl`](./packages/trl)   | Training & optimization    | GRPO training, custom rewards, optimizers          |
 | [`@mlx-node/core`](./packages/core) | Native bindings (internal) | Low-level operations (usually import via lm/trl)   |
 | [`@mlx-node/cli`](./packages/cli)   | CLI                        | Download models, quantize weights, run `mlx agent` |

@@ -1,7 +1,4 @@
 use crate::array::MxArray;
-// Only the test-only `forward_with_cache` uses Activations on the Rust side;
-// the production forward routes through the fused C++ SwiGLU kernels.
-#[cfg(test)]
 use crate::nn::Activations;
 use crate::nn::Linear;
 use mlx_sys as sys;
@@ -85,6 +82,13 @@ impl MLP {
     /// # Returns
     /// Output tensor, shape: (batch, seq_len, hidden_size)
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
+        if self.is_quantized() {
+            let gate = self.gate_proj.forward(x)?;
+            let up = self.up_proj.forward(x)?;
+            let activated = Activations::silu(&gate)?.mul(&up)?;
+            return self.down_proj.forward(&activated);
+        }
+
         // E39: fast path — pre-stacked + pre-transposed weights.
         // Env-toggle MLX_DISABLE_E39_STACKED_MLP=1 reverts to the legacy
         // two-matmul path for A/B testing.
@@ -180,6 +184,12 @@ impl MLP {
     pub fn down_proj_mut(&mut self) -> &mut Linear {
         self.down_proj_wt = None;
         &mut self.down_proj
+    }
+
+    pub(crate) fn is_quantized(&self) -> bool {
+        self.gate_proj.is_quantized()
+            || self.up_proj.is_quantized()
+            || self.down_proj.is_quantized()
     }
 
     // Weight getters for backward pass

@@ -839,7 +839,7 @@ mod tests {
         });
         let err = reject_quantized_checkpoint(&cfg, "/tmp/model")
             .expect_err("q4k checkpoint must be rejected by the dense loader");
-        let msg = err.reason;
+        let msg = err.reason.clone();
         assert!(msg.contains("q4k"), "error names the mode: {msg}");
         assert!(
             msg.contains("no quantized-weight support"),

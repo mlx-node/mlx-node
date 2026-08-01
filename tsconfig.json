@@ -2,6 +2,7 @@
   "files": [],
   "references": [
     { "path": "./packages/core" },
+    { "path": "./packages/asr" },
     { "path": "./packages/lm" },
     { "path": "./packages/agent" },
     { "path": "./packages/trl" },

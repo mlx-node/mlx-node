@@ -12,6 +12,7 @@ struct QuantizedBackend {
     biases: Option<MxArray>, // Quantization biases (affine mode)
     group_size: i32,
     bits: i32,
+    mode: String,
 }
 
 pub struct Linear {
@@ -59,7 +60,8 @@ impl Linear {
     /// When quantized, uses fused dequantize+matmul Metal kernel.
     pub fn forward(&self, input: &MxArray) -> Result<MxArray> {
         if let Some(ref q) = self.quantized {
-            let mode_c = c"affine";
+            let mode_c = std::ffi::CString::new(q.mode.as_str())
+                .map_err(|_| Error::from_reason("Invalid quantized linear mode string"))?;
             let biases_ptr = q
                 .biases
                 .as_ref()
@@ -127,6 +129,20 @@ impl Linear {
         group_size: i32,
         bits: i32,
     ) -> Result<()> {
+        self.load_quantized_mode(weight, scales, biases, group_size, bits, "affine")
+    }
+
+    /// Mode-aware packed load used by model families that support MLX's
+    /// microscaling formats in addition to affine integer packing.
+    pub fn load_quantized_mode(
+        &mut self,
+        weight: &MxArray,
+        scales: &MxArray,
+        biases: Option<&MxArray>,
+        group_size: i32,
+        bits: i32,
+        mode: &str,
+    ) -> Result<()> {
         // Verify out_features matches
         if weight.shape_at(0)? != self.out_features as i64 {
             return Err(Error::from_reason(format!(
@@ -138,6 +154,8 @@ impl Linear {
 
         // Dequantize for get_weight() (used by tied embeddings path)
         let biases_ptr = biases.map_or(std::ptr::null_mut(), |b| b.as_raw_ptr());
+        let mode_c = std::ffi::CString::new(mode)
+            .map_err(|_| Error::from_reason("Invalid quantized linear mode string"))?;
         let handle = unsafe {
             mlx_sys::mlx_dequantize(
                 weight.as_raw_ptr(),
@@ -146,7 +164,7 @@ impl Linear {
                 group_size,
                 bits,
                 -1,
-                c"affine".as_ptr(),
+                mode_c.as_ptr(),
             )
         };
         self.weight = MxArray::from_handle(handle, "dequantize_linear")?;
@@ -157,6 +175,7 @@ impl Linear {
             biases: biases.cloned(),
             group_size,
             bits,
+            mode: mode.to_string(),
         });
         Ok(())
     }
@@ -209,6 +228,7 @@ impl Clone for Linear {
                 biases: q.biases.clone(),
                 group_size: q.group_size,
                 bits: q.bits,
+                mode: q.mode.clone(),
             }),
         }
     }
@@ -308,6 +328,81 @@ mod tests {
                 "bias not applied at {i}: got {g}, want {w} (no-bias would be {})",
                 w - [10.0, 20.0, 30.0, 40.0][i % 4]
             );
+        }
+    }
+
+    #[test]
+    fn mxfp4_backend_and_clone_match_dequantized_reference() {
+        let weight_values: Vec<f32> = (0..8 * 64)
+            .map(|index| ((index % 17) as f32 - 8.0) * 0.025)
+            .collect();
+        let weight = MxArray::from_float32(&weight_values, &[8, 64])
+            .unwrap()
+            .astype(crate::array::DType::BFloat16)
+            .unwrap();
+        let mut packed = std::ptr::null_mut();
+        let mut scales = std::ptr::null_mut();
+        let mut biases = std::ptr::null_mut();
+        let ok = unsafe {
+            mlx_sys::mlx_quantize(
+                weight.as_raw_ptr(),
+                32,
+                4,
+                c"mxfp4".as_ptr(),
+                &mut packed,
+                &mut scales,
+                &mut biases,
+            )
+        };
+        assert!(ok);
+        assert!(biases.is_null());
+        let packed = MxArray::from_handle(packed, "mxfp4_linear_weight").unwrap();
+        let scales = MxArray::from_handle(scales, "mxfp4_linear_scales").unwrap();
+
+        let mut linear = Linear::new(64, 8, Some(false)).unwrap();
+        linear
+            .load_quantized_mode(&packed, &scales, None, 32, 4, "mxfp4")
+            .unwrap();
+        let input_values: Vec<f32> = (0..64)
+            .map(|index| ((index % 11) as f32 - 5.0) * 0.05)
+            .collect();
+        let input = MxArray::from_float32(&input_values, &[1, 64])
+            .unwrap()
+            .astype(crate::array::DType::BFloat16)
+            .unwrap();
+        let got = linear.forward(&input).unwrap().to_float32().unwrap();
+        let cloned = linear
+            .clone()
+            .forward(&input)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+
+        let dense_handle = unsafe {
+            mlx_sys::mlx_dequantize(
+                packed.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                std::ptr::null_mut(),
+                32,
+                4,
+                -1,
+                c"mxfp4".as_ptr(),
+            )
+        };
+        let dense = MxArray::from_handle(dense_handle, "mxfp4_linear_reference").unwrap();
+        let reference = input
+            .matmul(&dense.transpose(Some(&[1, 0])).unwrap())
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        for (index, ((got, cloned), reference)) in got
+            .iter()
+            .zip(cloned.iter())
+            .zip(reference.iter())
+            .enumerate()
+        {
+            assert!((got - reference).abs() < 5e-3, "output {index}");
+            assert!((cloned - reference).abs() < 5e-3, "clone output {index}");
         }
     }
 }
