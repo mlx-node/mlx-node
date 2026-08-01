@@ -909,8 +909,12 @@ struct StreamingState {
     /// A fresh audio/text anchor is required after a degenerate decode.
     recovery_pending: bool,
     stagnant_revisions: u32,
+    /// Whether the most recent rolling decode exhausted its token budget.
+    last_reached_max_tokens: bool,
     /// At most one CPAL worker may feed a streaming session at a time.
     capture_active: bool,
+    /// Dropping the public stream wrapper must wait for its capture worker.
+    remove_after_capture: bool,
 }
 
 struct Qwen3AsrInner {
@@ -1334,6 +1338,7 @@ impl Qwen3AsrInner {
             &text,
         )?;
         let total_ms = total_start.elapsed().as_secs_f64() * 1_000.0;
+        state.last_reached_max_tokens = reached_max_tokens;
         Ok(Qwen3AsrResult {
             text,
             stable_text,
@@ -1365,6 +1370,7 @@ impl Qwen3AsrInner {
         samples: Vec<f32>,
         source: StreamFeedSource,
     ) -> Result<Option<Qwen3AsrResult>> {
+        validate_audio_samples(&samples)?;
         let mut state = self
             .streams
             .remove(id)
@@ -1401,9 +1407,7 @@ impl Qwen3AsrInner {
     }
 
     fn release_capture(&mut self, id: &str) {
-        if let Some(state) = self.streams.get_mut(id) {
-            release_stream_capture(state);
-        }
+        release_capture_registration(&mut self.streams, id);
     }
 
     fn finish_stream(&mut self, id: &str) -> Result<Qwen3AsrResult> {
@@ -1433,7 +1437,7 @@ impl Qwen3AsrInner {
             provisional_text: String::new(),
             language: detected_language,
             token_ids: state.raw_token_ids,
-            reached_max_tokens: false,
+            reached_max_tokens: state.last_reached_max_tokens,
             audio_seconds: state.processed_samples as f64 / sample_rate as f64,
             segment_audio_seconds: 0.0,
             feature_ms: 0.0,
@@ -1480,6 +1484,30 @@ fn release_stream_capture(state: &mut StreamingState) {
     state.capture_active = false;
 }
 
+fn request_stream_removal(streams: &mut HashMap<String, StreamingState>, id: &str) {
+    let remove_now = match streams.get_mut(id) {
+        Some(state) if state.capture_active => {
+            state.remove_after_capture = true;
+            false
+        }
+        Some(_) => true,
+        None => false,
+    };
+    if remove_now {
+        streams.remove(id);
+    }
+}
+
+fn release_capture_registration(streams: &mut HashMap<String, StreamingState>, id: &str) {
+    let remove_now = streams.get_mut(id).is_some_and(|state| {
+        release_stream_capture(state);
+        state.remove_after_capture
+    });
+    if remove_now {
+        streams.remove(id);
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum StreamFeedSource {
     Public,
@@ -1491,6 +1519,13 @@ fn validate_stream_feed_source(state: &StreamingState, source: StreamFeedSource)
         return Err(Error::from_reason(
             "Cannot manually feed a Qwen3-ASR stream while microphone capture is active",
         ));
+    }
+    Ok(())
+}
+
+fn validate_audio_samples(samples: &[f32]) -> Result<()> {
+    if samples.iter().any(|sample| !sample.is_finite()) {
+        return Err(Error::from_reason("audio contains NaN or infinity"));
     }
     Ok(())
 }
@@ -1866,7 +1901,9 @@ fn handle_cmd(inner: &mut Qwen3AsrInner, cmd: Qwen3AsrCmd) {
                         .collect(),
                     recovery_pending: false,
                     stagnant_revisions: 0,
+                    last_reached_max_tokens: false,
                     capture_active: false,
+                    remove_after_capture: false,
                 },
             );
             let _ = reply.send(Ok(()));
@@ -1893,7 +1930,7 @@ fn handle_cmd(inner: &mut Qwen3AsrInner, cmd: Qwen3AsrCmd) {
             let _ = reply.send(inner.finish_stream(&id));
         }
         Qwen3AsrCmd::RemoveStream { id } => {
-            inner.streams.remove(&id);
+            request_stream_removal(&mut inner.streams, &id);
         }
     }
 }
@@ -2213,6 +2250,34 @@ fn parse_processor_config(data: &str) -> Result<ProcessorConfig> {
 mod tests {
     use super::*;
 
+    fn test_streaming_state() -> StreamingState {
+        StreamingState {
+            pending_samples: Vec::new(),
+            current_window_samples: Vec::new(),
+            options: Qwen3AsrStreamOptions {
+                sample_rate: Some(16_000),
+                prompt: None,
+                language: None,
+                max_tokens: None,
+                chunk_seconds: None,
+                provisional_tokens: None,
+                unfixed_chunks: None,
+            },
+            processed_samples: 0,
+            revision: 0,
+            raw_token_ids: Vec::new(),
+            encoder_windows: Vec::new(),
+            cached_encoder_windows: 0,
+            stable_cache_positions: 0,
+            decoder_caches: Vec::new(),
+            recovery_pending: false,
+            stagnant_revisions: 0,
+            last_reached_max_tokens: false,
+            capture_active: false,
+            remove_after_capture: false,
+        }
+    }
+
     #[test]
     fn language_codes_and_names_resolve_like_transformers() {
         assert_eq!(
@@ -2301,29 +2366,7 @@ mod tests {
 
     #[test]
     fn capture_uses_device_rate_and_rejects_mixed_manual_input() {
-        let mut state = StreamingState {
-            pending_samples: Vec::new(),
-            current_window_samples: Vec::new(),
-            options: Qwen3AsrStreamOptions {
-                sample_rate: Some(16_000),
-                prompt: None,
-                language: None,
-                max_tokens: None,
-                chunk_seconds: None,
-                provisional_tokens: None,
-                unfixed_chunks: None,
-            },
-            processed_samples: 0,
-            revision: 0,
-            raw_token_ids: Vec::new(),
-            encoder_windows: Vec::new(),
-            cached_encoder_windows: 0,
-            stable_cache_positions: 0,
-            decoder_caches: Vec::new(),
-            recovery_pending: false,
-            stagnant_revisions: 0,
-            capture_active: false,
-        };
+        let mut state = test_streaming_state();
         prepare_stream_capture(&mut state, 48_000).unwrap();
         assert_eq!(state.options.sample_rate, Some(48_000));
         let error = validate_stream_feed_source(&state, StreamFeedSource::Public).unwrap_err();
@@ -2347,6 +2390,35 @@ mod tests {
         state.pending_samples.push(0.0);
         assert!(prepare_stream_capture(&mut state, 16_000).is_err());
         assert_eq!(state.options.sample_rate, Some(44_100));
+    }
+
+    #[test]
+    fn capture_keeps_registration_alive_after_stream_wrapper_drop() {
+        let mut state = test_streaming_state();
+        prepare_stream_capture(&mut state, 48_000).unwrap();
+        let mut streams = HashMap::from([("stream".to_string(), state)]);
+
+        request_stream_removal(&mut streams, "stream");
+        let state = streams
+            .get("stream")
+            .expect("active capture must retain its stream registration");
+        assert!(state.capture_active);
+        assert!(state.remove_after_capture);
+
+        release_capture_registration(&mut streams, "stream");
+        assert!(
+            !streams.contains_key("stream"),
+            "capture release removes an otherwise unowned registration"
+        );
+    }
+
+    #[test]
+    fn non_finite_audio_is_rejected_before_stream_buffering() {
+        validate_audio_samples(&[0.0, -0.5, 1.0]).unwrap();
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = validate_audio_samples(&[0.25, invalid, 0.5]).unwrap_err();
+            assert!(error.reason.contains("NaN or infinity"), "{}", error.reason);
+        }
     }
 
     #[test]

@@ -2123,6 +2123,26 @@ fn reject_dense_only_family_quantization(
     )))
 }
 
+/// Qwen3-ASR's loader accepts one uniform packed format for the text tower.
+/// Mixed recipes emit per-layer metadata that the runtime intentionally
+/// rejects, and the remaining quantization modes have no ASR dispatch.
+fn validate_qwen3_asr_quantization(
+    model_type: Option<&str>,
+    do_quantize: bool,
+    quant_mode: &str,
+    quant_recipe: Option<&str>,
+) -> Result<()> {
+    if model_type != Some("qwen3_asr") || !do_quantize {
+        return Ok(());
+    }
+    if !matches!(quant_mode, "affine" | "mxfp4" | "mxfp8") || quant_recipe.is_some() {
+        return Err(Error::from_reason(
+            "Qwen3-ASR packed conversion supports uniform affine, mxfp4, or mxfp8 quantization; omit quant_recipe",
+        ));
+    }
+    Ok(())
+}
+
 /// Identify dense-only inference families from the source checkpoint itself.
 ///
 /// This closes the direct-NAPI/default-converter path where `model_type` was
@@ -2300,6 +2320,12 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // dense. Fail before mode-specific validation, input I/O, the conversion
     // mutex, or any MLX operation.
     reject_dense_only_family_quantization(model_type.as_deref(), do_quantize, &quant_mode)?;
+    validate_qwen3_asr_quantization(
+        model_type.as_deref(),
+        do_quantize,
+        &quant_mode,
+        quant_recipe.as_deref(),
+    )?;
 
     // "drafter" is accepted as an alias for "split" and normalized above.
     const VALID_MTP_QUANT_POLICIES: &[&str] = &["off", "cyankiwi", "all", "split", "drafter"];
@@ -8369,6 +8395,75 @@ mod tests {
             )
             .is_ok(),
             "unrecognized model types remain the later dispatch guard's responsibility"
+        );
+    }
+
+    #[test]
+    fn qwen3_asr_rejects_mixed_or_unsupported_native_quantization() {
+        for mode in ["affine", "mxfp4", "mxfp8"] {
+            validate_qwen3_asr_quantization(Some("qwen3_asr"), true, mode, None)
+                .expect("uniform ASR packed mode must remain supported");
+        }
+
+        for mode in ["nvfp4", "sym8"] {
+            let error = validate_qwen3_asr_quantization(Some("qwen3_asr"), true, mode, None)
+                .expect_err("unsupported ASR mode must fail before conversion I/O");
+            assert!(error.reason.contains("uniform"), "{}", error.reason);
+        }
+
+        let error =
+            validate_qwen3_asr_quantization(Some("qwen3_asr"), true, "affine", Some("mixed_4_6"))
+                .expect_err("ASR mixed recipe must fail before conversion I/O");
+        assert!(
+            error.reason.contains("omit quant_recipe"),
+            "{}",
+            error.reason
+        );
+
+        validate_qwen3_asr_quantization(Some("qwen3_asr"), false, "affine", Some("mixed_4_6"))
+            .expect("the existing generic recipe-without-quantize validation owns this case");
+        validate_qwen3_asr_quantization(Some("qwen3_5"), true, "affine", Some("mixed_4_6"))
+            .expect("other model families keep their recipe support");
+    }
+
+    #[tokio::test]
+    async fn qwen3_asr_native_recipe_rejection_precedes_converter_io() {
+        let base = std::env::temp_dir().join(format!(
+            "mlx-asr-invalid-recipe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let result = convert_model(ConversionOptions {
+            input_dir: base.join("absent-input").to_string_lossy().to_string(),
+            output_dir: base.join("output").to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("qwen3_asr".to_string()),
+            quantize: Some(true),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: Some("affine".to_string()),
+            quant_recipe: Some("mixed_4_6".to_string()),
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("native ASR recipe must fail before reading input"),
+        };
+        assert!(
+            error.reason.contains("omit quant_recipe"),
+            "{}",
+            error.reason
+        );
+        assert!(
+            !base.exists(),
+            "validation must not create converter output"
         );
     }
 
