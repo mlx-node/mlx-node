@@ -13,11 +13,11 @@ use uuid::Uuid;
 
 use crate::array::mask::create_causal_mask;
 use crate::array::{DType, MxArray, scaled_dot_product_attention};
+use crate::engine::persistence::load_all_safetensors;
 use crate::model_thread::{ModelThread, ResponseTx};
 use crate::nn::{Activations, Embedding, LayerNorm, Linear, RMSNorm};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::{KVCache, TransformerBlock};
-use crate::utils::safetensors::load_safetensors_lazy;
 use crate::vision::conv2d::Conv2d;
 
 use super::audio::{AudioFeatures, FeatureExtractor, resample_mono};
@@ -909,6 +909,8 @@ struct StreamingState {
     /// A fresh audio/text anchor is required after a degenerate decode.
     recovery_pending: bool,
     stagnant_revisions: u32,
+    /// At most one CPAL worker may feed a streaming session at a time.
+    capture_active: bool,
 }
 
 struct Qwen3AsrInner {
@@ -1392,6 +1394,12 @@ impl Qwen3AsrInner {
         prepare_stream_capture(state, sample_rate)
     }
 
+    fn release_capture(&mut self, id: &str) {
+        if let Some(state) = self.streams.get_mut(id) {
+            release_stream_capture(state);
+        }
+    }
+
     fn finish_stream(&mut self, id: &str) -> Result<Qwen3AsrResult> {
         let mut state = self.streams.remove(id).ok_or_else(|| {
             Error::from_reason(format!("Unknown or already finished ASR stream {id}"))
@@ -1441,6 +1449,11 @@ fn prepare_stream_capture(state: &mut StreamingState, sample_rate: u32) -> Resul
             "capture sample rate must be greater than zero",
         ));
     }
+    if state.capture_active {
+        return Err(Error::from_reason(
+            "A microphone capture is already active for this Qwen3-ASR stream",
+        ));
+    }
     if !state.pending_samples.is_empty()
         || !state.current_window_samples.is_empty()
         || state.processed_samples != 0
@@ -1453,7 +1466,12 @@ fn prepare_stream_capture(state: &mut StreamingState, sample_rate: u32) -> Resul
     // as authoritative so the feature extractor resamples the actual signal
     // rather than interpreting (typically) 48 kHz input as 16 kHz.
     state.options.sample_rate = Some(sample_rate);
+    state.capture_active = true;
     Ok(())
+}
+
+fn release_stream_capture(state: &mut StreamingState) {
+    state.capture_active = false;
 }
 
 fn stream_chunk_seconds(options: &Qwen3AsrStreamOptions) -> Result<f64> {
@@ -1767,6 +1785,9 @@ pub(super) enum Qwen3AsrCmd {
         sample_rate: u32,
         reply: ResponseTx<()>,
     },
+    ReleaseCapture {
+        id: String,
+    },
     FinishStream {
         id: String,
         reply: ResponseTx<Qwen3AsrResult>,
@@ -1823,6 +1844,7 @@ fn handle_cmd(inner: &mut Qwen3AsrInner, cmd: Qwen3AsrCmd) {
                         .collect(),
                     recovery_pending: false,
                     stagnant_revisions: 0,
+                    capture_active: false,
                 },
             );
             let _ = reply.send(Ok(()));
@@ -1836,6 +1858,9 @@ fn handle_cmd(inner: &mut Qwen3AsrInner, cmd: Qwen3AsrCmd) {
             reply,
         } => {
             let _ = reply.send(inner.prepare_capture(&id, sample_rate));
+        }
+        Qwen3AsrCmd::ReleaseCapture { id } => {
+            inner.release_capture(&id);
         }
         Qwen3AsrCmd::FinishStream { id, reply } => {
             let _ = reply.send(inner.finish_stream(&id));
@@ -2038,13 +2063,18 @@ fn load_inner(path: &Path) -> Result<(Qwen3AsrInner, u64)> {
         }
     };
     let weights_path = path.join("model.safetensors");
-    if !weights_path.is_file() {
+    let weights_index_path = path.join("model.safetensors.index.json");
+    if !weights_path.is_file() && !weights_index_path.is_file() {
         return Err(Error::from_reason(format!(
-            "Converted Qwen3-ASR weights not found at {}. Run `mlx convert` first.",
-            weights_path.display()
+            "Converted Qwen3-ASR weights not found at {} or {}. Run `mlx convert` first.",
+            weights_path.display(),
+            weights_index_path.display()
         )));
     }
-    let params = load_safetensors_lazy(&weights_path)?;
+    // The converter writes a single file up to 5 GiB and otherwise emits
+    // model-NNNNN-of-NNNNN.safetensors shards plus the standard index. Use the
+    // shared mmap-backed loader so both layouts have identical lazy semantics.
+    let params = load_all_safetensors(path, false)?;
     if params.keys().any(|key| key.starts_with("model.")) {
         return Err(Error::from_reason(
             "This is a Hugging Face-layout Qwen3-ASR checkpoint. Run `mlx convert` and load the converted directory.",
@@ -2264,13 +2294,23 @@ mod tests {
             decoder_caches: Vec::new(),
             recovery_pending: false,
             stagnant_revisions: 0,
+            capture_active: false,
         };
         prepare_stream_capture(&mut state, 48_000).unwrap();
         assert_eq!(state.options.sample_rate, Some(48_000));
 
-        state.pending_samples.push(0.0);
-        assert!(prepare_stream_capture(&mut state, 44_100).is_err());
+        let error = prepare_stream_capture(&mut state, 44_100).unwrap_err();
+        assert!(error.reason.contains("already active"), "{}", error.reason);
         assert_eq!(state.options.sample_rate, Some(48_000));
+
+        release_stream_capture(&mut state);
+        prepare_stream_capture(&mut state, 44_100).unwrap();
+        assert_eq!(state.options.sample_rate, Some(44_100));
+
+        release_stream_capture(&mut state);
+        state.pending_samples.push(0.0);
+        assert!(prepare_stream_capture(&mut state, 16_000).is_err());
+        assert_eq!(state.options.sample_rate, Some(44_100));
     }
 
     #[test]
