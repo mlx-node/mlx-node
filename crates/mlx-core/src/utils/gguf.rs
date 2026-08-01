@@ -1731,6 +1731,36 @@ fn fixup_qwen35_linear_attn(
     Ok(())
 }
 
+/// Find an imported K-quant tensor that the Qwen3.5 GGUF layout fixup would
+/// have to reorder as a dense array.
+///
+/// K-quant storage is a three-array group: packed codes in `.weight` and the
+/// ggml block scales in `.scales` / `.biases`. The dense Qwen3.5 fixup below
+/// slices and transposes logical rows or columns of `.weight` only. Applying it
+/// to the packed array both uses the wrong dimensions and leaves its sidecars
+/// in the old order. Until that transform is implemented at the complete
+/// quant-group level, reject exactly those tensors while the GGUF header is
+/// still the only part of the file that has been read.
+fn qwen35_kquant_dense_fixup_target(gguf: &GgufFile) -> Option<(&GgufTensorInfo, String)> {
+    const DENSE_FIXUP_SUFFIXES: &[&str] = &[
+        ".linear_attn.in_proj_a.weight",
+        ".linear_attn.in_proj_b.weight",
+        ".linear_attn.in_proj_z.weight",
+        ".linear_attn.out_proj.weight",
+        ".linear_attn.in_proj_qkv.weight",
+        ".linear_attn.conv1d.weight",
+    ];
+
+    gguf.tensors.iter().find_map(|tensor| {
+        tensor.tensor_type.k_quant_format()?;
+        let mapped = gguf_name_to_hf_for_metadata(&tensor.name, &gguf.metadata)?;
+        DENSE_FIXUP_SUFFIXES
+            .iter()
+            .any(|suffix| mapped.ends_with(suffix))
+            .then_some((tensor, mapped))
+    })
+}
+
 /// GGUF has no HuggingFace `model_type`, so require both a known llama.cpp
 /// Qwen3.5 architecture tag and the characteristic mixed full-attention/GDN
 /// tensor shape before enabling the fixed Unsloth MXFP map. `qwen3` is kept
@@ -1745,6 +1775,36 @@ fn is_qwen35_hybrid_gguf(
         .is_some_and(|arch| matches!(arch, "qwen35" | "qwen35moe" | "qwen3"));
 
     is_qwen35_arch && crate::convert::has_qwen35_hybrid_weight_shape(weight_keys)
+}
+
+/// Return the first quantized tensor in an ordinary Qwen3 GGUF.
+///
+/// The Qwen3 runtime is deliberately dense-only. Source-quantized GGUF tensors
+/// would otherwise be preserved as affine/K-quant groups and written with a
+/// non-empty quantization block that the loader must reject. Some older
+/// Qwen3.5 writers also use `general.architecture = "qwen3"`, so exempt the
+/// characteristic full-attention + GatedDeltaNet hybrid shape.
+fn plain_qwen3_quantized_source(gguf: &GgufFile) -> Option<&GgufTensorInfo> {
+    let arch = gguf
+        .metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str);
+    if arch != Some("qwen3") {
+        return None;
+    }
+
+    let weight_keys = gguf
+        .tensors
+        .iter()
+        .filter_map(|tensor| gguf_name_to_hf_for_metadata(&tensor.name, &gguf.metadata))
+        .collect::<Vec<_>>();
+    if is_qwen35_hybrid_gguf(&gguf.metadata, &weight_keys) {
+        return None;
+    }
+
+    gguf.tensors
+        .iter()
+        .find(|tensor| SourceQuantProfile::for_gguf_type(tensor.tensor_type).is_some())
 }
 
 // ── Config Extraction ───────────────────────────────────────────────────────
@@ -2578,6 +2638,35 @@ pub async fn convert_gguf_to_safetensors(
     }
 
     let import_k_quants = options.import_k_quants.unwrap_or(false);
+
+    // Plain Qwen3 has no quantized inference runtime. Preserving Q4_0/Q4_1/
+    // Q8_0 or K-quant source groups would successfully write an artifact whose
+    // loader rejects its quantization metadata. Reject from the header instead;
+    // true Qwen3.5 hybrids remain distinguished by their mixed attention/GDN
+    // tensor shape even when an older writer labels the architecture `qwen3`.
+    if let Some(tensor) = plain_qwen3_quantized_source(&gguf) {
+        return Err(Error::from_reason(format!(
+            "GGUF tensor '{}' uses {}, but the plain Qwen3 runtime is dense-only and cannot consume preserved quantized weights. Use a floating-point Qwen3 source or a Qwen3.5 hybrid checkpoint. Rejected from the GGUF header before tensor data was loaded.",
+            tensor.name,
+            tensor.tensor_type.name(),
+        )));
+    }
+
+    // Qwen3.5 GGUF stores GatedDeltaNet head axes in llama.cpp order, so the
+    // conversion must reinterleave several linear-attention projections. That
+    // transform currently operates on dense arrays. A K-quant projection is a
+    // packed `.weight` plus `.scales` / `.biases`; reshaping only `.weight`
+    // previously crossed the MLX FFI boundary with impossible packed geometry
+    // and aborted the process with an uncaught foreign exception. Fail from the
+    // header instead of loading or mutating any tensor payload.
+    if import_k_quants && let Some((tensor, mapped)) = qwen35_kquant_dense_fixup_target(&gguf) {
+        return Err(Error::from_reason(format!(
+            "GGUF tensor '{}' ({}) maps to Qwen3.5 linear-attention tensor '{}', which requires a head-axis reinterleave during conversion. --gguf-kquant cannot safely apply that dense transform to packed codes without also reordering the group's .scales/.biases, so this source cannot currently be imported losslessly. Use a floating-point source or a preconverted checkpoint. Rejected from the GGUF header before tensor data was loaded.",
+            tensor.name,
+            tensor.tensor_type.name(),
+            mapped,
+        )));
+    }
 
     // K-quant import repacks ggml's Q4_K/Q5_K/Q6_K blocks bit-for-bit and never
     // dequantizes them, so any path that would re-quantize the model — an
@@ -4198,7 +4287,7 @@ mod tests {
         let data = build_minimal_gguf(
             &[(
                 "general.architecture",
-                GgufMetaValue::String("qwen3".to_string()),
+                GgufMetaValue::String("llama".to_string()),
             )],
             &[
                 (
@@ -4275,6 +4364,122 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn qwen35_kquant_linear_attention_rejects_from_header() {
+        // Qwen3.5's `attn_qkv` maps to `linear_attn.in_proj_qkv`, one of the
+        // projections whose value-head rows must be reinterleaved. A packed
+        // Q5_K array cannot go through the dense-only fixup independently of
+        // its scales/biases. Pin the public conversion boundary so this is a
+        // recoverable, precise error instead of an MLX foreign exception.
+        let format = KQuantFormat::Q5K;
+        let (rows, k) = (2usize, QK_K);
+        let payload = lcg_bytes(0x3515, rows * format.row_bytes(k));
+        let data = build_minimal_gguf(
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("qwen35".to_string()),
+            )],
+            &[(
+                "blk.0.attn_qkv.weight",
+                &[k as u64, rows as u64],
+                GgufTensorType::Q5K,
+                &payload,
+            )],
+        );
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35-kquant-linear-attn-reject-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("model.gguf");
+        fs::write(&input, data).unwrap();
+        let output = root.join("output");
+
+        let result = convert_gguf_to_safetensors(GgufConversionOptions {
+            input_path: input.to_string_lossy().into_owned(),
+            output_dir: output.to_string_lossy().into_owned(),
+            config_source_dir: None,
+            dtype: None,
+            verbose: Some(false),
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            output_filename: None,
+            vlm_key_prefix: Some(false),
+            quant_mxfp: Some(false),
+            import_k_quants: Some(true),
+        })
+        .await;
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("packed Qwen3.5 linear attention must fail before dense fixup"),
+        };
+
+        let text = err.to_string();
+        assert!(text.contains("blk.0.attn_qkv.weight"), "{text}");
+        assert!(text.contains("Q5_K"), "{text}");
+        assert!(text.contains("linear_attn.in_proj_qkv.weight"), "{text}");
+        assert!(text.contains(".scales/.biases"), "{text}");
+        assert!(text.contains("before tensor data was loaded"), "{text}");
+        assert!(
+            !output.exists(),
+            "header-only rejection must not create or truncate output"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn plain_qwen3_quantized_source_has_no_runtime_but_hybrid_and_float_remain_allowed() {
+        let mut plain = source_quant_fixture(&[("blk.0.attn_q.weight", GgufTensorType::Q4_0)]);
+        plain.metadata.insert(
+            "general.architecture".to_string(),
+            GgufMetaValue::String("qwen3".to_string()),
+        );
+        let rejected = plain_qwen3_quantized_source(&plain)
+            .expect("source-quantized plain Qwen3 must fail closed");
+        assert_eq!(rejected.name, "blk.0.attn_q.weight");
+        assert_eq!(rejected.tensor_type, GgufTensorType::Q4_0);
+
+        let mut floating = source_quant_fixture(&[("blk.0.attn_q.weight", GgufTensorType::BF16)]);
+        floating.metadata = plain.metadata.clone();
+        assert!(
+            plain_qwen3_quantized_source(&floating).is_none(),
+            "floating Qwen3 conversion must remain available"
+        );
+
+        // Old writers can label Qwen3.5 as `qwen3`. Its characteristic full
+        // attention + GDN shape must win over the raw architecture string.
+        let hybrid_keys = qwen35_hybrid_test_keys();
+        let hybrid_tensors = hybrid_keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                (
+                    key.as_str(),
+                    if index == 0 {
+                        GgufTensorType::Q4_0
+                    } else {
+                        GgufTensorType::BF16
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut hybrid = source_quant_fixture(&hybrid_tensors);
+        hybrid.metadata = plain.metadata;
+        assert!(
+            plain_qwen3_quantized_source(&hybrid).is_none(),
+            "Qwen3.5 hybrid checkpoints must remain on their quantized runtime"
+        );
     }
 
     #[test]
@@ -5630,7 +5835,7 @@ mod tests {
             let data = build_minimal_gguf(
                 &[(
                     "general.architecture",
-                    GgufMetaValue::String("qwen3".to_string()),
+                    GgufMetaValue::String("llama".to_string()),
                 )],
                 &[
                     ("blk.0.attn_q.weight", &[32, 1], tensor_type, block),

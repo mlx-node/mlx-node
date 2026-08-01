@@ -612,6 +612,13 @@ export async function run(argv: string[]) {
       if (config.model_type === 'paddleocr_vl') {
         modelType = 'paddleocr-vl';
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
+      } else if (config.model_type === 'internvl_chat' || config.model_type === 'qianfan-ocr') {
+        // Qianfan-OCR checkpoints use InternVL's historical raw model_type.
+        // The runtime registry maps exactly both strings to QianfanOCRModel;
+        // canonicalize them to the converter recipe name so the native
+        // dense-only quantization guard cannot be bypassed when -m is omitted.
+        modelType = 'qianfan-ocr';
+        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       } else if (config.model_type === 'qwen3_5_moe' || config.model_type === 'qwen3_5') {
         modelType = config.model_type;
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
