@@ -31,7 +31,7 @@ impl FeatureExtractor {
         num_mels: usize,
         n_window: usize,
     ) -> Result<Self, String> {
-        if config.n_fft == 0 || config.hop_length == 0 || config.n_fft % 2 != 0 {
+        if config.n_fft == 0 || config.hop_length == 0 || !config.n_fft.is_multiple_of(2) {
             return Err(
                 "n_fft must be a non-zero even number and hop_length must be non-zero".into(),
             );
@@ -122,8 +122,8 @@ impl FeatureExtractor {
             }
             for mel_idx in 0..self.num_mels {
                 let mut value = 0.0f32;
-                for freq in 0..n_freqs {
-                    value += self.mel_filters[freq * self.num_mels + mel_idx] * power[freq];
+                for (freq, power_value) in power.iter().enumerate().take(n_freqs) {
+                    value += self.mel_filters[freq * self.num_mels + mel_idx] * *power_value;
                 }
                 mel[mel_idx * padded_frames + frame] = value.max(1e-10).log10();
             }

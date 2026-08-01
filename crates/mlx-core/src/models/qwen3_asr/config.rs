@@ -119,7 +119,7 @@ impl Qwen3AsrCheckpointConfig {
                 "Invalid Qwen3-ASR audio window configuration",
             ));
         }
-        if audio.d_model % audio.encoder_attention_heads != 0 {
+        if !audio.d_model.is_multiple_of(audio.encoder_attention_heads) {
             return Err(Error::from_reason(
                 "audio d_model must be divisible by encoder_attention_heads",
             ));

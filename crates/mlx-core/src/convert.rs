@@ -184,7 +184,7 @@ pub(crate) mod recipe {
 
         /// True when the family opts INTO quantizing the token embedding (its
         /// packed-quantized embedding backend handles gather-dequant). Replaces
-        /// the inline `embed_quantizable` match (lfm2, lfm2_moe).
+        /// the inline `embed_quantizable` match (qwen3_asr, lfm2, lfm2_moe).
         fn embed_quantizable(&self) -> bool {
             false
         }
@@ -3391,14 +3391,12 @@ const MTP_QUANT_GROUP_SIZE: i32 = 32;
 /// Determine whether a weight key should be quantized.
 ///
 /// `embed_quantizable` opts the model family INTO quantizing the token
-/// embedding (`embed_tokens` / `embedding.`). This is `true` ONLY for
-/// lfm2/lfm2_moe, whose `nn::Embedding` now installs a PACKED-quantized backend
-/// (`load_quantized_packed`) that gather-then-dequantizes on lookup and runs a
-/// quantized matmul for the tied head — so the embedding can be quantized for
-/// real memory savings. For every other family (qwen3_5, gemma4, …) it is
-/// `false` and the embedding is skipped, preserving the prior behavior. A TIED
-/// `lm_head` is always excluded (it is dropped at sanitize time) — the
-/// `lm_head` skip below is unconditional.
+/// embedding (`embed_tokens` / `embedding.`). Qwen3-ASR and lfm2/lfm2_moe opt
+/// in because their packed-quantized embedding paths gather-then-dequantize on
+/// lookup and support the tied-head projection. For every other family
+/// (qwen3_5, gemma4, …) it is `false` and the embedding is skipped, preserving
+/// the prior behavior. A TIED `lm_head` is always excluded (it is dropped at
+/// sanitize time) — the `lm_head` skip below is unconditional.
 fn should_quantize(key: &str, embed_quantizable: bool) -> bool {
     // Only .weight keys (not .scales, .biases, etc.)
     if !key.ends_with(".weight") {
@@ -3436,9 +3434,9 @@ fn should_quantize(key: &str, embed_quantizable: bool) -> bool {
         return false;
     }
 
-    // Token embeddings: excluded by default (vocab-dim tensor). lfm2/lfm2_moe
-    // opt in via `embed_quantizable` — their packed embedding backend handles
-    // a quantized table (gather-dequant lookup + quantized tied-head matmul).
+    // Token embeddings are excluded by default (vocab-dim tensor). Qwen3-ASR
+    // and lfm2/lfm2_moe opt in via `embed_quantizable`; their packed embedding
+    // paths handle gather-dequant lookup and the tied-head projection.
     if !embed_quantizable && (key.contains("embed_tokens") || key.contains("embedding.")) {
         return false;
     }
@@ -6569,12 +6567,9 @@ fn resolve_legacy_entry(
         return Ok(None);
     }
 
-    // EXCEPTION (lfm2/lfm2_moe): when `embed_quantizable`, the lfm2 PACKED
-    // embedding backend (`load_quantized_packed`) DOES support mxfp4/mxfp8/nvfp4
-    // (mode threaded through gather-dequant + quantized matmul), so the
-    // embedding keys must NOT be force-downgraded to affine below — they keep
-    // the global non-affine mode.
-    let is_lfm2_packed_embed =
+    // When `embed_quantizable`, the packed embedding path supports the active
+    // non-affine mode, so embedding keys must not be force-downgraded below.
+    let is_packed_embed =
         embed_quantizable && (key.contains("embed_tokens") || key.contains("embedding."));
     // sym8 is the EXCEPTION-to-the-exception: keep the lfm2 embedding DENSE bf16
     // (NO QuantEntry at all) under a sym8 default. The packed backend has no
@@ -6585,7 +6580,7 @@ fn resolve_legacy_entry(
     // Dense bf16 keeps sym8 checkpoints compiled-eligible, matching main-branch
     // quantized-lfm2 behavior (every other quantized lfm2 recipe leaves the
     // compiled path on).
-    if default_mode == "sym8" && is_lfm2_packed_embed {
+    if default_mode == "sym8" && is_packed_embed {
         return Ok(None);
     }
 
@@ -6612,7 +6607,7 @@ fn resolve_legacy_entry(
         || default_mode == "sym8";
     // (`is_lfm2_packed_embed` under a sym8 default already returned above, so
     // here it always means "keeps the non-affine default".)
-    if is_non_affine_default && is_affine_only_key(key) && !is_lfm2_packed_embed {
+    if is_non_affine_default && is_affine_only_key(key) && !is_packed_embed {
         return Ok(Some(QuantEntry {
             key: key.to_string(),
             bits: 8,
@@ -7059,9 +7054,9 @@ pub(crate) fn build_quantization_object(
 /// Public wrapper for quantize_weights, accessible from other crate modules (e.g., GGUF converter).
 /// Returns the per-layer override map; see `quantize_weights` for why this matters.
 ///
-/// `embed_quantizable` gates quantizing the token embedding (lfm2/lfm2_moe only);
-/// see `should_quantize`. GGUF/other callers pass `false` to preserve the
-/// embedding-skip behavior.
+/// `embed_quantizable` gates quantizing the token embedding for model families
+/// with a compatible packed embedding path; see `should_quantize`. GGUF/other
+/// callers pass `false` to preserve the embedding-skip behavior.
 pub(crate) fn quantize_weights_pub(
     weights: &mut HashMap<String, MxArray>,
     bits: i32,
@@ -7076,8 +7071,8 @@ pub(crate) fn quantize_weights_pub(
 /// Used by GGUF converter and convert_model when a recipe is specified.
 ///
 /// `embed_quantizable` only affects the predicate's `Default` fall-through and
-/// the legacy `is_affine_only_key` force (lfm2/lfm2_moe opt-in); a recipe that
-/// emits explicit `Custom`/`Skip` decisions for the embedding is unaffected.
+/// the legacy `is_affine_only_key` force; a recipe that emits explicit
+/// `Custom`/`Skip` decisions for the embedding is unaffected.
 pub(crate) fn quantize_weights_with_recipe_pub(
     weights: &mut HashMap<String, MxArray>,
     bits: i32,
@@ -7929,10 +7924,10 @@ mod tests {
                 "{mt}: owns_dtype_cast mismatch vs inline has_custom_sanitizer"
             );
 
-            // embed_quantizable == old embed_quantizable match.
+            // embed_quantizable must match the packed-embedding allowlist.
             assert_eq!(
                 r.embed_quantizable(),
-                matches!(mt, "lfm2" | "lfm2_moe"),
+                matches!(mt, "qwen3_asr" | "lfm2" | "lfm2_moe"),
                 "{mt}: embed_quantizable mismatch vs inline match"
             );
 

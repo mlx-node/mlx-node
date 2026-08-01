@@ -306,7 +306,7 @@ mod platform {
             Error::from_reason("Qwen3-ASR model thread exited during capture setup")
         })??;
         let ring_seconds = options.ring_seconds.unwrap_or(10.0);
-        if !ring_seconds.is_finite() || ring_seconds < 1.0 || ring_seconds > 120.0 {
+        if !ring_seconds.is_finite() || !(1.0..=120.0).contains(&ring_seconds) {
             return Err(Error::from_reason("ring_seconds must be between 1 and 120"));
         }
         let feed_ms = options.feed_milliseconds.unwrap_or(100).clamp(10, 1_000);
