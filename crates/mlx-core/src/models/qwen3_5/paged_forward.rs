@@ -448,7 +448,6 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
@@ -475,7 +474,6 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             caches,
             final_norm,
             lm_head,
-            embedding_weight,
             layer_kinds,
             paged_adapter,
             cached_rope_deltas,
@@ -501,7 +499,6 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             caches,
             final_norm,
             lm_head,
-            embedding_weight,
             layer_kinds,
             paged_adapter,
             cached_rope_deltas,
@@ -594,7 +591,6 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
                 final_norm,
                 lm_head,
                 embed,
-                embedding_weight,
             )?);
             if capture_checkpoint {
                 materialize_linear_layer_caches(caches)?;
@@ -727,7 +723,6 @@ fn run_paged_prefill_single_shot(
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     cached_rope_deltas: i32,
@@ -783,8 +778,7 @@ fn run_paged_prefill_single_shot(
         cached_rope_deltas,
     )?;
 
-    let logits =
-        project_last_token_logits(&hidden_states, final_norm, lm_head, embed, embedding_weight)?;
+    let logits = project_last_token_logits(&hidden_states, final_norm, lm_head, embed)?;
     if let Some(start) = single_shot_start {
         let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
         tracing::info!(
@@ -836,7 +830,6 @@ pub(crate) fn run_paged_vlm_prefill(
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
 ) -> Result<(MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
@@ -945,7 +938,6 @@ pub(crate) fn run_paged_vlm_prefill(
                 final_norm,
                 lm_head,
                 embed,
-                embedding_weight,
             )?);
         } else {
             hidden_states.eval();
@@ -1001,7 +993,6 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
@@ -1027,7 +1018,6 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
             caches,
             final_norm,
             lm_head,
-            embedding_weight,
             layer_kinds,
             paged_adapter,
             keep_last_hidden,
@@ -1054,7 +1044,6 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
             caches,
             final_norm,
             lm_head,
-            embedding_weight,
             layer_kinds,
             paged_adapter,
             keep_last_hidden,
@@ -1150,11 +1139,8 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
             let last_hidden = chunk_hidden.slice_axis(1, chunk_len - 1, chunk_len)?;
             let logits = if let Some(head) = lm_head {
                 head.forward(&last_hidden)?
-            } else if embed.is_packed_quantized() {
-                embed.as_linear(&last_hidden)?
             } else {
-                let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-                last_hidden.matmul(&weight_t)?
+                embed.as_linear(&last_hidden)?
             };
             last_logits = Some(logits.squeeze(Some(&[0, 1]))?);
         }
@@ -1272,7 +1258,6 @@ fn run_paged_prefill_single_shot_with_hidden(
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     keep_last_hidden: Option<usize>,
@@ -1310,7 +1295,6 @@ fn run_paged_prefill_single_shot_with_hidden(
         final_norm,
         lm_head,
         embed,
-        embedding_weight,
         keep_last_hidden,
     )
 }
@@ -1401,7 +1385,6 @@ fn project_last_token_logits(
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
     embed: &Embedding,
-    embedding_weight: &MxArray,
 ) -> Result<MxArray> {
     let seq_len = hidden_states.shape_at(1)?;
     let last_hidden = hidden_states.slice_axis(1, seq_len - 1, seq_len)?;
@@ -1409,15 +1392,8 @@ fn project_last_token_logits(
     let h = final_norm.forward(&last_hidden)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
-    } else if embed.is_packed_quantized() {
-        // Tied + packed-quantized embedding: route through the packed
-        // `quantized_matmul` instead of a dense `[vocab, hidden]` transpose
-        // + matmul (the `embedding_weight` fallback below reads a fully
-        // pre-dequantized/on-demand-dequantized dense copy).
-        embed.as_linear(&h)?
     } else {
-        let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        h.matmul(&weight_t)?
+        embed.as_linear(&h)?
     };
 
     logits.squeeze(Some(&[0, 1]))
@@ -1435,7 +1411,6 @@ fn project_last_token_logits_with_full_hidden(
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
     embed: &Embedding,
-    embedding_weight: &MxArray,
     keep_last_hidden: Option<usize>,
 ) -> Result<(MxArray, MxArray)> {
     let prompt_len = hidden_states.shape_at(1)?;
@@ -1444,11 +1419,8 @@ fn project_last_token_logits_with_full_hidden(
     let last_hidden = full_hidden.slice_axis(1, prompt_len - 1, prompt_len)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&last_hidden)?
-    } else if embed.is_packed_quantized() {
-        embed.as_linear(&last_hidden)?
     } else {
-        let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        last_hidden.matmul(&weight_t)?
+        embed.as_linear(&last_hidden)?
     };
 
     let keep_start = keep_last_hidden
@@ -1483,7 +1455,6 @@ pub(crate) fn run_paged_decode_step(
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     cached_rope_deltas: i32,
@@ -1534,11 +1505,8 @@ pub(crate) fn run_paged_decode_step(
     let h = final_norm.forward(&hidden_states)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
-    } else if embed.is_packed_quantized() {
-        embed.as_linear(&h)?
     } else {
-        let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        h.matmul(&weight_t)?
+        embed.as_linear(&h)?
     };
     Ok(logits)
 }
@@ -1564,8 +1532,6 @@ pub(crate) fn run_paged_step_with_hidden(
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
-    embedding_weight_t: Option<&MxArray>,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     cached_rope_deltas: i32,
@@ -1615,16 +1581,8 @@ pub(crate) fn run_paged_step_with_hidden(
     let h3 = final_norm.forward(&hidden_states)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h3)?
-    } else if embed.is_packed_quantized() {
-        embed.as_linear(&h3)?
     } else {
-        match embedding_weight_t {
-            Some(wt) => h3.matmul(wt)?,
-            None => {
-                let wt = embedding_weight.transpose(Some(&[1, 0]))?;
-                h3.matmul(&wt)?
-            }
-        }
+        embed.as_linear(&h3)?
     };
     let hidden = h3.squeeze(Some(&[1]))?;
     Ok((logits, hidden))
@@ -1655,8 +1613,6 @@ pub(crate) fn run_paged_verify_step(
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
-    embedding_weight_t: Option<&MxArray>,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     tape: &mut Vec<Option<super::gated_delta_net::GdnLayerTape>>,
@@ -1725,16 +1681,8 @@ pub(crate) fn run_paged_verify_step(
     let hiddens = final_norm.forward(&hidden_states)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&hiddens)?
-    } else if embed.is_packed_quantized() {
-        embed.as_linear(&hiddens)?
     } else {
-        match embedding_weight_t {
-            Some(wt) => hiddens.matmul(wt)?,
-            None => {
-                let wt = embedding_weight.transpose(Some(&[1, 0]))?;
-                hiddens.matmul(&wt)?
-            }
-        }
+        embed.as_linear(&hiddens)?
     };
     Ok(super::mtp_decode::MtpVerifyOutput::logits_only(
         logits, hiddens,

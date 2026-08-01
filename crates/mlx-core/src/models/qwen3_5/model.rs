@@ -1162,8 +1162,7 @@ pub(crate) struct ChatDecodeInputs {
     pub cached_tokens_for_result: u32,
 
     // --- MLX state ------------------------------------------------------
-    pub embedding_weight: MxArray,
-    pub embedding_weight_t: MxArray,
+    pub embedding: Embedding,
     pub generation_stream: Stream,
     pub params: crate::engine::ChatParams,
 
@@ -2043,7 +2042,6 @@ impl Qwen35Inner {
         Vec<super::paged_forward::MaterializedGdnPrefixCheckpoint>,
     )> {
         let embed = self.embedding.clone();
-        let embedding_weight = embed.get_weight();
         // Cross-turn M-RoPE delta (0 unless this text turn warm-continues an
         // image prefill); feeds the scalar-offset RoPE for the suffix.
         let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
@@ -2068,7 +2066,6 @@ impl Qwen35Inner {
                     caches_ref,
                     &self.final_norm,
                     &self.lm_head,
-                    &embedding_weight,
                     layer_kinds,
                     adapter,
                     chunk_size,
@@ -2087,7 +2084,6 @@ impl Qwen35Inner {
                 caches_ref,
                 &self.final_norm,
                 &self.lm_head,
-                &embedding_weight,
                 layer_kinds,
                 adapter,
                 chunk_size,
@@ -3018,7 +3014,7 @@ impl Qwen35Inner {
             ));
         }
 
-        let embedding_weight = self.embedding.get_weight();
+        let embedding = self.embedding.clone();
 
         // Text-only from here: the `has_images` early-return above is the only
         // image path. These bindings preserve the shared cache-reuse / decode
@@ -3129,7 +3125,6 @@ impl Qwen35Inner {
 
         let eos_id = eos_token_id;
 
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         let generation_stream = Stream::new(DeviceType::Gpu);
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
@@ -3170,12 +3165,11 @@ impl Qwen35Inner {
             let last_logits = if want_prompt_hidden {
                 let (logits, ph) = chunked_prefill_with_hidden(
                     &prompt,
-                    &embedding_weight,
+                    &embedding,
                     &mut self.layers,
                     &mut self.caches,
                     &self.final_norm,
                     &self.lm_head,
-                    Some(&embedding_weight_t),
                     generation_stream,
                     Some(mtp_prompt_history.keep_tokens),
                 )?;
@@ -3184,12 +3178,11 @@ impl Qwen35Inner {
             } else {
                 chunked_prefill(
                     &prompt,
-                    &embedding_weight,
+                    &embedding,
                     &mut self.layers,
                     &mut self.caches,
                     &self.final_norm,
                     &self.lm_head,
-                    Some(&embedding_weight_t),
                     generation_stream,
                 )?
             };
@@ -3233,8 +3226,7 @@ impl Qwen35Inner {
             prompt_tokens_for_result,
             // Fresh prefill: report the matched prefix length.
             cached_tokens_for_result: cached_prefix_len as u32,
-            embedding_weight,
-            embedding_weight_t,
+            embedding,
             generation_stream,
             params: p,
             // `prompt_hidden` is `Some` iff the hidden-emitting prefill ran;
@@ -3355,8 +3347,7 @@ impl Qwen35Inner {
             );
         }
 
-        let embedding_weight = self.embedding.get_weight();
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let embedding = self.embedding.clone();
         let generation_stream = Stream::new(DeviceType::Gpu);
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
@@ -3378,12 +3369,11 @@ impl Qwen35Inner {
                 MxArray::from_uint32(&full_token_history, &[1, full_token_history.len() as i64])?;
             let logits = chunked_prefill(
                 &prompt,
-                &embedding_weight,
+                &embedding,
                 &mut self.layers,
                 &mut self.caches,
                 &self.final_norm,
                 &self.lm_head,
-                Some(&embedding_weight_t),
                 generation_stream,
             )?;
             self.flat_mtp_caches_desynced = false;
@@ -3392,12 +3382,11 @@ impl Qwen35Inner {
             let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
             chunked_prefill(
                 &prompt,
-                &embedding_weight,
+                &embedding,
                 &mut self.layers,
                 &mut self.caches,
                 &self.final_norm,
                 &self.lm_head,
-                Some(&embedding_weight_t),
                 generation_stream,
             )?
         };
@@ -3440,8 +3429,7 @@ impl Qwen35Inner {
             prompt_tokens_for_result,
             // Delta path reuses the full prior history by construction.
             cached_tokens_for_result: prior_cached_len as u32,
-            embedding_weight,
-            embedding_weight_t,
+            embedding,
             generation_stream,
             params: p,
             // Delta path: the prefill runs on top of the live KV caches,
@@ -3490,8 +3478,7 @@ impl Qwen35Inner {
             prefill_tokens_len,
             prompt_tokens_for_result,
             cached_tokens_for_result,
-            embedding_weight,
-            embedding_weight_t,
+            embedding,
             generation_stream,
             params: p,
             prompt_hidden,
@@ -3617,7 +3604,7 @@ impl Qwen35Inner {
             MxArray::async_eval_arrays(&[&y]);
 
             let mut ops = mtp_decode::DecodeOps {
-                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                forward: |ids: &MxArray, emb: &Embedding| -> Result<(MxArray, bool)> {
                     let logits = forward_inner(
                         ids,
                         emb,
@@ -3625,7 +3612,6 @@ impl Qwen35Inner {
                         &mut self.caches,
                         &self.final_norm,
                         &self.lm_head,
-                        Some(&embedding_weight_t),
                     )?;
                     Ok((logits, true))
                 },
@@ -3636,7 +3622,7 @@ impl Qwen35Inner {
             mtp_decode::decode_loop!(
                 ops: ops,
                 y: y,
-                embedding_weight: embedding_weight,
+                embedding_weight: embedding,
                 params: p,
                 reasoning_tracker: reasoning_tracker,
                 profiler: profiler,
@@ -3771,12 +3757,6 @@ impl Qwen35Inner {
         tokenizer: &'a Arc<Qwen3Tokenizer>,
         cb: &StreamSender<'_>,
         cancelled: &AtomicBool,
-        // The embedding table + its transpose are owned by the model and
-        // pulled inside `begin_mtp_decode` (`self.embedding.get_weight()`),
-        // so the engine-owned loop does not read these; kept in the signature
-        // for call-site parity with the AR streaming arm.
-        _embedding_weight: MxArray,
-        _embedding_weight_t: MxArray,
         p: &engine::ChatParams,
         eos_id: u32,
         max_new_tokens: i32,
@@ -4376,7 +4356,6 @@ impl Qwen35Inner {
             // Decode forward (pure-Rust paged step).
             let next_logits = {
                 let embed = self.embedding.clone();
-                let embedding_weight = embed.get_weight();
                 let caches_ref = self.caches.as_mut().ok_or_else(|| {
                     Error::from_reason("paged_turn_sync_core_inner: caches dropped mid-decode")
                 })?;
@@ -4392,7 +4371,6 @@ impl Qwen35Inner {
                     caches_ref,
                     &self.final_norm,
                     &self.lm_head,
-                    &embedding_weight,
                     &layer_kinds,
                     adapter,
                     self.cached_rope_deltas.unwrap_or(0),
@@ -4495,7 +4473,6 @@ impl Qwen35Inner {
         let prompt_token_count = expanded_tokens.len() as u32;
 
         let embed = self.embedding.clone();
-        let embedding_weight = embed.get_weight();
         let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
 
         let generation_stream = Stream::new(DeviceType::Gpu);
@@ -4509,7 +4486,7 @@ impl Qwen35Inner {
             &processed,
             &vision_encoder,
             sms,
-            &embedding_weight,
+            &embed,
             generation_stream,
             &self.vision_cache,
         )?;
@@ -4597,7 +4574,6 @@ impl Qwen35Inner {
                     caches_ref,
                     &self.final_norm,
                     &self.lm_head,
-                    &embedding_weight,
                     &layer_kinds,
                     adapter,
                 )?
@@ -4666,7 +4642,6 @@ impl Qwen35Inner {
                         caches_ref,
                         &self.final_norm,
                         &self.lm_head,
-                        &embedding_weight,
                         &layer_kinds,
                         adapter,
                         self.cached_rope_deltas.unwrap_or(0),
@@ -4863,7 +4838,6 @@ impl Qwen35Inner {
         let prompt_token_count = expanded_tokens.len() as u32;
 
         let embed = self.embedding.clone();
-        let embedding_weight = embed.get_weight();
         let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
 
         let generation_stream = Stream::new(DeviceType::Gpu);
@@ -4877,7 +4851,7 @@ impl Qwen35Inner {
             &processed,
             &vision_encoder,
             sms,
-            &embedding_weight,
+            &embed,
             generation_stream,
             &self.vision_cache,
         )?;
@@ -4961,7 +4935,6 @@ impl Qwen35Inner {
                     caches_ref,
                     &self.final_norm,
                     &self.lm_head,
-                    &embedding_weight,
                     &layer_kinds,
                     adapter,
                 )?
@@ -5068,7 +5041,6 @@ impl Qwen35Inner {
                         caches_ref,
                         &self.final_norm,
                         &self.lm_head,
-                        &embedding_weight,
                         &layer_kinds,
                         adapter,
                         self.cached_rope_deltas.unwrap_or(0),
@@ -6059,7 +6031,6 @@ impl Qwen35Inner {
             // Decode forward (pure-Rust paged step).
             let next_logits = {
                 let embed = self.embedding.clone();
-                let embedding_weight = embed.get_weight();
                 let caches_ref = self.caches.as_mut().ok_or_else(|| {
                     Error::from_reason("paged_turn_stream_core_inner: caches dropped mid-decode")
                 })?;
@@ -6075,7 +6046,6 @@ impl Qwen35Inner {
                     caches_ref,
                     &self.final_norm,
                     &self.lm_head,
-                    &embedding_weight,
                     &layer_kinds,
                     adapter,
                     self.cached_rope_deltas.unwrap_or(0),
@@ -6183,8 +6153,7 @@ impl Qwen35Inner {
             );
         }
 
-        let embedding_weight = self.embedding.get_weight();
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let embedding = self.embedding.clone();
         let generation_stream = Stream::new(DeviceType::Gpu);
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
@@ -6250,12 +6219,11 @@ impl Qwen35Inner {
                 MxArray::from_uint32(&full_token_history, &[1, full_token_history.len() as i64])?;
             chunked_prefill(
                 &prompt,
-                &embedding_weight,
+                &embedding,
                 &mut self.layers,
                 &mut self.caches,
                 &self.final_norm,
                 &self.lm_head,
-                Some(&embedding_weight_t),
                 generation_stream,
             )?
         } else {
@@ -6263,12 +6231,11 @@ impl Qwen35Inner {
             let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
             chunked_prefill(
                 &prompt,
-                &embedding_weight,
+                &embedding,
                 &mut self.layers,
                 &mut self.caches,
                 &self.final_norm,
                 &self.lm_head,
-                Some(&embedding_weight_t),
                 generation_stream,
             )?
         };
@@ -6331,8 +6298,6 @@ impl Qwen35Inner {
                 &tokenizer_for_decode,
                 cb,
                 cancelled,
-                embedding_weight,
-                embedding_weight_t,
                 &p,
                 eos_id,
                 p.max_new_tokens,
@@ -6346,7 +6311,7 @@ impl Qwen35Inner {
             profiler.set_label("chat_stream_delta_rust");
 
             let mut ops = mtp_decode::DecodeOps {
-                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                forward: |ids: &MxArray, emb: &Embedding| -> Result<(MxArray, bool)> {
                     let logits = forward_inner(
                         ids,
                         emb,
@@ -6354,7 +6319,6 @@ impl Qwen35Inner {
                         &mut self.caches,
                         &self.final_norm,
                         &self.lm_head,
-                        Some(&embedding_weight_t),
                     )?;
                     Ok((logits, true))
                 },
@@ -6365,7 +6329,7 @@ impl Qwen35Inner {
             mtp_decode::decode_loop!(
                 ops: ops,
                 y: y,
-                embedding_weight: embedding_weight,
+                embedding_weight: embedding,
                 params: p,
                 reasoning_tracker: reasoning_tracker,
                 profiler: profiler,
@@ -6621,7 +6585,7 @@ impl Qwen35Inner {
             ));
         }
 
-        let embedding_weight = self.embedding.get_weight();
+        let embedding = self.embedding.clone();
 
         // Text-only from here: the `has_images` early-return above is the only
         // image path. These bindings preserve the shared cache-reuse / decode
@@ -6748,7 +6712,6 @@ impl Qwen35Inner {
         let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);
         let mut streamed_text_len: usize = 0;
 
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         let generation_stream = Stream::new(DeviceType::Gpu);
         let model_size_bytes = self.config.estimate_memory_bytes() as usize;
         let _wired_ctx =
@@ -6780,12 +6743,11 @@ impl Qwen35Inner {
             let last_logits = if want_prompt_hidden {
                 let (logits, ph) = chunked_prefill_with_hidden(
                     &prompt,
-                    &embedding_weight,
+                    &embedding,
                     &mut self.layers,
                     &mut self.caches,
                     &self.final_norm,
                     &self.lm_head,
-                    Some(&embedding_weight_t),
                     generation_stream,
                     Some(mtp_prompt_history.keep_tokens),
                 )?;
@@ -6794,12 +6756,11 @@ impl Qwen35Inner {
             } else {
                 chunked_prefill(
                     &prompt,
-                    &embedding_weight,
+                    &embedding,
                     &mut self.layers,
                     &mut self.caches,
                     &self.final_norm,
                     &self.lm_head,
-                    Some(&embedding_weight_t),
                     generation_stream,
                 )?
             };
@@ -6864,8 +6825,6 @@ impl Qwen35Inner {
                 &tokenizer_for_decode,
                 cb,
                 cancelled,
-                embedding_weight,
-                embedding_weight_t,
                 &p,
                 eos_id,
                 p.max_new_tokens,
@@ -6879,7 +6838,7 @@ impl Qwen35Inner {
             profiler.set_label("chat_stream_rust");
 
             let mut ops = mtp_decode::DecodeOps {
-                forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
+                forward: |ids: &MxArray, emb: &Embedding| -> Result<(MxArray, bool)> {
                     let logits = forward_inner(
                         ids,
                         emb,
@@ -6887,7 +6846,6 @@ impl Qwen35Inner {
                         &mut self.caches,
                         &self.final_norm,
                         &self.lm_head,
-                        Some(&embedding_weight_t),
                     )?;
                     Ok((logits, true))
                 },
@@ -6898,7 +6856,7 @@ impl Qwen35Inner {
             mtp_decode::decode_loop!(
                 ops: ops,
                 y: y,
-                embedding_weight: embedding_weight,
+                embedding_weight: embedding,
                 params: p,
                 reasoning_tracker: reasoning_tracker,
                 profiler: profiler,
@@ -7071,8 +7029,7 @@ impl Qwen35Inner {
         // Init caches
         self.init_caches_sync()?;
 
-        let embedding_weight = self.embedding.get_weight();
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let embedding = self.embedding.clone();
         let generation_stream = Stream::new(DeviceType::Gpu);
 
         // Prefill
@@ -7081,12 +7038,11 @@ impl Qwen35Inner {
             let _stream_ctx = StreamContext::new(generation_stream);
             forward_inner(
                 &prompt,
-                &embedding_weight,
+                &embedding,
                 &mut self.layers,
                 &mut self.caches,
                 &self.final_norm,
                 &self.lm_head,
-                Some(&embedding_weight_t),
             )?
         };
 
@@ -7134,12 +7090,11 @@ impl Qwen35Inner {
                 let _stream_ctx = StreamContext::new(generation_stream);
                 forward_inner(
                     &next_ids,
-                    &embedding_weight,
+                    &embedding,
                     &mut self.layers,
                     &mut self.caches,
                     &self.final_norm,
                     &self.lm_head,
-                    Some(&embedding_weight_t),
                 )?
             };
 
@@ -7441,8 +7396,7 @@ impl Qwen35Inner {
         let eos_token_id = config.eos_token_id.or(Some(self.config.eos_token_id));
         let return_logprobs = config.return_logprobs.unwrap_or(true);
 
-        let embedding_weight = self.embedding.get_weight();
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let embedding = self.embedding.clone();
         let generation_stream = Stream::new(DeviceType::Gpu);
 
         // Use fresh caches for training (not shared inference caches)
@@ -7489,12 +7443,11 @@ impl Qwen35Inner {
                 let _stream_ctx = StreamContext::new(generation_stream);
                 forward_inner(
                     &current_ids,
-                    &embedding_weight,
+                    &embedding,
                     &mut self.layers,
                     &mut training_caches,
                     &self.final_norm,
                     &self.lm_head,
-                    Some(&embedding_weight_t),
                 )?
             };
             let seq_len = logits.shape_at(1)?;
@@ -7568,12 +7521,11 @@ impl Qwen35Inner {
             let next_ids = MxArray::from_uint32(&[token_value], &[1, 1])?;
             let next_logits = forward_inner(
                 &next_ids,
-                &embedding_weight,
+                &embedding,
                 &mut self.layers,
                 &mut training_caches,
                 &self.final_norm,
                 &self.lm_head,
-                Some(&embedding_weight_t),
             )?;
             let next_last_logits = next_logits.slice_axis(1, 0, 1)?.squeeze(Some(&[0, 1]))?;
             last_logits = next_last_logits;
@@ -8573,7 +8525,6 @@ impl DecodeStep for Qwen35PagedDecode<'_> {
         // signature parity).
         let logits = {
             let embed = self.inner.embedding.clone();
-            let embedding_weight = embed.get_weight();
             let layer_kinds = super::decoder_layer::compute_layer_kinds(
                 self.inner.config.num_layers as usize,
                 |i| self.inner.config.is_linear_layer(i),
@@ -8591,7 +8542,6 @@ impl DecodeStep for Qwen35PagedDecode<'_> {
                 caches_ref,
                 &self.inner.final_norm,
                 &self.inner.lm_head,
-                &embedding_weight,
                 &layer_kinds,
                 adapter,
                 self.inner.cached_rope_deltas.unwrap_or(0),
@@ -8827,7 +8777,6 @@ impl PagedBackend for Qwen35Inner {
                 self.config.is_linear_layer(i)
             });
         let embed = self.embedding.clone();
-        let embedding_weight = embed.get_weight();
         // Cross-turn M-RoPE delta (0 unless this engine-driven text turn warm-
         // continues an image prefill); aligns the suffix keys with the
         // compressed-position image keys.
@@ -8852,7 +8801,6 @@ impl PagedBackend for Qwen35Inner {
                 caches_ref,
                 &self.final_norm,
                 &self.lm_head,
-                &embedding_weight,
                 &layer_kinds,
                 adapter,
                 chunk_size,
@@ -9234,8 +9182,7 @@ impl Qwen35Inner {
 /// Drives the pure-Rust eager `forward_inner` over the flat caches.
 pub(crate) struct Qwen35Decode<'a> {
     inner: &'a mut Qwen35Inner,
-    embedding_weight: MxArray,
-    embedding_weight_t: MxArray,
+    embedding: Embedding,
     /// Decode-path profiler relabel (`chat_rust` and its
     /// `chat_stream[_delta]_*` streaming variants), resolved in
     /// `begin_decode` from the turn's streaming-ness.
@@ -9247,12 +9194,11 @@ impl DecodeStep for Qwen35Decode<'_> {
         let inner = &mut *self.inner;
         let logits = forward_inner(
             input_ids,
-            &self.embedding_weight,
+            &self.embedding,
             &mut inner.layers,
             &mut inner.caches,
             &inner.final_norm,
             &inner.lm_head,
-            Some(&self.embedding_weight_t),
         )?;
         // `true` == the eager Rust forward returns `[1, 1, vocab]`;
         // the loop squeezes axis 1.
@@ -9324,12 +9270,8 @@ pub(crate) struct DenseMtpStepper<'a> {
     /// Mid-cycle-stop desync latch (set by `rollback_unemitted`), reported by
     /// `into_desynced`. == the closures' `mtp_desynced` cell.
     mtp_desynced: bool,
-    /// The model's embedding table. == the closures' `embedding_weight` /
-    /// `emb_capture`.
-    embedding_weight: MxArray,
-    /// Transposed embedding for the tied-LM-head projection. ==
-    /// `Some(&embedding_weight_t)` (`emb_t_ref`) in the closures.
-    embedding_weight_t: MxArray,
+    /// The model's embedding lookup and tied-head projection backend.
+    embedding: Embedding,
     /// Config clone for the per-cycle drafter cache reset/fresh build. == the
     /// closures' captured `config`.
     config: Qwen3_5Config,
@@ -9366,8 +9308,8 @@ impl Drop for DenseMtpStepper<'_> {
 }
 
 impl MtpStepper for DenseMtpStepper<'_> {
-    fn embedding_weight(&self) -> &MxArray {
-        &self.embedding_weight
+    fn embedding(&self) -> &Embedding {
+        &self.embedding
     }
 
     fn committed_history_active(&self) -> bool {
@@ -9392,19 +9334,15 @@ impl MtpStepper for DenseMtpStepper<'_> {
     fn forward_with_hidden(
         &mut self,
         ids: &MxArray,
-        emb: &MxArray,
+        embedding: &Embedding,
     ) -> Result<(MxArray, MxArray, bool)> {
         match &mut self.mode {
             MtpStepMode::Flat => {
                 let inner = &mut *self.inner;
-                let pre = forward_pre_norm_inner(ids, emb, &mut inner.layers, &mut inner.caches)?;
+                let pre =
+                    forward_pre_norm_inner(ids, embedding, &mut inner.layers, &mut inner.caches)?;
                 let h3 = inner.final_norm.forward(&pre)?;
-                let logits = project_logits_from_hidden(
-                    &h3,
-                    &inner.lm_head,
-                    emb,
-                    Some(&self.embedding_weight_t),
-                )?;
+                let logits = project_logits_from_hidden(&h3, &inner.lm_head, embedding)?;
                 let hidden = h3.squeeze(Some(&[1]))?;
                 Ok((logits, hidden, true))
             }
@@ -9425,8 +9363,6 @@ impl MtpStepper for DenseMtpStepper<'_> {
                     caches,
                     &inner.final_norm,
                     &inner.lm_head,
-                    emb,
-                    Some(&self.embedding_weight_t),
                     &self.layer_kinds,
                     adapter,
                     rope_deltas,
@@ -9453,12 +9389,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
             )
         })?;
         let h_next = mtp.forward(prev_hidden, prev_emb, Some(mtp_caches))?;
-        let dl3 = project_logits_from_hidden(
-            &h_next,
-            &inner.lm_head,
-            &self.embedding_weight,
-            Some(&self.embedding_weight_t),
-        )?;
+        let dl3 = project_logits_from_hidden(&h_next, &inner.lm_head, &self.embedding)?;
         let draft_logits = dl3.squeeze(Some(&[1]))?;
         Ok((h_next, draft_logits))
     }
@@ -9468,7 +9399,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
     fn verify_step(
         &mut self,
         ids: &MxArray,
-        emb: &MxArray,
+        embedding: &Embedding,
         depth: usize,
     ) -> Result<mtp_decode::MtpVerifyOutput> {
         match &mut self.mode {
@@ -9482,8 +9413,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
                     &inner.final_norm,
                     &inner.lm_head,
                     ids,
-                    emb,
-                    Some(&self.embedding_weight_t),
+                    embedding,
                     Some(tape),
                 )
             }
@@ -9520,8 +9450,6 @@ impl MtpStepper for DenseMtpStepper<'_> {
                     caches,
                     &inner.final_norm,
                     &inner.lm_head,
-                    emb,
-                    Some(&self.embedding_weight_t),
                     &self.layer_kinds,
                     adapter,
                     tape,
@@ -9682,7 +9610,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
     // already reconstructed the AR-exact main cache state, so no re-forward
     // loop is needed. This only surfaces a stashed replay error and clears
     // the per-cycle snapshot + tape.
-    fn restore_and_replay_main(&mut self, _accepted: &[u32], _emb: &MxArray) -> Result<()> {
+    fn restore_and_replay_main(&mut self, _accepted: &[u32], _embedding: &Embedding) -> Result<()> {
         self.snap = None;
         self.tape.clear();
         if let Some(e) = self.replay_err.take() {
@@ -9704,7 +9632,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
         verify_hiddens: &MxArray,
         committed_ids: &[u32],
         _k_accepted: usize,
-        emb: &MxArray,
+        embedding: &Embedding,
     ) -> Result<()> {
         if !self.use_committed {
             return Ok(());
@@ -9732,7 +9660,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
         // Gather the M committed-token input embeddings → [1, M, hidden].
         let ids_i32: Vec<i32> = committed_ids.iter().map(|&v| v as i32).collect();
         let ids_arr = MxArray::from_int32(&ids_i32, &[m as i64])?;
-        let gathered = emb.take(&ids_arr, 0)?;
+        let gathered = embedding.forward(&ids_arr)?;
         let emb_seq = gathered.reshape(&[1, m as i64, hidden_dim])?;
 
         // Drop this cycle's draft K/V (written past committed_len by the draft
@@ -9849,11 +9777,9 @@ impl MtpBackend for Qwen35Inner {
         let seed_trace_start = inference_info_enabled.then(std::time::Instant::now);
         let mut seed_tokens = 0usize;
         let mut seed_chunks = 0usize;
-        // Turn-constant captures the eager-MTP block built before the loop:
-        // the embedding table (+ its transpose for the tied projection) and a
+        // Turn-constant captures the packed-aware embedding backend and a
         // config clone for the per-cycle drafter cache reset.
-        let embedding_weight = self.embedding.get_weight();
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let embedding = self.embedding.clone();
         let config = self.config.clone();
 
         // Committed-history is only correct when the prompt tail's hiddens
@@ -9896,8 +9822,7 @@ impl MtpBackend for Qwen35Inner {
             tape: Vec::new(),
             replay_err: None,
             mtp_desynced: false,
-            embedding_weight,
-            embedding_weight_t,
+            embedding,
             config,
             mode,
             layer_kinds,
@@ -9947,7 +9872,7 @@ impl MtpBackend for Qwen35Inner {
                 // emb_seq = gather embedding rows for the chunk's ids.
                 let ids_arr =
                     MxArray::from_int32(&committed_ids[cursor..cursor + chunk], &[chunk_i64])?;
-                let gathered = stepper.embedding_weight.take(&ids_arr, 0)?;
+                let gathered = stepper.embedding.forward(&ids_arr)?;
                 let emb_seq = gathered.reshape(&[1, chunk_i64, hidden_dim])?;
 
                 let inner = &mut *stepper.inner;
@@ -10161,17 +10086,14 @@ impl ChatBackend for Qwen35Inner {
         // Text-only prefill block (the engine's reset-or-delta split already
         // ran; `self.caches` holds either fresh caches or the live session
         // state).
-        let embedding_weight = self.embedding.get_weight();
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         let prompt = MxArray::from_uint32(prompt_tokens, &[1, prompt_tokens.len() as i64])?;
         chunked_prefill(
             &prompt,
-            &embedding_weight,
+            &self.embedding,
             &mut self.layers,
             &mut self.caches,
             &self.final_norm,
             &self.lm_head,
-            Some(&embedding_weight_t),
             stream,
         )
     }
@@ -10218,8 +10140,7 @@ impl ChatBackend for Qwen35Inner {
             );
         }
 
-        let embedding_weight = self.embedding.get_weight();
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let embedding = self.embedding.clone();
 
         let relabel = match (is_streaming, turn.is_delta) {
             (false, _) => "chat_rust",
@@ -10229,8 +10150,7 @@ impl ChatBackend for Qwen35Inner {
 
         Ok(Qwen35Decode {
             inner: self,
-            embedding_weight,
-            embedding_weight_t,
+            embedding,
             relabel,
         })
     }
@@ -10820,22 +10740,20 @@ pub(crate) fn async_eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) {
 /// For `&[u32]` inputs (from tokenizer), callers convert with `MxArray::from_uint32` first.
 fn chunked_prefill(
     prompt: &MxArray,
-    embedding_weight: &MxArray,
+    embedding: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight_t: Option<&MxArray>,
     generation_stream: crate::stream::Stream,
 ) -> Result<MxArray> {
     chunked_prefill_with_size(
         prompt,
-        embedding_weight,
+        embedding,
         layers,
         caches,
         final_norm,
         lm_head,
-        embedding_weight_t,
         generation_stream,
         PREFILL_STEP_SIZE,
     )
@@ -10843,12 +10761,11 @@ fn chunked_prefill(
 
 fn chunked_prefill_with_size(
     prompt: &MxArray,
-    embedding_weight: &MxArray,
+    embedding: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight_t: Option<&MxArray>,
     generation_stream: crate::stream::Stream,
     chunk_size: i64,
 ) -> Result<MxArray> {
@@ -10870,7 +10787,7 @@ fn chunked_prefill_with_size(
         let chunk = prompt.slice_axis(1, offset, offset + chunk_size)?;
         {
             let _stream_ctx = StreamContext::new(generation_stream);
-            let _hidden = forward_pre_norm_inner(&chunk, embedding_weight, layers, caches)?;
+            let _hidden = forward_pre_norm_inner(&chunk, embedding, layers, caches)?;
         }
         if chunk_async {
             async_eval_layer_caches(caches);
@@ -10884,14 +10801,8 @@ fn chunked_prefill_with_size(
     let remaining = prompt.slice_axis(1, offset, total_len)?;
     let last_logits = {
         let _stream_ctx = StreamContext::new(generation_stream);
-        let hidden = forward_pre_norm_inner(&remaining, embedding_weight, layers, caches)?;
-        project_last_logits_from_pre_norm_hidden(
-            &hidden,
-            final_norm,
-            lm_head,
-            embedding_weight,
-            embedding_weight_t,
-        )?
+        let hidden = forward_pre_norm_inner(&remaining, embedding, layers, caches)?;
+        project_last_logits_from_pre_norm_hidden(&hidden, final_norm, lm_head, embedding)?
     };
     Ok(last_logits)
 }
@@ -10910,23 +10821,21 @@ fn chunked_prefill_with_size(
 /// MTPLX would not seed.
 fn chunked_prefill_with_hidden(
     prompt: &MxArray,
-    embedding_weight: &MxArray,
+    embedding: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight_t: Option<&MxArray>,
     generation_stream: crate::stream::Stream,
     keep_last_hidden: Option<usize>,
 ) -> Result<(MxArray, MxArray)> {
     chunked_prefill_with_hidden_with_size(
         prompt,
-        embedding_weight,
+        embedding,
         layers,
         caches,
         final_norm,
         lm_head,
-        embedding_weight_t,
         generation_stream,
         keep_last_hidden,
         PREFILL_STEP_SIZE,
@@ -10935,12 +10844,11 @@ fn chunked_prefill_with_hidden(
 
 fn chunked_prefill_with_hidden_with_size(
     prompt: &MxArray,
-    embedding_weight: &MxArray,
+    embedding: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight_t: Option<&MxArray>,
     generation_stream: crate::stream::Stream,
     keep_last_hidden: Option<usize>,
     chunk_size: i64,
@@ -10968,7 +10876,7 @@ fn chunked_prefill_with_hidden_with_size(
         let overlaps_kept_tail = end > keep_start;
         let kept_hidden = if overlaps_kept_tail {
             let _stream_ctx = StreamContext::new(generation_stream);
-            let hidden = forward_pre_norm_inner(&chunk, embedding_weight, layers, caches)?;
+            let hidden = forward_pre_norm_inner(&chunk, embedding, layers, caches)?;
             let keep_from = keep_start.max(offset);
             let hidden = if keep_from > offset {
                 hidden.slice_axis(1, keep_from - offset, end - offset)?
@@ -10978,7 +10886,7 @@ fn chunked_prefill_with_hidden_with_size(
             Some(final_norm.forward(&hidden)?)
         } else {
             let _stream_ctx = StreamContext::new(generation_stream);
-            let _hidden = forward_pre_norm_inner(&chunk, embedding_weight, layers, caches)?;
+            let _hidden = forward_pre_norm_inner(&chunk, embedding, layers, caches)?;
             None
         };
         eval_layer_caches(caches)?;
@@ -10996,14 +10904,9 @@ fn chunked_prefill_with_hidden_with_size(
     let remaining = prompt.slice_axis(1, offset, total_len)?;
     let (last_logits, last_hidden) = {
         let _stream_ctx = StreamContext::new(generation_stream);
-        let hidden = forward_pre_norm_inner(&remaining, embedding_weight, layers, caches)?;
-        let logits = project_last_logits_from_pre_norm_hidden(
-            &hidden,
-            final_norm,
-            lm_head,
-            embedding_weight,
-            embedding_weight_t,
-        )?;
+        let hidden = forward_pre_norm_inner(&remaining, embedding, layers, caches)?;
+        let logits =
+            project_last_logits_from_pre_norm_hidden(&hidden, final_norm, lm_head, embedding)?;
         let keep_from = keep_start.max(offset);
         let hidden = if keep_from > offset {
             hidden.slice_axis(1, keep_from - offset, total_len - offset)?
@@ -11052,25 +10955,23 @@ fn shape_dbg(arr: &MxArray) -> String {
 
 fn forward_inner(
     input_ids: &MxArray,
-    embedding_weight: &MxArray,
+    embedding: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight_t: Option<&MxArray>,
 ) -> Result<MxArray> {
-    let hidden = forward_pre_norm_inner(input_ids, embedding_weight, layers, caches)?;
+    let hidden = forward_pre_norm_inner(input_ids, embedding, layers, caches)?;
     let hidden = final_norm.forward(&hidden)?;
-    project_logits_from_hidden(&hidden, lm_head, embedding_weight, embedding_weight_t)
+    project_logits_from_hidden(&hidden, lm_head, embedding)
 }
 
 fn forward_pre_norm_inner(
     input_ids: &MxArray,
-    embedding_weight: &MxArray,
+    embedding: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
 ) -> Result<MxArray> {
-    let embedding = Embedding::from_weight(embedding_weight)?;
     let hidden_states = embedding.forward(input_ids)?;
     let mut h = hidden_states.clone();
 
@@ -11124,12 +11025,11 @@ fn forward_pre_norm_inner(
 /// graph that `eval_step`/`async_eval_layer_caches` materializes.
 fn forward_pre_norm_inner_with_tape(
     input_ids: &MxArray,
-    embedding_weight: &MxArray,
+    embedding: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     tape: &mut [Option<super::gated_delta_net::GdnLayerTape>],
 ) -> Result<MxArray> {
-    let embedding = Embedding::from_weight(embedding_weight)?;
     let hidden_states = embedding.forward(input_ids)?;
     let mut h = hidden_states.clone();
 
@@ -11152,18 +11052,11 @@ fn forward_pre_norm_inner_with_tape(
 fn project_logits_from_hidden(
     hidden: &MxArray,
     lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
-    embedding_weight_t: Option<&MxArray>,
+    embedding: &Embedding,
 ) -> Result<MxArray> {
     match lm_head {
         Some(head) => head.forward(hidden),
-        None => match embedding_weight_t {
-            Some(wt) => hidden.matmul(wt),
-            None => {
-                let wt = embedding_weight.transpose(Some(&[1, 0]))?;
-                hidden.matmul(&wt)
-            }
-        },
+        None => embedding.as_linear(hidden),
     }
 }
 
@@ -11180,9 +11073,8 @@ fn project_logits_from_hidden(
 ///   * `hiddens` is `[1, K+1, hidden]` — the post-final-norm hidden at every
 ///     verify position (the chained-seed and commit context).
 ///
-/// `emb` is the embedding table; `emb_t` is its precomputed transpose for the
-/// tied-embedding projection (passed straight through to
-/// `project_logits_from_hidden`).
+/// `embedding` owns the lookup and tied-head projection backends. Packed
+/// quantized tables therefore stay packed for both operations.
 #[allow(clippy::too_many_arguments)]
 fn eager_verify_step(
     layers: &mut [DecoderLayer],
@@ -11190,8 +11082,7 @@ fn eager_verify_step(
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
     verify_ids: &MxArray,
-    emb: &MxArray,
-    emb_t: Option<&MxArray>,
+    embedding: &Embedding,
     tape: Option<&mut Vec<Option<super::gated_delta_net::GdnLayerTape>>>,
 ) -> Result<mtp_decode::MtpVerifyOutput> {
     let pre = match tape {
@@ -11200,12 +11091,12 @@ fn eager_verify_step(
             // rollback replay can reconstruct the AR-exact carried state.
             tape.clear();
             tape.resize(layers.len(), None);
-            forward_pre_norm_inner_with_tape(verify_ids, emb, layers, caches, tape)?
+            forward_pre_norm_inner_with_tape(verify_ids, embedding, layers, caches, tape)?
         }
-        None => forward_pre_norm_inner(verify_ids, emb, layers, caches)?,
+        None => forward_pre_norm_inner(verify_ids, embedding, layers, caches)?,
     };
     let hiddens = final_norm.forward(&pre)?;
-    let logits = project_logits_from_hidden(&hiddens, lm_head, emb, emb_t)?;
+    let logits = project_logits_from_hidden(&hiddens, lm_head, embedding)?;
     Ok(mtp_decode::MtpVerifyOutput::logits_only(logits, hiddens))
 }
 
@@ -11213,14 +11104,12 @@ fn project_last_logits_from_pre_norm_hidden(
     hidden: &MxArray,
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
-    embedding_weight_t: Option<&MxArray>,
+    embedding: &Embedding,
 ) -> Result<MxArray> {
     let seq_len = hidden.shape_at(1)?;
     let last_hidden = hidden.slice_axis(1, seq_len - 1, seq_len)?;
     let last_hidden = final_norm.forward(&last_hidden)?;
-    let logits =
-        project_logits_from_hidden(&last_hidden, lm_head, embedding_weight, embedding_weight_t)?;
+    let logits = project_logits_from_hidden(&last_hidden, lm_head, embedding)?;
     logits.squeeze(Some(&[1]))
 }
 
@@ -11962,10 +11851,19 @@ pub(crate) fn vlm_prepare_vision_features(
     pre_processed: &ProcessedImages,
     vision_encoder: &Qwen3_5VisionEncoder,
     spatial_merge_size: i32,
-    text_model_embedding: &MxArray,
+    text_model_embedding: &Embedding,
     generation_stream: Stream,
     vision_cache: &VisionCache,
 ) -> Result<VisionMerge> {
+    // Build the text-embedding graph once up front. The packed backend gathers
+    // and dequantizes only the referenced rows; keeping this handle also gives
+    // the vision cache planner the exact merge dtype without materializing the
+    // full vocabulary table.
+    let text_embeds = {
+        let _stream_ctx = StreamContext::new(generation_stream);
+        text_model_embedding.forward(input_ids)?
+    };
+
     // === STEP 1: Compute vision features with per-image reuse ===
     let grid = pre_processed.grid_thw();
     let grid_data = grid.to_int32()?;
@@ -11988,7 +11886,7 @@ pub(crate) fn vlm_prepare_vision_features(
     let (vision_hidden_size, vision_intermediate_size, vision_output_size) =
         vision_encoder.memory_widths();
     let activation_dtype_bytes = u64::try_from(pv.dtype()?.byte_size()).unwrap_or(u64::MAX);
-    let cache_feature_dtype = text_model_embedding.dtype()?;
+    let cache_feature_dtype = text_embeds.dtype()?;
     let cache_feature_dtype_bytes =
         u64::try_from(cache_feature_dtype.byte_size()).unwrap_or(u64::MAX);
     let raw_pixel_bytes_per_patch = pv_shape[1..]
@@ -12378,12 +12276,6 @@ pub(crate) fn vlm_prepare_vision_features(
     };
 
     // === STEP 2: Get text embeddings and merge with vision features ===
-    let text_embeds = {
-        let _stream_ctx = StreamContext::new(generation_stream);
-        let embedding = Embedding::from_weight(text_model_embedding)?;
-        embedding.forward(input_ids)?
-    };
-
     let inputs_embeds = {
         let _stream_ctx = StreamContext::new(generation_stream);
         let embed_dtype = text_embeds.dtype()?;
@@ -13526,7 +13418,6 @@ mod paged_construction_tests {
                 inner.config.is_linear_layer(i)
             });
         let embed = inner.embedding.clone();
-        let embedding_weight = embed.get_weight();
         let caches = inner.caches.as_mut().expect("qwen35 caches initialized");
         let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
 
@@ -13540,7 +13431,6 @@ mod paged_construction_tests {
             caches,
             &inner.final_norm,
             &inner.lm_head,
-            &embedding_weight,
             &layer_kinds,
             adapter,
             chunk_size,
@@ -13571,7 +13461,6 @@ mod paged_construction_tests {
                 inner.config.is_linear_layer(i)
             });
         let embed = inner.embedding.clone();
-        let embedding_weight = embed.get_weight();
         let keep_tokens = full_tokens.len();
         let caches = inner.caches.as_mut().expect("qwen35 caches initialized");
         let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
@@ -13586,7 +13475,6 @@ mod paged_construction_tests {
             caches,
             &inner.final_norm,
             &inner.lm_head,
-            &embedding_weight,
             &layer_kinds,
             adapter,
             chunk_size,
@@ -13682,8 +13570,7 @@ mod paged_construction_tests {
     fn run_dense_final_logits_legacy_chunked_projection(
         inner: &mut Qwen35Inner,
         prompt: &MxArray,
-        embedding_weight: &MxArray,
-        embedding_weight_t: &MxArray,
+        embedding: &Embedding,
         chunk_size: i64,
     ) -> Result<MxArray> {
         reset_dense_caches(inner);
@@ -13701,12 +13588,11 @@ mod paged_construction_tests {
                 let _stream_ctx = StreamContext::new(generation_stream);
                 let _logits = forward_inner(
                     &chunk,
-                    embedding_weight,
+                    embedding,
                     &mut inner.layers,
                     &mut inner.caches,
                     &inner.final_norm,
                     &inner.lm_head,
-                    Some(embedding_weight_t),
                 )?;
             }
             eval_layer_caches(&inner.caches)?;
@@ -13719,12 +13605,11 @@ mod paged_construction_tests {
             let _stream_ctx = StreamContext::new(generation_stream);
             forward_inner(
                 &remaining,
-                embedding_weight,
+                embedding,
                 &mut inner.layers,
                 &mut inner.caches,
                 &inner.final_norm,
                 &inner.lm_head,
-                Some(embedding_weight_t),
             )?
         };
         let seq_len = logits.shape_at(1)?;
@@ -13736,19 +13621,17 @@ mod paged_construction_tests {
     fn run_dense_final_logits_chunked(
         inner: &mut Qwen35Inner,
         prompt: &MxArray,
-        embedding_weight: &MxArray,
-        embedding_weight_t: &MxArray,
+        embedding: &Embedding,
         chunk_size: i64,
     ) -> Result<MxArray> {
         reset_dense_caches(inner);
         chunked_prefill_with_size(
             prompt,
-            embedding_weight,
+            embedding,
             &mut inner.layers,
             &mut inner.caches,
             &inner.final_norm,
             &inner.lm_head,
-            Some(embedding_weight_t),
             Stream::new(DeviceType::Gpu),
             chunk_size,
         )
@@ -14286,29 +14169,17 @@ mod paged_construction_tests {
 
         let prompt_tokens: Vec<u32> = (0u32..33).map(|i| (i * 17 + 5) % 997).collect();
         let prompt = MxArray::from_uint32(&prompt_tokens, &[1, prompt_tokens.len() as i64])?;
-        let embedding_weight = inner.embedding.get_weight();
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let embedding = inner.embedding.clone();
 
-        let expected = run_dense_final_logits_legacy_chunked_projection(
-            &mut inner,
-            &prompt,
-            &embedding_weight,
-            &embedding_weight_t,
-            16,
-        )?;
+        let expected =
+            run_dense_final_logits_legacy_chunked_projection(&mut inner, &prompt, &embedding, 16)?;
         assert_finite_batch_vocab_logits(
             &expected,
             inner.config.vocab_size,
             "legacy chunked final logits",
         );
 
-        let chunked = run_dense_final_logits_chunked(
-            &mut inner,
-            &prompt,
-            &embedding_weight,
-            &embedding_weight_t,
-            16,
-        )?;
+        let chunked = run_dense_final_logits_chunked(&mut inner, &prompt, &embedding, 16)?;
         assert_finite_batch_vocab_logits(&chunked, inner.config.vocab_size, "chunked final logits");
         assert_close_batch_vocab_logits(
             &expected,
@@ -14340,18 +14211,16 @@ mod paged_construction_tests {
 
         let prompt_tokens: Vec<u32> = (0u32..35).map(|i| (i * 23 + 3) % 997).collect();
         let prompt = MxArray::from_uint32(&prompt_tokens, &[1, prompt_tokens.len() as i64])?;
-        let embedding_weight = inner.embedding.get_weight();
-        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let embedding = inner.embedding.clone();
 
         reset_dense_caches(&mut inner);
         let (logits, hidden) = chunked_prefill_with_hidden_with_size(
             &prompt,
-            &embedding_weight,
+            &embedding,
             &mut inner.layers,
             &mut inner.caches,
             &inner.final_norm,
             &inner.lm_head,
-            Some(&embedding_weight_t),
             Stream::new(DeviceType::Gpu),
             Some(5),
             16,
@@ -14371,13 +14240,8 @@ mod paged_construction_tests {
         );
         assert_finite_hidden(&hidden, "chunked hidden tail");
 
-        let logits_without_hidden = run_dense_final_logits_chunked(
-            &mut inner,
-            &prompt,
-            &embedding_weight,
-            &embedding_weight_t,
-            16,
-        )?;
+        let logits_without_hidden =
+            run_dense_final_logits_chunked(&mut inner, &prompt, &embedding, 16)?;
         assert_close_batch_vocab_logits(
             &logits,
             &logits_without_hidden,
@@ -14388,12 +14252,11 @@ mod paged_construction_tests {
         reset_dense_caches(&mut inner);
         let (_logits, full_tail_hidden) = chunked_prefill_with_hidden_with_size(
             &prompt,
-            &embedding_weight,
+            &embedding,
             &mut inner.layers,
             &mut inner.caches,
             &inner.final_norm,
             &inner.lm_head,
-            Some(&embedding_weight_t),
             Stream::new(DeviceType::Gpu),
             Some(100),
             16,

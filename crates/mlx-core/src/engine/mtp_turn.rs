@@ -30,6 +30,7 @@ use crate::models::qwen3_5::mtp_decode::{
     trace_acceptance_dense, trace_acceptance_emit, trace_acceptance_greedy,
     trace_acceptance_sparse,
 };
+use crate::nn::Embedding;
 use crate::sampling;
 use crate::stream::Stream;
 
@@ -70,7 +71,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     prev_hidden_in: MxArray,
     prev_emb_in: MxArray,
     last_committed_id: u32,
-    embedding_weight: &MxArray,
+    embedding: &Embedding,
     token_history: &[u32],
     params: &ChatParams,
     rng: &mut impl rand::Rng,
@@ -242,7 +243,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         // for MLX's lazy cache writes.
         prev_hidden = h_next;
         let id_arr = A::from_int32(&[tok_id], &[1])?;
-        let emb_2d = embedding_weight.take(&id_arr, 0)?; // [1, hidden]
+        let emb_2d = embedding.forward(&id_arr)?; // [1, hidden]
         let hidden = emb_2d.shape_at(1)?;
         prev_emb = emb_2d.reshape(&[1, 1, hidden])?;
         step_input_id = tok_id;
@@ -336,7 +337,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     let verify_step_res = if let Some(res) = use_greedy_argmax_only_verify
         .then(|| {
             profiler.begin("mtp_verify_dispatch_argmax_only");
-            let res = step.verify_step_argmax_only(&verify_in, embedding_weight, effective_depth);
+            let res = step.verify_step_argmax_only(&verify_in, embedding, effective_depth);
             profiler.end();
             res
         })
@@ -344,14 +345,12 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     {
         res
     } else if let Some(res) = use_native_sparse_verify
-        .then(|| {
-            step.verify_step_sparse(&verify_in, embedding_weight, effective_depth, &sampling_cfg)
-        })
+        .then(|| step.verify_step_sparse(&verify_in, embedding, effective_depth, &sampling_cfg))
         .flatten()
     {
         res
     } else {
-        step.verify_step(&verify_in, embedding_weight, effective_depth)
+        step.verify_step(&verify_in, embedding, effective_depth)
     };
     profiler.end();
     let MtpVerifyOutput {
@@ -492,7 +491,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     } else if let Some(target_sparse) = verify_target_sparse.as_ref() {
         target_sparse.vocab_size() as i64
     } else {
-        embedding_weight.shape_at(0)?
+        embedding.num_embeddings() as i64
     };
 
     // Step 3: per-position accept/reject. Build extended history as
@@ -948,7 +947,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         &verify_hiddens,
         &committed_ids,
         accepted_drafts,
-        embedding_weight,
+        embedding,
     );
     profiler.end();
     commit_res?;
@@ -999,7 +998,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
             "MTP tape replay (restore main caches + replay accepted prefix)"
         );
         profiler.begin("mtp_tape_replay");
-        let replay_res = step.restore_and_replay_main(&replay_ids, embedding_weight);
+        let replay_res = step.restore_and_replay_main(&replay_ids, embedding);
         profiler.end();
         replay_res?;
     }
@@ -1302,7 +1301,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     if let Some(label) = step.profiler_relabel() {
         profiler.set_label(label);
     }
-    let emb = step.embedding_weight().clone();
+    let embedding = step.embedding().clone();
 
     // `last_in_cache` is owned by the loop here (the macro mutated the
     // caller's `$last_in_cache` ident in place) and returned in the
@@ -1566,7 +1565,8 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         if do_step_a {
             profiler.begin("forward");
             let next_ids = y.reshape(&[1, 1])?;
-            let (mut logits, hidden, needs_squeeze) = step.forward_with_hidden(&next_ids, &emb)?;
+            let (mut logits, hidden, needs_squeeze) =
+                step.forward_with_hidden(&next_ids, &embedding)?;
             if needs_squeeze {
                 logits = logits.squeeze(Some(&[1]))?;
             }
@@ -1677,7 +1677,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             prev_hidden_opt = Some(hidden.reshape(&[1, 1, hidden_dim])?);
             // prev_emb is the embedding of the JUST-emitted token.
             let id_arr = MxArray::from_int32(&[token_id as i32], &[1])?;
-            let emb_2d = emb.take(&id_arr, 0)?;
+            let emb_2d = embedding.forward(&id_arr)?;
             let h = emb_2d.shape_at(1)?;
             prev_emb_opt = Some(emb_2d.reshape(&[1, 1, h])?);
             last_committed_id_opt = Some(token_id);
@@ -1713,7 +1713,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             let token_id = y.item_at_int32(0)? as u32;
 
             let id_arr = MxArray::from_int32(&[token_id as i32], &[1])?;
-            let emb_2d = emb.take(&id_arr, 0)?;
+            let emb_2d = embedding.forward(&id_arr)?;
             let h = emb_2d.shape_at(1)?;
             prev_emb_opt = Some(emb_2d.reshape(&[1, 1, h])?);
             last_committed_id_opt = Some(token_id);
@@ -1838,7 +1838,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             prev_h,
             prev_e,
             last_id,
-            &emb,
+            &embedding,
             hist,
             p,
             rng,
@@ -2082,6 +2082,7 @@ mod tests {
     use crate::models::qwen3_5::mtp_decode::{
         ForceSparseAcceptGuard, MtpCommitAnchor, MtpCycleOutcome, MtpVerifyOutput,
     };
+    use crate::nn::Embedding;
     use crate::sampling::SamplingConfig;
 
     use super::{MtpTurnArgs, run_mtp_cycle, run_mtp_turn};
@@ -2139,7 +2140,7 @@ mod tests {
     /// compile and dispatch.
     struct MockMtpStepper {
         ledger: RefCell<Vec<Call>>,
-        emb: MxArray,
+        embedding: Embedding,
         committed_history: bool,
         relabel: Option<&'static str>,
         desynced: bool,
@@ -2233,7 +2234,8 @@ mod tests {
         fn new() -> Self {
             Self {
                 ledger: RefCell::new(Vec::new()),
-                emb: lazy_scalar(1.0),
+                embedding: Embedding::from_weight(&lazy_scalar(1.0))
+                    .expect("mock embedding construction is infallible"),
                 committed_history: true,
                 relabel: None,
                 desynced: false,
@@ -2257,9 +2259,11 @@ mod tests {
             verify_argmax: Vec<i32>,
         ) -> Self {
             let mut s = Self::new();
-            s.emb =
+            let weight =
                 MxArray::from_float32(&vec![0.0f32; (vocab * hidden) as usize], &[vocab, hidden])
                     .expect("embedding_weight [vocab,hidden] construction is infallible");
+            s.embedding =
+                Embedding::from_weight(&weight).expect("mock embedding construction is infallible");
             s.cycle = Some(CycleScript {
                 vocab,
                 hidden,
@@ -2307,9 +2311,11 @@ mod tests {
             cycles: Vec<CycleArgmax>,
         ) -> Self {
             let mut s = Self::new();
-            s.emb =
+            let weight =
                 MxArray::from_float32(&vec![0.0f32; (vocab * hidden) as usize], &[vocab, hidden])
                     .expect("embedding_weight [vocab,hidden] construction is infallible");
+            s.embedding =
+                Embedding::from_weight(&weight).expect("mock embedding construction is infallible");
             s.turn = Some(TurnScript {
                 vocab,
                 hidden,
@@ -2355,9 +2361,9 @@ mod tests {
     }
 
     impl MtpStepper for MockMtpStepper {
-        fn embedding_weight(&self) -> &MxArray {
+        fn embedding(&self) -> &Embedding {
             self.record(Call::EmbeddingWeight);
-            &self.emb
+            &self.embedding
         }
 
         fn committed_history_active(&self) -> bool {
@@ -2373,7 +2379,7 @@ mod tests {
         fn forward_with_hidden(
             &mut self,
             _ids: &MxArray,
-            _emb: &MxArray,
+            _embedding: &Embedding,
         ) -> Result<(MxArray, MxArray, bool)> {
             self.record(Call::ForwardWithHidden);
             match self.turn.as_ref() {
@@ -2444,7 +2450,7 @@ mod tests {
         fn verify_step(
             &mut self,
             _ids: &MxArray,
-            _emb: &MxArray,
+            _embedding: &Embedding,
             depth: usize,
         ) -> Result<MtpVerifyOutput> {
             self.record(Call::VerifyStep { depth });
@@ -2501,7 +2507,7 @@ mod tests {
         fn verify_step_argmax_only(
             &mut self,
             _ids: &MxArray,
-            _emb: &MxArray,
+            _embedding: &Embedding,
             depth: usize,
         ) -> Option<Result<MtpVerifyOutput>> {
             self.record(Call::VerifyStepArgmaxOnly { depth });
@@ -2518,7 +2524,7 @@ mod tests {
         fn verify_step_sparse(
             &mut self,
             _ids: &MxArray,
-            _emb: &MxArray,
+            _embedding: &Embedding,
             depth: usize,
             _cfg: &SamplingConfig,
         ) -> Option<Result<MtpVerifyOutput>> {
@@ -2544,7 +2550,11 @@ mod tests {
             });
         }
 
-        fn restore_and_replay_main(&mut self, accepted: &[u32], _emb: &MxArray) -> Result<()> {
+        fn restore_and_replay_main(
+            &mut self,
+            accepted: &[u32],
+            _embedding: &Embedding,
+        ) -> Result<()> {
             self.record(Call::RestoreAndReplayMain {
                 accepted: accepted.len(),
             });
@@ -2558,7 +2568,7 @@ mod tests {
             _verify_hiddens: &MxArray,
             committed_ids: &[u32],
             k_accepted: usize,
-            _emb: &MxArray,
+            _embedding: &Embedding,
         ) -> Result<()> {
             self.record(Call::CommitMtp {
                 anchor,
@@ -2625,7 +2635,7 @@ mod tests {
         // Step A: main-path forward → seed hidden/emb. `emb` is read
         // through `&self` then re-borrowed into the `&mut self` forward —
         // the clone breaks the borrow overlap the real loop also avoids.
-        let emb = step.embedding_weight().clone();
+        let emb = step.embedding().clone();
         let (_logits, _hidden, _sq) = step
             .forward_with_hidden(&lazy_scalar(0.0), &emb)
             .expect("mock forward never fails");
@@ -2633,7 +2643,8 @@ mod tests {
         // Re-anchor, then D draft steps threading (h_next, emb) forward.
         step.begin_cycle(false);
         let mut prev_h = lazy_scalar(0.0);
-        let mut prev_emb = emb.clone();
+        let token_zero = MxArray::from_int32(&[0], &[1]).expect("mock token id");
+        let mut prev_emb = emb.forward(&token_zero).expect("mock embedding lookup");
         for _ in 0..depth {
             let (h_next, _draft_logits) = step
                 .draft_step(&prev_h, &prev_emb)
@@ -2748,10 +2759,11 @@ mod tests {
 
     #[test]
     fn mtp_stepper_verify_fast_paths_dispatch() {
+        let embedding = MockMtpStepper::new().embedding;
         // argmax-only fast path present → returns Some, engine uses it.
         let mut argmax = MockMtpStepper::new();
         argmax.has_argmax_only = true;
-        let r = argmax.verify_step_argmax_only(&lazy_scalar(0.0), &lazy_scalar(0.0), 4);
+        let r = argmax.verify_step_argmax_only(&lazy_scalar(0.0), &embedding, 4);
         assert!(r.is_some(), "argmax-only present must return Some");
         assert!(r.expect("present").is_ok());
 
@@ -2760,17 +2772,17 @@ mod tests {
         let mut sparse = MockMtpStepper::new();
         sparse.has_sparse = true;
         let cfg = SamplingConfig::default();
-        let s = sparse.verify_step_sparse(&lazy_scalar(0.0), &lazy_scalar(0.0), 4, &cfg);
+        let s = sparse.verify_step_sparse(&lazy_scalar(0.0), &embedding, 4, &cfg);
         assert!(s.is_some(), "sparse present must return Some");
 
         let mut none = MockMtpStepper::new();
         assert!(
-            none.verify_step_argmax_only(&lazy_scalar(0.0), &lazy_scalar(0.0), 4)
+            none.verify_step_argmax_only(&lazy_scalar(0.0), &embedding, 4)
                 .is_none(),
             "absent argmax-only default is None"
         );
         assert!(
-            none.verify_step_sparse(&lazy_scalar(0.0), &lazy_scalar(0.0), 4, &cfg)
+            none.verify_step_sparse(&lazy_scalar(0.0), &embedding, 4, &cfg)
                 .is_none(),
             "absent sparse default is None"
         );
@@ -2912,7 +2924,7 @@ mod tests {
         let mut profiler = crate::decode_profiler::DecodeProfiler::new("mtp_test", "test");
         profiler.enable_for_test();
         // Embedding weight is the mock's own `[vocab, hidden]` table.
-        let emb = step.emb.clone();
+        let emb = step.embedding.clone();
         let prev_hidden =
             MxArray::from_float32(&vec![0.0f32; hidden as usize], &[1, 1, hidden]).unwrap();
         let prev_emb =
@@ -3010,7 +3022,7 @@ mod tests {
             <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0xD0E5_DEAD_BEEF_F00D);
         let mut profiler = crate::decode_profiler::DecodeProfiler::new("mtp_dense_test", "test");
         profiler.enable_for_test();
-        let emb = step.emb.clone();
+        let emb = step.embedding.clone();
         let prev_hidden =
             MxArray::from_float32(&vec![0.0f32; hidden as usize], &[1, 1, hidden]).unwrap();
         let prev_emb =

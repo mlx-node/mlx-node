@@ -493,7 +493,7 @@ fn apply_weights_moe_inner(
     quant_group_size: i32,
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
-    has_vision: bool,
+    _has_vision: bool,
 ) -> Result<()> {
     // sym8 dispatch covers the NON-EXPERT sublayers (attention q/k/v/o, GDN
     // in_proj_qkvz/in_proj_ba/out_proj, shared-expert MLP body) through the
@@ -643,24 +643,13 @@ fn apply_weights_moe_inner(
         // affine). Mirrors the linear/switch builders' guard.
         ensure_kquant_storage_resolves_kquant(params, "embedding", plq.mode, "qwen3_5_moe")?;
         ensure_affine_biases_present(params, "embedding", plq.mode, "qwen3_5_moe")?;
-        // Gate the packed-resident load exactly like the dense loader
-        // (`qwen3_5/persistence.rs`): packed is a WIN only on the paged,
-        // non-MTP, non-VLM turn path, where the tied lm_head routes through
-        // `Embedding::as_linear` (packed `quantized_matmul`) in
-        // `paged_forward.rs`. The flat/eager path, MTP draft, and VLM image
-        // turns still eval a per-turn `get_weight()` — they keep the legacy
-        // full-pre-dequant load (unchanged behavior); extending the win to
-        // them is a follow-up.
-        //
-        // `use_block_paged_cache == Some(true)` is config INTENT; the paged
-        // adapter is only created when `compiled_forward_backend_available()`
-        // is ALSO true (`Qwen35MoeInner::new`), so a non-Metal/CUDA build with
-        // a paged config still runs flat — the added predicate keeps those on
-        // the legacy load (no per-turn dequant regression).
-        let prefer_packed = config.use_block_paged_cache == Some(true)
-            && crate::engine::persistence::compiled_forward_backend_available()
-            && config.n_mtp_layers == 0
-            && !has_vision;
+        // Dense/MoE flat, paged, MTP, and VLM consumers now carry `Embedding`
+        // itself and dispatch lookup/projection through its packed-aware APIs.
+        // Keep measured sub-byte affine embeddings packed independent of the
+        // configured backend, declared MTP depth, or vision presence. Runtime
+        // MTP selection uses `has_mtp_weights()` (the loaded complete set).
+        let prefer_packed =
+            crate::models::qwen3_5::persistence::packed_qwen_embedding_enabled(plq.mode, plq.bits);
         // Resolve the packing mode from the checkpoint rather than assuming
         // affine: a GGUF `token_embd` repacked to q6k/q4k/q5k must decode as
         // K-quant, and mxfp embeddings as mxfp. The `ensure_kquant_*` guard
@@ -2104,16 +2093,19 @@ mod tests {
     }
 
     /// MoE mirror of the dense `tied_quantized_embedding_loads_via_packed_path`:
-    /// a quantized `embedding.*` sidecar on a paged, non-MTP, non-VLM
+    /// a quantized `embedding.*` sidecar on a flat, declared-MTP, VLM
     /// `Qwen3_5MoeConfig` must load via `Embedding::load_quantized_packed`
     /// (packed-resident, so the tied lm_head runs `quantized_matmul` via
     /// `as_linear` on the paged path) — NOT the legacy full-table pre-dequant
-    /// `Embedding::load_quantized`. Guards `apply_weights_moe_inner`'s gated
-    /// load branch directly.
+    /// `Embedding::load_quantized`. Guards `apply_weights_moe_inner` directly
+    /// and covers all three former packed-load exclusions in one fixture.
     #[test]
     fn tied_quantized_embedding_loads_via_packed_path_moe() {
         let label = "tied_quantized_embedding_loads_via_packed_path_moe";
-        let cfg = moe_paged_tiny_cfg();
+        let mut cfg = moe_paged_tiny_cfg();
+        cfg.use_block_paged_cache = Some(false);
+        cfg.paged_cache_memory_mb = None;
+        cfg.n_mtp_layers = 1;
 
         let mut inner = match Qwen35MoeInner::new(cfg.clone()) {
             Ok(inner) => inner,
@@ -2198,7 +2190,7 @@ mod tests {
             DEFAULT_QUANT_GROUP_SIZE,
             None,
             &per_layer_quant,
-            /* has_vision */ false,
+            /* has_vision */ true,
         ) {
             Ok(()) => {}
             Err(err) => {
@@ -2212,7 +2204,11 @@ mod tests {
 
         assert!(
             inner.embedding.is_packed_quantized(),
-            "tied+quantized MoE embedding.* on the paged path must load via load_quantized_packed, not the legacy dense load_quantized"
+            "tied+quantized MoE embedding.* must stay packed across flat, declared-MTP, and VLM configs"
+        );
+        assert!(
+            !inner.has_mtp_weights(),
+            "declaring MoE MTP in config without loading its weights must not enable runtime MTP"
         );
     }
 

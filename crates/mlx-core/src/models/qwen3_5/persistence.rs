@@ -40,6 +40,35 @@ use super::quantized_linear::{
     try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear, try_build_quantized_linear,
     try_build_sym8_quantized_linear,
 };
+
+const DISABLE_PACKED_QWEN_EMBEDDING_ENV: &str = "MLX_DISABLE_PACKED_QWEN_EMBEDDING";
+
+fn packed_qwen_embedding_enabled_from_env(value: Option<&str>) -> bool {
+    !crate::inference_trace::env_flag_value_or_default(value, false)
+}
+
+fn should_load_packed_qwen_embedding(
+    mode: PerLayerMode,
+    bits: i32,
+    disable_value: Option<&str>,
+) -> bool {
+    mode == PerLayerMode::Affine
+        && bits < 8
+        && packed_qwen_embedding_enabled_from_env(disable_value)
+}
+
+/// Load-time-only compatibility switch for exact same-binary A/B runs.
+/// Callers sample this while installing weights; inference hot loops never
+/// read the environment.
+pub(crate) fn packed_qwen_embedding_enabled(mode: PerLayerMode, bits: i32) -> bool {
+    let value = std::env::var(DISABLE_PACKED_QWEN_EMBEDDING_ENV).ok();
+    // The tied-head projection is decode-critical. Exact same-binary E2E runs
+    // show that keeping sub-byte embeddings packed wins decisively, while the
+    // 8-bit affine head is faster after the one-time dense materialization.
+    // Keep the optimization on the measured shape class and leave every 8-bit
+    // mode on the legacy dense path until its packed head is proven faster.
+    should_load_packed_qwen_embedding(mode, bits, value.as_deref())
+}
 use super::vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 
 /// Sanitize weights from HuggingFace format (dense variant).
@@ -1113,7 +1142,7 @@ fn apply_weights_inner(
     quant_group_size: i32,
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
-    has_vision: bool,
+    _has_vision: bool,
 ) -> Result<()> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
@@ -1210,29 +1239,14 @@ fn apply_weights_inner(
         // affine). Mirrors the linear builders' guard on `try_build_ql`.
         ensure_kquant_storage_resolves_kquant(params, "embedding", plq.mode, "qwen3_5")?;
         ensure_affine_biases_present(params, "embedding", plq.mode, "qwen3_5")?;
-        // Packed-resident load (`quantized_matmul` on the tied lm_head via
-        // `Embedding::as_linear` on the paged path) is a WIN only where every
-        // per-turn `get_weight()` consumer is packed-aware. That holds for the
-        // paged, non-MTP, non-VLM turn path (input lookup already uses
-        // `embed.forward`; the only eval'd `get_weight()` was the tied-head
-        // matmul, now routed through `as_linear`). It REGRESSES under packed on:
-        // the flat/eager path (`use_block_paged_cache != Some(true)`, incl. sym8
-        // + the non-Metal preview — re-dequants input lookup AND head per turn),
-        // MTP draft (`n_mtp_layers > 0` — per-draft dequant), and VLM image turns
-        // (`has_vision` — the vision-merge text-embed re-dequants). Gate the
-        // packed load to the proven-clean case; everything else keeps the legacy
-        // full-pre-dequant load (unchanged behavior). Coverage of MTP / VLM /
-        // flat is a follow-up.
-        //
-        // `use_block_paged_cache == Some(true)` is config INTENT; the paged
-        // adapter is only created when `compiled_forward_backend_available()`
-        // is ALSO true (`Qwen35Inner::new`), so a non-Metal/CUDA build with a
-        // paged config still runs flat — the added predicate keeps those on the
-        // legacy load (no per-turn dequant regression).
-        let prefer_packed = config.use_block_paged_cache == Some(true)
-            && crate::engine::persistence::compiled_forward_backend_available()
-            && config.n_mtp_layers == 0
-            && !has_vision;
+        // Every inference consumer now carries `Embedding` itself: flat and
+        // paged lookup call `forward`, tied logits call `as_linear`, MTP draft /
+        // verify gather through `forward`, and VLM text merge does the same.
+        // Keep measured sub-byte affine embeddings packed regardless of cache
+        // backend, declared MTP depth, or vision presence. MTP execution is
+        // gated later by `has_mtp_weights()` (the actually loaded weight set),
+        // never merely by `config.n_mtp_layers`.
+        let prefer_packed = packed_qwen_embedding_enabled(plq.mode, plq.bits);
         // Resolve the packing mode from the checkpoint rather than assuming
         // affine: a GGUF `token_embd` repacked to q6k/q4k/q5k must decode as
         // K-quant, and mxfp embeddings as mxfp. The `ensure_kquant_*` guard
@@ -2512,6 +2526,58 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn packed_qwen_embedding_fallback_is_explicit_truthy_and_default_on() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("off"),
+        ] {
+            assert!(
+                packed_qwen_embedding_enabled_from_env(value),
+                "{value:?} must keep the packed embedding path enabled"
+            );
+        }
+
+        for value in [
+            Some("1"),
+            Some("true"),
+            Some("TRUE"),
+            Some(" yes "),
+            Some("On"),
+        ] {
+            assert!(
+                !packed_qwen_embedding_enabled_from_env(value),
+                "{value:?} must force the exact legacy full-dequant load path"
+            );
+        }
+    }
+
+    #[test]
+    fn packed_qwen_embedding_is_limited_to_sub_byte_weights() {
+        for bits in [2, 3, 4, 5, 6] {
+            assert!(
+                should_load_packed_qwen_embedding(PerLayerMode::Affine, bits, None),
+                "{bits}-bit affine embeddings should stay packed"
+            );
+        }
+        assert!(
+            !should_load_packed_qwen_embedding(PerLayerMode::Affine, 8, None),
+            "8-bit tied heads should use the measured dense path"
+        );
+        assert!(
+            !should_load_packed_qwen_embedding(PerLayerMode::Mxfp4, 4, None),
+            "unmeasured packing modes should stay on the dense path"
+        );
+        assert!(
+            !should_load_packed_qwen_embedding(PerLayerMode::Affine, 6, Some("1")),
+            "the fallback must disable an otherwise eligible embedding"
+        );
+    }
+
     fn qwen36_27b_mtp_config_json() -> Value {
         json!({
             "model_type": "qwen3_5",
@@ -3074,27 +3140,24 @@ mod tests {
     }
 
     /// Persistence-level regression for the tied+quantized lm_head packed
-    /// fast-path (paged, non-MTP, non-VLM): a quantized `embedding.*` sidecar
-    /// on a paged config must load via `Embedding::load_quantized_packed`
+    /// path: a quantized `embedding.*` sidecar must load via
+    /// `Embedding::load_quantized_packed`
     /// (packed-resident: `forward()` gather-then-dequants, `as_linear()` runs
     /// `quantized_matmul`) — NOT the legacy `Embedding::load_quantized` (eager
     /// full-table pre-dequant into a dense bf16 `[vocab, hidden]` array). Guards
-    /// the gated `apply_weights_inner` load branch directly; the packed-vs-dense
+    /// `apply_weights_inner` directly; the packed-vs-dense
     /// forward/as_linear numerical equivalence itself is already covered by
     /// `crate::nn::embedding::tests::packed_affine_2bit_lookup_byte_identical_to_legacy_dense`
     /// and `packed_affine_as_linear_matches_dense_matmul`.
     #[test]
     fn tied_quantized_embedding_loads_via_packed_path() {
         let label = "tied_quantized_embedding_loads_via_packed_path";
-        // Satisfy the packed-load gate: paged, non-MTP, non-VLM.
-        // `no_mtp_layer_cfg()` already sets `n_mtp_layers = 0` but leaves
-        // `use_block_paged_cache = None`, so opt the fixture into paged here.
-        // The block-paged `LayerKVPool` only accepts head sizes in a fixed set
-        // (`no_mtp_layer_cfg`'s `head_dim = 16` is rejected), so bump the tied
-        // head/attention dim to the smallest valid pool size (32).
+        // Exercise all three former exclusions at once: flat backend, declared
+        // MTP module, and VLM checkpoint. The fixture deliberately omits MTP
+        // weights, so runtime dispatch must remain gated by `has_mtp_weights()`.
         let mut cfg = no_mtp_layer_cfg(); // tie_word_embeddings: true, vocab 1024
-        cfg.use_block_paged_cache = Some(true);
-        cfg.head_dim = 32;
+        cfg.use_block_paged_cache = Some(false);
+        cfg.n_mtp_layers = 1;
 
         let mut inner = match Qwen35Inner::new(cfg.clone()) {
             Ok(inner) => inner,
@@ -3189,7 +3252,7 @@ mod tests {
             DEFAULT_QUANT_GROUP_SIZE,
             None,
             &per_layer_quant,
-            /* has_vision */ false,
+            /* has_vision */ true,
         ) {
             Ok(()) => {}
             Err(err) => {
@@ -3203,7 +3266,11 @@ mod tests {
 
         assert!(
             inner.embedding.is_packed_quantized(),
-            "tied+quantized embedding.* on the paged path must load via load_quantized_packed, not the legacy dense load_quantized"
+            "tied+quantized embedding.* must stay packed across flat, declared-MTP, and VLM configs"
+        );
+        assert!(
+            !inner.has_mtp_weights(),
+            "declaring MTP in config without loading its weights must not enable runtime MTP"
         );
     }
 
