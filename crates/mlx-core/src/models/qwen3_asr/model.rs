@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use napi::bindgen_prelude::*;
@@ -1411,9 +1412,14 @@ impl Qwen3AsrInner {
     }
 
     fn finish_stream(&mut self, id: &str) -> Result<Qwen3AsrResult> {
-        let mut state = self.streams.remove(id).ok_or_else(|| {
+        let state = self.streams.get(id).ok_or_else(|| {
             Error::from_reason(format!("Unknown or already finished ASR stream {id}"))
         })?;
+        validate_stream_finish(state)?;
+        let mut state = self
+            .streams
+            .remove(id)
+            .expect("stream registration was validated immediately before removal");
         if !state.pending_samples.is_empty() {
             let audio = std::mem::take(&mut state.pending_samples);
             return self.transcribe_stream_revision(&mut state, audio, true);
@@ -1518,6 +1524,15 @@ fn validate_stream_feed_source(state: &StreamingState, source: StreamFeedSource)
     if state.capture_active && matches!(source, StreamFeedSource::Public) {
         return Err(Error::from_reason(
             "Cannot manually feed a Qwen3-ASR stream while microphone capture is active",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stream_finish(state: &StreamingState) -> Result<()> {
+    if state.capture_active {
+        return Err(Error::from_reason(
+            "Cannot finish a Qwen3-ASR stream while microphone capture is active; stop and await the capture before finishing",
         ));
     }
     Ok(())
@@ -2005,6 +2020,7 @@ impl Qwen3AsrModel {
             Ok(Qwen3AsrStream {
                 sender,
                 id: Some(id),
+                finished: Arc::new(AtomicBool::new(false)),
             })
         })
     }
@@ -2014,6 +2030,7 @@ impl Qwen3AsrModel {
 pub struct Qwen3AsrStream {
     sender: mpsc::UnboundedSender<Qwen3AsrCmd>,
     id: Option<String>,
+    finished: Arc<AtomicBool>,
 }
 
 #[napi]
@@ -2024,6 +2041,9 @@ impl Qwen3AsrStream {
         env: &'env Env,
         samples: Float32Array,
     ) -> Result<PromiseRaw<'env, Option<Qwen3AsrResult>>> {
+        if self.finished.load(Ordering::Acquire) {
+            return Err(Error::from_reason("ASR stream is already finished"));
+        }
         let id = self
             .id
             .clone()
@@ -2044,13 +2064,28 @@ impl Qwen3AsrStream {
     pub fn finish<'env>(&mut self, env: &'env Env) -> Result<PromiseRaw<'env, Qwen3AsrResult>> {
         let id = self
             .id
-            .take()
+            .clone()
             .ok_or_else(|| Error::from_reason("ASR stream is already finished"))?;
+        if self.finished.swap(true, Ordering::AcqRel) {
+            return Err(Error::from_reason("ASR stream is already finished"));
+        }
         let (reply, rx) = oneshot::channel();
-        self.sender
+        if self
+            .sender
             .send(Qwen3AsrCmd::FinishStream { id, reply })
-            .map_err(|_| Error::from_reason("Qwen3-ASR model thread has exited"))?;
-        env.spawn_future(await_reply(rx))
+            .is_err()
+        {
+            self.finished.store(false, Ordering::Release);
+            return Err(Error::from_reason("Qwen3-ASR model thread has exited"));
+        }
+        let finished = self.finished.clone();
+        env.spawn_future(async move {
+            let result = await_reply(rx).await;
+            if result.is_err() {
+                finished.store(false, Ordering::Release);
+            }
+            result
+        })
     }
 
     /// Start real-time microphone capture through RustAudio/CPAL. The Core
@@ -2062,6 +2097,9 @@ impl Qwen3AsrStream {
         options: Option<Qwen3AsrCaptureOptions>,
         callback: ThreadsafeFunction<Qwen3AsrResult, ()>,
     ) -> Result<super::capture::Qwen3AsrCapture> {
+        if self.finished.load(Ordering::Acquire) {
+            return Err(Error::from_reason("ASR stream is already finished"));
+        }
         let id = self
             .id
             .clone()
@@ -2369,6 +2407,12 @@ mod tests {
         let mut state = test_streaming_state();
         prepare_stream_capture(&mut state, 48_000).unwrap();
         assert_eq!(state.options.sample_rate, Some(48_000));
+        let error = validate_stream_finish(&state).unwrap_err();
+        assert!(
+            error.reason.contains("capture is active"),
+            "{}",
+            error.reason
+        );
         let error = validate_stream_feed_source(&state, StreamFeedSource::Public).unwrap_err();
         assert!(
             error.reason.contains("capture is active"),
@@ -2382,6 +2426,7 @@ mod tests {
         assert_eq!(state.options.sample_rate, Some(48_000));
 
         release_stream_capture(&mut state);
+        validate_stream_finish(&state).unwrap();
         validate_stream_feed_source(&state, StreamFeedSource::Public).unwrap();
         prepare_stream_capture(&mut state, 44_100).unwrap();
         assert_eq!(state.options.sample_rate, Some(44_100));
