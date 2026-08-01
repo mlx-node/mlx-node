@@ -96,6 +96,10 @@ impl LinearProj {
         matches!(self, LinearProj::Quantized(_))
     }
 
+    pub(crate) fn has_q_gate_block_layout(&self) -> bool {
+        matches!(self, LinearProj::Quantized(ql) if ql.has_q_gate_block_layout())
+    }
+
     /// The per-tensor FP8 activation scale threaded onto the quantized backend
     /// at load time (`None` for a dense projection). Test-only read-back seam
     /// used to prove the loaders thread `PerLayerQuant::input_amax` onto the
@@ -485,6 +489,47 @@ pub fn try_build_kquant_quantized_linear(
 /// sym8 uses dedicated int8 kernels. Plain `fp8_e4m3` is the intentionally
 /// non-native exception: it retains raw Uint8 checkpoint storage, reconstructs
 /// BF16 once at load, and uses ordinary A16 matmul.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum QuantizedOutputLayout {
+    #[default]
+    Native,
+    QGateBlock,
+}
+
+fn q_gate_block_permutation(num_heads: i32, head_dim: i32, output_rows: i64) -> Result<Vec<i32>> {
+    if num_heads <= 0 || head_dim <= 0 {
+        return Err(Error::from_reason(format!(
+            "q/gate block layout requires positive num_heads/head_dim, got {num_heads}/{head_dim}"
+        )));
+    }
+    let h = i64::from(num_heads);
+    let d = i64::from(head_dim);
+    let expected_rows = h
+        .checked_mul(d)
+        .and_then(|value| value.checked_mul(2))
+        .ok_or_else(|| Error::from_reason("q/gate block row count overflow"))?;
+    if output_rows != expected_rows {
+        return Err(Error::from_reason(format!(
+            "q/gate block layout expected {expected_rows} output rows for H={num_heads}, D={head_dim}, got {output_rows}"
+        )));
+    }
+    if expected_rows > i64::from(i32::MAX) {
+        return Err(Error::from_reason(format!(
+            "q/gate block layout has too many output rows for int32 indices: {expected_rows}"
+        )));
+    }
+
+    let mut permutation = Vec::with_capacity(expected_rows as usize);
+    for part in 0..2i64 {
+        for head in 0..h {
+            for dim in 0..d {
+                permutation.push((head * 2 * d + part * d + dim) as i32);
+            }
+        }
+    }
+    Ok(permutation)
+}
+
 pub struct QuantizedLinear {
     weight: MxArray,         // Packed uint32 quantized weights [out, in_packed]
     scales: MxArray,         // Quantization scales
@@ -521,6 +566,7 @@ pub struct QuantizedLinear {
     // `mode == MXFP8_MODE` + collector-enabled), so it never affects normal
     // inference.
     amax_key: Option<String>,
+    output_layout: QuantizedOutputLayout,
 }
 
 /// Routing observability for the sym8 forward (unit-test scope only):
@@ -567,6 +613,7 @@ impl QuantizedLinear {
             s_w: None,
             input_amax: None,
             amax_key: None,
+            output_layout: QuantizedOutputLayout::Native,
         }
     }
 
@@ -592,6 +639,7 @@ impl QuantizedLinear {
             s_w: None,
             input_amax: None,
             amax_key: None,
+            output_layout: QuantizedOutputLayout::Native,
         }
     }
 
@@ -644,7 +692,82 @@ impl QuantizedLinear {
             s_w: Some(s_w),
             input_amax: None,
             amax_key: None,
+            output_layout: QuantizedOutputLayout::Native,
         }
+    }
+
+    /// Reorder an affine q/gate projection's output rows from checkpoint order
+    /// `[Q_h0,G_h0,Q_h1,G_h1,...]` to `[Q_all_heads,G_all_heads]`.
+    ///
+    /// All row-coupled operands are materialized together before replacing the
+    /// stored arrays. Once this returns `true`, the original-order arrays are
+    /// no longer retained by the projection. Non-affine or incompatible direct
+    /// constructor inputs stay untouched and return `false` so attention keeps
+    /// using its native per-head split.
+    pub(crate) fn finalize_affine_q_gate_block(
+        &mut self,
+        num_heads: i32,
+        head_dim: i32,
+    ) -> Result<bool> {
+        if self.output_layout == QuantizedOutputLayout::QGateBlock {
+            return Ok(true);
+        }
+        if self.mode != DEFAULT_QUANT_MODE {
+            return Ok(false);
+        }
+
+        let weight_shape = self.weight.shape()?.to_vec();
+        let scales_shape = self.scales.shape()?.to_vec();
+        let Some(quant_biases) = self.biases.as_ref() else {
+            return Ok(false);
+        };
+        let quant_biases_shape = quant_biases.shape()?.to_vec();
+        let expected_rows = i64::from(num_heads)
+            .checked_mul(i64::from(head_dim))
+            .and_then(|value| value.checked_mul(2))
+            .ok_or_else(|| Error::from_reason("q/gate block row count overflow"))?;
+        let additive_bias_compatible = match self.bias.as_ref() {
+            Some(bias) => bias.shape()?.to_vec() == [expected_rows],
+            None => true,
+        };
+        if weight_shape.len() != 2
+            || scales_shape.len() != 2
+            || quant_biases_shape.len() != 2
+            || weight_shape[0] != expected_rows
+            || scales_shape[0] != expected_rows
+            || quant_biases_shape != scales_shape
+            || !additive_bias_compatible
+        {
+            return Ok(false);
+        }
+
+        let permutation = q_gate_block_permutation(num_heads, head_dim, expected_rows)?;
+        let indices = MxArray::from_int32(&permutation, &[expected_rows])?;
+        let weight = self.weight.take(&indices, 0)?;
+        let scales = self.scales.take(&indices, 0)?;
+        let quant_biases = quant_biases.take(&indices, 0)?;
+        let bias = self
+            .bias
+            .as_ref()
+            .map(|bias| bias.take(&indices, 0))
+            .transpose()?;
+
+        let mut arrays = vec![&weight, &scales, &quant_biases];
+        if let Some(bias) = bias.as_ref() {
+            arrays.push(bias);
+        }
+        MxArray::eval_arrays(&arrays)?;
+
+        self.weight = weight;
+        self.scales = scales;
+        self.biases = Some(quant_biases);
+        self.bias = bias;
+        self.output_layout = QuantizedOutputLayout::QGateBlock;
+        Ok(true)
+    }
+
+    pub(crate) fn has_q_gate_block_layout(&self) -> bool {
+        self.output_layout == QuantizedOutputLayout::QGateBlock
     }
 
     /// sym8 forward: int8-weight GEMM/QMV + rescale.
@@ -1008,6 +1131,144 @@ mod affine_dtype_tests {
             expected.to_uint16_native().unwrap(),
             "the additive bias must be applied before the projection-boundary cast"
         );
+    }
+}
+
+#[cfg(test)]
+mod q_gate_block_tests {
+    use super::*;
+
+    #[test]
+    fn q_gate_block_permutation_is_bijective_for_multiple_heads() {
+        let permutation = q_gate_block_permutation(3, 2, 12).unwrap();
+        assert_eq!(permutation, vec![0, 1, 4, 5, 8, 9, 2, 3, 6, 7, 10, 11]);
+        let mut sorted = permutation.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..12).collect::<Vec<_>>());
+
+        assert!(q_gate_block_permutation(0, 2, 0).is_err());
+        assert!(q_gate_block_permutation(3, 0, 0).is_err());
+        assert!(q_gate_block_permutation(3, 2, 11).is_err());
+    }
+
+    #[test]
+    fn affine_q_gate_block_replaces_every_row_coupled_operand() {
+        let h = 3;
+        let d = 2;
+        let rows = 12i64;
+        let permutation = q_gate_block_permutation(h, d, rows).unwrap();
+        let weight_values = (0..rows)
+            .flat_map(|row| [row as u32 * 10, row as u32 * 10 + 1])
+            .collect::<Vec<_>>();
+        let scales_values = (0..rows).map(|row| row as f32 + 0.25).collect::<Vec<_>>();
+        let quant_bias_values = (0..rows).map(|row| row as f32 + 100.0).collect::<Vec<_>>();
+        let bias_values = (0..rows).map(|row| row as f32 + 200.0).collect::<Vec<_>>();
+
+        let weight = MxArray::from_uint32(&weight_values, &[rows, 2]).unwrap();
+        let scales = MxArray::from_float32(&scales_values, &[rows, 1]).unwrap();
+        let quant_biases = MxArray::from_float32(&quant_bias_values, &[rows, 1]).unwrap();
+        let bias = MxArray::from_float32(&bias_values, &[rows]).unwrap();
+        let original_ptrs = [
+            weight.as_raw_ptr(),
+            scales.as_raw_ptr(),
+            quant_biases.as_raw_ptr(),
+            bias.as_raw_ptr(),
+        ];
+        let mut linear = QuantizedLinear::new(
+            weight,
+            scales,
+            Some(quant_biases),
+            Some(bias),
+            32,
+            4,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+
+        assert!(linear.finalize_affine_q_gate_block(h, d).unwrap());
+        assert!(linear.has_q_gate_block_layout());
+        assert_ne!(linear.weight.as_raw_ptr(), original_ptrs[0]);
+        assert_ne!(linear.scales.as_raw_ptr(), original_ptrs[1]);
+        assert_ne!(
+            linear.biases.as_ref().unwrap().as_raw_ptr(),
+            original_ptrs[2]
+        );
+        assert_ne!(linear.bias.as_ref().unwrap().as_raw_ptr(), original_ptrs[3]);
+
+        let expected_weight = permutation
+            .iter()
+            .flat_map(|&row| [row as u32 * 10, row as u32 * 10 + 1])
+            .collect::<Vec<_>>();
+        let expected_scales = permutation
+            .iter()
+            .map(|&row| row as f32 + 0.25)
+            .collect::<Vec<_>>();
+        let expected_quant_biases = permutation
+            .iter()
+            .map(|&row| row as f32 + 100.0)
+            .collect::<Vec<_>>();
+        let expected_bias = permutation
+            .iter()
+            .map(|&row| row as f32 + 200.0)
+            .collect::<Vec<_>>();
+        assert_eq!(linear.weight.to_uint32().unwrap().to_vec(), expected_weight);
+        assert_eq!(
+            linear.scales.to_float32().unwrap().to_vec(),
+            expected_scales
+        );
+        assert_eq!(
+            linear
+                .biases
+                .as_ref()
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec(),
+            expected_quant_biases
+        );
+        assert_eq!(
+            linear.bias.as_ref().unwrap().to_float32().unwrap().to_vec(),
+            expected_bias
+        );
+
+        assert!(
+            linear.finalize_affine_q_gate_block(h, d).unwrap(),
+            "the finalized layout must be idempotent"
+        );
+    }
+
+    #[test]
+    fn q_gate_block_is_noop_for_non_affine_or_incompatible_operands() {
+        let weight = MxArray::from_uint32(&[0; 24], &[12, 2]).unwrap();
+        let scales = MxArray::from_float32(&[1.0; 12], &[12, 1]).unwrap();
+        let biases = MxArray::from_float32(&[0.0; 12], &[12, 1]).unwrap();
+
+        let mut non_affine = QuantizedLinear::new(
+            weight.clone(),
+            scales.clone(),
+            Some(biases.clone()),
+            None,
+            32,
+            4,
+            MXFP4_MODE.to_string(),
+        );
+        let original = non_affine.weight.as_raw_ptr();
+        assert!(!non_affine.finalize_affine_q_gate_block(3, 2).unwrap());
+        assert!(!non_affine.has_q_gate_block_layout());
+        assert_eq!(non_affine.weight.as_raw_ptr(), original);
+
+        let mut incompatible = QuantizedLinear::new(
+            weight,
+            MxArray::from_float32(&[1.0; 11], &[11, 1]).unwrap(),
+            Some(biases),
+            None,
+            32,
+            4,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+        let original = incompatible.weight.as_raw_ptr();
+        assert!(!incompatible.finalize_affine_q_gate_block(3, 2).unwrap());
+        assert!(!incompatible.has_q_gate_block_layout());
+        assert_eq!(incompatible.weight.as_raw_ptr(), original);
     }
 }
 
