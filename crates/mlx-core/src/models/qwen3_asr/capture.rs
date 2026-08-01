@@ -4,7 +4,7 @@ use napi_derive::napi;
 use tokio::sync::mpsc;
 
 use super::config::{Qwen3AsrCaptureOptions, Qwen3AsrResult};
-use super::model::Qwen3AsrCmd;
+use super::model::{Qwen3AsrCmd, StreamFeedSource};
 
 #[napi(object)]
 pub struct Qwen3AsrInputDevice {
@@ -406,6 +406,7 @@ mod platform {
                         .send(Qwen3AsrCmd::FeedStream {
                             id: worker_stream_id.clone(),
                             samples,
+                            source: StreamFeedSource::Capture,
                             reply,
                         })
                         .is_err()

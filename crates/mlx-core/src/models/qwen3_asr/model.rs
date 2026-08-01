@@ -1359,13 +1359,19 @@ impl Qwen3AsrInner {
         })
     }
 
-    fn feed_stream(&mut self, id: &str, samples: Vec<f32>) -> Result<Option<Qwen3AsrResult>> {
+    fn feed_stream(
+        &mut self,
+        id: &str,
+        samples: Vec<f32>,
+        source: StreamFeedSource,
+    ) -> Result<Option<Qwen3AsrResult>> {
         let mut state = self
             .streams
             .remove(id)
             .ok_or_else(|| Error::from_reason(format!("Unknown or finished ASR stream {id}")))?;
-        state.pending_samples.extend(samples);
         let result = (|| {
+            validate_stream_feed_source(&state, source)?;
+            state.pending_samples.extend(samples);
             let sample_rate = state
                 .options
                 .sample_rate
@@ -1472,6 +1478,21 @@ fn prepare_stream_capture(state: &mut StreamingState, sample_rate: u32) -> Resul
 
 fn release_stream_capture(state: &mut StreamingState) {
     state.capture_active = false;
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum StreamFeedSource {
+    Public,
+    Capture,
+}
+
+fn validate_stream_feed_source(state: &StreamingState, source: StreamFeedSource) -> Result<()> {
+    if state.capture_active && matches!(source, StreamFeedSource::Public) {
+        return Err(Error::from_reason(
+            "Cannot manually feed a Qwen3-ASR stream while microphone capture is active",
+        ));
+    }
+    Ok(())
 }
 
 fn stream_chunk_seconds(options: &Qwen3AsrStreamOptions) -> Result<f64> {
@@ -1778,6 +1799,7 @@ pub(super) enum Qwen3AsrCmd {
     FeedStream {
         id: String,
         samples: Vec<f32>,
+        source: StreamFeedSource,
         reply: ResponseTx<Option<Qwen3AsrResult>>,
     },
     PrepareCapture {
@@ -1849,8 +1871,13 @@ fn handle_cmd(inner: &mut Qwen3AsrInner, cmd: Qwen3AsrCmd) {
             );
             let _ = reply.send(Ok(()));
         }
-        Qwen3AsrCmd::FeedStream { id, samples, reply } => {
-            let _ = reply.send(inner.feed_stream(&id, samples));
+        Qwen3AsrCmd::FeedStream {
+            id,
+            samples,
+            source,
+            reply,
+        } => {
+            let _ = reply.send(inner.feed_stream(&id, samples, source));
         }
         Qwen3AsrCmd::PrepareCapture {
             id,
@@ -1969,6 +1996,7 @@ impl Qwen3AsrStream {
             .send(Qwen3AsrCmd::FeedStream {
                 id,
                 samples: samples.to_vec(),
+                source: StreamFeedSource::Public,
                 reply,
             })
             .map_err(|_| Error::from_reason("Qwen3-ASR model thread has exited"))?;
@@ -2298,12 +2326,20 @@ mod tests {
         };
         prepare_stream_capture(&mut state, 48_000).unwrap();
         assert_eq!(state.options.sample_rate, Some(48_000));
+        let error = validate_stream_feed_source(&state, StreamFeedSource::Public).unwrap_err();
+        assert!(
+            error.reason.contains("capture is active"),
+            "{}",
+            error.reason
+        );
+        validate_stream_feed_source(&state, StreamFeedSource::Capture).unwrap();
 
         let error = prepare_stream_capture(&mut state, 44_100).unwrap_err();
         assert!(error.reason.contains("already active"), "{}", error.reason);
         assert_eq!(state.options.sample_rate, Some(48_000));
 
         release_stream_capture(&mut state);
+        validate_stream_feed_source(&state, StreamFeedSource::Public).unwrap();
         prepare_stream_capture(&mut state, 44_100).unwrap();
         assert_eq!(state.options.sample_rate, Some(44_100));
 
