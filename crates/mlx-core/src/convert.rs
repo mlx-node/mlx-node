@@ -2015,9 +2015,10 @@ pub struct ConversionResult {
 const VALID_QUANT_MODES: &[&str] = &["affine", "mxfp4", "mxfp8", "nvfp4", "sym8"];
 
 /// Reject conversion-time quantization for a family whose Rust runtime only
-/// constructs dense weights. This is deliberately recipe-driven: the same
-/// family registry that selects sanitization declares whether its loader can
-/// consume the generic packer's output.
+/// constructs dense weights. Convertible families use the same recipe registry
+/// that selects sanitization. Runtime-only Qwen3/Harrier types have no conversion
+/// recipe, so they are rejected explicitly instead of falling through to the
+/// later unknown-type error after input I/O.
 fn reject_dense_only_family_quantization(
     model_type: Option<&str>,
     do_quantize: bool,
@@ -2029,10 +2030,9 @@ fn reject_dense_only_family_quantization(
     let Some(model_type) = model_type else {
         return Ok(());
     };
-    let Some(recipe) = recipe::recipe_for(model_type) else {
-        return Ok(());
-    };
-    if recipe.quantization_supported() {
+    let is_dense_only = matches!(model_type, "qwen3" | "harrier")
+        || recipe::recipe_for(model_type).is_some_and(|recipe| !recipe.quantization_supported());
+    if !is_dense_only {
         return Ok(());
     }
     Err(Error::from_reason(format!(
@@ -8163,12 +8163,12 @@ mod tests {
     }
 
     /// Every quant mode accepted by the public convert API must fail at the
-    /// family capability gate for PaddleOCR-VL and Qianfan-OCR. The helper is
+    /// family capability gate for every explicit dense-only model type. The helper is
     /// called before input validation and MLX setup, so this also proves the
-    /// generic packer cannot be reached for either dense-only runtime.
+    /// generic packer cannot be reached for any dense-only runtime.
     #[test]
-    fn dense_only_ocr_families_reject_every_supported_quant_mode_before_packing() {
-        for model_type in ["paddleocr-vl", "qianfan-ocr"] {
+    fn dense_only_families_reject_every_supported_quant_mode_before_packing() {
+        for model_type in ["paddleocr-vl", "qianfan-ocr", "qwen3", "harrier"] {
             for mode in VALID_QUANT_MODES {
                 let err = reject_dense_only_family_quantization(
                     Some(model_type),
@@ -8209,6 +8209,15 @@ mod tests {
             )
             .is_ok()
         );
+        assert!(
+            reject_dense_only_family_quantization(
+                Some("not-a-real-model"),
+                /* do_quantize */ true,
+                "affine",
+            )
+            .is_ok(),
+            "unrecognized model types remain the later dispatch guard's responsibility"
+        );
     }
 
     /// Exercise the public conversion entrypoint, not only its pure capability
@@ -8216,7 +8225,7 @@ mod tests {
     /// absent, proving no input access, output creation, or MLX packing happens
     /// first.
     #[tokio::test]
-    async fn dense_only_ocr_rejection_precedes_converter_io() {
+    async fn explicit_dense_only_rejection_precedes_converter_io() {
         let base = std::env::temp_dir().join(format!(
             "mlx-dense-only-convert-{}-{}",
             std::process::id(),
@@ -8227,7 +8236,7 @@ mod tests {
         ));
         let input = base.join("absent-input");
 
-        for model_type in ["paddleocr-vl", "qianfan-ocr"] {
+        for model_type in ["paddleocr-vl", "qianfan-ocr", "qwen3", "harrier"] {
             for mode in VALID_QUANT_MODES {
                 let output = base.join(format!("{model_type}-{mode}"));
                 let result = convert_model(ConversionOptions {
