@@ -637,6 +637,7 @@ enum PlainFp8Weight {
 }
 
 impl PlainFp8Weight {
+    #[cfg(test)]
     fn nbytes(&self) -> u64 {
         match self {
             Self::Transposed(weight) | Self::Source(weight) => weight.nbytes() as u64,
@@ -919,11 +920,20 @@ impl QuantizedLinear {
     ///
     /// The raw Uint8 weight and BF16 scales are already counted through the
     /// loader's params map; only the reconstructed BF16 weight is extra.
+    #[cfg(test)]
     pub(crate) fn reconstructed_fp8_weight_bytes(&self) -> u64 {
         self.fp8_dequant_weight
             .as_ref()
             .map(PlainFp8Weight::nbytes)
             .unwrap_or(0)
+    }
+
+    /// Model-owned BF16 reconstruction retained by the plain-E4M3 fallback.
+    /// Normally this is the cached `[K,N]` view used directly by forward.
+    pub(crate) fn reconstructed_fp8_weight(&self) -> Option<&MxArray> {
+        self.fp8_dequant_weight.as_ref().map(|weight| match weight {
+            PlainFp8Weight::Transposed(weight) | PlainFp8Weight::Source(weight) => weight,
+        })
     }
 
     /// Whether the plain-E4M3 reconstruction already has its `[K,N]` graph.

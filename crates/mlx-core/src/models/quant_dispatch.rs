@@ -24,6 +24,62 @@ use crate::array::{DType, MxArray};
 
 const SYM8_GROUP_SIZE_SENTINEL: i32 = -1;
 
+/// Model-owned BF16 reconstructions retained by the plain-E4M3 correctness
+/// fallback in addition to the serialized Uint8 weight and floating scales.
+///
+/// Loaders keep this collector alive until their final materialization pass so
+/// first inference cannot inherit a lazy dequantization graph. The checkpoint
+/// tensors remain counted through the params map; [`Self::nbytes`] reports only
+/// these extra arrays. Pointer de-duplication makes the accounting robust when
+/// a loader installs the same retained handle through more than one alias.
+#[derive(Default)]
+pub(crate) struct PlainFp8Residency {
+    arrays: Vec<MxArray>,
+    nbytes: u64,
+}
+
+impl std::fmt::Debug for PlainFp8Residency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlainFp8Residency")
+            .field("arrays", &self.arrays.len())
+            .field("nbytes", &self.nbytes)
+            .finish()
+    }
+}
+
+impl PlainFp8Residency {
+    pub(crate) fn track(&mut self, array: Option<&MxArray>) {
+        let Some(array) = array else {
+            return;
+        };
+        let ptr = array.as_raw_ptr();
+        if self
+            .arrays
+            .iter()
+            .any(|existing| existing.as_raw_ptr() == ptr)
+        {
+            return;
+        }
+        self.nbytes = self.nbytes.saturating_add(array.nbytes() as u64);
+        self.arrays.push(array.clone());
+    }
+
+    pub(crate) fn arrays(&self) -> impl Iterator<Item = &MxArray> {
+        self.arrays.iter()
+    }
+
+    pub(crate) fn nbytes(&self) -> u64 {
+        self.nbytes
+    }
+}
+
+/// Same-binary benchmark escape hatch for measuring the load-time residency
+/// pass against the historical first-forward materialization behavior.
+/// Accounting intentionally remains unchanged when this is set.
+pub(crate) fn defer_plain_fp8_materialization() -> bool {
+    std::env::var_os("MLX_DEFER_PLAIN_FP8_MATERIALIZATION").is_some()
+}
+
 /// `config.json` field naming the zero point a symmetric affine group subtracts
 /// from every code.
 ///
@@ -1110,6 +1166,32 @@ pub fn merge_per_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_fp8_residency_counts_each_retained_array_once() {
+        let reconstructed = MxArray::from_float32(&[0.0; 6], &[2, 3])
+            .expect("fixture")
+            .astype(DType::BFloat16)
+            .expect("bf16 fixture");
+        let alias = reconstructed.clone();
+        let mut residency = PlainFp8Residency::default();
+
+        residency.track(None);
+        residency.track(Some(&reconstructed));
+        residency.track(Some(&alias));
+
+        assert_eq!(
+            residency.arrays().count(),
+            1,
+            "aliases must be de-duplicated"
+        );
+        assert_eq!(residency.nbytes(), reconstructed.nbytes() as u64);
+        assert_eq!(
+            residency.arrays().next().unwrap().as_raw_ptr(),
+            reconstructed.as_raw_ptr(),
+            "the collector must retain the exact model-owned handle"
+        );
+    }
 
     /// `normalize_per_layer_key` delegates to the authoritative longest-first
     /// `strip_wrapper_prefix`, so per-layer override keys collapse to the same

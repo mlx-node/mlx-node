@@ -146,6 +146,12 @@ impl QuantizedSwitchLinear {
         &self.scales
     }
 
+    /// Model-owned pre-transposed BF16 reconstruction retained by the plain
+    /// E4M3 expert fallback. Serialized Uint8 storage remains in `weight`.
+    pub(crate) fn reconstructed_fp8_weight(&self) -> Option<&MxArray> {
+        self.fp8_dequant_weight_t.as_ref()
+    }
+
     pub fn get_biases(&self) -> Option<&MxArray> {
         self.biases.as_ref()
     }
@@ -309,6 +315,11 @@ mod plain_fp8_expert_tests {
             .unwrap();
         assert_eq!(qsl.get_weight().dtype().unwrap(), DType::Uint8);
         assert_eq!(qsl.get_scales().shape().unwrap().to_vec(), vec![2, 3, 1]);
+        assert_eq!(
+            qsl.reconstructed_fp8_weight().unwrap().nbytes(),
+            2 * 3 * 4 * std::mem::size_of::<u16>(),
+            "loader-visible residency must expose the retained BF16 expert reconstruction"
+        );
 
         let x = MxArray::from_float32(
             &[1.0, -0.5, 0.25, 2.0, -1.0, 0.75, 0.5, 1.25],

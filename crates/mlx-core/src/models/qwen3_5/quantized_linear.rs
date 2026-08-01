@@ -1000,6 +1000,13 @@ impl QuantizedLinear {
         &self.scales
     }
 
+    /// Model-owned BF16 reconstruction retained by the plain-E4M3 fallback.
+    /// The raw Uint8 weight and scales stay exposed through the ordinary
+    /// checkpoint accessors and are accounted separately by the loader.
+    pub(crate) fn reconstructed_fp8_weight(&self) -> Option<&MxArray> {
+        self.fp8_dequant_weight.as_ref()
+    }
+
     pub fn get_biases(&self) -> Option<&MxArray> {
         self.biases.as_ref()
     }
@@ -1054,6 +1061,11 @@ mod plain_fp8_weight_tests {
         assert_eq!(ql.mode(), FP8_E4M3_MODE);
         assert_eq!(ql.get_weight().dtype().unwrap(), DType::Uint8);
         assert_eq!(ql.get_scales().shape().unwrap().to_vec(), vec![3, 1]);
+        assert_eq!(
+            ql.reconstructed_fp8_weight().unwrap().nbytes(),
+            3 * 4 * std::mem::size_of::<u16>(),
+            "loader-visible residency must expose the retained BF16 reconstruction"
+        );
 
         let x = MxArray::from_float32(&[1.0, -0.5, 0.25, 2.0], &[1, 4])
             .unwrap()

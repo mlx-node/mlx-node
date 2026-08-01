@@ -12,8 +12,8 @@ use tracing::{info, warn};
 use crate::array::{DType, MxArray};
 use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
 use crate::models::quant_dispatch::{
-    default_per_layer_quant, effective_plq_for, ensure_affine_biases_present,
-    ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
+    PlainFp8Residency, default_per_layer_quant, defer_plain_fp8_materialization, effective_plq_for,
+    ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
     ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
     has_kquant_mode, has_sym8_mode, merge_per_layer, mode_to_str, normalize_per_layer_key,
     parse_mode_str, parse_quant_settings, resolve_default_mode, select_quantization_block,
@@ -1134,6 +1134,7 @@ fn missing_mtp_required_weights(
 }
 
 /// Apply weights directly to a Qwen35Inner (no locks needed).
+#[cfg(test)]
 fn apply_weights_inner(
     inner: &mut Qwen35Inner,
     params: &HashMap<String, MxArray>,
@@ -1144,10 +1145,36 @@ fn apply_weights_inner(
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     _has_vision: bool,
 ) -> Result<()> {
+    apply_weights_inner_with_residency(
+        inner,
+        params,
+        config,
+        quant_bits,
+        quant_group_size,
+        top_level_mode,
+        per_layer_quant,
+        _has_vision,
+    )
+    .map(drop)
+}
+
+/// Production load variant that also returns every model-owned plain-E4M3
+/// BF16 reconstruction for eager materialization and resident accounting.
+fn apply_weights_inner_with_residency(
+    inner: &mut Qwen35Inner,
+    params: &HashMap<String, MxArray>,
+    config: &Qwen3_5Config,
+    quant_bits: i32,
+    quant_group_size: i32,
+    top_level_mode: Option<PerLayerMode>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    _has_vision: bool,
+) -> Result<PlainFp8Residency> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
     let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
     let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
+    let plain_fp8_residency = std::cell::RefCell::new(PlainFp8Residency::default());
 
     let try_build_ql = |params: &HashMap<String, MxArray>,
                         prefix: &str|
@@ -1220,7 +1247,13 @@ fn apply_weights_inner(
         // projection must NOT thread it — else it would fake-quant a non-site's
         // activations, violating "activation FP8 only on attn/GDN sites".
         let input_amax = if is_site { plq.input_amax } else { None };
-        Ok(built.map(move |ql| ql.with_input_amax(input_amax).with_amax_key(amax_key)))
+        let built = built.map(move |ql| ql.with_input_amax(input_amax).with_amax_key(amax_key));
+        if let Some(linear) = built.as_ref() {
+            plain_fp8_residency
+                .borrow_mut()
+                .track(linear.reconstructed_fp8_weight());
+        }
+        Ok(built)
     };
 
     // Embedding
@@ -1669,7 +1702,7 @@ fn apply_weights_inner(
     // Validate mandatory weights
     validate_mandatory_weights(params, config, inner.layers.len())?;
 
-    Ok(())
+    Ok(plain_fp8_residency.into_inner())
 }
 
 /// Validate mandatory weights presence for `apply_weights_inner`.
@@ -1972,7 +2005,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(path));
 
                 // Apply weights (GPU finalize precompute reads now-resident pages).
-                apply_weights_inner(
+                let plain_fp8_residency = apply_weights_inner_with_residency(
                     &mut inner,
                     &params,
                     &config,
@@ -1987,7 +2020,10 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 // the chunked eval runs in the warm regime (no GPU page-fault
                 // stalls); the chunking is still a defensive watchdog guard.
                 let weights_resident = {
-                    let arrays: Vec<&MxArray> = params.values().collect();
+                    let mut arrays: Vec<&MxArray> = params.values().collect();
+                    if !defer_plain_fp8_materialization() {
+                        arrays.extend(plain_fp8_residency.arrays());
+                    }
                     crate::array::memory::materialize_weights(&arrays)?
                 };
 
@@ -2109,6 +2145,9 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                         .map(|a| a.nbytes() as u64)
                         .fold(weight_bytes, |acc, v| acc.saturating_add(v));
                 }
+                // The raw Uint8 weights + scales are already in `params`.
+                // Count only the retained BF16 correctness fallback arrays.
+                weight_bytes = weight_bytes.saturating_add(plain_fp8_residency.nbytes());
 
                 Ok((inner, weight_bytes))
             })();
