@@ -4308,6 +4308,10 @@ export interface Qwen3AsrInputDevice {
 export declare function qwen3AsrInputDevices(): Array<Qwen3AsrInputDevice>;
 
 export interface Qwen3AsrResult {
+  /**
+   * Complete transcription for the latest rolling revision. The trailing
+   * provisional region may be replaced by the next revision.
+   */
   text: string;
   /**
    * Prefix that survived the stream's provisional-token rollback window.
@@ -4315,13 +4319,22 @@ export interface Qwen3AsrResult {
    */
   stableText: string;
   /**
-   * Trailing text that may be replaced by the next rolling decode.
+   * Trailing text that may be replaced by the next rolling revision.
    * Empty for a final or one-shot result.
    */
   provisionalText: string;
   language?: string;
   tokenIds: Array<number>;
+  /**
+   * True when generation used the entire configured token budget without
+   * reaching an end token. The revision may contain incomplete or repeated
+   * text and callers may choose to flag it for review.
+   */
+  reachedMaxTokens: boolean;
+  /** Total audio committed by this stream, or the full one-shot duration. */
   audioSeconds: number;
+  /** Newly consumed audio duration for this update. */
+  segmentAudioSeconds: number;
   featureMs: number;
   encoderMs: number;
   prefillMs: number;
@@ -4330,7 +4343,7 @@ export interface Qwen3AsrResult {
   tokensPerSecond: number;
   realTimeFactor: number;
   /**
-   * Streaming revisions increment whenever a rolling re-decode replaces
+   * Streaming revisions increment whenever a rolling decode replaces
    * previously provisional text. Zero for one-shot transcription.
    */
   revision: number;
@@ -4341,11 +4354,23 @@ export interface Qwen3AsrStreamOptions {
   sampleRate?: number;
   prompt?: string;
   language?: string;
+  /**
+   * Maximum continuation tokens generated per revision (default 32).
+   * Keeping this bounded is essential for realtime latency.
+   */
   maxTokens?: number;
   /** Minimum newly buffered audio before a rolling decode (default 2 s). */
   chunkSeconds?: number;
-  /** Number of trailing tokens considered provisional (default 5). */
+  /**
+   * Number of trailing raw decoder tokens rolled back and regenerated on
+   * the next revision (default 5).
+   */
   provisionalTokens?: number;
+  /**
+   * Number of initial chunks decoded without transcript conditioning
+   * (default 2), matching Qwen's official streaming policy.
+   */
+  unfixedChunks?: number;
 }
 
 export interface Qwen3AsrTranscribeOptions {

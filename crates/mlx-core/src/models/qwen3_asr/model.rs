@@ -11,6 +11,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+use crate::array::mask::create_causal_mask;
 use crate::array::{DType, MxArray, scaled_dot_product_attention};
 use crate::model_thread::{ModelThread, ResponseTx};
 use crate::nn::{Activations, Embedding, LayerNorm, Linear, RMSNorm};
@@ -28,6 +29,14 @@ use super::config::{
 const DEFAULT_MAX_TOKENS: u32 = 256;
 const DEFAULT_STREAM_CHUNK_SECONDS: f64 = 2.0;
 const DEFAULT_PROVISIONAL_TOKENS: u32 = 5;
+const DEFAULT_UNFIXED_CHUNKS: u32 = 2;
+const DEFAULT_STREAM_MAX_TOKENS: u32 = 32;
+const MAX_STREAM_AUDIO_WINDOWS: usize = 4;
+const MAX_STREAM_PREFIX_TOKENS: usize = 150;
+const MAX_STREAM_REPEAT_TOKEN_RUN: usize = 12;
+const STREAM_DEGEN_MAX_PERIOD: usize = 6;
+const STREAM_DEGEN_MIN_REPEATS: usize = 4;
+const STREAM_STALE_REVISIONS: u32 = 4;
 
 #[derive(Clone, Debug)]
 struct AsrQuantization {
@@ -566,15 +575,60 @@ impl TextDecoder {
             suffix.push_str(language);
             suffix.push_str("<asr_text>");
         }
-        let prefix_ids = tokenizer.encode_sync(&prefix, Some(false))?;
-        let suffix_ids = tokenizer.encode_sync(&suffix, Some(false))?;
-        let prefix_array = MxArray::from_uint32(&prefix_ids, &[1, prefix_ids.len() as i64])?;
-        let suffix_array = MxArray::from_uint32(&suffix_ids, &[1, suffix_ids.len() as i64])?;
-        let prefix_embed = self.embedding.forward(&prefix_array)?;
-        let audio_embed =
-            audio.reshape(&[1, audio.shape_at(0)?, self.config.hidden_size as i64])?;
-        let suffix_embed = self.embedding.forward(&suffix_array)?;
+        let prefix_embed = self.embed_text(tokenizer, &prefix)?;
+        let audio_embed = self.reshape_audio(audio)?;
+        let suffix_embed = self.embed_text(tokenizer, &suffix)?;
         MxArray::concatenate_many(vec![&prefix_embed, &audio_embed, &suffix_embed], Some(1))
+    }
+
+    fn embed_text(&self, tokenizer: &Qwen3Tokenizer, text: &str) -> Result<MxArray> {
+        let ids = tokenizer.encode_sync(text, Some(false))?;
+        self.embed_token_ids(&ids)
+    }
+
+    fn embed_token_ids(&self, ids: &[u32]) -> Result<MxArray> {
+        if ids.is_empty() {
+            return Err(Error::from_reason(
+                "Qwen3-ASR cannot embed an empty token sequence",
+            ));
+        }
+        let array = MxArray::from_uint32(ids, &[1, ids.len() as i64])?;
+        self.embedding.forward(&array)
+    }
+
+    fn reshape_audio(&self, audio: &MxArray) -> Result<MxArray> {
+        audio.reshape(&[1, audio.shape_at(0)?, self.config.hidden_size as i64])
+    }
+
+    fn embed_stream_prefix(
+        &self,
+        tokenizer: &Qwen3Tokenizer,
+        prompt: Option<&str>,
+    ) -> Result<MxArray> {
+        self.embed_text(
+            tokenizer,
+            &format!(
+                "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n<|audio_start|>",
+                prompt.unwrap_or_default()
+            ),
+        )
+    }
+
+    fn embed_stream_suffix(
+        &self,
+        tokenizer: &Qwen3Tokenizer,
+        language: Option<&str>,
+        transcript_prefix: &[u32],
+    ) -> Result<MxArray> {
+        let mut suffix = "<|audio_end|><|im_end|>\n<|im_start|>assistant\n".to_string();
+        if let Some(language) = language {
+            suffix.push_str("language ");
+            suffix.push_str(language);
+            suffix.push_str("<asr_text>");
+        }
+        let mut ids = tokenizer.encode_sync(&suffix, Some(false))?;
+        ids.extend_from_slice(transcript_prefix);
+        self.embed_token_ids(&ids)
     }
 
     fn logits_from_hidden(&self, hidden: &MxArray) -> Result<MxArray> {
@@ -586,9 +640,19 @@ impl TextDecoder {
     }
 
     fn prefill(&self, embeddings: &MxArray, caches: &mut [KVCache]) -> Result<MxArray> {
+        let offset = caches.first().map(KVCache::get_offset).unwrap_or(0);
+        if caches.iter().any(|cache| cache.get_offset() != offset) {
+            return Err(Error::from_reason(
+                "Qwen3-ASR decoder caches have inconsistent offsets",
+            ));
+        }
+        let seq_len = embeddings.shape_at(1)? as i32;
+        let mask = (offset > 0 && seq_len > 1)
+            .then(|| create_causal_mask(seq_len, Some(offset), None))
+            .transpose()?;
         let mut hidden = embeddings.clone();
         for (index, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate() {
-            hidden = layer.forward(&hidden, None, Some(cache))?;
+            hidden = layer.forward(&hidden, mask.as_ref(), Some(cache))?;
             if (index + 1).is_multiple_of(8) {
                 hidden.eval();
             }
@@ -820,11 +884,31 @@ impl TextDecoder {
     }
 }
 
+struct EncodedAudioWindow {
+    embeddings: MxArray,
+    positions: usize,
+}
+
 struct StreamingState {
-    samples: Vec<f32>,
+    /// Samples waiting for the next public streaming revision.
+    pending_samples: Vec<f32>,
+    /// Samples in the current incomplete encoder-local-attention window.
+    current_window_samples: Vec<f32>,
     options: Qwen3AsrStreamOptions,
-    decoded_samples: usize,
+    processed_samples: usize,
     revision: u32,
+    /// Complete raw decoder history, including the detected-language prefix.
+    raw_token_ids: Vec<u32>,
+    /// Materialized outputs for completed 8-second audio encoder windows.
+    encoder_windows: Vec<EncodedAudioWindow>,
+    /// Completed windows already represented by `stable_cache_positions`.
+    cached_encoder_windows: usize,
+    /// Longest decoder prefix that is unchanged at the next revision.
+    stable_cache_positions: i32,
+    decoder_caches: Vec<KVCache>,
+    /// A fresh audio/text anchor is required after a degenerate decode.
+    recovery_pending: bool,
+    stagnant_revisions: u32,
 }
 
 struct Qwen3AsrInner {
@@ -950,6 +1034,10 @@ impl Qwen3AsrInner {
         }
         crate::array::synchronize();
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1_000.0;
+        let reached_max_tokens = generated.len() == max_tokens as usize
+            && !generated
+                .last()
+                .is_some_and(|token| self.config.eos_token_id.contains(token));
 
         let raw = self.tokenizer.decode_sync(&generated, true)?;
         let (detected_language, text) = parse_output(&raw, language.as_deref());
@@ -976,7 +1064,9 @@ impl Qwen3AsrInner {
             provisional_text,
             language: detected_language,
             token_ids: generated,
+            reached_max_tokens,
             audio_seconds,
+            segment_audio_seconds: audio_seconds,
             feature_ms,
             encoder_ms,
             prefill_ms,
@@ -993,43 +1083,305 @@ impl Qwen3AsrInner {
         })
     }
 
+    fn encode_stream_span(&self, audio: &[f32], source_rate: u32) -> Result<(MxArray, f64, f64)> {
+        let feature_start = Instant::now();
+        let native_audio = resample_mono(audio, source_rate, self.feature_extractor.sample_rate());
+        let features = self
+            .feature_extractor
+            .extract(&native_audio)
+            .map_err(Error::from_reason)?;
+        let feature_ms = feature_start.elapsed().as_secs_f64() * 1_000.0;
+
+        let encoder_start = Instant::now();
+        let embeddings = self.audio_tower.forward(features)?;
+        embeddings.eval();
+        crate::array::synchronize();
+        let encoder_ms = encoder_start.elapsed().as_secs_f64() * 1_000.0;
+        Ok((embeddings, feature_ms, encoder_ms))
+    }
+
+    fn transcribe_stream_revision(
+        &mut self,
+        state: &mut StreamingState,
+        audio: Vec<f32>,
+        is_final: bool,
+    ) -> Result<Qwen3AsrResult> {
+        let total_start = Instant::now();
+        let source_rate = state
+            .options
+            .sample_rate
+            .unwrap_or(self.feature_extractor.sample_rate());
+        if source_rate == 0 {
+            return Err(Error::from_reason("sample_rate must be greater than zero"));
+        }
+        let sample_count = audio.len();
+        if sample_count == 0 {
+            return Err(Error::from_reason(
+                "A Qwen3-ASR streaming revision must contain audio",
+            ));
+        }
+        let segment_audio_seconds = sample_count as f64 / source_rate as f64;
+        let language = resolve_language(state.options.language.as_deref())?;
+        let encoder_window_samples = stream_encoder_window_samples(
+            source_rate,
+            self.feature_extractor.sample_rate(),
+            self.feature_extractor.hop_length(),
+            self.audio_tower.config.n_window_infer,
+        )?;
+
+        state.current_window_samples.extend(audio);
+        let mut feature_ms = 0.0;
+        let mut encoder_ms = 0.0;
+        while state.current_window_samples.len() >= encoder_window_samples {
+            let remainder = state
+                .current_window_samples
+                .split_off(encoder_window_samples);
+            let complete = std::mem::replace(&mut state.current_window_samples, remainder);
+            let (embeddings, span_feature_ms, span_encoder_ms) =
+                self.encode_stream_span(&complete, source_rate)?;
+            let positions = embeddings.shape_at(0)? as usize;
+            state.encoder_windows.push(EncodedAudioWindow {
+                embeddings,
+                positions,
+            });
+            feature_ms += span_feature_ms;
+            encoder_ms += span_encoder_ms;
+        }
+
+        let partial_embeddings = if state.current_window_samples.is_empty() {
+            None
+        } else {
+            let (embeddings, span_feature_ms, span_encoder_ms) =
+                self.encode_stream_span(&state.current_window_samples, source_rate)?;
+            feature_ms += span_feature_ms;
+            encoder_ms += span_encoder_ms;
+            Some(embeddings)
+        };
+
+        if state.encoder_windows.len() > MAX_STREAM_AUDIO_WINDOWS {
+            let evicted = state.encoder_windows.len() - MAX_STREAM_AUDIO_WINDOWS;
+            state.encoder_windows.drain(..evicted);
+            for cache in &mut state.decoder_caches {
+                cache.reset();
+            }
+            state.cached_encoder_windows = 0;
+            state.stable_cache_positions = 0;
+        }
+
+        for cache in &mut state.decoder_caches {
+            cache.trim(state.stable_cache_positions);
+        }
+        if state
+            .decoder_caches
+            .iter()
+            .any(|cache| cache.get_offset() != state.stable_cache_positions)
+        {
+            return Err(Error::from_reason(
+                "Qwen3-ASR streaming cache could not rewind to its stable prefix",
+            ));
+        }
+
+        let chunk_index = state.revision;
+        let provisional_tokens = state
+            .options
+            .provisional_tokens
+            .unwrap_or(DEFAULT_PROVISIONAL_TOKENS) as usize;
+        let unfixed_chunks = state
+            .options
+            .unfixed_chunks
+            .unwrap_or(DEFAULT_UNFIXED_CHUNKS);
+        let recovering = state.recovery_pending;
+        let (raw_prefix_len, transcript_prefix) = if recovering {
+            (state.raw_token_ids.len(), &[][..])
+        } else {
+            stream_transcript_prefix(
+                &state.raw_token_ids,
+                chunk_index,
+                unfixed_chunks,
+                provisional_tokens,
+                MAX_STREAM_PREFIX_TOKENS,
+            )
+        };
+
+        let mut pieces = Vec::new();
+        let mut next_stable_cache_positions = state.stable_cache_positions;
+        if next_stable_cache_positions == 0 {
+            let prefix = self
+                .text_decoder
+                .embed_stream_prefix(&self.tokenizer, state.options.prompt.as_deref())?;
+            next_stable_cache_positions += prefix.shape_at(1)? as i32;
+            pieces.push(prefix);
+        }
+        for window in &state.encoder_windows[state.cached_encoder_windows..] {
+            pieces.push(self.text_decoder.reshape_audio(&window.embeddings)?);
+            next_stable_cache_positions += window.positions as i32;
+        }
+        if let Some(partial) = &partial_embeddings {
+            pieces.push(self.text_decoder.reshape_audio(partial)?);
+        }
+        pieces.push(self.text_decoder.embed_stream_suffix(
+            &self.tokenizer,
+            language.as_deref(),
+            transcript_prefix,
+        )?);
+        let piece_refs = pieces.iter().collect();
+        let input_embeddings = MxArray::concatenate_many(piece_refs, Some(1))?;
+        let total_positions =
+            state.stable_cache_positions as usize + input_embeddings.shape_at(1)? as usize;
+        if total_positions > self.text_decoder.config.max_position_embeddings {
+            return Err(Error::from_reason(format!(
+                "ASR streaming prompt has {total_positions} positions, above model maximum {}",
+                self.text_decoder.config.max_position_embeddings
+            )));
+        }
+
+        let prefill_start = Instant::now();
+        let mut logits = self
+            .text_decoder
+            .prefill(&input_embeddings, &mut state.decoder_caches)?;
+        logits.eval();
+        crate::array::synchronize();
+        let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1_000.0;
+
+        let decode_start = Instant::now();
+        let max_tokens = state
+            .options
+            .max_tokens
+            .unwrap_or(DEFAULT_STREAM_MAX_TOKENS)
+            .max(1);
+        let mut generated = Vec::with_capacity(max_tokens as usize);
+        let mut reached_end = false;
+        for _ in 0..max_tokens {
+            let next = logits.argmax(-1, Some(false))?.astype(DType::Uint32)?;
+            next.eval();
+            let token = next.item_at_uint32(0)?;
+            if self.config.eos_token_id.contains(&token) {
+                reached_end = true;
+                break;
+            }
+            generated.push(token);
+            logits = self.text_decoder.decode(token, &mut state.decoder_caches)?;
+        }
+        crate::array::synchronize();
+        let decode_ms = decode_start.elapsed().as_secs_f64() * 1_000.0;
+        let reached_max_tokens = generated.len() == max_tokens as usize && !reached_end;
+        let (repeated_tail, _) = stream_tail_repeat_blocks(&generated, STREAM_DEGEN_MAX_PERIOD);
+        let repeat_prefix = if recovering {
+            &[][..]
+        } else {
+            &state.raw_token_ids[..raw_prefix_len]
+        };
+        let dropped_repeats =
+            suppress_repeated_tokens(repeat_prefix, &mut generated, MAX_STREAM_REPEAT_TOKEN_RUN);
+
+        let raw_len_before = state.raw_token_ids.len();
+        if recovering {
+            state.raw_token_ids = recover_stream_history(
+                &self.tokenizer,
+                &state.raw_token_ids,
+                &generated,
+                language.as_deref(),
+            )?;
+            state.recovery_pending = false;
+        } else {
+            state.raw_token_ids.truncate(raw_prefix_len);
+            state.raw_token_ids.extend_from_slice(&generated);
+        }
+        let continuation_advance = state.raw_token_ids.len().saturating_sub(raw_len_before);
+        if reached_max_tokens && continuation_advance <= 1 {
+            state.stagnant_revisions += 1;
+        } else {
+            state.stagnant_revisions = 0;
+        }
+        let degenerate = repeated_tail >= STREAM_DEGEN_MIN_REPEATS
+            || dropped_repeats >= 8
+            || state.stagnant_revisions >= STREAM_STALE_REVISIONS;
+        if degenerate && !is_final {
+            trim_degenerate_tail(
+                &mut state.raw_token_ids,
+                STREAM_DEGEN_MAX_PERIOD,
+                STREAM_DEGEN_MIN_REPEATS,
+            );
+            state.encoder_windows.clear();
+            state.current_window_samples.clear();
+            for cache in &mut state.decoder_caches {
+                cache.reset();
+            }
+            state.cached_encoder_windows = 0;
+            state.stable_cache_positions = 0;
+            state.recovery_pending = true;
+            state.stagnant_revisions = 0;
+        }
+        state.processed_samples += sample_count;
+        state.revision += 1;
+        if !state.recovery_pending {
+            state.stable_cache_positions = next_stable_cache_positions;
+            state.cached_encoder_windows = state.encoder_windows.len();
+        }
+
+        let raw = self.tokenizer.decode_sync(&state.raw_token_ids, true)?;
+        let (detected_language, text) = parse_output(&raw, language.as_deref());
+        let (stable_text, provisional_text) = stream_stable_and_provisional(
+            &self.tokenizer,
+            &state.raw_token_ids,
+            provisional_tokens,
+            chunk_index,
+            unfixed_chunks,
+            is_final,
+            language.as_deref(),
+            &text,
+        )?;
+        let total_ms = total_start.elapsed().as_secs_f64() * 1_000.0;
+        Ok(Qwen3AsrResult {
+            text,
+            stable_text,
+            provisional_text,
+            language: detected_language,
+            token_ids: state.raw_token_ids.clone(),
+            reached_max_tokens,
+            audio_seconds: state.processed_samples as f64 / source_rate as f64,
+            segment_audio_seconds,
+            feature_ms,
+            encoder_ms,
+            prefill_ms,
+            decode_ms,
+            total_ms,
+            tokens_per_second: if decode_ms > 0.0 {
+                generated.len() as f64 * 1_000.0 / decode_ms
+            } else {
+                0.0
+            },
+            real_time_factor: total_ms / 1_000.0 / segment_audio_seconds,
+            revision: state.revision,
+            is_final,
+        })
+    }
+
     fn feed_stream(&mut self, id: &str, samples: Vec<f32>) -> Result<Option<Qwen3AsrResult>> {
-        let (audio, options, revision, provisional_tokens) = {
-            let state = self.streams.get_mut(id).ok_or_else(|| {
-                Error::from_reason(format!("Unknown or finished ASR stream {id}"))
-            })?;
-            state.samples.extend(samples);
+        let mut state = self
+            .streams
+            .remove(id)
+            .ok_or_else(|| Error::from_reason(format!("Unknown or finished ASR stream {id}")))?;
+        state.pending_samples.extend(samples);
+        let result = (|| {
             let sample_rate = state
                 .options
                 .sample_rate
                 .unwrap_or(self.feature_extractor.sample_rate());
-            let chunk_seconds = state
-                .options
-                .chunk_seconds
-                .unwrap_or(DEFAULT_STREAM_CHUNK_SECONDS);
-            if !chunk_seconds.is_finite() || chunk_seconds <= 0.0 {
-                return Err(Error::from_reason(
-                    "chunk_seconds must be finite and positive",
-                ));
+            let chunk_samples = ((stream_chunk_seconds(&state.options)? * sample_rate as f64)
+                .round() as usize)
+                .max(1);
+            let mut latest = None;
+            while state.pending_samples.len() >= chunk_samples {
+                let remainder = state.pending_samples.split_off(chunk_samples);
+                let audio = std::mem::replace(&mut state.pending_samples, remainder);
+                let result = self.transcribe_stream_revision(&mut state, audio, false)?;
+                latest = Some(result);
             }
-            let threshold = (chunk_seconds * sample_rate as f64).round() as usize;
-            if state.samples.len().saturating_sub(state.decoded_samples) < threshold {
-                return Ok(None);
-            }
-            state.decoded_samples = state.samples.len();
-            state.revision += 1;
-            (
-                state.samples.clone(),
-                stream_to_transcribe_options(&state.options),
-                state.revision,
-                state
-                    .options
-                    .provisional_tokens
-                    .unwrap_or(DEFAULT_PROVISIONAL_TOKENS),
-            )
-        };
-        self.transcribe(audio, options, revision, false, provisional_tokens)
-            .map(Some)
+            Ok(latest)
+        })();
+        self.streams.insert(id.to_string(), state);
+        result
     }
 
     fn prepare_capture(&mut self, id: &str, sample_rate: u32) -> Result<()> {
@@ -1041,16 +1393,45 @@ impl Qwen3AsrInner {
     }
 
     fn finish_stream(&mut self, id: &str) -> Result<Qwen3AsrResult> {
-        let state = self.streams.remove(id).ok_or_else(|| {
+        let mut state = self.streams.remove(id).ok_or_else(|| {
             Error::from_reason(format!("Unknown or already finished ASR stream {id}"))
         })?;
-        self.transcribe(
-            state.samples,
-            stream_to_transcribe_options(&state.options),
-            state.revision + 1,
-            true,
-            0,
-        )
+        if !state.pending_samples.is_empty() {
+            let audio = std::mem::take(&mut state.pending_samples);
+            return self.transcribe_stream_revision(&mut state, audio, true);
+        }
+        if state.processed_samples == 0 {
+            return Err(Error::from_reason(
+                "Cannot finish a Qwen3-ASR stream before feeding audio",
+            ));
+        }
+        let sample_rate = state
+            .options
+            .sample_rate
+            .unwrap_or(self.feature_extractor.sample_rate());
+        let language = resolve_language(state.options.language.as_deref())?;
+        let raw = self.tokenizer.decode_sync(&state.raw_token_ids, true)?;
+        let (detected_language, text) = parse_output(&raw, language.as_deref());
+        state.revision += 1;
+        Ok(Qwen3AsrResult {
+            stable_text: text.clone(),
+            text,
+            provisional_text: String::new(),
+            language: detected_language,
+            token_ids: state.raw_token_ids,
+            reached_max_tokens: false,
+            audio_seconds: state.processed_samples as f64 / sample_rate as f64,
+            segment_audio_seconds: 0.0,
+            feature_ms: 0.0,
+            encoder_ms: 0.0,
+            prefill_ms: 0.0,
+            decode_ms: 0.0,
+            total_ms: 0.0,
+            tokens_per_second: 0.0,
+            real_time_factor: 0.0,
+            revision: state.revision,
+            is_final: true,
+        })
     }
 }
 
@@ -1060,7 +1441,10 @@ fn prepare_stream_capture(state: &mut StreamingState, sample_rate: u32) -> Resul
             "capture sample rate must be greater than zero",
         ));
     }
-    if !state.samples.is_empty() {
+    if !state.pending_samples.is_empty()
+        || !state.current_window_samples.is_empty()
+        || state.processed_samples != 0
+    {
         return Err(Error::from_reason(
             "Microphone capture must start before manually feeding an ASR stream",
         ));
@@ -1072,13 +1456,158 @@ fn prepare_stream_capture(state: &mut StreamingState, sample_rate: u32) -> Resul
     Ok(())
 }
 
-fn stream_to_transcribe_options(options: &Qwen3AsrStreamOptions) -> Qwen3AsrTranscribeOptions {
-    Qwen3AsrTranscribeOptions {
-        sample_rate: options.sample_rate,
-        prompt: options.prompt.clone(),
-        language: options.language.clone(),
-        max_tokens: options.max_tokens,
+fn stream_chunk_seconds(options: &Qwen3AsrStreamOptions) -> Result<f64> {
+    let seconds = options
+        .chunk_seconds
+        .unwrap_or(DEFAULT_STREAM_CHUNK_SECONDS);
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(Error::from_reason(
+            "chunk_seconds must be finite and positive",
+        ));
     }
+    Ok(seconds)
+}
+
+fn stream_encoder_window_samples(
+    source_rate: u32,
+    native_rate: u32,
+    hop_length: usize,
+    window_frames: usize,
+) -> Result<usize> {
+    if source_rate == 0 || native_rate == 0 || hop_length == 0 || window_frames == 0 {
+        return Err(Error::from_reason(
+            "Qwen3-ASR streaming encoder window configuration must be non-zero",
+        ));
+    }
+    let native_samples = hop_length
+        .checked_mul(window_frames)
+        .ok_or_else(|| Error::from_reason("Qwen3-ASR streaming encoder window size overflowed"))?;
+    Ok(((native_samples as f64 * source_rate as f64 / native_rate as f64).round() as usize).max(1))
+}
+
+fn stream_transcript_prefix(
+    raw_tokens: &[u32],
+    chunk_index: u32,
+    unfixed_chunks: u32,
+    rollback_tokens: usize,
+    max_prefix_tokens: usize,
+) -> (usize, &[u32]) {
+    if chunk_index < unfixed_chunks {
+        return (0, &[]);
+    }
+    let full_len = raw_tokens.len().saturating_sub(rollback_tokens);
+    let visible_start = full_len.saturating_sub(max_prefix_tokens);
+    (full_len, &raw_tokens[visible_start..full_len])
+}
+
+fn suppress_repeated_tokens(prefix: &[u32], generated: &mut Vec<u32>, max_run: usize) -> usize {
+    if max_run == 0 || generated.is_empty() {
+        return 0;
+    }
+    let before = generated.len();
+    let mut previous = prefix.last().copied();
+    let mut run = previous.map_or(0, |token| {
+        prefix
+            .iter()
+            .rev()
+            .take_while(|candidate| **candidate == token)
+            .count()
+    });
+    generated.retain(|token| {
+        if Some(*token) == previous {
+            run += 1;
+        } else {
+            previous = Some(*token);
+            run = 1;
+        }
+        run <= max_run
+    });
+    before - generated.len()
+}
+
+fn stream_tail_repeat_blocks(tokens: &[u32], max_period: usize) -> (usize, usize) {
+    let mut best = (1, 0);
+    for period in 1..=max_period.min(tokens.len() / 2) {
+        let mut repetitions = 1;
+        while (repetitions + 1) * period <= tokens.len() {
+            let left = tokens.len() - (repetitions + 1) * period;
+            let right = tokens.len() - repetitions * period;
+            if tokens[left..left + period] != tokens[right..right + period] {
+                break;
+            }
+            repetitions += 1;
+        }
+        if repetitions > best.0 {
+            best = (repetitions, period);
+        }
+    }
+    best
+}
+
+fn trim_degenerate_tail(tokens: &mut Vec<u32>, max_period: usize, min_repetitions: usize) -> usize {
+    let (repetitions, period) = stream_tail_repeat_blocks(tokens, max_period);
+    if repetitions < min_repetitions || period == 0 {
+        return 0;
+    }
+    // Preserve one period as a lexical boundary for the fresh decoder anchor.
+    // Removing the entire run can make the model copy an older phrase from
+    // the transcript prefix instead of continuing after the degeneration.
+    let removed = (repetitions - 1) * period;
+    tokens.truncate(tokens.len() - removed);
+    removed
+}
+
+fn recover_stream_history(
+    tokenizer: &Qwen3Tokenizer,
+    previous_tokens: &[u32],
+    recovered_tokens: &[u32],
+    forced_language: Option<&str>,
+) -> Result<Vec<u32>> {
+    let previous_raw = tokenizer.decode_sync(previous_tokens, true)?;
+    let recovered_raw = tokenizer.decode_sync(recovered_tokens, true)?;
+    let (previous_language, previous_text) = parse_output(&previous_raw, forced_language);
+    let (recovered_language, recovered_text) = parse_output(&recovered_raw, forced_language);
+    let combined = join_transcript_fragments(&previous_text, &recovered_text);
+    let raw = if forced_language.is_some() {
+        combined
+    } else if let Some(language) = previous_language.or(recovered_language) {
+        format!("language {language}<asr_text>{combined}")
+    } else {
+        combined
+    };
+    tokenizer.encode_sync(&raw, Some(false))
+}
+
+fn join_transcript_fragments(previous: &str, recovered: &str) -> String {
+    let previous = previous.trim();
+    let recovered = recovered.trim();
+    if previous.is_empty() {
+        return recovered.to_string();
+    }
+    if recovered.is_empty() {
+        return previous.to_string();
+    }
+    let left = previous.chars().next_back().expect("previous is non-empty");
+    let right = recovered.chars().next().expect("recovered is non-empty");
+    let needs_space = !left.is_whitespace()
+        && !right.is_whitespace()
+        && !matches!(right, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}')
+        && !is_cjk(left)
+        && !is_cjk(right);
+    format!(
+        "{previous}{}{recovered}",
+        if needs_space { " " } else { "" }
+    )
+}
+
+fn is_cjk(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0x20000..=0x2FA1F
+    )
 }
 
 fn resolve_language(language: Option<&str>) -> Result<Option<String>> {
@@ -1166,6 +1695,57 @@ fn stable_and_provisional(
     Ok((stable, provisional))
 }
 
+fn find_token_subsequence(haystack: &[u32], needle: &[u32]) -> Option<usize> {
+    (!needle.is_empty() && needle.len() <= haystack.len())
+        .then(|| {
+            haystack
+                .windows(needle.len())
+                .position(|window| window == needle)
+        })
+        .flatten()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_stable_and_provisional(
+    tokenizer: &Qwen3Tokenizer,
+    raw_tokens: &[u32],
+    rollback_tokens: usize,
+    chunk_index: u32,
+    unfixed_chunks: u32,
+    is_final: bool,
+    language: Option<&str>,
+    full_text: &str,
+) -> Result<(String, String)> {
+    if is_final || rollback_tokens == 0 {
+        return Ok((full_text.to_string(), String::new()));
+    }
+    if chunk_index < unfixed_chunks {
+        return Ok((String::new(), full_text.to_string()));
+    }
+
+    let text_start = if language.is_some() {
+        0
+    } else {
+        let marker = tokenizer.encode_sync("<asr_text>", Some(false))?;
+        find_token_subsequence(raw_tokens, &marker)
+            .map(|index| index + marker.len())
+            .unwrap_or(0)
+    };
+    let text_tokens = raw_tokens.len().saturating_sub(text_start);
+    let stable_text_tokens = if text_tokens > rollback_tokens {
+        text_tokens - rollback_tokens
+    } else {
+        text_tokens.saturating_sub(1)
+    };
+    let stable_raw = tokenizer.decode_sync(&raw_tokens[..text_start + stable_text_tokens], true)?;
+    let (_, stable) = parse_output(&stable_raw, language);
+    let provisional = full_text
+        .strip_prefix(&stable)
+        .unwrap_or(full_text)
+        .to_string();
+    Ok((stable, provisional))
+}
+
 pub(super) enum Qwen3AsrCmd {
     Transcribe {
         audio: Vec<f32>,
@@ -1206,13 +1786,43 @@ fn handle_cmd(inner: &mut Qwen3AsrInner, cmd: Qwen3AsrCmd) {
             let _ = reply.send(inner.transcribe(audio, options, 0, true, 0));
         }
         Qwen3AsrCmd::StartStream { id, options, reply } => {
+            if let Err(error) = stream_chunk_seconds(&options) {
+                let _ = reply.send(Err(error));
+                return;
+            }
+            if options.sample_rate == Some(0) {
+                let _ = reply.send(Err(Error::from_reason(
+                    "sample_rate must be greater than zero",
+                )));
+                return;
+            }
+            if options.max_tokens == Some(0) {
+                let _ = reply.send(Err(Error::from_reason(
+                    "max_tokens must be greater than zero",
+                )));
+                return;
+            }
+            if let Err(error) = resolve_language(options.language.as_deref()) {
+                let _ = reply.send(Err(error));
+                return;
+            }
             inner.streams.insert(
                 id,
                 StreamingState {
-                    samples: Vec::new(),
+                    pending_samples: Vec::new(),
+                    current_window_samples: Vec::new(),
                     options,
-                    decoded_samples: 0,
+                    processed_samples: 0,
                     revision: 0,
+                    raw_token_ids: Vec::new(),
+                    encoder_windows: Vec::new(),
+                    cached_encoder_windows: 0,
+                    stable_cache_positions: 0,
+                    decoder_caches: (0..inner.text_decoder.layers.len())
+                        .map(|_| KVCache::new())
+                        .collect(),
+                    recovery_pending: false,
+                    stagnant_revisions: 0,
                 },
             );
             let _ = reply.send(Ok(()));
@@ -1293,6 +1903,7 @@ impl Qwen3AsrModel {
                     max_tokens: None,
                     chunk_seconds: None,
                     provisional_tokens: None,
+                    unfixed_chunks: None,
                 }),
                 reply,
             })
@@ -1630,7 +2241,8 @@ mod tests {
     #[test]
     fn capture_uses_device_rate_and_rejects_mixed_manual_input() {
         let mut state = StreamingState {
-            samples: Vec::new(),
+            pending_samples: Vec::new(),
+            current_window_samples: Vec::new(),
             options: Qwen3AsrStreamOptions {
                 sample_rate: Some(16_000),
                 prompt: None,
@@ -1638,15 +2250,91 @@ mod tests {
                 max_tokens: None,
                 chunk_seconds: None,
                 provisional_tokens: None,
+                unfixed_chunks: None,
             },
-            decoded_samples: 0,
+            processed_samples: 0,
             revision: 0,
+            raw_token_ids: Vec::new(),
+            encoder_windows: Vec::new(),
+            cached_encoder_windows: 0,
+            stable_cache_positions: 0,
+            decoder_caches: Vec::new(),
+            recovery_pending: false,
+            stagnant_revisions: 0,
         };
         prepare_stream_capture(&mut state, 48_000).unwrap();
         assert_eq!(state.options.sample_rate, Some(48_000));
 
-        state.samples.push(0.0);
+        state.pending_samples.push(0.0);
         assert!(prepare_stream_capture(&mut state, 44_100).is_err());
         assert_eq!(state.options.sample_rate, Some(48_000));
+    }
+
+    #[test]
+    fn realtime_chunk_options_use_official_default_and_validate_values() {
+        let options = Qwen3AsrStreamOptions {
+            sample_rate: None,
+            prompt: None,
+            language: None,
+            max_tokens: None,
+            chunk_seconds: Some(2.0),
+            provisional_tokens: None,
+            unfixed_chunks: None,
+        };
+        assert_eq!(stream_chunk_seconds(&options).unwrap(), 2.0);
+
+        let invalid = Qwen3AsrStreamOptions {
+            chunk_seconds: Some(0.0),
+            ..options
+        };
+        assert!(stream_chunk_seconds(&invalid).is_err());
+    }
+
+    #[test]
+    fn realtime_prefix_rolls_back_and_caps_only_the_visible_tail() {
+        let raw: Vec<_> = (0..200).collect();
+        assert_eq!(stream_transcript_prefix(&raw, 0, 2, 5, 150), (0, &[][..]));
+        assert_eq!(stream_transcript_prefix(&raw, 1, 2, 5, 150), (0, &[][..]));
+
+        let (full_len, visible) = stream_transcript_prefix(&raw, 2, 2, 5, 150);
+        assert_eq!(full_len, 195);
+        assert_eq!(visible, &raw[45..195]);
+    }
+
+    #[test]
+    fn realtime_encoder_window_tracks_source_sample_rate() {
+        assert_eq!(
+            stream_encoder_window_samples(16_000, 16_000, 160, 800).unwrap(),
+            128_000
+        );
+        assert_eq!(
+            stream_encoder_window_samples(48_000, 16_000, 160, 800).unwrap(),
+            384_000
+        );
+    }
+
+    #[test]
+    fn realtime_repeat_guard_bounds_a_cross_revision_run() {
+        let mut generated = vec![7, 7, 7, 8];
+        assert_eq!(suppress_repeated_tokens(&[6, 7, 7], &mut generated, 3), 2);
+        assert_eq!(generated, vec![7, 8]);
+    }
+
+    #[test]
+    fn realtime_recovery_keeps_one_boundary_period() {
+        let mut tokens = vec![1, 2, 3, 9, 10, 9, 10, 9, 10, 9, 10];
+        assert_eq!(stream_tail_repeat_blocks(&tokens, 6), (4, 2));
+        assert_eq!(trim_degenerate_tail(&mut tokens, 6, 4), 6);
+        assert_eq!(tokens, vec![1, 2, 3, 9, 10]);
+    }
+
+    #[test]
+    fn realtime_recovery_joins_words_punctuation_and_cjk() {
+        assert_eq!(join_transcript_fragments("Hello", "world"), "Hello world");
+        assert_eq!(
+            join_transcript_fragments("Hello", ", again"),
+            "Hello, again"
+        );
+        assert_eq!(join_transcript_fragments("你好", "世界"), "你好世界");
     }
 }

@@ -28,11 +28,11 @@ export {
 };
 
 export interface Qwen3AsrRealtimeOptions {
-  /** Rolling decode, language, and prompting options. */
+  /** Rolling decode cadence, language, and prompting options. */
   stream?: Qwen3AsrStreamOptions;
   /** CPAL device and callback-ring options. */
   capture?: Qwen3AsrCaptureOptions;
-  /** Called for every provisional rolling transcription. */
+  /** Called for every rolling transcription revision. */
   onResult: (result: Qwen3AsrResult) => void;
   /** Called for asynchronous CPAL or model-worker errors. */
   onError?: (error: Error) => void;

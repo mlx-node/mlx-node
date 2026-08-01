@@ -110,7 +110,7 @@ impl Attention {
         mask: Option<&MxArray>,
         cache: Option<&mut KVCache>,
     ) -> Result<MxArray> {
-        if self.is_quantized() {
+        if self.is_quantized() || mask.is_some() {
             return self.forward_quantized(x, mask, cache);
         }
 
@@ -211,11 +211,11 @@ impl Attention {
         MxArray::from_handle(handle, "fused_attention_output")
     }
 
-    /// Component path for packed projections. The dense path above passes raw
-    /// weights into a fused helper; doing that for a packed tensor would either
-    /// misinterpret its bytes or force a full dequantization. Keep every Q/K/V/O
-    /// projection on `Linear::forward`, which dispatches directly to MLX's
-    /// fused dequantize-matmul kernel.
+    /// Component path for packed projections or an explicit attention mask.
+    /// The dense fused helper cannot consume an arbitrary mask, and passing a
+    /// packed tensor as a raw weight would misinterpret its bytes or force a
+    /// full dequantization. Keep every Q/K/V/O projection on `Linear::forward`,
+    /// which dispatches packed weights to MLX's fused dequantize-matmul kernel.
     fn forward_quantized(
         &self,
         x: &MxArray,

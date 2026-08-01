@@ -85,6 +85,10 @@ impl FeatureExtractor {
         self.config.sampling_rate
     }
 
+    pub(crate) fn hop_length(&self) -> usize {
+        self.config.hop_length
+    }
+
     pub(crate) fn extract(&self, audio: &[f32]) -> Result<AudioFeatures, String> {
         if audio.is_empty() {
             return Err("audio must contain at least one sample".into());

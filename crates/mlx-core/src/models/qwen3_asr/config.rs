@@ -183,16 +183,25 @@ pub struct Qwen3AsrTranscribeOptions {
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct Qwen3AsrResult {
+    /// Complete transcription for the latest rolling revision. The trailing
+    /// provisional region may be replaced by the next revision.
     pub text: String,
     /// Prefix that survived the stream's provisional-token rollback window.
     /// Equals `text` for a final or one-shot result.
     pub stable_text: String,
-    /// Trailing text that may be replaced by the next rolling decode.
+    /// Trailing text that may be replaced by the next rolling revision.
     /// Empty for a final or one-shot result.
     pub provisional_text: String,
     pub language: Option<String>,
     pub token_ids: Vec<u32>,
+    /// True when generation used the entire configured token budget without
+    /// reaching an end token. The revision may contain incomplete or repeated
+    /// text and callers may choose to flag it for review.
+    pub reached_max_tokens: bool,
+    /// Total audio committed by this stream, or the full one-shot duration.
     pub audio_seconds: f64,
+    /// Newly consumed audio duration for this update.
+    pub segment_audio_seconds: f64,
     pub feature_ms: f64,
     pub encoder_ms: f64,
     pub prefill_ms: f64,
@@ -200,7 +209,7 @@ pub struct Qwen3AsrResult {
     pub total_ms: f64,
     pub tokens_per_second: f64,
     pub real_time_factor: f64,
-    /// Streaming revisions increment whenever a rolling re-decode replaces
+    /// Streaming revisions increment whenever a rolling decode replaces
     /// previously provisional text. Zero for one-shot transcription.
     pub revision: u32,
     pub is_final: bool,
@@ -212,11 +221,17 @@ pub struct Qwen3AsrStreamOptions {
     pub sample_rate: Option<u32>,
     pub prompt: Option<String>,
     pub language: Option<String>,
+    /// Maximum continuation tokens generated per revision (default 32).
+    /// Keeping this bounded is essential for realtime latency.
     pub max_tokens: Option<u32>,
     /// Minimum newly buffered audio before a rolling decode (default 2 s).
     pub chunk_seconds: Option<f64>,
-    /// Number of trailing tokens considered provisional (default 5).
+    /// Number of trailing raw decoder tokens rolled back and regenerated on
+    /// the next revision (default 5).
     pub provisional_tokens: Option<u32>,
+    /// Number of initial chunks decoded without transcript conditioning
+    /// (default 2), matching Qwen's official streaming policy.
+    pub unfixed_chunks: Option<u32>,
 }
 
 #[napi(object)]
