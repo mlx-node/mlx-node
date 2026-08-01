@@ -885,6 +885,7 @@ impl TextDecoder {
     }
 }
 
+#[derive(Clone)]
 struct EncodedAudioWindow {
     embeddings: MxArray,
     positions: usize,
@@ -916,6 +917,31 @@ struct StreamingState {
     capture_active: bool,
     /// Dropping the public stream wrapper must wait for its capture worker.
     remove_after_capture: bool,
+}
+
+impl StreamingState {
+    /// Build an isolated final-decode transaction. Encoder outputs are
+    /// immutable MLX arrays and can share handles, while decoder caches use
+    /// in-place buffers and must be rebuilt from the stable audio/text state.
+    fn finalization_copy(&self, decoder_layers: usize) -> Self {
+        Self {
+            pending_samples: self.pending_samples.clone(),
+            current_window_samples: self.current_window_samples.clone(),
+            options: self.options.clone(),
+            processed_samples: self.processed_samples,
+            revision: self.revision,
+            raw_token_ids: self.raw_token_ids.clone(),
+            encoder_windows: self.encoder_windows.clone(),
+            cached_encoder_windows: 0,
+            stable_cache_positions: 0,
+            decoder_caches: (0..decoder_layers).map(|_| KVCache::new()).collect(),
+            recovery_pending: self.recovery_pending,
+            stagnant_revisions: self.stagnant_revisions,
+            last_reached_max_tokens: self.last_reached_max_tokens,
+            capture_active: false,
+            remove_after_capture: self.remove_after_capture,
+        }
+    }
 }
 
 struct Qwen3AsrInner {
@@ -1420,42 +1446,50 @@ impl Qwen3AsrInner {
             .streams
             .remove(id)
             .expect("stream registration was validated immediately before removal");
-        if !state.pending_samples.is_empty() {
-            let audio = std::mem::take(&mut state.pending_samples);
-            return self.transcribe_stream_revision(&mut state, audio, true);
+        let result = if !state.pending_samples.is_empty() {
+            let mut transaction = state.finalization_copy(self.text_decoder.layers.len());
+            let audio = std::mem::take(&mut transaction.pending_samples);
+            self.transcribe_stream_revision(&mut transaction, audio, true)
+        } else {
+            (|| {
+                if state.processed_samples == 0 {
+                    return Err(Error::from_reason(
+                        "Cannot finish a Qwen3-ASR stream before feeding audio",
+                    ));
+                }
+                let sample_rate = state
+                    .options
+                    .sample_rate
+                    .unwrap_or(self.feature_extractor.sample_rate());
+                let language = resolve_language(state.options.language.as_deref())?;
+                let raw = self.tokenizer.decode_sync(&state.raw_token_ids, true)?;
+                let (detected_language, text) = parse_output(&raw, language.as_deref());
+                state.revision += 1;
+                Ok(Qwen3AsrResult {
+                    stable_text: text.clone(),
+                    text,
+                    provisional_text: String::new(),
+                    language: detected_language,
+                    token_ids: state.raw_token_ids.clone(),
+                    reached_max_tokens: state.last_reached_max_tokens,
+                    audio_seconds: state.processed_samples as f64 / sample_rate as f64,
+                    segment_audio_seconds: 0.0,
+                    feature_ms: 0.0,
+                    encoder_ms: 0.0,
+                    prefill_ms: 0.0,
+                    decode_ms: 0.0,
+                    total_ms: 0.0,
+                    tokens_per_second: 0.0,
+                    real_time_factor: 0.0,
+                    revision: state.revision,
+                    is_final: true,
+                })
+            })()
+        };
+        if result.is_err() {
+            self.streams.insert(id.to_string(), state);
         }
-        if state.processed_samples == 0 {
-            return Err(Error::from_reason(
-                "Cannot finish a Qwen3-ASR stream before feeding audio",
-            ));
-        }
-        let sample_rate = state
-            .options
-            .sample_rate
-            .unwrap_or(self.feature_extractor.sample_rate());
-        let language = resolve_language(state.options.language.as_deref())?;
-        let raw = self.tokenizer.decode_sync(&state.raw_token_ids, true)?;
-        let (detected_language, text) = parse_output(&raw, language.as_deref());
-        state.revision += 1;
-        Ok(Qwen3AsrResult {
-            stable_text: text.clone(),
-            text,
-            provisional_text: String::new(),
-            language: detected_language,
-            token_ids: state.raw_token_ids,
-            reached_max_tokens: state.last_reached_max_tokens,
-            audio_seconds: state.processed_samples as f64 / sample_rate as f64,
-            segment_audio_seconds: 0.0,
-            feature_ms: 0.0,
-            encoder_ms: 0.0,
-            prefill_ms: 0.0,
-            decode_ms: 0.0,
-            total_ms: 0.0,
-            tokens_per_second: 0.0,
-            real_time_factor: 0.0,
-            revision: state.revision,
-            is_final: true,
-        })
+        result
     }
 }
 
