@@ -78,6 +78,16 @@ impl QuantizedSwitchLinear {
             return x.gather_mm(weight_t, indices, sorted);
         }
 
+        // Affine gather-QMM promotes mixed activation/sidecar dtypes to FP32.
+        // Preserve its arithmetic, then restore the routed activation dtype at
+        // this expert projection boundary. MX/NV/K-quant modes already return
+        // `x`'s dtype and remain byte-for-byte unchanged.
+        let activation_dtype = if self.mode == DEFAULT_QUANT_MODE {
+            Some(x.dtype()?)
+        } else {
+            None
+        };
+
         let mode_c = CString::new(self.mode.as_str())
             .map_err(|e| Error::from_reason(format!("Invalid mode string: {}", e)))?;
 
@@ -101,7 +111,13 @@ impl QuantizedSwitchLinear {
                 sorted,
             )
         };
-        MxArray::from_handle(handle, "gather_qmm")
+        let mut result = MxArray::from_handle(handle, "gather_qmm")?;
+        if let Some(dtype) = activation_dtype
+            && result.dtype()? != dtype
+        {
+            result = result.astype(dtype)?;
+        }
+        Ok(result)
     }
 
     pub fn set_weight(&mut self, weight: MxArray) {
@@ -128,6 +144,12 @@ impl QuantizedSwitchLinear {
 
     pub fn get_scales(&self) -> &MxArray {
         &self.scales
+    }
+
+    /// Model-owned pre-transposed BF16 reconstruction retained by the plain
+    /// E4M3 expert fallback. Serialized Uint8 storage remains in `weight`.
+    pub(crate) fn reconstructed_fp8_weight(&self) -> Option<&MxArray> {
+        self.fp8_dequant_weight_t.as_ref()
     }
 
     pub fn get_biases(&self) -> Option<&MxArray> {
@@ -293,6 +315,11 @@ mod plain_fp8_expert_tests {
             .unwrap();
         assert_eq!(qsl.get_weight().dtype().unwrap(), DType::Uint8);
         assert_eq!(qsl.get_scales().shape().unwrap().to_vec(), vec![2, 3, 1]);
+        assert_eq!(
+            qsl.reconstructed_fp8_weight().unwrap().nbytes(),
+            2 * 3 * 4 * std::mem::size_of::<u16>(),
+            "loader-visible residency must expose the retained BF16 expert reconstruction"
+        );
 
         let x = MxArray::from_float32(
             &[1.0, -0.5, 0.25, 2.0, -1.0, 0.75, 0.5, 1.25],
@@ -354,5 +381,35 @@ mod plain_fp8_expert_tests {
             MxArray::from_uint8(&[0; 24], &[2, 3, 4]).unwrap(),
         )]);
         assert!(try_build_fp8_e4m3_quantized_switch_linear(&params, "experts").is_err());
+    }
+}
+
+#[cfg(test)]
+mod affine_dtype_tests {
+    use super::*;
+    use crate::array::DType;
+
+    #[test]
+    fn affine_q4_gather_qmm_restores_bfloat16_activation_dtype() {
+        let input =
+            MxArray::from_bfloat16(&[half::bf16::from_f32(0.5).to_bits(); 32], &[1, 1, 1, 32])
+                .unwrap();
+        let indices = MxArray::from_int32(&[0], &[1, 1]).unwrap();
+        let weight = MxArray::from_uint32(&[0x7654_3210; 4], &[1, 1, 4]).unwrap();
+        let scales =
+            MxArray::from_float16(&[half::f16::from_f32(0.03125).to_bits()], &[1, 1, 1]).unwrap();
+        let biases =
+            MxArray::from_float16(&[half::f16::from_f32(-0.25).to_bits()], &[1, 1, 1]).unwrap();
+
+        let linear = QuantizedSwitchLinear::new(
+            weight,
+            scales,
+            Some(biases),
+            32,
+            4,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+        let actual = linear.forward(&input, &indices, false).unwrap();
+        assert_eq!(actual.dtype().unwrap(), DType::BFloat16);
     }
 }

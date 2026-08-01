@@ -159,7 +159,6 @@ pub(crate) fn run_paged_prefill_chunk(
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     cached_rope_deltas: i32,
@@ -179,7 +178,6 @@ pub(crate) fn run_paged_prefill_chunk(
         caches,
         final_norm,
         lm_head,
-        embedding_weight,
         layer_kinds,
         paged_adapter,
         chunk_size,
@@ -238,7 +236,6 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
@@ -254,7 +251,6 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         caches,
         final_norm,
         lm_head,
-        embedding_weight,
         layer_kinds,
         paged_adapter,
         chunk_size,
@@ -274,7 +270,6 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
@@ -299,7 +294,6 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
             caches,
             final_norm,
             lm_head,
-            embedding_weight,
             layer_kinds,
             paged_adapter,
             cached_rope_deltas,
@@ -326,7 +320,6 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
             caches,
             final_norm,
             lm_head,
-            embedding_weight,
             layer_kinds,
             paged_adapter,
             cached_rope_deltas,
@@ -410,11 +403,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
             // Last chunk: project final_norm + lm_head and extract
             // last-token logits.
             last_logits = Some(project_last_token_logits_moe(
-                &hidden,
-                final_norm,
-                lm_head,
-                embed,
-                embedding_weight,
+                &hidden, final_norm, lm_head, embed,
             )?);
             if capture_checkpoint {
                 materialize_linear_layer_caches(caches)?;
@@ -525,7 +514,6 @@ pub(crate) fn run_paged_prefill_single_shot(
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     cached_rope_deltas: i32,
@@ -561,7 +549,7 @@ pub(crate) fn run_paged_prefill_single_shot(
         /* position_ids */ None,
         cached_rope_deltas,
     )?;
-    project_last_token_logits_moe(&hidden_states, final_norm, lm_head, embed, embedding_weight)
+    project_last_token_logits_moe(&hidden_states, final_norm, lm_head, embed)
 }
 
 /// Image-bearing paged prefill with optional cached-prefix reuse for MoE.
@@ -592,7 +580,6 @@ pub(crate) fn run_paged_vlm_prefill_moe(
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
 ) -> Result<(MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
@@ -700,7 +687,6 @@ pub(crate) fn run_paged_vlm_prefill_moe(
                 final_norm,
                 lm_head,
                 embed,
-                embedding_weight,
             )?);
         } else {
             hidden_states.eval();
@@ -849,26 +835,19 @@ fn run_paged_prefill_one_chunk_moe(
 /// final-chunk return path. Hidden state shape on entry: `[1,
 /// chunk_len, hidden]`.
 ///
-/// `lm_head = None` corresponds to the tied-word-embeddings case;
-/// we matmul against `embedding_weight.T` instead of going through a
-/// dedicated `LinearProj`.
+/// `lm_head = None` corresponds to the tied-word-embeddings case and routes
+/// through `Embedding::as_linear`, including packed quantized backends.
 fn project_last_token_logits_moe(
     hidden_states: &MxArray,
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
     embed: &Embedding,
-    embedding_weight: &MxArray,
 ) -> Result<MxArray> {
     let h = final_norm.forward(hidden_states)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
-    } else if embed.is_packed_quantized() {
-        // Tied + packed-quantized embedding: route through the packed
-        // `quantized_matmul` instead of dequantizing the full dense table.
-        embed.as_linear(&h)?
     } else {
-        let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        h.matmul(&weight_t)?
+        embed.as_linear(&h)?
     };
     // Slice last token: logits shape [1, chunk_len, vocab] -> [vocab].
     let seq_len = logits.shape_at(1)?;
@@ -886,7 +865,6 @@ pub(crate) fn run_paged_decode_step(
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
-    embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     cached_rope_deltas: i32,
@@ -937,11 +915,8 @@ pub(crate) fn run_paged_decode_step(
     let h = final_norm.forward(&hidden_states)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
-    } else if embed.is_packed_quantized() {
-        embed.as_linear(&h)?
     } else {
-        let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-        h.matmul(&weight_t)?
+        embed.as_linear(&h)?
     };
     Ok(logits)
 }
@@ -1252,7 +1227,6 @@ mod tests {
 
         let logits = {
             let embed = inner.embedding.clone();
-            let embedding_weight = embed.get_weight();
             let caches_ref = inner.caches.as_mut().expect("caches");
             let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
             match super::run_paged_prefill_chunk_with_size(
@@ -1265,7 +1239,6 @@ mod tests {
                 caches_ref,
                 &inner.final_norm,
                 &inner.lm_head,
-                &embedding_weight,
                 &layer_kinds,
                 adapter,
                 chunk_size,
@@ -1434,7 +1407,6 @@ mod tests {
         });
         let (logits, checkpoint) = {
             let embed = inner.embedding.clone();
-            let embedding_weight = embed.get_weight();
             let caches = inner.caches.as_mut().expect("caches");
             let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
             super::run_paged_prefill_chunk_with_size_and_checkpoint(
@@ -1447,7 +1419,6 @@ mod tests {
                 caches,
                 &inner.final_norm,
                 &inner.lm_head,
-                &embedding_weight,
                 &layer_kinds,
                 adapter,
                 2048,
@@ -1892,7 +1863,6 @@ mod tests {
         }
         let logits_default = {
             let embed = inner.embedding.clone();
-            let embedding_weight = embed.get_weight();
             let caches_ref = inner.caches.as_mut().expect("caches");
             let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
             match super::run_paged_prefill_chunk(
@@ -1905,7 +1875,6 @@ mod tests {
                 caches_ref,
                 &inner.final_norm,
                 &inner.lm_head,
-                &embedding_weight,
                 &layer_kinds,
                 adapter,
                 /* cached_rope_deltas */ 0,
@@ -1953,7 +1922,6 @@ mod tests {
         }
         let logits_explicit = {
             let embed = inner.embedding.clone();
-            let embedding_weight = embed.get_weight();
             let caches_ref = inner.caches.as_mut().expect("caches");
             let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
             super::run_paged_prefill_chunk_with_size(
@@ -1966,7 +1934,6 @@ mod tests {
                 caches_ref,
                 &inner.final_norm,
                 &inner.lm_head,
-                &embedding_weight,
                 &layer_kinds,
                 adapter,
                 0,

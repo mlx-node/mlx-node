@@ -28,6 +28,7 @@ use crate::engine::params::{
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaInputs, TurnPlan};
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::models::qwen3_5::mtp_decode::{MtpCommitAnchor, MtpVerifyOutput};
+use crate::nn::Embedding;
 use crate::profiling::PerformanceMetrics;
 use crate::sampling::SamplingConfig;
 use crate::stream::Stream;
@@ -1510,7 +1511,7 @@ pub(crate) trait MtpStepper {
     /// steps. Borrowed for the lifetime of the call (the engine passes it
     /// straight back into [`Self::verify_step`] /
     /// [`Self::restore_and_replay_main`] / [`Self::commit_mtp`]).
-    fn embedding_weight(&self) -> &MxArray;
+    fn embedding(&self) -> &Embedding;
 
     /// `true` when [`Self::commit_mtp`] runs the real committed-history
     /// commit. The engine ANDs it with `cycle_seed_was_chained` to pick
@@ -1548,7 +1549,7 @@ pub(crate) trait MtpStepper {
     fn forward_with_hidden(
         &mut self,
         ids: &MxArray,
-        emb: &MxArray,
+        embedding: &Embedding,
     ) -> Result<(MxArray, MxArray, bool)>;
 
     /// One MTP draft step returning `(h_next [1,1,hidden], draft_logits
@@ -1561,7 +1562,7 @@ pub(crate) trait MtpStepper {
     fn verify_step(
         &mut self,
         ids: &MxArray,
-        emb: &MxArray,
+        embedding: &Embedding,
         depth: usize,
     ) -> Result<MtpVerifyOutput>;
 
@@ -1573,7 +1574,7 @@ pub(crate) trait MtpStepper {
     fn verify_step_argmax_only(
         &mut self,
         _ids: &MxArray,
-        _emb: &MxArray,
+        _embedding: &Embedding,
         _depth: usize,
     ) -> Option<Result<MtpVerifyOutput>> {
         None
@@ -1585,7 +1586,7 @@ pub(crate) trait MtpStepper {
     fn verify_step_sparse(
         &mut self,
         _ids: &MxArray,
-        _emb: &MxArray,
+        _embedding: &Embedding,
         _depth: usize,
         _cfg: &SamplingConfig,
     ) -> Option<Result<MtpVerifyOutput>> {
@@ -1610,7 +1611,7 @@ pub(crate) trait MtpStepper {
     /// accepted draft so the main linear state catches up. `accepted` is
     /// the accepted-draft prefix (NOT the residual). ==
     /// `MtpOps::restore_and_replay_main` (the `RR` closure).
-    fn restore_and_replay_main(&mut self, accepted: &[u32], emb: &MxArray) -> Result<()>;
+    fn restore_and_replay_main(&mut self, accepted: &[u32], embedding: &Embedding) -> Result<()>;
 
     /// Committed-history commit. Appends `K+2` exact committed K/V slots
     /// to the persistent MTP cache. The `anchor` selects the commit
@@ -1627,7 +1628,7 @@ pub(crate) trait MtpStepper {
         verify_hiddens: &MxArray,
         committed_ids: &[u32],
         k_accepted: usize,
-        emb: &MxArray,
+        embedding: &Embedding,
     ) -> Result<()>;
 
     /// Re-anchor the MTP draft caches/offset to the main path's current

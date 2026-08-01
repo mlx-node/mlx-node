@@ -56,8 +56,8 @@ pub fn matmul_int8(x: &MxArray, w: &MxArray) -> Result<MxArray> {
 ///     orientation, so it stays correct for the `acc[M,N] * s_x[M] * s_w[N]`
 ///     rescale.
 ///
-/// Stage 3 holds both handles alongside each quantized linear and passes them to
-/// [`int8_w8a8_matmul`] on every forward.
+/// This helper remains useful for tests and legacy `[K,N]` kernel callers.
+/// Sym8 checkpoints instead store `[N,K]` and use the native-layout wrappers.
 pub fn quantize_weight_int8(w: &MxArray) -> Result<(MxArray, MxArray)> {
     let mut out_w_i8: *mut sys::mlx_array = std::ptr::null_mut();
     let mut out_s_w: *mut sys::mlx_array = std::ptr::null_mut();
@@ -72,9 +72,9 @@ pub fn quantize_weight_int8(w: &MxArray) -> Result<(MxArray, MxArray)> {
     Ok((w_i8, s_w))
 }
 
-/// LOAD-time sym8 kernel-operand builder (runs once per sym8 linear).
+/// Legacy sym8 kernel-operand builder for standalone diagnostics.
 ///
-/// `w_i8_nk` is the STORED checkpoint weight — int8 `[N,K]`, source
+/// `w_i8_nk` is a stored checkpoint weight — int8 `[N,K]`, source
 /// orientation, as emitted by `mlx convert --q-mode sym8`
 /// (`mlx_sym8_quantize_store`). Returns the opaque contiguous `[K,N]` int8
 /// kernel operand that [`int8_w8a8_matmul`] / [`int8_w8a8_qmv`] consume —
@@ -128,6 +128,29 @@ pub fn int8_w8a8_matmul(x: &MxArray, w_i8: &MxArray, s_w: &MxArray) -> Result<Mx
         ));
     }
     MxArray::from_handle(out, "int8_w8a8_matmul")
+}
+
+/// W8A8 prefill on the checkpoint-native int8 `[N,K]` weight.
+///
+/// MPP's NT descriptor applies the transpose logically, so the default sym8
+/// model keeps no duplicated `[K,N]` allocation. Math and output dtype match
+/// [`int8_w8a8_matmul`] exactly.
+pub fn int8_w8a8_matmul_nk(x: &MxArray, w_nk: &MxArray, s_w: &MxArray) -> Result<MxArray> {
+    let mut out: *mut sys::mlx_array = std::ptr::null_mut();
+    let ok = unsafe {
+        sys::mlx_w8a8_linear_nk(
+            x.as_raw_ptr(),
+            w_nk.as_raw_ptr(),
+            s_w.as_raw_ptr(),
+            &mut out,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "mlx_w8a8_linear_nk failed (unsupported gen/K or kernel error; see stderr)",
+        ));
+    }
+    MxArray::from_handle(out, "int8_w8a8_matmul_nk")
 }
 
 /// sym8 DECODE matvec (QMV): the small-M analogue of [`int8_w8a8_matmul`].
@@ -211,6 +234,29 @@ pub fn int8_w8a16_qmv(
         ));
     }
     MxArray::from_handle(out, "int8_w8a16_qmv")
+}
+
+/// W8A16 sym8 decode on the checkpoint-native int8 `[N,K]` weight only.
+///
+/// This calls the same simd_sum core as [`int8_w8a16_qmv`]'s default branch.
+/// Legacy W8A8 and 2D-block diagnostics that require `[K,N]` use the separate
+/// dual-input wrapper.
+pub fn int8_w8a16_qmv_nk(x: &MxArray, w_nk: &MxArray, s_w: &MxArray) -> Result<MxArray> {
+    let mut out: *mut sys::mlx_array = std::ptr::null_mut();
+    let ok = unsafe {
+        sys::mlx_int8_qmv_w8a16_nk(
+            x.as_raw_ptr(),
+            w_nk.as_raw_ptr(),
+            s_w.as_raw_ptr(),
+            &mut out,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "mlx_int8_qmv_w8a16_nk failed (unsupported gen/K or kernel error; see stderr)",
+        ));
+    }
+    MxArray::from_handle(out, "int8_w8a16_qmv_nk")
 }
 
 /// MEASUREMENT ONLY (de-risk microbench — NOT a production path).
@@ -1759,6 +1805,116 @@ mod tests {
             run("gate_up", m, 9216, 2560); // x[M,2560] @ deq(w[9216,2560])^T
             run("down", m, 2560, 9216); // x[M,9216] @ deq(w[2560,9216])^T
         }
+    }
+
+    // ===================== sym8 single-layout prefill de-risk =====================
+    // Compare the compatibility NN GEMM on a duplicated [K,N] operand with the
+    // default MPP NT GEMM that consumes checkpoint-native [N,K] directly. This
+    // remains ignored because it is a manual, fresh-process performance probe;
+    // non-ignored layer tests cover output and routing parity.
+    //
+    // One shape per fresh process:
+    //   SYM8_NK_SHAPE=M,N,K SYM8_NK_ORDER=old-first|new-first \
+    //     cargo test -p mlx-core --release \
+    //       int8_gemm::tests::profile_sym8_single_layout_prefill -- \
+    //       --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore = "manual fresh-process sym8 [K,N] NN vs [N,K] NT prefill A/B"]
+    fn profile_sym8_single_layout_prefill() {
+        use crate::array::memory::synchronize;
+        use std::time::Instant;
+
+        if gpu_gen() < 17 {
+            eprintln!("[sym8-nk] SKIP gpu gen {} < 17", gpu_gen());
+            return;
+        }
+
+        let parse_usize = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(default)
+        };
+        let shape = std::env::var("SYM8_NK_SHAPE").unwrap_or_else(|_| "128,9216,2560".into());
+        let dims: Vec<usize> = shape
+            .split(',')
+            .map(|v| v.parse::<usize>().expect("SYM8_NK_SHAPE must be M,N,K"))
+            .collect();
+        assert_eq!(dims.len(), 3, "SYM8_NK_SHAPE must contain M,N,K");
+        let (m, n, k) = (dims[0], dims[1], dims[2]);
+        assert_eq!(k % 16, 0, "sym8 requires K % 16 == 0");
+        let warm = parse_usize("SYM8_NK_WARM", 4);
+        let iters = parse_usize("SYM8_NK_ITERS", 8);
+        let rounds = parse_usize("SYM8_NK_ROUNDS", 5);
+        let new_first = std::env::var("SYM8_NK_ORDER").is_ok_and(|v| v == "new-first");
+
+        let x = MxArray::random_normal(&[m as i64, k as i64], 0.0, 0.05, Some(DType::BFloat16))
+            .unwrap();
+        let w = MxArray::random_normal(&[n as i64, k as i64], 0.0, 0.02, Some(DType::BFloat16))
+            .unwrap();
+        x.eval();
+        w.eval();
+        let (w_kn, s_w) = quantize_weight_int8(&w).unwrap();
+        w_kn.eval();
+        s_w.eval();
+        // sym8_kernel_operand is a requant-free transpose+contiguous. Applied
+        // to the generated [K,N] operand, it reconstructs the exact [N,K]
+        // checkpoint layout used by the proposed single-layout kernel.
+        let w_nk = sym8_kernel_operand(&w_kn).unwrap();
+        w_nk.eval();
+
+        let old = || int8_w8a8_matmul(&x, &w_kn, &s_w).unwrap();
+        let new = || int8_w8a8_matmul_nk(&x, &w_nk, &s_w).unwrap();
+
+        // Full-output exact parity: both paths share the same activation quant
+        // and rescale kernels, while their int8 accumulators are exact int32.
+        let old_y = old();
+        let new_y = new();
+        old_y.eval();
+        new_y.eval();
+        let old_v = old_y.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let new_v = new_y.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let differing = old_v
+            .iter()
+            .zip(new_v.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(differing, 0, "NN/[K,N] and NT/[N,K] outputs differ");
+
+        for _ in 0..warm {
+            old().eval();
+            new().eval();
+        }
+        synchronize();
+
+        let bench = |f: &dyn Fn() -> MxArray| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                f().eval();
+            }
+            synchronize();
+            start.elapsed().as_secs_f64() * 1e3 / iters as f64
+        };
+        let mut old_ms = Vec::with_capacity(rounds);
+        let mut new_ms = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            if new_first ^ (round % 2 == 1) {
+                new_ms.push(bench(&new));
+                old_ms.push(bench(&old));
+            } else {
+                old_ms.push(bench(&old));
+                new_ms.push(bench(&new));
+            }
+        }
+        old_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        new_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let old_median = old_ms[old_ms.len() / 2];
+        let new_median = new_ms[new_ms.len() / 2];
+        eprintln!(
+            "[sym8-nk] M={m} N={n} K={k} order={} parity=BIT-EXACT old_kn_nn_ms={old_median:.6} new_nk_nt_ms={new_median:.6} new/old={:.6} old_samples={old_ms:?} new_samples={new_ms:?}",
+            if new_first { "new-first" } else { "old-first" },
+            new_median / old_median,
+        );
     }
 
     // ===================== sym8 DECODE de-risk =====================

@@ -205,6 +205,13 @@ pub(crate) mod recipe {
             false
         }
 
+        /// True when the family's runtime can consume the packed weights and
+        /// quantization metadata emitted by the generic quantizer. Dense-only
+        /// families opt out so conversion fails before any tensor is packed.
+        fn quantization_supported(&self) -> bool {
+            true
+        }
+
         /// How the family carries MTP weights through convert. Drives the
         /// driver's MTP emission: `Sidecar` extracts `mtp.*` into a separate
         /// `mtp.safetensors` / drafter dir (qwen3_5 dense), `Inline` retains
@@ -461,6 +468,179 @@ pub(crate) mod recipe {
             }
         }
         Ok(())
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    enum PrestackedExpertProjection {
+        GateUp,
+        Down,
+    }
+
+    impl PrestackedExpertProjection {
+        fn source_name(self) -> &'static str {
+            match self {
+                Self::GateUp => "gate_up_proj",
+                Self::Down => "down_proj",
+            }
+        }
+    }
+
+    /// Parse one pre-stacked Qwen expert tensor. A bare projection is the dense
+    /// source convention and normalizes to `.weight`; already-quantized sources
+    /// carry the ordinary `.weight` / `.scales` / `.biases` triplet.
+    fn prestacked_qwen_expert_component(
+        key: &str,
+    ) -> Result<Option<(&str, PrestackedExpertProjection, &'static str)>> {
+        for (needle, projection) in [
+            (".experts.gate_up_proj", PrestackedExpertProjection::GateUp),
+            (".experts.down_proj", PrestackedExpertProjection::Down),
+        ] {
+            let Some(index) = key.rfind(needle) else {
+                continue;
+            };
+            let suffix = &key[index + needle.len()..];
+            let normalized_suffix = match suffix {
+                "" | ".weight" => ".weight",
+                ".scales" => ".scales",
+                ".biases" => ".biases",
+                other => {
+                    return Err(Error::from_reason(format!(
+                        "Qwen convert: unsupported pre-stacked expert companion '{other}' in '{key}'; expected a bare dense tensor or .weight/.scales/.biases"
+                    )));
+                }
+            };
+            return Ok(Some((&key[..index], projection, normalized_suffix)));
+        }
+        Ok(None)
+    }
+
+    /// Normalize fused pre-stacked Qwen experts without dropping quantization
+    /// companions. The fused output axis is shared by packed weights, scales,
+    /// and biases, so every member of a quant group is split at the same point.
+    /// All shapes and destinations are preflighted before the map is mutated.
+    fn normalize_qwen35_prestacked_experts(
+        weights: &mut HashMap<String, MxArray>,
+    ) -> Result<usize> {
+        let source_keys: Vec<String> = weights
+            .keys()
+            .filter(|key| {
+                key.contains(".experts.gate_up_proj") || key.contains(".experts.down_proj")
+            })
+            .cloned()
+            .collect();
+
+        type GroupKey = (String, PrestackedExpertProjection);
+        let mut groups: HashMap<GroupKey, HashMap<&'static str, String>> = HashMap::new();
+        let mut plans = Vec::with_capacity(source_keys.len());
+        let mut destinations = std::collections::HashSet::new();
+
+        for key in source_keys {
+            let Some((prefix, projection, suffix)) = prestacked_qwen_expert_component(&key)? else {
+                continue;
+            };
+            let prefix = prefix.to_string();
+            let array = weights.get(&key).expect("key collected from weights");
+            let ndim = array.ndim()?;
+            if ndim < 2 {
+                return Err(Error::from_reason(format!(
+                    "Qwen convert: pre-stacked expert tensor '{key}' must have at least 2 dimensions, got {ndim}"
+                )));
+            }
+            if projection == PrestackedExpertProjection::GateUp {
+                let fused = array.shape_at(1)?;
+                if fused % 2 != 0 {
+                    return Err(Error::from_reason(format!(
+                        "Qwen convert: pre-stacked gate_up_proj tensor '{key}' has odd fused output dimension {fused}"
+                    )));
+                }
+            }
+
+            let group = groups.entry((prefix.clone(), projection)).or_default();
+            if let Some(previous) = group.insert(suffix, key.clone()) {
+                return Err(Error::from_reason(format!(
+                    "Qwen convert: pre-stacked expert tensors '{previous}' and '{key}' both normalize to {}.experts.{}{}",
+                    prefix,
+                    projection.source_name(),
+                    suffix,
+                )));
+            }
+
+            let output_keys: Vec<String> = match projection {
+                PrestackedExpertProjection::GateUp => ["gate_proj", "up_proj"]
+                    .into_iter()
+                    .map(|name| format!("{prefix}.switch_mlp.{name}{suffix}"))
+                    .collect(),
+                PrestackedExpertProjection::Down => {
+                    vec![format!("{prefix}.switch_mlp.down_proj{suffix}")]
+                }
+            };
+            for output in &output_keys {
+                if weights.contains_key(output) || !destinations.insert(output.clone()) {
+                    return Err(Error::from_reason(format!(
+                        "Qwen convert: pre-stacked expert tensor '{key}' would overwrite existing normalized tensor '{output}'"
+                    )));
+                }
+            }
+            plans.push((key, prefix, projection, suffix, output_keys));
+        }
+
+        // A sidecar-only source, or biases without scales, cannot form a
+        // loadable quantized group. Companions must also agree on the expert and
+        // fused-output axes; only the packed/input axis is format-dependent.
+        for ((prefix, projection), companions) in &groups {
+            let Some(weight_key) = companions.get(".weight") else {
+                return Err(Error::from_reason(format!(
+                    "Qwen convert: pre-stacked expert group '{prefix}.experts.{}' has quantization sidecars but no weight",
+                    projection.source_name(),
+                )));
+            };
+            if companions.contains_key(".biases") && !companions.contains_key(".scales") {
+                return Err(Error::from_reason(format!(
+                    "Qwen convert: pre-stacked expert group '{prefix}.experts.{}' has .biases without .scales",
+                    projection.source_name(),
+                )));
+            }
+            let weight = weights.get(weight_key).expect("preflight weight exists");
+            let experts = weight.shape_at(0)?;
+            let outputs = weight.shape_at(1)?;
+            for (suffix, companion_key) in companions {
+                if *suffix == ".weight" {
+                    continue;
+                }
+                let companion = weights
+                    .get(companion_key)
+                    .expect("preflight companion exists");
+                let companion_experts = companion.shape_at(0)?;
+                let companion_outputs = companion.shape_at(1)?;
+                if (companion_experts, companion_outputs) != (experts, outputs) {
+                    return Err(Error::from_reason(format!(
+                        "Qwen convert: pre-stacked expert companion '{companion_key}' has leading shape [{companion_experts}, {companion_outputs}], but '{weight_key}' has [{experts}, {outputs}]"
+                    )));
+                }
+            }
+        }
+
+        let normalized = plans.len();
+        for (source, _prefix, projection, _suffix, outputs) in plans {
+            let array = weights
+                .remove(&source)
+                .expect("preflighted source tensor must still exist");
+            match projection {
+                PrestackedExpertProjection::GateUp => {
+                    let fused = array.shape_at(1)?;
+                    let half = fused / 2;
+                    let gate = array.slice_axis(1, 0, half)?;
+                    let up = array.slice_axis(1, half, fused)?;
+                    weights.insert(outputs[0].clone(), gate);
+                    weights.insert(outputs[1].clone(), up);
+                }
+                PrestackedExpertProjection::Down => {
+                    weights.insert(outputs[0].clone(), array);
+                }
+            }
+        }
+
+        Ok(normalized)
     }
 
     impl ConversionRecipe for Qwen35Recipe {
@@ -963,44 +1143,15 @@ pub(crate) mod recipe {
                     new_weights.remove(&k);
                 }
             } else if has_prestacked_experts {
-                // Format B: pre-stacked fused experts → split gate_up_proj, rename with .weight suffix
-                let expert_keys: Vec<String> = new_weights
-                    .keys()
-                    .filter(|k| {
-                        k.contains(".experts.gate_up_proj") || k.contains(".experts.down_proj")
-                    })
-                    .cloned()
-                    .collect();
-
+                // Format B: split every member of a fused pre-stacked quant
+                // group along the shared output axis. The old suffixless-only
+                // branch silently removed `.weight/.scales/.biases` inputs
+                // without reinserting any of them.
+                let normalized = normalize_qwen35_prestacked_experts(&mut new_weights)?;
                 info!(
-                    "  Normalizing {} pre-stacked expert tensors (split gate_up_proj, add .weight suffix)",
-                    expert_keys.len()
+                    "  Normalized {} pre-stacked expert tensors (split gate_up_proj groups, preserved quant companions)",
+                    normalized
                 );
-
-                for k in expert_keys {
-                    let array = new_weights.remove(&k).unwrap();
-
-                    if k.ends_with(".experts.gate_up_proj") {
-                        // Split fused [E, gate_dim+up_dim, in] → gate [E, dim, in] + up [E, dim, in]
-                        let dim1 = array.shape_at(1)?;
-                        if dim1 % 2 != 0 {
-                            return Err(Error::from_reason(format!(
-                                "gate_up_proj dim 1 must be even, got {} for '{}'",
-                                dim1, k
-                            )));
-                        }
-                        let half = dim1 / 2;
-                        let gate = array.slice_axis(1, 0, half)?;
-                        let up = array.slice_axis(1, half, dim1)?;
-
-                        let base = k.strip_suffix(".experts.gate_up_proj").unwrap();
-                        new_weights.insert(format!("{}.switch_mlp.gate_proj.weight", base), gate);
-                        new_weights.insert(format!("{}.switch_mlp.up_proj.weight", base), up);
-                    } else if k.ends_with(".experts.down_proj") {
-                        let base = k.strip_suffix(".experts.down_proj").unwrap();
-                        new_weights.insert(format!("{}.switch_mlp.down_proj.weight", base), array);
-                    }
-                }
             }
 
             info!("  After expert stacking: {} tensors", new_weights.len());
@@ -1534,6 +1685,10 @@ pub(crate) mod recipe {
         ) -> Result<HashMap<String, MxArray>> {
             super::load_paddleocr_vl_weights(weights)
         }
+
+        fn quantization_supported(&self) -> bool {
+            false
+        }
     }
 
     /// Qianfan-OCR. Same shape as PaddleOCR-VL — generic flags.
@@ -1553,6 +1708,10 @@ pub(crate) mod recipe {
             _verbose: bool,
         ) -> Result<HashMap<String, MxArray>> {
             super::load_qianfan_ocr_weights(weights)
+        }
+
+        fn quantization_supported(&self) -> bool {
+            false
         }
     }
 
@@ -1934,6 +2093,88 @@ pub struct ConversionResult {
     pub tensor_names: Vec<String>,
 }
 
+const VALID_QUANT_MODES: &[&str] = &["affine", "mxfp4", "mxfp8", "nvfp4", "sym8"];
+
+/// Reject conversion-time quantization for a family whose Rust runtime only
+/// constructs dense weights. Convertible families use the same recipe registry
+/// that selects sanitization. Runtime-only Qwen3/Harrier types have no conversion
+/// recipe, so they are rejected explicitly instead of falling through to the
+/// later unknown-type error after input I/O.
+fn reject_dense_only_family_quantization(
+    model_type: Option<&str>,
+    do_quantize: bool,
+    quant_mode: &str,
+) -> Result<()> {
+    if !do_quantize {
+        return Ok(());
+    }
+    let Some(model_type) = model_type else {
+        return Ok(());
+    };
+    let is_dense_only = matches!(model_type, "qwen3" | "harrier")
+        || recipe::recipe_for(model_type).is_some_and(|recipe| !recipe.quantization_supported());
+    if !is_dense_only {
+        return Ok(());
+    }
+    Err(Error::from_reason(format!(
+        "Model type '{model_type}' does not support --quantize (requested mode '{quant_mode}'): \
+         its Rust inference runtime is dense-only and does not consume packed weights or \
+         quantization metadata. Convert this family without quantization."
+    )))
+}
+
+/// Identify dense-only inference families from the source checkpoint itself.
+///
+/// This closes the direct-NAPI/default-converter path where `model_type` was
+/// omitted: the generic converter would otherwise pack weights without ever
+/// selecting a family recipe. Harrier's published Qwen3-base configs use
+/// `architectures: ["Qwen3Model"]`; causal Qwen3 uses
+/// `Qwen3ForCausalLM`. Both runtimes are dense-only, but naming the resolved
+/// family keeps the rejection actionable.
+fn dense_only_source_family(config: &serde_json::Value) -> Option<&'static str> {
+    let raw_model_type = config.get("model_type").and_then(|v| v.as_str())?;
+    match raw_model_type {
+        "paddleocr_vl" => Some("PaddleOCR-VL"),
+        "internvl_chat" | "qianfan-ocr" => Some("Qianfan-OCR"),
+        "harrier" => Some("Harrier"),
+        "qwen3" => {
+            let architectures: Vec<&str> = match config.get("architectures") {
+                Some(serde_json::Value::Array(values)) => {
+                    values.iter().filter_map(|v| v.as_str()).collect()
+                }
+                Some(serde_json::Value::String(value)) => vec![value.as_str()],
+                _ => Vec::new(),
+            };
+            if architectures.contains(&"Qwen3Model") && !architectures.contains(&"Qwen3ForCausalLM")
+            {
+                Some("Harrier")
+            } else {
+                Some("Qwen3")
+            }
+        }
+        _ => None,
+    }
+}
+
+fn reject_implicit_dense_only_source_quantization(
+    config: &serde_json::Value,
+    requested_model_type: Option<&str>,
+    do_quantize: bool,
+    quant_mode: &str,
+) -> Result<()> {
+    if !do_quantize || requested_model_type.is_some() {
+        return Ok(());
+    }
+    let Some(family) = dense_only_source_family(config) else {
+        return Ok(());
+    };
+    Err(Error::from_reason(format!(
+        "Source config resolves to the dense-only {family} runtime, which does not support \
+         --quantize (requested mode '{quant_mode}') or consume packed weights and quantization \
+         metadata. Convert this checkpoint without quantization."
+    )))
+}
+
 /// Convert a HuggingFace SafeTensors model to MLX format
 ///
 /// This function:
@@ -2045,7 +2286,6 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     };
 
     // Validate quant_mode before it reaches FFI
-    const VALID_QUANT_MODES: &[&str] = &["affine", "mxfp4", "mxfp8", "nvfp4", "sym8"];
     if do_quantize && !VALID_QUANT_MODES.contains(&quant_mode.as_str()) {
         return Err(Error::from_reason(format!(
             "Invalid quant_mode '{}': must be one of {}",
@@ -2053,6 +2293,13 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             VALID_QUANT_MODES.join(", ")
         )));
     }
+
+    // PaddleOCR-VL and Qianfan-OCR currently have dense-only Rust runtimes.
+    // Their conversion recipes used to fall through to the generic packer,
+    // which emitted metadata the loaders ignored and weights they read as
+    // dense. Fail before mode-specific validation, input I/O, the conversion
+    // mutex, or any MLX operation.
+    reject_dense_only_family_quantization(model_type.as_deref(), do_quantize, &quant_mode)?;
 
     // "drafter" is accepted as an alias for "split" and normalized above.
     const VALID_MTP_QUANT_POLICIES: &[&str] = &["off", "cyankiwi", "all", "split", "drafter"];
@@ -2252,6 +2499,16 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     }
     let config_data = fs::read_to_string(&config_path)?;
     let config: serde_json::Value = serde_json::from_str(&config_data)?;
+
+    // A caller may omit `model_type` and rely on generic dtype conversion.
+    // Fail closed from the source config before the converter mutex, MLX setup,
+    // output creation, or tensor loading for families whose runtimes are dense-only.
+    reject_implicit_dense_only_source_quantization(
+        &config,
+        model_type.as_deref(),
+        do_quantize,
+        &quant_mode,
+    )?;
 
     // The nvidia recipe is documented + validated only for qwen3_5 /
     // qwen3_5_moe / dense gemma4 / gemma4_unified. Gate on the INPUT
@@ -3427,6 +3684,15 @@ fn should_quantize(key: &str, embed_quantizable: bool) -> bool {
         return false;
     }
 
+    // Gemma4 PLE linears load through dense `Linear::set_weight`, and these
+    // encoder/projector namespaces are discarded by the Rust loader. They must
+    // stay dense for EVERY quant mode and recipe. Keep the supported
+    // `embed_tokens_per_layer`, `embed_audio`, and `embed_vision` paths out of
+    // this predicate.
+    if is_gemma_dense_or_unused_quant_exclusion(key) {
+        return false;
+    }
+
     // lm_head (output head) is ALWAYS excluded — for tied models it is dropped
     // at sanitize, for untied models it shares the vocab dimension and loads
     // through an affine-only head loader.
@@ -3488,6 +3754,16 @@ fn should_quantize(key: &str, embed_quantizable: bool) -> bool {
     }
 
     true
+}
+
+fn is_gemma_dense_or_unused_quant_exclusion(key: &str) -> bool {
+    key.ends_with("per_layer_model_projection.weight")
+        || key.ends_with("per_layer_input_gate.weight")
+        || key.ends_with("per_layer_projection.weight")
+        || key.contains("audio_tower.")
+        || key.contains("audio_encoder.")
+        || key.contains("vision_encoder.")
+        || key.contains("multi_modal_projector.")
 }
 
 fn is_mtp_key(key: &str) -> bool {
@@ -6549,29 +6825,11 @@ fn resolve_legacy_entry(
         return Ok(None);
     }
 
-    // sym8-scoped exclusions (legacy path only — recipes reject sym8):
-    // gemma4 PLE linears (`per_layer_model_projection`, `per_layer_input_gate`,
-    // `per_layer_projection`) load DENSE-ONLY (`Linear::set_weight`), and the
-    // Rust loader skips audio-tower weights entirely. A sym8 PLE entry would
-    // keep the [N,K] shape (int8) so no shape guard trips at load — silent
-    // garbage; a forced-affine entry fails the dense-only loader too. Keep them
-    // bf16 under a sym8 default.
-    if default_mode == "sym8"
-        && (key.contains("per_layer_model_projection")
-            || key.contains("per_layer_input_gate")
-            || key.contains("per_layer_projection")
-            || key.contains("audio_tower")
-            || key.contains("audio_encoder")
-            || key.contains("embed_audio"))
-    {
-        return Ok(None);
-    }
-
     // When `embed_quantizable`, the packed embedding path supports the active
     // non-affine mode, so embedding keys must not be force-downgraded below.
     let is_packed_embed =
         embed_quantizable && (key.contains("embed_tokens") || key.contains("embedding."));
-    // sym8 is the EXCEPTION-to-the-exception: keep the lfm2 embedding DENSE bf16
+    // sym8 is the EXCEPTION-to-the-exception: keep the packed embedding DENSE bf16
     // (NO QuantEntry at all) under a sym8 default. The packed backend has no
     // sym8 gather-dequant, and the previous forced-affine-8 downgrade emitted
     // `embed_tokens.scales`, which bars the ENTIRE lfm2 compiled path at load
@@ -6605,7 +6863,7 @@ fn resolve_legacy_entry(
         || default_mode == "mxfp8"
         || default_mode == "nvfp4"
         || default_mode == "sym8";
-    // (`is_lfm2_packed_embed` under a sym8 default already returned above, so
+    // (`is_packed_embed` under a sym8 default already returned above, so
     // here it always means "keeps the non-affine default".)
     if is_non_affine_default && is_affine_only_key(key) && !is_packed_embed {
         return Ok(Some(QuantEntry {
@@ -7951,6 +8209,15 @@ mod tests {
                 "{mt}: quant_managed_by_sanitizer mismatch vs inline is_privacy_filter"
             );
 
+            // Only PaddleOCR-VL and Qianfan-OCR are dense-only at runtime;
+            // allowing the generic packer for either would emit weights their
+            // loaders interpret as dense.
+            assert_eq!(
+                r.quantization_supported(),
+                !matches!(mt, "paddleocr-vl" | "qianfan-ocr"),
+                "{mt}: quantization_supported mismatch vs runtime capability"
+            );
+
             // has_mtp drives the driver's MTP emission, replacing the inline
             // matches!(model_type, "qwen3_5" / "qwen3_5_moe") checks: Sidecar
             // iff dense qwen3_5, Inline iff qwen3_5_moe, None otherwise.
@@ -8044,6 +8311,292 @@ mod tests {
         assert!(!should_quantize(
             "multi_modal_projector.linear_1.weight",
             true
+        ));
+    }
+
+    /// Every quant mode accepted by the public convert API must fail at the
+    /// family capability gate for every explicit dense-only model type. The helper is
+    /// called before input validation and MLX setup, so this also proves the
+    /// generic packer cannot be reached for any dense-only runtime.
+    #[test]
+    fn dense_only_families_reject_every_supported_quant_mode_before_packing() {
+        for model_type in ["paddleocr-vl", "qianfan-ocr", "qwen3", "harrier"] {
+            for mode in VALID_QUANT_MODES {
+                let err = reject_dense_only_family_quantization(
+                    Some(model_type),
+                    /* do_quantize */ true,
+                    mode,
+                )
+                .expect_err("dense-only OCR runtime must reject quantization");
+                let message = &err.reason;
+                assert!(message.contains(model_type), "{message}");
+                assert!(message.contains(mode), "{message}");
+                assert!(message.contains("dense-only"), "{message}");
+            }
+        }
+
+        // Dense conversion stays available, and quant-capable families are not
+        // accidentally narrowed by the new capability flag.
+        assert!(
+            reject_dense_only_family_quantization(
+                Some("paddleocr-vl"),
+                /* do_quantize */ false,
+                "affine",
+            )
+            .is_ok()
+        );
+        assert!(
+            reject_dense_only_family_quantization(
+                Some("qianfan-ocr"),
+                /* do_quantize */ false,
+                "affine",
+            )
+            .is_ok()
+        );
+        assert!(
+            reject_dense_only_family_quantization(
+                Some("qwen3_5"),
+                /* do_quantize */ true,
+                "affine",
+            )
+            .is_ok()
+        );
+        assert!(
+            reject_dense_only_family_quantization(
+                Some("not-a-real-model"),
+                /* do_quantize */ true,
+                "affine",
+            )
+            .is_ok(),
+            "unrecognized model types remain the later dispatch guard's responsibility"
+        );
+    }
+
+    /// Exercise the public conversion entrypoint, not only its pure capability
+    /// helper. A dense-only family reject must win even when the input path is
+    /// absent, proving no input access, output creation, or MLX packing happens
+    /// first.
+    #[tokio::test]
+    async fn explicit_dense_only_rejection_precedes_converter_io() {
+        let base = std::env::temp_dir().join(format!(
+            "mlx-dense-only-convert-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let input = base.join("absent-input");
+
+        for model_type in ["paddleocr-vl", "qianfan-ocr", "qwen3", "harrier"] {
+            for mode in VALID_QUANT_MODES {
+                let output = base.join(format!("{model_type}-{mode}"));
+                let result = convert_model(ConversionOptions {
+                    input_dir: input.to_string_lossy().to_string(),
+                    output_dir: output.to_string_lossy().to_string(),
+                    dtype: Some("bfloat16".to_string()),
+                    verbose: Some(false),
+                    model_type: Some(model_type.to_string()),
+                    quantize: Some(true),
+                    quant_bits: None,
+                    quant_group_size: None,
+                    quant_mode: Some((*mode).to_string()),
+                    quant_recipe: None,
+                    imatrix_path: None,
+                    quant_mxfp: None,
+                    quant_mtp: None,
+                })
+                .await;
+                let err = match result {
+                    Err(err) => err,
+                    Ok(_) => panic!("dense-only OCR conversion must fail before input access"),
+                };
+                assert!(err.reason.contains("dense-only"), "{}", err.reason);
+                assert!(
+                    !output.exists(),
+                    "rejected conversion must not create {}",
+                    output.display()
+                );
+            }
+        }
+        assert!(!base.exists(), "pre-I/O rejection must create no artifacts");
+    }
+
+    #[test]
+    fn implicit_dense_only_source_classifier_matches_runtime_registry() {
+        for (config, expected) in [
+            (
+                serde_json::json!({ "model_type": "paddleocr_vl" }),
+                "PaddleOCR-VL",
+            ),
+            (
+                serde_json::json!({ "model_type": "internvl_chat" }),
+                "Qianfan-OCR",
+            ),
+            (
+                serde_json::json!({ "model_type": "qianfan-ocr" }),
+                "Qianfan-OCR",
+            ),
+            (serde_json::json!({ "model_type": "harrier" }), "Harrier"),
+            (
+                serde_json::json!({
+                    "model_type": "qwen3",
+                    "architectures": ["Qwen3Model"],
+                }),
+                "Harrier",
+            ),
+            (
+                serde_json::json!({
+                    "model_type": "qwen3",
+                    "architectures": ["Qwen3ForCausalLM"],
+                }),
+                "Qwen3",
+            ),
+            (serde_json::json!({ "model_type": "qwen3" }), "Qwen3"),
+        ] {
+            assert_eq!(dense_only_source_family(&config), Some(expected));
+        }
+
+        assert_eq!(
+            dense_only_source_family(&serde_json::json!({ "model_type": "qwen3_5" })),
+            None
+        );
+    }
+
+    /// With no explicit family, source config must still reject every public
+    /// quant mode before output creation/tensor loading. An explicit family is
+    /// left to the recipe/unknown-family validation path.
+    #[tokio::test]
+    async fn implicit_dense_only_sources_reject_quantization_before_tensor_io() {
+        let base = std::env::temp_dir().join(format!(
+            "mlx-dense-source-convert-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        for (name, config) in [
+            (
+                "paddle",
+                serde_json::json!({ "model_type": "paddleocr_vl" }),
+            ),
+            (
+                "qianfan",
+                serde_json::json!({ "model_type": "internvl_chat" }),
+            ),
+            ("harrier", serde_json::json!({ "model_type": "harrier" })),
+            (
+                "harrier-qwen-base",
+                serde_json::json!({
+                    "model_type": "qwen3",
+                    "architectures": ["Qwen3Model"],
+                }),
+            ),
+            (
+                "qwen3",
+                serde_json::json!({
+                    "model_type": "qwen3",
+                    "architectures": ["Qwen3ForCausalLM"],
+                }),
+            ),
+        ] {
+            let input = base.join(name);
+            fs::create_dir_all(&input).expect("create source fixture");
+            fs::write(
+                input.join("config.json"),
+                serde_json::to_vec(&config).expect("serialize source fixture"),
+            )
+            .expect("write source fixture");
+            for mode in VALID_QUANT_MODES {
+                let output = base.join(format!("out-{name}-{mode}"));
+                let result = convert_model(ConversionOptions {
+                    input_dir: input.to_string_lossy().to_string(),
+                    output_dir: output.to_string_lossy().to_string(),
+                    dtype: Some("bfloat16".to_string()),
+                    verbose: Some(false),
+                    model_type: None,
+                    quantize: Some(true),
+                    quant_bits: None,
+                    quant_group_size: None,
+                    quant_mode: Some((*mode).to_string()),
+                    quant_recipe: None,
+                    imatrix_path: None,
+                    quant_mxfp: None,
+                    quant_mtp: None,
+                })
+                .await;
+                let err = match result {
+                    Err(err) => err,
+                    Ok(_) => panic!("implicit dense-only source must reject quantization"),
+                };
+                if *mode == "sym8" {
+                    // `sym8` has an even earlier family allowlist and rejects a
+                    // missing explicit model_type before config I/O. Either
+                    // fail-closed boundary is correct; all other modes reach
+                    // the source-config-aware dense-family guard below.
+                    assert!(
+                        err.reason.contains("dense-only")
+                            || err.reason.contains("sym8 is currently supported"),
+                        "{}",
+                        err.reason
+                    );
+                } else {
+                    assert!(err.reason.contains("dense-only"), "{}", err.reason);
+                }
+                assert!(err.reason.contains(mode), "{}", err.reason);
+                assert!(!output.exists(), "rejection must precede output creation");
+            }
+        }
+        fs::remove_dir_all(&base).expect("remove source fixtures");
+    }
+
+    #[test]
+    fn gemma_dense_and_unused_namespaces_skip_every_quant_mode() {
+        let skipped = [
+            "language_model.model.per_layer_model_projection.weight",
+            "language_model.model.layers.0.per_layer_input_gate.weight",
+            "language_model.model.layers.0.per_layer_projection.weight",
+            "audio_tower.layers.0.proj.weight",
+            "audio_encoder.layers.0.proj.weight",
+            "vision_encoder.layers.0.proj.weight",
+            "multi_modal_projector.linear.weight",
+        ];
+        let no_weights = HashMap::new();
+        for mode in VALID_QUANT_MODES {
+            for key in skipped {
+                assert!(
+                    is_gemma_dense_or_unused_quant_exclusion(key),
+                    "{key} must be in the universal Gemma exclusion set"
+                );
+                assert!(!should_quantize(key, false), "{key} under {mode}");
+                assert!(
+                    resolve_legacy_entry(key, &no_weights, 4, 64, mode, false, false)
+                        .expect("skip resolution")
+                        .is_none(),
+                    "{key} must stay dense under {mode}"
+                );
+            }
+        }
+
+        // Supported PLE/multimodal paths must not be caught by this predicate.
+        for key in [
+            "embed_tokens_per_layer.weight",
+            "embed_audio.embedding_projection.weight",
+            "embed_vision.embedding_projection.weight",
+        ] {
+            assert!(
+                !is_gemma_dense_or_unused_quant_exclusion(key),
+                "supported path must not be excluded: {key}"
+            );
+        }
+        assert!(should_quantize(
+            "embed_audio.embedding_projection.weight",
+            false
+        ));
+        assert!(should_quantize(
+            "embed_vision.embedding_projection.weight",
+            false
         ));
     }
 
@@ -12692,6 +13245,105 @@ mod tests {
             .err()
             .expect("production sanitizer must wire the expert preflight");
         assert!(err.to_string().contains("pre-quantized individual expert"));
+    }
+
+    #[test]
+    fn qwen_prestacked_quantized_expert_groups_split_all_companions() {
+        let mut weights = HashMap::new();
+        let gate_up_weight: Vec<u32> = (0..24).collect();
+        let gate_up_scales: Vec<f32> = (0..12).map(|value| value as f32).collect();
+        let gate_up_biases: Vec<u16> = (0..12)
+            .map(|value| half::f16::from_f32(value as f32).to_bits())
+            .collect();
+        weights.insert(
+            "model.layers.0.mlp.experts.gate_up_proj.weight".to_string(),
+            MxArray::from_uint32(&gate_up_weight, &[2, 6, 2]).unwrap(),
+        );
+        weights.insert(
+            "model.layers.0.mlp.experts.gate_up_proj.scales".to_string(),
+            MxArray::from_float32(&gate_up_scales, &[2, 6, 1])
+                .unwrap()
+                .astype(DType::Int8)
+                .unwrap(),
+        );
+        weights.insert(
+            "model.layers.0.mlp.experts.gate_up_proj.biases".to_string(),
+            MxArray::from_float16(&gate_up_biases, &[2, 6, 1]).unwrap(),
+        );
+
+        weights.insert(
+            "model.layers.0.mlp.experts.down_proj.weight".to_string(),
+            MxArray::from_uint32(&(100..116).collect::<Vec<_>>(), &[2, 4, 2]).unwrap(),
+        );
+        weights.insert(
+            "model.layers.0.mlp.experts.down_proj.scales".to_string(),
+            MxArray::from_float32(&[1.0; 8], &[2, 4, 1])
+                .unwrap()
+                .astype(DType::Int8)
+                .unwrap(),
+        );
+        weights.insert(
+            "model.layers.0.mlp.experts.down_proj.biases".to_string(),
+            MxArray::from_float16(&[half::f16::ONE.to_bits(); 8], &[2, 4, 1]).unwrap(),
+        );
+
+        let out = recipe::Qwen35Recipe { is_moe: true }
+            .sanitize(
+                weights,
+                &serde_json::json!({"num_experts": 2, "num_hidden_layers": 1}),
+                "bfloat16",
+                true,
+                false,
+            )
+            .expect("pre-stacked quantized experts must normalize as complete groups");
+
+        let prefix = "language_model.model.layers.0.mlp.switch_mlp";
+        for projection in ["gate_proj", "up_proj"] {
+            let weight = &out[&format!("{prefix}.{projection}.weight")];
+            let scales = &out[&format!("{prefix}.{projection}.scales")];
+            let biases = &out[&format!("{prefix}.{projection}.biases")];
+            assert_eq!(weight.shape().unwrap().to_vec(), vec![2, 3, 2]);
+            assert_eq!(weight.dtype().unwrap(), DType::Uint32);
+            assert_eq!(scales.shape().unwrap().to_vec(), vec![2, 3, 1]);
+            assert_eq!(scales.dtype().unwrap(), DType::Int8);
+            assert_eq!(biases.shape().unwrap().to_vec(), vec![2, 3, 1]);
+            assert_eq!(biases.dtype().unwrap(), DType::Float16);
+        }
+        assert_eq!(
+            out[&format!("{prefix}.gate_proj.weight")]
+                .to_uint32()
+                .unwrap()
+                .to_vec(),
+            vec![0, 1, 2, 3, 4, 5, 12, 13, 14, 15, 16, 17],
+            "gate codes must take the first half of each expert's fused output axis"
+        );
+        assert_eq!(
+            out[&format!("{prefix}.up_proj.weight")]
+                .to_uint32()
+                .unwrap()
+                .to_vec(),
+            vec![6, 7, 8, 9, 10, 11, 18, 19, 20, 21, 22, 23],
+            "up codes must take the second half of each expert's fused output axis"
+        );
+        for suffix in ["weight", "scales", "biases"] {
+            assert_eq!(
+                out[&format!("{prefix}.down_proj.{suffix}")]
+                    .shape()
+                    .unwrap()
+                    .to_vec(),
+                if suffix == "weight" {
+                    vec![2, 4, 2]
+                } else {
+                    vec![2, 4, 1]
+                },
+            );
+        }
+        assert!(
+            !out.keys()
+                .any(|key| key.contains(".experts.gate_up_proj")
+                    || key.contains(".experts.down_proj")),
+            "all pre-stacked source companions must be consumed"
+        );
     }
 
     #[test]

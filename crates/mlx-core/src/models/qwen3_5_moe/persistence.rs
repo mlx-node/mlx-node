@@ -16,8 +16,8 @@ use crate::engine::persistence::{
 };
 use crate::models::mtp_drafter::{DrafterBodyVariant, MTP_MOE_LAYER_LINEAR_SUFFIXES};
 use crate::models::quant_dispatch::{
-    default_per_layer_quant, effective_plq_for, ensure_affine_biases_present,
-    ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
+    PlainFp8Residency, default_per_layer_quant, defer_plain_fp8_materialization, effective_plq_for,
+    ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
     ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
     has_kquant_mode, has_sym8_mode, mode_to_str, normalize_per_layer_key, parse_quant_settings,
     resolve_default_mode, select_quantization_block,
@@ -485,6 +485,7 @@ fn compute_moe_defaults(
 ///
 /// Accesses inner fields directly (no `Arc<RwLock<>>`). Used by
 /// `load_with_thread`.
+#[cfg(test)]
 fn apply_weights_moe_inner(
     inner: &mut Qwen35MoeInner,
     params: &HashMap<String, MxArray>,
@@ -493,8 +494,31 @@ fn apply_weights_moe_inner(
     quant_group_size: i32,
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
-    has_vision: bool,
+    _has_vision: bool,
 ) -> Result<()> {
+    apply_weights_moe_inner_with_residency(
+        inner,
+        params,
+        config,
+        quant_bits,
+        quant_group_size,
+        top_level_mode,
+        per_layer_quant,
+        _has_vision,
+    )
+    .map(drop)
+}
+
+fn apply_weights_moe_inner_with_residency(
+    inner: &mut Qwen35MoeInner,
+    params: &HashMap<String, MxArray>,
+    config: &Qwen3_5MoeConfig,
+    quant_bits: i32,
+    quant_group_size: i32,
+    top_level_mode: Option<PerLayerMode>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    _has_vision: bool,
+) -> Result<PlainFp8Residency> {
     // sym8 dispatch covers the NON-EXPERT sublayers (attention q/k/v/o, GDN
     // in_proj_qkvz/in_proj_ba/out_proj, shared-expert MLP body) through the
     // same shared `QuantizedLinear` machinery as the dense qwen3_5 loader.
@@ -508,6 +532,7 @@ fn apply_weights_moe_inner(
     let is_quantized = is_quantized_checkpoint(params);
     let (default_plq, default_gate_plq) =
         compute_moe_defaults(params, top_level_mode, quant_bits, quant_group_size);
+    let plain_fp8_residency = std::cell::RefCell::new(PlainFp8Residency::default());
 
     // Helper: dispatch by per-layer mode (mxfp4 / mxfp8 / nvfp4 / affine /
     // sym8).
@@ -572,7 +597,13 @@ fn apply_weights_moe_inner(
         // it — else it would fake-quant a non-site's activations, violating
         // "activation FP8 only on attn/GDN sites".
         let input_amax = if is_site { plq.input_amax } else { None };
-        Ok(built.map(move |ql| ql.with_input_amax(input_amax).with_amax_key(amax_key)))
+        let built = built.map(move |ql| ql.with_input_amax(input_amax).with_amax_key(amax_key));
+        if let Some(linear) = built.as_ref() {
+            plain_fp8_residency
+                .borrow_mut()
+                .track(linear.reconstructed_fp8_weight());
+        }
+        Ok(built)
     };
 
     let try_build_qsl = |params: &HashMap<String, MxArray>,
@@ -583,7 +614,7 @@ fn apply_weights_moe_inner(
         ensure_plain_fp8_storage_resolves_fp8_e4m3(params, prefix, plq.mode, "qwen3_5_moe")?;
         ensure_kquant_storage_resolves_kquant(params, prefix, plq.mode, "qwen3_5_moe")?;
         ensure_affine_biases_present(params, prefix, plq.mode, "qwen3_5_moe")?;
-        Ok(match plq.mode {
+        let built = match plq.mode {
             PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
             PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, prefix),
@@ -624,7 +655,13 @@ fn apply_weights_moe_inner(
                      per-layer override — re-convert the checkpoint"
                 )));
             }
-        })
+        };
+        if let Some(linear) = built.as_ref() {
+            plain_fp8_residency
+                .borrow_mut()
+                .track(linear.reconstructed_fp8_weight());
+        }
+        Ok(built)
     };
 
     // Embedding — supports both dense and quantized weights
@@ -643,24 +680,13 @@ fn apply_weights_moe_inner(
         // affine). Mirrors the linear/switch builders' guard.
         ensure_kquant_storage_resolves_kquant(params, "embedding", plq.mode, "qwen3_5_moe")?;
         ensure_affine_biases_present(params, "embedding", plq.mode, "qwen3_5_moe")?;
-        // Gate the packed-resident load exactly like the dense loader
-        // (`qwen3_5/persistence.rs`): packed is a WIN only on the paged,
-        // non-MTP, non-VLM turn path, where the tied lm_head routes through
-        // `Embedding::as_linear` (packed `quantized_matmul`) in
-        // `paged_forward.rs`. The flat/eager path, MTP draft, and VLM image
-        // turns still eval a per-turn `get_weight()` — they keep the legacy
-        // full-pre-dequant load (unchanged behavior); extending the win to
-        // them is a follow-up.
-        //
-        // `use_block_paged_cache == Some(true)` is config INTENT; the paged
-        // adapter is only created when `compiled_forward_backend_available()`
-        // is ALSO true (`Qwen35MoeInner::new`), so a non-Metal/CUDA build with
-        // a paged config still runs flat — the added predicate keeps those on
-        // the legacy load (no per-turn dequant regression).
-        let prefer_packed = config.use_block_paged_cache == Some(true)
-            && crate::engine::persistence::compiled_forward_backend_available()
-            && config.n_mtp_layers == 0
-            && !has_vision;
+        // Dense/MoE flat, paged, MTP, and VLM consumers now carry `Embedding`
+        // itself and dispatch lookup/projection through its packed-aware APIs.
+        // Keep measured sub-byte affine embeddings packed independent of the
+        // configured backend, declared MTP depth, or vision presence. Runtime
+        // MTP selection uses `has_mtp_weights()` (the loaded complete set).
+        let prefer_packed =
+            crate::models::qwen3_5::persistence::packed_qwen_embedding_enabled(plq.mode, plq.bits);
         // Resolve the packing mode from the checkpoint rather than assuming
         // affine: a GGUF `token_embd` repacked to q6k/q4k/q5k must decode as
         // K-quant, and mxfp embeddings as mxfp. The `ensure_kquant_*` guard
@@ -1325,7 +1351,7 @@ fn apply_weights_moe_inner(
         "Applied weights to inner from checkpoint: {} total in checkpoint",
         total_weights
     );
-    Ok(())
+    Ok(plain_fp8_residency.into_inner())
 }
 
 /// Load the vision encoder onto `inner` when the checkpoint ships one —
@@ -1666,7 +1692,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     ));
 
                     // Apply weights directly to inner (no locks)
-                    apply_weights_moe_inner(
+                    let plain_fp8_residency = apply_weights_moe_inner_with_residency(
                         &mut inner,
                         &params,
                         &config,
@@ -1679,7 +1705,10 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
 
                     // Materialize mmap-backed weights
                     let weights_resident = {
-                        let arrays: Vec<&MxArray> = params.values().collect();
+                        let mut arrays: Vec<&MxArray> = params.values().collect();
+                        if !defer_plain_fp8_materialization() {
+                            arrays.extend(plain_fp8_residency.arrays());
+                        }
                         crate::array::memory::materialize_weights(&arrays)?
                     };
 
@@ -1767,6 +1796,10 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                             .map(|a| a.nbytes() as u64)
                             .fold(weight_bytes, |acc, v| acc.saturating_add(v));
                     }
+                    // The serialized Uint8 expert/dense weights and their
+                    // scales are already covered by `params`; only the
+                    // retained BF16 correctness reconstructions are extra.
+                    weight_bytes = weight_bytes.saturating_add(plain_fp8_residency.nbytes());
 
                     Ok((inner, weight_bytes))
                 })();
@@ -2104,16 +2137,19 @@ mod tests {
     }
 
     /// MoE mirror of the dense `tied_quantized_embedding_loads_via_packed_path`:
-    /// a quantized `embedding.*` sidecar on a paged, non-MTP, non-VLM
+    /// a quantized `embedding.*` sidecar on a flat, declared-MTP, VLM
     /// `Qwen3_5MoeConfig` must load via `Embedding::load_quantized_packed`
     /// (packed-resident, so the tied lm_head runs `quantized_matmul` via
     /// `as_linear` on the paged path) — NOT the legacy full-table pre-dequant
-    /// `Embedding::load_quantized`. Guards `apply_weights_moe_inner`'s gated
-    /// load branch directly.
+    /// `Embedding::load_quantized`. Guards `apply_weights_moe_inner` directly
+    /// and covers all three former packed-load exclusions in one fixture.
     #[test]
     fn tied_quantized_embedding_loads_via_packed_path_moe() {
         let label = "tied_quantized_embedding_loads_via_packed_path_moe";
-        let cfg = moe_paged_tiny_cfg();
+        let mut cfg = moe_paged_tiny_cfg();
+        cfg.use_block_paged_cache = Some(false);
+        cfg.paged_cache_memory_mb = None;
+        cfg.n_mtp_layers = 1;
 
         let mut inner = match Qwen35MoeInner::new(cfg.clone()) {
             Ok(inner) => inner,
@@ -2198,7 +2234,7 @@ mod tests {
             DEFAULT_QUANT_GROUP_SIZE,
             None,
             &per_layer_quant,
-            /* has_vision */ false,
+            /* has_vision */ true,
         ) {
             Ok(()) => {}
             Err(err) => {
@@ -2212,7 +2248,11 @@ mod tests {
 
         assert!(
             inner.embedding.is_packed_quantized(),
-            "tied+quantized MoE embedding.* on the paged path must load via load_quantized_packed, not the legacy dense load_quantized"
+            "tied+quantized MoE embedding.* must stay packed across flat, declared-MTP, and VLM configs"
+        );
+        assert!(
+            !inner.has_mtp_weights(),
+            "declaring MoE MTP in config without loading its weights must not enable runtime MTP"
         );
     }
 

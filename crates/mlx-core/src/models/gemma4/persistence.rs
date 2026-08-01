@@ -14,10 +14,10 @@ use crate::engine::persistence::{
     prewarm_checkpoint_pages,
 };
 use crate::models::quant_dispatch::{
-    default_per_layer_quant, ensure_affine_biases_present, ensure_dense_weight_floating,
-    ensure_int8_storage_resolves_sym8, ensure_kquant_storage_resolves_kquant,
-    ensure_plain_fp8_storage_resolves_fp8_e4m3, kquant_mode_params, load_quant_settings_from_disk,
-    merge_per_layer, resolve_default_mode,
+    PlainFp8Residency, default_per_layer_quant, defer_plain_fp8_materialization,
+    ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
+    ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
+    kquant_mode_params, load_quant_settings_from_disk, merge_per_layer, resolve_default_mode,
 };
 use crate::tokenizer::Qwen3Tokenizer;
 
@@ -1421,7 +1421,7 @@ fn apply_weights(
     quant_group_size: i32,
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
-) -> Result<u64> {
+) -> Result<PlainFp8Residency> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
     let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
@@ -1455,16 +1455,14 @@ fn apply_weights(
     // validation-scope choice on its own path (sym8 there is validated on
     // the flat path only; paged is simply unvalidated) — a rationale that
     // does not transfer here.
-    let reconstructed_fp8_weight_bytes = std::cell::Cell::new(0u64);
+    let plain_fp8_residency = std::cell::RefCell::new(PlainFp8Residency::default());
     let try_build_ql = |prefix: &str| -> Result<Option<super::quantized_linear::QuantizedLinear>> {
         let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
         let quantized = build_gemma_ql(params, prefix, plq)?;
         if let Some(linear) = quantized.as_ref() {
-            reconstructed_fp8_weight_bytes.set(
-                reconstructed_fp8_weight_bytes
-                    .get()
-                    .saturating_add(linear.reconstructed_fp8_weight_bytes()),
-            );
+            plain_fp8_residency
+                .borrow_mut()
+                .track(linear.reconstructed_fp8_weight());
         }
         Ok(quantized)
     };
@@ -1934,7 +1932,7 @@ fn apply_weights(
     }
 
     info!("All weights applied successfully");
-    Ok(reconstructed_fp8_weight_bytes.get())
+    Ok(plain_fp8_residency.into_inner())
 }
 
 /// Apply vision weights to the inner model's vision tower and multimodal embedder.
@@ -2613,7 +2611,7 @@ impl Gemma4Inner {
         maybe_shard_ple_embedding(&mut inner, &mut params, path)?;
 
         // Apply weights
-        let reconstructed_fp8_weight_bytes = apply_weights(
+        let plain_fp8_residency = apply_weights(
             &mut inner,
             &params,
             &config,
@@ -2654,6 +2652,9 @@ impl Gemma4Inner {
             // chunked eval allocates fine.
             if let Some(ple) = inner.ple.as_ref() {
                 weight_refs.extend(ple.embed_tokens_per_layer.shard_arrays());
+            }
+            if !defer_plain_fp8_materialization() {
+                weight_refs.extend(plain_fp8_residency.arrays());
             }
             crate::array::memory::materialize_weights(&weight_refs)?
         };
@@ -2786,7 +2787,7 @@ impl Gemma4Inner {
         // (already counted through `params`) and also own a reconstructed BF16
         // weight for the A16 matmul fallback. Count that additional resident
         // array exactly once for every successfully installed linear.
-        weight_bytes = weight_bytes.saturating_add(reconstructed_fp8_weight_bytes);
+        weight_bytes = weight_bytes.saturating_add(plain_fp8_residency.nbytes());
         // The PLE shards were removed from `params` (their oversized source key
         // is gone) but are still model-owned resident weights. Count them too,
         // mirroring the materialize pass above; omitting their ~4GB would
@@ -4745,7 +4746,8 @@ mod tests {
         let reported = apply_weights(&mut inner, &params, &config, 4, 64, None, &per_layer_quant)
             .expect("plain FP8 attention must load");
         assert_eq!(
-            reported, expected_reconstruction_bytes,
+            reported.nbytes(),
+            expected_reconstruction_bytes,
             "apply_weights must report the model-owned BF16 reconstruction"
         );
 
@@ -4762,7 +4764,8 @@ mod tests {
                 None,
                 &HashMap::new(),
             )
-            .expect("dense attention must load"),
+            .expect("dense attention must load")
+            .nbytes(),
             0,
             "checkpoint-backed dense weights must not be counted as extra allocations"
         );

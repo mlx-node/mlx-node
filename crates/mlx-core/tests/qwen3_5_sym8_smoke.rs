@@ -15,7 +15,8 @@
 //! ```
 //!
 //! Optional: `MLX_SYM8_DEBUG=1` prints per-forward kernel dispatch lines
-//! (`[sym8] qmv M=1 ...` during decode, `[sym8] gemm M=<prefill> ...`).
+//! (`[sym8] qmv layout=nk M=1 ...` during decode,
+//! `[sym8] gemm layout=nk M=<prefill> ...`).
 
 use std::path::Path;
 

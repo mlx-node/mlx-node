@@ -1,6 +1,11 @@
 use crate::array::MxArray;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
+#[cfg(test)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 // ============================================
 // Embedding Layer (supports quantized weights)
@@ -52,23 +57,27 @@ pub struct Embedding {
     /// kept ONLY as a small placeholder (the real table lives packed in
     /// `quantized_packed`); it is never read on the forward/logits paths.
     ///
-    /// NOTE: the legacy `load_quantized()` path (used by qwen3_5/qwen3_5_moe/
-    /// gemma4 tied heads) still PRE-dequantizes the full table into this field
-    /// — that behavior is unchanged.
+    /// NOTE: the legacy `load_quantized()` compatibility path still
+    /// PRE-dequantizes the full table into this field.
     weight: MxArray,
     num_embeddings: u32,
     embedding_dim: u32,
     /// True when weights were loaded via `load_quantized()` (legacy
     /// pre-dequantized path) OR `load_quantized_packed()` (packed path).
     is_quantized_flag: bool,
-    /// Packed-quantized backend (set only via `load_quantized_packed()`, the
-    /// lfm2 opt-in path). When present, `forward`/`as_linear` use the packed
-    /// tensors instead of the dense `weight`.
+    /// Packed-quantized backend (set via `load_quantized_packed()`). When
+    /// present, `forward`/`as_linear` use the packed tensors instead of the
+    /// dense `weight`.
     quantized_packed: Option<QuantizedEmbeddingBackend>,
     /// Row-sharded backend (set only via `set_sharded()`). When present,
     /// `forward` gathers across the sub-cap shards instead of reading the dense
     /// `weight`; used for tables too large to materialize as one Metal buffer.
     sharded: Option<ShardedEmbedding>,
+    /// Test-only tripwire shared by clones. Production inference must never
+    /// call `get_weight()` on a packed embedding because that constructs a
+    /// full `[vocab, hidden]` dequantization graph.
+    #[cfg(test)]
+    packed_full_dequant_calls: Arc<AtomicUsize>,
 }
 
 impl Embedding {
@@ -85,6 +94,8 @@ impl Embedding {
             is_quantized_flag: false,
             quantized_packed: None,
             sharded: None,
+            #[cfg(test)]
+            packed_full_dequant_calls: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -176,6 +187,8 @@ impl Embedding {
         self.is_quantized_flag = false;
         self.quantized_packed = None;
         self.sharded = None;
+        #[cfg(test)]
+        self.packed_full_dequant_calls.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -241,6 +254,8 @@ impl Embedding {
         });
         self.is_quantized_flag = false;
         self.quantized_packed = None;
+        #[cfg(test)]
+        self.packed_full_dequant_calls.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -257,8 +272,8 @@ impl Embedding {
     /// Load quantized embedding weights (LEGACY pre-dequantized path).
     ///
     /// Pre-dequantizes the full table into `self.weight` — the packed
-    /// weight/scales/biases are NOT retained. Used by qwen3_5/qwen3_5_moe tied
-    /// heads which read `get_weight()`. `mode` is the quantization mode string
+    /// weight/scales/biases are NOT retained. Kept as an exact compatibility
+    /// fallback for callers that still require a dense table. `mode` is the quantization mode string
     /// ("affine" / "mxfp4" / "mxfp8" / "nvfp4" / "q6k" / "q4k" / "q5k") the
     /// dequant is decoded with — the caller passes the mode resolved from the
     /// checkpoint, so a K-quant table decodes as K-quant instead of being
@@ -288,10 +303,12 @@ impl Embedding {
         self.weight = dequantized;
         self.is_quantized_flag = true;
         self.quantized_packed = None;
+        #[cfg(test)]
+        self.packed_full_dequant_calls.store(0, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Load PACKED-quantized embedding weights (the lfm2 opt-in path).
+    /// Load PACKED-quantized embedding weights.
     ///
     /// Retains the packed `weight`/`scales`/(`biases`) AS-IS — does NOT
     /// dequantize the table. `forward` gather-then-dequantizes only the looked-
@@ -335,6 +352,8 @@ impl Embedding {
         // dequantizes on demand from the packed backend, so it never reads this
         // placeholder for packed embeddings.
         self.weight = MxArray::zeros(&[1, 1], Some(crate::array::DType::BFloat16))?;
+        #[cfg(test)]
+        self.packed_full_dequant_calls.store(0, Ordering::Relaxed);
         Ok(())
     }
 
@@ -348,9 +367,12 @@ impl Embedding {
     ///   never returns the placeholder. The dense table is materialized only if a
     ///   caller actually evals the result; the production lfm2 logits path uses
     ///   `as_linear` (a `mlx_quantized_matmul` on the packed tensors) and never
-    ///   hits this, so no full dense table is resident under normal operation.
+    ///   hits this, so no full dense table is resident under normal inference.
     pub fn get_weight(&self) -> MxArray {
         if let Some(ref q) = self.quantized_packed {
+            #[cfg(test)]
+            self.packed_full_dequant_calls
+                .fetch_add(1, Ordering::Relaxed);
             // Dequantize the full packed table on demand. `unwrap_or_else` keeps
             // this getter infallible: on the (effectively impossible) dequant
             // error for already-validated packed data, fall back to the
@@ -384,6 +406,11 @@ impl Embedding {
         self.embedding_dim
     }
 
+    /// Get the vocabulary size without materializing the embedding table.
+    pub fn num_embeddings(&self) -> u32 {
+        self.num_embeddings
+    }
+
     /// Whether this embedding uses quantized weights (either path)
     pub fn is_quantized(&self) -> bool {
         self.is_quantized_flag
@@ -394,6 +421,14 @@ impl Embedding {
     /// `as_linear` (the dense `get_weight()` is only a placeholder).
     pub fn is_packed_quantized(&self) -> bool {
         self.quantized_packed.is_some()
+    }
+
+    /// Number of packed full-table dequantization graphs requested through
+    /// `get_weight()`. Shared across clones so focused inference tests can
+    /// prove that every path stayed on `forward()` / `as_linear()`.
+    #[cfg(test)]
+    pub(crate) fn packed_full_dequant_calls(&self) -> usize {
+        self.packed_full_dequant_calls.load(Ordering::Relaxed)
     }
 }
 
@@ -416,6 +451,8 @@ impl Clone for Embedding {
                     mode: q.mode.clone(),
                 }),
             sharded: self.sharded.clone(),
+            #[cfg(test)]
+            packed_full_dequant_calls: Arc::clone(&self.packed_full_dequant_calls),
         }
     }
 }
@@ -441,6 +478,8 @@ impl Embedding {
             is_quantized_flag: false,
             quantized_packed: None,
             sharded: None,
+            #[cfg(test)]
+            packed_full_dequant_calls: Arc::new(AtomicUsize::new(0)),
         })
     }
 }
@@ -628,6 +667,11 @@ mod tests {
 
         // gather-then-dequant (our forward)
         let got = emb.forward(&idx).expect("forward");
+        assert_eq!(
+            emb.packed_full_dequant_calls(),
+            0,
+            "packed forward must not request a full-table dequantization"
+        );
         // dequant-full-table-then-gather (reference)
         let full = dequantize(&qw, &qs, Some(&qb), 64, 4, "affine").expect("dequant full");
         let ref_rows = full.take(&idx, 0).expect("gather ref");
@@ -721,6 +765,11 @@ mod tests {
         // get_weight() must return the CORRECT full table (shape + values), via
         // on-demand dequant — NOT the [1,1] placeholder, NOT stale random init.
         let got = emb.get_weight();
+        assert_eq!(
+            emb.packed_full_dequant_calls(),
+            1,
+            "the tripwire must observe an explicit packed get_weight() call"
+        );
         assert_eq!(
             got.shape().expect("get_weight shape").as_ref(),
             &[vocab, hidden],
@@ -934,6 +983,11 @@ mod tests {
             .expect("x bf16");
 
         let got = emb.as_linear(&x).expect("as_linear"); // [2, vocab]
+        assert_eq!(
+            emb.packed_full_dequant_calls(),
+            0,
+            "packed tied-head projection must not request a full-table dequantization"
+        );
         // Reference: x @ dequant(table)^T
         let full = dequantize(&qw, &qs, Some(&qb), 64, 4, "affine").expect("dequant full");
         let full_t = full.transpose(Some(&[1, 0])).expect("transpose");

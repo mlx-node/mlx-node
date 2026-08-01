@@ -107,6 +107,39 @@ const char* kNaInt8GemmBodyMul = R"(
   op.run(mA, mB, mC);
 )";
 
+// Single-residency sym8 prefill. Computes the same int8 GEMM as
+// kNaInt8GemmBodyMul, but consumes the checkpoint-native [N,K]
+// row-major buffer directly. MPP's NT descriptor interprets the right tensor
+// as [N,K] and applies the transpose logically, avoiding the load-time [K,N]
+// materialization. The output-N tile therefore slices the right tensor's
+// second coordinate (physical rows), rather than the first coordinate used by
+// the current NN/[K,N] kernel.
+const char* kNaInt8GemmBodyMulNk = R"(
+  constexpr int TM2 = 128;
+  constexpr int TN2 = 64;
+  constexpr int SG2 = 8;
+  constexpr auto desc = matmul2d_descriptor(
+      TM2, TN2, static_cast<int>(dynamic_extent),
+      false, true, false,
+      matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<SG2>> op;
+  const int Mi = M;
+  const int Ni = N;
+  const int Ki = K;
+  tensor<device int8_t, dextents<int32_t, 2>, tensor_inline> tA(
+      const_cast<device int8_t*>(A), dextents<int32_t, 2>(Ki, Mi));
+  tensor<device int8_t, dextents<int32_t, 2>, tensor_inline> tB(
+      const_cast<device int8_t*>(B), dextents<int32_t, 2>(Ki, Ni));
+  tensor<device int32_t, dextents<int32_t, 2>, tensor_inline> tC(
+      C, dextents<int32_t, 2>(Ni, Mi));
+  const uint m0 = threadgroup_position_in_grid.y * TM2;
+  const uint n0 = threadgroup_position_in_grid.x * TN2;
+  auto mA = tA.slice(0, m0);
+  auto mB = tB.slice(0, n0);
+  auto mC = tC.slice(n0, m0);
+  op.run(mA, mB, mC);
+)";
+
 // Architecture gate. M5 = gen 17 is the first arch with the Neural Accelerator
 // matmul2d path; below that the JIT compile fails outright. Cached once.
 int na_int8_gpu_gen() {
@@ -166,6 +199,24 @@ mlx::core::fast::CustomKernelFunction& get_int8_gemm_kernel_mul() {
         {"A", "B", "M", "N", "K"},
         {"C"},
         kNaInt8GemmBodyMul,
+        kNaInt8GemmHeader,
+        /* ensure_row_contiguous */ true,
+        /* atomic_outputs        */ false);
+  }
+  return kernel.value();
+}
+
+// Cached JIT kernel for the NT/native-[N,K] variant.
+mlx::core::fast::CustomKernelFunction& get_int8_gemm_kernel_mul_nk() {
+  static std::mutex mtx;
+  static std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+  std::lock_guard<std::mutex> lock(mtx);
+  if (!kernel.has_value()) {
+    kernel = mlx::core::fast::metal_kernel(
+        "na_int8_gemm_mul_nk",
+        {"A", "B", "M", "N", "K"},
+        {"C"},
+        kNaInt8GemmBodyMulNk,
         kNaInt8GemmHeader,
         /* ensure_row_contiguous */ true,
         /* atomic_outputs        */ false);
@@ -709,6 +760,35 @@ mlx::core::array int8_gemm_core_nofill(const mlx::core::array& x_i8,
   return results[0];
 }
 
+// Native sym8 checkpoint-layout version of int8_gemm_core_nofill: x_i8 [M,K]
+// times b_nk^T, where b_nk is contiguous
+// int8 [N,K]. The MPP kernel uses an NT descriptor, so no [K,N] copy exists.
+mlx::core::array int8_gemm_core_nofill_nk(const mlx::core::array& x_i8,
+                                          const mlx::core::array& b_nk) {
+  using namespace mlx::core;
+  const int M = x_i8.shape(0);
+  const int K = x_i8.shape(1);
+  const int N = b_nk.shape(0);
+  array M_arr(M, int32);
+  array N_arr(N, int32);
+  array K_arr(K, int32);
+  const int tgN = (N + 64 - 1) / 64;
+  const int tgM = (M + 128 - 1) / 128;
+  std::tuple<int, int, int> grid{256 * tgN, tgM, 1};
+  std::tuple<int, int, int> threadgroup{256, 1, 1};
+  auto results = get_int8_gemm_kernel_mul_nk()(
+      {x_i8, b_nk, M_arr, N_arr, K_arr},
+      {Shape{M, N}},
+      {int32},
+      grid,
+      threadgroup,
+      /* template_args */ {},
+      /* init_value */ std::nullopt,
+      /* verbose */ false,
+      default_stream(Device::gpu));
+  return results[0];
+}
+
 // Core int8 GEMM. `x_i8` is [M,K] int8 (row-major); `b_kn` is the PRE-TRANSPOSED
 // weight: a contiguous [K,N] int8 buffer with b_kn[k,n] = w[n,k] (output channels
 // = columns). Returns int32 [M,N] = x @ w^T.
@@ -1023,8 +1103,8 @@ bool mlx_quantize_weight_int8(mlx_array* w_handle, mlx_array** out_w_i8,
 // Identical math to mlx_quantize_weight_int8 above but WITHOUT the [K,N]
 // transpose: that function emits the runtime KERNEL operand; this one emits the
 // on-disk CHECKPOINT tensors ({prefix}.weight int8 [N,K] + {prefix}.scales f32
-// [N], no .biases). The loader re-derives the [K,N] kernel operand at load
-// time. Dequant contract: w[n,k] ≈ scales[n] * q[n,k].
+// [N], no .biases). The loader consumes [N,K] directly.
+// Dequant contract: w[n,k] ≈ scales[n] * q[n,k].
 bool mlx_sym8_quantize_store(mlx_array* w_handle, mlx_array** out_q,
                              mlx_array** out_scales) {
   using namespace mlx::core;
@@ -1217,7 +1297,85 @@ bool mlx_int8_qmv_w8a16(mlx_array* x_handle, mlx_array* w_kn_handle,
   }
 }
 
+// Single-layout sym8 prefill. Same full W8A8 graph as
+// mlx_w8a8_linear, but the int8 GEMM consumes the checkpoint's native [N,K]
+// tensor via MPP NT instead of the duplicated [K,N] operand via NN.
+bool mlx_w8a8_linear_nk(mlx_array* x_handle, mlx_array* w_nk_handle,
+                        mlx_array* s_w_handle, mlx_array** out_bf16) {
+  using namespace mlx::core;
+  if (out_bf16) *out_bf16 = nullptr;
+  try {
+    auto& x = *reinterpret_cast<array*>(x_handle);
+    auto& w_nk = *reinterpret_cast<array*>(w_nk_handle);
+    auto& s_w = *reinterpret_cast<array*>(s_w_handle);
+    if (x.ndim() != 2 || w_nk.ndim() != 2) {
+      std::cerr << "[mlx_w8a8_linear_nk] expected 2D x,w_nk\n";
+      return false;
+    }
+    const int K = x.shape(1);
+    const int N = w_nk.shape(0);
+    if (w_nk.shape(1) != K || s_w.ndim() != 1 || s_w.shape(0) != N) {
+      std::cerr << "[mlx_w8a8_linear_nk] shape mismatch\n";
+      return false;
+    }
+    if (w_nk.dtype() != int8 || !na_int8_supported(K)) {
+      std::cerr << "[mlx_w8a8_linear_nk] unsupported dtype/gen/K\n";
+      return false;
+    }
+    array x_bf16 = (x.dtype() == bfloat16) ? x : astype(x, bfloat16);
+    auto [x_i8, s_x] = int8_act_quant(x_bf16);
+    array acc = int8_gemm_core_nofill_nk(x_i8, w_nk);
+    array y_bf16 = int8_rescale(acc, s_x, s_w);
+    *out_bf16 = reinterpret_cast<mlx_array*>(new array(std::move(y_bf16)));
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[mlx_w8a8_linear_nk] EXCEPTION: " << e.what()
+              << std::endl;
+    if (out_bf16) *out_bf16 = nullptr;
+    return false;
+  }
+}
+
+// Single-layout W8A16 decode. This is the production sym8 path and accepts the
+// checkpoint-native [N,K] operand. The old W8A8 and 2D-block diagnostic
+// branches use the separate mlx_int8_qmv_w8a16 entry point.
+bool mlx_int8_qmv_w8a16_nk(mlx_array* x_handle, mlx_array* w_nk_handle,
+                           mlx_array* s_w_handle, mlx_array** out_bf16) {
+  using namespace mlx::core;
+  if (out_bf16) *out_bf16 = nullptr;
+  try {
+    auto& x = *reinterpret_cast<array*>(x_handle);
+    auto& w_nk = *reinterpret_cast<array*>(w_nk_handle);
+    auto& s_w = *reinterpret_cast<array*>(s_w_handle);
+    if (x.ndim() != 2 || w_nk.ndim() != 2) {
+      std::cerr << "[mlx_int8_qmv_w8a16_nk] expected 2D x,w_nk\n";
+      return false;
+    }
+    const int K = x.shape(1);
+    const int N = w_nk.shape(0);
+    if (w_nk.shape(1) != K || s_w.ndim() != 1 || s_w.shape(0) != N) {
+      std::cerr << "[mlx_int8_qmv_w8a16_nk] shape mismatch\n";
+      return false;
+    }
+    if (w_nk.dtype() != int8 || !na_int8_supported(K)) {
+      std::cerr << "[mlx_int8_qmv_w8a16_nk] unsupported dtype/gen/K\n";
+      return false;
+    }
+    array x_bf16 = (x.dtype() == bfloat16) ? x : astype(x, bfloat16);
+    array sw_f32 = (s_w.dtype() == float32) ? s_w : astype(s_w, float32);
+    array y_bf16 = int8_qmv_w8a16_sg_core(x_bf16, w_nk, sw_f32);
+    *out_bf16 = reinterpret_cast<mlx_array*>(new array(std::move(y_bf16)));
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[mlx_int8_qmv_w8a16_nk] EXCEPTION: " << e.what()
+              << std::endl;
+    if (out_bf16) *out_bf16 = nullptr;
+    return false;
+  }
+}
+
 // ============================ MEASUREMENT ONLY ============================
+
 // DIAGNOSTIC op (profiler/test scope only — NOT a production path). Pure int8
 // GEMM with a PRE-TRANSPOSED [K,N] weight, isolating the kernel from the
 // per-call `int8_weight_to_kn` transpose that `mlx_matmul_int8` pays every

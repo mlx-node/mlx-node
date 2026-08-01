@@ -60,9 +60,9 @@ pub struct Qwen3_5Attention {
     /// fails MLX's `prepare_reshape` free-view check and dispatches a real
     /// strided `copy_gpu_inplace` (`CopyType::General`) Metal kernel on
     /// every call — this cache makes that copy a one-time load-time cost
-    /// instead of a per-forward one. `None` (falls back to the unfused
-    /// per-head path) when `q_proj` is quantized, mirroring
-    /// `GatedDeltaNet::finalize_in_proj`.
+    /// instead of a per-forward one. Affine quantized q_proj stores the same
+    /// block order directly in its packed operands instead of using this
+    /// duplicate dense cache; other quantization modes retain the fallback.
     q_gate_block_t: Option<MxArray>,
     /// Reordered `[2*num_heads*head_dim]` q_proj bias matching
     /// `q_gate_block_t`'s column order. `None` when q_proj has no bias.
@@ -527,14 +527,13 @@ impl Qwen3_5Attention {
     /// Project queries + gate, returning `(queries [B,T,H,D], gate
     /// [B,T,H*D])`.
     ///
-    /// Fast path (`q_gate_block_t` present, i.e. `q_proj` is non-quantized
-    /// and `finalize_q_gate_block()` has run): one matmul against the
-    /// block-ordered weight, then two flat `slice_axis` calls — both
-    /// already row-contiguous, so `queries`'s subsequent `[B,T,H,D]`
-    /// reshape is a free view and `gate` needs no reshape at all.
-    /// `MLX_DISABLE_QGATE_BLOCK_SPLIT=1` forces the fallback below (for
-    /// same-binary A/B benchmarking), mirroring
-    /// `MLX_DISABLE_E51_STACKED_GDN_IN_PROJ`.
+    /// Fast path (`finalize_q_gate_block()` installed either the dense cache or
+    /// an affine quantized block layout): one projection followed by two flat
+    /// `slice_axis` calls. Both halves are already row-contiguous, so queries'
+    /// `[B,T,H,D]` reshape is a free view and gate needs no reshape at all.
+    /// `MLX_DISABLE_QGATE_BLOCK_SPLIT=1` is sampled by the finalizer at load
+    /// time, letting a second process load native order for same-binary A/B
+    /// without retaining both quantized layouts.
     ///
     /// Fallback path (quantized `q_proj`, or the env override above):
     /// the original per-head reshape+slice, unchanged from before this
@@ -542,12 +541,11 @@ impl Qwen3_5Attention {
     /// `copy_gpu_inplace` every call — see `q_gate_block_t`'s doc comment.
     fn project_q_gate(&self, x: &MxArray, batch: i64, seq_len: i64) -> Result<(MxArray, MxArray)> {
         let hd = (self.num_heads * self.head_dim) as i64;
-        if let Some(w_block_t) = &self.q_gate_block_t
-            && std::env::var("MLX_DISABLE_QGATE_BLOCK_SPLIT").is_err()
-        {
-            let flat = match &self.q_gate_block_bias {
-                Some(bias) => x.addmm(bias, w_block_t, None, None)?,
-                None => x.matmul(w_block_t)?,
+        if self.q_gate_block_t.is_some() || self.q_proj.has_q_gate_block_layout() {
+            let flat = match (&self.q_gate_block_t, &self.q_gate_block_bias) {
+                (Some(w_block_t), Some(bias)) => x.addmm(bias, w_block_t, None, None)?,
+                (Some(w_block_t), None) => x.matmul(w_block_t)?,
+                (None, _) => self.q_proj.forward(x)?,
             };
             let queries_flat = flat.slice_axis(2, 0, hd)?;
             let gate = flat.slice_axis(2, hd, 2 * hd)?;
@@ -1529,15 +1527,28 @@ impl Qwen3_5Attention {
     /// comment for why the checkpoint's native per-head-interleaved column
     /// order forces a strided copy on every call.
     ///
-    /// Safe to call repeatedly (idempotent). No-op when `q_proj` is
-    /// quantized — mirrors `GatedDeltaNet::finalize_in_proj` (quantized
-    /// checkpoints stay on the unfused path).
+    /// Safe to call repeatedly (idempotent). Affine quantized q_proj consumes
+    /// its native-order packed operands and replaces them with materialized
+    /// block-order arrays. Other quantization modes remain on the fallback.
     pub fn finalize_q_gate_block(&mut self) -> Result<()> {
-        let LinearProj::Standard(q_lin) = &self.q_proj else {
+        self.finalize_q_gate_block_enabled(std::env::var("MLX_DISABLE_QGATE_BLOCK_SPLIT").is_err())
+    }
+
+    fn finalize_q_gate_block_enabled(&mut self, enabled: bool) -> Result<()> {
+        if !enabled {
             return Ok(());
-        };
+        }
         let h = self.num_heads as i64;
         let d = self.head_dim as i64;
+
+        if let LinearProj::Quantized(q_lin) = &mut self.q_proj {
+            q_lin.finalize_affine_q_gate_block(self.num_heads, self.head_dim)?;
+            return Ok(());
+        }
+
+        let LinearProj::Standard(q_lin) = &self.q_proj else {
+            unreachable!("q_proj variant checked above")
+        };
 
         let weight = q_lin.get_weight(); // [2*H*D, hidden], per-head-interleaved
         let hidden = weight.shape_at(1)?;
@@ -2320,6 +2331,110 @@ mod tests {
                 "mismatch at element {i}: fast={g} slow={w}"
             );
         }
+        Ok(())
+    }
+
+    fn quantize_affine(weight: &MxArray) -> Result<(MxArray, MxArray, MxArray)> {
+        let mut out_q: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_s: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_b: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            mlx_sys::mlx_quantize(
+                weight.as_raw_ptr(),
+                32,
+                4,
+                c"affine".as_ptr(),
+                &mut out_q,
+                &mut out_s,
+                &mut out_b,
+            )
+        };
+        if !ok {
+            return Err(Error::from_reason("mlx_quantize affine failed"));
+        }
+        Ok((
+            MxArray::from_handle(out_q, "q_gate_test_weight")?,
+            MxArray::from_handle(out_s, "q_gate_test_scales")?,
+            MxArray::from_handle(out_b, "q_gate_test_biases")?,
+        ))
+    }
+
+    #[test]
+    fn affine_quantized_q_gate_block_matches_native_h4_with_bias() -> Result<()> {
+        let cfg = tiny_cfg();
+        assert!(
+            cfg.num_heads > 1,
+            "fixture must cover the multi-head permutation"
+        );
+        let h = cfg.num_heads as i64;
+        let d = cfg.head_dim as i64;
+        let hidden = cfg.hidden_size as i64;
+        let rows = 2 * h * d;
+
+        let dense_values = (0..rows * hidden)
+            .map(|i| ((i as f32) * 0.017 + 0.3).sin() * 0.5)
+            .collect::<Vec<_>>();
+        let dense =
+            MxArray::from_float32(&dense_values, &[rows, hidden])?.astype(DType::BFloat16)?;
+        let (weight, scales, quant_biases) = quantize_affine(&dense)?;
+        let additive_values = (0..rows)
+            .map(|i| ((i as f32) * 0.031 - 0.2).cos() * 0.1)
+            .collect::<Vec<_>>();
+        let additive_bias =
+            MxArray::from_float32(&additive_values, &[rows])?.astype(DType::BFloat16)?;
+
+        let make_q_proj = || {
+            QuantizedLinear::new(
+                weight.clone(),
+                scales.clone(),
+                Some(quant_biases.clone()),
+                Some(additive_bias.clone()),
+                32,
+                4,
+                super::super::quantized_linear::DEFAULT_QUANT_MODE.to_string(),
+            )
+        };
+        let mut block = Qwen3_5Attention::new(&cfg)?;
+        let mut native = Qwen3_5Attention::new(&cfg)?;
+        block.set_quantized_q_proj(make_q_proj());
+        native.set_quantized_q_proj(make_q_proj());
+        let block_original_weight = block.get_q_proj_weight().as_raw_ptr();
+        let native_original_weight = native.get_q_proj_weight().as_raw_ptr();
+
+        block.finalize_q_gate_block_enabled(true)?;
+        native.finalize_q_gate_block_enabled(false)?;
+        assert!(block.q_proj.has_q_gate_block_layout());
+        assert!(!native.q_proj.has_q_gate_block_layout());
+        assert!(
+            block.q_gate_block_t.is_none(),
+            "quantized block order must replace operands, not retain a dense cache"
+        );
+        assert_ne!(
+            block.get_q_proj_weight().as_raw_ptr(),
+            block_original_weight
+        );
+        assert_eq!(
+            native.get_q_proj_weight().as_raw_ptr(),
+            native_original_weight
+        );
+
+        let x_values = (0..2 * hidden)
+            .map(|i| ((i as f32) * 0.023 + 0.7).sin())
+            .collect::<Vec<_>>();
+        let x = MxArray::from_float32(&x_values, &[1, 2, hidden])?.astype(DType::BFloat16)?;
+        let (block_q, block_gate) = block.project_q_gate(&x, 1, 2)?;
+        let (native_q, native_gate) = native.project_q_gate(&x, 1, 2)?;
+        MxArray::eval_arrays(&[&block_q, &block_gate, &native_q, &native_gate])?;
+        assert_eq!(
+            block_q.to_uint16_native()?,
+            native_q.to_uint16_native()?,
+            "block-order affine queries must be bit-identical to native per-head splitting"
+        );
+        assert_eq!(
+            block_gate.to_uint16_native()?,
+            native_gate.to_uint16_native()?,
+            "block-order affine gates must be bit-identical to native per-head splitting"
+        );
         Ok(())
     }
 }

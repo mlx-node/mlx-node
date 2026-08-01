@@ -1677,6 +1677,15 @@ unsafe extern "C-unwind" {
         out_bf16: *mut *mut mlx_array,
     ) -> bool;
 
+    // Single-residency W8A8 prefill graph consuming the checkpoint-native
+    // int8 [N,K] layout through MPP NT, with no [K,N] duplicate.
+    pub fn mlx_w8a8_linear_nk(
+        x: *mut mlx_array,
+        w_nk: *mut mlx_array,
+        s_w: *mut mlx_array,
+        out_bf16: *mut *mut mlx_array,
+    ) -> bool;
+
     // sym8 DECODE matvec (QMV): per-token int8 act quant + int8 MATVEC + rescale
     // -> bf16 [M,N] = x @ w^T. The small-M (decode, M=1..~16) analogue of
     // mlx_w8a8_linear — reuses the SAME activation int8 quant + the SAME [K,N]
@@ -1705,6 +1714,16 @@ unsafe extern "C-unwind" {
     pub fn mlx_int8_qmv_w8a16(
         x: *mut mlx_array,
         w_kn: *mut mlx_array,
+        w_nk: *mut mlx_array,
+        s_w: *mut mlx_array,
+        out_bf16: *mut *mut mlx_array,
+    ) -> bool;
+
+    // Single-residency W8A16 decode: the same default simd_sum kernel as
+    // mlx_int8_qmv_w8a16, but only takes checkpoint-native w_nk [N,K]. Legacy
+    // W8A8/2D-block diagnostics use the dual-layout entry point above.
+    pub fn mlx_int8_qmv_w8a16_nk(
+        x: *mut mlx_array,
         w_nk: *mut mlx_array,
         s_w: *mut mlx_array,
         out_bf16: *mut *mut mlx_array,

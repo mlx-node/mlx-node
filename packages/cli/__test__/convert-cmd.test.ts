@@ -241,6 +241,39 @@ describe('mlx convert model-type auto-detection', () => {
     expect(await detectModelType('gemma4_text')).toBe('gemma4');
   });
 
+  it.each(['internvl_chat', 'qianfan-ocr'])(
+    "canonicalizes Qianfan raw model_type '%s' to 'qianfan-ocr'",
+    async (rawModelType) => {
+      expect(await detectModelType(rawModelType)).toBe('qianfan-ocr');
+    },
+  );
+
+  it("forwards auto-detected Qianfan to the native dense-only quantization guard when -m is omitted", async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const inputDir = mkdtempSync(join(tmpdir(), 'mlx-convert-qianfan-quant-'));
+    writeFileSync(join(inputDir, 'config.json'), JSON.stringify({ model_type: 'internvl_chat' }));
+
+    await runConvert([
+      '--input',
+      inputDir,
+      '--output',
+      join(tmp, 'out'),
+      '--quantize',
+      '--q-mode',
+      'mxfp4',
+    ]);
+
+    expect(vi.mocked(convertModel)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        modelType: 'qianfan-ocr',
+        quantize: true,
+        quantMode: 'mxfp4',
+      }),
+    );
+    rmSync(inputDir, { recursive: true, force: true });
+  });
+
   it("detects an architecture-only unified config (no model_type) as 'gemma4_unified'", async () => {
     // Mirrors the runtime loader: a config with no `model_type` but with
     // `architectures: ['Gemma4UnifiedForConditionalGeneration']` must resolve

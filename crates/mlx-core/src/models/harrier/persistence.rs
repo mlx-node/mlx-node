@@ -59,6 +59,7 @@ fn load_impl(model_path: &str) -> Result<HarrierModel> {
 
     let config_data = fs::read_to_string(&config_path)?;
     let raw: Value = serde_json::from_str(&config_data)?;
+    reject_quantized_checkpoint(&raw, model_path)?;
     let config = parse_config(&raw)?;
 
     info!(
@@ -104,6 +105,32 @@ fn load_impl(model_path: &str) -> Result<HarrierModel> {
         model.num_parameters()
     );
     Ok(model)
+}
+
+/// Reject quantized Harrier checkpoints before packed tensors reach the dense
+/// Qwen3 embedding backbone. Harrier's embedding and projection layers accept
+/// only floating weights and do not parse quantization metadata.
+///
+/// The shared alias selector keeps malformed or divergent
+/// `quantization`/`quantization_config` handling aligned with quant-capable
+/// families. Empty blocks are harmless compatibility stubs; any non-empty
+/// block is an unsupported quantized checkpoint and fails before weight I/O.
+fn reject_quantized_checkpoint(raw_config: &Value, model_path: &str) -> Result<()> {
+    let Some(block) = crate::models::quant_dispatch::select_quantization_block(raw_config)? else {
+        return Ok(());
+    };
+    if !block.as_object().is_some_and(|o| !o.is_empty()) {
+        return Ok(());
+    }
+    let mode = block
+        .get("mode")
+        .and_then(|m| m.as_str())
+        .unwrap_or("affine");
+    Err(Error::from_reason(format!(
+        "Model at '{model_path}' carries a '{mode}' quantization config, but the Harrier \
+         loader (model_type \"harrier\") has no quantized-weight support — it can only load \
+         dense (bf16/f16/f32) checkpoints. Re-convert without quantization."
+    )))
 }
 
 /// Parse HarrierConfig from raw JSON, supporting both HuggingFace and internal naming.
@@ -216,4 +243,91 @@ fn get_i32(raw: &Value, keys: &[&str]) -> Result<i32> {
         "Missing required config field: {}",
         keys[0]
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn dense_harrier_configs_remain_accepted() {
+        let dense = json!({ "model_type": "harrier", "hidden_size": 1024 });
+        assert!(reject_quantized_checkpoint(&dense, "/tmp/harrier").is_ok());
+
+        let empty_stub = json!({ "model_type": "harrier", "quantization": {} });
+        assert!(reject_quantized_checkpoint(&empty_stub, "/tmp/harrier").is_ok());
+    }
+
+    #[test]
+    fn harrier_rejects_nonempty_quantization_metadata() {
+        for block in [
+            json!({ "mode": "affine", "bits": 4, "group_size": 64 }),
+            json!({ "mode": "mxfp4", "bits": 4, "group_size": 32 }),
+            json!({ "mode": "mxfp8", "bits": 8, "group_size": 32 }),
+            json!({ "mode": "nvfp4", "bits": 4, "group_size": 16 }),
+            json!({ "mode": "sym8", "bits": 8, "group_size": null }),
+        ] {
+            let mode = block["mode"].as_str().expect("test mode");
+            let config = json!({
+                "model_type": "harrier",
+                "quantization": block.clone(),
+                "quantization_config": block,
+            });
+            let err = reject_quantized_checkpoint(&config, "/tmp/harrier")
+                .expect_err("Harrier's dense runtime must reject quantized metadata");
+            assert!(err.reason.contains(mode), "{}", err.reason);
+            assert!(
+                err.reason.contains("no quantized-weight support"),
+                "{}",
+                err.reason
+            );
+        }
+    }
+
+    #[test]
+    fn harrier_load_rejects_quantization_before_weight_io() {
+        let dir = std::env::temp_dir().join(format!(
+            "mlx-harrier-quant-reject-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create Harrier smoke directory");
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec_pretty(&json!({
+                "model_type": "harrier",
+                "hidden_size": 1024,
+                "num_attention_heads": 16,
+                "num_hidden_layers": 1,
+                "num_key_value_heads": 2,
+                "intermediate_size": 3072,
+                "vocab_size": 151936,
+                "quantization": {
+                    "mode": "mxfp4",
+                    "bits": 4,
+                    "group_size": 32,
+                },
+            }))
+            .expect("serialize config"),
+        )
+        .expect("write config.json");
+
+        // There is deliberately no safetensors file: the quantization contract
+        // must reject first rather than fall through to weight loading.
+        let err = match load_impl(dir.to_str().expect("UTF-8 temp path")) {
+            Err(err) => err,
+            Ok(_) => panic!("quantized Harrier config must fail before missing weights"),
+        };
+        assert!(
+            err.reason.contains("no quantized-weight support"),
+            "{}",
+            err.reason
+        );
+
+        fs::remove_dir_all(&dir).expect("remove Harrier smoke directory");
+    }
 }

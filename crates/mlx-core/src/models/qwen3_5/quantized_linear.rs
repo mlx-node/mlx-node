@@ -96,6 +96,10 @@ impl LinearProj {
         matches!(self, LinearProj::Quantized(_))
     }
 
+    pub(crate) fn has_q_gate_block_layout(&self) -> bool {
+        matches!(self, LinearProj::Quantized(ql) if ql.has_q_gate_block_layout())
+    }
+
     /// The per-tensor FP8 activation scale threaded onto the quantized backend
     /// at load time (`None` for a dense projection). Test-only read-back seam
     /// used to prove the loaders thread `PerLayerQuant::input_amax` onto the
@@ -363,10 +367,7 @@ pub const SYM8_MODE: &str = "sym8";
 ///   * GPU gen < 17 (the int8 kernels need M5+; the convert-side
 ///     `sym8_eligible` deliberately omits this runtime-only gate).
 ///
-/// The `[K,N]` kernel operand is built ONCE here at load time
-/// ([`int8_gemm::sym8_kernel_operand`] — the exact transpose+contiguous tail
-/// of `quantize_weight_int8`, requant-free), so forward does zero weight
-/// reshaping.
+/// The checkpoint-native `[N,K]` tensor is the only resident weight.
 pub fn try_build_sym8_quantized_linear(
     params: &HashMap<String, MxArray>,
     key_prefix: &str,
@@ -436,11 +437,8 @@ pub fn try_build_sym8_quantized_linear(
         )));
     }
 
-    // Build the [K,N] kernel operand ONCE at load (fail-loud on FFI error).
-    let w_kn = int8_gemm::sym8_kernel_operand(weight)?;
     Ok(Some(QuantizedLinear::new_sym8(
         weight.clone(),
-        w_kn,
         scales.clone(),
         None,
     )))
@@ -485,6 +483,47 @@ pub fn try_build_kquant_quantized_linear(
 /// sym8 uses dedicated int8 kernels. Plain `fp8_e4m3` is the intentionally
 /// non-native exception: it retains raw Uint8 checkpoint storage, reconstructs
 /// BF16 once at load, and uses ordinary A16 matmul.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum QuantizedOutputLayout {
+    #[default]
+    Native,
+    QGateBlock,
+}
+
+fn q_gate_block_permutation(num_heads: i32, head_dim: i32, output_rows: i64) -> Result<Vec<i32>> {
+    if num_heads <= 0 || head_dim <= 0 {
+        return Err(Error::from_reason(format!(
+            "q/gate block layout requires positive num_heads/head_dim, got {num_heads}/{head_dim}"
+        )));
+    }
+    let h = i64::from(num_heads);
+    let d = i64::from(head_dim);
+    let expected_rows = h
+        .checked_mul(d)
+        .and_then(|value| value.checked_mul(2))
+        .ok_or_else(|| Error::from_reason("q/gate block row count overflow"))?;
+    if output_rows != expected_rows {
+        return Err(Error::from_reason(format!(
+            "q/gate block layout expected {expected_rows} output rows for H={num_heads}, D={head_dim}, got {output_rows}"
+        )));
+    }
+    if expected_rows > i64::from(i32::MAX) {
+        return Err(Error::from_reason(format!(
+            "q/gate block layout has too many output rows for int32 indices: {expected_rows}"
+        )));
+    }
+
+    let mut permutation = Vec::with_capacity(expected_rows as usize);
+    for part in 0..2i64 {
+        for head in 0..h {
+            for dim in 0..d {
+                permutation.push((head * 2 * d + part * d + dim) as i32);
+            }
+        }
+    }
+    Ok(permutation)
+}
+
 pub struct QuantizedLinear {
     weight: MxArray,         // Packed uint32 quantized weights [out, in_packed]
     scales: MxArray,         // Quantization scales
@@ -496,14 +535,8 @@ pub struct QuantizedLinear {
     // Reconstructed BF16 `[N,K]` weight for the plain E4M3 correctness
     // fallback. `Some` iff mode == fp8_e4m3; activations remain A16.
     fp8_dequant_weight: Option<MxArray>,
-    // sym8 kernel operands (`Some` iff `mode == "sym8"`): `w_i8` is the opaque
-    // contiguous [K,N] int8 weight (pre-transposed at load), `s_w` is the f32
-    // [N] per-output-channel scale. Consumed by `int8_w8a16_qmv` (M <= 2,
-    // decode — bf16 activations, no act quant; ALSO takes `self.weight`, the
-    // [N,K] checkpoint tensor, which its default simd_sum kernel streams
-    // row-major) / `int8_w8a8_matmul` (M >= 3, prefill) — NEVER by
-    // `mlx_quantized_matmul` (there is no affine pack for sym8).
-    w_i8: Option<MxArray>,
+    // sym8 scale: `Some` iff mode == "sym8". Decode/prefill consume the
+    // checkpoint-native `self.weight` [N,K] directly.
     s_w: Option<MxArray>,
     // Per-tensor static FP8 (E4M3) activation scale (modelopt MaxCalibrator
     // amax), threaded from the layer's `config.json` quantization override via
@@ -521,6 +554,7 @@ pub struct QuantizedLinear {
     // `mode == MXFP8_MODE` + collector-enabled), so it never affects normal
     // inference.
     amax_key: Option<String>,
+    output_layout: QuantizedOutputLayout,
 }
 
 /// Routing observability for the sym8 forward (unit-test scope only):
@@ -563,10 +597,10 @@ impl QuantizedLinear {
             bits,
             mode,
             fp8_dequant_weight: None,
-            w_i8: None,
             s_w: None,
             input_amax: None,
             amax_key: None,
+            output_layout: QuantizedOutputLayout::Native,
         }
     }
 
@@ -588,10 +622,10 @@ impl QuantizedLinear {
             bits: FP8_E4M3_BITS,
             mode: FP8_E4M3_MODE.to_string(),
             fp8_dequant_weight: Some(dequant_weight),
-            w_i8: None,
             s_w: None,
             input_amax: None,
             amax_key: None,
+            output_layout: QuantizedOutputLayout::Native,
         }
     }
 
@@ -628,9 +662,8 @@ impl QuantizedLinear {
     /// `weight` is the STORED int8 `[N,K]` checkpoint tensor (kept so
     /// `get_weight()` returns the source-layout tensor like every other
     /// mode — it shares the underlying buffer with the params map entry);
-    /// `w_kn` is the contiguous `[K,N]` kernel operand; `s_w` is the f32
-    /// `[N]` scale (doubling as the `scales` field).
-    pub fn new_sym8(weight: MxArray, w_kn: MxArray, s_w: MxArray, bias: Option<MxArray>) -> Self {
+    /// `s_w` is the f32 `[N]` scale (doubling as the `scales` field).
+    pub fn new_sym8(weight: MxArray, s_w: MxArray, bias: Option<MxArray>) -> Self {
         Self {
             weight,
             scales: s_w.clone(),
@@ -640,29 +673,99 @@ impl QuantizedLinear {
             bits: SYM8_BITS,
             mode: SYM8_MODE.to_string(),
             fp8_dequant_weight: None,
-            w_i8: Some(w_kn),
             s_w: Some(s_w),
             input_amax: None,
             amax_key: None,
+            output_layout: QuantizedOutputLayout::Native,
         }
+    }
+
+    /// Reorder an affine q/gate projection's output rows from checkpoint order
+    /// `[Q_h0,G_h0,Q_h1,G_h1,...]` to `[Q_all_heads,G_all_heads]`.
+    ///
+    /// All row-coupled operands are materialized together before replacing the
+    /// stored arrays. Once this returns `true`, the original-order arrays are
+    /// no longer retained by the projection. Non-affine or incompatible direct
+    /// constructor inputs stay untouched and return `false` so attention keeps
+    /// using its native per-head split.
+    pub(crate) fn finalize_affine_q_gate_block(
+        &mut self,
+        num_heads: i32,
+        head_dim: i32,
+    ) -> Result<bool> {
+        if self.output_layout == QuantizedOutputLayout::QGateBlock {
+            return Ok(true);
+        }
+        if self.mode != DEFAULT_QUANT_MODE {
+            return Ok(false);
+        }
+
+        let weight_shape = self.weight.shape()?.to_vec();
+        let scales_shape = self.scales.shape()?.to_vec();
+        let Some(quant_biases) = self.biases.as_ref() else {
+            return Ok(false);
+        };
+        let quant_biases_shape = quant_biases.shape()?.to_vec();
+        let expected_rows = i64::from(num_heads)
+            .checked_mul(i64::from(head_dim))
+            .and_then(|value| value.checked_mul(2))
+            .ok_or_else(|| Error::from_reason("q/gate block row count overflow"))?;
+        let additive_bias_compatible = match self.bias.as_ref() {
+            Some(bias) => bias.shape()?.to_vec() == [expected_rows],
+            None => true,
+        };
+        if weight_shape.len() != 2
+            || scales_shape.len() != 2
+            || quant_biases_shape.len() != 2
+            || weight_shape[0] != expected_rows
+            || scales_shape[0] != expected_rows
+            || quant_biases_shape != scales_shape
+            || !additive_bias_compatible
+        {
+            return Ok(false);
+        }
+
+        let permutation = q_gate_block_permutation(num_heads, head_dim, expected_rows)?;
+        let indices = MxArray::from_int32(&permutation, &[expected_rows])?;
+        let weight = self.weight.take(&indices, 0)?;
+        let scales = self.scales.take(&indices, 0)?;
+        let quant_biases = quant_biases.take(&indices, 0)?;
+        let bias = self
+            .bias
+            .as_ref()
+            .map(|bias| bias.take(&indices, 0))
+            .transpose()?;
+
+        let mut arrays = vec![&weight, &scales, &quant_biases];
+        if let Some(bias) = bias.as_ref() {
+            arrays.push(bias);
+        }
+        MxArray::eval_arrays(&arrays)?;
+
+        self.weight = weight;
+        self.scales = scales;
+        self.biases = Some(quant_biases);
+        self.bias = bias;
+        self.output_layout = QuantizedOutputLayout::QGateBlock;
+        Ok(true)
+    }
+
+    pub(crate) fn has_q_gate_block_layout(&self) -> bool {
+        self.output_layout == QuantizedOutputLayout::QGateBlock
     }
 
     /// sym8 forward: int8-weight GEMM/QMV + rescale.
     ///
-    /// Dispatch rule: `M <= 2` → [`int8_gemm::int8_w8a16_qmv`] (the dedicated
+    /// Dispatch rule: `M <= 2` → W8A16 decode (the dedicated
     /// W8A16 decode matvec — bf16 activations read directly, NO act quant,
     /// activation-exact; the W8A8 act-quant passes were pure in-stream
     /// overhead at decode M and the prefill tile wastes 127/128 rows at M=1),
-    /// `M >= 3` → [`int8_gemm::int8_w8a8_matmul`] (the W8A8 prefill GEMM —
-    /// act quant amortizes at prefill M). The only env gate is the
-    /// same-binary A/B escape hatch `INT8_QMV_W8A16=0` (read inside the
-    /// shared C++ builder, so every caller sees one dispatch rule) which
-    /// reroutes decode back to the W8A8 qmv. Fail-loud on kernel error
-    /// (there is no affine pack to fall back to).
+    /// `M >= 3` → W8A8 prefill. Routing consumes only `self.weight` `[N,K]`.
+    /// Fail-loud on kernel error (there is no affine pack fallback).
     fn forward_sym8(&self, x: &MxArray) -> Result<MxArray> {
-        let (Some(w_i8), Some(s_w)) = (self.w_i8.as_ref(), self.s_w.as_ref()) else {
+        let Some(s_w) = self.s_w.as_ref() else {
             return Err(Error::from_reason(
-                "sym8 QuantizedLinear missing kernel operands (w_i8/s_w) — \
+                "sym8 QuantizedLinear missing per-channel scales — \
                  constructed without new_sym8?",
             ));
         };
@@ -676,19 +779,16 @@ impl QuantizedLinear {
         let y2d = if m <= 2 {
             #[cfg(test)]
             SYM8_QMV_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // `self.weight` is the stored [N,K] int8 checkpoint tensor — the
-            // decode matvec's simd_sum kernel streams that orientation
-            // directly (the [K,N] operand stays for fallback/A-B kernels).
-            int8_gemm::int8_w8a16_qmv(&x2d, w_i8, &self.weight, s_w)?
+            int8_gemm::int8_w8a16_qmv_nk(&x2d, &self.weight, s_w)?
         } else {
             #[cfg(test)]
             SYM8_GEMM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            int8_gemm::int8_w8a8_matmul(&x2d, w_i8, s_w)?
+            int8_gemm::int8_w8a8_matmul_nk(&x2d, &self.weight, s_w)?
         };
         let n = y2d.shape_at(1)?;
         if sym8_debug_enabled() {
             eprintln!(
-                "[sym8] {} M={m} K={k} N={n}",
+                "[sym8] {} layout=nk M={m} K={k} N={n}",
                 if m <= 2 { "qmv" } else { "gemm" }
             );
         }
@@ -773,6 +873,17 @@ impl QuantizedLinear {
             return Ok(result);
         }
 
+        // Affine QMM promotes mixed activation/sidecar dtypes (for example,
+        // BF16 activations with GGUF FP16 scales/biases) to FP32. Keep that
+        // arithmetic, including the additive linear bias below, then restore
+        // the model activation dtype at the projection boundary. Other modes
+        // already define their output dtype from `x` and stay untouched.
+        let activation_dtype = if self.mode == DEFAULT_QUANT_MODE {
+            Some(x.dtype()?)
+        } else {
+            None
+        };
+
         let mode_c = CString::new(self.mode.as_str())
             .map_err(|e| Error::from_reason(format!("Invalid mode string: {}", e)))?;
 
@@ -798,6 +909,12 @@ impl QuantizedLinear {
         // Add linear bias if present
         if let Some(ref b) = self.bias {
             result = result.add(b)?;
+        }
+
+        if let Some(dtype) = activation_dtype
+            && result.dtype()? != dtype
+        {
+            result = result.astype(dtype)?;
         }
 
         Ok(result)
@@ -836,6 +953,13 @@ impl QuantizedLinear {
         &self.scales
     }
 
+    /// Model-owned BF16 reconstruction retained by the plain-E4M3 fallback.
+    /// The raw Uint8 weight and scales stay exposed through the ordinary
+    /// checkpoint accessors and are accounted separately by the loader.
+    pub(crate) fn reconstructed_fp8_weight(&self) -> Option<&MxArray> {
+        self.fp8_dequant_weight.as_ref()
+    }
+
     pub fn get_biases(&self) -> Option<&MxArray> {
         self.biases.as_ref()
     }
@@ -847,15 +971,12 @@ impl QuantizedLinear {
     }
 
     /// Test-scope accessor for the sym8 operands
-    /// `(w_nk [N,K] checkpoint, w_kn [K,N] kernel operand, s_w [N])`.
+    /// `(w_nk [N,K] checkpoint, s_w [N])`.
     /// Used by the routing/parity unit tests to call the reference kernels with
     /// the exact operands forward consumes.
     #[cfg(test)]
-    pub(crate) fn sym8_operands(&self) -> Option<(&MxArray, &MxArray, &MxArray)> {
-        match (self.w_i8.as_ref(), self.s_w.as_ref()) {
-            (Some(w), Some(s)) => Some((&self.weight, w, s)),
-            _ => None,
-        }
+    pub(crate) fn sym8_operands(&self) -> Option<(&MxArray, &MxArray)> {
+        self.s_w.as_ref().map(|s_w| (&self.weight, s_w))
     }
 }
 
@@ -891,6 +1012,11 @@ mod plain_fp8_weight_tests {
         assert_eq!(ql.mode(), FP8_E4M3_MODE);
         assert_eq!(ql.get_weight().dtype().unwrap(), DType::Uint8);
         assert_eq!(ql.get_scales().shape().unwrap().to_vec(), vec![3, 1]);
+        assert_eq!(
+            ql.reconstructed_fp8_weight().unwrap().nbytes(),
+            3 * 4 * std::mem::size_of::<u16>(),
+            "loader-visible residency must expose the retained BF16 reconstruction"
+        );
 
         let x = MxArray::from_float32(&[1.0, -0.5, 0.25, 2.0], &[1, 4])
             .unwrap()
@@ -934,6 +1060,201 @@ mod plain_fp8_weight_tests {
             MxArray::from_float32(&[1.0, 1.0, 1.0], &[3]).unwrap(),
         );
         assert!(try_build_fp8_e4m3_quantized_linear(&wrong_scale_shape, "proj").is_err());
+    }
+}
+
+#[cfg(test)]
+mod affine_dtype_tests {
+    use super::*;
+    use crate::array::DType;
+
+    #[test]
+    fn affine_q4_forward_restores_bfloat16_after_additive_bias() {
+        let input =
+            MxArray::from_bfloat16(&[half::bf16::from_f32(0.5).to_bits(); 32], &[1, 32]).unwrap();
+        let weight = MxArray::from_uint32(&[0x7654_3210; 4], &[1, 4]).unwrap();
+        let scales =
+            MxArray::from_float16(&[half::f16::from_f32(0.03125).to_bits()], &[1, 1]).unwrap();
+        let biases =
+            MxArray::from_float16(&[half::f16::from_f32(-0.25).to_bits()], &[1, 1]).unwrap();
+        let additive_bias = MxArray::from_float32(&[0.00390625], &[1]).unwrap();
+
+        let raw_handle = unsafe {
+            sys::mlx_quantized_matmul(
+                input.as_raw_ptr(),
+                weight.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases.as_raw_ptr(),
+                true,
+                32,
+                4,
+                c"affine".as_ptr(),
+            )
+        };
+        let raw = MxArray::from_handle(raw_handle, "test_raw_affine_qmm").unwrap();
+        assert_eq!(raw.dtype().unwrap(), DType::Float32);
+        let expected = raw
+            .add(&additive_bias)
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        let linear = QuantizedLinear::new(
+            weight,
+            scales,
+            Some(biases),
+            Some(additive_bias),
+            32,
+            4,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+        let actual = linear.forward(&input).unwrap();
+        assert_eq!(actual.dtype().unwrap(), DType::BFloat16);
+        actual.eval();
+        expected.eval();
+        assert_eq!(
+            actual.to_uint16_native().unwrap(),
+            expected.to_uint16_native().unwrap(),
+            "the additive bias must be applied before the projection-boundary cast"
+        );
+    }
+}
+
+#[cfg(test)]
+mod q_gate_block_tests {
+    use super::*;
+
+    #[test]
+    fn q_gate_block_permutation_is_bijective_for_multiple_heads() {
+        let permutation = q_gate_block_permutation(3, 2, 12).unwrap();
+        assert_eq!(permutation, vec![0, 1, 4, 5, 8, 9, 2, 3, 6, 7, 10, 11]);
+        let mut sorted = permutation.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..12).collect::<Vec<_>>());
+
+        assert!(q_gate_block_permutation(0, 2, 0).is_err());
+        assert!(q_gate_block_permutation(3, 0, 0).is_err());
+        assert!(q_gate_block_permutation(3, 2, 11).is_err());
+    }
+
+    #[test]
+    fn affine_q_gate_block_replaces_every_row_coupled_operand() {
+        let h = 3;
+        let d = 2;
+        let rows = 12i64;
+        let permutation = q_gate_block_permutation(h, d, rows).unwrap();
+        let weight_values = (0..rows)
+            .flat_map(|row| [row as u32 * 10, row as u32 * 10 + 1])
+            .collect::<Vec<_>>();
+        let scales_values = (0..rows).map(|row| row as f32 + 0.25).collect::<Vec<_>>();
+        let quant_bias_values = (0..rows).map(|row| row as f32 + 100.0).collect::<Vec<_>>();
+        let bias_values = (0..rows).map(|row| row as f32 + 200.0).collect::<Vec<_>>();
+
+        let weight = MxArray::from_uint32(&weight_values, &[rows, 2]).unwrap();
+        let scales = MxArray::from_float32(&scales_values, &[rows, 1]).unwrap();
+        let quant_biases = MxArray::from_float32(&quant_bias_values, &[rows, 1]).unwrap();
+        let bias = MxArray::from_float32(&bias_values, &[rows]).unwrap();
+        let original_ptrs = [
+            weight.as_raw_ptr(),
+            scales.as_raw_ptr(),
+            quant_biases.as_raw_ptr(),
+            bias.as_raw_ptr(),
+        ];
+        let mut linear = QuantizedLinear::new(
+            weight,
+            scales,
+            Some(quant_biases),
+            Some(bias),
+            32,
+            4,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+
+        assert!(linear.finalize_affine_q_gate_block(h, d).unwrap());
+        assert!(linear.has_q_gate_block_layout());
+        assert_ne!(linear.weight.as_raw_ptr(), original_ptrs[0]);
+        assert_ne!(linear.scales.as_raw_ptr(), original_ptrs[1]);
+        assert_ne!(
+            linear.biases.as_ref().unwrap().as_raw_ptr(),
+            original_ptrs[2]
+        );
+        assert_ne!(linear.bias.as_ref().unwrap().as_raw_ptr(), original_ptrs[3]);
+
+        let expected_weight = permutation
+            .iter()
+            .flat_map(|&row| [row as u32 * 10, row as u32 * 10 + 1])
+            .collect::<Vec<_>>();
+        let expected_scales = permutation
+            .iter()
+            .map(|&row| row as f32 + 0.25)
+            .collect::<Vec<_>>();
+        let expected_quant_biases = permutation
+            .iter()
+            .map(|&row| row as f32 + 100.0)
+            .collect::<Vec<_>>();
+        let expected_bias = permutation
+            .iter()
+            .map(|&row| row as f32 + 200.0)
+            .collect::<Vec<_>>();
+        assert_eq!(linear.weight.to_uint32().unwrap().to_vec(), expected_weight);
+        assert_eq!(
+            linear.scales.to_float32().unwrap().to_vec(),
+            expected_scales
+        );
+        assert_eq!(
+            linear
+                .biases
+                .as_ref()
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec(),
+            expected_quant_biases
+        );
+        assert_eq!(
+            linear.bias.as_ref().unwrap().to_float32().unwrap().to_vec(),
+            expected_bias
+        );
+
+        assert!(
+            linear.finalize_affine_q_gate_block(h, d).unwrap(),
+            "the finalized layout must be idempotent"
+        );
+    }
+
+    #[test]
+    fn q_gate_block_is_noop_for_non_affine_or_incompatible_operands() {
+        let weight = MxArray::from_uint32(&[0; 24], &[12, 2]).unwrap();
+        let scales = MxArray::from_float32(&[1.0; 12], &[12, 1]).unwrap();
+        let biases = MxArray::from_float32(&[0.0; 12], &[12, 1]).unwrap();
+
+        let mut non_affine = QuantizedLinear::new(
+            weight.clone(),
+            scales.clone(),
+            Some(biases.clone()),
+            None,
+            32,
+            4,
+            MXFP4_MODE.to_string(),
+        );
+        let original = non_affine.weight.as_raw_ptr();
+        assert!(!non_affine.finalize_affine_q_gate_block(3, 2).unwrap());
+        assert!(!non_affine.has_q_gate_block_layout());
+        assert_eq!(non_affine.weight.as_raw_ptr(), original);
+
+        let mut incompatible = QuantizedLinear::new(
+            weight,
+            MxArray::from_float32(&[1.0; 11], &[11, 1]).unwrap(),
+            Some(biases),
+            None,
+            32,
+            4,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+        let original = incompatible.weight.as_raw_ptr();
+        assert!(!incompatible.finalize_affine_q_gate_block(3, 2).unwrap());
+        assert!(!incompatible.has_q_gate_block_layout());
+        assert_eq!(incompatible.weight.as_raw_ptr(), original);
     }
 }
 
@@ -1022,21 +1343,12 @@ mod sym8_tests {
             .expect("builder must succeed on a well-formed sym8 layer")
             .expect("scales present => Some");
         assert_eq!(ql.mode(), SYM8_MODE);
-        let (w_nk, w_kn, s_w) = ql.sym8_operands().expect("sym8 operands present");
-        // The load-time kernel operand is the contiguous [K,N] transpose of
-        // the stored [N,K] weight — verify element-exactly via int8 bytes.
-        let stored = params.get("test_layer.weight").unwrap().to_int8().unwrap();
-        let kn = w_kn.to_int8().unwrap();
-        assert_eq!(w_kn.shape().unwrap().to_vec(), vec![k, n]);
-        for ni in 0..n as usize {
-            for ki in 0..k as usize {
-                assert_eq!(
-                    stored[ni * k as usize + ki],
-                    kn[ki * n as usize + ni],
-                    "kernel operand transpose mismatch at (n={ni}, k={ki})"
-                );
-            }
-        }
+        let (w_nk, s_w) = ql.sym8_operands().expect("sym8 operands present");
+        assert_eq!(
+            w_nk.as_raw_ptr(),
+            params.get("test_layer.weight").unwrap().as_raw_ptr(),
+            "builder must retain the checkpoint-native [N,K] allocation",
+        );
 
         // --- M=1 → QMV ---
         let x1 = synth_x_bf16(&[1, k], 0xaaaa_0001);
@@ -1053,7 +1365,7 @@ mod sym8_tests {
             gemm_before,
             "M=1 must NOT route the GEMM kernel"
         );
-        let y1_ref = int8_gemm::int8_w8a16_qmv(&x1, w_kn, w_nk, s_w).unwrap();
+        let y1_ref = int8_gemm::int8_w8a16_qmv_nk(&x1, w_nk, s_w).unwrap();
         assert_bf16_bit_identical(&y1, &y1_ref, "M=1 qmv parity");
 
         // --- M=2 still QMV (decode-dispatch upper bound) ---
@@ -1085,7 +1397,7 @@ mod sym8_tests {
         );
         assert_eq!(y512.shape().unwrap().to_vec(), vec![4, 128, n]);
         let x512_2d = x512.reshape(&[512, k]).unwrap();
-        let y512_ref = int8_gemm::int8_w8a8_matmul(&x512_2d, w_kn, s_w)
+        let y512_ref = int8_gemm::int8_w8a8_matmul_nk(&x512_2d, w_nk, s_w)
             .unwrap()
             .reshape(&[4, 128, n])
             .unwrap();
@@ -1104,16 +1416,10 @@ mod sym8_tests {
         let weight = params.get("biased.weight").unwrap().clone();
         let scales = params.get("biased.scales").unwrap().clone();
         let bias = synth_x_bf16(&[n], 0xbbbb_0001);
-        let w_kn = int8_gemm::sym8_kernel_operand(&weight).unwrap();
-        let ql = QuantizedLinear::new_sym8(
-            weight.clone(),
-            w_kn.clone(),
-            scales.clone(),
-            Some(bias.clone()),
-        );
+        let ql = QuantizedLinear::new_sym8(weight.clone(), scales.clone(), Some(bias.clone()));
         let x = synth_x_bf16(&[1, k], 0xbbbb_0002);
         let y = ql.forward(&x).unwrap();
-        let y_ref = int8_gemm::int8_w8a16_qmv(&x, &w_kn, &weight, &scales)
+        let y_ref = int8_gemm::int8_w8a16_qmv_nk(&x, &weight, &scales)
             .unwrap()
             .add(&bias)
             .unwrap();
