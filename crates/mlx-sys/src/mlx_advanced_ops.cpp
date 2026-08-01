@@ -29,9 +29,10 @@ static array qwen_linear(
     std::optional<array> quant_biases = biases == nullptr
         ? std::nullopt
         : std::optional<array>(*biases);
-    return quantized_matmul(
+    auto result = quantized_matmul(
         x, weight, *scales, quant_biases, true,
         std::optional<int>(group_size), std::optional<int>(bits), mode);
+    return result.dtype() == x.dtype() ? result : astype(result, x.dtype());
   }
   return matmul(x, transpose(weight, {1, 0}));
 }
