@@ -1860,7 +1860,10 @@ pub struct Qwen3AsrModel {
 #[napi]
 impl Qwen3AsrModel {
     #[napi]
-    pub fn load<'env>(env: &'env Env, model_path: String) -> Result<PromiseRaw<'env, Self>> {
+    pub fn load<'env>(
+        env: &'env Env,
+        model_path: String,
+    ) -> Result<PromiseRaw<'env, Qwen3AsrModel>> {
         env.spawn_future(load_with_thread(model_path))
     }
 

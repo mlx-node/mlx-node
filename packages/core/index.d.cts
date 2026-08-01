@@ -1327,7 +1327,7 @@ export declare class Qwen3AsrCapture {
 }
 
 export declare class Qwen3AsrModel {
-  static load(modelPath: string): Promise<Self>;
+  static load(modelPath: string): Promise<Qwen3AsrModel>;
   transcribe(audio: Float32Array, options?: Qwen3AsrTranscribeOptions | undefined | null): Promise<Qwen3AsrResult>;
   createStream(options?: Qwen3AsrStreamOptions | undefined | null): Promise<Qwen3AsrStream>;
 }

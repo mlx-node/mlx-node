@@ -294,17 +294,6 @@ mod platform {
                 "CPAL returned an invalid input configuration",
             ));
         }
-        let (prepare_reply, prepare_rx) = tokio::sync::oneshot::channel();
-        sender
-            .send(Qwen3AsrCmd::PrepareCapture {
-                id: stream_id.clone(),
-                sample_rate,
-                reply: prepare_reply,
-            })
-            .map_err(|_| Error::from_reason("Qwen3-ASR model thread has exited"))?;
-        prepare_rx.blocking_recv().map_err(|_| {
-            Error::from_reason("Qwen3-ASR model thread exited during capture setup")
-        })??;
         let ring_seconds = options.ring_seconds.unwrap_or(10.0);
         if !ring_seconds.is_finite() || !(1.0..=120.0).contains(&ring_seconds) {
             return Err(Error::from_reason("ring_seconds must be between 1 and 120"));
@@ -360,10 +349,34 @@ mod platform {
 
         let worker_ring = ring.clone();
         let worker_callback = callback.clone();
+        let worker_ready = Arc::new(AtomicBool::new(false));
+        let capture_ready = worker_ready.clone();
+        let worker_sender = sender.clone();
+        let worker_stream_id = stream_id.clone();
         let feed_frames = ((sample_rate as u64 * feed_ms as u64) / 1_000).max(1) as usize;
         let worker = std::thread::Builder::new()
             .name("mlx-asr-capture".into())
             .spawn(move || {
+                // Building and starting CPAL, spawning this worker, and
+                // preparing the model stream are all fallible. Keep the
+                // worker parked until every setup step succeeds so a failed
+                // capture attempt cannot feed device-rate PCM into the
+                // caller's still-manual stream.
+                while !worker_ready.load(Ordering::Acquire) {
+                    if worker_ring.stopped.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let guard = worker_ring
+                        .wait_lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if worker_ready.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let _ = worker_ring
+                        .ready
+                        .wait_timeout(guard, Duration::from_millis(20));
+                }
                 loop {
                     let available = worker_ring.available();
                     if available < feed_frames && !worker_ring.stopped.load(Ordering::Acquire) {
@@ -389,9 +402,9 @@ mod platform {
                         continue;
                     }
                     let (reply, rx) = tokio::sync::oneshot::channel();
-                    if sender
+                    if worker_sender
                         .send(Qwen3AsrCmd::FeedStream {
-                            id: stream_id.clone(),
+                            id: worker_stream_id.clone(),
                             samples,
                             reply,
                         })
@@ -435,6 +448,30 @@ mod platform {
                 "Failed to start CPAL input stream: {error}"
             )));
         }
+
+        let prepare_result = (|| {
+            let (prepare_reply, prepare_rx) = tokio::sync::oneshot::channel();
+            sender
+                .send(Qwen3AsrCmd::PrepareCapture {
+                    id: stream_id,
+                    sample_rate,
+                    reply: prepare_reply,
+                })
+                .map_err(|_| Error::from_reason("Qwen3-ASR model thread has exited"))?;
+            prepare_rx.blocking_recv().map_err(|_| {
+                Error::from_reason("Qwen3-ASR model thread exited during capture setup")
+            })??;
+            Ok(())
+        })();
+        if let Err(error) = prepare_result {
+            ring.stop();
+            drop(stream);
+            let _ = worker.join();
+            return Err(error);
+        }
+        capture_ready.store(true, Ordering::Release);
+        ring.wake();
+
         Ok(Qwen3AsrCapture {
             stream: Some(stream),
             ring,
