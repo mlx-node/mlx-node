@@ -1,6 +1,6 @@
 {
   "name": "@mlx-node/core",
-  "version": "0.0.9",
+  "version": "0.0.10",
   "description": "Internal native bindings - import from @mlx-node/lm or @mlx-node/trl instead",
   "homepage": "https://github.com/mlx-node/mlx-node",
   "bugs": {

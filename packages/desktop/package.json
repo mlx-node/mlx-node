@@ -1,6 +1,6 @@
 {
   "name": "@mlx-node/desktop",
-  "version": "0.0.9",
+  "version": "0.0.10",
   "private": true,
   "productName": "mlx-node",
   "description": "mlx-node macOS desktop app (Electron shell: tray, control panel window, supervised inference sidecar)",
