@@ -59,6 +59,7 @@ impl Linear {
     /// When quantized, uses fused dequantize+matmul Metal kernel.
     pub fn forward(&self, input: &MxArray) -> Result<MxArray> {
         if let Some(ref q) = self.quantized {
+            let activation_dtype = input.dtype()?;
             let mode_c = c"affine";
             let biases_ptr = q
                 .biases
@@ -81,6 +82,13 @@ impl Linear {
 
             if let Some(ref b) = self.bias {
                 result = result.add(b)?;
+            }
+
+            // Affine QMM promotes mixed activation/sidecar dtypes to FP32.
+            // Retain that arithmetic through the additive linear bias, then
+            // match the dense Linear contract at the projection boundary.
+            if result.dtype()? != activation_dtype {
+                result = result.astype(activation_dtype)?;
             }
             Ok(result)
         } else if let Some(ref b) = self.bias {
@@ -309,5 +317,52 @@ mod tests {
                 w - [10.0, 20.0, 30.0, 40.0][i % 4]
             );
         }
+    }
+
+    #[test]
+    fn affine_quantized_forward_restores_bfloat16_after_additive_bias() {
+        let input =
+            MxArray::from_bfloat16(&[half::bf16::from_f32(0.5).to_bits(); 32], &[1, 32]).unwrap();
+        let weight = MxArray::from_uint32(&[0x7654_3210; 4], &[1, 4]).unwrap();
+        let scales =
+            MxArray::from_float16(&[half::f16::from_f32(0.03125).to_bits()], &[1, 1]).unwrap();
+        let biases =
+            MxArray::from_float16(&[half::f16::from_f32(-0.25).to_bits()], &[1, 1]).unwrap();
+        let additive_bias = MxArray::from_float32(&[0.00390625], &[1]).unwrap();
+
+        let raw_handle = unsafe {
+            mlx_sys::mlx_quantized_matmul(
+                input.as_raw_ptr(),
+                weight.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases.as_raw_ptr(),
+                true,
+                32,
+                4,
+                c"affine".as_ptr(),
+            )
+        };
+        let raw = MxArray::from_handle(raw_handle, "test_raw_affine_linear").unwrap();
+        assert_eq!(raw.dtype().unwrap(), crate::array::DType::Float32);
+        let expected = raw
+            .add(&additive_bias)
+            .unwrap()
+            .astype(crate::array::DType::BFloat16)
+            .unwrap();
+
+        let mut linear = Linear::new(32, 1, Some(false)).unwrap();
+        linear
+            .load_quantized(&weight, &scales, Some(&biases), 32, 4)
+            .unwrap();
+        linear.set_bias(Some(&additive_bias)).unwrap();
+        let actual = linear.forward(&input).unwrap();
+        assert_eq!(actual.dtype().unwrap(), crate::array::DType::BFloat16);
+        actual.eval();
+        expected.eval();
+        assert_eq!(
+            actual.to_uint16_native().unwrap(),
+            expected.to_uint16_native().unwrap(),
+            "the additive bias must be applied before the projection-boundary cast"
+        );
     }
 }

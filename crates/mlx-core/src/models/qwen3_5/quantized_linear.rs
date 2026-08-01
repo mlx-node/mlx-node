@@ -773,6 +773,17 @@ impl QuantizedLinear {
             return Ok(result);
         }
 
+        // Affine QMM promotes mixed activation/sidecar dtypes (for example,
+        // BF16 activations with GGUF FP16 scales/biases) to FP32. Keep that
+        // arithmetic, including the additive linear bias below, then restore
+        // the model activation dtype at the projection boundary. Other modes
+        // already define their output dtype from `x` and stay untouched.
+        let activation_dtype = if self.mode == DEFAULT_QUANT_MODE {
+            Some(x.dtype()?)
+        } else {
+            None
+        };
+
         let mode_c = CString::new(self.mode.as_str())
             .map_err(|e| Error::from_reason(format!("Invalid mode string: {}", e)))?;
 
@@ -798,6 +809,12 @@ impl QuantizedLinear {
         // Add linear bias if present
         if let Some(ref b) = self.bias {
             result = result.add(b)?;
+        }
+
+        if let Some(dtype) = activation_dtype
+            && result.dtype()? != dtype
+        {
+            result = result.astype(dtype)?;
         }
 
         Ok(result)
@@ -934,6 +951,63 @@ mod plain_fp8_weight_tests {
             MxArray::from_float32(&[1.0, 1.0, 1.0], &[3]).unwrap(),
         );
         assert!(try_build_fp8_e4m3_quantized_linear(&wrong_scale_shape, "proj").is_err());
+    }
+}
+
+#[cfg(test)]
+mod affine_dtype_tests {
+    use super::*;
+    use crate::array::DType;
+
+    #[test]
+    fn affine_q4_forward_restores_bfloat16_after_additive_bias() {
+        let input =
+            MxArray::from_bfloat16(&[half::bf16::from_f32(0.5).to_bits(); 32], &[1, 32]).unwrap();
+        let weight = MxArray::from_uint32(&[0x7654_3210; 4], &[1, 4]).unwrap();
+        let scales =
+            MxArray::from_float16(&[half::f16::from_f32(0.03125).to_bits()], &[1, 1]).unwrap();
+        let biases =
+            MxArray::from_float16(&[half::f16::from_f32(-0.25).to_bits()], &[1, 1]).unwrap();
+        let additive_bias = MxArray::from_float32(&[0.00390625], &[1]).unwrap();
+
+        let raw_handle = unsafe {
+            sys::mlx_quantized_matmul(
+                input.as_raw_ptr(),
+                weight.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases.as_raw_ptr(),
+                true,
+                32,
+                4,
+                c"affine".as_ptr(),
+            )
+        };
+        let raw = MxArray::from_handle(raw_handle, "test_raw_affine_qmm").unwrap();
+        assert_eq!(raw.dtype().unwrap(), DType::Float32);
+        let expected = raw
+            .add(&additive_bias)
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        let linear = QuantizedLinear::new(
+            weight,
+            scales,
+            Some(biases),
+            Some(additive_bias),
+            32,
+            4,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+        let actual = linear.forward(&input).unwrap();
+        assert_eq!(actual.dtype().unwrap(), DType::BFloat16);
+        actual.eval();
+        expected.eval();
+        assert_eq!(
+            actual.to_uint16_native().unwrap(),
+            expected.to_uint16_native().unwrap(),
+            "the additive bias must be applied before the projection-boundary cast"
+        );
     }
 }
 

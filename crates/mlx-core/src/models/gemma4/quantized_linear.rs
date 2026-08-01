@@ -55,6 +55,16 @@ impl QuantizedSwitchLinear {
     /// `indices`: [N] — expert index for each token
     /// `sorted`: whether indices are pre-sorted for gather efficiency
     pub fn forward(&self, x: &MxArray, indices: &MxArray, sorted: bool) -> Result<MxArray> {
+        // Affine gather-QMM promotes mixed activation/sidecar dtypes to FP32.
+        // Keep that arithmetic inside the projection, then restore the routed
+        // activation dtype before expert outputs reach weighting/residuals.
+        // MX/NV/K-quant modes already return `x`'s dtype and stay untouched.
+        let activation_dtype = if self.mode == DEFAULT_QUANT_MODE {
+            Some(x.dtype()?)
+        } else {
+            None
+        };
+
         let mode_c = CString::new(self.mode.as_str())
             .map_err(|e| Error::from_reason(format!("Invalid mode string: {}", e)))?;
 
@@ -78,7 +88,13 @@ impl QuantizedSwitchLinear {
                 sorted,
             )
         };
-        MxArray::from_handle(handle, "gather_qmm")
+        let mut result = MxArray::from_handle(handle, "gather_qmm")?;
+        if let Some(dtype) = activation_dtype
+            && result.dtype()? != dtype
+        {
+            result = result.astype(dtype)?;
+        }
+        Ok(result)
     }
 }
 
@@ -1315,5 +1331,29 @@ mod affine_dtype_tests {
 
         let output = linear.forward(&input).unwrap();
         assert_eq!(output.dtype().unwrap(), crate::array::DType::BFloat16);
+    }
+
+    #[test]
+    fn affine_q4_expert_forward_restores_bfloat16_activation_dtype() {
+        let input =
+            MxArray::from_bfloat16(&[half::bf16::from_f32(0.5).to_bits(); 32], &[1, 1, 1, 32])
+                .unwrap();
+        let indices = MxArray::from_int32(&[0], &[1, 1]).unwrap();
+        let weight = MxArray::from_uint32(&[0x7654_3210; 4], &[1, 1, 4]).unwrap();
+        let scales =
+            MxArray::from_float16(&[half::f16::from_f32(0.03125).to_bits()], &[1, 1, 1]).unwrap();
+        let biases =
+            MxArray::from_float16(&[half::f16::from_f32(-0.25).to_bits()], &[1, 1, 1]).unwrap();
+
+        let linear = QuantizedSwitchLinear::new(
+            weight,
+            scales,
+            Some(biases),
+            32,
+            4,
+            DEFAULT_QUANT_MODE.to_string(),
+        );
+        let actual = linear.forward(&input, &indices, false).unwrap();
+        assert_eq!(actual.dtype().unwrap(), DType::BFloat16);
     }
 }
