@@ -1713,9 +1713,8 @@ unsafe extern "C-unwind" {
     ) -> bool;
 
     // Single-residency W8A16 decode: the same default simd_sum kernel as
-    // mlx_int8_qmv_w8a16, but only takes checkpoint-native w_nk [N,K]. The
-    // legacy W8A8/2D-block diagnostics require MLX_SYM8_DUAL_LAYOUT=1 and the
-    // dual-layout entry point above.
+    // mlx_int8_qmv_w8a16, but only takes checkpoint-native w_nk [N,K]. Legacy
+    // W8A8/2D-block diagnostics use the dual-layout entry point above.
     pub fn mlx_int8_qmv_w8a16_nk(
         x: *mut mlx_array,
         w_nk: *mut mlx_array,

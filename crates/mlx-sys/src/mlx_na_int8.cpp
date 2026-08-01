@@ -1103,8 +1103,7 @@ bool mlx_quantize_weight_int8(mlx_array* w_handle, mlx_array** out_w_i8,
 // Identical math to mlx_quantize_weight_int8 above but WITHOUT the [K,N]
 // transpose: that function emits the runtime KERNEL operand; this one emits the
 // on-disk CHECKPOINT tensors ({prefix}.weight int8 [N,K] + {prefix}.scales f32
-// [N], no .biases). The loader consumes [N,K] directly by default; it derives
-// the legacy [K,N] operand only when MLX_SYM8_DUAL_LAYOUT=1 at load time.
+// [N], no .biases). The loader consumes [N,K] directly.
 // Dequant contract: w[n,k] ≈ scales[n] * q[n,k].
 bool mlx_sym8_quantize_store(mlx_array* w_handle, mlx_array** out_q,
                              mlx_array** out_scales) {
@@ -1337,11 +1336,9 @@ bool mlx_w8a8_linear_nk(mlx_array* x_handle, mlx_array* w_nk_handle,
   }
 }
 
-// Single-layout W8A16 decode. This is the exact simd_sum core used by the
-// current dual-layout wrapper's default branch, but it only accepts the
+// Single-layout W8A16 decode. This is the production sym8 path and accepts the
 // checkpoint-native [N,K] operand. The old W8A8 and 2D-block diagnostic
-// branches require [K,N]; callers that need those set MLX_SYM8_DUAL_LAYOUT=1
-// at model load and use mlx_int8_qmv_w8a16 instead.
+// branches use the separate mlx_int8_qmv_w8a16 entry point.
 bool mlx_int8_qmv_w8a16_nk(mlx_array* x_handle, mlx_array* w_nk_handle,
                            mlx_array* s_w_handle, mlx_array** out_bf16) {
   using namespace mlx::core;

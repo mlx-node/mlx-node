@@ -23,24 +23,6 @@ use crate::array::MxArray;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
-fn env_flag_enabled(value: &str) -> bool {
-    matches!(
-        value.to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-/// Whether sym8 loaders should retain the legacy pre-transposed `[K,N]`
-/// operand alongside the checkpoint-native `[N,K]` weight.
-///
-/// This is intentionally read at model load, not in the hot forward path.
-/// Unset/default keeps one weight layout; `MLX_SYM8_DUAL_LAYOUT=1` restores
-/// the exact former routing, including its W8A8 and 2D-block decode diagnostic
-/// fallbacks.
-pub(crate) fn sym8_dual_layout_enabled() -> bool {
-    std::env::var("MLX_SYM8_DUAL_LAYOUT").is_ok_and(|value| env_flag_enabled(&value))
-}
-
 /// int8 `x @ w^T -> int32 [M, N]`.
 ///
 /// `x` is `[M, K]` and `w` is `[N, K]` (weight rows are output channels), both
@@ -75,8 +57,7 @@ pub fn matmul_int8(x: &MxArray, w: &MxArray) -> Result<MxArray> {
 ///     rescale.
 ///
 /// This helper remains useful for tests and legacy `[K,N]` kernel callers.
-/// Sym8 checkpoints instead store `[N,K]` and use the native-layout wrappers
-/// unless the explicit dual-layout compatibility policy is enabled.
+/// Sym8 checkpoints instead store `[N,K]` and use the native-layout wrappers.
 pub fn quantize_weight_int8(w: &MxArray) -> Result<(MxArray, MxArray)> {
     let mut out_w_i8: *mut sys::mlx_array = std::ptr::null_mut();
     let mut out_s_w: *mut sys::mlx_array = std::ptr::null_mut();
@@ -91,9 +72,9 @@ pub fn quantize_weight_int8(w: &MxArray) -> Result<(MxArray, MxArray)> {
     Ok((w_i8, s_w))
 }
 
-/// LOAD-time sym8 kernel-operand builder (runs once per sym8 linear).
+/// Legacy sym8 kernel-operand builder for standalone diagnostics.
 ///
-/// `w_i8_nk` is the STORED checkpoint weight — int8 `[N,K]`, source
+/// `w_i8_nk` is a stored checkpoint weight — int8 `[N,K]`, source
 /// orientation, as emitted by `mlx convert --q-mode sym8`
 /// (`mlx_sym8_quantize_store`). Returns the opaque contiguous `[K,N]` int8
 /// kernel operand that [`int8_w8a8_matmul`] / [`int8_w8a8_qmv`] consume —
@@ -257,10 +238,9 @@ pub fn int8_w8a16_qmv(
 
 /// W8A16 sym8 decode on the checkpoint-native int8 `[N,K]` weight only.
 ///
-/// This calls the same simd_sum core as [`int8_w8a16_qmv`]'s default branch,
-/// so the single- and dual-layout routes are bit-identical. The legacy W8A8
-/// and 2D-block diagnostic branches require `[K,N]`; set
-/// `MLX_SYM8_DUAL_LAYOUT=1` before model load to retain and exercise them.
+/// This calls the same simd_sum core as [`int8_w8a16_qmv`]'s default branch.
+/// Legacy W8A8 and 2D-block diagnostics that require `[K,N]` use the separate
+/// dual-input wrapper.
 pub fn int8_w8a16_qmv_nk(x: &MxArray, w_nk: &MxArray, s_w: &MxArray) -> Result<MxArray> {
     let mut out: *mut sys::mlx_array = std::ptr::null_mut();
     let ok = unsafe {
@@ -528,16 +508,6 @@ mod tests {
 
     fn gpu_gen() -> i32 {
         unsafe { sys::mlx_gpu_architecture_gen() }
-    }
-
-    #[test]
-    fn sym8_dual_layout_env_policy_is_explicit_opt_in() {
-        for enabled in ["1", "true", "TRUE", "yes", "ON"] {
-            assert!(env_flag_enabled(enabled), "{enabled} must opt in");
-        }
-        for disabled in ["", "0", "false", "no", "off", "2", " 1"] {
-            assert!(!env_flag_enabled(disabled), "{disabled:?} must stay off");
-        }
     }
 
     /// Deterministic pseudo-random integer in `[lo, hi]` from a linear-congruential

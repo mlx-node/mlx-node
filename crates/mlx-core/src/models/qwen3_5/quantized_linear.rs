@@ -367,24 +367,10 @@ pub const SYM8_MODE: &str = "sym8";
 ///   * GPU gen < 17 (the int8 kernels need M5+; the convert-side
 ///     `sym8_eligible` deliberately omits this runtime-only gate).
 ///
-/// By default, the checkpoint-native `[N,K]` tensor is the only resident
-/// weight. `MLX_SYM8_DUAL_LAYOUT=1` restores the former load-time `[K,N]`
-/// transpose and exact legacy routing for diagnostics.
+/// The checkpoint-native `[N,K]` tensor is the only resident weight.
 pub fn try_build_sym8_quantized_linear(
     params: &HashMap<String, MxArray>,
     key_prefix: &str,
-) -> Result<Option<QuantizedLinear>> {
-    try_build_sym8_quantized_linear_with_dual_layout(
-        params,
-        key_prefix,
-        int8_gemm::sym8_dual_layout_enabled(),
-    )
-}
-
-fn try_build_sym8_quantized_linear_with_dual_layout(
-    params: &HashMap<String, MxArray>,
-    key_prefix: &str,
-    dual_layout: bool,
 ) -> Result<Option<QuantizedLinear>> {
     let Some(scales) = params.get(&format!("{}.scales", key_prefix)) else {
         return Ok(None);
@@ -451,14 +437,8 @@ fn try_build_sym8_quantized_linear_with_dual_layout(
         )));
     }
 
-    // Exact compatibility fallback: retain the former [K,N] allocation and
-    // routing only when explicitly requested before model load.
-    let w_kn = dual_layout
-        .then(|| int8_gemm::sym8_kernel_operand(weight))
-        .transpose()?;
-    Ok(Some(QuantizedLinear::new_sym8_with_layout(
+    Ok(Some(QuantizedLinear::new_sym8(
         weight.clone(),
-        w_kn,
         scales.clone(),
         None,
     )))
@@ -555,11 +535,8 @@ pub struct QuantizedLinear {
     // Reconstructed BF16 `[N,K]` weight for the plain E4M3 correctness
     // fallback. `Some` iff mode == fp8_e4m3; activations remain A16.
     fp8_dequant_weight: Option<MxArray>,
-    // sym8 operands: `s_w` is `Some` iff mode == "sym8". `w_i8` is the
-    // optional contiguous [K,N] compatibility operand, present only when
-    // MLX_SYM8_DUAL_LAYOUT=1 at load. Default decode/prefill consume the
+    // sym8 scale: `Some` iff mode == "sym8". Decode/prefill consume the
     // checkpoint-native `self.weight` [N,K] directly.
-    w_i8: Option<MxArray>,
     s_w: Option<MxArray>,
     // Per-tensor static FP8 (E4M3) activation scale (modelopt MaxCalibrator
     // amax), threaded from the layer's `config.json` quantization override via
@@ -620,7 +597,6 @@ impl QuantizedLinear {
             bits,
             mode,
             fp8_dequant_weight: None,
-            w_i8: None,
             s_w: None,
             input_amax: None,
             amax_key: None,
@@ -646,7 +622,6 @@ impl QuantizedLinear {
             bits: FP8_E4M3_BITS,
             mode: FP8_E4M3_MODE.to_string(),
             fp8_dequant_weight: Some(dequant_weight),
-            w_i8: None,
             s_w: None,
             input_amax: None,
             amax_key: None,
@@ -687,20 +662,8 @@ impl QuantizedLinear {
     /// `weight` is the STORED int8 `[N,K]` checkpoint tensor (kept so
     /// `get_weight()` returns the source-layout tensor like every other
     /// mode — it shares the underlying buffer with the params map entry);
-    /// `w_kn` is the contiguous `[K,N]` compatibility operand; `s_w` is the
-    /// f32 `[N]` scale (doubling as the `scales` field). The checkpoint loader
-    /// uses a private optional-layout constructor so the public direct-
-    /// constructor API retains its former dual-layout behavior.
-    pub fn new_sym8(weight: MxArray, w_kn: MxArray, s_w: MxArray, bias: Option<MxArray>) -> Self {
-        Self::new_sym8_with_layout(weight, Some(w_kn), s_w, bias)
-    }
-
-    fn new_sym8_with_layout(
-        weight: MxArray,
-        w_kn: Option<MxArray>,
-        s_w: MxArray,
-        bias: Option<MxArray>,
-    ) -> Self {
+    /// `s_w` is the f32 `[N]` scale (doubling as the `scales` field).
+    pub fn new_sym8(weight: MxArray, s_w: MxArray, bias: Option<MxArray>) -> Self {
         Self {
             weight,
             scales: s_w.clone(),
@@ -710,7 +673,6 @@ impl QuantizedLinear {
             bits: SYM8_BITS,
             mode: SYM8_MODE.to_string(),
             fp8_dequant_weight: None,
-            w_i8: w_kn,
             s_w: Some(s_w),
             input_amax: None,
             amax_key: None,
@@ -798,10 +760,8 @@ impl QuantizedLinear {
     /// W8A16 decode matvec — bf16 activations read directly, NO act quant,
     /// activation-exact; the W8A8 act-quant passes were pure in-stream
     /// overhead at decode M and the prefill tile wastes 127/128 rows at M=1),
-    /// `M >= 3` → W8A8 prefill. Default routing consumes only `self.weight`
-    /// `[N,K]`; `MLX_SYM8_DUAL_LAYOUT=1` (read at load) retains `[K,N]` and
-    /// restores the exact former wrappers, including their diagnostic env
-    /// switches. Fail-loud on kernel error (there is no affine pack fallback).
+    /// `M >= 3` → W8A8 prefill. Routing consumes only `self.weight` `[N,K]`.
+    /// Fail-loud on kernel error (there is no affine pack fallback).
     fn forward_sym8(&self, x: &MxArray) -> Result<MxArray> {
         let Some(s_w) = self.s_w.as_ref() else {
             return Err(Error::from_reason(
@@ -819,24 +779,17 @@ impl QuantizedLinear {
         let y2d = if m <= 2 {
             #[cfg(test)]
             SYM8_QMV_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            match self.w_i8.as_ref() {
-                Some(w_kn) => int8_gemm::int8_w8a16_qmv(&x2d, w_kn, &self.weight, s_w)?,
-                None => int8_gemm::int8_w8a16_qmv_nk(&x2d, &self.weight, s_w)?,
-            }
+            int8_gemm::int8_w8a16_qmv_nk(&x2d, &self.weight, s_w)?
         } else {
             #[cfg(test)]
             SYM8_GEMM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            match self.w_i8.as_ref() {
-                Some(w_kn) => int8_gemm::int8_w8a8_matmul(&x2d, w_kn, s_w)?,
-                None => int8_gemm::int8_w8a8_matmul_nk(&x2d, &self.weight, s_w)?,
-            }
+            int8_gemm::int8_w8a8_matmul_nk(&x2d, &self.weight, s_w)?
         };
         let n = y2d.shape_at(1)?;
         if sym8_debug_enabled() {
             eprintln!(
-                "[sym8] {} layout={} M={m} K={k} N={n}",
-                if m <= 2 { "qmv" } else { "gemm" },
-                if self.w_i8.is_some() { "dual" } else { "nk" }
+                "[sym8] {} layout=nk M={m} K={k} N={n}",
+                if m <= 2 { "qmv" } else { "gemm" }
             );
         }
         let mut out_shape: Vec<i64> = shape[..shape.len() - 1].to_vec();
@@ -1018,14 +971,12 @@ impl QuantizedLinear {
     }
 
     /// Test-scope accessor for the sym8 operands
-    /// `(w_nk [N,K] checkpoint, optional w_kn [K,N] fallback, s_w [N])`.
+    /// `(w_nk [N,K] checkpoint, s_w [N])`.
     /// Used by the routing/parity unit tests to call the reference kernels with
     /// the exact operands forward consumes.
     #[cfg(test)]
-    pub(crate) fn sym8_operands(&self) -> Option<(&MxArray, Option<&MxArray>, &MxArray)> {
-        self.s_w
-            .as_ref()
-            .map(|s_w| (&self.weight, self.w_i8.as_ref(), s_w))
+    pub(crate) fn sym8_operands(&self) -> Option<(&MxArray, &MxArray)> {
+        self.s_w.as_ref().map(|s_w| (&self.weight, s_w))
     }
 }
 
@@ -1388,12 +1339,16 @@ mod sym8_tests {
         }
         let (n, k) = (48i64, 64i64); // K % 16 == 0
         let params = synth_sym8_params("test_layer", n, k, 0x5197_0001);
-        let ql = try_build_sym8_quantized_linear_with_dual_layout(&params, "test_layer", false)
+        let ql = try_build_sym8_quantized_linear(&params, "test_layer")
             .expect("builder must succeed on a well-formed sym8 layer")
             .expect("scales present => Some");
         assert_eq!(ql.mode(), SYM8_MODE);
-        let (w_nk, w_kn, s_w) = ql.sym8_operands().expect("sym8 operands present");
-        assert!(w_kn.is_none(), "default must retain only native [N,K]");
+        let (w_nk, s_w) = ql.sym8_operands().expect("sym8 operands present");
+        assert_eq!(
+            w_nk.as_raw_ptr(),
+            params.get("test_layer.weight").unwrap().as_raw_ptr(),
+            "builder must retain the checkpoint-native [N,K] allocation",
+        );
 
         // --- M=1 → QMV ---
         let x1 = synth_x_bf16(&[1, k], 0xaaaa_0001);
@@ -1449,77 +1404,6 @@ mod sym8_tests {
         assert_bf16_bit_identical(&y512, &y512_ref, "M=512 gemm parity");
     }
 
-    /// The default owns only `[N,K]`; the explicit compatibility policy owns
-    /// one additional, bit-exact `[K,N]` transpose and preserves old outputs.
-    #[test]
-    fn sym8_dual_layout_fallback_residency_and_parity() {
-        if gpu_gen() < 17 {
-            eprintln!("[sym8] SKIP: gpu gen {} < 17", gpu_gen());
-            return;
-        }
-        let (n, k) = (48i64, 64i64);
-        let params = synth_sym8_params("fallback", n, k, 0x5197_1001);
-        let single = try_build_sym8_quantized_linear_with_dual_layout(&params, "fallback", false)
-            .unwrap()
-            .unwrap();
-        let dual = try_build_sym8_quantized_linear_with_dual_layout(&params, "fallback", true)
-            .unwrap()
-            .unwrap();
-        let (single_nk, single_kn, _) = single.sym8_operands().unwrap();
-        let (dual_nk, dual_kn, _) = dual.sym8_operands().unwrap();
-        assert!(single_kn.is_none(), "single-layout policy allocated [K,N]");
-        let dual_kn = dual_kn.expect("fallback policy must allocate [K,N]");
-        assert_eq!(dual_kn.shape().unwrap().to_vec(), vec![k, n]);
-        assert_eq!(dual_kn.nbytes(), dual_nk.nbytes());
-        assert_eq!(single_nk.as_raw_ptr(), dual_nk.as_raw_ptr());
-
-        let stored = dual_nk.to_int8().unwrap();
-        let transposed = dual_kn.to_int8().unwrap();
-        for ni in 0..n as usize {
-            for ki in 0..k as usize {
-                assert_eq!(
-                    stored[ni * k as usize + ki],
-                    transposed[ki * n as usize + ni],
-                    "fallback transpose mismatch at (n={ni}, k={ki})"
-                );
-            }
-        }
-
-        for (m, seed) in [
-            (1, 0xaaaa_1001),
-            (2, 0xaaaa_1002),
-            (3, 0xaaaa_1003),
-            (128, 0xaaaa_1080),
-        ] {
-            let x = synth_x_bf16(&[m, k], seed);
-            assert_bf16_bit_identical(
-                &single.forward(&x).unwrap(),
-                &dual.forward(&x).unwrap(),
-                &format!("single/dual M={m}"),
-            );
-        }
-    }
-
-    /// Fresh-process gate for the public loader's environment wiring. The
-    /// same test is run once with the variable unset and once with `=1`.
-    #[test]
-    fn sym8_loader_policy_matches_process_env() {
-        if gpu_gen() < 17 {
-            eprintln!("[sym8] SKIP: gpu gen {} < 17", gpu_gen());
-            return;
-        }
-        let params = synth_sym8_params("env_policy", 16, 32, 0x5197_2001);
-        let ql = try_build_sym8_quantized_linear(&params, "env_policy")
-            .unwrap()
-            .unwrap();
-        let (_, w_kn, _) = ql.sym8_operands().unwrap();
-        assert_eq!(
-            w_kn.is_some(),
-            int8_gemm::sym8_dual_layout_enabled(),
-            "public loader must apply MLX_SYM8_DUAL_LAYOUT at load time"
-        );
-    }
-
     /// Additive linear bias is applied after the int8 kernel.
     #[test]
     fn sym8_forward_applies_linear_bias() {
@@ -1532,12 +1416,7 @@ mod sym8_tests {
         let weight = params.get("biased.weight").unwrap().clone();
         let scales = params.get("biased.scales").unwrap().clone();
         let bias = synth_x_bf16(&[n], 0xbbbb_0001);
-        let ql = QuantizedLinear::new_sym8_with_layout(
-            weight.clone(),
-            None,
-            scales.clone(),
-            Some(bias.clone()),
-        );
+        let ql = QuantizedLinear::new_sym8(weight.clone(), scales.clone(), Some(bias.clone()));
         let x = synth_x_bf16(&[1, k], 0xbbbb_0002);
         let y = ql.forward(&x).unwrap();
         let y_ref = int8_gemm::int8_w8a16_qmv_nk(&x, &weight, &scales)
