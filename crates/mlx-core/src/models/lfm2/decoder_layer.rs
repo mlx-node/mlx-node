@@ -18,7 +18,7 @@ use super::sparse_moe::Lfm2SparseMoeBlock;
 /// flat fallback" stance described in the messages-kv-reuse docs:
 /// only `FullAttention` layers go through the `PagedKVCacheAdapter`; conv
 /// layers continue to use `Lfm2LayerCache::Conv(ArraysCache)`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lfm2LayerKind {
     /// Full-attention layer routed through the paged adapter.
     /// `paged_idx` is the ATTENTION-LAYER ORDINAL into the adapter's

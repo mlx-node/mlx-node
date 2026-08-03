@@ -18,7 +18,7 @@ use super::quantized_linear::{MLPVariant, QuantizedLinear};
 /// (GDN) layers continue to use `Qwen3_5LayerCache::Linear(ArraysCache)`
 /// with no cross-request prefix reuse — vLLM's `MambaManager`-style "no
 /// prefix reuse for recurrent layers" stance.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Qwen3_5LayerKind {
     /// GDN linear-attention layer that stays on the existing flat
     /// `Qwen3_5LayerCache::Linear` path.

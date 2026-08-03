@@ -1922,7 +1922,7 @@ mod paged_adapter_construction_tests {
     //! "default = no allocation" invariant and verify that flipping the
     //! flag wires up a real adapter without churning forward-path code.
 
-    use super::Lfm2Inner;
+    use super::{Lfm2Inner, compute_layer_kinds_for};
     use crate::models::lfm2::Lfm2Config;
 
     /// Tiny LFM2-shaped config compatible with `LayerKVPool`'s validate
@@ -2303,6 +2303,20 @@ mod paged_adapter_construction_tests {
             err_msg.contains("no full_attention layers")
                 || err_msg.contains("No Metal device found"),
             "expected clear error about missing attention layers, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn inner_caches_layer_kinds_matching_fresh_compute() {
+        // The paged decode stepper consumes the cached classification
+        // instead of re-deriving it per step; pin cache == fresh compute
+        // (paged OFF so construction needs no Metal pool).
+        let cfg = paged_tiny_config(Some(false));
+        let inner = Lfm2Inner::new(cfg.clone()).expect("construct");
+        let fresh = compute_layer_kinds_for(&cfg, cfg.num_hidden_layers as usize);
+        assert_eq!(
+            inner.layer_kinds, fresh,
+            "cached layer classification must equal a fresh compute over the same config"
         );
     }
 }
