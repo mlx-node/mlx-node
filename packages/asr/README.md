@@ -1,6 +1,6 @@
 # @mlx-node/asr
 
-Local Qwen3-ASR transcription and realtime microphone capture on Apple Silicon.
+Local Qwen3-ASR transcription and realtime meeting capture on Apple Silicon.
 
 ## Convert the Hugging Face checkpoint
 
@@ -89,36 +89,56 @@ provisional suffix is worth flagging for review. Repeated-token and stalled
 decode guards automatically discard a degenerate provisional tail and
 re-anchor the next chunk with fresh bounded audio context.
 
-## Realtime RustAudio/CPAL capture
+## Realtime meeting capture
+
+`startMeetingTranscription()` captures the local microphone and the Mac's
+system/output audio by default. Revisions are kept on separate source-tagged
+tracks because the two devices have independent clocks and represent different
+speakers.
 
 ```typescript
-import { Qwen3AsrModel, qwen3AsrInputDevices, startRealtimeTranscription } from '@mlx-node/asr';
+import { Qwen3AsrModel, qwen3AsrAudioDevices, startMeetingTranscription } from '@mlx-node/asr';
 
-console.table(qwen3AsrInputDevices());
+console.table(qwen3AsrAudioDevices());
 
 const model = await Qwen3AsrModel.load('.cache/models/qwen3-asr-1.7b-mlx-mxfp4');
-const session = await startRealtimeTranscription(model, {
+const meeting = await startMeetingTranscription(model, {
   stream: { chunkSeconds: 2, provisionalTokens: 5, unfixedChunks: 2, maxTokens: 32 },
-  capture: { feedMilliseconds: 100, ringSeconds: 10 },
-  onResult(result) {
-    process.stdout.write(`\r${result.stableText}\x1b[2m${result.provisionalText}\x1b[0m`);
+  microphone: { feedMilliseconds: 100, ringSeconds: 10 },
+  systemAudio: {
+    feedMilliseconds: 100,
+    ringSeconds: 10,
+    // Optional: capture selected apps instead of all system output.
+    // applicationBundleIds: ['us.zoom.xos', 'com.microsoft.teams2'],
   },
-  onError(error) {
-    console.error(error);
+  onResult({ source, result }) {
+    console.log(`[${source}] ${result.stableText}${result.provisionalText}`);
+  },
+  onError({ source, error }) {
+    console.error(`[${source}]`, error);
   },
 });
 
 process.once('SIGINT', async () => {
-  const { result, capture } = await session.stop();
-  console.log(`\n${result.text}`);
-  console.log(`dropped microphone frames: ${capture.droppedFrames}`);
+  const final = await meeting.stop();
+  console.log('local:', final.microphone?.result.text);
+  console.log('remote:', final.systemAudio?.result.text);
 });
 ```
 
-The Core Audio callback only converts and downmixes samples into a bounded
-single-producer/single-consumer ring. Resampling and MLX inference run outside
-the realtime callback. Starting capture automatically binds the ASR stream to
-the device's actual sample rate. macOS may prompt the host process for
-microphone permission the first time capture starts. `feedMilliseconds` controls
-how often capture drains into the model buffer; `chunkSeconds` controls the
+Set either `microphone: false` or `systemAudio: false` for a single-track
+session. The lower-level `startRealtimeTranscription()` API remains available
+when you want to own exactly one source; its `capture.source` defaults to
+`Qwen3AsrCaptureSource.Microphone`.
+
+The native Core Audio callbacks only write packed mono float samples into
+bounded single-producer/single-consumer rings. Resampling and MLX inference run
+outside the realtime callbacks. Each capture automatically binds its ASR stream
+to the selected device's actual sample rate. `feedMilliseconds` controls how
+often capture drains into the model buffer; `chunkSeconds` controls the
 transcription update cadence.
+
+Packaged macOS hosts must include both `NSMicrophoneUsageDescription` and
+`NSAudioCaptureUsageDescription` in `Info.plist`. macOS prompts separately for
+microphone and system-audio permission. System capture uses a private Core
+Audio tap and does not mute normal speaker playback.

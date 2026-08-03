@@ -9,6 +9,8 @@
 mod audio;
 mod capture;
 mod config;
+#[cfg(target_os = "macos")]
+mod core_audio_capture;
 mod model;
 
 pub use capture::*;

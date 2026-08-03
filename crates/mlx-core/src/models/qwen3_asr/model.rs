@@ -913,7 +913,7 @@ struct StreamingState {
     stagnant_revisions: u32,
     /// Whether the most recent rolling decode exhausted its token budget.
     last_reached_max_tokens: bool,
-    /// At most one CPAL worker may feed a streaming session at a time.
+    /// At most one native capture worker may feed a streaming session at a time.
     capture_active: bool,
     /// Dropping the public stream wrapper must wait for its capture worker.
     remove_after_capture: bool,
@@ -1501,7 +1501,7 @@ fn prepare_stream_capture(state: &mut StreamingState, sample_rate: u32) -> Resul
     }
     if state.capture_active {
         return Err(Error::from_reason(
-            "A microphone capture is already active for this Qwen3-ASR stream",
+            "An audio capture is already active for this Qwen3-ASR stream",
         ));
     }
     if !state.pending_samples.is_empty()
@@ -1509,12 +1509,12 @@ fn prepare_stream_capture(state: &mut StreamingState, sample_rate: u32) -> Resul
         || state.processed_samples != 0
     {
         return Err(Error::from_reason(
-            "Microphone capture must start before manually feeding an ASR stream",
+            "Audio capture must start before manually feeding an ASR stream",
         ));
     }
-    // CPAL chooses the device's native input configuration. Treat that rate
-    // as authoritative so the feature extractor resamples the actual signal
-    // rather than interpreting (typically) 48 kHz input as 16 kHz.
+    // Core Audio chooses the device's native configuration. Treat that rate as
+    // authoritative so the feature extractor resamples the actual signal
+    // rather than interpreting (typically) 48 kHz capture as 16 kHz.
     state.options.sample_rate = Some(sample_rate);
     state.capture_active = true;
     Ok(())
@@ -1557,7 +1557,7 @@ pub(super) enum StreamFeedSource {
 fn validate_stream_feed_source(state: &StreamingState, source: StreamFeedSource) -> Result<()> {
     if state.capture_active && matches!(source, StreamFeedSource::Public) {
         return Err(Error::from_reason(
-            "Cannot manually feed a Qwen3-ASR stream while microphone capture is active",
+            "Cannot manually feed a Qwen3-ASR stream while audio capture is active",
         ));
     }
     Ok(())
@@ -1566,7 +1566,7 @@ fn validate_stream_feed_source(state: &StreamingState, source: StreamFeedSource)
 fn validate_stream_finish(state: &StreamingState) -> Result<()> {
     if state.capture_active {
         return Err(Error::from_reason(
-            "Cannot finish a Qwen3-ASR stream while microphone capture is active; stop and await the capture before finishing",
+            "Cannot finish a Qwen3-ASR stream while audio capture is active; stop and await the capture before finishing",
         ));
     }
     Ok(())
@@ -2122,9 +2122,9 @@ impl Qwen3AsrStream {
         })
     }
 
-    /// Start real-time microphone capture through RustAudio/CPAL. The Core
-    /// Audio callback only converts/downmixes into a bounded lock-free ring;
-    /// a separate worker drains that ring and feeds this streaming session.
+    /// Start real-time microphone or system-output capture through Core Audio.
+    /// The realtime callback only writes mono float PCM into a bounded lock-free
+    /// ring; a separate worker drains it and feeds this streaming session.
     #[napi]
     pub fn start_capture(
         &self,

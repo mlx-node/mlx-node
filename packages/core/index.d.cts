@@ -1318,6 +1318,7 @@ export declare class Qwen35MoeModel {
 export type Qwen3_5MoeModel = Qwen35MoeModel;
 
 export declare class Qwen3AsrCapture {
+  get source(): Qwen3AsrCaptureSource;
   get deviceName(): string;
   get sampleRate(): number;
   get channels(): number;
@@ -1336,9 +1337,9 @@ export declare class Qwen3AsrStream {
   feed(samples: Float32Array): Promise<Qwen3AsrResult | undefined | null>;
   finish(): Promise<Qwen3AsrResult>;
   /**
-   * Start real-time microphone capture through RustAudio/CPAL. The Core
-   * Audio callback only converts/downmixes into a bounded lock-free ring;
-   * a separate worker drains that ring and feeds this streaming session.
+   * Start real-time microphone or system-output capture through Core Audio.
+   * The realtime callback only writes mono float PCM into a bounded lock-free
+   * ring; a separate worker drains it and feeds this streaming session.
    */
   startCapture(
     options: Qwen3AsrCaptureOptions | undefined | null,
@@ -4280,15 +4281,44 @@ export interface Qwen35MoeGenerationResult {
   finishReason: string;
 }
 
+export interface Qwen3AsrAudioDevice {
+  id: string;
+  name: string;
+  source: Qwen3AsrCaptureSource;
+  isDefault: boolean;
+  sampleRate: number;
+  channels: number;
+}
+
+export declare function qwen3AsrAudioDevices(): Array<Qwen3AsrAudioDevice>;
+
 export interface Qwen3AsrCaptureOptions {
-  /** Stable CPAL device identifier returned by `qwen3AsrInputDevices()`. */
+  /** Audio source. Omit to capture the microphone. */
+  source?: Qwen3AsrCaptureSource;
+  /**
+   * Stable Core Audio device UID returned by `qwen3AsrAudioDevices()` or
+   * `qwen3AsrInputDevices()`.
+   */
   deviceId?: string;
-  /** Input device name. Omit to use CPAL's default input device. */
+  /**
+   * Device name. Omit to use the default input or output device for the
+   * selected source.
+   */
   deviceName?: string;
+  /**
+   * For system audio, optionally capture only processes with these bundle
+   * identifiers. Empty or omitted captures all audio sent to the device.
+   */
+  applicationBundleIds?: Array<string>;
   /** Lock-free callback ring capacity in seconds (default 10). */
   ringSeconds?: number;
   /** Amount drained from the ring into each model feed (default 100 ms). */
   feedMilliseconds?: number;
+}
+
+export declare const enum Qwen3AsrCaptureSource {
+  Microphone = 'microphone',
+  SystemAudio = 'systemAudio',
 }
 
 export interface Qwen3AsrCaptureStats {

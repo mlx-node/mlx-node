@@ -203,6 +203,24 @@ run('plutil', [
 ]);
 console.log(`LSMinimumSystemVersion: ${minimumSystemVersion} (highest minos of ${floors.length} binaries)`);
 
+// Qwen3-ASR can capture both local microphone input and remote/system output.
+// These are privacy usage descriptions, not sandbox or hardened-runtime
+// entitlements. They must live in the host app's Info.plist before signing.
+run('plutil', [
+  '-insert',
+  'NSMicrophoneUsageDescription',
+  '-string',
+  'mlx-node uses your microphone to transcribe speech locally on this Mac.',
+  join(appPath, 'Contents', 'Info.plist'),
+]);
+run('plutil', [
+  '-insert',
+  'NSAudioCaptureUsageDescription',
+  '-string',
+  'mlx-node captures app and system audio to transcribe meetings locally on this Mac.',
+  join(appPath, 'Contents', 'Info.plist'),
+]);
+
 if (sign) {
   const identity = process.env.SIGN_IDENTITY ?? findIdentity();
   const entitlements = join(APP_DIR, 'build', 'entitlements.mac.plist');

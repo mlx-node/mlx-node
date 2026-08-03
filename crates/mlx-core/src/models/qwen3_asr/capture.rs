@@ -3,7 +3,7 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use tokio::sync::mpsc;
 
-use super::config::{Qwen3AsrCaptureOptions, Qwen3AsrResult};
+use super::config::{Qwen3AsrCaptureOptions, Qwen3AsrCaptureSource, Qwen3AsrResult};
 use super::model::{Qwen3AsrCmd, StreamFeedSource};
 
 #[napi(object)]
@@ -14,6 +14,16 @@ pub struct Qwen3AsrInputDevice {
     pub sample_rate: u32,
     pub channels: u32,
     pub sample_format: String,
+}
+
+#[napi(object)]
+pub struct Qwen3AsrAudioDevice {
+    pub id: String,
+    pub name: String,
+    pub source: Qwen3AsrCaptureSource,
+    pub is_default: bool,
+    pub sample_rate: u32,
+    pub channels: u32,
 }
 
 #[napi(object)]
@@ -30,10 +40,8 @@ mod platform {
     use std::thread::JoinHandle;
     use std::time::Duration;
 
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    use cpal::{FromSample, Sample, SampleFormat};
-
     use super::*;
+    use crate::models::qwen3_asr::core_audio_capture::{self, NativeCapture};
 
     /// Fixed-capacity single-producer/single-consumer ring. The Core Audio
     /// callback performs no allocation, lock acquisition, inference, or
@@ -51,8 +59,8 @@ mod platform {
         ready: Condvar,
     }
 
-    // SPSC discipline: only the CPAL callback writes slots and only the feeder
-    // worker reads them; cursors publish ownership transitions.
+    // SPSC discipline: only the Core Audio callback writes slots and only the
+    // feeder worker reads them; cursors publish ownership transitions.
     unsafe impl Sync for AudioRing {}
 
     impl AudioRing {
@@ -85,6 +93,13 @@ mod platform {
             self.captured.fetch_add(1, Ordering::Relaxed);
         }
 
+        fn push_mono(&self, samples: &[f32]) {
+            for &sample in samples {
+                self.push(sample);
+            }
+            self.wake();
+        }
+
         fn available(&self) -> usize {
             self.write
                 .load(Ordering::Acquire)
@@ -112,52 +127,12 @@ mod platform {
         }
     }
 
-    fn push_interleaved<T>(ring: &AudioRing, data: &[T], channels: usize)
-    where
-        T: Sample,
-        f32: FromSample<T>,
-    {
-        for frame in data.chunks_exact(channels) {
-            let mut mono = 0.0f32;
-            for &sample in frame {
-                mono += f32::from_sample(sample);
-            }
-            ring.push(mono / channels as f32);
-        }
-        ring.wake();
-    }
-
-    fn select_device(host: &cpal::Host, options: &Qwen3AsrCaptureOptions) -> Result<cpal::Device> {
-        if let Some(id) = options.device_id.as_deref() {
-            let id = id
-                .parse()
-                .map_err(|error| Error::from_reason(format!("Invalid CPAL device id: {error}")))?;
-            return host.device_by_id(&id).ok_or_else(|| {
-                Error::from_reason(format!("CPAL input device is unavailable: {id}"))
-            });
-        }
-        if let Some(name) = options.device_name.as_deref() {
-            return host
-                .input_devices()
-                .map_err(|error| {
-                    Error::from_reason(format!("Failed to list input devices: {error}"))
-                })?
-                .find(|device| {
-                    device
-                        .description()
-                        .is_ok_and(|description| description.name() == name)
-                })
-                .ok_or_else(|| Error::from_reason(format!("CPAL input device not found: {name}")));
-        }
-        host.default_input_device()
-            .ok_or_else(|| Error::from_reason("No default CPAL input device is available"))
-    }
-
     #[napi]
     pub struct Qwen3AsrCapture {
-        stream: Option<cpal::Stream>,
+        stream: Option<NativeCapture>,
         ring: Arc<AudioRing>,
         worker: Option<JoinHandle<()>>,
+        source: Qwen3AsrCaptureSource,
         device_name: String,
         sample_rate: u32,
         channels: u32,
@@ -165,6 +140,11 @@ mod platform {
 
     #[napi]
     impl Qwen3AsrCapture {
+        #[napi(getter)]
+        pub fn source(&self) -> Qwen3AsrCaptureSource {
+            self.source
+        }
+
         #[napi(getter)]
         pub fn device_name(&self) -> String {
             self.device_name.clone()
@@ -181,21 +161,19 @@ mod platform {
         }
 
         #[napi]
-        pub fn pause(&self) -> Result<()> {
+        pub fn pause(&mut self) -> Result<()> {
             self.stream
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| Error::from_reason("Capture is stopped"))?
-                .pause()
-                .map_err(|error| Error::from_reason(format!("Failed to pause capture: {error}")))
+                .stop()
         }
 
         #[napi]
-        pub fn resume(&self) -> Result<()> {
+        pub fn resume(&mut self) -> Result<()> {
             self.stream
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| Error::from_reason("Capture is stopped"))?
-                .play()
-                .map_err(|error| Error::from_reason(format!("Failed to resume capture: {error}")))
+                .start()
         }
 
         #[napi]
@@ -203,8 +181,8 @@ mod platform {
             &mut self,
             env: &'env Env,
         ) -> Result<PromiseRaw<'env, Qwen3AsrCaptureStats>> {
-            if let Some(stream) = self.stream.take() {
-                let _ = stream.pause();
+            if let Some(mut stream) = self.stream.take() {
+                let _ = stream.stop();
                 drop(stream);
             }
             self.ring.stop();
@@ -227,42 +205,6 @@ mod platform {
         }
     }
 
-    pub(super) fn input_devices() -> Result<Vec<Qwen3AsrInputDevice>> {
-        let host = cpal::default_host();
-        let default_id = host
-            .default_input_device()
-            .and_then(|device| device.id().ok())
-            .map(|id| id.to_string());
-        host.input_devices()
-            .map_err(|error| {
-                Error::from_reason(format!("Failed to list CPAL input devices: {error}"))
-            })?
-            .map(|device| {
-                let id = device.id().map_err(|error| {
-                    Error::from_reason(format!("Failed to identify CPAL device: {error}"))
-                })?;
-                let description = device.description().map_err(|error| {
-                    Error::from_reason(format!("Failed to describe CPAL device: {error}"))
-                })?;
-                let config = device.default_input_config().map_err(|error| {
-                    Error::from_reason(format!(
-                        "Failed to query default input config for {}: {error}",
-                        description.name()
-                    ))
-                })?;
-                let id_string = id.to_string();
-                Ok(Qwen3AsrInputDevice {
-                    is_default: default_id.as_deref() == Some(id_string.as_str()),
-                    id: id_string,
-                    name: description.name().to_string(),
-                    sample_rate: config.sample_rate(),
-                    channels: config.channels() as u32,
-                    sample_format: config.sample_format().to_string(),
-                })
-            })
-            .collect()
-    }
-
     impl Drop for Qwen3AsrCapture {
         fn drop(&mut self) {
             self.ring.stop();
@@ -273,80 +215,74 @@ mod platform {
         }
     }
 
+    pub(super) fn audio_devices() -> Result<Vec<Qwen3AsrAudioDevice>> {
+        let mut devices = Vec::new();
+        for source in [
+            Qwen3AsrCaptureSource::Microphone,
+            Qwen3AsrCaptureSource::SystemAudio,
+        ] {
+            let default = core_audio_capture::default_device_id(source);
+            devices.extend(
+                core_audio_capture::audio_devices(source)?
+                    .into_iter()
+                    .map(|device| Qwen3AsrAudioDevice {
+                        is_default: default == Some(device.object_id),
+                        id: device.id,
+                        name: device.name,
+                        source,
+                        sample_rate: device.sample_rate,
+                        channels: device.channels,
+                    }),
+            );
+        }
+        Ok(devices)
+    }
+
+    pub(super) fn input_devices() -> Result<Vec<Qwen3AsrInputDevice>> {
+        let source = Qwen3AsrCaptureSource::Microphone;
+        let default = core_audio_capture::default_device_id(source);
+        Ok(core_audio_capture::audio_devices(source)?
+            .into_iter()
+            .map(|device| Qwen3AsrInputDevice {
+                id: device.id,
+                name: device.name,
+                is_default: default == Some(device.object_id),
+                sample_rate: device.sample_rate,
+                channels: device.channels,
+                sample_format: "f32".into(),
+            })
+            .collect())
+    }
+
     pub(super) fn start_capture(
         sender: mpsc::UnboundedSender<Qwen3AsrCmd>,
         stream_id: String,
         options: Qwen3AsrCaptureOptions,
         callback: ThreadsafeFunction<Qwen3AsrResult, ()>,
     ) -> Result<Qwen3AsrCapture> {
-        let host = cpal::default_host();
-        let device = select_device(&host, &options)?;
-        let description = device.description().map_err(|error| {
-            Error::from_reason(format!("Failed to describe CPAL input device: {error}"))
-        })?;
-        let supported = device.default_input_config().map_err(|error| {
-            Error::from_reason(format!("Failed to get CPAL input configuration: {error}"))
-        })?;
-        let sample_rate = supported.sample_rate();
-        let channels = supported.channels() as usize;
-        if channels == 0 || sample_rate == 0 {
-            return Err(Error::from_reason(
-                "CPAL returned an invalid input configuration",
-            ));
-        }
         let ring_seconds = options.ring_seconds.unwrap_or(10.0);
         if !ring_seconds.is_finite() || !(1.0..=120.0).contains(&ring_seconds) {
             return Err(Error::from_reason("ring_seconds must be between 1 and 120"));
         }
         let feed_ms = options.feed_milliseconds.unwrap_or(100).clamp(10, 1_000);
-        let ring = Arc::new(AudioRing::new(
-            (ring_seconds * sample_rate as f64).ceil() as usize
-        ));
-        let callback = Arc::new(callback);
-        let error_callback = callback.clone();
-        let error_fn = move |error: cpal::Error| {
-            error_callback.call(
-                Err(Error::from_reason(format!("CPAL input error: {error}"))),
-                ThreadsafeFunctionCallMode::NonBlocking,
-            );
-        };
-        let callback_ring = ring.clone();
-        let sample_format = supported.sample_format();
-        let stream = device
-            .build_input_stream_raw(
-                supported.config(),
-                sample_format,
-                move |data, _| {
-                    macro_rules! push_as {
-                        ($ty:ty) => {
-                            if let Some(samples) = data.as_slice::<$ty>() {
-                                push_interleaved(&callback_ring, samples, channels);
-                            }
-                        };
-                    }
-                    match sample_format {
-                        SampleFormat::I8 => push_as!(i8),
-                        SampleFormat::I16 => push_as!(i16),
-                        SampleFormat::I24 => push_as!(cpal::I24),
-                        SampleFormat::I32 => push_as!(i32),
-                        SampleFormat::I64 => push_as!(i64),
-                        SampleFormat::U8 => push_as!(u8),
-                        SampleFormat::U16 => push_as!(u16),
-                        SampleFormat::U24 => push_as!(cpal::U24),
-                        SampleFormat::U32 => push_as!(u32),
-                        SampleFormat::U64 => push_as!(u64),
-                        SampleFormat::F32 => push_as!(f32),
-                        SampleFormat::F64 => push_as!(f64),
-                        _ => {}
-                    }
-                },
-                error_fn,
-                None,
-            )
-            .map_err(|error| {
-                Error::from_reason(format!("Failed to build CPAL input stream: {error}"))
-            })?;
 
+        let (_, selected_device) = core_audio_capture::selected_device(&options)?;
+        let ring = Arc::new(AudioRing::new(
+            (ring_seconds * selected_device.sample_rate as f64).ceil() as usize,
+        ));
+        let callback_ring = ring.clone();
+        let (source, mut stream) = core_audio_capture::build(&options, move |samples| {
+            callback_ring.push_mono(samples);
+        })?;
+        let sample_rate = stream.device.sample_rate;
+        let channels = stream.device.channels;
+        let device_name = stream.device.name.clone();
+        if sample_rate == 0 || channels == 0 {
+            return Err(Error::from_reason(
+                "Core Audio returned an invalid capture configuration",
+            ));
+        }
+        let callback = Arc::new(callback);
         let worker_ring = ring.clone();
         let worker_callback = callback.clone();
         let worker_ready = Arc::new(AtomicBool::new(false));
@@ -355,13 +291,10 @@ mod platform {
         let worker_stream_id = stream_id.clone();
         let feed_frames = ((sample_rate as u64 * feed_ms as u64) / 1_000).max(1) as usize;
         let worker = std::thread::Builder::new()
-            .name("mlx-asr-capture".into())
+            .name(format!("mlx-asr-{}-capture", source_name(source)))
             .spawn(move || {
-                // Building and starting CPAL, spawning this worker, and
-                // preparing the model stream are all fallible. Keep the
-                // worker parked until every setup step succeeds so a failed
-                // capture attempt cannot feed device-rate PCM into the
-                // caller's still-manual stream.
+                // Native setup, worker creation, and model preparation are all
+                // fallible. Keep the worker parked until every step succeeds.
                 while !worker_ready.load(Ordering::Acquire) {
                     if worker_ring.stopped.load(Ordering::Acquire) {
                         return;
@@ -444,13 +377,11 @@ mod platform {
                 Error::from_reason(format!("Failed to start capture worker: {error}"))
             })?;
 
-        if let Err(error) = stream.play() {
+        if let Err(error) = stream.start() {
             ring.stop();
             drop(stream);
             let _ = worker.join();
-            return Err(Error::from_reason(format!(
-                "Failed to start CPAL input stream: {error}"
-            )));
+            return Err(error);
         }
 
         let prepare_result = (|| {
@@ -480,10 +411,18 @@ mod platform {
             stream: Some(stream),
             ring,
             worker: Some(worker),
-            device_name: description.name().to_string(),
+            source,
+            device_name,
             sample_rate,
-            channels: channels as u32,
+            channels,
         })
+    }
+
+    fn source_name(source: Qwen3AsrCaptureSource) -> &'static str {
+        match source {
+            Qwen3AsrCaptureSource::Microphone => "microphone",
+            Qwen3AsrCaptureSource::SystemAudio => "system-audio",
+        }
     }
 
     #[cfg(test)]
@@ -493,22 +432,12 @@ mod platform {
         #[test]
         fn audio_ring_is_bounded_and_preserves_order() {
             let ring = AudioRing::new(3);
-            ring.push(1.0);
-            ring.push(2.0);
-            ring.push(3.0);
-            ring.push(4.0);
+            ring.push_mono(&[1.0, 2.0, 3.0, 4.0]);
             assert_eq!(ring.captured.load(Ordering::Relaxed), 3);
             assert_eq!(ring.dropped.load(Ordering::Relaxed), 1);
             assert_eq!(ring.drain(2), vec![1.0, 2.0]);
-            ring.push(5.0);
+            ring.push_mono(&[5.0]);
             assert_eq!(ring.drain(3), vec![3.0, 5.0]);
-        }
-
-        #[test]
-        fn interleaved_capture_downmixes_without_changing_frame_count() {
-            let ring = AudioRing::new(4);
-            push_interleaved(&ring, &[1.0f32, -1.0, 0.5, 0.25], 2);
-            assert_eq!(ring.drain(4), vec![0.0, 0.375]);
         }
     }
 }
@@ -525,7 +454,13 @@ mod platform {
 
     pub(super) fn input_devices() -> Result<Vec<Qwen3AsrInputDevice>> {
         Err(Error::from_reason(
-            "Qwen3-ASR CPAL capture is currently built only for macOS",
+            "Qwen3-ASR Core Audio capture is currently built only for macOS",
+        ))
+    }
+
+    pub(super) fn audio_devices() -> Result<Vec<Qwen3AsrAudioDevice>> {
+        Err(Error::from_reason(
+            "Qwen3-ASR Core Audio capture is currently built only for macOS",
         ))
     }
 
@@ -536,7 +471,7 @@ mod platform {
         _callback: ThreadsafeFunction<Qwen3AsrResult, ()>,
     ) -> Result<Qwen3AsrCapture> {
         Err(Error::from_reason(
-            "Qwen3-ASR CPAL capture is currently built only for macOS",
+            "Qwen3-ASR Core Audio capture is currently built only for macOS",
         ))
     }
 }
@@ -555,4 +490,9 @@ pub(super) fn start_capture(
 #[napi]
 pub fn qwen3_asr_input_devices() -> Result<Vec<Qwen3AsrInputDevice>> {
     platform::input_devices()
+}
+
+#[napi]
+pub fn qwen3_asr_audio_devices() -> Result<Vec<Qwen3AsrAudioDevice>> {
+    platform::audio_devices()
 }

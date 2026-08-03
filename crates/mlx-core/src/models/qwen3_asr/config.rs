@@ -237,12 +237,29 @@ pub struct Qwen3AsrStreamOptions {
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct Qwen3AsrCaptureOptions {
-    /// Stable CPAL device identifier returned by `qwen3AsrInputDevices()`.
+    /// Audio source. Omit to capture the microphone.
+    pub source: Option<Qwen3AsrCaptureSource>,
+    /// Stable Core Audio device UID returned by `qwen3AsrAudioDevices()` or
+    /// `qwen3AsrInputDevices()`.
     pub device_id: Option<String>,
-    /// Input device name. Omit to use CPAL's default input device.
+    /// Device name. Omit to use the default input or output device for the
+    /// selected source.
     pub device_name: Option<String>,
+    /// For system audio, optionally capture only processes with these bundle
+    /// identifiers. Empty or omitted captures all audio sent to the device.
+    pub application_bundle_ids: Option<Vec<String>>,
     /// Lock-free callback ring capacity in seconds (default 10).
     pub ring_seconds: Option<f64>,
     /// Amount drained from the ring into each model feed (default 100 ms).
     pub feed_milliseconds: Option<u32>,
+}
+
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Qwen3AsrCaptureSource {
+    #[default]
+    #[napi(value = "microphone")]
+    Microphone,
+    #[napi(value = "systemAudio")]
+    SystemAudio,
 }
