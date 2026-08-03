@@ -296,6 +296,10 @@ pub(crate) struct Qwen35MoeInner {
     /// `None` = no MTP turn completed yet (first turn probes) or the gate
     /// is disabled.
     mtp_last_acceptance: Option<f64>,
+    /// Consecutive turns the MTP acceptance gate has blocked; after
+    /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns the gate
+    /// re-probes (`mtp_last_acceptance` resets to `None`).
+    mtp_gated_turns: u32,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -669,6 +673,7 @@ impl Qwen35MoeInner {
             mtp,
             mtp_weights_loaded: false,
             mtp_last_acceptance: None,
+            mtp_gated_turns: 0,
             training_state: None,
             turn_is_streaming: Cell::new(false),
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
@@ -8725,15 +8730,31 @@ impl MtpBackend for Qwen35MoeInner {
 
     fn record_turn_mtp_acceptance(&mut self, ratio: Option<f64>) {
         self.mtp_last_acceptance = ratio;
+        // A fresh acceptance sample supersedes any gated-turn streak.
+        self.mtp_gated_turns = 0;
     }
 }
 
 impl Qwen35MoeInner {
     /// MTP acceptance gate — see `mtp_decode::mtp_accept_gate_enabled`.
-    /// Mirrors the dense `Qwen35Inner::mtp_gate_allows` policy.
-    fn mtp_gate_allows(&self) -> bool {
-        !mtp_decode::mtp_accept_gate_enabled()
-            || mtp_decode::mtp_accept_gate_passes(self.mtp_last_acceptance)
+    /// Mirrors the dense `Qwen35Inner::mtp_gate_allows` policy (re-probes
+    /// after [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns).
+    fn mtp_gate_allows(&mut self) -> bool {
+        if !mtp_decode::mtp_accept_gate_enabled() {
+            return true;
+        }
+        match self.mtp_last_acceptance {
+            None => true, // no history — probe
+            Some(r) if mtp_decode::mtp_accept_gate_passes(Some(r)) => true,
+            Some(_) => {
+                self.mtp_gated_turns += 1;
+                if self.mtp_gated_turns >= mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS {
+                    self.mtp_gated_turns = 0;
+                    self.mtp_last_acceptance = None; // re-probe next turn
+                }
+                false
+            }
+        }
     }
 }
 

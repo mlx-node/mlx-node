@@ -128,15 +128,27 @@ pub(crate) fn mtp_defer_verify_hidden_eval() -> bool {
 /// loss there and the gate is what keeps it from auto-enabling).
 pub(crate) const MTP_ACCEPT_GATE_THRESHOLD: f64 = 0.6;
 
+/// After this many consecutive gated (MTP-disabled) turns, the MTP
+/// acceptance gate re-probes: the model resets its recorded acceptance to
+/// `None` so the next turn runs speculation again. Without this, one hard
+/// first turn would permanently disable MTP for the model's lifetime — a
+/// genuinely weak head (e.g. qwen3.5-0.8b, acceptance 0.0) re-gates after
+/// one probe, while a prompt-dependent head (qwen3.5-4b: 0.756 on complex
+/// tasks, 1.0 on counting) can recover on an easier later turn.
+pub(crate) const MTP_ACCEPT_GATE_REPROBE_TURNS: u32 = 3;
+
 /// MTP acceptance gate — `MLX_MTP_ACCEPT_GATE` (default ON).
 ///
 /// When ON, a completed MTP turn whose draft-acceptance ratio
 /// (accepted drafts / attempted drafts) fell below
 /// [`MTP_ACCEPT_GATE_THRESHOLD`] disables speculative decoding for the
 /// NEXT turn, falling back to the exact target autoregressive path. The
-/// first turn of a session has no history and probes. The gate is
-/// model-owned (per-session), not engine-level: it reuses the existing
-/// "unsupported combination disables speculation for this turn" routing.
+/// first turn of a model load has no history and probes; after
+/// [`MTP_ACCEPT_GATE_REPROBE_TURNS`] consecutive gated turns the gate
+/// re-probes. The state is **per-model** (one loaded checkpoint, shared
+/// by every ChatSession over it), not per-session. The gate reuses the
+/// existing "unsupported combination disables speculation for this turn"
+/// routing.
 ///
 /// Opt-out: `MLX_MTP_ACCEPT_GATE=0` (or `false` / `off`) disables the
 /// gate so MTP always runs when requested. Read once per process and

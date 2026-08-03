@@ -2058,9 +2058,13 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // Publish this turn's draft-acceptance ratio for the NEXT turn's MTP
     // admission gate (backend-owned; default no-op). Only on the normal
     // completion path — a replayed/aborted turn must not masquerade as a
-    // healthy speculative sample. `None` (no cycle ran) lets the family
-    // keep its prior history.
-    if let Some(ratio) = turn_mtp_acceptance(profiler) {
+    // healthy speculative sample, and a USER-CANCELLED turn is not a
+    // representative acceptance sample either (it may contain only the
+    // hard first cycles). `None` (no cycle ran) lets the family keep its
+    // prior history.
+    if *reason != "cancelled"
+        && let Some(ratio) = turn_mtp_acceptance(profiler)
+    {
         backend.record_turn_mtp_acceptance(Some(ratio));
     }
 
@@ -2132,6 +2136,7 @@ mod tests {
         RollbackUnemitted { unemitted: usize },
         TakeReplayError,
         IntoDesynced,
+        RecordTurnMtpAcceptance,
     }
 
     /// Tiny lazy `[1, 1]` array — fabricated WITHOUT Metal (mlx arrays are
@@ -3837,6 +3842,9 @@ mod tests {
         ledger: Rc<RefCell<Vec<Call>>>,
         /// Records that `begin_mtp_decode` ran exactly once.
         begin_calls: std::cell::Cell<usize>,
+        /// Last value passed to `record_turn_mtp_acceptance` (the engine's
+        /// acceptance-gate hook); `None` when never called.
+        recorded_ratio: std::cell::RefCell<Option<f64>>,
     }
 
     impl MockMtpBackend {
@@ -3856,6 +3864,7 @@ mod tests {
                 replay_error: None,
                 ledger: Rc::new(RefCell::new(Vec::new())),
                 begin_calls: std::cell::Cell::new(0),
+                recorded_ratio: std::cell::RefCell::new(None),
             }
         }
 
@@ -3939,6 +3948,11 @@ mod tests {
             }
             step.shared_ledger = Some(Rc::clone(&self.ledger));
             Ok(step)
+        }
+
+        fn record_turn_mtp_acceptance(&mut self, ratio: Option<f64>) {
+            self.ledger.borrow_mut().push(Call::RecordTurnMtpAcceptance);
+            *self.recorded_ratio.borrow_mut() = ratio;
         }
     }
 
@@ -4133,6 +4147,18 @@ mod tests {
             count(&out.ledger, |c| matches!(c, Call::IntoDesynced)),
             1,
             "engine consumes the stepper's desync out once"
+        );
+        // The MTP acceptance gate hook fires exactly once on the normal
+        // completion path with the full-accept ratio (accepted == attempted).
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::RecordTurnMtpAcceptance)),
+            1,
+            "engine publishes the turn's acceptance ratio once on a clean length exit"
+        );
+        let recorded = *backend.recorded_ratio.borrow();
+        assert!(
+            matches!(recorded, Some(r) if r > 0.99),
+            "full-accept run records a ~1.0 ratio, got {recorded:?} (accepted == attempted)"
         );
     }
 
@@ -4345,6 +4371,11 @@ mod tests {
         );
         let ledger = backend.ledger_snapshot();
         assert_eq!(count(&ledger, |c| matches!(c, Call::TakeReplayError)), 1);
+        assert_eq!(
+            count(&ledger, |c| matches!(c, Call::RecordTurnMtpAcceptance)),
+            0,
+            "a replayed/aborted turn must not publish an acceptance sample"
+        );
         assert_eq!(
             count(&ledger, |c| matches!(c, Call::IntoDesynced)),
             0,

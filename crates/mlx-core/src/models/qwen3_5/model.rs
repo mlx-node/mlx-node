@@ -827,8 +827,14 @@ pub(crate) struct Qwen35Inner {
     /// gate ([`Self::mtp_gate_allows`]) when planning the NEXT turn:
     /// a head that accepts below break-even disables speculation so the
     /// verify cost is not paid for zero speedup. `None` = no MTP turn
-    /// completed yet (the first turn probes) or the gate is disabled.
+    /// completed yet (the first turn probes) or the gate re-probed after
+    /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns.
     mtp_last_acceptance: Option<f64>,
+    /// Consecutive turns the MTP acceptance gate has blocked; after
+    /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns the gate
+    /// re-probes (`mtp_last_acceptance` resets to `None`) so a later
+    /// easier turn can re-enable speculation.
+    mtp_gated_turns: u32,
     /// Whether the CURRENT generic-flow turn is streaming. Set by the
     /// [`ChatBackend::profiler_label`] hook (the session core calls it
     /// exactly once per generic-flow turn, before `begin_decode`);
@@ -1282,6 +1288,7 @@ impl Qwen35Inner {
             mtp,
             mtp_weights_loaded: false,
             mtp_last_acceptance: None,
+            mtp_gated_turns: 0,
             turn_is_streaming: Cell::new(false),
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
         })
@@ -9941,6 +9948,8 @@ impl MtpBackend for Qwen35Inner {
 
     fn record_turn_mtp_acceptance(&mut self, ratio: Option<f64>) {
         self.mtp_last_acceptance = ratio;
+        // A fresh acceptance sample supersedes any gated-turn streak.
+        self.mtp_gated_turns = 0;
     }
 }
 
@@ -9949,10 +9958,26 @@ impl Qwen35Inner {
     /// `false` means the most recent completed MTP turn's draft-acceptance
     /// ratio fell below the break-even bound, so this turn should run
     /// plain AR instead of paying the verify cost for zero speedup. First
-    /// turn (no history) probes; the env knob disables the gate entirely.
-    fn mtp_gate_allows(&self) -> bool {
-        !mtp_decode::mtp_accept_gate_enabled()
-            || mtp_decode::mtp_accept_gate_passes(self.mtp_last_acceptance)
+    /// turn (no history) probes; after [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`]
+    /// consecutive gated turns the gate re-probes; the env knob disables
+    /// the gate entirely. `&mut self` because a blocked turn advances the
+    /// gated-turn counter and may trigger the re-probe reset.
+    fn mtp_gate_allows(&mut self) -> bool {
+        if !mtp_decode::mtp_accept_gate_enabled() {
+            return true;
+        }
+        match self.mtp_last_acceptance {
+            None => true, // no history — probe
+            Some(r) if mtp_decode::mtp_accept_gate_passes(Some(r)) => true,
+            Some(_) => {
+                self.mtp_gated_turns += 1;
+                if self.mtp_gated_turns >= mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS {
+                    self.mtp_gated_turns = 0;
+                    self.mtp_last_acceptance = None; // re-probe next turn
+                }
+                false
+            }
+        }
     }
 }
 
