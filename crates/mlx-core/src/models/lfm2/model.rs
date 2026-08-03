@@ -65,6 +65,11 @@ fn conv_state_reuse_enabled() -> bool {
 /// No `Arc<RwLock<>>` — the model thread has sole ownership.
 pub(crate) struct Lfm2Inner {
     pub(crate) config: Lfm2Config,
+    /// Turn-constant layer classification (`FullAttention` vs `Conv`),
+    /// computed once in [`Self::new`] instead of re-derived on every paged
+    /// decode step. Pure function of the immutable `config` + layer count.
+    /// Mirrors the `Gemma4Inner::layer_kinds` caching pattern.
+    pub(crate) layer_kinds: Vec<Lfm2LayerKind>,
     pub(crate) embed_tokens: Embedding,
     pub(crate) layers: Vec<Lfm2DecoderLayer>,
     /// Output norm (called "embedding_norm" in HF, applied AFTER all layers).
@@ -336,8 +341,13 @@ impl Lfm2Inner {
             None
         };
 
+        // Layer classification is a pure function of the immutable config +
+        // layer count; compute once here (see the field rustdoc).
+        let layer_kinds = compute_layer_kinds_for(&config, num_layers);
+
         Ok(Self {
             config,
+            layer_kinds,
             embed_tokens,
             layers,
             embedding_norm,
@@ -696,7 +706,9 @@ impl Lfm2Inner {
                 .map_err(Error::from_reason)?;
         }
 
-        let layer_kinds = self.compute_layer_kinds();
+        // Turn-constant classification, cached once at construction (see the
+        // field rustdoc) instead of re-derived every decode step.
+        let layer_kinds = &self.layer_kinds;
 
         let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
         let mut hidden_states = self.embed_tokens.forward(&input_ids)?;

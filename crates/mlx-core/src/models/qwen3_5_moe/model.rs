@@ -233,6 +233,11 @@ use crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER;
 /// and training state. Training commands are routed via `TrainingDispatch`.
 pub(crate) struct Qwen35MoeInner {
     pub(crate) config: Qwen3_5MoeConfig,
+    /// Turn-constant layer classification (`Linear` vs `FullAttentionPaged`),
+    /// computed once in [`Self::new`] instead of re-derived on every paged
+    /// decode step. Pure function of the immutable `config`. Mirrors the
+    /// `Gemma4Inner::layer_kinds` caching pattern.
+    pub(crate) layer_kinds: Vec<crate::models::qwen3_5::decoder_layer::Qwen3_5LayerKind>,
     pub(crate) embedding: Embedding,
     pub(crate) layers: Vec<DecoderLayer>,
     pub(crate) final_norm: RMSNorm,
@@ -595,6 +600,13 @@ impl Qwen35MoeInner {
 
         let model_id = QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
+        // Layer classification is a pure function of the immutable config;
+        // compute once here (see the field rustdoc).
+        let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
+            config.num_layers as usize,
+            |i| config.is_linear_layer(i),
+        );
+
         // Persistence constructs the physical pool only after weights are
         // installed and materialized, when live unified-memory pressure can be
         // measured safely.
@@ -623,6 +635,7 @@ impl Qwen35MoeInner {
 
         Ok(Self {
             config,
+            layer_kinds,
             embedding,
             layers,
             final_norm,
@@ -7367,10 +7380,6 @@ impl DecodeStep for Qwen35MoePagedDecode<'_> {
         // signature parity).
         let logits = {
             let embed = self.inner.embedding.clone();
-            let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
-                self.inner.config.num_layers as usize,
-                |i| self.inner.config.is_linear_layer(i),
-            );
             let caches_ref = self.inner.caches.as_mut().ok_or_else(|| {
                 Error::from_reason("Qwen35MoePagedDecode::forward: caches dropped mid-decode")
             })?;
@@ -7386,7 +7395,7 @@ impl DecodeStep for Qwen35MoePagedDecode<'_> {
                 caches_ref,
                 &self.inner.final_norm,
                 &self.inner.lm_head,
-                &layer_kinds,
+                &self.inner.layer_kinds,
                 adapter,
                 self.inner.cached_rope_deltas.unwrap_or(0),
             )?
