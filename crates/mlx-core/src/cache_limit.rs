@@ -236,11 +236,11 @@ impl CacheLimitCoordinator {
 /// it unregisters the delta and triggers a recompute so the cap shrinks
 /// back down when a model unloads.
 ///
-/// Each generative model wrapper (`Qwen3_5Model`, `Qwen3_5MoeModel`,
-/// `Qwen3Model`, `Gemma4Model`, `Lfm2Model`, `VLModel`, `QianfanOCRModel`)
-/// holds one of these as a field so its lifetime matches the native
-/// model's lifetime. JS GC of the wrapper → `Drop` on the guard →
-/// unregister.
+/// Each generative model keeps one of these with the owner of its native
+/// weights. That is normally the JavaScript model wrapper; models that expose
+/// independently retained stream handles keep it in their model-thread state
+/// instead. Dropping the final owner of the weights drops the guard and
+/// unregisters the model.
 pub struct CacheLimitGuard {
     id: u64,
 }

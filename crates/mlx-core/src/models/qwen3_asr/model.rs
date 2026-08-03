@@ -953,6 +953,17 @@ struct Qwen3AsrInner {
     streams: HashMap<String, StreamingState>,
 }
 
+/// Everything whose lifetime must match the model thread rather than the
+/// JavaScript model wrapper. A `Qwen3AsrStream` owns a cloned command sender,
+/// so it can intentionally keep the thread and its multi-gigabyte weights
+/// alive after `Qwen3AsrModel` is collected. Keep the cache-limit registration
+/// here as well so the process-wide budget accounts for those resident weights
+/// until the final model/stream/capture sender closes.
+struct Qwen3AsrThreadState {
+    inner: Qwen3AsrInner,
+    _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
+}
+
 impl Qwen3AsrInner {
     fn transcribe(
         &mut self,
@@ -1903,7 +1914,8 @@ pub(super) enum Qwen3AsrCmd {
     },
 }
 
-fn handle_cmd(inner: &mut Qwen3AsrInner, cmd: Qwen3AsrCmd) {
+fn handle_cmd(state: &mut Qwen3AsrThreadState, cmd: Qwen3AsrCmd) {
+    let inner = &mut state.inner;
     match cmd {
         Qwen3AsrCmd::Transcribe {
             audio,
@@ -1992,7 +2004,6 @@ async fn await_reply<T>(rx: oneshot::Receiver<Result<T>>) -> Result<T> {
 #[napi]
 pub struct Qwen3AsrModel {
     thread: ModelThread<Qwen3AsrCmd>,
-    _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
 }
 
 #[napi]
@@ -2160,18 +2171,21 @@ async fn load_with_thread(model_path: String) -> Result<Qwen3AsrModel> {
         move || {
             let path = PathBuf::from(&model_path);
             let (inner, weight_bytes) = load_inner(&path)?;
-            let guard = crate::cache_limit::coordinator().register(weight_bytes);
-            Ok((inner, guard))
+            let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
+            Ok((
+                Qwen3AsrThreadState {
+                    inner,
+                    _cache_limit_guard: cache_limit_guard,
+                },
+                (),
+            ))
         },
         handle_cmd,
     );
-    let guard = init_rx
+    init_rx
         .await
         .map_err(|_| Error::from_reason("Qwen3-ASR model thread exited during load"))??;
-    Ok(Qwen3AsrModel {
-        thread,
-        _cache_limit_guard: guard,
-    })
+    Ok(Qwen3AsrModel { thread })
 }
 
 fn load_inner(path: &Path) -> Result<(Qwen3AsrInner, u64)> {
