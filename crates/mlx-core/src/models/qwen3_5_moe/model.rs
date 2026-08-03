@@ -290,6 +290,12 @@ pub(crate) struct Qwen35MoeInner {
     /// `has_mtp_weights()` AND-gates on this flag so speculative decode never
     /// runs against a half-loaded head.
     pub(crate) mtp_weights_loaded: bool,
+    /// Draft-acceptance ratio (accepted drafts / attempted drafts) of the
+    /// most recently completed MTP turn, consulted by the MTP acceptance
+    /// gate ([`Self::mtp_gate_allows`]) when planning the NEXT turn.
+    /// `None` = no MTP turn completed yet (first turn probes) or the gate
+    /// is disabled.
+    mtp_last_acceptance: Option<f64>,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -662,6 +668,7 @@ impl Qwen35MoeInner {
             paged_adapter,
             mtp,
             mtp_weights_loaded: false,
+            mtp_last_acceptance: None,
             training_state: None,
             turn_is_streaming: Cell::new(false),
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
@@ -7257,7 +7264,13 @@ impl Qwen35MoeInner {
         // cores still re-extract `ChatParams`, so mirror the selected decoder
         // into their config rather than independently consulting the raw MTP
         // request flag a second time.
-        let planned_mtp = apply_qwen35_moe_planned_decoder(&mut config, args.plan.decoder);
+        let mut planned_mtp = apply_qwen35_moe_planned_decoder(&mut config, args.plan.decoder);
+        // MTP acceptance gate: a previous turn whose draft head accepted
+        // below break-even disables speculation for THIS turn (plain AR).
+        if planned_mtp && !self.mtp_gate_allows() {
+            planned_mtp = false;
+            config.enable_mtp = Some(false);
+        }
         debug_assert!(!planned_mtp || self.has_mtp_weights());
         let thinking = args.thinking;
         match (args.sink, args.cancelled) {
@@ -8708,6 +8721,19 @@ impl MtpBackend for Qwen35MoeInner {
         }
 
         Ok(stepper)
+    }
+
+    fn record_turn_mtp_acceptance(&mut self, ratio: Option<f64>) {
+        self.mtp_last_acceptance = ratio;
+    }
+}
+
+impl Qwen35MoeInner {
+    /// MTP acceptance gate — see `mtp_decode::mtp_accept_gate_enabled`.
+    /// Mirrors the dense `Qwen35Inner::mtp_gate_allows` policy.
+    fn mtp_gate_allows(&self) -> bool {
+        !mtp_decode::mtp_accept_gate_enabled()
+            || mtp_decode::mtp_accept_gate_passes(self.mtp_last_acceptance)
     }
 }
 

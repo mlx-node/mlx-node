@@ -118,6 +118,52 @@ pub(crate) fn mtp_defer_verify_hidden_eval() -> bool {
     })
 }
 
+/// Break-even draft-acceptance ratio for the MTP acceptance gate.
+///
+/// A depth-1 verify forward costs ~1.4-1.6× a single AR step (one batched
+/// `[1, 2]` forward), so speculative decoding only wins while the draft
+/// head actually accepts. Below this ratio the verify is pure overhead.
+/// Measured on real checkpoints: 1.000 (qwen3.5-4b, counting prompt),
+/// 0.756 (qwen3.5-4b, complex task), 0.000 (qwen3.5-0.8b — MTP is a net
+/// loss there and the gate is what keeps it from auto-enabling).
+pub(crate) const MTP_ACCEPT_GATE_THRESHOLD: f64 = 0.6;
+
+/// MTP acceptance gate — `MLX_MTP_ACCEPT_GATE` (default ON).
+///
+/// When ON, a completed MTP turn whose draft-acceptance ratio
+/// (accepted drafts / attempted drafts) fell below
+/// [`MTP_ACCEPT_GATE_THRESHOLD`] disables speculative decoding for the
+/// NEXT turn, falling back to the exact target autoregressive path. The
+/// first turn of a session has no history and probes. The gate is
+/// model-owned (per-session), not engine-level: it reuses the existing
+/// "unsupported combination disables speculation for this turn" routing.
+///
+/// Opt-out: `MLX_MTP_ACCEPT_GATE=0` (or `false` / `off`) disables the
+/// gate so MTP always runs when requested. Read once per process and
+/// cached.
+pub(crate) fn mtp_accept_gate_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_ACCEPT_GATE") {
+        Ok(v) => {
+            let v = v.trim();
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true, // default ON — a head that never accepts must not tax every turn
+    })
+}
+
+/// Pure MTP acceptance-gate decision: does the recorded acceptance ratio
+/// pass the break-even bound? `None` (no completed MTP turn yet) probes —
+/// the first turn always runs speculation so a healthy head is never
+/// starved. Extracted from the model gate so it is unit-testable without
+/// the env-knob `OnceLock`.
+pub(crate) fn mtp_accept_gate_passes(ratio: Option<f64>) -> bool {
+    match ratio {
+        None => true,
+        Some(r) => r >= MTP_ACCEPT_GATE_THRESHOLD,
+    }
+}
+
 // MTPLX-style stochastic verify scheduling.
 //
 // In the T>0 sparse-accept path, target top-k distributions are the first
@@ -1036,7 +1082,8 @@ impl MtpVerifyOutput {
 #[cfg(test)]
 mod mtp_history_policy_tests {
     use super::{
-        MtpHistoryPolicy, MtpPromptHistorySelection, resolve_mtp_prompt_history_selection,
+        MtpHistoryPolicy, MtpPromptHistorySelection, mtp_accept_gate_passes,
+        resolve_mtp_prompt_history_selection,
     };
 
     #[test]
@@ -1073,5 +1120,28 @@ mod mtp_history_policy_tests {
                 position_base: 6,
             }
         );
+    }
+
+    #[test]
+    fn acceptance_gate_probes_without_history() {
+        // No completed MTP turn — the first turn probes (speculation runs).
+        assert!(mtp_accept_gate_passes(None));
+    }
+
+    #[test]
+    fn acceptance_gate_blocks_below_break_even() {
+        // Measured net-loss regimes: qwen3.5-0.8b accepts 0.0 (MTP is a
+        // 0.6x net loss there); anything under the 0.6 threshold must block.
+        assert!(!mtp_accept_gate_passes(Some(0.0)));
+        assert!(!mtp_accept_gate_passes(Some(0.3)));
+        assert!(!mtp_accept_gate_passes(Some(0.59)));
+    }
+
+    #[test]
+    fn acceptance_gate_allows_at_and_above_break_even() {
+        // 4b counting (1.0) and 4b complex task (0.756) stay speculative.
+        assert!(mtp_accept_gate_passes(Some(0.6)));
+        assert!(mtp_accept_gate_passes(Some(0.756)));
+        assert!(mtp_accept_gate_passes(Some(1.0)));
     }
 }

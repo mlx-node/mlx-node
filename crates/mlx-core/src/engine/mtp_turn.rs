@@ -2055,11 +2055,32 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // post-macro `mtp_desynced.get()` read does. Paged MUST return false.
     let desynced = step.into_desynced();
 
+    // Publish this turn's draft-acceptance ratio for the NEXT turn's MTP
+    // admission gate (backend-owned; default no-op). Only on the normal
+    // completion path — a replayed/aborted turn must not masquerade as a
+    // healthy speculative sample. `None` (no cycle ran) lets the family
+    // keep its prior history.
+    if let Some(ratio) = turn_mtp_acceptance(profiler) {
+        backend.record_turn_mtp_acceptance(Some(ratio));
+    }
+
     Ok(MtpTurnOutcome {
         last_in_cache,
         desynced,
         rollback_unemitted,
     })
+}
+
+/// Accepted-drafts / attempted-drafts ratio of a completed MTP turn,
+/// from the profiler's cycle counters. `None` when no speculative cycle
+/// ran (plain AR turn).
+fn turn_mtp_acceptance(profiler: &DecodeProfiler) -> Option<f64> {
+    let (mean_accepted_per_cycle, _, _) = profiler.mtp_acceptance_summary()?;
+    let mean_depth = profiler.mtp_mean_depth().unwrap_or(0.0);
+    if mean_depth <= 0.0 {
+        return None;
+    }
+    Some((mean_accepted_per_cycle / mean_depth).clamp(0.0, 1.0))
 }
 
 #[cfg(test)]
@@ -2085,7 +2106,7 @@ mod tests {
     use crate::nn::Embedding;
     use crate::sampling::SamplingConfig;
 
-    use super::{MtpTurnArgs, run_mtp_cycle, run_mtp_turn};
+    use super::{MtpTurnArgs, run_mtp_cycle, run_mtp_turn, turn_mtp_acceptance};
 
     /// One recorded `MtpStepper` call, tagged so a test can assert the
     /// exact propose/verify/commit/rollback ORDER (the analog of the paged
@@ -4329,5 +4350,37 @@ mod tests {
             0,
             "the error returns before consuming the successful outcome"
         );
+    }
+
+    #[test]
+    fn turn_acceptance_ratio_from_profiler() {
+        use crate::decode_profiler::DecodeProfiler;
+        // 10 cycles at depth 1, 7 accepted drafts => 0.7.
+        let mut profiler = DecodeProfiler::new("test", "test");
+        for i in 0..10 {
+            profiler.record_mtp_cycle(1, if i < 7 { 1 } else { 0 });
+        }
+        let ratio = turn_mtp_acceptance(&profiler).expect("cycles were recorded");
+        assert!((ratio - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn turn_acceptance_is_none_when_no_cycle_ran() {
+        use crate::decode_profiler::DecodeProfiler;
+        // A plain-AR turn records no speculative cycle -> no history is
+        // published (the family keeps its prior gate state).
+        let profiler = DecodeProfiler::new("test", "test");
+        assert!(turn_mtp_acceptance(&profiler).is_none());
+    }
+
+    #[test]
+    fn turn_acceptance_clamps_at_one() {
+        use crate::decode_profiler::DecodeProfiler;
+        // Accepted drafts can never exceed attempted depth; guard the clamp
+        // so a malformed counter cannot publish a ratio above 1.0.
+        let mut profiler = DecodeProfiler::new("test", "test");
+        profiler.record_mtp_cycle(1, 3); // accepted > depth (malformed input)
+        let ratio = turn_mtp_acceptance(&profiler).expect("cycle recorded");
+        assert!(ratio <= 1.0);
     }
 }

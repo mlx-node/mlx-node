@@ -821,6 +821,14 @@ pub(crate) struct Qwen35Inner {
     /// applied it to `mtp`. The module may exist from config alone; this
     /// flag prevents random-init MTP modules from advertising capability.
     pub(crate) mtp_weights_loaded: bool,
+    /// Draft-acceptance ratio (accepted drafts / attempted drafts) of the
+    /// most recently completed MTP turn, recorded by the engine's
+    /// `run_mtp_turn` end-of-turn hook. Consulted by the MTP acceptance
+    /// gate ([`Self::mtp_gate_allows`]) when planning the NEXT turn:
+    /// a head that accepts below break-even disables speculation so the
+    /// verify cost is not paid for zero speedup. `None` = no MTP turn
+    /// completed yet (the first turn probes) or the gate is disabled.
+    mtp_last_acceptance: Option<f64>,
     /// Whether the CURRENT generic-flow turn is streaming. Set by the
     /// [`ChatBackend::profiler_label`] hook (the session core calls it
     /// exactly once per generic-flow turn, before `begin_decode`);
@@ -1273,6 +1281,7 @@ impl Qwen35Inner {
             training_state: None,
             mtp,
             mtp_weights_loaded: false,
+            mtp_last_acceptance: None,
             turn_is_streaming: Cell::new(false),
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
         })
@@ -9048,7 +9057,14 @@ impl Qwen35Inner {
         // These legacy whole-turn cores still extract their own `ChatParams`,
         // so project the selected decoder back into their config instead of
         // letting the raw request independently re-open the MTP gate.
-        let planned_mtp = apply_qwen35_dense_planned_decoder(&mut config, args.plan.decoder);
+        let mut planned_mtp = apply_qwen35_dense_planned_decoder(&mut config, args.plan.decoder);
+        // MTP acceptance gate: a previous turn whose draft head accepted
+        // below break-even disables speculation for THIS turn (plain AR),
+        // so the verify cost is not paid for zero speedup.
+        if planned_mtp && !self.mtp_gate_allows() {
+            planned_mtp = false;
+            config.enable_mtp = Some(false);
+        }
         debug_assert!(!planned_mtp || self.has_mtp_weights());
         let thinking = args.thinking;
         match (args.sink, args.cancelled) {
@@ -9112,7 +9128,12 @@ impl Qwen35Inner {
         // honors them too (no-op when the checkpoint ships none).
         let mut config = args.config.clone();
         crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
-        let planned_mtp = apply_qwen35_dense_planned_decoder(&mut config, args.plan.decoder);
+        let mut planned_mtp = apply_qwen35_dense_planned_decoder(&mut config, args.plan.decoder);
+        // MTP acceptance gate (same policy as the sync whole-turn core).
+        if planned_mtp && !self.mtp_gate_allows() {
+            planned_mtp = false;
+            config.enable_mtp = Some(false);
+        }
         debug_assert!(!planned_mtp || self.has_mtp_weights());
         let mut p = extract_chat_params(&config);
         p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
@@ -9916,6 +9937,22 @@ impl MtpBackend for Qwen35Inner {
         }
 
         Ok(stepper)
+    }
+
+    fn record_turn_mtp_acceptance(&mut self, ratio: Option<f64>) {
+        self.mtp_last_acceptance = ratio;
+    }
+}
+
+impl Qwen35Inner {
+    /// MTP acceptance gate — see `mtp_decode::mtp_accept_gate_enabled`.
+    /// `false` means the most recent completed MTP turn's draft-acceptance
+    /// ratio fell below the break-even bound, so this turn should run
+    /// plain AR instead of paying the verify cost for zero speedup. First
+    /// turn (no history) probes; the env knob disables the gate entirely.
+    fn mtp_gate_allows(&self) -> bool {
+        !mtp_decode::mtp_accept_gate_enabled()
+            || mtp_decode::mtp_accept_gate_passes(self.mtp_last_acceptance)
     }
 }
 
