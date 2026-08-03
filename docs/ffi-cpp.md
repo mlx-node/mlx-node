@@ -16,10 +16,10 @@ The bridge between MLX (C++) and the NAPI/Rust layer lives in `crates/mlx-sys/`.
 | `mlx_stream.cpp`         | Stream/device management, memory limits                                                                                                               |
 | `mlx_autograd.cpp`       | `value_and_grad` integration                                                                                                                          |
 | `mlx_gated_delta.cpp`    | Metal GDN kernel opaque handles and shader indexing                                                                                                   |
-| `mlx_qwen35.cpp`         | Compiled Qwen3.5 dense forward (uses `mlx::core::compile`)                                                                                            |
-| `mlx_qwen35_moe.cpp`     | Compiled Qwen3.5 MoE forward with expert routing (uses `mlx::core::compile`)                                                                          |
-| `mlx_qwen35_vlm.cpp`     | Qwen3.5 VLM prefill — runs the full LM forward over text+vision embeddings and stores caches; the compiled decode path then resumes from those caches |
-| `mlx_qwen35_common.h`    | Shared compiled-forward helpers — linear_proj, attn, GDN, RoPE                                                                                        |
+| ~~`mlx_qwen35.cpp`~~     | **DELETED** in the chat-engine refactor (`ee88b92b`). Was the compiled Qwen3.5 dense forward (`mlx::core::compile`); decode is now pure-Rust eager (`paged_forward::run_paged_decode_step` / `forward_inner`). |
+| ~~`mlx_qwen35_moe.cpp`~~ | **DELETED** (same refactor). Was the compiled MoE forward with expert routing. |
+| ~~`mlx_qwen35_vlm.cpp`~~ | **DELETED** (same refactor). VLM prefill now runs in Rust (`models/qwen3_5/vision.rs` + `chunked_prefill`). |
+| `mlx_qwen35_common.h`    | Shared compiled-forward helpers — only the compiled SwiGLU helper survives the deletion |
 | `mlx_common.h`           | FFI macros, error handling, array conversion                                                                                                          |
 | `mlx_common_weights.cpp` | Common weight storage for compiled forward passes                                                                                                     |
 | `mlx_paged_dispatch.cpp` | C++ paged-attention kernel dispatch                                                                                                                   |
@@ -46,21 +46,31 @@ Two limits of that guard, both deliberate and both worth knowing before trusting
 
 **The vendored ggml reference is a test oracle, not a runtime dependency.** It is compiled with `-ffp-contract=off` — contracting `d * sc * q` into an fma would round differently from ggml's own build and quietly move the reference. Its three functions are referenced by no production path, so the linker drops the object from the cdylib and only the test binaries pull it in. `ggml_quants_upstream.inc` is a byte-verbatim upstream anchor guarded by `vendored_ggml_reference_is_verbatim`; **never reformat it** (a repo-wide `vp fmt` once cut it from 117 lines to 43).
 
-## Compiled forward paths
+## Compiled forward paths — deleted
 
-Qwen3.5 dense + MoE decode use `mlx::core::compile` to cache the forward graph: trace once, reuse via `compile_replace`. Key design points:
+Qwen3.5 dense + MoE **used to** use `mlx::core::compile` to cache the decode
+forward graph (trace once, reuse via `compile_replace`). Those compiled C++
+paths — `mlx_qwen35.cpp`, `mlx_qwen35_moe.cpp`, `mlx_qwen35_vlm.cpp`, and the
+MTP compiled helpers — were **deleted in the chat-engine refactor**
+(`ee88b92b`, 2026-06-22) and replaced by pure-Rust eager forwards. The only
+remnant is the compiled SwiGLU helper in `mlx_qwen35_common.h`.
 
-- Pre-allocated KV caches passed in as compile inputs
-- `fast::rope` invoked with an array-valued offset
-- `slice_update` invoked with an array start index
-- Path only enabled when `mlx_qwen35_weight_count() > 0`
+Current state:
 
-```
-mlx_qwen35.cpp        dense compiled decode (mlx::core::compile)
-mlx_qwen35_moe.cpp    MoE compiled decode + expert routing (mlx::core::compile)
-mlx_qwen35_vlm.cpp    VLM prefill — stores caches that the compiled decode path resumes from
-mlx_qwen35_common.h   shared helpers (linear_proj, attn, GDN, RoPE)
-```
+- The Qwen3.5 dense/MoE, LFM2, and Gemma4 chat forwards build the MLX op
+  graph eagerly per step — `models/qwen3_5/paged_forward.rs::run_paged_decode_step`,
+  `models/qwen3_5/model.rs::forward_inner` / `forward_pre_norm_inner`, and the
+  per-family equivalents in `lfm2` / `gemma4`.
+- The remaining fused C++ forwards are Qwen3's `mlx_qwen3_forward_step`
+  (`mlx_advanced_ops.cpp`; one call per token vs ~300 per-op FFI calls on the
+  eager paths) and the PaddleOCR-VL one-shot OCR steps
+  `mlx_paddleocr_vl_forward_step` / `mlx_paddleocr_vl_forward_step_batched`
+  (called from `models/paddleocr_vl/language.rs`).
+- Per-token graph re-trace is the dominant CPU-side cost on the eager paths
+  (several hundred FFI calls + lazy-node allocations per token). Restoring a
+  compiled/traced forward for Qwen3.5 dense (and the deleted
+  `MLX_MTP_BUCKETED_VERIFY` per-kv-len compiled verify graphs) is an open perf
+  follow-up, not implemented.
 
 ### Pitfalls
 
@@ -72,17 +82,17 @@ mlx_qwen35_common.h   shared helpers (linear_proj, attn, GDN, RoPE)
 
 | Var                     | Effect                                                                  |
 | ----------------------- | ----------------------------------------------------------------------- |
-| `MLX_NO_COMPILE=1`      | Disables the compiled forward path; falls back to per-step Rust forward |
-| `MLX_EVAL_ALL_CACHES=1` | Reverts to eval-all-caches strategy (vs. the default token-only eval)   |
+| ~~`MLX_NO_COMPILE=1`~~  | **REMOVED (dead)** — gated the deleted compiled forward; unread today.  |
+| ~~`MLX_EVAL_ALL_CACHES=1`~~ | **REMOVED (dead)** — token-only eval is the only strategy; unread today. |
 
 ## Process-wide globals
 
-Compiled paths use process-wide globals in `crates/mlx-core/src/models/qwen3_5/model.rs`:
-
-- `DENSE_COMPILED_MUTEX: std::sync::Mutex<()>` — serializes dense compiled-path access
-- `COMPILED_WEIGHTS_RWLOCK: std::sync::RwLock<()>` — read locks during compiled forward, write locks during weight load
-
-The paged-cache code path bypasses both locks entirely (see [paged-cache.md](paged-cache.md) for the compile-lockout contract).
+The compiled paths that needed process-wide globals are deleted. The old
+`DENSE_COMPILED_MUTEX` / `COMPILED_WEIGHTS_RWLOCK` in
+`crates/mlx-core/src/models/qwen3_5/model.rs` no longer exist; today the
+paged and flat decode paths are pure-Rust eager and take no compile-path
+locks per step. `crates/mlx-core/src/engine/compiled_lock.rs` is now only an
+`AtomicU64` model-id counter.
 
 ## Metal shaders
 
