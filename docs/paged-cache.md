@@ -28,9 +28,10 @@ For Qwen3.5 (dense + MoE) both the flat and paged decode paths are pure-Rust
 eager — the compiled C++ forward and its process-wide locks
 (`DENSE_COMPILED_MUTEX` / `COMPILED_WEIGHTS_RWLOCK`) were deleted in the
 chat-engine refactor (`ee88b92b`), so there is no compile state to corrupt and
-no per-step lock is taken on either path. VLM checkpoints are permitted under
-a text-only contract — image-bearing turns fail loudly when
-`paged_adapter.is_some()`.
+no per-step lock is taken on either path. VLM checkpoints run their image
+turns through the paged vision core when `paged_adapter` is present (plain AR,
+MTP weights ignored), and fail loudly when it is `None` — the flat fallback is
+text-only.
 
 ## SSD cold tier: hybrid families and the auxiliary sidecar
 

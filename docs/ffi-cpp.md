@@ -21,7 +21,7 @@ The bridge between MLX (C++) and the NAPI/Rust layer lives in `crates/mlx-sys/`.
 | ~~`mlx_qwen35_vlm.cpp`~~ | **DELETED** (same refactor). VLM prefill now runs in Rust (`models/qwen3_5/vision.rs` + `chunked_prefill`). |
 | `mlx_qwen35_common.h`    | Shared compiled-forward helpers — only the compiled SwiGLU helper survives the deletion |
 | `mlx_common.h`           | FFI macros, error handling, array conversion                                                                                                          |
-| `mlx_common_weights.cpp` | Common weight storage for compiled forward passes                                                                                                     |
+| ~~`mlx_common_weights.cpp`~~ | **DELETED** (same refactor) — was the common weight storage for the compiled forward passes. |
 | `mlx_paged_dispatch.cpp` | C++ paged-attention kernel dispatch                                                                                                                   |
 | `mlx_paged_ops.cpp`      | `PagedKVWrite` / `PagedAttention` custom MLX ops (largest file in the bridge)                                                                         |
 | `mlx_paged_profile.cpp`  | Profile-run helpers for auto-sizing the block pool                                                                                                    |
