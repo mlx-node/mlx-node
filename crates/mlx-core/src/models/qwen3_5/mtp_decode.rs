@@ -143,23 +143,38 @@ pub(crate) const MTP_ACCEPT_GATE_THRESHOLD: f64 = 0.6;
 /// tasks, 1.0 on counting) can recover on an easier later turn.
 pub(crate) const MTP_ACCEPT_GATE_REPROBE_TURNS: u32 = 3;
 
+/// Minimum number of depth-1 speculative cycles a turn must complete
+/// before its acceptance rate is published to the MTP acceptance gate.
+///
+/// A turn with a single cycle records exactly 0.0 or 1.0 — a 24% chance
+/// for the documented 0.756-acceptance head to record 0.0 from one draft
+/// and gate the next three turns. Undersampled turns are ignored (the
+/// family keeps its prior history), so the gate only reacts to a
+/// representative sample. 4 cycles make a 0.756 head's four-reject streak
+/// (~0.35%) rare enough to treat as a real signal.
+pub(crate) const MTP_ACCEPT_GATE_MIN_CYCLES: u32 = 4;
+
 /// MTP acceptance gate — `MLX_MTP_ACCEPT_GATE` (default ON).
 ///
-/// When ON, a completed depth-1 MTP turn whose FIRST-draft acceptance
+/// When ON, a completed depth-1 MTP turn with at least
+/// [`MTP_ACCEPT_GATE_MIN_CYCLES`] cycles whose FIRST-draft acceptance
 /// rate (the per-position acceptance at draft slot 0, see
 /// [`MTP_ACCEPT_GATE_THRESHOLD`]) fell below the break-even bound
 /// disables speculative decoding for the NEXT depth-1 turn, falling back
-/// to the exact target autoregressive path. The gate is **depth-1-scoped**:
-/// the 0.6 threshold is depth-1 calibrated, and at depth > 1 the verify
-/// cost vs deeper-slot acceptance economics are not captured by a single
-/// threshold — depth > 1 turns are never gated and do not publish gate
-/// history. The first turn of a model load has no history and probes;
-/// after [`MTP_ACCEPT_GATE_REPROBE_TURNS`] consecutive gated turns the
-/// gate re-probes. A full session reset (`reset_caches`) clears the
-/// history so a new independent chat starts fresh. The state is
-/// **per-model** (one loaded checkpoint, shared by every ChatSession over
-/// it), not per-session. The gate reuses the existing "unsupported
-/// combination disables speculation for this turn" routing.
+/// to the exact target autoregressive path. Undersampled turns (fewer
+/// than [`MTP_ACCEPT_GATE_MIN_CYCLES`] cycles) do not publish — a
+/// 1-cycle turn records exactly 0.0 or 1.0, which is not representative.
+/// The gate is **depth-1-scoped**: the 0.6 threshold is depth-1
+/// calibrated, and at depth > 1 the verify cost vs deeper-slot
+/// acceptance economics are not captured by a single threshold — depth >
+/// 1 turns are never gated and do not publish gate history. The first
+/// turn of a model load has no history and probes; after
+/// [`MTP_ACCEPT_GATE_REPROBE_TURNS`] consecutive gated turns the gate
+/// re-probes. A full session reset (`reset_caches`) clears the history
+/// so a new independent chat starts fresh. The state is **per-model**
+/// (one loaded checkpoint, shared by every ChatSession over it), not
+/// per-session. The gate reuses the existing "unsupported combination
+/// disables speculation for this turn" routing.
 ///
 /// Opt-out: `MLX_MTP_ACCEPT_GATE=0` (or `false` / `off`) disables the
 /// gate so MTP always runs when requested. Read once per process and

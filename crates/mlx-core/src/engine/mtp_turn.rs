@@ -23,12 +23,12 @@ use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup};
 use crate::engine::params::ChatParams;
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::models::qwen3_5::mtp_decode::{
-    MtpCommitAnchor, MtpCycleOutcome, MtpVerifyOutput, mtp_batch_target_arrays_enabled,
-    mtp_defer_verify_hidden_eval, mtp_draft_sampling_config, mtp_greedy_argmax_only_verify_enabled,
-    mtp_native_sparse_verify_enabled, mtp_target_distribution_first_enabled, mtp_trace_acceptance,
-    mtp_verify_async_eval, mtp_verify_top1_check_enabled, sparse_accept_gate,
-    trace_acceptance_dense, trace_acceptance_emit, trace_acceptance_greedy,
-    trace_acceptance_sparse,
+    MTP_ACCEPT_GATE_MIN_CYCLES, MtpCommitAnchor, MtpCycleOutcome, MtpVerifyOutput,
+    mtp_batch_target_arrays_enabled, mtp_defer_verify_hidden_eval, mtp_draft_sampling_config,
+    mtp_greedy_argmax_only_verify_enabled, mtp_native_sparse_verify_enabled,
+    mtp_target_distribution_first_enabled, mtp_trace_acceptance, mtp_verify_async_eval,
+    mtp_verify_top1_check_enabled, sparse_accept_gate, trace_acceptance_dense,
+    trace_acceptance_emit, trace_acceptance_greedy, trace_acceptance_sparse,
 };
 use crate::nn::Embedding;
 use crate::sampling;
@@ -2063,8 +2063,13 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // hard first cycles). Only depth-1 turns publish: the gate's 0.6
     // threshold is depth-1-calibrated, and at depth > 1 the full
     // economics (verify cost vs deeper-slot acceptance) are not captured
-    // by a single threshold — see `mtp_gate_allows`.
+    // by a single threshold — see `mtp_gate_allows`. And only turns with
+    // enough cycles publish: a 1-cycle turn records exactly 0.0 or 1.0,
+    // which is not a representative acceptance sample (see
+    // `MTP_ACCEPT_GATE_MIN_CYCLES`).
     if *reason != "cancelled"
+        && let Some((_, _, cycles)) = profiler.mtp_acceptance_summary()
+        && cycles >= MTP_ACCEPT_GATE_MIN_CYCLES
         && profiler.mtp_mean_depth().unwrap_or(0.0) == 1.0
         && let Some(rate) = turn_mtp_first_draft_acceptance(profiler)
     {
@@ -4169,8 +4174,35 @@ mod tests {
     #[test]
     fn run_mtp_turn_depth1_records_acceptance() {
         let _chained_off = force_chained_off();
-        // depth 1, full accept (draft 4 + bonus 5), clean length exit:
-        //   gen: [3] (seed) -> Step A -> 7 -> cycle -> 4, 5  (len 4 = max)
+        // depth 1, full accept (draft 4 + bonus 5) for 4+ cycles (the
+        // gate's min-sample requirement), clean length exit:
+        //   gen: [3] (seed) + 4 x (Step A + cycle) = 13 tokens
+        let cycle = CycleArgmax {
+            draft_argmax: vec![4],
+            verify_argmax: vec![4, 5],
+        };
+        let mut backend = MockMtpBackend::new(16, 4, vec![7, 8, 9, 10, 11], vec![cycle; 8], false);
+        let out = drive_turn(&mut backend, 3, 13, 15, 1);
+        assert_eq!(out.finish_reason, "length");
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::RecordTurnMtpAcceptance)),
+            1,
+            "a depth-1 turn with enough cycles publishes its acceptance exactly once"
+        );
+        let recorded = *backend.recorded_ratio.borrow();
+        assert!(
+            matches!(recorded, Some(r) if r > 0.99),
+            "full-accept depth-1 turn records ~1.0 first-draft rate, got {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn run_mtp_turn_undersampled_turn_does_not_record() {
+        let _chained_off = force_chained_off();
+        // A 1-cycle depth-1 turn records exactly 0.0 or 1.0 — not a
+        // representative acceptance sample (a 0.756-acceptance head would
+        // record 0.0 with ~24% probability and wrongly gate the next
+        // turns). Undersampled turns must not publish.
         let cycle = CycleArgmax {
             draft_argmax: vec![4],
             verify_argmax: vec![4, 5],
@@ -4180,13 +4212,12 @@ mod tests {
         assert_eq!(out.finish_reason, "length");
         assert_eq!(
             count(&out.ledger, |c| matches!(c, Call::RecordTurnMtpAcceptance)),
-            1,
-            "a depth-1 turn publishes its acceptance exactly once"
+            0,
+            "an undersampled turn must not publish gate history"
         );
-        let recorded = *backend.recorded_ratio.borrow();
         assert!(
-            matches!(recorded, Some(r) if r > 0.99),
-            "full-accept depth-1 turn records ~1.0 first-draft rate, got {recorded:?}"
+            backend.recorded_ratio.borrow().is_none(),
+            "no acceptance sample recorded for an undersampled turn"
         );
     }
 
