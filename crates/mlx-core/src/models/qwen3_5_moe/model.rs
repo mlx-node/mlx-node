@@ -297,10 +297,11 @@ pub(crate) struct Qwen35MoeInner {
     /// (first turn probes), the gate re-probed after
     /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns, or a
     /// full session reset cleared it.
-    mtp_last_acceptance: Option<f64>,
+    mtp_draft_accepted: u64,
+    mtp_draft_attempted: u64,
     /// Consecutive turns the MTP acceptance gate has blocked; after
     /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns the gate
-    /// re-probes (`mtp_last_acceptance` resets to `None`).
+    /// re-probes (the aggregate resets to zero).
     mtp_gated_turns: u32,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
@@ -674,7 +675,8 @@ impl Qwen35MoeInner {
             paged_adapter,
             mtp,
             mtp_weights_loaded: false,
-            mtp_last_acceptance: None,
+            mtp_draft_accepted: 0,
+            mtp_draft_attempted: 0,
             mtp_gated_turns: 0,
             training_state: None,
             turn_is_streaming: Cell::new(false),
@@ -944,7 +946,8 @@ impl Qwen35MoeInner {
         // A full session reset must also clear the MTP acceptance gate
         // state: a new independent chat on this model starts fresh (probes)
         // instead of inheriting the previous chat's rejection.
-        self.mtp_last_acceptance = None;
+        self.mtp_draft_accepted = 0;
+        self.mtp_draft_attempted = 0;
         self.mtp_gated_turns = 0;
         Ok(())
     }
@@ -8735,9 +8738,9 @@ impl MtpBackend for Qwen35MoeInner {
         Ok(stepper)
     }
 
-    fn record_turn_mtp_acceptance(&mut self, ratio: Option<f64>) {
-        self.mtp_last_acceptance = ratio;
-        // A fresh acceptance sample supersedes any gated-turn streak.
+    fn record_turn_mtp_acceptance(&mut self, accepted: u64, attempted: u64) {
+        self.mtp_draft_accepted += accepted;
+        self.mtp_draft_attempted += attempted;
         self.mtp_gated_turns = 0;
     }
 }
@@ -8745,24 +8748,27 @@ impl MtpBackend for Qwen35MoeInner {
 impl Qwen35MoeInner {
     /// MTP acceptance gate — see `mtp_decode::mtp_accept_gate_enabled`.
     /// Mirrors the dense `Qwen35Inner::mtp_gate_allows` policy
-    /// (depth-1-scoped; re-probes after
-    /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns).
+    /// (depth-1-scoped, confidence-aware on the aggregate; re-probes
+    /// after [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns).
     fn mtp_gate_allows(&mut self, requested_depth: u32) -> bool {
         if !mtp_decode::mtp_accept_gate_enabled() || requested_depth > 1 {
             return true;
         }
-        match self.mtp_last_acceptance {
-            None => true, // no history — probe
-            Some(r) if mtp_decode::mtp_accept_gate_passes(Some(r)) => true,
-            Some(_) => {
-                self.mtp_gated_turns += 1;
-                if self.mtp_gated_turns >= mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS {
-                    self.mtp_gated_turns = 0;
-                    self.mtp_last_acceptance = None; // re-probe next turn
-                }
-                false
-            }
+        let attempted = self.mtp_draft_attempted;
+        if attempted == 0 {
+            return true; // no history — probe
         }
+        let rate = self.mtp_draft_accepted as f64 / attempted as f64;
+        if !mtp_decode::mtp_accept_gate_blocks(rate, attempted) {
+            return true;
+        }
+        self.mtp_gated_turns += 1;
+        if self.mtp_gated_turns >= mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS {
+            self.mtp_gated_turns = 0;
+            self.mtp_draft_accepted = 0;
+            self.mtp_draft_attempted = 0; // re-probe next turn
+        }
+        false
     }
 }
 

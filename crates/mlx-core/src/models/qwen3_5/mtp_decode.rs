@@ -143,38 +143,37 @@ pub(crate) const MTP_ACCEPT_GATE_THRESHOLD: f64 = 0.6;
 /// tasks, 1.0 on counting) can recover on an easier later turn.
 pub(crate) const MTP_ACCEPT_GATE_REPROBE_TURNS: u32 = 3;
 
-/// Minimum number of depth-1 speculative cycles a turn must complete
-/// before its acceptance rate is published to the MTP acceptance gate.
-///
-/// A turn with a single cycle records exactly 0.0 or 1.0 — a 24% chance
-/// for the documented 0.756-acceptance head to record 0.0 from one draft
-/// and gate the next three turns. Undersampled turns are ignored (the
-/// family keeps its prior history), so the gate only reacts to a
-/// representative sample. 4 cycles make a 0.756 head's four-reject streak
-/// (~0.35%) rare enough to treat as a real signal.
-pub(crate) const MTP_ACCEPT_GATE_MIN_CYCLES: u32 = 4;
+/// 95% one-sided normal quantile used by the MTP acceptance gate's
+/// confidence bound (Wilson score interval upper edge). The gate only
+/// disables speculation when the UPPER confidence bound of the first-draft
+/// acceptance rate is below the break-even threshold, so small samples
+/// (which have wide intervals) never trigger it — a single-cycle turn
+/// (exactly 0.0 or 1.0) or a 2-of-4 streak from a healthy 0.756 head
+/// (~25% of turns) cannot wrongly gate.
+pub(crate) const MTP_ACCEPT_GATE_Z95: f64 = 1.645;
 
 /// MTP acceptance gate — `MLX_MTP_ACCEPT_GATE` (default ON).
 ///
-/// When ON, a completed depth-1 MTP turn with at least
-/// [`MTP_ACCEPT_GATE_MIN_CYCLES`] cycles whose FIRST-draft acceptance
-/// rate (the per-position acceptance at draft slot 0, see
-/// [`MTP_ACCEPT_GATE_THRESHOLD`]) fell below the break-even bound
-/// disables speculative decoding for the NEXT depth-1 turn, falling back
-/// to the exact target autoregressive path. Undersampled turns (fewer
-/// than [`MTP_ACCEPT_GATE_MIN_CYCLES`] cycles) do not publish — a
-/// 1-cycle turn records exactly 0.0 or 1.0, which is not representative.
-/// The gate is **depth-1-scoped**: the 0.6 threshold is depth-1
-/// calibrated, and at depth > 1 the verify cost vs deeper-slot
-/// acceptance economics are not captured by a single threshold — depth >
-/// 1 turns are never gated and do not publish gate history. The first
-/// turn of a model load has no history and probes; after
-/// [`MTP_ACCEPT_GATE_REPROBE_TURNS`] consecutive gated turns the gate
-/// re-probes. A full session reset (`reset_caches`) clears the history
-/// so a new independent chat starts fresh. The state is **per-model**
-/// (one loaded checkpoint, shared by every ChatSession over it), not
-/// per-session. The gate reuses the existing "unsupported combination
-/// disables speculation for this turn" routing.
+/// When ON, the model AGGREGATES the first-draft acceptance counts
+/// (accepted / attempted at draft slot 0, see
+/// [`MTP_ACCEPT_GATE_THRESHOLD`]) across completed depth-1 turns and
+/// disables speculative decoding for the NEXT depth-1 turn only when a
+/// 95% confidence bound on the aggregate rate is below the break-even
+/// bound — falling back to the exact target autoregressive path. The
+/// confidence-aware decision is what makes undersampling harmless: a
+/// 1-cycle turn records exactly 0.0 or 1.0 but has a wide interval, and
+/// a 2-of-4 streak from a healthy 0.756 head (~25% of turns, upper bound
+/// ~0.82) cannot wrongly gate. The gate is **depth-1-scoped**: the 0.6
+/// threshold is depth-1 calibrated, and at depth > 1 the verify cost vs
+/// deeper-slot acceptance economics are not captured by a single
+/// threshold — depth > 1 turns are never gated and do not publish gate
+/// history. The first turn of a model load has no history and probes;
+/// after [`MTP_ACCEPT_GATE_REPROBE_TURNS`] consecutive gated turns the
+/// gate re-probes. A full session reset (`reset_caches`) clears the
+/// history so a new independent chat starts fresh. The state is
+/// **per-model** (one loaded checkpoint, shared by every ChatSession over
+/// it), not per-session. The gate reuses the existing "unsupported
+/// combination disables speculation for this turn" routing.
 ///
 /// Opt-out: `MLX_MTP_ACCEPT_GATE=0` (or `false` / `off`) disables the
 /// gate so MTP always runs when requested. Read once per process and
@@ -190,16 +189,24 @@ pub(crate) fn mtp_accept_gate_enabled() -> bool {
     })
 }
 
-/// Pure MTP acceptance-gate decision: does the recorded acceptance ratio
-/// pass the break-even bound? `None` (no completed MTP turn yet) probes —
-/// the first turn always runs speculation so a healthy head is never
-/// starved. Extracted from the model gate so it is unit-testable without
-/// the env-knob `OnceLock`.
-pub(crate) fn mtp_accept_gate_passes(ratio: Option<f64>) -> bool {
-    match ratio {
-        None => true,
-        Some(r) => r >= MTP_ACCEPT_GATE_THRESHOLD,
+/// Confidence-aware MTP acceptance-gate decision: gate only when the
+/// 95% Wilson upper bound on the observed first-draft acceptance rate is
+/// below the break-even threshold. This is what makes undersampled turns
+/// harmless: a small sample has a wide interval, so only an extreme rate
+/// (e.g. 0-of-4, ~0.35% for a 0.756 head) gates, while a 1-of-4 or
+/// 2-of-4 streak (upper bound ~0.64 / ~0.82) does not. The aggregate
+/// across turns is used, so a session's sample grows and a genuinely
+/// weak head is caught with high confidence.
+pub(crate) fn mtp_accept_gate_blocks(rate: f64, samples: u64) -> bool {
+    if samples == 0 {
+        return false;
     }
+    let n = samples as f64;
+    let z = MTP_ACCEPT_GATE_Z95;
+    let denom = 1.0 + z * z / n;
+    let center = rate + z * z / (2.0 * n);
+    let half = z * ((rate * (1.0 - rate)) / n + z * z / (4.0 * n * n)).sqrt();
+    (center + half) / denom < MTP_ACCEPT_GATE_THRESHOLD
 }
 
 // MTPLX-style stochastic verify scheduling.
@@ -1120,7 +1127,7 @@ impl MtpVerifyOutput {
 #[cfg(test)]
 mod mtp_history_policy_tests {
     use super::{
-        MtpHistoryPolicy, MtpPromptHistorySelection, mtp_accept_gate_passes,
+        MtpHistoryPolicy, MtpPromptHistorySelection, mtp_accept_gate_blocks,
         resolve_mtp_prompt_history_selection,
     };
 
@@ -1161,25 +1168,38 @@ mod mtp_history_policy_tests {
     }
 
     #[test]
-    fn acceptance_gate_probes_without_history() {
-        // No completed MTP turn — the first turn probes (speculation runs).
-        assert!(mtp_accept_gate_passes(None));
+    fn confidence_gate_ignores_undersampled_and_marginal_rates() {
+        // 2-of-4 (upper Wilson-95 ~0.82) and 1-of-4 (~0.64) are NOT
+        // confidently below break-even — a healthy 0.756 head hits 2-of-4
+        // in ~25% of 4-cycle turns, so those must not gate.
+        assert!(!mtp_accept_gate_blocks(0.5, 4), "2-of-4 must not gate");
+        assert!(!mtp_accept_gate_blocks(0.25, 4), "1-of-4 must not gate");
+        assert!(
+            !mtp_accept_gate_blocks(0.0, 1),
+            "0-of-1 must not gate (CI too wide)"
+        );
     }
 
     #[test]
-    fn acceptance_gate_blocks_below_break_even() {
-        // Measured net-loss regimes: qwen3.5-0.8b accepts 0.0 (MTP is a
-        // 0.6x net loss there); anything under the 0.6 threshold must block.
-        assert!(!mtp_accept_gate_passes(Some(0.0)));
-        assert!(!mtp_accept_gate_passes(Some(0.3)));
-        assert!(!mtp_accept_gate_passes(Some(0.59)));
+    fn confidence_gate_gates_only_extreme_rates() {
+        // 0-of-4 gates (upper ~0.40 < 0.6); the false-gate rate for a
+        // 0.756 head is P(0-of-4) ≈ 0.35%.
+        assert!(mtp_accept_gate_blocks(0.0, 4), "0-of-4 must gate");
+        assert!(mtp_accept_gate_blocks(0.0, 64), "0-of-64 must gate");
+        // A clearly-below-break-even head gates once the sample is large
+        // enough for the bound to tighten.
+        assert!(
+            mtp_accept_gate_blocks(0.3, 64),
+            "0.3 over 64 samples must gate"
+        );
     }
 
     #[test]
-    fn acceptance_gate_allows_at_and_above_break_even() {
-        // 4b counting (1.0) and 4b complex task (0.756) stay speculative.
-        assert!(mtp_accept_gate_passes(Some(0.6)));
-        assert!(mtp_accept_gate_passes(Some(0.756)));
-        assert!(mtp_accept_gate_passes(Some(1.0)));
+    fn confidence_gate_never_gates_a_healthy_head() {
+        // The documented 0.756 head: at any sample size the upper bound
+        // stays well above 0.6.
+        assert!(!mtp_accept_gate_blocks(0.756, 4));
+        assert!(!mtp_accept_gate_blocks(0.756, 32));
+        assert!(!mtp_accept_gate_blocks(0.756, 256));
     }
 }

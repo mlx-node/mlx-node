@@ -821,21 +821,23 @@ pub(crate) struct Qwen35Inner {
     /// applied it to `mtp`. The module may exist from config alone; this
     /// flag prevents random-init MTP modules from advertising capability.
     pub(crate) mtp_weights_loaded: bool,
-    /// FIRST-draft acceptance rate (the per-position acceptance at draft
-    /// slot 0 — depth-agnostic) of the most recently completed MTP turn,
-    /// recorded by the engine's `run_mtp_turn` end-of-turn hook. Consulted
-    /// by the MTP acceptance gate ([`Self::mtp_gate_allows`]) when planning
-    /// the NEXT turn: a head whose first draft accepts below break-even
-    /// disables speculation so the verify cost is not paid for zero
-    /// speedup. `None` = no MTP turn completed yet (the first turn probes),
-    /// the gate re-probed after
-    /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns, or a full
-    /// session reset cleared it.
-    mtp_last_acceptance: Option<f64>,
+    /// Aggregated first-draft acceptance counts (accepted / attempted at
+    /// draft slot 0) across completed depth-1 MTP turns, recorded by the
+    /// engine's `run_mtp_turn` end-of-turn hook. The MTP acceptance gate
+    /// ([`Self::mtp_gate_allows`]) disables speculation for the NEXT
+    /// depth-1 turn only when a 95% confidence bound on the aggregate
+    /// rate is below the break-even — so a single undersampled turn or a
+    /// short bad streak from a healthy head cannot wrongly gate. `None`-
+    /// equivalent (attempted == 0) = no history yet (the first turn
+    /// probes), the gate re-probed after
+    /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns, or a
+    /// full session reset cleared it.
+    mtp_draft_accepted: u64,
+    mtp_draft_attempted: u64,
     /// Consecutive turns the MTP acceptance gate has blocked; after
     /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns the gate
-    /// re-probes (`mtp_last_acceptance` resets to `None`) so a later
-    /// easier turn can re-enable speculation.
+    /// re-probes (the aggregate resets to zero) so a later easier turn
+    /// can re-enable speculation.
     mtp_gated_turns: u32,
     /// Whether the CURRENT generic-flow turn is streaming. Set by the
     /// [`ChatBackend::profiler_label`] hook (the session core calls it
@@ -1289,7 +1291,8 @@ impl Qwen35Inner {
             training_state: None,
             mtp,
             mtp_weights_loaded: false,
-            mtp_last_acceptance: None,
+            mtp_draft_accepted: 0,
+            mtp_draft_attempted: 0,
             mtp_gated_turns: 0,
             turn_is_streaming: Cell::new(false),
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
@@ -1548,7 +1551,8 @@ impl Qwen35Inner {
         // A full session reset must also clear the MTP acceptance gate
         // state: a new independent chat on this model starts fresh (probes)
         // instead of inheriting the previous chat's rejection.
-        self.mtp_last_acceptance = None;
+        self.mtp_draft_accepted = 0;
+        self.mtp_draft_attempted = 0;
         self.mtp_gated_turns = 0;
         Ok(())
     }
@@ -9953,42 +9957,48 @@ impl MtpBackend for Qwen35Inner {
         Ok(stepper)
     }
 
-    fn record_turn_mtp_acceptance(&mut self, ratio: Option<f64>) {
-        self.mtp_last_acceptance = ratio;
-        // A fresh acceptance sample supersedes any gated-turn streak.
+    fn record_turn_mtp_acceptance(&mut self, accepted: u64, attempted: u64) {
+        // Aggregate across turns so the confidence-aware gate decision has
+        // a growing sample. A fresh sample also resets any gated-turn
+        // streak.
+        self.mtp_draft_accepted += accepted;
+        self.mtp_draft_attempted += attempted;
         self.mtp_gated_turns = 0;
     }
 }
 
 impl Qwen35Inner {
     /// MTP acceptance gate — see `mtp_decode::mtp_accept_gate_enabled`.
-    /// `false` means the most recent completed depth-1 MTP turn's
-    /// first-draft acceptance rate fell below the break-even bound, so
-    /// this turn should run plain AR instead of paying the verify cost
-    /// for zero speedup. Depth-1-scoped: the 0.6 threshold is depth-1
-    /// calibrated, and at depth > 1 the verify cost vs deeper-slot
-    /// acceptance economics are not captured by a single threshold — the
-    /// gate never blocks a depth>1 turn. First turn (no history) probes;
-    /// after [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] consecutive
-    /// gated turns the gate re-probes; the env knob disables the gate
-    /// entirely. `&mut self` because a blocked turn advances the
-    /// gated-turn counter and may trigger the re-probe reset.
+    /// `false` means the aggregated first-draft acceptance rate is below
+    /// the break-even bound WITH 95% confidence, so this turn should run
+    /// plain AR instead of paying the verify cost for zero speedup.
+    /// Depth-1-scoped: the 0.6 threshold is depth-1 calibrated, and at
+    /// depth > 1 the verify cost vs deeper-slot acceptance economics are
+    /// not captured by a single threshold — the gate never blocks a
+    /// depth>1 turn. First turn (no history) probes; after
+    /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] consecutive gated
+    /// turns the gate re-probes; the env knob disables the gate entirely.
+    /// `&mut self` because a blocked turn advances the gated-turn counter
+    /// and may trigger the re-probe reset.
     fn mtp_gate_allows(&mut self, requested_depth: u32) -> bool {
         if !mtp_decode::mtp_accept_gate_enabled() || requested_depth > 1 {
             return true;
         }
-        match self.mtp_last_acceptance {
-            None => true, // no history — probe
-            Some(r) if mtp_decode::mtp_accept_gate_passes(Some(r)) => true,
-            Some(_) => {
-                self.mtp_gated_turns += 1;
-                if self.mtp_gated_turns >= mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS {
-                    self.mtp_gated_turns = 0;
-                    self.mtp_last_acceptance = None; // re-probe next turn
-                }
-                false
-            }
+        let attempted = self.mtp_draft_attempted;
+        if attempted == 0 {
+            return true; // no history — probe
         }
+        let rate = self.mtp_draft_accepted as f64 / attempted as f64;
+        if !mtp_decode::mtp_accept_gate_blocks(rate, attempted) {
+            return true; // not confident the head is below break-even
+        }
+        self.mtp_gated_turns += 1;
+        if self.mtp_gated_turns >= mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS {
+            self.mtp_gated_turns = 0;
+            self.mtp_draft_accepted = 0;
+            self.mtp_draft_attempted = 0; // re-probe next turn
+        }
+        false
     }
 }
 
@@ -15262,28 +15272,49 @@ mod mtp_gate_state_tests {
         // so a new independent chat on this model probes instead of
         // inheriting the previous chat's rejection.
         let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct");
-        inner.mtp_last_acceptance = Some(0.3);
+        inner.mtp_draft_accepted = 1;
+        inner.mtp_draft_attempted = 4;
         inner.mtp_gated_turns = 2;
         inner.reset_caches_sync().expect("reset");
-        assert_eq!(inner.mtp_last_acceptance, None, "gate history cleared");
+        assert_eq!(inner.mtp_draft_accepted, 0, "gate history cleared");
+        assert_eq!(inner.mtp_draft_attempted, 0, "gate history cleared");
         assert_eq!(inner.mtp_gated_turns, 0, "gated-turn streak cleared");
     }
 
     #[test]
     fn gate_is_depth_1_scoped() {
         // The 0.6 threshold is depth-1 calibrated; a depth>1 turn is never
-        // gated even when a low first-draft rate was recorded (the verify
-        // cost vs deeper-slot acceptance economics at depth>1 are not
-        // captured by a single threshold).
+        // gated even when the aggregated rate is confidently below
+        // break-even (the verify cost vs deeper-slot acceptance economics
+        // at depth>1 are not captured by a single threshold).
         let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct");
-        inner.mtp_last_acceptance = Some(0.3); // below break-even
+        inner.mtp_draft_accepted = 0;
+        inner.mtp_draft_attempted = 4; // 0/4: confident below break-even
         assert!(
             inner.mtp_gate_allows(2),
             "depth>1 request must not be gated by the depth-1 threshold"
         );
         assert!(
             !inner.mtp_gate_allows(1),
-            "a depth-1 request with below-break-even history must be gated"
+            "a depth-1 request with confidently-low acceptance must be gated"
+        );
+    }
+
+    #[test]
+    fn gate_does_not_act_on_undersampled_or_marginal_rates() {
+        // The gate is confidence-aware: a 2-of-4 rate (upper Wilson 95%
+        // bound ~0.82) or a 1-of-4 rate (~0.64) is NOT confidently below
+        // break-even — a healthy 0.756 head hits 2-of-4 ~25% of the time.
+        let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct");
+        inner.mtp_draft_accepted = 2;
+        inner.mtp_draft_attempted = 4;
+        assert!(inner.mtp_gate_allows(1), "2-of-4 must not gate");
+        inner.mtp_draft_accepted = 1;
+        assert!(inner.mtp_gate_allows(1), "1-of-4 must not gate");
+        inner.mtp_draft_accepted = 0;
+        assert!(
+            !inner.mtp_gate_allows(1),
+            "0-of-4 must gate (~0.35% for a 0.756 head)"
         );
     }
 }

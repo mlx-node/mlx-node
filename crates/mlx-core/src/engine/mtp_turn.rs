@@ -23,12 +23,12 @@ use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup};
 use crate::engine::params::ChatParams;
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::models::qwen3_5::mtp_decode::{
-    MTP_ACCEPT_GATE_MIN_CYCLES, MtpCommitAnchor, MtpCycleOutcome, MtpVerifyOutput,
-    mtp_batch_target_arrays_enabled, mtp_defer_verify_hidden_eval, mtp_draft_sampling_config,
-    mtp_greedy_argmax_only_verify_enabled, mtp_native_sparse_verify_enabled,
-    mtp_target_distribution_first_enabled, mtp_trace_acceptance, mtp_verify_async_eval,
-    mtp_verify_top1_check_enabled, sparse_accept_gate, trace_acceptance_dense,
-    trace_acceptance_emit, trace_acceptance_greedy, trace_acceptance_sparse,
+    MtpCommitAnchor, MtpCycleOutcome, MtpVerifyOutput, mtp_batch_target_arrays_enabled,
+    mtp_defer_verify_hidden_eval, mtp_draft_sampling_config, mtp_greedy_argmax_only_verify_enabled,
+    mtp_native_sparse_verify_enabled, mtp_target_distribution_first_enabled, mtp_trace_acceptance,
+    mtp_verify_async_eval, mtp_verify_top1_check_enabled, sparse_accept_gate,
+    trace_acceptance_dense, trace_acceptance_emit, trace_acceptance_greedy,
+    trace_acceptance_sparse,
 };
 use crate::nn::Embedding;
 use crate::sampling;
@@ -2055,25 +2055,22 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // post-macro `mtp_desynced.get()` read does. Paged MUST return false.
     let desynced = step.into_desynced();
 
-    // Publish this turn's draft-acceptance signal for the NEXT turn's MTP
-    // admission gate (backend-owned; default no-op). Only on the normal
-    // completion path — a replayed/aborted turn must not masquerade as a
-    // healthy speculative sample, and a USER-CANCELLED turn is not a
-    // representative acceptance sample either (it may contain only the
-    // hard first cycles). Only depth-1 turns publish: the gate's 0.6
-    // threshold is depth-1-calibrated, and at depth > 1 the full
-    // economics (verify cost vs deeper-slot acceptance) are not captured
-    // by a single threshold — see `mtp_gate_allows`. And only turns with
-    // enough cycles publish: a 1-cycle turn records exactly 0.0 or 1.0,
-    // which is not a representative acceptance sample (see
-    // `MTP_ACCEPT_GATE_MIN_CYCLES`).
+    // Publish this turn's first-draft acceptance counts for the NEXT
+    // turn's MTP admission gate (backend-owned; default no-op). Only on
+    // the normal completion path — a replayed/aborted turn must not
+    // masquerade as a healthy speculative sample, and a USER-CANCELLED
+    // turn is not a representative acceptance sample either (it may
+    // contain only the hard first cycles). Only depth-1 turns publish:
+    // the gate's 0.6 threshold is depth-1-calibrated, and at depth > 1
+    // the full economics (verify cost vs deeper-slot acceptance) are not
+    // captured by a single threshold — see `mtp_gate_allows`. The family
+    // aggregates the counts, so a single undersampled turn cannot wrongly
+    // gate (the confidence-aware decision in `mtp_accept_gate_blocks`).
     if *reason != "cancelled"
-        && let Some((_, _, cycles)) = profiler.mtp_acceptance_summary()
-        && cycles >= MTP_ACCEPT_GATE_MIN_CYCLES
         && profiler.mtp_mean_depth().unwrap_or(0.0) == 1.0
-        && let Some(rate) = turn_mtp_first_draft_acceptance(profiler)
+        && let Some((accepted, attempted)) = profiler.mtp_first_draft_counts()
     {
-        backend.record_turn_mtp_acceptance(Some(rate));
+        backend.record_turn_mtp_acceptance(accepted, attempted);
     }
 
     Ok(MtpTurnOutcome {
@@ -2081,19 +2078,6 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         desynced,
         rollback_unemitted,
     })
-}
-
-/// First-draft acceptance rate of a completed MTP turn — the per-position
-/// acceptance at draft slot 0 — from the profiler's cycle counters. This
-/// is the depth-agnostic signal for the MTP acceptance gate: at depth 1 it
-/// equals the accepted/attempted ratio (the 0.6 break-even's calibration
-/// domain), and at depth > 1 it is NOT diluted by the naturally-lower
-/// deeper-slot acceptance — a head that accepts its first draft at ~73% is
-/// profitable (docs' depth-3 workload) even when the accepted/attempted
-/// average is ~0.48. `None` when no speculative cycle ran (plain AR turn).
-fn turn_mtp_first_draft_acceptance(profiler: &DecodeProfiler) -> Option<f64> {
-    let (_, per_position, _) = profiler.mtp_acceptance_summary()?;
-    per_position.first().copied()
 }
 
 #[cfg(test)]
@@ -2119,7 +2103,7 @@ mod tests {
     use crate::nn::Embedding;
     use crate::sampling::SamplingConfig;
 
-    use super::{MtpTurnArgs, run_mtp_cycle, run_mtp_turn, turn_mtp_first_draft_acceptance};
+    use super::{MtpTurnArgs, run_mtp_cycle, run_mtp_turn};
 
     /// One recorded `MtpStepper` call, tagged so a test can assert the
     /// exact propose/verify/commit/rollback ORDER (the analog of the paged
@@ -3851,9 +3835,9 @@ mod tests {
         ledger: Rc<RefCell<Vec<Call>>>,
         /// Records that `begin_mtp_decode` ran exactly once.
         begin_calls: std::cell::Cell<usize>,
-        /// Last value passed to `record_turn_mtp_acceptance` (the engine's
-        /// acceptance-gate hook); `None` when never called.
-        recorded_ratio: std::cell::RefCell<Option<f64>>,
+        /// Last counts passed to `record_turn_mtp_acceptance` (the
+        /// engine's acceptance-gate hook); `None` when never called.
+        recorded_counts: std::cell::RefCell<Option<(u64, u64)>>,
     }
 
     impl MockMtpBackend {
@@ -3873,7 +3857,7 @@ mod tests {
                 replay_error: None,
                 ledger: Rc::new(RefCell::new(Vec::new())),
                 begin_calls: std::cell::Cell::new(0),
-                recorded_ratio: std::cell::RefCell::new(None),
+                recorded_counts: std::cell::RefCell::new(None),
             }
         }
 
@@ -3959,9 +3943,9 @@ mod tests {
             Ok(step)
         }
 
-        fn record_turn_mtp_acceptance(&mut self, ratio: Option<f64>) {
+        fn record_turn_mtp_acceptance(&mut self, accepted: u64, attempted: u64) {
             self.ledger.borrow_mut().push(Call::RecordTurnMtpAcceptance);
-            *self.recorded_ratio.borrow_mut() = ratio;
+            *self.recorded_counts.borrow_mut() = Some((accepted, attempted));
         }
     }
 
@@ -4166,7 +4150,7 @@ mod tests {
             "a mixed-depth turn must not publish gate history"
         );
         assert!(
-            backend.recorded_ratio.borrow().is_none(),
+            backend.recorded_counts.borrow().is_none(),
             "no acceptance sample recorded for a mixed-depth turn"
         );
     }
@@ -4174,9 +4158,8 @@ mod tests {
     #[test]
     fn run_mtp_turn_depth1_records_acceptance() {
         let _chained_off = force_chained_off();
-        // depth 1, full accept (draft 4 + bonus 5) for 4+ cycles (the
-        // gate's min-sample requirement), clean length exit:
-        //   gen: [3] (seed) + 4 x (Step A + cycle) = 13 tokens
+        // depth 1, full accept (draft 4 + bonus 5), clean length exit:
+        //   gen: [3] (seed) + N x (Step A + cycle)
         let cycle = CycleArgmax {
             draft_argmax: vec![4],
             verify_argmax: vec![4, 5],
@@ -4187,22 +4170,22 @@ mod tests {
         assert_eq!(
             count(&out.ledger, |c| matches!(c, Call::RecordTurnMtpAcceptance)),
             1,
-            "a depth-1 turn with enough cycles publishes its acceptance exactly once"
+            "a depth-1 turn publishes its acceptance counts exactly once"
         );
-        let recorded = *backend.recorded_ratio.borrow();
+        let recorded = *backend.recorded_counts.borrow();
         assert!(
-            matches!(recorded, Some(r) if r > 0.99),
-            "full-accept depth-1 turn records ~1.0 first-draft rate, got {recorded:?}"
+            matches!(recorded, Some((a, t)) if t > 0 && a == t),
+            "full-accept depth-1 turn records accepted == attempted counts, got {recorded:?}"
         );
     }
 
     #[test]
-    fn run_mtp_turn_undersampled_turn_does_not_record() {
+    fn run_mtp_turn_single_cycle_still_records_counts() {
         let _chained_off = force_chained_off();
-        // A 1-cycle depth-1 turn records exactly 0.0 or 1.0 — not a
-        // representative acceptance sample (a 0.756-acceptance head would
-        // record 0.0 with ~24% probability and wrongly gate the next
-        // turns). Undersampled turns must not publish.
+        // A 1-cycle depth-1 turn records its raw (accepted, attempted)
+        // counts — undersampling is NOT filtered at the recording layer;
+        // the gate's confidence-aware decision (mtp_accept_gate_blocks)
+        // is what prevents a single 0-of-1 fluke from wrongly gating.
         let cycle = CycleArgmax {
             draft_argmax: vec![4],
             verify_argmax: vec![4, 5],
@@ -4212,12 +4195,12 @@ mod tests {
         assert_eq!(out.finish_reason, "length");
         assert_eq!(
             count(&out.ledger, |c| matches!(c, Call::RecordTurnMtpAcceptance)),
-            0,
-            "an undersampled turn must not publish gate history"
+            1,
+            "a depth-1 turn always publishes its acceptance counts"
         );
         assert!(
-            backend.recorded_ratio.borrow().is_none(),
-            "no acceptance sample recorded for an undersampled turn"
+            backend.recorded_counts.borrow().is_some(),
+            "a 1-cycle depth-1 turn still records (1,1)"
         );
     }
 
@@ -4443,43 +4426,36 @@ mod tests {
     }
 
     #[test]
-    fn turn_first_draft_acceptance_from_profiler() {
+    fn mtp_first_draft_counts_from_profiler() {
         use crate::decode_profiler::DecodeProfiler;
-        // 10 depth-1 cycles, first draft accepted 7 times => 0.7.
+        // 10 depth-1 cycles, first draft accepted 7 times => (7, 10).
         let mut profiler = DecodeProfiler::new("test", "test");
         for i in 0..10 {
             profiler.record_mtp_cycle(1, if i < 7 { 1 } else { 0 });
         }
-        let rate = turn_mtp_first_draft_acceptance(&profiler).expect("cycles were recorded");
-        assert!((rate - 0.7).abs() < 1e-9);
+        let (accepted, attempted) = profiler.mtp_first_draft_counts().expect("cycles recorded");
+        assert_eq!((accepted, attempted), (7, 10));
     }
 
     #[test]
-    fn turn_first_draft_acceptance_is_none_when_no_cycle_ran() {
+    fn mtp_first_draft_counts_is_none_when_no_cycle_ran() {
         use crate::decode_profiler::DecodeProfiler;
-        // A plain-AR turn records no speculative cycle -> no history is
+        // A plain-AR turn records no speculative cycle -> no counts are
         // published (the family keeps its prior gate state).
         let profiler = DecodeProfiler::new("test", "test");
-        assert!(turn_mtp_first_draft_acceptance(&profiler).is_none());
+        assert!(profiler.mtp_first_draft_counts().is_none());
     }
 
     #[test]
-    fn first_draft_rate_is_not_diluted_by_deeper_slots() {
+    fn mtp_first_draft_counts_count_only_slot_zero() {
         use crate::decode_profiler::DecodeProfiler;
-        // Depth-3 cycles where the FIRST draft accepts 2/3 of the time but
-        // the deeper slots accept less: the gate signal must be the
-        // first-position rate, not the accepted/attempted average — the
-        // depth-1 0.6 threshold would misclassify the latter (docs' depth-3
-        // workload: per-position [0.735, 0.471, 0.235] -> mean 0.48 but
-        // first-draft 0.735, and it runs at ~1.06x AR).
+        // Depth-3 cycles: the counts must reflect ONLY draft slot 0
+        // (leading-acceptance model: cycle k accepts positions 0..k).
         let mut profiler = DecodeProfiler::new("test", "test");
-        profiler.record_mtp_cycle(3, 2); // positions 0,1 accepted
+        profiler.record_mtp_cycle(3, 2); // position 0 accepted
         profiler.record_mtp_cycle(3, 1); // position 0 accepted
-        profiler.record_mtp_cycle(3, 0); // nothing accepted
-        let rate = turn_mtp_first_draft_acceptance(&profiler).expect("cycles recorded");
-        assert!(
-            (rate - 2.0 / 3.0).abs() < 1e-9,
-            "first-draft rate must be 2/3 (not the ~1/3 accepted/attempted average)"
-        );
+        profiler.record_mtp_cycle(3, 0); // position 0 rejected
+        let (accepted, attempted) = profiler.mtp_first_draft_counts().expect("cycles recorded");
+        assert_eq!((accepted, attempted), (2, 3));
     }
 }

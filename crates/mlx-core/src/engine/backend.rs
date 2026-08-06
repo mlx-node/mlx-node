@@ -1472,13 +1472,13 @@ pub(crate) trait MtpBackend: ChatBackend {
     /// `run_mtp_turn` propose/verify loop.
     fn begin_mtp_decode(&mut self, setup: &MtpTurnSetup<'_>) -> Result<Self::MtpDecode<'_>>;
 
-    /// Record the just-completed turn's MTP draft-acceptance ratio
-    /// (accepted drafts / attempted drafts; `None` when no speculative
-    /// cycle ran). The engine's `run_mtp_turn` calls this once on the
-    /// normal completion path, after the stepper is dropped. Families use
-    /// the recorded value to gate future MTP admission (the MTP acceptance
-    /// gate — see `mtp_decode::mtp_accept_gate_enabled`). Default: no-op.
-    fn record_turn_mtp_acceptance(&mut self, _ratio: Option<f64>) {}
+    /// Record a completed depth-1 turn's first-draft acceptance COUNTS
+    /// (accepted / attempted at draft slot 0). The engine's `run_mtp_turn`
+    /// calls this on the normal completion path for depth-1 turns only
+    /// (see `mtp_decode::mtp_accept_gate_enabled`); the family AGGREGATES
+    /// the counts across turns so the gate's confidence-aware decision has
+    /// a growing sample. Default: no-op.
+    fn record_turn_mtp_acceptance(&mut self, _accepted: u64, _attempted: u64) {}
 }
 
 /// Per-turn MTP stepper the engine-owned propose/verify loop drives — the

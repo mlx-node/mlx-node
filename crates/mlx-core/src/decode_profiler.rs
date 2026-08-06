@@ -421,6 +421,22 @@ impl DecodeProfiler {
         Some(self.mtp_depth_total as f64 / self.mtp_cycles as f64)
     }
 
+    /// Raw accepted / attempted counts at draft slot 0 (the first draft),
+    /// for the MTP acceptance gate's confidence-aware decision. `None`
+    /// when no MTP cycle ran. The gate aggregates these across depth-1
+    /// turns and only disables speculation when a 95% confidence bound on
+    /// the first-draft acceptance rate is below the break-even threshold,
+    /// so a single undersampled turn (or a 2-of-4 streak from a healthy
+    /// head) cannot wrongly gate.
+    pub fn mtp_first_draft_counts(&self) -> Option<(u64, u64)> {
+        if self.mtp_cycles == 0 {
+            return None;
+        }
+        let accepted = self.mtp_accept_by_position.first().copied().unwrap_or(0);
+        let attempted = self.mtp_attempt_by_position.first().copied().unwrap_or(0);
+        Some((accepted, attempted))
+    }
+
     /// Build the public phase profile vector for `PerformanceMetrics`
     /// and `GenerationProfile`.
     fn phase_profiles(&self) -> Vec<PhaseProfile> {
