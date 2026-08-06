@@ -2064,15 +2064,17 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // publish: the gate's 0.6 threshold is depth-1-calibrated, and at
     // depth > 1 (or when the adaptive policy sweeps depths 1-5) the full
     // economics (verify cost vs deeper-slot acceptance) are not captured
-    // by a single threshold — see `mtp_gate_allows`. Adaptive turns are
-    // exempt from the gate, so they must not pollute its history even
-    // when a particular run happened to cycle at depth 1 throughout.
-    // The family aggregates the counts, so a single undersampled turn
-    // cannot wrongly gate (the exact-binomial decision in
-    // `mtp_accept_gate_blocks`).
+    // by a single threshold — see `mtp_gate_allows`. The check uses the
+    // REQUESTED depth (`p.mtp_depth`), not the observed mean: the
+    // near-tail budget cap can reduce every executed cycle of a depth>1
+    // request to depth 1, and such a turn is still depth-1-exempt.
+    // Adaptive turns are exempt from the gate, so they must not pollute
+    // its history either. The family aggregates the counts, so a single
+    // undersampled turn cannot wrongly gate (the exact-binomial decision
+    // in `mtp_accept_gate_blocks`).
     if *reason != "cancelled"
         && !p.mtp_adaptive_depth
-        && profiler.mtp_mean_depth().unwrap_or(0.0) == 1.0
+        && p.mtp_depth == 1
         && let Some((accepted, attempted)) = profiler.mtp_first_draft_counts()
     {
         backend.record_turn_mtp_acceptance(accepted, attempted);
@@ -4206,6 +4208,36 @@ mod tests {
         assert!(
             backend.recorded_counts.borrow().is_some(),
             "a 1-cycle depth-1 turn still records (1,1)"
+        );
+    }
+
+    #[test]
+    fn run_mtp_turn_requested_depth_gt_1_never_publishes() {
+        let _chained_off = force_chained_off();
+        // The gate is scoped to REQUESTED depth-1 turns: eligibility is
+        // decided by `p.mtp_depth`, not the observed mean. A depth-2
+        // request whose only cycle is near-tail-capped to depth 1 observes
+        // a mean depth of EXACTLY 1.0 — the old mean-based check would have
+        // published history for it, but the request is depth-2 and must not.
+        let cycle = CycleArgmax {
+            draft_argmax: vec![4],
+            verify_argmax: vec![4, 5],
+        };
+        let mut backend = MockMtpBackend::new(16, 4, vec![7, 8], vec![cycle; 2], false);
+        // Budget 4: seed (3), Step A (7), then remaining=2 near-tail-caps the
+        // depth-2 request's cycle to depth 1 -> emits 4 + bonus 5, length stop.
+        let out = drive_turn(&mut backend, 3, 4, 15, 2);
+        assert_eq!(out.finish_reason, "length");
+        assert_eq!(out.generated, vec![3, 7, 4, 5]);
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::RecordTurnMtpAcceptance)),
+            0,
+            "a depth-2 request must never publish gate history, even when every \
+             cycle is near-tail-capped to depth 1"
+        );
+        assert!(
+            backend.recorded_counts.borrow().is_none(),
+            "no acceptance sample recorded for a depth-2 request"
         );
     }
 
