@@ -9079,7 +9079,10 @@ impl Qwen35Inner {
         // MTP acceptance gate: a previous turn whose draft head accepted
         // below break-even disables speculation for THIS turn (plain AR),
         // so the verify cost is not paid for zero speedup.
-        if planned_mtp && !self.mtp_gate_allows(config.mtp_depth.unwrap_or(1).max(1) as u32) {
+        if planned_mtp
+            && !config.mtp_adaptive_depth.unwrap_or(false)
+            && !self.mtp_gate_allows(config.mtp_depth.unwrap_or(1).max(1) as u32)
+        {
             planned_mtp = false;
             config.enable_mtp = Some(false);
         }
@@ -9148,7 +9151,10 @@ impl Qwen35Inner {
         crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
         let mut planned_mtp = apply_qwen35_dense_planned_decoder(&mut config, args.plan.decoder);
         // MTP acceptance gate (same policy as the sync whole-turn core).
-        if planned_mtp && !self.mtp_gate_allows(config.mtp_depth.unwrap_or(1).max(1) as u32) {
+        if planned_mtp
+            && !config.mtp_adaptive_depth.unwrap_or(false)
+            && !self.mtp_gate_allows(config.mtp_depth.unwrap_or(1).max(1) as u32)
+        {
             planned_mtp = false;
             config.enable_mtp = Some(false);
         }
@@ -9959,10 +9965,14 @@ impl MtpBackend for Qwen35Inner {
 
     fn record_turn_mtp_acceptance(&mut self, accepted: u64, attempted: u64) {
         // Aggregate across turns so the confidence-aware gate decision has
-        // a growing sample. A fresh sample also resets any gated-turn
-        // streak.
+        // a growing sample — but bound it so a long healthy phase cannot
+        // drown out a later degradation (see `mtp_bound_gate_history`).
         self.mtp_draft_accepted += accepted;
         self.mtp_draft_attempted += attempted;
+        mtp_decode::mtp_bound_gate_history(
+            &mut self.mtp_draft_accepted,
+            &mut self.mtp_draft_attempted,
+        );
         self.mtp_gated_turns = 0;
     }
 }
@@ -15315,6 +15325,35 @@ mod mtp_gate_state_tests {
         assert!(
             !inner.mtp_gate_allows(1),
             "0-of-4 must gate (~0.35% for a 0.756 head)"
+        );
+    }
+
+    #[test]
+    fn bounded_history_catches_late_degradation() {
+        // A long healthy phase must not drown out a later degradation:
+        // with the bounded history, a sustained run of rejected drafts
+        // pulls the window rate below break-even and the gate blocks.
+        let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct");
+        // 10,000 healthy depth-1 drafts, then a sustained bad streak
+        // (175 turns x 0-of-4). The history bound keeps the window finite.
+        inner.mtp_draft_accepted = 10_000;
+        inner.mtp_draft_attempted = 10_000;
+        for _ in 0..175 {
+            inner.record_turn_mtp_acceptance(0, 4);
+        }
+        let attempted = inner.mtp_draft_attempted;
+        assert!(
+            attempted <= mtp_decode::MTP_ACCEPT_GATE_HISTORY_CAP,
+            "history must stay bounded, got {attempted}"
+        );
+        let rate = inner.mtp_draft_accepted as f64 / attempted as f64;
+        assert!(
+            mtp_decode::mtp_accept_gate_blocks(rate, attempted),
+            "sustained degradation must be confidently below break-even"
+        );
+        assert!(
+            !inner.mtp_gate_allows(1),
+            "the gate must block after a sustained degradation"
         );
     }
 }

@@ -7282,7 +7282,10 @@ impl Qwen35MoeInner {
         let mut planned_mtp = apply_qwen35_moe_planned_decoder(&mut config, args.plan.decoder);
         // MTP acceptance gate: a previous turn whose draft head accepted
         // below break-even disables speculation for THIS turn (plain AR).
-        if planned_mtp && !self.mtp_gate_allows(config.mtp_depth.unwrap_or(1).max(1) as u32) {
+        if planned_mtp
+            && !config.mtp_adaptive_depth.unwrap_or(false)
+            && !self.mtp_gate_allows(config.mtp_depth.unwrap_or(1).max(1) as u32)
+        {
             planned_mtp = false;
             config.enable_mtp = Some(false);
         }
@@ -8741,6 +8744,10 @@ impl MtpBackend for Qwen35MoeInner {
     fn record_turn_mtp_acceptance(&mut self, accepted: u64, attempted: u64) {
         self.mtp_draft_accepted += accepted;
         self.mtp_draft_attempted += attempted;
+        mtp_decode::mtp_bound_gate_history(
+            &mut self.mtp_draft_accepted,
+            &mut self.mtp_draft_attempted,
+        );
         self.mtp_gated_turns = 0;
     }
 }

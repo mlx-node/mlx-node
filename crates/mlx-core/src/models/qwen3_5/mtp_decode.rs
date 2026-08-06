@@ -152,6 +152,27 @@ pub(crate) const MTP_ACCEPT_GATE_REPROBE_TURNS: u32 = 3;
 /// (~25% of turns) cannot wrongly gate.
 pub(crate) const MTP_ACCEPT_GATE_Z95: f64 = 1.645;
 
+/// Cap on the aggregated acceptance-history sample the MTP gate carries.
+///
+/// Without a bound, lifetime counters let a long healthy phase drown out
+/// a later degradation: after 10,000 accepted drafts a head would need
+/// ~6,667 consecutive rejects just to pull the raw rate below 0.6.
+/// When the aggregate exceeds this cap the counters are halved (rate
+/// preserved, sample bounded), so the gate's confidence bound reflects
+/// roughly the most recent ~512-1024 depth-1 drafts and reacts to a
+/// sustained degradation within a turn or two.
+pub(crate) const MTP_ACCEPT_GATE_HISTORY_CAP: u64 = 512;
+
+/// Bound the aggregated gate history: halve both counters until the
+/// sample fits under [`MTP_ACCEPT_GATE_HISTORY_CAP`], preserving the
+/// rate while keeping the window finite. Integer-only (no float drift).
+pub(crate) fn mtp_bound_gate_history(accepted: &mut u64, attempted: &mut u64) {
+    while *attempted > MTP_ACCEPT_GATE_HISTORY_CAP {
+        *accepted /= 2;
+        *attempted /= 2;
+    }
+}
+
 /// MTP acceptance gate — `MLX_MTP_ACCEPT_GATE` (default ON).
 ///
 /// When ON, the model AGGREGATES the first-draft acceptance counts
@@ -163,10 +184,13 @@ pub(crate) const MTP_ACCEPT_GATE_Z95: f64 = 1.645;
 /// confidence-aware decision is what makes undersampling harmless: a
 /// 1-cycle turn records exactly 0.0 or 1.0 but has a wide interval, and
 /// a 2-of-4 streak from a healthy 0.756 head (~25% of turns, upper bound
-/// ~0.82) cannot wrongly gate. The gate is **depth-1-scoped**: the 0.6
-/// threshold is depth-1 calibrated, and at depth > 1 the verify cost vs
-/// deeper-slot acceptance economics are not captured by a single
-/// threshold — depth > 1 turns are never gated and do not publish gate
+/// ~0.82) cannot wrongly gate. The aggregate is BOUNDED
+/// ([`MTP_ACCEPT_GATE_HISTORY_CAP`]) so a long healthy phase cannot
+/// drown out a later degradation. The gate is **depth-1-scoped and
+/// adaptive-exempt**: the 0.6 threshold is depth-1 calibrated, and at
+/// depth > 1 (or when `mtpAdaptiveDepth` sweeps depths 1-5) the verify
+/// cost vs deeper-slot acceptance economics are not captured by a single
+/// threshold — such turns are never gated and do not publish gate
 /// history. The first turn of a model load has no history and probes;
 /// after [`MTP_ACCEPT_GATE_REPROBE_TURNS`] consecutive gated turns the
 /// gate re-probes. A full session reset (`reset_caches`) clears the
@@ -1127,8 +1151,8 @@ impl MtpVerifyOutput {
 #[cfg(test)]
 mod mtp_history_policy_tests {
     use super::{
-        MtpHistoryPolicy, MtpPromptHistorySelection, mtp_accept_gate_blocks,
-        resolve_mtp_prompt_history_selection,
+        MTP_ACCEPT_GATE_HISTORY_CAP, MtpHistoryPolicy, MtpPromptHistorySelection,
+        mtp_accept_gate_blocks, mtp_bound_gate_history, resolve_mtp_prompt_history_selection,
     };
 
     #[test]
@@ -1201,5 +1225,24 @@ mod mtp_history_policy_tests {
         assert!(!mtp_accept_gate_blocks(0.756, 4));
         assert!(!mtp_accept_gate_blocks(0.756, 32));
         assert!(!mtp_accept_gate_blocks(0.756, 256));
+    }
+
+    #[test]
+    fn gate_history_is_bounded_and_preserves_rate() {
+        // A long healthy phase must not persist forever: halving preserves
+        // the rate while capping the window.
+        let (mut a, mut t) = (10_000u64, 20_000u64); // rate 0.5
+        mtp_bound_gate_history(&mut a, &mut t);
+        assert!(t <= MTP_ACCEPT_GATE_HISTORY_CAP, "sample bounded");
+        assert!(t > 0, "sample never empties");
+        let rate = a as f64 / t as f64;
+        assert!((rate - 0.5).abs() < 0.01, "rate preserved, got {rate}");
+    }
+
+    #[test]
+    fn gate_history_under_cap_is_untouched() {
+        let (mut a, mut t) = (300u64, 500u64); // under cap
+        mtp_bound_gate_history(&mut a, &mut t);
+        assert_eq!((a, t), (300, 500));
     }
 }
