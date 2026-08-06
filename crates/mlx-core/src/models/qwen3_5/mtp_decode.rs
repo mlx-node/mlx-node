@@ -163,6 +163,17 @@ pub(crate) const MTP_ACCEPT_GATE_Z95: f64 = 1.645;
 /// sustained degradation within a turn or two.
 pub(crate) const MTP_ACCEPT_GATE_HISTORY_CAP: u64 = 512;
 
+/// Minimum aggregate sample (attempted depth-1 first drafts) before the
+/// MTP gate may act at all.
+///
+/// The 95% Wilson bound alone leaves an unguarded small-sample hole: a
+/// 0-of-2 aggregate has upper bound ~0.575 < 0.6 and gates, and a 0.756
+/// head records 0-of-2 with ~5.95% probability (0-of-3 ~1.45%). Below
+/// this floor the gate never triggers, so only 0-of-4+ (false rate
+/// ~0.35% for a 0.756 head) can gate. Aggregation means the floor is
+/// reached after a few depth-1 turns, not per turn.
+pub(crate) const MTP_ACCEPT_GATE_MIN_SAMPLES: u64 = 4;
+
 /// Bound the aggregated gate history: halve both counters until the
 /// sample fits under [`MTP_ACCEPT_GATE_HISTORY_CAP`], preserving the
 /// rate while keeping the window finite. Integer-only (no float drift).
@@ -184,7 +195,9 @@ pub(crate) fn mtp_bound_gate_history(accepted: &mut u64, attempted: &mut u64) {
 /// confidence-aware decision is what makes undersampling harmless: a
 /// 1-cycle turn records exactly 0.0 or 1.0 but has a wide interval, and
 /// a 2-of-4 streak from a healthy 0.756 head (~25% of turns, upper bound
-/// ~0.82) cannot wrongly gate. The aggregate is BOUNDED
+/// ~0.82) cannot wrongly gate. Below [`MTP_ACCEPT_GATE_MIN_SAMPLES`]
+/// aggregated drafts the gate never acts at all (0-of-2 would otherwise
+/// gate with a ~5.95% false rate). The aggregate is BOUNDED
 /// ([`MTP_ACCEPT_GATE_HISTORY_CAP`]) so a long healthy phase cannot
 /// drown out a later degradation. The gate is **depth-1-scoped and
 /// adaptive-exempt**: the 0.6 threshold is depth-1 calibrated, and at
@@ -222,8 +235,8 @@ pub(crate) fn mtp_accept_gate_enabled() -> bool {
 /// across turns is used, so a session's sample grows and a genuinely
 /// weak head is caught with high confidence.
 pub(crate) fn mtp_accept_gate_blocks(rate: f64, samples: u64) -> bool {
-    if samples == 0 {
-        return false;
+    if samples < MTP_ACCEPT_GATE_MIN_SAMPLES {
+        return false; // too little data — never gate on <4 samples
     }
     let n = samples as f64;
     let z = MTP_ACCEPT_GATE_Z95;
@@ -1201,6 +1214,17 @@ mod mtp_history_policy_tests {
         assert!(
             !mtp_accept_gate_blocks(0.0, 1),
             "0-of-1 must not gate (CI too wide)"
+        );
+        // Below the minimum sample the gate never acts, even at rate 0:
+        // 0-of-2 would otherwise gate (upper ~0.575) with a 5.95% false
+        // rate for a 0.756 head; 0-of-3 with ~1.45%.
+        assert!(
+            !mtp_accept_gate_blocks(0.0, 2),
+            "0-of-2 must not gate (5.95% false rate for a 0.756 head)"
+        );
+        assert!(
+            !mtp_accept_gate_blocks(0.0, 3),
+            "0-of-3 must not gate (1.45% false rate for a 0.756 head)"
         );
     }
 
