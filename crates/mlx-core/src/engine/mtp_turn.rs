@@ -2060,9 +2060,12 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // completion path — a replayed/aborted turn must not masquerade as a
     // healthy speculative sample, and a USER-CANCELLED turn is not a
     // representative acceptance sample either (it may contain only the
-    // hard first cycles). `None` (no cycle ran) lets the family keep its
-    // prior history.
+    // hard first cycles). Only depth-1 turns publish: the gate's 0.6
+    // threshold is depth-1-calibrated, and at depth > 1 the full
+    // economics (verify cost vs deeper-slot acceptance) are not captured
+    // by a single threshold — see `mtp_gate_allows`.
     if *reason != "cancelled"
+        && profiler.mtp_mean_depth().unwrap_or(0.0) == 1.0
         && let Some(rate) = turn_mtp_first_draft_acceptance(profiler)
     {
         backend.record_turn_mtp_acceptance(Some(rate));
@@ -4149,17 +4152,41 @@ mod tests {
             1,
             "engine consumes the stepper's desync out once"
         );
-        // The MTP acceptance gate hook fires exactly once on the normal
-        // completion path with the full-accept ratio (accepted == attempted).
+        // The MTP acceptance-gate hook only fires for DEPTH-1 turns (the
+        // threshold's calibration domain). This run is depth 2 then a
+        // near-tail depth-1 cap (mean 1.5), so it must NOT publish history.
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::RecordTurnMtpAcceptance)),
+            0,
+            "a mixed-depth turn must not publish gate history"
+        );
+        assert!(
+            backend.recorded_ratio.borrow().is_none(),
+            "no acceptance sample recorded for a mixed-depth turn"
+        );
+    }
+
+    #[test]
+    fn run_mtp_turn_depth1_records_acceptance() {
+        let _chained_off = force_chained_off();
+        // depth 1, full accept (draft 4 + bonus 5), clean length exit:
+        //   gen: [3] (seed) -> Step A -> 7 -> cycle -> 4, 5  (len 4 = max)
+        let cycle = CycleArgmax {
+            draft_argmax: vec![4],
+            verify_argmax: vec![4, 5],
+        };
+        let mut backend = MockMtpBackend::new(16, 4, vec![7, 8], vec![cycle; 2], false);
+        let out = drive_turn(&mut backend, 3, 4, 15, 1);
+        assert_eq!(out.finish_reason, "length");
         assert_eq!(
             count(&out.ledger, |c| matches!(c, Call::RecordTurnMtpAcceptance)),
             1,
-            "engine publishes the turn's acceptance ratio once on a clean length exit"
+            "a depth-1 turn publishes its acceptance exactly once"
         );
         let recorded = *backend.recorded_ratio.borrow();
         assert!(
             matches!(recorded, Some(r) if r > 0.99),
-            "full-accept run records a ~1.0 ratio, got {recorded:?} (accepted == attempted)"
+            "full-accept depth-1 turn records ~1.0 first-draft rate, got {recorded:?}"
         );
     }
 

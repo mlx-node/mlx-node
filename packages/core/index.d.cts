@@ -2234,6 +2234,13 @@ export interface ChatConfig {
    * loop (pure-Rust eager; qwen3.5 dense and MoE). Requires the model
    * checkpoint to carry an MTP head (otherwise silently ignored). Default:
    * `false`.
+   *
+   * The MTP acceptance gate (`MLX_MTP_ACCEPT_GATE`, default ON) also
+   * applies to explicit requests at depth 1: if the previous completed
+   * depth-1 turn's first-draft acceptance rate fell below the break-even
+   * bound, the model runs plain AR for this turn regardless. The gate is
+   * depth-1-scoped (depth > 1 turns are never gated). Set the env var to
+   * `0` to bypass the gate and always run MTP when requested.
    */
   enableMtp?: boolean | undefined;
   /**
