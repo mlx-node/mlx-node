@@ -118,14 +118,20 @@ pub(crate) fn mtp_defer_verify_hidden_eval() -> bool {
     })
 }
 
-/// Break-even draft-acceptance ratio for the MTP acceptance gate.
+/// Break-even first-draft acceptance rate for the MTP acceptance gate.
 ///
-/// A depth-1 verify forward costs ~1.4-1.6× a single AR step (one batched
-/// `[1, 2]` forward), so speculative decoding only wins while the draft
-/// head actually accepts. Below this ratio the verify is pure overhead.
-/// Measured on real checkpoints: 1.000 (qwen3.5-4b, counting prompt),
-/// 0.756 (qwen3.5-4b, complex task), 0.000 (qwen3.5-0.8b — MTP is a net
-/// loss there and the gate is what keeps it from auto-enabling).
+/// The gate signal is the per-position acceptance at draft slot 0 (the
+/// FIRST draft's acceptance rate) — the depth-agnostic measure of whether
+/// speculation pays. At depth 1 it equals the accepted/attempted ratio,
+/// where the break-even is ~0.6 (a depth-1 verify costs ~1.4-1.6× an AR
+/// step). At depth > 1 the verify amortizes over more tokens, so the
+/// first-draft rate is the right comparison: a head accepting its first
+/// draft at ~73% is profitable (docs' depth-3 workload: per-position
+/// [0.735, 0.471, 0.235]) even though the accepted/attempted average is
+/// only ~0.48. Measured first-draft acceptance on real checkpoints:
+/// 1.000 (qwen3.5-4b, counting prompt), 0.756 (qwen3.5-4b, complex task),
+/// 0.000 (qwen3.5-0.8b — MTP is a net loss there and the gate is what
+/// keeps it from auto-enabling).
 pub(crate) const MTP_ACCEPT_GATE_THRESHOLD: f64 = 0.6;
 
 /// After this many consecutive gated (MTP-disabled) turns, the MTP
@@ -139,16 +145,18 @@ pub(crate) const MTP_ACCEPT_GATE_REPROBE_TURNS: u32 = 3;
 
 /// MTP acceptance gate — `MLX_MTP_ACCEPT_GATE` (default ON).
 ///
-/// When ON, a completed MTP turn whose draft-acceptance ratio
-/// (accepted drafts / attempted drafts) fell below
-/// [`MTP_ACCEPT_GATE_THRESHOLD`] disables speculative decoding for the
-/// NEXT turn, falling back to the exact target autoregressive path. The
-/// first turn of a model load has no history and probes; after
+/// When ON, a completed MTP turn whose FIRST-draft acceptance rate (the
+/// per-position acceptance at draft slot 0 — depth-agnostic, see
+/// [`MTP_ACCEPT_GATE_THRESHOLD`]) fell below the break-even bound
+/// disables speculative decoding for the NEXT turn, falling back to the
+/// exact target autoregressive path. The first turn of a model load has
+/// no history and probes; after
 /// [`MTP_ACCEPT_GATE_REPROBE_TURNS`] consecutive gated turns the gate
-/// re-probes. The state is **per-model** (one loaded checkpoint, shared
-/// by every ChatSession over it), not per-session. The gate reuses the
-/// existing "unsupported combination disables speculation for this turn"
-/// routing.
+/// re-probes. A full session reset (`reset_caches`) clears the history so
+/// a new independent chat starts fresh. The state is **per-model** (one
+/// loaded checkpoint, shared by every ChatSession over it), not
+/// per-session. The gate reuses the existing "unsupported combination
+/// disables speculation for this turn" routing.
 ///
 /// Opt-out: `MLX_MTP_ACCEPT_GATE=0` (or `false` / `off`) disables the
 /// gate so MTP always runs when requested. Read once per process and

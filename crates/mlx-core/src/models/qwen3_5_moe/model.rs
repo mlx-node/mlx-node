@@ -290,11 +290,13 @@ pub(crate) struct Qwen35MoeInner {
     /// `has_mtp_weights()` AND-gates on this flag so speculative decode never
     /// runs against a half-loaded head.
     pub(crate) mtp_weights_loaded: bool,
-    /// Draft-acceptance ratio (accepted drafts / attempted drafts) of the
-    /// most recently completed MTP turn, consulted by the MTP acceptance
-    /// gate ([`Self::mtp_gate_allows`]) when planning the NEXT turn.
-    /// `None` = no MTP turn completed yet (first turn probes) or the gate
-    /// is disabled.
+    /// FIRST-draft acceptance rate (the per-position acceptance at draft
+    /// slot 0 — depth-agnostic) of the most recently completed MTP turn,
+    /// consulted by the MTP acceptance gate ([`Self::mtp_gate_allows`])
+    /// when planning the NEXT turn. `None` = no MTP turn completed yet
+    /// (first turn probes), the gate re-probed after
+    /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns, or a
+    /// full session reset cleared it.
     mtp_last_acceptance: Option<f64>,
     /// Consecutive turns the MTP acceptance gate has blocked; after
     /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns the gate
@@ -939,6 +941,11 @@ impl Qwen35MoeInner {
         }
         self.caches = None;
         self.clear_reuse_state();
+        // A full session reset must also clear the MTP acceptance gate
+        // state: a new independent chat on this model starts fresh (probes)
+        // instead of inheriting the previous chat's rejection.
+        self.mtp_last_acceptance = None;
+        self.mtp_gated_turns = 0;
         Ok(())
     }
 

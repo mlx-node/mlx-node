@@ -821,14 +821,16 @@ pub(crate) struct Qwen35Inner {
     /// applied it to `mtp`. The module may exist from config alone; this
     /// flag prevents random-init MTP modules from advertising capability.
     pub(crate) mtp_weights_loaded: bool,
-    /// Draft-acceptance ratio (accepted drafts / attempted drafts) of the
-    /// most recently completed MTP turn, recorded by the engine's
-    /// `run_mtp_turn` end-of-turn hook. Consulted by the MTP acceptance
-    /// gate ([`Self::mtp_gate_allows`]) when planning the NEXT turn:
-    /// a head that accepts below break-even disables speculation so the
-    /// verify cost is not paid for zero speedup. `None` = no MTP turn
-    /// completed yet (the first turn probes) or the gate re-probed after
-    /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns.
+    /// FIRST-draft acceptance rate (the per-position acceptance at draft
+    /// slot 0 — depth-agnostic) of the most recently completed MTP turn,
+    /// recorded by the engine's `run_mtp_turn` end-of-turn hook. Consulted
+    /// by the MTP acceptance gate ([`Self::mtp_gate_allows`]) when planning
+    /// the NEXT turn: a head whose first draft accepts below break-even
+    /// disables speculation so the verify cost is not paid for zero
+    /// speedup. `None` = no MTP turn completed yet (the first turn probes),
+    /// the gate re-probed after
+    /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns, or a full
+    /// session reset cleared it.
     mtp_last_acceptance: Option<f64>,
     /// Consecutive turns the MTP acceptance gate has blocked; after
     /// [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns the gate
@@ -1543,6 +1545,11 @@ impl Qwen35Inner {
         }
         self.caches = None;
         self.clear_reuse_state();
+        // A full session reset must also clear the MTP acceptance gate
+        // state: a new independent chat on this model starts fresh (probes)
+        // instead of inheriting the previous chat's rejection.
+        self.mtp_last_acceptance = None;
+        self.mtp_gated_turns = 0;
         Ok(())
     }
 
@@ -15146,7 +15153,6 @@ mod paged_construction_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
-
 #[cfg(test)]
 mod layer_kinds_cache_tests {
     //! The paged decode steppers consume `Qwen35Inner::layer_kinds` (cached
@@ -15202,5 +15208,60 @@ mod layer_kinds_cache_tests {
             inner.layer_kinds, fresh,
             "cached layer classification must equal a fresh compute over the same config"
         );
+    }
+}
+
+#[cfg(test)]
+mod mtp_gate_state_tests {
+    //! Cheap construction-only tests for the MTP acceptance-gate state on
+    //! `Qwen35Inner` (no Metal: `new` defers the paged pool, and
+    //! `reset_caches_sync` on a fresh inner touches no GPU state).
+
+    use super::*;
+    use crate::models::qwen3_5::config::Qwen3_5Config;
+
+    fn tiny_cfg() -> Qwen3_5Config {
+        Qwen3_5Config {
+            vocab_size: 1024,
+            hidden_size: 64,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: 2,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            head_dim: 16,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 1024,
+            pad_token_id: 0,
+            eos_token_id: 0,
+            bos_token_id: 0,
+            linear_num_value_heads: 4,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 0.25,
+            rope_theta: 100_000.0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: None,
+            persist_paged_cache: None,
+            n_mtp_layers: 0,
+        }
+    }
+
+    #[test]
+    fn reset_caches_clears_mtp_acceptance_gate_state() {
+        // A full session reset must clear the MTP acceptance-gate history
+        // so a new independent chat on this model probes instead of
+        // inheriting the previous chat's rejection.
+        let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct");
+        inner.mtp_last_acceptance = Some(0.3);
+        inner.mtp_gated_turns = 2;
+        inner.reset_caches_sync().expect("reset");
+        assert_eq!(inner.mtp_last_acceptance, None, "gate history cleared");
+        assert_eq!(inner.mtp_gated_turns, 0, "gated-turn streak cleared");
     }
 }
