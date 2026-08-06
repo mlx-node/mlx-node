@@ -8765,8 +8765,7 @@ impl Qwen35MoeInner {
         if attempted == 0 {
             return true; // no history — probe
         }
-        let rate = self.mtp_draft_accepted as f64 / attempted as f64;
-        if !mtp_decode::mtp_accept_gate_blocks(rate, attempted) {
+        if !mtp_decode::mtp_accept_gate_blocks(self.mtp_draft_accepted, attempted) {
             return true;
         }
         self.mtp_gated_turns += 1;

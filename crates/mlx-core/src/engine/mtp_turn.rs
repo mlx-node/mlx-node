@@ -2060,13 +2060,18 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // the normal completion path — a replayed/aborted turn must not
     // masquerade as a healthy speculative sample, and a USER-CANCELLED
     // turn is not a representative acceptance sample either (it may
-    // contain only the hard first cycles). Only depth-1 turns publish:
-    // the gate's 0.6 threshold is depth-1-calibrated, and at depth > 1
-    // the full economics (verify cost vs deeper-slot acceptance) are not
-    // captured by a single threshold — see `mtp_gate_allows`. The family
-    // aggregates the counts, so a single undersampled turn cannot wrongly
-    // gate (the confidence-aware decision in `mtp_accept_gate_blocks`).
+    // contain only the hard first cycles). Only FIXED depth-1 turns
+    // publish: the gate's 0.6 threshold is depth-1-calibrated, and at
+    // depth > 1 (or when the adaptive policy sweeps depths 1-5) the full
+    // economics (verify cost vs deeper-slot acceptance) are not captured
+    // by a single threshold — see `mtp_gate_allows`. Adaptive turns are
+    // exempt from the gate, so they must not pollute its history even
+    // when a particular run happened to cycle at depth 1 throughout.
+    // The family aggregates the counts, so a single undersampled turn
+    // cannot wrongly gate (the exact-binomial decision in
+    // `mtp_accept_gate_blocks`).
     if *reason != "cancelled"
+        && !p.mtp_adaptive_depth
         && profiler.mtp_mean_depth().unwrap_or(0.0) == 1.0
         && let Some((accepted, attempted)) = profiler.mtp_first_draft_counts()
     {

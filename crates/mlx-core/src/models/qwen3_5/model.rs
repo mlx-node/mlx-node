@@ -9998,8 +9998,7 @@ impl Qwen35Inner {
         if attempted == 0 {
             return true; // no history — probe
         }
-        let rate = self.mtp_draft_accepted as f64 / attempted as f64;
-        if !mtp_decode::mtp_accept_gate_blocks(rate, attempted) {
+        if !mtp_decode::mtp_accept_gate_blocks(self.mtp_draft_accepted, attempted) {
             return true; // not confident the head is below break-even
         }
         self.mtp_gated_turns += 1;
@@ -15346,9 +15345,8 @@ mod mtp_gate_state_tests {
             attempted <= mtp_decode::MTP_ACCEPT_GATE_HISTORY_CAP,
             "history must stay bounded, got {attempted}"
         );
-        let rate = inner.mtp_draft_accepted as f64 / attempted as f64;
         assert!(
-            mtp_decode::mtp_accept_gate_blocks(rate, attempted),
+            mtp_decode::mtp_accept_gate_blocks(inner.mtp_draft_accepted, attempted),
             "sustained degradation must be confidently below break-even"
         );
         assert!(
