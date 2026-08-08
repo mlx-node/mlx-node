@@ -42,6 +42,22 @@ const DEFAULT_CLOSE_TIMEOUT_MS = 5000;
 const DEFAULT_RESPONSE_RETENTION_SECONDS = 7 * 24 * 60 * 60; // 7 days
 
 /**
+ * Default per-model queue-depth cap (waiters-only; the actively running
+ * dispatch does not count). Applied when neither
+ * {@link ServerConfig.maxQueueDepthPerModel} nor the
+ * `MLX_MAX_QUEUE_DEPTH_PER_MODEL` env var is set; the config sentinel
+ * `'unbounded'` opts out entirely.
+ *
+ * 16, not 8: an agent fan-out (e.g. Claude Code bursting parallel tool
+ * calls) can put well over 8 concurrent requests behind one model from a
+ * SINGLE client, so 8 risked 429s on a lone user. Over-cap requests get
+ * HTTP 429 with `Retry-After: 1`, which the OpenAI/Anthropic SDK retry
+ * loops honor — the cap sheds pile-up instead of failing well-behaved
+ * clients.
+ */
+export const DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL = 16;
+
+/**
  * Parse a positive integer seconds value; returns undefined for unset/invalid so caller can apply its own default.
  *
  * Non-integer positive values (e.g. `"1.5"`) are rejected rather than
@@ -184,10 +200,13 @@ export interface ServerConfig {
    * `Retry-After: 1` header so clients can back off instead of piling
    * into an unbounded queue.
    *
-   * Default: `undefined` (unbounded — current behaviour). Env override:
-   * `MLX_MAX_QUEUE_DEPTH_PER_MODEL` (positive integer).
+   * Default: {@link DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL} (16). Env
+   * override: `MLX_MAX_QUEUE_DEPTH_PER_MODEL` (positive integer). Pass
+   * `'unbounded'` to opt out of the cap entirely (the pre-cap
+   * behaviour); the sentinel also bypasses the env override, because an
+   * explicit config value always wins over env.
    */
-  maxQueueDepthPerModel?: number;
+  maxQueueDepthPerModel?: number | 'unbounded';
   /**
    * Milliseconds of HTTP inactivity (no request arrivals or completions)
    * before the server issues a single `clearCache()` to drain the MLX
@@ -368,11 +387,21 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
   const configRetentionSec = normalizePositiveIntConfig(config?.responseRetentionSec, 'responseRetentionSec');
   const responseRetentionSec =
     configRetentionSec ?? parseEnvSeconds('MLX_RESPONSE_RETENTION_SECONDS') ?? DEFAULT_RESPONSE_RETENTION_SECONDS;
-  // Opt-in queue-depth cap; resolved exactly once at server construction
-  // so the registry (and its per-model `SessionRegistry` instances
-  // allocated on `register()`) all share a single effective value.
-  const configMaxQueueDepth = normalizePositiveIntConfig(config?.maxQueueDepthPerModel, 'maxQueueDepthPerModel');
-  const maxQueueDepthPerModel = configMaxQueueDepth ?? parseEnvPositiveInt('MLX_MAX_QUEUE_DEPTH_PER_MODEL');
+  // Queue-depth cap; resolved exactly once at server construction so the
+  // registry (and its per-model `SessionRegistry` instances allocated on
+  // `register()`) all share a single effective value. Precedence:
+  // explicit config (the `'unbounded'` sentinel disables the cap
+  // outright, short-circuiting env) wins over env wins over the default
+  // of {@link DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL}. Bogus numeric config
+  // still fails fast in `normalizePositiveIntConfig` before any env /
+  // default fallback applies.
+  const maxQueueDepthConfig = config?.maxQueueDepthPerModel;
+  const maxQueueDepthPerModel =
+    maxQueueDepthConfig === 'unbounded'
+      ? undefined
+      : (normalizePositiveIntConfig(maxQueueDepthConfig, 'maxQueueDepthPerModel') ??
+        parseEnvPositiveInt('MLX_MAX_QUEUE_DEPTH_PER_MODEL') ??
+        DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL);
 
   // Idle sweeper wiring. `0` is a legal explicit "off" value so we
   // cannot reuse `normalizePositiveIntConfig` (which rejects 0).

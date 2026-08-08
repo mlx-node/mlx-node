@@ -315,9 +315,12 @@ export interface SessionRegistryOptions {
    * synchronously so the endpoint layer can emit HTTP 429 and the
    * client can retry later.
    *
-   * Default: `undefined` (unbounded — current behaviour). Opt-in per
-   * {@link ServerConfig.maxQueueDepthPerModel} or the
-   * `MLX_MAX_QUEUE_DEPTH_PER_MODEL` env var.
+   * Default at THIS layer: `undefined` (unbounded) — a directly
+   * constructed `SessionRegistry` has no cap. `createServer` supplies
+   * its own default of 16 per {@link ServerConfig.maxQueueDepthPerModel}
+   * (or the `MLX_MAX_QUEUE_DEPTH_PER_MODEL` env var; config
+   * `'unbounded'` opts out), so server-allocated registries are capped
+   * unless the operator explicitly opted out.
    */
   maxQueueDepth?: number;
   /**

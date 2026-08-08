@@ -5,7 +5,7 @@
  * `GET /v1/models`, in both streaming (SSE) and non-streaming modes.
  */
 
-export { createServer } from './server.js';
+export { createServer, DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL } from './server.js';
 export type { CloseOptions, CloseResult, ServerConfig, ServerInstance } from './server.js';
 
 /**

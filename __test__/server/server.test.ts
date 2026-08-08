@@ -1,5 +1,29 @@
-import { __parseEnvPositiveInt, __parseEnvSeconds, createServer } from '@mlx-node/server';
+import {
+  __parseEnvPositiveInt,
+  __parseEnvSeconds,
+  createServer,
+  DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL,
+  type ServableModel,
+} from '@mlx-node/server';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
+
+/**
+ * Minimal session-capable stub for observing per-model registry state
+ * (`queueDepthLimit`). `ModelRegistry.register()` never invokes the
+ * model — it only binds a `SessionRegistry` to it (the constructor is
+ * pure field assignment) — so no-op methods are sufficient.
+ */
+function createStubModel(): ServableModel {
+  return {
+    chatSessionStart: async () => ({}),
+    chatSessionContinue: async () => ({}),
+    chatSessionContinueTool: async () => ({}),
+    chatStreamSessionStart: () => {},
+    chatStreamSessionContinue: () => {},
+    chatStreamSessionContinueTool: () => {},
+    resetCaches: () => {},
+  } as unknown as ServableModel;
+}
 
 /**
  * `createServer` config validation.
@@ -72,13 +96,53 @@ describe('createServer config validation', () => {
     it('accepts the minimum valid value of 1', async () => {
       const srv = await createServer({ maxQueueDepthPerModel: 1, disableStore: true, port: 0 });
       openedServers.push(srv);
-      expect(srv.registry).toBeDefined();
+      srv.registry.register('m', createStubModel());
+      expect(srv.registry.getSessionRegistry('m')!.queueDepthLimit).toBe(1);
     });
 
-    it('accepts undefined (no opt-in)', async () => {
+    // Deliberate behavior-change pins: before the default cap landed,
+    // omitting the knob meant an UNBOUNDED per-model FIFO
+    // (`queueDepthLimit === undefined`). The default is now 16 so an
+    // agent fan-out cannot pile unbounded waiters behind one model;
+    // `'unbounded'` restores the old behaviour explicitly.
+    it('applies the default cap of 16 when config is undefined and env is absent', async () => {
+      // `beforeEach` deleted MLX_MAX_QUEUE_DEPTH_PER_MODEL. The literal
+      // pin keeps the exported constant honest; the registry assertion
+      // proves the constant actually flows into per-model admission.
+      expect(DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL).toBe(16);
       const srv = await createServer({ maxQueueDepthPerModel: undefined, disableStore: true, port: 0 });
       openedServers.push(srv);
-      expect(srv.registry).toBeDefined();
+      srv.registry.register('m', createStubModel());
+      expect(srv.registry.getSessionRegistry('m')!.queueDepthLimit).toBe(DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL);
+    });
+
+    it('applies the default cap when the knob is entirely absent from config', async () => {
+      // Same `??` path as explicit-undefined today, but pinned separately
+      // so a future "explicit undefined differs from absent" refactor
+      // cannot silently drop either case.
+      const srv = await createServer({ disableStore: true, port: 0 });
+      openedServers.push(srv);
+      srv.registry.register('m', createStubModel());
+      expect(srv.registry.getSessionRegistry('m')!.queueDepthLimit).toBe(DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL);
+    });
+
+    it("'unbounded' opts out of the default cap", async () => {
+      const srv = await createServer({ maxQueueDepthPerModel: 'unbounded', disableStore: true, port: 0 });
+      openedServers.push(srv);
+      srv.registry.register('m', createStubModel());
+      expect(srv.registry.getSessionRegistry('m')!.queueDepthLimit).toBeUndefined();
+    });
+
+    it("'unbounded' also bypasses an env override (explicit config wins over env)", async () => {
+      process.env.MLX_MAX_QUEUE_DEPTH_PER_MODEL = '4';
+      try {
+        const srv = await createServer({ maxQueueDepthPerModel: 'unbounded', disableStore: true, port: 0 });
+        openedServers.push(srv);
+        srv.registry.register('m', createStubModel());
+        expect(srv.registry.getSessionRegistry('m')!.queueDepthLimit).toBeUndefined();
+      } finally {
+        delete process.env.MLX_MAX_QUEUE_DEPTH_PER_MODEL;
+      }
     });
 
     it('falls through to env when config value is absent', async () => {
@@ -86,7 +150,20 @@ describe('createServer config validation', () => {
       try {
         const srv = await createServer({ disableStore: true, port: 0 });
         openedServers.push(srv);
-        expect(srv.registry).toBeDefined();
+        srv.registry.register('m', createStubModel());
+        expect(srv.registry.getSessionRegistry('m')!.queueDepthLimit).toBe(4);
+      } finally {
+        delete process.env.MLX_MAX_QUEUE_DEPTH_PER_MODEL;
+      }
+    });
+
+    it('numeric config wins over env and default', async () => {
+      process.env.MLX_MAX_QUEUE_DEPTH_PER_MODEL = '4';
+      try {
+        const srv = await createServer({ maxQueueDepthPerModel: 3, disableStore: true, port: 0 });
+        openedServers.push(srv);
+        srv.registry.register('m', createStubModel());
+        expect(srv.registry.getSessionRegistry('m')!.queueDepthLimit).toBe(3);
       } finally {
         delete process.env.MLX_MAX_QUEUE_DEPTH_PER_MODEL;
       }

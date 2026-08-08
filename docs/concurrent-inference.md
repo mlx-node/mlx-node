@@ -32,13 +32,13 @@ paged decode clear-cache interval is 1024 steps
 ```text
 req A ─▶ withExclusive ─▶ model thread ─▶ whole turn: prefill → decode [1,1] × N → SSE (in lock)
               │
-req B ─▶ ●────┘ parked until A's terminal SSE event (queue uncapped by default)
+req B ─▶ ●────┘ parked until A's terminal SSE event (default cap: 16 waiters, then 429)
 ```
 
 | Layer | Mechanism | Where |
 | ----- | --------- | ----- |
 | Server | One rolling-promise FIFO per model object; `/v1/responses` and `/v1/messages` share it (aliases too). Held through the last SSE byte; SSE writes ignore backpressure, so hold time tracks decode, not the client. | `packages/server/src/session-registry.ts:919-946`, `streaming.ts:36-39` |
-| Admission | Queue depth is unbounded unless `maxQueueDepthPerModel` / `MLX_MAX_QUEUE_DEPTH_PER_MODEL` is set (then 429). `createInferenceHost` sets no cap. | `session-registry.ts:933-934`, `server.ts:374-375`, `host/index.ts:289-297` |
+| Admission | Queue depth caps at 16 waiters by default (`DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL`); over-cap requests get 429 + `Retry-After: 1`. Override via `maxQueueDepthPerModel` / `MLX_MAX_QUEUE_DEPTH_PER_MODEL`; config `'unbounded'` opts out. `createInferenceHost` inherits the default. | `session-registry.ts:933-934`, `server.ts:397-404`, `host/index.ts:289-297` |
 | Native | One dedicated `"mlx-model"` OS thread per loaded model consumes one command — a whole turn — at a time. Chat NAPI fns only enqueue (streaming returns a handle immediately; non-streaming awaits a oneshot). Forwards never run on the tokio pool. | `crates/mlx-core/src/model_thread.rs:49-67`, `engine/cmd.rs:213-238`, `models/chat_napi.rs:85-215` |
 | Engine | The decode loop is one token of one sequence: `y.item_at_int32(0)`, next forward `[1,1]`. The only batch>1 forwards are within a single request (prefill chunks, MTP/draft verification). | `engine/decode.rs:227-321`, `engine/mtp_turn.rs:367` |
 | Host mode | Every request passes an exclusive writer bracket (`resolveModel`) before inference, even when the model is resident; single-resident by construction so it collapses into the same FIFO. Swaps drain all in-flight streams, then run a full serial unload/load; parked requests get 400 "binding changed"; there is no fast wrong-resident reject. | `endpoints/responses.ts:1781-1799`, `model-work-coordinator.ts:176-212`, `host/swap.ts` |
