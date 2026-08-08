@@ -9,6 +9,7 @@ import { handleCreateMessage } from '../../packages/server/src/endpoints/message
 import { handleCreateResponse } from '../../packages/server/src/endpoints/responses.js';
 import { ModelWorkCoordinator } from '../../packages/server/src/model-work-coordinator.js';
 import { ModelRegistry } from '../../packages/server/src/registry.js';
+import { DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL } from '../../packages/server/src/server.js';
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -280,4 +281,252 @@ describe('ModelWorkCoordinator + SessionRegistry queue cap', () => {
       if (requestB) await requestB;
     }
   });
+});
+
+/**
+ * Gated model for host-mode admission tests: the FIRST `chatSessionStart`
+ * parks on `hold` and signals `onEnter`, so the test can pin one
+ * inference open — holding the coordinator READER inside `withExclusive`
+ * — while concurrent arrivals park in the `resolveModel` writer queue.
+ * Later calls return immediately so the backlog drains. Exposes the
+ * `chatSessionStart` mock so a test can gate one more turn via
+ * `mockImplementationOnce`.
+ */
+function createGatedModel(
+  onEnter: () => void,
+  hold: Promise<void>,
+): { model: SessionCapableModel; chatSessionStart: ReturnType<typeof vi.fn> } {
+  let first = true;
+  const chatSessionStart = vi.fn(async () => {
+    if (first) {
+      first = false;
+      onEnter();
+      await hold;
+    }
+    return makeChatResult();
+  });
+  const model = {
+    chatSessionStart,
+    chatSessionContinue: vi.fn(async () => makeChatResult()),
+    chatSessionContinueTool: vi.fn(async () => makeChatResult()),
+    chatStreamSessionStart: vi.fn(),
+    chatStreamSessionContinue: vi.fn(),
+    chatStreamSessionContinueTool: vi.fn(),
+    resetCaches: vi.fn(),
+  } as unknown as SessionCapableModel;
+  return { model, chatSessionStart };
+}
+
+/**
+ * H3 host-mode regression: with `resolveModel` wired (as
+ * `createInferenceHost` wires it), every request enters the
+ * `ModelWorkCoordinator` writer bracket BEFORE `withExclusive`. While a
+ * turn holds the coordinator's reader, arrivals park as writer waiters
+ * where `SessionRegistry.queueDepth` stays 0 — so without a pre-dispatch
+ * gate the per-model cap could never fire and the parked backlog grew
+ * without bound. These tests pin the gate: over-cap arrivals get the
+ * same 429 envelope, BEFORE the active turn completes.
+ */
+describe('pre-dispatch admission gate (resolveModel + coordinator wiring)', () => {
+  it('POST /v1/messages rejects over-cap arrivals with 429 while the active turn still holds the reader', async () => {
+    const registry = new ModelRegistry({ maxQueueDepth: DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL });
+    const coordinator = new ModelWorkCoordinator();
+    const holderEntered = deferred();
+    const releaseHolder = deferred();
+    const { model } = createGatedModel(() => holderEntered.resolve(undefined), releaseHolder.promise);
+    registry.register('gated-model', model);
+    // Resident fast path: the host's resolveModel is a no-op once the
+    // model is registered, but it still runs inside the writer bracket.
+    const resolveModel = vi.fn(async () => {});
+
+    const sendOne = () => {
+      const mock = createMockRes();
+      const done = handleCreateMessage(
+        mock.res,
+        {
+          model: 'gated-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 16,
+        },
+        registry,
+        undefined,
+        null,
+        resolveModel,
+        coordinator,
+      );
+      return { mock, done };
+    };
+
+    const holder = sendOne();
+    await holderEntered.promise;
+
+    // 18 concurrent arrivals against cap 16: the first 16 are admitted
+    // (they park behind the coordinator writer gate), #17 and #18 are
+    // rejected by the pre-dispatch gate.
+    const arrivals = Array.from({ length: 18 }, () => sendOne());
+    await tick();
+
+    for (const overflow of arrivals.slice(16)) {
+      const outcome = await Promise.race([overflow.done.then(() => 'done' as const), timeout(200)]);
+      // The 429 must land BEFORE the holder releases — this is the whole
+      // point of the gate; without it the overflow would park unbounded
+      // for the length of the active turn.
+      expect(outcome).toBe('done');
+      await overflow.mock.waitForEnd();
+      expect(overflow.mock.getStatus()).toBe(429);
+      expect(overflow.mock.getHeaders()['retry-after']).toBe('1');
+      const parsed = JSON.parse(overflow.mock.getBody());
+      expect(parsed.type).toBe('error');
+      expect(parsed.error.type).toBe('rate_limit_error');
+      expect(parsed.error.message).toContain('Model queue full');
+    }
+    // The finding's mechanism, pinned: the admitted arrivals are parked
+    // at the COORDINATOR, not in the SessionRegistry FIFO — queueDepth
+    // never needs to exceed (or even reach) the cap for the gate to fire.
+    expect(registry.getSessionRegistry('gated-model')!.queueDepth).toBe(0);
+
+    releaseHolder.resolve(undefined);
+    await holder.done;
+    await holder.mock.waitForEnd();
+    expect(holder.mock.getStatus()).toBe(200);
+    for (const admitted of arrivals.slice(0, 16)) {
+      await admitted.done;
+      await admitted.mock.waitForEnd();
+      expect(admitted.mock.getStatus()).toBe(200);
+    }
+  }, 15000);
+
+  it('POST /v1/responses rejects over-cap arrivals with 429 while the active turn still holds the reader', async () => {
+    const registry = new ModelRegistry({ maxQueueDepth: DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL });
+    const coordinator = new ModelWorkCoordinator();
+    const holderEntered = deferred();
+    const releaseHolder = deferred();
+    const { model } = createGatedModel(() => holderEntered.resolve(undefined), releaseHolder.promise);
+    registry.register('gated-model', model);
+    const resolveModel = vi.fn(async () => {});
+
+    const sendOne = () => {
+      const mock = createMockRes();
+      const done = handleCreateResponse(
+        mock.res,
+        { model: 'gated-model', input: 'hi' },
+        registry,
+        null,
+        undefined,
+        undefined,
+        null,
+        coordinator,
+        resolveModel,
+      );
+      return { mock, done };
+    };
+
+    const holder = sendOne();
+    await holderEntered.promise;
+
+    const arrivals = Array.from({ length: 18 }, () => sendOne());
+    await tick();
+
+    for (const overflow of arrivals.slice(16)) {
+      const outcome = await Promise.race([overflow.done.then(() => 'done' as const), timeout(200)]);
+      expect(outcome).toBe('done');
+      await overflow.mock.waitForEnd();
+      expect(overflow.mock.getStatus()).toBe(429);
+      expect(overflow.mock.getHeaders()['retry-after']).toBe('1');
+      const parsed = JSON.parse(overflow.mock.getBody());
+      expect(parsed.error.type).toBe('rate_limit_error');
+      expect(parsed.error.code).toBe('queue_full');
+      expect(parsed.error.message).toContain('Model queue full');
+    }
+    expect(registry.getSessionRegistry('gated-model')!.queueDepth).toBe(0);
+
+    releaseHolder.resolve(undefined);
+    await holder.done;
+    await holder.mock.waitForEnd();
+    expect(holder.mock.getStatus()).toBe(200);
+    for (const admitted of arrivals.slice(0, 16)) {
+      await admitted.done;
+      await admitted.mock.waitForEnd();
+      expect(admitted.mock.getStatus()).toBe(200);
+    }
+  }, 15000);
+
+  it('cold-load burst bypasses the early gate (not resident yet); the cap engages once the model is resident', async () => {
+    const registry = new ModelRegistry({ maxQueueDepth: 2 });
+    const coordinator = new ModelWorkCoordinator();
+    const holderEntered = deferred();
+    const releaseHolder = deferred();
+    const { model, chatSessionStart } = createGatedModel(() => holderEntered.resolve(undefined), releaseHolder.promise);
+    // Cold-load hook: registers the model on first resolve, exactly like
+    // the host's lazy loader. Until then `getSessionRegistry` is
+    // undefined, so the pre-dispatch gate cannot (and must not) fire.
+    const resolveModel = vi.fn(async () => {
+      registry.register('cold-model', model);
+    });
+
+    const sendOne = () => {
+      const mock = createMockRes();
+      const done = handleCreateMessage(
+        mock.res,
+        {
+          model: 'cold-model',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 16,
+        },
+        registry,
+        undefined,
+        null,
+        resolveModel,
+        coordinator,
+      );
+      return { mock, done };
+    };
+
+    // Phase 1 — cold burst: 3 concurrent requests at a NON-resident
+    // model with cap 2. All bypass the early gate; the first parks the
+    // turn open (gated model), so this also proves the burst was not
+    // early-rejected while the load + first turn were in flight.
+    const cold = Array.from({ length: 3 }, () => sendOne());
+    await holderEntered.promise;
+    releaseHolder.resolve(undefined);
+    for (const req of cold) {
+      await req.done;
+      await req.mock.waitForEnd();
+      // Documented residual: non-resident requests are never 429d by the
+      // early gate; 3 requests fit the post-load withExclusive budget
+      // (runner + 2 waiters), so every one completes.
+      expect(req.mock.getStatus()).toBe(200);
+    }
+    expect(resolveModel).toHaveBeenCalled();
+
+    // Phase 2 — the model is now resident, so the same burst shape hits
+    // the pre-dispatch gate: holder + 2 admitted (cap 2), 3rd arrival
+    // rejected while the holder still runs.
+    const holderEntered2 = deferred();
+    const releaseHolder2 = deferred();
+    chatSessionStart.mockImplementationOnce(async () => {
+      holderEntered2.resolve(undefined);
+      await releaseHolder2.promise;
+      return makeChatResult();
+    });
+    const holder2 = sendOne();
+    await holderEntered2.promise;
+    const arrivals = Array.from({ length: 3 }, () => sendOne());
+    await tick();
+
+    const overflow = arrivals[2]!;
+    const outcome = await Promise.race([overflow.done.then(() => 'done' as const), timeout(200)]);
+    expect(outcome).toBe('done');
+    await overflow.mock.waitForEnd();
+    expect(overflow.mock.getStatus()).toBe(429);
+    expect(overflow.mock.getHeaders()['retry-after']).toBe('1');
+
+    releaseHolder2.resolve(undefined);
+    await holder2.done;
+    for (const admitted of arrivals.slice(0, 2)) {
+      await admitted.done;
+      await admitted.mock.waitForEnd();
+      expect(admitted.mock.getStatus()).toBe(200);
+    }
+  }, 15000);
 });

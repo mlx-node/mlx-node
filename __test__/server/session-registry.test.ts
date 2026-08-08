@@ -864,3 +864,110 @@ describe('SessionRegistry', () => {
     });
   });
 });
+
+/**
+ * Pre-dispatch admission — the endpoint-side early gate that keeps
+ * host-mode traffic from parking unbounded in the `ModelWorkCoordinator`
+ * writer queue where `queuedCount` cannot see it. The gate shares this
+ * registry's cap: pre-dispatch admits and `withExclusive` waiters draw
+ * from the same budget, plus one runner slot while the exec chain is
+ * idle (mirroring `withExclusive`'s runner-slot admission).
+ */
+describe('SessionRegistry.beginPreDispatchAdmission', () => {
+  it('idle chain: cap 1 admits runner + one waiter, rejects the next', () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+
+    // Chain idle: one of the admitted callers will take the runner
+    // slot, so cap+1 pre-dispatch admissions are legal.
+    const releaseA = reg.beginPreDispatchAdmission();
+    const releaseB = reg.beginPreDispatchAdmission();
+    expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+    releaseA();
+    releaseB();
+  });
+
+  it('busy chain: cap 1 admits exactly one pre-dispatch waiter', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+    let releaseHolder!: () => void;
+    const holderDone = new Promise<void>((r) => {
+      releaseHolder = r;
+    });
+    const holder = reg.withExclusive(async () => {
+      await holderDone;
+    });
+    await Promise.resolve();
+
+    // Runner slot is taken -> only the single waiter slot remains.
+    const releaseB = reg.beginPreDispatchAdmission();
+    expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+    // Releasing the pre-dispatch admit frees the slot again.
+    releaseB();
+    const releaseC = reg.beginPreDispatchAdmission();
+    releaseC();
+
+    releaseHolder();
+    await holder;
+  });
+
+  it('shares the budget with withExclusive waiters', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 2 });
+    let releaseHolder!: () => void;
+    const holderDone = new Promise<void>((r) => {
+      releaseHolder = r;
+    });
+    const holder = reg.withExclusive(async () => {
+      await holderDone;
+    });
+    await Promise.resolve();
+    const queued = reg.withExclusive(async () => {});
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(1);
+
+    // 1 queued waiter + 1 pre-dispatch admit == cap 2 -> next rejects.
+    const release = reg.beginPreDispatchAdmission();
+    expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+    release();
+
+    releaseHolder();
+    await holder;
+    await queued;
+  });
+
+  it('release is idempotent — double release frees one slot only', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+    let releaseHolder!: () => void;
+    const holderDone = new Promise<void>((r) => {
+      releaseHolder = r;
+    });
+    const holder = reg.withExclusive(async () => {
+      await holderDone;
+    });
+    await Promise.resolve();
+
+    const releaseB = reg.beginPreDispatchAdmission();
+    releaseB();
+    releaseB();
+    // Were the double release under-counting, TWO admits would now fit
+    // under cap 1 with the runner slot taken.
+    const releaseC = reg.beginPreDispatchAdmission();
+    expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+    releaseC();
+
+    releaseHolder();
+    await holder;
+  });
+
+  it('unbounded registry never rejects pre-dispatch admissions', () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model });
+    const releases: Array<() => void> = [];
+    for (let i = 0; i < 64; i += 1) {
+      releases.push(reg.beginPreDispatchAdmission());
+    }
+    for (const release of releases) release();
+  });
+});

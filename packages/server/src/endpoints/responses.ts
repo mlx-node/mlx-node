@@ -1769,6 +1769,36 @@ export async function handleCreateResponse(
   }
   const effectiveRetentionSec = requestedRetentionSec ?? responseRetentionSec;
 
+  // Pre-dispatch admission gate (H3, host mode). In host mode every
+  // request enters the `ModelWorkCoordinator` writer bracket just below
+  // and, while a turn holds the coordinator's reader, parks there as a
+  // writer waiter that `SessionRegistry.queueDepth` cannot see — so the
+  // `withExclusive` cap alone never fires and the parked backlog grows
+  // without bound. When the model is ALREADY resident, admit-or-429 up
+  // front against the same per-model budget (same envelope as the
+  // `withExclusive` reject below). A non-resident model has no
+  // `SessionRegistry` yet: cold loads skip the gate deliberately, and
+  // the post-load `withExclusive` cap still applies.
+  //
+  // Race tolerance (deliberate — no lock couples the counters): the
+  // admit is released right after the writer bracket, so a request
+  // between release and its `withExclusive` call is briefly uncounted.
+  // A stale admit falls through to the `withExclusive` cap; a stale
+  // reject is conservative admission control.
+  let releasePreDispatchAdmit: (() => void) | undefined;
+  const preDispatchRegistry = registry.getSessionRegistry(body.model);
+  if (preDispatchRegistry) {
+    try {
+      releasePreDispatchAdmit = preDispatchRegistry.beginPreDispatchAdmission();
+    } catch (err) {
+      if (err instanceof QueueFullError) {
+        sendRateLimit(res, `Model queue full: ${err.queuedCount} waiting (limit ${err.limit}). Retry after 1s.`);
+        return;
+      }
+      throw err;
+    }
+  }
+
   // Lazy load, exactly as the Anthropic endpoints do. Nothing is resident at
   // boot — `createInferenceHost` only discovers — so without this the very
   // first `/v1/responses` 404s against a `/v1/models` list that advertises the
@@ -1795,10 +1825,15 @@ export async function handleCreateResponse(
           : resolveModel(body.model);
       await (idleSweeper ? idleSweeper.withSuspendedDrains(load) : load());
     } catch (err) {
+      releasePreDispatchAdmit?.();
       sendInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
       return;
     }
   }
+  // Past the only pre-dispatch parking spot — hand accounting back to
+  // `withExclusive`'s own waiter counter. The release is idempotent, so
+  // the failure path above calling it too is safe.
+  releasePreDispatchAdmit?.();
 
   // Look up model
   const model = registry.get(body.model);

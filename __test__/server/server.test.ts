@@ -169,6 +169,22 @@ describe('createServer config validation', () => {
       }
     });
 
+    it('invalid env value falls back to the default cap of 16, not to unbounded', async () => {
+      // The parser rejecting `"1.5"` used to leave the queue UNBOUNDED;
+      // since the default cap landed, the fall-through target is 16.
+      // This is the effective end-to-end pin the parser unit tests
+      // below cannot provide on their own.
+      process.env.MLX_MAX_QUEUE_DEPTH_PER_MODEL = '1.5';
+      try {
+        const srv = await createServer({ disableStore: true, port: 0 });
+        openedServers.push(srv);
+        srv.registry.register('m', createStubModel());
+        expect(srv.registry.getSessionRegistry('m')!.queueDepthLimit).toBe(DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL);
+      } finally {
+        delete process.env.MLX_MAX_QUEUE_DEPTH_PER_MODEL;
+      }
+    });
+
     it('rejects bogus config even if env has a valid value', async () => {
       // Fail-fast: a caller who explicitly passes a bad value should see
       // the error instead of silently using the env fallback.
@@ -235,10 +251,10 @@ describe('createServer config validation', () => {
  *
  * Fix: reject non-integer positive values by returning `undefined` so the
  * caller falls through to its documented default (7 days retention /
- * unbounded queue). We deliberately do NOT throw on bad env — env vars
- * are routinely set by orchestrators and CI templates, and a
- * startup-crash-on-typo is harsher than falling through to a safe
- * default.
+ * the 16-waiter queue cap `DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL`). We
+ * deliberately do NOT throw on bad env — env vars are routinely set by
+ * orchestrators and CI templates, and a startup-crash-on-typo is
+ * harsher than falling through to a safe default.
  */
 describe('env var parsing', () => {
   const RETENTION_VAR = 'MLX_RESPONSE_RETENTION_SECONDS';
@@ -321,9 +337,12 @@ describe('env var parsing', () => {
   });
 
   describe('parseEnvPositiveInt (MLX_MAX_QUEUE_DEPTH_PER_MODEL)', () => {
-    it('rejects fractional MLX_MAX_QUEUE_DEPTH_PER_MODEL and leaves queue unbounded', () => {
+    it('rejects fractional MLX_MAX_QUEUE_DEPTH_PER_MODEL so createServer falls back to the default cap', () => {
       // `"1.5"` must NOT silently coerce to 1 — that would clamp the
       // queue to depth=1 and return 429 for every second request.
+      // The parser returns undefined; `createServer` then applies the
+      // 16-waiter default (pinned end-to-end by 'invalid env value
+      // falls back to the default cap of 16' above).
       process.env[QUEUE_VAR] = '1.5';
       expect(__parseEnvPositiveInt(QUEUE_VAR)).toBeUndefined();
     });

@@ -444,6 +444,15 @@ export class SessionRegistry {
    */
   private queuedCount = 0;
   /**
+   * Requests admitted by {@link beginPreDispatchAdmission} that have not
+   * yet reached `withExclusive` (or bailed out). In host mode these are
+   * typically parked in the `ModelWorkCoordinator` writer queue, which
+   * `queuedCount` cannot see — this counter is what lets the endpoint
+   * gate bound that otherwise-invisible backlog. Never touched by
+   * `withExclusive` itself.
+   */
+  private preDispatchAdmits = 0;
+  /**
    * Holds AT MOST ONE entry under the single-warm invariant (see the
    * module-level rustdoc). `getOrCreate` and `adopt` both clear the
    * map as part of their contract so a later lookup cannot hand out
@@ -519,6 +528,49 @@ export class SessionRegistry {
    */
   get queueDepthLimit(): number | undefined {
     return this.maxQueueDepth;
+  }
+
+  /**
+   * Endpoint-side early admission against this registry's cap, taken
+   * BEFORE the request enters any pre-dispatch parking spot the FIFO
+   * cannot see. In host mode (`createInferenceHost`) every request
+   * passes the `ModelWorkCoordinator` writer bracket ahead of
+   * `withExclusive`; while a turn holds the coordinator's reader, each
+   * arrival parks there as a writer waiter with `queuedCount` still 0 —
+   * so without this gate the `withExclusive` cap could never fire and
+   * the parked backlog grew without bound (H3).
+   *
+   * Accounting: pre-dispatch admits and `withExclusive` waiters draw
+   * from ONE budget (`maxQueueDepth`), plus one runner slot while the
+   * execution chain is idle — mirroring `withExclusive`'s runner-slot
+   * admission so a burst against an idle model admits exactly as many
+   * requests as `withExclusive` itself would.
+   *
+   * Throws {@link QueueFullError} synchronously when over cap (the
+   * caller maps it to the same 429 envelope as the `withExclusive`
+   * reject). On admission returns an IDEMPOTENT release the caller must
+   * invoke once its `withExclusive` call is placed (or on any earlier
+   * bail-out). Race tolerance is deliberate — no lock couples the two
+   * counters: a request released here but not yet queued there is
+   * briefly uncounted, so a concurrent over-admit falls through to the
+   * `withExclusive` cap, and a transient over-count only rejects
+   * conservatively.
+   */
+  beginPreDispatchAdmission(): () => void {
+    if (this.maxQueueDepth !== undefined) {
+      const runnerFree = this.execLock === this.initialLock ? 1 : 0;
+      if (this.preDispatchAdmits + this.queuedCount >= this.maxQueueDepth + runnerFree) {
+        throw new QueueFullError(this.preDispatchAdmits + this.queuedCount, this.maxQueueDepth);
+      }
+    }
+    this.preDispatchAdmits += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.preDispatchAdmits -= 1;
+      if (this.preDispatchAdmits < 0) this.preDispatchAdmits = 0;
+    };
   }
 
   /**

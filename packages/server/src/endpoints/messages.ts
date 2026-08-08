@@ -1062,6 +1062,34 @@ export async function handleCreateMessage(
     return;
   }
 
+  // Pre-dispatch admission gate (H3, host mode). Mirror of the
+  // `/v1/responses` gate — see the long-form rationale there. In host
+  // mode arrivals park in the `ModelWorkCoordinator` writer bracket
+  // below, invisible to `SessionRegistry.queueDepth`, so the
+  // `withExclusive` cap alone cannot bound the backlog. Resident model:
+  // admit-or-429 (Anthropic envelope) against the same per-model
+  // budget. Non-resident (cold-load) requests skip the gate — no
+  // `SessionRegistry` exists yet — and the post-load `withExclusive`
+  // cap still applies. Races are tolerated by design: a stale admit
+  // falls through to the `withExclusive` cap, a stale reject is
+  // conservative.
+  let releasePreDispatchAdmit: (() => void) | undefined;
+  const preDispatchRegistry = registry.getSessionRegistry(body.model);
+  if (preDispatchRegistry) {
+    try {
+      releasePreDispatchAdmit = preDispatchRegistry.beginPreDispatchAdmission();
+    } catch (err) {
+      if (err instanceof QueueFullError) {
+        sendAnthropicRateLimit(
+          res,
+          `Model queue full: ${err.queuedCount} waiting (limit ${err.limit}). Retry after 1s.`,
+        );
+        return;
+      }
+      throw err;
+    }
+  }
+
   // Lazy-load hook: give the host a chance to register the requested
   // model before we look it up. Errors bubble up to the handler's
   // top-level catch which returns 500.
@@ -1117,10 +1145,15 @@ export async function handleCreateMessage(
         serverModelResolveMs = Date.now() - resolveStartedAt;
       }
     } catch (err) {
+      releasePreDispatchAdmit?.();
       sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
       return;
     }
   }
+  // Past the only pre-dispatch parking spot — hand accounting back to
+  // `withExclusive`'s own waiter counter. The release is idempotent, so
+  // the failure path above calling it too is safe.
+  releasePreDispatchAdmit?.();
 
   const model = registry.get(body.model);
   if (!model) {
