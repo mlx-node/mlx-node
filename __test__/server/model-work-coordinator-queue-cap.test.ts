@@ -609,6 +609,94 @@ describe('pre-dispatch permit lifetime (pre-lock async work)', () => {
     expect(b.mock.getStatus()).toBe(200);
   }, 15000);
 
+  it('a permitless cold-load alias cannot double-spend a budget slot held by an outstanding permit', async () => {
+    // Mixed admission, endpoint-reachable: cold-load requests skip the
+    // gate (no SessionRegistry at gate time) and reach `withExclusive`
+    // with NO permit. If the permitless admission checked only
+    // `queuedCount`, it would spend the slot an outstanding permit
+    // (here: a continuation parked in getChain) already owns —
+    // breaching the cap instead of returning 429.
+    const registry = new ModelRegistry({ maxQueueDepth: 1 });
+    const holderEntered = deferred();
+    const releaseHolder = deferred();
+    const { model } = createGatedModel(() => holderEntered.resolve(undefined), releaseHolder.promise);
+    registry.register('m', model);
+    const sessReg = registry.getSessionRegistry('m')!;
+
+    let rejectGetChain!: (err: Error) => void;
+    const getChainGate = new Promise<StoredResponseRecord[]>((_, reject) => {
+      rejectGetChain = reject;
+    });
+    const store = {
+      getChain: vi.fn(() => getChainGate),
+      store: vi.fn(async () => {}),
+    } as unknown as ResponseStore;
+    // The lazy loader aliases the SAME model object under the cold
+    // name — the alias resolves to the SAME SessionRegistry. Only the
+    // request that actually ASKS for the alias registers it, so the
+    // earlier 'm' requests cannot make it resident ahead of C's gate.
+    const resolveModel = vi.fn(async (name: string) => {
+      if (name === 'm-alias') {
+        registry.register('m-alias', model);
+      }
+    });
+
+    const sendOne = (body: { model: string; input: string; previous_response_id?: string }) => {
+      const mock = createMockRes();
+      const done = handleCreateResponse(
+        mock.res,
+        body,
+        registry,
+        store,
+        undefined,
+        undefined,
+        null,
+        undefined,
+        resolveModel,
+      );
+      return { mock, done };
+    };
+
+    // B holds the turn (runner slot — outside the waiter budget).
+    const b = sendOne({ model: 'm', input: 'b' });
+    await holderEntered.promise;
+
+    // A: continuation parked inside getChain, holding the single waiter
+    // slot as an outstanding permit.
+    const a = sendOne({ model: 'm', input: 'a', previous_response_id: 'resp_1' });
+    await tick();
+    expect(sessReg.queueDepth).toBe(0);
+    expect(sessReg.preDispatchAdmitCount).toBe(1);
+
+    // C: cold name — the gate is skipped (no SessionRegistry for
+    // 'm-alias' yet); resolveModel aliases it to the same model, and
+    // C reaches withExclusive permitless. It must get the same 429,
+    // not a seat on top of A's outstanding permit.
+    const c = sendOne({ model: 'm-alias', input: 'c' });
+    const cOutcome = await Promise.race([c.done.then(() => 'done' as const), timeout(200)]);
+    expect(cOutcome).toBe('done');
+    await c.mock.waitForEnd();
+    expect(c.mock.getStatus()).toBe(429);
+    expect(c.mock.getHeaders()['retry-after']).toBe('1');
+    const parsed = JSON.parse(c.mock.getBody());
+    expect(parsed.error.type).toBe('rate_limit_error');
+    expect(parsed.error.code).toBe('queue_full');
+    // Combined footprint never exceeds the cap.
+    expect(sessReg.queueDepth + sessReg.preDispatchAdmitCount).toBeLessThanOrEqual(1);
+
+    // Drain: A's chain misses (404, permit released), holder finishes,
+    // and the invariant still holds at rest.
+    rejectGetChain(new Error('Response not found: resp_1'));
+    await a.done;
+    await a.mock.waitForEnd();
+    expect(a.mock.getStatus()).toBe(404);
+    expect(sessReg.preDispatchAdmitCount).toBe(0);
+    releaseHolder.resolve(undefined);
+    await b.done;
+    await b.mock.waitForEnd();
+    expect(b.mock.getStatus()).toBe(200);
+  }, 15000);
+
   it('releases the permit when the storage lookup throws', async () => {
     const registry = new ModelRegistry({ maxQueueDepth: 1 });
     registry.register('m', createModel());

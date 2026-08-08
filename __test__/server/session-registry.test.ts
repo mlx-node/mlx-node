@@ -1049,6 +1049,43 @@ describe('SessionRegistry pre-dispatch permit handoff', () => {
     await runner;
   });
 
+  it('permitless callers cannot double-spend outstanding permits (mixed admission)', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+    // Active holder occupies the runner slot (outside the budget).
+    let releaseHolder!: () => void;
+    const holderDone = new Promise<void>((r) => {
+      releaseHolder = r;
+    });
+    const holder = reg.withExclusive(async () => {
+      await holderDone;
+    });
+    await Promise.resolve();
+
+    // The single waiter slot is held as an OUTSTANDING permit — a
+    // continuation parked in pre-lock store work, for example.
+    const permit = reg.beginPreDispatchAdmission();
+    expect(reg.preDispatchAdmitCount).toBe(1);
+
+    // A permitless waiter (the cold-load path calls withExclusive with
+    // no permit; a foreign registry's permit degrades to the same) must
+    // see the COMBINED footprint and reject — admitting it would put
+    // queueDepth + outstanding permits at 2 under cap 1.
+    expect(() => reg.withExclusive(async () => {})).toThrow(QueueFullError);
+    expect(reg.queueDepth + reg.preDispatchAdmitCount).toBeLessThanOrEqual(1);
+
+    // The permit handoff still lands: its unit converts, total constant.
+    const queued = reg.withExclusive(async () => {}, permit);
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(1);
+    expect(reg.preDispatchAdmitCount).toBe(0);
+    expect(reg.queueDepth + reg.preDispatchAdmitCount).toBeLessThanOrEqual(1);
+
+    releaseHolder();
+    await holder;
+    await queued;
+  });
+
   it('a released (stale) permit falls back to normal waiter charging', async () => {
     const model = makeMockModel();
     const reg = new SessionRegistry({ model, maxQueueDepth: 1 });

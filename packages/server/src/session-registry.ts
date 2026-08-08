@@ -590,7 +590,12 @@ export class SessionRegistry {
    * from ONE budget (`maxQueueDepth`), plus one runner slot while the
    * execution chain is idle — mirroring `withExclusive`'s runner-slot
    * admission so a burst against an idle model admits exactly as many
-   * requests as `withExclusive` itself would.
+   * requests as `withExclusive` itself would. The runner slot sits
+   * OUTSIDE the budget in BOTH gates (`runnerFree` here, the
+   * `asWaiter` guard there), and both charge against the same combined
+   * footprint `queuedCount + preDispatchAdmits` — so the invariant
+   * "footprint never exceeds the cap" holds across any interleaving of
+   * permitted and permitless callers.
    *
    * Throws {@link QueueFullError} synchronously when over cap (the
    * caller maps it to the same 429 envelope as the `withExclusive`
@@ -1005,18 +1010,20 @@ export class SessionRegistry {
    * `finally` releases regardless of whether `fn` threw.
    *
    * **Admission control.** When `maxQueueDepth` is configured and the
-   * current number of waiters (`queuedCount`, excluding the active
-   * holder) is already at or above the cap, the call throws
-   * {@link QueueFullError} synchronously — SYNCHRONOUSLY from the
-   * caller's perspective, not merely before `await prev`. The wrapper
-   * is deliberately NOT declared `async` so the admission gate
-   * throws on the caller's stack frame, letting endpoint handlers
-   * wrap the call site in a plain try/catch without racing promise
-   * microtasks. On acceptance the async body takes over via the
-   * returned `Promise<T>`.
+   * combined admission footprint — queued waiters (`queuedCount`,
+   * excluding the active holder) PLUS outstanding pre-dispatch permits
+   * (`preDispatchAdmits`) — is already at or above the cap, a
+   * permitless call throws {@link QueueFullError} synchronously —
+   * SYNCHRONOUSLY from the caller's perspective, not merely before
+   * `await prev`. The wrapper is deliberately NOT declared `async` so
+   * the admission gate throws on the caller's stack frame, letting
+   * endpoint handlers wrap the call site in a plain try/catch without
+   * racing promise microtasks. On acceptance the async body takes over
+   * via the returned `Promise<T>`.
    *
    * The cap is "waiters-only" — a cap of N permits one running
-   * dispatch plus N queued ones, rejecting the (N+1)th waiter. The
+   * dispatch plus N admitted-but-not-running requests (queued waiters
+   * and outstanding permits combined), rejecting the (N+1)th. The
    * default (undefined) preserves the original unbounded behaviour.
    *
    * **Runner-slot admission.** Whether a given caller counts as the
@@ -1052,22 +1059,37 @@ export class SessionRegistry {
     // same synchronous block as the waiter accounting below — converts
     // that unit into this call's admission (waiter path increments
     // `queuedCount`, keeping the total constant) or retires it (runner
-    // path). No second cap check runs for a handed-off permit;
-    // re-checking would double-charge and could reject a request that
-    // was already admitted at the endpoint gate. A permit minted by a
-    // DIFFERENT registry is not in `permitConsumers` and falls through
-    // to normal charging (its own budget stays balanced by the caller's
-    // `finally` release).
+    // path). The handoff skips only the caller's OWN token: its budget
+    // share was charged at acquisition and conversion keeps the total
+    // constant, so the handoff itself can never create a breach —
+    // whereas re-checking would double-charge and could reject a
+    // request that was already admitted at the endpoint gate. A permit
+    // minted by a DIFFERENT registry is not in `permitConsumers` and
+    // falls through to normal charging (its own budget stays balanced
+    // by the caller's `finally` release).
     const consume = permit === undefined ? undefined : this.permitConsumers.get(permit);
     const handedOff = consume !== undefined && consume();
 
     // Admission check — raised synchronously so endpoint handlers
     // can reliably catch `QueueFullError` without racing any
     // `await`. Only waiters can trip the cap; the runner slot is
-    // always admitted. The counter is NOT mutated on the reject
-    // path; the request never queued.
-    if (!handedOff && asWaiter && this.maxQueueDepth !== undefined && this.queuedCount >= this.maxQueueDepth) {
-      throw new QueueFullError(this.queuedCount, this.maxQueueDepth);
+    // always admitted (it sits OUTSIDE the waiter budget, exactly as
+    // in `beginPreDispatchAdmission`'s `runnerFree` term). Permitless
+    // waiters — cold-load dispatches that skipped the endpoint gate,
+    // or a foreign registry's permit degraded to permitless — are
+    // charged against the COMBINED footprint: queued waiters PLUS
+    // outstanding pre-dispatch permits. Checking `queuedCount` alone
+    // would let a permitless caller spend a slot an outstanding permit
+    // already owns (e.g. a continuation parked in `store.getChain`),
+    // breaching the cap once that permit converts. The counter is NOT
+    // mutated on the reject path; the request never queued.
+    if (
+      !handedOff &&
+      asWaiter &&
+      this.maxQueueDepth !== undefined &&
+      this.queuedCount + this.preDispatchAdmits >= this.maxQueueDepth
+    ) {
+      throw new QueueFullError(this.queuedCount + this.preDispatchAdmits, this.maxQueueDepth);
     }
 
     const prev = this.execLock;
