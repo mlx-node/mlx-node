@@ -880,11 +880,11 @@ describe('SessionRegistry.beginPreDispatchAdmission', () => {
 
     // Chain idle: one of the admitted callers will take the runner
     // slot, so cap+1 pre-dispatch admissions are legal.
-    const releaseA = reg.beginPreDispatchAdmission();
-    const releaseB = reg.beginPreDispatchAdmission();
+    const permitA = reg.beginPreDispatchAdmission();
+    const permitB = reg.beginPreDispatchAdmission();
     expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
-    releaseA();
-    releaseB();
+    permitA.release();
+    permitB.release();
   });
 
   it('busy chain: cap 1 admits exactly one pre-dispatch waiter', async () => {
@@ -900,12 +900,12 @@ describe('SessionRegistry.beginPreDispatchAdmission', () => {
     await Promise.resolve();
 
     // Runner slot is taken -> only the single waiter slot remains.
-    const releaseB = reg.beginPreDispatchAdmission();
+    const permitB = reg.beginPreDispatchAdmission();
     expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
-    // Releasing the pre-dispatch admit frees the slot again.
-    releaseB();
-    const releaseC = reg.beginPreDispatchAdmission();
-    releaseC();
+    // Releasing the pre-dispatch permit frees the slot again.
+    permitB.release();
+    const permitC = reg.beginPreDispatchAdmission();
+    permitC.release();
 
     releaseHolder();
     await holder;
@@ -926,10 +926,10 @@ describe('SessionRegistry.beginPreDispatchAdmission', () => {
     await Promise.resolve();
     expect(reg.queueDepth).toBe(1);
 
-    // 1 queued waiter + 1 pre-dispatch admit == cap 2 -> next rejects.
-    const release = reg.beginPreDispatchAdmission();
+    // 1 queued waiter + 1 pre-dispatch permit == cap 2 -> next rejects.
+    const permit = reg.beginPreDispatchAdmission();
     expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
-    release();
+    permit.release();
 
     releaseHolder();
     await holder;
@@ -948,14 +948,14 @@ describe('SessionRegistry.beginPreDispatchAdmission', () => {
     });
     await Promise.resolve();
 
-    const releaseB = reg.beginPreDispatchAdmission();
-    releaseB();
-    releaseB();
+    const permitB = reg.beginPreDispatchAdmission();
+    permitB.release();
+    permitB.release();
     // Were the double release under-counting, TWO admits would now fit
     // under cap 1 with the runner slot taken.
-    const releaseC = reg.beginPreDispatchAdmission();
+    const permitC = reg.beginPreDispatchAdmission();
     expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
-    releaseC();
+    permitC.release();
 
     releaseHolder();
     await holder;
@@ -964,10 +964,116 @@ describe('SessionRegistry.beginPreDispatchAdmission', () => {
   it('unbounded registry never rejects pre-dispatch admissions', () => {
     const model = makeMockModel();
     const reg = new SessionRegistry({ model });
-    const releases: Array<() => void> = [];
+    const permits = [];
     for (let i = 0; i < 64; i += 1) {
-      releases.push(reg.beginPreDispatchAdmission());
+      permits.push(reg.beginPreDispatchAdmission());
     }
-    for (const release of releases) release();
+    for (const permit of permits) permit.release();
+    expect(reg.preDispatchAdmitCount).toBe(0);
+  });
+});
+
+/**
+ * Permit handoff: `withExclusive(fn, permit)` must consume an
+ * outstanding permit ATOMICALLY as this call's admission instead of
+ * charging `queuedCount` a second time — one budget, one token per
+ * request. Without the handoff, a permit-holding request that reaches
+ * `withExclusive` would double-spend (its permit still outstanding
+ * while it also occupies a waiter slot), and a request whose permit was
+ * released early would be counted by neither side while parked in
+ * pre-lock async work.
+ */
+describe('SessionRegistry pre-dispatch permit handoff', () => {
+  it('withExclusive consumes a handed-off permit as the waiter charge (no double-spend)', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+    let releaseHolder!: () => void;
+    const holderDone = new Promise<void>((r) => {
+      releaseHolder = r;
+    });
+    const holder = reg.withExclusive(async () => {
+      await holderDone;
+    });
+    await Promise.resolve();
+
+    // The permit occupies the single waiter slot...
+    const permit = reg.beginPreDispatchAdmission();
+    expect(reg.preDispatchAdmitCount).toBe(1);
+
+    // ...and placement converts it: the SAME budget unit moves from
+    // `preDispatchAdmits` to `queuedCount`, with no second cap check
+    // (a re-check would double-charge an already-admitted request).
+    const queued = reg.withExclusive(async () => {}, permit);
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(1);
+    expect(reg.preDispatchAdmitCount).toBe(0);
+
+    // Budget is still exactly full: both gates reject the next caller.
+    expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+    expect(() => reg.withExclusive(async () => {})).toThrow(QueueFullError);
+
+    // Post-handoff release must be a no-op — the token was consumed.
+    permit.release();
+    expect(reg.queueDepth).toBe(1);
+    expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+
+    releaseHolder();
+    await holder;
+    await queued;
+  });
+
+  it('runner-slot handoff retires the permit without charging the queue', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+
+    // Idle chain: the permit holder becomes the runner; its budget unit
+    // is retired, leaving the full waiter budget available.
+    const permit = reg.beginPreDispatchAdmission();
+    let releaseRunner!: () => void;
+    const runnerDone = new Promise<void>((r) => {
+      releaseRunner = r;
+    });
+    const runner = reg.withExclusive(async () => {
+      await runnerDone;
+    }, permit);
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(0);
+    expect(reg.preDispatchAdmitCount).toBe(0);
+
+    // Exactly one waiter slot remains under cap 1.
+    const next = reg.beginPreDispatchAdmission();
+    expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+    next.release();
+
+    releaseRunner();
+    await runner;
+  });
+
+  it('a released (stale) permit falls back to normal waiter charging', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+    let releaseHolder!: () => void;
+    const holderDone = new Promise<void>((r) => {
+      releaseHolder = r;
+    });
+    const holder = reg.withExclusive(async () => {
+      await holderDone;
+    });
+    await Promise.resolve();
+
+    const permit = reg.beginPreDispatchAdmission();
+    permit.release();
+    expect(reg.preDispatchAdmitCount).toBe(0);
+
+    // The stale permit must NOT skip the cap check or double-free: the
+    // call charges `queuedCount` exactly like a permitless caller.
+    const queued = reg.withExclusive(async () => {}, permit);
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(1);
+    expect(() => reg.withExclusive(async () => {})).toThrow(QueueFullError);
+
+    releaseHolder();
+    await holder;
+    await queued;
   });
 });

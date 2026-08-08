@@ -29,7 +29,12 @@ import {
 import type { ModelWorkCoordinator } from '../model-work-coordinator.js';
 import { getPendingWritesFor } from '../pending-writes.js';
 import type { ModelRegistry } from '../registry.js';
-import { maybeWarnPromptCacheKeyIneligible, QueueFullError, type SessionRegistry } from '../session-registry.js';
+import {
+  maybeWarnPromptCacheKeyIneligible,
+  QueueFullError,
+  type PreDispatchAdmission,
+  type SessionRegistry,
+} from '../session-registry.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { mergeTimingUsageExtensions, resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
@@ -73,9 +78,14 @@ export const MAX_OUTPUT_TOKENS = 2147483647; // i32::MAX — native ChatConfig.m
 function withAdmissionControlledInference<T>(
   sessionReg: SessionRegistry,
   modelWorkCoordinator: ModelWorkCoordinator | undefined,
+  // Pre-dispatch permit handed off ATOMICALLY as this call's admission
+  // (`withExclusive` consumes it instead of charging `queuedCount` a
+  // second time). See `beginPreDispatchAdmission`. Placed BEFORE `fn`
+  // so call sites keep the trailing-closure layout.
+  permit: PreDispatchAdmission | undefined,
   fn: () => Promise<T>,
 ): Promise<T> {
-  return sessionReg.withExclusive(() => (modelWorkCoordinator ? modelWorkCoordinator.withInference(fn) : fn()));
+  return sessionReg.withExclusive(() => (modelWorkCoordinator ? modelWorkCoordinator.withInference(fn) : fn()), permit);
 }
 
 /**
@@ -1780,16 +1790,19 @@ export async function handleCreateResponse(
   // `SessionRegistry` yet: cold loads skip the gate deliberately, and
   // the post-load `withExclusive` cap still applies.
   //
-  // Race tolerance (deliberate — no lock couples the counters): the
-  // admit is released right after the writer bracket, so a request
-  // between release and its `withExclusive` call is briefly uncounted.
-  // A stale admit falls through to the `withExclusive` cap; a stale
-  // reject is conservative admission control.
-  let releasePreDispatchAdmit: (() => void) | undefined;
+  // The permit is RETAINED through every pre-lock await — the writer
+  // bracket below AND the `store.getChain` continuation lookups — and
+  // handed to `withExclusive` at placement, which consumes it
+  // atomically as this request's admission (one budget, one token,
+  // never double-counted). It is released only on the bail-out exits:
+  // explicitly on the early returns before the outer `try`, and by the
+  // outer `finally` for everything inside it (idempotent + no-op after
+  // handoff, so the unconditional release is always safe).
+  let preDispatchAdmission: PreDispatchAdmission | undefined;
   const preDispatchRegistry = registry.getSessionRegistry(body.model);
   if (preDispatchRegistry) {
     try {
-      releasePreDispatchAdmit = preDispatchRegistry.beginPreDispatchAdmission();
+      preDispatchAdmission = preDispatchRegistry.beginPreDispatchAdmission();
     } catch (err) {
       if (err instanceof QueueFullError) {
         sendRateLimit(res, `Model queue full: ${err.queuedCount} waiting (limit ${err.limit}). Retry after 1s.`);
@@ -1825,19 +1838,20 @@ export async function handleCreateResponse(
           : resolveModel(body.model);
       await (idleSweeper ? idleSweeper.withSuspendedDrains(load) : load());
     } catch (err) {
-      releasePreDispatchAdmit?.();
+      preDispatchAdmission?.release();
       sendInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
       return;
     }
   }
-  // Past the only pre-dispatch parking spot — hand accounting back to
-  // `withExclusive`'s own waiter counter. The release is idempotent, so
-  // the failure path above calling it too is safe.
-  releasePreDispatchAdmit?.();
+  // NOTE: the permit is NOT released here. Pre-lock work continues below
+  // (`store.getChain` on continuations can block indefinitely on a slow
+  // store) and the request must stay counted until `withExclusive`
+  // consumes the permit at placement. Only bail-out exits release.
 
   // Look up model
   const model = registry.get(body.model);
   if (!model) {
+    preDispatchAdmission?.release();
     sendNotFound(
       res,
       `Model "${body.model}" not found. Available models: ${registry
@@ -1855,6 +1869,7 @@ export async function handleCreateResponse(
   // chains against one native model. Released in `finally` below.
   const lease = registry.acquireDispatchLease(body.model);
   if (!lease) {
+    preDispatchAdmission?.release();
     sendInternalError(res, 'session registry missing for registered model');
     return;
   }
@@ -2496,7 +2511,7 @@ export async function handleCreateResponse(
     try {
       const mutexQueuedAt = Date.now();
       const runInference = () =>
-        withAdmissionControlledInference(sessionReg, modelWorkCoordinator, async () => {
+        withAdmissionControlledInference(sessionReg, modelWorkCoordinator, preDispatchAdmission, async () => {
           const serverTiming: ServerTimingForUsage = {
             server_queue_ms: Date.now() - mutexQueuedAt,
             server_pre_inference_ms: Date.now() - handlerStartedAt,
@@ -3740,6 +3755,12 @@ export async function handleCreateResponse(
       }
     }
   } finally {
+    // Balance the pre-dispatch admission on EVERY exit that never
+    // handed the permit to `withExclusive`: getChain storage errors,
+    // the binding-changed 400s, disconnects, and any validation
+    // early-return inside the outer `try`. Idempotent and a no-op
+    // after handoff, so the unconditional call is always safe.
+    preDispatchAdmission?.release();
     // Idempotent fallback: if the post-dispatch cleanup above
     // never ran (early-return validation failure, or an exception
     // raised inside the outer `try` block between lease

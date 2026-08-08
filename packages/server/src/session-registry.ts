@@ -363,6 +363,28 @@ export class QueueFullError extends Error {
 }
 
 /**
+ * Admission permit returned by
+ * {@link SessionRegistry.beginPreDispatchAdmission}. Represents exactly
+ * ONE unit of the per-model admission budget, and ends in exactly one of
+ * two terminal states:
+ *
+ *  - **handed off**: passed as the second argument of
+ *    `withExclusive(fn, permit)`, which consumes it atomically as that
+ *    call's admission — the unit converts into the waiter charge (or is
+ *    retired when the caller wins the runner slot). `release()` becomes
+ *    a no-op afterwards.
+ *  - **released**: `release()` frees the unit without a dispatch. Every
+ *    exit between admission and lock placement must do this — the
+ *    recommended pattern is one unconditional `release()` in a
+ *    `finally`, which is safe on every path because `release()` is
+ *    idempotent and a no-op after handoff.
+ */
+export interface PreDispatchAdmission {
+  /** Idempotent: free the budget unit unless already handed off. */
+  release(): void;
+}
+
+/**
  * Result of {@link SessionRegistry.getOrCreate}. `hit` reflects whether
  * the call consumed a live warm entry (single-use lease) or returned a
  * fresh `ChatSession` on a miss. The endpoint layer uses `hit` to
@@ -444,14 +466,24 @@ export class SessionRegistry {
    */
   private queuedCount = 0;
   /**
-   * Requests admitted by {@link beginPreDispatchAdmission} that have not
-   * yet reached `withExclusive` (or bailed out). In host mode these are
-   * typically parked in the `ModelWorkCoordinator` writer queue, which
-   * `queuedCount` cannot see — this counter is what lets the endpoint
-   * gate bound that otherwise-invisible backlog. Never touched by
-   * `withExclusive` itself.
+   * Requests admitted by {@link beginPreDispatchAdmission} whose permit
+   * is still outstanding — parked in the `ModelWorkCoordinator` writer
+   * queue (host mode), blocked in pre-lock store lookups
+   * (`previous_response_id` continuations), or anywhere else between the
+   * endpoint gate and `withExclusive` placement. None of that parking is
+   * visible to `queuedCount`; this counter is what lets the gate bound
+   * it. Decremented ONLY by the permit itself: `release()` on a bail-out
+   * or the atomic consume inside `withExclusive` on handoff.
    */
   private preDispatchAdmits = 0;
+  /**
+   * Consume hooks for outstanding permits, keyed by permit identity.
+   * Registry-scoped on purpose: `withExclusive` consults THIS map, so a
+   * permit minted by a different registry is simply not found and the
+   * call falls back to normal waiter charging — a cross-registry handoff
+   * cannot corrupt either registry's counters.
+   */
+  private readonly permitConsumers = new WeakMap<PreDispatchAdmission, () => boolean>();
   /**
    * Holds AT MOST ONE entry under the single-warm invariant (see the
    * module-level rustdoc). `getOrCreate` and `adopt` both clear the
@@ -531,6 +563,18 @@ export class SessionRegistry {
   }
 
   /**
+   * Outstanding pre-dispatch permits — requests admitted by
+   * {@link beginPreDispatchAdmission} that have neither handed their
+   * permit to `withExclusive` nor released it yet.
+   * `queueDepth + preDispatchAdmitCount` is the registry's whole
+   * admission footprint (excluding the active runner) and never exceeds
+   * the cap. For probes and diagnostics.
+   */
+  get preDispatchAdmitCount(): number {
+    return this.preDispatchAdmits;
+  }
+
+  /**
    * Endpoint-side early admission against this registry's cap, taken
    * BEFORE the request enters any pre-dispatch parking spot the FIFO
    * cannot see. In host mode (`createInferenceHost`) every request
@@ -538,9 +582,11 @@ export class SessionRegistry {
    * `withExclusive`; while a turn holds the coordinator's reader, each
    * arrival parks there as a writer waiter with `queuedCount` still 0 —
    * so without this gate the `withExclusive` cap could never fire and
-   * the parked backlog grew without bound (H3).
+   * the parked backlog grew without bound (H3). The same applies to a
+   * continuation blocked in `await store.getChain(...)` on a slow
+   * store: pre-lock async work of any kind parks OUTSIDE `queuedCount`.
    *
-   * Accounting: pre-dispatch admits and `withExclusive` waiters draw
+   * Accounting: pre-dispatch permits and `withExclusive` waiters draw
    * from ONE budget (`maxQueueDepth`), plus one runner slot while the
    * execution chain is idle — mirroring `withExclusive`'s runner-slot
    * admission so a burst against an idle model admits exactly as many
@@ -548,15 +594,19 @@ export class SessionRegistry {
    *
    * Throws {@link QueueFullError} synchronously when over cap (the
    * caller maps it to the same 429 envelope as the `withExclusive`
-   * reject). On admission returns an IDEMPOTENT release the caller must
-   * invoke once its `withExclusive` call is placed (or on any earlier
-   * bail-out). Race tolerance is deliberate — no lock couples the two
-   * counters: a request released here but not yet queued there is
-   * briefly uncounted, so a concurrent over-admit falls through to the
-   * `withExclusive` cap, and a transient over-count only rejects
-   * conservatively.
+   * reject). On admission returns a {@link PreDispatchAdmission} permit
+   * the caller must RETAIN through ALL pre-lock asynchronous work and
+   * then hand to `withExclusive(fn, permit)`, which consumes it
+   * atomically as that call's admission — one budget, one token per
+   * request, never double-counted. Releasing the permit early instead
+   * of handing it off re-opens the hole this gate closes: the request
+   * would be counted by NEITHER counter while parked, arrivals would
+   * refill the budget, and `withExclusive` would then admit a second
+   * full waiter budget on top. `release()` belongs on bail-out paths
+   * only (idempotent, no-op after handoff — an unconditional `finally`
+   * release is the recommended shape).
    */
-  beginPreDispatchAdmission(): () => void {
+  beginPreDispatchAdmission(): PreDispatchAdmission {
     if (this.maxQueueDepth !== undefined) {
       const runnerFree = this.execLock === this.initialLock ? 1 : 0;
       if (this.preDispatchAdmits + this.queuedCount >= this.maxQueueDepth + runnerFree) {
@@ -564,13 +614,22 @@ export class SessionRegistry {
       }
     }
     this.preDispatchAdmits += 1;
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
+    let settled = false;
+    const settle = (): boolean => {
+      if (settled) return false;
+      settled = true;
       this.preDispatchAdmits -= 1;
       if (this.preDispatchAdmits < 0) this.preDispatchAdmits = 0;
+      this.permitConsumers.delete(permit);
+      return true;
     };
+    const permit: PreDispatchAdmission = {
+      release: (): void => {
+        void settle();
+      },
+    };
+    this.permitConsumers.set(permit, settle);
+    return permit;
   }
 
   /**
@@ -970,8 +1029,15 @@ export class SessionRegistry {
    * what keeps a synchronous burst such as `Promise.all([fn, fn])`
    * admissible under `maxQueueDepth = 1` — Call 1 is the runner,
    * Call 2 is the one allowed waiter, Call 3 would throw.
+   *
+   * **Permit handoff.** A caller that was already admitted by
+   * {@link beginPreDispatchAdmission} passes its permit as the second
+   * argument; the permit is consumed atomically as this call's
+   * admission instead of charging `queuedCount` a second time — one
+   * budget, one token per request. See the handoff comment in the
+   * body and {@link PreDispatchAdmission}.
    */
-  withExclusive<T>(fn: () => Promise<T>): Promise<T> {
+  withExclusive<T>(fn: () => Promise<T>, permit?: PreDispatchAdmission): Promise<T> {
     // Distinguish runner-slot from waiter admission. If the chain is
     // idle (`execLock === initialLock`) the current caller is about
     // to become the active holder on its very first `await prev`
@@ -980,12 +1046,27 @@ export class SessionRegistry {
     // else still holds or is ahead in the FIFO) count as waiters.
     const asWaiter = this.execLock !== this.initialLock;
 
+    // Atomic permit handoff (see `beginPreDispatchAdmission`). A caller
+    // handing in a still-outstanding permit from THIS registry already
+    // owns one unit of the shared budget: consuming it here — in the
+    // same synchronous block as the waiter accounting below — converts
+    // that unit into this call's admission (waiter path increments
+    // `queuedCount`, keeping the total constant) or retires it (runner
+    // path). No second cap check runs for a handed-off permit;
+    // re-checking would double-charge and could reject a request that
+    // was already admitted at the endpoint gate. A permit minted by a
+    // DIFFERENT registry is not in `permitConsumers` and falls through
+    // to normal charging (its own budget stays balanced by the caller's
+    // `finally` release).
+    const consume = permit === undefined ? undefined : this.permitConsumers.get(permit);
+    const handedOff = consume !== undefined && consume();
+
     // Admission check — raised synchronously so endpoint handlers
     // can reliably catch `QueueFullError` without racing any
     // `await`. Only waiters can trip the cap; the runner slot is
     // always admitted. The counter is NOT mutated on the reject
     // path; the request never queued.
-    if (asWaiter && this.maxQueueDepth !== undefined && this.queuedCount >= this.maxQueueDepth) {
+    if (!handedOff && asWaiter && this.maxQueueDepth !== undefined && this.queuedCount >= this.maxQueueDepth) {
       throw new QueueFullError(this.queuedCount, this.maxQueueDepth);
     }
 

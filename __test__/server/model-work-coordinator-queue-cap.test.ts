@@ -1,7 +1,7 @@
 import type { ServerResponse } from 'node:http';
 import { Writable } from 'node:stream';
 
-import type { ChatResult } from '@mlx-node/core';
+import type { ChatResult, ResponseStore, StoredResponseRecord } from '@mlx-node/core';
 import type { SessionCapableModel } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
@@ -529,4 +529,169 @@ describe('pre-dispatch admission gate (resolveModel + coordinator wiring)', () =
       expect(admitted.mock.getStatus()).toBe(200);
     }
   }, 15000);
+});
+
+/**
+ * Permit lifetime across pre-lock asynchronous work. A continuation can
+ * block at `await store.getChain(...)` (and its retry paths) between the
+ * pre-dispatch gate and the `withExclusive` placement. The permit must
+ * stay held for that whole interval and convert ATOMICALLY into the
+ * `withExclusive` admission — one budget, one token per request. If the
+ * permit were released early, the request would be counted by NEITHER
+ * `preDispatchAdmits` NOR `queuedCount` while parked at the store, other
+ * arrivals would refill the budget, and `withExclusive` would then admit
+ * a second full waiter budget on top — unbounded accumulation of
+ * slow-store continuations ahead of the cap.
+ */
+describe('pre-dispatch permit lifetime (pre-lock async work)', () => {
+  it('holds the permit across a blocked store.getChain — the budget never double-spends', async () => {
+    const registry = new ModelRegistry({ maxQueueDepth: 1 });
+    const holderEntered = deferred();
+    const releaseHolder = deferred();
+    const { model } = createGatedModel(() => holderEntered.resolve(undefined), releaseHolder.promise);
+    registry.register('m', model);
+    const sessReg = registry.getSessionRegistry('m')!;
+
+    let rejectGetChain!: (err: Error) => void;
+    const getChainGate = new Promise<StoredResponseRecord[]>((_, reject) => {
+      rejectGetChain = reject;
+    });
+    const store = {
+      getChain: vi.fn(() => getChainGate),
+      store: vi.fn(async () => {}),
+    } as unknown as ResponseStore;
+
+    const sendOne = (body: { model: string; input: string; previous_response_id?: string }) => {
+      const mock = createMockRes();
+      const done = handleCreateResponse(mock.res, body, registry, store, undefined, undefined, null, undefined);
+      return { mock, done };
+    };
+
+    // A: continuation parked inside `store.getChain` — pre-lock, holding
+    // its admission permit the whole time.
+    const a = sendOne({ model: 'm', input: 'a', previous_response_id: 'resp_1' });
+    await tick();
+    expect(sessReg.queueDepth).toBe(0);
+    expect(sessReg.preDispatchAdmitCount).toBe(1);
+
+    // B: stateless request; its permit converts into the runner slot at
+    // `withExclusive` placement, then the turn parks inside the model.
+    const b = sendOne({ model: 'm', input: 'b' });
+    await holderEntered.promise;
+    // Probe shape from the review: queueDepth + outstanding permits must
+    // never exceed the cap. A's permit is the whole budget (cap 1).
+    expect(sessReg.queueDepth).toBe(0);
+    expect(sessReg.preDispatchAdmitCount).toBe(1);
+    expect(sessReg.queueDepth + sessReg.preDispatchAdmitCount).toBeLessThanOrEqual(1);
+
+    // C: must be rejected at the gate NOW — under the early-release bug
+    // it would be admitted on the refilled budget and park as a second
+    // in-flight waiter on a cap-1 model.
+    const c = sendOne({ model: 'm', input: 'c' });
+    const cOutcome = await Promise.race([c.done.then(() => 'done' as const), timeout(200)]);
+    expect(cOutcome).toBe('done');
+    await c.mock.waitForEnd();
+    expect(c.mock.getStatus()).toBe(429);
+    expect(c.mock.getHeaders()['retry-after']).toBe('1');
+    expect(sessReg.queueDepth + sessReg.preDispatchAdmitCount).toBeLessThanOrEqual(1);
+
+    // Unblock A's getChain with the native miss shape: A settles as a
+    // 404 and its permit is released by the handler's outer finally.
+    rejectGetChain(new Error('Response not found: resp_1'));
+    await a.done;
+    await a.mock.waitForEnd();
+    expect(a.mock.getStatus()).toBe(404);
+    expect(sessReg.preDispatchAdmitCount).toBe(0);
+
+    releaseHolder.resolve(undefined);
+    await b.done;
+    await b.mock.waitForEnd();
+    expect(b.mock.getStatus()).toBe(200);
+  }, 15000);
+
+  it('releases the permit when the storage lookup throws', async () => {
+    const registry = new ModelRegistry({ maxQueueDepth: 1 });
+    registry.register('m', createModel());
+    const sessReg = registry.getSessionRegistry('m')!;
+    const store = {
+      // Non-"not found" message: a real infrastructure error that must
+      // bubble to the handler's error path, not the retry path.
+      getChain: vi.fn(async () => {
+        throw new Error('disk exploded');
+      }),
+      store: vi.fn(async () => {}),
+    } as unknown as ResponseStore;
+
+    const mock = createMockRes();
+    await handleCreateResponse(
+      mock.res,
+      { model: 'm', input: 'a', previous_response_id: 'resp_1' },
+      registry,
+      store,
+      undefined,
+      undefined,
+      null,
+      undefined,
+    );
+    await mock.waitForEnd();
+    expect(mock.getStatus()).toBeGreaterThanOrEqual(500);
+    // The failed continuation must not leak its budget slot...
+    expect(sessReg.preDispatchAdmitCount).toBe(0);
+
+    // ...so the next request against the same model is admitted cleanly.
+    const followUp = createMockRes();
+    await handleCreateResponse(
+      followUp.res,
+      { model: 'm', input: 'b' },
+      registry,
+      store,
+      undefined,
+      undefined,
+      null,
+      undefined,
+    );
+    await followUp.waitForEnd();
+    expect(followUp.getStatus()).toBe(200);
+  });
+
+  it('releases the permit on the binding-changed 400 exit', async () => {
+    const registry = new ModelRegistry({ maxQueueDepth: 1 });
+    registry.register('m', createModel());
+    const oldReg = registry.getSessionRegistry('m')!;
+
+    let resolveGetChain!: (chain: StoredResponseRecord[]) => void;
+    const getChainGate = new Promise<StoredResponseRecord[]>((resolve) => {
+      resolveGetChain = resolve;
+    });
+    const store = {
+      getChain: vi.fn(() => getChainGate),
+      store: vi.fn(async () => {}),
+    } as unknown as ResponseStore;
+
+    const mock = createMockRes();
+    const done = handleCreateResponse(
+      mock.res,
+      { model: 'm', input: 'a', previous_response_id: 'resp_1' },
+      registry,
+      store,
+      undefined,
+      undefined,
+      null,
+      undefined,
+    );
+    await tick();
+    expect(oldReg.preDispatchAdmitCount).toBe(1);
+
+    // Hot-swap while the continuation is parked at getChain: the name now
+    // points at a DIFFERENT model instance, so the post-await binding
+    // guard must 400 — and the permit (held against the OLD registry)
+    // must be released on that exit.
+    registry.register('m', createModel());
+    resolveGetChain([{} as StoredResponseRecord]);
+    await done;
+    await mock.waitForEnd();
+    expect(mock.getStatus()).toBe(400);
+    expect(mock.getBody()).toContain('binding changed');
+    expect(oldReg.preDispatchAdmitCount).toBe(0);
+  });
 });

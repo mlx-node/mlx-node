@@ -45,7 +45,7 @@ export { ModelRegistry } from './registry.js';
 export type { ServableModel, ModelEntry, ModelRegistryOptions, RegisterOptions } from './registry.js';
 
 export { QueueFullError, SessionRegistry } from './session-registry.js';
-export type { SessionLookupResult, SessionRegistryOptions } from './session-registry.js';
+export type { PreDispatchAdmission, SessionLookupResult, SessionRegistryOptions } from './session-registry.js';
 export { resolveServerTuningForUsage } from './timing.js';
 // NOTE: `__resetPromptCacheKeyNonceForTests` is intentionally NOT
 // re-exported here. It is a test-only helper that nukes the module-

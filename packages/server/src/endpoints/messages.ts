@@ -88,7 +88,7 @@ import {
 import { genId } from '../mappers/response.js';
 import type { ModelWorkCoordinator } from '../model-work-coordinator.js';
 import type { ModelRegistry } from '../registry.js';
-import { QueueFullError, type SessionRegistry } from '../session-registry.js';
+import { QueueFullError, type PreDispatchAdmission, type SessionRegistry } from '../session-registry.js';
 import { StopSequenceBuffer } from '../stop-sequence-buffer.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
@@ -121,9 +121,14 @@ const CLAUDE_CODE_TITLE_MAX_TOKENS = 128;
 function withAdmissionControlledInference<T>(
   sessionReg: SessionRegistry,
   modelWorkCoordinator: ModelWorkCoordinator | undefined,
+  // Pre-dispatch permit handed off ATOMICALLY as this call's admission
+  // (`withExclusive` consumes it instead of charging `queuedCount` a
+  // second time). See `beginPreDispatchAdmission`. Placed BEFORE `fn`
+  // so call sites keep the trailing-closure layout.
+  permit: PreDispatchAdmission | undefined,
   fn: () => Promise<T>,
 ): Promise<T> {
-  return sessionReg.withExclusive(() => (modelWorkCoordinator ? modelWorkCoordinator.withInference(fn) : fn()));
+  return sessionReg.withExclusive(() => (modelWorkCoordinator ? modelWorkCoordinator.withInference(fn) : fn()), permit);
 }
 
 function requestAllowsToolUse(body: AnthropicMessagesRequest): boolean {
@@ -1070,14 +1075,18 @@ export async function handleCreateMessage(
   // admit-or-429 (Anthropic envelope) against the same per-model
   // budget. Non-resident (cold-load) requests skip the gate — no
   // `SessionRegistry` exists yet — and the post-load `withExclusive`
-  // cap still applies. Races are tolerated by design: a stale admit
-  // falls through to the `withExclusive` cap, a stale reject is
-  // conservative.
-  let releasePreDispatchAdmit: (() => void) | undefined;
+  // cap still applies. The permit is RETAINED through every pre-lock
+  // await and handed to `withExclusive` at placement, which consumes it
+  // atomically as this request's admission (one budget, one token,
+  // never double-counted); it is released only on bail-out exits —
+  // explicitly on the early returns before the outer `try`, and by the
+  // outer `finally` for everything inside it (idempotent + no-op after
+  // handoff).
+  let preDispatchAdmission: PreDispatchAdmission | undefined;
   const preDispatchRegistry = registry.getSessionRegistry(body.model);
   if (preDispatchRegistry) {
     try {
-      releasePreDispatchAdmit = preDispatchRegistry.beginPreDispatchAdmission();
+      preDispatchAdmission = preDispatchRegistry.beginPreDispatchAdmission();
     } catch (err) {
       if (err instanceof QueueFullError) {
         sendAnthropicRateLimit(
@@ -1145,18 +1154,18 @@ export async function handleCreateMessage(
         serverModelResolveMs = Date.now() - resolveStartedAt;
       }
     } catch (err) {
-      releasePreDispatchAdmit?.();
+      preDispatchAdmission?.release();
       sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
       return;
     }
   }
-  // Past the only pre-dispatch parking spot — hand accounting back to
-  // `withExclusive`'s own waiter counter. The release is idempotent, so
-  // the failure path above calling it too is safe.
-  releasePreDispatchAdmit?.();
+  // NOTE: the permit is NOT released here. The request must stay counted
+  // through the remaining pre-lock work until `withExclusive` consumes
+  // the permit at placement. Only bail-out exits release.
 
   const model = registry.get(body.model);
   if (!model) {
+    preDispatchAdmission?.release();
     sendAnthropicNotFound(res, `Model "${body.model}" not found`);
     return;
   }
@@ -1167,6 +1176,7 @@ export async function handleCreateMessage(
   // against one shared native model. Must be released in the `finally` below.
   const lease = registry.acquireDispatchLease(body.model);
   if (!lease) {
+    preDispatchAdmission?.release();
     sendAnthropicInternalError(res, 'session registry missing for registered model');
     return;
   }
@@ -1294,7 +1304,7 @@ export async function handleCreateMessage(
     try {
       const mutexQueuedAt = Date.now();
       const runInference = () =>
-        withAdmissionControlledInference(sessionReg, modelWorkCoordinator, async () => {
+        withAdmissionControlledInference(sessionReg, modelWorkCoordinator, preDispatchAdmission, async () => {
           const serverTiming: ServerTimingForUsage = {
             server_model_resolve_ms: serverModelResolveMs,
             server_load_wait_ms: serverLoadWaitMs,
@@ -1629,6 +1639,11 @@ export async function handleCreateMessage(
       }
     }
   } finally {
+    // Balance the pre-dispatch admission on EVERY exit that never handed
+    // the permit to `withExclusive`: binding-changed 400s, disconnects,
+    // and any validation early-return inside the outer `try`. Idempotent
+    // and a no-op after handoff, so the unconditional call is safe.
+    preDispatchAdmission?.release();
     // Drop disconnect listeners so they don't pin the request past handler
     // return. Only detach if we actually attached (gated by the flag).
     if (abortListenersAttached) {
