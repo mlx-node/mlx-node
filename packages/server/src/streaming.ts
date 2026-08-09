@@ -33,9 +33,58 @@ export function beginSSE(res: ServerResponse): void {
 }
 
 /** Write one SSE event. Injects `type: eventType` into the payload (data's own `type` wins) for OpenAI SDK compatibility. */
-export function writeSSEEvent(res: ServerResponse, eventType: string, data: object): void {
+export function writeSSEEvent(res: ServerResponse, eventType: string, data: object): boolean {
   const payload = { type: eventType, ...data };
-  res.write(`event: ${eventType}\ndata: ${JSON.stringify(payload)}\n\n`);
+  return res.write(`event: ${eventType}\ndata: ${JSON.stringify(payload)}\n\n`);
+}
+
+/**
+ * Wait until a backpressured response can accept more data, or until its
+ * transport closes. Close and error resolve rather than reject: endpoint abort
+ * listeners own the `clientAborted` state, and the next loop check exits before
+ * another native item is written.
+ *
+ * Call this synchronously after `writeSSEEvent` returns false. In particular,
+ * do not defer listener installation until the next iterator turn: `drain`
+ * could fire while that turn is being fetched and leave the handler parked on
+ * an event that already happened.
+ */
+export function awaitDrainOrClose(res: ServerResponse): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    const socket = res.socket;
+    const settle = (): void => {
+      if (settled) return;
+      settled = true;
+      res.removeListener('drain', onDrain);
+      res.removeListener('close', onClose);
+      res.removeListener('error', onError);
+      if (socket != null) socket.removeListener('close', onClose);
+      resolve();
+    };
+    const onDrain = (): void => {
+      settle();
+    };
+    const onClose = (): void => {
+      settle();
+    };
+    const onError = (_err: unknown): void => {
+      settle();
+    };
+
+    // A destroyed peer cannot emit a future useful drain. Do not include
+    // `writableEnded` here: write-after-end returns false and reports
+    // ERR_STREAM_WRITE_AFTER_END asynchronously through the error listener.
+    if (res.destroyed || (socket != null && socket.destroyed)) {
+      settle();
+      return;
+    }
+
+    res.once('drain', onDrain);
+    res.once('close', onClose);
+    res.once('error', onError);
+    if (socket != null) socket.once('close', onClose);
+  });
 }
 
 export function endSSE(res: ServerResponse): void {

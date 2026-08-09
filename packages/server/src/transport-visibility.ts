@@ -14,10 +14,11 @@
  * firing the callback or `'error'`, which would pin the per-model mutex on a
  * client that cannot see anything we write.
  *
- * Non-terminal SSE writes remain synchronous — only the terminal event is
- * flushed through the async helper. Streaming handlers independently attach a
- * `res.once('close', …)` listener to flip `clientAborted` so the decode loop
- * breaks at the next iteration boundary.
+ * Non-terminal SSE write calls remain synchronous, but streaming handlers
+ * await a close-safe drain promise whenever one reports backpressure. Only the
+ * terminal event uses the callback-backed visibility flush. Streaming handlers
+ * independently attach a `res.once('close', …)` listener to flip
+ * `clientAborted` so the decode loop breaks at the next iteration boundary.
  */
 
 import type { ServerResponse } from 'node:http';

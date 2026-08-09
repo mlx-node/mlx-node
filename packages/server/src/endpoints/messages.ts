@@ -90,7 +90,7 @@ import type { ModelWorkCoordinator } from '../model-work-coordinator.js';
 import type { ModelRegistry } from '../registry.js';
 import { QueueFullError, type PreDispatchAdmission, type SessionRegistry } from '../session-registry.js';
 import { StopSequenceBuffer } from '../stop-sequence-buffer.js';
-import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
+import { awaitDrainOrClose, beginSSE, endSSE, writeSSEEvent as writeRawSSEEvent } from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
@@ -316,7 +316,22 @@ async function handleStreamingNative(
   // to the streaming error epilogue instead of corrupting the JSON path.
   markSSEMode(visibility);
 
-  writeSSEEvent(res, 'message_start', buildMessageStartEvent(body, messageId, 0));
+  // A native event can expand into several SSE frames. Preserve the first
+  // false write until the loop awaits it, and install the drain/close/error
+  // listeners immediately so an intervening iterator fetch cannot miss drain.
+  let pendingDrain: Promise<void> | null = null;
+  const writeSSEEvent = (response: ServerResponse, eventType: string, data: object): void => {
+    const ok = writeRawSSEEvent(response, eventType, data);
+    if (!ok && pendingDrain === null) {
+      pendingDrain = awaitDrainOrClose(response);
+    }
+  };
+  const drainPending = async (): Promise<void> => {
+    const drain = pendingDrain;
+    if (drain === null) return;
+    await drain;
+    if (pendingDrain === drain) pendingDrain = null;
+  };
 
   let contentBlockIndex = 0;
   let hasEmittedThinking = false;
@@ -414,8 +429,13 @@ async function handleStreamingNative(
     resSocketForAbort.once('close', onResClose);
   }
 
+  // Abort listeners precede the first body write so an asynchronous socket
+  // error makes `clientAborted` authoritative before the drain wait resumes.
+  writeSSEEvent(res, 'message_start', buildMessageStartEvent(body, messageId, 0));
+
   try {
     for await (const event of chatStream) {
+      await drainPending();
       if (clientAborted) break;
       if (event.done) {
         sawDone = true;
@@ -795,6 +815,7 @@ async function handleStreamingNative(
     // epilogue (single streaming `error` event, no `message_stop`).
     thrownError = err instanceof Error ? err : new Error(String(err));
   } finally {
+    await drainPending();
     if (httpReq) {
       httpReq.off('close', onClientClose);
       httpReq.off('error', onClientError);
@@ -847,6 +868,7 @@ async function handleStreamingNative(
         // up front — non-fatal; the SSE usage field still carries the value.
       }
     }
+    await drainPending();
     await flushTerminalSSE(res, 'message_stop', buildMessageStop(), visibility);
     endSSE(res);
     return { ok: true, suppressedToolCalls };
@@ -859,6 +881,7 @@ async function handleStreamingNative(
   } else if (hasEmittedText) {
     writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
   }
+  await drainPending();
   let message: string;
   if (thrownError != null) {
     message = thrownError.message;

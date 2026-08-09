@@ -35,7 +35,7 @@ import {
   type PreDispatchAdmission,
   type SessionRegistry,
 } from '../session-registry.js';
-import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
+import { awaitDrainOrClose, beginSSE, endSSE, writeSSEEvent as writeRawSSEEvent } from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { mergeTimingUsageExtensions, resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
@@ -363,8 +363,23 @@ async function handleStreamingNative(
   markSSEMode(visibility);
 
   const partial = buildPartialResponse(req, responseId, previousResponseId);
-  writeSSEEvent(res, 'response.created', { response: partial });
-  writeSSEEvent(res, 'response.in_progress', { response: partial });
+
+  // Arm the close-safe drain listener synchronously on the FIRST false write.
+  // A native event can expand into several SSE frames, so the promise stays
+  // sticky until the loop awaits it; no later true return may erase the gate.
+  let pendingDrain: Promise<void> | null = null;
+  const writeSSEEvent = (response: ServerResponse, eventType: string, data: object): void => {
+    const ok = writeRawSSEEvent(response, eventType, data);
+    if (!ok && pendingDrain === null) {
+      pendingDrain = awaitDrainOrClose(response);
+    }
+  };
+  const drainPending = async (): Promise<void> => {
+    const drain = pendingDrain;
+    if (drain === null) return;
+    await drain;
+    if (pendingDrain === drain) pendingDrain = null;
+  };
 
   const outputItems: OutputItem[] = [];
   let outputIndex = 0;
@@ -430,8 +445,15 @@ async function handleStreamingNative(
     resSocketForAbort.once('close', onResClose);
   }
 
+  // Install abort listeners before the first body write. If that write queues
+  // an asynchronous transport error, `clientAborted` must flip before its
+  // drain promise settles and the loop evaluates the abort gate.
+  writeSSEEvent(res, 'response.created', { response: partial });
+  writeSSEEvent(res, 'response.in_progress', { response: partial });
+
   try {
     for await (const event of chatStream) {
+      await drainPending();
       // Honor client disconnect at loop-top. Native decode has no
       // AbortSignal yet; `break` drops the generator reference so
       // the producer's `finally` releases per-model locks and the
@@ -921,6 +943,9 @@ async function handleStreamingNative(
     // and never the underlying exception text.
     console.error(`[responses] native dispatch failed for ${req.model} (response ${responseId}):`, thrownError.message);
   } finally {
+    // Cover done/break/continue/generator-throw paths, and keep the abort
+    // listeners installed until close/error has made `clientAborted` sticky.
+    await drainPending();
     if (httpReq) {
       httpReq.off('close', onClientClose);
       httpReq.off('error', onClientError);
@@ -965,6 +990,8 @@ async function handleStreamingNative(
         writeSSEEvent(res, 'response.output_item.done', { output_index: fcIndex, item });
       }
     }
+
+    await drainPending();
 
     // The terminal SSE flushes inside the per-model mutex (client
     // expects it ordered against prior deltas); the `ResponseStore`
@@ -1058,6 +1085,8 @@ async function handleStreamingNative(
       writeSSEEvent(res, 'response.output_item.done', { output_index: riIndex, item: reasoningItem });
     }
   }
+
+  await drainPending();
 
   const failedTerminal = buildFailedTerminal(
     partial,
