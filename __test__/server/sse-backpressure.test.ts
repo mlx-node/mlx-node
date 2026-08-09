@@ -3,6 +3,7 @@ import { request as httpRequest, type IncomingMessage, type ServerResponse } fro
 import type { AddressInfo } from 'node:net';
 import { Writable } from 'node:stream';
 
+import type { ChatResult } from '@mlx-node/core';
 import type { SessionCapableModel } from '@mlx-node/lm';
 import { createServer, type ServerInstance } from '@mlx-node/server';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
@@ -11,6 +12,8 @@ import * as streaming from '../../packages/server/src/streaming.js';
 
 const TOTAL_CHUNKS = 4_096;
 const DELTA = 'x'.repeat(4 * 1_024);
+const MAX_CONSUMED_AT_PARK = 1_024;
+const MAX_WRITABLE_OVERSHOOT = DELTA.length * 4;
 
 let servers: ServerInstance[] = [];
 
@@ -18,13 +21,13 @@ afterEach(async () => {
   const pending = servers;
   servers = [];
   for (const instance of pending) {
-    await instance.close({ timeoutMs: 250 }).catch(() => {});
+    await instance.close({ timeoutMs: 1_000 });
   }
 });
 
-function deferred(): { promise: Promise<void>; resolve: () => void } {
-  let resolve!: () => void;
-  const promise = new Promise<void>((done) => {
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
     resolve = done;
   });
   return { promise, resolve };
@@ -172,6 +175,11 @@ type EndpointCase = {
   name: string;
   path: string;
   body: (model: string) => object;
+  successorBody: (model: string) => object;
+  residualMarker: string;
+  successTerminal: string;
+  failureTerminal: string;
+  abortEvent: 'close' | 'error';
 };
 
 const endpointCases: EndpointCase[] = [
@@ -179,6 +187,11 @@ const endpointCases: EndpointCase[] = [
     name: 'Responses API',
     path: '/v1/responses',
     body: (model) => ({ model, input: 'hi', stream: true, max_output_tokens: TOTAL_CHUNKS + 1 }),
+    successorBody: (model) => ({ model, input: 'successor', max_output_tokens: 8 }),
+    residualMarker: 'event: response.output_item.added',
+    successTerminal: 'event: response.completed',
+    failureTerminal: 'event: response.failed',
+    abortEvent: 'close',
   },
   {
     name: 'Messages API',
@@ -189,8 +202,31 @@ const endpointCases: EndpointCase[] = [
       max_tokens: TOTAL_CHUNKS + 1,
       stream: true,
     }),
+    successorBody: (model) => ({
+      model,
+      messages: [{ role: 'user', content: 'successor' }],
+      max_tokens: 8,
+    }),
+    residualMarker: 'event: message_delta',
+    successTerminal: 'event: message_stop',
+    failureTerminal: 'event: error',
+    abortEvent: 'error',
   },
 ];
+
+function quickResult(): ChatResult {
+  return {
+    text: 'successor-ok',
+    toolCalls: [],
+    thinkingEnabled: false,
+    numTokens: 1,
+    promptTokens: 1,
+    reasoningTokens: 0,
+    finishReason: 'stop',
+    rawText: 'successor-ok',
+    cachedTokens: 0,
+  };
+}
 
 function createFloodModel(): {
   model: SessionCapableModel;
@@ -223,9 +259,9 @@ function createFloodModel(): {
   }
 
   const model = {
-    chatSessionStart: vi.fn().mockRejectedValue(new Error('should use streaming dispatch')),
-    chatSessionContinue: vi.fn().mockRejectedValue(new Error('should use streaming dispatch')),
-    chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('should use streaming dispatch')),
+    chatSessionStart: vi.fn(async () => quickResult()),
+    chatSessionContinue: vi.fn(async () => quickResult()),
+    chatSessionContinueTool: vi.fn(async () => quickResult()),
     chatStreamSessionStart: vi.fn(flood),
     chatStreamSessionContinue: vi.fn(flood),
     chatStreamSessionContinueTool: vi.fn(flood),
@@ -233,6 +269,44 @@ function createFloodModel(): {
   } as unknown as SessionCapableModel;
 
   return { model, consumed: () => consumed, generatorClosed: closed.promise };
+}
+
+async function postJson(
+  instance: ServerInstance,
+  path: string,
+  body: object,
+): Promise<{ status: number; body: string }> {
+  const { port } = instance.server.address() as AddressInfo;
+  const payload = JSON.stringify(body);
+  return withTimeout(
+    new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = httpRequest(
+        {
+          host: '127.0.0.1',
+          port,
+          path,
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'content-length': Buffer.byteLength(payload),
+          },
+        },
+        (res) => {
+          let responseBody = '';
+          res.setEncoding('utf8');
+          res.on('data', (chunk: string) => {
+            responseBody += chunk;
+          });
+          res.once('end', () => resolve({ status: res.statusCode ?? 0, body: responseBody }));
+          res.once('error', reject);
+        },
+      );
+      req.once('error', reject);
+      req.end(payload);
+    }),
+    `${path} successor request hung behind the disconnected stream`,
+    5_000,
+  );
 }
 
 async function openPausedStream(
@@ -288,17 +362,105 @@ describe('paused SSE clients', () => {
         `${endpoint.name} never parked at persistent HTTP backpressure`,
       );
       expect(serverResponse.writableNeedDrain).toBe(true);
-      expect(parkedAt).toBeLessThan(TOTAL_CHUNKS);
+      expect(parkedAt).toBeLessThanOrEqual(MAX_CONSUMED_AT_PARK);
+      expect(serverResponse.writableLength).toBeLessThanOrEqual(
+        serverResponse.writableHighWaterMark + MAX_WRITABLE_OVERSHOOT,
+      );
       await new Promise<void>((resolve) => setImmediate(resolve));
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(flood.consumed()).toBe(parkedAt);
 
       clientResponse.socket.destroy();
       await withTimeout(flood.generatorClosed, `${endpoint.name} handler hung after the paused socket was destroyed`);
-      await waitUntil(
-        () => instance.registry.getSessionRegistry(modelName)?.queueDepth === 0,
-        `${endpoint.name} queue did not drain after client disconnect`,
-      );
+      const successor = await postJson(instance, endpoint.path, endpoint.successorBody(modelName));
+      expect(successor.status).toBe(200);
+      expect(successor.body).toContain('successor-ok');
+      await waitUntil(() => {
+        const sessionRegistry = instance.registry.getSessionRegistry(modelName);
+        return sessionRegistry?.queueDepth === 0 && sessionRegistry.preDispatchAdmitCount === 0;
+      }, `${endpoint.name} admission footprint did not drain after the same-model successor`);
+      const sessionRegistry = instance.registry.getSessionRegistry(modelName)!;
+      expect(sessionRegistry.queueDepth).toBe(0);
+      expect(sessionRegistry.preDispatchAdmitCount).toBe(0);
+    });
+  }
+});
+
+function createResidualModel(endpoint: EndpointCase): SessionCapableModel {
+  async function* residual(): AsyncGenerator<Record<string, unknown>> {
+    yield {
+      done: true,
+      text: endpoint.name === 'Messages API' ? 'complete text' : '',
+      finishReason: endpoint.name === 'Responses API' ? 'tool_calls' : 'stop',
+      toolCalls:
+        endpoint.name === 'Responses API'
+          ? [
+              {
+                id: 'call_residual',
+                name: 'lookup',
+                arguments: '{"q":"residual"}',
+                status: 'ok',
+                rawContent: '',
+              },
+            ]
+          : [],
+      thinking: null,
+      numTokens: 1,
+      promptTokens: 1,
+      reasoningTokens: 0,
+      rawText: '',
+    };
+  }
+
+  return {
+    chatSessionStart: vi.fn(async () => quickResult()),
+    chatSessionContinue: vi.fn(async () => quickResult()),
+    chatSessionContinueTool: vi.fn(async () => quickResult()),
+    chatStreamSessionStart: vi.fn(residual),
+    chatStreamSessionContinue: vi.fn(residual),
+    chatStreamSessionContinueTool: vi.fn(residual),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
+  } as unknown as SessionCapableModel;
+}
+
+describe('post-loop residual backpressure', () => {
+  for (const endpoint of endpointCases) {
+    it(`${endpoint.name} keeps abort tracking through residual drain and never emits/adopts success`, async () => {
+      const instance = await createServer({ port: 0, host: '127.0.0.1', disableStore: true });
+      servers.push(instance);
+      const modelName = `residual-${endpoint.name.toLowerCase().replaceAll(' ', '-')}`;
+      instance.registry.register(modelName, createResidualModel(endpoint));
+
+      let residualTriggered = false;
+      instance.server.once('request', (_req, res) => {
+        const originalWrite = res.write.bind(res);
+        res.write = ((chunk: string | Uint8Array, ...args: unknown[]): boolean => {
+          const ok = Reflect.apply(originalWrite, res, [chunk, ...args]) as boolean;
+          if (!residualTriggered && chunk.toString().includes(endpoint.residualMarker)) {
+            residualTriggered = true;
+            queueMicrotask(() => {
+              if (endpoint.abortEvent === 'error') {
+                res.emit('error', new Error('simulated residual write error'));
+              } else {
+                res.emit('close');
+              }
+            });
+            return false;
+          }
+          return ok;
+        }) as ServerResponse['write'];
+      });
+
+      const response = await postJson(instance, endpoint.path, {
+        ...endpoint.body(modelName),
+        max_output_tokens: 8,
+        max_tokens: 8,
+      });
+      expect(response.status).toBe(200);
+      expect(residualTriggered).toBe(true);
+      expect(response.body).toContain(endpoint.failureTerminal);
+      expect(response.body).not.toContain(endpoint.successTerminal);
+      expect(instance.registry.getSessionRegistry(modelName)?.size).toBe(0);
     });
   }
 });

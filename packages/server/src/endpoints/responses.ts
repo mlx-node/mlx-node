@@ -35,7 +35,14 @@ import {
   type PreDispatchAdmission,
   type SessionRegistry,
 } from '../session-registry.js';
-import { awaitDrainOrClose, beginSSE, endSSE, writeSSEEvent as writeRawSSEEvent } from '../streaming.js';
+import {
+  awaitDrainOrClose,
+  beginSSE,
+  endSSE,
+  type SSEClientAbortTracker,
+  trackSSEClientAbort,
+  writeSSEEvent as writeRawSSEEvent,
+} from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { mergeTimingUsageExtensions, resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
@@ -351,6 +358,35 @@ async function handleStreamingNative(
   visibility: TransportVisibility,
   serverTiming?: ServerTimingForUsage,
 ): Promise<StreamingHandlerOutcome> {
+  const abort = trackSSEClientAbort(res, httpReq);
+  try {
+    return await handleStreamingNativeWithAbort(
+      res,
+      chatStream,
+      req,
+      responseId,
+      previousResponseId,
+      wasCommitted,
+      abort,
+      visibility,
+      serverTiming,
+    );
+  } finally {
+    abort.dispose();
+  }
+}
+
+async function handleStreamingNativeWithAbort(
+  res: ServerResponse,
+  chatStream: AsyncGenerator<ChatStreamEvent>,
+  req: ResponsesAPIRequest,
+  responseId: string,
+  previousResponseId: string | undefined,
+  wasCommitted: () => boolean,
+  abort: SSEClientAbortTracker,
+  visibility: TransportVisibility,
+  serverTiming?: ServerTimingForUsage,
+): Promise<StreamingHandlerOutcome> {
   // `runSessionStreaming` completed the exact token/capacity preflight before
   // handing us this iterator. Commit SSE immediately instead of entering the
   // generator here: its first `next()` also starts image processing/prefill and
@@ -415,39 +451,14 @@ async function handleStreamingNative(
   // future native plumbing change can lift it through.
   let cachedTokens: number | undefined;
 
-  // Fault state. `thrownError` sticks on a generator throw;
-  // `clientAborted` sticks on any `close`/`error` from `httpReq`, `res`,
-  // or `res.socket`. Either flips the post-loop block to the failure
-  // epilogue. Listening on `res` and `res.socket` matters because
-  // non-terminal SSE writes can silently "succeed" on a dead socket.
+  // Fault state. `thrownError` sticks on a generator throw. The outer
+  // `SSEClientAbortTracker` remains armed through every residual write, drain,
+  // classification, and terminal flush — not merely through this loop.
   let thrownError: Error | null = null;
-  let clientAborted = false;
-  const onClientClose = () => {
-    clientAborted = true;
-  };
-  const onClientError = (_err: unknown) => {
-    clientAborted = true;
-  };
-  const onResClose = () => {
-    clientAborted = true;
-  };
-  const onResError = (_err: unknown) => {
-    clientAborted = true;
-  };
-  const resSocketForAbort = res.socket;
-  if (httpReq) {
-    httpReq.once('close', onClientClose);
-    httpReq.once('error', onClientError);
-  }
-  res.once('close', onResClose);
-  res.once('error', onResError);
-  if (resSocketForAbort != null) {
-    resSocketForAbort.once('close', onResClose);
-  }
 
-  // Install abort listeners before the first body write. If that write queues
-  // an asynchronous transport error, `clientAborted` must flip before its
-  // drain promise settles and the loop evaluates the abort gate.
+  // The outer wrapper installed abort listeners before the first body write.
+  // If that write queues an asynchronous transport error, `abort.aborted` must
+  // flip before its drain promise settles and the loop evaluates the gate.
   writeSSEEvent(res, 'response.created', { response: partial });
   writeSSEEvent(res, 'response.in_progress', { response: partial });
 
@@ -458,7 +469,7 @@ async function handleStreamingNative(
       // AbortSignal yet; `break` drops the generator reference so
       // the producer's `finally` releases per-model locks and the
       // post-loop block routes to the failure epilogue.
-      if (clientAborted) break;
+      if (abort.aborted) break;
       if (event.done) {
         sawDone = true;
         // Final event -- close open items and emit completed
@@ -943,18 +954,9 @@ async function handleStreamingNative(
     // and never the underlying exception text.
     console.error(`[responses] native dispatch failed for ${req.model} (response ${responseId}):`, thrownError.message);
   } finally {
-    // Cover done/break/continue/generator-throw paths, and keep the abort
-    // listeners installed until close/error has made `clientAborted` sticky.
+    // Cover done/break/continue/generator-throw paths. Abort listeners belong
+    // to the outer wrapper and intentionally remain installed after this.
     await drainPending();
-    if (httpReq) {
-      httpReq.off('close', onClientClose);
-      httpReq.off('error', onClientError);
-    }
-    res.off('close', onResClose);
-    res.off('error', onResError);
-    if (resSocketForAbort != null) {
-      resSocketForAbort.off('close', onResClose);
-    }
   }
 
   // Post-loop terminal emission. The producer's finally has run so
@@ -964,7 +966,7 @@ async function handleStreamingNative(
   // `stream_exhausted`. `response.failed` is emitted even on
   // `client_abort` so a tee/proxy that stays connected sees a terminal.
   const committed = wasCommitted();
-  const successful = sawDone && committed && thrownError == null && !clientAborted;
+  const successful = sawDone && committed && thrownError == null && !abort.aborted;
 
   if (successful) {
     const terminal = completedResponse!;
@@ -993,16 +995,20 @@ async function handleStreamingNative(
 
     await drainPending();
 
-    // The terminal SSE flushes inside the per-model mutex (client
-    // expects it ordered against prior deltas); the `ResponseStore`
-    // write is deferred to the outer handler so a slow SQLite write
-    // does not pin the next waiter. `flushTerminalSSE` flips
-    // `terminalEmitted` only once the kernel acks the frame — a
-    // callback-reported error rejects so the outer catch refuses to
-    // adopt under an unseen responseId.
-    await flushTerminalSSE(res, 'response.completed', { response: terminal }, visibility);
-    endSSE(res);
-    return { terminalToPersist: terminal, failureMode: null, cachedTokens };
+    // A close/error can be the event that settled the residual drain. Recheck
+    // after the await; the pre-drain success snapshot is no longer sufficient.
+    if (!abort.aborted) {
+      // The terminal SSE flushes inside the per-model mutex (client
+      // expects it ordered against prior deltas); the `ResponseStore`
+      // write is deferred to the outer handler so a slow SQLite write
+      // does not pin the next waiter. `flushTerminalSSE` flips
+      // `terminalEmitted` only once the kernel acks the frame — a
+      // callback-reported error rejects so the outer catch refuses to
+      // adopt under an unseen responseId.
+      await flushTerminalSSE(res, 'response.completed', { response: terminal }, visibility);
+      endSSE(res);
+      return { terminalToPersist: terminal, failureMode: null, cachedTokens };
+    }
   }
 
   // Failure epilogue. Close any dangling message items BEFORE the
@@ -1011,7 +1017,7 @@ async function handleStreamingNative(
   // deferred to the success path); reasoning items have no `status`.
   const reason: 'error' | 'client_abort' | 'finish_reason_error' | 'stream_exhausted' = thrownError
     ? 'error'
-    : clientAborted
+    : abort.aborted
       ? 'client_abort'
       : sawDone
         ? 'finish_reason_error'

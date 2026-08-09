@@ -90,7 +90,14 @@ import type { ModelWorkCoordinator } from '../model-work-coordinator.js';
 import type { ModelRegistry } from '../registry.js';
 import { QueueFullError, type PreDispatchAdmission, type SessionRegistry } from '../session-registry.js';
 import { StopSequenceBuffer } from '../stop-sequence-buffer.js';
-import { awaitDrainOrClose, beginSSE, endSSE, writeSSEEvent as writeRawSSEEvent } from '../streaming.js';
+import {
+  awaitDrainOrClose,
+  beginSSE,
+  endSSE,
+  type SSEClientAbortTracker,
+  trackSSEClientAbort,
+  writeSSEEvent as writeRawSSEEvent,
+} from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
@@ -306,6 +313,35 @@ async function handleStreamingNative(
   stopSequences: string[],
   serverTiming?: ServerTimingForUsage,
 ): Promise<MessagesStreamingHandlerResult> {
+  const abort = trackSSEClientAbort(res, httpReq);
+  try {
+    return await handleStreamingNativeWithAbort(
+      res,
+      chatStream,
+      body,
+      wasCommitted,
+      abort,
+      visibility,
+      emitReasoning,
+      stopSequences,
+      serverTiming,
+    );
+  } finally {
+    abort.dispose();
+  }
+}
+
+async function handleStreamingNativeWithAbort(
+  res: ServerResponse,
+  chatStream: AsyncGenerator<ChatStreamEvent>,
+  body: AnthropicMessagesRequest,
+  wasCommitted: () => boolean,
+  abort: SSEClientAbortTracker,
+  visibility: TransportVisibility,
+  emitReasoning: boolean,
+  stopSequences: string[],
+  serverTiming?: ServerTimingForUsage,
+): Promise<MessagesStreamingHandlerResult> {
   const messageId = genId('msg_');
   // `runSessionStreaming` completed the exact token/capacity preflight before
   // handing us this iterator. Commit SSE immediately instead of entering the
@@ -399,44 +435,19 @@ async function handleStreamingNative(
   const allowToolUse = requestAllowsToolUse(body);
   let suppressedToolCalls = false;
 
-  // `thrownError` sticks on a generator throw; `clientAborted` sticks on
-  // HTTP `close`/`error` on req, res, or res.socket. Either one routes the
-  // post-loop block to the failure epilogue. Native decode has no
-  // AbortSignal yet, so on a client disconnect we can only stop consuming
-  // deltas — the native decode still runs to completion under the mutex.
+  // `thrownError` sticks on a generator throw. The outer abort tracker remains
+  // armed through post-loop residual writes and the terminal flush as well as
+  // the decode loop itself.
   let thrownError: Error | null = null;
-  let clientAborted = false;
-  const onClientClose = () => {
-    clientAborted = true;
-  };
-  const onClientError = (_err: unknown) => {
-    clientAborted = true;
-  };
-  const onResClose = () => {
-    clientAborted = true;
-  };
-  const onResError = (_err: unknown) => {
-    clientAborted = true;
-  };
-  const resSocketForAbort = res.socket;
-  if (httpReq) {
-    httpReq.once('close', onClientClose);
-    httpReq.once('error', onClientError);
-  }
-  res.once('close', onResClose);
-  res.once('error', onResError);
-  if (resSocketForAbort != null) {
-    resSocketForAbort.once('close', onResClose);
-  }
 
-  // Abort listeners precede the first body write so an asynchronous socket
-  // error makes `clientAborted` authoritative before the drain wait resumes.
+  // The outer wrapper's abort listeners precede the first body write so an
+  // asynchronous socket error is authoritative before the drain wait resumes.
   writeSSEEvent(res, 'message_start', buildMessageStartEvent(body, messageId, 0));
 
   try {
     for await (const event of chatStream) {
       await drainPending();
-      if (clientAborted) break;
+      if (abort.aborted) break;
       if (event.done) {
         sawDone = true;
 
@@ -816,15 +827,6 @@ async function handleStreamingNative(
     thrownError = err instanceof Error ? err : new Error(String(err));
   } finally {
     await drainPending();
-    if (httpReq) {
-      httpReq.off('close', onClientClose);
-      httpReq.off('error', onClientError);
-    }
-    res.off('close', onResClose);
-    res.off('error', onResError);
-    if (resSocketForAbort != null) {
-      resSocketForAbort.off('close', onResClose);
-    }
   }
 
   // Success requires ALL of: sawDone, wasCommitted, no terminal error, no thrown
@@ -834,7 +836,7 @@ async function handleStreamingNative(
   // withhold `message_stop`. Every failure path emits a streaming `error` and
   // withholds `message_stop`.
   const committed = wasCommitted();
-  const successful = sawDone && committed && terminalErrorMessage == null && thrownError == null && !clientAborted;
+  const successful = sawDone && committed && terminalErrorMessage == null && thrownError == null && !abort.aborted;
 
   if (successful) {
     const stopReason = terminalStopReason ?? 'end_turn';
@@ -869,9 +871,13 @@ async function handleStreamingNative(
       }
     }
     await drainPending();
-    await flushTerminalSSE(res, 'message_stop', buildMessageStop(), visibility);
-    endSSE(res);
-    return { ok: true, suppressedToolCalls };
+    // The residual drain may have settled because the transport closed or
+    // errored. Never emit/adopt a success terminal from the stale snapshot.
+    if (!abort.aborted) {
+      await flushTerminalSSE(res, 'message_stop', buildMessageStop(), visibility);
+      endSSE(res);
+      return { ok: true, suppressedToolCalls };
+    }
   }
   // Close any dangling content block so the error frame lands at a clean state,
   // then emit the streaming error. Never emit `message_stop` here — pairing it
@@ -885,7 +891,7 @@ async function handleStreamingNative(
   let message: string;
   if (thrownError != null) {
     message = thrownError.message;
-  } else if (clientAborted) {
+  } else if (abort.aborted) {
     message = 'client disconnected before the stream completed';
   } else if (terminalErrorMessage != null) {
     message = terminalErrorMessage;

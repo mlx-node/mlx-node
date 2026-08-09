@@ -1,6 +1,6 @@
 /** SSE writer utilities. */
 
-import type { ServerResponse } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 
 /**
  * Responses that have committed to SSE (`beginSSE`) but have not yet been
@@ -15,6 +15,56 @@ import type { ServerResponse } from 'node:http';
  * `beginSSE`/`endSSE` are free functions called from both endpoints.
  */
 const activeSSEResponses = new Set<ServerResponse>();
+
+/** Disconnect state whose listeners stay armed for one complete SSE handler. */
+export interface SSEClientAbortTracker {
+  readonly aborted: boolean;
+  dispose(): void;
+}
+
+/**
+ * Track request/response/socket disconnects until the caller's outermost
+ * `finally`. Keeping this lifetime outside the decode loop matters: a final
+ * native item can expand into backpressured residual protocol frames after the
+ * iterator has already closed, and a disconnect during that drain must still
+ * prevent a success terminal and session adoption.
+ */
+export function trackSSEClientAbort(res: ServerResponse, httpReq: IncomingMessage | undefined): SSEClientAbortTracker {
+  let aborted = false;
+  let disposed = false;
+  const onClose = (): void => {
+    aborted = true;
+  };
+  const onError = (_err: unknown): void => {
+    aborted = true;
+  };
+  const socket = res.socket;
+
+  if (httpReq != null) {
+    httpReq.once('close', onClose);
+    httpReq.once('error', onError);
+  }
+  res.once('close', onClose);
+  res.once('error', onError);
+  if (socket != null) socket.once('close', onClose);
+
+  return {
+    get aborted(): boolean {
+      return aborted;
+    },
+    dispose(): void {
+      if (disposed) return;
+      disposed = true;
+      if (httpReq != null) {
+        httpReq.removeListener('close', onClose);
+        httpReq.removeListener('error', onError);
+      }
+      res.removeListener('close', onClose);
+      res.removeListener('error', onError);
+      if (socket != null) socket.removeListener('close', onClose);
+    },
+  };
+}
 
 export function beginSSE(res: ServerResponse): void {
   activeSSEResponses.add(res);
@@ -40,9 +90,9 @@ export function writeSSEEvent(res: ServerResponse, eventType: string, data: obje
 
 /**
  * Wait until a backpressured response can accept more data, or until its
- * transport closes. Close and error resolve rather than reject: endpoint abort
- * listeners own the `clientAborted` state, and the next loop check exits before
- * another native item is written.
+ * transport closes. Close and error resolve rather than reject: the endpoint's
+ * outer abort tracker owns the sticky state, and the next loop check exits
+ * before another native item is written.
  *
  * Call this synchronously after `writeSSEEvent` returns false. In particular,
  * do not defer listener installation until the next iterator turn: `drain`
