@@ -530,16 +530,18 @@ stage0Describe('Stage-0 real-model concurrency hazards', () => {
       const cleanupPromises = holderOutcomes.map(settle);
       if (hazardLoop !== undefined) cleanupPromises.push(settle(hazardLoop));
       await withTimeout(
-        Promise.all(cleanupPromises).then(() => undefined),
-        'H1 failure-path holder/hazard loop cleanup did not settle',
-        15_000,
+        (async () => {
+          await Promise.all(cleanupPromises);
+          await waitUntil(
+            () => instrumented.streamCloses() >= baselineStreamCloses + startedHazardStreams,
+            'H1 failure-path stream generators did not unwind',
+            15_000,
+          );
+          await waitForAdmissionDrain('H1 queue/admission/in-flight state did not drain');
+        })(),
+        'H1 failure-path loop/generator/admission cleanup did not settle',
+        20_000,
       );
-      await waitUntil(
-        () => instrumented.streamCloses() >= baselineStreamCloses + startedHazardStreams,
-        'H1 failure-path stream generators did not unwind',
-        15_000,
-      );
-      await waitForAdmissionDrain('H1 queue/admission/in-flight state did not drain');
     }
   }, 45_000);
 
@@ -625,11 +627,13 @@ stage0Describe('Stage-0 real-model concurrency hazards', () => {
       const cleanupPromises = [settle(holderOutcome)];
       if (successorOutcome !== undefined) cleanupPromises.push(settle(successorOutcome));
       await withTimeout(
-        Promise.all(cleanupPromises).then(() => undefined),
-        'H2 failure-path holder/successor cleanup did not settle',
-        15_000,
+        (async () => {
+          await Promise.all(cleanupPromises);
+          await waitForAdmissionDrain('H2 failure-path queue/admission/in-flight state did not drain');
+        })(),
+        'H2 failure-path holder/successor/admission cleanup did not settle',
+        20_000,
       );
-      await waitForAdmissionDrain('H2 failure-path queue/admission/in-flight state did not drain');
     }
   }, 45_000);
 
