@@ -826,6 +826,56 @@ describe('ChatSession', () => {
       await session.reset();
       expect(session.turns).toBe(0);
     });
+
+    it('reset() reserves the in-flight guard while the native reset is pending (fix round 1)', async () => {
+      // The async native resetCaches() genuinely suspends reset(). The
+      // guard must be RESERVED across that window — otherwise a
+      // concurrent send() could commit against the old history and then
+      // have its state erased when reset resumes (or reset could clear
+      // history while the send is still committing), desynchronizing JS
+      // history from native cache state. Pinned semantics: every
+      // mutating entry point REJECTS while the reset is pending — the
+      // same behavior as the existing double-send guard.
+      let releaseReset: () => void = () => {
+        /* overwritten below */
+      };
+      const pendingReset = new Promise<void>((r) => {
+        releaseReset = r;
+      });
+      const { model, chatSessionStart } = makeMockModel();
+      model.resetCaches = () => pendingReset;
+      const session = new ChatSession(model);
+
+      // Seed one committed turn so the wipe is observable.
+      await session.send('seed');
+      expect(session.turns).toBe(1);
+
+      const resetPromise = session.reset();
+      // Let reset() reach its await on the deferred native promise.
+      await Promise.resolve();
+
+      await expect(session.send('interleaved')).rejects.toThrow(/concurrent send\(\) not allowed/);
+      await expect(session.sendStream('interleaved').next()).rejects.toThrow(/concurrent send\(\) not allowed/);
+      await expect(session.sendToolResult('call_1', '{}')).rejects.toThrow(/concurrent send\(\) not allowed/);
+      await expect(session.reset()).rejects.toThrow(/cannot reset\(\).*in flight/i);
+      expect(() => session.primeHistory([{ role: 'user', content: 'x' }])).toThrow(
+        /cannot primeHistory\(\).*in flight/i,
+      );
+      await expect(session.startFromHistory()).rejects.toThrow(/in flight/i);
+      // None of the rejected calls reached the native model.
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      // The pre-reset state is still intact while the reset is pending —
+      // no partial wipe leaked out of the suspended reset().
+      expect(session.turns).toBe(1);
+
+      // Release: reset settles, wipes state, frees the guard.
+      releaseReset();
+      await resetPromise;
+      expect(session.turns).toBe(0);
+      const after = await session.send('after');
+      expect(after.text).toBe('start-reply');
+      expect(session.turns).toBe(1);
+    });
   });
 
   // -------------------------------------------------------------------

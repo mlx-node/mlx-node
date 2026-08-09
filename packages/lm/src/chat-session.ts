@@ -1372,23 +1372,32 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * The native `resetCaches()` is async (H1a): the wipe is awaited so
    * the reset command has fully drained through the model thread
    * before this promise resolves — callers that `await reset()` and
-   * then start a turn keep strict command-queue ordering. Callers
-   * must not interleave `send()` with an in-progress `reset()` on the
-   * same session (the server serializes per-session turns; direct
-   * consumers get the same contract documented on `send()`).
+   * then start a turn keep strict command-queue ordering. Because the
+   * await genuinely suspends, `reset()` RESERVES the same in-flight
+   * guard as the send entry points for its whole duration: any
+   * concurrent `send*()`, `reset()`, `primeHistory()`, or
+   * `startFromHistory*()` on this session rejects until the reset
+   * settles, so a racing turn can never commit against the pre-wipe
+   * history (or have its state erased mid-commit). If the native reset
+   * rejects, no JS state is wiped and the guard is released.
    */
   async reset(): Promise<void> {
     if (this.inFlight) {
       throw new Error('ChatSession: cannot reset() while a send() is in flight; await the previous call first');
     }
-    await this.model.resetCaches();
-    this.history = [];
-    this.lastImagesKey = null;
-    this.lastAudioKey = null;
-    this.turnCount = 0;
-    this.unresolvedOkToolCallCount = null;
-    this.needsFullReplay = false;
-    this.activeTools = this.defaultConfig.tools;
+    this.inFlight = true;
+    try {
+      await this.model.resetCaches();
+      this.history = [];
+      this.lastImagesKey = null;
+      this.lastAudioKey = null;
+      this.turnCount = 0;
+      this.unresolvedOkToolCallCount = null;
+      this.needsFullReplay = false;
+      this.activeTools = this.defaultConfig.tools;
+    } finally {
+      this.inFlight = false;
+    }
   }
 
   /**

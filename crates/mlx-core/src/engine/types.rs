@@ -101,6 +101,20 @@ pub struct ChatConfig {
     /// loop (pure-Rust eager; qwen3.5 dense and MoE). Requires the model
     /// checkpoint to carry an MTP head (otherwise silently ignored). Default:
     /// `false`.
+    ///
+    /// The MTP acceptance gate (`MLX_MTP_ACCEPT_GATE`, default ON) also
+    /// applies to explicit requests at fixed depth 1: the model aggregates
+    /// first-draft acceptance counts across completed depth-1 turns (history
+    /// bounded to roughly the most recent ~512 attempts) and silently runs
+    /// plain autoregressive decoding for the next depth-1 turn when an
+    /// exact-binomial test at the 5% level shows the aggregate is
+    /// inconsistent with the ~0.6 break-even acceptance rate. After 3
+    /// consecutive gated turns the gate re-probes with speculation on, and
+    /// `resetCaches()` clears the per-model (not per-session) history. The
+    /// gate is depth-1-scoped and exempts adaptive-depth turns
+    /// (`mtpAdaptiveDepth` and explicit depth > 1 turns are never gated).
+    /// Set the env var to `0` / `false` / `off` to bypass the gate and
+    /// always run MTP when requested.
     #[napi(ts_type = "boolean | undefined")]
     pub enable_mtp: Option<bool>,
     /// MTP: number of draft tokens per speculative cycle.
