@@ -1502,6 +1502,11 @@ impl Qwen35MoeInner {
         // image prefill); feeds the scalar-offset RoPE for the suffix.
         let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
         let chunk_size = self.cold_gdn_prefill_chunk_size();
+        // Cloned up front (cheap Option<Arc>) so the chunk-loop call below
+        // can borrow `self.layers`/`self.caches` mutably at the same time.
+        // Both family paged cores fail closed on Err via
+        // `invalidate_moe_paged_session`.
+        let turn_cancel = self.turn_cancel.clone();
         let caches_ref = self
             .caches
             .as_mut()
@@ -1524,10 +1529,7 @@ impl Qwen35MoeInner {
             adapter,
             chunk_size,
             rope_deltas,
-            // Family MTP/vision cores: mid-prefill cancel not wired here
-            // (documented residual window) — the engine AR path threads the
-            // real flag via `PagedBackend::paged_prefill`.
-            None,
+            turn_cancel.as_deref(),
         )
     }
 
@@ -2327,12 +2329,13 @@ impl Qwen35MoeInner {
         // core (or error when no paged adapter is present). This is the
         // text-only flat path.
         profiler.begin_prefill();
+        let turn_cancel = self.turn_cancel.clone();
         let (mut last_logits, _seq_len) = {
             // Standard text prefill. Chunked to bound peak GPU memory for
             // long prompts (e.g. 40k+ tokens) — see `chunked_prefill` docs.
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
 
-            let logits = chunked_prefill(
+            let prefill_result = chunked_prefill(
                 &prompt,
                 &embedding,
                 &mut self.layers,
@@ -2341,8 +2344,18 @@ impl Qwen35MoeInner {
                 &self.lm_head,
                 fa_idx,
                 generation_stream,
-                None,
-            )?;
+                turn_cancel.as_deref(),
+            );
+            // A partially advanced prefill (cancel or failure) must never be
+            // continued: `self.caches` would hold the partial delta while
+            // `cached_token_history` still describes the previous turn.
+            let logits = match prefill_result {
+                Ok(logits) => logits,
+                Err(e) => {
+                    self.invalidate_moe_paged_session("MTP whole-turn flat prefill failure");
+                    return Err(e);
+                }
+            };
 
             let seq_len = logits.shape_at(1)?;
             let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
@@ -2646,6 +2659,7 @@ impl Qwen35MoeInner {
             |i| self.config.is_linear_layer(i),
         );
 
+        let turn_cancel = self.turn_cancel.clone();
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
             // === PREFILL ===
             let last_logits = {
@@ -2668,6 +2682,7 @@ impl Qwen35MoeInner {
                     &self.lm_head,
                     &layer_kinds,
                     adapter,
+                    turn_cancel.as_deref(),
                 )?
             };
             let (last_logits, gdn_checkpoint) = last_logits;
@@ -2998,6 +3013,7 @@ impl Qwen35MoeInner {
             |i| self.config.is_linear_layer(i),
         );
 
+        let turn_cancel = self.turn_cancel.clone();
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
             // === PREFILL ===
             let last_logits = {
@@ -3020,6 +3036,7 @@ impl Qwen35MoeInner {
                     &self.lm_head,
                     &layer_kinds,
                     adapter,
+                    turn_cancel.as_deref(),
                 )?
             };
             let (last_logits, gdn_checkpoint) = last_logits;
@@ -4574,11 +4591,12 @@ impl Qwen35MoeInner {
         // the paged-vision stream core (or error when no paged adapter is
         // present). This is the text-only flat path.
         profiler.begin_prefill();
+        let turn_cancel = self.turn_cancel.clone();
         let (mut last_logits, _seq_len) = {
             // Chunked to bound peak GPU memory for long prompts. See
             // `chunked_prefill` docs for the memory rationale.
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
-            let logits = chunked_prefill(
+            let prefill_result = chunked_prefill(
                 &prompt,
                 &embedding,
                 &mut self.layers,
@@ -4587,8 +4605,18 @@ impl Qwen35MoeInner {
                 &self.lm_head,
                 fa_idx,
                 generation_stream,
-                None,
-            )?;
+                turn_cancel.as_deref(),
+            );
+            // A partially advanced prefill (cancel or failure) must never be
+            // continued: `self.caches` would hold the partial delta while
+            // `cached_token_history` still describes the previous turn.
+            let logits = match prefill_result {
+                Ok(logits) => logits,
+                Err(e) => {
+                    self.invalidate_moe_paged_session("MTP stream flat prefill failure");
+                    return Err(e);
+                }
+            };
 
             let seq_len = logits.shape_at(1)?;
             let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
@@ -4955,7 +4983,8 @@ impl Qwen35MoeInner {
         // Usually tiny (a single user turn), but chunked defensively so a
         // user pasting a long follow-up message doesn't blow memory.
         profiler.begin_prefill();
-        let logits = if self.flat_mtp_caches_desynced {
+        let turn_cancel = self.turn_cancel.clone();
+        let prefill_result = if self.flat_mtp_caches_desynced {
             // A prior eager-MTP turn stopped mid-cycle, leaving self.caches advanced
             // past the emitted history; GDN state cannot be rewound, so discard and
             // re-prefill the full conversation into fresh caches.
@@ -4972,9 +5001,11 @@ impl Qwen35MoeInner {
                 &self.lm_head,
                 fa_idx,
                 generation_stream,
-                None,
-            )?;
-            self.flat_mtp_caches_desynced = false;
+                turn_cancel.as_deref(),
+            );
+            if logits.is_ok() {
+                self.flat_mtp_caches_desynced = false;
+            }
             logits
         } else {
             let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
@@ -4987,8 +5018,18 @@ impl Qwen35MoeInner {
                 &self.lm_head,
                 fa_idx,
                 generation_stream,
-                None,
-            )?
+                turn_cancel.as_deref(),
+            )
+        };
+        // A partial delta prefill (cancel or failure) leaves `self.caches`
+        // ahead of `cached_token_history` — invalidate rather than let the
+        // next delta extend poisoned caches.
+        let logits = match prefill_result {
+            Ok(logits) => logits,
+            Err(e) => {
+                self.invalidate_moe_paged_session("delta flat prefill failure");
+                return Err(e);
+            }
         };
         let prefill_out_seq_len = logits.shape_at(1)?;
         let mut last_logits = logits.slice_axis(1, prefill_out_seq_len - 1, prefill_out_seq_len)?;
@@ -5229,7 +5270,8 @@ impl Qwen35MoeInner {
         // Text-only prefill of the delta on top of the existing caches.
         // Chunked defensively — see the sync sibling for rationale.
         profiler.begin_prefill();
-        let logits = if self.flat_mtp_caches_desynced {
+        let turn_cancel = self.turn_cancel.clone();
+        let prefill_result = if self.flat_mtp_caches_desynced {
             // A prior eager-MTP turn stopped mid-cycle, leaving self.caches advanced
             // past the emitted history; GDN state cannot be rewound, so discard and
             // re-prefill the full conversation into fresh caches.
@@ -5246,9 +5288,11 @@ impl Qwen35MoeInner {
                 &self.lm_head,
                 fa_idx,
                 generation_stream,
-                None,
-            )?;
-            self.flat_mtp_caches_desynced = false;
+                turn_cancel.as_deref(),
+            );
+            if logits.is_ok() {
+                self.flat_mtp_caches_desynced = false;
+            }
             logits
         } else {
             let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
@@ -5261,8 +5305,18 @@ impl Qwen35MoeInner {
                 &self.lm_head,
                 fa_idx,
                 generation_stream,
-                None,
-            )?
+                turn_cancel.as_deref(),
+            )
+        };
+        // A partial delta prefill (cancel or failure) leaves `self.caches`
+        // ahead of `cached_token_history` — invalidate rather than let the
+        // next delta extend poisoned caches.
+        let logits = match prefill_result {
+            Ok(logits) => logits,
+            Err(e) => {
+                self.invalidate_moe_paged_session("delta stream flat prefill failure");
+                return Err(e);
+            }
         };
         let prefill_out_seq_len = logits.shape_at(1)?;
         let mut last_logits = logits.slice_axis(1, prefill_out_seq_len - 1, prefill_out_seq_len)?;
@@ -9371,6 +9425,13 @@ fn chunked_prefill_with_size(
         offset += chunk_size;
     }
 
+    // The final remainder is a chunk boundary too once at least one looped
+    // chunk ran: poll before forwarding it so a cancel landing during the
+    // last looped chunk aborts instead of riding through the remainder.
+    // `offset == 0` (single-shot) stays uncancellable by design.
+    if offset > 0 && turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+        return Err(Error::from_reason("prefill cancelled"));
+    }
     // Final chunk: return logits to caller. No eval/clear here — the
     // caller's next step (sampling / slicing last_logits) triggers eval
     // naturally, and the outer decode loop clears cache on its own rhythm.

@@ -594,6 +594,7 @@ pub(crate) fn run_paged_vlm_prefill_moe(
     lm_head: &Option<LinearProj>,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<(MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if expanded_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -662,6 +663,12 @@ pub(crate) fn run_paged_vlm_prefill_moe(
     let mut checkpoints = Vec::new();
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
+        // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary.
+        // The Err rides the VLM cores' `invalidate_moe_paged_session` arm —
+        // the request is released, never finalized.
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let absolute_start = cached_prefix_len_us + range.start;
         let absolute_end = cached_prefix_len_us + range.end;
         let chunk_tokens = &expanded_tokens[absolute_start..absolute_end];

@@ -2101,9 +2101,8 @@ impl Qwen35Inner {
         let chunk_size = self.cold_gdn_prefill_chunk_size();
         // Cloned up front (cheap Option<Arc>) so the chunk-loop call below
         // can borrow `self.layers`/`self.caches` mutably at the same time.
-        // Threaded into the AR chunk loop only — the planned-MTP
-        // `_with_hidden` prefill stays uncancellable (documented residual
-        // window).
+        // Threaded into BOTH arms: the AR chunk loop and the planned-MTP
+        // `_with_hidden` chunk loop poll it at every chunk boundary.
         let turn_cancel = self.turn_cancel.clone();
         let caches_ref = self
             .caches
@@ -2130,6 +2129,7 @@ impl Qwen35Inner {
                     chunk_size,
                     Some(keep_tokens),
                     rope_deltas,
+                    turn_cancel.as_deref(),
                 )?;
             Ok((logits, Some(hidden), checkpoints))
         } else {
@@ -3222,8 +3222,9 @@ impl Qwen35Inner {
         let mut prompt_hidden: Option<MxArray> = None;
         let (last_logits, seq_len) = {
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
-            let last_logits = if want_prompt_hidden {
-                let (logits, ph) = chunked_prefill_with_hidden(
+            let turn_cancel = self.turn_cancel.clone();
+            let prefill_result = if want_prompt_hidden {
+                chunked_prefill_with_hidden(
                     &prompt,
                     &embedding,
                     &mut self.layers,
@@ -3232,9 +3233,12 @@ impl Qwen35Inner {
                     &self.lm_head,
                     generation_stream,
                     Some(mtp_prompt_history.keep_tokens),
-                )?;
-                prompt_hidden = Some(ph);
-                logits
+                    turn_cancel.as_deref(),
+                )
+                .map(|(logits, ph)| {
+                    prompt_hidden = Some(ph);
+                    logits
+                })
             } else {
                 chunked_prefill(
                     &prompt,
@@ -3244,8 +3248,18 @@ impl Qwen35Inner {
                     &self.final_norm,
                     &self.lm_head,
                     generation_stream,
-                    None,
-                )?
+                    turn_cancel.as_deref(),
+                )
+            };
+            // A partially advanced prefill (cancel or failure) must never be
+            // continued: `self.caches` would hold the partial delta while
+            // `cached_token_history` still describes the previous turn.
+            let last_logits = match prefill_result {
+                Ok(logits) => logits,
+                Err(e) => {
+                    self.invalidate_dense_paged_session("MTP whole-turn flat prefill failure");
+                    return Err(e);
+                }
             };
 
             (last_logits, tokens.len() as i64)
@@ -3420,7 +3434,8 @@ impl Qwen35Inner {
 
         // Text-only prefill of the delta on top of the existing caches.
         profiler.begin_prefill();
-        let last_logits = if self.flat_mtp_caches_desynced {
+        let turn_cancel = self.turn_cancel.clone();
+        let prefill_result = if self.flat_mtp_caches_desynced {
             // A prior eager-MTP turn stopped mid-cycle, leaving self.caches
             // advanced past the emitted history; GDN state cannot be rewound,
             // so discard and re-prefill the full conversation into fresh caches.
@@ -3436,9 +3451,11 @@ impl Qwen35Inner {
                 &self.final_norm,
                 &self.lm_head,
                 generation_stream,
-                None,
-            )?;
-            self.flat_mtp_caches_desynced = false;
+                turn_cancel.as_deref(),
+            );
+            if logits.is_ok() {
+                self.flat_mtp_caches_desynced = false;
+            }
             logits
         } else {
             let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
@@ -3450,8 +3467,18 @@ impl Qwen35Inner {
                 &self.final_norm,
                 &self.lm_head,
                 generation_stream,
-                None,
-            )?
+                turn_cancel.as_deref(),
+            )
+        };
+        // A partial delta prefill (cancel or failure) leaves `self.caches`
+        // ahead of `cached_token_history` — invalidate rather than let the
+        // next delta extend poisoned caches.
+        let last_logits = match prefill_result {
+            Ok(logits) => logits,
+            Err(e) => {
+                self.invalidate_dense_paged_session("delta flat prefill failure");
+                return Err(e);
+            }
         };
         // Total context length post-prefill = full history length.
         let total_seq_len = full_token_history.len() as i64;
@@ -4617,6 +4644,7 @@ impl Qwen35Inner {
                 self.config.is_linear_layer(i)
             });
 
+        let turn_cancel = self.turn_cancel.clone();
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
             // === PREFILL ===
             let last_logits = {
@@ -4639,6 +4667,7 @@ impl Qwen35Inner {
                     &self.lm_head,
                     &layer_kinds,
                     adapter,
+                    turn_cancel.as_deref(),
                 )?
             };
             let (last_logits, gdn_checkpoint) = last_logits;
@@ -4978,6 +5007,7 @@ impl Qwen35Inner {
                 self.config.is_linear_layer(i)
             });
 
+        let turn_cancel = self.turn_cancel.clone();
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
             // === PREFILL ===
             let last_logits = {
@@ -5000,6 +5030,7 @@ impl Qwen35Inner {
                     &self.lm_head,
                     &layer_kinds,
                     adapter,
+                    turn_cancel.as_deref(),
                 )?
             };
             let (last_logits, gdn_checkpoint) = last_logits;
@@ -6272,7 +6303,8 @@ impl Qwen35Inner {
             delta_tokens.len() as u32
         });
         profiler.begin_prefill();
-        let mut last_logits = if rebuild_full_flat_prefill {
+        let turn_cancel = self.turn_cancel.clone();
+        let prefill_result = if rebuild_full_flat_prefill {
             // Discard the paged-session flat caches (full-attn slots are
             // stale, GDN state belongs to the released paged request) and
             // re-prefill the entire conversation into fresh flat caches.
@@ -6288,8 +6320,8 @@ impl Qwen35Inner {
                 &self.final_norm,
                 &self.lm_head,
                 generation_stream,
-                None,
-            )?
+                turn_cancel.as_deref(),
+            )
         } else {
             // Text-only prefill of the delta on top of the existing caches.
             let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
@@ -6301,8 +6333,19 @@ impl Qwen35Inner {
                 &self.final_norm,
                 &self.lm_head,
                 generation_stream,
-                None,
-            )?
+                turn_cancel.as_deref(),
+            )
+        };
+        // A partial prefill (cancel or failure) leaves `self.caches` ahead of
+        // `cached_token_history` — invalidate so the session goes cold instead
+        // of extending poisoned caches. Full invalidation supersedes the
+        // dirty-gate mitigation described below for this exit.
+        let mut last_logits = match prefill_result {
+            Ok(logits) => logits,
+            Err(e) => {
+                self.invalidate_dense_paged_session("delta stream flat prefill failure");
+                return Err(e);
+            }
         };
         // caches now reflect the prefilled history
         self.flat_mtp_caches_desynced = false;
@@ -6805,8 +6848,9 @@ impl Qwen35Inner {
         profiler.begin_prefill();
         let (mut last_logits, _seq_len) = {
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
-            let last_logits = if want_prompt_hidden {
-                let (logits, ph) = chunked_prefill_with_hidden(
+            let turn_cancel = self.turn_cancel.clone();
+            let prefill_result = if want_prompt_hidden {
+                chunked_prefill_with_hidden(
                     &prompt,
                     &embedding,
                     &mut self.layers,
@@ -6815,9 +6859,12 @@ impl Qwen35Inner {
                     &self.lm_head,
                     generation_stream,
                     Some(mtp_prompt_history.keep_tokens),
-                )?;
-                prompt_hidden = Some(ph);
-                logits
+                    turn_cancel.as_deref(),
+                )
+                .map(|(logits, ph)| {
+                    prompt_hidden = Some(ph);
+                    logits
+                })
             } else {
                 chunked_prefill(
                     &prompt,
@@ -6827,8 +6874,21 @@ impl Qwen35Inner {
                     &self.final_norm,
                     &self.lm_head,
                     generation_stream,
-                    None,
-                )?
+                    turn_cancel.as_deref(),
+                )
+            };
+            // A partially advanced prefill (cancel or failure) must never be
+            // continued: `self.caches` would hold the partial delta while
+            // `cached_token_history` still describes the previous turn. Full
+            // invalidation supersedes the dirty-gate mitigation described
+            // below — the session goes cold, so the next turn prefills from
+            // scratch rather than rebuilding.
+            let last_logits = match prefill_result {
+                Ok(logits) => logits,
+                Err(e) => {
+                    self.invalidate_dense_paged_session("MTP stream flat prefill failure");
+                    return Err(e);
+                }
             };
 
             (last_logits, tokens.len() as i64)
@@ -10946,6 +11006,14 @@ fn chunked_prefill_with_size(
         offset += chunk_size;
     }
 
+    // The final remainder is a chunk boundary too once at least one looped
+    // chunk ran: poll before forwarding it so a cancel landing during the
+    // last looped chunk aborts instead of riding through the remainder.
+    // `offset == 0` means the whole prompt fits in one forward — single-shot
+    // prefills stay uncancellable by design.
+    if offset > 0 && turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+        return Err(Error::from_reason("prefill cancelled"));
+    }
     let remaining = prompt.slice_axis(1, offset, total_len)?;
     let last_logits = {
         let _stream_ctx = StreamContext::new(generation_stream);
@@ -10967,6 +11035,7 @@ fn chunked_prefill_with_size(
 /// chunks whose hidden is kept; chunks before the requested tail use the
 /// logits-only path and discard hidden to avoid materializing prompt history
 /// MTPLX would not seed.
+#[allow(clippy::too_many_arguments)]
 fn chunked_prefill_with_hidden(
     prompt: &MxArray,
     embedding: &Embedding,
@@ -10976,6 +11045,7 @@ fn chunked_prefill_with_hidden(
     lm_head: &Option<LinearProj>,
     generation_stream: crate::stream::Stream,
     keep_last_hidden: Option<usize>,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<(MxArray, MxArray)> {
     chunked_prefill_with_hidden_with_size(
         prompt,
@@ -10987,9 +11057,11 @@ fn chunked_prefill_with_hidden(
         generation_stream,
         keep_last_hidden,
         PREFILL_STEP_SIZE,
+        turn_cancel,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn chunked_prefill_with_hidden_with_size(
     prompt: &MxArray,
     embedding: &Embedding,
@@ -11000,6 +11072,7 @@ fn chunked_prefill_with_hidden_with_size(
     generation_stream: crate::stream::Stream,
     keep_last_hidden: Option<usize>,
     chunk_size: i64,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<(MxArray, MxArray)> {
     let total_len = prompt.shape_at(1)?;
     if total_len <= 0 {
@@ -11019,6 +11092,11 @@ fn chunked_prefill_with_hidden_with_size(
         .unwrap_or(0);
 
     while total_len - offset > chunk_size {
+        // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary,
+        // same contract as `chunked_prefill_with_size`.
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let end = offset + chunk_size;
         let chunk = prompt.slice_axis(1, offset, end)?;
         let overlaps_kept_tail = end > keep_start;
@@ -11049,6 +11127,11 @@ fn chunked_prefill_with_hidden_with_size(
         offset = end;
     }
 
+    // Final-remainder boundary poll, mirroring `chunked_prefill_with_size`:
+    // single-shot (`offset == 0`) stays uncancellable by design.
+    if offset > 0 && turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+        return Err(Error::from_reason("prefill cancelled"));
+    }
     let remaining = prompt.slice_axis(1, offset, total_len)?;
     let (last_logits, last_hidden) = {
         let _stream_ctx = StreamContext::new(generation_stream);
@@ -13629,6 +13712,7 @@ mod paged_construction_tests {
             chunk_size,
             Some(keep_tokens),
             /* cached_rope_deltas */ 0,
+            None,
         )
     }
 
@@ -14374,6 +14458,7 @@ mod paged_construction_tests {
             Stream::new(DeviceType::Gpu),
             Some(5),
             16,
+            None,
         )?;
         assert_finite_batch_vocab_logits(
             &logits,
@@ -14410,6 +14495,7 @@ mod paged_construction_tests {
             Stream::new(DeviceType::Gpu),
             Some(100),
             16,
+            None,
         )?;
         assert_eq!(
             full_tail_hidden.shape_at(1)?,

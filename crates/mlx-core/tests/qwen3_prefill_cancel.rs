@@ -29,7 +29,8 @@
 //!     -- --ignored --nocapture
 //! ```
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use mlx_core::engine::types::{ChatConfig, ChatStreamChunk};
@@ -60,6 +61,70 @@ fn user_message(content: String) -> ChatMessage {
         images: None,
         audio: None,
     }
+}
+
+fn assistant_message(content: &str) -> ChatMessage {
+    ChatMessage {
+        role: "assistant".to_string(),
+        content: content.to_string(),
+        tool_calls: None,
+        tool_call_id: None,
+        is_error: None,
+        reasoning_content: None,
+        thinking_enabled: None,
+        images: None,
+        audio: None,
+    }
+}
+
+/// Clone the checkpoint dir with `use_block_paged_cache` forced OFF so the
+/// chat turn takes the FLAT engine path (`ChatBackend::prefill` →
+/// `flat_prefill`'s 2048-token chunk loop). Weight files are symlinked;
+/// only `config.json` is copied and patched. Pattern:
+/// `qwen3_paged_vs_flat_parity.rs::clone_model_dir`.
+fn clone_flat_model_dir(src: &Path) -> Result<PathBuf, String> {
+    let pid = std::process::id();
+    let workspace_target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let manifest = std::env::var("CARGO_MANIFEST_DIR")
+                .expect("CARGO_MANIFEST_DIR must be set when running cargo test");
+            let mut p = PathBuf::from(manifest);
+            p.pop();
+            p.pop();
+            p.join("target")
+        });
+    let dst = workspace_target.join(format!("prefill-cancel-flat-{pid}"));
+    if dst.exists() {
+        let _ = fs::remove_dir_all(&dst);
+    }
+    fs::create_dir_all(&dst).map_err(|e| format!("create_dir_all({}): {e}", dst.display()))?;
+    let read_dir = fs::read_dir(src).map_err(|e| format!("read_dir({}): {e}", src.display()))?;
+    for entry in read_dir {
+        let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_file() {
+            if entry.file_name() == "config.json" {
+                fs::copy(&from, &to)
+                    .map_err(|e| format!("copy({} -> {}): {e}", from.display(), to.display()))?;
+            } else {
+                std::os::unix::fs::symlink(&from, &to)
+                    .map_err(|e| format!("symlink({} -> {}): {e}", from.display(), to.display()))?;
+            }
+        }
+    }
+    let cfg_path = dst.join("config.json");
+    let raw = fs::read_to_string(&cfg_path).map_err(|e| format!("read config.json: {e}"))?;
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse config.json: {e}"))?;
+    cfg["use_block_paged_cache"] = serde_json::Value::Bool(false);
+    fs::write(
+        &cfg_path,
+        serde_json::to_string_pretty(&cfg).map_err(|e| format!("serialize config.json: {e}"))?,
+    )
+    .map_err(|e| format!("write config.json: {e}"))?;
+    Ok(dst)
 }
 
 /// A prompt long enough for many 512-token prefill chunks (~5.5k tokens
@@ -158,10 +223,11 @@ async fn qwen3_paged_mid_prefill_cancel_fails_closed() {
         eprintln!("skipping: MLX_TEST_MODEL_PATH unset");
         return;
     };
-    assert!(
-        Path::new(&model_path).exists(),
-        "MLX_TEST_MODEL_PATH does not exist: {model_path}",
-    );
+    // A missing fixture SKIPS (plan-mandated), never fails the gate.
+    if !Path::new(&model_path).exists() {
+        eprintln!("skipping: MLX_TEST_MODEL_PATH does not exist: {model_path}");
+        return;
+    }
 
     let model = qwen3_load_with_thread(&model_path)
         .await
@@ -250,7 +316,22 @@ async fn qwen3_paged_mid_prefill_cancel_fails_closed() {
         ttft2,
     );
 
-    // ---- Gate 2 (fail closed): the cancelled prefill must NOT have
+    // ---- Gate 2 (distinguished error): the cancelled turn must have
+    // terminated with the mid-prefill cancel error specifically — an
+    // unrelated early failure (load/OOM/template) must not satisfy this
+    // gate.
+    assert!(
+        turn1
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("prefill cancelled")),
+        "turn 1 must terminate with the distinguished \"prefill \
+         cancelled\" error (got error={:?}, done={:?})",
+        turn1.error,
+        turn1.done.as_ref().and_then(|c| c.finish_reason.clone()),
+    );
+
+    // ---- Gate 3 (fail closed): the cancelled prefill must NOT have
     // left partially-written KV registered as a live/reusable prefix —
     // the identical second turn re-prefills from zero.
     assert_eq!(
@@ -261,5 +342,129 @@ async fn qwen3_paged_mid_prefill_cancel_fails_closed() {
          be released without registering its blocks and without saving \
          session history)",
         done2.cached_tokens,
+    );
+}
+
+/// FLAT-path twin of the paged gate: a cancel flipped during an EARLY
+/// flat prefill chunk must abort BEFORE the final remainder forward and
+/// fail closed (no `save_cache_state`, session invalidated).
+///
+/// Named mutation this pins (review Finding 1): the flat chunk loops
+/// poll only at the top of NON-final iterations — a flag flipped during
+/// the last looped chunk was never seen again, the remainder ran, decode
+/// treated the cancel as a normal `finish_reason="cancelled"` finish,
+/// and `save_cache_state` committed the turn. With the fix, a poll runs
+/// before the final remainder whenever an earlier chunk was processed
+/// (offset > 0); offset-zero single-shot prefills stay uncancellable.
+///
+/// The ~5.5k-token prompt spans two full 2048-token loop chunks plus a
+/// remainder; the timer fires mid-chunk-1 (chunk ≈ tens of seconds in a
+/// debug build), so at the defect the only later poll would be decode's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3 checkpoint"]
+async fn qwen3_flat_mid_prefill_cancel_fails_closed() {
+    let Ok(model_path) = std::env::var("MLX_TEST_MODEL_PATH") else {
+        eprintln!("skipping: MLX_TEST_MODEL_PATH unset");
+        return;
+    };
+    // A missing fixture SKIPS (plan-mandated), never fails the gate.
+    if !Path::new(&model_path).exists() {
+        eprintln!("skipping: MLX_TEST_MODEL_PATH does not exist: {model_path}");
+        return;
+    }
+
+    let flat_dir = clone_flat_model_dir(Path::new(&model_path))
+        .expect("failed to clone a flat (use_block_paged_cache=false) model dir");
+    let model = qwen3_load_with_thread(&flat_dir.to_string_lossy())
+        .await
+        .expect("failed to load flat Qwen3 model");
+    assert!(
+        !model.has_block_paged_cache(),
+        "flat clone must load WITHOUT the paged adapter",
+    );
+
+    let messages = || vec![user_message(long_prompt())];
+
+    // Turn 1: cancel mid-prefill via a timer thread. The flat fused
+    // forward is FAST (prefill ends ~380ms for this whole 5.5k-token
+    // prompt on an M5 in a debug build; boundary polls sit at ~0/~130/
+    // ~240ms), so the default 100ms lands inside an early chunk and is
+    // caught at the NEXT boundary poll — well clear of the uncancellable
+    // final-remainder forward, on this machine and on anything slower.
+    // `MLX_TEST_FLAT_CANCEL_DELAY_MS` overrides for machine-speed tuning
+    // (200ms was the mutation-A/B point aimed between the last loop-top
+    // poll and the pre-remainder poll).
+    let delay_ms: u64 = std::env::var("MLX_TEST_FLAT_CANCEL_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+    let started1 = Instant::now();
+    let (handle1, rx1) = model
+        .chat_stream_session_start_for_test(messages(), Some(chat_config(16)))
+        .expect("flat turn 1 dispatch failed");
+    let timer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        handle1.cancel();
+    });
+    let turn1 = drain_turn(rx1, started1).await;
+    timer.join().expect("cancel timer thread panicked");
+
+    // Premise guard: the flag flipped AFTER the model thread dequeued
+    // the turn.
+    if let Some(err) = &turn1.error {
+        assert!(
+            !err.contains("cancelled before start"),
+            "cancel timer fired before the model thread dequeued the \
+             turn; raise the delay (turn 1 error: {err})",
+        );
+    }
+    println!(
+        "flat turn 1: elapsed={:?} error={:?} done_finish_reason={:?}",
+        turn1.elapsed,
+        turn1.error,
+        turn1.done.as_ref().and_then(|c| c.finish_reason.clone()),
+    );
+
+    // Gate A (distinguished error, chunk-boundary abort): the turn must
+    // terminate with "prefill cancelled" and NO done chunk. At the
+    // defect the whole prefill runs, decode cancels normally, and a done
+    // chunk (finish_reason="cancelled") arrives instead.
+    assert!(
+        turn1
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("prefill cancelled")),
+        "flat turn 1 must abort with the distinguished \"prefill \
+         cancelled\" error (got error={:?}, done_finish_reason={:?})",
+        turn1.error,
+        turn1.done.as_ref().and_then(|c| c.finish_reason.clone()),
+    );
+    assert!(
+        turn1.done.is_none(),
+        "flat turn 1 must not emit a terminal done chunk after a \
+         mid-prefill cancel",
+    );
+
+    // Gate B (fail closed, no cache save): the aborted turn must NOT
+    // have registered a live session. A role-aware continue therefore
+    // hits the "requires an initialized session" guard. At the defect
+    // the cancelled turn SAVED state, a live session exists, and the
+    // continue is admitted.
+    let mut history = messages();
+    history.push(assistant_message("partial reply"));
+    history.push(user_message("Continue.".to_string()));
+    let (_handle2, rx2) = model
+        .chat_stream_session_continue_for_test(history, Some(chat_config(4)))
+        .expect("continue dispatch failed");
+    let turn2 = drain_turn(rx2, Instant::now()).await;
+    assert!(
+        turn2
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("requires an initialized session")),
+        "the cancelled flat prefill must leave NO live session (expected \
+         the initialized-session guard, got error={:?} done={:?})",
+        turn2.error,
+        turn2.done.as_ref().and_then(|c| c.finish_reason.clone()),
     );
 }

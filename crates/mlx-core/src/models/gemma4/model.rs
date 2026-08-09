@@ -6121,6 +6121,17 @@ impl Gemma4Inner {
         if pass1_position < pass1_end {
             let configured_chunk_size = crate::array::paged_prefill_chunk_size();
             while pass1_position < pass1_end {
+                // Cooperative-cancel checkpoint (H1b): abort at the chunk
+                // boundary. Both VLM cores fail closed on Err via
+                // `invalidate_gemma4_hybrid_session` — the request is
+                // released, never finalized.
+                if self
+                    .turn_cancel
+                    .as_ref()
+                    .is_some_and(|f| f.load(Ordering::Relaxed))
+                {
+                    return Err(Error::from_reason("prefill cancelled"));
+                }
                 // The first unified chunk must include the complete image
                 // overlay. Boundaries before the end of that span are ignored;
                 // otherwise the later chunk would receive no overlay ids and
@@ -6537,6 +6548,17 @@ impl Gemma4Inner {
 
         let total_chunks = chunk_plan.len();
         for (chunk_idx, chunk_plan) in chunk_plan.iter().enumerate() {
+            // Cooperative-cancel checkpoint (H1b): abort at the chunk
+            // boundary. Both callers fail closed on Err — the VLM
+            // leading-text replay invalidates the hybrid session, and the
+            // paged chunk driver rides `abort_paged_turn`.
+            if self
+                .turn_cancel
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+            {
+                return Err(Error::from_reason("prefill cancelled"));
+            }
             let chunk_end = chunk_plan
                 .start
                 .checked_add(chunk_plan.len)
@@ -10123,6 +10145,14 @@ fn prefill_body_gemma4(
 
     // Final chunk (still body only — no lm_head needed)
     if offset < prefill_len {
+        // The final remainder is a chunk boundary too once at least one
+        // looped chunk ran: poll before forwarding it so a cancel landing
+        // during the last looped chunk aborts instead of riding through the
+        // remainder. `offset == 0` (single-shot) stays uncancellable by
+        // design.
+        if offset > 0 && turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let remaining_embeds = all_embeds.slice_axis(1, offset, prefill_len)?;
         let remaining_ple = all_ple
             .as_ref()

@@ -1004,6 +1004,18 @@ impl Gemma4Inner {
                 };
                 let mut offset: i64 = 0;
                 while offset < prefill_len {
+                    // Cooperative-cancel checkpoint (H1b) at every chunk
+                    // boundary after the first chunk (a one-chunk prefill is
+                    // the single-shot case and stays uncancellable). The Err
+                    // rides `draft_chat_turn`'s `draft_fail_closed` arm.
+                    if offset > 0
+                        && inner
+                            .turn_cancel
+                            .as_ref()
+                            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        return Err(Error::from_reason("prefill cancelled"));
+                    }
                     let end = if prefill_len - offset > GEMMA4_PREFILL_STEP_SIZE {
                         offset + GEMMA4_PREFILL_STEP_SIZE
                     } else {

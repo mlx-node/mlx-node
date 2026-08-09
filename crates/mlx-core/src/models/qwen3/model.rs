@@ -2832,6 +2832,19 @@ impl Qwen3Inner {
                 synchronize_and_clear_cache();
                 offset = chunk_end;
             }
+            // The final remainder is a chunk boundary too once at least one
+            // looped chunk ran (always true in this arm): poll before
+            // forwarding it so a cancel landing during the last looped chunk
+            // aborts instead of riding through the remainder. The offset-zero
+            // single-shot arm below stays uncancellable by design.
+            if offset > 0
+                && self
+                    .turn_cancel
+                    .as_ref()
+                    .is_some_and(|f| f.load(Ordering::Relaxed))
+            {
+                return Err(Error::from_reason("prefill cancelled"));
+            }
             let final_chunk = prefill_input.slice(&[0, offset as i64], &[1, total_len as i64])?;
             rope_offsets = MxArray::from_int32(&[self.turn_cache_idx], &[1])?;
             let logits = {
@@ -3534,6 +3547,36 @@ impl Qwen3Model {
             tokio::sync::mpsc::unbounded_channel::<Result<crate::engine::types::ChatStreamChunk>>();
         self.thread
             .send(Qwen3Cmd::Chat(ChatCmd::StreamSessionStart {
+                messages,
+                config,
+                stream_tx,
+                cancelled: cancelled_inner,
+            }))?;
+        Ok((
+            crate::engine::types::ChatStreamHandle { cancelled },
+            stream_rx,
+        ))
+    }
+
+    /// Test-only entry point that dispatches
+    /// `ChatCmd::StreamSessionContinue` and returns the raw mpsc receiver
+    /// the model thread writes into.
+    #[doc(hidden)]
+    pub fn chat_stream_session_continue_for_test(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<crate::engine::types::ChatConfig>,
+    ) -> Result<(
+        crate::engine::types::ChatStreamHandle,
+        tokio::sync::mpsc::UnboundedReceiver<Result<crate::engine::types::ChatStreamChunk>>,
+    )> {
+        let config = config.unwrap_or_default();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<crate::engine::types::ChatStreamChunk>>();
+        self.thread
+            .send(Qwen3Cmd::Chat(ChatCmd::StreamSessionContinue {
                 messages,
                 config,
                 stream_tx,

@@ -448,6 +448,19 @@ impl Lfm2Inner {
             crate::array::clear_cache();
             offset += PREFILL_STEP_SIZE;
         }
+        // The final remainder is a chunk boundary too once at least one
+        // looped chunk ran: poll before forwarding it so a cancel landing
+        // during the last looped chunk aborts instead of riding through the
+        // remainder. `offset == 0` (single-shot) stays uncancellable by
+        // design.
+        if offset > 0
+            && self
+                .turn_cancel
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+        {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let remaining = prompt.slice_axis(1, offset, total_len)?;
         let logits = {
             let _stream_ctx = StreamContext::new(generation_stream);

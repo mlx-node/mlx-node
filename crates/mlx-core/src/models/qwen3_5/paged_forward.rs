@@ -843,6 +843,7 @@ pub(crate) fn run_paged_vlm_prefill(
     lm_head: &Option<LinearProj>,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<(MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if expanded_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -911,6 +912,12 @@ pub(crate) fn run_paged_vlm_prefill(
     let mut checkpoints = Vec::new();
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
+        // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary.
+        // The Err rides the VLM cores' `invalidate_dense_paged_session` arm —
+        // the request is released, never finalized.
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let absolute_start = cached_prefix_len_us + range.start;
         let absolute_end = cached_prefix_len_us + range.end;
         let chunk_tokens = &expanded_tokens[absolute_start..absolute_end];
@@ -1009,6 +1016,7 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
     chunk_size: i32,
     keep_last_hidden: Option<usize>,
     cached_rope_deltas: i32,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<(MxArray, MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -1107,6 +1115,13 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
     let mut suffix_offset = 0usize;
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
+        // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary.
+        // The Err rides the caller's `invalidate_dense_paged_session` /
+        // `abort_paged_turn` arm — the request is released, never finalized,
+        // so partial K/V is never registered as a live prefix.
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let chunk = &suffix_tokens[range];
         let chunk_trace_start = inference_info_enabled.then(Instant::now);
         let is_last_chunk = chunk_idx + 1 == total_chunks;
