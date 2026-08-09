@@ -697,6 +697,102 @@ describe('pre-dispatch permit lifetime (pre-lock async work)', () => {
     expect(b.mock.getStatus()).toBe(200);
   }, 15000);
 
+  it('an idle-chain permitless cold-load alias cannot double-spend the reserved runner entitlement', async () => {
+    // The variant above starts with an ACTIVE holder. This one starts
+    // with the exec chain IDLE: the gate has legitimately lent the
+    // whole runner-plus-waiter capacity (cap 1 + runner entitlement =
+    // 2 permits) to two resident requests parked in pre-lock work
+    // (resolveModel), with `withExclusive` untouched. A cold-alias
+    // request skips the gate, dispatches permitless into the SAME
+    // still-idle registry, and — because `asWaiter === false` — would
+    // seat itself on the runner entitlement one of those permits
+    // already owns unless the runner path checks the combined
+    // footprint too.
+    const registry = new ModelRegistry({ maxQueueDepth: 1 });
+    const model = createModel();
+    registry.register('m', model);
+    const sessReg = registry.getSessionRegistry('m')!;
+
+    const resolveGate = deferred();
+    const resolveModel = vi.fn(async (name: string) => {
+      if (name === 'm') {
+        // Both resident requests park HERE — pre-lock, permits
+        // retained, exec chain still idle.
+        await resolveGate.promise;
+        return;
+      }
+      if (name === 'm-alias') {
+        // Same model object -> same SessionRegistry (alias binding).
+        registry.register('m-alias', model);
+      }
+    });
+
+    const store = {
+      getChain: vi.fn(async () => []),
+      store: vi.fn(async () => {}),
+    } as unknown as ResponseStore;
+
+    const sendOne = (body: { model: string; input: string }) => {
+      const mock = createMockRes();
+      const done = handleCreateResponse(
+        mock.res,
+        body,
+        registry,
+        store,
+        undefined,
+        undefined,
+        null,
+        undefined,
+        resolveModel,
+      );
+      return { mock, done };
+    };
+
+    // A1 + A2: resident requests; each takes a permit at the gate (an
+    // idle chain admits cap + 1 = 2) and parks in resolveModel.
+    const a1 = sendOne({ model: 'm', input: 'a1' });
+    const a2 = sendOne({ model: 'm', input: 'a2' });
+    await tick();
+    expect(sessReg.queueDepth).toBe(0);
+    expect(sessReg.preDispatchAdmitCount).toBe(2);
+
+    // C: cold alias — the gate is skipped ('m-alias' is not resident
+    // yet); resolveModel registers the alias and C reaches
+    // `withExclusive` permitless at the still-idle chain. It must get
+    // the 429, not the runner seat.
+    const c = sendOne({ model: 'm-alias', input: 'c' });
+    const cOutcome = await Promise.race([c.done.then(() => 'done' as const), timeout(200)]);
+    expect(cOutcome).toBe('done');
+    await c.mock.waitForEnd();
+    expect(c.mock.getStatus()).toBe(429);
+    expect(c.mock.getHeaders()['retry-after']).toBe('1');
+    const parsed = JSON.parse(c.mock.getBody());
+    expect(parsed.error.code).toBe('queue_full');
+    // The reject seated nothing: both permits are still outstanding
+    // and nothing is queued.
+    expect(sessReg.queueDepth).toBe(0);
+    expect(sessReg.preDispatchAdmitCount).toBe(2);
+
+    // Unblock the parked requests: their permits hand off at
+    // placement (one runner + the one legal waiter). Sample the
+    // invariant on every tick of the drain — the queue depth must
+    // never exceed the waiter capacity.
+    resolveGate.resolve(undefined);
+    const drained = Promise.all([a1.done, a2.done]).then(() => 'done' as const);
+    let settled: 'done' | 'pending' = 'pending';
+    while (settled === 'pending') {
+      settled = await Promise.race([drained, tick().then(() => 'pending' as const)]);
+      expect(sessReg.queueDepth).toBeLessThanOrEqual(1);
+      expect(sessReg.queueDepth + sessReg.preDispatchAdmitCount).toBeLessThanOrEqual(2);
+    }
+    await a1.mock.waitForEnd();
+    await a2.mock.waitForEnd();
+    expect(a1.mock.getStatus()).toBe(200);
+    expect(a2.mock.getStatus()).toBe(200);
+    expect(sessReg.queueDepth).toBe(0);
+    expect(sessReg.preDispatchAdmitCount).toBe(0);
+  }, 15000);
+
   it('releases the permit when the storage lookup throws', async () => {
     const registry = new ModelRegistry({ maxQueueDepth: 1 });
     registry.register('m', createModel());

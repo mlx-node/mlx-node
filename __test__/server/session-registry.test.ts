@@ -1113,4 +1113,87 @@ describe('SessionRegistry pre-dispatch permit handoff', () => {
     await holder;
     await queued;
   });
+
+  it('idle chain: a permitless runner cannot double-spend the reserved runner entitlement', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+
+    // Idle chain: the gate legitimately lends the full runner-plus-
+    // waiter capacity (cap + 1 = 2) as outstanding permits — exactly
+    // ONE of them is entitled to become the runner.
+    const permitA = reg.beginPreDispatchAdmission();
+    const permitB = reg.beginPreDispatchAdmission();
+    expect(reg.preDispatchAdmitCount).toBe(2);
+    expect(reg.queueDepth).toBe(0);
+
+    // A permitless call at the still-idle chain would seat itself on
+    // the runner entitlement a permit already owns: the footprint (2)
+    // fills the whole runner-plus-waiter capacity, so admission must
+    // reject — NOT bypass the check because `asWaiter === false`.
+    expect(() => reg.withExclusive(async () => {})).toThrow(QueueFullError);
+    // The reject path mutated nothing.
+    expect(reg.queueDepth).toBe(0);
+    expect(reg.preDispatchAdmitCount).toBe(2);
+
+    // Both permits still hand off cleanly. First one becomes the
+    // runner: its unit retires and the chain is now occupied.
+    let releaseRunner!: () => void;
+    const runnerDone = new Promise<void>((r) => {
+      releaseRunner = r;
+    });
+    const runner = reg.withExclusive(async () => {
+      await runnerDone;
+    }, permitA);
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(0);
+    expect(reg.preDispatchAdmitCount).toBe(1);
+    expect(reg.queueDepth + reg.preDispatchAdmitCount).toBeLessThanOrEqual(1);
+
+    // Second one converts into the single legal waiter slot; the
+    // queue depth never exceeds the waiter capacity (cap 1) at any
+    // observation point.
+    const waiter = reg.withExclusive(async () => {}, permitB);
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(1);
+    expect(reg.preDispatchAdmitCount).toBe(0);
+    expect(reg.queueDepth).toBeLessThanOrEqual(1);
+
+    releaseRunner();
+    await runner;
+    await waiter;
+    expect(reg.queueDepth).toBe(0);
+    expect(reg.preDispatchAdmitCount).toBe(0);
+  });
+
+  it('idle chain: a permitless runner IS admitted while the entitlement is free (no over-reject)', async () => {
+    // Over-rejection guard for the unified admission check: with only
+    // ONE outstanding permit under cap 1, the runner entitlement is
+    // still free (footprint 1 < cap 1 + entitlement 1) — a permitless
+    // arrival at the idle chain must run immediately, and the parked
+    // permit must still convert into the waiter slot behind it.
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+
+    const permit = reg.beginPreDispatchAdmission();
+    let releaseRunner!: () => void;
+    const runnerDone = new Promise<void>((r) => {
+      releaseRunner = r;
+    });
+    const runner = reg.withExclusive(async () => {
+      await runnerDone;
+    });
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(0);
+    expect(reg.preDispatchAdmitCount).toBe(1);
+
+    const waiter = reg.withExclusive(async () => {}, permit);
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(1);
+    expect(reg.preDispatchAdmitCount).toBe(0);
+
+    releaseRunner();
+    await runner;
+    await waiter;
+    expect(reg.queueDepth).toBe(0);
+  });
 });
