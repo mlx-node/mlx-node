@@ -402,6 +402,7 @@ pub(crate) fn run_gdn_only_prefill_materialized(
     embed: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<()> {
     let configured_chunk_size = crate::array::paged_prefill_chunk_size();
     let chunk_size = if configured_chunk_size > 0 {
@@ -409,7 +410,42 @@ pub(crate) fn run_gdn_only_prefill_materialized(
     } else {
         2048
     };
-    for chunk in prefix_tokens.chunks(chunk_size) {
+    run_gdn_only_prefill_materialized_with_chunk_size(
+        prefix_tokens,
+        embed,
+        layers,
+        caches,
+        chunk_size,
+        turn_cancel,
+    )
+}
+
+/// Chunk-size-parameterized worker for [`run_gdn_only_prefill_materialized`]
+/// (mirrors the MoE split so tests can pin the replay behavior without
+/// touching the process environment).
+pub(crate) fn run_gdn_only_prefill_materialized_with_chunk_size(
+    prefix_tokens: &[u32],
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    chunk_size: usize,
+    turn_cancel: Option<&AtomicBool>,
+) -> Result<()> {
+    if chunk_size == 0 {
+        return Err(Error::from_reason(
+            "dense GDN materialized replay chunk size must be positive",
+        ));
+    }
+    for (chunk_idx, chunk) in prefix_tokens.chunks(chunk_size).enumerate() {
+        // Cooperative-cancel checkpoint (H1b) between replay chunks — an
+        // O(prefix) cached-prefix replay must not hold the model thread
+        // hostage after a cancel. A one-chunk replay stays single-shot by
+        // design. The Err rides the callers' invalidate/abort arms, and
+        // `replay_gdn_cache_and_commit` drops the staged cache, so the
+        // partial replay is never published.
+        if chunk_idx > 0 && turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         run_gdn_only_prefill(chunk, embed, layers, caches)?;
         materialize_linear_layer_caches(caches)?;
         crate::array::synchronize_and_clear_cache();

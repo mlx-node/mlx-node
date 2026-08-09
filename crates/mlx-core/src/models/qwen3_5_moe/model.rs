@@ -1870,6 +1870,7 @@ impl Qwen35MoeInner {
                     )
                 })?;
             let embed = self.embedding.clone();
+            let turn_cancel = self.turn_cancel.clone();
             let layers = &mut self.layers;
             replay_gdn_cache_and_commit(&mut self.caches, checkpoint, |staged| {
                 super::paged_forward::run_gdn_only_prefill_materialized(
@@ -1877,6 +1878,7 @@ impl Qwen35MoeInner {
                     &embed,
                     layers,
                     staged,
+                    turn_cancel.as_deref(),
                 )
             })?;
             return Ok(finish(
@@ -1924,9 +1926,16 @@ impl Qwen35MoeInner {
             Error::from_reason("MoE paged GDN prefix replay length exceeds prompt length")
         })?;
         let embed = self.embedding.clone();
+        let turn_cancel = self.turn_cancel.clone();
         let layers = &mut self.layers;
         replay_gdn_cache_and_commit(&mut self.caches, fresh_caches, |staged| {
-            super::paged_forward::run_gdn_only_prefill_materialized(prefix, &embed, layers, staged)
+            super::paged_forward::run_gdn_only_prefill_materialized(
+                prefix,
+                &embed,
+                layers,
+                staged,
+                turn_cancel.as_deref(),
+            )
         })?;
         Ok(finish("replay_materialized", 0, cached_prefix_len))
     }

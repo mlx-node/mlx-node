@@ -21,10 +21,18 @@
 //! `MLX_TEST_MODEL_PATH` so a plain `cargo test` (and `--ignored` without
 //! the env var) still passes; a missing fixture SKIPS, never fails.
 //!
+//! This binary holds TWO heavyweight timing gates (paged + flat). They
+//! are serialized through [`HEAVY_GATE`] so the GPU is never shared and
+//! the cancel-timer windows stay meaningful, and neither test mutates
+//! the process environment — the paged gate REQUIRES
+//! `MLX_PAGED_PREFILL_CHUNK_SIZE=512` to be exported by the harness
+//! (`run-cancel-gate.sh`) and skips otherwise.
+//!
 //! Run locally with:
 //!
 //! ```shell
 //! MLX_TEST_MODEL_PATH=./.cache/models/qwen3-0.6b-mlx-bf16 \
+//!     MLX_PAGED_PREFILL_CHUNK_SIZE=512 \
 //!     cargo test -p mlx-core --test qwen3_prefill_cancel \
 //!     -- --ignored --nocapture
 //! ```
@@ -33,14 +41,25 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use tokio::sync::Mutex;
+
 use mlx_core::engine::types::{ChatConfig, ChatStreamChunk};
 use mlx_core::models::qwen3::persistence::load_with_thread as qwen3_load_with_thread;
 use mlx_core::tokenizer::ChatMessage;
 
 /// Chunked-prefill chunk size for this gate. 512 tokens per chunk over a
 /// multi-thousand-token prompt gives the cancel timer many chunk
-/// boundaries to land on.
+/// boundaries to land on. The harness must EXPORT
+/// `MLX_PAGED_PREFILL_CHUNK_SIZE` with this value before the test binary
+/// starts — the test never mutates the process environment.
 const PREFILL_CHUNK_SIZE: &str = "512";
+
+/// Serializes the two real-weight timing gates in this binary: libtest
+/// may otherwise run both `--ignored` tests concurrently, sharing the
+/// GPU and making the cancel-timer windows meaningless. A tokio mutex so
+/// the guard may be held across awaits (a panicked sibling cannot poison
+/// it — its verdict stays independent).
+static HEAVY_GATE: Mutex<()> = Mutex::const_new(());
 
 /// Delay before the timer thread flips the cancel flag. Must be long
 /// enough that the model thread has dequeued the turn and entered the
@@ -210,14 +229,18 @@ async fn drain_turn(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3 checkpoint"]
 async fn qwen3_paged_mid_prefill_cancel_fails_closed() {
-    // Chunk the paged prefill BEFORE anything can initialize the
-    // process-wide OnceLock that caches this env var. This test file is
-    // its own test binary and this is its only test, so nothing races
-    // the read.
-    //
-    // SAFETY: no other thread exists yet (the model thread spawns at
-    // load, below) and nothing has read the variable.
-    unsafe { std::env::set_var("MLX_PAGED_PREFILL_CHUNK_SIZE", PREFILL_CHUNK_SIZE) };
+    let _gate = HEAVY_GATE.lock().await;
+    // The paged chunk size must be exported by the harness BEFORE this
+    // binary starts (see `run-cancel-gate.sh`): this binary holds a
+    // second test, so an in-process `set_var` would race the sibling's
+    // environment reads. Skip when the environment is not prepared.
+    if std::env::var("MLX_PAGED_PREFILL_CHUNK_SIZE").as_deref() != Ok(PREFILL_CHUNK_SIZE) {
+        eprintln!(
+            "skipping: MLX_PAGED_PREFILL_CHUNK_SIZE={PREFILL_CHUNK_SIZE} must be exported \
+             by the harness (see run-cancel-gate.sh)"
+        );
+        return;
+    }
 
     let Ok(model_path) = std::env::var("MLX_TEST_MODEL_PATH") else {
         eprintln!("skipping: MLX_TEST_MODEL_PATH unset");
@@ -358,11 +381,13 @@ async fn qwen3_paged_mid_prefill_cancel_fails_closed() {
 /// (offset > 0); offset-zero single-shot prefills stay uncancellable.
 ///
 /// The ~5.5k-token prompt spans two full 2048-token loop chunks plus a
-/// remainder; the timer fires mid-chunk-1 (chunk ≈ tens of seconds in a
-/// debug build), so at the defect the only later poll would be decode's.
+/// remainder (boundary polls at ~0/~130/~240 ms on an M5 debug build);
+/// the default timer fires inside an early chunk, so at the defect the
+/// only later poll would be decode's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3 checkpoint"]
 async fn qwen3_flat_mid_prefill_cancel_fails_closed() {
+    let _gate = HEAVY_GATE.lock().await;
     let Ok(model_path) = std::env::var("MLX_TEST_MODEL_PATH") else {
         eprintln!("skipping: MLX_TEST_MODEL_PATH unset");
         return;

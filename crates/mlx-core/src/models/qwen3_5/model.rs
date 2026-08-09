@@ -2494,6 +2494,7 @@ impl Qwen35Inner {
                     )
                 })?;
             let embed = self.embedding.clone();
+            let turn_cancel = self.turn_cancel.clone();
             let layers = &mut self.layers;
             replay_gdn_cache_and_commit(&mut self.caches, checkpoint, |staged| {
                 super::paged_forward::run_gdn_only_prefill_materialized(
@@ -2501,6 +2502,7 @@ impl Qwen35Inner {
                     &embed,
                     layers,
                     staged,
+                    turn_cancel.as_deref(),
                 )
             })?;
             return Ok(finish(
@@ -2547,9 +2549,16 @@ impl Qwen35Inner {
             Error::from_reason("dense paged GDN prefix replay length exceeds prompt length")
         })?;
         let embed = self.embedding.clone();
+        let turn_cancel = self.turn_cancel.clone();
         let layers = &mut self.layers;
         replay_gdn_cache_and_commit(&mut self.caches, fresh_caches, |staged| {
-            super::paged_forward::run_gdn_only_prefill_materialized(prefix, &embed, layers, staged)
+            super::paged_forward::run_gdn_only_prefill_materialized(
+                prefix,
+                &embed,
+                layers,
+                staged,
+                turn_cancel.as_deref(),
+            )
         })?;
         Ok(finish("replay_materialized", 0, cached_prefix_len))
     }
@@ -14824,6 +14833,95 @@ mod paged_construction_tests {
 
         let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
         let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+        adapter.release_request().expect("release_request");
+    }
+
+    /// H1b regression: a cancel flag observed between materialized GDN
+    /// replay chunks must abort the replay with the distinguished error,
+    /// and the staged-commit wrapper must drop the partial state (no warm
+    /// publish). A one-chunk replay stays single-shot and ignores the flag.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn test_dense_materialized_gdn_replay_cancels_between_chunks() {
+        let Some((mut inner, cfg)) =
+            paged_inner_or_skip("test_dense_materialized_gdn_replay_cancels_between_chunks")
+        else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+        let prompt: Vec<u32> = (0u32..37).map(|i| (i * 19 + 11) % 128).collect();
+        let embed = inner.embedding.clone();
+        let cancelled = std::sync::Arc::new(AtomicBool::new(true));
+
+        // Multi-chunk replay with the flag pre-set: chunk 1 runs, the
+        // between-chunk poll aborts before chunk 2, and the staged cache is
+        // dropped — the active cache is never published.
+        {
+            let mut active: Option<Vec<Qwen3_5LayerCache>> = None;
+            let staged = fresh_dense_layer_caches(&cfg);
+            let layers = &mut inner.layers;
+            let err = replay_gdn_cache_and_commit(&mut active, staged, |staged| {
+                super::super::paged_forward::run_gdn_only_prefill_materialized_with_chunk_size(
+                    &prompt,
+                    &embed,
+                    layers,
+                    staged,
+                    7,
+                    Some(cancelled.as_ref()),
+                )
+            })
+            .expect_err("cancelled multi-chunk replay must abort");
+            assert!(
+                err.to_string().contains("prefill cancelled"),
+                "replay abort must carry the distinguished error, got: {err}",
+            );
+            assert!(
+                active.is_none(),
+                "a cancelled replay must never publish the staged cache"
+            );
+        }
+
+        // One-chunk exception: the same pre-set flag is ignored when the
+        // whole prefix fits in a single replay chunk (single-shot contract).
+        {
+            let mut active: Option<Vec<Qwen3_5LayerCache>> = None;
+            let staged = fresh_dense_layer_caches(&cfg);
+            let layers = &mut inner.layers;
+            replay_gdn_cache_and_commit(&mut active, staged, |staged| {
+                super::super::paged_forward::run_gdn_only_prefill_materialized_with_chunk_size(
+                    &prompt,
+                    &embed,
+                    layers,
+                    staged,
+                    prompt.len(),
+                    Some(cancelled.as_ref()),
+                )
+            })
+            .expect("single-chunk replay stays uncancellable");
+            assert!(active.is_some(), "a completed replay must publish");
+        }
+
+        // Un-set flag: the multi-chunk replay completes and publishes.
+        cancelled.store(false, Ordering::Relaxed);
+        {
+            let mut active: Option<Vec<Qwen3_5LayerCache>> = None;
+            let staged = fresh_dense_layer_caches(&cfg);
+            let layers = &mut inner.layers;
+            replay_gdn_cache_and_commit(&mut active, staged, |staged| {
+                super::super::paged_forward::run_gdn_only_prefill_materialized_with_chunk_size(
+                    &prompt,
+                    &embed,
+                    layers,
+                    staged,
+                    7,
+                    Some(cancelled.as_ref()),
+                )
+            })
+            .expect("uncancelled multi-chunk replay must complete");
+            assert!(active.is_some(), "a completed replay must publish");
+        }
+
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
         adapter.release_request().expect("release_request");
     }
 
