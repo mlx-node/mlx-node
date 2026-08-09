@@ -4747,19 +4747,26 @@ describe('handleCreateMessage', () => {
       // socket — awaiting it would pin the per-model `withExclusive` mutex on a
       // dead client. `endJson` pre-checks `res.destroyed || res.socket?.destroyed`
       // and rejects synchronously.
+      //
+      // The socket is destroyed MID-FLIGHT (from inside the mock's
+      // `chatSessionStart`): a socket already destroyed BEFORE dispatch
+      // now takes the H2 pre-dispatch skip and never reaches `endJson`.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'hi' }));
       registry.register('test-model', mockModel);
       const { res, getBody, wasDestroyed } = createMockRes();
 
-      Object.defineProperty(res, 'socket', {
-        configurable: true,
-        get: () => ({
-          destroyed: true,
-          once: () => {},
-          removeListener: () => {},
-          off: () => {},
-        }),
+      (mockModel.chatSessionStart as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        Object.defineProperty(res, 'socket', {
+          configurable: true,
+          get: () => ({
+            destroyed: true,
+            once: () => {},
+            removeListener: () => {},
+            off: () => {},
+          }),
+        });
+        return makeChatResult({ text: 'hi' });
       });
 
       const handlerPromise = handleCreateMessage(

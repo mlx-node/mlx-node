@@ -68,23 +68,40 @@ enum TurnKind {
 /// prefix-reuse support requires the core to decide reset-vs-reuse from
 /// `verify_cache_prefix` (stateless-agent clients resend the full
 /// transcript every turn).
+///
+/// Cancel-flag lifecycle (H2, mirrors the streaming twins): a flag
+/// already flipped before the guards rejects immediately; otherwise the
+/// flag is installed on the backend via
+/// [`ChatBackend::set_turn_cancel_flag`] (mid-prefill chunk-boundary
+/// polling) AND threaded into the core (per-step decode polling), then
+/// cleared on every exit. Reply contract: a cancelled turn REJECTS with
+/// the exact string `"chat session cancelled"` — see
+/// [`sync_turn_reply`].
 pub(crate) fn session_start<B: ChatBackend>(
     backend: &mut B,
     messages: Vec<ChatMessage>,
     config: ChatConfig,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<ChatResult> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(Error::from_reason(CHAT_SESSION_CANCELLED));
+    }
     if config.reuse_cache == Some(false) {
         return Err(Error::from_reason(
             "chat_session_start requires reuse_cache=true (pass ChatConfig { reuse_cache: Some(true), .. } or leave as None). The session API only makes sense with cache reuse enabled.",
         ));
     }
-    expect_sync_result(chat_turn_core(
+    backend.set_turn_cancel_flag(Some(Arc::clone(cancelled)));
+    let turn = chat_turn_core(
         backend,
         messages,
         config,
         TurnKind::Start,
         None,
-    ))
+        Some(cancelled.as_ref()),
+    );
+    backend.set_turn_cancel_flag(None);
+    sync_turn_reply(turn, cancelled)
 }
 
 /// Generic role-aware session continuation.
@@ -99,7 +116,11 @@ pub(crate) fn session_continue<B: ChatBackend>(
     backend: &mut B,
     messages: Vec<ChatMessage>,
     config: ChatConfig,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<ChatResult> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(Error::from_reason(CHAT_SESSION_CANCELLED));
+    }
     if config.reuse_cache == Some(false) {
         return Err(Error::from_reason(
             "chat_session_continue requires reuse_cache=true (leave as None or set to true). \
@@ -111,13 +132,17 @@ pub(crate) fn session_continue<B: ChatBackend>(
             "chat_session_continue requires an initialized session (call chatSessionStart first)",
         ));
     }
-    expect_sync_result(chat_turn_core(
+    backend.set_turn_cancel_flag(Some(Arc::clone(cancelled)));
+    let turn = chat_turn_core(
         backend,
         messages,
         config,
         TurnKind::Continue,
         None,
-    ))
+        Some(cancelled.as_ref()),
+    );
+    backend.set_turn_cancel_flag(None);
+    sync_turn_reply(turn, cancelled)
 }
 
 /// Generic role-aware tool-result continuation.
@@ -129,7 +154,11 @@ pub(crate) fn session_continue_tool<B: ChatBackend>(
     backend: &mut B,
     messages: Vec<ChatMessage>,
     config: ChatConfig,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<ChatResult> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(Error::from_reason(CHAT_SESSION_CANCELLED));
+    }
     if config.reuse_cache == Some(false) {
         return Err(Error::from_reason(
             "chat_session_continue_tool requires reuse_cache=true (leave as None or set to true). \
@@ -141,13 +170,17 @@ pub(crate) fn session_continue_tool<B: ChatBackend>(
             "chat_session_continue_tool requires an initialized session (call chatSessionStart first)",
         ));
     }
-    expect_sync_result(chat_turn_core(
+    backend.set_turn_cancel_flag(Some(Arc::clone(cancelled)));
+    let turn = chat_turn_core(
         backend,
         messages,
         config,
         TurnKind::Continue,
         None,
-    ))
+        Some(cancelled.as_ref()),
+    );
+    backend.set_turn_cancel_flag(None);
+    sync_turn_reply(turn, cancelled)
 }
 
 // =====================================================================
@@ -196,6 +229,7 @@ pub(crate) fn session_start_stream<B: ChatBackend>(
             sink,
             cancelled: cancelled.as_ref(),
         }),
+        Some(cancelled.as_ref()),
     );
     backend.set_turn_cancel_flag(None);
     if let Err(e) = turn {
@@ -242,6 +276,7 @@ pub(crate) fn session_continue_stream<B: ChatBackend>(
             sink,
             cancelled: cancelled.as_ref(),
         }),
+        Some(cancelled.as_ref()),
     );
     backend.set_turn_cancel_flag(None);
     if let Err(e) = turn {
@@ -288,6 +323,7 @@ pub(crate) fn session_continue_tool_stream<B: ChatBackend>(
             sink,
             cancelled: cancelled.as_ref(),
         }),
+        Some(cancelled.as_ref()),
     );
     backend.set_turn_cancel_flag(None);
     if let Err(e) = turn {
@@ -309,6 +345,50 @@ fn expect_sync_result(out: Result<Option<ChatResult>>) -> Result<ChatResult> {
             "specialized executor returned TurnOutput::Streamed on the sync (sink-less) path",
         )
     })
+}
+
+/// The distinguished non-streaming cancellation reply (H2). Load-bearing
+/// exact string: the TS `ChatSession` / server endpoints treat this
+/// rejection as "turn cancelled, nothing committed to the client".
+pub(crate) const CHAT_SESSION_CANCELLED: &str = "chat session cancelled";
+
+/// Map a sync turn's outcome to the reply contract: once the turn's
+/// cancel flag was flipped, the reply REJECTS with the exact
+/// [`CHAT_SESSION_CANCELLED`] string — regardless of how far the turn
+/// got before the flag was observed.
+///
+/// Three cancellation shapes collapse into that one contract:
+///   * mid-prefill: a chunk-boundary poll aborted with the distinguished
+///     `"prefill cancelled"` error and the fail-closed cleanup arms
+///     already ran (paged release / flat invalidate);
+///   * mid-decode: the loop broke with `finish_reason == "cancelled"`
+///     and the ordinary save/finalize epilogue ran (same state outcome
+///     as a cancelled STREAMING turn — deliberately not fail-closed);
+///   * post-completion race: the flag flipped after the last poll — the
+///     turn's state was committed, but the caller asked for
+///     cancellation, so the result is discarded and the reply rejects
+///     (the server treats rejections as non-committed; the next
+///     full-history turn re-verifies the prefix, so a discarded result
+///     can never corrupt state).
+///
+/// The underlying outcome is traced before being masked so a genuine
+/// error racing a cancel stays diagnosable.
+fn sync_turn_reply(turn: Result<Option<ChatResult>>, cancelled: &AtomicBool) -> Result<ChatResult> {
+    let result = expect_sync_result(turn);
+    if cancelled.load(Ordering::Relaxed) {
+        match &result {
+            Ok(r) => tracing::debug!(
+                "cancelled sync turn completed with finish_reason={:?}; rejecting per contract",
+                r.finish_reason,
+            ),
+            Err(e) => tracing::debug!(
+                "cancelled sync turn surfaced {:?}; normalizing to the cancellation reply",
+                e.reason,
+            ),
+        }
+        return Err(Error::from_reason(CHAT_SESSION_CANCELLED));
+    }
+    result
 }
 
 /// Invalidate every live-session signal after the generic flat executor has
@@ -826,12 +906,20 @@ fn render_live_continuation<B: ChatBackend>(
 /// generic streaming flow emits the terminal chunk itself and still
 /// returns `Ok(None)`; specialized executors signal the same via
 /// [`TurnOutput::Streamed`]).
+///
+/// `turn_cancel` is the whole-turn cooperative cancel flag, populated
+/// by BOTH the sync wrappers and the streaming twins (streaming passes
+/// the same atomic that backs its [`StreamingHooks::cancelled`], so
+/// streaming behavior is byte-identical). It feeds the specialized
+/// executors' [`WholeTurnArgs::cancelled`] and the generic decode
+/// loop's per-step snapshot ([`DecodeLoopArgs::cancel_flag`]).
 fn chat_turn_core<B: ChatBackend>(
     backend: &mut B,
     messages: Vec<ChatMessage>,
     config: ChatConfig,
     turn_kind: TurnKind,
     streaming: Option<StreamingHooks<'_>>,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<Option<ChatResult>> {
     // --- tokenizer + session EOS + thinking state ---
     let tokenizer = backend.tokenizer()?;
@@ -977,7 +1065,12 @@ fn chat_turn_core<B: ChatBackend>(
             thinking,
             plan: turn_plan,
             sink: streaming.as_ref().map(|s| s.sink),
-            cancelled: streaming.as_ref().map(|s| s.cancelled),
+            // The whole-turn cancel flag rides for SYNC turns too (H2).
+            // Family cores route on the `(sink, cancelled)` PAIR — a
+            // `(None, Some(_))` turn still takes the sync arm — so
+            // populating this on sink-less turns only arms their decode
+            // polls, never their streaming paths.
+            cancelled: turn_cancel,
             media,
         };
 
@@ -1150,6 +1243,7 @@ fn chat_turn_core<B: ChatBackend>(
                     first_token_instant: &mut first_token_instant,
                     report_perf,
                     generation_stream,
+                    cancel_flag: turn_cancel,
                 },
                 streaming_ctx,
             )?;

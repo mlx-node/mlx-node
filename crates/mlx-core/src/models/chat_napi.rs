@@ -1,9 +1,11 @@
 //! Declarative generator for the per-family chat NAPI surface.
 //!
 //! Every language-model `#[napi]` class (`Qwen3Model`, `Qwen3_5Model`,
-//! `Qwen3_5MoeModel`, `Gemma4Model`, `Lfm2Model`) exposes the SAME seven
+//! `Qwen3_5MoeModel`, `Gemma4Model`, `Lfm2Model`) exposes the SAME ten
 //! chat-surface methods — `reset_caches`, `chat_session_start`,
-//! `chat_session_continue`, `chat_session_continue_tool`,
+//! `chat_session_continue`, `chat_session_continue_tool`, their
+//! additive `chat_session_*_cancellable` twins (H2 — return a
+//! `CancellableChatCall` immediately, reply via `result()`),
 //! `chat_stream_session_start`, `chat_stream_session_continue`,
 //! `chat_stream_session_continue_tool` — that simply forward a
 //! [`crate::engine::cmd::ChatCmd`] onto the family's dedicated model
@@ -12,7 +14,7 @@
 //! forwarding shims.
 //!
 //! [`chat_napi_surface!`] emits one dedicated `#[napi] impl $Class`
-//! block carrying those seven methods. napi-rs allows multiple
+//! block carrying those ten methods. napi-rs allows multiple
 //! `#[napi] impl` blocks per class, so each family keeps its own
 //! hand-written block (`load`, `generate`, `save_*`, `has_mtp_weights`,
 //! `has_block_paged_cache`, …) and adds one macro invocation for the
@@ -96,10 +98,46 @@ macro_rules! chat_napi_surface {
                             messages,
                             config,
                             reply,
+                            cancelled: ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(
+                                false,
+                            )),
                         },
                     )
                 })
                 .await
+            }
+
+            /// Cancellable twin of `chatSessionStart` (H2). Resolves
+            /// IMMEDIATELY with a `CancellableChatCall` whose `handle`
+            /// can cancel the queued/running turn; the reply arrives via
+            /// `call.result()`. A cancelled turn rejects `result()` with
+            /// the exact string `"chat session cancelled"`. The plain
+            /// `chatSessionStart` is untouched — this method is additive.
+            #[napi]
+            pub async fn chat_session_start_cancellable(
+                &self,
+                messages: ::std::vec::Vec<$crate::tokenizer::ChatMessage>,
+                config: ::std::option::Option<$crate::engine::types::ChatConfig>,
+            ) -> ::napi::Result<$crate::engine::types::CancellableChatCall> {
+                $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
+                $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
+                let config = config.unwrap_or_default();
+                let cancelled = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
+                let (reply, result_rx) = ::tokio::sync::oneshot::channel();
+                thread.send(
+                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
+                        $crate::engine::cmd::ChatCmd::SessionStart {
+                            messages,
+                            config,
+                            reply,
+                            cancelled: ::std::sync::Arc::clone(&cancelled),
+                        },
+                    ),
+                )?;
+                Ok($crate::engine::types::CancellableChatCall {
+                    cancelled,
+                    result_rx: ::std::sync::Mutex::new(::std::option::Option::Some(result_rx)),
+                })
             }
 
             /// Continue an existing chat session from the complete
@@ -123,10 +161,43 @@ macro_rules! chat_napi_surface {
                             messages,
                             config,
                             reply,
+                            cancelled: ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(
+                                false,
+                            )),
                         },
                     )
                 })
                 .await
+            }
+
+            /// Cancellable twin of `chatSessionContinue` (H2). Same
+            /// contract as `chatSessionStartCancellable`.
+            #[napi]
+            pub async fn chat_session_continue_cancellable(
+                &self,
+                messages: ::std::vec::Vec<$crate::tokenizer::ChatMessage>,
+                config: ::std::option::Option<$crate::engine::types::ChatConfig>,
+            ) -> ::napi::Result<$crate::engine::types::CancellableChatCall> {
+                $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
+                $crate::models::chat_napi::chat_napi_continuation_media_guard!(messages);
+                $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
+                let config = config.unwrap_or_default();
+                let cancelled = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
+                let (reply, result_rx) = ::tokio::sync::oneshot::channel();
+                thread.send(
+                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
+                        $crate::engine::cmd::ChatCmd::SessionContinue {
+                            messages,
+                            config,
+                            reply,
+                            cancelled: ::std::sync::Arc::clone(&cancelled),
+                        },
+                    ),
+                )?;
+                Ok($crate::engine::types::CancellableChatCall {
+                    cancelled,
+                    result_rx: ::std::sync::Mutex::new(::std::option::Option::Some(result_rx)),
+                })
             }
 
             /// Continue an existing chat session from a complete
@@ -147,10 +218,43 @@ macro_rules! chat_napi_surface {
                             messages,
                             config,
                             reply,
+                            cancelled: ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(
+                                false,
+                            )),
                         },
                     )
                 })
                 .await
+            }
+
+            /// Cancellable twin of `chatSessionContinueTool` (H2). Same
+            /// contract as `chatSessionStartCancellable`.
+            #[napi]
+            pub async fn chat_session_continue_tool_cancellable(
+                &self,
+                messages: ::std::vec::Vec<$crate::tokenizer::ChatMessage>,
+                config: ::std::option::Option<$crate::engine::types::ChatConfig>,
+            ) -> ::napi::Result<$crate::engine::types::CancellableChatCall> {
+                $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
+                $crate::models::chat_napi::chat_napi_continuation_media_guard!(messages);
+                $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
+                let config = config.unwrap_or_default();
+                let cancelled = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
+                let (reply, result_rx) = ::tokio::sync::oneshot::channel();
+                thread.send(
+                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
+                        $crate::engine::cmd::ChatCmd::SessionContinueTool {
+                            messages,
+                            config,
+                            reply,
+                            cancelled: ::std::sync::Arc::clone(&cancelled),
+                        },
+                    ),
+                )?;
+                Ok($crate::engine::types::CancellableChatCall {
+                    cancelled,
+                    result_rx: ::std::sync::Mutex::new(::std::option::Option::Some(result_rx)),
+                })
             }
 
             /// Streaming variant of `chatSessionStart`.

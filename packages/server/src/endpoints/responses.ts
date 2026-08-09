@@ -1379,6 +1379,7 @@ async function runSessionNonStreaming(
   newInputMessages: ChatMessage[],
   config: ChatConfig,
   isFreshSession: boolean,
+  signal?: AbortSignal,
 ): Promise<NonStreamingOutcome> {
   if (session.turns === 0) {
     // Fresh JS session does NOT imply a fresh native cache — the
@@ -1405,7 +1406,7 @@ async function runSessionNonStreaming(
     }
     session.primeHistory(messages);
     const initialTurns = session.turns;
-    const result = await session.startFromHistory(config);
+    const result = await session.startFromHistory(config, signal);
     return { result, committed: session.turns > initialTurns };
   }
 
@@ -1425,7 +1426,7 @@ async function runSessionNonStreaming(
     if (last.role === 'user') {
       const initialTurns = session.turns;
       const images = last.images ?? undefined;
-      const result = await session.send(last.content, images ? { images, config } : { config });
+      const result = await session.send(last.content, images ? { images, config, signal } : { config, signal });
       return { result, committed: session.turns > initialTurns };
     }
     if (last.role === 'tool') {
@@ -1438,7 +1439,11 @@ async function runSessionNonStreaming(
       // with the Anthropic `tool_result.is_error === true` source field
       // (the structured channel is the authoritative signal — see
       // `ChatMessage.isError` rustdoc).
-      const result = await session.sendToolResult(last.toolCallId, last.content, { config, isError: last.isError });
+      const result = await session.sendToolResult(last.toolCallId, last.content, {
+        config,
+        isError: last.isError,
+        signal,
+      });
       return { result, committed: session.turns > initialTurns };
     }
     // Non-user / non-tool single-message continuation (assistant /
@@ -1464,7 +1469,7 @@ async function runSessionNonStreaming(
   }
   session.primeHistory(messages);
   const initialTurns = session.turns;
-  const result = await session.startFromHistory(config);
+  const result = await session.startFromHistory(config, signal);
   return { result, committed: session.turns > initialTurns };
 }
 
@@ -2420,6 +2425,17 @@ export async function handleCreateResponse(
       httpReq.once('close', onAbortClose);
       httpReq.once('error', onAbortError);
     }
+    // Catch-up abort: a response torn down BEFORE the attach above has
+    // already emitted its terminal event, so the `once('close')`
+    // listeners will never fire. Consult the response-side socket state
+    // directly (the REQUEST side is deliberately excluded — a fully
+    // consumed IncomingMessage auto-destroys after 'end' on every normal
+    // request, so `httpReq.destroyed` is not a disconnect signal). This
+    // makes `streamSignal.aborted` authoritative for the H2 pre-dispatch
+    // disconnect check inside the mutex callback.
+    if (res.destroyed || res.writableEnded || abortSocket?.destroyed === true) {
+      abortController.abort();
+    }
     abortListenersAttached = true;
     const streamSignal: AbortSignal = abortController.signal;
 
@@ -2632,6 +2648,23 @@ export async function handleCreateResponse(
           if (effectivePromptCacheKey !== null) {
             maybeWarnPromptCacheKeyIneligible(effectivePromptCacheKey);
           }
+
+          // H2 pre-dispatch disconnect check (non-streaming only). A
+          // client that vanished while this request was parked behind the
+          // per-model mutex must not burn a whole prefill+decode budget
+          // producing a JSON body nobody can receive. Checked BEFORE the
+          // session lease so no warm entry is consumed and no native
+          // state is touched — the early return composes with the permit
+          // lifecycle exactly like the binding-changed return above (the
+          // pre-dispatch permit was already consumed atomically by
+          // `withExclusive`, and the handler's outer `finally` release is
+          // an idempotent no-op after that handoff). Streaming keeps its
+          // existing paths: the signal fast-aborts `_runChatStream` and
+          // the SSE drain loop breaks on `clientAborted` at loop-top.
+          if (mappedBody.stream !== true && abortController.signal.aborted) {
+            return;
+          }
+
           const lookup = sessionReg.getOrCreate(
             previousResponseId ?? null,
             requestedInstructions,
@@ -3220,16 +3253,27 @@ export async function handleCreateResponse(
               }
               committed = streamingWasCommitted();
             } else {
-              // The non-streaming native path has NO AbortSignal surface
-              // (plain `chatSession*` returns a Promise, no cancel), so a
-              // client that disconnects mid-generation still burns the
-              // full decode budget under this mutex. TODO: native
-              // cancellation for `chatSession*` — until then the best we
-              // can do is the disconnect-aware skip inside
-              // `handleNonStreaming` (short-circuits `endJson` and
-              // signals the outer persist gate) plus this documented
-              // limitation.
-              const outcome = await runSessionNonStreaming(session, messages, newInputMessages, config, !lookup.hit);
+              // Non-streaming cancellation (H2): `streamSignal` threads
+              // through `ChatSession.send/sendToolResult/startFromHistory`
+              // into the additive native `chatSession*Cancellable`
+              // surface, so a client that disconnects mid-generation
+              // flips the controller, the native turn unwinds at the
+              // next safepoint, and the dispatch REJECTS with
+              // "chat session cancelled" (routed through the ordinary
+              // uncommitted-error epilogue below — no adopt, no
+              // persist). A disconnect that lands before dispatch takes
+              // the pre-dispatch early return above instead. The
+              // disconnect-aware skip inside `handleNonStreaming` /
+              // `endJson` remains the last line of defense for a
+              // disconnect racing the final flush.
+              const outcome = await runSessionNonStreaming(
+                session,
+                messages,
+                newInputMessages,
+                config,
+                !lookup.hit,
+                streamSignal,
+              );
               // Prefix-cache observability headers for the non-streaming
               // path. `res.end` has not fired yet (the handler's
               // `endJson` call below is what flushes), so `setHeader`

@@ -599,7 +599,10 @@ pub(crate) struct WholeTurnArgs<'a> {
     /// Streaming sink; `None` on the sync core (`cb` at the
     /// `paged_turn_stream_core` call sites).
     pub sink: Option<&'a dyn ChunkSink>,
-    /// Cooperative-cancel flag; `None` on the sync core.
+    /// Cooperative-cancel flag for the WHOLE turn. Populated on both
+    /// streaming AND sync turns (H2) — family cores must route on the
+    /// `(sink, cancelled)` PAIR (a `(None, Some(_))` turn is a sync turn
+    /// whose decode polls are armed), never on `cancelled` alone.
     pub cancelled: Option<&'a AtomicBool>,
     /// Raw media for the model's multimodal preparation layer. Image and
     /// audio are independent, composable inputs; adding another modality
@@ -848,14 +851,13 @@ pub(crate) trait ChatBackend {
     /// support mid-prefill cancellation poll it at chunk boundaries; the
     /// default impl ignores it (single-shot prefills stay uncancellable).
     ///
-    /// Lifecycle (load-bearing): the streaming session cores install the
-    /// flag (`Some`) after their cancelled-before-start guard and clear it
-    /// (`None`) in the turn epilogue on EVERY exit path — success, error,
-    /// and cancel. A stale flag left on the backend would spuriously
-    /// cancel the NEXT turn's prefill (the per-turn `Arc<AtomicBool>`
-    /// stays flipped forever once its turn was cancelled). Sync entry
-    /// points carry no flag today and never call this, so `turn_cancel`
-    /// stays `None` for their whole turn (Task 4 wires them).
+    /// Lifecycle (load-bearing): BOTH the streaming session cores and the
+    /// sync session wrappers (H2) install the flag (`Some`) after their
+    /// cancelled-before-start guard and clear it (`None`) in the turn
+    /// epilogue on EVERY exit path — success, error, and cancel. A stale
+    /// flag left on the backend would spuriously cancel the NEXT turn's
+    /// prefill (the per-turn `Arc<AtomicBool>` stays flipped forever once
+    /// its turn was cancelled).
     ///
     /// A poll that observes `true` returns the distinguished error
     /// `"prefill cancelled"`, which rides the existing prefill-`Err`

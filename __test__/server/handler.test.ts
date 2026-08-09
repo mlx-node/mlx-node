@@ -3004,12 +3004,15 @@ describe('createHandler', () => {
     });
 
     it('iter-35 finding 2: non-streaming skips endJson and persistResponse on a dead peer', async () => {
-      // The non-streaming native path has no AbortSignal surface, so a mid-generation
-      // client disconnect still burns every remaining token under the per-model
-      // mutex. Once decode returns, the handler must NOT write JSON to a dead socket
-      // and must NOT persist a record the client never saw — persistence would leave
-      // a dangling entry that a later `previous_response_id` could resurrect.
-      // `handleNonStreaming` checks `res.destroyed || res.socket?.destroyed` first.
+      // A peer that is already dead when the request reaches the mutex
+      // now takes the H2 pre-dispatch skip: the native turn is never
+      // dispatched at all (previously it ran to completion and only the
+      // flush inside `handleNonStreaming` was skipped). Either way the
+      // handler must NOT write JSON to a dead socket and must NOT
+      // persist a record the client never saw — persistence would leave
+      // a dangling entry that a later `previous_response_id` could
+      // resurrect. Note: no `waitForEnd()` here — the pre-dispatch skip
+      // returns without ever calling `end()`/`destroy()`.
       const model = createMockModel(makeChatResult({ text: 'late reply' }));
       const registry = new ModelRegistry();
       registry.register('nonstream-model', model);
@@ -3029,20 +3032,178 @@ describe('createHandler', () => {
         input: 'hi',
         stream: false,
       });
-      const { res, waitForEnd, getBody } = createMockRes();
-      // Mark the response destroyed BEFORE invoking the handler
-      // so the disconnect-aware skip fires the moment the handler
-      // tries to flush.
+      const { res, getBody } = createMockRes();
+      // Mark the response destroyed BEFORE invoking the handler so the
+      // catch-up abort at listener-attach flips the signal and the
+      // pre-dispatch skip fires inside the mutex callback.
       (res as unknown as { destroyed: boolean }).destroyed = true;
 
       await handler(req, res);
-      await waitForEnd();
 
-      // No body written (the skip branch returns early) and no
-      // persisted record (the outer persist gate reads
-      // `clientObservedOrDisconnected === false`).
+      // No native dispatch, no body, no persisted record.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(model.chatSessionStart).not.toHaveBeenCalled();
       expect(getBody()).toBe('');
       expect(mockStore.store).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Build a session-capable mock with the ADDITIVE cancellable
+     * non-streaming surface (H2). `chatSessionStartCancellable` records
+     * the returned handle; its `result()` promise resolves only after
+     * `handle.cancel()` was observed — modelling the native reply
+     * contract without the addon. The PLAIN `chatSessionStart` also
+     * signals dispatch so a pre-fix run fails the assertions instead of
+     * hanging the test.
+     */
+    function createCancellableMockModel(): {
+      model: SessionCapableModel;
+      handle: { cancel: ReturnType<typeof vi.fn> };
+      plainStart: ReturnType<typeof vi.fn>;
+      cancellableStart: ReturnType<typeof vi.fn>;
+      dispatchObserved: Promise<void>;
+    } {
+      let dispatched!: () => void;
+      const dispatchObserved = new Promise<void>((r) => {
+        dispatched = r;
+      });
+      let cancelSeen!: () => void;
+      const cancelObserved = new Promise<void>((r) => {
+        cancelSeen = r;
+      });
+      const handle = {
+        cancel: vi.fn(() => {
+          cancelSeen();
+        }),
+      };
+      const plainStart = vi.fn(async (): Promise<ChatResult> => {
+        dispatched();
+        return makeChatResult({ text: 'plain (non-cancellable) reply' });
+      });
+      const cancellableStart = vi.fn(async () => {
+        dispatched();
+        return {
+          handle,
+          result: () => cancelObserved.then(() => makeChatResult({ text: 'resolved after cancel' })),
+        };
+      });
+      const model = {
+        chatSessionStart: plainStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('continue should not be reached')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+        chatSessionStartCancellable: cancellableStart,
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
+      } as unknown as SessionCapableModel;
+      return { model, handle, plainStart, cancellableStart, dispatchObserved };
+    }
+
+    it('H2: non-streaming skips native dispatch entirely when the socket is already destroyed pre-dispatch', async () => {
+      // A client that vanished before the request cleared the per-model
+      // mutex must not burn a whole decode budget. The handler's
+      // pre-dispatch disconnect check fires INSIDE the mutex callback,
+      // before any session lease / reset / prime — so neither the plain
+      // nor the cancellable native method is ever invoked.
+      const { model, plainStart, cancellableStart } = createCancellableMockModel();
+      const registry = new ModelRegistry();
+      registry.register('h2-predispatch-model', model);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'h2-predispatch-model',
+        input: 'hi',
+        stream: false,
+      });
+      const { res, getBody } = createMockRes();
+      // Destroy the response BEFORE the handler runs — the 'close' event
+      // (if any) predates the abort-listener attach, so the handler must
+      // consult socket state, not just its AbortController.
+      (res as unknown as { destroyed: boolean }).destroyed = true;
+
+      await handler(req, res);
+
+      expect(plainStart).not.toHaveBeenCalled();
+      expect(cancellableStart).not.toHaveBeenCalled();
+      expect(getBody()).toBe('');
+    });
+
+    it('H2: mid-flight client disconnect cancels the non-streaming native turn via handle.cancel()', async () => {
+      // Once the non-streaming dispatch is in flight, a client 'close'
+      // must flip the handler's AbortController, whose signal the
+      // ChatSession wires to the native CancellableChatCall handle. The
+      // mock's result() resolves only after cancel() is observed, so a
+      // missing wire-up either leaves cancel() un-invoked (pre-fix plain
+      // path — clean RED) or hangs (broken listener wiring).
+      const { model, handle, cancellableStart, dispatchObserved } = createCancellableMockModel();
+      const registry = new ModelRegistry();
+      registry.register('h2-midflight-model', model);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'h2-midflight-model',
+        input: 'hi',
+        stream: false,
+      });
+      const { res } = createMockRes();
+      const inflight = handler(req, res);
+
+      await dispatchObserved;
+      // Let the ChatSession attach its abort listener to the signal
+      // before the disconnect fires.
+      await new Promise((r) => setImmediate(r));
+      (res as unknown as NodeJS.EventEmitter).emit('close');
+
+      await inflight;
+      expect(cancellableStart).toHaveBeenCalledTimes(1);
+      expect(handle.cancel).toHaveBeenCalled();
+    });
+
+    it('H2: /v1/messages non-streaming skips native dispatch for a pre-destroyed socket', async () => {
+      const { model, plainStart, cancellableStart } = createCancellableMockModel();
+      const registry = new ModelRegistry();
+      registry.register('h2-msg-predispatch-model', model);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/messages', {
+        model: 'h2-msg-predispatch-model',
+        max_tokens: 16,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      });
+      const { res, getBody } = createMockRes();
+      (res as unknown as { destroyed: boolean }).destroyed = true;
+
+      await handler(req, res);
+
+      expect(plainStart).not.toHaveBeenCalled();
+      expect(cancellableStart).not.toHaveBeenCalled();
+      expect(getBody()).toBe('');
+    });
+
+    it('H2: /v1/messages mid-flight disconnect cancels the non-streaming native turn via handle.cancel()', async () => {
+      const { model, handle, cancellableStart, dispatchObserved } = createCancellableMockModel();
+      const registry = new ModelRegistry();
+      registry.register('h2-msg-midflight-model', model);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/messages', {
+        model: 'h2-msg-midflight-model',
+        max_tokens: 16,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      });
+      const { res } = createMockRes();
+      const inflight = handler(req, res);
+
+      await dispatchObserved;
+      await new Promise((r) => setImmediate(r));
+      (res as unknown as NodeJS.EventEmitter).emit('close');
+
+      await inflight;
+      expect(cancellableStart).toHaveBeenCalledTimes(1);
+      expect(handle.cancel).toHaveBeenCalled();
     });
 
     it('iter-35 finding 2: persistResponse runs OUTSIDE the per-model mutex', async () => {
@@ -11216,9 +11377,12 @@ describe('createHandler', () => {
       // returns without queuing the write) — pinning the per-
       // model `withExclusive` mutex on a dead client forever.
       //
-      // This test marks the underlying socket destroyed before
-      // the handler runs, then verifies the handler completes
-      // within a timeout bound (no hang), no session is
+      // This test destroys the underlying socket MID-FLIGHT (from
+      // inside the mock's `chatSessionStart`, i.e. after the H2
+      // pre-dispatch disconnect check has already passed — a socket
+      // destroyed BEFORE dispatch now takes the pre-dispatch skip and
+      // never reaches `endJson` at all), then verifies the handler
+      // completes within a timeout bound (no hang), no session is
       // adopted, and no SSE frame leaks into the JSON body.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'committed reply' }));
@@ -11231,16 +11395,21 @@ describe('createHandler', () => {
       });
       const { res, getBody, wasDestroyed } = createMockRes();
 
-      // Install a fake destroyed socket. The `endJson` helper's
-      // pre-check reads `res.socket?.destroyed`; mirror that shape.
-      Object.defineProperty(res, 'socket', {
-        configurable: true,
-        get: () => ({
-          destroyed: true,
-          once: () => {},
-          removeListener: () => {},
-          off: () => {},
-        }),
+      // Install the fake destroyed socket only once the native dispatch
+      // is in flight, so the turn completes and `endJson`'s pre-check
+      // (`res.destroyed || res.socket?.destroyed`) is what must catch
+      // the dead peer.
+      (mockModel.chatSessionStart as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        Object.defineProperty(res, 'socket', {
+          configurable: true,
+          get: () => ({
+            destroyed: true,
+            once: () => {},
+            removeListener: () => {},
+            off: () => {},
+          }),
+        });
+        return makeChatResult({ text: 'committed reply' });
       });
 
       // If the helper regressed to parking on a callback that

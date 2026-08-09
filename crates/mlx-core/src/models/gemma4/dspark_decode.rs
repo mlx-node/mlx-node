@@ -2119,9 +2119,18 @@ pub(crate) mod tests {
         let (mut inner, _weight_bytes) = Gemma4Inner::load_from_dir(&model_path, Some(&draft_path))
             .expect("12B + draft load failed");
 
+        // Never-flipped whole-turn cancel flag — the sync session cores
+        // now take one (H2); these turns are never cancelled.
+        let no_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         // --- AR baseline: 2 turns, capturing history + offsets ---
-        let ar1 = crate::engine::session::session_start(&mut inner, vec![user(PROMPT)], cfg(false))
-            .expect("AR turn 1 failed");
+        let ar1 = crate::engine::session::session_start(
+            &mut inner,
+            vec![user(PROMPT)],
+            cfg(false),
+            &no_cancel,
+        )
+        .expect("AR turn 1 failed");
         assert_eq!(ar1.finish_reason, "stop", "fixture must stop early on EOS");
         let ar_h1 = inner.cached_token_history.clone();
         assert_offsets_match_history(&inner, "ar_turn1");
@@ -2129,14 +2138,20 @@ pub(crate) mod tests {
             &mut inner,
             vec![user(PROMPT), assistant(&ar1), user(FOLLOW_UP)],
             cfg(false),
+            &no_cancel,
         )
         .expect("AR turn 2 failed");
         let ar_h2 = inner.cached_token_history.clone();
         assert_offsets_match_history(&inner, "ar_turn2");
 
         // --- DSpark pass: same 2 turns ---
-        let sp1 = crate::engine::session::session_start(&mut inner, vec![user(PROMPT)], cfg(true))
-            .expect("DSpark turn 1 failed");
+        let sp1 = crate::engine::session::session_start(
+            &mut inner,
+            vec![user(PROMPT)],
+            cfg(true),
+            &no_cancel,
+        )
+        .expect("DSpark turn 1 failed");
         assert_eq!(sp1.finish_reason, "stop");
         // SHAPE fingerprint: the EOS must have been accepted as a DRAFT.
         let perf = sp1.performance.as_ref().expect("DSpark perf missing");
@@ -2161,6 +2176,7 @@ pub(crate) mod tests {
             &mut inner,
             vec![user(PROMPT), assistant(&sp1), user(FOLLOW_UP)],
             cfg(true),
+            &no_cancel,
         )
         .expect("DSpark turn 2 failed");
         assert!(

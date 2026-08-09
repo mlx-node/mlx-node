@@ -344,6 +344,22 @@ function publicStreamEvent(event: ChatStreamEvent, config: ChatConfig): ChatStre
  * (handy for IDE autocomplete) while the implementation remains
  * fully structural.
  */
+/**
+ * Structural shape of the native `CancellableChatCall` object returned
+ * by the additive `chatSession*Cancellable` methods (H2). Kept
+ * structural (rather than importing the class type from
+ * `@mlx-node/core`) so test doubles satisfy it with a plain object.
+ */
+export interface CancellableChatCall {
+  /** Cancellation token — `handle.cancel()` flips the shared native flag. */
+  readonly handle: { cancel(): void };
+  /**
+   * The turn's reply. Single-shot; rejects with the exact string
+   * `"chat session cancelled"` when the turn was cancelled.
+   */
+  result(): Promise<ChatResult>;
+}
+
 export interface SessionCapableModel {
   /**
    * Optional non-generating chat-template tokenizer. Exposed by
@@ -394,6 +410,24 @@ export interface SessionCapableModel {
   chatSessionStart(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
   chatSessionContinue(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
   chatSessionContinueTool(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
+  /**
+   * ADDITIVE cancellable twins of the three non-streaming entry points
+   * (H2). Each resolves immediately with a {@link CancellableChatCall}
+   * whose `handle.cancel()` cooperatively cancels the queued/running
+   * native turn; the turn's reply arrives via `call.result()`, which
+   * REJECTS with the exact string `"chat session cancelled"` when the
+   * turn was cancelled. Optional so third-party/mock implementations
+   * (and wrappers pre-dating the surface, e.g. the Qianfan-OCR VLM)
+   * keep satisfying the structural contract — when absent, the
+   * non-streaming entry points ignore {@link SendOptions.signal}
+   * exactly as before.
+   */
+  chatSessionStartCancellable?(messages: ChatMessage[], config?: ChatConfig | null): Promise<CancellableChatCall>;
+  chatSessionContinueCancellable?(messages: ChatMessage[], config?: ChatConfig | null): Promise<CancellableChatCall>;
+  chatSessionContinueToolCancellable?(
+    messages: ChatMessage[],
+    config?: ChatConfig | null,
+  ): Promise<CancellableChatCall>;
   /**
    * The optional `signal` parameter on every streaming entry point is
    * plumbed into the `_runChatStream` fast-abort path in the wrapper
@@ -578,20 +612,27 @@ export interface SendOptions {
    */
   config?: ChatConfig;
   /**
-   * Optional AbortSignal plumbed into the streaming fast-abort path.
+   * Optional AbortSignal for client-disconnect-aware cancellation.
    *
-   * Only honored by the streaming entry points (`sendStream`,
-   * `sendToolResultStream`, `startFromHistoryStream`) — the
-   * non-streaming `send` / `sendToolResult` / `startFromHistory`
-   * calls have NO native cancel surface, so a signal passed to them
-   * is ignored. Pass one here and the inner `_runChatStream`
-   * adapter wakes from `waitForItem()` on abort, calls
-   * `handle.cancel()` on the native handle, and unwinds the stream
-   * without throwing an AbortError — the outer consumer's `for await`
-   * just ends early. Intended for HTTP endpoints that flip a
-   * controller on `res.once('close', …)` so client disconnect stops
-   * the native decode at the next safepoint rather than running it
-   * to completion under the per-model mutex.
+   * Streaming entry points (`sendStream`, `sendToolResultStream`,
+   * `startFromHistoryStream`): the inner `_runChatStream` adapter wakes
+   * from `waitForItem()` on abort, calls `handle.cancel()` on the
+   * native handle, and unwinds the stream without throwing an
+   * AbortError — the outer consumer's `for await` just ends early.
+   *
+   * Non-streaming entry points (`send` / `sendToolResult` /
+   * `startFromHistory`) honor it too (H2) WHEN the model exposes the
+   * additive `chatSession*Cancellable` surface: an already-aborted
+   * signal rejects before dispatch, and an abort mid-turn calls
+   * `handle.cancel()` on the native `CancellableChatCall`, whose
+   * `result()` then REJECTS with `"chat session cancelled"`. Models
+   * without the cancellable surface keep the previous behavior (the
+   * signal is ignored on non-streaming calls).
+   *
+   * Intended for HTTP endpoints that flip a controller on
+   * `res.once('close', …)` so client disconnect stops the native
+   * decode at the next safepoint rather than running it to completion
+   * under the per-model mutex.
    */
   signal?: AbortSignal;
 }
@@ -876,6 +917,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           imageChanged || audioChanged || replayRequired,
           isFirstTurn,
           mergedConfig,
+          opts.signal,
         );
       }
 
@@ -887,9 +929,11 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const constrainedConfig = await this.constrainToContextCapacity(pendingHistory, mergedConfig);
       let result: ChatResult;
       try {
-        result = await this.model.chatSessionContinue(
+        result = await this.runNonStreamingNative(
+          'continue',
           pendingHistory,
           withReplayReasoning(constrainedConfig, this.model),
+          opts.signal,
         );
       } catch (err) {
         if (!isMediaHeldRestartError(err)) {
@@ -903,7 +947,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // the trailing-media keys keep `lastImagesKey`/`lastAudioKey`
         // consistent across the replay. The continuation path has NOT pushed
         // `userMessage` yet, so `runStartPath` pushing it adds no duplicate.
-        return await this.runStartPath(userMessage, undefined, undefined, true, false, constrainedConfig);
+        return await this.runStartPath(userMessage, undefined, undefined, true, false, constrainedConfig, opts.signal);
       }
       this.history.push(pendingUser);
       this.history.push(
@@ -1105,7 +1149,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   async sendToolResult(
     toolCallId: string,
     content: string,
-    opts: { isError?: boolean; config?: ChatConfig } = {},
+    opts: { isError?: boolean; config?: ChatConfig; signal?: AbortSignal } = {},
   ): Promise<ChatResult> {
     if (this.inFlight) {
       throw new Error('ChatSession: concurrent send() not allowed; await the previous call first');
@@ -1113,7 +1157,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     this.assertCanSendToolResult('sendToolResult');
     this.inFlight = true;
     try {
-      const { isError, config } = opts;
+      const { isError, config, signal } = opts;
       const mergedConfig = this.mergeConfig(config);
       const toolMsg: ChatMessage = {
         role: 'tool',
@@ -1134,12 +1178,14 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // tool-call turn (turnCount>=1), so this never fires on the happy
       // path.
       if (this.turnCount === 0 || this.needsFullReplay) {
-        return await this.replayToolResultThroughStartPath(toolMsg, constrainedConfig);
+        return await this.replayToolResultThroughStartPath(toolMsg, constrainedConfig, signal);
       }
       try {
-        const result = await this.model.chatSessionContinueTool(
+        const result = await this.runNonStreamingNative(
+          'continueTool',
           pendingHistory,
           withReplayReasoning(constrainedConfig, this.model),
+          signal,
         );
         this.history.push({ role: 'tool', content, toolCallId, isError });
         this.history.push(
@@ -1171,7 +1217,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // restart core pushes it — `isError` rides on that message so the
         // wire-format error marker is re-rendered, and a tool result
         // always follows >=1 prior turn so `isFirstTurn` is false.
-        return await this.replayToolResultThroughStartPath(toolMsg, constrainedConfig);
+        return await this.replayToolResultThroughStartPath(toolMsg, constrainedConfig, signal);
       }
     } finally {
       this.inFlight = false;
@@ -1189,8 +1235,12 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * cache; `isFirstTurn=false` because a tool result always follows a
    * prior tool-call turn.
    */
-  private async replayToolResultThroughStartPath(toolMsg: ChatMessage, config: ChatConfig): Promise<ChatResult> {
-    return await this.runStartPathWithMessage(toolMsg, true, false, config);
+  private async replayToolResultThroughStartPath(
+    toolMsg: ChatMessage,
+    config: ChatConfig,
+    signal?: AbortSignal,
+  ): Promise<ChatResult> {
+    return await this.runStartPathWithMessage(toolMsg, true, false, config, signal);
   }
 
   /**
@@ -1452,7 +1502,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * stay on the delta path, and subsequent image turns correctly
    * trigger restart).
    */
-  async startFromHistory(config?: ChatConfig): Promise<ChatResult> {
+  async startFromHistory(config?: ChatConfig, signal?: AbortSignal): Promise<ChatResult> {
     if (this.inFlight) {
       throw new Error('ChatSession: cannot startFromHistory() while a send() is in flight');
     }
@@ -1467,9 +1517,11 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const mergedConfig = this.mergeConfig(config);
       const historySnapshot = this.history.slice();
       const constrainedConfig = await this.constrainToContextCapacity(historySnapshot, mergedConfig);
-      const result = await this.model.chatSessionStart(
+      const result = await this.runNonStreamingNative(
+        'start',
         historySnapshot,
         withReplayReasoning(constrainedConfig, this.model),
+        signal,
       );
       this.history.push(
         buildAssistantMessage(
@@ -1585,6 +1637,72 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   // -------------------------------------------------------------------
   // Internal helpers
   // -------------------------------------------------------------------
+
+  /**
+   * Dispatch one non-streaming native turn, preferring the cancellable
+   * surface (H2) when BOTH an AbortSignal was supplied AND the model
+   * exposes the matching `chatSession*Cancellable` method.
+   *
+   * Cancellable path: an already-aborted signal rejects BEFORE dispatch
+   * (`"chat session cancelled"` — the same string the native reply
+   * contract uses); otherwise the call object's handle is wired to the
+   * signal (`{ once: true }` listener plus a post-attach `aborted`
+   * re-check, because an 'abort' listener added to an already-aborted
+   * signal never fires) and the reply is awaited via `call.result()`.
+   * The listener is detached in `finally` so a long-lived signal cannot
+   * accumulate handlers across turns.
+   *
+   * Fallback path (no signal, or the model lacks the surface — e.g.
+   * mocks and the Qianfan-OCR VLM): the plain method, byte-identical
+   * behavior to before.
+   *
+   * Callers sit inside the entry points' existing try/finally blocks,
+   * so a rejection here releases `inFlight` and (on the delta paths)
+   * sets `needsFullReplay` exactly like any other native failure.
+   */
+  private async runNonStreamingNative(
+    kind: 'start' | 'continue' | 'continueTool',
+    messages: ChatMessage[],
+    config: ChatConfig,
+    signal: AbortSignal | undefined,
+  ): Promise<ChatResult> {
+    const model = this.model;
+    const cancellable =
+      signal == null
+        ? undefined
+        : kind === 'start'
+          ? model.chatSessionStartCancellable?.bind(model)
+          : kind === 'continue'
+            ? model.chatSessionContinueCancellable?.bind(model)
+            : model.chatSessionContinueToolCancellable?.bind(model);
+    if (signal != null && cancellable != null) {
+      if (signal.aborted) {
+        throw new Error('chat session cancelled');
+      }
+      const call = await cancellable(messages, config);
+      const onAbort = (): void => {
+        call.handle.cancel();
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      // Attach race: an abort landing between the pre-dispatch check
+      // and the attach never fires the listener — catch up explicitly.
+      if (signal.aborted) {
+        call.handle.cancel();
+      }
+      try {
+        return await call.result();
+      } finally {
+        signal.removeEventListener('abort', onAbort);
+      }
+    }
+    if (kind === 'start') {
+      return await model.chatSessionStart(messages, config);
+    }
+    if (kind === 'continue') {
+      return await model.chatSessionContinue(messages, config);
+    }
+    return await model.chatSessionContinueTool(messages, config);
+  }
 
   /**
    * Gate plain-text continuation entry points (`send`, `sendStream`)
@@ -1814,9 +1932,10 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     mediaChanged: boolean,
     isFirstTurn: boolean,
     config: ChatConfig,
+    signal?: AbortSignal,
   ): Promise<ChatResult> {
     const userMsg = this.buildUserMessage(userMessage, images, audio);
-    return await this.runStartPathWithMessage(userMsg, mediaChanged, isFirstTurn, config);
+    return await this.runStartPathWithMessage(userMsg, mediaChanged, isFirstTurn, config, signal);
   }
 
   /**
@@ -1832,6 +1951,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     mediaChanged: boolean,
     isFirstTurn: boolean,
     config: ChatConfig,
+    signal?: AbortSignal,
   ): Promise<ChatResult> {
     // Capture pre-state so the restart can be rolled back if the
     // native call fails. The media-change branch resets caches BEFORE
@@ -1854,9 +1974,11 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // (e.g. the assistant reply below) don't retroactively mutate
       // what the native side / any mock observed as its `messages`
       // argument.
-      const result = await this.model.chatSessionStart(
+      const result = await this.runNonStreamingNative(
+        'start',
         this.history.slice(),
         withReplayReasoning(constrainedConfig, this.model),
+        signal,
       );
       this.history.push(
         buildAssistantMessage(

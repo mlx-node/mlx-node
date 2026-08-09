@@ -898,6 +898,7 @@ async function runSessionNonStreaming(
   messages: ChatMessage[],
   config: ChatConfig,
   resetNativeCache: boolean,
+  signal?: AbortSignal,
 ): Promise<MessagesNonStreamingOutcome> {
   // Dual-branch reset gated by the caller's native-cache policy:
   //
@@ -929,7 +930,7 @@ async function runSessionNonStreaming(
   }
   session.primeHistory(messages);
   const initialTurns = session.turns;
-  const result = await session.startFromHistory(config);
+  const result = await session.startFromHistory(config, signal);
   // Mirror the streaming-side dual-gate (`streamResult.ok &&
   // outcome.wasCommitted()`) and the sibling `/v1/responses` adopt
   // gate. `ChatSession.startFromHistory` advances `turnCount`
@@ -1279,6 +1280,17 @@ export async function handleCreateMessage(
       httpReq.once('close', onAbortClose);
       httpReq.once('error', onAbortError);
     }
+    // Catch-up abort: a response torn down BEFORE the attach above has
+    // already emitted its terminal event, so the `once('close')`
+    // listeners will never fire. Consult the response-side socket state
+    // directly (the REQUEST side is deliberately excluded — a fully
+    // consumed IncomingMessage auto-destroys after 'end' on every
+    // normal request, so `httpReq.destroyed` is not a disconnect
+    // signal). Makes `streamSignal.aborted` authoritative for the H2
+    // pre-dispatch disconnect check inside the mutex callback.
+    if (res.destroyed || res.writableEnded || abortSocket?.destroyed === true) {
+      abortController.abort();
+    }
     abortListenersAttached = true;
     const streamSignal: AbortSignal = abortController.signal;
 
@@ -1393,6 +1405,22 @@ export async function handleCreateMessage(
           // reuse on paged-active models is now driven by native
           // content-addressing instead of the JS warm slot, so adding
           // the field is no longer a prerequisite for that use case.
+          // H2 pre-dispatch disconnect check (non-streaming only). A
+          // client that vanished while this request was parked behind
+          // the per-model mutex must not burn a whole prefill+decode
+          // budget producing a JSON body nobody can receive. Checked
+          // BEFORE the warm-slot lease so no session state is consumed
+          // or mutated — the early return composes with the permit
+          // lifecycle exactly like the binding-changed return above
+          // (the pre-dispatch permit was already consumed atomically by
+          // `withExclusive`; the outer `finally` release is an
+          // idempotent no-op after handoff). Streaming keeps its
+          // existing paths: the signal fast-aborts `_runChatStream` and
+          // the SSE drain loop breaks on `clientAborted` at loop-top.
+          if (body.stream !== true && streamSignal.aborted) {
+            return;
+          }
+
           const pagedActive = leaseModel.hasBlockPagedCache?.() === true;
           const lookup = pagedActive ? sessionReg.createFreshSession() : sessionReg.getOrCreateWarmAny(requestedSystem);
           const session = lookup.session;
@@ -1512,9 +1540,17 @@ export async function handleCreateMessage(
               // See the streaming branch above for the rationale on
               // preserving native cache on the paged path.
               const resetNativeCache = pagedActive ? false : !lookup.hit;
-              // Native `chatSessionStart` has no AbortSignal yet — disconnect handling
-              // lives inside `handleNonStreaming` / `endJson`.
-              const outcome = await runSessionNonStreaming(session, messages, config, resetNativeCache);
+              // Non-streaming cancellation (H2): `streamSignal` threads
+              // through `ChatSession.startFromHistory` into the additive
+              // native `chatSession*Cancellable` surface — a mid-turn
+              // disconnect flips the controller, the native turn unwinds
+              // at the next safepoint, and the dispatch rejects with
+              // "chat session cancelled" (routed through the catch below:
+              // warm slot dropped, nothing persisted). The
+              // disconnect-aware skip inside `handleNonStreaming` /
+              // `endJson` remains the last line of defense for a
+              // disconnect racing the final flush.
+              const outcome = await runSessionNonStreaming(session, messages, config, resetNativeCache, streamSignal);
               const result = outcome.result;
               // Re-classify the `X-Session-Cache` header.
               //

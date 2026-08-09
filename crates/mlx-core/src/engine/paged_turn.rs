@@ -217,6 +217,10 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
                 first_token_instant: &mut first_token_instant,
                 report_perf,
                 generation_stream: decode_generation_stream,
+                // Whole-turn cancel flag (H2): populated for sync paged
+                // turns too — the engine passes it via
+                // `WholeTurnArgs::cancelled` regardless of sink presence.
+                cancel_flag: args.cancelled,
             },
             streaming_ctx,
         )?;
