@@ -45,7 +45,9 @@ import { loadModel, type ChatStreamEvent, type LoadableModel, type SessionCapabl
 import { createServer, type ServerInstance } from '@mlx-node/server';
 import { afterAll, beforeAll, describe, expect, it } from 'vite-plus/test';
 
-const MODEL_PATH = process.env.QWEN3_STAGE0_MODEL_PATH;
+const MODEL_ENV_NAME = 'QWEN3_STAGE0_MODEL_PATH';
+const MODEL_ENV_PRESENT = Object.prototype.hasOwnProperty.call(process.env, MODEL_ENV_NAME);
+const MODEL_PATH = process.env[MODEL_ENV_NAME];
 const MODEL_NAME = 'stage0-qwen3';
 // This checkpoint's CI-sized paged pool reports 18,720 prompt-token capacity;
 // stay below it while remaining comfortably above the plan's 8k+ threshold.
@@ -86,7 +88,7 @@ type InstrumentedModel = {
   streamEvents: () => number;
   streamCloses: () => number;
   nonStreamingDispatches: () => number;
-  nonStreamingCancellations: () => number;
+  nonStreamingCancellationErrors: () => readonly unknown[];
 };
 
 const trackedSockets = new Set<Socket>();
@@ -107,6 +109,13 @@ async function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs: num
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
+}
+
+function settle(promise: Promise<unknown>): Promise<void> {
+  return promise.then(
+    () => undefined,
+    () => undefined,
+  );
 }
 
 async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 5_000): Promise<void> {
@@ -247,7 +256,7 @@ function instrumentModel(target: SessionCapableModel): InstrumentedModel {
   let streamEvents = 0;
   let streamCloses = 0;
   let nonStreamingDispatches = 0;
-  let nonStreamingCancellations = 0;
+  const nonStreamingCancellationErrors: unknown[] = [];
 
   const proxy = new Proxy(target, {
     get(model, property) {
@@ -289,9 +298,7 @@ function instrumentModel(target: SessionCapableModel): InstrumentedModel {
                 try {
                   return await awaitResult();
                 } catch (error) {
-                  if (String(error).includes('chat session cancelled')) {
-                    nonStreamingCancellations += 1;
-                  }
+                  nonStreamingCancellationErrors.push(error);
                   throw error;
                 }
               },
@@ -310,7 +317,7 @@ function instrumentModel(target: SessionCapableModel): InstrumentedModel {
     streamEvents: () => streamEvents,
     streamCloses: () => streamCloses,
     nonStreamingDispatches: () => nonStreamingDispatches,
-    nonStreamingCancellations: () => nonStreamingCancellations,
+    nonStreamingCancellationErrors: () => nonStreamingCancellationErrors,
   };
 }
 
@@ -331,7 +338,7 @@ function startTickProbe(intervalMs = 50): { stop: () => number } {
   };
 }
 
-const stage0Describe = MODEL_PATH ? describe.sequential : describe.skip;
+const stage0Describe = MODEL_ENV_PRESENT ? describe.sequential : describe.skip;
 
 stage0Describe('Stage-0 real-model concurrency hazards', () => {
   let instance: ServerInstance;
@@ -345,8 +352,8 @@ stage0Describe('Stage-0 real-model concurrency hazards', () => {
     return registry;
   };
 
-  const waitForAdmissionDrain = (label: string, timeoutMs = 15_000) =>
-    waitUntil(
+  const waitForAdmissionDrain = async (label: string, timeoutMs = 15_000): Promise<void> => {
+    await waitUntil(
       () =>
         sessionRegistry().queueDepth === 0 &&
         sessionRegistry().preDispatchAdmitCount === 0 &&
@@ -354,41 +361,49 @@ stage0Describe('Stage-0 real-model concurrency hazards', () => {
       label,
       timeoutMs,
     );
+    expect(sessionRegistry().queueDepth).toBe(0);
+    expect(sessionRegistry().preDispatchAdmitCount).toBe(0);
+    expect(instance.health().work.inFlight).toBe(0);
+  };
 
   beforeAll(async () => {
-    if (MODEL_PATH === undefined) return;
-    if (!existsSync(MODEL_PATH) || !statSync(MODEL_PATH).isDirectory()) {
-      throw new Error(`QWEN3_STAGE0_MODEL_PATH is set but is not a directory: ${MODEL_PATH}`);
+    if (!MODEL_ENV_PRESENT) return;
+    const modelPath = MODEL_PATH;
+    if (modelPath == null || modelPath.trim() === '') {
+      throw new Error(`${MODEL_ENV_NAME} is explicitly set but empty; provide a converted Qwen3 checkpoint path`);
     }
-    if (!existsSync(join(MODEL_PATH, 'config.json'))) {
-      throw new Error(`QWEN3_STAGE0_MODEL_PATH has no config.json: ${MODEL_PATH}`);
+    if (!existsSync(modelPath) || !statSync(modelPath).isDirectory()) {
+      throw new Error(`${MODEL_ENV_NAME} is set but is not a directory: ${modelPath}`);
+    }
+    if (!existsSync(join(modelPath, 'config.json'))) {
+      throw new Error(`${MODEL_ENV_NAME} has no config.json: ${modelPath}`);
     }
     let modelType: unknown;
     try {
-      modelType = (JSON.parse(readFileSync(join(MODEL_PATH, 'config.json'), 'utf8')) as { model_type?: unknown })
+      modelType = (JSON.parse(readFileSync(join(modelPath, 'config.json'), 'utf8')) as { model_type?: unknown })
         .model_type;
     } catch (error) {
-      throw new Error(`QWEN3_STAGE0_MODEL_PATH has an invalid config.json: ${MODEL_PATH}: ${String(error)}`);
+      throw new Error(`${MODEL_ENV_NAME} has an invalid config.json: ${modelPath}: ${String(error)}`);
     }
     if (modelType !== 'qwen3') {
-      throw new Error(
-        `QWEN3_STAGE0_MODEL_PATH must identify a Qwen3 checkpoint; config model_type=${String(modelType)}`,
-      );
+      throw new Error(`${MODEL_ENV_NAME} must identify a Qwen3 checkpoint; config model_type=${String(modelType)}`);
     }
 
     instance = await createServer({
       port: 0,
       host: '127.0.0.1',
       disableStore: true,
-      idleClearCacheMs: 0,
+      // Keep the sweeper enabled so health().work.inFlight is the real
+      // request counter, but delay the allocator drain beyond this suite.
+      idleClearCacheMs: 3_600_000,
       maxQueueDepthPerModel: 1,
     });
     await instance.loadModel({
       name: MODEL_NAME,
       load: async () => {
-        const loaded = await loadModel(MODEL_PATH);
+        const loaded = await loadModel(modelPath);
         if (!isSessionModel(loaded)) {
-          throw new Error(`QWEN3_STAGE0_MODEL_PATH did not load a session-capable chat model: ${MODEL_PATH}`);
+          throw new Error(`${MODEL_ENV_NAME} did not load a session-capable chat model: ${modelPath}`);
         }
         nativeModel = loaded;
         instrumented = instrumentModel(loaded);
@@ -437,61 +452,66 @@ stage0Describe('Stage-0 real-model concurrency hazards', () => {
     const holderResponses: IncomingMessage[] = [];
     const holderOutcomes: Promise<unknown>[] = [];
     let stopHazardLoop = false;
+    let hazardLoop: Promise<JsonHttpResult> | undefined;
+    let startedHazardStreams = 0;
     // Give the interval one ordinary sample before entering the hazard window.
     await delay(75);
 
     try {
       const hazardStarted = performance.now();
-      const successor = await withTimeout(
-        (async () => {
-          for (let round = 0; round < H1_ABORT_ROUNDS; round += 1) {
-            const holder = startSseRequest(instance, {
-              model: MODEL_NAME,
-              input: LONG_PROMPT,
-              stream: true,
-              temperature: 0,
-              max_output_tokens: 64,
-            });
-            holders.push(holder);
-            holderOutcomes.push(holder.response.catch((error: unknown) => error));
-            const response = await withTimeout(
-              holder.response,
-              `H1 streaming holder ${round + 1} never returned SSE headers`,
-              5_000,
-            );
-            holderResponses.push(response);
-            await waitUntil(
-              () => instrumented.streamStarts() > baselineStreamStarts + round,
-              `H1 real stream ${round + 1} never entered native dispatch`,
-            );
-            await delay(25);
-            // The handle is now in flight. Abort before the first chunk can
-            // cross the HTTP iterator, then enqueue resetCaches DIRECTLY on
-            // the model. Awaiting it also keeps rounds strictly serial.
-            response.socket.destroy();
-            holder.request.destroy();
-            await nativeModel.resetCaches();
-            if (stopHazardLoop) {
-              throw new Error('H1 hazard loop stopped after the outer completion deadline');
-            }
-            await waitUntil(
-              () => instrumented.streamCloses() > baselineStreamCloses + round,
-              `H1 aborted stream ${round + 1} did not unwind`,
-            );
-          }
-          return await postJson(
-            instance,
-            CONTROL_BODY,
-            'H1 greedy successor did not complete',
-            H1_COMPLETION_DEADLINE_MS,
+      hazardLoop = (async () => {
+        for (let round = 0; round < H1_ABORT_ROUNDS; round += 1) {
+          const eventsBeforeRound = instrumented.streamEvents();
+          const holder = startSseRequest(instance, {
+            model: MODEL_NAME,
+            input: LONG_PROMPT,
+            stream: true,
+            temperature: 0,
+            max_output_tokens: 64,
+          });
+          holders.push(holder);
+          holderOutcomes.push(holder.response.catch((error: unknown) => error));
+          const response = await withTimeout(
+            holder.response,
+            `H1 streaming holder ${round + 1} never returned SSE headers`,
+            5_000,
           );
-        })(),
+          holderResponses.push(response);
+          await waitUntil(
+            () => instrumented.streamStarts() > baselineStreamStarts + round,
+            `H1 real stream ${round + 1} never entered native dispatch`,
+          );
+          startedHazardStreams += 1;
+          await delay(25);
+          expect(instrumented.streamEvents()).toBe(eventsBeforeRound);
+          // The handle is now in flight. Abort before the first chunk can
+          // cross the HTTP iterator, then enqueue resetCaches DIRECTLY on
+          // the model. Awaiting it also keeps rounds strictly serial.
+          response.socket.destroy();
+          holder.request.destroy();
+          await nativeModel.resetCaches();
+          if (stopHazardLoop) {
+            throw new Error('H1 hazard loop stopped after the outer completion deadline');
+          }
+          await waitUntil(
+            () => instrumented.streamCloses() > baselineStreamCloses + round,
+            `H1 aborted stream ${round + 1} did not unwind`,
+          );
+        }
+        return await postJson(
+          instance,
+          CONTROL_BODY,
+          'H1 greedy successor did not complete',
+          H1_COMPLETION_DEADLINE_MS,
+        );
+      })();
+      const successor = await withTimeout(
+        hazardLoop,
         'H1 aborted prefill did not release reset + successor within its generous deadline',
         H1_COMPLETION_DEADLINE_MS,
       );
       expect(outputText(successor)).toBe(expected);
       expect(performance.now() - hazardStarted).toBeLessThan(H1_COMPLETION_DEADLINE_MS);
-      await waitForAdmissionDrain('H1 queue/admission/in-flight state did not drain');
       // Let a post-hazard interval callback record any delayed tick before
       // reading the maximum.
       await delay(75);
@@ -503,10 +523,23 @@ stage0Describe('Stage-0 real-model concurrency hazards', () => {
       stopHazardLoop = true;
       throw error;
     } finally {
+      stopHazardLoop = true;
       tickProbe.stop();
       for (const response of holderResponses) response.socket.destroy();
       for (const holder of holders) holder.request.destroy();
-      await Promise.all(holderOutcomes);
+      const cleanupPromises = holderOutcomes.map(settle);
+      if (hazardLoop !== undefined) cleanupPromises.push(settle(hazardLoop));
+      await withTimeout(
+        Promise.all(cleanupPromises).then(() => undefined),
+        'H1 failure-path holder/hazard loop cleanup did not settle',
+        15_000,
+      );
+      await waitUntil(
+        () => instrumented.streamCloses() >= baselineStreamCloses + startedHazardStreams,
+        'H1 failure-path stream generators did not unwind',
+        15_000,
+      );
+      await waitForAdmissionDrain('H1 queue/admission/in-flight state did not drain');
     }
   }, 45_000);
 
@@ -515,9 +548,10 @@ stage0Describe('Stage-0 real-model concurrency hazards', () => {
     const control = await postJson(instance, CONTROL_BODY, 'H2 greedy control did not complete');
     const expected = outputText(control);
     await nativeModel.resetCaches();
+    await waitForAdmissionDrain('H2 greedy control request did not drain before the holder');
 
     const baselineDispatches = instrumented.nonStreamingDispatches();
-    const baselineCancellations = instrumented.nonStreamingCancellations();
+    const baselineCancellationErrors = instrumented.nonStreamingCancellationErrors().length;
     const holder = startJsonRequest(instance, {
       model: MODEL_NAME,
       input: LONG_PROMPT,
@@ -536,13 +570,21 @@ stage0Describe('Stage-0 real-model concurrency hazards', () => {
         holderSettled = true;
       });
     let successor: StartedJsonRequest | undefined;
+    let successorOutcome: Promise<unknown> | undefined;
 
     try {
       await waitUntil(
         () => instrumented.nonStreamingDispatches() > baselineDispatches,
         'H2 holder never entered cancellable native dispatch',
       );
+      await waitUntil(
+        () => instance.health().work.inFlight === 1,
+        'H2 holder never registered in real server in-flight accounting',
+        1_000,
+      );
+      expect(instance.health().work.inFlight).toBe(1);
       successor = startJsonRequest(instance, CONTROL_BODY);
+      successorOutcome = successor.result.catch((error: unknown) => error);
       let successorSettled = false;
       void successor.result.then(
         () => {
@@ -572,11 +614,22 @@ stage0Describe('Stage-0 real-model concurrency hazards', () => {
       );
       expect(outputText(result)).toBe(expected);
       await holderOutcome;
-      expect(instrumented.nonStreamingCancellations()).toBe(baselineCancellations + 1);
+      const cancellationErrors = instrumented.nonStreamingCancellationErrors().slice(baselineCancellationErrors);
+      expect(cancellationErrors).toHaveLength(1);
+      expect(cancellationErrors[0]).toBeInstanceOf(Error);
+      expect((cancellationErrors[0] as Error).message).toBe('chat session cancelled');
       await waitForAdmissionDrain('H2 queue/admission/in-flight state did not drain');
     } finally {
       holder.request.destroy();
       successor?.request.destroy();
+      const cleanupPromises = [settle(holderOutcome)];
+      if (successorOutcome !== undefined) cleanupPromises.push(settle(successorOutcome));
+      await withTimeout(
+        Promise.all(cleanupPromises).then(() => undefined),
+        'H2 failure-path holder/successor cleanup did not settle',
+        15_000,
+      );
+      await waitForAdmissionDrain('H2 failure-path queue/admission/in-flight state did not drain');
     }
   }, 45_000);
 
