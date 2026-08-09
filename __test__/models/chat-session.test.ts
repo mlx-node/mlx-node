@@ -3563,5 +3563,6 @@ describe('ChatSession H2 cancellable non-streaming turns', () => {
     expect(second.text).toBe('start-reply');
     expect(mock.chatSessionStart).toHaveBeenCalledTimes(1);
     expect(mock.chatSessionContinue).not.toHaveBeenCalled();
+    expect(mock.chatSessionStart.mock.calls[0][0]).toEqual([{ role: 'user', content: 'again' }]);
   });
 });
