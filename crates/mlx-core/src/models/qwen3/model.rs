@@ -6,6 +6,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -87,6 +88,16 @@ pub(crate) struct Qwen3Inner {
     /// `begin_decode` can bake the streaming profiler relabel
     /// (`"qwen3_chat_stream[_delta]_rust"`) into the stepper.
     turn_is_streaming: Cell<bool>,
+    /// The in-flight turn's cooperative-cancel flag, installed by the
+    /// streaming session cores via [`ChatBackend::set_turn_cancel_flag`]
+    /// and cleared (`None`) in their turn epilogue on every exit path.
+    /// Polled at the top of each prefill chunk (flat `flat_prefill` and
+    /// paged `run_paged_prefill_chunk_with_size`); `true` aborts the
+    /// prefill with the distinguished `"prefill cancelled"` error, which
+    /// rides the engine's existing fail-closed prefill-`Err` arms.
+    /// `None` for sync turns (they carry no flag today) and single-shot
+    /// prefills stay uncancellable.
+    turn_cancel: Option<Arc<AtomicBool>>,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -406,6 +417,7 @@ impl Qwen3Inner {
             turn_cache_idx: 0,
             pending_exact_match_rewind: Cell::new(false),
             turn_is_streaming: Cell::new(false),
+            turn_cancel: None,
             training_state: None,
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
         })
@@ -620,6 +632,17 @@ impl Qwen3Inner {
         let mut last_hidden: Option<MxArray> = None;
         let mut tokens_consumed: u32 = 0;
         for (chunk_idx, chunk) in suffix_tokens.chunks(chunk_size_usize).enumerate() {
+            // Cooperative-cancel checkpoint (H1b): abort at the chunk
+            // boundary instead of running the rest of the prefill. The
+            // Err rides the paged engine's abort arm, which releases the
+            // live request without registering its blocks (fail closed).
+            if self
+                .turn_cancel
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+            {
+                return Err(Error::from_reason("prefill cancelled"));
+            }
             let chunk_start_pos = first_logical_position + tokens_consumed;
             let is_last_chunk = chunk_idx + 1 == total_chunks;
             let hidden =
@@ -2769,6 +2792,18 @@ impl Qwen3Inner {
         let last_logits = if use_chunked_prefill {
             let mut offset = 0usize;
             while offset + prefill_step_size < total_len {
+                // Cooperative-cancel checkpoint (H1b): abort at the chunk
+                // boundary. The Err rides the flat engine's
+                // `fail_closed_flat_turn` arm — no `save_cache_state`, the
+                // session is invalidated, so the partial turn-KV never
+                // becomes a live prefix.
+                if self
+                    .turn_cancel
+                    .as_ref()
+                    .is_some_and(|f| f.load(Ordering::Relaxed))
+                {
+                    return Err(Error::from_reason("prefill cancelled"));
+                }
                 let chunk_end = offset + prefill_step_size;
                 let chunk = prefill_input.slice(&[0, offset as i64], &[1, chunk_end as i64])?;
                 rope_offsets = MxArray::from_int32(&[self.turn_cache_idx], &[1])?;
@@ -3209,6 +3244,10 @@ impl ChatBackend for Qwen3Inner {
         "qwen3"
     }
 
+    fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
+        self.turn_cancel = flag;
+    }
+
     fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32> {
         tok.im_end_id()
             .ok_or_else(|| napi::Error::from_reason("Tokenizer missing <|im_end|> special token"))
@@ -3466,6 +3505,44 @@ impl Qwen3Model {
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
+    }
+
+    // ---------------------------------------------------------------
+    // Test-only helpers: streaming session entry points that bypass
+    // ThreadsafeFunction and expose the mpsc receiver directly. Used
+    // by `crates/mlx-core/tests/qwen3_prefill_cancel.rs` to exercise
+    // the streaming path from a pure-Rust integration test without a
+    // NAPI host. Marked `#[doc(hidden)]` because they're not part of
+    // the public API surface. Mirrors `Lfm2Model`'s equivalents.
+    // ---------------------------------------------------------------
+
+    /// Test-only entry point that dispatches `ChatCmd::StreamSessionStart`
+    /// and returns the raw mpsc receiver the model thread writes into.
+    #[doc(hidden)]
+    pub fn chat_stream_session_start_for_test(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<crate::engine::types::ChatConfig>,
+    ) -> Result<(
+        crate::engine::types::ChatStreamHandle,
+        tokio::sync::mpsc::UnboundedReceiver<Result<crate::engine::types::ChatStreamChunk>>,
+    )> {
+        let config = config.unwrap_or_default();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<crate::engine::types::ChatStreamChunk>>();
+        self.thread
+            .send(Qwen3Cmd::Chat(ChatCmd::StreamSessionStart {
+                messages,
+                config,
+                stream_tx,
+                cancelled: cancelled_inner,
+            }))?;
+        Ok((
+            crate::engine::types::ChatStreamHandle { cancelled },
+            stream_rx,
+        ))
     }
 
     /// Fused forward pass using C++ implementation for maximum performance.

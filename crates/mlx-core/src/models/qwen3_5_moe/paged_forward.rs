@@ -4,6 +4,7 @@
 //! the MoE `DecoderLayer` (which holds an MoE/dense MLP variant) and
 //! its own `forward_paged_or_flat` method.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use napi::bindgen_prelude::*;
@@ -182,6 +183,7 @@ pub(crate) fn run_paged_prefill_chunk(
         paged_adapter,
         chunk_size,
         cached_rope_deltas,
+        None,
     )
     .map(|(logits, _)| logits)
 }
@@ -240,6 +242,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
     cached_rope_deltas: i32,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<MxArray> {
     run_paged_prefill_chunk_with_size_and_checkpoint(
         full_tokens,
@@ -255,6 +258,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         paged_adapter,
         chunk_size,
         cached_rope_deltas,
+        turn_cancel,
     )
     .map(|(logits, _)| logits)
 }
@@ -274,6 +278,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
     cached_rope_deltas: i32,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<(MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -362,6 +367,13 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
     let mut chunk_start_position: u32 = cached_prefix_len;
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
+        // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary
+        // instead of running the rest of the prefill. The Err rides the
+        // generic paged engine's `abort_paged_turn` arm, which releases
+        // the live request without registering its blocks (fail closed).
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let chunk = &suffix_tokens[range];
         let is_last_chunk = chunk_idx + 1 == total_chunks;
         let chunk_trace_start = trace_enabled.then(Instant::now);
@@ -1243,6 +1255,7 @@ mod tests {
                 adapter,
                 chunk_size,
                 /* cached_rope_deltas */ 0,
+                None,
             ) {
                 Ok(l) => l,
                 Err(e) => {
@@ -1423,6 +1436,7 @@ mod tests {
                 adapter,
                 2048,
                 0,
+                None,
             )
             .expect("MoE checkpoint prefill")
         };
@@ -1938,6 +1952,7 @@ mod tests {
                 adapter,
                 0,
                 /* cached_rope_deltas */ 0,
+                None,
             )
             .expect("explicit chunk_size=0 prefill")
         };

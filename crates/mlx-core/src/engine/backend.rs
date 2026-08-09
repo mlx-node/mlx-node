@@ -844,6 +844,27 @@ pub(crate) trait ChatBackend {
     /// stall their current paths do not pay.
     fn eval_caches(&self) -> Result<()>;
 
+    /// Install the current turn's cancel flag before prefill. Families that
+    /// support mid-prefill cancellation poll it at chunk boundaries; the
+    /// default impl ignores it (single-shot prefills stay uncancellable).
+    ///
+    /// Lifecycle (load-bearing): the streaming session cores install the
+    /// flag (`Some`) after their cancelled-before-start guard and clear it
+    /// (`None`) in the turn epilogue on EVERY exit path — success, error,
+    /// and cancel. A stale flag left on the backend would spuriously
+    /// cancel the NEXT turn's prefill (the per-turn `Arc<AtomicBool>`
+    /// stays flipped forever once its turn was cancelled). Sync entry
+    /// points carry no flag today and never call this, so `turn_cancel`
+    /// stays `None` for their whole turn (Task 4 wires them).
+    ///
+    /// A poll that observes `true` returns the distinguished error
+    /// `"prefill cancelled"`, which rides the existing prefill-`Err`
+    /// cleanup arms: the paged engine releases the live request without
+    /// registering its blocks (`abort_paged_turn`), the flat engine
+    /// invalidates the session (`fail_closed_flat_turn`) — so a cancelled
+    /// prefill never leaves partial KV registered as a live prefix.
+    fn set_turn_cancel_flag(&mut self, _flag: Option<Arc<AtomicBool>>) {}
+
     /// Run the (chunked) prefill forward over `prompt_tokens` on top of
     /// the live caches and return **sampling-ready last-token logits**
     /// (whatever shape `apply_all_penalties` + `sampling::sample`

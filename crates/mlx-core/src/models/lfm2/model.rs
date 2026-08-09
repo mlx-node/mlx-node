@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -65,6 +65,15 @@ fn conv_state_reuse_enabled() -> bool {
 /// No `Arc<RwLock<>>` — the model thread has sole ownership.
 pub(crate) struct Lfm2Inner {
     pub(crate) config: Lfm2Config,
+    /// The in-flight turn's cooperative-cancel flag, installed by the
+    /// streaming session cores via [`ChatBackend::set_turn_cancel_flag`]
+    /// and cleared (`None`) in their turn epilogue on every exit path.
+    /// Polled at the top of each flat `chunked_prefill` chunk; `true`
+    /// aborts with the distinguished `"prefill cancelled"` error, riding
+    /// the engine's fail-closed prefill-`Err` arm. The lfm2 PAGED prefill
+    /// is single-shot over the suffix (no chunk loop) and stays
+    /// uncancellable — documented residual window.
+    pub(crate) turn_cancel: Option<Arc<AtomicBool>>,
     /// Turn-constant layer classification (`FullAttention` vs `Conv`),
     /// computed once in [`Self::new`] instead of re-derived on every paged
     /// decode step. Pure function of the immutable `config` + layer count.
@@ -347,6 +356,7 @@ impl Lfm2Inner {
 
         Ok(Self {
             config,
+            turn_cancel: None,
             layer_kinds,
             embed_tokens,
             layers,
@@ -417,6 +427,18 @@ impl Lfm2Inner {
         let total_len = prompt.shape_at(1)?;
         let mut offset: i64 = 0;
         while total_len - offset > PREFILL_STEP_SIZE {
+            // Cooperative-cancel checkpoint (H1b): abort at the chunk
+            // boundary. The Err rides the flat engine's
+            // `fail_closed_flat_turn` arm — no `save_cache_state`, the
+            // session is invalidated, so the partially-advanced
+            // conv/attention caches never become a live prefix.
+            if self
+                .turn_cancel
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+            {
+                return Err(Error::from_reason("prefill cancelled"));
+            }
             let chunk = prompt.slice_axis(1, offset, offset + PREFILL_STEP_SIZE)?;
             {
                 let _stream_ctx = StreamContext::new(generation_stream);
@@ -889,6 +911,10 @@ impl ChatBackend for Lfm2Inner {
 
     fn family_name(&self) -> &'static str {
         "lfm2"
+    }
+
+    fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
+        self.turn_cancel = flag;
     }
 
     fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32> {

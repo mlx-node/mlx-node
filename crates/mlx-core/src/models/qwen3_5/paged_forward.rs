@@ -34,6 +34,7 @@
 //!   skipped entirely and the result is exact.
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use napi::bindgen_prelude::*;
@@ -452,6 +453,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
     cached_rope_deltas: i32,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<(MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -560,6 +562,15 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     let mut chunk_start_position = cached_prefix_len;
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
+        // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary
+        // instead of running the rest of the prefill. The Err rides the
+        // caller's release arm (the generic engine's `abort_paged_turn` /
+        // the dense core's `invalidate_dense_paged_session`), which
+        // releases the live request without registering its blocks (fail
+        // closed).
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let chunk = &suffix_tokens[range];
         let is_last_chunk = chunk_idx + 1 == total_chunks;
         let chunk_trace_start = trace_enabled.then(Instant::now);

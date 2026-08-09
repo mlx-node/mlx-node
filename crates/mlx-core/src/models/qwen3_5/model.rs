@@ -732,6 +732,18 @@ fn clone_dense_linear_layer_caches(
 /// and training state. Training commands are routed via `TrainingDispatch`.
 pub(crate) struct Qwen35Inner {
     pub(crate) config: Qwen3_5Config,
+    /// The in-flight turn's cooperative-cancel flag, installed by the
+    /// streaming session cores via [`ChatBackend::set_turn_cancel_flag`]
+    /// and cleared (`None`) in their turn epilogue on every exit path.
+    /// Threaded into the engine AR prefill chunk loops (flat
+    /// `chunked_prefill` from `ChatBackend::prefill`, paged
+    /// `run_paged_prefill_chunk_with_size` from
+    /// `PagedBackend::paged_prefill`); a set flag aborts at the next
+    /// chunk boundary with the distinguished `"prefill cancelled"` error,
+    /// riding the engine's fail-closed prefill-`Err` arms. The family's
+    /// own MTP/vision cores pass `None` (mid-prefill cancel there is a
+    /// documented residual window), as do single-shot prefills.
+    pub(crate) turn_cancel: Option<Arc<AtomicBool>>,
     /// Turn-constant layer classification (`Linear` vs `FullAttentionPaged`),
     /// computed once in [`Self::new`] instead of re-derived on every paged
     /// decode step. Pure function of the immutable `config`. Mirrors the
@@ -1261,6 +1273,7 @@ impl Qwen35Inner {
 
         Ok(Self {
             config,
+            turn_cancel: None,
             layer_kinds,
             embedding,
             layers,
@@ -2086,6 +2099,12 @@ impl Qwen35Inner {
         // image prefill); feeds the scalar-offset RoPE for the suffix.
         let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
         let chunk_size = self.cold_gdn_prefill_chunk_size();
+        // Cloned up front (cheap Option<Arc>) so the chunk-loop call below
+        // can borrow `self.layers`/`self.caches` mutably at the same time.
+        // Threaded into the AR chunk loop only — the planned-MTP
+        // `_with_hidden` prefill stays uncancellable (documented residual
+        // window).
+        let turn_cancel = self.turn_cancel.clone();
         let caches_ref = self
             .caches
             .as_mut()
@@ -2128,6 +2147,7 @@ impl Qwen35Inner {
                 adapter,
                 chunk_size,
                 rope_deltas,
+                turn_cancel.as_deref(),
             )?;
             Ok((logits, None, checkpoints))
         }
@@ -3224,6 +3244,7 @@ impl Qwen35Inner {
                     &self.final_norm,
                     &self.lm_head,
                     generation_stream,
+                    None,
                 )?
             };
 
@@ -3415,6 +3436,7 @@ impl Qwen35Inner {
                 &self.final_norm,
                 &self.lm_head,
                 generation_stream,
+                None,
             )?;
             self.flat_mtp_caches_desynced = false;
             logits
@@ -3428,6 +3450,7 @@ impl Qwen35Inner {
                 &self.final_norm,
                 &self.lm_head,
                 generation_stream,
+                None,
             )?
         };
         // Total context length post-prefill = full history length.
@@ -6265,6 +6288,7 @@ impl Qwen35Inner {
                 &self.final_norm,
                 &self.lm_head,
                 generation_stream,
+                None,
             )?
         } else {
             // Text-only prefill of the delta on top of the existing caches.
@@ -6277,6 +6301,7 @@ impl Qwen35Inner {
                 &self.final_norm,
                 &self.lm_head,
                 generation_stream,
+                None,
             )?
         };
         // caches now reflect the prefilled history
@@ -6802,6 +6827,7 @@ impl Qwen35Inner {
                     &self.final_norm,
                     &self.lm_head,
                     generation_stream,
+                    None,
                 )?
             };
 
@@ -8818,6 +8844,9 @@ impl PagedBackend for Qwen35Inner {
         // compressed-position image keys.
         let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
         let chunk_size = self.cold_gdn_prefill_chunk_size();
+        // Cloned up front (cheap Option<Arc>) so the chunk-loop call below
+        // can borrow `self.layers`/`self.caches` mutably at the same time.
+        let turn_cancel = self.turn_cancel.clone();
         let (logits, checkpoint) = {
             let caches_ref = self
                 .caches
@@ -8841,6 +8870,7 @@ impl PagedBackend for Qwen35Inner {
                 adapter,
                 chunk_size,
                 rope_deltas,
+                turn_cancel.as_deref(),
             )?
         };
         self.publish_dense_gdn_materialized_prefix_checkpoint(&prefix.full_tokens, checkpoint);
@@ -10022,6 +10052,10 @@ impl ChatBackend for Qwen35Inner {
         "qwen3_5"
     }
 
+    fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
+        self.turn_cancel = flag;
+    }
+
     fn set_cache_owner_id(&mut self, owner_id: &str, root_owner_id: Option<&str>) {
         self.active_cache_owner_id.clear();
         self.active_cache_owner_id.push_str(owner_id);
@@ -10195,6 +10229,7 @@ impl ChatBackend for Qwen35Inner {
             &self.final_norm,
             &self.lm_head,
             stream,
+            self.turn_cancel.as_deref(),
         )
     }
 
@@ -10838,6 +10873,7 @@ pub(crate) fn async_eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) {
 ///
 /// Accepts `&MxArray` shaped `[1, seq_len]`. Slices on GPU — no data roundtrip.
 /// For `&[u32]` inputs (from tokenizer), callers convert with `MxArray::from_uint32` first.
+#[allow(clippy::too_many_arguments)]
 fn chunked_prefill(
     prompt: &MxArray,
     embedding: &Embedding,
@@ -10846,6 +10882,7 @@ fn chunked_prefill(
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
     generation_stream: crate::stream::Stream,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<MxArray> {
     chunked_prefill_with_size(
         prompt,
@@ -10856,9 +10893,11 @@ fn chunked_prefill(
         lm_head,
         generation_stream,
         PREFILL_STEP_SIZE,
+        turn_cancel,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn chunked_prefill_with_size(
     prompt: &MxArray,
     embedding: &Embedding,
@@ -10868,6 +10907,7 @@ fn chunked_prefill_with_size(
     lm_head: &Option<LinearProj>,
     generation_stream: crate::stream::Stream,
     chunk_size: i64,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<MxArray> {
     let total_len = prompt.shape_at(1)?;
     if total_len <= 0 {
@@ -10884,6 +10924,14 @@ fn chunked_prefill_with_size(
     // falls back to synchronous eval_layer_caches (the prior behavior).
     let chunk_async = std::env::var("MLX_PREFILL_SYNC_BETWEEN_CHUNKS").is_err();
     while total_len - offset > chunk_size {
+        // Cooperative-cancel checkpoint (H1b): abort at the chunk
+        // boundary. The Err rides the flat engine's
+        // `fail_closed_flat_turn` arm — no `save_cache_state`, the
+        // session is invalidated, so the partially-advanced caches never
+        // become a live prefix.
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let chunk = prompt.slice_axis(1, offset, offset + chunk_size)?;
         {
             let _stream_ctx = StreamContext::new(generation_stream);
@@ -13535,6 +13583,7 @@ mod paged_construction_tests {
             adapter,
             chunk_size,
             /* cached_rope_deltas */ 0,
+            None,
         )
     }
 
@@ -13734,6 +13783,7 @@ mod paged_construction_tests {
             &inner.lm_head,
             Stream::new(DeviceType::Gpu),
             chunk_size,
+            None,
         )
     }
 

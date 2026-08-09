@@ -18,6 +18,7 @@
 //! family. The 6 public entry points (3 sync + 3 streaming twins) are
 //! thin guard wrappers around the core.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -157,12 +158,20 @@ pub(crate) fn session_continue_tool<B: ChatBackend>(
 /// delivered through the sink as `Err` items (see
 /// [`crate::engine::finalize::send_stream_error`]'s rustdoc for why
 /// they must NOT be fake done-chunks), never returned.
+///
+/// Takes the cancel flag as `&Arc<AtomicBool>` (the dispatcher owns the
+/// `Arc` from the `Stream*` command) so the turn's clone can be
+/// installed on the backend via [`ChatBackend::set_turn_cancel_flag`]
+/// for mid-prefill chunk-boundary polling. The install happens AFTER
+/// every guard (nothing to clear on a guard exit); the epilogue clears
+/// it on BOTH the success and error path — a stale flag would spuriously
+/// cancel the next turn.
 pub(crate) fn session_start_stream<B: ChatBackend>(
     backend: &mut B,
     messages: Vec<ChatMessage>,
     config: ChatConfig,
     sink: &dyn ChunkSink,
-    cancelled: &AtomicBool,
+    cancelled: &Arc<AtomicBool>,
 ) {
     if cancelled.load(Ordering::Relaxed) {
         sink.send(Err(Error::from_reason(
@@ -177,24 +186,32 @@ pub(crate) fn session_start_stream<B: ChatBackend>(
         )));
         return;
     }
-    if let Err(e) = chat_turn_core(
+    backend.set_turn_cancel_flag(Some(Arc::clone(cancelled)));
+    let turn = chat_turn_core(
         backend,
         messages,
         config,
         TurnKind::Start,
-        Some(StreamingHooks { sink, cancelled }),
-    ) {
+        Some(StreamingHooks {
+            sink,
+            cancelled: cancelled.as_ref(),
+        }),
+    );
+    backend.set_turn_cancel_flag(None);
+    if let Err(e) = turn {
         sink.send(Err(e));
     }
 }
 
-/// Streaming twin of [`session_continue`].
+/// Streaming twin of [`session_continue`]. Cancel-flag lifecycle as on
+/// [`session_start_stream`]: install after the guards, clear on every
+/// exit of the core.
 pub(crate) fn session_continue_stream<B: ChatBackend>(
     backend: &mut B,
     messages: Vec<ChatMessage>,
     config: ChatConfig,
     sink: &dyn ChunkSink,
-    cancelled: &AtomicBool,
+    cancelled: &Arc<AtomicBool>,
 ) {
     if cancelled.load(Ordering::Relaxed) {
         sink.send(Err(Error::from_reason(
@@ -215,24 +232,32 @@ pub(crate) fn session_continue_stream<B: ChatBackend>(
         )));
         return;
     }
-    if let Err(e) = chat_turn_core(
+    backend.set_turn_cancel_flag(Some(Arc::clone(cancelled)));
+    let turn = chat_turn_core(
         backend,
         messages,
         config,
         TurnKind::Continue,
-        Some(StreamingHooks { sink, cancelled }),
-    ) {
+        Some(StreamingHooks {
+            sink,
+            cancelled: cancelled.as_ref(),
+        }),
+    );
+    backend.set_turn_cancel_flag(None);
+    if let Err(e) = turn {
         sink.send(Err(e));
     }
 }
 
-/// Streaming twin of [`session_continue_tool`].
+/// Streaming twin of [`session_continue_tool`]. Cancel-flag lifecycle
+/// as on [`session_start_stream`]: install after the guards, clear on
+/// every exit of the core.
 pub(crate) fn session_continue_tool_stream<B: ChatBackend>(
     backend: &mut B,
     messages: Vec<ChatMessage>,
     config: ChatConfig,
     sink: &dyn ChunkSink,
-    cancelled: &AtomicBool,
+    cancelled: &Arc<AtomicBool>,
 ) {
     if cancelled.load(Ordering::Relaxed) {
         sink.send(Err(Error::from_reason(
@@ -253,13 +278,19 @@ pub(crate) fn session_continue_tool_stream<B: ChatBackend>(
         )));
         return;
     }
-    if let Err(e) = chat_turn_core(
+    backend.set_turn_cancel_flag(Some(Arc::clone(cancelled)));
+    let turn = chat_turn_core(
         backend,
         messages,
         config,
         TurnKind::Continue,
-        Some(StreamingHooks { sink, cancelled }),
-    ) {
+        Some(StreamingHooks {
+            sink,
+            cancelled: cancelled.as_ref(),
+        }),
+    );
+    backend.set_turn_cancel_flag(None);
+    if let Err(e) = turn {
         sink.send(Err(e));
     }
 }

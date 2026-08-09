@@ -312,6 +312,16 @@ impl StreamEmitter for Gemma4Emitter {
 /// No `Arc<RwLock<>>` — the model thread has sole ownership.
 pub(crate) struct Gemma4Inner {
     pub(crate) config: Gemma4Config,
+    /// The in-flight turn's cooperative-cancel flag, installed by the
+    /// streaming session cores via [`ChatBackend::set_turn_cancel_flag`]
+    /// and cleared (`None`) in their turn epilogue on every exit path.
+    /// Polled at the top of each prefill chunk (flat `prefill_body_gemma4`
+    /// and the paged chunk-plan loop in `run_paged_prefill_chunk`);
+    /// `true` aborts with the distinguished `"prefill cancelled"` error,
+    /// riding the engine's fail-closed prefill-`Err` arms. Single-shot
+    /// prefills and the speculative (assistant/dspark) prefill clones
+    /// stay uncancellable — documented residual windows.
+    pub(crate) turn_cancel: Option<Arc<AtomicBool>>,
     pub(crate) embed_tokens: Embedding,
     pub(crate) layers: Vec<Gemma4DecoderLayer>,
     pub(crate) final_norm: RMSNorm,
@@ -1771,6 +1781,7 @@ impl Gemma4Inner {
 
         Ok(Self {
             config,
+            turn_cancel: None,
             embed_tokens,
             layers,
             final_norm,
@@ -5169,6 +5180,18 @@ impl Gemma4Inner {
                 ));
             }
             for (chunk_idx, chunk_plan) in body_chunk_plan.iter().enumerate() {
+                // Cooperative-cancel checkpoint (H1b): abort at the chunk
+                // boundary instead of running the rest of the prefill. The
+                // Err rides the paged engine's abort arm, which releases
+                // the live request without registering its blocks (fail
+                // closed).
+                if self
+                    .turn_cancel
+                    .as_ref()
+                    .is_some_and(|f| f.load(Ordering::Relaxed))
+                {
+                    return Err(Error::from_reason("prefill cancelled"));
+                }
                 let chunk_end = chunk_plan
                     .start
                     .checked_add(chunk_plan.len)
@@ -7311,6 +7334,10 @@ impl ChatBackend for Gemma4Inner {
         "gemma4"
     }
 
+    fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
+        self.turn_cancel = flag;
+    }
+
     fn session_eos_id(&self, _tok: &Qwen3Tokenizer) -> Result<u32> {
         // Gemma4 stops on its `<turn|>` turn terminator, not `<|im_end|>`.
         self.turn_end_id()
@@ -7565,6 +7592,7 @@ impl ChatBackend for Gemma4Inner {
                 self.ple.as_ref(),
                 &self.config,
                 None,
+                self.turn_cancel.as_deref(),
             )?;
         }
         eval_gemma4_caches(
@@ -10022,6 +10050,7 @@ pub(crate) fn eval_gemma4_caches(caches: &[Gemma4LayerCache]) -> Result<()> {
 /// 1. Embed ALL tokens once upfront (including PLE if enabled)
 /// 2. Run only the transformer body for each chunk (no lm_head)
 /// 3. Stop BEFORE the last token — the caller handles it via forward_inner
+#[allow(clippy::too_many_arguments)]
 fn prefill_body_gemma4(
     prompt: &MxArray,
     embedding: &Embedding,
@@ -10031,6 +10060,7 @@ fn prefill_body_gemma4(
     ple: Option<&PleComponents>,
     config: &Gemma4Config,
     mut tap: Option<&mut DsparkTap<'_>>,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<()> {
     let total_len = prompt.shape_at(1)?;
 
@@ -10060,6 +10090,14 @@ fn prefill_body_gemma4(
 
     // Process in chunks
     while prefill_len - offset > GEMMA4_PREFILL_STEP_SIZE {
+        // Cooperative-cancel checkpoint (H1b): abort at the chunk
+        // boundary. The Err rides the flat engine's
+        // `fail_closed_flat_turn` arm — no `save_cache_state`, the
+        // session is invalidated, so the partially-advanced caches never
+        // become a live prefix.
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let chunk_embeds = all_embeds.slice_axis(1, offset, offset + GEMMA4_PREFILL_STEP_SIZE)?;
         let chunk_ple = all_ple
             .as_ref()

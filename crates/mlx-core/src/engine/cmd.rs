@@ -589,6 +589,12 @@ mod mock_backend_tests {
         /// hook takes `&self`). The pre-render image guard must reject
         /// text-only image turns with this still 0.
         render_prompt_calls: AtomicUsize,
+        /// Recorded `set_turn_cancel_flag` calls: `true` = a flag was
+        /// installed (`Some`), `false` = cleared (`None`). Pins the
+        /// streaming cores' install-then-clear lifecycle — a stale flag
+        /// on the backend would spuriously cancel the NEXT turn's
+        /// prefill.
+        turn_cancel_events: Vec<bool>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -630,6 +636,7 @@ mod mock_backend_tests {
                 comparison_media_positions_knob: Vec::new(),
                 flat_caches_desynced_knob: false,
                 render_prompt_calls: AtomicUsize::new(0),
+                turn_cancel_events: Vec::new(),
             }
         }
     }
@@ -794,6 +801,10 @@ mod mock_backend_tests {
 
         fn clear_flat_caches_desynced(&mut self) {
             self.flat_caches_desynced_knob = false;
+        }
+
+        fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
+            self.turn_cancel_events.push(flag.is_some());
         }
 
         fn run_paged_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
@@ -1355,6 +1366,82 @@ mod mock_backend_tests {
             "raw_text must scrub reasoning when include_reasoning=false"
         );
         assert!(last.text.contains("world"));
+    }
+
+    /// H1b flag lifecycle: the streaming cores install the turn's cancel
+    /// flag (`Some`) after the cancelled-before-start guard and clear it
+    /// (`None`) in the epilogue on EVERY exit path — success AND error.
+    /// A stale flag left installed would spuriously cancel the next
+    /// turn's prefill (the per-turn `Arc<AtomicBool>` stays flipped
+    /// forever once cancelled). Named mutation this pins: removing the
+    /// epilogue `set_turn_cancel_flag(None)` leaves the event tape
+    /// ending on `true`.
+    #[test]
+    fn stream_turn_installs_then_clears_cancel_flag_on_success_and_error() {
+        // ONE script — the second streaming turn errors in prefill
+        // ("no script left"), exercising the error-path clear.
+        let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_IM_END]]);
+
+        let stream_turn = |backend: &mut MockBackend, pre_cancelled: bool| {
+            let cancelled = Arc::new(AtomicBool::new(pre_cancelled));
+            let (stream_tx, mut stream_rx) =
+                tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+            handle_chat_cmd(
+                backend,
+                ChatCmd::StreamSessionStart {
+                    messages: user_messages("hello"),
+                    config: greedy_config(),
+                    stream_tx,
+                    cancelled,
+                },
+            );
+            let mut last_err: Option<String> = None;
+            let mut saw_done = false;
+            while let Some(item) = stream_rx.blocking_recv() {
+                match item {
+                    Ok(chunk) => saw_done |= chunk.done,
+                    Err(e) => last_err = Some(e.reason.clone()),
+                }
+            }
+            (saw_done, last_err)
+        };
+
+        // Success path: install (true) then clear (false).
+        let (saw_done, err) = stream_turn(&mut backend, false);
+        assert!(saw_done, "first streaming turn must complete: {err:?}");
+        assert_eq!(
+            backend.turn_cancel_events,
+            vec![true, false],
+            "success path must install then clear the cancel flag",
+        );
+
+        // Error path (prefill Err: script exhausted): still install+clear.
+        let (saw_done, err) = stream_turn(&mut backend, false);
+        assert!(!saw_done, "second turn must fail in prefill");
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("no script left")),
+            "expected the scripted prefill error, got: {err:?}",
+        );
+        assert_eq!(
+            backend.turn_cancel_events,
+            vec![true, false, true, false],
+            "the error path must ALSO clear the flag in the epilogue",
+        );
+
+        // Cancelled-before-start: the guard exits BEFORE the install, so
+        // no event is recorded at all (nothing to clear).
+        let (saw_done, err) = stream_turn(&mut backend, true);
+        assert!(!saw_done);
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("cancelled before start")),
+            "expected the pre-start cancel guard, got: {err:?}",
+        );
+        assert_eq!(
+            backend.turn_cancel_events,
+            vec![true, false, true, false],
+            "a pre-start cancel must not install the flag",
+        );
     }
 
     #[test]
