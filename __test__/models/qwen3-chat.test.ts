@@ -10,9 +10,9 @@
  * rather than correctness (since the weights are random).
  */
 
+import type { ChatMessage } from '@mlx-node/core';
 import { loadModel, Qwen3Model, createToolDefinition } from '@mlx-node/lm';
 import type { ToolCallResult } from '@mlx-node/lm';
-import type { ChatMessage } from '@mlx-node/core';
 import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
 
 import { createTempModel, TINY_TEST_CONFIG } from '../test-model-utils';
@@ -36,7 +36,7 @@ describe.sequential('Qwen3 Chat Session API', () => {
 
   describe('Basic chatSessionStart', () => {
     it('should return ChatResult with expected structure', async () => {
-      model.resetCaches();
+      await model.resetCaches();
       const messages = [{ role: 'user', content: 'Hello' }];
 
       const result = await model.chatSessionStart(messages);
@@ -53,7 +53,7 @@ describe.sequential('Qwen3 Chat Session API', () => {
     });
 
     it('should generate tokens with default config', async () => {
-      model.resetCaches();
+      await model.resetCaches();
       const messages = [{ role: 'user', content: 'Say something' }];
 
       const result = await model.chatSessionStart(messages);
@@ -65,7 +65,7 @@ describe.sequential('Qwen3 Chat Session API', () => {
     });
 
     it('should respect maxNewTokens config', async () => {
-      model.resetCaches();
+      await model.resetCaches();
       const messages = [{ role: 'user', content: 'Count to 100' }];
 
       const result = await model.chatSessionStart(messages, {
@@ -79,7 +79,7 @@ describe.sequential('Qwen3 Chat Session API', () => {
 
   describe('Multi-turn session', () => {
     it('should allow continuing an existing session via chatSessionContinue', async () => {
-      model.resetCaches();
+      await model.resetCaches();
 
       // Turn 1: start
       const first = await model.chatSessionStart([{ role: 'user', content: 'Hi' }], { maxNewTokens: 10 });
@@ -108,7 +108,7 @@ describe.sequential('Qwen3 Chat Session API', () => {
     });
 
     it('should reject image input via chatSessionContinue (text-only backend)', async () => {
-      model.resetCaches();
+      await model.resetCaches();
       await model.chatSessionStart([{ role: 'user', content: 'Hi' }], { maxNewTokens: 5 });
 
       const fakeImage = new Uint8Array([0, 1, 2, 3]);
@@ -118,7 +118,7 @@ describe.sequential('Qwen3 Chat Session API', () => {
     });
 
     it('should error when chatSessionContinue is called without an active session', async () => {
-      model.resetCaches();
+      await model.resetCaches();
       await expect(model.chatSessionContinue([{ role: 'user', content: 'No session first' }])).rejects.toThrow();
     });
   });
@@ -138,7 +138,7 @@ describe.sequential('Qwen3 Chat Session API', () => {
     ];
 
     it('should accept tool definitions without error', async () => {
-      model.resetCaches();
+      await model.resetCaches();
       const messages = [{ role: 'user', content: 'Use a tool' }];
 
       // Should not throw even with random weights
@@ -152,7 +152,7 @@ describe.sequential('Qwen3 Chat Session API', () => {
     });
 
     it('should return empty toolCalls when no tool_call tags in output', async () => {
-      model.resetCaches();
+      await model.resetCaches();
       const messages = [{ role: 'user', content: 'Hello' }];
 
       const result = await model.chatSessionStart(messages, {
@@ -201,7 +201,7 @@ describe.sequential('Qwen3 Chat Session API', () => {
 
   describe('Finish Reasons', () => {
     it('should return "length" when max tokens reached', async () => {
-      model.resetCaches();
+      await model.resetCaches();
       const messages = [{ role: 'user', content: 'Write a very long essay' }];
 
       const result = await model.chatSessionStart(messages, {
@@ -214,7 +214,7 @@ describe.sequential('Qwen3 Chat Session API', () => {
     });
 
     it('should accept a generous token budget', async () => {
-      model.resetCaches();
+      await model.resetCaches();
       const messages = [{ role: 'user', content: 'Hi' }];
 
       const result = await model.chatSessionStart(messages, {
@@ -228,7 +228,7 @@ describe.sequential('Qwen3 Chat Session API', () => {
 
   describe('Thinking Extraction', () => {
     it('should return null thinking when no think tags', async () => {
-      model.resetCaches();
+      await model.resetCaches();
       const messages = [{ role: 'user', content: 'Hello' }];
 
       const result = await model.chatSessionStart(messages, {
@@ -243,7 +243,7 @@ describe.sequential('Qwen3 Chat Session API', () => {
 
   describe('Generation Config', () => {
     it('should accept all config options', async () => {
-      model.resetCaches();
+      await model.resetCaches();
       const messages = [{ role: 'user', content: 'Test' }];
 
       // Should not throw with any valid config
@@ -264,13 +264,13 @@ describe.sequential('Qwen3 Chat Session API', () => {
       const messages = [{ role: 'user', content: 'Test' }];
 
       // Temperature 0 = greedy decoding (deterministic)
-      model.resetCaches();
+      await model.resetCaches();
       const result1 = await model.chatSessionStart(messages, {
         maxNewTokens: 10,
         temperature: 0,
       });
 
-      model.resetCaches();
+      await model.resetCaches();
       const result2 = await model.chatSessionStart(messages, {
         maxNewTokens: 10,
         temperature: 0,
@@ -283,7 +283,7 @@ describe.sequential('Qwen3 Chat Session API', () => {
 
   describe('Session delta paths', () => {
     it('chatSessionContinueTool extends the session with a tool-result message', async () => {
-      model.resetCaches();
+      await model.resetCaches();
 
       // Prime the session with an initial turn.
       const r1 = await model.chatSessionStart([{ role: 'user', content: 'call a tool' }], {
@@ -334,10 +334,10 @@ describe.sequential('Qwen3 Chat Session API', () => {
     it('resetCaches restores a clean slate (determinism canary)', async () => {
       const msgs = [{ role: 'user', content: 'say hi in one word' }];
 
-      model.resetCaches();
+      await model.resetCaches();
       const r1 = await model.chatSessionStart(msgs, { maxNewTokens: 8, temperature: 0 });
 
-      model.resetCaches();
+      await model.resetCaches();
       const r2 = await model.chatSessionStart(msgs, { maxNewTokens: 8, temperature: 0 });
 
       expect(r2.rawText).toBe(r1.rawText);

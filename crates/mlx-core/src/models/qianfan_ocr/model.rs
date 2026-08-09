@@ -1628,14 +1628,17 @@ impl QianfanOCRModel {
         .await
     }
 
-    /// Reset KV caches and token history.
+    /// Reset KV caches and token history. Async so a reset queued behind
+    /// an in-flight turn parks a tokio future, never the Node event loop
+    /// (H1a — same contract as the `chat_napi_surface!` families).
     #[napi]
-    pub fn reset_caches(&self) -> Result<()> {
+    pub async fn reset_caches(&self) -> Result<()> {
         let Some(thread) = self.thread.as_ref() else {
             // Uninitialized model — nothing to reset.
             return Ok(());
         };
-        crate::model_thread::send_and_block(thread, |reply| QianfanOCRCmd::ResetCaches { reply })
+        crate::model_thread::send_and_await(thread, |reply| QianfanOCRCmd::ResetCaches { reply })
+            .await
     }
 
     /// Start a new chat session.

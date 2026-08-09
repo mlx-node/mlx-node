@@ -241,7 +241,7 @@ function createMockModel(result: ChatResult = makeChatResult()): SessionCapableM
     chatStreamSessionStart: vi.fn(() => emptyStream()),
     chatStreamSessionContinue: vi.fn(() => emptyStream()),
     chatStreamSessionContinueTool: vi.fn(() => emptyStream()),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
 }
 
@@ -263,7 +263,7 @@ function createMockStreamModel(streamEvents: Array<Record<string, unknown>>): Se
     chatStreamSessionStart: vi.fn(() => makeStream()),
     chatStreamSessionContinue: vi.fn(() => makeStream()),
     chatStreamSessionContinueTool: vi.fn(() => makeStream()),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
 }
 
@@ -305,7 +305,7 @@ function setupMultiCallChain(followUpText = 'ok'): {
     chatStreamSessionStart: vi.fn(),
     chatStreamSessionContinue: vi.fn(),
     chatStreamSessionContinueTool: vi.fn(),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
   registry.register('test-model', mockModel);
 
@@ -366,7 +366,7 @@ function setupSingleCallChain(followUpText = 'single-ok'): {
     chatStreamSessionStart: vi.fn(),
     chatStreamSessionContinue: vi.fn(),
     chatStreamSessionContinueTool: vi.fn(),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
   registry.register('test-model', mockModel);
 

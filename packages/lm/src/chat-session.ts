@@ -418,7 +418,18 @@ export interface SessionCapableModel {
     config?: ChatConfig | null,
     signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent>;
-  resetCaches(): void;
+  /**
+   * Wipe the native KV caches and cached token history.
+   *
+   * Native models return a `Promise<void>` (the reset is dispatched
+   * onto the model thread's command queue and resolves once
+   * processed — H1a: a reset queued behind an in-flight turn must
+   * park a promise, never the Node event loop). The union keeps
+   * synchronous test doubles valid; every consumer in this file
+   * `await`s the result so command-queue ordering is preserved
+   * relative to subsequent session calls.
+   */
+  resetCaches(): void | Promise<void>;
   /**
    * Whether the underlying native model has the block-paged KV cache
    * adapter (`PagedKVCacheAdapter` + `BlockAllocator` + `LayerKVPool`)
@@ -1358,14 +1369,19 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * signal, so the public API intentionally offers only the full-wipe
    * option.
    *
-   * Returns `Promise<void>` for an async-friendly signature even
-   * though `resetCaches()` is currently synchronous.
+   * The native `resetCaches()` is async (H1a): the wipe is awaited so
+   * the reset command has fully drained through the model thread
+   * before this promise resolves — callers that `await reset()` and
+   * then start a turn keep strict command-queue ordering. Callers
+   * must not interleave `send()` with an in-progress `reset()` on the
+   * same session (the server serializes per-session turns; direct
+   * consumers get the same contract documented on `send()`).
    */
   async reset(): Promise<void> {
     if (this.inFlight) {
       throw new Error('ChatSession: cannot reset() while a send() is in flight; await the previous call first');
     }
-    this.model.resetCaches();
+    await this.model.resetCaches();
     this.history = [];
     this.lastImagesKey = null;
     this.lastAudioKey = null;
@@ -1822,7 +1838,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     // is a request error and must leave both JS history and native state intact.
     const constrainedConfig = await this.constrainToContextCapacity(this.historyWithPending(pendingMessage), config);
 
-    this.prepareStartPath(mediaChanged, isFirstTurn);
+    await this.prepareStartPath(mediaChanged, isFirstTurn);
     this.history.push(pendingMessage);
     try {
       // Pass a shallow snapshot so later pushes to `this.history`
@@ -1909,7 +1925,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     // state, and make the output budget explicit before allocating KV blocks.
     const constrainedConfig = await this.constrainToContextCapacity(this.historyWithPending(pendingMessage), config);
 
-    this.prepareStartPath(mediaChanged, isFirstTurn);
+    await this.prepareStartPath(mediaChanged, isFirstTurn);
     // Stage the pending message on the pending history BEFORE the
     // stream starts — the native call reads it synchronously via
     // `model.chatStreamSessionStart(history, config)`.
@@ -2017,9 +2033,13 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    *     turn.
    *   - On a fresh / reset history, re-inject the system prompt.
    */
-  private prepareStartPath(mediaChanged: boolean, isFirstTurn: boolean): void {
+  private async prepareStartPath(mediaChanged: boolean, isFirstTurn: boolean): Promise<void> {
     if (mediaChanged && !isFirstTurn) {
-      this.model.resetCaches();
+      // Await the async native reset (H1a) so the wipe has drained
+      // through the model thread before the start call is enqueued —
+      // without the await, two async NAPI calls carry no relative
+      // ordering guarantee.
+      await this.model.resetCaches();
     }
     if (this.history.length === 0 && this.system != null) {
       this.history.push({ role: 'system', content: this.system });

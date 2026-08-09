@@ -139,9 +139,9 @@ export declare class Gemma4Model {
    * with a `napi::Error` whose message is exactly
    * `"Model not initialized. Call Gemma4Model.load() first."` until
    * `load()` runs and installs the underlying model thread. The
-   * synchronous `resetCaches()` call is a silent no-op on the stub
-   * to keep `ChatSession.reset()` idempotent across both runnable
-   * and stub instances.
+   * async `resetCaches()` call resolves as a silent no-op on the
+   * stub to keep `ChatSession.reset()` idempotent across both
+   * runnable and stub instances.
    *
    * A runnable model requires `await Gemma4Model.load(path)`. The
    * constructor signature is fixed by NAPI-RS; the stub-only behavior is
@@ -182,11 +182,11 @@ export declare class Gemma4Model {
   /** Load a Gemma4 model from a directory. */
   static load(modelPath: string, options?: Gemma4LoadOptions | undefined | null): Promise<Gemma4Model>;
   /**
-   * Reset all caches and clear cached token history. Exposed
-   * so tests and session-management code can start from a
-   * known clean state between turns.
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
    */
-  resetCaches(): void;
+  resetCaches(): Promise<void>;
   /**
    * Start a new chat session.
    *
@@ -540,11 +540,11 @@ export declare class Lfm2Model {
   /** Estimated number of model parameters. */
   numParameters(): number;
   /**
-   * Reset all caches and clear cached token history. Exposed
-   * so tests and session-management code can start from a
-   * known clean state between turns.
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
    */
-  resetCaches(): void;
+  resetCaches(): Promise<void>;
   /**
    * Start a new chat session.
    *
@@ -1098,8 +1098,12 @@ export declare class QianfanOCRModel {
     maxNewTokens?: number | undefined | null,
     temperature?: number | undefined | null,
   ): Promise<Array<number>>;
-  /** Reset KV caches and token history. */
-  resetCaches(): void;
+  /**
+   * Reset KV caches and token history. Async so a reset queued behind
+   * an in-flight turn parks a tokio future, never the Node event loop
+   * (H1a — same contract as the `chat_napi_surface!` families).
+   */
+  resetCaches(): Promise<void>;
   /**
    * Start a new chat session.
    *
@@ -1268,11 +1272,11 @@ export declare class Qwen35Model {
    */
   saveModel(savePath: string): Promise<undefined>;
   /**
-   * Reset all caches and clear cached token history. Exposed
-   * so tests and session-management code can start from a
-   * known clean state between turns.
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
    */
-  resetCaches(): void;
+  resetCaches(): Promise<void>;
   /**
    * Start a new chat session.
    *
@@ -1405,11 +1409,11 @@ export declare class Qwen35MoeModel {
    */
   saveModel(savePath: string): Promise<undefined>;
   /**
-   * Reset all caches and clear cached token history. Exposed
-   * so tests and session-management code can start from a
-   * known clean state between turns.
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
    */
-  resetCaches(): void;
+  resetCaches(): Promise<void>;
   /**
    * Start a new chat session.
    *
@@ -1606,11 +1610,11 @@ export declare class Qwen3Model {
     enableThinking?: boolean | undefined | null,
   ): Promise<Uint32Array>;
   /**
-   * Reset all caches and clear cached token history. Exposed
-   * so tests and session-management code can start from a
-   * known clean state between turns.
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
    */
-  resetCaches(): void;
+  resetCaches(): Promise<void>;
   /**
    * Start a new chat session.
    *

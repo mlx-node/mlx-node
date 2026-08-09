@@ -68,7 +68,7 @@ function makeMockModel(): SessionCapableModel {
     chatStreamSessionContinueTool: async function* () {
       yield finalEvent;
     },
-    resetCaches: () => {},
+    resetCaches: () => Promise.resolve(),
   } as unknown as SessionCapableModel;
 }
 

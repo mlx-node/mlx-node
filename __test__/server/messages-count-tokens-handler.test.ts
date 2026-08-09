@@ -124,7 +124,7 @@ function createCountingModel(tokenCount: number): SessionCapableModel & {
     chatStreamSessionStart,
     chatStreamSessionContinue: vi.fn(() => stream()),
     chatStreamSessionContinueTool: vi.fn(() => stream()),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
     spies: { chatSessionStart, chatStreamSessionStart },
   } as unknown as SessionCapableModel & {
     applyChatTemplate: ReturnType<typeof vi.fn>;

@@ -123,7 +123,7 @@ function makeMockModel() {
     yield { text: 'tool', done: false };
     yield finalChunk('tool-reply');
   });
-  const resetCaches = vi.fn(() => undefined);
+  const resetCaches = vi.fn(() => Promise.resolve(undefined));
 
   const model: SessionCapableModel = {
     chatSessionStart,

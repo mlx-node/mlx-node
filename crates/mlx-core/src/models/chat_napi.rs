@@ -68,11 +68,11 @@ macro_rules! chat_napi_surface {
     ) => {
         #[napi]
         impl $Class {
-            /// Reset all caches and clear cached token history. Exposed
-            /// so tests and session-management code can start from a
-            /// known clean state between turns.
+            /// Reset all caches and clear cached token history. Async so a reset
+            /// queued behind an in-flight turn parks a tokio future, never the
+            /// Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
             #[napi]
-            pub fn reset_caches(&self) -> ::napi::Result<()> {
+            pub async fn reset_caches(&self) -> ::napi::Result<()> {
                 $crate::models::chat_napi::chat_napi_thread_reset!(self, $thread_mode, $thread_cmd)
             }
 
@@ -263,26 +263,32 @@ macro_rules! chat_napi_thread_bind {
     };
 }
 
-/// `reset_caches` body. The `option` arm silently no-ops on an
-/// uninitialised stub so `ChatSession.reset()` stays idempotent — it is
-/// invoked without `await` from the JS session-restart path.
+/// `reset_caches` body. Awaits [`crate::model_thread::send_and_await`]
+/// so a reset queued behind an in-flight turn parks a tokio future —
+/// never `blocking_recv()` on the Node event loop (H1a). Ordering is
+/// unchanged: the single per-model command channel still serializes the
+/// reset behind any queued turn. The `option` arm silently resolves
+/// `Ok(())` on an uninitialised stub so `ChatSession.reset()` stays
+/// idempotent across stub + loaded instances.
 macro_rules! chat_napi_thread_reset {
     ($self:ident, direct, $thread_cmd:ty) => {
-        $crate::model_thread::send_and_block(&$self.thread, |reply| {
+        $crate::model_thread::send_and_await(&$self.thread, |reply| {
             <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
                 $crate::engine::cmd::ChatCmd::ResetCaches { reply },
             )
         })
+        .await
     };
     ($self:ident, { option: $not_loaded_msg:literal }, $thread_cmd:ty) => {{
         let Some(thread) = $self.thread.as_ref() else {
             return Ok(());
         };
-        $crate::model_thread::send_and_block(thread, |reply| {
+        $crate::model_thread::send_and_await(thread, |reply| {
             <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
                 $crate::engine::cmd::ChatCmd::ResetCaches { reply },
             )
         })
+        .await
     }};
 }
 

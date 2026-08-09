@@ -237,7 +237,7 @@ async fn lfm2_moe_reset_determinism() {
         .expect("first start failed");
 
     // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
-    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
+    model.reset_caches().await.expect("reset_caches failed");
 
     let r2 = model
         .chat_session_start(vec![user_message(prompt)], Some(chat_config_default(8)))

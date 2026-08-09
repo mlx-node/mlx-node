@@ -198,7 +198,7 @@ async fn qwen3_5_moe_session_reset_purges_prefix_cache_cold_prefill() {
     // Explicit Command reset via the sync NAPI method. block_in_place:
     // reset_caches blocks on blocking_recv, which panics on a tokio
     // worker thread (see qwen3_5_moe_session.rs + 8d5283a7 precedent).
-    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
+    model.reset_caches().await.expect("reset_caches failed");
 
     // Turn 2: rerun the IDENTICAL prompt as a fresh session start.
     let r2 = model

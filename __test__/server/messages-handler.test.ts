@@ -156,7 +156,7 @@ function createMockModel(result: ChatResult = makeChatResult()): SessionCapableM
     chatStreamSessionStart: vi.fn(() => fallbackStream()),
     chatStreamSessionContinue: vi.fn(() => fallbackStream()),
     chatStreamSessionContinueTool: vi.fn(() => fallbackStream()),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
 }
 
@@ -178,7 +178,7 @@ function createMockStreamModel(streamEvents: Array<Record<string, unknown>>): Se
     chatStreamSessionStart: vi.fn(() => makeStream()),
     chatStreamSessionContinue: vi.fn(() => makeStream()),
     chatStreamSessionContinueTool: vi.fn(() => makeStream()),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
 }
 

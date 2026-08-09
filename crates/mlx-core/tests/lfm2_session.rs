@@ -871,7 +871,7 @@ async fn lfm2_session_reset_reproduces_turn_output_deterministically() {
     // again with the SAME config. `reset_caches` is a sync NAPI method
     // on `&Lfm2Model`.
     // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
-    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
+    model.reset_caches().await.expect("reset_caches failed");
 
     let cfg2 = chat_config_default(32);
     let r2 = model
@@ -941,7 +941,7 @@ async fn lfm2_session_stream_matches_non_stream_byte_for_byte() {
     // Hard reset so the streaming run starts from the same fully cold
     // state as the non-streaming run above (prefix-cache purged).
     // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
-    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
+    model.reset_caches().await.expect("reset_caches failed");
 
     // Streaming: drain every non-done chunk and concatenate `chunk.text`.
     let cfg_s = chat_config_default(32);

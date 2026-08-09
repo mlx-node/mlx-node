@@ -21,7 +21,7 @@ function createStubModel(): ServableModel {
     chatStreamSessionStart: () => {},
     chatStreamSessionContinue: () => {},
     chatStreamSessionContinueTool: () => {},
-    resetCaches: () => {},
+    resetCaches: () => Promise.resolve(),
   } as unknown as ServableModel;
 }
 

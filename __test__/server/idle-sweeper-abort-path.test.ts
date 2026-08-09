@@ -218,7 +218,7 @@ function createMockStreamModelAbortable(streamFactory: () => AsyncGenerator<Reco
     chatStreamSessionStart: vi.fn(() => streamFactory()),
     chatStreamSessionContinue: vi.fn(() => streamFactory()),
     chatStreamSessionContinueTool: vi.fn(() => streamFactory()),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   };
 }
 

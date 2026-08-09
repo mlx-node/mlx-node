@@ -288,7 +288,10 @@ async fn qwen3_5_moe_paged_vlm_correctness() {
     );
 
     // --- 2. DETERMINISM: paged(image) at T=0 is byte-identical run-to-run. ---
-    tokio::task::block_in_place(|| paged_model.reset_caches()).expect("reset_caches failed");
+    paged_model
+        .reset_caches()
+        .await
+        .expect("reset_caches failed");
     let paged_b = paged_model
         .chat_session_start(
             vec![user_message_with_image(PROMPT, &image)],
@@ -307,7 +310,10 @@ async fn qwen3_5_moe_paged_vlm_correctness() {
     );
 
     // --- 3. IMAGE-DEPENDENCE: paged(image) differs from paged(no-image). ---
-    tokio::task::block_in_place(|| paged_model.reset_caches()).expect("reset_caches failed");
+    paged_model
+        .reset_caches()
+        .await
+        .expect("reset_caches failed");
     let paged_no_image = paged_model
         .chat_session_start(
             vec![user_message(PROMPT)],

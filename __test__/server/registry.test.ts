@@ -29,7 +29,7 @@ function createMockSessionModel(): SessionCapableModel {
     chatStreamSessionStart: vi.fn(() => emptyStream()),
     chatStreamSessionContinue: vi.fn(() => emptyStream()),
     chatStreamSessionContinueTool: vi.fn(() => emptyStream()),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
 }
 

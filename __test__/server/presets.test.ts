@@ -66,7 +66,7 @@ function createCapturingModel(): CapturingModel {
     chatStreamSessionStart: vi.fn(() => emptyStream()),
     chatStreamSessionContinue: vi.fn(() => emptyStream()),
     chatStreamSessionContinueTool: vi.fn(() => emptyStream()),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   };
   return model as unknown as CapturingModel;
 }

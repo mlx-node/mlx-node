@@ -45,7 +45,7 @@ function createModel(): SessionCapableModel {
     chatStreamSessionStart: vi.fn(),
     chatStreamSessionContinue: vi.fn(),
     chatStreamSessionContinueTool: vi.fn(),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
 }
 
@@ -312,7 +312,7 @@ function createGatedModel(
     chatStreamSessionStart: vi.fn(),
     chatStreamSessionContinue: vi.fn(),
     chatStreamSessionContinueTool: vi.fn(),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
   return { model, chatSessionStart };
 }

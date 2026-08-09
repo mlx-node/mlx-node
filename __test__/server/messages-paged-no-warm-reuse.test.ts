@@ -146,7 +146,7 @@ function createMockModel(paged: boolean, result: ChatResult = makeChatResult()):
     chatStreamSessionStart: vi.fn(() => fallbackStream()),
     chatStreamSessionContinue: vi.fn(() => fallbackStream()),
     chatStreamSessionContinueTool: vi.fn(() => fallbackStream()),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
     hasBlockPagedCache: vi.fn(() => paged),
   } as unknown as SessionCapableModel;
 }

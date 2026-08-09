@@ -7796,9 +7796,9 @@ impl Gemma4Model {
     /// with a `napi::Error` whose message is exactly
     /// `"Model not initialized. Call Gemma4Model.load() first."` until
     /// `load()` runs and installs the underlying model thread. The
-    /// synchronous `resetCaches()` call is a silent no-op on the stub
-    /// to keep `ChatSession.reset()` idempotent across both runnable
-    /// and stub instances.
+    /// async `resetCaches()` call resolves as a silent no-op on the
+    /// stub to keep `ChatSession.reset()` idempotent across both
+    /// runnable and stub instances.
     ///
     /// A runnable model requires `await Gemma4Model.load(path)`. The
     /// constructor signature is fixed by NAPI-RS; the stub-only behavior is

@@ -222,12 +222,12 @@ async fn qwen3_5_vl_image_chat_t0_capture() {
         .expect("failed to load Qwen3.5-VL model");
 
     // Full cache purge so every replay is a cold turn-1 (no cross-run reuse).
-    let reset = |m: &Qwen3_5Model| {
-        tokio::task::block_in_place(|| m.reset_caches()).expect("reset_caches failed");
-    };
+    async fn reset(m: &Qwen3_5Model) {
+        m.reset_caches().await.expect("reset_caches failed");
+    }
 
     // --- Pass 1: capture the digest. ---
-    reset(&model);
+    reset(&model).await;
     let (d1, raw1, d2, raw2) = run_two_turns(&model, &image).await;
 
     println!(
@@ -267,7 +267,7 @@ async fn qwen3_5_vl_image_chat_t0_capture() {
     // --- Image-dependence control. Same prompt, NO image, fresh session: the
     // digest MUST differ, proving turn 1 is conditioned on the image (so a
     // broken vision-feature merge would change the captured fingerprint). ---
-    reset(&model);
+    reset(&model).await;
     let d_noimg = describe_without_image(&model).await;
     assert_ne!(
         d1.raw_hash, d_noimg.raw_hash,
@@ -277,7 +277,7 @@ async fn qwen3_5_vl_image_chat_t0_capture() {
 
     // --- Pass 2: determinism. Reset + replay; digests must be byte-identical
     // run-to-run so the printed fingerprint is a stable cross-binary gate. ---
-    reset(&model);
+    reset(&model).await;
     let (d1b, _, d2b, _) = run_two_turns(&model, &image).await;
     assert_eq!(d1, d1b, "turn 1 digest is not deterministic at T=0");
     assert_eq!(d2, d2b, "turn 2 digest is not deterministic at T=0");
@@ -331,7 +331,7 @@ async fn qwen3_5_vl_reads_document_text() {
         .await
         .expect("failed to load Qwen3.5-VL model");
 
-    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
+    model.reset_caches().await.expect("reset_caches failed");
 
     // ONE image+text turn at T=0 (greedy/deterministic). max_new_tokens (512) is
     // well past the small thinking budget so the transcription answer is emitted.

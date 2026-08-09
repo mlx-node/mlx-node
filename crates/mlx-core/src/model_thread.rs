@@ -165,7 +165,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::ModelThread;
+    use super::{ModelThread, ResponseTx, send_and_await};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -207,5 +207,95 @@ mod tests {
             .shutdown_and_join()
             .expect("exclusive shutdown should join the worker");
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// H1a shape pin: a reset-style command queued behind an in-flight
+    /// turn must park a *future*, never the calling thread. This is the
+    /// dispatch shape `chat_napi_thread_reset!` uses via
+    /// [`send_and_await`] — the old `send_and_block` path would freeze
+    /// the caller (the Node event loop in production) on the first
+    /// `poll`-equivalent instead of returning `Pending`.
+    ///
+    /// Deterministic (no timers): the first command occupies the model
+    /// thread until explicitly released, so the queued reset is
+    /// provably pending while the caller keeps doing other work.
+    #[test]
+    fn queued_reset_parks_a_future_not_the_calling_thread() {
+        enum Cmd {
+            /// Simulated in-flight turn: holds the model thread until
+            /// the test releases it.
+            Occupy {
+                release: std::sync::mpsc::Receiver<()>,
+                reply: ResponseTx<()>,
+            },
+            /// Simulated `ResetCaches`: replies immediately once the
+            /// model thread reaches it.
+            Reset { reply: ResponseTx<()> },
+        }
+
+        let (model_thread, init_rx) = ModelThread::<Cmd>::spawn_with_init(
+            || Ok(((), ())),
+            |_, cmd| match cmd {
+                Cmd::Occupy { release, reply } => {
+                    release.recv().expect("test dropped the release sender");
+                    let _ = reply.send(Ok(()));
+                }
+                Cmd::Reset { reply } => {
+                    let _ = reply.send(Ok(()));
+                }
+            },
+        );
+        init_rx
+            .blocking_recv()
+            .expect("model init channel closed")
+            .expect("model init failed");
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (turn_tx, turn_rx) = tokio::sync::oneshot::channel();
+        model_thread
+            .send(Cmd::Occupy {
+                release: release_rx,
+                reply: turn_tx,
+            })
+            .expect("failed to enqueue the occupying turn");
+
+        // A current-thread runtime models the Node event loop: anything
+        // that blocks this thread blocks *everything* scheduled on it.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("failed to build current-thread runtime");
+        rt.block_on(async {
+            let reset = send_and_await(&model_thread, |reply| Cmd::Reset { reply });
+            futures::pin_mut!(reset);
+
+            // Queued behind the occupied turn: polling returns Pending
+            // instead of blocking the calling thread (`send_and_block`
+            // would never return here).
+            assert!(
+                futures::poll!(reset.as_mut()).is_pending(),
+                "reset resolved while the in-flight turn still held the model thread"
+            );
+
+            // The "event loop" stays free to run unrelated work while
+            // the reset is parked.
+            let other_work = async { 21 * 2 }.await;
+            assert_eq!(other_work, 42);
+            assert!(
+                futures::poll!(reset.as_mut()).is_pending(),
+                "reset must stay parked until the in-flight turn drains"
+            );
+
+            // Drain the turn; FIFO ordering then completes the reset.
+            release_tx
+                .send(())
+                .expect("model thread dropped the occupy command");
+            turn_rx
+                .await
+                .expect("turn reply channel closed")
+                .expect("occupying turn failed");
+            reset
+                .await
+                .expect("reset should resolve once the turn drains");
+        });
     }
 }

@@ -142,9 +142,7 @@ describe('Gemma4Model(config) stub (round-5 Finding B)', () => {
 
   it('rejects chatSessionContinue with a "not initialized" error', async () => {
     const stub = new Gemma4ModelNative(stubConfig());
-    await expect(stub.chatSessionContinue([{ role: 'user', content: 'hi' }], null)).rejects.toThrow(
-      /not initialized/i,
-    );
+    await expect(stub.chatSessionContinue([{ role: 'user', content: 'hi' }], null)).rejects.toThrow(/not initialized/i);
   });
 
   it('rejects chatSessionContinueTool with a "not initialized" error', async () => {
@@ -167,9 +165,9 @@ describe('Gemma4Model(config) stub (round-5 Finding B)', () => {
 
   it('rejects chatStreamSessionContinue with a "not initialized" error', async () => {
     const stub = new Gemma4ModelNative(stubConfig());
-    await expect(
-      stub.chatStreamSessionContinue([{ role: 'user', content: 'hi' }], null, () => {}),
-    ).rejects.toThrow(/not initialized/i);
+    await expect(stub.chatStreamSessionContinue([{ role: 'user', content: 'hi' }], null, () => {})).rejects.toThrow(
+      /not initialized/i,
+    );
   });
 
   it('rejects chatStreamSessionContinueTool with a "not initialized" error', async () => {
@@ -183,12 +181,13 @@ describe('Gemma4Model(config) stub (round-5 Finding B)', () => {
     ).rejects.toThrow(/not initialized/i);
   });
 
-  it('resetCaches is a silent no-op on the stub', () => {
+  it('resetCaches is a silent no-op on the stub', async () => {
     const stub = new Gemma4ModelNative(stubConfig());
-    // Matches the documented contract on the Rust impl: uninitialized
-    // stub returns Ok(()) so `ChatSession.reset()` is idempotent
-    // across stub + loaded instances.
-    expect(() => stub.resetCaches()).not.toThrow();
+    // Matches the documented contract on the Rust impl: the async
+    // reset resolves Ok(()) on an uninitialized stub so
+    // `ChatSession.reset()` is idempotent across stub + loaded
+    // instances (H1a made resetCaches async end-to-end).
+    await expect(stub.resetCaches()).resolves.toBeUndefined();
   });
 });
 
