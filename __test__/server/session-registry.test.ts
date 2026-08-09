@@ -570,9 +570,7 @@ describe('SessionRegistry', () => {
       await dispatchB;
     });
 
-    it('attaches queuedCount and limit to the thrown QueueFullError', async () => {
-      // The error needs to carry both numbers so endpoint handlers
-      // can surface them to the client in the 429 body.
+    it('reports queue depth separately from the combined admission footprint', async () => {
       const model = makeMockModel();
       const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
 
@@ -597,9 +595,11 @@ describe('SessionRegistry', () => {
       }
       expect(caught).toBeInstanceOf(QueueFullError);
       const queueErr = caught as QueueFullError;
-      expect(queueErr.queuedCount).toBe(1);
+      expect(queueErr.queueDepth).toBe(1);
+      expect(queueErr.preDispatchAdmissions).toBe(0);
+      expect(queueErr.admissionFootprint).toBe(1);
       expect(queueErr.limit).toBe(1);
-      expect(queueErr.message).toContain('1 waiting (limit 1)');
+      expect(queueErr.message).toContain('1 queued, 0 pre-dispatch');
 
       releaseA();
       await dispatchA;
@@ -708,7 +708,8 @@ describe('SessionRegistry', () => {
         caught = err;
       }
       expect(caught).toBeInstanceOf(QueueFullError);
-      expect((caught as QueueFullError).queuedCount).toBe(1);
+      expect((caught as QueueFullError).queueDepth).toBe(1);
+      expect((caught as QueueFullError).admissionFootprint).toBe(1);
       expect((caught as QueueFullError).limit).toBe(1);
 
       // A and B still drain cleanly; the rejected 3rd never entered the
@@ -882,7 +883,19 @@ describe('SessionRegistry.beginPreDispatchAdmission', () => {
     // slot, so cap+1 pre-dispatch admissions are legal.
     const permitA = reg.beginPreDispatchAdmission();
     const permitB = reg.beginPreDispatchAdmission();
-    expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+    let caught: unknown;
+    try {
+      reg.beginPreDispatchAdmission();
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(QueueFullError);
+    expect(caught).toMatchObject({
+      queueDepth: 0,
+      preDispatchAdmissions: 2,
+      admissionFootprint: 2,
+      limit: 1,
+    });
     permitA.release();
     permitB.release();
   });

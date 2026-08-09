@@ -3400,15 +3400,15 @@ describe('ChatSession', () => {
 });
 
 // ---------------------------------------------------------------------
-// H2 cancellable non-streaming turns — lm-level contract
+// H2 abortable non-streaming turns — lm-level contract
 // ---------------------------------------------------------------------
 
 /**
- * A controllable `CancellableChatCall` double: `result()` stays pending
+ * A controllable `ChatSessionCall` double: `result()` stays pending
  * until either `resolveResult` settles it or `cancel()` rejects it with
  * the native reply contract's exact string.
  */
-function makeCancellableCall() {
+function makeChatSessionCall() {
   let resolveResult: (r: ChatResult) => void = () => {
     /* overwritten */
   };
@@ -3423,50 +3423,60 @@ function makeCancellableCall() {
     rejectResult(new Error('chat session cancelled'));
   });
   return {
-    call: { handle: { cancel }, result: () => resultPromise },
+    call: { cancel, result: () => resultPromise },
     cancel,
     resolveResult: (r: ChatResult) => resolveResult(r),
   };
 }
 
-/**
- * `makeMockModel()` extended with the three `chatSession*Cancellable`
- * surfaces, each minting a fresh controllable call.
- */
-function makeCancellableMockModel() {
+/** `makeMockModel()` with public AbortSignal-aware non-streaming methods. */
+function makeAbortableMockModel() {
   const base = makeMockModel();
-  const calls: ReturnType<typeof makeCancellableCall>[] = [];
-  const mint = async () => {
-    const c = makeCancellableCall();
+  const calls: ReturnType<typeof makeChatSessionCall>[] = [];
+  const run = async (signal: AbortSignal | undefined, fallback: () => Promise<ChatResult>) => {
+    if (signal == null) return await fallback();
+    const c = makeChatSessionCall();
     calls.push(c);
-    return c.call;
+    const cancel = (): void => c.call.cancel();
+    signal.addEventListener('abort', cancel, { once: true });
+    if (signal.aborted) cancel();
+    try {
+      return await c.call.result();
+    } finally {
+      signal.removeEventListener('abort', cancel);
+    }
   };
-  const chatSessionStartCancellable = vi.fn(async (_messages: ChatMessage[], _config?: ChatConfig | null) => mint());
-  const chatSessionContinueCancellable = vi.fn(async (_messages: ChatMessage[], _config?: ChatConfig | null) => mint());
-  const chatSessionContinueToolCancellable = vi.fn(async (_messages: ChatMessage[], _config?: ChatConfig | null) =>
-    mint(),
+  const chatSessionStart = vi.fn(async (messages: ChatMessage[], config?: ChatConfig | null, signal?: AbortSignal) =>
+    run(signal, () => base.chatSessionStart(messages, config)),
+  );
+  const chatSessionContinue = vi.fn(async (messages: ChatMessage[], config?: ChatConfig | null, signal?: AbortSignal) =>
+    run(signal, () => base.chatSessionContinue(messages, config)),
+  );
+  const chatSessionContinueTool = vi.fn(
+    async (messages: ChatMessage[], config?: ChatConfig | null, signal?: AbortSignal) =>
+      run(signal, () => base.chatSessionContinueTool(messages, config)),
   );
   const model: SessionCapableModel = {
     ...base.model,
-    chatSessionStartCancellable,
-    chatSessionContinueCancellable,
-    chatSessionContinueToolCancellable,
+    chatSessionStart,
+    chatSessionContinue,
+    chatSessionContinueTool,
   };
   return {
     ...base,
     model,
     calls,
-    chatSessionStartCancellable,
-    chatSessionContinueCancellable,
-    chatSessionContinueToolCancellable,
+    chatSessionStart,
+    chatSessionContinue,
+    chatSessionContinueTool,
   };
 }
 
-describe('ChatSession H2 cancellable non-streaming turns', () => {
+describe('ChatSession H2 abortable non-streaming turns', () => {
   // Finding 2: `startFromHistory` takes `opts.signal` (an options object,
   // matching `send` / `sendToolResult`), NOT a positional AbortSignal.
   it('startFromHistory(config, { signal }) rejects pre-dispatch on an already-aborted signal', async () => {
-    const mock = makeCancellableMockModel();
+    const mock = makeAbortableMockModel();
     const session = new ChatSession(mock.model);
     session.primeHistory([{ role: 'user', content: 'replay me' }]);
 
@@ -3477,24 +3487,23 @@ describe('ChatSession H2 cancellable non-streaming turns', () => {
       'chat session cancelled',
     );
     // Pre-dispatch: NEITHER surface was invoked.
-    expect(mock.chatSessionStartCancellable).not.toHaveBeenCalled();
     expect(mock.chatSessionStart).not.toHaveBeenCalled();
     // No turn committed; the primed state stays intact for a retry.
     expect(session.turns).toBe(0);
   });
 
-  it('startFromHistory(config, { signal }) with a live signal routes through the cancellable surface', async () => {
-    const mock = makeCancellableMockModel();
+  it('startFromHistory(config, { signal }) with a live signal routes through the AbortSignal surface', async () => {
+    const mock = makeAbortableMockModel();
     const session = new ChatSession(mock.model);
     session.primeHistory([{ role: 'user', content: 'replay me' }]);
 
     const controller = new AbortController();
     const resultPromise = session.startFromHistory(undefined, { signal: controller.signal });
-    // The cancellable twin (not the plain method) received the dispatch.
+    // The operation bridge (not the plain method) received the dispatch.
     await vi.waitFor(() => {
-      expect(mock.chatSessionStartCancellable).toHaveBeenCalledTimes(1);
+      expect(mock.chatSessionStart).toHaveBeenCalledTimes(1);
     });
-    expect(mock.chatSessionStart).not.toHaveBeenCalled();
+    expect(mock.chatSessionStart.mock.calls[0][2]).toBe(controller.signal);
 
     mock.calls[0].resolveResult(makeChatResult('replayed'));
     const result = await resultPromise;
@@ -3502,35 +3511,14 @@ describe('ChatSession H2 cancellable non-streaming turns', () => {
     expect(session.turns).toBe(1);
   });
 
-  // Finding 3: an abort landing in the attach window (during the async
-  // dispatch, before the listener attach) must invoke `handle.cancel`
-  // EXACTLY once — the `{ once: true }` listener and the post-attach
-  // catch-up check are routed through one guarded closure.
-  it('invokes handle.cancel exactly once when the abort lands in the attach window', async () => {
-    const mock = makeCancellableMockModel();
-    const controller = new AbortController();
-    // Abort synchronously INSIDE the dispatch — before runNonStreamingNative
-    // attaches its listener or runs the catch-up check.
-    mock.chatSessionStartCancellable.mockImplementationOnce(async () => {
-      const c = makeCancellableCall();
-      mock.calls.push(c);
-      controller.abort();
-      return c.call;
-    });
-    const session = new ChatSession(mock.model);
-
-    await expect(session.send('hi', { signal: controller.signal })).rejects.toThrow('chat session cancelled');
-    expect(mock.calls[0].cancel).toHaveBeenCalledTimes(1);
-  });
-
   it('invokes handle.cancel exactly once on a mid-flight abort', async () => {
-    const mock = makeCancellableMockModel();
+    const mock = makeAbortableMockModel();
     const controller = new AbortController();
     const session = new ChatSession(mock.model);
 
     const pending = session.send('hi', { signal: controller.signal });
     await vi.waitFor(() => {
-      expect(mock.chatSessionStartCancellable).toHaveBeenCalledTimes(1);
+      expect(mock.chatSessionStart).toHaveBeenCalledTimes(1);
     });
     controller.abort();
 
@@ -3538,16 +3526,49 @@ describe('ChatSession H2 cancellable non-streaming turns', () => {
     expect(mock.calls[0].cancel).toHaveBeenCalledTimes(1);
   });
 
+  it('forwards AbortSignal to a text continuation', async () => {
+    const mock = makeAbortableMockModel();
+    const session = new ChatSession(mock.model);
+    await session.send('first');
+
+    const controller = new AbortController();
+    const pending = session.send('second', { signal: controller.signal });
+    await vi.waitFor(() => {
+      expect(mock.chatSessionContinue).toHaveBeenCalledTimes(1);
+    });
+    expect(mock.chatSessionContinue.mock.calls[0][2]).toBe(controller.signal);
+    mock.calls[0].resolveResult(makeChatResult('continued'));
+
+    await expect(pending).resolves.toMatchObject({ text: 'continued' });
+  });
+
+  it('forwards AbortSignal to a tool continuation', async () => {
+    const mock = makeAbortableMockModel();
+    mock.chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('call it', 'call-1'));
+    const session = new ChatSession(mock.model);
+    await session.send('first');
+
+    const controller = new AbortController();
+    const pending = session.sendToolResult('call-1', 'done', { signal: controller.signal });
+    await vi.waitFor(() => {
+      expect(mock.chatSessionContinueTool).toHaveBeenCalledTimes(1);
+    });
+    expect(mock.chatSessionContinueTool.mock.calls[0][2]).toBe(controller.signal);
+    mock.calls[0].resolveResult(makeChatResult('tool continued'));
+
+    await expect(pending).resolves.toMatchObject({ text: 'tool continued' });
+  });
+
   // Finding 4 (lm side): a cancelled turn must release the inFlight
   // guard and commit nothing, so the session serves the next turn.
   it('releases the inFlight guard and commits nothing after a cancelled turn', async () => {
-    const mock = makeCancellableMockModel();
+    const mock = makeAbortableMockModel();
     const controller = new AbortController();
     const session = new ChatSession(mock.model);
 
     const pending = session.send('hi', { signal: controller.signal });
     await vi.waitFor(() => {
-      expect(mock.chatSessionStartCancellable).toHaveBeenCalledTimes(1);
+      expect(mock.chatSessionStart).toHaveBeenCalledTimes(1);
     });
     controller.abort();
     await expect(pending).rejects.toThrow('chat session cancelled');
@@ -3561,8 +3582,8 @@ describe('ChatSession H2 cancellable non-streaming turns', () => {
     // START (turn 0 again), proving the cancelled turn adopted nothing.
     const second = await session.send('again');
     expect(second.text).toBe('start-reply');
-    expect(mock.chatSessionStart).toHaveBeenCalledTimes(1);
+    expect(mock.chatSessionStart).toHaveBeenCalledTimes(2);
     expect(mock.chatSessionContinue).not.toHaveBeenCalled();
-    expect(mock.chatSessionStart.mock.calls[0][0]).toEqual([{ role: 'user', content: 'again' }]);
+    expect(mock.chatSessionStart.mock.calls[1][0]).toEqual([{ role: 'user', content: 'again' }]);
   });
 });

@@ -10,23 +10,23 @@
 //!
 //! Named mutation this gate catches:
 //!   * checkpoints reverted (HEAD behavior): the first turn completes the
-//!     ENTIRE prefill before the decode-loop cancel fires — the timing
-//!     assertion fails (and the completed turn registers the prompt
-//!     blocks, so `cached_tokens > 0` fails too);
+//!     ENTIRE prefill before the decode-loop cancel fires, so the
+//!     distinguished `"prefill cancelled"` assertion fails (and a
+//!     completed turn can register prompt blocks too);
 //!   * checkpoints present but fail-OPEN (abort path skipped / history
 //!     still saved): the second turn warm-hits partial state —
 //!     `cached_tokens == 0` fails.
 //!
 //! Pattern: `qwen3_paged_vs_flat_parity.rs` — gated on
-//! `MLX_TEST_MODEL_PATH` so a plain `cargo test` (and `--ignored` without
-//! the env var) still passes; a missing fixture SKIPS, never fails.
+//! `MLX_TEST_MODEL_PATH` so a local plain `cargo test` (and `--ignored`
+//! without the env var) still passes; CI fails closed on a missing fixture.
 //!
 //! This binary holds TWO heavyweight timing gates (paged + flat). They
 //! are serialized through [`HEAVY_GATE`] so the GPU is never shared and
 //! the cancel-timer windows stay meaningful, and neither test mutates
 //! the process environment — the paged gate REQUIRES
-//! `MLX_PAGED_PREFILL_CHUNK_SIZE=512` to be exported by the harness
-//! (`run-cancel-gate.sh`) and skips otherwise.
+//! `MLX_PAGED_PREFILL_CHUNK_SIZE=512` to be exported before this test
+//! binary starts. CI treats a missing/wrong value as a hard failure.
 //!
 //! Run locally with:
 //!
@@ -66,7 +66,30 @@ static HEAVY_GATE: Mutex<()> = Mutex::const_new(());
 /// prefill (the pre-start cancel guard would otherwise swallow the turn
 /// before any chunk ran — asserted below), and short enough to land well
 /// before the multi-second full prefill completes.
-const CANCEL_DELAY_MS: u64 = 150;
+const DEFAULT_CANCEL_DELAY_MS: u64 = 100;
+// Debug Rust real-weight prefills are intentionally unoptimized and the
+// fail-closed proof must complete the full, uncached 11k-token follow-up.
+// Five minutes still turns a deadlock into a bounded failure instead of the
+// CI provider's multi-hour default.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(300);
+
+struct TemporaryModelDir(PathBuf);
+
+impl TemporaryModelDir {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TemporaryModelDir {
+    fn drop(&mut self) {
+        if let Err(err) = fs::remove_dir_all(&self.0)
+            && self.0.exists()
+        {
+            eprintln!("warning: failed to clean {}: {err}", self.0.display());
+        }
+    }
+}
 
 fn user_message(content: String) -> ChatMessage {
     ChatMessage {
@@ -96,12 +119,30 @@ fn assistant_message(content: &str) -> ChatMessage {
     }
 }
 
+fn test_model_path() -> Option<String> {
+    let Ok(model_path) = std::env::var("MLX_TEST_MODEL_PATH") else {
+        if std::env::var_os("CI").is_some() {
+            panic!("MLX_TEST_MODEL_PATH must be set for the CI cancellation gate");
+        }
+        eprintln!("skipping: MLX_TEST_MODEL_PATH unset");
+        return None;
+    };
+    if !Path::new(&model_path).exists() {
+        if std::env::var_os("CI").is_some() {
+            panic!("MLX_TEST_MODEL_PATH does not exist: {model_path}");
+        }
+        eprintln!("skipping: MLX_TEST_MODEL_PATH does not exist: {model_path}");
+        return None;
+    }
+    Some(model_path)
+}
+
 /// Clone the checkpoint dir with `use_block_paged_cache` forced OFF so the
 /// chat turn takes the FLAT engine path (`ChatBackend::prefill` →
 /// `flat_prefill`'s 2048-token chunk loop). Weight files are symlinked;
 /// only `config.json` is copied and patched. Pattern:
 /// `qwen3_paged_vs_flat_parity.rs::clone_model_dir`.
-fn clone_flat_model_dir(src: &Path) -> Result<PathBuf, String> {
+fn clone_flat_model_dir(src: &Path) -> Result<TemporaryModelDir, String> {
     let pid = std::process::id();
     let workspace_target = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
@@ -143,19 +184,20 @@ fn clone_flat_model_dir(src: &Path) -> Result<PathBuf, String> {
         serde_json::to_string_pretty(&cfg).map_err(|e| format!("serialize config.json: {e}"))?,
     )
     .map_err(|e| format!("write config.json: {e}"))?;
-    Ok(dst)
+    Ok(TemporaryModelDir(dst))
 }
 
-/// A prompt long enough for many 512-token prefill chunks (~5.5k tokens
-/// on the qwen3 tokenizer — 10+ chunk boundaries).
+/// A prompt long enough for many 512-token prefill chunks (~11k tokens
+/// on the qwen3 tokenizer — 20+ chunk boundaries). The wide window keeps
+/// the timer away from the final chunk even on faster Metal generations.
 fn long_prompt() -> String {
     let paragraph = "The quick brown fox jumps over the lazy dog while the \
                      patient owl watches from a very tall oak tree near the \
                      river bend, counting every leaf that falls into the \
                      slow-moving water below. ";
-    let mut prompt = String::with_capacity(paragraph.len() * 150 + 64);
+    let mut prompt = String::with_capacity(paragraph.len() * 300 + 64);
     prompt.push_str("Summarize the following text in one sentence:\n");
-    for _ in 0..150 {
+    for _ in 0..300 {
         prompt.push_str(paragraph);
     }
     prompt
@@ -186,7 +228,7 @@ struct TurnOutcome {
     first_item: Option<Duration>,
 }
 
-async fn drain_turn(
+async fn drain_turn_inner(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<napi::Result<ChatStreamChunk>>,
     started: Instant,
 ) -> TurnOutcome {
@@ -226,31 +268,40 @@ async fn drain_turn(
     outcome
 }
 
+async fn drain_turn(
+    rx: tokio::sync::mpsc::UnboundedReceiver<napi::Result<ChatStreamChunk>>,
+    started: Instant,
+) -> TurnOutcome {
+    tokio::time::timeout(DRAIN_TIMEOUT, drain_turn_inner(rx, started))
+        .await
+        .unwrap_or_else(|_| panic!("stream turn did not terminate within {DRAIN_TIMEOUT:?}"))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3 checkpoint"]
 async fn qwen3_paged_mid_prefill_cancel_fails_closed() {
     let _gate = HEAVY_GATE.lock().await;
     // The paged chunk size must be exported by the harness BEFORE this
-    // binary starts (see `run-cancel-gate.sh`): this binary holds a
+    // binary starts: this binary holds a
     // second test, so an in-process `set_var` would race the sibling's
-    // environment reads. Skip when the environment is not prepared.
+    // environment reads. CI must fail rather than silently skip when the
+    // environment is not prepared.
     if std::env::var("MLX_PAGED_PREFILL_CHUNK_SIZE").as_deref() != Ok(PREFILL_CHUNK_SIZE) {
+        if std::env::var_os("CI").is_some() {
+            panic!(
+                "MLX_PAGED_PREFILL_CHUNK_SIZE={PREFILL_CHUNK_SIZE} must be exported for the CI cancellation gate"
+            );
+        }
         eprintln!(
             "skipping: MLX_PAGED_PREFILL_CHUNK_SIZE={PREFILL_CHUNK_SIZE} must be exported \
-             by the harness (see run-cancel-gate.sh)"
+             before the test binary starts"
         );
         return;
     }
 
-    let Ok(model_path) = std::env::var("MLX_TEST_MODEL_PATH") else {
-        eprintln!("skipping: MLX_TEST_MODEL_PATH unset");
+    let Some(model_path) = test_model_path() else {
         return;
     };
-    // A missing fixture SKIPS (plan-mandated), never fails the gate.
-    if !Path::new(&model_path).exists() {
-        eprintln!("skipping: MLX_TEST_MODEL_PATH does not exist: {model_path}");
-        return;
-    }
 
     let model = qwen3_load_with_thread(&model_path)
         .await
@@ -270,8 +321,12 @@ async fn qwen3_paged_mid_prefill_cancel_fails_closed() {
     let (handle1, rx1) = model
         .chat_stream_session_start_for_test(messages(), Some(chat_config(64)))
         .expect("turn 1 dispatch failed");
+    let delay_ms: u64 = std::env::var("MLX_TEST_PAGED_CANCEL_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_CANCEL_DELAY_MS);
     let timer = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(CANCEL_DELAY_MS));
+        std::thread::sleep(Duration::from_millis(delay_ms));
         handle1.cancel();
     });
     let turn1 = drain_turn(rx1, started1).await;
@@ -284,7 +339,7 @@ async fn qwen3_paged_mid_prefill_cancel_fails_closed() {
         assert!(
             !err.contains("cancelled before start"),
             "cancel timer fired before the model thread dequeued the \
-             turn; raise CANCEL_DELAY_MS (turn 1 error: {err})",
+             turn; raise MLX_TEST_PAGED_CANCEL_DELAY_MS (turn 1 error: {err})",
         );
     }
     println!(
@@ -325,21 +380,7 @@ async fn qwen3_paged_mid_prefill_cancel_fails_closed() {
          multi-chunk prefill at chunk size {PREFILL_CHUNK_SIZE}",
     );
 
-    // ---- Gate 1 (H1b responsiveness): the cancel took effect within
-    // ~one chunk of prefill work, not after the whole prefill. Turn 2's
-    // TTFT bounds a full-prefill duration from above on this machine
-    // (cold when fail-closed holds; even warmer at HEAD — which only
-    // makes the bound tighter and the assertion redder).
-    assert!(
-        turn1.elapsed < ttft2.mul_f64(0.6),
-        "cancel did not take effect within one prefill chunk: cancelled \
-         turn ran {:?} vs full-prefill TTFT {:?} — mid-prefill cancel \
-         checkpoints are missing (H1b)",
-        turn1.elapsed,
-        ttft2,
-    );
-
-    // ---- Gate 2 (distinguished error): the cancelled turn must have
+    // ---- Gate 1 (distinguished error): the cancelled turn must have
     // terminated with the mid-prefill cancel error specifically — an
     // unrelated early failure (load/OOM/template) must not satisfy this
     // gate.
@@ -354,7 +395,7 @@ async fn qwen3_paged_mid_prefill_cancel_fails_closed() {
         turn1.done.as_ref().and_then(|c| c.finish_reason.clone()),
     );
 
-    // ---- Gate 3 (fail closed): the cancelled prefill must NOT have
+    // ---- Gate 2 (fail closed): the cancelled prefill must NOT have
     // left partially-written KV registered as a live/reusable prefix —
     // the identical second turn re-prefills from zero.
     assert_eq!(
@@ -380,27 +421,21 @@ async fn qwen3_paged_mid_prefill_cancel_fails_closed() {
 /// before the final remainder whenever an earlier chunk was processed
 /// (offset > 0); offset-zero single-shot prefills stay uncancellable.
 ///
-/// The ~5.5k-token prompt spans two full 2048-token loop chunks plus a
-/// remainder (boundary polls at ~0/~130/~240 ms on an M5 debug build);
-/// the default timer fires inside an early chunk, so at the defect the
-/// only later poll would be decode's.
+/// The ~11k-token prompt spans five full 2048-token loop chunks plus a
+/// remainder, leaving multiple later checkpoint opportunities after the
+/// default timer. The override below remains available for unusually fast
+/// or slow test hosts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3 checkpoint"]
 async fn qwen3_flat_mid_prefill_cancel_fails_closed() {
     let _gate = HEAVY_GATE.lock().await;
-    let Ok(model_path) = std::env::var("MLX_TEST_MODEL_PATH") else {
-        eprintln!("skipping: MLX_TEST_MODEL_PATH unset");
+    let Some(model_path) = test_model_path() else {
         return;
     };
-    // A missing fixture SKIPS (plan-mandated), never fails the gate.
-    if !Path::new(&model_path).exists() {
-        eprintln!("skipping: MLX_TEST_MODEL_PATH does not exist: {model_path}");
-        return;
-    }
 
     let flat_dir = clone_flat_model_dir(Path::new(&model_path))
         .expect("failed to clone a flat (use_block_paged_cache=false) model dir");
-    let model = qwen3_load_with_thread(&flat_dir.to_string_lossy())
+    let model = qwen3_load_with_thread(&flat_dir.path().to_string_lossy())
         .await
         .expect("failed to load flat Qwen3 model");
     assert!(
@@ -410,19 +445,14 @@ async fn qwen3_flat_mid_prefill_cancel_fails_closed() {
 
     let messages = || vec![user_message(long_prompt())];
 
-    // Turn 1: cancel mid-prefill via a timer thread. The flat fused
-    // forward is FAST (prefill ends ~380ms for this whole 5.5k-token
-    // prompt on an M5 in a debug build; boundary polls sit at ~0/~130/
-    // ~240ms), so the default 100ms lands inside an early chunk and is
-    // caught at the NEXT boundary poll — well clear of the uncancellable
-    // final-remainder forward, on this machine and on anything slower.
-    // `MLX_TEST_FLAT_CANCEL_DELAY_MS` overrides for machine-speed tuning
-    // (200ms was the mutation-A/B point aimed between the last loop-top
-    // poll and the pre-remainder poll).
+    // Turn 1: cancel mid-prefill via a timer thread. The long prompt leaves
+    // several full chunks after the default timer, so cancellation is caught
+    // at a later boundary rather than relying on one machine's exact TTFT.
+    // `MLX_TEST_FLAT_CANCEL_DELAY_MS` remains a machine-speed override.
     let delay_ms: u64 = std::env::var("MLX_TEST_FLAT_CANCEL_DELAY_MS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
+        .unwrap_or(DEFAULT_CANCEL_DELAY_MS);
     let started1 = Instant::now();
     let (handle1, rx1) = model
         .chat_stream_session_start_for_test(messages(), Some(chat_config(16)))

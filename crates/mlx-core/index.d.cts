@@ -27,14 +27,14 @@ export declare class BatchGenerationResult {
 }
 
 /**
- * In-flight NON-streaming chat turn returned by the additive
- * `chat_session_*_cancellable` entry points (H2).
+ * In-flight non-streaming chat turn returned by the internal
+ * `begin_chat_session_*` operation entry points (H2).
  *
  * The dispatching NAPI method resolves with this object IMMEDIATELY
  * after the command is queued (mirroring how the streaming methods
  * return their [`ChatStreamHandle`] before the turn runs); the turn's
- * reply arrives later through [`Self::result`]. `handle` shares the
- * same `Arc<AtomicBool>` the command carries, so `handle.cancel()`
+ * reply arrives later through [`Self::result`]. `cancel()` flips the
+ * same `Arc<AtomicBool>` the command carries, so it
  * reaches the model thread's chunk-boundary / per-step polls exactly
  * like a streaming cancel.
  *
@@ -42,13 +42,9 @@ export declare class BatchGenerationResult {
  * the exact string `"chat session cancelled"`
  * ([`crate::engine::session::CHAT_SESSION_CANCELLED`]).
  */
-export declare class CancellableChatCall {
-  /**
-   * Cancellation token for this turn. Each access mints a fresh
-   * `ChatStreamHandle` wrapping the SAME shared flag, so
-   * `call.handle.cancel()` behaves identically across accesses.
-   */
-  get handle(): ChatStreamHandle;
+export declare class ChatSessionCall {
+  /** Cooperatively cancel this queued or running turn. */
+  cancel(): void;
   /**
    * Await the turn's reply. Resolves with the [`ChatResult`] on a
    * completed turn; rejects with `"chat session cancelled"` when the
@@ -197,6 +193,11 @@ export declare class Gemma4Model {
    * without a model-thread roundtrip.
    */
   hasBlockPagedCache(): boolean;
+  /**
+   * Whether this loaded instance can execute image-bearing chat turns.
+   * Config-only stubs and incomplete/non-paged physical paths return false.
+   */
+  supportsImages(): boolean;
   modelId(): number;
   /**
    * Whether a draft model — DSpark or Google assistant — is loaded on
@@ -222,78 +223,50 @@ export declare class Gemma4Model {
   /**
    * Start a new chat session.
    *
-   * Runs the full jinja chat template once, decodes until the
-   * family's session stop token, and leaves the KV caches on a
-   * clean turn boundary so subsequent `chatSessionContinue` /
-   * `chatSessionContinueTool` calls can append a raw delta on
-   * top without re-rendering the chat template.
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionStart` (H2). Resolves
-   * IMMEDIATELY with a `CancellableChatCall` whose `handle`
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
    * can cancel the queued/running turn; the reply arrives via
    * `call.result()`. A cancelled turn rejects `result()` with
-   * the exact string `"chat session cancelled"`. The plain
-   * `chatSessionStart` is untouched — this method is additive.
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
    */
-  chatSessionStartCancellable(
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
+   */
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /**
-   * Continue an existing chat session with a new user message.
-   *
-   * Appends a raw user/assistant delta to the session's cached
-   * KV state, then decodes the assistant reply, stopping on the
-   * family's session boundary token.
-   *
-   * `images` is an opt-in guard parameter: when non-empty the
-   * native side returns an error whose message begins with
-   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can route image-changes back through a
-   * fresh `chatSessionStart`.
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
    */
-  chatSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null | undefined,
-  ): Promise<ChatResult>;
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionContinue` (H2). Same
-   * contract as `chatSessionStartCancellable`.
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
    */
-  chatSessionContinueCancellable(
+  beginChatSessionContinueTool(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
-  /**
-   * Continue an existing chat session with a tool-result turn.
-   *
-   * Builds the family's tool-result delta from `content` and
-   * prefills it on top of the live session caches, then decodes
-   * the assistant reply.
-   *
-   * `is_error` is the structured tool-error signal. When
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * rendered tool block.
-   */
-  chatSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
-  ): Promise<ChatResult>;
-  /**
-   * Cancellable twin of `chatSessionContinueTool` (H2). Same
-   * contract as `chatSessionStartCancellable`.
-   */
-  chatSessionContinueToolCancellable(
-    messages: Array<ChatMessage>,
-    config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -302,26 +275,15 @@ export declare class Gemma4Model {
   ): Promise<ChatStreamHandle>;
   /** Streaming variant of `chatSessionContinue`. */
   chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
+    messages: ChatMessage[],
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the rendered
-   * tool block.
-   */
+  /** Streaming variant of `chatSessionContinueTool`. */
   chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
+    messages: ChatMessage[],
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
 }
 
@@ -608,78 +570,50 @@ export declare class Lfm2Model {
   /**
    * Start a new chat session.
    *
-   * Runs the full jinja chat template once, decodes until the
-   * family's session stop token, and leaves the KV caches on a
-   * clean turn boundary so subsequent `chatSessionContinue` /
-   * `chatSessionContinueTool` calls can append a raw delta on
-   * top without re-rendering the chat template.
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionStart` (H2). Resolves
-   * IMMEDIATELY with a `CancellableChatCall` whose `handle`
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
    * can cancel the queued/running turn; the reply arrives via
    * `call.result()`. A cancelled turn rejects `result()` with
-   * the exact string `"chat session cancelled"`. The plain
-   * `chatSessionStart` is untouched — this method is additive.
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
    */
-  chatSessionStartCancellable(
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
+   */
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /**
-   * Continue an existing chat session with a new user message.
-   *
-   * Appends a raw user/assistant delta to the session's cached
-   * KV state, then decodes the assistant reply, stopping on the
-   * family's session boundary token.
-   *
-   * `images` is an opt-in guard parameter: when non-empty the
-   * native side returns an error whose message begins with
-   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can route image-changes back through a
-   * fresh `chatSessionStart`.
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
    */
-  chatSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null | undefined,
-  ): Promise<ChatResult>;
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionContinue` (H2). Same
-   * contract as `chatSessionStartCancellable`.
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
    */
-  chatSessionContinueCancellable(
+  beginChatSessionContinueTool(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
-  /**
-   * Continue an existing chat session with a tool-result turn.
-   *
-   * Builds the family's tool-result delta from `content` and
-   * prefills it on top of the live session caches, then decodes
-   * the assistant reply.
-   *
-   * `is_error` is the structured tool-error signal. When
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * rendered tool block.
-   */
-  chatSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
-  ): Promise<ChatResult>;
-  /**
-   * Cancellable twin of `chatSessionContinueTool` (H2). Same
-   * contract as `chatSessionStartCancellable`.
-   */
-  chatSessionContinueToolCancellable(
-    messages: Array<ChatMessage>,
-    config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -688,26 +622,15 @@ export declare class Lfm2Model {
   ): Promise<ChatStreamHandle>;
   /** Streaming variant of `chatSessionContinue`. */
   chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
+    messages: ChatMessage[],
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the rendered
-   * tool block.
-   */
+  /** Streaming variant of `chatSessionContinueTool`. */
   chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
+    messages: ChatMessage[],
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
 }
 
@@ -1189,17 +1112,16 @@ export declare class QianfanOCRModel {
   /**
    * Reset KV caches and token history. Async so a reset queued behind
    * an in-flight turn parks a tokio future, never the Node event loop
-   * (H1a — same contract as the `chat_napi_surface!` families).
+   * (H1a — same contract as the `chat_napi_surface!` families). Callers
+   * requiring reset-before-next-turn ordering must await this Promise.
    */
   resetCaches(): Promise<void>;
   /**
    * Start a new chat session.
    *
-   * Runs the full chat template once, decodes until `<|im_end|>`,
-   * and leaves the KV caches on a clean turn boundary so subsequent
-   * `chatSessionContinue` / `chatSessionContinueTool` calls can
-   * append a raw ChatML delta on top without re-rendering the chat
-   * template.
+   * Renders the complete structured conversation through the checkpoint
+   * template, decodes until `<|im_end|>`, and preserves KV state for an
+   * exact-prefix check against the next complete template render.
    *
    * Qianfan-OCR is always a VLM (InternViT + Qwen3 language model), so
    * this entry point accepts images in `messages` without the text-only
@@ -1207,97 +1129,49 @@ export declare class QianfanOCRModel {
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Continue an existing chat session with a new user message.
-   *
-   * Appends a raw ChatML user/assistant delta to the session's cached
-   * KV state, then decodes the model reply. Stops on `<|im_end|>` so
-   * the cache remains on a clean turn boundary for the next turn.
-   *
-   * Requires a live session started via `chatSessionStart`. Errors
-   * if the session is empty or if `config.reuse_cache` is
-   * explicitly set to `false`.
-   *
-   * `images` is an opt-in guard parameter: when non-empty the native
-   * side returns an error whose message begins with
-   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can catch the prefix and route image-changes
-   * back through a fresh `chatSessionStart` uniformly across all
-   * model backends. Qianfan-OCR is a VLM but the continue path cannot
-   * splice new vision features into a live KV cache — image changes
-   * always require a fresh session start.
-   *
-   * `audio` exists only to keep this method's positional ABI aligned
-   * with the shared chat surface every other family exposes (the
-   * `chat_napi_surface!` macro inserts `audio` between `images` and
-   * `config`). Qianfan-OCR has no audio support, so a non-empty
-   * `audio` is rejected at the boundary with the shared no-audio
-   * error; `None` / empty is a complete no-op and audio is never
-   * threaded into the model thread.
+   * Internal operation for `chatSessionStart`. The returned call exposes an
+   * idempotent `cancel()` immediately; `result()` resolves or rejects with the
+   * exact `chat session cancelled` sentinel.
    */
-  chatSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null | undefined,
-  ): Promise<ChatResult>;
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
   /**
-   * Continue an existing chat session with a tool-result turn.
-   *
-   * Builds a ChatML `<tool_response>` delta from `tool_call_id` and
-   * `content` and prefills it on top of the live session caches, then
-   * decodes the model reply. Stops on `<|im_end|>` so the cache stays
-   * on a clean turn boundary for the next turn.
-   *
-   * `is_error` is the structured tool-error signal. When `Some(true)`,
-   * the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * `<tool_response>` wrapper so the model receives a clear text-level
-   * cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
-   * pre-feature output.
-   *
-   * Requires a live session started via `chatSessionStart`.
+   * Continue from the caller's complete conversation history. The
+   * checkpoint's chat template is rendered again and exact prefix matching
+   * decides whether the live cache can be reused.
    */
-  chatSessionContinueTool(
-    toolCallId: string,
-    content: string,
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /** Internal operation for `chatSessionContinue`. */
+  beginChatSessionContinue(
+    messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
-  ): Promise<ChatResult>;
+  ): Promise<ChatSessionCall>;
+  /**
+   * Tool-result continuation over a full history. Tool representation is
+   * owned entirely by the model-provided template.
+   */
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /** Internal operation for `chatSessionContinueTool`. */
+  beginChatSessionContinueTool(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinue`.
-   *
-   * `audio` mirrors the non-streaming entry point: it exists only to
-   * keep the positional ABI aligned with the shared chat surface, and
-   * a non-empty value is rejected at the boundary with the shared
-   * no-audio error. `None` / empty is a complete no-op.
-   */
+  /** Streaming continuation over a complete conversation history. */
   chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
+    messages: ChatMessage[],
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * `<tool_response>` wrapper.
-   */
+  /** Streaming tool-result continuation over a complete history. */
   chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
+    messages: ChatMessage[],
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
 }
 
@@ -1337,6 +1211,28 @@ export declare class Qwen35Model {
    */
   hasMtpWeights(): boolean;
   /**
+   * Whether this loaded model instance can execute image-bearing turns.
+   *
+   * This is an authoritative load-time snapshot, not a `config.json`
+   * family guess: it requires a loaded vision encoder, image processor,
+   * and the block-paged KV adapter used by the dense vision path.
+   */
+  supportsImages(): boolean;
+  /**
+   * Synchronous snapshot used by higher layers to preflight rendered
+   * prompts and clamp output before native cache allocation.
+   */
+  contextLimits(): Qwen35ContextLimits;
+  /**
+   * Compute the exact prompt length after Qwen image-placeholder expansion
+   * without running the vision encoder or touching inference caches.
+   *
+   * `prompt_tokens` is the already-rendered chat-template output. `messages`
+   * supplies the complete image history so both fresh and leased-session
+   * preflights account for every image in template order.
+   */
+  expandedPromptTokenCount(promptTokens: Uint32Array, messages: Array<ChatMessage>): Promise<number>;
+  /**
    * Load a pretrained model from a directory.
    *
    * Expects the directory to contain:
@@ -1368,78 +1264,50 @@ export declare class Qwen35Model {
   /**
    * Start a new chat session.
    *
-   * Runs the full jinja chat template once, decodes until the
-   * family's session stop token, and leaves the KV caches on a
-   * clean turn boundary so subsequent `chatSessionContinue` /
-   * `chatSessionContinueTool` calls can append a raw delta on
-   * top without re-rendering the chat template.
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionStart` (H2). Resolves
-   * IMMEDIATELY with a `CancellableChatCall` whose `handle`
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
    * can cancel the queued/running turn; the reply arrives via
    * `call.result()`. A cancelled turn rejects `result()` with
-   * the exact string `"chat session cancelled"`. The plain
-   * `chatSessionStart` is untouched — this method is additive.
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
    */
-  chatSessionStartCancellable(
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
+   */
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /**
-   * Continue an existing chat session with a new user message.
-   *
-   * Appends a raw user/assistant delta to the session's cached
-   * KV state, then decodes the assistant reply, stopping on the
-   * family's session boundary token.
-   *
-   * `images` is an opt-in guard parameter: when non-empty the
-   * native side returns an error whose message begins with
-   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can route image-changes back through a
-   * fresh `chatSessionStart`.
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
    */
-  chatSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null | undefined,
-  ): Promise<ChatResult>;
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionContinue` (H2). Same
-   * contract as `chatSessionStartCancellable`.
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
    */
-  chatSessionContinueCancellable(
+  beginChatSessionContinueTool(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
-  /**
-   * Continue an existing chat session with a tool-result turn.
-   *
-   * Builds the family's tool-result delta from `content` and
-   * prefills it on top of the live session caches, then decodes
-   * the assistant reply.
-   *
-   * `is_error` is the structured tool-error signal. When
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * rendered tool block.
-   */
-  chatSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
-  ): Promise<ChatResult>;
-  /**
-   * Cancellable twin of `chatSessionContinueTool` (H2). Same
-   * contract as `chatSessionStartCancellable`.
-   */
-  chatSessionContinueToolCancellable(
-    messages: Array<ChatMessage>,
-    config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -1448,26 +1316,15 @@ export declare class Qwen35Model {
   ): Promise<ChatStreamHandle>;
   /** Streaming variant of `chatSessionContinue`. */
   chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
+    messages: ChatMessage[],
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the rendered
-   * tool block.
-   */
+  /** Streaming variant of `chatSessionContinueTool`. */
   chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
+    messages: ChatMessage[],
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
 }
 export type Qwen3_5Model = Qwen35Model;
@@ -1508,6 +1365,21 @@ export declare class Qwen35MoeModel {
    * the per-request `enableMtp` flag.
    */
   hasMtpWeights(): boolean;
+  /**
+   * Whether this loaded model instance can execute image-bearing turns.
+   *
+   * This is an authoritative load-time snapshot, not a model-family guess:
+   * it requires the loaded vision encoder, image processor, and block-paged
+   * KV adapter used by the MoE vision path.
+   */
+  supportsImages(): boolean;
+  /** Synchronous active-context snapshot shared with the dense wrapper. */
+  contextLimits(): Qwen35ContextLimits;
+  /**
+   * Exact, non-mutating Qwen image-placeholder expansion count for a fully
+   * rendered prompt and complete message history.
+   */
+  expandedPromptTokenCount(promptTokens: Uint32Array, messages: Array<ChatMessage>): Promise<number>;
   /** Load a pretrained model from a directory. */
   static load(path: string): Promise<Qwen35MoeModel>;
   /** Generate text from a prompt token sequence. */
@@ -1533,78 +1405,50 @@ export declare class Qwen35MoeModel {
   /**
    * Start a new chat session.
    *
-   * Runs the full jinja chat template once, decodes until the
-   * family's session stop token, and leaves the KV caches on a
-   * clean turn boundary so subsequent `chatSessionContinue` /
-   * `chatSessionContinueTool` calls can append a raw delta on
-   * top without re-rendering the chat template.
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionStart` (H2). Resolves
-   * IMMEDIATELY with a `CancellableChatCall` whose `handle`
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
    * can cancel the queued/running turn; the reply arrives via
    * `call.result()`. A cancelled turn rejects `result()` with
-   * the exact string `"chat session cancelled"`. The plain
-   * `chatSessionStart` is untouched — this method is additive.
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
    */
-  chatSessionStartCancellable(
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
+   */
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /**
-   * Continue an existing chat session with a new user message.
-   *
-   * Appends a raw user/assistant delta to the session's cached
-   * KV state, then decodes the assistant reply, stopping on the
-   * family's session boundary token.
-   *
-   * `images` is an opt-in guard parameter: when non-empty the
-   * native side returns an error whose message begins with
-   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can route image-changes back through a
-   * fresh `chatSessionStart`.
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
    */
-  chatSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null | undefined,
-  ): Promise<ChatResult>;
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionContinue` (H2). Same
-   * contract as `chatSessionStartCancellable`.
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
    */
-  chatSessionContinueCancellable(
+  beginChatSessionContinueTool(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
-  /**
-   * Continue an existing chat session with a tool-result turn.
-   *
-   * Builds the family's tool-result delta from `content` and
-   * prefills it on top of the live session caches, then decodes
-   * the assistant reply.
-   *
-   * `is_error` is the structured tool-error signal. When
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * rendered tool block.
-   */
-  chatSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
-  ): Promise<ChatResult>;
-  /**
-   * Cancellable twin of `chatSessionContinueTool` (H2). Same
-   * contract as `chatSessionStartCancellable`.
-   */
-  chatSessionContinueToolCancellable(
-    messages: Array<ChatMessage>,
-    config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -1613,29 +1457,48 @@ export declare class Qwen35MoeModel {
   ): Promise<ChatStreamHandle>;
   /** Streaming variant of `chatSessionContinue`. */
   chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
+    messages: ChatMessage[],
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the rendered
-   * tool block.
-   */
+  /** Streaming variant of `chatSessionContinueTool`. */
   chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
+    messages: ChatMessage[],
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
 }
 export type Qwen3_5MoeModel = Qwen35MoeModel;
+
+export declare class Qwen3AsrCapture {
+  get source(): Qwen3AsrCaptureSource;
+  get deviceName(): string;
+  get sampleRate(): number;
+  get channels(): number;
+  pause(): void;
+  resume(): void;
+  stop(): Promise<Qwen3AsrCaptureStats>;
+}
+
+export declare class Qwen3AsrModel {
+  static load(modelPath: string): Promise<Qwen3AsrModel>;
+  transcribe(audio: Float32Array, options?: Qwen3AsrTranscribeOptions | undefined | null): Promise<Qwen3AsrResult>;
+  createStream(options?: Qwen3AsrStreamOptions | undefined | null): Promise<Qwen3AsrStream>;
+}
+
+export declare class Qwen3AsrStream {
+  feed(samples: Float32Array): Promise<Qwen3AsrResult | undefined | null>;
+  finish(): Promise<Qwen3AsrResult>;
+  /**
+   * Start real-time microphone or system-output capture through Core Audio.
+   * The realtime callback only writes mono float PCM into a bounded lock-free
+   * ring; a separate worker drains it and feeds this streaming session.
+   */
+  startCapture(
+    options: Qwen3AsrCaptureOptions | undefined | null,
+    callback: (err: Error | null, arg: Qwen3AsrResult) => void,
+  ): Qwen3AsrCapture;
+}
 
 /**
  * Qwen3 Model with automatic differentiation support
@@ -1762,78 +1625,50 @@ export declare class Qwen3Model {
   /**
    * Start a new chat session.
    *
-   * Runs the full jinja chat template once, decodes until the
-   * family's session stop token, and leaves the KV caches on a
-   * clean turn boundary so subsequent `chatSessionContinue` /
-   * `chatSessionContinueTool` calls can append a raw delta on
-   * top without re-rendering the chat template.
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionStart` (H2). Resolves
-   * IMMEDIATELY with a `CancellableChatCall` whose `handle`
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
    * can cancel the queued/running turn; the reply arrives via
    * `call.result()`. A cancelled turn rejects `result()` with
-   * the exact string `"chat session cancelled"`. The plain
-   * `chatSessionStart` is untouched — this method is additive.
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
    */
-  chatSessionStartCancellable(
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
+   */
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /**
-   * Continue an existing chat session with a new user message.
-   *
-   * Appends a raw user/assistant delta to the session's cached
-   * KV state, then decodes the assistant reply, stopping on the
-   * family's session boundary token.
-   *
-   * `images` is an opt-in guard parameter: when non-empty the
-   * native side returns an error whose message begins with
-   * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-   * `ChatSession` layer can route image-changes back through a
-   * fresh `chatSessionStart`.
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
    */
-  chatSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
-    config: ChatConfig | null | undefined,
-  ): Promise<ChatResult>;
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionContinue` (H2). Same
-   * contract as `chatSessionStartCancellable`.
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
    */
-  chatSessionContinueCancellable(
+  beginChatSessionContinueTool(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
-  /**
-   * Continue an existing chat session with a tool-result turn.
-   *
-   * Builds the family's tool-result delta from `content` and
-   * prefills it on top of the live session caches, then decodes
-   * the assistant reply.
-   *
-   * `is_error` is the structured tool-error signal. When
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-   * rendered tool block.
-   */
-  chatSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | undefined | null,
-    isError?: boolean | undefined | null,
-  ): Promise<ChatResult>;
-  /**
-   * Cancellable twin of `chatSessionContinueTool` (H2). Same
-   * contract as `chatSessionStartCancellable`.
-   */
-  chatSessionContinueToolCancellable(
-    messages: Array<ChatMessage>,
-    config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -1842,26 +1677,15 @@ export declare class Qwen3Model {
   ): Promise<ChatStreamHandle>;
   /** Streaming variant of `chatSessionContinue`. */
   chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null | undefined,
-    audio: Uint8Array[] | null | undefined,
+    messages: ChatMessage[],
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /**
-   * Streaming variant of `chatSessionContinueTool`.
-   *
-   * `is_error` mirrors the non-streaming entry point — when
-   * `Some(true)`, the renderer prepends the shared
-   * [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the rendered
-   * tool block.
-   */
+  /** Streaming variant of `chatSessionContinueTool`. */
   chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
+    messages: ChatMessage[],
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-    isError?: boolean | null | undefined,
   ): Promise<ChatStreamHandle>;
   /**
    * Load a pretrained model from disk
@@ -1996,6 +1820,9 @@ export declare class Qwen3Tokenizer {
    * * `add_generation_prompt` - Whether to add assistant prompt at end (default: true)
    * * `tools` - Optional array of tool definitions for function calling
    * * `enable_thinking` - Optional flag to enable thinking mode (<think> tags)
+   * * `content_order` - Optional structured multimodal content ordering
+   * * `existing_image_placeholder` - Optional model marker that suppresses
+   *   synthetic image parts when it is already present in sanitized text
    *
    * # Returns
    * Encoded token IDs ready for model input
@@ -2021,6 +1848,8 @@ export declare class Qwen3Tokenizer {
     addGenerationPrompt?: boolean | undefined | null,
     tools?: Array<ToolDefinition> | undefined | null,
     enableThinking?: boolean | undefined | null,
+    contentOrder?: MultimodalContentOrder | undefined | null,
+    existingImagePlaceholder?: string | undefined | null,
   ): Promise<Uint32Array>;
   /** Get vocabulary size */
   vocabSize(): number;
@@ -2303,17 +2132,11 @@ export declare class TextRecModel {
   recognizeCrop(rgbData: Uint8Array, width: number, height: number): RecResult;
 }
 
-/** Result from VLM chat */
 export declare class VlmChatResult {
-  /** Get the response text */
   get text(): string;
-  /** Get the generated tokens */
   get tokens(): MxArray;
-  /** Get the log probabilities */
   get logprobs(): MxArray;
-  /** Get the finish reason */
   get finishReason(): 'stop' | 'length' | 'repetition';
-  /** Get the number of tokens generated */
   get numTokens(): number;
 }
 export type VLMChatResult = VlmChatResult;
@@ -2467,25 +2290,41 @@ export declare const enum BuiltinRewardType {
  * Data-free static FP8 activation-amax calibration over RAW-text PREFILL
  * (NVIDIA modelopt `MaxCalibrator` parity), end to end in native code.
  *
- * Reuses the SAME loader the inference session uses
+ * The nvidia recipe covers BOTH `qwen3_5` (dense) and `qwen3_5_moe` (MoE), so
+ * this reads `<model_path>/config.json`'s `model_type` and dispatches to the
+ * matching loader + `CalibratePrefillRaw` command (any other `model_type` is a
+ * clear error). Both loaders are the SAME ones the inference session uses
  * ([`persistence::load_with_thread`]) — the model is only usable on its
- * dedicated model thread — then:
- *   1. arms the process-global [`ActivationAmaxCollector`] (AFTER load, so no
- *      load-time eval is recorded);
- *   2. dispatches [`Qwen35Cmd::CalibratePrefillRaw`], which on the model thread
- *      tokenizes each `text` WITHOUT the chat template, truncates to
- *      `calib_seq` tokens, and runs PREFILL ONLY (no generation) so every
- *      mxfp8 attn/GDN projection's activation tap fires over realistic
- *      raw-text activations, resetting caches between rows;
- *   3. disarms the collector, then — ONLY if the full loop succeeded — drains
- *      the per-tensor amax and ATOMICALLY writes it into
- *      `<model_path>/config.json` (temp file + `rename`).
+ * dedicated model thread. Then:
+ *   1. dispatches `{Qwen35Cmd,Qwen35MoeCmd}::CalibratePrefillRaw`, which on the
+ *      model thread SELF-ARMS that thread's thread-local
+ *      [`ActivationAmaxCollector`] flag (RAII, AFTER load so no load-time eval
+ *      is recorded), tokenizes each `text` WITHOUT the chat template, truncates
+ *      to `calib_seq` tokens, and runs PREFILL ONLY (no generation) so every
+ *      mxfp8 attn/GDN projection's activation tap fires over realistic raw-text
+ *      activations, resetting caches between rows, then disarms on exit;
+ *   2. ONLY if the full loop succeeded — drains the per-tensor amax and
+ *      ATOMICALLY writes it into `<model_path>/config.json` (temp file +
+ *      `rename`).
+ *
+ * CONCURRENCY: the whole clear→prefill→take→write section is serialized by
+ * [`calib_guard`] (a process-wide `try_lock`); a second concurrent calibration
+ * fails fast with "another calibration is in progress". The arm flag is
+ * thread-local (so a concurrent inference model can't contaminate the run), but
+ * the running-max MAP is process-global, so serializing RUNS keeps two
+ * calibrations from interleaving `record`/`take` on it. The map is CLEARED at
+ * the very start so stale amax from a prior PANICKED run cannot leak into this
+ * write.
  *
  * On ANY error before the final write, the partial amax is discarded and
  * `config.json` is left UNTOUCHED (a failed calibration must not mutate the
- * live model in place). Returns the number of projections calibrated (the
- * count of collected amax entries); 0 means the model exercised no
- * activation-fp8 sites (not an nvidia-recipe checkpoint).
+ * live model in place). A run that prefilled ZERO rows (empty dataset, or every
+ * row tokenized to nothing) is likewise an ERROR that leaves `config.json`
+ * untouched — a no-op calibration must not report a silent success. Returns the
+ * number of projections calibrated (the count of collected amax entries); 0
+ * means a real prefill ran but the model exercised no activation-fp8 sites (not
+ * an nvidia-recipe checkpoint), and in that case `config.json` is left
+ * UNCHANGED (no rewrite).
  */
 export declare function calibrateActivationAmaxRaw(
   modelPath: string,
@@ -2604,15 +2443,18 @@ export interface ChatConfig {
    * variant instead (`gemma4/model.rs` `resolve_params`, always from the
    * RAW config value — the engine's central `[1, 5]` clamp is an MTP-head
    * contract that does not apply to external drafts):
-   * - DSpark: an unset `mtpDepth` runs full draft blocks (the draft
-   *   checkpoint's block size — 7 tokens on `dspark_gemma4_12b_block7`),
-   *   and an explicit `mtpDepth` acts as a CAP on that block (clamped to
-   *   `[1, blockSize]`).
+   * - DSpark: with both knobs unset, full draft blocks (the checkpoint's
+   *   block size — 7 tokens on `dspark_gemma4_12b_block7`) run behind a
+   *   short target-AR/DSpark break-even calibration. A short generation
+   *   budget that cannot finish calibration retains the fixed-block
+   *   schedule. An explicit
+   *   `mtpDepth` caps and pins the block unless `mtpAdaptiveDepth: true`
+   *   opts the guard back in; explicit `false` disables it.
    * - Assistant (Google `gemma-4-*-it-assistant`): an unset `mtpDepth`
    *   drafts 3 tokens per cycle (`ASSISTANT_DEFAULT_DEPTH`), and an
    *   explicit `mtpDepth` clamps to `[1, 8]` (`ASSISTANT_MAX_DEPTH`).
    *
-   * `mtpAdaptiveDepth` is ignored for both Gemma4 external-draft variants.
+   * `mtpAdaptiveDepth` is ignored for the Gemma4 assistant variant.
    */
   mtpDepth?: number | undefined;
   /**
@@ -2625,7 +2467,9 @@ export interface ChatConfig {
    * `MLX_MTP_EV_ALLOW_DEEPEN=0` to pin the base depth.
    * When false, the loop pins `mtpDepth` for every cycle.
    *
-   * Default: false. An explicit value always wins over the default.
+   * Default: false, except Gemma4 DSpark enables its measured break-even
+   * guard when both this field and `mtpDepth` are unset. An explicit value
+   * always wins over the family default.
    */
   mtpAdaptiveDepth?: boolean | undefined;
 }
@@ -2646,20 +2490,23 @@ export interface ChatMessage {
    * Authoritative, structured signal of tool-call failure. Set to
    * `Some(true)` when the caller (e.g. the Anthropic
    * `tool_result.is_error === true` translator) wants the model to
-   * treat the tool output as an error. The renderer prepends a short
-   * `[tool error]` prefix to `content` when emitting the wire-format
-   * tool response so the model receives a clear text-level cue, but
-   * the original `content` stays byte-for-byte intact in the
-   * structured form — no JSON wrapping, no in-band marker that could
-   * collide with a successful tool result whose literal content
-   * happens to start with the same prefix.
-   *
-   * `None` / `Some(false)` produce the unmarked wire format.
+   * treat the tool output as an error. It is exposed to the model's
+   * chat template as `message.is_error`; Rust never rewrites `content`
+   * or invents a model-facing error marker.
    */
   isError?: boolean;
   /** Reasoning content for thinking mode (used with <think> tags) */
   reasoningContent?: string;
-  /** Thinking mode used when this historical assistant message was generated. */
+  /**
+   * Thinking mode used when this assistant message was generated.
+   *
+   * This is replay provenance, not a request override. Gemma4's disabled-
+   * thinking generation prefix contains an explicit empty thought channel,
+   * while an enabled-thinking turn that emitted no reasoning contains no
+   * such channel. Keeping the historical mode on the message lets the chat
+   * template reproduce either byte sequence even when a later request
+   * changes its current thinking setting.
+   */
   thinkingEnabled?: boolean;
   /** Image data for VLM models (encoded image bytes: PNG/JPEG, passed as Uint8Array/Buffer) */
   images?: Array<Uint8Array> | undefined;
@@ -2672,11 +2519,25 @@ export interface ChatResult {
   text: string;
   toolCalls: Array<ToolCallResult>;
   thinking?: string;
+  /**
+   * Effective `enable_thinking` boolean passed to the model-provided
+   * chat template for this turn. This is replay provenance and is
+   * intentionally distinct from the family's decode-time
+   * [`ThinkingSetup`](crate::engine::ThinkingSetup).
+   */
+  thinkingEnabled: boolean;
   numTokens: number;
   promptTokens: number;
   reasoningTokens: number;
   finishReason: string;
   rawText: string;
+  /**
+   * Reasoning-redacted raw output computed from the same token-aware
+   * boundary as `raw_text`. Session wrappers may request full reasoning
+   * internally for deterministic replay, then expose this safe view to a
+   * caller that set `includeReasoning: false`.
+   */
+  publicRawText?: string | undefined;
   /**
    * Number of prompt tokens served from the reused KV-cache prefix.
    *
@@ -2692,15 +2553,11 @@ export interface ChatResult {
   performance?: PerformanceMetrics;
 }
 
-/** Chat message role (lowercase values matching standard convention) */
+/** Chat message role (lowercase values matching standard convention). */
 export declare const enum ChatRole {
-  /** User message */
   User = 'user',
-  /** Assistant response */
   Assistant = 'assistant',
-  /** System prompt */
   System = 'system',
-  /** Tool response */
   Tool = 'tool',
 }
 
@@ -2711,10 +2568,23 @@ export interface ChatStreamChunk {
   finishReason?: string;
   toolCalls?: Array<ToolCallResult>;
   thinking?: string;
+  /**
+   * Effective template `enable_thinking` value. Present on the terminal
+   * chunk only; incremental text/reasoning chunks leave it unset.
+   */
+  thinkingEnabled?: boolean | undefined;
   numTokens?: number;
   promptTokens?: number;
   reasoningTokens?: number;
   rawText?: string;
+  /** Reasoning-redacted counterpart to `raw_text` on terminal chunks. */
+  publicRawText?: string | undefined;
+  /**
+   * Whether terminal `text` is the authoritative parsed assistant content.
+   * Generic emitters set true; Gemma streams visible content exclusively as
+   * deltas and set false so session history commits the accumulated text.
+   */
+  textAuthoritative?: boolean | undefined;
   /**
    * Number of prompt tokens served from the reused KV-cache prefix on
    * this turn. Populated on the terminal chunk (`done == true`) only;
@@ -2783,25 +2653,15 @@ export declare function coldCacheDrain(timeoutMs: number): boolean;
  * Return a snapshot of the process-wide cold tier. Read-only: never opens
  * the tier itself, so it reports `enabled: false` until inference first
  * initializes the tier.
+ *
+ * The source snapshot is DESTRUCTURED rather than field-accessed, so a
+ * counter added to `ColdCacheStats` and forgotten here fails to compile.
+ * The failure this guards is silent and has already happened twice: a native
+ * counter that never reaches this struct reaches no JS consumer either, and
+ * nothing downstream can tell "the counter is zero" from "the counter was
+ * never carried across".
  */
 export declare function coldCacheStats(): ColdCacheStats;
-
-/**
- * The native cold-restore allowlist, exposed so a test can assert it agrees
- * exactly with the TypeScript `COLD_TIER_RESTORE_FAMILIES` set.
- */
-export declare function coldRestoreFamilies(): Array<string>;
-
-/**
- * Return the process-wide sidecar counters. Unlike [`cold_cache_stats`] this
- * never consults the tier at all, so it is valid before any inference has run
- * and reports honestly even when the tier failed to open.
- *
- * The plain-Rust [`cold_sidecar_telemetry`] stays as it is: the parity harness
- * and the in-crate tests destructure `ColdSidecarTelemetry`, and a napi
- * `#[napi(object)]` return type cannot serve both.
- */
-export declare function coldSidecarStats(): ColdSidecarStats;
 
 /**
  * Snapshot of the process-wide SSD cold tier for paged prefix blocks.
@@ -2861,6 +2721,23 @@ export interface ColdCacheStats {
    */
   restoreDeclines: number;
 }
+
+/**
+ * The native cold-restore allowlist, exposed so a test can assert it agrees
+ * exactly with the TypeScript `COLD_TIER_RESTORE_FAMILIES` set.
+ */
+export declare function coldRestoreFamilies(): Array<string>;
+
+/**
+ * Return the process-wide sidecar counters. Unlike [`cold_cache_stats`] this
+ * never consults the tier at all, so it is valid before any inference has run
+ * and reports honestly even when the tier failed to open.
+ *
+ * The plain-Rust [`cold_sidecar_telemetry`] stays as it is: the parity harness
+ * and the in-crate tests destructure `ColdSidecarTelemetry`, and a napi
+ * `#[napi(object)]` return type cannot serve both.
+ */
+export declare function coldSidecarStats(): ColdSidecarStats;
 
 /**
  * Snapshot of [`ColdSidecarTelemetry`] for JS. Counters are cumulative since
@@ -3391,8 +3268,9 @@ export interface Gemma4LoadOptions {
    * Directory of a draft checkpoint (config.json + safetensors) to load
    * alongside the target model for speculative decoding — either a
    * DSpark draft or a Google assistant draft; the kind is probed from
-   * the draft config.json. Draft decoding runs only on the flat KV-cache
-   * path: setting this while the model config explicitly enables
+   * the draft config.json. When omitted, `<model_path>/draft/` is loaded
+   * automatically when present. Draft decoding runs only on the flat
+   * KV-cache path: setting this while the model config explicitly enables
    * `use_block_paged_cache` is a hard load error, and an unset
    * `use_block_paged_cache` is forced to `false`.
    */
@@ -3574,6 +3452,13 @@ export interface GgufConversionOptions {
   inputPath: string;
   /** Output directory for converted SafeTensors model */
   outputDir: string;
+  /**
+   * Optional directory containing the authoritative HuggingFace config and
+   * tokenizer/processor assets. GGUF metadata is not rich enough to recreate
+   * unified Gemma4 config fields such as head_dim, layer_types, vision, and
+   * audio configuration exactly.
+   */
+  configSourceDir?: string;
   /** Target dtype: "float32", "float16", "bfloat16" (default: keep original) */
   dtype?: string;
   /** Enable verbose logging */
@@ -4038,6 +3923,21 @@ export interface ModelConfig {
   eosTokenId: number;
 }
 
+/**
+ * Ordering policy for structured multimodal content parts handed to a
+ * checkpoint-provided Jinja template.
+ *
+ * The default preserves the generic serializer's existing text-before-media
+ * behavior. PaddleOCR-VL and Qianfan-OCR were trained with image placeholders
+ * before the instruction and opt into
+ * [`MultimodalContentOrder::ImagesThenText`] at their adapter boundaries.
+ * Audio remains after text in both modes.
+ */
+export declare const enum MultimodalContentOrder {
+  TextThenMedia = 'textThenMedia',
+  ImagesThenText = 'imagesThenText',
+}
+
 /** Result from document orientation classification. */
 export interface OrientationResult {
   /** Detected rotation angle (0, 90, 180, or 270 degrees) */
@@ -4382,7 +4282,7 @@ export interface Qwen35Config {
   /**
    * GPU memory budget for paged KV cache in megabytes.
    * Only used when `use_block_paged_cache` is true.
-   * Default: 2048 (2GB).
+   * Default: automatically sized for one full-context sequence.
    */
   pagedCacheMemoryMb?: number | undefined;
   /**
@@ -4442,6 +4342,18 @@ export interface Qwen35Config {
   nMtpLayers: number;
 }
 
+/**
+ * Trained and physically available active-context limits for one loaded
+ * Qwen3.5 model. Values are snapshots because the physical pool is fixed for
+ * the lifetime of the resident model.
+ */
+export interface Qwen35ContextLimits {
+  trainedWindowTokens: number;
+  effectiveWindowTokens: number;
+  pagedBlockCapacity: number;
+  pagedBlockSize: number;
+}
+
 /** Generation configuration for Qwen3.5 */
 export interface Qwen35GenerationConfig {
   maxNewTokens: number;
@@ -4497,7 +4409,7 @@ export interface Qwen35MoeConfig {
   /**
    * GPU memory budget for paged KV cache in megabytes.
    * Only used when `use_block_paged_cache` is true.
-   * Default: 2048 (2GB).
+   * Default: automatically sized for one full-context sequence.
    */
   pagedCacheMemoryMb?: number | undefined;
   /**
@@ -4560,6 +4472,145 @@ export interface Qwen35MoeGenerationResult {
   text: string;
   numTokens: number;
   finishReason: string;
+}
+
+export interface Qwen3AsrAudioDevice {
+  id: string;
+  name: string;
+  source: Qwen3AsrCaptureSource;
+  isDefault: boolean;
+  sampleRate: number;
+  channels: number;
+}
+
+export declare function qwen3AsrAudioDevices(): Array<Qwen3AsrAudioDevice>;
+
+export interface Qwen3AsrCaptureOptions {
+  /** Audio source. Omit to capture the microphone. */
+  source?: Qwen3AsrCaptureSource;
+  /**
+   * Stable Core Audio device UID returned by `qwen3AsrAudioDevices()` or
+   * `qwen3AsrInputDevices()`.
+   */
+  deviceId?: string;
+  /**
+   * Device name. Omit to use the default input or output device for the
+   * selected source.
+   */
+  deviceName?: string;
+  /**
+   * For system audio, optionally capture only processes with these bundle
+   * identifiers. Empty or omitted captures all audio sent to the device.
+   */
+  applicationBundleIds?: Array<string>;
+  /** Lock-free callback ring capacity in seconds (default 10). */
+  ringSeconds?: number;
+  /** Amount drained from the ring into each model feed (default 100 ms). */
+  feedMilliseconds?: number;
+}
+
+export declare const enum Qwen3AsrCaptureSource {
+  Microphone = 'microphone',
+  SystemAudio = 'systemAudio',
+}
+
+export interface Qwen3AsrCaptureStats {
+  capturedFrames: number;
+  droppedFrames: number;
+}
+
+export interface Qwen3AsrInputDevice {
+  id: string;
+  name: string;
+  isDefault: boolean;
+  sampleRate: number;
+  channels: number;
+  sampleFormat: string;
+}
+
+export declare function qwen3AsrInputDevices(): Array<Qwen3AsrInputDevice>;
+
+export interface Qwen3AsrResult {
+  /**
+   * Complete transcription for the latest rolling revision. The trailing
+   * provisional region may be replaced by the next revision.
+   */
+  text: string;
+  /**
+   * Prefix that survived the stream's provisional-token rollback window.
+   * Equals `text` for a final or one-shot result.
+   */
+  stableText: string;
+  /**
+   * Trailing text that may be replaced by the next rolling revision.
+   * Empty for a final or one-shot result.
+   */
+  provisionalText: string;
+  language?: string;
+  tokenIds: Array<number>;
+  /**
+   * True when generation used the entire configured token budget without
+   * reaching an end token. The revision may contain incomplete or repeated
+   * text and callers may choose to flag it for review.
+   */
+  reachedMaxTokens: boolean;
+  /** Total audio committed by this stream, or the full one-shot duration. */
+  audioSeconds: number;
+  /** Newly consumed audio duration for this update. */
+  segmentAudioSeconds: number;
+  featureMs: number;
+  encoderMs: number;
+  prefillMs: number;
+  decodeMs: number;
+  totalMs: number;
+  tokensPerSecond: number;
+  realTimeFactor: number;
+  /**
+   * Streaming revisions increment whenever a rolling decode replaces
+   * previously provisional text. Zero for one-shot transcription.
+   */
+  revision: number;
+  isFinal: boolean;
+}
+
+export interface Qwen3AsrStreamOptions {
+  sampleRate?: number;
+  prompt?: string;
+  language?: string;
+  /**
+   * Maximum continuation tokens generated per revision (default 32).
+   * Keeping this bounded is essential for realtime latency.
+   */
+  maxTokens?: number;
+  /** Minimum newly buffered audio before a rolling decode (default 2 s). */
+  chunkSeconds?: number;
+  /**
+   * Number of trailing raw decoder tokens rolled back and regenerated on
+   * the next revision (default 5).
+   */
+  provisionalTokens?: number;
+  /**
+   * Number of initial chunks decoded without transcript conditioning
+   * (default 2), matching Qwen's official streaming policy.
+   */
+  unfixedChunks?: number;
+}
+
+export interface Qwen3AsrTranscribeOptions {
+  /**
+   * Sampling rate of `audio`. Inputs are resampled to the checkpoint's
+   * native 16 kHz rate before feature extraction.
+   */
+  sampleRate?: number;
+  /** Optional domain/context prompt placed in the system turn. */
+  prompt?: string;
+  /**
+   * Language code (`en`, `zh`, ...) or canonical language name. Omit for
+   * automatic language detection.
+   */
+  language?: string;
+  /** Maximum number of newly generated tokens (default 256). */
+  maxTokens?: number;
 }
 
 /** Qwen3 model configuration */
@@ -5063,51 +5114,32 @@ export interface VisionConfig {
   spatialMergeSize: number;
 }
 
-/** A batch item for VLM batch inference */
 export interface VlmBatchItem {
-  /** Chat messages for this item */
   messages: Array<VlmChatMessage>;
-  /** Encoded image buffers for this item (one image per item for OCR) */
   images?: Array<Buffer>;
 }
 
-/** Configuration for VLM chat */
 export interface VlmChatConfig {
-  /** Encoded image buffers to process (PNG/JPEG bytes) */
   images?: Array<Buffer>;
-  /** Maximum number of new tokens to generate (default: 512) */
   maxNewTokens?: number;
-  /** Sampling temperature (0 = greedy, higher = more random) (default: 0.0 for OCR) */
   temperature?: number;
-  /** Top-k sampling (default: 0) */
   topK?: number;
-  /** Top-p (nucleus) sampling (default: 1.0) */
   topP?: number;
-  /** Repetition penalty (default: 1.5) */
   repetitionPenalty?: number;
-  /**
-   * Presence penalty (0.0 = disabled). Subtracts a flat penalty from logits of any
-   * token that appeared at least once in context. Matches OpenAI API semantics.
-   */
   presencePenalty?: number;
-  /** Number of recent tokens to consider for presence penalty (default: 20) */
   presenceContextSize?: number;
-  /**
-   * Frequency penalty (0.0 = disabled). Subtracts penalty * occurrence_count from
-   * logits of each token in context. Matches OpenAI API semantics.
-   */
   frequencyPenalty?: number;
-  /** Number of recent tokens to consider for frequency penalty (default: 20) */
   frequencyContextSize?: number;
-  /** Whether to return log probabilities (default: false) */
   returnLogprobs?: boolean;
 }
 
-/** A chat message with optional image */
+/**
+ * A chat message with textual content. Images are supplied through
+ * [`VLMChatConfig`] and attached to the first user content part before the
+ * model template is rendered.
+ */
 export interface VlmChatMessage {
-  /** Role of the message sender */
   role: ChatRole;
-  /** Text content of the message */
   content: string;
 }
 

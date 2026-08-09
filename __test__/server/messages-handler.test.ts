@@ -3420,7 +3420,7 @@ describe('handleCreateMessage', () => {
         chatStreamSessionStart: vi.fn(() => crashingStream()),
         chatStreamSessionContinue: vi.fn(() => crashingStream()),
         chatStreamSessionContinueTool: vi.fn(() => crashingStream()),
-        resetCaches: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
       registry.register('test-model', mockModel);
       const { res, getBody } = createMockRes();
@@ -3462,7 +3462,7 @@ describe('handleCreateMessage', () => {
         chatStreamSessionStart: vi.fn(() => throwingStream()),
         chatStreamSessionContinue: vi.fn(() => throwingStream()),
         chatStreamSessionContinueTool: vi.fn(() => throwingStream()),
-        resetCaches: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
       const registry = new ModelRegistry();
       registry.register('test-model', mockModel);
@@ -3546,7 +3546,7 @@ describe('handleCreateMessage', () => {
         chatStreamSessionStart: vi.fn(() => abortingStream()),
         chatStreamSessionContinue: vi.fn(() => abortingStream()),
         chatStreamSessionContinueTool: vi.fn(() => abortingStream()),
-        resetCaches: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
       const registry = new ModelRegistry();
       registry.register('test-model', mockModel);
@@ -3652,7 +3652,7 @@ describe('handleCreateMessage', () => {
         chatStreamSessionStart: vi.fn(signalAwareStream),
         chatStreamSessionContinue: vi.fn(signalAwareStream),
         chatStreamSessionContinueTool: vi.fn(signalAwareStream),
-        resetCaches: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
       const registry = new ModelRegistry();
       registry.register('stall-model', mockModel);
@@ -4703,7 +4703,7 @@ describe('handleCreateMessage', () => {
         chatStreamSessionStart: vi.fn(() => stream()),
         chatStreamSessionContinue: vi.fn(() => stream()),
         chatStreamSessionContinueTool: vi.fn(() => stream()),
-        resetCaches: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
       registry.register('test-model', mockModel);
 
@@ -5006,7 +5006,7 @@ describe('handleCreateMessage', () => {
         chatStreamSessionStart: vi.fn(),
         chatStreamSessionContinue: vi.fn(),
         chatStreamSessionContinueTool: vi.fn(),
-        resetCaches: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
 
       const registry = new ModelRegistry({ maxQueueDepth: 1 });
@@ -6095,7 +6095,7 @@ describe('handleCreateMessage', () => {
         chatStreamSessionStart: vi.fn().mockRejectedValue(new Error('non-streaming test')),
         chatStreamSessionContinue: vi.fn().mockRejectedValue(new Error('non-streaming test')),
         chatStreamSessionContinueTool: vi.fn().mockRejectedValue(new Error('non-streaming test')),
-        resetCaches: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
       const registry = new ModelRegistry();
       registry.register('test-model', mockModel);
@@ -6192,7 +6192,7 @@ describe('handleCreateMessage', () => {
         chatStreamSessionStart: stream,
         chatStreamSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
         chatStreamSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
-        resetCaches: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
       const registry = new ModelRegistry();
       registry.register('stream-model', mockModel);

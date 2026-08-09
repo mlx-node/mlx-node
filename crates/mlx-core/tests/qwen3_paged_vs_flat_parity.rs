@@ -275,9 +275,7 @@ async fn qwen3_paged_vs_flat_greedy_token_parity() {
         // `verify_cache_prefix` will return 0 inside `chat_sync_core`
         // and trigger an implicit cache reset via
         // `reset_kv_caches_sync()` before the prefill. No explicit
-        // `reset_caches()` is needed (and we can't call it here anyway:
-        // it's a sync NAPI method backed by `blocking_recv`, which
-        // panics inside a tokio runtime).
+        // `reset_caches()` is needed: each fresh start owns the reset.
 
         let cfg_flat = parity_chat_config(32);
         let cfg_paged = parity_chat_config(32);

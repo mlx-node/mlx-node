@@ -776,9 +776,8 @@ async fn moe_session_reset_reproduces_turn_output_deterministically() {
         .expect("first chat_session_start failed");
 
     // Reset the entire session/cache state, then run the SAME prompt
-    // again with the SAME config. `reset_caches` is a sync NAPI method
-    // on `&Qwen3_5MoeModel`.
-    // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
+    // again with the SAME config. Await the async reset before dispatching
+    // the rerun.
     model.reset_caches().await.expect("reset_caches failed");
 
     let cfg2 = chat_config_default(32);
@@ -834,7 +833,7 @@ async fn moe_session_stream_matches_non_stream_byte_for_byte() {
     // a greedy near-tie (observed on the lfm2 sibling test). Priming
     // pins BOTH compared runs to the same cache state so byte-for-byte
     // parity is well-defined.
-    // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
+    // Await the async reset before the parity pair.
     let _prime = model
         .chat_session_start(
             vec![user_message(prompt_text)],
@@ -881,8 +880,7 @@ async fn moe_session_stream_matches_non_stream_byte_for_byte() {
     // `raw_text`, NOT the reasoning-stripped `text`. The original
     // `streamed == text` assert could never pass on a thinking trajectory
     // (the 32-token budget is spent inside `<think>`, leaving `text`
-    // empty) — a defect previously masked by the blocking_recv panic in
-    // `reset_caches` (fixed above).
+    // empty) — a defect previously masked by the old synchronous reset path.
     assert_eq!(
         streamed, non_stream_result.raw_text,
         "streamed deltas do not match non-stream raw_text byte-for-byte: \

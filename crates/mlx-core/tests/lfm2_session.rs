@@ -868,9 +868,8 @@ async fn lfm2_session_reset_reproduces_turn_output_deterministically() {
         .expect("first chat_session_start failed");
 
     // Reset the entire session/cache state, then run the SAME prompt
-    // again with the SAME config. `reset_caches` is a sync NAPI method
-    // on `&Lfm2Model`.
-    // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
+    // again with the SAME config. Await the async reset so it settles before
+    // the rerun is dispatched.
     model.reset_caches().await.expect("reset_caches failed");
 
     let cfg2 = chat_config_default(32);
@@ -940,7 +939,7 @@ async fn lfm2_session_stream_matches_non_stream_byte_for_byte() {
 
     // Hard reset so the streaming run starts from the same fully cold
     // state as the non-streaming run above (prefix-cache purged).
-    // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
+    // Await the async reset before dispatching the streaming run.
     model.reset_caches().await.expect("reset_caches failed");
 
     // Streaming: drain every non-done chunk and concatenate `chunk.text`.
@@ -968,8 +967,7 @@ async fn lfm2_session_stream_matches_non_stream_byte_for_byte() {
     // `raw_text`, NOT the reasoning-stripped `text`. The original
     // `streamed == text` assert could never pass on a thinking trajectory
     // (lfm2 spends the whole 32-token budget inside `<think>`, so `text` is
-    // empty) — a defect previously masked by the blocking_recv panic in
-    // `reset_caches` (fixed above).
+    // empty) — a defect previously masked by the old synchronous reset path.
     assert_eq!(
         streamed, non_stream_result.raw_text,
         "streamed deltas do not match non-stream raw_text byte-for-byte: \

@@ -66,13 +66,15 @@ fn conv_state_reuse_enabled() -> bool {
 pub(crate) struct Lfm2Inner {
     pub(crate) config: Lfm2Config,
     /// The in-flight turn's cooperative-cancel flag, installed by the
-    /// streaming session cores via [`ChatBackend::set_turn_cancel_flag`]
-    /// and cleared (`None`) in their turn epilogue on every exit path.
+    /// sync and streaming session wrappers via
+    /// [`ChatBackend::set_turn_cancel_flag`] and cleared (`None`) in their
+    /// turn epilogue on every exit path.
     /// Polled at the top of each flat `chunked_prefill` chunk; `true`
     /// aborts with the distinguished `"prefill cancelled"` error, riding
     /// the engine's fail-closed prefill-`Err` arm. The lfm2 PAGED prefill
-    /// is single-shot over the suffix (no chunk loop) and stays
-    /// uncancellable — documented residual window.
+    /// performs a full cached-prefix convolution replay in Pass 1 and a
+    /// single-shot suffix forward in Pass 2; neither has an internal chunk
+    /// boundary, so both remain documented uncancellable windows.
     pub(crate) turn_cancel: Option<Arc<AtomicBool>>,
     /// Turn-constant layer classification (`FullAttention` vs `Conv`),
     /// computed once in [`Self::new`] instead of re-derived on every paged

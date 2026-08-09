@@ -27,14 +27,14 @@ export declare class BatchGenerationResult {
 }
 
 /**
- * In-flight NON-streaming chat turn returned by the additive
- * `chat_session_*_cancellable` entry points (H2).
+ * In-flight non-streaming chat turn returned by the internal
+ * `begin_chat_session_*` operation entry points (H2).
  *
  * The dispatching NAPI method resolves with this object IMMEDIATELY
  * after the command is queued (mirroring how the streaming methods
  * return their [`ChatStreamHandle`] before the turn runs); the turn's
- * reply arrives later through [`Self::result`]. `handle` shares the
- * same `Arc<AtomicBool>` the command carries, so `handle.cancel()`
+ * reply arrives later through [`Self::result`]. `cancel()` flips the
+ * same `Arc<AtomicBool>` the command carries, so it
  * reaches the model thread's chunk-boundary / per-step polls exactly
  * like a streaming cancel.
  *
@@ -42,13 +42,9 @@ export declare class BatchGenerationResult {
  * the exact string `"chat session cancelled"`
  * ([`crate::engine::session::CHAT_SESSION_CANCELLED`]).
  */
-export declare class CancellableChatCall {
-  /**
-   * Cancellation token for this turn. Each access mints a fresh
-   * `ChatStreamHandle` wrapping the SAME shared flag, so
-   * `call.handle.cancel()` behaves identically across accesses.
-   */
-  get handle(): ChatStreamHandle;
+export declare class ChatSessionCall {
+  /** Cooperatively cancel this queued or running turn. */
+  cancel(): void;
   /**
    * Await the turn's reply. Resolves with the [`ChatResult`] on a
    * completed turn; rejects with `"chat session cancelled"` when the
@@ -233,17 +229,15 @@ export declare class Gemma4Model {
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionStart` (H2). Resolves
-   * IMMEDIATELY with a `CancellableChatCall` whose `handle`
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
    * can cancel the queued/running turn; the reply arrives via
    * `call.result()`. A cancelled turn rejects `result()` with
-   * the exact string `"chat session cancelled"`. The plain
-   * `chatSessionStart` is untouched — this method is additive.
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
    */
-  chatSessionStartCancellable(
-    messages: Array<ChatMessage>,
-    config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
   /**
    * Continue an existing chat session from the complete
    * structured conversation. The loaded model template is the
@@ -253,26 +247,26 @@ export declare class Gemma4Model {
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionContinue` (H2). Same
-   * contract as `chatSessionStartCancellable`.
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
    */
-  chatSessionContinueCancellable(
+  beginChatSessionContinue(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /**
    * Continue an existing chat session from a complete
    * structured conversation ending in a tool-role message.
    */
   chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionContinueTool` (H2). Same
-   * contract as `chatSessionStartCancellable`.
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
    */
-  chatSessionContinueToolCancellable(
+  beginChatSessionContinueTool(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -582,17 +576,15 @@ export declare class Lfm2Model {
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionStart` (H2). Resolves
-   * IMMEDIATELY with a `CancellableChatCall` whose `handle`
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
    * can cancel the queued/running turn; the reply arrives via
    * `call.result()`. A cancelled turn rejects `result()` with
-   * the exact string `"chat session cancelled"`. The plain
-   * `chatSessionStart` is untouched — this method is additive.
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
    */
-  chatSessionStartCancellable(
-    messages: Array<ChatMessage>,
-    config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
   /**
    * Continue an existing chat session from the complete
    * structured conversation. The loaded model template is the
@@ -602,26 +594,26 @@ export declare class Lfm2Model {
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionContinue` (H2). Same
-   * contract as `chatSessionStartCancellable`.
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
    */
-  chatSessionContinueCancellable(
+  beginChatSessionContinue(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /**
    * Continue an existing chat session from a complete
    * structured conversation ending in a tool-role message.
    */
   chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionContinueTool` (H2). Same
-   * contract as `chatSessionStartCancellable`.
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
    */
-  chatSessionContinueToolCancellable(
+  beginChatSessionContinueTool(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -1120,7 +1112,8 @@ export declare class QianfanOCRModel {
   /**
    * Reset KV caches and token history. Async so a reset queued behind
    * an in-flight turn parks a tokio future, never the Node event loop
-   * (H1a — same contract as the `chat_napi_surface!` families).
+   * (H1a — same contract as the `chat_napi_surface!` families). Callers
+   * requiring reset-before-next-turn ordering must await this Promise.
    */
   resetCaches(): Promise<void>;
   /**
@@ -1136,16 +1129,32 @@ export declare class QianfanOCRModel {
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
+   * Internal operation for `chatSessionStart`. The returned call exposes an
+   * idempotent `cancel()` immediately; `result()` resolves or rejects with the
+   * exact `chat session cancelled` sentinel.
+   */
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
    * Continue from the caller's complete conversation history. The
    * checkpoint's chat template is rendered again and exact prefix matching
    * decides whether the live cache can be reused.
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /** Internal operation for `chatSessionContinue`. */
+  beginChatSessionContinue(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
   /**
    * Tool-result continuation over a full history. Tool representation is
    * owned entirely by the model-provided template.
    */
   chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /** Internal operation for `chatSessionContinueTool`. */
+  beginChatSessionContinueTool(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -1261,17 +1270,15 @@ export declare class Qwen35Model {
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionStart` (H2). Resolves
-   * IMMEDIATELY with a `CancellableChatCall` whose `handle`
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
    * can cancel the queued/running turn; the reply arrives via
    * `call.result()`. A cancelled turn rejects `result()` with
-   * the exact string `"chat session cancelled"`. The plain
-   * `chatSessionStart` is untouched — this method is additive.
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
    */
-  chatSessionStartCancellable(
-    messages: Array<ChatMessage>,
-    config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
   /**
    * Continue an existing chat session from the complete
    * structured conversation. The loaded model template is the
@@ -1281,26 +1288,26 @@ export declare class Qwen35Model {
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionContinue` (H2). Same
-   * contract as `chatSessionStartCancellable`.
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
    */
-  chatSessionContinueCancellable(
+  beginChatSessionContinue(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /**
    * Continue an existing chat session from a complete
    * structured conversation ending in a tool-role message.
    */
   chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionContinueTool` (H2). Same
-   * contract as `chatSessionStartCancellable`.
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
    */
-  chatSessionContinueToolCancellable(
+  beginChatSessionContinueTool(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -1404,17 +1411,15 @@ export declare class Qwen35MoeModel {
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionStart` (H2). Resolves
-   * IMMEDIATELY with a `CancellableChatCall` whose `handle`
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
    * can cancel the queued/running turn; the reply arrives via
    * `call.result()`. A cancelled turn rejects `result()` with
-   * the exact string `"chat session cancelled"`. The plain
-   * `chatSessionStart` is untouched — this method is additive.
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
    */
-  chatSessionStartCancellable(
-    messages: Array<ChatMessage>,
-    config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
   /**
    * Continue an existing chat session from the complete
    * structured conversation. The loaded model template is the
@@ -1424,26 +1429,26 @@ export declare class Qwen35MoeModel {
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionContinue` (H2). Same
-   * contract as `chatSessionStartCancellable`.
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
    */
-  chatSessionContinueCancellable(
+  beginChatSessionContinue(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /**
    * Continue an existing chat session from a complete
    * structured conversation ending in a tool-role message.
    */
   chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionContinueTool` (H2). Same
-   * contract as `chatSessionStartCancellable`.
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
    */
-  chatSessionContinueToolCancellable(
+  beginChatSessionContinueTool(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -1626,17 +1631,15 @@ export declare class Qwen3Model {
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionStart` (H2). Resolves
-   * IMMEDIATELY with a `CancellableChatCall` whose `handle`
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
    * can cancel the queued/running turn; the reply arrives via
    * `call.result()`. A cancelled turn rejects `result()` with
-   * the exact string `"chat session cancelled"`. The plain
-   * `chatSessionStart` is untouched — this method is additive.
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
    */
-  chatSessionStartCancellable(
-    messages: Array<ChatMessage>,
-    config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
   /**
    * Continue an existing chat session from the complete
    * structured conversation. The loaded model template is the
@@ -1646,26 +1649,26 @@ export declare class Qwen3Model {
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionContinue` (H2). Same
-   * contract as `chatSessionStartCancellable`.
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
    */
-  chatSessionContinueCancellable(
+  beginChatSessionContinue(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /**
    * Continue an existing chat session from a complete
    * structured conversation ending in a tool-role message.
    */
   chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
-   * Cancellable twin of `chatSessionContinueTool` (H2). Same
-   * contract as `chatSessionStartCancellable`.
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
    */
-  chatSessionContinueToolCancellable(
+  beginChatSessionContinueTool(
     messages: Array<ChatMessage>,
     config?: ChatConfig | undefined | null,
-  ): Promise<CancellableChatCall>;
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],

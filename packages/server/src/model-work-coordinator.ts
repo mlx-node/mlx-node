@@ -52,6 +52,25 @@ export interface ModelLoadOutcome<T> {
   ownMs: number;
 }
 
+/** A bounded request admission retained until the resident FIFO placement. */
+export interface ModelLoadAdmission {
+  /** Idempotently release this request's pre-resolution budget unit. */
+  release(): void;
+}
+
+/** Raised synchronously when unresolved model-load traffic is over capacity. */
+export class ModelLoadQueueFullError extends Error {
+  readonly admissionFootprint: number;
+  readonly limit: number;
+
+  constructor(admissionFootprint: number, limit: number) {
+    super(`Model load queue full: admission footprint ${admissionFootprint} (waiter limit ${limit})`);
+    this.name = 'ModelLoadQueueFullError';
+    this.admissionFootprint = admissionFootprint;
+    this.limit = limit;
+  }
+}
+
 /**
  * Process-local gate for native MLX work.
  *
@@ -67,6 +86,8 @@ export class ModelWorkCoordinator {
   private queuedWriters = 0;
   private readonly readerWaiters: Array<() => void> = [];
   private readonly writerWaiters: Array<() => void> = [];
+  private requestLoadAdmissions = 0;
+  private readonly maxRequestLoadQueueDepth: number | undefined;
   /**
    * Most recent settled load bracket. Retained here because the coordinator
    * is the ONE place that brackets every load: a `resolveModel` failure in
@@ -76,6 +97,39 @@ export class ModelWorkCoordinator {
    * an earlier failure" caveat.
    */
   private lastLoadRecord: ModelLoadRecord | null = null;
+
+  constructor(maxRequestLoadQueueDepth?: number) {
+    this.maxRequestLoadQueueDepth = maxRequestLoadQueueDepth;
+  }
+
+  /**
+   * Bound requests that arrive before a model has a resident
+   * `SessionRegistry`. The capacity mirrors the resident FIFO: `limit`
+   * waiters plus one owner/runner. Callers retain the permit through every
+   * pre-lock await and release it immediately before synchronously entering
+   * `SessionRegistry.withExclusive`.
+   */
+  beginRequestLoadAdmission(): ModelLoadAdmission {
+    const limit = this.maxRequestLoadQueueDepth;
+    if (limit !== undefined && this.requestLoadAdmissions >= limit + 1) {
+      throw new ModelLoadQueueFullError(this.requestLoadAdmissions, limit);
+    }
+    this.requestLoadAdmissions += 1;
+    let released = false;
+    return {
+      release: (): void => {
+        if (released) return;
+        released = true;
+        this.requestLoadAdmissions -= 1;
+        if (this.requestLoadAdmissions < 0) this.requestLoadAdmissions = 0;
+      },
+    };
+  }
+
+  /** Read-only unresolved/pre-FIFO request footprint for diagnostics/tests. */
+  get requestLoadAdmissionCount(): number {
+    return this.requestLoadAdmissions;
+  }
 
   /** Read-only: `true` while a load holds the exclusive writer slot. */
   get writerActive(): boolean {

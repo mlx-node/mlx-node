@@ -3047,20 +3047,11 @@ describe('createHandler', () => {
       expect(mockStore.store).not.toHaveBeenCalled();
     });
 
-    /**
-     * Build a session-capable mock with the ADDITIVE cancellable
-     * non-streaming surface (H2). `chatSessionStartCancellable` records
-     * the returned handle; its `result()` promise resolves only after
-     * `handle.cancel()` was observed — modelling the native reply
-     * contract without the addon. The PLAIN `chatSessionStart` also
-     * signals dispatch so a pre-fix run fails the assertions instead of
-     * hanging the test.
-     */
-    function createCancellableMockModel(): {
+    /** Build a model whose ordinary chatSessionStart honors AbortSignal. */
+    function createAbortableMockModel(): {
       model: SessionCapableModel;
       handle: { cancel: ReturnType<typeof vi.fn> };
-      plainStart: ReturnType<typeof vi.fn>;
-      cancellableStart: ReturnType<typeof vi.fn>;
+      chatSessionStart: ReturnType<typeof vi.fn>;
       dispatchObserved: Promise<void>;
     } {
       let dispatched!: () => void;
@@ -3076,37 +3067,37 @@ describe('createHandler', () => {
           cancelSeen();
         }),
       };
-      const plainStart = vi.fn(async (): Promise<ChatResult> => {
+      const chatSessionStart = vi.fn(async (_messages: unknown, _config: unknown, signal?: AbortSignal) => {
         dispatched();
-        return makeChatResult({ text: 'plain (non-cancellable) reply' });
-      });
-      const cancellableStart = vi.fn(async () => {
-        dispatched();
-        return {
-          handle,
-          result: () => cancelObserved.then(() => makeChatResult({ text: 'resolved after cancel' })),
-        };
+        if (signal == null) return makeChatResult({ text: 'plain reply' });
+        const onAbort = (): void => handle.cancel();
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) onAbort();
+        try {
+          await cancelObserved;
+          return makeChatResult({ text: 'resolved after cancel' });
+        } finally {
+          signal.removeEventListener('abort', onAbort);
+        }
       });
       const model = {
-        chatSessionStart: plainStart,
+        chatSessionStart,
         chatSessionContinue: vi.fn().mockRejectedValue(new Error('continue should not be reached')),
         chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
-        chatSessionStartCancellable: cancellableStart,
         chatStreamSessionStart: vi.fn(),
         chatStreamSessionContinue: vi.fn(),
         chatStreamSessionContinueTool: vi.fn(),
         resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
-      return { model, handle, plainStart, cancellableStart, dispatchObserved };
+      return { model, handle, chatSessionStart, dispatchObserved };
     }
 
     it('H2: non-streaming skips native dispatch entirely when the socket is already destroyed pre-dispatch', async () => {
       // A client that vanished before the request cleared the per-model
       // mutex must not burn a whole decode budget. The handler's
       // pre-dispatch disconnect check fires INSIDE the mutex callback,
-      // before any session lease / reset / prime — so neither the plain
-      // nor the cancellable native method is ever invoked.
-      const { model, plainStart, cancellableStart } = createCancellableMockModel();
+      // before any session lease / reset / prime, so the model is untouched.
+      const { model, chatSessionStart } = createAbortableMockModel();
       const registry = new ModelRegistry();
       registry.register('h2-predispatch-model', model);
       const handler = createHandler(registry);
@@ -3124,19 +3115,18 @@ describe('createHandler', () => {
 
       await handler(req, res);
 
-      expect(plainStart).not.toHaveBeenCalled();
-      expect(cancellableStart).not.toHaveBeenCalled();
+      expect(chatSessionStart).not.toHaveBeenCalled();
       expect(getBody()).toBe('');
     });
 
     it('H2: mid-flight client disconnect cancels the non-streaming native turn via handle.cancel()', async () => {
       // Once the non-streaming dispatch is in flight, a client 'close'
       // must flip the handler's AbortController, whose signal the
-      // ChatSession wires to the native CancellableChatCall handle. The
-      // mock's result() resolves only after cancel() is observed, so a
+      // model wrapper maps to the native turn flag. The mock resolves only
+      // after cancel() is observed, so a
       // missing wire-up either leaves cancel() un-invoked (pre-fix plain
       // path — clean RED) or hangs (broken listener wiring).
-      const { model, handle, cancellableStart, dispatchObserved } = createCancellableMockModel();
+      const { model, handle, chatSessionStart, dispatchObserved } = createAbortableMockModel();
       const registry = new ModelRegistry();
       registry.register('h2-midflight-model', model);
       const handler = createHandler(registry);
@@ -3156,12 +3146,13 @@ describe('createHandler', () => {
       (res as unknown as NodeJS.EventEmitter).emit('close');
 
       await inflight;
-      expect(cancellableStart).toHaveBeenCalledTimes(1);
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(chatSessionStart.mock.calls[0][2]).toBeInstanceOf(AbortSignal);
       expect(handle.cancel).toHaveBeenCalled();
     });
 
     it('H2: /v1/messages non-streaming skips native dispatch for a pre-destroyed socket', async () => {
-      const { model, plainStart, cancellableStart } = createCancellableMockModel();
+      const { model, chatSessionStart } = createAbortableMockModel();
       const registry = new ModelRegistry();
       registry.register('h2-msg-predispatch-model', model);
       const handler = createHandler(registry);
@@ -3177,13 +3168,12 @@ describe('createHandler', () => {
 
       await handler(req, res);
 
-      expect(plainStart).not.toHaveBeenCalled();
-      expect(cancellableStart).not.toHaveBeenCalled();
+      expect(chatSessionStart).not.toHaveBeenCalled();
       expect(getBody()).toBe('');
     });
 
     it('H2: /v1/messages mid-flight disconnect cancels the non-streaming native turn via handle.cancel()', async () => {
-      const { model, handle, cancellableStart, dispatchObserved } = createCancellableMockModel();
+      const { model, handle, chatSessionStart, dispatchObserved } = createAbortableMockModel();
       const registry = new ModelRegistry();
       registry.register('h2-msg-midflight-model', model);
       const handler = createHandler(registry);
@@ -3202,7 +3192,8 @@ describe('createHandler', () => {
       (res as unknown as NodeJS.EventEmitter).emit('close');
 
       await inflight;
-      expect(cancellableStart).toHaveBeenCalledTimes(1);
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(chatSessionStart.mock.calls[0][2]).toBeInstanceOf(AbortSignal);
       expect(handle.cancel).toHaveBeenCalled();
     });
 
@@ -3226,10 +3217,13 @@ describe('createHandler', () => {
         }),
       };
       const observedRejections: Error[] = [];
-      const cancellableStart = vi.fn(async () => {
+      const chatSessionStart = vi.fn(async (_messages: unknown, _config: unknown, signal?: AbortSignal) => {
         dispatched();
-        // Reject — with the exact native reply string — once cancel()
-        // lands, mirroring `CancellableChatCall.result()`.
+        if (signal == null) throw new Error('AbortSignal missing');
+        const onAbort = (): void => handle.cancel();
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) onAbort();
+        // Reject with the exact native reply string once cancellation lands.
         const result = cancelObserved.then((): Promise<ChatResult> => {
           throw new Error('chat session cancelled');
         });
@@ -3238,13 +3232,16 @@ describe('createHandler', () => {
         result.catch((e: Error) => {
           observedRejections.push(e);
         });
-        return { handle, result: () => result };
+        try {
+          return await result;
+        } finally {
+          signal.removeEventListener('abort', onAbort);
+        }
       });
       const model = {
-        chatSessionStart: vi.fn().mockRejectedValue(new Error('plain start should not be reached')),
+        chatSessionStart,
         chatSessionContinue: vi.fn().mockRejectedValue(new Error('continue should not be reached')),
         chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
-        chatSessionStartCancellable: cancellableStart,
         chatStreamSessionStart: vi.fn(),
         chatStreamSessionContinue: vi.fn(),
         chatStreamSessionContinueTool: vi.fn(),

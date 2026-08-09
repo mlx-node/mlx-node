@@ -344,22 +344,6 @@ function publicStreamEvent(event: ChatStreamEvent, config: ChatConfig): ChatStre
  * (handy for IDE autocomplete) while the implementation remains
  * fully structural.
  */
-/**
- * Structural shape of the native `CancellableChatCall` object returned
- * by the additive `chatSession*Cancellable` methods (H2). Kept
- * structural (rather than importing the class type from
- * `@mlx-node/core`) so test doubles satisfy it with a plain object.
- */
-export interface CancellableChatCall {
-  /** Cancellation token — `handle.cancel()` flips the shared native flag. */
-  readonly handle: { cancel(): void };
-  /**
-   * The turn's reply. Single-shot; rejects with the exact string
-   * `"chat session cancelled"` when the turn was cancelled.
-   */
-  result(): Promise<ChatResult>;
-}
-
 export interface SessionCapableModel {
   /**
    * Optional non-generating chat-template tokenizer. Exposed by
@@ -407,27 +391,18 @@ export interface SessionCapableModel {
    * `reasoningContent` field.
    */
   replaysAssistantRawText?(): boolean;
-  chatSessionStart(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
-  chatSessionContinue(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
-  chatSessionContinueTool(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
   /**
-   * ADDITIVE cancellable twins of the three non-streaming entry points
-   * (H2). Each resolves immediately with a {@link CancellableChatCall}
-   * whose `handle.cancel()` cooperatively cancels the queued/running
-   * native turn; the turn's reply arrives via `call.result()`, which
-   * REJECTS with the exact string `"chat session cancelled"` when the
-   * turn was cancelled. Optional so third-party/mock implementations
-   * (and wrappers pre-dating the surface, e.g. the Qianfan-OCR VLM)
-   * keep satisfying the structural contract — when absent, the
-   * non-streaming entry points ignore {@link SendOptions.signal}
-   * exactly as before.
+   * Non-streaming entry points accept the platform-native AbortSignal.
+   * The bundled wrappers translate it to the Rust atomic cancellation
+   * flag without exposing the native two-phase handle API.
    */
-  chatSessionStartCancellable?(messages: ChatMessage[], config?: ChatConfig | null): Promise<CancellableChatCall>;
-  chatSessionContinueCancellable?(messages: ChatMessage[], config?: ChatConfig | null): Promise<CancellableChatCall>;
-  chatSessionContinueToolCancellable?(
+  chatSessionStart(messages: ChatMessage[], config?: ChatConfig | null, signal?: AbortSignal): Promise<ChatResult>;
+  chatSessionContinue(messages: ChatMessage[], config?: ChatConfig | null, signal?: AbortSignal): Promise<ChatResult>;
+  chatSessionContinueTool(
     messages: ChatMessage[],
     config?: ChatConfig | null,
-  ): Promise<CancellableChatCall>;
+    signal?: AbortSignal,
+  ): Promise<ChatResult>;
   /**
    * The optional `signal` parameter on every streaming entry point is
    * plumbed into the `_runChatStream` fast-abort path in the wrapper
@@ -621,13 +596,10 @@ export interface SendOptions {
    * AbortError — the outer consumer's `for await` just ends early.
    *
    * Non-streaming entry points (`send` / `sendToolResult` /
-   * `startFromHistory`) honor it too (H2) WHEN the model exposes the
-   * additive `chatSession*Cancellable` surface: an already-aborted
-   * signal rejects before dispatch, and an abort mid-turn calls
-   * `handle.cancel()` on the native `CancellableChatCall`, whose
-   * `result()` then REJECTS with `"chat session cancelled"`. Models
-   * without the cancellable surface keep the previous behavior (the
-   * signal is ignored on non-streaming calls).
+   * `startFromHistory`) honor it too (H2): an already-aborted signal
+   * rejects before dispatch, and the bundled model wrappers translate a
+   * mid-turn abort to the native turn flag. The public method remains one
+   * ordinary Promise and rejects with `"chat session cancelled"`.
    *
    * Intended for HTTP endpoints that flip a controller on
    * `res.once('close', …)` so client disconnect stops the native
@@ -1639,23 +1611,10 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   // -------------------------------------------------------------------
 
   /**
-   * Dispatch one non-streaming native turn, preferring the cancellable
-   * surface (H2) when BOTH an AbortSignal was supplied AND the model
-   * exposes the matching `chatSession*Cancellable` method.
-   *
-   * Cancellable path: an already-aborted signal rejects BEFORE dispatch
-   * (`"chat session cancelled"` — the same string the native reply
-   * contract uses); otherwise the call object's handle is wired to the
-   * signal (`{ once: true }` listener plus a post-attach `aborted`
-   * re-check, because an 'abort' listener added to an already-aborted
-   * signal never fires) and the reply is awaited via `call.result()`.
-   * Both paths route through one `cancelOnce` guard so `handle.cancel()`
-   * runs at most once per call. The listener is detached in `finally`
-   * so a long-lived signal cannot accumulate handlers across turns.
-   *
-   * Fallback path (no signal, or the model lacks the surface — e.g.
-   * mocks and the Qianfan-OCR VLM): the plain method, byte-identical
-   * behavior to before.
+   * Dispatch one non-streaming native turn through the public AbortSignal
+   * surface (H2). The model wrapper owns the attach-race-safe translation
+   * from AbortSignal to the lower-level native operation handle; ChatSession
+   * never exposes that two-phase primitive to callers.
    *
    * Callers sit inside the entry points' existing try/finally blocks,
    * so a rejection here releases `inFlight` and (on the delta paths)
@@ -1668,50 +1627,20 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     signal: AbortSignal | undefined,
   ): Promise<ChatResult> {
     const model = this.model;
-    const cancellable =
-      signal == null
-        ? undefined
-        : kind === 'start'
-          ? model.chatSessionStartCancellable?.bind(model)
-          : kind === 'continue'
-            ? model.chatSessionContinueCancellable?.bind(model)
-            : model.chatSessionContinueToolCancellable?.bind(model);
-    if (signal != null && cancellable != null) {
-      if (signal.aborted) {
-        throw new Error('chat session cancelled');
-      }
-      const call = await cancellable(messages, config);
-      // BOTH cancellation paths — the abort listener and the post-attach
-      // catch-up below — route through one guarded closure so
-      // `handle.cancel()` runs at most once per call, whatever the
-      // signal's event-dispatch semantics.
-      let cancelledOnce = false;
-      const cancelOnce = (): void => {
-        if (cancelledOnce) {
-          return;
-        }
-        cancelledOnce = true;
-        call.handle.cancel();
-      };
-      signal.addEventListener('abort', cancelOnce, { once: true });
-      // Attach race: an abort landing between the pre-dispatch check
-      // and the attach never fires the listener — catch up explicitly.
-      if (signal.aborted) {
-        cancelOnce();
-      }
-      try {
-        return await call.result();
-      } finally {
-        signal.removeEventListener('abort', cancelOnce);
-      }
-    }
+    if (signal?.aborted === true) throw new Error('chat session cancelled');
     if (kind === 'start') {
-      return await model.chatSessionStart(messages, config);
+      return signal == null
+        ? await model.chatSessionStart(messages, config)
+        : await model.chatSessionStart(messages, config, signal);
     }
     if (kind === 'continue') {
-      return await model.chatSessionContinue(messages, config);
+      return signal == null
+        ? await model.chatSessionContinue(messages, config)
+        : await model.chatSessionContinue(messages, config, signal);
     }
-    return await model.chatSessionContinueTool(messages, config);
+    return signal == null
+      ? await model.chatSessionContinueTool(messages, config)
+      : await model.chatSessionContinueTool(messages, config, signal);
   }
 
   /**

@@ -147,6 +147,33 @@ describe('SSE writable contract', () => {
     expect(res.listenerCount('error')).toBe(baseline.error);
   });
 
+  it('times out a connected non-draining peer, marks abort, and destroys the transport', async () => {
+    const { res } = createHeldWritable();
+    expect(streaming.writeSSEEvent(res, 'delta', { text: 'x' })).toBe(false);
+
+    const baseline = {
+      drain: res.listenerCount('drain'),
+      close: res.listenerCount('close'),
+      error: res.listenerCount('error'),
+    };
+    let timedOut = false;
+    await withTimeout(
+      streaming.awaitDrainOrClose(res, {
+        timeoutMs: 10,
+        onTimeout: () => {
+          timedOut = true;
+        },
+      }),
+      'awaitDrainOrClose ignored its bounded timeout',
+    );
+
+    expect(timedOut).toBe(true);
+    expect(res.destroyed).toBe(true);
+    expect(res.listenerCount('drain')).toBe(baseline.drain);
+    expect(res.listenerCount('close')).toBe(baseline.close);
+    expect(res.listenerCount('error')).toBe(baseline.error);
+  });
+
   it('settles through the asynchronous ERR_STREAM_WRITE_AFTER_END error event', async () => {
     const writable = new Writable({
       write(_chunk, _encoding, callback) {

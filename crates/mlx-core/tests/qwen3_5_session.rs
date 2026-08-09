@@ -193,9 +193,8 @@ async fn qwen3_5_session_reset_purges_prefix_cache_cold_prefill() {
         r1.cached_tokens
     );
 
-    // Explicit Command reset via the sync NAPI method. block_in_place:
-    // reset_caches blocks on blocking_recv, which panics on a tokio
-    // worker thread (see lfm2_session.rs + 8d5283a7 precedent).
+    // Explicit async Command reset; awaiting preserves reset-before-rerun
+    // ordering without blocking a Tokio/Node worker.
     model.reset_caches().await.expect("reset_caches failed");
 
     // Turn 2: rerun the IDENTICAL prompt as a fresh session start.

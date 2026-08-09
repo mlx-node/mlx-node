@@ -236,7 +236,7 @@ async fn lfm2_moe_reset_determinism() {
         .await
         .expect("first start failed");
 
-    // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
+    // Await the async reset so it is enqueued and settled before the rerun.
     model.reset_caches().await.expect("reset_caches failed");
 
     let r2 = model

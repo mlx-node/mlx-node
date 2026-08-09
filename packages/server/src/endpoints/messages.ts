@@ -86,7 +86,11 @@ import {
   mapStopReason,
 } from '../mappers/anthropic-response.js';
 import { genId } from '../mappers/response.js';
-import type { ModelWorkCoordinator } from '../model-work-coordinator.js';
+import {
+  type ModelLoadAdmission,
+  ModelLoadQueueFullError,
+  type ModelWorkCoordinator,
+} from '../model-work-coordinator.js';
 import type { ModelRegistry } from '../registry.js';
 import { QueueFullError, type PreDispatchAdmission, type SessionRegistry } from '../session-registry.js';
 import { StopSequenceBuffer } from '../stop-sequence-buffer.js';
@@ -278,11 +282,9 @@ async function handleNonStreaming(
     matchedStopSequence,
   );
 
-  // Native `chatSession*` has no AbortSignal surface yet, so a client that
-  // disconnects mid-decode still burns every remaining token under the
-  // per-model mutex. Disconnect handling is delegated to `endJson`'s
-  // pre-entry destroyed check, which rejects synchronously after `responseMode`
-  // has been committed to 'json' — the outer catch then destroys the socket.
+  // The request AbortSignal reaches the normal session method, whose wrapper
+  // maps it to native cancellation at the next model safepoint. `endJson` keeps
+  // the final pre-entry destroyed check for the transport race after decode.
   await endJson(res, JSON.stringify(response), visibility);
 }
 
@@ -359,7 +361,7 @@ async function handleStreamingNativeWithAbort(
   const writeSSEEvent = (response: ServerResponse, eventType: string, data: object): void => {
     const ok = writeRawSSEEvent(response, eventType, data);
     if (!ok && pendingDrain === null) {
-      pendingDrain = awaitDrainOrClose(response);
+      pendingDrain = awaitDrainOrClose(response, { onTimeout: () => abort.markAborted() });
     }
   };
   const drainPending = async (): Promise<void> => {
@@ -1103,9 +1105,9 @@ export async function handleCreateMessage(
   // below, invisible to `SessionRegistry.queueDepth`, so the
   // `withExclusive` cap alone cannot bound the backlog. Resident model:
   // admit-or-429 (Anthropic envelope) against the same per-model
-  // budget. Non-resident (cold-load) requests skip the gate — no
-  // `SessionRegistry` exists yet — and the post-load `withExclusive`
-  // cap still applies. The permit is RETAINED through every pre-lock
+  // budget. Non-resident (cold-load) requests use the coordinator's
+  // bounded pre-resolution permit below because no `SessionRegistry`
+  // exists yet. The permit is RETAINED through every pre-lock
   // await and handed to `withExclusive` at placement, which consumes it
   // atomically as this request's admission (one budget, one token,
   // never double-counted); it is released only on bail-out exits —
@@ -1113,15 +1115,26 @@ export async function handleCreateMessage(
   // outer `finally` for everything inside it (idempotent + no-op after
   // handoff).
   let preDispatchAdmission: PreDispatchAdmission | undefined;
+  let modelLoadAdmission: ModelLoadAdmission | undefined;
   const preDispatchRegistry = registry.getSessionRegistry(body.model);
   if (preDispatchRegistry) {
     try {
       preDispatchAdmission = preDispatchRegistry.beginPreDispatchAdmission();
     } catch (err) {
       if (err instanceof QueueFullError) {
+        sendAnthropicRateLimit(res, `${err.message}. Retry after 1s.`);
+        return;
+      }
+      throw err;
+    }
+  } else if (resolveModel && modelWorkCoordinator) {
+    try {
+      modelLoadAdmission = modelWorkCoordinator.beginRequestLoadAdmission();
+    } catch (err) {
+      if (err instanceof ModelLoadQueueFullError) {
         sendAnthropicRateLimit(
           res,
-          `Model queue full: ${err.queuedCount} waiting (limit ${err.limit}). Retry after 1s.`,
+          `Model queue full: admission footprint ${err.admissionFootprint} (limit ${err.limit}). Retry after 1s.`,
         );
         return;
       }
@@ -1185,6 +1198,7 @@ export async function handleCreateMessage(
       }
     } catch (err) {
       preDispatchAdmission?.release();
+      modelLoadAdmission?.release();
       sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
       return;
     }
@@ -1196,6 +1210,7 @@ export async function handleCreateMessage(
   const model = registry.get(body.model);
   if (!model) {
     preDispatchAdmission?.release();
+    modelLoadAdmission?.release();
     sendAnthropicNotFound(res, `Model "${body.model}" not found`);
     return;
   }
@@ -1207,6 +1222,7 @@ export async function handleCreateMessage(
   const lease = registry.acquireDispatchLease(body.model);
   if (!lease) {
     preDispatchAdmission?.release();
+    modelLoadAdmission?.release();
     sendAnthropicInternalError(res, 'session registry missing for registered model');
     return;
   }
@@ -1344,8 +1360,11 @@ export async function handleCreateMessage(
 
     try {
       const mutexQueuedAt = Date.now();
-      const runInference = () =>
-        withAdmissionControlledInference(sessionReg, modelWorkCoordinator, preDispatchAdmission, async () => {
+      const runInference = () => {
+        // No await or callback can interleave between releasing the cold-load
+        // unit and synchronously entering the resident FIFO.
+        modelLoadAdmission?.release();
+        return withAdmissionControlledInference(sessionReg, modelWorkCoordinator, preDispatchAdmission, async () => {
           const serverTiming: ServerTimingForUsage = {
             server_model_resolve_ms: serverModelResolveMs,
             server_load_wait_ms: serverLoadWaitMs,
@@ -1570,8 +1589,8 @@ export async function handleCreateMessage(
               // preserving native cache on the paged path.
               const resetNativeCache = pagedActive ? false : !lookup.hit;
               // Non-streaming cancellation (H2): `streamSignal` threads
-              // through `ChatSession.startFromHistory` into the additive
-              // native `chatSession*Cancellable` surface — a mid-turn
+              // through `ChatSession.startFromHistory` into the normal public
+              // method; the wrapper maps it to the internal native operation — a mid-turn
               // disconnect flips the controller, the native turn unwinds
               // at the next safepoint, and the dispatch rejects with
               // "chat session cancelled" (routed through the catch below:
@@ -1681,6 +1700,7 @@ export async function handleCreateMessage(
             }
           }
         });
+      };
       await runInference();
     } catch (err) {
       // Admission-control rejection from the per-model queue cap
@@ -1694,10 +1714,7 @@ export async function handleCreateMessage(
       // still routes through the handler's existing error paths.
       if (err instanceof QueueFullError) {
         if (!res.headersSent) {
-          sendAnthropicRateLimit(
-            res,
-            `Model queue full: ${err.queuedCount} waiting (limit ${err.limit}). Retry after 1s.`,
-          );
+          sendAnthropicRateLimit(res, `${err.message}. Retry after 1s.`);
         }
       } else {
         throw err;
@@ -1709,6 +1726,7 @@ export async function handleCreateMessage(
     // and any validation early-return inside the outer `try`. Idempotent
     // and a no-op after handoff, so the unconditional call is safe.
     preDispatchAdmission?.release();
+    modelLoadAdmission?.release();
     // Drop disconnect listeners so they don't pin the request past handler
     // return. Only detach if we actually attached (gated by the flag).
     if (abortListenersAttached) {

@@ -280,6 +280,7 @@ jobs:
             tests: >-
               --test qwen3_paged_vs_flat_parity
               --test qwen3_cold_tier_parity
+              --test qwen3_prefill_cancel
           - name: qwen3_5-dense
             model: Qwen/Qwen3.5-0.8B
             slug: qwen3.5-0.8b
@@ -429,6 +430,11 @@ jobs:
             # listing them here already satisfies that; the harness creates its
             # own per-process temp root when MLX_COLD_CACHE_DIR is unset.
             for v in ${{ matrix.env }}; do export "$v=$ckpt"; done
+            if [ -n "${{ matrix.stage0_ts }}" ]; then
+              # qwen3_prefill_cancel reads this before its test binary starts.
+              # CI=true makes a missing/wrong value fail instead of self-skip.
+              export MLX_PAGED_PREFILL_CHUNK_SIZE=512
+            fi
             cargo test -p mlx-core ${{ matrix.tests }} -- --ignored --test-threads=1 --nocapture
             # Ignored UNIT tests, selected by name. Empty for legs that set no
             # `lib_tests:`, in which case nothing extra runs. See the comment on

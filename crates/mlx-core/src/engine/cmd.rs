@@ -43,8 +43,8 @@ pub(crate) enum ChatCmd {
         reply: ResponseTx<ChatResult>,
         /// Cooperative cancel flag for the whole sync turn (H2). The
         /// plain NAPI methods pass a fresh never-flipped flag; the
-        /// `*_cancellable` twins share it with the returned
-        /// [`crate::engine::types::CancellableChatCall`] handle. A
+        /// `begin_chat_session_*` operations share it with the returned
+        /// [`crate::engine::types::ChatSessionCall`] handle. A
         /// cancelled sync turn REJECTS with the distinguished
         /// `"chat session cancelled"` (see [`session::session_start`]).
         cancelled: Arc<AtomicBool>,
@@ -1056,7 +1056,7 @@ mod mock_backend_tests {
     }
 
     /// Fresh, never-flipped whole-turn cancel flag for sync command
-    /// literals — the same thing the plain (non-cancellable) NAPI
+    /// literals — the same thing the plain NAPI
     /// methods pass.
     fn test_cancel_flag() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))

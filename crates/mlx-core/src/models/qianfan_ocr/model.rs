@@ -27,14 +27,16 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 use napi::{Env, Status, bindgen_prelude::*};
 use napi_derive::napi;
 use serde_json::Value;
 use tracing::info;
 
 use crate::array::{MxArray, synchronize_and_clear_cache};
-use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
+use crate::engine::types::{
+    ChatConfig, ChatResult, ChatSessionCall, ChatStreamChunk, ChatStreamHandle,
+};
 use crate::model_thread::{ResponseTx, StreamTx};
 use crate::models::qianfan_ocr::bridge::InternVLBridge;
 use crate::models::qianfan_ocr::config::{InternVisionConfig, QianfanOCRConfig, Qwen3LMConfig};
@@ -57,6 +59,15 @@ use crate::utils::safetensors::SafeTensorsFile;
 /// model-provided Jinja template. The vision processor replaces it with the
 /// checkpoint-configured image span after template rendering.
 const QIANFAN_IMAGE_TEMPLATE_PLACEHOLDER: &str = "<image>";
+
+fn ensure_qianfan_turn_not_cancelled(cancelled: &AtomicBool) -> Result<()> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(Error::from_reason(
+            crate::engine::session::CHAT_SESSION_CANCELLED,
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct QianfanPrefillPlan {
@@ -186,6 +197,7 @@ pub(crate) enum QianfanOCRCmd {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
+        cancelled: Arc<AtomicBool>,
     },
     /// Continue an existing session by rendering the caller's full history
     /// with the model-provided chat template. Prefix verification decides
@@ -194,6 +206,7 @@ pub(crate) enum QianfanOCRCmd {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
+        cancelled: Arc<AtomicBool>,
     },
     /// Tool-result continuation. Tool structure lives in `messages` and is
     /// rendered exclusively by the model-provided chat template.
@@ -201,6 +214,7 @@ pub(crate) enum QianfanOCRCmd {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
+        cancelled: Arc<AtomicBool>,
     },
     /// Streaming session-start: same semantics as
     /// [`ChatSessionStart`](Self::ChatSessionStart) but streams token
@@ -247,27 +261,35 @@ pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOC
             messages,
             config,
             reply,
+            cancelled,
         } => {
             // NOTE: no per-request cache drain here. On a multi-model
             // server the MLX allocator free-pool is process-wide, so
             // flushing after a request on model A discards blocks about
             // to be reused by model B. The TS idle sweeper in
             // `@mlx-node/server` handles between-turn drains.
-            let _ = reply.send(inner.chat_session_start_sync(messages, config));
+            let _ = reply.send(inner.chat_session_start_sync(messages, config, cancelled.as_ref()));
         }
         QianfanOCRCmd::ChatSessionContinue {
             messages,
             config,
             reply,
+            cancelled,
         } => {
-            let _ = reply.send(inner.chat_session_continue_sync(messages, config));
+            let _ =
+                reply.send(inner.chat_session_continue_sync(messages, config, cancelled.as_ref()));
         }
         QianfanOCRCmd::ChatSessionContinueTool {
             messages,
             config,
             reply,
+            cancelled,
         } => {
-            let _ = reply.send(inner.chat_session_continue_tool_sync(messages, config));
+            let _ = reply.send(inner.chat_session_continue_tool_sync(
+                messages,
+                config,
+                cancelled.as_ref(),
+            ));
         }
         QianfanOCRCmd::ChatStreamSessionStart {
             messages,
@@ -596,8 +618,9 @@ impl QianfanOCRInner {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
         eos_token_id: u32,
+        cancelled: &AtomicBool,
     ) -> Result<ChatResult> {
-        let result = self.chat_turn_sync_core_inner(messages, config, eos_token_id);
+        let result = self.chat_turn_sync_core_inner(messages, config, eos_token_id, cancelled);
         if result.is_err() {
             self.reset_caches_sync();
         }
@@ -609,7 +632,9 @@ impl QianfanOCRInner {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
         eos_token_id: u32,
+        cancelled: &AtomicBool,
     ) -> Result<ChatResult> {
+        ensure_qianfan_turn_not_cancelled(cancelled)?;
         // Clamp a nonpositive budget to 0 so the `Vec::with_capacity(.. as
         // usize)` below never sees a negative `i32` (`-1 as usize` would
         // request `usize::MAX`); the `0..max_new_tokens` loop then emits 0.
@@ -645,6 +670,7 @@ impl QianfanOCRInner {
         let generation_stream = Stream::new(DeviceType::Gpu);
         let prepared =
             self.prepare_chat_prefill(&messages, &config, reuse_cache, generation_stream)?;
+        ensure_qianfan_turn_not_cancelled(cancelled)?;
         let PreparedQianfanPrompt {
             token_ids,
             prefill_embeds,
@@ -653,6 +679,7 @@ impl QianfanOCRInner {
             cached_tokens,
         } = prepared;
 
+        ensure_qianfan_turn_not_cancelled(cancelled)?;
         let mut cache = self.kv_caches.take();
         let prefill_result: Result<MxArray> = {
             let _ctx = StreamContext::new(generation_stream);
@@ -665,6 +692,7 @@ impl QianfanOCRInner {
         // Eval prefill logits -- caches materialize through dependency graph
         prefill_logits.eval();
         synchronize_and_clear_cache();
+        ensure_qianfan_turn_not_cancelled(cancelled)?;
 
         // Get last logits for first token sampling
         let prefill_seq = prefill_logits.shape()?[1];
@@ -722,6 +750,7 @@ impl QianfanOCRInner {
 
         // --- Step 8: Decode loop ---
         for _step in 0..max_new_tokens {
+            ensure_qianfan_turn_not_cancelled(cancelled)?;
             let token_value = token.item_at_int32(0)? as u32;
             generated_tokens.push(token_value);
             all_tokens.push(token_value);
@@ -783,6 +812,7 @@ impl QianfanOCRInner {
 
             token = sample(&next_logits, Some(sampling_config))?;
             token.eval();
+            ensure_qianfan_turn_not_cancelled(cancelled)?;
 
             // Periodic cache clearing to prevent memory accumulation
             if (_step + 1) % 256 == 0 {
@@ -1301,7 +1331,9 @@ impl QianfanOCRInner {
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
+        cancelled: &AtomicBool,
     ) -> Result<ChatResult> {
+        ensure_qianfan_turn_not_cancelled(cancelled)?;
         // The session API only makes sense with cache reuse enabled: if we
         // silently accept `reuse_cache = false`, the post-decode save
         // block wipes the caches we just populated, and the next
@@ -1323,7 +1355,7 @@ impl QianfanOCRInner {
         // intentionally invalidates any prior cache.
         self.reset_caches_sync();
 
-        self.chat_turn_sync_core(messages, config, im_end_id)
+        self.chat_turn_sync_core(messages, config, im_end_id, cancelled)
     }
 
     /// Continue a session from the caller's complete structured history.
@@ -1336,7 +1368,9 @@ impl QianfanOCRInner {
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
+        cancelled: &AtomicBool,
     ) -> Result<ChatResult> {
+        ensure_qianfan_turn_not_cancelled(cancelled)?;
         if config.reuse_cache == Some(false) {
             return Err(Error::from_reason(
                 "chat_session_continue requires reuse_cache=true (leave as None or set to true)",
@@ -1348,7 +1382,7 @@ impl QianfanOCRInner {
             ));
         }
         let eos_id = self.session_eos_id();
-        self.chat_turn_sync_core(messages, config, eos_id)
+        self.chat_turn_sync_core(messages, config, eos_id, cancelled)
     }
 
     /// Tool-result continuation uses the same complete-history template path;
@@ -1357,8 +1391,9 @@ impl QianfanOCRInner {
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
+        cancelled: &AtomicBool,
     ) -> Result<ChatResult> {
-        self.chat_session_continue_sync(messages, config)
+        self.chat_session_continue_sync(messages, config, cancelled)
     }
 
     /// Streaming variant of [`Self::chat_session_start_sync`].
@@ -1630,7 +1665,8 @@ impl QianfanOCRModel {
 
     /// Reset KV caches and token history. Async so a reset queued behind
     /// an in-flight turn parks a tokio future, never the Node event loop
-    /// (H1a — same contract as the `chat_napi_surface!` families).
+    /// (H1a — same contract as the `chat_napi_surface!` families). Callers
+    /// requiring reset-before-next-turn ordering must await this Promise.
     #[napi]
     pub async fn reset_caches(&self) -> Result<()> {
         let Some(thread) = self.thread.as_ref() else {
@@ -1668,8 +1704,36 @@ impl QianfanOCRModel {
             messages,
             config,
             reply,
+            cancelled: Arc::new(AtomicBool::new(false)),
         })
         .await
+    }
+
+    /// Internal operation for `chatSessionStart`. The returned call exposes an
+    /// idempotent `cancel()` immediately; `result()` resolves or rejects with the
+    /// exact `chat session cancelled` sentinel.
+    #[napi]
+    pub async fn begin_chat_session_start(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+    ) -> Result<ChatSessionCall> {
+        reject_unsupported_audio_in_messages(&messages)?;
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
+        })?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (reply, result_rx) = tokio::sync::oneshot::channel();
+        thread.send(QianfanOCRCmd::ChatSessionStart {
+            messages,
+            config: config.unwrap_or_default(),
+            reply,
+            cancelled: Arc::clone(&cancelled),
+        })?;
+        Ok(ChatSessionCall {
+            cancelled,
+            result_rx: std::sync::Mutex::new(Some(result_rx)),
+        })
     }
 
     /// Continue from the caller's complete conversation history. The
@@ -1693,8 +1757,34 @@ impl QianfanOCRModel {
             messages,
             config,
             reply,
+            cancelled: Arc::new(AtomicBool::new(false)),
         })
         .await
+    }
+
+    /// Internal operation for `chatSessionContinue`.
+    #[napi]
+    pub async fn begin_chat_session_continue(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+    ) -> Result<ChatSessionCall> {
+        reject_unsupported_audio_in_messages(&messages)?;
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
+        })?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (reply, result_rx) = tokio::sync::oneshot::channel();
+        thread.send(QianfanOCRCmd::ChatSessionContinue {
+            messages,
+            config: config.unwrap_or_default(),
+            reply,
+            cancelled: Arc::clone(&cancelled),
+        })?;
+        Ok(ChatSessionCall {
+            cancelled,
+            result_rx: std::sync::Mutex::new(Some(result_rx)),
+        })
     }
 
     /// Tool-result continuation over a full history. Tool representation is
@@ -1717,9 +1807,35 @@ impl QianfanOCRModel {
                 messages,
                 config,
                 reply,
+                cancelled: Arc::new(AtomicBool::new(false)),
             }
         })
         .await
+    }
+
+    /// Internal operation for `chatSessionContinueTool`.
+    #[napi]
+    pub async fn begin_chat_session_continue_tool(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+    ) -> Result<ChatSessionCall> {
+        reject_unsupported_audio_in_messages(&messages)?;
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
+        })?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (reply, result_rx) = tokio::sync::oneshot::channel();
+        thread.send(QianfanOCRCmd::ChatSessionContinueTool {
+            messages,
+            config: config.unwrap_or_default(),
+            reply,
+            cancelled: Arc::clone(&cancelled),
+        })?;
+        Ok(ChatSessionCall {
+            cancelled,
+            result_rx: std::sync::Mutex::new(Some(result_rx)),
+        })
     }
 
     /// Streaming variant of `chatSessionStart`.
@@ -1730,7 +1846,7 @@ impl QianfanOCRModel {
         &self,
         messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+        callback: crate::engine::napi_glue::ChatStreamCallback,
     ) -> Result<ChatStreamHandle> {
         reject_unsupported_audio_in_messages(&messages)?;
 
@@ -1740,26 +1856,16 @@ impl QianfanOCRModel {
 
         let config = config.unwrap_or_default();
 
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+        let plumbing = crate::engine::napi_glue::start_chat_stream(callback);
 
         thread.send(QianfanOCRCmd::ChatStreamSessionStart {
             messages,
             config,
-            stream_tx,
-            cancelled: cancelled_inner,
+            stream_tx: plumbing.stream_tx,
+            cancelled: Arc::clone(&plumbing.cancelled),
         })?;
 
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-
-        Ok(ChatStreamHandle { cancelled })
+        Ok(plumbing.handle)
     }
 
     /// Streaming continuation over a complete conversation history.
@@ -1770,7 +1876,7 @@ impl QianfanOCRModel {
         &self,
         messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+        callback: crate::engine::napi_glue::ChatStreamCallback,
     ) -> Result<ChatStreamHandle> {
         reject_unsupported_audio_in_messages(&messages)?;
 
@@ -1780,26 +1886,16 @@ impl QianfanOCRModel {
 
         let config = config.unwrap_or_default();
 
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+        let plumbing = crate::engine::napi_glue::start_chat_stream(callback);
 
         thread.send(QianfanOCRCmd::ChatStreamSessionContinue {
             messages,
             config,
-            stream_tx,
-            cancelled: cancelled_inner,
+            stream_tx: plumbing.stream_tx,
+            cancelled: Arc::clone(&plumbing.cancelled),
         })?;
 
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-
-        Ok(ChatStreamHandle { cancelled })
+        Ok(plumbing.handle)
     }
 
     /// Streaming tool-result continuation over a complete history.
@@ -1810,7 +1906,7 @@ impl QianfanOCRModel {
         &self,
         messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+        callback: crate::engine::napi_glue::ChatStreamCallback,
     ) -> Result<ChatStreamHandle> {
         reject_unsupported_audio_in_messages(&messages)?;
         let thread = self.thread.as_ref().ok_or_else(|| {
@@ -1819,26 +1915,32 @@ impl QianfanOCRModel {
 
         let config = config.unwrap_or_default();
 
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+        let plumbing = crate::engine::napi_glue::start_chat_stream(callback);
 
         thread.send(QianfanOCRCmd::ChatStreamSessionContinueTool {
             messages,
             config,
-            stream_tx,
-            cancelled: cancelled_inner,
+            stream_tx: plumbing.stream_tx,
+            cancelled: Arc::clone(&plumbing.cancelled),
         })?;
 
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
+        Ok(plumbing.handle)
+    }
+}
 
-        Ok(ChatStreamHandle { cancelled })
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn qianfan_sync_cancel_check_uses_the_shared_exact_sentinel() {
+        let live = AtomicBool::new(false);
+        ensure_qianfan_turn_not_cancelled(&live).expect("live turn should pass");
+
+        live.store(true, Ordering::Relaxed);
+        let error =
+            ensure_qianfan_turn_not_cancelled(&live).expect_err("cancelled turn should stop");
+        assert_eq!(error.reason, crate::engine::session::CHAT_SESSION_CANCELLED);
     }
 }
 

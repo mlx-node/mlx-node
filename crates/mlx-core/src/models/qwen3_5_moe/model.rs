@@ -234,17 +234,18 @@ use crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER;
 pub(crate) struct Qwen35MoeInner {
     pub(crate) config: Qwen3_5MoeConfig,
     /// The in-flight turn's cooperative-cancel flag, installed by the
-    /// streaming session cores via [`ChatBackend::set_turn_cancel_flag`]
-    /// and cleared (`None`) in their turn epilogue on every exit path.
+    /// sync and streaming session wrappers via
+    /// [`ChatBackend::set_turn_cancel_flag`] and cleared (`None`) in their
+    /// turn epilogue on every exit path.
     /// Threaded into the engine AR prefill chunk loops (flat
     /// `chunked_prefill` from `ChatBackend::prefill`, paged
     /// `run_paged_prefill_chunk_with_size_and_checkpoint` from
     /// `PagedBackend::paged_prefill` — MoE AR paged turns run the generic
     /// engine); a set flag aborts at the next chunk boundary with the
     /// distinguished `"prefill cancelled"` error, riding the engine's
-    /// fail-closed prefill-`Err` arms. The family's own MTP/vision cores
-    /// pass `None` (documented residual window), as do single-shot
-    /// prefills.
+    /// fail-closed prefill-`Err` arms. The family's MTP, vision, and hidden
+    /// replay cores thread the same flag; single-shot prefills remain the
+    /// documented residual window.
     pub(crate) turn_cancel: Option<Arc<AtomicBool>>,
     /// Turn-constant layer classification (`Linear` vs `FullAttentionPaged`),
     /// computed once in [`Self::new`] instead of re-derived on every paged

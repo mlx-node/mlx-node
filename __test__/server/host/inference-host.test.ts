@@ -156,6 +156,14 @@ describe('createInferenceHost — discovery and model binding', () => {
     expect(host.boundModel).toBe('alpha');
   });
 
+  it('forwards an explicit unbounded queue policy to the embedded server', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    const host = await start({ modelsDir, maxQueueDepthPerModel: 'unbounded' });
+    host.server.registry.register('queue-policy-probe', fakeModel() as never);
+
+    expect(host.server.registry.getSessionRegistry('queue-policy-probe')?.queueDepthLimit).toBeUndefined();
+  });
+
   it('throws NoModelsDiscoveredError for an empty models dir', async () => {
     const modelsDir = await mkdtemp(join(tmpdir(), 'mlx-host-empty-'));
     scratchDirs.push(modelsDir);

@@ -746,7 +746,7 @@ if (!nativeBinding) {
 
 module.exports = nativeBinding;
 module.exports.BatchGenerationResult = nativeBinding.BatchGenerationResult;
-module.exports.CancellableChatCall = nativeBinding.CancellableChatCall;
+module.exports.ChatSessionCall = nativeBinding.ChatSessionCall;
 module.exports.ChatStreamHandle = nativeBinding.ChatStreamHandle;
 module.exports.DocLayoutModel = nativeBinding.DocLayoutModel;
 module.exports.PPDocLayoutV3Model = nativeBinding.PPDocLayoutV3Model;

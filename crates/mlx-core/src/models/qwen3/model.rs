@@ -89,14 +89,15 @@ pub(crate) struct Qwen3Inner {
     /// (`"qwen3_chat_stream[_delta]_rust"`) into the stepper.
     turn_is_streaming: Cell<bool>,
     /// The in-flight turn's cooperative-cancel flag, installed by the
-    /// streaming session cores via [`ChatBackend::set_turn_cancel_flag`]
-    /// and cleared (`None`) in their turn epilogue on every exit path.
+    /// sync and streaming session wrappers via
+    /// [`ChatBackend::set_turn_cancel_flag`] and cleared (`None`) in their
+    /// turn epilogue on every exit path.
     /// Polled at the top of each prefill chunk (flat `flat_prefill` and
     /// paged `run_paged_prefill_chunk_with_size`); `true` aborts the
     /// prefill with the distinguished `"prefill cancelled"` error, which
     /// rides the engine's existing fail-closed prefill-`Err` arms.
-    /// `None` for sync turns (they carry no flag today) and single-shot
-    /// prefills stay uncancellable.
+    /// Plain non-cancellable calls install a never-flipped flag; single-shot
+    /// prefills remain the documented uncancellable window.
     turn_cancel: Option<Arc<AtomicBool>>,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.

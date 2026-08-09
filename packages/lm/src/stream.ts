@@ -11,6 +11,7 @@ import {
 import type {
   ChatConfig,
   ChatMessage,
+  ChatResult,
   ChatStreamChunk,
   ChatStreamHandle,
   PerformanceMetrics,
@@ -19,6 +20,38 @@ import type {
 } from "@mlx-node/core";
 
 import type { SessionCapableModel } from "./chat-session.js";
+
+interface NativeChatSessionCall {
+  cancel(): void;
+  result(): Promise<ChatResult>;
+}
+
+interface NativeChatSessionOperations {
+  chatSessionStart?(
+    messages: ChatMessage[],
+    config?: ChatConfig | null,
+  ): Promise<ChatResult>;
+  chatSessionContinue?(
+    messages: ChatMessage[],
+    config?: ChatConfig | null,
+  ): Promise<ChatResult>;
+  chatSessionContinueTool?(
+    messages: ChatMessage[],
+    config?: ChatConfig | null,
+  ): Promise<ChatResult>;
+  beginChatSessionStart?(
+    messages: ChatMessage[],
+    config?: ChatConfig | null,
+  ): Promise<NativeChatSessionCall>;
+  beginChatSessionContinue?(
+    messages: ChatMessage[],
+    config?: ChatConfig | null,
+  ): Promise<NativeChatSessionCall>;
+  beginChatSessionContinueTool?(
+    messages: ChatMessage[],
+    config?: ChatConfig | null,
+  ): Promise<NativeChatSessionCall>;
+}
 
 export interface ChatStreamDelta {
   text: string;
@@ -193,12 +226,34 @@ export async function* _runChatStream(
   ) => Promise<ChatStreamHandle>,
   signal?: AbortSignal,
 ): AsyncGenerator<ChatStreamEvent> {
+  // The native ThreadsafeFunction uses the same fixed ceiling. This JS-side
+  // guard also protects handwritten/test adapters that bypass the Rust glue.
+  const maxBufferedEvents = 64;
   const queue: Array<{
     chunk?: ChatStreamChunk;
     error?: Error;
     aborted?: boolean;
   }> = [];
   let resolve: (() => void) | null = null;
+  let handle: ChatStreamHandle | null = null;
+  let cancelRequested = false;
+  let cancelled = false;
+  let overflowed = false;
+
+  const cancelOnce = (): void => {
+    if (cancelled) return;
+    if (handle === null) {
+      cancelRequested = true;
+      return;
+    }
+    cancelled = true;
+    try {
+      handle.cancel();
+    } catch {
+      // Cancellation is best-effort. The distinguished backlog error below
+      // remains authoritative for the consumer even if a backend throws.
+    }
+  };
 
   const waitForItem = () =>
     queue.length > 0
@@ -216,11 +271,26 @@ export async function* _runChatStream(
   };
 
   const callback = (err: Error | null, chunk: ChatStreamChunk) => {
+    if (overflowed) return;
+    if (queue.length >= maxBufferedEvents) {
+      overflowed = true;
+      cancelOnce();
+      // Keep the queue at its fixed ceiling while guaranteeing the consumer
+      // eventually observes why the stream was cancelled.
+      queue[queue.length - 1] = {
+        error: new Error(
+          `Native chat stream backlog exceeded ${maxBufferedEvents} buffered events`,
+        ),
+      };
+      notify();
+      return;
+    }
     queue.push(err ? { error: err } : { chunk });
     notify();
   };
 
-  const handle = await startCall(callback);
+  handle = await startCall(callback);
+  if (cancelRequested) cancelOnce();
 
   // Guard against double-cancel. Some native backends throw on a
   // second `cancel()`; we route every cancel site through this
@@ -228,20 +298,6 @@ export async function* _runChatStream(
   // path (via the `finally` block) don't cancel twice and so any
   // backend that does throw is swallowed rather than escaping as
   // an error out of an otherwise-clean early termination.
-  let cancelled = false;
-  const cancelOnce = (): void => {
-    if (cancelled) return;
-    cancelled = true;
-    try {
-      handle.cancel();
-    } catch {
-      // Native backend threw on cancel — nothing actionable here.
-      // Swallow so aborted streams still surface as a clean early
-      // termination via the synthetic `aborted` marker rather than
-      // as an unexpected error out of the generator.
-    }
-  };
-
   // Signal-driven fast-abort. If the signal is already aborted at
   // attach time we still arm the listener so the synchronous abort
   // dispatch path runs below (calling `handle.cancel()` after the
@@ -350,6 +406,32 @@ export async function* _runChatStream(
       }
     }
     cancelOnce();
+  }
+}
+
+/**
+ * Translate the public AbortSignal API to the native two-phase cancellation
+ * operation. Callers receive one ordinary Promise and use the same
+ * AbortController as fetch and the streaming APIs.
+ */
+async function runChatSessionCall(
+  startCall: () => Promise<NativeChatSessionCall>,
+  signal: AbortSignal,
+): Promise<ChatResult> {
+  if (signal.aborted) throw new Error("chat session cancelled");
+  const call = await startCall();
+  let cancelled = false;
+  const cancelOnce = (): void => {
+    if (cancelled) return;
+    cancelled = true;
+    call.cancel();
+  };
+  signal.addEventListener("abort", cancelOnce, { once: true });
+  if (signal.aborted) cancelOnce();
+  try {
+    return await call.result();
+  } finally {
+    signal.removeEventListener("abort", cancelOnce);
   }
 }
 
@@ -465,15 +547,25 @@ type ResolvedApplyTemplate<O extends StreamingModelOptions> = O extends {
 /** @internal Method names whose callback ABI is replaced by the generator wrapper. */
 export type NativeStreamingMethod = keyof NativeStreamingInstance;
 
+type NativeSessionReplacementMethod =
+  | "chatSessionStart"
+  | "chatSessionContinue"
+  | "chatSessionContinueTool"
+  | "beginChatSessionStart"
+  | "beginChatSessionContinue"
+  | "beginChatSessionContinueTool";
+
 type StreamingReplacementMethod<O extends StreamingModelOptions> =
   | NativeStreamingMethod
+  | NativeSessionReplacementMethod
   | (ResolvedApplyTemplate<O> extends true ? "applyChatTemplate" : never);
 
 /**
  * Instance surface of a generated streaming wrapper. Only methods replaced at
  * runtime are removed from the native instance: the three callback streaming
- * methods, plus `applyChatTemplate` when the wrapper installs its path-backed
- * implementation. Intersecting the remaining native surface with
+ * methods, the internal operation methods, plus `applyChatTemplate` when the
+ * wrapper installs its path-backed implementation. Intersecting the remaining
+ * native surface with
  * `SessionCapableModel` preserves required native capabilities such as
  * `hasBlockPagedCache()` while exposing the generator streaming signatures.
  *
@@ -543,6 +635,8 @@ export function makeStreamingModel<
   const nativeContinue = NativeClass.prototype.chatStreamSessionContinue;
   const nativeContinueTool =
     NativeClass.prototype.chatStreamSessionContinueTool;
+  const nativeChat = NativeClass.prototype as NativeStreamingInstance &
+    NativeChatSessionOperations;
 
   // `NativeClass` is structurally a constructor; cast to a concrete
   // constructor type so `class extends` accepts it. Runtime behavior is
@@ -578,6 +672,66 @@ export function makeStreamingModel<
       Object.setPrototypeOf(instance, this.prototype);
       if (recordPath) rememberModelPath(instance, modelPath);
       return instance as unknown as StreamingModel;
+    }
+
+    async chatSessionStart(
+      messages: ChatMessage[],
+      config?: ChatConfig | null,
+      signal?: AbortSignal,
+    ): Promise<ChatResult> {
+      if (signal == null) {
+        if (nativeChat.chatSessionStart == null) {
+          throw new Error("Native model does not implement chatSessionStart");
+        }
+        return await nativeChat.chatSessionStart.call(this, messages, config);
+      }
+      if (nativeChat.beginChatSessionStart == null) {
+        throw new Error("Native model does not implement beginChatSessionStart");
+      }
+      return await runChatSessionCall(
+        () => nativeChat.beginChatSessionStart!.call(this, messages, config),
+        signal,
+      );
+    }
+
+    async chatSessionContinue(
+      messages: ChatMessage[],
+      config?: ChatConfig | null,
+      signal?: AbortSignal,
+    ): Promise<ChatResult> {
+      if (signal == null) {
+        if (nativeChat.chatSessionContinue == null) {
+          throw new Error("Native model does not implement chatSessionContinue");
+        }
+        return await nativeChat.chatSessionContinue.call(this, messages, config);
+      }
+      if (nativeChat.beginChatSessionContinue == null) {
+        throw new Error("Native model does not implement beginChatSessionContinue");
+      }
+      return await runChatSessionCall(
+        () => nativeChat.beginChatSessionContinue!.call(this, messages, config),
+        signal,
+      );
+    }
+
+    async chatSessionContinueTool(
+      messages: ChatMessage[],
+      config?: ChatConfig | null,
+      signal?: AbortSignal,
+    ): Promise<ChatResult> {
+      if (signal == null) {
+        if (nativeChat.chatSessionContinueTool == null) {
+          throw new Error("Native model does not implement chatSessionContinueTool");
+        }
+        return await nativeChat.chatSessionContinueTool.call(this, messages, config);
+      }
+      if (nativeChat.beginChatSessionContinueTool == null) {
+        throw new Error("Native model does not implement beginChatSessionContinueTool");
+      }
+      return await runChatSessionCall(
+        () => nativeChat.beginChatSessionContinueTool!.call(this, messages, config),
+        signal,
+      );
     }
 
     // The native methods are callback-based, but `Base` is typed as a
@@ -752,10 +906,10 @@ void _assertExpandedPromptPlannerSurfaces;
 
 type PreservedNativeSurface<C extends NativeStreamingCtor> = Omit<
   InstanceType<C>,
-  NativeStreamingMethod
+  NativeStreamingMethod | NativeSessionReplacementMethod
 >;
 
-/** Compile-time guard that the factory preserves every non-streaming native member. */
+/** Compile-time guard for every native member the factory does not replace. */
 function _assertPreservedNativeSurfaces(): void {
   const _qwen3: PreservedNativeSurface<typeof Qwen3ModelNative> =
     null as unknown as Qwen3Model;

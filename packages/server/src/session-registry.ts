@@ -351,13 +351,21 @@ export interface SessionRegistryOptions {
  * can reliably catch it without racing the chain.
  */
 export class QueueFullError extends Error {
-  readonly queuedCount: number;
+  readonly queueDepth: number;
+  readonly preDispatchAdmissions: number;
+  readonly admissionFootprint: number;
   readonly limit: number;
 
-  constructor(queuedCount: number, limit: number) {
-    super(`Model queue full: ${queuedCount} waiting (limit ${limit})`);
+  constructor(queueDepth: number, preDispatchAdmissions: number, limit: number) {
+    const admissionFootprint = queueDepth + preDispatchAdmissions;
+    super(
+      `Model queue full: ${queueDepth} queued, ${preDispatchAdmissions} pre-dispatch ` +
+        `(${admissionFootprint} admitted outside the active runner; waiter limit ${limit})`,
+    );
     this.name = 'QueueFullError';
-    this.queuedCount = queuedCount;
+    this.queueDepth = queueDepth;
+    this.preDispatchAdmissions = preDispatchAdmissions;
+    this.admissionFootprint = admissionFootprint;
     this.limit = limit;
   }
 }
@@ -615,7 +623,7 @@ export class SessionRegistry {
     const runnerEntitlement = this.execLock === this.initialLock ? 1 : 0;
     const footprint = this.queuedCount + this.preDispatchAdmits;
     if (footprint >= this.maxQueueDepth + runnerEntitlement) {
-      throw new QueueFullError(footprint, this.maxQueueDepth);
+      throw new QueueFullError(this.queuedCount, this.preDispatchAdmits, this.maxQueueDepth);
     }
   }
 

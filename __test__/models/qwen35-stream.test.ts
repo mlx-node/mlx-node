@@ -328,4 +328,32 @@ describe.sequential('_runChatStream bridge', () => {
       }
     }).rejects.toThrow('generation failed');
   });
+
+  it('bounds callback backlog and cancels native production when the consumer is stalled', async () => {
+    const cancel = vi.fn();
+    let callback!: (err: Error | null, chunk: ChatStreamChunk) => void;
+    const gen = _runChatStream((cb) => {
+      callback = cb;
+      return Promise.resolve({ cancel } as unknown as ChatStreamHandle);
+    });
+
+    // Start the adapter without consuming a yielded event, then emulate a
+    // native producer that outruns the JS consumer by a wide margin.
+    const first = gen.next();
+    await Promise.resolve();
+    for (let i = 0; i < 1_024; i += 1) {
+      callback(null, { text: String(i), done: false } as ChatStreamChunk);
+    }
+
+    expect(cancel).toHaveBeenCalledTimes(1);
+    await expect(
+      (async () => {
+        await first;
+        for await (const _event of gen) {
+          // Drain until the bounded-backlog sentinel becomes observable.
+        }
+      })(),
+    ).rejects.toThrow('Native chat stream backlog exceeded 64 buffered events');
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
 });

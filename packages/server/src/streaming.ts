@@ -2,6 +2,9 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
+/** Default time a connected SSE peer may remain continuously backpressured. */
+export const DEFAULT_SSE_DRAIN_TIMEOUT_MS = 30_000;
+
 /**
  * Responses that have committed to SSE (`beginSSE`) but have not yet been
  * ended (`endSSE`) or had their connection torn down.
@@ -19,6 +22,7 @@ const activeSSEResponses = new Set<ServerResponse>();
 /** Disconnect state whose listeners stay armed for one complete SSE handler. */
 export interface SSEClientAbortTracker {
   readonly aborted: boolean;
+  markAborted(): void;
   dispose(): void;
 }
 
@@ -42,15 +46,21 @@ export function trackSSEClientAbort(res: ServerResponse, httpReq: IncomingMessag
 
   if (httpReq != null) {
     httpReq.once('close', onClose);
-    httpReq.once('error', onError);
+    httpReq.on('error', onError);
   }
   res.once('close', onClose);
-  res.once('error', onError);
-  if (socket != null) socket.once('close', onClose);
+  res.on('error', onError);
+  if (socket != null) {
+    socket.once('close', onClose);
+    socket.on('error', onError);
+  }
 
   return {
     get aborted(): boolean {
       return aborted;
+    },
+    markAborted(): void {
+      aborted = true;
     },
     dispose(): void {
       if (disposed) return;
@@ -61,9 +71,26 @@ export function trackSSEClientAbort(res: ServerResponse, httpReq: IncomingMessag
       }
       res.removeListener('close', onClose);
       res.removeListener('error', onError);
-      if (socket != null) socket.removeListener('close', onClose);
+      if (socket != null) {
+        socket.removeListener('close', onClose);
+        socket.removeListener('error', onError);
+      }
     },
   };
+}
+
+interface SSEDrainWaitOptions {
+  /** Override used by focused tests; production reads the env/default. */
+  timeoutMs?: number;
+  /** Mark the owning handler's sticky abort state before the transport closes. */
+  onTimeout?: () => void;
+}
+
+function resolveSSEDrainTimeoutMs(): number {
+  const raw = process.env.MLX_SSE_DRAIN_TIMEOUT_MS;
+  if (raw == null || raw.trim() === '') return DEFAULT_SSE_DRAIN_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_SSE_DRAIN_TIMEOUT_MS;
 }
 
 export function beginSSE(res: ServerResponse): void {
@@ -99,13 +126,24 @@ export function writeSSEEvent(res: ServerResponse, eventType: string, data: obje
  * could fire while that turn is being fetched and leave the handler parked on
  * an event that already happened.
  */
-export function awaitDrainOrClose(res: ServerResponse): Promise<void> {
+export function awaitDrainOrClose(res: ServerResponse, options: SSEDrainWaitOptions = {}): Promise<void> {
   return new Promise<void>((resolve) => {
     let settled = false;
     const socket = res.socket;
+    const timeoutMs = options.timeoutMs ?? resolveSSEDrainTimeoutMs();
+    const timer = setTimeout(() => {
+      // Set the handler-visible state synchronously. `destroy()` emits close on
+      // a later turn, which is too late for the success gate immediately after
+      // this promise resolves.
+      options.onTimeout?.();
+      if (!res.destroyed) res.destroy();
+      settle();
+    }, timeoutMs);
+    timer.unref();
     const settle = (): void => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       res.removeListener('drain', onDrain);
       res.removeListener('close', onClose);
       res.removeListener('error', onError);

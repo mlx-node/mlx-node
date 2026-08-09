@@ -20,8 +20,8 @@
  * - H1b NO_PREFILL_CHECKPOINTS: run with
  *   MLX_PAGED_PREFILL_CHUNK_SIZE=0. The aborted long prefill cannot stop at a
  *   chunk boundary, so reset + its deterministic successor miss the deadline.
- * - H2 DROP_NONSTREAM_CANCEL: hide the model's three
- *   chatSession*Cancellable methods in instrumentModel. The destroyed holder
+ * - H2 DROP_NONSTREAM_CANCEL: drop the AbortSignal before the model's three
+ *   chatSession methods. The destroyed holder
  *   keeps the successor visibly queued and it misses the completion deadline.
  * - H3 CAP_TWO: construct the server with maxQueueDepthPerModel=2. The third
  *   request is admitted instead of returning the exact queue_full 429.
@@ -248,9 +248,6 @@ function instrumentModel(target: SessionCapableModel): InstrumentedModel {
     'chatSessionStart',
     'chatSessionContinue',
     'chatSessionContinueTool',
-    'chatSessionStartCancellable',
-    'chatSessionContinueCancellable',
-    'chatSessionContinueToolCancellable',
   ]);
   let streamStarts = 0;
   let streamEvents = 0;
@@ -268,8 +265,9 @@ function instrumentModel(target: SessionCapableModel): InstrumentedModel {
             const stream = (value as (...callArgs: unknown[]) => AsyncGenerator<ChatStreamEvent>).apply(model, args);
             for await (const event of stream) {
               // Count only events actually pulled through the real Qwen3
-              // generator by the endpoint. Native callback queue production
-              // is intentionally outside Task 5's HTTP-side bound.
+              // generator by the endpoint. The native callback and JS queues
+              // have their own 64-event ceilings; this counter pins the HTTP
+              // pull boundary independently.
               streamEvents += 1;
               yield event;
             }
@@ -285,26 +283,14 @@ function instrumentModel(target: SessionCapableModel): InstrumentedModel {
           // async NAPI method) so a very fast 0.6B turn cannot finish between
           // native handle creation and the test's 10 ms readiness poll.
           nonStreamingDispatches += 1;
-          const result = await (value as (...callArgs: unknown[]) => Promise<unknown>).apply(model, args);
-          if (String(property).endsWith('Cancellable')) {
-            const call = result as {
-              handle: unknown;
-              result: () => Promise<unknown>;
-            };
-            const awaitResult = call.result.bind(call);
-            return {
-              handle: call.handle,
-              result: async () => {
-                try {
-                  return await awaitResult();
-                } catch (error) {
-                  nonStreamingCancellationErrors.push(error);
-                  throw error;
-                }
-              },
-            };
+          try {
+            return await (value as (...callArgs: unknown[]) => Promise<unknown>).apply(model, args);
+          } catch (error) {
+            if (error instanceof Error && error.message === 'chat session cancelled') {
+              nonStreamingCancellationErrors.push(error);
+            }
+            throw error;
           }
-          return result;
         };
       }
       return typeof value === 'function' ? value.bind(model) : value;
@@ -589,7 +575,7 @@ stage0Describe('Stage-0 real-model concurrency hazards', () => {
     try {
       await waitUntil(
         () => instrumented.nonStreamingDispatches() > baselineDispatches,
-        'H2 holder never entered cancellable native dispatch',
+        'H2 holder never entered abortable native dispatch',
       );
       await waitUntil(
         () => instance.health().work.inFlight === 1,

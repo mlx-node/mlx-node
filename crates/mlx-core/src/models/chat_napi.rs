@@ -1,11 +1,11 @@
 //! Declarative generator for the per-family chat NAPI surface.
 //!
 //! Every language-model `#[napi]` class (`Qwen3Model`, `Qwen3_5Model`,
-//! `Qwen3_5MoeModel`, `Gemma4Model`, `Lfm2Model`) exposes the SAME ten
+//! `Qwen3_5MoeModel`, `Gemma4Model`, `Lfm2Model`) exposes the same ten
 //! chat-surface methods — `reset_caches`, `chat_session_start`,
 //! `chat_session_continue`, `chat_session_continue_tool`, their
-//! additive `chat_session_*_cancellable` twins (H2 — return a
-//! `CancellableChatCall` immediately, reply via `result()`),
+//! three internal `begin_chat_session_*` operations (H2 — return a
+//! `ChatSessionCall` immediately, reply via `result()`),
 //! `chat_stream_session_start`, `chat_stream_session_continue`,
 //! `chat_stream_session_continue_tool` — that simply forward a
 //! [`crate::engine::cmd::ChatCmd`] onto the family's dedicated model
@@ -54,7 +54,7 @@
 //! `ChatConfig | null`). Passing them in keeps the emitted strings
 //! byte-identical to the hand-written originals.
 
-/// Emit the seven-method chat NAPI surface for one model class.
+/// Emit the ten-method chat NAPI surface for one model class.
 ///
 /// See the module docs for the axis breakdown. `$Class` is the NAPI
 /// class, `$thread_cmd` its model-thread command type.
@@ -107,18 +107,19 @@ macro_rules! chat_napi_surface {
                 .await
             }
 
-            /// Cancellable twin of `chatSessionStart` (H2). Resolves
-            /// IMMEDIATELY with a `CancellableChatCall` whose `handle`
+            /// Internal operation bridge for `chatSessionStart` (H2). Resolves
+            /// IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
             /// can cancel the queued/running turn; the reply arrives via
             /// `call.result()`. A cancelled turn rejects `result()` with
-            /// the exact string `"chat session cancelled"`. The plain
-            /// `chatSessionStart` is untouched — this method is additive.
+            /// the exact string `"chat session cancelled"`. The LM wrapper
+            /// keeps this two-phase operation private and exposes cancellation
+            /// through the ordinary method's `AbortSignal` argument.
             #[napi]
-            pub async fn chat_session_start_cancellable(
+            pub async fn begin_chat_session_start(
                 &self,
                 messages: ::std::vec::Vec<$crate::tokenizer::ChatMessage>,
                 config: ::std::option::Option<$crate::engine::types::ChatConfig>,
-            ) -> ::napi::Result<$crate::engine::types::CancellableChatCall> {
+            ) -> ::napi::Result<$crate::engine::types::ChatSessionCall> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
@@ -134,7 +135,7 @@ macro_rules! chat_napi_surface {
                         },
                     ),
                 )?;
-                Ok($crate::engine::types::CancellableChatCall {
+                Ok($crate::engine::types::ChatSessionCall {
                     cancelled,
                     result_rx: ::std::sync::Mutex::new(::std::option::Option::Some(result_rx)),
                 })
@@ -170,14 +171,14 @@ macro_rules! chat_napi_surface {
                 .await
             }
 
-            /// Cancellable twin of `chatSessionContinue` (H2). Same
-            /// contract as `chatSessionStartCancellable`.
+            /// Internal operation bridge for `chatSessionContinue` (H2). Same
+            /// contract as `beginChatSessionStart`.
             #[napi]
-            pub async fn chat_session_continue_cancellable(
+            pub async fn begin_chat_session_continue(
                 &self,
                 messages: ::std::vec::Vec<$crate::tokenizer::ChatMessage>,
                 config: ::std::option::Option<$crate::engine::types::ChatConfig>,
-            ) -> ::napi::Result<$crate::engine::types::CancellableChatCall> {
+            ) -> ::napi::Result<$crate::engine::types::ChatSessionCall> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
                 $crate::models::chat_napi::chat_napi_continuation_media_guard!(messages);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
@@ -194,7 +195,7 @@ macro_rules! chat_napi_surface {
                         },
                     ),
                 )?;
-                Ok($crate::engine::types::CancellableChatCall {
+                Ok($crate::engine::types::ChatSessionCall {
                     cancelled,
                     result_rx: ::std::sync::Mutex::new(::std::option::Option::Some(result_rx)),
                 })
@@ -227,14 +228,14 @@ macro_rules! chat_napi_surface {
                 .await
             }
 
-            /// Cancellable twin of `chatSessionContinueTool` (H2). Same
-            /// contract as `chatSessionStartCancellable`.
+            /// Internal operation bridge for `chatSessionContinueTool` (H2). Same
+            /// contract as `beginChatSessionStart`.
             #[napi]
-            pub async fn chat_session_continue_tool_cancellable(
+            pub async fn begin_chat_session_continue_tool(
                 &self,
                 messages: ::std::vec::Vec<$crate::tokenizer::ChatMessage>,
                 config: ::std::option::Option<$crate::engine::types::ChatConfig>,
-            ) -> ::napi::Result<$crate::engine::types::CancellableChatCall> {
+            ) -> ::napi::Result<$crate::engine::types::ChatSessionCall> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
                 $crate::models::chat_napi::chat_napi_continuation_media_guard!(messages);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
@@ -251,7 +252,7 @@ macro_rules! chat_napi_surface {
                         },
                     ),
                 )?;
-                Ok($crate::engine::types::CancellableChatCall {
+                Ok($crate::engine::types::ChatSessionCall {
                     cancelled,
                     result_rx: ::std::sync::Mutex::new(::std::option::Option::Some(result_rx)),
                 })
@@ -263,10 +264,7 @@ macro_rules! chat_napi_surface {
                 &self,
                 messages: ::std::vec::Vec<$crate::tokenizer::ChatMessage>,
                 config: ::std::option::Option<$crate::engine::types::ChatConfig>,
-                callback: ::napi::threadsafe_function::ThreadsafeFunction<
-                    $crate::engine::types::ChatStreamChunk,
-                    (),
-                >,
+                callback: $crate::engine::napi_glue::ChatStreamCallback,
             ) -> ::napi::Result<$crate::engine::types::ChatStreamHandle> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
@@ -293,10 +291,7 @@ macro_rules! chat_napi_surface {
                 &self,
                 messages: ::std::vec::Vec<$crate::tokenizer::ChatMessage>,
                 config: ::std::option::Option<$crate::engine::types::ChatConfig>,
-                callback: ::napi::threadsafe_function::ThreadsafeFunction<
-                    $crate::engine::types::ChatStreamChunk,
-                    (),
-                >,
+                callback: $crate::engine::napi_glue::ChatStreamCallback,
             ) -> ::napi::Result<$crate::engine::types::ChatStreamHandle> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
                 $crate::models::chat_napi::chat_napi_continuation_media_guard!(messages);
@@ -324,10 +319,7 @@ macro_rules! chat_napi_surface {
                 &self,
                 messages: ::std::vec::Vec<$crate::tokenizer::ChatMessage>,
                 config: ::std::option::Option<$crate::engine::types::ChatConfig>,
-                callback: ::napi::threadsafe_function::ThreadsafeFunction<
-                    $crate::engine::types::ChatStreamChunk,
-                    (),
-                >,
+                callback: $crate::engine::napi_glue::ChatStreamCallback,
             ) -> ::napi::Result<$crate::engine::types::ChatStreamHandle> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
                 $crate::models::chat_napi::chat_napi_continuation_media_guard!(messages);
@@ -369,9 +361,11 @@ macro_rules! chat_napi_thread_bind {
 
 /// `reset_caches` body. Awaits [`crate::model_thread::send_and_await`]
 /// so a reset queued behind an in-flight turn parks a tokio future —
-/// never `blocking_recv()` on the Node event loop (H1a). Ordering is
-/// unchanged: the single per-model command channel still serializes the
-/// reset behind any queued turn. The `option` arm silently resolves
+/// never `blocking_recv()` on the Node event loop (H1a). Once this future is
+/// polled and the command is sent, the single per-model channel preserves FIFO
+/// order. Callers that require reset-before-next-turn ordering MUST await the
+/// returned Promise before dispatching that turn; two fire-and-forget async
+/// calls have no call-stack enqueue ordering guarantee. The `option` arm silently resolves
 /// `Ok(())` on an uninitialised stub so `ChatSession.reset()` stays
 /// idempotent across stub + loaded instances.
 macro_rules! chat_napi_thread_reset {
@@ -467,6 +461,28 @@ macro_rules! chat_napi_continuation_media_guard {
             }
         }
     };
+}
+
+// Compile-adjacent H1a pin: changing any emitted/manual `reset_caches`
+// surface back to a synchronous return makes this helper fail to type-check.
+// The runtime event-loop oracle remains the env-gated Stage-0 e2e test.
+#[cfg(test)]
+#[allow(dead_code)]
+fn reset_cache_surfaces_return_futures(
+    qwen3: &crate::models::qwen3::Qwen3Model,
+    qwen35: &crate::models::qwen3_5::Qwen3_5Model,
+    qwen35_moe: &crate::models::qwen3_5_moe::Qwen3_5MoeModel,
+    gemma4: &crate::models::gemma4::Gemma4Model,
+    lfm2: &crate::models::lfm2::model::Lfm2Model,
+    qianfan: &crate::models::qianfan_ocr::QianfanOCRModel,
+) {
+    fn assert_future<F: std::future::Future<Output = napi::Result<()>>>(_: F) {}
+    assert_future(qwen3.reset_caches());
+    assert_future(qwen35.reset_caches());
+    assert_future(qwen35_moe.reset_caches());
+    assert_future(gemma4.reset_caches());
+    assert_future(lfm2.reset_caches());
+    assert_future(qianfan.reset_caches());
 }
 
 pub(crate) use chat_napi_continuation_media_guard;

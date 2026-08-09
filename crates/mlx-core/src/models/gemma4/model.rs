@@ -313,14 +313,15 @@ impl StreamEmitter for Gemma4Emitter {
 pub(crate) struct Gemma4Inner {
     pub(crate) config: Gemma4Config,
     /// The in-flight turn's cooperative-cancel flag, installed by the
-    /// streaming session cores via [`ChatBackend::set_turn_cancel_flag`]
-    /// and cleared (`None`) in their turn epilogue on every exit path.
+    /// sync and streaming session wrappers via
+    /// [`ChatBackend::set_turn_cancel_flag`] and cleared (`None`) in their
+    /// turn epilogue on every exit path.
     /// Polled at the top of each prefill chunk (flat `prefill_body_gemma4`
     /// and the paged chunk-plan loop in `run_paged_prefill_chunk`);
     /// `true` aborts with the distinguished `"prefill cancelled"` error,
-    /// riding the engine's fail-closed prefill-`Err` arms. Single-shot
-    /// prefills and the speculative (assistant/dspark) prefill clones
-    /// stay uncancellable — documented residual windows.
+    /// riding the engine's fail-closed prefill-`Err` arms. Speculative
+    /// assistant/DSpark and vision paths thread the same flag; single-shot
+    /// prefills remain the documented residual window.
     pub(crate) turn_cancel: Option<Arc<AtomicBool>>,
     pub(crate) embed_tokens: Embedding,
     pub(crate) layers: Vec<Gemma4DecoderLayer>,

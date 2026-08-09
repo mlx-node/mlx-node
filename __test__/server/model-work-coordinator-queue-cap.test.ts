@@ -451,16 +451,13 @@ describe('pre-dispatch admission gate (resolveModel + coordinator wiring)', () =
     }
   }, 15000);
 
-  it('cold-load burst bypasses the early gate (not resident yet); the cap engages once the model is resident', async () => {
+  it('POST /v1/messages bounds a cold-load burst while the load promise remains unresolved', async () => {
     const registry = new ModelRegistry({ maxQueueDepth: 2 });
-    const coordinator = new ModelWorkCoordinator();
-    const holderEntered = deferred();
-    const releaseHolder = deferred();
-    const { model, chatSessionStart } = createGatedModel(() => holderEntered.resolve(undefined), releaseHolder.promise);
-    // Cold-load hook: registers the model on first resolve, exactly like
-    // the host's lazy loader. Until then `getSessionRegistry` is
-    // undefined, so the pre-dispatch gate cannot (and must not) fire.
+    const coordinator = new ModelWorkCoordinator(2);
+    const model = createModel();
+    const releaseLoad = deferred();
     const resolveModel = vi.fn(async () => {
+      await releaseLoad.promise;
       registry.register('cold-model', model);
     });
 
@@ -482,52 +479,74 @@ describe('pre-dispatch admission gate (resolveModel + coordinator wiring)', () =
       return { mock, done };
     };
 
-    // Phase 1 — cold burst: 3 concurrent requests at a NON-resident
-    // model with cap 2. All bypass the early gate; the first parks the
-    // turn open (gated model), so this also proves the burst was not
-    // early-rejected while the load + first turn were in flight.
-    const cold = Array.from({ length: 3 }, () => sendOne());
-    await holderEntered.promise;
-    releaseHolder.resolve(undefined);
-    for (const req of cold) {
-      await req.done;
-      await req.mock.waitForEnd();
-      // Documented residual: non-resident requests are never 429d by the
-      // early gate; 3 requests fit the post-load withExclusive budget
-      // (runner + 2 waiters), so every one completes.
-      expect(req.mock.getStatus()).toBe(200);
-    }
-    expect(resolveModel).toHaveBeenCalled();
-
-    // Phase 2 — the model is now resident, so the same burst shape hits
-    // the pre-dispatch gate: holder + 2 admitted (cap 2), 3rd arrival
-    // rejected while the holder still runs.
-    const holderEntered2 = deferred();
-    const releaseHolder2 = deferred();
-    chatSessionStart.mockImplementationOnce(async () => {
-      holderEntered2.resolve(undefined);
-      await releaseHolder2.promise;
-      return makeChatResult();
-    });
-    const holder2 = sendOne();
-    await holderEntered2.promise;
-    const arrivals = Array.from({ length: 3 }, () => sendOne());
+    const cold = Array.from({ length: 4 }, () => sendOne());
     await tick();
 
-    const overflow = arrivals[2]!;
-    const outcome = await Promise.race([overflow.done.then(() => 'done' as const), timeout(200)]);
-    expect(outcome).toBe('done');
+    const overflow = cold[3]!;
+    expect(await Promise.race([overflow.done.then(() => 'done' as const), timeout(200)])).toBe('done');
     await overflow.mock.waitForEnd();
     expect(overflow.mock.getStatus()).toBe(429);
     expect(overflow.mock.getHeaders()['retry-after']).toBe('1');
+    expect(JSON.parse(overflow.mock.getBody()).error.type).toBe('rate_limit_error');
+    expect(registry.getSessionRegistry('cold-model')).toBeUndefined();
+    expect(coordinator.requestLoadAdmissionCount).toBe(3);
 
-    releaseHolder2.resolve(undefined);
-    await holder2.done;
-    for (const admitted of arrivals.slice(0, 2)) {
-      await admitted.done;
-      await admitted.mock.waitForEnd();
-      expect(admitted.mock.getStatus()).toBe(200);
+    releaseLoad.resolve(undefined);
+    for (const req of cold.slice(0, 3)) {
+      await req.done;
+      await req.mock.waitForEnd();
+      expect(req.mock.getStatus()).toBe(200);
     }
+    expect(coordinator.requestLoadAdmissionCount).toBe(0);
+  }, 15000);
+
+  it('POST /v1/responses bounds a cold-load burst while the load promise remains unresolved', async () => {
+    const registry = new ModelRegistry({ maxQueueDepth: 2 });
+    const coordinator = new ModelWorkCoordinator(2);
+    const model = createModel();
+    const releaseLoad = deferred();
+    const resolveModel = vi.fn(async () => {
+      await releaseLoad.promise;
+      registry.register('cold-model', model);
+    });
+
+    const sendOne = () => {
+      const mock = createMockRes();
+      const done = handleCreateResponse(
+        mock.res,
+        { model: 'cold-model', input: 'hi' },
+        registry,
+        null,
+        undefined,
+        undefined,
+        null,
+        coordinator,
+        resolveModel,
+      );
+      return { mock, done };
+    };
+
+    const cold = Array.from({ length: 4 }, () => sendOne());
+    await tick();
+
+    const overflow = cold[3]!;
+    expect(await Promise.race([overflow.done.then(() => 'done' as const), timeout(200)])).toBe('done');
+    await overflow.mock.waitForEnd();
+    expect(overflow.mock.getStatus()).toBe(429);
+    expect(overflow.mock.getHeaders()['retry-after']).toBe('1');
+    const parsed = JSON.parse(overflow.mock.getBody());
+    expect(parsed.error.type).toBe('rate_limit_error');
+    expect(parsed.error.code).toBe('queue_full');
+    expect(registry.getSessionRegistry('cold-model')).toBeUndefined();
+    expect(coordinator.requestLoadAdmissionCount).toBe(3);
+
+    releaseLoad.resolve(undefined);
+    for (const req of cold.slice(0, 3)) {
+      await req.done;
+      await req.mock.waitForEnd();
+      expect(req.mock.getStatus()).toBe(200);
+    }
+    expect(coordinator.requestLoadAdmissionCount).toBe(0);
   }, 15000);
 });
 

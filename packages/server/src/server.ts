@@ -414,7 +414,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
   // request will not fire `clearCache()`. See the `idle-sweeper.ts`
   // module doc (section "Drain is post-request only") for rationale.
   const registry = new ModelRegistry({ maxQueueDepth: maxQueueDepthPerModel });
-  const modelWorkCoordinator = new ModelWorkCoordinator();
+  const modelWorkCoordinator = new ModelWorkCoordinator(maxQueueDepthPerModel);
 
   let store: ResponseStore | null = null;
   if (!disableStore) {

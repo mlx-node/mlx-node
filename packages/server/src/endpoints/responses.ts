@@ -26,7 +26,11 @@ import {
   genId,
   mapFinishReasonToStatus,
 } from '../mappers/response.js';
-import type { ModelWorkCoordinator } from '../model-work-coordinator.js';
+import {
+  type ModelLoadAdmission,
+  ModelLoadQueueFullError,
+  type ModelWorkCoordinator,
+} from '../model-work-coordinator.js';
 import { getPendingWritesFor } from '../pending-writes.js';
 import type { ModelRegistry } from '../registry.js';
 import {
@@ -253,10 +257,9 @@ async function handleNonStreaming(
     serverTiming,
   );
 
-  // `chatSession*` has no AbortSignal surface yet, so a mid-decode
-  // client disconnect still burns the full decode budget — peer loss
-  // is only observable when native decode resolves. Disconnect
-  // detection is delegated to `endJson`'s `isSocketGone(res)` check:
+  // The request AbortSignal reaches the normal session method, whose wrapper
+  // maps it to native cancellation at the next model safepoint.
+  // `endJson`'s `isSocketGone(res)` remains the final transport race check:
   // on a dead peer it rejects AFTER committing `responseMode = 'json'`
   // so the outer catch routes to the JSON error / socket-destroy
   // shape; `responseBodyWritten` flips only from `res.end`'s write
@@ -407,7 +410,7 @@ async function handleStreamingNativeWithAbort(
   const writeSSEEvent = (response: ServerResponse, eventType: string, data: object): void => {
     const ok = writeRawSSEEvent(response, eventType, data);
     if (!ok && pendingDrain === null) {
-      pendingDrain = awaitDrainOrClose(response);
+      pendingDrain = awaitDrainOrClose(response, { onTimeout: () => abort.markAborted() });
     }
   };
   const drainPending = async (): Promise<void> => {
@@ -465,10 +468,9 @@ async function handleStreamingNativeWithAbort(
   try {
     for await (const event of chatStream) {
       await drainPending();
-      // Honor client disconnect at loop-top. Native decode has no
-      // AbortSignal yet; `break` drops the generator reference so
-      // the producer's `finally` releases per-model locks and the
-      // post-loop block routes to the failure epilogue.
+      // Honor disconnect or a bounded drain timeout at loop-top. Breaking
+      // drops the generator reference; its AbortSignal cancels native work
+      // and its finally releases the per-model lock.
       if (abort.aborted) break;
       if (event.done) {
         sawDone = true;
@@ -1827,8 +1829,9 @@ export async function handleCreateResponse(
   // without bound. When the model is ALREADY resident, admit-or-429 up
   // front against the same per-model budget (same envelope as the
   // `withExclusive` reject below). A non-resident model has no
-  // `SessionRegistry` yet: cold loads skip the gate deliberately, and
-  // the post-load `withExclusive` cap still applies.
+  // `SessionRegistry` yet, so it takes the coordinator's bounded
+  // pre-resolution permit below instead of entering its writer queue
+  // uncounted.
   //
   // The permit is RETAINED through every pre-lock await — the writer
   // bracket below AND the `store.getChain` continuation lookups — and
@@ -1839,13 +1842,27 @@ export async function handleCreateResponse(
   // outer `finally` for everything inside it (idempotent + no-op after
   // handoff, so the unconditional release is always safe).
   let preDispatchAdmission: PreDispatchAdmission | undefined;
+  let modelLoadAdmission: ModelLoadAdmission | undefined;
   const preDispatchRegistry = registry.getSessionRegistry(body.model);
   if (preDispatchRegistry) {
     try {
       preDispatchAdmission = preDispatchRegistry.beginPreDispatchAdmission();
     } catch (err) {
       if (err instanceof QueueFullError) {
-        sendRateLimit(res, `Model queue full: ${err.queuedCount} waiting (limit ${err.limit}). Retry after 1s.`);
+        sendRateLimit(res, `${err.message}. Retry after 1s.`);
+        return;
+      }
+      throw err;
+    }
+  } else if (resolveModel && modelWorkCoordinator) {
+    try {
+      modelLoadAdmission = modelWorkCoordinator.beginRequestLoadAdmission();
+    } catch (err) {
+      if (err instanceof ModelLoadQueueFullError) {
+        sendRateLimit(
+          res,
+          `Model queue full: admission footprint ${err.admissionFootprint} (limit ${err.limit}). Retry after 1s.`,
+        );
         return;
       }
       throw err;
@@ -1879,6 +1896,7 @@ export async function handleCreateResponse(
       await (idleSweeper ? idleSweeper.withSuspendedDrains(load) : load());
     } catch (err) {
       preDispatchAdmission?.release();
+      modelLoadAdmission?.release();
       sendInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
       return;
     }
@@ -1892,6 +1910,7 @@ export async function handleCreateResponse(
   const model = registry.get(body.model);
   if (!model) {
     preDispatchAdmission?.release();
+    modelLoadAdmission?.release();
     sendNotFound(
       res,
       `Model "${body.model}" not found. Available models: ${registry
@@ -1910,6 +1929,7 @@ export async function handleCreateResponse(
   const lease = registry.acquireDispatchLease(body.model);
   if (!lease) {
     preDispatchAdmission?.release();
+    modelLoadAdmission?.release();
     sendInternalError(res, 'session registry missing for registered model');
     return;
   }
@@ -2561,8 +2581,11 @@ export async function handleCreateResponse(
 
     try {
       const mutexQueuedAt = Date.now();
-      const runInference = () =>
-        withAdmissionControlledInference(sessionReg, modelWorkCoordinator, preDispatchAdmission, async () => {
+      const runInference = () => {
+        // No await or callback can interleave between releasing the cold-load
+        // unit and synchronously entering the resident FIFO.
+        modelLoadAdmission?.release();
+        return withAdmissionControlledInference(sessionReg, modelWorkCoordinator, preDispatchAdmission, async () => {
           const serverTiming: ServerTimingForUsage = {
             server_queue_ms: Date.now() - mutexQueuedAt,
             server_pre_inference_ms: Date.now() - handlerStartedAt,
@@ -3290,8 +3313,8 @@ export async function handleCreateResponse(
             } else {
               // Non-streaming cancellation (H2): `streamSignal` threads
               // through `ChatSession.send/sendToolResult/startFromHistory`
-              // into the additive native `chatSession*Cancellable`
-              // surface, so a client that disconnects mid-generation
+              // into the normal public session method; the wrapper maps it to
+              // the internal native operation, so a client that disconnects mid-generation
               // flips the controller, the native turn unwinds at the
               // next safepoint, and the dispatch REJECTS with
               // "chat session cancelled" (routed through the ordinary
@@ -3674,6 +3697,7 @@ export async function handleCreateResponse(
             }
           }
         });
+      };
       await runInference();
     } catch (err) {
       // Admission-control rejection from the per-model queue cap
@@ -3690,7 +3714,7 @@ export async function handleCreateResponse(
       // preserved untouched.
       if (err instanceof QueueFullError) {
         if (!res.headersSent) {
-          sendRateLimit(res, `Model queue full: ${err.queuedCount} waiting (limit ${err.limit}). Retry after 1s.`);
+          sendRateLimit(res, `${err.message}. Retry after 1s.`);
         }
       } else {
         throw err;
@@ -3840,6 +3864,7 @@ export async function handleCreateResponse(
     // early-return inside the outer `try`. Idempotent and a no-op
     // after handoff, so the unconditional call is always safe.
     preDispatchAdmission?.release();
+    modelLoadAdmission?.release();
     // Idempotent fallback: if the post-dispatch cleanup above
     // never ran (early-return validation failure, or an exception
     // raised inside the outer `try` block between lease

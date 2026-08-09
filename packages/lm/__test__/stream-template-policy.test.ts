@@ -1,4 +1,4 @@
-import type { ChatMessage } from '@mlx-node/core';
+import type { ChatMessage, ChatResult } from '@mlx-node/core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const tokenizerMocks = vi.hoisted(() => ({
@@ -36,6 +36,30 @@ class NativeStreamingStub {
   }
 
   chatStreamSessionContinueTool(..._args: never[]): never {
+    throw new Error('not used');
+  }
+
+  async chatSessionStart(): Promise<ChatResult> {
+    return { text: 'plain' } as ChatResult;
+  }
+
+  async chatSessionContinue(): Promise<ChatResult> {
+    return { text: 'plain' } as ChatResult;
+  }
+
+  async chatSessionContinueTool(): Promise<ChatResult> {
+    return { text: 'plain' } as ChatResult;
+  }
+
+  async beginChatSessionStart(): Promise<{ cancel(): void; result(): Promise<ChatResult> }> {
+    throw new Error('test must install beginChatSessionStart spy');
+  }
+
+  async beginChatSessionContinue(): Promise<{ cancel(): void; result(): Promise<ChatResult> }> {
+    throw new Error('not used');
+  }
+
+  async beginChatSessionContinueTool(): Promise<{ cancel(): void; result(): Promise<ChatResult> }> {
     throw new Error('not used');
   }
 }
@@ -106,5 +130,27 @@ describe('makeStreamingModel template content policy', () => {
 
     expect(defaultModel.replaysAssistantRawText?.()).toBe(false);
     expect(rawReplayModel.replaysAssistantRawText?.()).toBe(true);
+  });
+
+  it('maps public AbortSignal cancellation to the hidden native operation exactly once', async () => {
+    const controller = new AbortController();
+    const cancel = vi.fn();
+    let rejectResult!: (error: Error) => void;
+    const result = new Promise<ChatResult>((_resolve, reject) => {
+      rejectResult = reject;
+    });
+    cancel.mockImplementation(() => rejectResult(new Error('chat session cancelled')));
+    const begin = vi.spyOn(NativeStreamingStub.prototype, 'beginChatSessionStart').mockImplementationOnce(async () => {
+      // Exercise the attach race: the signal fires after the public method's
+      // precheck but before the wrapper receives the native operation.
+      controller.abort();
+      return { cancel, result: () => result };
+    });
+    const Model = makeStreamingModel(NativeStreamingStub, { recordModelPath: false });
+    const model = await Model.load('/models/abortable');
+
+    await expect(model.chatSessionStart([], null, controller.signal)).rejects.toThrow('chat session cancelled');
+    expect(begin).toHaveBeenCalledTimes(1);
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 });

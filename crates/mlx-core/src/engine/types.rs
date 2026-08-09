@@ -259,14 +259,14 @@ impl ChatStreamHandle {
     }
 }
 
-/// In-flight NON-streaming chat turn returned by the additive
-/// `chat_session_*_cancellable` entry points (H2).
+/// In-flight non-streaming chat turn returned by the internal
+/// `begin_chat_session_*` operation entry points (H2).
 ///
 /// The dispatching NAPI method resolves with this object IMMEDIATELY
 /// after the command is queued (mirroring how the streaming methods
 /// return their [`ChatStreamHandle`] before the turn runs); the turn's
-/// reply arrives later through [`Self::result`]. `handle` shares the
-/// same `Arc<AtomicBool>` the command carries, so `handle.cancel()`
+/// reply arrives later through [`Self::result`]. `cancel()` flips the
+/// same `Arc<AtomicBool>` the command carries, so it
 /// reaches the model thread's chunk-boundary / per-step polls exactly
 /// like a streaming cancel.
 ///
@@ -274,7 +274,7 @@ impl ChatStreamHandle {
 /// the exact string `"chat session cancelled"`
 /// ([`crate::engine::session::CHAT_SESSION_CANCELLED`]).
 #[napi]
-pub struct CancellableChatCall {
+pub struct ChatSessionCall {
     pub(crate) cancelled: Arc<AtomicBool>,
     /// Oneshot receiver for the turn's reply. `Mutex<Option<..>>`
     /// because NAPI methods take `&self` and the receiver is consumed by
@@ -284,15 +284,11 @@ pub struct CancellableChatCall {
 }
 
 #[napi]
-impl CancellableChatCall {
-    /// Cancellation token for this turn. Each access mints a fresh
-    /// `ChatStreamHandle` wrapping the SAME shared flag, so
-    /// `call.handle.cancel()` behaves identically across accesses.
-    #[napi(getter)]
-    pub fn handle(&self) -> ChatStreamHandle {
-        ChatStreamHandle {
-            cancelled: Arc::clone(&self.cancelled),
-        }
+impl ChatSessionCall {
+    /// Cooperatively cancel this queued or running turn.
+    #[napi]
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
     }
 
     /// Await the turn's reply. Resolves with the [`ChatResult`] on a
@@ -304,10 +300,10 @@ impl CancellableChatCall {
         let rx = self
             .result_rx
             .lock()
-            .map_err(|_| napi::Error::from_reason("CancellableChatCall.result mutex poisoned"))?
+            .map_err(|_| napi::Error::from_reason("ChatSessionCall.result mutex poisoned"))?
             .take()
             .ok_or_else(|| {
-                napi::Error::from_reason("CancellableChatCall.result was already consumed")
+                napi::Error::from_reason("ChatSessionCall.result was already consumed")
             })?;
         rx.await
             .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
