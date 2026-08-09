@@ -930,7 +930,7 @@ async function runSessionNonStreaming(
   }
   session.primeHistory(messages);
   const initialTurns = session.turns;
-  const result = await session.startFromHistory(config, signal);
+  const result = await session.startFromHistory(config, { signal });
   // Mirror the streaming-side dual-gate (`streamResult.ok &&
   // outcome.wasCommitted()`) and the sibling `/v1/responses` adopt
   // gate. `ChatSession.startFromHistory` advances `turnCount`

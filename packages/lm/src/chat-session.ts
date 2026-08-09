@@ -1502,7 +1502,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * stay on the delta path, and subsequent image turns correctly
    * trigger restart).
    */
-  async startFromHistory(config?: ChatConfig, signal?: AbortSignal): Promise<ChatResult> {
+  async startFromHistory(config?: ChatConfig, opts: { signal?: AbortSignal } = {}): Promise<ChatResult> {
     if (this.inFlight) {
       throw new Error('ChatSession: cannot startFromHistory() while a send() is in flight');
     }
@@ -1521,7 +1521,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         'start',
         historySnapshot,
         withReplayReasoning(constrainedConfig, this.model),
-        signal,
+        opts.signal,
       );
       this.history.push(
         buildAssistantMessage(
@@ -1649,8 +1649,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * signal (`{ once: true }` listener plus a post-attach `aborted`
    * re-check, because an 'abort' listener added to an already-aborted
    * signal never fires) and the reply is awaited via `call.result()`.
-   * The listener is detached in `finally` so a long-lived signal cannot
-   * accumulate handlers across turns.
+   * Both paths route through one `cancelOnce` guard so `handle.cancel()`
+   * runs at most once per call. The listener is detached in `finally`
+   * so a long-lived signal cannot accumulate handlers across turns.
    *
    * Fallback path (no signal, or the model lacks the surface — e.g.
    * mocks and the Qianfan-OCR VLM): the plain method, byte-identical
@@ -1680,19 +1681,28 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         throw new Error('chat session cancelled');
       }
       const call = await cancellable(messages, config);
-      const onAbort = (): void => {
+      // BOTH cancellation paths — the abort listener and the post-attach
+      // catch-up below — route through one guarded closure so
+      // `handle.cancel()` runs at most once per call, whatever the
+      // signal's event-dispatch semantics.
+      let cancelledOnce = false;
+      const cancelOnce = (): void => {
+        if (cancelledOnce) {
+          return;
+        }
+        cancelledOnce = true;
         call.handle.cancel();
       };
-      signal.addEventListener('abort', onAbort, { once: true });
+      signal.addEventListener('abort', cancelOnce, { once: true });
       // Attach race: an abort landing between the pre-dispatch check
       // and the attach never fires the listener — catch up explicitly.
       if (signal.aborted) {
-        call.handle.cancel();
+        cancelOnce();
       }
       try {
         return await call.result();
       } finally {
-        signal.removeEventListener('abort', onAbort);
+        signal.removeEventListener('abort', cancelOnce);
       }
     }
     if (kind === 'start') {

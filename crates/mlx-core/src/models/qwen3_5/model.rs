@@ -3635,6 +3635,11 @@ impl Qwen35Inner {
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
 
+        // H2: clone the backend-installed per-turn cancel flag up front —
+        // the decode closures below borrow `self` mutably, so the flat AR
+        // macro / eager-MTP loop read the clone, not `self.turn_cancel`.
+        let turn_cancel = self.turn_cancel.clone();
+
         let mut token_history: Vec<u32> = token_history_init;
 
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
@@ -3684,6 +3689,9 @@ impl Qwen35Inner {
                     prompt_hidden,
                     prompt_hidden_ids,
                     prompt_hidden_position_base,
+                    // H2: sync turns cancel through the engine loop's
+                    // ungated polls (this site has no StreamingCtx).
+                    cancel_flag: turn_cancel.as_deref(),
                 },
                 // SYNC site: no streaming sink (the streaming flat site wires
                 // its own `StreamingCtx` and shares this one loop).
@@ -3733,7 +3741,8 @@ impl Qwen35Inner {
                 last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
-                generation_stream: generation_stream
+                generation_stream: generation_stream,
+                cancel: turn_cancel.as_deref()
             );
         }
 
@@ -3909,6 +3918,9 @@ impl Qwen35Inner {
                 prompt_hidden,
                 prompt_hidden_ids,
                 prompt_hidden_position_base,
+                // H2: the same flag StreamingCtx carries — the engine's
+                // ungated polls and the streaming reads are idempotent.
+                cancel_flag: Some(cancelled),
             },
             Some(streaming),
         )?;
@@ -4284,6 +4296,10 @@ impl Qwen35Inner {
             "paged_turn_sync_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
         );
 
+        // H2: clone the backend-installed per-turn cancel flag up front —
+        // the decode loop below borrows `self` mutably.
+        let turn_cancel = self.turn_cancel.clone();
+
         let suffix = &tokens[(cached_prefix_len as usize)..];
         let layer_kinds =
             super::decoder_layer::compute_layer_kinds(self.config.num_layers as usize, |i| {
@@ -4419,6 +4435,9 @@ impl Qwen35Inner {
                     prompt_hidden,
                     prompt_hidden_ids: Some(prompt_hidden_ids),
                     prompt_hidden_position_base,
+                    // H2: sync paged MTP cancels through the engine loop's
+                    // ungated polls (no StreamingCtx on this site).
+                    cancel_flag: turn_cancel.as_deref(),
                 },
                 None,
             )?;
@@ -4437,6 +4456,16 @@ impl Qwen35Inner {
 
             if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
                 finish_reason = String::from("stop");
+                break;
+            }
+            // H2 sync cancel poll — the SAME snapshot point as the paged
+            // streaming twin (`paged_turn_stream_core_inner`): after the
+            // EOS check, before the repetition cutoff.
+            if turn_cancel
+                .as_deref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                finish_reason = String::from("cancelled");
                 break;
             }
             if let Some(reason) = crate::sampling::check_repetition_cutoff(
@@ -4711,6 +4740,16 @@ impl Qwen35Inner {
 
                 if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
                     finish_reason = String::from("stop");
+                    break;
+                }
+                // H2 sync cancel poll — the SAME snapshot point as the
+                // vision paged streaming twin: after the EOS check, before
+                // the repetition cutoff.
+                if turn_cancel
+                    .as_deref()
+                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                {
+                    finish_reason = String::from("cancelled");
                     break;
                 }
                 if let Some(reason) = crate::sampling::check_repetition_cutoff(
@@ -6024,6 +6063,9 @@ impl Qwen35Inner {
                     prompt_hidden,
                     prompt_hidden_ids: Some(prompt_hidden_ids),
                     prompt_hidden_position_base,
+                    // H2: the same flag StreamingCtx carries — the engine's
+                    // ungated polls and the streaming reads are idempotent.
+                    cancel_flag: Some(cancelled),
                 },
                 Some(streaming),
             )?;

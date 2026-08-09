@@ -3206,6 +3206,84 @@ describe('createHandler', () => {
       expect(handle.cancel).toHaveBeenCalled();
     });
 
+    it('H2: a cancelled turn — result() rejecting exactly "chat session cancelled" — persists nothing and adopts no session', async () => {
+      // The native reply contract: a cancelled non-streaming turn REJECTS
+      // with the distinguished string. The endpoint must treat that as a
+      // dead-client outcome — no response record persisted, no warm
+      // session adopted into the per-model SessionRegistry — instead of
+      // storing/adopting a half-finished turn.
+      let dispatched!: () => void;
+      const dispatchObserved = new Promise<void>((r) => {
+        dispatched = r;
+      });
+      let cancelSeen!: () => void;
+      const cancelObserved = new Promise<void>((r) => {
+        cancelSeen = r;
+      });
+      const handle = {
+        cancel: vi.fn(() => {
+          cancelSeen();
+        }),
+      };
+      const observedRejections: Error[] = [];
+      const cancellableStart = vi.fn(async () => {
+        dispatched();
+        // Reject — with the exact native reply string — once cancel()
+        // lands, mirroring `CancellableChatCall.result()`.
+        const result = cancelObserved.then((): Promise<ChatResult> => {
+          throw new Error('chat session cancelled');
+        });
+        // Second observer: records the exact rejection the session saw
+        // (and keeps the shared promise handled in every interleaving).
+        result.catch((e: Error) => {
+          observedRejections.push(e);
+        });
+        return { handle, result: () => result };
+      });
+      const model = {
+        chatSessionStart: vi.fn().mockRejectedValue(new Error('plain start should not be reached')),
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('continue should not be reached')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+        chatSessionStartCancellable: cancellableStart,
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
+      } as unknown as SessionCapableModel;
+      const mockStore = {
+        store: vi.fn().mockResolvedValue(undefined),
+        getChain: vi.fn().mockResolvedValue([]),
+        cleanupExpired: vi.fn(),
+      };
+      const registry = new ModelRegistry();
+      registry.register('h2-cancelled-reply-model', model);
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'h2-cancelled-reply-model',
+        input: 'hi',
+        stream: false,
+      });
+      const { res } = createMockRes();
+      const inflight = handler(req, res);
+
+      await dispatchObserved;
+      await new Promise((r) => setImmediate(r));
+      (res as unknown as NodeJS.EventEmitter).emit('close');
+      await inflight;
+
+      // The native handle was cancelled exactly once and the session
+      // observed the distinguished rejection verbatim.
+      expect(handle.cancel).toHaveBeenCalledTimes(1);
+      expect(observedRejections).toHaveLength(1);
+      expect(observedRejections[0].message).toBe('chat session cancelled');
+      // No persistence: the cancelled turn produced no response record.
+      expect(mockStore.store).not.toHaveBeenCalled();
+      // No adoption: the per-model warm SessionRegistry stays empty, so
+      // no later request can warm-hit the half-cancelled session.
+      expect(registry.getSessionRegistry('h2-cancelled-reply-model')!.size).toBe(0);
+    });
+
     it('iter-35 finding 2: persistResponse runs OUTSIDE the per-model mutex', async () => {
       // `persistResponse()` must run OUTSIDE `withExclusive` — the handler captures
       // the terminal ResponseObject inside the mutex, returns it, and writes to the

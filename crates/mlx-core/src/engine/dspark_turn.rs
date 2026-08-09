@@ -12,7 +12,7 @@
 //! is resolved BEFORE [`crate::engine::backend::DsparkStepper::commit`] and
 //! the stepper commits exactly once per cycle.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use napi::bindgen_prelude::*;
@@ -50,6 +50,15 @@ pub(crate) struct DsparkTurnArgs<'a> {
     pub first_token_instant: &'a mut Option<Instant>,
     pub report_perf: bool,
     pub generation_stream: Stream,
+    /// Per-turn cooperative cancel flag (H2) — the family core's clone of
+    /// the backend-installed `turn_cancel`. Polled at the SAME per-cycle
+    /// snapshot points the STREAMING path already polls (the pre-cycle
+    /// check and the stop-clamp simulation), so a disconnected
+    /// non-streaming client stops a DSpark decode instead of holding the
+    /// model mutex to budget exhaustion. `None` ⇒ legacy behavior.
+    /// Streaming turns carry the SAME flag in `StreamingCtx.cancelled`;
+    /// the polls are idempotent, so double-polling is harmless.
+    pub cancel_flag: Option<&'a AtomicBool>,
 }
 
 /// Terminal outs of [`run_dspark_turn`] the caller threads into its save /
@@ -273,7 +282,12 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         first_token_instant: first_tok,
         report_perf: report,
         generation_stream,
+        cancel_flag,
     } = args;
+    // One closure for every cancel snapshot point below — sync turns poll
+    // `cancel_flag` directly; streaming turns pass the same flag, so a
+    // single ungated read covers both paths byte-identically.
+    let turn_cancelled = || cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed));
 
     let setup = DsparkTurnSetup {
         params: p,
@@ -402,8 +416,14 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             last_in_cache = false;
             break;
         }
-        if let Some(s) = streaming.as_ref()
-            && s.cancelled.load(Ordering::Relaxed)
+        // H2: `turn_cancelled()` extends the SAME pre-cycle poll to sync
+        // turns (`args.cancel_flag`); the streaming read is kept so
+        // streaming behavior never depends on the caller also wiring
+        // `cancel_flag`.
+        if turn_cancelled()
+            || streaming
+                .as_ref()
+                .is_some_and(|s| s.cancelled.load(Ordering::Relaxed))
         {
             *reason = String::from("cancelled");
             last_in_cache = false;
@@ -653,8 +673,13 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                 }
                 sim.push(tok);
                 emit_count = idx + 1;
-                if let Some(s) = streaming.as_ref()
-                    && s.cancelled.load(Ordering::Relaxed)
+                // H2: `turn_cancelled()` extends the SAME stop-clamp poll
+                // to sync turns; the streaming read is kept so streaming
+                // behavior never depends on `cancel_flag` also being wired.
+                if turn_cancelled()
+                    || streaming
+                        .as_ref()
+                        .is_some_and(|s| s.cancelled.load(Ordering::Relaxed))
                 {
                     stop = Some(CycleStop::Cancelled);
                     break;
@@ -1401,6 +1426,21 @@ mod tests {
         block_size: usize,
         rng: &mut R,
     ) -> RawTurnOut {
+        drive_turn_raw_with_cancel(backend, params, first_token, eos_id, block_size, rng, None)
+    }
+
+    /// [`drive_turn_raw`] with an H2 sync cancel flag threaded into
+    /// `DsparkTurnArgs.cancel_flag` — the streaming ctx stays `None`, so any
+    /// "cancelled" outcome can ONLY come from the ungated sync polls.
+    fn drive_turn_raw_with_cancel<R: rand::Rng>(
+        backend: &mut MockDsparkBackend,
+        params: ChatParams,
+        first_token: u32,
+        eos_id: u32,
+        block_size: usize,
+        rng: &mut R,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> RawTurnOut {
         let mut tracker = ReasoningTracker::new(false, None, None);
         let mut profiler = DecodeProfiler::new("dspark_turn_test", "test");
         let mut generated: Vec<u32> = Vec::new();
@@ -1429,6 +1469,7 @@ mod tests {
                 first_token_instant: &mut first_token_instant,
                 report_perf: false,
                 generation_stream,
+                cancel_flag,
             },
             None,
         );
@@ -2170,6 +2211,10 @@ mod tests {
                 first_token_instant: &mut first_token_instant,
                 report_perf: false,
                 generation_stream,
+                // The streaming drive exercises the StreamingCtx polls in
+                // isolation — production (gemma4 `draft_chat_turn`) also
+                // wires the same flag here.
+                cancel_flag: None,
             },
             Some(StreamingCtx {
                 callback: &sink,
@@ -2350,6 +2395,93 @@ mod tests {
         );
         assert_eq!(
             count(&out.ledger, |c| matches!(c, Call::EvalBoundary { .. })),
+            0,
+            "cancel stop breaks before scheduling a next anchor"
+        );
+    }
+
+    #[test]
+    fn dspark_turn_sync_preset_cancel_stops_before_any_cycle() {
+        // H2: a NON-streaming turn (streaming ctx None) whose cancel flag is
+        // already set at loop entry — the ungated pre-cycle poll must exit
+        // "cancelled" after the seed, before ANY propose/verify/commit.
+        // Catches the mutation that re-gates the pre-cycle poll on
+        // `streaming.is_some()` (the pre-fix behavior): under it this turn
+        // runs speculative cycles to the length budget.
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut backend =
+            MockDsparkBackend::greedy(7, vec![CycleScript::greedy(vec![1, 3], vec![1, 3, 4])]);
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0xD5_9A2B_C0DE);
+        let raw = drive_turn_raw_with_cancel(
+            &mut backend,
+            greedy_params(),
+            0,
+            5,
+            2,
+            &mut rng,
+            Some(cancel.as_ref()),
+        );
+        let outcome = raw
+            .result
+            .unwrap_or_else(|e| panic!("run_dspark_turn failed: {}", e.reason));
+
+        assert_eq!(raw.finish_reason, "cancelled");
+        assert_eq!(raw.generated, vec![0], "only the prefill seed commits");
+        assert!(!outcome.last_in_cache, "the unverified seed has no K/V");
+        assert!(
+            backend.ledger_snapshot().is_empty(),
+            "cancel at the cycle boundary: no propose/verify/commit ran"
+        );
+    }
+
+    #[test]
+    fn dspark_turn_sync_cancel_in_clamp_commits_exactly_once() {
+        // H2 sync twin of `dspark_turn_streaming_cancel_in_clamp_commits_
+        // exactly_once`: the flag flips DURING the first verify (after the
+        // pre-cycle check), the streaming ctx is None, and the flag rides
+        // ONLY `DsparkTurnArgs.cancel_flag`. The ungated stop-clamp poll —
+        // the SAME snapshot point the streaming twin polls — must observe it
+        // after the first accepted token: emit 1, reason "cancelled",
+        // AR-parity slot exclusion → commit(keep = 1, total 3), exactly
+        // once. Catches the mutation that re-gates the clamp poll on the
+        // streaming ctx: under it the whole cycle emits and the turn ends
+        // "length" with a (3, 3) commit.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut backend =
+            MockDsparkBackend::greedy(7, vec![CycleScript::greedy(vec![1, 3], vec![1, 3, 4])]);
+        backend.cancel_on_verify = Some((0, Arc::clone(&cancel)));
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0xD5_9A2B_C0DE);
+        let raw = drive_turn_raw_with_cancel(
+            &mut backend,
+            greedy_params(),
+            0,
+            5,
+            2,
+            &mut rng,
+            Some(cancel.as_ref()),
+        );
+        let outcome = raw
+            .result
+            .unwrap_or_else(|e| panic!("run_dspark_turn failed: {}", e.reason));
+        let ledger = backend.ledger_snapshot();
+
+        assert_eq!(raw.finish_reason, "cancelled");
+        assert_eq!(
+            raw.generated,
+            vec![0, 1],
+            "seed + the one token emitted before the clamp saw the cancel"
+        );
+        assert!(
+            !outcome.last_in_cache,
+            "the cancel token's slot is excluded from keep (AR-parity)"
+        );
+        assert_eq!(
+            commits(&ledger),
+            vec![(1, 3)],
+            "commit-exactly-once with the clamped, stop-excluded keep"
+        );
+        assert_eq!(
+            count(&ledger, |c| matches!(c, Call::EvalBoundary { .. })),
             0,
             "cancel stop breaks before scheduling a next anchor"
         );

@@ -780,6 +780,12 @@ impl Gemma4Inner {
                     first_token_instant: &mut first_token_instant,
                     report_perf,
                     generation_stream,
+                    // H2: on SYNC turns `args.cancelled` is the whole-turn
+                    // cancel flag (streaming_ctx is None, so the loop's
+                    // sync polls are the only cancellation path); on
+                    // streaming turns it is the SAME flag StreamingCtx
+                    // carries — the polls are idempotent.
+                    cancel_flag: args.cancelled,
                 },
                 streaming_ctx,
             );

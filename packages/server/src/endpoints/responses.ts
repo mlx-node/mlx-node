@@ -1406,7 +1406,7 @@ async function runSessionNonStreaming(
     }
     session.primeHistory(messages);
     const initialTurns = session.turns;
-    const result = await session.startFromHistory(config, signal);
+    const result = await session.startFromHistory(config, { signal });
     return { result, committed: session.turns > initialTurns };
   }
 
@@ -1469,7 +1469,7 @@ async function runSessionNonStreaming(
   }
   session.primeHistory(messages);
   const initialTurns = session.turns;
-  const result = await session.startFromHistory(config, signal);
+  const result = await session.startFromHistory(config, { signal });
   return { result, committed: session.turns > initialTurns };
 }
 

@@ -4086,6 +4086,10 @@ impl Gemma4Inner {
         )?;
         let cached_prefix_len = turn.cached_prefix_len;
 
+        // H2: clone the backend-installed per-turn cancel flag before the
+        // closure — the decode loop inside borrows `self` mutably.
+        let turn_cancel = self.turn_cancel.clone();
+
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
             let last_logits = {
                 let _stream_ctx = StreamContext::new(generation_stream);
@@ -4112,6 +4116,18 @@ impl Gemma4Inner {
             for step in 0..max_new_tokens {
                 let token_id = y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
+
+                // H2 sync cancel poll — the SAME snapshot point as the
+                // gemma4 vision paged streaming twin
+                // (`vision_paged_turn_stream_core`): right after the token
+                // push, BEFORE the EOS check.
+                if turn_cancel
+                    .as_deref()
+                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                {
+                    finish_reason = "cancelled".to_string();
+                    break;
+                }
 
                 if is_eos_token(token_id, &eos_ids, eos_token_id) {
                     finish_reason = String::from("stop");

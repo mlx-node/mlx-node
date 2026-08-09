@@ -2419,6 +2419,9 @@ impl Qwen35MoeInner {
                     prompt_hidden: None,
                     prompt_hidden_ids: None,
                     prompt_hidden_position_base: 0,
+                    // H2: sync turns cancel through the engine loop's
+                    // ungated polls (this site has no StreamingCtx).
+                    cancel_flag: turn_cancel.as_deref(),
                 },
                 None,
             )?;
@@ -2465,7 +2468,8 @@ impl Qwen35MoeInner {
                 last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
-                generation_stream: generation_stream
+                generation_stream: generation_stream,
+                cancel: turn_cancel.as_deref()
             );
         }
 
@@ -2726,6 +2730,16 @@ impl Qwen35MoeInner {
 
                 if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
                     finish_reason = String::from("stop");
+                    break;
+                }
+                // H2 sync cancel poll — the SAME snapshot point as the MoE
+                // vision paged streaming twin: after the EOS check, before
+                // the repetition cutoff.
+                if turn_cancel
+                    .as_deref()
+                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                {
+                    finish_reason = String::from("cancelled");
                     break;
                 }
                 if let Some(reason) = crate::sampling::check_repetition_cutoff(
@@ -3612,6 +3626,10 @@ impl Qwen35MoeInner {
             "MoE paged_turn_sync_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
         );
 
+        // H2: clone the backend-installed per-turn cancel flag up front —
+        // the decode loop below borrows `self` mutably.
+        let turn_cancel = self.turn_cancel.clone();
+
         let suffix = &tokens[(cached_prefix_len as usize)..];
         let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
             self.config.num_layers as usize,
@@ -3668,6 +3686,16 @@ impl Qwen35MoeInner {
 
             if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
                 finish_reason = String::from("stop");
+                break;
+            }
+            // H2 sync cancel poll — the SAME snapshot point as the MoE
+            // paged streaming twin (`paged_turn_stream_core_inner`): after
+            // the EOS check, before the repetition cutoff.
+            if turn_cancel
+                .as_deref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                finish_reason = String::from("cancelled");
                 break;
             }
             if let Some(reason) = crate::sampling::check_repetition_cutoff(
@@ -4690,6 +4718,9 @@ impl Qwen35MoeInner {
                     prompt_hidden: None,
                     prompt_hidden_ids: None,
                     prompt_hidden_position_base: 0,
+                    // H2: the same flag StreamingCtx carries — the engine's
+                    // ungated polls and the streaming reads are idempotent.
+                    cancel_flag: Some(cancelled),
                 },
                 Some(streaming),
             )?;
@@ -5095,6 +5126,9 @@ impl Qwen35MoeInner {
                     prompt_hidden: None,
                     prompt_hidden_ids: None,
                     prompt_hidden_position_base: 0,
+                    // H2: sync turns cancel through the engine loop's
+                    // ungated polls (this site has no StreamingCtx).
+                    cancel_flag: turn_cancel.as_deref(),
                 },
                 None,
             )?;
@@ -5138,7 +5172,8 @@ impl Qwen35MoeInner {
                 last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
-                generation_stream: generation_stream
+                generation_stream: generation_stream,
+                cancel: turn_cancel.as_deref()
             );
         }
 
@@ -5395,6 +5430,9 @@ impl Qwen35MoeInner {
                     prompt_hidden: None,
                     prompt_hidden_ids: None,
                     prompt_hidden_position_base: 0,
+                    // H2: the same flag StreamingCtx carries — the engine's
+                    // ungated polls and the streaming reads are idempotent.
+                    cancel_flag: Some(cancelled),
                 },
                 Some(streaming),
             )?;

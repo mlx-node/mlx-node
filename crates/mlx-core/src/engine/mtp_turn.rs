@@ -12,7 +12,7 @@
 //! `&mut self` borrow model compile and are usable. Nothing in production
 //! calls this module yet, so the families' MTP behavior is byte-identical.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use napi::bindgen_prelude::*;
@@ -1085,6 +1085,15 @@ pub(crate) struct MtpTurnArgs<'a> {
     pub prompt_hidden: Option<MxArray>,
     pub prompt_hidden_ids: Option<Vec<u32>>,
     pub prompt_hidden_position_base: usize,
+    /// Per-turn cooperative cancel flag (H2) — the family core's clone of
+    /// the backend-installed `turn_cancel`. Polled at every per-step /
+    /// per-cycle snapshot point the STREAMING path already polls, so a
+    /// disconnected non-streaming client stops a speculative decode
+    /// instead of holding the model mutex to budget exhaustion. `None` ⇒
+    /// legacy behavior (no sync cancellation). Streaming turns pass the
+    /// SAME flag here as in `StreamingCtx.cancelled`; the polls are
+    /// idempotent so double-polling is harmless.
+    pub cancel_flag: Option<&'a AtomicBool>,
 }
 
 /// Terminal outs of [`run_mtp_turn`] the caller threads into its save /
@@ -1256,7 +1265,12 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         prompt_hidden,
         prompt_hidden_ids,
         prompt_hidden_position_base,
+        cancel_flag,
     } = args;
+    // One closure for every cancel snapshot point below — sync turns poll
+    // `cancel_flag` directly; streaming turns pass the same flag, so a
+    // single ungated read covers both paths byte-identically.
+    let turn_cancelled = || cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed));
     let mut decode_progress = DecodeProgressTrace::new(inference_info_enabled, generated.len());
 
     // Materialize the first sampled token's id before building the setup.
@@ -1498,13 +1512,18 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             last_in_cache = false;
             break;
         }
-        // Streaming-only pre-loop cancel check — relocated VERBATIM from
+        // Pre-loop cancel check — relocated VERBATIM from
         // `decode_loop_mtp!` (it sits between the EOS pre-check and the
         // repetition pre-check). A cancel observed at the iteration top
         // exits "cancelled" before any forward; the last emitted token is
         // the unforwarded seed/boundary, so it is not yet in the cache.
-        if let Some(s) = streaming.as_ref()
-            && s.cancelled.load(Ordering::Relaxed)
+        // H2: `turn_cancelled()` extends the SAME poll to sync turns
+        // (`args.cancel_flag`); the streaming read is kept so streaming
+        // behavior never depends on the caller also wiring `cancel_flag`.
+        if turn_cancelled()
+            || streaming
+                .as_ref()
+                .is_some_and(|s| s.cancelled.load(Ordering::Relaxed))
         {
             *reason = String::from("cancelled");
             last_in_cache = false;
@@ -1614,19 +1633,29 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             profiler.step();
             let _is_reasoning = tracker.observe_token(token_id);
 
-            // Streaming-only — relocated VERBATIM from `decode_loop_mtp!`'s
-            // Step A arm. It runs AFTER `observe_token` and BEFORE the EOS
-            // check (the macro's order): a cancel observed here breaks
-            // "cancelled" (the just-committed token is unforwarded, so
-            // `last_in_cache = false`); otherwise detokenize + length-advance
-            // (outside the emitter's gate) then emit through the emitter.
+            // Relocated VERBATIM from `decode_loop_mtp!`'s Step A arm. It
+            // runs AFTER `observe_token` and BEFORE the EOS check (the
+            // macro's order): a cancel observed here breaks "cancelled"
+            // (the just-committed token is unforwarded, so
+            // `last_in_cache = false`); otherwise detokenize +
+            // length-advance (outside the emitter's gate) then emit
+            // through the emitter. H2: the poll itself is UNGATED
+            // (`turn_cancelled()` covers sync turns at the same snapshot
+            // point); only `last_is_reasoning` and the emit stay
+            // streaming-only.
             if let Some(s) = streaming.as_mut() {
                 *s.last_is_reasoning = _is_reasoning;
-                if s.cancelled.load(Ordering::Relaxed) {
-                    *reason = String::from("cancelled");
-                    last_in_cache = false;
-                    break;
-                }
+            }
+            if turn_cancelled()
+                || streaming
+                    .as_ref()
+                    .is_some_and(|s| s.cancelled.load(Ordering::Relaxed))
+            {
+                *reason = String::from("cancelled");
+                last_in_cache = false;
+                break;
+            }
+            if let Some(s) = streaming.as_mut() {
                 let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
                     s.decode_stream,
                     s.tokenizer,
@@ -1910,23 +1939,32 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             // only the prefix that was really pushed.
             profiler.step();
             let _is_reasoning = tracker.observe_token(tok_id);
-            // Streaming-only — relocated VERBATIM from `decode_loop_mtp!`'s
-            // emit-loop arm. It runs AFTER `observe_token` and BEFORE the EOS
-            // check (the macro's order). A cancel here breaks "cancelled":
-            // the last outcome token is the unforwarded boundary
-            // (bonus/residual), so keep an earlier emitted token (verify
-            // wrote its K/V) but drop the boundary —
+            // Relocated VERBATIM from `decode_loop_mtp!`'s emit-loop arm.
+            // It runs AFTER `observe_token` and BEFORE the EOS check (the
+            // macro's order). A cancel here breaks "cancelled": the last
+            // outcome token is the unforwarded boundary (bonus/residual),
+            // so keep an earlier emitted token (verify wrote its K/V) but
+            // drop the boundary —
             // `last_in_cache = cycle_emitted < outcome.tokens.len()`.
             // Detokenize + length-advance stay outside the emitter's gate so
-            // DecodeStream sees every token.
+            // DecodeStream sees every token. H2: the poll itself is UNGATED
+            // (`turn_cancelled()` covers sync turns at the same snapshot
+            // point); only `last_is_reasoning` and the emit stay
+            // streaming-only.
             if let Some(s) = streaming.as_mut() {
                 *s.last_is_reasoning = _is_reasoning;
-                if s.cancelled.load(Ordering::Relaxed) {
-                    *reason = String::from("cancelled");
-                    hit_stop = true;
-                    last_in_cache = cycle_emitted < outcome.tokens.len();
-                    break;
-                }
+            }
+            if turn_cancelled()
+                || streaming
+                    .as_ref()
+                    .is_some_and(|s| s.cancelled.load(Ordering::Relaxed))
+            {
+                *reason = String::from("cancelled");
+                hit_stop = true;
+                last_in_cache = cycle_emitted < outcome.tokens.len();
+                break;
+            }
+            if let Some(s) = streaming.as_mut() {
                 let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
                     s.decode_stream,
                     s.tokenizer,
@@ -2195,6 +2233,15 @@ mod tests {
         // sequence (anchor policy + accepted prefix + boundary). `None` until
         // the first commit.
         commit_payload: RefCell<Option<(Vec<u32>, usize)>>,
+        // ---- H2 sync-cancel knobs ----
+        // When `Some`, the FIRST `forward_with_hidden` (Step A) / the FIRST
+        // `commit_mtp` flips the shared flag TRUE, emulating a client
+        // disconnect landing mid-Step-A-forward / mid-cycle (between verify
+        // and the emit loop). Timing the flip inside the stepper pins WHICH
+        // sync poll observes it: forward → the Step-A poll; commit → the
+        // emit-loop poll.
+        flip_cancel_on_forward: Option<Arc<AtomicBool>>,
+        flip_cancel_on_commit: Option<Arc<AtomicBool>>,
     }
 
     /// Canned per-cycle script for the `run_mtp_cycle` integration tests.
@@ -2272,6 +2319,8 @@ mod tests {
                 turn: None,
                 shared_ledger: None,
                 commit_payload: RefCell::new(None),
+                flip_cancel_on_forward: None,
+                flip_cancel_on_commit: None,
             }
         }
 
@@ -2408,6 +2457,12 @@ mod tests {
             _embedding: &Embedding,
         ) -> Result<(MxArray, MxArray, bool)> {
             self.record(Call::ForwardWithHidden);
+            // H2 knob: emulate a client disconnect landing DURING the Step-A
+            // forward — the Step-A sync cancel poll (after the token push)
+            // must observe it on this very step.
+            if let Some(flag) = &self.flip_cancel_on_forward {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             match self.turn.as_ref() {
                 Some(t) => {
                     // Step A logits `[1, vocab]` whose argmax (the T=0 draw,
@@ -2600,6 +2655,12 @@ mod tests {
                 anchor,
                 k: k_accepted,
             });
+            // H2 knob: emulate a client disconnect landing BETWEEN the
+            // cycle's verify/commit and the emit loop — the emit-loop sync
+            // cancel poll must observe it at the FIRST emitted cycle token.
+            if let Some(flag) = &self.flip_cancel_on_commit {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             // Committed-sequence shape: `IncludeAnchor` prepends the anchor
             // (`[last_committed, d_0..d_{K-1}, boundary]` = K+2);
             // `SkipAlreadyCommittedAnchor` (chained cycles) omits it
@@ -3780,6 +3841,7 @@ mod tests {
 
     use std::rc::Rc;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::time::Instant;
 
     use crate::engine::backend::{
@@ -3845,6 +3907,11 @@ mod tests {
         /// Last counts passed to `record_turn_mtp_acceptance` (the
         /// engine's acceptance-gate hook); `None` when never called.
         recorded_counts: std::cell::RefCell<Option<(u64, u64)>>,
+        /// H2 knobs forwarded into the constructed stepper — see
+        /// [`MockMtpStepper::flip_cancel_on_forward`] /
+        /// [`MockMtpStepper::flip_cancel_on_commit`].
+        flip_cancel_on_forward: Option<Arc<AtomicBool>>,
+        flip_cancel_on_commit: Option<Arc<AtomicBool>>,
     }
 
     impl MockMtpBackend {
@@ -3865,11 +3932,27 @@ mod tests {
                 ledger: Rc::new(RefCell::new(Vec::new())),
                 begin_calls: std::cell::Cell::new(0),
                 recorded_counts: std::cell::RefCell::new(None),
+                flip_cancel_on_forward: None,
+                flip_cancel_on_commit: None,
             }
         }
 
         fn with_replay_error(mut self, reason: &'static str) -> Self {
             self.replay_error = Some(reason);
+            self
+        }
+
+        /// H2: flip `flag` TRUE inside every Step-A forward (first flip is
+        /// the observable one — the flag is monotonic for the turn).
+        fn with_cancel_flip_on_forward(mut self, flag: Arc<AtomicBool>) -> Self {
+            self.flip_cancel_on_forward = Some(flag);
+            self
+        }
+
+        /// H2: flip `flag` TRUE inside every `commit_mtp` (between the
+        /// cycle's verify and the engine's emit loop).
+        fn with_cancel_flip_on_commit(mut self, flag: Arc<AtomicBool>) -> Self {
+            self.flip_cancel_on_commit = Some(flag);
             self
         }
 
@@ -3947,6 +4030,8 @@ mod tests {
                 *step.replay_error.borrow_mut() = Some(Error::from_reason(reason));
             }
             step.shared_ledger = Some(Rc::clone(&self.ledger));
+            step.flip_cancel_on_forward = self.flip_cancel_on_forward.clone();
+            step.flip_cancel_on_commit = self.flip_cancel_on_commit.clone();
             Ok(step)
         }
 
@@ -3976,6 +4061,20 @@ mod tests {
         max_new_tokens: i32,
         eos_id: u32,
         depth: usize,
+    ) -> TurnOut {
+        drive_turn_with_cancel(backend, first_token, max_new_tokens, eos_id, depth, None)
+    }
+
+    /// [`drive_turn`] with an H2 sync cancel flag threaded into
+    /// `MtpTurnArgs.cancel_flag` — the streaming ctx stays `None`, so any
+    /// "cancelled" outcome can ONLY come from the ungated sync polls.
+    fn drive_turn_with_cancel(
+        backend: &mut MockMtpBackend,
+        first_token: u32,
+        max_new_tokens: i32,
+        eos_id: u32,
+        depth: usize,
+        cancel_flag: Option<&AtomicBool>,
     ) -> TurnOut {
         let _force_sparse = ForceSparseAcceptGuard::force(true);
         let params = {
@@ -4019,6 +4118,7 @@ mod tests {
                 prompt_hidden: None,
                 prompt_hidden_ids: None,
                 prompt_hidden_position_base: 0,
+                cancel_flag,
             },
             // The whole-turn mock tests drive the SYNC path.
             None,
@@ -4432,6 +4532,7 @@ mod tests {
                 prompt_hidden: None,
                 prompt_hidden_ids: None,
                 prompt_hidden_position_base: 0,
+                cancel_flag: None,
             },
             None,
         );
@@ -4459,6 +4560,158 @@ mod tests {
             count(&ledger, |c| matches!(c, Call::IntoDesynced)),
             0,
             "the error returns before consuming the successful outcome"
+        );
+    }
+
+    #[test]
+    fn run_mtp_turn_sync_preset_cancel_stops_before_any_forward() {
+        let _chained_off = force_chained_off();
+        // H2: a NON-streaming turn (streaming ctx None) whose cancel flag is
+        // already set when the loop starts — the ungated loop-top poll must
+        // exit "cancelled" after the seed, before ANY Step-A forward or
+        // speculative cycle. Catches the mutation that re-gates the loop-top
+        // poll on `streaming.is_some()` (the pre-fix behavior): under it this
+        // turn walks the FULL 13-token budget and finishes "length".
+        let cycle = CycleArgmax {
+            draft_argmax: vec![4, 5],
+            verify_argmax: vec![4, 5, 6],
+        };
+        let mut backend = MockMtpBackend::new(16, 4, vec![7, 8, 9], vec![cycle; 8], false);
+        let cancel = Arc::new(AtomicBool::new(true));
+        let out = drive_turn_with_cancel(&mut backend, 3, 13, 15, 2, Some(cancel.as_ref()));
+
+        assert_eq!(out.finish_reason, "cancelled");
+        assert_eq!(out.generated, vec![3], "only the prefill seed commits");
+        assert!(
+            !out.last_in_cache,
+            "the unforwarded seed is not in the physical cache"
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::ForwardWithHidden)),
+            0,
+            "a pre-set cancel stops the turn before any Step-A forward"
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::BeginCycle { .. })),
+            0,
+            "no speculative cycle runs after a pre-set cancel"
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::RecordTurnMtpAcceptance)),
+            0,
+            "a cancelled turn must not publish acceptance-gate history"
+        );
+    }
+
+    #[test]
+    fn run_mtp_turn_sync_cancel_during_step_a_forward() {
+        let _chained_off = force_chained_off();
+        // H2: the disconnect lands DURING the first Step-A forward (the mock
+        // flips the shared flag inside `forward_with_hidden`). The ungated
+        // Step-A poll — same snapshot point as the streaming twin's: after
+        // the token push, before the EOS check — must exit "cancelled" on
+        // that very step, before the speculative cycle. Catches the mutation
+        // that re-gates the Step-A poll on the streaming ctx: under it the
+        // loop-top poll only fires on the NEXT iteration, AFTER a full
+        // speculative cycle ran and emitted (BeginCycle > 0, generated > 2).
+        let cycle = CycleArgmax {
+            draft_argmax: vec![4, 5],
+            verify_argmax: vec![4, 5, 6],
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut backend = MockMtpBackend::new(16, 4, vec![7, 8, 9], vec![cycle; 8], false)
+            .with_cancel_flip_on_forward(Arc::clone(&cancel));
+        let out = drive_turn_with_cancel(&mut backend, 3, 13, 15, 2, Some(cancel.as_ref()));
+
+        assert_eq!(out.finish_reason, "cancelled");
+        assert_eq!(
+            out.generated,
+            vec![3, 7],
+            "seed + the Step-A token whose forward observed the disconnect"
+        );
+        assert!(
+            !out.last_in_cache,
+            "the just-committed Step-A token is forwarded only by the next iteration"
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::ForwardWithHidden)),
+            1,
+            "exactly the forward that observed the disconnect"
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::BeginCycle { .. })),
+            0,
+            "the Step-A poll breaks before the speculative cycle"
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::RollbackUnemitted { .. })),
+            0,
+            "no cycle ran, so there is no unemitted tail to roll back"
+        );
+    }
+
+    #[test]
+    fn run_mtp_turn_sync_cancel_mid_cycle_rolls_back_unemitted() {
+        let _chained_off = force_chained_off();
+        // H2: the disconnect lands BETWEEN the cycle's verify/commit and the
+        // emit loop (the mock flips the flag inside `commit_mtp`). The
+        // ungated emit-loop poll — same snapshot point as the streaming
+        // twin's: after the push/observe of each accepted token, before its
+        // EOS check — must stop at the FIRST emitted cycle token with the
+        // mid-cycle boundary semantics: the emitted token's K/V was written
+        // by verify (`last_in_cache`), and the 2-token accepted tail is
+        // rolled back + latches the desync out. Catches the mutation that
+        // re-gates the emit-loop poll on the streaming ctx: under it the
+        // whole cycle emits and the turn keeps running (reason "length",
+        // no RollbackUnemitted).
+        let cycle = CycleArgmax {
+            draft_argmax: vec![4, 5],
+            verify_argmax: vec![4, 5, 6],
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut backend = MockMtpBackend::new(
+            16,
+            4,
+            vec![7, 8, 9],
+            vec![cycle; 8],
+            /* desynced (canned flat mid-cycle latch) */ true,
+        )
+        .with_cancel_flip_on_commit(Arc::clone(&cancel));
+        let out = drive_turn_with_cancel(&mut backend, 3, 20, 15, 2, Some(cancel.as_ref()));
+
+        assert_eq!(out.finish_reason, "cancelled");
+        assert_eq!(
+            out.generated,
+            vec![3, 7, 4],
+            "seed + Step-A token + exactly ONE emitted cycle token"
+        );
+        assert!(
+            out.last_in_cache,
+            "verify wrote the emitted (non-boundary) cycle token's K/V"
+        );
+        assert_eq!(
+            out.rollback_unemitted, 2,
+            "the accepted-but-unemitted cycle tail ([5, 6]) is rolled back"
+        );
+        assert!(
+            out.desynced,
+            "a mid-cycle sync cancel surfaces the stepper's desync latch"
+        );
+        assert_eq!(
+            out.ledger
+                .iter()
+                .filter_map(|c| match c {
+                    Call::RollbackUnemitted { unemitted } => Some(*unemitted),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![2],
+            "rollback_unemitted(2) fires exactly once"
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::RecordTurnMtpAcceptance)),
+            0,
+            "a cancelled turn must not publish acceptance-gate history"
         );
     }
 
