@@ -454,6 +454,11 @@ stage0Describe('Stage-0 real-model concurrency hazards', () => {
     let stopHazardLoop = false;
     let hazardLoop: Promise<JsonHttpResult> | undefined;
     let startedHazardStreams = 0;
+    const assertHazardLoopRunning = (boundary: string): void => {
+      if (stopHazardLoop) {
+        throw new Error(`H1 hazard loop stopped before ${boundary}`);
+      }
+    };
     // Give the interval one ordinary sample before entering the hazard window.
     await delay(75);
 
@@ -461,7 +466,12 @@ stage0Describe('Stage-0 real-model concurrency hazards', () => {
       const hazardStarted = performance.now();
       hazardLoop = (async () => {
         for (let round = 0; round < H1_ABORT_ROUNDS; round += 1) {
+          assertHazardLoopRunning(`round ${round + 1}`);
           const eventsBeforeRound = instrumented.streamEvents();
+          // Keep this guard immediately adjacent to request creation. Once it
+          // passes, no await can let teardown latch the loop before the holder
+          // is recorded in the cleanup arrays below.
+          assertHazardLoopRunning(`streaming holder ${round + 1}`);
           const holder = startSseRequest(instance, {
             model: MODEL_NAME,
             input: LONG_PROMPT,
@@ -490,14 +500,16 @@ stage0Describe('Stage-0 real-model concurrency hazards', () => {
           response.socket.destroy();
           holder.request.destroy();
           await nativeModel.resetCaches();
-          if (stopHazardLoop) {
-            throw new Error('H1 hazard loop stopped after the outer completion deadline');
-          }
+          assertHazardLoopRunning(`stream-close wait ${round + 1}`);
           await waitUntil(
             () => instrumented.streamCloses() > baselineStreamCloses + round,
             `H1 aborted stream ${round + 1} did not unwind`,
           );
+          // The outer completion timeout may fire while waitUntil is pending.
+          // Re-check before this iteration can roll over and create a holder.
+          assertHazardLoopRunning(`round ${round + 1} completion`);
         }
+        assertHazardLoopRunning('greedy successor');
         return await postJson(
           instance,
           CONTROL_BODY,
@@ -518,8 +530,8 @@ stage0Describe('Stage-0 real-model concurrency hazards', () => {
       expect(tickProbe.stop()).toBeLessThan(500);
     } catch (error) {
       // Promise.race cannot cancel an in-progress async loop. Latch this so a
-      // timed-out native reset may settle, but cannot launch another holder
-      // after the test has begun teardown.
+      // timed-out awaited boundary may settle, but cannot launch another
+      // holder or the successor after the test has begun teardown.
       stopHazardLoop = true;
       throw error;
     } finally {
