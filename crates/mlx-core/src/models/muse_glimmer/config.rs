@@ -138,6 +138,11 @@ pub struct MuseGlimmerTextConfig {
     pub layer_kinds: Vec<LayerKind>,
     /// One entry per layer; `0.0` means NoPE. Prefer
     /// [`MuseGlimmerTextConfig::rope_theta_for`] over indexing this directly.
+    ///
+    /// Validation guarantees the biconditional
+    /// `layer_kinds[i] == Full` **iff** `layer_rope_theta[i] == 0.0`, so
+    /// `rope_theta_for(i).is_none()` is equivalent to
+    /// `layer_kinds[i] == LayerKind::Full` for every in-range `i`.
     pub layer_rope_theta: Vec<f32>,
 }
 
@@ -233,10 +238,16 @@ impl MuseGlimmerConfig {
             )));
         }
 
-        // A theta of 0 is NoPE, and in this architecture only the full-attention
-        // layers are NoPE. A theta-0 sliding layer means the two tables disagree
-        // about which layers those are; guessing either way silently mis-rotates
-        // a whole layer, so refuse the config instead.
+        // In this architecture a layer is full_attention if and only if its theta
+        // is 0 (NoPE). Either direction of disagreement means the two tables
+        // describe different models, and guessing silently mis-rotates a whole
+        // layer, so refuse the config. Both directions are checked and reported
+        // separately, because the reader needs to know WHICH table is wrong.
+        //
+        // The `theta != 0` on a Full layer half matters most: it fails open. The
+        // model loads, `rope_theta_for` hands back `Some(theta)`, and inference
+        // stays numerically valid while rotating a layer the reference does not
+        // rotate — fluent output that is quietly wrong.
         for (i, (kind, theta)) in layer_kinds
             .iter()
             .zip(text.layer_rope_theta.iter())
@@ -246,6 +257,14 @@ impl MuseGlimmerConfig {
                 return Err(Error::from_reason(format!(
                     "muse_glimmer: layer {i} has layer_rope_theta 0 (NoPE) but layer_types says \
                      {kind:?}; NoPE is expected only on full_attention layers"
+                )));
+            }
+            if *kind == LayerKind::Full && *theta != 0.0 {
+                return Err(Error::from_reason(format!(
+                    "muse_glimmer: layer {i} is full_attention with layer_rope_theta {theta}; \
+                     the full_attention layers of this architecture are NoPE, so their theta \
+                     must be 0 — a non-zero theta here would rotate a layer the reference \
+                     leaves unrotated"
                 )));
             }
         }
@@ -480,6 +499,33 @@ mod tests {
         assert!(
             err.contains("NoPE") || err.contains("full_attention"),
             "a theta-0 sliding layer must fail closed, got: {err}"
+        );
+    }
+
+    /// The inverse of the test above, and the direction that fails OPEN if it is
+    /// missing: a Full layer carrying a real theta loads fine, `rope_theta_for`
+    /// returns `Some(500000.0)`, and the decoder rotates q/k on a layer the
+    /// reference leaves unrotated — numerically valid, fluent, and wrong.
+    #[test]
+    fn rejects_a_full_attention_layer_that_is_not_nope() {
+        // Give layer 3 (full_attention) the sliding layers' theta instead of 0.
+        let bad = text_config_json(52).replacen(
+            "500000.0,500000.0,500000.0,0,",
+            "500000.0,500000.0,500000.0,500000.0,",
+            1,
+        );
+        let err = parse(&bad).unwrap_err().to_string();
+        // Pinned to wording unique to this direction. The other half's message
+        // reads "layer {i} has layer_rope_theta 0 (NoPE) but layer_types says
+        // …" and can never produce "is full_attention with", so this assert
+        // cannot be satisfied by the theta-0-on-sliding error.
+        assert!(
+            err.contains("layer 3 is full_attention with layer_rope_theta 500000"),
+            "a full_attention layer with a non-zero theta must fail closed, got: {err}"
+        );
+        assert!(
+            err.contains("must be 0"),
+            "the error must state the theta has to be 0, got: {err}"
         );
     }
 
