@@ -2,3 +2,4 @@
 //! decoder ([slide,slide,slide,full] x13, NoPE on the full layers).
 
 pub mod config;
+pub mod output_parser;
