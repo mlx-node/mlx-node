@@ -487,6 +487,87 @@ fn load_safetensors_mapped(path: &Path) -> Result<HashMap<String, MxArray>> {
     Ok(mapped_params)
 }
 
+fn apply_loaded_parameters(
+    inner: &mut Qwen3Inner,
+    mapped_params: &HashMap<String, MxArray>,
+    config: &Qwen3Config,
+) -> Result<()> {
+    if let Some(array) = mapped_params.get("embedding.weight") {
+        inner.embedding.set_weight(array)?;
+    }
+    if let Some(array) = mapped_params.get("final_norm.weight") {
+        inner.final_norm.set_weight(array)?;
+    }
+    if !config.tie_word_embeddings
+        && let Some(array) = mapped_params.get("lm_head.weight")
+    {
+        inner.lm_head.set_weight(array)?;
+    }
+
+    for layer_idx in 0..config.num_layers as usize {
+        let prefix = format!("layers.{layer_idx}");
+        let layer = &mut inner.layers[layer_idx];
+        if let Some(weight) = mapped_params.get(&format!("{prefix}.self_attn.q_proj.weight")) {
+            layer.self_attn.set_q_proj_weight(weight)?;
+        }
+        if let Some(weight) = mapped_params.get(&format!("{prefix}.self_attn.k_proj.weight")) {
+            layer.self_attn.set_k_proj_weight(weight)?;
+        }
+        if let Some(weight) = mapped_params.get(&format!("{prefix}.self_attn.v_proj.weight")) {
+            layer.self_attn.set_v_proj_weight(weight)?;
+        }
+        if let Some(weight) = mapped_params.get(&format!("{prefix}.self_attn.o_proj.weight")) {
+            layer.self_attn.set_o_proj_weight(weight)?;
+        }
+        if config.use_qk_norm {
+            if let Some(weight) = mapped_params.get(&format!("{prefix}.self_attn.q_norm.weight")) {
+                layer.self_attn.set_q_norm_weight(weight)?;
+            }
+            if let Some(weight) = mapped_params.get(&format!("{prefix}.self_attn.k_norm.weight")) {
+                layer.self_attn.set_k_norm_weight(weight)?;
+            }
+        }
+        if let Some(weight) = mapped_params.get(&format!("{prefix}.mlp.gate_proj.weight")) {
+            layer.mlp.set_gate_proj_weight(weight)?;
+        }
+        if let Some(weight) = mapped_params.get(&format!("{prefix}.mlp.up_proj.weight")) {
+            layer.mlp.set_up_proj_weight(weight)?;
+        }
+        if let Some(weight) = mapped_params.get(&format!("{prefix}.mlp.down_proj.weight")) {
+            layer.mlp.set_down_proj_weight(weight)?;
+        }
+        if let Some(weight) = mapped_params.get(&format!("{prefix}.input_layernorm.weight")) {
+            layer.set_input_layernorm_weight(weight)?;
+        }
+        if let Some(weight) =
+            mapped_params.get(&format!("{prefix}.post_attention_layernorm.weight"))
+        {
+            layer.set_post_attention_layernorm_weight(weight)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn load_inner_for_test(model_path: &Path) -> Result<Qwen3Inner> {
+    let config_path = model_path.join("config.json");
+    let config_data = fs::read_to_string(&config_path)
+        .map_err(|error| Error::from_reason(format!("Failed to read config: {error}")))?;
+    let raw_config: Value = serde_json::from_str(&config_data)
+        .map_err(|error| Error::from_reason(format!("Failed to parse config: {error}")))?;
+    let mut config = parse_config(&raw_config)?;
+    reject_quantized_checkpoint(&raw_config, &model_path.display().to_string())?;
+    let mapped_params = load_safetensors_mapped(model_path)?;
+    validate_loaded_parameters(&mapped_params, &config)?;
+    config.use_block_paged_cache = Some(true);
+    config.paged_cache_memory_mb = Some(256);
+    let mut inner = Qwen3Inner::new(config.clone())?;
+    apply_loaded_parameters(&mut inner, &mapped_params, &config)?;
+    let arrays: Vec<&MxArray> = mapped_params.values().collect();
+    crate::array::memory::materialize_weights(&arrays)?;
+    Ok(inner)
+}
+
 /// Spawn a dedicated model thread, load all weights inside init_fn.
 ///
 /// Returns a thin `Qwen3Model` NAPI shell with the thread handle.
@@ -614,89 +695,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                     ));
                     inner.set_tokenizer(Arc::new(tokenizer.clone()));
 
-                    // Load parameters into inner
-                    let num_layers = config.num_layers as usize;
-
-                    // Embedding
-                    if let Some(arr) = mapped_params.get("embedding.weight") {
-                        inner.embedding.set_weight(arr)?;
-                    }
-
-                    // Final norm
-                    if let Some(arr) = mapped_params.get("final_norm.weight") {
-                        inner.final_norm.set_weight(arr)?;
-                    }
-
-                    // LM head (only if not tied)
-                    if !config.tie_word_embeddings
-                        && let Some(arr) = mapped_params.get("lm_head.weight")
-                    {
-                        inner.lm_head.set_weight(arr)?;
-                    }
-
-                    // Per-layer weights
-                    for i in 0..num_layers {
-                        let prefix = format!("layers.{}", i);
-                        let layer = &mut inner.layers[i];
-
-                        if let Some(w) =
-                            mapped_params.get(&format!("{}.self_attn.q_proj.weight", prefix))
-                        {
-                            layer.self_attn.set_q_proj_weight(w)?;
-                        }
-                        if let Some(w) =
-                            mapped_params.get(&format!("{}.self_attn.k_proj.weight", prefix))
-                        {
-                            layer.self_attn.set_k_proj_weight(w)?;
-                        }
-                        if let Some(w) =
-                            mapped_params.get(&format!("{}.self_attn.v_proj.weight", prefix))
-                        {
-                            layer.self_attn.set_v_proj_weight(w)?;
-                        }
-                        if let Some(w) =
-                            mapped_params.get(&format!("{}.self_attn.o_proj.weight", prefix))
-                        {
-                            layer.self_attn.set_o_proj_weight(w)?;
-                        }
-                        if config.use_qk_norm {
-                            if let Some(w) =
-                                mapped_params.get(&format!("{}.self_attn.q_norm.weight", prefix))
-                            {
-                                layer.self_attn.set_q_norm_weight(w)?;
-                            }
-                            if let Some(w) =
-                                mapped_params.get(&format!("{}.self_attn.k_norm.weight", prefix))
-                            {
-                                layer.self_attn.set_k_norm_weight(w)?;
-                            }
-                        }
-                        if let Some(w) =
-                            mapped_params.get(&format!("{}.mlp.gate_proj.weight", prefix))
-                        {
-                            layer.mlp.set_gate_proj_weight(w)?;
-                        }
-                        if let Some(w) =
-                            mapped_params.get(&format!("{}.mlp.up_proj.weight", prefix))
-                        {
-                            layer.mlp.set_up_proj_weight(w)?;
-                        }
-                        if let Some(w) =
-                            mapped_params.get(&format!("{}.mlp.down_proj.weight", prefix))
-                        {
-                            layer.mlp.set_down_proj_weight(w)?;
-                        }
-                        if let Some(w) =
-                            mapped_params.get(&format!("{}.input_layernorm.weight", prefix))
-                        {
-                            layer.set_input_layernorm_weight(w)?;
-                        }
-                        if let Some(w) = mapped_params
-                            .get(&format!("{}.post_attention_layernorm.weight", prefix))
-                        {
-                            layer.set_post_attention_layernorm_weight(w)?;
-                        }
-                    }
+                    apply_loaded_parameters(&mut inner, &mapped_params, &config)?;
 
                     // Materialize all mmap-backed weight arrays
                     let weights_resident = {

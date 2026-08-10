@@ -4,7 +4,7 @@
  * Contains the model structure, forward passes, and core model methods.
  */
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -30,7 +30,7 @@ use crate::sampling::{
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::training_model::ModelType;
-use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use crate::transformer::{KVCache, TransformerBlock};
 
 use super::{BatchGenerationResult, GenerationConfig, GenerationResult, Qwen3Config};
@@ -857,6 +857,102 @@ impl Qwen3Inner {
             self.lm_head.forward(&hidden_states)?
         };
         Ok(logits)
+    }
+
+    /// Run one uniform paged decode step for multiple live requests.
+    ///
+    /// `rows` carries `(sequence_id, token_id)` in authoritative batch order.
+    /// The method snapshots each request's write cursor, records exactly one
+    /// token per row, then executes every transformer layer once over
+    /// `[N,1,H]`. A pre-forward record failure rolls back only the rows already
+    /// advanced by this call; forward failures are left for scheduler teardown,
+    /// matching the single-row stepper's abort contract.
+    // B3 produces the executor seam; B5 wires it into the scheduler loop.
+    #[allow(dead_code)]
+    pub(crate) fn run_paged_decode_step_batched(
+        &mut self,
+        rows: &[(SeqId, u32)],
+    ) -> Result<MxArray> {
+        if rows.is_empty() {
+            return Err(Error::from_reason(
+                "run_paged_decode_step_batched requires at least one row",
+            ));
+        }
+        let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+            Error::from_reason("run_paged_decode_step_batched: paged_adapter is None")
+        })?;
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut planned_rows = Vec::with_capacity(rows.len());
+        for &(seq_id, _) in rows {
+            if !seen.insert(seq_id) {
+                return Err(Error::from_reason(format!(
+                    "run_paged_decode_step_batched received duplicate sequence {seq_id}"
+                )));
+            }
+            let position = adapter.current_token_count_for(seq_id).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "run_paged_decode_step_batched: unknown sequence {seq_id}"
+                ))
+            })?;
+            planned_rows.push((seq_id, position));
+        }
+
+        let mut recorded = Vec::with_capacity(rows.len());
+        for &(seq_id, token) in rows {
+            let result = self
+                .paged_adapter
+                .as_mut()
+                .expect("adapter validated above")
+                .record_token_for(seq_id, token);
+            if let Err(error) = result {
+                for &recorded_seq in recorded.iter().rev() {
+                    let adapter = self
+                        .paged_adapter
+                        .as_mut()
+                        .expect("adapter validated above");
+                    adapter.activate_request(recorded_seq).map_err(|rollback| {
+                        Error::from_reason(format!(
+                            "run_paged_decode_step_batched: record failed for sequence {seq_id}: {error}; rollback activation for sequence {recorded_seq} also failed: {rollback}"
+                        ))
+                    })?;
+                    adapter.rollback_last_tokens(1).map_err(|rollback| {
+                        Error::from_reason(format!(
+                            "run_paged_decode_step_batched: record failed for sequence {seq_id}: {error}; rollback for sequence {recorded_seq} also failed: {rollback}"
+                        ))
+                    })?;
+                }
+                return Err(Error::from_reason(format!(
+                    "run_paged_decode_step_batched: failed to record sequence {seq_id}: {error}"
+                )));
+            }
+            recorded.push(seq_id);
+        }
+
+        let token_ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
+        let input_ids = MxArray::from_uint32(&token_ids, &[rows.len() as i64, 1])?;
+        let mut hidden_states = self.embedding.forward(&input_ids)?;
+        for layer_idx in 0..self.layers.len() {
+            let layer: &TransformerBlock = unsafe {
+                let pointer = self.layers.as_ptr().add(layer_idx);
+                &*pointer
+            };
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_decode_step_batched: paged_adapter dropped")
+            })?;
+            hidden_states = layer.forward_paged_adapter_batched(
+                &hidden_states,
+                adapter,
+                layer_idx as u32,
+                &planned_rows,
+            )?;
+        }
+        hidden_states = self.final_norm.forward(&hidden_states)?;
+        if self.config.tie_word_embeddings {
+            let embedding_weight = self.embedding.get_weight();
+            hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)
+        } else {
+            self.lm_head.forward(&hidden_states)
+        }
     }
 
     /// Generate synchronous (runs on model thread).
@@ -4234,6 +4330,114 @@ mod tests {
         }
     }
 
+    fn cast_paged_inner_to_bf16(inner: &mut super::Qwen3Inner) {
+        use crate::array::DType;
+        let cast = |array: &MxArray| -> MxArray {
+            array.astype(DType::BFloat16).expect("astype BFloat16")
+        };
+        let weight = inner.embedding.get_weight();
+        inner
+            .embedding
+            .set_weight(&cast(&weight))
+            .expect("set embed");
+        let weight = inner.final_norm.get_weight();
+        inner
+            .final_norm
+            .set_weight(&cast(&weight))
+            .expect("set final_norm");
+        let weight = inner.lm_head.get_weight();
+        inner
+            .lm_head
+            .set_weight(&cast(&weight))
+            .expect("set lm_head");
+        for layer in &mut inner.layers {
+            let weight = layer.get_input_layernorm_weight();
+            layer
+                .set_input_layernorm_weight(&cast(&weight))
+                .expect("set in ln");
+            let weight = layer.get_post_attention_layernorm_weight();
+            layer
+                .set_post_attention_layernorm_weight(&cast(&weight))
+                .expect("set post ln");
+            let weight = layer.self_attn.get_q_proj_weight();
+            layer
+                .self_attn
+                .set_q_proj_weight(&cast(&weight))
+                .expect("set q");
+            let weight = layer.self_attn.get_k_proj_weight();
+            layer
+                .self_attn
+                .set_k_proj_weight(&cast(&weight))
+                .expect("set k");
+            let weight = layer.self_attn.get_v_proj_weight();
+            layer
+                .self_attn
+                .set_v_proj_weight(&cast(&weight))
+                .expect("set v");
+            let weight = layer.self_attn.get_o_proj_weight();
+            layer
+                .self_attn
+                .set_o_proj_weight(&cast(&weight))
+                .expect("set o");
+            if let Some(weight) = layer.self_attn.get_q_norm_weight() {
+                layer
+                    .self_attn
+                    .set_q_norm_weight(&cast(&weight))
+                    .expect("set qn");
+            }
+            if let Some(weight) = layer.self_attn.get_k_norm_weight() {
+                layer
+                    .self_attn
+                    .set_k_norm_weight(&cast(&weight))
+                    .expect("set kn");
+            }
+            let weight = layer.mlp.get_gate_proj_weight();
+            layer
+                .mlp
+                .set_gate_proj_weight(&cast(&weight))
+                .expect("set gate");
+            let weight = layer.mlp.get_up_proj_weight();
+            layer
+                .mlp
+                .set_up_proj_weight(&cast(&weight))
+                .expect("set up");
+            let weight = layer.mlp.get_down_proj_weight();
+            layer
+                .mlp
+                .set_down_proj_weight(&cast(&weight))
+                .expect("set down");
+        }
+    }
+
+    fn prime_paged_request(
+        inner: &mut super::Qwen3Inner,
+        seq_id: SeqId,
+        prompt: &[u32],
+    ) -> Result<()> {
+        {
+            let adapter = inner
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("paged adapter missing"))?;
+            adapter.begin_request(seq_id).map_err(Error::from_reason)?;
+            let prefix = adapter
+                .find_cached_prefix(prompt, &[], 0, false)
+                .map_err(Error::from_reason)?;
+            if prefix.cached_token_count != 0 {
+                return Err(Error::from_reason(format!(
+                    "synthetic request {seq_id} unexpectedly hit {} cached tokens",
+                    prefix.cached_token_count
+                )));
+            }
+            adapter
+                .allocate_suffix_blocks(prompt.len() as u32 + 2)
+                .map_err(Error::from_reason)?;
+        }
+        let positions = MxArray::from_int32(&[0], &[1])?;
+        let _ = inner.run_paged_prefill_chunk(prompt, 0, inner.layers.len(), &positions)?;
+        Ok(())
+    }
+
     /// Explicit opt-out (`Some(false)`) must NOT allocate the block-paged
     /// adapter. Pure path that only relies on the existing MLX runtime
     /// (matches the rest of the `models::qwen3` test suite).
@@ -4372,57 +4576,7 @@ mod tests {
         // would be Float32 and `update_keys_values` would (correctly) reject
         // them. Cast every weight to BFloat16 to match the production
         // configuration the chat path will see at inference time.
-        use crate::array::DType;
-        let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype BFloat16") };
-        // Embedding.
-        let w = inner.embedding.get_weight();
-        inner.embedding.set_weight(&cast(&w)).expect("set embed");
-        // Final norm.
-        let w = inner.final_norm.get_weight();
-        inner
-            .final_norm
-            .set_weight(&cast(&w))
-            .expect("set final_norm");
-        // LM head.
-        let w = inner.lm_head.get_weight();
-        inner.lm_head.set_weight(&cast(&w)).expect("set lm_head");
-        // Per-layer.
-        for layer in inner.layers.iter_mut() {
-            let w = layer.get_input_layernorm_weight();
-            layer
-                .set_input_layernorm_weight(&cast(&w))
-                .expect("set in ln");
-            let w = layer.get_post_attention_layernorm_weight();
-            layer
-                .set_post_attention_layernorm_weight(&cast(&w))
-                .expect("set post ln");
-            let w = layer.self_attn.get_q_proj_weight();
-            layer.self_attn.set_q_proj_weight(&cast(&w)).expect("set q");
-            let w = layer.self_attn.get_k_proj_weight();
-            layer.self_attn.set_k_proj_weight(&cast(&w)).expect("set k");
-            let w = layer.self_attn.get_v_proj_weight();
-            layer.self_attn.set_v_proj_weight(&cast(&w)).expect("set v");
-            let w = layer.self_attn.get_o_proj_weight();
-            layer.self_attn.set_o_proj_weight(&cast(&w)).expect("set o");
-            if let Some(qn) = layer.self_attn.get_q_norm_weight() {
-                layer
-                    .self_attn
-                    .set_q_norm_weight(&cast(&qn))
-                    .expect("set qn");
-            }
-            if let Some(kn) = layer.self_attn.get_k_norm_weight() {
-                layer
-                    .self_attn
-                    .set_k_norm_weight(&cast(&kn))
-                    .expect("set kn");
-            }
-            let w = layer.mlp.get_gate_proj_weight();
-            layer.mlp.set_gate_proj_weight(&cast(&w)).expect("set gate");
-            let w = layer.mlp.get_up_proj_weight();
-            layer.mlp.set_up_proj_weight(&cast(&w)).expect("set up");
-            let w = layer.mlp.get_down_proj_weight();
-            layer.mlp.set_down_proj_weight(&cast(&w)).expect("set down");
-        }
+        cast_paged_inner_to_bf16(&mut inner);
 
         // Drive the adapter lifecycle the same way `paged_turn_sync_core`
         // does. seq_id is arbitrary (per-request scoping).
@@ -4536,6 +4690,151 @@ mod tests {
             let _ = adapter.register_full_blocks_for_reuse(&[], 0);
             adapter.release_request().expect("release_request");
         }
+    }
+
+    #[test]
+    fn uniform_batched_decode_matches_two_serial_request_rows() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
+        let config = paged_tiny_config(Some(true));
+        let mut batched = match super::Qwen3Inner::new(config.clone()) {
+            Ok(inner) => inner,
+            Err(error) if error.to_string().contains("No Metal device") => {
+                eprintln!("skipping (no Metal device): {error}");
+                return;
+            }
+            Err(error) => panic!("batched inner construction failed: {error}"),
+        };
+        cast_paged_inner_to_bf16(&mut batched);
+
+        let mut serial = super::Qwen3Inner::new(config.clone()).expect("serial inner");
+        serial.embedding = batched.embedding.clone();
+        serial.layers = batched.layers.clone();
+        serial.final_norm = batched.final_norm.clone();
+        serial.lm_head = batched.lm_head.clone();
+
+        let requests = [
+            (11, vec![10, 20, 30, 40]),
+            (22, vec![7, 8, 9, 10, 11, 12, 13]),
+        ];
+        for (seq_id, prompt) in &requests {
+            if let Err(error) = prime_paged_request(&mut batched, *seq_id, prompt) {
+                let message = error.to_string();
+                if message.contains("Metal GPU not available")
+                    || message.contains("No Metal device")
+                {
+                    eprintln!("skipping uniform batched decode: {message}");
+                    return;
+                }
+                panic!("batched request {seq_id} prime failed: {message}");
+            }
+            prime_paged_request(&mut serial, *seq_id, prompt)
+                .unwrap_or_else(|error| panic!("serial request {seq_id} prime failed: {error}"));
+        }
+
+        let before = [
+            batched
+                .paged_adapter
+                .as_ref()
+                .expect("batched adapter")
+                .current_token_count_for(11),
+            batched
+                .paged_adapter
+                .as_ref()
+                .expect("batched adapter")
+                .current_token_count_for(22),
+        ];
+        assert!(
+            batched
+                .run_paged_decode_step_batched(&[(11, 50), (11, 60)])
+                .is_err(),
+            "duplicate rows must fail before advancing either request"
+        );
+        assert_eq!(
+            [
+                batched
+                    .paged_adapter
+                    .as_ref()
+                    .expect("batched adapter")
+                    .current_token_count_for(11),
+                batched
+                    .paged_adapter
+                    .as_ref()
+                    .expect("batched adapter")
+                    .current_token_count_for(22),
+            ],
+            before
+        );
+
+        let batch_logits = batched
+            .run_paged_decode_step_batched(&[(11, 50), (22, 60)])
+            .expect("batched decode");
+        assert_eq!(
+            batch_logits.shape().expect("batch shape").as_ref(),
+            [2, 1, config.vocab_size as i64]
+        );
+
+        let positions = MxArray::from_int32(&[0], &[1]).expect("positions");
+        let mut serial_rows = Vec::new();
+        for (seq_id, token) in [(11, 50), (22, 60)] {
+            serial
+                .paged_adapter
+                .as_mut()
+                .expect("serial adapter")
+                .activate_request(seq_id)
+                .expect("activate serial row");
+            serial_rows.push(
+                serial
+                    .run_paged_decode_step(token, serial.layers.len(), &positions)
+                    .expect("serial decode row"),
+            );
+        }
+        let serial_logits = MxArray::concatenate_many(serial_rows.iter().collect(), Some(0))
+            .expect("concatenate serial logits");
+        let batch_tokens = batch_logits
+            .argmax(-1, Some(false))
+            .expect("batch argmax")
+            .to_uint32()
+            .expect("batch tokens")
+            .to_vec();
+        let serial_tokens = serial_logits
+            .argmax(-1, Some(false))
+            .expect("serial argmax")
+            .to_uint32()
+            .expect("serial tokens")
+            .to_vec();
+        assert_eq!(batch_tokens, serial_tokens, "batched token rows diverged");
+        assert_eq!(
+            batched
+                .paged_adapter
+                .as_ref()
+                .expect("batched adapter")
+                .current_token_count_for(11),
+            Some(5)
+        );
+        assert_eq!(
+            batched
+                .paged_adapter
+                .as_ref()
+                .expect("batched adapter")
+                .current_token_count_for(22),
+            Some(8)
+        );
+
+        batched
+            .paged_adapter
+            .as_mut()
+            .expect("batched adapter")
+            .release_all_requests()
+            .expect("release batched rows");
+        serial
+            .paged_adapter
+            .as_mut()
+            .expect("serial adapter")
+            .release_all_requests()
+            .expect("release serial rows");
     }
 
     /// `use_block_paged_cache: true` round-trips correctly through serde —
@@ -4760,6 +5059,91 @@ mod tests {
             let adapter = inner.paged_adapter.as_mut().unwrap();
             let _ = adapter.register_full_blocks_for_reuse(&[], 0);
             adapter.release_request().expect("release_request");
+        }
+    }
+
+    #[test]
+    fn real_uniform_batched_decode_matches_serial_rows_in_same_request_table() {
+        let Some(model_path) = std::env::var_os("QWEN3_STAGE1_MODEL_PATH") else {
+            eprintln!("skipping (set QWEN3_STAGE1_MODEL_PATH for the real Qwen3 B3 oracle)");
+            return;
+        };
+        let model_path = std::path::PathBuf::from(model_path);
+        let mut inner = crate::models::qwen3::persistence::load_inner_for_test(&model_path)
+            .unwrap_or_else(|error| panic!("failed to load {}: {error}", model_path.display()));
+        let rows = [
+            (101, vec![9707, 11, 279, 3650]),
+            (202, vec![9707, 374, 264, 1296, 13]),
+        ];
+        for (seq_id, prompt) in &rows {
+            prime_paged_request(&mut inner, *seq_id, prompt)
+                .unwrap_or_else(|error| panic!("request {seq_id} prime failed: {error}"));
+        }
+
+        let decode_rows = [(101, 198), (202, 220)];
+        let batched_logits = inner
+            .run_paged_decode_step_batched(&decode_rows)
+            .expect("real batched decode");
+        let batched_tokens = batched_logits
+            .argmax(-1, Some(false))
+            .expect("batched argmax")
+            .to_uint32()
+            .expect("batched tokens")
+            .to_vec();
+
+        for &(seq_id, _) in decode_rows.iter().rev() {
+            let adapter = inner.paged_adapter.as_mut().expect("paged adapter");
+            adapter
+                .activate_request(seq_id)
+                .expect("activate rollback row");
+            adapter
+                .rollback_last_tokens(1)
+                .expect("rollback batched token");
+        }
+
+        let positions = MxArray::from_int32(&[0], &[1]).expect("positions");
+        let mut serial_rows = Vec::with_capacity(decode_rows.len());
+        for (seq_id, token) in decode_rows {
+            inner
+                .paged_adapter
+                .as_mut()
+                .expect("paged adapter")
+                .activate_request(seq_id)
+                .expect("activate serial row");
+            serial_rows.push(
+                inner
+                    .run_paged_decode_step(token, inner.layers.len(), &positions)
+                    .expect("serial decode"),
+            );
+        }
+        let serial_logits = MxArray::concatenate_many(serial_rows.iter().collect(), Some(0))
+            .expect("serial concatenate");
+        let serial_tokens = serial_logits
+            .argmax(-1, Some(false))
+            .expect("serial argmax")
+            .to_uint32()
+            .expect("serial tokens")
+            .to_vec();
+        assert_eq!(
+            batched_tokens, serial_tokens,
+            "real batched rows diverged from scalar replay over the same request table"
+        );
+        for (seq_id, prompt) in &rows {
+            assert_eq!(
+                inner
+                    .paged_adapter
+                    .as_ref()
+                    .expect("paged adapter")
+                    .current_token_count_for(*seq_id),
+                Some(prompt.len() as u32 + 1),
+                "request {seq_id} cursor"
+            );
+            inner
+                .paged_adapter
+                .as_mut()
+                .expect("paged adapter")
+                .release_request_for(*seq_id)
+                .expect("release row");
         }
     }
 

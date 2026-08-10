@@ -4101,6 +4101,125 @@ impl PagedKVCacheAdapter {
         )
     }
 
+    /// Graph-native uniform decode attention for one query token per request.
+    ///
+    /// `queries` is `[N, num_query_heads, head_size]`; `seq_ids` defines the
+    /// exact row order used to build `[N,max_blocks]` block tables and `[N]`
+    /// context lengths. No serial fallback is hidden inside this method.
+    #[cfg(target_os = "macos")]
+    pub fn gather_kv_for_decode_graph_batched(
+        &mut self,
+        layer_idx: u32,
+        queries: &MxArray,
+        seq_ids: &[SeqId],
+        scale: f32,
+        softcap: f32,
+    ) -> Result<MxArray, String> {
+        if seq_ids.is_empty() {
+            return Err(
+                "gather_kv_for_decode_graph_batched requires at least one sequence".to_string(),
+            );
+        }
+        if layer_idx as usize >= self.layer_kv_pool.num_layers() {
+            return Err(format!(
+                "gather_kv_for_decode_graph_batched: layer_idx {layer_idx} out of range (num_layers = {})",
+                self.layer_kv_pool.num_layers()
+            ));
+        }
+        let q_meta = KvTensorMeta::from_array(queries, "queries")?;
+        if q_meta.ndim != 3 || q_meta.shape.len() != 3 {
+            return Err(format!(
+                "gather_kv_for_decode_graph_batched: queries must be 3-D [N, num_query_heads, head_size], got ndim {} shape {:?}",
+                q_meta.ndim, q_meta.shape
+            ));
+        }
+        if q_meta.shape[0] != seq_ids.len() as i64 {
+            return Err(format!(
+                "gather_kv_for_decode_graph_batched: query rows {} do not match {} sequence ids",
+                q_meta.shape[0],
+                seq_ids.len()
+            ));
+        }
+        if q_meta.shape[1] <= 0 {
+            return Err(
+                "gather_kv_for_decode_graph_batched requires at least one query head".to_string(),
+            );
+        }
+        if q_meta.shape[2] != self.layer_kv_pool.config().head_size as i64 {
+            return Err(format!(
+                "gather_kv_for_decode_graph_batched: query head size {} does not match pool head size {}",
+                q_meta.shape[2],
+                self.layer_kv_pool.config().head_size
+            ));
+        }
+        let query_dtype = match q_meta.dtype {
+            DType::Float16 => mlx_paged_attn::metal::MetalDtype::Float16,
+            DType::BFloat16 => mlx_paged_attn::metal::MetalDtype::BFloat16,
+            other => {
+                return Err(format!(
+                    "gather_kv_for_decode_graph_batched: unsupported query dtype {other:?} (expected Float16 or BFloat16)"
+                ));
+            }
+        };
+        let cache_dtype = self.layer_kv_pool.cache_dtype();
+        if !cache_dtype.is_fp8() && query_dtype != cache_dtype {
+            return Err(format!(
+                "gather_kv_for_decode_graph_batched: query_dtype ({query_dtype:?}) must equal cache_dtype ({cache_dtype:?}) for non-FP8 caches"
+            ));
+        }
+
+        let (block_tables, seq_lens, max_context_len) =
+            self.decode_attention_inputs_batched(seq_ids)?;
+        let k_pool = self.key_pool_array(layer_idx)?;
+        let v_pool = self.value_pool_array(layer_idx)?;
+        let k_scale = self.k_scale_array(layer_idx)?;
+        let v_scale = self.v_scale_array(layer_idx)?;
+        let graph_softcap = if softcap == 1.0 { 0.0 } else { softcap };
+        let raw = unsafe {
+            mlx_sys::mlx_paged_attention_forward(
+                queries.as_raw_ptr(),
+                k_pool.as_raw_ptr(),
+                v_pool.as_raw_ptr(),
+                block_tables.as_raw_ptr(),
+                seq_lens.as_raw_ptr(),
+                k_scale.as_raw_ptr(),
+                v_scale.as_raw_ptr(),
+                scale,
+                graph_softcap,
+                0,
+                self.block_size as i32,
+                q_meta.shape[1] as i32,
+                self.layer_kv_pool.config().num_kv_heads as i32,
+                self.layer_kv_pool.config().head_size as i32,
+                self.kv_dtype_raw()?,
+            )
+        };
+        if raw.is_null() {
+            return Err(format!(
+                "gather_kv_for_decode_graph_batched: mlx_paged_attention_forward returned null (layer={layer_idx}, rows={}, max_context_len={max_context_len})",
+                seq_ids.len()
+            ));
+        }
+        MxArray::from_handle(raw, "gather_kv_for_decode_graph_batched").map_err(|error| {
+            format!("gather_kv_for_decode_graph_batched: failed to wrap output array: {error}")
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn gather_kv_for_decode_graph_batched(
+        &mut self,
+        _layer_idx: u32,
+        _queries: &MxArray,
+        _seq_ids: &[SeqId],
+        _scale: f32,
+        _softcap: f32,
+    ) -> Result<MxArray, String> {
+        Err(
+            "gather_kv_for_decode_graph_batched is only supported on macOS (Metal backend)"
+                .to_string(),
+        )
+    }
+
     /// Route-hinted graph-native decode attention. The hint is captured in the
     /// lazy MLX primitive; it never changes pool ownership, block tables, or
     /// sequence length.
