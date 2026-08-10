@@ -20,8 +20,23 @@
 //! carves segments strictly left to right and never lets two overlap. A parser
 //! that instead searches each field's `open_pattern` over the whole string
 //! independently finds `to=user<|message|>` *inside* a reasoning segment — text
-//! the model wrote as thinking — and republishes it as the answer. See
-//! `a_reasoning_segment_cannot_forge_a_content_segment`.
+//! the model wrote as thinking — and republishes it as the answer.
+//!
+//! Non-overlap alone is not enough, because a segment whose own close marker
+//! never arrives would otherwise run over the top of whatever came next. So a
+//! segment also ends at the first construct that says "this segment never
+//! closed": the spec's `start_anchor`, or an `xml-inline` open. End of input is
+//! the last resort, used only when nothing else follows — that is the
+//! `max_tokens` truncation case, and nothing else. An `xml-inline` segment
+//! whose close does not arrive stops the scan outright: a tool body the parser
+//! could not delimit makes the rest of the input unstructured, and resuming
+//! inside it is how a tool payload becomes the answer.
+//!
+//! Four tests pin the failures this prevents, all of them observed rather than
+//! imagined: `a_reasoning_segment_cannot_forge_a_content_segment`,
+//! `a_later_reasoning_message_cannot_be_absorbed_into_an_unclosed_answer`,
+//! `an_unterminated_tool_invoke_stops_the_scan_instead_of_leaking_its_body`,
+//! and `a_tool_invoke_whose_close_follows_a_new_message_is_not_trusted`.
 
 use napi::bindgen_prelude::*;
 use regex::{Regex, RegexBuilder};
@@ -184,10 +199,9 @@ pub struct ResponseTemplate {
     /// deleted the moment M1 reads it.
     #[cfg_attr(not(test), expect(dead_code))]
     default_role: String,
-    /// `start_anchor` (`<|start|>assistant`). Checkpoint spec surface: M1's
-    /// streaming path needs it to spot a message boundary in a partial stream.
-    /// Deliberately NOT used to bound segments here — see [`Self::parse`].
-    #[cfg_attr(not(test), expect(dead_code))]
+    /// `start_anchor` (`<|start|>assistant`). The spec's own marker for "a new
+    /// message begins here", and therefore the boundary that stops a segment
+    /// whose close marker never arrived — see [`Self::parse`].
     start_anchor: String,
     /// `tool_calls.transform`, verbatim and uninterpreted. It describes how to
     /// reshape a parsed call into an OpenAI-style `{type, function}` object,
@@ -354,31 +368,62 @@ fn parse_arguments(tag: &Regex, body: &str) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
-/// Append a segment to a single-valued text channel.
+/// Fill a single-valued text channel, first segment wins.
 ///
-/// Only `tool_calls` is marked `repeats`, so the text channels hold one value —
-/// but the checkpoint's own chat template renders EVERY `to=self` message as its
-/// own `<|start|>assistant to=self<|message|>…<|eom|>` segment, so a single
-/// generation can legitimately produce several. Dropping the later ones loses
-/// tokens the model produced; joining keeps all of them. Joining can never move
-/// text across channels: which slot a segment lands in is decided solely by
-/// which field's `open_pattern` matched it.
-fn append_segment(slot: &mut Option<String>, segment: &str) {
-    match slot {
-        Some(existing) => {
-            existing.push('\n');
-            existing.push_str(segment);
-        }
-        None => *slot = Some(segment.to_owned()),
+/// Only `tool_calls` declares `repeats`, so for the two `text` fields the spec's
+/// contract is one segment and a second one is outside it. Keeping the first and
+/// ignoring the rest is the contract; joining them would synthesise a delimiter
+/// the model never emitted, and [`ParsedTurn`]'s `Option<String>` leaves the
+/// caller no way to undo that. Widening the type to carry a segment list is an
+/// interface decision for the streaming path, not something to smuggle in here.
+fn set_once(slot: &mut Option<String>, segment: &str) {
+    if slot.is_none() {
+        *slot = Some(segment.to_owned());
     }
 }
 
-/// Body and resume point of a `text` segment. The close marker is OPTIONAL
-/// here: a generation cut off by `max_tokens` has no terminator and its partial
-/// text is still the answer.
-fn text_segment(text: &str, body_start: usize, close: Option<(usize, usize)>) -> (&str, usize) {
-    let (body_end, after) = close.unwrap_or((text.len(), text.len()));
-    (&text[body_start..body_end], after)
+/// Where a segment stops and where the scan resumes.
+#[derive(Debug, Clone, Copy)]
+struct SegmentEnd {
+    /// Last byte of the body (exclusive).
+    body_end: usize,
+    /// Where the next pass starts looking.
+    resume: usize,
+    /// True only when one of the field's OWN close markers ended it. An
+    /// `xml-inline` field requires this; a `text` field does not.
+    closed: bool,
+}
+
+impl SegmentEnd {
+    /// Properly terminated: resume past the marker so it cannot be re-read.
+    fn closed(marker_start: usize, marker_end: usize) -> Self {
+        Self {
+            body_end: marker_start,
+            resume: marker_end,
+            closed: true,
+        }
+    }
+
+    /// The close never arrived; something else began. The body still counts —
+    /// it is what the model wrote before switching — but the cursor rewinds to
+    /// the boundary so the next pass reads that construct on its own terms.
+    fn interrupted(at: usize) -> Self {
+        Self {
+            body_end: at,
+            resume: at,
+            closed: false,
+        }
+    }
+
+    /// Generation stopped mid-segment. The ONLY case that runs to the end of
+    /// the input, and it is reachable only when no boundary follows the body.
+    fn end_of_input(len: usize) -> Self {
+        Self {
+            body_end: len,
+            resume: len,
+            closed: false,
+        }
+    }
 }
 
 /// Smallest char boundary strictly greater than `pos`, clamped to the end.
@@ -418,6 +463,16 @@ impl ResponseTemplate {
             )
         })?;
 
+        // `start_anchor` is load-bearing now: it both bounds an unclosed segment
+        // and gates channel openers. An empty one makes `str::find` succeed at
+        // every position, so every segment would end where it began.
+        if raw.start_anchor.is_empty() {
+            return Err(Error::from_reason(
+                "muse_glimmer: response_template start_anchor is empty; it is the message \
+                 boundary every segment is bounded by and cannot be a match-anything",
+            ));
+        }
+
         let transform = raw.fields.tool_calls.transform.clone();
         let fields = vec![
             compile_text_field(
@@ -437,36 +492,120 @@ impl ResponseTemplate {
         })
     }
 
+    /// Earliest position at or after `from` where a construct the spec knows
+    /// about says the current segment never closed.
+    ///
+    /// Two things qualify:
+    ///
+    /// - `start_anchor` — the chat template emits it before EVERY message, so it
+    ///   is the one unambiguous "a new message begins here" in the grammar.
+    /// - an `xml-inline` `open_pattern`, but only against a `text` segment: a
+    ///   tool block inside a message is not part of the user-visible answer.
+    ///   It is not a boundary for another `xml-inline` segment, because the
+    ///   repeated form always puts `</atem:invoke>` before the next
+    ///   `<atem:invoke>` and the close wins there anyway.
+    ///
+    /// The two `text` fields' own openers are deliberately NOT boundaries. A
+    /// bare `to=user<|message|>` with no `start_anchor` in front of it is TEXT,
+    /// not a channel switch — every real switch is anchored, per the template.
+    /// Treating it as a boundary is what lets a reasoning body terminate itself
+    /// and republish its own tail as the answer, which is exactly the leak
+    /// `a_reasoning_segment_cannot_forge_a_content_segment` exists to stop.
+    fn earliest_interruption(
+        &self,
+        field: &CompiledField,
+        text: &str,
+        from: usize,
+    ) -> Option<usize> {
+        let anchor = text[from..]
+            .find(self.start_anchor.as_str())
+            .map(|i| from + i);
+        if matches!(field.sink, Sink::ToolCalls { .. }) {
+            return anchor;
+        }
+        let inline = self
+            .fields
+            .iter()
+            .filter_map(|f| match &f.sink {
+                Sink::ToolCalls { .. } => f.open.find_at(text, from).map(|m| m.start()),
+                _ => None,
+            })
+            .min();
+        match (anchor, inline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Where a segment that starts at `body_start` ends. The earliest of three
+    /// things wins, and only the third runs to the end of the input:
+    ///
+    /// 1. one of the field's own `close` markers — properly terminated;
+    /// 2. an interruption ([`Self::earliest_interruption`]) — never closed;
+    /// 3. end of input — truncated by `max_tokens`, and reachable only when
+    ///    neither 1 nor 2 follows the body.
+    fn segment_end(&self, field: &CompiledField, text: &str, body_start: usize) -> SegmentEnd {
+        let close = field.earliest_close(text, body_start);
+        let interrupt = self.earliest_interruption(field, text, body_start);
+        match (close, interrupt) {
+            // Ties go to the close: a properly terminated segment stays one.
+            (Some((marker, end)), Some(i)) if marker <= i => SegmentEnd::closed(marker, end),
+            (Some((marker, end)), None) => SegmentEnd::closed(marker, end),
+            (_, Some(i)) => SegmentEnd::interrupted(i),
+            (None, None) => SegmentEnd::end_of_input(text.len()),
+        }
+    }
+
     /// Split one generated assistant turn into its three channels.
     ///
     /// Infallible by design: generation is untrusted text that can stop at any
     /// byte, so every malformation degrades to "that segment is absent" rather
     /// than an error the caller would have to invent a response to.
     ///
-    /// The walk is a single left-to-right pass. At each step the field whose
-    /// `open_pattern` matches EARLIEST wins, its body runs to the earliest of
-    /// its own close markers, and the cursor resumes past that close. Segments
-    /// therefore never overlap, which is the whole reason a `to=user<|message|>`
-    /// sequence appearing inside a reasoning body cannot become the answer.
-    ///
-    /// `start_anchor` is deliberately not consulted: bounding a segment at the
-    /// next `<|start|>assistant` would recover more text from a generation that
-    /// dropped its `<|eom|>`, but the failure it would fix errs in the safe
-    /// direction already (reasoning absorbs the answer; the answer never
-    /// absorbs reasoning), and inventing that rule is M1's call to make.
+    /// A single left-to-right pass. At each step the field whose `open_pattern`
+    /// matches EARLIEST wins and its body runs to [`Self::segment_end`], so
+    /// segments never overlap and no byte is ever read as belonging to two
+    /// channels. An `xml-inline` segment additionally REQUIRES its own close:
+    /// without one the tool body has no delimiter, the rest of the input is
+    /// unstructured, and the scan stops rather than resume inside it. Anything
+    /// already parsed before that point is kept.
     pub fn parse(&self, generated: &str) -> ParsedTurn {
         let mut out = ParsedTurn::default();
         let mut pos = 0usize;
+        // The generation starts at a message start: the prompt already emitted
+        // `<|start|>assistant`, which is why the first segment's opener is bare.
+        // Every later message carries its own anchor, per the chat template.
+        let mut inside_a_message = false;
 
         while pos <= generated.len() {
+            // A `text` opener only means "a channel starts here" at a message
+            // start. Mid-message it is just text the model wrote — and the
+            // cursor CAN legitimately sit mid-message, because an `xml-inline`
+            // block interrupts a text segment without ending its message. Ungate
+            // it and a bare `to=user<|message|>` after a tool block inside a
+            // `to=self` message becomes the answer.
+            let text_gate = if inside_a_message {
+                generated[pos..]
+                    .find(self.start_anchor.as_str())
+                    .map(|i| pos + i + self.start_anchor.len())
+            } else {
+                Some(pos)
+            };
+
             let Some((field, start, body_start, caps)) = self
                 .fields
                 .iter()
                 .filter_map(|f| {
+                    // `xml-inline` is an in-body construct, so it is never
+                    // gated; `text` openers are.
+                    let from = match &f.sink {
+                        Sink::ToolCalls { .. } => pos,
+                        _ => text_gate?,
+                    };
                     // `captures_at` rather than `find_at`: the tool-call open
                     // pattern carries the `name` group, and the whole-match
                     // range comes off group 0 without an `unwrap`.
-                    let caps = f.open.captures_at(generated, pos)?;
+                    let caps = f.open.captures_at(generated, from)?;
                     let whole = caps.get(0)?;
                     Some((f, whole.start(), whole.end(), caps))
                 })
@@ -475,46 +614,43 @@ impl ResponseTemplate {
                 break;
             };
             debug_assert!(start >= pos, "captures_at must not match before the cursor");
+            // Any segment at all means we are inside a message now, so the next
+            // channel opener needs an anchor in front of it.
+            inside_a_message = true;
 
-            let close = field.earliest_close(generated, body_start);
-            // Consume the open unconditionally, so even a segment that is
-            // dropped below cannot be re-matched. A zero-width open would leave
+            let end = self.segment_end(field, generated, body_start);
+            let body = &generated[body_start..end.body_end];
+
+            match &field.sink {
+                Sink::Reasoning => set_once(&mut out.reasoning, body),
+                Sink::Content => set_once(&mut out.content, body),
+                Sink::ToolCalls { tag } => {
+                    if !end.closed {
+                        // No `</atem:invoke>` before the next boundary. Emitting
+                        // a half-parsed call would hand a tool arguments the
+                        // model never finished writing, and resuming inside the
+                        // body is how that body's text becomes the answer.
+                        break;
+                    }
+                    if let Some(name) = caps.name("name") {
+                        out.tool_calls.push(ParsedToolCall {
+                            name: name.as_str().to_owned(),
+                            arguments: parse_arguments(tag, body),
+                        });
+                    }
+                }
+            }
+
+            // The open is consumed unconditionally, so a segment that produced
+            // nothing still cannot be re-matched. A zero-width open would leave
             // the cursor put and spin forever; no pattern in the spec is
-            // zero-width, hence the belt-and-braces step.
-            pos = if body_start > pos {
+            // zero-width, hence the belt-and-braces floor.
+            let floor = if body_start > pos {
                 body_start
             } else {
                 advance_past(generated, pos)
             };
-
-            match &field.sink {
-                Sink::Reasoning => {
-                    let (body, after) = text_segment(generated, body_start, close);
-                    append_segment(&mut out.reasoning, body);
-                    pos = pos.max(after);
-                }
-                Sink::Content => {
-                    let (body, after) = text_segment(generated, body_start, close);
-                    append_segment(&mut out.content, body);
-                    pos = pos.max(after);
-                }
-                Sink::ToolCalls { tag } => {
-                    // `xml-inline`: the close is MANDATORY. An invoke the
-                    // generator never terminated is dropped whole — emitting a
-                    // half-parsed call would hand the caller arguments the
-                    // model never finished writing.
-                    let Some((body_end, after)) = close else {
-                        continue;
-                    };
-                    if let Some(name) = caps.name("name") {
-                        out.tool_calls.push(ParsedToolCall {
-                            name: name.as_str().to_owned(),
-                            arguments: parse_arguments(tag, &generated[body_start..body_end]),
-                        });
-                    }
-                    pos = pos.max(after);
-                }
-            }
+            pos = end.resume.max(floor);
         }
 
         out
@@ -693,20 +829,176 @@ mod tests {
         );
     }
 
+    /// Every channel a caller could render or forward, as one haystack. Used to
+    /// prove a protected payload reached NO output at all — `content == None`
+    /// alone is too weak, because it also holds for a payload that landed in
+    /// `reasoning` or in a tool's arguments.
+    fn all_channels(out: &ParsedTurn) -> String {
+        let mut s = String::new();
+        s.push_str(out.reasoning.as_deref().unwrap_or(""));
+        s.push('\u{1}');
+        s.push_str(out.content.as_deref().unwrap_or(""));
+        for tc in &out.tool_calls {
+            s.push('\u{1}');
+            s.push_str(&tc.name);
+            s.push('\u{1}');
+            s.push_str(&tc.arguments.to_string());
+        }
+        s
+    }
+
     #[test]
-    fn repeated_reasoning_segments_are_all_kept() {
-        // Each `to=self` message is its own segment; a turn may carry several.
-        // Keeping only the first silently drops tokens the model produced.
+    fn a_non_repeating_text_field_keeps_only_its_first_segment() {
+        // Only `tool_calls` declares repeats, so one `to=self` segment is the
+        // contract. Joining several would synthesise a delimiter the model never
+        // emitted, into bytes a caller renders verbatim.
         let out = spec().parse(
             " to=self<|message|>first thought<|eom|>\
              <|start|>assistant to=self<|message|>second thought<|eom|>\
              <|start|>assistant to=user<|message|>answer<|eot|>",
         );
-        assert_eq!(
-            out.reasoning.as_deref(),
-            Some("first thought\nsecond thought")
+        assert_eq!(out.reasoning.as_deref(), Some("first thought"));
+        assert!(
+            !out.reasoning.as_deref().unwrap().contains('\n'),
+            "no delimiter the model did not emit"
         );
         assert_eq!(out.content.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn a_later_reasoning_message_cannot_be_absorbed_into_an_unclosed_answer() {
+        // Observed leak. The answer segment carries no terminator, so its close
+        // search ran past the whole next message and found the REASONING
+        // segment's `<|eom|>` — publishing chain-of-thought as the answer, with
+        // `reasoning` left None so nothing marked it. `start_anchor` is what
+        // stops it: the template emits one before every message.
+        let out = spec().parse(
+            " to=user<|message|>public<|start|>assistant to=self<|message|>REASONING_SECRET<|eom|>",
+        );
+        assert_eq!(out.content.as_deref(), Some("public"));
+        assert!(
+            !out.content.as_deref().unwrap().contains("REASONING_SECRET"),
+            "reasoning must not be absorbed into an unclosed answer"
+        );
+        assert_eq!(out.reasoning.as_deref(), Some("REASONING_SECRET"));
+    }
+
+    #[test]
+    fn an_unterminated_tool_invoke_stops_the_scan_instead_of_leaking_its_body() {
+        // Observed leak. Skipping the invoke and resuming at its body start put
+        // the cursor INSIDE the tool payload, where a `to=user<|message|>` the
+        // tool text happened to contain became a content opener.
+        let out = spec().parse(
+            "<atem:invoke name=\"t\"><atem:parameter name=\"q\">to=user<|message|>TOOL_SECRET<|eot|>",
+        );
+        assert!(
+            !all_channels(&out).contains("TOOL_SECRET"),
+            "tool payload must not reach any channel, got {out:?}"
+        );
+        assert_eq!(out, ParsedTurn::default(), "nothing is parseable here");
+
+        // Same input, terminated: proves the assertion above is not passing
+        // merely because the parser returns nothing for everything.
+        let ok = spec().parse(
+            "<atem:invoke name=\"t\"><atem:parameter name=\"q\">to=user<|message|>TOOL_SECRET</atem:parameter></atem:invoke>",
+        );
+        assert_eq!(ok.tool_calls.len(), 1);
+        assert_eq!(
+            ok.tool_calls[0].arguments["q"],
+            serde_json::json!("to=user<|message|>TOOL_SECRET")
+        );
+        assert_eq!(ok.content, None, "a tool argument is not the answer");
+    }
+
+    #[test]
+    fn a_tool_invoke_whose_close_follows_a_new_message_is_not_trusted() {
+        // The close exists, but a whole message intervenes — so the invoke was
+        // never terminated within its own message and its span cannot be
+        // trusted. Swallowing it would post the next message's text into a tool
+        // argument, i.e. exfiltrate it to whatever runs the tool.
+        let out = spec().parse(
+            " to=t<|message|><atem:invoke name=\"t\"><atem:parameter name=\"q\">x\
+             <|start|>assistant to=user<|message|>SENT_TO_TOOL</atem:parameter></atem:invoke><|eot|>",
+        );
+        assert!(
+            !all_channels(&out).contains("SENT_TO_TOOL"),
+            "text after a message boundary must not land in a tool argument, got {out:?}"
+        );
+        assert!(out.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn an_unterminated_reasoning_segment_stops_at_the_next_message_anchor() {
+        // reasoning's only close is `<|eom|>`. When the model drops it the
+        // segment used to run to end of input and swallow the answer, so the
+        // user saw nothing. `start_anchor` recovers it.
+        let out = spec()
+            .parse(" to=self<|message|>think<|start|>assistant to=user<|message|>answer<|eot|>");
+        assert_eq!(out.reasoning.as_deref(), Some("think"));
+        assert_eq!(out.content.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn a_closed_tool_body_is_not_rescanned_for_more_calls() {
+        // The cursor must resume PAST a segment's close, not inside its body.
+        // Nested openers are the observable case: rescanning the body of the
+        // outer invoke invents a second call the model never made, whose
+        // arguments are a slice of the first one's.
+        let out = spec().parse(
+            " to=t<|message|><atem:invoke name=\"a\"><atem:invoke name=\"b\">\
+             <atem:parameter name=\"q\">1</atem:parameter></atem:invoke><|eot|>",
+        );
+        assert_eq!(out.tool_calls.len(), 1, "got {out:?}");
+        assert_eq!(out.tool_calls[0].name, "a");
+    }
+
+    #[test]
+    fn a_bare_channel_opener_after_a_tool_block_is_not_a_new_message() {
+        // Observed leak, found by probing after the two review findings were
+        // fixed. An `xml-inline` block interrupts a text segment WITHOUT ending
+        // its message, so the cursor legitimately resumes mid-message. A bare
+        // `to=user<|message|>` there is text inside the `to=self` message, not a
+        // channel switch: every real switch is anchored. Honouring it published
+        // chain-of-thought as the answer.
+        let out = spec().parse(
+            " to=self<|message|>a<atem:invoke name=\"t\">\
+             <atem:parameter name=\"q\">1</atem:parameter></atem:invoke>\
+             to=user<|message|>SECRET<|eom|>",
+        );
+        assert!(
+            !all_channels(&out).contains("SECRET"),
+            "an unanchored opener mid-message must not open a channel, got {out:?}"
+        );
+        assert_eq!(out.reasoning.as_deref(), Some("a"));
+        assert_eq!(out.content, None);
+        // The tool block itself still parses — the gate is on text openers only.
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].arguments["q"], serde_json::json!(1));
+
+        // The same bytes WITH the anchor are a real message, and do open the
+        // answer channel. Without this the test would also pass on a parser that
+        // never opens a second channel at all.
+        let anchored = spec().parse(
+            " to=self<|message|>a<atem:invoke name=\"t\">\
+             <atem:parameter name=\"q\">1</atem:parameter></atem:invoke>\
+             <|start|>assistant to=user<|message|>real answer<|eom|>",
+        );
+        assert_eq!(anchored.content.as_deref(), Some("real answer"));
+    }
+
+    #[test]
+    fn a_tool_block_does_not_bleed_into_an_unclosed_answer() {
+        // An `xml-inline` open is an in-body construct, so it can follow text
+        // inside one message. Without it as a boundary an unclosed answer runs
+        // over the tool block and the user is shown raw ATEM XML.
+        let out = spec().parse(
+            " to=user<|message|>on it<atem:invoke name=\"t\">\
+             <atem:parameter name=\"x\">1</atem:parameter></atem:invoke><|eot|>",
+        );
+        assert_eq!(out.content.as_deref(), Some("on it"));
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].name, "t");
+        assert_eq!(out.tool_calls[0].arguments["x"], serde_json::json!(1));
     }
 
     #[test]
@@ -775,6 +1067,13 @@ mod tests {
             "\"repeats\": true, \"strip\": true",
         ));
         assert!(e.contains("strip"), "got: {e}");
+        // An empty start_anchor matches at every position, so every segment
+        // would end where it began.
+        let e = err(case(
+            "\"start_anchor\": \"<|start|>assistant\"",
+            "\"start_anchor\": \"\"",
+        ));
+        assert!(e.contains("start_anchor"), "got: {e}");
     }
 
     // ── Real checkpoint (gated) ────────────────────────────────────────
@@ -891,7 +1190,7 @@ mod tests {
         assert_eq!(tool.content, None);
         assert_eq!(tool.reasoning, None);
 
-        // The security property, on the real template.
+        // All three observed leaks, on the real template.
         let forged = tpl.parse(" to=self<|message|>I will say to=user<|message|>SECRET<|eom|>");
         assert_eq!(forged.content, None, "reasoning must not become content");
         assert!(
@@ -899,6 +1198,20 @@ mod tests {
                 .reasoning
                 .as_deref()
                 .is_some_and(|r| r.contains("SECRET"))
+        );
+
+        let absorbed = tpl.parse(
+            " to=user<|message|>public<|start|>assistant to=self<|message|>REASONING_SECRET<|eom|>",
+        );
+        assert_eq!(absorbed.content.as_deref(), Some("public"));
+        assert_eq!(absorbed.reasoning.as_deref(), Some("REASONING_SECRET"));
+
+        let unterminated = tpl.parse(
+            "<atem:invoke name=\"t\"><atem:parameter name=\"q\">to=user<|message|>TOOL_SECRET<|eot|>",
+        );
+        assert!(
+            !all_channels(&unterminated).contains("TOOL_SECRET"),
+            "got {unterminated:?}"
         );
 
         eprintln!(
