@@ -426,6 +426,62 @@ impl SegmentEnd {
     }
 }
 
+/// The exact bytes `chat_template.jinja` puts between a message's
+/// `start_anchor` and its channel opener.
+///
+/// The template renders an assistant header as `'<|start|>assistant'` then
+/// `' to=' + recipient` then `'<|message|>'`, and every text `open_pattern`
+/// begins at `to=`. So after an anchor the gap is exactly one space — never two,
+/// never none, never anything else. `<|start|>assistantto=user<|message|>` is as
+/// unemittable as `<|start|>assistantX to=user<|message|>`, and accepting either
+/// is accepting a malformed anchor as a message start.
+const AFTER_ANCHOR_PREFIXES: [&str; 1] = [" "];
+
+/// The same, at byte 0. No anchor precedes it — the prompt's own
+/// `<|start|>assistant` sits outside the generated text — so there is no anchor
+/// to be malformed, and a generation that opens without the leading space is
+/// still unambiguous.
+const AT_START_PREFIXES: [&str; 2] = ["", " "];
+
+/// Match a `text` field's `open_pattern` ANCHORED at a message header.
+///
+/// `arrival` is where a header begins: byte 0, or just past a `start_anchor`.
+/// The opener must begin exactly there, modulo the allowed prefix above.
+/// Returns the opener's `(start, body_start)`.
+///
+/// The distinction from a search is the whole point. `find_at`/`captures_at`
+/// take a lower bound and then scan FORWARD, so a `to=<tool>` message whose
+/// prose happened to contain `to=user<|message|>` supplied a content opener and
+/// its payload was published as the answer; so did `<|start|>assistantX`,
+/// `<|start|>assistant JUNK`, and an anchor followed by two spaces. An opener
+/// counts only where the parser ARRIVES at it.
+fn anchored_text_open(field: &CompiledField, text: &str, arrival: usize) -> Option<(usize, usize)> {
+    if arrival > text.len() {
+        return None;
+    }
+    // `next_arrival` always lands past a non-empty anchor, so 0 is reachable
+    // only as the initial cursor.
+    let prefixes: &[&str] = if arrival == 0 {
+        &AT_START_PREFIXES
+    } else {
+        &AFTER_ANCHOR_PREFIXES
+    };
+    for prefix in prefixes {
+        if !text[arrival..].starts_with(prefix) {
+            continue;
+        }
+        let at = arrival + prefix.len();
+        // `find` on the slice plus `start() == 0` IS an anchored match: leftmost
+        // semantics return a match at 0 whenever one exists there. Every text
+        // `open_pattern` is a plain literal sequence with no look-behind, so
+        // slicing loses it no context.
+        if let Some(m) = field.open.find(&text[at..]).filter(|m| m.start() == 0) {
+            return Some((at, at + m.end()));
+        }
+    }
+    None
+}
+
 /// Smallest char boundary strictly greater than `pos`, clamped to the end.
 fn advance_past(text: &str, pos: usize) -> usize {
     let mut next = pos + 1;
@@ -556,67 +612,90 @@ impl ResponseTemplate {
         }
     }
 
+    /// Offset where the next message's header begins: just past the next
+    /// `start_anchor` at or after `from`, or `None` when none follows.
+    ///
+    /// Strictly greater than `from`, because an empty `start_anchor` is refused
+    /// at construction. That is what makes the scan terminate.
+    fn next_arrival(&self, text: &str, from: usize) -> Option<usize> {
+        debug_assert!(from <= text.len());
+        text[from..]
+            .find(self.start_anchor.as_str())
+            .map(|i| from + i + self.start_anchor.len())
+    }
+
     /// Split one generated assistant turn into its three channels.
     ///
     /// Infallible by design: generation is untrusted text that can stop at any
     /// byte, so every malformation degrades to "that segment is absent" rather
     /// than an error the caller would have to invent a response to.
     ///
-    /// A single left-to-right pass. At each step the field whose `open_pattern`
-    /// matches EARLIEST wins and its body runs to [`Self::segment_end`], so
-    /// segments never overlap and no byte is ever read as belonging to two
-    /// channels. An `xml-inline` segment additionally REQUIRES its own close:
-    /// without one the tool body has no delimiter, the rest of the input is
-    /// unstructured, and the scan stops rather than resume inside it. Anything
-    /// already parsed before that point is kept.
+    /// A single left-to-right pass over two different kinds of opener:
+    ///
+    /// - A `text` channel opens only where the parser ARRIVES at its opener —
+    ///   byte 0, or a validated `start_anchor` plus the protocol's exact header
+    ///   prefix ([`anchored_text_open`]). Never by scanning forward for one.
+    /// - An `xml-inline` opener is searched for from the cursor, because the
+    ///   spec calls that field `xml-inline`: a tool block is an in-body
+    ///   construct that can follow text inside one message.
+    ///
+    /// The earliest of those wins, its body runs to [`Self::segment_end`], and
+    /// the cursor resumes past the close. So segments never overlap AND no byte
+    /// is ever attributed to a channel the grammar did not open there.
+    /// `xml-inline` additionally REQUIRES its own close: without one the tool
+    /// body has no delimiter, the rest of the input is unstructured, and the
+    /// scan stops rather than resume inside it. Anything already parsed is kept.
     pub fn parse(&self, generated: &str) -> ParsedTurn {
         let mut out = ParsedTurn::default();
         let mut pos = 0usize;
-        // The generation starts at a message start: the prompt already emitted
-        // `<|start|>assistant`, which is why the first segment's opener is bare.
-        // Every later message carries its own anchor, per the chat template.
-        let mut inside_a_message = false;
+        // Byte 0 is a message header: the prompt emitted `<|start|>assistant`
+        // itself, which is why the first opener is bare. Every later header is
+        // reached only through an anchor.
+        let mut arrival = Some(0usize);
 
         while pos <= generated.len() {
-            // A `text` opener only means "a channel starts here" at a message
-            // start. Mid-message it is just text the model wrote — and the
-            // cursor CAN legitimately sit mid-message, because an `xml-inline`
-            // block interrupts a text segment without ending its message. Ungate
-            // it and a bare `to=user<|message|>` after a tool block inside a
-            // `to=self` message becomes the answer.
-            let text_gate = if inside_a_message {
-                generated[pos..]
-                    .find(self.start_anchor.as_str())
-                    .map(|i| pos + i + self.start_anchor.len())
-            } else {
-                Some(pos)
-            };
+            let mut best: Option<(&CompiledField, usize, usize, Option<regex::Captures<'_>>)> =
+                None;
+            for f in &self.fields {
+                let found = match &f.sink {
+                    // Searched, and it carries the `name` group.
+                    Sink::ToolCalls { .. } => f
+                        .open
+                        .captures_at(generated, pos)
+                        .and_then(|c| c.get(0).map(|m| (m.start(), m.end(), Some(c)))),
+                    // Anchored at the header, never searched.
+                    _ => arrival
+                        .and_then(|a| anchored_text_open(f, generated, a))
+                        .map(|(s, e)| (s, e, None)),
+                };
+                let Some((s, e, c)) = found else {
+                    continue;
+                };
+                // Earliest opener wins. Ties cannot arise: the two text openers
+                // differ in their recipient literal, and neither can match where
+                // an `<atem:invoke` does.
+                if best.as_ref().is_none_or(|(_, bs, _, _)| s < *bs) {
+                    best = Some((f, s, e, c));
+                }
+            }
 
-            let Some((field, start, body_start, caps)) = self
-                .fields
-                .iter()
-                .filter_map(|f| {
-                    // `xml-inline` is an in-body construct, so it is never
-                    // gated; `text` openers are.
-                    let from = match &f.sink {
-                        Sink::ToolCalls { .. } => pos,
-                        _ => text_gate?,
-                    };
-                    // `captures_at` rather than `find_at`: the tool-call open
-                    // pattern carries the `name` group, and the whole-match
-                    // range comes off group 0 without an `unwrap`.
-                    let caps = f.open.captures_at(generated, from)?;
-                    let whole = caps.get(0)?;
-                    Some((f, whole.start(), whole.end(), caps))
-                })
-                .min_by_key(|(_, start, _, _)| *start)
-            else {
-                break;
+            let Some((field, start, body_start, caps)) = best else {
+                // Nothing opens here. A message addressed to a tool opens no
+                // text channel at all (`to=wx<|message|>` matches neither text
+                // `open_pattern`), so skip to the next header rather than stop —
+                // but skip to the HEADER, never into the message body.
+                let Some(next) = arrival.and_then(|a| self.next_arrival(generated, a)) else {
+                    break;
+                };
+                debug_assert!(Some(next) > arrival, "next_arrival must make progress");
+                pos = pos.max(next);
+                arrival = Some(next);
+                continue;
             };
-            debug_assert!(start >= pos, "captures_at must not match before the cursor");
-            // Any segment at all means we are inside a message now, so the next
-            // channel opener needs an anchor in front of it.
-            inside_a_message = true;
+            debug_assert!(
+                start >= pos,
+                "an opener must not be found before the cursor"
+            );
 
             let end = self.segment_end(field, generated, body_start);
             let body = &generated[body_start..end.body_end];
@@ -632,7 +711,7 @@ impl ResponseTemplate {
                         // body is how that body's text becomes the answer.
                         break;
                     }
-                    if let Some(name) = caps.name("name") {
+                    if let Some(name) = caps.as_ref().and_then(|c| c.name("name")) {
                         out.tool_calls.push(ParsedToolCall {
                             name: name.as_str().to_owned(),
                             arguments: parse_arguments(tag, body),
@@ -651,6 +730,11 @@ impl ResponseTemplate {
                 advance_past(generated, pos)
             };
             pos = end.resume.max(floor);
+            // Past this point a text channel can open only at the next header.
+            // That is what stops a bare `to=user<|message|>` after a tool block
+            // — which leaves the cursor mid-message by design — from becoming
+            // the answer.
+            arrival = self.next_arrival(generated, pos.min(generated.len()));
         }
 
         out
@@ -936,6 +1020,65 @@ mod tests {
             .parse(" to=self<|message|>think<|start|>assistant to=user<|message|>answer<|eot|>");
         assert_eq!(out.reasoning.as_deref(), Some("think"));
         assert_eq!(out.content.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn tool_channel_prose_cannot_supply_a_content_opener() {
+        // Observed leak, and the one with no malformed byte anywhere in it. The
+        // message is addressed to a tool, so it opens NO text channel — but its
+        // prose contains `to=user<|message|>`, and a gate that only lower-bounds
+        // the search found it there and published the tool channel's payload as
+        // the answer. An opener counts only where the parser ARRIVES at it.
+        let out = spec().parse(" to=wx<|message|>tool prose to=user<|message|>SECRET<|eot|>");
+        assert!(
+            !out.content.as_deref().unwrap_or("").contains("SECRET"),
+            "tool-channel prose must not open the answer channel, got {out:?}"
+        );
+        assert_eq!(out.content, None);
+        assert!(!all_channels(&out).contains("SECRET"), "got {out:?}");
+
+        // The same tool message followed by a REAL anchored answer still parses,
+        // so the assertions above are not passing on a parser that gave up.
+        let ok = spec().parse(
+            " to=wx<|message|>tool prose<|eom|><|start|>assistant to=user<|message|>real<|eot|>",
+        );
+        assert_eq!(ok.content.as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn a_malformed_anchor_is_not_a_message_start() {
+        // Observed leak. `<|start|>assistantX` is not an assistant header, so
+        // nothing after it arrives at a header — distinct from the accepted
+        // residual, where the model emits a COMPLETE valid boundary and there is
+        // genuinely nothing left to distinguish. An anchor matches the protocol
+        // exactly or it is not an anchor.
+        for bad in [
+            " to=self<|message|>thought<|start|>assistantX to=user<|message|>SECRET<|eom|>",
+            // Same class: the header prefix is not the protocol's single space.
+            " to=self<|message|>thought<|start|>assistant  to=user<|message|>SECRET<|eom|>",
+            " to=self<|message|>thought<|start|>assistant JUNK to=user<|message|>SECRET<|eom|>",
+            // And no gap at all: the template's ` to=` always carries its space,
+            // so this header is unemittable too.
+            " to=self<|message|>thought<|start|>assistantto=user<|message|>SECRET<|eom|>",
+        ] {
+            let out = spec().parse(bad);
+            assert!(
+                !out.content.as_deref().unwrap_or("").contains("SECRET"),
+                "a malformed anchor must not open the answer channel: {bad:?} gave {out:?}"
+            );
+            assert_eq!(out.content, None, "{bad:?}");
+            assert!(
+                !all_channels(&out).contains("SECRET"),
+                "{bad:?} gave {out:?}"
+            );
+        }
+
+        // The well-formed header — anchor plus exactly one space — DOES open the
+        // channel, so the loop above is not passing vacuously.
+        let ok = spec()
+            .parse(" to=self<|message|>thought<|start|>assistant to=user<|message|>real<|eom|>");
+        assert_eq!(ok.reasoning.as_deref(), Some("thought"));
+        assert_eq!(ok.content.as_deref(), Some("real"));
     }
 
     #[test]
