@@ -1218,6 +1218,28 @@ impl Qwen3Tokenizer {
                             _ => Ok(default),
                         }
                     }
+                    // Muse-Glimmer's template walks tool-call arguments with
+                    // `args.items()` — the method form. miniJinja ships `items`
+                    // only as the `|items` filter, so without this the render of
+                    // any assistant message carrying `tool_calls` hard-fails.
+                    "items" => {
+                        if !args.is_empty() {
+                            return Err(minijinja::Error::new(
+                                minijinja::ErrorKind::InvalidOperation,
+                                "items takes no arguments",
+                            ));
+                        }
+                        // `try_iter()` on a Map yields its keys in the map's own
+                        // iteration order, which is insertion order because
+                        // miniJinja is built with `preserve_order`. Do NOT sort:
+                        // the emitted parameter order has to match the caller's.
+                        let mut pairs: Vec<minijinja::Value> = Vec::new();
+                        for key in value.try_iter()? {
+                            let val = value.get_item(&key)?;
+                            pairs.push(minijinja::Value::from(vec![key, val]));
+                        }
+                        Ok(minijinja::Value::from(pairs))
+                    }
                     _ => Err(minijinja::Error::new(
                         minijinja::ErrorKind::UnknownMethod,
                         format!("map has no method named {}", method),
@@ -3246,5 +3268,58 @@ mod tests {
         assert_eq!(sanitized[0].is_error, Some(true));
         assert_eq!(sanitized[1].is_error, Some(false));
         assert_eq!(sanitized[2].is_error, None);
+    }
+
+    /// Muse-Glimmer's chat template walks tool-call arguments with
+    /// `{%- for k, v in args.items() -%}` — the *method* form. miniJinja ships
+    /// `items` only as a filter, so without the unknown-method bridge every
+    /// render of an assistant message carrying `tool_calls` hard-fails with
+    /// `map has no method named items`.
+    #[test]
+    fn map_items_method_iterates_in_insertion_order() {
+        let mut env = Environment::new();
+        super::Qwen3Tokenizer::install_template_helpers(&mut env);
+        env.add_template(
+            "t",
+            "{%- for k, v in args.items() -%}{{ k }}={{ v }};{%- endfor -%}",
+        )
+        .unwrap();
+        let out = env
+            .get_template("t")
+            .unwrap()
+            .render(context! {
+                args => minijinja::Value::from_serialize(serde_json::json!({
+                    "zeta": 1, "alpha": 2, "mid": 3
+                })),
+            })
+            .unwrap();
+        // Insertion order, NOT sorted: serde_json and miniJinja are both built
+        // with `preserve_order`, and the ATEM parameter order the template emits
+        // must match the order the caller passed its arguments in.
+        assert_eq!(out, "zeta=1;alpha=2;mid=3;");
+    }
+
+    /// `.items()` must be indistinguishable from `|items` so templates can use
+    /// either spelling interchangeably.
+    #[test]
+    fn map_items_method_and_filter_agree() {
+        let mut env = Environment::new();
+        super::Qwen3Tokenizer::install_template_helpers(&mut env);
+        env.add_template(
+            "m",
+            "{%- for k, _v in args.items() -%}{{ k }}|{%- endfor -%}",
+        )
+        .unwrap();
+        env.add_template("f", "{%- for k, _v in args|items -%}{{ k }}|{%- endfor -%}")
+            .unwrap();
+        let ctx = context! {
+            args => minijinja::Value::from_serialize(serde_json::json!({"b": 1, "a": 2})),
+        };
+        let via_method = env.get_template("m").unwrap().render(&ctx).unwrap();
+        let via_filter = env.get_template("f").unwrap().render(&ctx).unwrap();
+        assert_eq!(via_method, via_filter);
+        // Anchor the shared value too, so the equality above can't pass by both
+        // sides yielding an empty sequence.
+        assert_eq!(via_method, "b|a|");
     }
 }
