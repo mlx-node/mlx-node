@@ -1181,4 +1181,45 @@ mod generation_defaults_tests {
         assert!(d.do_sample.is_none());
         let _ = fs::remove_dir_all(&root);
     }
+
+    /// Pins the Muse-Glimmer-30B checkpoint's declared stop set. Three files in
+    /// that checkpoint disagree about eos and only `generation_config.json` is
+    /// right, so the fixture below is its verbatim body.
+    ///
+    /// * `200001` (`<|end_of_text|>`) is the one id all three sources agree on.
+    /// * `200008` (`<|eot|>`) is the token the chat template emits to end every
+    ///   user-facing turn, yet it appears in NEITHER `tokenizer_config.json`'s
+    ///   `eos_token` NOR `config.json`'s `text_config.eos_token_id` — both of
+    ///   those give `200001` alone. A loader trusting either trap never stops,
+    ///   so every turn runs to `max_tokens`.
+    /// * `200007` (`<|eom|>`) ends a MESSAGE, not a turn: it closes the
+    ///   reasoning block before the answer within one `generate()` call.
+    ///   Admitting it to the stop set would truncate every
+    ///   reasoning-then-answer turn down to just the reasoning.
+    ///
+    /// This pins the parser only. The stop-set WIRING lives in `ChatBackend`
+    /// (`session_eos_id` / `extra_eos_ids`) and lands with M1.
+    #[test]
+    fn muse_glimmer_generation_defaults_declare_both_stops() {
+        let root = write_gen_config(
+            r#"{"bos_token_id":200000,"eos_token_id":[200001,200008],"pad_token_id":200018,"max_length":131072,"do_sample":false}"#,
+        );
+        let d = parse_generation_defaults(&root);
+        assert!(
+            d.eos_token_ids.contains(&200001),
+            "<|end_of_text|> (200001) missing: {:?}",
+            d.eos_token_ids
+        );
+        assert!(
+            d.eos_token_ids.contains(&200008),
+            "<|eot|> (200008) missing — tokenizer_config.json / text_config.eos_token_id trusted instead: {:?}",
+            d.eos_token_ids
+        );
+        assert!(
+            !d.eos_token_ids.contains(&200007),
+            "<|eom|> (200007) must NOT be a stop — it ends a message, not a turn: {:?}",
+            d.eos_token_ids
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 }
