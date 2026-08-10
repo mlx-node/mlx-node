@@ -3,3 +3,4 @@
 
 pub mod config;
 pub mod output_parser;
+pub mod stream_guard;
