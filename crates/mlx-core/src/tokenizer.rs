@@ -239,6 +239,57 @@ pub struct Qwen3Tokenizer {
 const MISSING_CHAT_TEMPLATE_ERROR: &str = "Model-provided chat template not found: expected \
 `chat_template` in tokenizer_config.json or chat_template.jinja next to tokenizer.json";
 
+/// One `(` / `[` / `{` nesting level, while scanning the inside of a Jinja tag
+/// for call keyword arguments whose value is a bare conditional expression.
+/// See [`Qwen3Tokenizer::parenthesize_ternary_call_kwargs`].
+///
+/// Only a `(` that follows a callable expression opens an argument list, and
+/// only there is `ident = value` a keyword argument — miniJinja's `parse_args` is
+/// the single place a kwarg value reaches `parse_expr_noif`. Every other bracket
+/// is a grouping paren, a subscript, or a container literal, all of which accept
+/// a bare ternary and must be left alone.
+struct KwargFrame {
+    /// The byte that closes this level.
+    close: u8,
+    /// True when this level is a call argument list rather than a grouping
+    /// paren / subscript / container literal.
+    is_call: bool,
+    /// Where the current keyword argument's value starts, once `ident =` has been
+    /// seen at this level. `None` for a positional argument.
+    value_start: Option<usize>,
+    /// True when a bare `if` token appeared inside that value AT THIS LEVEL. An
+    /// `if` one level deeper belongs to that level's own frame, which is what
+    /// makes `f(k=(1 if a else 2))` and `f(k=g(1 if a else 2))` no-ops.
+    value_has_if: bool,
+}
+
+impl KwargFrame {
+    /// A bracket that is not a call argument list.
+    fn group(close: u8) -> Self {
+        Self {
+            close,
+            is_call: false,
+            value_start: None,
+            value_has_if: false,
+        }
+    }
+
+    /// The byte range to wrap, when the argument ending at `end` turns out to be
+    /// a keyword argument whose value is a bare ternary. Trailing whitespace is
+    /// excluded so the rewrite disturbs as little as possible.
+    fn pending_span(&self, end: usize, bytes: &[u8]) -> Option<(usize, usize)> {
+        if !self.is_call || !self.value_has_if {
+            return None;
+        }
+        let start = self.value_start?;
+        let mut end = end;
+        while end > start && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        (start < end).then_some((start, end))
+    }
+}
+
 #[napi]
 impl Qwen3Tokenizer {
     /// Load tokenizer from tokenizer.json file
@@ -457,6 +508,305 @@ impl Qwen3Tokenizer {
             LEGACY_GATE,
             "(preserve_thinking or loop.index0 > ns.last_query_index)",
         )
+    }
+
+    /// Parenthesize a call keyword argument whose value is a bare conditional
+    /// expression, so a stock minijinja `Environment` can parse the template.
+    ///
+    /// minijinja parses a kwarg VALUE with `parse_expr_noif`
+    /// (`= parse_or`, `minijinja-2.23.0/src/compiler/parser.rs:671`), which cannot
+    /// consume a trailing `if`. Control returns to the argument loop, which then
+    /// demands `,` or `)`, meets the identifier `if`, and fails — at PARSE time,
+    /// so the whole template dies rather than just the branch that would have run.
+    /// Muse-Glimmer's tool-name fallback is exactly that shape:
+    ///
+    /// ```jinja
+    /// {%- set rns = namespace(name=tcid if tcid else '') -%}
+    /// ```
+    ///
+    /// Python Jinja2 3.1.6 accepts both spellings, so the checkpoint is
+    /// well-formed and the workaround belongs on our side. Wrapping the value in
+    /// parentheses re-enters full `parse_expr` and changes no semantics.
+    ///
+    /// The restriction is general to every call kwarg — plain functions, filters
+    /// and macros alike — and narrow to the *ternary*: a filter inside a kwarg
+    /// value parses fine, which is why Gemma4's
+    /// `namespace(name=follow.get('name') | default('unknown'))` works today. So
+    /// this rewrites by GRAMMAR, not by literal. A `str::replace` of the one known
+    /// literal would corrupt that same text inside a string literal, a
+    /// `{% raw %}` block or a comment, and would miss the next checkpoint that
+    /// writes a ternary kwarg anywhere else.
+    ///
+    /// Regions Jinja renders VERBATIM are skipped wholesale, the same trap
+    /// [`Self::neutralize_generation_tags`] was written to avoid: template text
+    /// outside any tag, `{# ... #}` comments, `{% raw %} ... {% endraw %}` bodies,
+    /// and string literals inside a tag. Only real code inside `{% ... %}` /
+    /// `{{ ... }}` is examined, and a template with no ternary kwarg comes back
+    /// byte-identical because `out` is fed only when a rewrite actually happens.
+    fn parenthesize_ternary_call_kwargs(template: &str) -> String {
+        // Fast path: no `if` anywhere means no conditional expression anywhere.
+        if !template.contains("if") {
+            return template.to_string();
+        }
+        let bytes = template.as_bytes();
+        let mut out = String::with_capacity(template.len());
+        // `last` marks the start of the not-yet-flushed verbatim run, and moves
+        // ONLY on a rewrite, so a template needing no fix is returned byte for
+        // byte. Byte indices are safe: every delimiter we cut on is ASCII, so
+        // each boundary lands on a char boundary of the original UTF-8 string.
+        let mut last = 0usize;
+        let mut i = 0usize;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'{' && bytes[i + 1] == b'#' {
+                // `{# ... #}` comment: never code.
+                i = Self::skip_to_close(bytes, i + 2, b'#', b'}');
+                continue;
+            }
+            if bytes[i] == b'{' && bytes[i + 1] == b'%' {
+                if let Some(raw_consumed) = Self::match_keyword_tag(&bytes[i..], b"raw") {
+                    // A `{% raw %}` body is emitted verbatim, so it is not code.
+                    i = Self::skip_to_endraw(bytes, i + raw_consumed);
+                    continue;
+                }
+                i = Self::rewrite_kwarg_ternaries_in_region(
+                    template, i, b'%', b'}', &mut out, &mut last,
+                );
+                continue;
+            }
+            if bytes[i] == b'{' && bytes[i + 1] == b'{' {
+                i = Self::rewrite_kwarg_ternaries_in_region(
+                    template, i, b'}', b'}', &mut out, &mut last,
+                );
+                continue;
+            }
+            i += 1;
+        }
+        out.push_str(&template[last..]);
+        out
+    }
+
+    /// Rewrite the single code region opening at `open` (a `{%` or `{{`, closed by
+    /// `c0 c1`), and return the index just past it so the caller's scan resumes
+    /// outside. `out`/`last` are advanced only when the region's bytes changed.
+    ///
+    /// Jumping the whole region — rather than walking into it byte by byte — is
+    /// what keeps a `{{ ... }}` written inside a `{% ... %}` string literal from
+    /// being mistaken for a nested region.
+    fn rewrite_kwarg_ternaries_in_region(
+        template: &str,
+        open: usize,
+        c0: u8,
+        c1: u8,
+        out: &mut String,
+        last: &mut usize,
+    ) -> usize {
+        let bytes = template.as_bytes();
+        let body_start = open + 2;
+        let after = Self::skip_to_close(bytes, body_start, c0, c1);
+        // `skip_to_close` yields `bytes.len()` for an unterminated region, which
+        // reads the same as a close sitting at the very end — the bytes decide.
+        // An unterminated tag is a template error minijinja rejects anyway, and we
+        // must not rewrite inside it, so bail to the end of the template.
+        if after < body_start + 2 || bytes[after - 2] != c0 || bytes[after - 1] != c1 {
+            return bytes.len();
+        }
+        let body_end = after - 2;
+        if let Some(rewritten) = Self::parenthesize_kwarg_ternaries(&template[body_start..body_end])
+        {
+            out.push_str(&template[*last..body_start]);
+            out.push_str(&rewritten);
+            *last = body_end;
+        }
+        after
+    }
+
+    /// Wrap every bare-ternary keyword-argument value in `code` (the inside of one
+    /// `{% ... %}` / `{{ ... }}` region) in parentheses. Returns `None` when the
+    /// region needs no change, so the caller keeps the original bytes.
+    fn parenthesize_kwarg_ternaries(code: &str) -> Option<String> {
+        let bytes = code.as_bytes();
+        let mut frames: Vec<KwargFrame> = Vec::new();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                // A string literal is data, not code: `'a if b else c'` is text
+                // and must never be rewritten.
+                q @ (b'\'' | b'"') => {
+                    i = Self::skip_string_literal(bytes, i, q);
+                    continue;
+                }
+                b'(' => frames.push(KwargFrame {
+                    close: b')',
+                    is_call: Self::paren_opens_a_call(bytes, i),
+                    value_start: None,
+                    value_has_if: false,
+                }),
+                b'[' => frames.push(KwargFrame::group(b']')),
+                b'{' => frames.push(KwargFrame::group(b'}')),
+                closer @ (b')' | b']' | b'}') => {
+                    // A closer that does not match is unbalanced template source;
+                    // leave the stack alone so nothing downstream is rewritten.
+                    if frames.last().is_some_and(|frame| frame.close == closer)
+                        && let Some(span) =
+                            frames.pop().and_then(|frame| frame.pending_span(i, bytes))
+                    {
+                        spans.push(span);
+                    }
+                }
+                b',' => {
+                    if let Some(frame) = frames.last_mut() {
+                        if let Some(span) = frame.pending_span(i, bytes) {
+                            spans.push(span);
+                        }
+                        frame.value_start = None;
+                        frame.value_has_if = false;
+                    }
+                }
+                b'=' => {
+                    if Self::starts_kwarg_value(bytes, i)
+                        && let Some(frame) = frames.last_mut()
+                        && frame.is_call
+                        && frame.value_start.is_none()
+                    {
+                        let mut value = i + 1;
+                        while bytes.get(value).is_some_and(u8::is_ascii_whitespace) {
+                            value += 1;
+                        }
+                        frame.value_start = Some(value);
+                    }
+                }
+                b'i' if Self::is_bare_keyword(bytes, i, b"if") => {
+                    if let Some(frame) = frames.last_mut()
+                        && frame.value_start.is_some()
+                    {
+                        frame.value_has_if = true;
+                    }
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+
+        if spans.is_empty() {
+            return None;
+        }
+        let mut inserts: Vec<(usize, char)> = Vec::with_capacity(spans.len() * 2);
+        for (start, end) in spans {
+            inserts.push((start, '('));
+            inserts.push((end, ')'));
+        }
+        // Kwarg values nest (`f(k=g(j=1 if a else 2) if b else 3)`) but never
+        // cross, so splicing by ascending position is well defined; at a shared
+        // position a close is emitted before an open.
+        inserts.sort_by_key(|&(pos, ch)| (pos, u8::from(ch == '(')));
+        let mut out = String::with_capacity(code.len() + inserts.len());
+        let mut cursor = 0usize;
+        for (pos, ch) in inserts {
+            out.push_str(&code[cursor..pos]);
+            out.push(ch);
+            cursor = pos;
+        }
+        out.push_str(&code[cursor..]);
+        Some(out)
+    }
+
+    /// Advance past the string literal opened by `quote` at `at`, honoring `\`
+    /// escapes exactly as minijinja's lexer does. Returns the index just after the
+    /// closing quote, or `bytes.len()` for an unterminated literal (a template
+    /// error minijinja also rejects — treating the remainder as opaque is right,
+    /// because we must not rewrite inside it).
+    fn skip_string_literal(bytes: &[u8], at: usize, quote: u8) -> usize {
+        let mut j = at + 1;
+        while j < bytes.len() {
+            if bytes[j] == b'\\' {
+                j += 2;
+                continue;
+            }
+            if bytes[j] == quote {
+                return j + 1;
+            }
+            j += 1;
+        }
+        bytes.len()
+    }
+
+    /// Is the `=` at `at` the separator of a call keyword argument — `f(k=…)`,
+    /// `f(a, k=…)` — rather than a comparison or part of another operator?
+    ///
+    /// minijinja only takes the kwarg path for an `ast::Expr::Var` immediately
+    /// followed by `Token::Assign` (`parser.rs:671`), so the left side must be a
+    /// bare identifier that STARTS the argument. `f(a.b = 1)` and `{% set x = 1 %}`
+    /// are not keyword arguments and must not be treated as one.
+    fn starts_kwarg_value(bytes: &[u8], at: usize) -> bool {
+        // `==` is a comparison; `!=` / `<=` / `>=` also end in `=`.
+        if bytes.get(at + 1) == Some(&b'=')
+            || at == 0
+            || matches!(bytes[at - 1], b'=' | b'!' | b'<' | b'>')
+        {
+            return false;
+        }
+        let mut p = at;
+        while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        let ident_end = p;
+        while p > 0 && (bytes[p - 1].is_ascii_alphanumeric() || bytes[p - 1] == b'_') {
+            p -= 1;
+        }
+        // Nothing to the left, or a number rather than an identifier.
+        if p == ident_end || bytes[p].is_ascii_digit() {
+            return false;
+        }
+        // The identifier has to OPEN the argument, so the previous non-whitespace
+        // byte is the call's `(` or the `,` that ended the previous argument.
+        while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        p > 0 && matches!(bytes[p - 1], b'(' | b',')
+    }
+
+    /// Does the `(` at `at` open a call argument list?
+    ///
+    /// minijinja's `parse_postfix` turns `(` into a call whenever it follows a
+    /// primary expression, and the lexer has already dropped whitespace, so
+    /// `f (x)` is a call too. Keywords are excluded, because `{% if (a) %}` is a
+    /// grouping paren — a misread there could only matter for an `ident =` inside,
+    /// which is not valid Jinja in that position anyway.
+    fn paren_opens_a_call(bytes: &[u8], at: usize) -> bool {
+        let mut p = at;
+        while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+            p -= 1;
+        }
+        if p == 0 {
+            return false;
+        }
+        // A call can also follow a subscript or another call: `a[0](x)`, `f()(x)`.
+        if matches!(bytes[p - 1], b')' | b']') {
+            return true;
+        }
+        let ident_end = p;
+        while p > 0 && (bytes[p - 1].is_ascii_alphanumeric() || bytes[p - 1] == b'_') {
+            p -= 1;
+        }
+        if p == ident_end {
+            return false;
+        }
+        !matches!(
+            &bytes[p..ident_end],
+            b"if" | b"else" | b"elif" | b"and" | b"or" | b"not" | b"in" | b"is"
+        )
+    }
+
+    /// Does `kw` sit at `at` as a whole token — not as part of a longer
+    /// identifier? `x_if_y` and `notif` must not read as the keyword `if`.
+    fn is_bare_keyword(bytes: &[u8], at: usize, kw: &[u8]) -> bool {
+        let ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        bytes[at..].starts_with(kw)
+            && (at == 0 || !ident_byte(bytes[at - 1]))
+            && bytes.get(at + kw.len()).is_none_or(|b| !ident_byte(*b))
     }
 
     /// Advance past a two-byte close delimiter (`c0 c1`, e.g. `}}` or `#}`)
@@ -1399,6 +1749,11 @@ impl Qwen3Tokenizer {
         // mark assistant-generated token spans for training masks).
         let template_str = Self::enable_legacy_preserve_thinking(template_str);
         let template_str = Self::neutralize_generation_tags(&template_str);
+        // Parenthesize any call kwarg whose value is a bare ternary — minijinja
+        // parses that value with `parse_expr_noif` and hard-fails at PARSE time,
+        // where Python Jinja2 accepts it. Muse-Glimmer's tool-name fallback is one,
+        // so without this NO Muse-Glimmer prompt renders at all.
+        let template_str = Self::parenthesize_ternary_call_kwargs(&template_str);
 
         env.add_template("chat", &template_str)
             .map_err(|e| format!("Template parse error: {}", e))?;
@@ -2975,6 +3330,356 @@ mod tests {
             expected,
             "real top-level generation tags must still be neutralized; raw body preserved",
         );
+    }
+
+    /// The defect, then the fix, on the smallest template that shows it: a call
+    /// keyword argument whose value is a bare ternary is a minijinja PARSE error,
+    /// so the whole template dies before any statement runs. Asserting the raw
+    /// form really does fail is what keeps the rest of this test non-vacuous.
+    #[test]
+    fn ternary_call_kwarg_is_a_parse_error_until_it_is_parenthesized() {
+        let raw = "{% set n = namespace(name=a if a else '') %}";
+
+        let mut env = Environment::new();
+        let err = env
+            .add_template("raw", raw)
+            .expect_err("minijinja must reject a bare ternary as a kwarg value");
+        assert_eq!(err.kind(), minijinja::ErrorKind::SyntaxError, "got: {err}");
+
+        // The transform's output is the parenthesized spelling, and nothing else
+        // moves — including the whitespace-control dashes.
+        assert_eq!(
+            Qwen3Tokenizer::parenthesize_ternary_call_kwargs(raw),
+            "{% set n = namespace(name=(a if a else '')) %}",
+        );
+        assert_eq!(
+            Qwen3Tokenizer::parenthesize_ternary_call_kwargs(
+                "{%- set n = namespace(name=a if a else '') -%}"
+            ),
+            "{%- set n = namespace(name=(a if a else '')) -%}",
+        );
+
+        // And the parenthesized form parses.
+        let mut env = Environment::new();
+        env.add_template(
+            "fixed",
+            &Qwen3Tokenizer::parenthesize_ternary_call_kwargs(raw),
+        )
+        .expect("the parenthesized spelling must parse");
+    }
+
+    /// End-to-end through the production entry point, which is where the transform
+    /// is actually installed: the ternary still SELECTS, so this pins semantics as
+    /// well as parseability. Both arms are exercised, because a transform that
+    /// dropped the conditional entirely would satisfy only one.
+    #[test]
+    fn ternary_call_kwarg_renders_and_still_chooses_both_arms() {
+        let template = "{%- set n = namespace(name=messages[0].content if messages[0].content \
+                        else 'FALLBACK') -%}{{ n.name }}";
+        for (content, expected) in [("hi", "hi"), ("", "FALLBACK")] {
+            let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+                template,
+                &[user_msg(content, 0)],
+                None,
+                false,
+                None,
+                "<bos>",
+                "<eos>",
+            )
+            .unwrap_or_else(|e| panic!("ternary kwarg template must render: {e}"));
+            assert_eq!(rendered, expected, "content {content:?}");
+        }
+    }
+
+    /// Grammar, not literal. The pattern is general to every call kwarg —
+    /// functions, filters and macro calls — and narrow to the ternary, so the
+    /// transform has to fire on all of the first group and none of the second.
+    #[test]
+    fn ternary_call_kwarg_transform_follows_the_grammar() {
+        // FIRES: any call's kwarg value.
+        let rewritten = [
+            (
+                "{{ range(start=1 if a else 2) }}",
+                "{{ range(start=(1 if a else 2)) }}",
+            ),
+            (
+                "{{ [1,2] | join(d=',' if a else '.') }}",
+                "{{ [1,2] | join(d=(',' if a else '.')) }}",
+            ),
+            ("{{ m(k=1 if a else 2) }}", "{{ m(k=(1 if a else 2)) }}"),
+            // Second and later arguments, and more than one on the same call.
+            (
+                "{{ f(a, k=1 if b else 2) }}",
+                "{{ f(a, k=(1 if b else 2)) }}",
+            ),
+            (
+                "{{ f(k=1 if b else 2, j=3 if c else 4) }}",
+                "{{ f(k=(1 if b else 2), j=(3 if c else 4)) }}",
+            ),
+            // A ternary with no `else` is the same parse error.
+            ("{{ f(k=1 if b) }}", "{{ f(k=(1 if b)) }}"),
+            // Trailing whitespace inside the argument stays outside the parens.
+            ("{{ f(k=1 if b else 2 ) }}", "{{ f(k=(1 if b else 2) ) }}"),
+            // Nested: both the inner kwarg and the outer one need wrapping.
+            (
+                "{{ f(k=g(j=1 if a else 2) if b else 3) }}",
+                "{{ f(k=(g(j=(1 if a else 2)) if b else 3)) }}",
+            ),
+        ];
+        for (input, expected) in rewritten {
+            assert_eq!(
+                Qwen3Tokenizer::parenthesize_ternary_call_kwargs(input),
+                expected,
+                "`{input}` must be parenthesized",
+            );
+        }
+
+        // DOES NOT FIRE: minijinja parses all of these today, so touching them
+        // would be a gratuitous prompt change. Verified against the engine below.
+        let untouched = [
+            // Positional arguments reach full `parse_expr`.
+            "{{ f(1 if a else 2) }}",
+            // A plain `{% set %}` is not a call at all.
+            "{% set x = 1 if a else 2 %}",
+            "{%- set fn = tool.function if tool.function is defined else tool -%}",
+            // Container literals accept a bare ternary.
+            "{% set d = {'k': 1 if a else 2} %}",
+            "{% set l = [1 if a else 2] %}",
+            // Already parenthesized.
+            "{{ f(k=(1 if a else 2)) }}",
+            // A filter in a kwarg value is fine — this is Gemma4's shape.
+            "{%- set ns = namespace(name=follow.get('name') | default('unknown')) -%}",
+            // `==` is not an assignment, and neither is a grouping paren after a
+            // keyword.
+            "{%- set t = '<|eom|>' if (not loop.last and m[i + 1]['role'] == role) else '<|eot|>' -%}",
+            // `if` inside a longer identifier is not the keyword.
+            "{{ f(k=notif_value) }}",
+            "{{ f(k=x_if_y) }}",
+        ];
+        for input in untouched {
+            assert_eq!(
+                Qwen3Tokenizer::parenthesize_ternary_call_kwargs(input),
+                input,
+                "`{input}` must be left byte-identical",
+            );
+            let mut env = Environment::new();
+            env.add_template("t", input).unwrap_or_else(|e| {
+                panic!("`{input}` was expected to parse as-is, so leaving it alone is correct: {e}")
+            });
+        }
+    }
+
+    /// The checkpoint's own offending fragment, verbatim. Every region case below
+    /// uses THIS text, because it is the one a fixture-specific `str::replace`
+    /// would rewrite: a literal replace passes a region test written with any other
+    /// spelling, so these cases would not catch it.
+    const MUSE_TERNARY_KWARG: &str = "namespace(name=tcid if tcid else '')";
+
+    /// Region awareness, mirroring [`neutralize_generation_tags_is_region_aware`]:
+    /// a ternary kwarg that appears as *text* rather than as code is rendered
+    /// verbatim by Jinja, so rewriting it would change the output bytes. One case
+    /// per region, each asserted byte-identical.
+    #[test]
+    fn parenthesize_ternary_call_kwargs_is_region_aware() {
+        // 1. Inside a `{{ ... }}` expression's string literal: PRESERVED.
+        let in_string = format!(r#"{{{{ "{MUSE_TERNARY_KWARG}" }}}}"#);
+        assert_eq!(
+            Qwen3Tokenizer::parenthesize_ternary_call_kwargs(&in_string),
+            in_string,
+            "a ternary kwarg inside a string literal is data, not code",
+        );
+        // 1b. Single-quoted, and with an escaped quote inside the literal.
+        let single = r#"{% set s = 'f(k=1 if a else 2)' %}"#;
+        assert_eq!(
+            Qwen3Tokenizer::parenthesize_ternary_call_kwargs(single),
+            single,
+        );
+        let escaped = r#"{% set s = 'it\'s f(k=1 if a else 2)' %}"#;
+        assert_eq!(
+            Qwen3Tokenizer::parenthesize_ternary_call_kwargs(escaped),
+            escaped,
+        );
+
+        // 2. Inside a `{% raw %} ... {% endraw %}` block: PRESERVED.
+        let raw = format!("{{% raw %}}{{%- set rns = {MUSE_TERNARY_KWARG} -%}}{{% endraw %}}");
+        assert_eq!(
+            Qwen3Tokenizer::parenthesize_ternary_call_kwargs(&raw),
+            raw,
+            "a {{% raw %}} body is emitted verbatim",
+        );
+        let raw_dash = format!("{{%- raw -%}}{{{{ {MUSE_TERNARY_KWARG} }}}}{{%- endraw -%}}");
+        assert_eq!(
+            Qwen3Tokenizer::parenthesize_ternary_call_kwargs(&raw_dash),
+            raw_dash,
+        );
+
+        // 3. Inside a `{# ... #}` comment: PRESERVED.
+        let comment = format!("{{# {{%- set rns = {MUSE_TERNARY_KWARG} -%}} #}}");
+        assert_eq!(
+            Qwen3Tokenizer::parenthesize_ternary_call_kwargs(&comment),
+            comment,
+            "a comment is not code",
+        );
+
+        // 4. Plain template text outside any tag: PRESERVED.
+        let text = format!("write it as {MUSE_TERNARY_KWARG} in your own template");
+        assert_eq!(
+            Qwen3Tokenizer::parenthesize_ternary_call_kwargs(&text),
+            text,
+            "text outside a tag is literal output",
+        );
+
+        // 5. A REAL kwarg ternary outside every skip region is still fixed, even
+        // when a skip region precedes it in the same template.
+        let mixed = concat!(
+            "{% raw %}{{ f(k=1 if a else 2) }}{% endraw %}",
+            "{# {{ f(k=1 if a else 2) }} #}",
+            r#"{{ "f(k=1 if a else 2)" }}"#,
+            "{{ f(k=1 if a else 2) }}",
+        );
+        let expected = concat!(
+            "{% raw %}{{ f(k=1 if a else 2) }}{% endraw %}",
+            "{# {{ f(k=1 if a else 2) }} #}",
+            r#"{{ "f(k=1 if a else 2)" }}"#,
+            "{{ f(k=(1 if a else 2)) }}",
+        );
+        assert_eq!(
+            Qwen3Tokenizer::parenthesize_ternary_call_kwargs(mixed),
+            expected,
+            "real code must still be fixed; verbatim regions preserved",
+        );
+    }
+
+    /// The no-op proof, at the granularity that matters: every template shipped as
+    /// a fixture in this file, plus the two other preprocessors' own outputs, must
+    /// survive byte-identically. A transform that is not the identity here would
+    /// silently move some other family's prompt.
+    #[test]
+    fn parenthesize_ternary_call_kwargs_is_identity_without_a_ternary_kwarg() {
+        let untouched = [
+            "",
+            "hi",
+            "{{ messages[0].content }}",
+            "{%- for m in messages -%}{{ m.role }}{%- endfor -%}",
+            // `neutralize_generation_tags`' replacement text: an `=` at statement
+            // level, with no enclosing call.
+            "{% set __hf_generation_noop = true %}",
+            // `enable_legacy_preserve_thinking`' replacement text.
+            "{%- if (preserve_thinking or loop.index0 > ns.last_query_index) -%}x{%- endif -%}",
+            DEFINEDNESS_PROBE_TEMPLATE,
+            // Unterminated regions are template errors minijinja rejects; we must
+            // not rewrite inside them either.
+            "{% set n = namespace(name=a if a else '')",
+            "{{ f(k=1 if a else 2)",
+            "{# unterminated",
+            "{% raw %}{{ f(k=1 if a else 2) }}",
+        ];
+        for input in untouched {
+            assert_eq!(
+                Qwen3Tokenizer::parenthesize_ternary_call_kwargs(input),
+                input,
+                "`{input}` must be byte-identical",
+            );
+        }
+    }
+
+    /// Directly assert that the real checkpoint's template PARSES, so a parse
+    /// regression names itself instead of surfacing as ten failing goldens.
+    #[test]
+    #[ignore = "requires the local Muse-Glimmer checkpoint; set MLX_TEST_MUSE_GLIMMER_MODEL_PATH and run with --ignored"]
+    fn muse_glimmer_checkpoint_template_parses_after_the_ternary_kwarg_fix() {
+        let Ok(dir) = std::env::var("MLX_TEST_MUSE_GLIMMER_MODEL_PATH") else {
+            panic!("set MLX_TEST_MUSE_GLIMMER_MODEL_PATH to the Muse-Glimmer checkpoint directory");
+        };
+        let path = Path::new(&dir).join("chat_template.jinja");
+        let template = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        // Verbatim, the checkpoint does not parse — this is the defect, and it is
+        // also what proves the assertion below is not vacuous.
+        let mut env = Environment::new();
+        Qwen3Tokenizer::install_template_helpers(&mut env);
+        let err = env
+            .add_template("verbatim", &template)
+            .expect_err("the checkpoint's template must still be the one with the ternary kwarg");
+        assert_eq!(err.kind(), minijinja::ErrorKind::SyntaxError, "got: {err}");
+
+        let fixed = Qwen3Tokenizer::parenthesize_ternary_call_kwargs(&template);
+        assert_ne!(
+            fixed, template,
+            "the transform must have rewritten something"
+        );
+        let mut env = Environment::new();
+        Qwen3Tokenizer::install_template_helpers(&mut env);
+        env.add_template("fixed", &fixed)
+            .expect("the checkpoint's template must parse after the fix");
+    }
+
+    /// THE BLAST-RADIUS GATE. Every other installed chat template must come back
+    /// byte-identical: this transform runs on every family's template, so a
+    /// too-broad rewrite would silently move some other model's prompt. Opt in with
+    /// `MLX_TEST_MODEL_CACHE_DIR=/path/to/.cache/models cargo test -p mlx-core
+    /// --lib -- ternary_kwarg_transform --ignored`.
+    ///
+    /// Muse-Glimmer's own template is identified by its ATEM surface rather than by
+    /// a directory name, so the gate keeps working when the checkpoint is renamed
+    /// or re-quantized. If any OTHER template changes, that is the signal to stop:
+    /// the transform is too broad.
+    #[test]
+    #[ignore = "requires a local model cache; set MLX_TEST_MODEL_CACHE_DIR and run with --ignored"]
+    fn ternary_kwarg_transform_is_byte_identity_on_every_other_installed_template() {
+        let Ok(root) = std::env::var("MLX_TEST_MODEL_CACHE_DIR") else {
+            panic!("set MLX_TEST_MODEL_CACHE_DIR to the directory holding checkpoint directories");
+        };
+        let entries = std::fs::read_dir(&root).unwrap_or_else(|e| panic!("read_dir {root}: {e}"));
+
+        let mut seen = 0usize;
+        let mut atem = 0usize;
+        let mut changed: Vec<String> = Vec::new();
+        for entry in entries.flatten() {
+            let template_path = entry.path().join("chat_template.jinja");
+            let Ok(template) = std::fs::read_to_string(&template_path) else {
+                continue;
+            };
+            seen += 1;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_atem =
+                template.contains("<atem:function_calls>") && template.contains("<|patch|>");
+            if is_atem {
+                atem += 1;
+            }
+            let transformed = Qwen3Tokenizer::parenthesize_ternary_call_kwargs(&template);
+            if transformed == template {
+                continue;
+            }
+            assert!(
+                is_atem,
+                "the transform rewrote a NON-Muse-Glimmer template ({name}) — it is too broad, \
+                 and shipping it would move that family's prompt. First diff at byte {}",
+                transformed
+                    .as_bytes()
+                    .iter()
+                    .zip(template.as_bytes())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(template.len()),
+            );
+            changed.push(name);
+        }
+
+        // A cache directory with nothing in it would pass every assertion above
+        // while proving nothing.
+        assert!(
+            seen >= 2,
+            "only {seen} chat template(s) found under {root} — this gate needs the real cache",
+        );
+        assert_eq!(
+            changed.len(),
+            atem,
+            "every Muse-Glimmer template must be rewritten and no other: {atem} ATEM \
+             template(s) present, {} rewritten ({changed:?})",
+            changed.len(),
+        );
+        eprintln!("scanned {seen} templates, {atem} ATEM, rewrote {changed:?}");
     }
 
     /// Finding B end-to-end: a template that emits literal `{% generation %}`
