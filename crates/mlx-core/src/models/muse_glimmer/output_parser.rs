@@ -38,6 +38,22 @@
 //! is an action only in a tool-channel message, and everywhere else it stays in
 //! the text it was written in.
 //!
+//! # Two kinds of evidence, and the difference between them
+//!
+//! Wherever this parser was wrong, it had taken a signal as evidence of
+//! something stronger than the signal actually means. Two states exist here
+//! *because* collapsing them executed calls the model never made:
+//!
+//! - [`Arrival::terminated`] — a `start_anchor` in the middle of a message that
+//!   never terminated proves only that the BYTES appeared, not that a message
+//!   ended. A model explaining the wire format writes exactly those bytes.
+//! - [`Message::Tool`]'s `recipient` — the template renders `to=<name>` and
+//!   `<atem:invoke name="<name>">` from the same string, so an invoke that
+//!   disagrees with its recipient is not output the protocol renders. Reading
+//!   only the invoke name discards the one signal that says so, and a dispatcher
+//!   checking its registry cannot get it back: the danger is `rm` under
+//!   `to=explain`, where `rm` is legitimately declared.
+//!
 //! Every failure guarded here was observed rather than imagined:
 //! `a_reasoning_segment_cannot_forge_a_content_segment`,
 //! `a_later_reasoning_message_cannot_be_absorbed_into_an_unclosed_answer`,
@@ -45,8 +61,11 @@
 //! `a_tool_invoke_whose_close_follows_a_new_message_is_not_trusted`,
 //! `a_bare_channel_opener_after_a_tool_block_is_not_a_new_message`,
 //! `tool_channel_prose_cannot_supply_a_content_opener`,
-//! `a_malformed_anchor_is_not_a_message_start`, and
-//! `an_atem_block_is_an_action_only_in_a_tool_channel_message`.
+//! `a_malformed_anchor_is_not_a_message_start`,
+//! `an_atem_block_is_an_action_only_in_a_tool_channel_message`,
+//! `a_quoted_tool_header_in_a_text_message_is_not_a_call`,
+//! `a_tool_header_no_message_terminated_before_is_not_a_call`, and
+//! `an_invoke_name_must_equal_its_recipient`.
 
 use napi::bindgen_prelude::*;
 use regex::{Regex, RegexBuilder};
@@ -219,6 +238,19 @@ pub struct ResponseTemplate {
     /// key is pinned against the real file.
     #[cfg_attr(not(test), expect(dead_code))]
     tool_call_transform: Option<serde_json::Value>,
+    /// The protocol's MESSAGE terminators: the `text` fields' close markers,
+    /// unioned and deduplicated (`<|eom|>`, `<|eot|>`).
+    ///
+    /// Derived, not hardcoded. `chat_template.jinja` ends every assistant message
+    /// with `<|eot|>` or `<|eom|>` whatever its recipient, and those two are
+    /// exactly what `reasoning_content.close` and `content.close` list. The tool
+    /// field's `</atem:invoke>` is deliberately excluded — it closes a BLOCK
+    /// inside a message, not the message — and a tool message that omits its
+    /// terminator is therefore not one this parser will act after.
+    ///
+    /// This is what [`Arrival::terminated`] is computed from, i.e. what separates
+    /// "a message ended here" from "these bytes appeared here".
+    terminators: Vec<String>,
     /// Order is `reasoning_content`, `content`, `tool_calls` — the scan picks
     /// the earliest match regardless, so this only breaks positional ties.
     fields: Vec<CompiledField>,
@@ -274,6 +306,17 @@ fn check_close(field: &str, close: &[String]) -> Result<()> {
         return Err(Error::from_reason(format!(
             "muse_glimmer: response_template field {field:?} lists no close marker; every \
              segment would run to end of input"
+        )));
+    }
+    // An empty marker is found at every position, so it would close each segment
+    // where it began — and because the `text` fields' close markers ARE the
+    // message-terminator set (see `ResponseTemplate::terminators`), it would also
+    // make every byte in the generation look like the end of a message.
+    if close.iter().any(String::is_empty) {
+        return Err(Error::from_reason(format!(
+            "muse_glimmer: response_template field {field:?} lists an empty close marker; it \
+             matches at every position, so no segment and no message could ever be said to have \
+             ended"
         )));
     }
     Ok(())
@@ -477,16 +520,55 @@ const RECIPIENT_PREFIX: &str = "to=";
 const MESSAGE_MARKER: &str = "<|message|>";
 
 /// What the message at a header is, once its recipient has been read.
-enum Message<'f> {
+enum Message<'a> {
     /// Recipient `self` or `user`: one text segment. An ATEM block inside it is
     /// prose a human was meant to read, not an action.
     Text {
-        field: &'f CompiledField,
+        field: &'a CompiledField,
         body_start: usize,
     },
     /// Any other recipient: a tool channel, and the ONLY place the protocol puts
     /// an ATEM block that means something.
-    Tool { body_start: usize },
+    ///
+    /// The recipient is CARRIED, not just used to reach this arm. It is the tool
+    /// function name the template built the header from, and every invoke in the
+    /// body has to be named exactly that — see
+    /// [`ResponseTemplate::collect_tool_calls`]. Reading the body without it is
+    /// how `<atem:invoke name="rm">` under `to=explain` became a real `rm`.
+    Tool {
+        recipient: &'a str,
+        body_start: usize,
+    },
+}
+
+/// A message header the parser has ARRIVED at, plus what the grammar says about
+/// how it got there.
+#[derive(Debug, Clone, Copy)]
+struct Arrival {
+    /// Byte offset of the header: just past a `start_anchor`, or 0.
+    at: usize,
+    /// Whether a message really ENDED before this header.
+    ///
+    /// True at byte 0 — the prompt emitted `<|start|>assistant` itself, so that
+    /// boundary is the prompt's and not something the model could have written —
+    /// and true for a `start_anchor` that begins exactly where one of
+    /// [`ResponseTemplate::terminators`] ends. False otherwise.
+    ///
+    /// The difference is the whole point. An anchor inside a message that never
+    /// terminated is not a message boundary; it is a model writing out the wire
+    /// syntax, which is a thing models do when asked how tools work. Treating it
+    /// as a boundary truncated the text the user was owed AND handed the quoted
+    /// call to the dispatcher.
+    terminated: bool,
+}
+
+impl Arrival {
+    /// The first header of a generated turn. Terminated by construction: the
+    /// prompt's own `<|start|>assistant` precedes byte 0.
+    const START: Self = Self {
+        at: 0,
+        terminated: true,
+    };
 }
 
 /// Match a `text` field's `open_pattern` ANCHORED at a message header.
@@ -570,10 +652,26 @@ impl ResponseTemplate {
             compile_tool_field(raw.fields.tool_calls)?,
         ];
 
+        // The message-terminator set, read off the spec: every `text` field's
+        // close markers, in field order, deduplicated. Non-empty because each
+        // field's list is non-empty and every marker in it is non-empty, both
+        // checked by `check_close`.
+        let mut terminators: Vec<String> = Vec::new();
+        for marker in fields
+            .iter()
+            .filter(|f| !matches!(f.sink, Sink::ToolCalls { .. }))
+            .flat_map(|f| f.close.iter())
+        {
+            if !terminators.iter().any(|t| t == marker) {
+                terminators.push(marker.clone());
+            }
+        }
+
         Ok(Self {
             default_role: raw.defaults.role,
             start_anchor: raw.start_anchor,
             tool_call_transform: transform,
+            terminators,
             fields,
         })
     }
@@ -604,18 +702,37 @@ impl ResponseTemplate {
             .map(|i| from + i)
     }
 
-    /// Offset where the next message's header begins: just past the next
-    /// `start_anchor` at or after `from`, or `None` when none follows.
+    /// Does one of the protocol's message terminators end exactly at `pos`?
     ///
-    /// Strictly greater than `from`, because an empty `start_anchor` is refused
-    /// at construction. That is what makes the scan terminate.
-    fn next_arrival(&self, text: &str, from: usize) -> Option<usize> {
-        self.next_anchor(text, from)
-            .map(|i| i + self.start_anchor.len())
+    /// The one question that separates "a message ended here" from "these bytes
+    /// appeared here". See [`Self::terminators`].
+    fn terminator_ends_at(&self, text: &str, pos: usize) -> bool {
+        debug_assert!(text.is_char_boundary(pos));
+        self.terminators
+            .iter()
+            .any(|t| text[..pos].ends_with(t.as_str()))
     }
 
-    /// End of a well-formed header at `arrival` whose recipient no `text` field
-    /// claims — i.e. a TOOL channel. Returns where the message body starts.
+    /// The arrival the `start_anchor` beginning at `anchor` leads to.
+    fn arrival_after(&self, text: &str, anchor: usize) -> Arrival {
+        Arrival {
+            at: anchor + self.start_anchor.len(),
+            terminated: self.terminator_ends_at(text, anchor),
+        }
+    }
+
+    /// The next header at or after `from`, or `None` when no anchor follows.
+    ///
+    /// Its offset is strictly greater than the anchor's, because an empty
+    /// `start_anchor` is refused at construction. That is what makes the walk
+    /// terminate.
+    fn next_arrival(&self, text: &str, from: usize) -> Option<Arrival> {
+        self.next_anchor(text, from)
+            .map(|anchor| self.arrival_after(text, anchor))
+    }
+
+    /// A well-formed header at `at` whose recipient no `text` field claims — i.e.
+    /// a TOOL channel. Returns `(recipient, body_start)`.
     ///
     /// `None` when the bytes are not a header at all, which is deliberately NOT
     /// the same answer as "tool channel": a malformed header opens nothing, so an
@@ -624,15 +741,15 @@ impl ResponseTemplate {
     /// The recipient must be non-empty, carry no whitespace, and not span a
     /// message boundary. The template builds it from a tool function name, so
     /// anything else is not a header the model was trained to emit.
-    fn tool_header_end(&self, text: &str, arrival: usize) -> Option<usize> {
-        if arrival > text.len() {
+    fn tool_header_at<'a>(&self, text: &'a str, at: usize) -> Option<(&'a str, usize)> {
+        if at > text.len() {
             return None;
         }
-        for prefix in header_prefixes(arrival) {
-            if !text[arrival..].starts_with(prefix) {
+        for prefix in header_prefixes(at) {
+            if !text[at..].starts_with(prefix) {
                 continue;
             }
-            let after_prefix = arrival + prefix.len();
+            let after_prefix = at + prefix.len();
             let Some(rest) = text[after_prefix..].strip_prefix(RECIPIENT_PREFIX) else {
                 continue;
             };
@@ -646,42 +763,91 @@ impl ResponseTemplate {
             {
                 continue;
             }
-            return Some(after_prefix + RECIPIENT_PREFIX.len() + i + MESSAGE_MARKER.len());
+            let body_start = after_prefix + RECIPIENT_PREFIX.len() + i + MESSAGE_MARKER.len();
+            return Some((recipient, body_start));
         }
         None
     }
 
-    /// Classify the message whose header begins at `header`.
+    /// What the bytes at header offset `at` are, per the protocol's grammar.
     ///
     /// A text channel wins outright: the spec's own `open_pattern`s name `self`
     /// and `user`, so whatever they match is by definition not a tool. Only when
-    /// neither matches is the generic header grammar consulted, and only a
-    /// well-formed one yields a tool channel.
-    fn message_at(&self, text: &str, header: usize) -> Option<Message<'_>> {
+    /// neither matches is the generic header grammar consulted.
+    ///
+    /// TRUST IS NOT APPLIED HERE, deliberately. Both callers need to know a tool
+    /// header is *present* even when they must refuse it, and "a tool header we do
+    /// not trust" and "not a header at all" need different answers in both:
+    /// [`Self::parse`] refuses to act on the first and skips both, while
+    /// [`Self::next_message_boundary`] ends a segment at the second but not at the
+    /// first. Folding the gate in here is what would force the two cases together
+    /// again.
+    fn header_at<'a>(&'a self, text: &'a str, at: usize) -> Option<Message<'a>> {
         let text_open = self
             .fields
             .iter()
             .filter(|f| !matches!(f.sink, Sink::ToolCalls { .. }))
-            .filter_map(|f| anchored_text_open(f, text, header).map(|(_, body)| (f, body)))
+            .filter_map(|f| anchored_text_open(f, text, at).map(|(_, body)| (f, body)))
             .min_by_key(|(_, body)| *body);
         if let Some((field, body_start)) = text_open {
             return Some(Message::Text { field, body_start });
         }
-        self.tool_header_end(text, header)
-            .map(|body_start| Message::Tool { body_start })
+        self.tool_header_at(text, at)
+            .map(|(recipient, body_start)| Message::Tool {
+                recipient,
+                body_start,
+            })
+    }
+
+    /// The next `start_anchor` at or after `from` that a real message follows —
+    /// i.e. the next place a text segment must stop.
+    ///
+    /// Not every anchor is a boundary. A tool header that no message terminator
+    /// precedes is the model quoting the wire syntax inside its own message: it is
+    /// text, so it neither ends this segment nor becomes a call, and the bytes stay
+    /// in the channel they were written in. That is the whole of
+    /// `a_quoted_tool_header_in_a_text_message_is_not_a_call`, and skipping it here
+    /// is what "keep the bytes as text" means — `parse` refusing to act on the
+    /// header would otherwise still have truncated the answer at it.
+    ///
+    /// Everything else does end the segment:
+    ///
+    /// - a `text` header — genuine, or the accepted `to=user`-inside-reasoning
+    ///   ambiguity, which is indistinguishable and out of scope;
+    /// - a tool header a terminator DID precede — a real message, and the reason
+    ///   `to=self<|message|>think<|eot|>` followed by a tool call still works even
+    ///   though `<|eot|>` is not in `reasoning_content.close`;
+    /// - bytes that are no header at all — the grammar is broken there either way,
+    ///   and running a segment through it republishes whatever follows, which is
+    ///   `a_malformed_anchor_is_not_a_message_start`.
+    fn next_message_boundary(&self, text: &str, from: usize) -> Option<usize> {
+        let mut from = from;
+        while let Some(anchor) = self.next_anchor(text, from) {
+            let arrival = self.arrival_after(text, anchor);
+            match self.header_at(text, arrival.at) {
+                // Quoted wire syntax. Keep scanning — and `arrival.at` is past a
+                // non-empty anchor, so this advances.
+                Some(Message::Tool { .. }) if !arrival.terminated => from = arrival.at,
+                _ => return Some(anchor),
+            }
+        }
+        None
     }
 
     /// Where a text segment that starts at `body_start` ends. The earliest of
     /// three things wins, and only the third runs to the end of the input:
     ///
     /// 1. one of the field's own `close` markers — properly terminated;
-    /// 2. the next `start_anchor` — a new message began, so this one never
-    ///    closed;
+    /// 2. the next MESSAGE BOUNDARY — a new message began, so this one never
+    ///    closed. Not merely the next `start_anchor`: see
+    ///    [`Self::next_message_boundary`], because an anchor the model quoted is
+    ///    not a message beginning and truncating the answer at it is a bug, not
+    ///    caution;
     /// 3. end of input — truncated by `max_tokens`, and reachable only when
     ///    neither 1 nor 2 follows the body.
     fn segment_end(&self, field: &CompiledField, text: &str, body_start: usize) -> SegmentEnd {
         let close = field.earliest_close(text, body_start);
-        let anchor = self.next_anchor(text, body_start);
+        let anchor = self.next_message_boundary(text, body_start);
         match (close, anchor) {
             // Ties go to the close: a properly terminated segment stays one.
             (Some((marker, end)), Some(a)) if marker <= a => SegmentEnd::closed(marker, end),
@@ -691,17 +857,44 @@ impl ResponseTemplate {
         }
     }
 
-    /// Read every ATEM block in a tool-channel message body.
+    /// Read every ATEM block in a tool-channel message body, for the message
+    /// addressed to `recipient`.
+    ///
+    /// **Every accepted invoke must be named exactly `recipient`.**
+    /// `chat_template.jinja` renders one call per message as `'<|start|>assistant
+    /// to=' + tc.function.name + '<|message|>'` followed by `render_atem(tc)`,
+    /// which writes `<atem:invoke name="' + tc.function.name + '">` — the same
+    /// string twice. So equality is fidelity to the checkpoint, not a restriction
+    /// added on top of it. `repeats` permits repeated invokes and repeated
+    /// messages; it does not permit a different name underneath one recipient.
+    ///
+    /// A mismatch stops this body rather than skipping one invoke. Keeping the
+    /// invokes that agree and dropping the rest would be cherry-picking a body the
+    /// protocol never renders, and the shape that matters is exactly that:
+    /// `<atem:invoke name="rm">` under `to=explain`, where `rm` is a legitimately
+    /// declared tool, so a dispatcher validating the emitted call against its
+    /// registry sees nothing wrong. The disagreeing recipient is the only signal
+    /// there is, and it exists only here.
     ///
     /// The message runs to the next `start_anchor` or end of input, and BOTH the
     /// opener and its close must lie inside that extent: a `</atem:invoke>`
     /// belonging to a later message closes nothing, which is what stops that
-    /// message's text from being posted into a tool argument.
+    /// message's text from being posted into a tool argument. The extent uses the
+    /// raw anchor, not [`Self::next_message_boundary`] — for a body headed for a
+    /// tool, any anchor at all is reason enough to distrust the span, whereas for
+    /// a text segment the boundary decides where the user's own answer stops and
+    /// cutting it short has its own cost.
     ///
     /// An invoke with no close inside the extent is dropped and reading this body
     /// stops — there is no structure left in it. The caller still moves on to the
     /// next validated header, so an answer that follows survives.
-    fn collect_tool_calls(&self, text: &str, body_start: usize, into: &mut Vec<ParsedToolCall>) {
+    fn collect_tool_calls(
+        &self,
+        text: &str,
+        recipient: &str,
+        body_start: usize,
+        into: &mut Vec<ParsedToolCall>,
+    ) {
         let Some((field, tag)) = self.fields.iter().find_map(|f| match &f.sink {
             Sink::ToolCalls { tag } => Some((f, tag)),
             _ => None,
@@ -718,15 +911,21 @@ impl ResponseTemplate {
             let Some(whole) = caps.get(0) else {
                 break;
             };
+            // `require_group` proved the group exists at construction; a match
+            // that somehow lacks it is a body this parser cannot vouch for.
+            let Some(name) = caps.name("name") else {
+                break;
+            };
+            if name.as_str() != recipient {
+                break;
+            }
             let Some((close_start, close_end)) = field.earliest_close(body, whole.end()) else {
                 break;
             };
-            if let Some(name) = caps.name("name") {
-                into.push(ParsedToolCall {
-                    name: name.as_str().to_owned(),
-                    arguments: parse_arguments(tag, &body[whole.end()..close_start]),
-                });
-            }
+            into.push(ParsedToolCall {
+                name: name.as_str().to_owned(),
+                arguments: parse_arguments(tag, &body[whole.end()..close_start]),
+            });
             // Every close marker is non-empty (checked at construction), so this
             // is strictly past `pos` and the scan cannot spin.
             debug_assert!(close_end > pos, "the invoke scan must advance");
@@ -740,13 +939,15 @@ impl ResponseTemplate {
     /// byte, so every malformation degrades to "that segment is absent" rather
     /// than an error the caller would have to invent a response to.
     ///
-    /// A walk over MESSAGES, not over openers. Each step lands on a header and
-    /// [`Self::message_at`] decides what that header opened:
+    /// A walk over MESSAGES, not over openers. Each step lands on an
+    /// [`Arrival`] and [`Self::header_at`] decides what that header opened:
     ///
     /// - a `text` channel — one segment, running to [`Self::segment_end`];
-    /// - a tool channel — zero or more ATEM blocks
+    /// - a tool channel, IF a message really ended before it — zero or more ATEM
+    ///   blocks, each named after the recipient
     ///   ([`Self::collect_tool_calls`]);
-    /// - nothing at all, for bytes that are not a header.
+    /// - nothing to attribute, for a tool header the model merely quoted and for
+    ///   bytes that are not a header at all.
     ///
     /// Headers are only ever ARRIVED at: byte 0, or just past a `start_anchor`
     /// plus the protocol's exact prefix. Nothing is ever found by scanning
@@ -754,37 +955,47 @@ impl ResponseTemplate {
     /// being read as another channel's opener. And because the recipient decides
     /// the channel, an ATEM block is an action ONLY in a tool message — in an
     /// answer or a chain of thought it is prose, and stays in that text.
+    ///
+    /// A `text` header is NOT gated on `terminated`. A quoted `to=user` header is
+    /// byte-identical to genuinely starting an answer, which is the accepted
+    /// residual; gating it would also throw away the answer that follows a
+    /// malformed header, which is a real generation and a real user's text. An
+    /// action gets the strict treatment because an action cannot be taken back.
     pub fn parse(&self, generated: &str) -> ParsedTurn {
         let mut out = ParsedTurn::default();
-        // Byte 0 is a header: the prompt emitted `<|start|>assistant` itself,
-        // which is why the first header's ` to=` needs no anchor in front of it.
-        // Every later header is reached only through one.
-        let mut arrival = Some(0usize);
+        let mut arrival = Some(Arrival::START);
 
-        while let Some(header) = arrival {
-            arrival = match self.message_at(generated, header) {
+        while let Some(here) = arrival {
+            arrival = match self.header_at(generated, here.at) {
                 Some(Message::Text { field, body_start }) => {
                     let end = self.segment_end(field, generated, body_start);
                     let body = &generated[body_start..end.body_end];
                     match &field.sink {
                         Sink::Reasoning => set_once(&mut out.reasoning, body),
                         Sink::Content => set_once(&mut out.content, body),
-                        // `message_at` filters the tool field out of this branch.
+                        // `header_at` filters the tool field out of this branch.
                         Sink::ToolCalls { .. } => {}
                     }
                     self.next_arrival(generated, end.resume)
                 }
-                Some(Message::Tool { body_start }) => {
-                    self.collect_tool_calls(generated, body_start, &mut out.tool_calls);
+                Some(Message::Tool {
+                    recipient,
+                    body_start,
+                }) if here.terminated => {
+                    self.collect_tool_calls(generated, recipient, body_start, &mut out.tool_calls);
                     self.next_arrival(generated, body_start)
                 }
-                // Not a header. Move to the next one — never into these bytes.
-                None => self.next_arrival(generated, header),
+                // Either a tool header that no message terminated before — the
+                // model quoting the wire syntax, which is text and never an
+                // action — or bytes that are no header at all. Move to the next
+                // header, never into these bytes. If a text segment was open
+                // across them, `next_message_boundary` already kept them in it.
+                Some(Message::Tool { .. }) | None => self.next_arrival(generated, here.at),
             };
             // `next_arrival` lands past a non-empty anchor at or after an offset
-            // strictly greater than `header`, so the walk always advances.
+            // at least `here.at`, so the walk always advances.
             debug_assert!(
-                arrival.is_none_or(|a| a > header),
+                arrival.is_none_or(|a| a.at > here.at),
                 "every arrival must make progress"
             );
         }
@@ -875,13 +1086,32 @@ mod tests {
 
     #[test]
     fn parses_repeated_tool_calls() {
+        // REWRITTEN in fix round 4 into the shape the template actually renders:
+        // `{%- for tc in message['tool_calls'] -%}` emits ONE message per call,
+        // `'<|start|>assistant to=' + tc.function.name + '<|message|>'`, joined by
+        // `<|eom|>` and terminated by `end_token`. The old fixture put two
+        // differently-named invokes in ONE message, which the template cannot
+        // produce and which fix round 4 refuses — see
+        // `an_invoke_name_must_equal_its_recipient`.
         let out = spec().parse(
-            " to=a<|message|><atem:invoke name=\"a\"><atem:parameter name=\"x\">1</atem:parameter></atem:invoke>\
-             <atem:invoke name=\"b\"><atem:parameter name=\"y\">2</atem:parameter></atem:invoke><|eot|>",
+            " to=a<|message|><atem:invoke name=\"a\"><atem:parameter name=\"x\">1</atem:parameter></atem:invoke><|eom|>\
+             <|start|>assistant to=b<|message|><atem:invoke name=\"b\"><atem:parameter name=\"y\">2</atem:parameter></atem:invoke><|eot|>",
         );
-        assert_eq!(out.tool_calls.len(), 2);
+        assert_eq!(out.tool_calls.len(), 2, "got {out:?}");
         assert_eq!(out.tool_calls[0].name, "a");
+        assert_eq!(out.tool_calls[0].arguments["x"], serde_json::json!(1));
         assert_eq!(out.tool_calls[1].name, "b");
+        assert_eq!(out.tool_calls[1].arguments["y"], serde_json::json!(2));
+
+        // `repeats` also still means repeated invokes inside ONE message — what it
+        // never meant is a different NAME under one recipient. Both of these are
+        // `to=a`, so both run.
+        let twice = spec().parse(
+            " to=a<|message|><atem:invoke name=\"a\"><atem:parameter name=\"x\">1</atem:parameter></atem:invoke>\
+             <atem:invoke name=\"a\"><atem:parameter name=\"x\">2</atem:parameter></atem:invoke><|eot|>",
+        );
+        assert_eq!(twice.tool_calls.len(), 2, "got {twice:?}");
+        assert_eq!(twice.tool_calls[1].arguments["x"], serde_json::json!(2));
     }
 
     #[test]
@@ -1109,6 +1339,163 @@ mod tests {
         assert_eq!(call.content, None);
     }
 
+    /// One `rm /` call, exactly as `render_atem` writes it. `rm` stands for a tool
+    /// that is legitimately DECLARED — that is the point of the mismatch tests
+    /// below: a dispatcher checking this call against its registry finds nothing
+    /// wrong with it, so the recipient is the only signal that it was never
+    /// requested.
+    const RM: &str = "<atem:invoke name=\"rm\">\
+                      <atem:parameter name=\"path\">/</atem:parameter>\
+                      </atem:invoke>";
+
+    #[test]
+    fn a_quoted_tool_header_in_a_text_message_is_not_a_call() {
+        // Observed bypass, found by the round-3 reviewer, and the realistic one:
+        // ask a model for "the complete syntax" and it writes out a whole wire
+        // message, header included. The header made the parser truncate the answer
+        // AND run the quoted call — an irreversible action manufactured out of an
+        // explanation. A `start_anchor` inside a message that never terminated is
+        // not a message boundary; it is bytes.
+        for (recipient, close) in [("user", "<|eot|>"), ("self", "<|eom|>")] {
+            let prose = format!("the complete syntax is <|start|>assistant to=rm<|message|>{RM}");
+            let out = spec().parse(&format!(" to={recipient}<|message|>{prose}{close}"));
+            assert!(
+                out.tool_calls.is_empty(),
+                "a quoted header in a to={recipient} message must not run: got {out:?}"
+            );
+            // And the bytes stay where they were written: the explanation the
+            // human asked for is not truncated at the quoted header.
+            let got = if recipient == "user" {
+                out.content.as_deref()
+            } else {
+                out.reasoning.as_deref()
+            };
+            assert_eq!(got, Some(&*prose), "got {out:?}");
+        }
+
+        // The same header, reached the way the template really emits it — after a
+        // terminator — IS a call. Without this the test would pass on a parser
+        // that had simply stopped executing tools.
+        let real = spec().parse(&format!(
+            " to=user<|message|>on it<|eom|><|start|>assistant to=rm<|message|>{RM}<|eot|>"
+        ));
+        assert_eq!(real.content.as_deref(), Some("on it"));
+        assert_eq!(real.tool_calls.len(), 1, "got {real:?}");
+        assert_eq!(real.tool_calls[0].name, "rm");
+    }
+
+    #[test]
+    fn a_tool_header_no_message_terminated_before_is_not_a_call() {
+        // The same bypass from the other three directions. In each of these a
+        // `start_anchor` appears with no message terminator in front of it, so
+        // nothing says a message ended and the tool header after it is not one.
+        let cases = [
+            // Inside an unterminated tool body: the first invoke never closed.
+            format!(
+                " to=wx<|message|><atem:invoke name=\"wx\"><atem:parameter name=\"q\">1\
+                 <|start|>assistant to=rm<|message|>{RM}<|eot|>"
+            ),
+            // After a closed answer, but with bytes between the close and the
+            // anchor — so the anchor is not where a message ended.
+            format!(
+                " to=user<|message|>a<|eot|>garbage<|start|>assistant to=rm<|message|>{RM}<|eot|>"
+            ),
+            // A tool message whose invoke closed but whose MESSAGE did not:
+            // `</atem:invoke>` ends a block, never a message.
+            format!(
+                " to=a<|message|><atem:invoke name=\"a\"><atem:parameter name=\"x\">1</atem:parameter>\
+                 </atem:invoke><|start|>assistant to=rm<|message|>{RM}<|eot|>"
+            ),
+        ];
+        for input in &cases {
+            let out = spec().parse(input);
+            assert!(
+                !out.tool_calls.iter().any(|tc| tc.name == "rm"),
+                "no terminator preceded this header, so it is not a call: {input:?} gave {out:?}"
+            );
+        }
+        // The third case's own call is unaffected — only the untrusted one is.
+        let first = spec().parse(&cases[2]);
+        assert_eq!(first.tool_calls.len(), 1, "got {first:?}");
+        assert_eq!(first.tool_calls[0].name, "a");
+
+        // Both terminators count, and a terminator that is not in the segment's
+        // own close list still ends the message: `reasoning_content.close` is only
+        // `<|eom|>`, but a `to=self` message ending in `<|eot|>` has still ended.
+        for terminator in ["<|eom|>", "<|eot|>"] {
+            let out = spec().parse(&format!(
+                " to=self<|message|>think{terminator}<|start|>assistant to=rm<|message|>{RM}<|eot|>"
+            ));
+            assert_eq!(out.tool_calls.len(), 1, "{terminator} gave {out:?}");
+            assert_eq!(out.tool_calls[0].name, "rm");
+        }
+    }
+
+    #[test]
+    fn an_invoke_name_must_equal_its_recipient() {
+        // Observed bypass. `tool_header_at` accepted any whitespace-free recipient
+        // and threw it away, so the invoke name alone decided what ran: `to=userX`
+        // and `to=explain` both produced a real `rm`. The template builds the
+        // header and the invoke from ONE string —
+        // `'<|start|>assistant to=' + tc.function.name` and
+        // `<atem:invoke name="' + tc.function.name + '">` — so a disagreement is
+        // not output it can render.
+        for recipient in [
+            "userX",
+            "selfish",
+            "explain",
+            "\u{5220}\u{9664}",
+            "rm.exe",
+            "rmx",
+        ] {
+            let out = spec().parse(&format!(" to={recipient}<|message|>{RM}<|eot|>"));
+            assert!(
+                out.tool_calls.is_empty(),
+                "to={recipient} must not run an rm invoke: got {out:?}"
+            );
+        }
+
+        // A mismatch refuses the whole body rather than picking out the invokes
+        // that agree: a body mixing names is not one the template renders, and
+        // "run the parts that match" is how `rm` rides along behind `ls`.
+        let mixed = spec().parse(
+            " to=rm<|message|><atem:invoke name=\"ls\"><atem:parameter name=\"p\">.</atem:parameter></atem:invoke>\
+             <atem:invoke name=\"rm\"><atem:parameter name=\"path\">/</atem:parameter></atem:invoke><|eot|>",
+        );
+        assert!(out_names(&mixed).is_empty(), "got {mixed:?}");
+
+        // Two `name=` attributes: the pattern's lazy `[^>]*?` captures the LAST,
+        // so the two spellings disagree about what this invoke is. The recipient
+        // settles it, and the settled answer is the only one that can run — which
+        // means the name handed to a dispatcher is always the one the header
+        // named.
+        const TWO_NAMES: &str = "<atem:invoke name=\"rm\" name=\"ls\">\
+                                 <atem:parameter name=\"p\">.</atem:parameter></atem:invoke>";
+        assert!(
+            out_names(&spec().parse(&format!(" to=rm<|message|>{TWO_NAMES}<|eot|>"))).is_empty(),
+            "the captured name is `ls`, so `to=rm` must refuse it"
+        );
+        assert_eq!(
+            out_names(&spec().parse(&format!(" to=ls<|message|>{TWO_NAMES}<|eot|>"))),
+            vec!["ls"]
+        );
+
+        // Equality, not similarity: the matching cases still run, including a
+        // dotted namespace and a multibyte name.
+        for name in ["rm", "wx.forecast", "\u{5220}\u{9664}"] {
+            let out = spec().parse(&format!(
+                " to={name}<|message|><atem:invoke name=\"{name}\">\
+                 <atem:parameter name=\"q\">1</atem:parameter></atem:invoke><|eot|>"
+            ));
+            assert_eq!(out_names(&out), vec![name], "got {out:?}");
+            assert_eq!(out.tool_calls[0].arguments["q"], serde_json::json!(1));
+        }
+    }
+
+    fn out_names(out: &ParsedTurn) -> Vec<&str> {
+        out.tool_calls.iter().map(|tc| tc.name.as_str()).collect()
+    }
+
     #[test]
     fn a_tool_invoke_whose_close_follows_a_new_message_is_not_trusted() {
         // The close exists, but a whole message intervenes — so the invoke was
@@ -1268,8 +1655,14 @@ mod tests {
         // Nested openers are the observable case: rescanning the body of the
         // outer invoke invents a second call the model never made, whose
         // arguments are a slice of the first one's.
+        //
+        // NAMES REWRITTEN in fix round 4: recipient and BOTH invokes are `a`, so
+        // that the invented second call would be accepted. With the old
+        // `to=t`/`a`/`b` fixture the recipient check would have rejected the
+        // rescanned call for the wrong reason and this test would have passed
+        // while the resume bug was live.
         let out = spec().parse(
-            " to=t<|message|><atem:invoke name=\"a\"><atem:invoke name=\"b\">\
+            " to=a<|message|><atem:invoke name=\"a\"><atem:invoke name=\"a\">\
              <atem:parameter name=\"q\">1</atem:parameter></atem:invoke><|eot|>",
         );
         assert_eq!(out.tool_calls.len(), 1, "got {out:?}");
@@ -1289,8 +1682,10 @@ mod tests {
         // the situation this test exists for. In a `to=self` message an ATEM
         // block is now text and moves nothing, so the old input no longer
         // reaches the behaviour under test.
+        // Recipient renamed `wx` -> `t` in fix round 4 so it matches the invoke
+        // name; otherwise the call is refused and the tool half asserts nothing.
         let out = spec().parse(
-            " to=wx<|message|><atem:invoke name=\"t\">\
+            " to=t<|message|><atem:invoke name=\"t\">\
              <atem:parameter name=\"q\">1</atem:parameter></atem:invoke>\
              to=user<|message|>SECRET<|eot|>",
         );
@@ -1307,7 +1702,7 @@ mod tests {
         // answer channel. Without this the test would also pass on a parser that
         // never opens a second channel at all.
         let anchored = spec().parse(
-            " to=wx<|message|><atem:invoke name=\"t\">\
+            " to=t<|message|><atem:invoke name=\"t\">\
              <atem:parameter name=\"q\">1</atem:parameter></atem:invoke>\
              <|start|>assistant to=user<|message|>real answer<|eot|>",
         );
@@ -1333,6 +1728,32 @@ mod tests {
             )
         );
         assert!(out.tool_calls.is_empty(), "got {out:?}");
+    }
+
+    #[test]
+    fn a_full_turn_in_template_shape_parses() {
+        // The only test that runs the exact multi-message shape
+        // `chat_template.jinja` renders: `to=self` reasoning closed with `<|eom|>`,
+        // then ONE message per tool call — `'<|start|>assistant to=' +
+        // tc.function.name + '<|message|>'` with `render_atem`'s
+        // `<atem:function_calls>` wrapper, joined by `<|eom|>` — then the answer.
+        // Fix round 4 made an action depend on a message having terminated, and
+        // this is what proves the dependency does not break real generations.
+        let out = spec().parse(
+            " to=self<|message|>plan<|eom|>\
+             <|start|>assistant to=a<|message|><atem:function_calls>\n\
+             <atem:invoke name=\"a\">\n\
+             <atem:parameter name=\"x\">1</atem:parameter>\n\
+             </atem:invoke>\n</atem:function_calls><|eom|>\
+             <|start|>assistant to=b<|message|><atem:invoke name=\"b\">\
+             <atem:parameter name=\"y\">2</atem:parameter></atem:invoke><|eom|>\
+             <|start|>assistant to=user<|message|>all done<|eot|>",
+        );
+        assert_eq!(out.reasoning.as_deref(), Some("plan"));
+        assert_eq!(out.content.as_deref(), Some("all done"));
+        assert_eq!(out_names(&out), vec!["a", "b"], "got {out:?}");
+        assert_eq!(out.tool_calls[0].arguments["x"], serde_json::json!(1));
+        assert_eq!(out.tool_calls[1].arguments["y"], serde_json::json!(2));
     }
 
     #[test]
@@ -1408,6 +1829,17 @@ mod tests {
             "\"start_anchor\": \"\"",
         ));
         assert!(e.contains("start_anchor"), "got: {e}");
+        // An empty close marker, same reason twice over: it would close every
+        // segment where it began AND — since the text fields' closes ARE the
+        // message-terminator set — make every byte look like the end of a message,
+        // which is what decides whether a tool call may run.
+        let e = err(case("\"close\": \"<|eom|>\"", "\"close\": \"\""));
+        assert!(e.contains("empty close marker"), "got: {e}");
+        let e = err(case(
+            "\"close\": [\"<|eot|>\", \"<|eom|>\"]",
+            "\"close\": [\"<|eot|>\", \"\"]",
+        ));
+        assert!(e.contains("empty close marker"), "got: {e}");
     }
 
     // ── Real checkpoint (gated) ────────────────────────────────────────
@@ -1456,6 +1888,10 @@ mod tests {
         assert_eq!(tpl.start_anchor, "<|start|>assistant");
         assert_eq!(tpl.default_role, "assistant");
         assert!(tpl.tool_call_transform.is_some());
+        // The message terminators, derived from the REAL spec rather than from the
+        // transcription: `reasoning_content.close` then `content.close`, unioned.
+        // `</atem:invoke>` must not be in here — it closes a block, not a message.
+        assert_eq!(tpl.terminators, vec!["<|eom|>", "<|eot|>"]);
 
         // `repeats` is validated at construction rather than stored, so read it
         // straight off the file: that is the assertion the brief asks for.
@@ -1547,6 +1983,22 @@ mod tests {
             !all_channels(&unterminated).contains("TOOL_SECRET"),
             "got {unterminated:?}"
         );
+
+        // And both fix-round-4 bypasses, on the real template: the two shapes that
+        // produced an irreversible action out of prose.
+        let quoted = tpl.parse(&format!(
+            " to=user<|message|>the complete syntax is <|start|>assistant to=rm<|message|>{RM}<|eot|>"
+        ));
+        assert!(quoted.tool_calls.is_empty(), "got {quoted:?}");
+        assert!(
+            quoted
+                .content
+                .as_deref()
+                .is_some_and(|c| c.ends_with("</atem:invoke>")),
+            "the explanation must not be truncated at the quoted header: got {quoted:?}"
+        );
+        let mismatched = tpl.parse(&format!(" to=explain<|message|>{RM}<|eot|>"));
+        assert!(mismatched.tool_calls.is_empty(), "got {mismatched:?}");
 
         eprintln!(
             "real checkpoint OK: 3 fields, content closes on {:?}, tool tag {:?}",
