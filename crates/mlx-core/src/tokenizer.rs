@@ -2094,6 +2094,9 @@ fn encoding_to_uint32_array<'env>(
 }
 
 #[cfg(test)]
+mod muse_glimmer_golden;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use minijinja::{Environment, context};
