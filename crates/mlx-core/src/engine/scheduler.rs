@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::transformer::paged_kv_cache_adapter::SeqId;
 use napi_derive::napi;
@@ -231,6 +232,9 @@ pub(crate) struct SchedulerStats {
     pub allocated_blocks: u32,
     pub watermark_blocks: u32,
     pub reserved_blocks: u32,
+    pub ssd_restore_waiting: u32,
+    pub ssd_restore_bytes: u64,
+    pub ssd_restore_wait_micros: u64,
 }
 
 #[napi(object, js_name = "DecodeBatchOccupancyBucket")]
@@ -256,6 +260,9 @@ pub struct SchedulerStatsJs {
     pub allocated_blocks: u32,
     pub watermark_blocks: u32,
     pub reserved_blocks: u32,
+    pub ssd_restore_waiting: u32,
+    pub ssd_restore_bytes: f64,
+    pub ssd_restore_wait_ms: f64,
 }
 
 impl SchedulerStats {
@@ -281,6 +288,9 @@ impl SchedulerStats {
             allocated_blocks: self.allocated_blocks,
             watermark_blocks: self.watermark_blocks,
             reserved_blocks: self.reserved_blocks,
+            ssd_restore_waiting: self.ssd_restore_waiting,
+            ssd_restore_bytes: self.ssd_restore_bytes as f64,
+            ssd_restore_wait_ms: self.ssd_restore_wait_micros as f64 / 1_000.0,
         }
     }
 }
@@ -465,11 +475,20 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             .iter_mut()
             .find(|turn| turn.seq_id == seq_id)
             .ok_or_else(|| format!("cannot park unknown waiting sequence {seq_id}"))?;
+        if turn.status != TurnStatus::Waiting {
+            return Err(format!("sequence {seq_id} is not admission-waiting"));
+        }
         turn.status = TurnStatus::WaitingForSsd;
+        self.stats.ssd_restore_waiting = self.stats.ssd_restore_waiting.saturating_add(1);
         Ok(())
     }
 
-    pub fn wake_from_ssd(&mut self, seq_id: SeqId) -> Result<(), String> {
+    pub fn wake_from_ssd(
+        &mut self,
+        seq_id: SeqId,
+        bytes_restored: u64,
+        wait: Duration,
+    ) -> Result<(), String> {
         let turn = self
             .waiting
             .iter_mut()
@@ -479,7 +498,26 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             return Err(format!("sequence {seq_id} is not waiting for SSD"));
         }
         turn.status = TurnStatus::Waiting;
+        self.stats.ssd_restore_waiting = self.stats.ssd_restore_waiting.saturating_sub(1);
+        self.stats.ssd_restore_bytes = self.stats.ssd_restore_bytes.saturating_add(bytes_restored);
+        self.stats.ssd_restore_wait_micros = self
+            .stats
+            .ssd_restore_wait_micros
+            .saturating_add(wait.as_micros().try_into().unwrap_or(u64::MAX));
         Ok(())
+    }
+
+    pub fn waiting_turn_mut(&mut self, seq_id: SeqId) -> Option<&mut TurnState<P>> {
+        self.waiting.iter_mut().find(|turn| turn.seq_id == seq_id)
+    }
+
+    pub fn take_waiting(&mut self, seq_id: SeqId) -> Option<TurnState<P>> {
+        let index = self.waiting.iter().position(|turn| turn.seq_id == seq_id)?;
+        let turn = self.waiting.remove(index)?;
+        if turn.status == TurnStatus::WaitingForSsd {
+            self.stats.ssd_restore_waiting = self.stats.ssd_restore_waiting.saturating_sub(1);
+        }
+        Some(turn)
     }
 
     pub fn running(&self) -> &[TurnState<P>] {
@@ -507,12 +545,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         if !self.running.is_empty() {
             return None;
         }
-        let waiting_order = self
-            .waiting
-            .iter()
-            .filter(|turn| turn.status == TurnStatus::Waiting)
-            .map(|turn| turn.arrival_order)
-            .min();
+        let waiting_order = self.waiting.iter().map(|turn| turn.arrival_order).min();
         let exclusive_order = self.exclusive_lane.front().map(|item| item.order);
         let barrier_order = self.barriers.front().map(|item| item.order);
         let control_order = exclusive_order.into_iter().chain(barrier_order).min()?;
@@ -1004,7 +1037,37 @@ mod tests {
             panic!("expected runnable step");
         };
         assert_eq!(plan.rows[0].seq_id, 2);
-        scheduler.wake_from_ssd(1).expect("wake SSD row");
+        scheduler
+            .wake_from_ssd(1, 4096, Duration::from_millis(3))
+            .expect("wake SSD row");
+        assert_eq!(scheduler.stats().ssd_restore_waiting, 0);
+        assert_eq!(scheduler.stats().ssd_restore_bytes, 4096);
+        assert!(scheduler.stats().ssd_restore_wait_micros >= 3_000);
+    }
+
+    #[test]
+    fn control_barrier_cannot_overtake_an_older_ssd_wait() {
+        let mut scheduler = Scheduler::<_, (), &'static str>::new(1, 4).expect("scheduler");
+        scheduler
+            .enqueue_turn(turn(1, 0, &[4], None))
+            .expect("enqueue SSD row");
+        scheduler.park_waiting_for_ssd(1).expect("park SSD row");
+        scheduler.enqueue_barrier("reset");
+
+        let mut step = MockStep::default();
+        assert!(matches!(
+            scheduler.drive_once(&mut step).expect("idle behind SSD"),
+            SchedulerAction::Idle
+        ));
+        scheduler
+            .wake_from_ssd(1, 0, Duration::from_millis(1))
+            .expect("wake SSD row");
+        assert!(matches!(
+            scheduler
+                .drive_once(&mut step)
+                .expect("older turn runs first"),
+            SchedulerAction::Stepped { .. }
+        ));
     }
 
     #[test]

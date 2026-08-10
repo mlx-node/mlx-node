@@ -4809,6 +4809,9 @@ export interface SchedulerStats {
   allocatedBlocks: number;
   watermarkBlocks: number;
   reservedBlocks: number;
+  ssdRestoreWaiting: number;
+  ssdRestoreBytes: number;
+  ssdRestoreWaitMs: number;
 }
 
 /** Enable or disable profiling globally. */

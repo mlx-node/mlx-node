@@ -37,7 +37,9 @@ use crate::sampling::{
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::training_model::ModelType;
-use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
+use crate::transformer::paged_kv_cache_adapter::{
+    PagedKVCacheAdapter, PagedRestorePoll, PagedRestoreTicket, PagedTurnAdmission, SeqId,
+};
 use crate::transformer::{KVCache, TransformerBlock};
 
 use super::{BatchGenerationResult, GenerationConfig, GenerationResult, Qwen3Config};
@@ -403,6 +405,11 @@ struct PreparedQwenScheduledTurn {
     seq_id: SeqId,
     reservation_blocks: u32,
     block_size: u32,
+}
+
+enum QwenAdmission {
+    Ready(TurnState<QwenScheduledTurn>),
+    Waiting(TurnState<QwenScheduledTurn>, PagedRestoreTicket),
 }
 
 struct QwenStepExecutor<'a> {
@@ -982,6 +989,7 @@ pub(crate) struct QwenSchedulerState {
     scheduler: Scheduler<QwenScheduledTurn, Qwen3Cmd, Qwen3Cmd>,
     pending: VecDeque<Qwen3Cmd>,
     prepared_waiting: Option<Box<PreparedQwenScheduledTurn>>,
+    pending_restores: HashMap<SeqId, PagedRestoreTicket>,
     owner_sequences: HashMap<String, SeqId>,
     owner_histories: HashMap<String, Vec<u32>>,
     next_seq_id: SeqId,
@@ -997,6 +1005,7 @@ impl QwenSchedulerState {
                 .expect("validated qwen3 scheduler limits"),
             pending: VecDeque::new(),
             prepared_waiting: None,
+            pending_restores: HashMap::new(),
             owner_sequences: HashMap::new(),
             owner_histories: HashMap::new(),
             next_seq_id: 1,
@@ -1245,8 +1254,7 @@ impl QwenSchedulerState {
     fn admit_prepared(
         &mut self,
         prepared: Box<PreparedQwenScheduledTurn>,
-    ) -> std::result::Result<Option<TurnState<QwenScheduledTurn>>, Box<PreparedQwenScheduledTurn>>
-    {
+    ) -> std::result::Result<Option<QwenAdmission>, Box<PreparedQwenScheduledTurn>> {
         let telemetry = match self
             .inner
             .paged_adapter
@@ -1319,19 +1327,45 @@ impl QwenSchedulerState {
             .set_turn_cancel_flag(Some(Arc::clone(&cancelled)));
         let reuse_cache = admitted.plan.is_delta || admitted.params.reuse_cache;
         let generation_start = admitted.params.report_performance.then(Instant::now);
-        let prefix =
-            match self
-                .inner
-                .prime_prefix_state_for(seq_id, &admitted.tokens, reuse_cache, &[], 0)
-            {
-                Ok(prefix) => prefix,
-                Err(error) => {
-                    self.inner.abort_paged_turn();
-                    self.inner.set_turn_cancel_flag(None);
-                    Self::reply_admission_error(response, cancelled.as_ref(), error);
-                    return Ok(None);
-                }
-            };
+        let total_budget = admitted.tokens.len() as u32;
+        let prefix_admission = match self
+            .inner
+            .paged_adapter
+            .as_mut()
+            .expect("paged route checked by caller")
+            .prepare_turn_with_async_restore(
+                seq_id,
+                &admitted.tokens,
+                total_budget,
+                reuse_cache,
+                &[],
+                0,
+                false,
+                total_budget.saturating_sub(1),
+            ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.inner.abort_paged_turn();
+                self.inner.set_turn_cancel_flag(None);
+                Self::reply_admission_error(
+                    response,
+                    cancelled.as_ref(),
+                    Error::from_reason(error),
+                );
+                return Ok(None);
+            }
+        };
+        let (turn_plan, restore) = match prefix_admission {
+            PagedTurnAdmission::Ready(plan) => (plan, None),
+            PagedTurnAdmission::Waiting {
+                provisional,
+                restore,
+            } => (provisional, Some(restore)),
+        };
+        let prefix = Qwen3PrefixState {
+            effective_cached_prefix_len: turn_plan.cached_prefix_len as usize,
+            suffix_len: turn_plan.suffix_len as usize,
+        };
         if prefix.suffix_len == 0 {
             self.inner.abort_paged_turn();
             self.inner.set_turn_cancel_flag(None);
@@ -1348,7 +1382,12 @@ impl QwenSchedulerState {
             .as_ref()
             .and_then(|adapter| adapter.block_table_for(seq_id))
             .map(|table| table.num_blocks() as u32)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .saturating_add(
+                restore
+                    .as_ref()
+                    .map_or(0, PagedRestoreTicket::reserved_blocks),
+            );
         let is_streaming = response.sink().is_some();
         let generation_stream = Stream::new(DeviceType::Gpu);
         let mut profiler = crate::decode_profiler::DecodeProfiler::new(
@@ -1399,23 +1438,132 @@ impl QwenSchedulerState {
             boundary = boundary.saturating_add(long_prefill_tokens).min(prompt_len);
             pinned_prefill_breaks.push(boundary);
         }
-        Ok(Some(
-            TurnState::new(
-                seq_id,
-                u64::from(seq_id),
-                admitted.tokens,
-                payload.prefix.effective_cached_prefix_len as u32,
-                pinned_prefill_breaks,
-                Some(cancelled),
-                payload,
-            )
-            .expect("prime-derived qwen3 scheduler turn must satisfy progress invariants")
-            .with_block_reservation(
-                reservation_blocks,
-                materialized_blocks,
-                block_size,
-            ),
-        ))
+        let turn = TurnState::new(
+            seq_id,
+            u64::from(seq_id),
+            admitted.tokens,
+            payload.prefix.effective_cached_prefix_len as u32,
+            pinned_prefill_breaks,
+            Some(cancelled),
+            payload,
+        )
+        .expect("prime-derived qwen3 scheduler turn must satisfy progress invariants")
+        .with_block_reservation(reservation_blocks, materialized_blocks, block_size);
+        Ok(Some(match restore {
+            Some(restore) => QwenAdmission::Waiting(turn, restore),
+            None => QwenAdmission::Ready(turn),
+        }))
+    }
+
+    fn enqueue_admission(&mut self, admission: QwenAdmission) -> std::result::Result<(), String> {
+        match admission {
+            QwenAdmission::Ready(turn) => self.scheduler.enqueue_turn(turn),
+            QwenAdmission::Waiting(turn, restore) => {
+                let seq_id = turn.seq_id;
+                if self.pending_restores.contains_key(&seq_id) {
+                    return Err(format!("duplicate SSD restore for sequence {seq_id}"));
+                }
+                self.scheduler.enqueue_turn(turn)?;
+                if let Err(error) = self.scheduler.park_waiting_for_ssd(seq_id) {
+                    let _ = self.scheduler.take_waiting(seq_id);
+                    return Err(error);
+                }
+                let replaced = self.pending_restores.insert(seq_id, restore);
+                debug_assert!(replaced.is_none(), "duplicate checked before enqueue");
+                Ok(())
+            }
+        }
+    }
+
+    fn poll_restores(&mut self) {
+        let seq_ids: Vec<SeqId> = self.pending_restores.keys().copied().collect();
+        for seq_id in seq_ids {
+            let cancelled = self
+                .scheduler
+                .waiting_turn_mut(seq_id)
+                .and_then(|turn| turn.cancelled.as_ref())
+                .is_some_and(|cancelled| cancelled.load(Ordering::Relaxed));
+            if cancelled {
+                // The reader owns host bytes only. Dropping the ticket returns
+                // destination reservations immediately; a worker already in a
+                // filesystem read may finish harmlessly against a closed
+                // result channel.
+                self.pending_restores.remove(&seq_id);
+                if let Some(mut turn) = self.scheduler.take_waiting(seq_id) {
+                    turn.payload.failure =
+                        Some(Error::from_reason(engine::session::CHAT_SESSION_CANCELLED));
+                    self.finish_completed(turn);
+                }
+                continue;
+            }
+            let outcome = {
+                let Some(restore) = self.pending_restores.get_mut(&seq_id) else {
+                    continue;
+                };
+                self.inner
+                    .paged_adapter
+                    .as_mut()
+                    .expect("pending restore requires paged adapter")
+                    .poll_restore(restore)
+            };
+            match outcome {
+                Ok(PagedRestorePoll::Pending) => continue,
+                Ok(PagedRestorePoll::Ready {
+                    plan,
+                    bytes_restored,
+                    wait,
+                }) => {
+                    self.pending_restores.remove(&seq_id);
+                    let materialized_blocks = self
+                        .inner
+                        .paged_adapter
+                        .as_ref()
+                        .and_then(|adapter| adapter.block_table_for(seq_id))
+                        .map(|table| table.num_blocks() as u32)
+                        .unwrap_or(0);
+                    let long_prefill_tokens = scheduler_long_prefill_tokens();
+                    let Some(turn) = self.scheduler.waiting_turn_mut(seq_id) else {
+                        tracing::error!("SSD restore completed for missing sequence {seq_id}");
+                        let _ = self
+                            .inner
+                            .paged_adapter
+                            .as_mut()
+                            .expect("completed restore requires paged adapter")
+                            .release_request_for(seq_id);
+                        continue;
+                    };
+                    turn.num_computed_tokens = plan.cached_prefix_len;
+                    turn.block_materialized_blocks = materialized_blocks;
+                    turn.payload.prefix = Qwen3PrefixState {
+                        effective_cached_prefix_len: plan.cached_prefix_len as usize,
+                        suffix_len: plan.suffix_len as usize,
+                    };
+                    turn.payload.profiler.set_prompt_tokens(plan.suffix_len);
+                    turn.pinned_prefill_breaks.clear();
+                    let mut boundary = plan.cached_prefix_len;
+                    while boundary < turn.prompt_tokens {
+                        boundary = boundary
+                            .saturating_add(long_prefill_tokens)
+                            .min(turn.prompt_tokens);
+                        turn.pinned_prefill_breaks.push(boundary);
+                    }
+                    if let Err(error) = self.scheduler.wake_from_ssd(seq_id, bytes_restored, wait) {
+                        tracing::error!("failed to wake SSD restore {seq_id}: {error}");
+                    }
+                }
+                Err(error) => {
+                    self.pending_restores.remove(&seq_id);
+                    let Some(mut turn) = self.scheduler.take_waiting(seq_id) else {
+                        tracing::error!(
+                            "failed SSD restore for missing sequence {seq_id}: {error}"
+                        );
+                        continue;
+                    };
+                    turn.payload.failure = Some(Error::from_reason(error));
+                    self.finish_completed(turn);
+                }
+            }
+        }
     }
 
     fn finish_completed(&mut self, mut turn: TurnState<QwenScheduledTurn>) {
@@ -1506,12 +1654,13 @@ impl QwenSchedulerState {
         while let Ok(command) = receiver.try_recv() {
             self.pending.push_back(command);
         }
+        self.poll_restores();
 
         let mut admission_deferred = false;
         if let Some(prepared) = self.prepared_waiting.take() {
             match self.admit_prepared(prepared) {
-                Ok(Some(turn)) => {
-                    if let Err(error) = self.scheduler.enqueue_turn(turn) {
+                Ok(Some(admission)) => {
+                    if let Err(error) = self.enqueue_admission(admission) {
                         tracing::error!("qwen3 scheduler admission failed: {error}");
                     }
                 }
@@ -1536,12 +1685,13 @@ impl QwenSchedulerState {
             }
             match command {
                 Qwen3Cmd::Chat(chat) => {
+                    let is_reset = matches!(&chat, ChatCmd::ResetCaches { .. });
                     if self.inner.paged_adapter.is_none() {
                         self.scheduler.enqueue_exclusive(Qwen3Cmd::Chat(chat));
                     } else if let Some(prepared) = self.prepare_chat(chat) {
                         match self.admit_prepared(prepared) {
-                            Ok(Some(turn)) => {
-                                if let Err(error) = self.scheduler.enqueue_turn(turn) {
+                            Ok(Some(admission)) => {
+                                if let Err(error) = self.enqueue_admission(admission) {
                                     tracing::error!("qwen3 scheduler admission failed: {error}");
                                 }
                             }
@@ -1552,8 +1702,18 @@ impl QwenSchedulerState {
                             }
                         }
                     }
+                    if is_reset {
+                        // A reset is a mutation barrier, not merely an
+                        // execution-order marker. Do not begin prefix lookup
+                        // or SSD restore for commands behind it before the
+                        // barrier has actually run.
+                        break;
+                    }
                 }
-                barrier => self.scheduler.enqueue_barrier(barrier),
+                barrier => {
+                    self.scheduler.enqueue_barrier(barrier);
+                    break;
+                }
             }
         }
 

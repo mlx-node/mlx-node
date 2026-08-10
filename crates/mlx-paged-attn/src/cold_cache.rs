@@ -22,7 +22,7 @@ use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -522,6 +522,56 @@ pub struct RestorePrefixIdentity {
     pub extra_keys: Vec<u64>,
     pub cache_salt: u64,
     pub block_index: usize,
+}
+
+/// Background filesystem/decode work for one ordered cold-prefix chain.
+///
+/// The worker never touches Metal or the block allocator. Those remain on the
+/// model thread and are reached only through [`ColdCacheManager::commit_restore_batch`].
+pub struct ColdRestoreBatchJob {
+    receiver: Option<Receiver<ColdRestoreBatch>>,
+    expected_blocks: usize,
+    started: Instant,
+}
+
+impl ColdRestoreBatchJob {
+    /// Non-blocking completion probe. A disconnected worker is converted into
+    /// a failed batch so inference can fall back to ordinary prefill.
+    pub fn poll(&mut self) -> Option<ColdRestoreBatch> {
+        let receiver = self.receiver.as_ref()?;
+        match receiver.try_recv() {
+            Ok(batch) => {
+                self.receiver = None;
+                Some(batch)
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.receiver = None;
+                Some(ColdRestoreBatch {
+                    blocks: Vec::with_capacity(self.expected_blocks),
+                    worker_failed: true,
+                })
+            }
+        }
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
+/// Host-side result of a background restore read. Kept opaque so decoded KV
+/// bytes cannot accidentally be published without the model-thread commit.
+pub struct ColdRestoreBatch {
+    blocks: Vec<Option<ColdCacheBlock>>,
+    worker_failed: bool,
+}
+
+/// Successful model-thread commit of an asynchronous restore batch.
+pub struct ColdRestoreCommit {
+    pub blocks: Vec<Arc<PhysicalBlock>>,
+    pub bytes_restored: u64,
+    pub wait: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1638,6 +1688,161 @@ impl ColdCacheManager {
                 None
             }
         }
+    }
+
+    /// Start an ordered cold-prefix read on a background filesystem thread.
+    ///
+    /// Only file I/O, safetensors decode, checksum, and identity validation run
+    /// there. Destination blocks must already be reserved by the caller; Metal
+    /// upload and hot-prefix publication happen later, synchronously on the
+    /// model thread, in [`Self::commit_restore_batch`].
+    pub fn begin_restore_batch(
+        &self,
+        pool: &LayerKVPool,
+        keys: Vec<ColdCacheKey>,
+        fingerprint: ColdCacheFingerprint,
+    ) -> Result<ColdRestoreBatchJob, String> {
+        if keys.is_empty() {
+            return Err("cannot start an empty cold restore batch".to_string());
+        }
+        let expected_blocks = keys.len();
+        let max_encoded = max_encoded_len_for_pool(pool);
+        let manager = self.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let started = Instant::now();
+        std::thread::Builder::new()
+            .name("mlx-paged-ssd-reader".to_string())
+            .spawn(move || {
+                let blocks = keys
+                    .into_iter()
+                    .map(|key| manager.load_bounded(key, fingerprint, max_encoded))
+                    .collect();
+                let _ = sender.send(ColdRestoreBatch {
+                    blocks,
+                    worker_failed: false,
+                });
+            })
+            .map_err(|error| format!("start cold-cache restore reader: {error}"))?;
+        Ok(ColdRestoreBatchJob {
+            receiver: Some(receiver),
+            expected_blocks,
+            started,
+        })
+    }
+
+    /// Upload and atomically publish a completed background restore batch.
+    ///
+    /// Any missing/corrupt block, layout mismatch, upload error, or prefix
+    /// collision releases every reserved destination and publishes nothing.
+    /// This method must run on the model thread because it touches Metal.
+    pub fn commit_restore_batch(
+        &self,
+        pool: &LayerKVPool,
+        allocator: &Mutex<BlockAllocator>,
+        batch: ColdRestoreBatch,
+        reserved: Vec<Arc<PhysicalBlock>>,
+        identities: &[RestorePrefixIdentity],
+        wait: Duration,
+    ) -> Option<ColdRestoreCommit> {
+        let decoded_successes = batch.blocks.iter().filter(|block| block.is_some()).count();
+        let valid_shape = !batch.worker_failed
+            && batch.blocks.len() == reserved.len()
+            && reserved.len() == identities.len()
+            && batch
+                .blocks
+                .iter()
+                .zip(identities)
+                .all(|(block, identity)| {
+                    block.as_ref().is_some_and(|block| {
+                        block.tokens == identity.tokens && layout_matches_pool(&block.layout, pool)
+                    })
+                });
+        if !valid_shape {
+            self.shared
+                .stats
+                .misses
+                .fetch_add(decoded_successes as u64, Ordering::Relaxed);
+            let mut guard = allocator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for block in reserved {
+                guard.free(block);
+            }
+            return None;
+        }
+
+        let decoded: Vec<ColdCacheBlock> = batch.blocks.into_iter().flatten().collect();
+        for (cold, destination) in decoded.iter().zip(&reserved) {
+            let layer_bytes: Vec<(&[u8], &[u8])> = cold
+                .layers
+                .iter()
+                .map(|layer| (layer.keys.as_slice(), layer.values.as_slice()))
+                .collect();
+            if pool
+                .write_block_all_layers(destination.block_id, &layer_bytes)
+                .is_err()
+            {
+                self.shared
+                    .stats
+                    .misses
+                    .fetch_add(decoded.len() as u64, Ordering::Relaxed);
+                let mut guard = allocator
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for block in reserved {
+                    guard.free(block);
+                }
+                return None;
+            }
+        }
+
+        let published = {
+            let mut guard = allocator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let registrations: Vec<crate::RestoredPrefixRegistration<'_>> = reserved
+                .iter()
+                .zip(identities)
+                .map(|(block, identity)| crate::RestoredPrefixRegistration {
+                    block: Arc::clone(block),
+                    hash: identity.hot_hash,
+                    token_ids: &identity.tokens,
+                    parent_hash: identity.parent_hot_hash,
+                    extra_keys: &identity.extra_keys,
+                    cache_salt: identity.cache_salt,
+                    block_index: identity.block_index,
+                })
+                .collect();
+            guard.publish_restored_prefix_batch(&registrations)
+        };
+        if !matches!(published, Ok(true)) {
+            self.shared
+                .stats
+                .misses
+                .fetch_add(decoded.len() as u64, Ordering::Relaxed);
+            let mut guard = allocator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for block in reserved {
+                guard.free(block);
+            }
+            return None;
+        }
+
+        let bytes_restored = decoded.iter().map(ColdCacheBlock::encoded_len).sum::<u64>();
+        self.shared
+            .stats
+            .hits
+            .fetch_add(decoded.len() as u64, Ordering::Relaxed);
+        self.shared
+            .stats
+            .bytes_restored
+            .fetch_add(bytes_restored, Ordering::Relaxed);
+        Some(ColdRestoreCommit {
+            blocks: reserved,
+            bytes_restored,
+            wait,
+        })
     }
 
     /// Restore one block transactionally. Returns `None` on every cold-tier
@@ -7336,7 +7541,8 @@ mod tests {
         let hot = chain_hashes(&tokens, 8, extra_keys, cache_salt);
         assert_eq!(hot.len(), 2);
         let mut parent_key: Option<ColdCacheKey> = None;
-        let mut restored = Vec::new();
+        let mut keys = Vec::new();
+        let mut identities = Vec::new();
         for idx in 0..2usize {
             let toks = &tokens[idx * 8..(idx + 1) * 8];
             let key = ColdCacheKey::chain(
@@ -7348,23 +7554,49 @@ mod tests {
                 cache_salt,
                 idx,
             );
-            let identity = RestorePrefixIdentity {
+            identities.push(RestorePrefixIdentity {
                 hot_hash: hot[idx],
                 tokens: toks.to_vec(),
                 parent_hot_hash: if idx == 0 { 0 } else { hot[idx - 1] },
                 extra_keys: extra_keys.to_vec(),
                 cache_salt,
                 block_index: idx,
-            };
-            let block = reopened
-                .restore_block(&pool_dst, &fresh_alloc, key, fp, &identity)
-                .expect("cold block restore");
+            });
+            keys.push(key);
+            parent_key = Some(key);
+        }
+        let reserved: Vec<_> = (0..keys.len())
+            .map(|_| fresh_alloc.lock().unwrap().allocate().unwrap())
+            .collect();
+        let mut job = reopened
+            .begin_restore_batch(&pool_dst, keys, fp)
+            .expect("start asynchronous restore");
+        let batch = (0..200)
+            .find_map(|_| {
+                let ready = job.poll();
+                if ready.is_none() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                ready
+            })
+            .expect("asynchronous restore must finish");
+        let commit = reopened
+            .commit_restore_batch(
+                &pool_dst,
+                &fresh_alloc,
+                batch,
+                reserved,
+                &identities,
+                job.elapsed(),
+            )
+            .expect("atomic cold-prefix commit");
+        assert!(commit.bytes_restored > 0);
+        let restored = commit.blocks;
+        for (idx, block) in restored.iter().enumerate() {
             let (rk, rv) = pool_dst.read_blocks_to_host(0, &[block.block_id]).unwrap();
             let (ek, ev) = if idx == 0 { (&k0, &v0) } else { (&k1, &v1) };
             assert_eq!(&rk, ek, "restored keys must match captured block {idx}");
             assert_eq!(&rv, ev, "restored values must match captured block {idx}");
-            parent_key = Some(key);
-            restored.push(block);
         }
 
         // The fresh hot cache now serves the entire two-block prefix.
@@ -7384,6 +7616,68 @@ mod tests {
                 allocator.free(hit);
             }
         }
+
+        // A partial background read is an all-or-nothing miss: neither the
+        // successfully decoded head nor the missing tail may become hot, and
+        // every destination reservation must return to the allocator.
+        let partial_alloc = Mutex::new(BlockAllocator::new(2, 8));
+        let partial_reserved: Vec<_> = (0..2)
+            .map(|_| partial_alloc.lock().unwrap().allocate().unwrap())
+            .collect();
+        let missing_tokens: Vec<u32> = (17..=24).collect();
+        let missing_key = ColdCacheKey::chain(
+            ColdGroup::Kv,
+            fp,
+            Some(key0),
+            &missing_tokens,
+            extra_keys,
+            cache_salt,
+            1,
+        );
+        let partial_identities = vec![
+            identities[0].clone(),
+            RestorePrefixIdentity {
+                hot_hash: 0xDEAD_BEEF,
+                tokens: missing_tokens,
+                parent_hot_hash: hot[0],
+                extra_keys: Vec::new(),
+                cache_salt,
+                block_index: 1,
+            },
+        ];
+        let mut partial_job = reopened
+            .begin_restore_batch(&pool_dst, vec![key0, missing_key], fp)
+            .expect("start partial asynchronous restore");
+        let partial_batch = (0..200)
+            .find_map(|_| {
+                let ready = partial_job.poll();
+                if ready.is_none() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                ready
+            })
+            .expect("partial asynchronous restore must finish");
+        assert!(
+            reopened
+                .commit_restore_batch(
+                    &pool_dst,
+                    &partial_alloc,
+                    partial_batch,
+                    partial_reserved,
+                    &partial_identities,
+                    partial_job.elapsed(),
+                )
+                .is_none()
+        );
+        let mut partial_guard = partial_alloc.lock().unwrap();
+        assert_eq!(partial_guard.num_free_blocks(), 2);
+        assert_eq!(
+            partial_guard
+                .find_longest_cache_hit(&tokens[0..8], 8, extra_keys, cache_salt)
+                .1,
+            0,
+            "partial restore must publish no head prefix"
+        );
         drop(reopened);
         let _ = fs::remove_dir_all(root);
     }

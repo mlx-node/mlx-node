@@ -629,6 +629,64 @@ pub struct PagedTurnPlan {
     pub reason: PagedTurnPlanReason,
 }
 
+/// Two-phase result of scheduler-aware turn preparation.
+///
+/// Dense Qwen cold restores return `Waiting` after hot-prefix lookup and
+/// destination reservation. The scheduler can then run peer rows until
+/// [`PagedKVCacheAdapter::poll_restore`] completes the model-thread commit.
+pub(crate) enum PagedTurnAdmission {
+    Ready(PagedTurnPlan),
+    Waiting {
+        provisional: PagedTurnPlan,
+        restore: PagedRestoreTicket,
+    },
+}
+
+pub(crate) enum PagedRestorePoll {
+    Pending,
+    Ready {
+        plan: PagedTurnPlan,
+        bytes_restored: u64,
+        wait: Duration,
+    },
+}
+
+pub(crate) struct PagedRestoreTicket {
+    seq_id: SeqId,
+    total_budget: u32,
+    prompt_tokens: Vec<u32>,
+    hot_cached_prefix_len: u32,
+    hot_cached_blocks: usize,
+    reason: PagedTurnPlanReason,
+    job: mlx_paged_attn::ColdRestoreBatchJob,
+    reserved: Option<Vec<Arc<PhysicalBlock>>>,
+    identities: Vec<mlx_paged_attn::RestorePrefixIdentity>,
+    allocator: Arc<Mutex<BlockAllocator>>,
+}
+
+impl PagedRestoreTicket {
+    pub(crate) fn reserved_blocks(&self) -> u32 {
+        self.reserved
+            .as_ref()
+            .map_or(0, |blocks| blocks.len().try_into().unwrap_or(u32::MAX))
+    }
+}
+
+impl Drop for PagedRestoreTicket {
+    fn drop(&mut self) {
+        let Some(blocks) = self.reserved.take() else {
+            return;
+        };
+        let mut allocator = self
+            .allocator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for block in blocks {
+            allocator.free(block);
+        }
+    }
+}
+
 /// Prefix-cache identity supplied to the shared turn-preparation lifecycle.
 ///
 /// The turn lifecycle itself (live continuation, reset, suffix allocation,
@@ -722,6 +780,12 @@ struct ColdRestore {
     sidecar: Option<mlx_paged_attn::ColdSidecar>,
 }
 
+struct PendingColdRestore {
+    job: mlx_paged_attn::ColdRestoreBatchJob,
+    reserved: Vec<Arc<PhysicalBlock>>,
+    identities: Vec<mlx_paged_attn::RestorePrefixIdentity>,
+}
+
 impl ColdRestore {
     /// Restore nothing: the hot hit stands unextended and no state is handed
     /// back. Every fail-closed exit returns this.
@@ -734,6 +798,129 @@ impl ColdRestore {
 }
 
 impl ColdTierWalk<'_> {
+    /// Prepare a dense-family cold restore without performing filesystem I/O
+    /// or Metal work on the model thread. The consecutive on-disk chain is
+    /// index-probed first, every destination is reserved next, and only then
+    /// is the background read launched.
+    fn begin_restore_extend<'k>(
+        &self,
+        lookup_tokens: &[u32],
+        hot_cached_tokens: usize,
+        cache_salt: u64,
+        extra_keys_for: impl Fn(usize) -> Option<&'k [u64]>,
+        hot_hashes: impl FnOnce(usize) -> Vec<u64>,
+    ) -> Option<PendingColdRestore> {
+        if self.cold.sidecar_policy.is_some() {
+            return None;
+        }
+        let bs = self.block_size as usize;
+        if bs == 0 {
+            return None;
+        }
+        let mut full_blocks = lookup_tokens.len() / bs;
+        let base = hot_cached_tokens.min(lookup_tokens.len()) / bs;
+        if base >= full_blocks {
+            return None;
+        }
+        let hot = hot_hashes(full_blocks);
+        full_blocks = full_blocks.min(hot.len());
+        if base >= full_blocks {
+            return None;
+        }
+
+        let mut parent_key = None;
+        for index in 0..base {
+            let extra_keys = extra_keys_for(index)?;
+            let tokens = lookup_tokens.get(index * bs..(index + 1) * bs)?;
+            parent_key = Some(mlx_paged_attn::ColdCacheKey::chain(
+                mlx_paged_attn::ColdGroup::Kv,
+                self.cold.fingerprint,
+                parent_key,
+                tokens,
+                extra_keys,
+                cache_salt,
+                index,
+            ));
+        }
+        let limit = self.kv_chain_upper_bound(
+            lookup_tokens,
+            cache_salt,
+            &extra_keys_for,
+            base,
+            full_blocks,
+            parent_key,
+        );
+        if limit <= base {
+            return None;
+        }
+
+        let mut keys = Vec::with_capacity(limit - base);
+        let mut identities = Vec::with_capacity(limit - base);
+        for index in base..limit {
+            let extra_keys = extra_keys_for(index)?;
+            let tokens = lookup_tokens.get(index * bs..(index + 1) * bs)?;
+            let key = mlx_paged_attn::ColdCacheKey::chain(
+                mlx_paged_attn::ColdGroup::Kv,
+                self.cold.fingerprint,
+                parent_key,
+                tokens,
+                extra_keys,
+                cache_salt,
+                index,
+            );
+            keys.push(key);
+            identities.push(mlx_paged_attn::RestorePrefixIdentity {
+                hot_hash: hot[index],
+                tokens: tokens.to_vec(),
+                parent_hot_hash: if index == 0 { 0 } else { hot[index - 1] },
+                extra_keys: extra_keys.to_vec(),
+                cache_salt,
+                block_index: index,
+            });
+            parent_key = Some(key);
+        }
+
+        let mut reserved = Vec::with_capacity(keys.len());
+        {
+            let mut allocator = self
+                .allocator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for _ in 0..keys.len() {
+                let Some(block) = allocator.allocate() else {
+                    for block in reserved.drain(..) {
+                        allocator.free(block);
+                    }
+                    return None;
+                };
+                reserved.push(block);
+            }
+        }
+        let job =
+            match self
+                .cold
+                .manager
+                .begin_restore_batch(self.pool, keys, self.cold.fingerprint)
+            {
+                Ok(job) => job,
+                Err(_) => {
+                    let mut allocator = self
+                        .allocator
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    for block in reserved {
+                        allocator.free(block);
+                    }
+                    return None;
+                }
+            };
+        Some(PendingColdRestore {
+            job,
+            reserved,
+            identities,
+        })
+    }
+
     /// SSD cold-tier restore on a hot-cache prefix miss: for each full block
     /// the in-memory lookup did NOT cover, recompute the persisted chain (the
     /// capture contract below — parent-linked per block, `cache_salt` mixed
@@ -2250,6 +2437,252 @@ impl PagedKVCacheAdapter {
         )
     }
 
+    /// Scheduler-aware dense-family preparation with asynchronous SSD restore.
+    ///
+    /// Live continuations and families with auxiliary sidecars retain the
+    /// established synchronous path. A fresh dense request performs only the
+    /// hot lookup on the model thread, reserves every destination for the
+    /// consecutive cold chain, and returns a ticket while filesystem work runs
+    /// in the background.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_turn_with_async_restore(
+        &mut self,
+        seq_id: SeqId,
+        prompt_tokens: &[u32],
+        total_budget: u32,
+        reuse_cache: bool,
+        extra_keys: &[u64],
+        cache_salt: u64,
+        skip_lookup: bool,
+        max_cache_hit_tokens: u32,
+    ) -> Result<PagedTurnAdmission, String> {
+        let async_dense = self
+            .cold_tier
+            .as_ref()
+            .is_some_and(|cold| cold.sidecar_policy.is_none());
+        if !async_dense {
+            return self
+                .prepare_turn_with_max_cache_hit_tokens(
+                    seq_id,
+                    prompt_tokens,
+                    total_budget,
+                    reuse_cache,
+                    extra_keys,
+                    cache_salt,
+                    skip_lookup,
+                    max_cache_hit_tokens,
+                )
+                .map(PagedTurnAdmission::Ready);
+        }
+
+        self.activate_request(seq_id)?;
+        let max_live_continue_tokens = usize::try_from(max_cache_hit_tokens).unwrap_or(usize::MAX);
+        let can_continue = reuse_cache
+            && self.is_live_for_continue()
+            && prompt_tokens.starts_with(self.request_tokens())
+            && self.request_tokens().len() <= max_live_continue_tokens;
+        if can_continue {
+            let result = self.prepare_turn_inner_mutating(
+                seq_id,
+                prompt_tokens,
+                total_budget,
+                reuse_cache,
+                PreparePrefixKeys::Uniform(extra_keys),
+                cache_salt,
+                skip_lookup,
+                Some(max_cache_hit_tokens),
+            );
+            if result.is_err() {
+                let _ = self.release_request();
+            }
+            return result.map(PagedTurnAdmission::Ready);
+        }
+
+        let result = (|| {
+            if self.block_table().is_some() {
+                let _ = self.release_request();
+            }
+            self.reset_for_new_request(seq_id)?;
+            let cold_suppressed = self.suppress_cold_restore_once;
+            let prefix = self.find_cached_prefix_inner(
+                prompt_tokens,
+                extra_keys,
+                cache_salt,
+                skip_lookup,
+                Some(max_cache_hit_tokens),
+                false,
+            )?;
+            let cached_prefix_len = prefix.cached_token_count;
+            let cached_blocks = prefix.blocks.len();
+            let lookup_len = usize::try_from(max_cache_hit_tokens)
+                .unwrap_or(usize::MAX)
+                .min(prompt_tokens.len());
+            let lookup_tokens = &prompt_tokens[..lookup_len];
+            let pending = if cold_suppressed || skip_lookup {
+                None
+            } else {
+                self.cold_tier.as_ref().and_then(|cold| {
+                    let walk = ColdTierWalk {
+                        cold,
+                        pool: &self.layer_kv_pool,
+                        allocator: &self.allocator,
+                        block_size: self.block_size,
+                    };
+                    walk.begin_restore_extend(
+                        lookup_tokens,
+                        cached_prefix_len as usize,
+                        cache_salt,
+                        |_| Some(extra_keys),
+                        |full_blocks| {
+                            mlx_paged_attn::chain_hashes(
+                                &lookup_tokens[..full_blocks * self.block_size as usize],
+                                self.block_size,
+                                extra_keys,
+                                cache_salt,
+                            )
+                        },
+                    )
+                })
+            };
+            let suffix_len = total_budget.checked_sub(cached_prefix_len).ok_or_else(|| {
+                format!(
+                    "prepare_turn: cached_prefix_len {cached_prefix_len} exceeds total_budget {total_budget}"
+                )
+            })?;
+            let reason = PagedTurnPlanReason::FreshReset;
+            let Some(pending) = pending else {
+                let allocated_blocks = self.allocate_suffix_blocks(total_budget)?;
+                return Ok(PagedTurnAdmission::Ready(PagedTurnPlan {
+                    cached_prefix_len,
+                    continued_live_prefix: false,
+                    allocated_blocks,
+                    cached_blocks,
+                    total_budget,
+                    suffix_len,
+                    reason,
+                }));
+            };
+            let provisional = PagedTurnPlan {
+                cached_prefix_len,
+                continued_live_prefix: false,
+                allocated_blocks: pending.reserved.len() as u32,
+                cached_blocks,
+                total_budget,
+                suffix_len,
+                reason,
+            };
+            Ok(PagedTurnAdmission::Waiting {
+                provisional,
+                restore: PagedRestoreTicket {
+                    seq_id,
+                    total_budget,
+                    prompt_tokens: prompt_tokens.to_vec(),
+                    hot_cached_prefix_len: cached_prefix_len,
+                    hot_cached_blocks: cached_blocks,
+                    reason,
+                    job: pending.job,
+                    reserved: Some(pending.reserved),
+                    identities: pending.identities,
+                    allocator: Arc::clone(&self.allocator),
+                },
+            })
+        })();
+        if result.is_err() {
+            let _ = self.release_request();
+        }
+        result
+    }
+
+    /// Poll and, once ready, commit one scheduler-owned restore ticket.
+    pub(crate) fn poll_restore(
+        &mut self,
+        restore: &mut PagedRestoreTicket,
+    ) -> Result<PagedRestorePoll, String> {
+        let Some(batch) = restore.job.poll() else {
+            return Ok(PagedRestorePoll::Pending);
+        };
+        let wait = restore.job.elapsed();
+        self.activate_request(restore.seq_id)?;
+        let manager = Arc::clone(
+            &self
+                .cold_tier
+                .as_ref()
+                .ok_or_else(|| "cold tier disappeared during restore".to_string())?
+                .manager,
+        );
+        let reserved = restore.reserved.take().unwrap_or_default();
+        let committed = manager.commit_restore_batch(
+            &self.layer_kv_pool,
+            &self.allocator,
+            batch,
+            reserved,
+            &restore.identities,
+            wait,
+        );
+        let (blocks, bytes_restored) = committed
+            .map(|commit| (commit.blocks, commit.bytes_restored))
+            .unwrap_or_default();
+        let restored_block_count = blocks.len();
+        let restored_tokens = (blocks.len() as u32).saturating_mul(self.block_size);
+        let cached_prefix_len = restore
+            .hot_cached_prefix_len
+            .saturating_add(restored_tokens);
+        if cached_prefix_len > restore.total_budget
+            || cached_prefix_len as usize > restore.prompt_tokens.len()
+        {
+            let mut allocator = self
+                .allocator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for block in blocks {
+                allocator.free(block);
+            }
+            return Err("asynchronous cold restore exceeded the prepared prompt".to_string());
+        }
+        if !blocks.is_empty() {
+            if self.block_table.is_none() {
+                let mut allocator = self
+                    .allocator
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for block in blocks {
+                    allocator.free(block);
+                }
+                return Err("restore commit has no active block table".to_string());
+            }
+            {
+                let block_table = self
+                    .block_table
+                    .as_mut()
+                    .expect("presence checked before consuming restored blocks");
+                for block in blocks {
+                    block_table.add_block(block);
+                }
+                block_table.set_num_tokens(cached_prefix_len);
+            }
+            self.cached_token_count = cached_prefix_len;
+            self.request_tokens.extend_from_slice(
+                &restore.prompt_tokens
+                    [restore.hot_cached_prefix_len as usize..cached_prefix_len as usize],
+            );
+        }
+        let allocated_blocks = self.allocate_suffix_blocks(restore.total_budget)?;
+        let suffix_len = restore.total_budget.saturating_sub(cached_prefix_len);
+        Ok(PagedRestorePoll::Ready {
+            plan: PagedTurnPlan {
+                cached_prefix_len,
+                continued_live_prefix: false,
+                allocated_blocks,
+                cached_blocks: restore.hot_cached_blocks + restored_block_count,
+                total_budget: restore.total_budget,
+                suffix_len,
+                reason: restore.reason,
+            },
+            bytes_restored,
+            wait,
+        })
+    }
+
     /// Per-block-extra-keys variant of
     /// [`Self::prepare_turn_with_max_cache_hit_tokens`].
     ///
@@ -2467,6 +2900,7 @@ impl PagedKVCacheAdapter {
                 cache_salt,
                 skip_lookup,
                 max_cache_hit_tokens,
+                true,
             ),
             PreparePrefixKeys::PerBlock(extra_keys_per_block) => self
                 .find_cached_prefix_per_block_inner(
@@ -2553,7 +2987,14 @@ impl PagedKVCacheAdapter {
         cache_salt: u64,
         skip_lookup: bool,
     ) -> Result<CachedPrefix, String> {
-        self.find_cached_prefix_inner(prompt_tokens, extra_keys, cache_salt, skip_lookup, None)
+        self.find_cached_prefix_inner(
+            prompt_tokens,
+            extra_keys,
+            cache_salt,
+            skip_lookup,
+            None,
+            true,
+        )
     }
 
     /// Variant of [`Self::find_cached_prefix`] that caps the lookup length
@@ -2580,6 +3021,7 @@ impl PagedKVCacheAdapter {
             cache_salt,
             skip_lookup,
             Some(max_cache_hit_tokens),
+            true,
         )
     }
 
@@ -2590,6 +3032,7 @@ impl PagedKVCacheAdapter {
         cache_salt: u64,
         skip_lookup: bool,
         max_cache_hit_tokens: Option<u32>,
+        restore_cold: bool,
     ) -> Result<CachedPrefix, String> {
         // Reject re-entrant calls BEFORE touching the allocator. The flag
         // tracks lookup-already-ran regardless of hit/miss outcome, so a
@@ -2652,7 +3095,10 @@ impl PagedKVCacheAdapter {
         //
         // Skipped for one lookup after a command reset (`suppress_cold_restore`)
         // so the just-purged prefix is re-prefilled cold rather than restored.
-        if !suppress_cold_restore && let Some(cold) = self.cold_tier.as_ref() {
+        if restore_cold
+            && !suppress_cold_restore
+            && let Some(cold) = self.cold_tier.as_ref()
+        {
             let block_size = self.block_size;
             let walk = ColdTierWalk {
                 cold,

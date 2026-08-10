@@ -36,6 +36,7 @@ mod cold_tier_parity_harness;
 
 use cold_tier_parity_harness as harness;
 use mlx_core::models::qwen3::persistence::load_with_thread as qwen3_load_with_thread;
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // Cold-tier restart parity gate
@@ -44,14 +45,48 @@ use mlx_core::models::qwen3::persistence::load_with_thread as qwen3_load_with_th
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3 checkpoint; run with --test-threads=1"]
 async fn qwen3_cold_tier_restart_parity() {
+    let scheduler_stats = Arc::new(Mutex::new(Vec::new()));
+    let collected = Arc::clone(&scheduler_stats);
     harness::run_restart_parity(
         harness::ColdTierParitySpec::new("qwen3"),
-        |model_dir, messages, config| async move {
-            // Loaded fresh per instance and dropped when this future
-            // completes, so instance 2 really starts from an empty hot cache.
-            let model = qwen3_load_with_thread(&model_dir.to_string_lossy()).await?;
-            model.chat_session_start(messages, Some(config)).await
+        move |model_dir, messages, config| {
+            let collected = Arc::clone(&collected);
+            async move {
+                // Loaded fresh per instance and dropped when this future
+                // completes, so instance 2 really starts from an empty hot cache.
+                let model = qwen3_load_with_thread(&model_dir.to_string_lossy()).await?;
+                let result = model.chat_session_start(messages, Some(config)).await?;
+                let stats = model.scheduler_stats().await?;
+                collected.lock().unwrap().push((
+                    stats.ssd_restore_bytes,
+                    stats.ssd_restore_wait_ms,
+                    stats.ssd_restore_waiting,
+                ));
+                Ok(result)
+            }
         },
     )
     .await;
+    let snapshots = scheduler_stats.lock().unwrap();
+    if snapshots.is_empty() {
+        return;
+    }
+    eprintln!("[qwen3] scheduler SSD snapshots: {snapshots:?}");
+    assert_eq!(
+        snapshots.len(),
+        3,
+        "capture, restore, and baseline snapshots"
+    );
+    assert!(
+        snapshots[1].0 > 0.0,
+        "restart instance must report bytes committed by async SSD restore"
+    );
+    assert!(
+        snapshots[1].1 > 0.0,
+        "restart instance must report non-zero SSD wait time"
+    );
+    assert_eq!(
+        snapshots[1].2, 0,
+        "restore waiting gauge must drain before the turn completes"
+    );
 }
