@@ -157,6 +157,9 @@ async fn serial_uniform_batch_and_interleaved_streams_are_token_identical() {
             .map(|bucket| (bucket.occupancy, bucket.steps))
             .collect::<Vec<_>>()
     );
+    assert!(stats.block_capacity > 0, "live block telemetry is required");
+    assert_eq!(stats.rows_alloc_evicted, 0.0);
+    assert_eq!(stats.reserved_blocks, 0);
     eprintln!(
         "stage1 N=8 host+device wall: serial={:.2}ms batch={:.2}ms aggregate_speedup={:.2}x hist={:?}",
         serial_elapsed.as_secs_f64() * 1_000.0,

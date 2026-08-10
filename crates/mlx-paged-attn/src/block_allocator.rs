@@ -1009,12 +1009,18 @@ impl BlockAllocator {
         if free >= num_blocks {
             return true;
         }
-        let evictable = self
-            .prefix_cache
-            .values()
-            .filter(|b| b.get_ref_count() == 1)
-            .count() as u32;
+        let evictable = self.num_evictable_blocks();
         free + evictable >= num_blocks
+    }
+
+    /// Cache-only blocks that admission may reclaim without touching a live
+    /// request. Active request blocks have refcount greater than one and are
+    /// deliberately excluded.
+    pub fn num_evictable_blocks(&self) -> u32 {
+        self.prefix_cache
+            .values()
+            .filter(|block| block.get_ref_count() == 1)
+            .count() as u32
     }
 
     /// Set the maximum number of entries the prefix cache will hold before

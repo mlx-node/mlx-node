@@ -33,6 +33,11 @@ pub(crate) struct TurnState<P> {
     pub status: TurnStatus,
     pub cancelled: Option<Arc<AtomicBool>>,
     pub cancel_snapshot: bool,
+    /// Full-ISL KV reservation for this request. Zero means the model does
+    /// not participate in block-watermark admission.
+    pub block_reservation_total: u32,
+    pub block_materialized_blocks: u32,
+    pub block_size: u32,
     pub payload: P,
     arrival_order: u64,
 }
@@ -74,6 +79,9 @@ impl<P> TurnState<P> {
             status: TurnStatus::Waiting,
             cancelled,
             cancel_snapshot: false,
+            block_reservation_total: 0,
+            block_materialized_blocks: 0,
+            block_size: 0,
             payload,
             arrival_order: 0,
         })
@@ -92,6 +100,69 @@ impl<P> TurnState<P> {
             .copied()
             .find(|&boundary| boundary > self.num_computed_tokens)
             .unwrap_or(self.prompt_tokens)
+    }
+
+    pub fn with_block_reservation(
+        mut self,
+        total_blocks: u32,
+        materialized_blocks: u32,
+        block_size: u32,
+    ) -> Self {
+        self.block_reservation_total = total_blocks;
+        self.block_materialized_blocks = materialized_blocks.min(total_blocks);
+        self.block_size = block_size;
+        self
+    }
+
+    fn unallocated_reserved_blocks(&self) -> u32 {
+        if self.block_reservation_total == 0 || self.block_size == 0 {
+            return 0;
+        }
+        self.block_reservation_total
+            .saturating_sub(self.block_materialized_blocks)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BlockTelemetry {
+    pub total_blocks: u32,
+    pub free_blocks: u32,
+    pub reclaimable_blocks: u32,
+    pub allocated_blocks: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlockAdmission {
+    pub admitted: bool,
+    pub watermark_blocks: u32,
+    pub reserved_blocks: u32,
+}
+
+pub(crate) fn block_admission_decision(
+    telemetry: BlockTelemetry,
+    existing_unallocated: u32,
+    candidate_blocks: u32,
+    has_live_rows: bool,
+    watermark_fraction: f64,
+) -> BlockAdmission {
+    let fraction = if watermark_fraction.is_finite() {
+        watermark_fraction.clamp(0.0, 1.0)
+    } else {
+        0.05
+    };
+    let watermark_blocks = if has_live_rows {
+        ((telemetry.total_blocks as f64) * fraction).ceil() as u32
+    } else {
+        0
+    };
+    let reserved_blocks = existing_unallocated.saturating_add(candidate_blocks);
+    BlockAdmission {
+        admitted: reserved_blocks.saturating_add(watermark_blocks)
+            <= telemetry
+                .free_blocks
+                .saturating_add(telemetry.reclaimable_blocks),
+        watermark_blocks,
+        reserved_blocks,
     }
 }
 
@@ -132,6 +203,7 @@ pub(crate) struct StepResult {
     /// This is executor-reported rather than inferred from the plan so a
     /// silent N-times-scalar fallback cannot fake occupancy telemetry.
     pub executed_decode_batch: usize,
+    pub rows_alloc_evicted: u32,
 }
 
 pub(crate) trait StepExecutor<P> {
@@ -151,6 +223,14 @@ pub(crate) struct SchedulerStats {
     pub decode_batch_occupancy_hist: BTreeMap<usize, u64>,
     pub admitted: u64,
     pub completed: u64,
+    pub admission_deferred_blocks: u64,
+    pub rows_alloc_evicted: u64,
+    pub block_capacity: u32,
+    pub free_blocks: u32,
+    pub reclaimable_blocks: u32,
+    pub allocated_blocks: u32,
+    pub watermark_blocks: u32,
+    pub reserved_blocks: u32,
 }
 
 #[napi(object, js_name = "DecodeBatchOccupancyBucket")]
@@ -168,6 +248,14 @@ pub struct SchedulerStatsJs {
     pub decode_batch_occupancy_hist: Vec<DecodeBatchOccupancyBucketJs>,
     pub admitted: f64,
     pub completed: f64,
+    pub admission_deferred_blocks: f64,
+    pub rows_alloc_evicted: f64,
+    pub block_capacity: u32,
+    pub free_blocks: u32,
+    pub reclaimable_blocks: u32,
+    pub allocated_blocks: u32,
+    pub watermark_blocks: u32,
+    pub reserved_blocks: u32,
 }
 
 impl SchedulerStats {
@@ -185,6 +273,14 @@ impl SchedulerStats {
                 .collect(),
             admitted: self.admitted as f64,
             completed: self.completed as f64,
+            admission_deferred_blocks: self.admission_deferred_blocks as f64,
+            rows_alloc_evicted: self.rows_alloc_evicted as f64,
+            block_capacity: self.block_capacity,
+            free_blocks: self.free_blocks,
+            reclaimable_blocks: self.reclaimable_blocks,
+            allocated_blocks: self.allocated_blocks,
+            watermark_blocks: self.watermark_blocks,
+            reserved_blocks: self.reserved_blocks,
         }
     }
 }
@@ -300,6 +396,67 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             .iter()
             .chain(self.running.iter())
             .any(|turn| turn.seq_id == seq_id)
+    }
+
+    pub fn has_live_turns(&self) -> bool {
+        !self.waiting.is_empty() || !self.running.is_empty()
+    }
+
+    fn unallocated_reserved_blocks(&self) -> u32 {
+        self.waiting
+            .iter()
+            .chain(self.running.iter())
+            .fold(0u32, |sum, turn| {
+                sum.saturating_add(turn.unallocated_reserved_blocks())
+            })
+    }
+
+    pub fn observe_blocks(
+        &mut self,
+        telemetry: BlockTelemetry,
+        watermark_fraction: f64,
+    ) -> BlockAdmission {
+        let decision = block_admission_decision(
+            telemetry,
+            self.unallocated_reserved_blocks(),
+            0,
+            self.has_live_turns(),
+            watermark_fraction,
+        );
+        self.stats.block_capacity = telemetry.total_blocks;
+        self.stats.free_blocks = telemetry.free_blocks;
+        self.stats.reclaimable_blocks = telemetry.reclaimable_blocks;
+        self.stats.allocated_blocks = telemetry.allocated_blocks;
+        self.stats.watermark_blocks = decision.watermark_blocks;
+        self.stats.reserved_blocks = decision.reserved_blocks;
+        decision
+    }
+
+    pub fn try_reserve_blocks(
+        &mut self,
+        telemetry: BlockTelemetry,
+        candidate_blocks: u32,
+        watermark_fraction: f64,
+    ) -> BlockAdmission {
+        let existing_unallocated = self.unallocated_reserved_blocks();
+        let decision = block_admission_decision(
+            telemetry,
+            existing_unallocated,
+            candidate_blocks,
+            self.has_live_turns(),
+            watermark_fraction,
+        );
+        self.stats.block_capacity = telemetry.total_blocks;
+        self.stats.free_blocks = telemetry.free_blocks;
+        self.stats.reclaimable_blocks = telemetry.reclaimable_blocks;
+        self.stats.allocated_blocks = telemetry.allocated_blocks;
+        self.stats.watermark_blocks = decision.watermark_blocks;
+        self.stats.reserved_blocks = decision.reserved_blocks;
+        if !decision.admitted {
+            self.stats.admission_deferred_blocks =
+                self.stats.admission_deferred_blocks.saturating_add(1);
+        }
+        decision
     }
 
     pub fn park_waiting_for_ssd(&mut self, seq_id: SeqId) -> Result<(), String> {
@@ -474,6 +631,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             .execute(&plan, &mut self.running)
             .map_err(SchedulerError::Executor)?;
         let executed_decode_batch = result.executed_decode_batch;
+        let rows_alloc_evicted = result.rows_alloc_evicted;
         let planned_decode_rows = plan
             .rows
             .iter()
@@ -488,6 +646,10 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             .map_err(SchedulerError::InvalidResult)?;
         self.global_step = self.global_step.saturating_add(1);
         self.stats.global_steps = self.global_step;
+        self.stats.rows_alloc_evicted = self
+            .stats
+            .rows_alloc_evicted
+            .saturating_add(u64::from(rows_alloc_evicted));
         let decode_occupancy = executed_decode_batch;
         if decode_occupancy != 0 {
             self.stats.max_batch_occupancy = self.stats.max_batch_occupancy.max(decode_occupancy);
@@ -564,6 +726,11 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                 .num_computed_tokens
                 .checked_add(output.num_computed_tokens)
                 .ok_or_else(|| format!("request {} computed-token overflow", turn.seq_id))?;
+            if turn.block_size != 0 {
+                turn.block_materialized_blocks = turn
+                    .block_materialized_blocks
+                    .max(turn.num_computed_tokens.div_ceil(turn.block_size));
+            }
             if let Some(token) = output.generated_token {
                 turn.token_history.push(token);
                 turn.num_tokens = turn
@@ -624,6 +791,7 @@ mod tests {
                     .iter()
                     .filter(|row| row.kind == StepKind::Decode)
                     .count(),
+                rows_alloc_evicted: 0,
             })
         }
     }
@@ -837,5 +1005,89 @@ mod tests {
         };
         assert_eq!(plan.rows[0].seq_id, 2);
         scheduler.wake_from_ssd(1).expect("wake SSD row");
+    }
+
+    #[test]
+    fn block_admission_reserves_growth_and_watermark_before_allocation() {
+        let mut scheduler = Scheduler::<_, (), ()>::new(2, 8).expect("scheduler");
+        scheduler
+            .enqueue_turn(turn(1, 4, &[4], None).with_block_reservation(6, 2, 2))
+            .expect("enqueue reserved row");
+
+        // A has four unallocated blocks left. B asks for five. Both the
+        // existing reservation and the 10% watermark are individually
+        // decisive: ignoring either would incorrectly admit B into ten free
+        // blocks (5 + 2 <= 10, or 4 + 5 <= 10).
+        let deferred = scheduler.try_reserve_blocks(
+            BlockTelemetry {
+                total_blocks: 20,
+                free_blocks: 10,
+                reclaimable_blocks: 0,
+                allocated_blocks: 10,
+            },
+            5,
+            0.10,
+        );
+        assert_eq!(
+            deferred,
+            BlockAdmission {
+                admitted: false,
+                watermark_blocks: 2,
+                reserved_blocks: 9,
+            }
+        );
+        assert_eq!(scheduler.stats().admission_deferred_blocks, 1);
+        assert_eq!(scheduler.stats().free_blocks, 10);
+
+        let admitted = scheduler.try_reserve_blocks(
+            BlockTelemetry {
+                total_blocks: 20,
+                free_blocks: 10,
+                reclaimable_blocks: 0,
+                allocated_blocks: 10,
+            },
+            4,
+            0.10,
+        );
+        assert!(admitted.admitted);
+        assert_eq!(admitted.reserved_blocks + admitted.watermark_blocks, 10);
+    }
+
+    #[test]
+    fn first_block_admission_has_no_watermark_but_still_must_fit() {
+        assert_eq!(
+            block_admission_decision(
+                BlockTelemetry {
+                    total_blocks: 100,
+                    free_blocks: 8,
+                    reclaimable_blocks: 0,
+                    allocated_blocks: 92,
+                },
+                0,
+                8,
+                false,
+                0.05,
+            ),
+            BlockAdmission {
+                admitted: true,
+                watermark_blocks: 0,
+                reserved_blocks: 8,
+            }
+        );
+        assert!(
+            !block_admission_decision(
+                BlockTelemetry {
+                    total_blocks: 100,
+                    free_blocks: 8,
+                    reclaimable_blocks: 0,
+                    allocated_blocks: 92,
+                },
+                0,
+                9,
+                false,
+                0.05,
+            )
+            .admitted
+        );
     }
 }

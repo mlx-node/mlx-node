@@ -591,7 +591,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
             // load completes — no active-memory sampling, so no race
             // with concurrent inference on the process-wide counter.
             // See `cache_limit.rs` module docs.
-            let load_result: Result<(Qwen3Inner, Qwen3Config, Qwen3Tokenizer, u64, bool)> =
+            let load_result: Result<(Qwen3Inner, Qwen3Config, Qwen3Tokenizer, u64, u64, bool)> =
                 (|| {
                     // Load config
                     let config_path = path.join("config.json");
@@ -703,6 +703,8 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                         crate::array::memory::materialize_weights(&arrays)?
                     };
 
+                    inner.size_paged_pool_after_weight_load()?;
+
                     if persist_cold {
                         // Fail-closed revalidation bracketing the WHOLE
                         // load-to-materialize-to-fingerprint span. Compute the
@@ -750,24 +752,40 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                         .values()
                         .map(|a| a.nbytes() as u64)
                         .fold(0u64, |acc, v| acc.saturating_add(v));
+                    let pool_bytes = inner.paged_pool_allocated_bytes()?;
 
                     let paged_active = inner.paged_adapter.is_some();
-                    Ok((inner, config, tokenizer, weight_bytes, paged_active))
+                    Ok((
+                        inner,
+                        config,
+                        tokenizer,
+                        weight_bytes,
+                        pool_bytes,
+                        paged_active,
+                    ))
                 })();
-            let (inner, config, tokenizer, weight_bytes, paged_active) = load_result?;
+            let (inner, config, tokenizer, weight_bytes, pool_bytes, paged_active) = load_result?;
             let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
+            let pool_cache_limit_guard = (pool_bytes != 0)
+                .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
             let config_out = config.clone();
             let tokenizer_out = Some(Arc::new(tokenizer));
 
             Ok((
                 QwenSchedulerState::new(inner),
-                (config_out, tokenizer_out, cache_limit_guard, paged_active),
+                (
+                    config_out,
+                    tokenizer_out,
+                    cache_limit_guard,
+                    pool_cache_limit_guard,
+                    paged_active,
+                ),
             ))
         },
         |state, receiver| state.drive(receiver),
     );
 
-    let (config, tokenizer, cache_limit_guard, paged_active) = init_rx
+    let (config, tokenizer, cache_limit_guard, pool_cache_limit_guard, paged_active) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
@@ -777,6 +795,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
         tokenizer,
         paged_active,
         _cache_limit_guard: cache_limit_guard,
+        _pool_cache_limit_guard: pool_cache_limit_guard,
     })
 }
 

@@ -6,6 +6,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -41,6 +42,74 @@ use crate::transformer::{KVCache, TransformerBlock};
 
 use super::{BatchGenerationResult, GenerationConfig, GenerationResult, Qwen3Config};
 use crate::engine;
+
+fn scheduler_max_num_seqs() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_SCHED_MAX_NUM_SEQS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(8)
+            .min(32)
+    })
+}
+
+fn scheduler_max_batched_tokens() -> u32 {
+    static VALUE: OnceLock<u32> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_SCHED_MAX_BATCHED_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(2048)
+    })
+}
+
+fn scheduler_long_prefill_tokens() -> u32 {
+    static VALUE: OnceLock<u32> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_SCHED_LONG_PREFILL_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(2048)
+    })
+}
+
+fn scheduler_per_seq_context() -> u32 {
+    static VALUE: OnceLock<u32> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_PAGED_PER_SEQ_CTX")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(32_768)
+    })
+}
+
+fn scheduler_watermark_fraction() -> f64 {
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_SCHED_WATERMARK_FRACTION")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            .unwrap_or(0.05)
+    })
+}
+
+fn scheduler_reserve_full_isl() -> bool {
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_SCHED_RESERVE_FULL_ISL").map_or(true, |value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+    })
+}
 
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
@@ -323,6 +392,17 @@ struct QwenScheduledTurn {
     streamed_text_len: usize,
     last_is_reasoning: bool,
     failure: Option<Error>,
+    allocation_failed: bool,
+}
+
+struct PreparedQwenScheduledTurn {
+    admitted: engine::session::AdmittedPagedTurn,
+    response: ScheduledReply,
+    cancelled: Arc<AtomicBool>,
+    owner_id: String,
+    seq_id: SeqId,
+    reservation_blocks: u32,
+    block_size: u32,
 }
 
 struct QwenStepExecutor<'a> {
@@ -347,6 +427,9 @@ impl QwenStepExecutor<'_> {
         row: &engine::scheduler::StepRow,
         error: Error,
     ) -> RowStepResult {
+        turn.payload.allocation_failed |= error.reason.contains("could not reserve")
+            || error.reason.contains("failed to record sequence")
+            || error.reason.contains("paged cache capacity");
         turn.payload.failure = Some(error);
         turn.payload.profiler.snapshot_memory_after();
         turn.payload.profiler.report();
@@ -884,6 +967,10 @@ impl StepExecutor<QwenScheduledTurn> for QwenStepExecutor<'_> {
             } else {
                 usize::from(decode_count != 0)
             },
+            rows_alloc_evicted: running
+                .iter()
+                .filter(|turn| turn.payload.allocation_failed)
+                .count() as u32,
         })
     }
 }
@@ -894,6 +981,7 @@ pub(crate) struct QwenSchedulerState {
     inner: Qwen3Inner,
     scheduler: Scheduler<QwenScheduledTurn, Qwen3Cmd, Qwen3Cmd>,
     pending: VecDeque<Qwen3Cmd>,
+    prepared_waiting: Option<Box<PreparedQwenScheduledTurn>>,
     owner_sequences: HashMap<String, SeqId>,
     owner_histories: HashMap<String, Vec<u32>>,
     next_seq_id: SeqId,
@@ -901,21 +989,14 @@ pub(crate) struct QwenSchedulerState {
 
 impl QwenSchedulerState {
     pub(crate) fn new(inner: Qwen3Inner) -> Self {
-        let max_num_seqs = std::env::var("MLX_SCHED_MAX_NUM_SEQS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(8);
-        let max_num_batched_tokens = std::env::var("MLX_SCHED_MAX_BATCHED_TOKENS")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(2048);
+        let max_num_seqs = scheduler_max_num_seqs();
+        let max_num_batched_tokens = scheduler_max_batched_tokens();
         Self {
             inner,
             scheduler: Scheduler::new(max_num_seqs, max_num_batched_tokens)
                 .expect("validated qwen3 scheduler limits"),
             pending: VecDeque::new(),
+            prepared_waiting: None,
             owner_sequences: HashMap::new(),
             owner_histories: HashMap::new(),
             next_seq_id: 1,
@@ -951,7 +1032,7 @@ impl QwenSchedulerState {
         response.send_error(error, cancelled);
     }
 
-    fn admit_chat(&mut self, command: ChatCmd) -> Option<TurnState<QwenScheduledTurn>> {
+    fn prepare_chat(&mut self, command: ChatCmd) -> Option<Box<PreparedQwenScheduledTurn>> {
         let (messages, config, response, cancelled, turn_kind, guard_name, stream_guard_name) =
             match command {
                 ChatCmd::SessionStart {
@@ -1081,19 +1162,15 @@ impl QwenSchedulerState {
             return None;
         }
 
-        self.inner
-            .set_turn_cancel_flag(Some(Arc::clone(&cancelled)));
         let admitted =
             match engine::session::admit_paged_turn(&mut self.inner, messages, config, turn_kind) {
                 Ok(admitted) => admitted,
                 Err(error) => {
-                    self.inner.set_turn_cancel_flag(None);
                     Self::reply_admission_error(response, cancelled.as_ref(), error);
                     return None;
                 }
             };
         if admitted.plan.path() != engine::plan::TurnPath::Paged {
-            self.inner.set_turn_cancel_flag(None);
             Self::reply_admission_error(
                 response,
                 cancelled.as_ref(),
@@ -1101,19 +1178,52 @@ impl QwenSchedulerState {
             );
             return None;
         }
-        let reuse_cache = admitted.plan.is_delta || admitted.params.reuse_cache;
-        let seq_id = if owner_id.is_empty() {
-            0
+        let prompt_tokens = admitted.tokens.len() as u32;
+        let max_new_tokens = admitted.params.max_new_tokens.max(0) as u32;
+        let trained_context = u32::try_from(self.inner.config.max_position_embeddings)
+            .unwrap_or(1)
+            .max(1);
+        let per_seq_context = trained_context.min(scheduler_per_seq_context());
+        let requested_tokens = prompt_tokens.saturating_add(max_new_tokens);
+        if requested_tokens > per_seq_context {
+            Self::reply_admission_error(
+                response,
+                cancelled.as_ref(),
+                Error::from_reason(format!(
+                    "context_length_exceeded: prompt ({prompt_tokens}) + max_new_tokens ({max_new_tokens}) exceeds scheduler per-sequence context {per_seq_context}"
+                )),
+            );
+            return None;
+        }
+        let block_size = self
+            .inner
+            .paged_adapter
+            .as_ref()
+            .expect("paged route checked by caller")
+            .block_size();
+        let full_reservation_blocks = requested_tokens.div_ceil(block_size);
+        let reservation_blocks = if scheduler_reserve_full_isl() {
+            full_reservation_blocks
+        } else {
+            prompt_tokens
+                .div_ceil(block_size)
+                .saturating_add(u32::from(max_new_tokens != 0))
+                .min(full_reservation_blocks)
+        };
+        let (seq_id, newly_assigned) = if owner_id.is_empty() {
+            (0, false)
         } else if let Some(&seq_id) = self.owner_sequences.get(&owner_id) {
-            seq_id
+            (seq_id, false)
         } else {
             let seq_id = self.next_seq_id;
             self.next_seq_id = self.next_seq_id.saturating_add(1);
             self.owner_sequences.insert(owner_id.clone(), seq_id);
-            seq_id
+            (seq_id, true)
         };
         if self.scheduler.contains_seq(seq_id) {
-            self.inner.set_turn_cancel_flag(None);
+            if newly_assigned {
+                self.owner_sequences.remove(&owner_id);
+            }
             Self::reply_admission_error(
                 response,
                 cancelled.as_ref(),
@@ -1121,6 +1231,93 @@ impl QwenSchedulerState {
             );
             return None;
         }
+        Some(Box::new(PreparedQwenScheduledTurn {
+            admitted,
+            response,
+            cancelled,
+            owner_id,
+            seq_id,
+            reservation_blocks,
+            block_size,
+        }))
+    }
+
+    fn admit_prepared(
+        &mut self,
+        prepared: Box<PreparedQwenScheduledTurn>,
+    ) -> std::result::Result<Option<TurnState<QwenScheduledTurn>>, Box<PreparedQwenScheduledTurn>>
+    {
+        let telemetry = match self
+            .inner
+            .paged_adapter
+            .as_ref()
+            .expect("paged route checked by caller")
+            .block_telemetry()
+        {
+            Ok(telemetry) => telemetry,
+            Err(error) => {
+                Self::reply_admission_error(
+                    prepared.response,
+                    prepared.cancelled.as_ref(),
+                    Error::from_reason(error),
+                );
+                return Ok(None);
+            }
+        };
+        if prepared.reservation_blocks > telemetry.total_blocks {
+            Self::reply_admission_error(
+                prepared.response,
+                prepared.cancelled.as_ref(),
+                Error::from_reason(format!(
+                    "context_length_exceeded: request requires {} paged blocks but the pool has {}",
+                    prepared.reservation_blocks, telemetry.total_blocks
+                )),
+            );
+            return Ok(None);
+        }
+        let decision = self.scheduler.try_reserve_blocks(
+            engine::scheduler::BlockTelemetry {
+                total_blocks: telemetry.total_blocks,
+                free_blocks: telemetry.free_blocks,
+                reclaimable_blocks: telemetry.reclaimable_blocks,
+                allocated_blocks: telemetry.allocated_blocks,
+            },
+            prepared.reservation_blocks,
+            scheduler_watermark_fraction(),
+        );
+        if !decision.admitted {
+            return Err(prepared);
+        }
+
+        let PreparedQwenScheduledTurn {
+            admitted,
+            response,
+            cancelled,
+            owner_id,
+            seq_id,
+            reservation_blocks,
+            block_size,
+        } = *prepared;
+        if cancelled.load(Ordering::Relaxed) {
+            Self::reply_admission_error(
+                response,
+                cancelled.as_ref(),
+                Error::from_reason(engine::session::CHAT_SESSION_CANCELLED),
+            );
+            return Ok(None);
+        }
+        self.inner.cached_token_history = self
+            .owner_histories
+            .get(&owner_id)
+            .cloned()
+            .unwrap_or_default();
+        self.inner.set_cache_owner_id(
+            &admitted.params.cache_owner_id,
+            admitted.params.cache_root_owner_id.as_deref(),
+        );
+        self.inner
+            .set_turn_cancel_flag(Some(Arc::clone(&cancelled)));
+        let reuse_cache = admitted.plan.is_delta || admitted.params.reuse_cache;
         let generation_start = admitted.params.report_performance.then(Instant::now);
         let prefix =
             match self
@@ -1132,7 +1329,7 @@ impl QwenSchedulerState {
                     self.inner.abort_paged_turn();
                     self.inner.set_turn_cancel_flag(None);
                     Self::reply_admission_error(response, cancelled.as_ref(), error);
-                    return None;
+                    return Ok(None);
                 }
             };
         if prefix.suffix_len == 0 {
@@ -1143,8 +1340,15 @@ impl QwenSchedulerState {
                 cancelled.as_ref(),
                 Error::from_reason("scheduler admission produced an empty prefill suffix"),
             );
-            return None;
+            return Ok(None);
         }
+        let materialized_blocks = self
+            .inner
+            .paged_adapter
+            .as_ref()
+            .and_then(|adapter| adapter.block_table_for(seq_id))
+            .map(|table| table.num_blocks() as u32)
+            .unwrap_or(0);
         let is_streaming = response.sink().is_some();
         let generation_stream = Stream::new(DeviceType::Gpu);
         let mut profiler = crate::decode_profiler::DecodeProfiler::new(
@@ -1183,22 +1387,19 @@ impl QwenSchedulerState {
             streamed_text_len: 0,
             last_is_reasoning: admitted.thinking.enabled,
             failure: None,
+            allocation_failed: false,
             prefix,
             is_delta: admitted.plan.is_delta,
         };
         let prompt_len = admitted.tokens.len() as u32;
-        let long_prefill_tokens = std::env::var("MLX_SCHED_LONG_PREFILL_TOKENS")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(2048);
+        let long_prefill_tokens = scheduler_long_prefill_tokens();
         let mut pinned_prefill_breaks = Vec::new();
         let mut boundary = payload.prefix.effective_cached_prefix_len as u32;
         while boundary < prompt_len {
             boundary = boundary.saturating_add(long_prefill_tokens).min(prompt_len);
             pinned_prefill_breaks.push(boundary);
         }
-        Some(
+        Ok(Some(
             TurnState::new(
                 seq_id,
                 u64::from(seq_id),
@@ -1208,8 +1409,13 @@ impl QwenSchedulerState {
                 Some(cancelled),
                 payload,
             )
-            .expect("prime-derived qwen3 scheduler turn must satisfy progress invariants"),
-        )
+            .expect("prime-derived qwen3 scheduler turn must satisfy progress invariants")
+            .with_block_reservation(
+                reservation_blocks,
+                materialized_blocks,
+                block_size,
+            ),
+        ))
     }
 
     fn finish_completed(&mut self, mut turn: TurnState<QwenScheduledTurn>) {
@@ -1290,7 +1496,8 @@ impl QwenSchedulerState {
         &mut self,
         receiver: &mut tokio::sync::mpsc::UnboundedReceiver<Qwen3Cmd>,
     ) -> LoopControl {
-        if !self.scheduler.has_work() && self.pending.is_empty() {
+        if !self.scheduler.has_work() && self.pending.is_empty() && self.prepared_waiting.is_none()
+        {
             match receiver.blocking_recv() {
                 Some(command) => self.pending.push_back(command),
                 None => return LoopControl::Break,
@@ -1300,7 +1507,23 @@ impl QwenSchedulerState {
             self.pending.push_back(command);
         }
 
-        while let Some(command) = self.pending.front() {
+        let mut admission_deferred = false;
+        if let Some(prepared) = self.prepared_waiting.take() {
+            match self.admit_prepared(prepared) {
+                Ok(Some(turn)) => {
+                    if let Err(error) = self.scheduler.enqueue_turn(turn) {
+                        tracing::error!("qwen3 scheduler admission failed: {error}");
+                    }
+                }
+                Ok(None) => {}
+                Err(prepared) => {
+                    self.prepared_waiting = Some(prepared);
+                    admission_deferred = true;
+                }
+            }
+        }
+
+        while !admission_deferred && let Some(command) = self.pending.front() {
             let must_wait_for_legacy_owner = matches!(command, Qwen3Cmd::Chat(chat)
                 if !Self::chat_has_explicit_owner(chat) && self.scheduler.has_work());
             if must_wait_for_legacy_owner {
@@ -1315,13 +1538,39 @@ impl QwenSchedulerState {
                 Qwen3Cmd::Chat(chat) => {
                     if self.inner.paged_adapter.is_none() {
                         self.scheduler.enqueue_exclusive(Qwen3Cmd::Chat(chat));
-                    } else if let Some(turn) = self.admit_chat(chat)
-                        && let Err(error) = self.scheduler.enqueue_turn(turn)
-                    {
-                        tracing::error!("qwen3 scheduler admission failed: {error}");
+                    } else if let Some(prepared) = self.prepare_chat(chat) {
+                        match self.admit_prepared(prepared) {
+                            Ok(Some(turn)) => {
+                                if let Err(error) = self.scheduler.enqueue_turn(turn) {
+                                    tracing::error!("qwen3 scheduler admission failed: {error}");
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(prepared) => {
+                                self.prepared_waiting = Some(prepared);
+                                admission_deferred = true;
+                            }
+                        }
                     }
                 }
                 barrier => self.scheduler.enqueue_barrier(barrier),
+            }
+        }
+
+        if let Some(adapter) = self.inner.paged_adapter.as_ref() {
+            match adapter.block_telemetry() {
+                Ok(telemetry) => {
+                    self.scheduler.observe_blocks(
+                        engine::scheduler::BlockTelemetry {
+                            total_blocks: telemetry.total_blocks,
+                            free_blocks: telemetry.free_blocks,
+                            reclaimable_blocks: telemetry.reclaimable_blocks,
+                            allocated_blocks: telemetry.allocated_blocks,
+                        },
+                        scheduler_watermark_fraction(),
+                    );
+                }
+                Err(error) => tracing::warn!("qwen3 scheduler telemetry unavailable: {error}"),
             }
         }
 
@@ -1453,14 +1702,7 @@ impl Qwen3Inner {
                 // (KvScaleManager); always false here.
                 use_fp8_cache: Some(false),
                 max_seq_len: Some(config.max_position_embeddings as u32),
-                max_batch_size: Some(
-                    std::env::var("MLX_SCHED_MAX_NUM_SEQS")
-                        .ok()
-                        .and_then(|value| value.parse::<u32>().ok())
-                        .filter(|&value| value > 0)
-                        .unwrap_or(8)
-                        .min(32),
-                ),
+                max_batch_size: Some(scheduler_max_num_seqs() as u32),
             };
 
             let num_blocks = pa_config.calculate_num_blocks();
@@ -1527,6 +1769,84 @@ impl Qwen3Inner {
             training_state: None,
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
         })
+    }
+
+    /// Rebuild the provisional constructor-time pool after weights are
+    /// materialized, using the scheduler policy and live Metal budget. The
+    /// load-time probe can now see the model weights, so the selected pool is
+    /// capped against the real working set instead of double-budgeting them.
+    pub(crate) fn size_paged_pool_after_weight_load(&mut self) -> Result<()> {
+        if self.paged_adapter.is_none() {
+            return Ok(());
+        }
+        // Drop the provisional pool before sizing/allocating its replacement.
+        // It is still empty here: production calls this immediately after
+        // weight materialization and before cold-tier attachment or inference.
+        self.paged_adapter = None;
+
+        let block_size = self.config.paged_block_size.unwrap_or(16);
+        let trained_context = u32::try_from(self.config.max_position_embeddings)
+            .unwrap_or(1)
+            .max(1);
+        let per_seq_context = trained_context.min(scheduler_per_seq_context());
+        let requested_tokens = per_seq_context.saturating_mul(scheduler_max_num_seqs() as u32);
+        let requested_blocks = requested_tokens.div_ceil(block_size).max(1);
+        let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+        let sizing = mlx_paged_attn::profile::load_time_pool_sizing(
+            requested_blocks,
+            self.config.num_layers as u32,
+            self.config.num_kv_heads as u32,
+            self.config.head_dim as u32,
+            block_size,
+            cache_dtype,
+        )
+        .map_err(|error| {
+            Error::from_reason(format!(
+                "Qwen3 adaptive paged cache sizing failed safely; refusing an uncapped pool request: {error}"
+            ))
+        })?;
+        let selected_mb = sizing.selected_bytes.div_ceil(1024 * 1024).max(1) as u32;
+        let pa_config = mlx_paged_attn::PagedAttentionConfig {
+            block_size,
+            gpu_memory_mb: selected_mb,
+            head_size: self.config.head_dim as u32,
+            num_kv_heads: self.config.num_kv_heads as u32,
+            num_layers: self.config.num_layers as u32,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(per_seq_context),
+            max_batch_size: Some(scheduler_max_num_seqs() as u32),
+        };
+        let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+            sizing.selected_blocks,
+            block_size,
+        )));
+        let pool = mlx_paged_attn::LayerKVPool::new(pa_config, sizing.selected_blocks, cache_dtype)
+            .map_err(|error| {
+                Error::from_reason(format!("Failed to construct Qwen3 KV pool: {error}"))
+            })?;
+        self.paged_adapter = Some(
+            PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|error| {
+                Error::from_reason(format!("Failed to construct Qwen3 paged adapter: {error}"))
+            })?,
+        );
+        info!(
+            "Qwen3 scheduler pool enabled: requested_blocks={}, selected_blocks={}, bytes={:.2} GiB, per_seq_context={}, max_num_seqs={}",
+            requested_blocks,
+            sizing.selected_blocks,
+            sizing.selected_bytes as f64 / (1u64 << 30) as f64,
+            per_seq_context,
+            scheduler_max_num_seqs(),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn paged_pool_allocated_bytes(&self) -> Result<u64> {
+        self.paged_adapter
+            .as_ref()
+            .map(PagedKVCacheAdapter::pool_allocated_bytes)
+            .transpose()
+            .map(|bytes| bytes.unwrap_or(0))
+            .map_err(Error::from_reason)
     }
 
     pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
@@ -4711,6 +5031,7 @@ pub struct Qwen3Model {
     /// shrink back. Held as a field rather than consumed because the
     /// guard has no API — only its Drop does useful work.
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
+    pub(crate) _pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
 }
 
 #[napi]

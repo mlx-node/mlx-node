@@ -658,6 +658,14 @@ pub struct PagedPrefillMemorySnapshot {
     pub paged_pool_allocated_bytes: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PagedBlockTelemetry {
+    pub total_blocks: u32,
+    pub free_blocks: u32,
+    pub reclaimable_blocks: u32,
+    pub allocated_blocks: u32,
+}
+
 /// SSD cold-tier handle for persisting full paged KV blocks across process
 /// restarts. `fingerprint` binds every persisted block to one model + cache
 /// layout identity; any drift (weights, config, pool geometry, dtype) must
@@ -6276,6 +6284,32 @@ impl PagedKVCacheAdapter {
     /// Number of physical blocks shared by the allocator and layer pool.
     pub fn block_capacity(&self) -> u32 {
         self.layer_kv_pool.num_blocks()
+    }
+
+    pub(crate) fn block_telemetry(&self) -> Result<PagedBlockTelemetry, String> {
+        let allocator = self
+            .allocator
+            .lock()
+            .map_err(|error| format!("BlockAllocator mutex poisoned: {error}"))?;
+        Ok(PagedBlockTelemetry {
+            total_blocks: allocator.num_blocks(),
+            free_blocks: allocator.num_free_blocks(),
+            reclaimable_blocks: allocator.num_evictable_blocks(),
+            allocated_blocks: allocator.num_allocated_blocks(),
+        })
+    }
+
+    pub(crate) fn pool_allocated_bytes(&self) -> Result<u64, String> {
+        let config = self.layer_kv_pool.config();
+        mlx_paged_attn::profile::bytes_per_block(
+            self.layer_kv_pool.num_layers() as u32,
+            config.num_kv_heads,
+            config.head_size,
+            config.block_size,
+            self.layer_kv_pool.cache_dtype(),
+        )
+        .map(|bytes| bytes.saturating_mul(self.layer_kv_pool.num_blocks() as u64))
+        .map_err(|error| error.to_string())
     }
 
     /// Number of physical full-attention K/V layers in the authoritative pool.

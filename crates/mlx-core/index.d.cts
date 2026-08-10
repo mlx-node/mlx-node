@@ -4801,6 +4801,14 @@ export interface SchedulerStats {
   decodeBatchOccupancyHist: Array<DecodeBatchOccupancyBucket>;
   admitted: number;
   completed: number;
+  admissionDeferredBlocks: number;
+  rowsAllocEvicted: number;
+  blockCapacity: number;
+  freeBlocks: number;
+  reclaimableBlocks: number;
+  allocatedBlocks: number;
+  watermarkBlocks: number;
+  reservedBlocks: number;
 }
 
 /** Enable or disable profiling globally. */
