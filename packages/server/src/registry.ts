@@ -42,6 +42,13 @@ import type { SessionCapableModel } from '@mlx-node/lm';
 
 import { SessionRegistry } from './session-registry.js';
 
+function concurrentDispatchCapacity(model: ServableModel): number {
+  if (model.hasBlockPagedCache?.() !== true) return 1;
+  const reported = model.maxConcurrentSequences?.();
+  if (reported === undefined || !Number.isSafeInteger(reported) || reported < 2) return 1;
+  return reported;
+}
+
 /** Minimal contract for a model that can be served via chat sessions. */
 export type ServableModel = SessionCapableModel;
 
@@ -254,6 +261,7 @@ export class ModelRegistry {
         registry: new SessionRegistry({
           model,
           maxQueueDepth: this.maxQueueDepth,
+          maxConcurrentDispatches: concurrentDispatchCapacity(model),
           samplingDefaults,
           maxOutputTokens,
         }),

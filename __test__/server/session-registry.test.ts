@@ -986,6 +986,100 @@ describe('SessionRegistry.beginPreDispatchAdmission', () => {
   });
 });
 
+describe('SessionRegistry.withAdmission', () => {
+  it('runs up to the configured model capacity and queues the next caller', async () => {
+    const reg = new SessionRegistry({
+      model: makeMockModel(),
+      maxConcurrentDispatches: 2,
+      maxQueueDepth: 1,
+    });
+    const active = new Set<string>();
+    const started: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const run = (name: string) =>
+      reg.withAdmission(async () => {
+        active.add(name);
+        started.push(name);
+        await held;
+        active.delete(name);
+      });
+
+    const a = run('A');
+    const b = run('B');
+    const c = run('C');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(new Set(started)).toEqual(new Set(['A', 'B']));
+    expect(active.size).toBe(2);
+    expect(reg.queueDepth).toBe(1);
+    expect(() => run('D')).toThrow(QueueFullError);
+    expect(reg.queueDepth).toBe(1);
+
+    release();
+    await Promise.all([a, b, c]);
+    expect(started).toEqual(['A', 'B', 'C']);
+    expect(active.size).toBe(0);
+    expect(reg.queueDepth).toBe(0);
+  });
+
+  it('atomically hands pre-dispatch permits into active and queued slots', async () => {
+    const reg = new SessionRegistry({
+      model: makeMockModel(),
+      maxConcurrentDispatches: 2,
+      maxQueueDepth: 1,
+    });
+    const permitA = reg.beginPreDispatchAdmission();
+    const permitB = reg.beginPreDispatchAdmission();
+    const permitC = reg.beginPreDispatchAdmission();
+    expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const a = reg.withAdmission(async () => held, permitA);
+    const b = reg.withAdmission(async () => held, permitB);
+    const c = reg.withAdmission(async () => {}, permitC);
+    await Promise.resolve();
+
+    expect(reg.preDispatchAdmitCount).toBe(0);
+    expect(reg.queueDepth).toBe(1);
+    expect(() => reg.withAdmission(async () => {})).toThrow(QueueFullError);
+
+    release();
+    await Promise.all([a, b, c]);
+    expect(reg.queueDepth).toBe(0);
+    expect(reg.preDispatchAdmitCount).toBe(0);
+  });
+
+  it('releases a slot when a concurrent closure rejects', async () => {
+    const reg = new SessionRegistry({
+      model: makeMockModel(),
+      maxConcurrentDispatches: 2,
+    });
+    const events: string[] = [];
+    const failing = reg.withAdmission(async () => {
+      events.push('fail');
+      throw new Error('boom');
+    });
+    const peer = reg.withAdmission(async () => {
+      events.push('peer');
+    });
+    const successor = reg.withAdmission(async () => {
+      events.push('successor');
+    });
+
+    await expect(failing).rejects.toThrow('boom');
+    await Promise.all([peer, successor]);
+    expect(events).toEqual(['fail', 'peer', 'successor']);
+    expect(reg.queueDepth).toBe(0);
+  });
+});
+
 /**
  * Permit handoff: `withExclusive(fn, permit)` must consume an
  * outstanding permit ATOMICALLY as this call's admission instead of

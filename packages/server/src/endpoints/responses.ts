@@ -90,13 +90,16 @@ function withAdmissionControlledInference<T>(
   sessionReg: SessionRegistry,
   modelWorkCoordinator: ModelWorkCoordinator | undefined,
   // Pre-dispatch permit handed off ATOMICALLY as this call's admission
-  // (`withExclusive` consumes it instead of charging `queuedCount` a
-  // second time). See `beginPreDispatchAdmission`. Placed BEFORE `fn`
+  // (the selected admission lane consumes it instead of charging
+  // `queuedCount` a second time). See `beginPreDispatchAdmission`. Placed BEFORE `fn`
   // so call sites keep the trailing-closure layout.
   permit: PreDispatchAdmission | undefined,
   fn: () => Promise<T>,
 ): Promise<T> {
-  return sessionReg.withExclusive(() => (modelWorkCoordinator ? modelWorkCoordinator.withInference(fn) : fn()), permit);
+  const run = () => (modelWorkCoordinator ? modelWorkCoordinator.withInference(fn) : fn());
+  return sessionReg.concurrentAdmissionLimit > 1
+    ? sessionReg.withAdmission(run, permit)
+    : sessionReg.withExclusive(run, permit);
 }
 
 /**
@@ -1392,14 +1395,14 @@ interface StreamingOutcome {
  * is responsible for rejecting partial tool-result submissions
  * against a fan-out (`handleCreateResponse` fan-out gate).
  *
- * `isFreshSession` is the MISS / HIT signal from `SessionRegistry`:
- * `true` when `lookup.hit === false` (a truly new session minted via
- * `newSession()`), `false` when a tier-1 or tier-2 warm lease was
- * handed out. On a MISS we must wipe the shared native model's
+ * `resetNativeCache` is the cache-isolation decision made by the caller.
+ * A non-paged registry miss wipes the shared native model's
  * leftover `cached_token_history` + KV caches before re-priming, or
  * a previous UNRELATED request's cache could silently get reused as
- * a prefix (cross-request cache-affinity side channel). On a HIT we
- * must NOT wipe — the whole point of the warm lease is that
+ * a prefix (cross-request cache-affinity side channel). Registry hits
+ * and block-paged models preserve native state: the former owns the
+ * leased cache, while the latter validates reusable blocks by content
+ * hash and isolates live requests by cache owner. In both cases
  * `verify_cache_prefix_direct` can recover the reused prefix on the
  * next `chat_session_start_sync`. The HIT branch calls the
  * server-private `resetPreservingNativeCacheForWarmReuse(session)`
@@ -1415,7 +1418,7 @@ async function runSessionNonStreaming(
   messages: ChatMessage[],
   newInputMessages: ChatMessage[],
   config: ChatConfig,
-  isFreshSession: boolean,
+  resetNativeCache: boolean,
   signal?: AbortSignal,
 ): Promise<NonStreamingOutcome> {
   if (session.turns === 0) {
@@ -1429,14 +1432,11 @@ async function runSessionNonStreaming(
     // `primeHistory() + startFromHistory()` on a fresh session would
     // inherit the PREVIOUS request's native cache and silently reuse
     // whatever prefix happened to overlap — a cross-request
-    // cache-affinity side channel. Only registry HITS (tier-1 /
-    // tier-2) are authorized for cache reuse, and a leased session
-    // almost always has `turns > 0` so this branch is nearly always
-    // a MISS. The `isFreshSession` flag is the authoritative signal
-    // — on `false` we still need to clear JS-side state so
-    // `primeHistory()` accepts the replay, but we keep the native
-    // cache intact so the prefix verifier can recover it.
-    if (isFreshSession) {
+    // cache-affinity side channel. The caller permits native reuse only
+    // for a registry hit or a content-addressed block-paged model. In
+    // both cases we still clear JS-side state so `primeHistory()` accepts
+    // the replay while the native prefix verifier decides what is reusable.
+    if (resetNativeCache) {
       await session.reset();
     } else {
       await resetPreservingNativeCacheForWarmReuse(session);
@@ -1497,9 +1497,10 @@ async function runSessionNonStreaming(
   // warm session falls through to this branch), we MUST keep the
   // native KV cache so the native `verify_cache_prefix_direct` can
   // recover the reused prefix — wiping it would neutralize the
-  // entire warm-lease feature on multi-message hits. On a MISS we
-  // still wipe to prevent cross-request cache-affinity leakage.
-  if (isFreshSession) {
+  // entire warm-lease feature on multi-message hits. Block-paged models
+  // also preserve their content-verified per-owner cache; only a non-paged
+  // miss wipes to prevent cross-request cache-affinity leakage.
+  if (resetNativeCache) {
     await session.reset();
   } else {
     await resetPreservingNativeCacheForWarmReuse(session);
@@ -1517,7 +1518,7 @@ async function runSessionStreaming(
   newInputMessages: ChatMessage[],
   config: ChatConfig,
   signal: AbortSignal | undefined,
-  isFreshSession: boolean,
+  resetNativeCache: boolean,
 ): Promise<StreamingOutcome> {
   // Preserve the startFromHistoryStream precondition outside the lazy
   // generator. Without this guard an accepted `input: []` request would commit
@@ -1536,11 +1537,10 @@ async function runSessionStreaming(
     // prior requests; without an explicit `reset()` here the native
     // prefix verifier can silently reuse a previous request's cache
     // on any prompt-prefix overlap (a cross-request cache-affinity
-    // side channel). On MISS (`isFreshSession === true`) we wipe
-    // native cache + JS state. On tier-1 / tier-2 HIT we keep the
-    // native cache so the prefix verifier can recover the reused
-    // prefix, while still clearing JS-side state for `primeHistory`.
-    if (isFreshSession) {
+    // side channel). The caller requests a full native wipe only for a
+    // non-paged registry miss; warm hits and content-addressed paged models
+    // keep verified native state while still clearing JS state for replay.
+    if (resetNativeCache) {
       await session.reset();
     } else {
       await resetPreservingNativeCacheForWarmReuse(session);
@@ -1602,10 +1602,11 @@ async function runSessionStreaming(
   // captured AFTER reset. On tier-1 / tier-2 HIT (warm lease that
   // cannot use the delta API because the input spans multiple
   // messages), keep the native KV cache so the prefix verifier can
-  // reuse it on the replayed `chat_session_start_sync`; on MISS, wipe
+  // reuse it on the replayed `chat_session_start_sync`. Block-paged models
+  // likewise preserve content-verified native state; non-paged misses wipe
   // to block cross-request cache-affinity leakage.
   const constrainedConfig = await session.preflightContextCapacity(messages, config);
-  if (isFreshSession) {
+  if (resetNativeCache) {
     await session.reset();
   } else {
     await resetPreservingNativeCacheForWarmReuse(session);
@@ -2723,6 +2724,7 @@ export async function handleCreateResponse(
             return;
           }
 
+          const pagedActive = leaseModel.hasBlockPagedCache?.() === true;
           const lookup = sessionReg.getOrCreate(
             previousResponseId ?? null,
             requestedInstructions,
@@ -3071,7 +3073,7 @@ export async function handleCreateResponse(
                 newInputMessages,
                 config,
                 streamSignal,
-                !lookup.hit,
+                !lookup.hit && !pagedActive,
               );
               const streamingWasCommitted = () => outcome.wasCommitted();
               try {
@@ -3329,7 +3331,7 @@ export async function handleCreateResponse(
                 messages,
                 newInputMessages,
                 config,
-                !lookup.hit,
+                !lookup.hit && !pagedActive,
                 streamSignal,
               );
               // Prefix-cache observability headers for the non-streaming

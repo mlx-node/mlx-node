@@ -7,19 +7,19 @@
  * and nothing re-exports it. Callers are the two server endpoints —
  * `endpoints/responses.ts` (tier-1 / tier-2 HIT branch) and
  * `endpoints/messages.ts` (`getOrCreateWarmAny` HIT branch) — each
- * invoking the helper exclusively under a `SessionRegistry` HIT gate.
+ * invoking the helper only when native cache reuse is authorized: either a
+ * `SessionRegistry` hit or a block-paged model whose allocator validates
+ * reusable prefixes by content hash and isolates live cache owners.
  *
  * Why this helper exists at all: `ChatSession.reset()` is the safe
  * public wipe — it always calls `model.resetCaches()` because the
  * underlying `SessionCapableModel` is shared across every session
  * lifetime via the native `ModelRegistry`. A partial wipe that leaves
- * the shared native KV cache intact without the HIT gate would leak a
- * previous (unrelated) request's cached prefix into the next
- * `chat_session_start_sync` call. The server's warm-lease replay path
- * DOES have that HIT gate — the registry's own `getOrCreate` hit
- * signal is the authoritative proof that the native cache genuinely
- * belongs to this chain — so a JS-state-only reset that preserves the
- * native cache is correct there and only there.
+ * shared native KV state intact without an ownership or content-
+ * verification gate would leak an unrelated request's prefix into the
+ * next `chat_session_start_sync` call. Warm leases provide the ownership
+ * gate; block-paged adapters provide the content-verification gate. A
+ * JS-state-only reset is valid in either case.
  *
  * Fields accessed: `inFlight`, `history`, `lastImagesKey`, `lastAudioKey`, `turnCount`,
  * `unresolvedOkToolCallCount`, `needsFullReplay`, `defaultConfig`, `activeTools`.

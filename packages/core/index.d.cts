@@ -1524,6 +1524,12 @@ export declare class Qwen3Model {
    */
   hasBlockPagedCache(): boolean;
   /**
+   * Maximum number of independent sequences admitted to the continuous
+   * batching scheduler. Flat-cache and forced-serial instances deliberately
+   * report one so the server retains its exclusive dispatch lane.
+   */
+  maxConcurrentSequences(): number;
+  /**
    * Snapshot continuous-batching scheduler counters after all commands
    * already ahead of this query have drained.
    */

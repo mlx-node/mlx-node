@@ -2395,6 +2395,89 @@ describe('createHandler', () => {
       expect(resp2.output_text).toBe('second reply');
     });
 
+    it('streams two scheduler-capable paged responses concurrently', async () => {
+      const registry = new ModelRegistry();
+      let active = 0;
+      let peak = 0;
+      let starts = 0;
+      let resolveBoth!: () => void;
+      const bothStarted = new Promise<void>((resolve) => {
+        resolveBoth = resolve;
+      });
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const stream = vi.fn(async function* () {
+        starts += 1;
+        active += 1;
+        peak = Math.max(peak, active);
+        if (starts === 2) resolveBoth();
+        try {
+          yield { done: false as const, text: 'token', isReasoning: false };
+          await held;
+          yield {
+            done: true as const,
+            text: 'done',
+            finishReason: 'stop' as const,
+            toolCalls: [] as ToolCallResult[],
+            thinking: null,
+            numTokens: 1,
+            promptTokens: 1,
+            reasoningTokens: 0,
+            rawText: 'done',
+            cachedTokens: 0,
+          };
+        } finally {
+          active -= 1;
+        }
+      });
+      const model = Object.assign(createMockModel(), {
+        hasBlockPagedCache: () => true,
+        maxConcurrentSequences: () => 2,
+        chatStreamSessionStart: stream,
+      });
+      registry.register('test-model', model);
+      const handler = createHandler(registry);
+      const firstReq = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'first',
+        stream: true,
+      });
+      const secondReq = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'second',
+        stream: true,
+      });
+      const first = createMockRes();
+      const second = createMockRes();
+      const firstRequest = handler(firstReq, first.res);
+      const secondRequest = handler(secondReq, second.res);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      try {
+        await Promise.race([
+          bothStarted,
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error('paged response streams did not overlap')), 1_000);
+          }),
+        ]);
+        expect(peak).toBe(2);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        release();
+      }
+
+      await Promise.all([firstRequest, secondRequest, first.waitForEnd(), second.waitForEnd()]);
+      expect(first.getStatus()).toBe(200);
+      expect(second.getStatus()).toBe(200);
+      expect(first.getBody()).toContain('response.created');
+      expect(second.getBody()).toContain('response.created');
+      expect(registry.getSessionRegistry('test-model')?.queueDepth).toBe(0);
+      // oxlint-disable-next-line typescript/unbound-method
+      expect(model.resetCaches).not.toHaveBeenCalled();
+    });
+
     it('adopts the session into the registry after a successful non-streaming turn', async () => {
       // Baseline for the non-commit regression tests below: a turn
       // that returns cleanly must re-key the live session under the

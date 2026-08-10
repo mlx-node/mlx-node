@@ -5214,6 +5214,18 @@ impl Qwen3Model {
         self.paged_active
     }
 
+    /// Maximum number of independent sequences admitted to the continuous
+    /// batching scheduler. Flat-cache and forced-serial instances deliberately
+    /// report one so the server retains its exclusive dispatch lane.
+    #[napi]
+    pub fn max_concurrent_sequences(&self) -> u32 {
+        if self.paged_active && !QwenSchedulerState::force_serial() {
+            scheduler_max_num_seqs() as u32
+        } else {
+            1
+        }
+    }
+
     /// Snapshot continuous-batching scheduler counters after all commands
     /// already ahead of this query have drained.
     #[napi]

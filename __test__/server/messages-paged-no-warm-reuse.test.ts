@@ -151,6 +151,59 @@ function createMockModel(paged: boolean, result: ChatResult = makeChatResult()):
   } as unknown as SessionCapableModel;
 }
 
+function createConcurrentStreamModel(): {
+  model: SessionCapableModel;
+  bothStarted: Promise<void>;
+  release: () => void;
+  maxActive: () => number;
+} {
+  let active = 0;
+  let peak = 0;
+  let starts = 0;
+  let resolveBoth!: () => void;
+  const bothStarted = new Promise<void>((resolve) => {
+    resolveBoth = resolve;
+  });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const base = createMockModel(true);
+  const stream = vi.fn(async function* () {
+    starts += 1;
+    active += 1;
+    peak = Math.max(peak, active);
+    if (starts === 2) resolveBoth();
+    try {
+      yield { done: false as const, text: 'token', isReasoning: false };
+      await held;
+      yield {
+        done: true as const,
+        text: 'done',
+        finishReason: 'stop',
+        toolCalls: [],
+        thinking: null,
+        numTokens: 1,
+        promptTokens: 1,
+        reasoningTokens: 0,
+        rawText: 'done',
+        cachedTokens: 0,
+      };
+    } finally {
+      active -= 1;
+    }
+  });
+  return {
+    model: Object.assign(base, {
+      maxConcurrentSequences: () => 2,
+      chatStreamSessionStart: stream,
+    }),
+    bothStarted,
+    release,
+    maxActive: () => peak,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -351,5 +404,49 @@ describe('handleCreateMessage — paged-active warm-slot bypass', () => {
     expect(getStatus2()).toBe(200);
     // Both turns committed AND neither adopted: the size is still 0.
     expect(sessionReg.size).toBe(0);
+  });
+
+  it('streams two paged scheduler-capable requests at the same time', async () => {
+    const registry = new ModelRegistry();
+    const concurrent = createConcurrentStreamModel();
+    registry.register('paged-model', concurrent.model);
+    expect(registry.getSessionRegistry('paged-model')?.concurrentAdmissionLimit).toBe(2);
+
+    const first = createMockRes();
+    const second = createMockRes();
+    const request = (res: ServerResponse, content: string) =>
+      handleCreateMessage(
+        res,
+        {
+          model: 'paged-model',
+          messages: [{ role: 'user', content }],
+          max_tokens: 8,
+          stream: true,
+        },
+        registry,
+      );
+    const firstRequest = request(first.res, 'first');
+    const secondRequest = request(second.res, 'second');
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      await Promise.race([
+        concurrent.bothStarted,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('paged streams did not overlap')), 1_000);
+        }),
+      ]);
+      expect(concurrent.maxActive()).toBe(2);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      concurrent.release();
+    }
+
+    await Promise.all([firstRequest, secondRequest]);
+    expect(first.getStatus()).toBe(200);
+    expect(second.getStatus()).toBe(200);
+    expect(first.getBody()).toContain('message_start');
+    expect(second.getBody()).toContain('message_start');
+    expect(registry.getSessionRegistry('paged-model')?.queueDepth).toBe(0);
   });
 });

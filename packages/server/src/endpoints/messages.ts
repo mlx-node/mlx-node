@@ -133,13 +133,16 @@ function withAdmissionControlledInference<T>(
   sessionReg: SessionRegistry,
   modelWorkCoordinator: ModelWorkCoordinator | undefined,
   // Pre-dispatch permit handed off ATOMICALLY as this call's admission
-  // (`withExclusive` consumes it instead of charging `queuedCount` a
-  // second time). See `beginPreDispatchAdmission`. Placed BEFORE `fn`
+  // (the selected admission lane consumes it instead of charging
+  // `queuedCount` a second time). See `beginPreDispatchAdmission`. Placed BEFORE `fn`
   // so call sites keep the trailing-closure layout.
   permit: PreDispatchAdmission | undefined,
   fn: () => Promise<T>,
 ): Promise<T> {
-  return sessionReg.withExclusive(() => (modelWorkCoordinator ? modelWorkCoordinator.withInference(fn) : fn()), permit);
+  const run = () => (modelWorkCoordinator ? modelWorkCoordinator.withInference(fn) : fn());
+  return sessionReg.concurrentAdmissionLimit > 1
+    ? sessionReg.withAdmission(run, permit)
+    : sessionReg.withExclusive(run, permit);
 }
 
 function requestAllowsToolUse(body: AnthropicMessagesRequest): boolean {

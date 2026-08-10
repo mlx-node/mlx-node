@@ -21,18 +21,13 @@
  *     by response id — no secondary keying on model name because the
  *     registry is already scoped per model.
  *
- *   - **Single-warm-session invariant.** `ChatSession<M>` is a thin
- *     JS wrapper — it does NOT own any native KV cache. The cache
- *     lives on the underlying `SessionCapableModel` (one shared
- *     `cached_token_history` / `caches` vector per model instance).
- *     Any call that runs a turn overwrites that shared native state,
- *     silently invalidating every other `ChatSession` wrapper
- *     pointing at the same model. Caching multiple wrappers per
- *     model is therefore an illusion: at most ONE matches real
- *     native state (whichever ran most recently). To prevent
- *     cross-session corruption this registry holds at most ONE
- *     entry — both `getOrCreate` and `adopt` clear the map before
- *     returning or inserting.
+ *   - **Single-warm-session invariant.** The JS warm registry retains at
+ *     most ONE `ChatSession` entry — both `getOrCreate` and `adopt` clear
+ *     the map before returning or inserting. This remains the sole safe
+ *     reuse mechanism for flat-cache models whose native cache is one
+ *     mutable vector. Block-paged schedulers instead isolate live turns by
+ *     cache owner and reuse verified physical blocks through the native
+ *     prefix table; those models may run fresh JS sessions concurrently.
  *
  *   - **Lease semantics on hit.** Clear-on-hit also gives single-
  *     flight lease semantics: two overlapping requests referencing
@@ -73,23 +68,12 @@
  *     concurrent mutation by design. `sweep()` can be scheduled
  *     via `setInterval` without colliding with in-flight calls.
  *
- *   - **Per-model execution mutex.** A dispatch that spans multiple
- *     awaits (map -> prefill -> decode -> persist -> adopt) is NOT
- *     atomic from the registry's POV. Two requests against the
- *     same model would both receive a `ChatSession` pointing at
- *     the same native model; even though the lease-on-hit clear
- *     prevents sharing one `ChatSession` object, the native KV
- *     cache is a single mutable resource and two parallel
- *     `primeHistory()` / `send*()` calls would race. Whichever
- *     finished last would win `adopt()`, poisoning the hot path
- *     for every subsequent chained turn.
- *
- *     `withExclusive(fn)` serializes every per-model dispatch via
- *     a FIFO `execLock` chain. `/v1/responses` and `/v1/messages`
- *     wrap the full `getOrCreate -> run -> adopt/drop` span in one
- *     `withExclusive` so at most one request holds the model at a
- *     time. A weaker epoch-token scheme would let the losing
- *     `adopt()` no-op but the native KV would already be wrong.
+ *   - **Per-model admission lane.** Flat and not-yet-batched families use
+ *     `withExclusive(fn)`, the original FIFO mutex across the full dispatch.
+ *     A model that explicitly reports `maxConcurrentSequences() > 1` uses
+ *     `withAdmission(fn)`, a counting semaphore sized to that native
+ *     scheduler. Per-session serialization still lives in `ChatSession`;
+ *     only independent sessions share the model lane.
  */
 
 import { createHash, createHmac, randomBytes } from 'node:crypto';
@@ -324,6 +308,13 @@ export interface SessionRegistryOptions {
    */
   maxQueueDepth?: number;
   /**
+   * Number of independent dispatches the native model scheduler can advance
+   * concurrently. Values below two retain the legacy exclusive FIFO. The
+   * model registry derives this from `maxConcurrentSequences()`; direct
+   * construction defaults to one.
+   */
+  maxConcurrentDispatches?: number;
+  /**
    * Optional sampling defaults applied to every `ChatSession` this
    * registry allocates. Forwarded verbatim into `new ChatSession(model,
    * { defaultConfig })` so the session's `mergeConfig(overlay)` shallow-
@@ -377,7 +368,8 @@ export class QueueFullError extends Error {
  * two terminal states:
  *
  *  - **handed off**: passed as the second argument of
- *    `withExclusive(fn, permit)`, which consumes it atomically as that
+ *    `withExclusive(fn, permit)` or `withAdmission(fn, permit)`, which
+ *    consumes it atomically as that
  *    call's admission — the unit converts into the waiter charge (or is
  *    retired when the caller wins the runner slot). `release()` becomes
  *    a no-op afterwards.
@@ -444,6 +436,7 @@ export class SessionRegistry {
   private readonly model: SessionCapableModel;
   private readonly ttlSec: number;
   private readonly maxQueueDepth: number | undefined;
+  private readonly maxConcurrentDispatches: number;
   /**
    * Per-model sampling defaults forwarded into every new `ChatSession`
    * via its `defaultConfig` constructor option. `undefined` preserves
@@ -478,15 +471,15 @@ export class SessionRegistry {
    * is still outstanding — parked in the `ModelWorkCoordinator` writer
    * queue (host mode), blocked in pre-lock store lookups
    * (`previous_response_id` continuations), or anywhere else between the
-   * endpoint gate and `withExclusive` placement. None of that parking is
+   * endpoint gate and resident-lane placement. None of that parking is
    * visible to `queuedCount`; this counter is what lets the gate bound
    * it. Decremented ONLY by the permit itself: `release()` on a bail-out
-   * or the atomic consume inside `withExclusive` on handoff.
+   * or the atomic consume inside the selected lane on handoff.
    */
   private preDispatchAdmits = 0;
   /**
    * Consume hooks for outstanding permits, keyed by permit identity.
-   * Registry-scoped on purpose: `withExclusive` consults THIS map, so a
+   * Registry-scoped on purpose: both execution lanes consult THIS map, so a
    * permit minted by a different registry is simply not found and the
    * call falls back to normal waiter charging — a cross-registry handoff
    * cannot corrupt either registry's counters.
@@ -525,11 +518,18 @@ export class SessionRegistry {
    * cleanly from the idle state.
    */
   private execLock: Promise<void> = this.initialLock;
+  /** Active holders in the continuous-batching admission lane. */
+  private activeAdmissions = 0;
+  /** FIFO waiters parked behind the continuous-batching admission limit. */
+  private readonly admissionWaiters: Array<() => void> = [];
 
   constructor(opts: SessionRegistryOptions) {
     this.model = opts.model;
     this.ttlSec = opts.ttlSec ?? 1800;
     this.maxQueueDepth = opts.maxQueueDepth;
+    const requestedConcurrency = opts.maxConcurrentDispatches ?? 1;
+    this.maxConcurrentDispatches =
+      Number.isSafeInteger(requestedConcurrency) && requestedConcurrency > 1 ? requestedConcurrency : 1;
     this.samplingDefaults = opts.samplingDefaults;
     this.maxOutputTokens = opts.maxOutputTokens;
   }
@@ -552,16 +552,15 @@ export class SessionRegistry {
   }
 
   /**
-   * Number of requests currently WAITING to acquire the per-model
-   * execution mutex. Does NOT include the one actively running inside
-   * `fn`. Primarily for tests and diagnostics.
+   * Number of requests waiting for this model's selected admission lane.
+   * Active dispatches are not included. Primarily for diagnostics/tests.
    */
   get queueDepth(): number {
     return this.queuedCount;
   }
 
   /**
-   * Configured waiter cap for this model's execution mutex, or `undefined`
+   * Configured waiter cap for this model's admission lane, or `undefined`
    * when unbounded. Paired with {@link queueDepth} so a readiness probe can
    * tell "3 waiters, unbounded" (fine) from "3 waiters, cap of 3" (the next
    * request gets a 429) without reaching into private state.
@@ -570,13 +569,16 @@ export class SessionRegistry {
     return this.maxQueueDepth;
   }
 
+  /** Native continuous-batching capacity used by the endpoint route switch. */
+  get concurrentAdmissionLimit(): number {
+    return this.maxConcurrentDispatches;
+  }
+
   /**
    * Outstanding pre-dispatch permits — requests admitted by
    * {@link beginPreDispatchAdmission} that have neither handed their
-   * permit to `withExclusive` nor released it yet.
-   * `queueDepth + preDispatchAdmitCount` is the registry's whole
-   * admission footprint (excluding the active runner) and never exceeds
-   * `maxQueueDepth` plus the idle-chain runner entitlement — see
+   * permit to the selected execution lane nor released it yet. These permits,
+   * queued callers, and active dispatches share one bounded budget; see
    * {@link assertAdmissionCapacity}. For probes and diagnostics.
    */
   get preDispatchAdmitCount(): number {
@@ -587,30 +589,23 @@ export class SessionRegistry {
    * Single source of truth for the per-model admission budget — the
    * ONLY place the cap arithmetic lives. Every admission path calls
    * this: {@link beginPreDispatchAdmission} before minting a permit,
-   * and {@link withExclusive} for every non-handed-off caller — waiter
-   * AND runner alike. A handed-off permit skips the call for its OWN
+   * and both execution lanes for every non-handed-off caller. A handed-off
+   * permit skips the call for its OWN
    * token only: that token was charged here at acquisition and its
    * conversion keeps the total constant, so re-checking would
    * double-charge an already-admitted request. It never exempts anyone
    * else — all other outstanding state stays counted for every caller
    * that did not pay.
    *
-   * Budget invariant: the combined admission footprint
-   * `queuedCount + preDispatchAdmits` — every admitted request that is
-   * not the active holder — plus the caller itself must fit within
-   * `maxQueueDepth` waiter slots plus ONE runner entitlement that
-   * exists only while the execution chain is idle
-   * (`execLock === initialLock`). The caller's own +1 is folded into
-   * the `>=` comparison. While the chain is idle the entitlement
-   * admits exactly one extra request (the future runner) through
-   * EITHER gate; once any caller occupies the chain the entitlement is
-   * spent and only waiter slots remain. Equivalently: admitted-but-
-   * not-running requests + the active holder never exceed
-   * `maxQueueDepth + 1`.
+   * Budget invariant: active dispatches + queued callers + outstanding
+   * permits never exceed `maxConcurrentDispatches + maxQueueDepth`.
+   * On the exclusive lane `maxConcurrentDispatches` is one, exactly the
+   * original runner entitlement. On the batched lane it is the native
+   * scheduler's sequence capacity.
    *
    * Charging stays at the call sites (`preDispatchAdmits += 1` at the
-   * gate, `queuedCount += 1` for waiters, chain occupancy itself for
-   * runners); every admitted unit is counted by exactly one of those
+   * gate, `queuedCount += 1` for waiters, and the selected lane's active
+   * count for runners); every admitted unit is counted by exactly one
    * at any time, which is what makes the footprint sum complete across
    * any interleaving of permitted and permitless callers.
    *
@@ -620,9 +615,10 @@ export class SessionRegistry {
    */
   private assertAdmissionCapacity(): void {
     if (this.maxQueueDepth === undefined) return;
-    const runnerEntitlement = this.execLock === this.initialLock ? 1 : 0;
-    const footprint = this.queuedCount + this.preDispatchAdmits;
-    if (footprint >= this.maxQueueDepth + runnerEntitlement) {
+    const activeDispatches =
+      this.maxConcurrentDispatches > 1 ? this.activeAdmissions : this.execLock === this.initialLock ? 0 : 1;
+    const footprint = activeDispatches + this.queuedCount + this.preDispatchAdmits;
+    if (footprint >= this.maxQueueDepth + this.maxConcurrentDispatches) {
       throw new QueueFullError(this.queuedCount, this.preDispatchAdmits, this.maxQueueDepth);
     }
   }
@@ -632,35 +628,30 @@ export class SessionRegistry {
    * BEFORE the request enters any pre-dispatch parking spot the FIFO
    * cannot see. In host mode (`createInferenceHost`) every request
    * passes the `ModelWorkCoordinator` writer bracket ahead of
-   * `withExclusive`; while a turn holds the coordinator's reader, each
+   * the resident admission lane; while a turn holds the coordinator's reader, each
    * arrival parks there as a writer waiter with `queuedCount` still 0 —
-   * so without this gate the `withExclusive` cap could never fire and
+   * so without this gate the resident-lane cap could never fire and
    * the parked backlog grew without bound (H3). The same applies to a
    * continuation blocked in `await store.getChain(...)` on a slow
    * store: pre-lock async work of any kind parks OUTSIDE `queuedCount`.
    *
-   * Accounting: pre-dispatch permits and `withExclusive` waiters draw
-   * from ONE budget (`maxQueueDepth`), plus one runner entitlement
-   * while the execution chain is idle — so a burst against an idle
-   * model admits exactly as many requests as `withExclusive` itself
-   * would. Both this gate and every non-handed-off `withExclusive`
-   * caller route through the SAME predicate,
-   * {@link assertAdmissionCapacity}, which charges the combined
-   * footprint `queuedCount + preDispatchAdmits` against
-   * `maxQueueDepth` plus the entitlement — so the budget invariant
-   * holds across any interleaving of permitted and permitless callers,
-   * runner and waiter alike.
+   * Accounting: pre-dispatch permits, active dispatches, and queued callers
+   * draw from ONE budget: `maxQueueDepth` waiter slots plus the selected
+   * lane's active capacity. Both lanes and this early gate route through
+   * {@link assertAdmissionCapacity}, so permitted and permitless arrivals
+   * cannot double-spend a slot.
    *
    * Throws {@link QueueFullError} synchronously when over cap (the
-   * caller maps it to the same 429 envelope as the `withExclusive`
+   * caller maps it to the same 429 envelope as resident-lane rejection
    * reject). On admission returns a {@link PreDispatchAdmission} permit
    * the caller must RETAIN through ALL pre-lock asynchronous work and
-   * then hand to `withExclusive(fn, permit)`, which consumes it
+   * then hand to `withExclusive(fn, permit)` or `withAdmission(fn, permit)`,
+   * which consumes it
    * atomically as that call's admission — one budget, one token per
    * request, never double-counted. Releasing the permit early instead
    * of handing it off re-opens the hole this gate closes: the request
    * would be counted by NEITHER counter while parked, arrivals would
-   * refill the budget, and `withExclusive` would then admit a second
+   * refill the budget, and the resident lane would then admit a second
    * full waiter budget on top. `release()` belongs on bail-out paths
    * only (idempotent, no-op after handoff — an unconditional `finally`
    * release is the recommended shape).
@@ -1154,6 +1145,55 @@ export class SessionRegistry {
       this.queuedCount += 1;
     }
     return this._runExclusive(prev, myLock, release, fn, asWaiter);
+  }
+
+  /**
+   * Admit one dispatch to the model's continuous-batching lane.
+   *
+   * Admission rejection is synchronous, matching {@link withExclusive} and
+   * preserving the endpoint's existing QueueFullError-to-429 mapping. Once
+   * accepted, at most {@link concurrentAdmissionLimit} closures run at once;
+   * excess accepted callers wait FIFO and contribute to {@link queueDepth}.
+   * A pre-dispatch permit is consumed atomically into either an active slot or
+   * a queued slot, so the early endpoint gate and this semaphore share one
+   * bounded budget.
+   */
+  withAdmission<T>(fn: () => Promise<T>, permit?: PreDispatchAdmission): Promise<T> {
+    const consume = permit === undefined ? undefined : this.permitConsumers.get(permit);
+    const handedOff = consume !== undefined && consume();
+    if (!handedOff) {
+      this.assertAdmissionCapacity();
+    }
+
+    let acquire!: () => void;
+    const acquired = new Promise<void>((resolve) => {
+      acquire = resolve;
+    });
+    if (this.activeAdmissions < this.maxConcurrentDispatches) {
+      this.activeAdmissions += 1;
+      acquire();
+    } else {
+      this.queuedCount += 1;
+      this.admissionWaiters.push(() => {
+        this.queuedCount -= 1;
+        if (this.queuedCount < 0) this.queuedCount = 0;
+        this.activeAdmissions += 1;
+        acquire();
+      });
+    }
+    return this._runAdmission(acquired, fn);
+  }
+
+  private async _runAdmission<T>(acquired: Promise<void>, fn: () => Promise<T>): Promise<T> {
+    await acquired;
+    try {
+      return await fn();
+    } finally {
+      this.activeAdmissions -= 1;
+      if (this.activeAdmissions < 0) this.activeAdmissions = 0;
+      const next = this.admissionWaiters.shift();
+      next?.();
+    }
   }
 
   /**

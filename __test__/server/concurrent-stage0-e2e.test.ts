@@ -257,6 +257,12 @@ function instrumentModel(target: SessionCapableModel): InstrumentedModel {
 
   const proxy = new Proxy(target, {
     get(model, property) {
+      // This suite pins the Stage-0 exclusive-server hazards (visible waiter
+      // depth, holder cancellation, exact queue-full overflow). Stage 1 has a
+      // separate real-model gate for the admission semaphore, so keep this
+      // instrumented wrapper on one server dispatch even when the underlying
+      // Qwen3 binary advertises a wider native scheduler.
+      if (property === 'maxConcurrentSequences') return () => 1;
       const value = Reflect.get(model, property, model) as unknown;
       if (streamMethods.has(property) && typeof value === 'function') {
         return async function* (...args: unknown[]): AsyncGenerator<ChatStreamEvent> {

@@ -471,6 +471,16 @@ export interface SessionCapableModel {
    */
   hasBlockPagedCache?(): boolean;
   /**
+   * Maximum number of independent chat sequences this model can advance in
+   * one scheduler lane. Models without a continuous-batching scheduler omit
+   * the method and remain on the server's single-dispatch lane.
+   *
+   * The value is synchronous and fixed for normal server operation so the
+   * per-model admission semaphore can be constructed without a model-thread
+   * round trip. A value below two is treated as exclusive execution.
+   */
+  maxConcurrentSequences?(): number;
+  /**
    * MTP: whether the underlying native model can run speculative
    * decoding. Surfaced by `Qwen3_5Model` / `Qwen3_5MoeModel` (an MTP
    * head shipped in the checkpoint and loaded by persistence) and by
