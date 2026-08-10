@@ -181,6 +181,24 @@ fn default_rope_theta() -> f64 {
 }
 
 impl Qwen3_5Config {
+    /// BF16 bytes for one request's complete GDN conv + recurrent state.
+    /// Full-attention K/V is accounted separately by the paged allocator.
+    pub(crate) fn recurrent_state_bytes(&self) -> u64 {
+        let linear_layers = (0..self.num_layers.max(0) as usize)
+            .filter(|&layer| self.is_linear_layer(layer))
+            .count() as u64;
+        let conv_elements = u64::try_from((self.linear_conv_kernel_dim - 1).max(0))
+            .unwrap_or(0)
+            .saturating_mul(u64::try_from(self.linear_conv_dim().max(0)).unwrap_or(0));
+        let recurrent_elements = u64::try_from(self.linear_num_value_heads.max(0))
+            .unwrap_or(0)
+            .saturating_mul(u64::try_from(self.linear_value_head_dim.max(0)).unwrap_or(0))
+            .saturating_mul(u64::try_from(self.linear_key_head_dim.max(0)).unwrap_or(0));
+        linear_layers
+            .saturating_mul(conv_elements.saturating_add(recurrent_elements))
+            .saturating_mul(2)
+    }
+
     /// Returns whether a given layer index uses linear attention (GatedDeltaNet)
     /// vs full attention (Qwen3NextAttention).
     ///
@@ -244,7 +262,9 @@ impl Qwen3_5Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{qwen35_default_paged_cache_memory_mb, qwen35_resolve_paged_cache_memory_mb};
+    use super::{
+        Qwen3_5Config, qwen35_default_paged_cache_memory_mb, qwen35_resolve_paged_cache_memory_mb,
+    };
     use mlx_paged_attn::PagedAttentionConfig;
 
     fn paged_config(
@@ -263,6 +283,41 @@ mod tests {
             max_seq_len: Some(262_144),
             max_batch_size: Some(32),
         }
+    }
+
+    #[test]
+    fn gdn_state_bytes_follow_the_real_conv_and_recurrent_shapes() {
+        let config = Qwen3_5Config {
+            vocab_size: 32,
+            hidden_size: 16,
+            num_layers: 4,
+            num_heads: 2,
+            num_kv_heads: 1,
+            intermediate_size: 32,
+            rms_norm_eps: 1e-6,
+            head_dim: 8,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 128,
+            pad_token_id: 0,
+            eos_token_id: 1,
+            bos_token_id: 2,
+            linear_num_value_heads: 2,
+            linear_num_key_heads: 1,
+            linear_key_head_dim: 4,
+            linear_value_head_dim: 3,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 2,
+            partial_rotary_factor: 0.25,
+            rope_theta: 10_000.0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: Some(true),
+            persist_paged_cache: None,
+            n_mtp_layers: 0,
+        };
+        // Two linear layers. conv=[3, (1*4)*2 + (2*3)=14], recurrent=[2,3,4].
+        assert_eq!(config.recurrent_state_bytes(), 2 * (3 * 14 + 2 * 3 * 4) * 2);
     }
 
     #[test]

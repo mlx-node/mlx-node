@@ -31,7 +31,7 @@ use crate::engine::persistence::{
 
 use super::config::Qwen3_5Config;
 use super::decoder_layer::AttentionType;
-use super::model::{Qwen3_5Model, Qwen35Inner, handle_qwen35_cmd};
+use super::model::{Qwen3_5Model, Qwen35Inner, Qwen35SchedulerState, handle_qwen35_cmd};
 use super::processing::Qwen35VLImageProcessor;
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MLPVariant, PerLayerMode, PerLayerQuant,
@@ -1780,12 +1780,13 @@ fn validate_mandatory_weights(
 
 /// Load a Qwen3.5 dense model using a dedicated model thread.
 ///
-/// Spawns a `ModelThread<Qwen35Cmd>` that loads all weights inside the init_fn.
+/// Spawns a `ModelThread<Qwen35Cmd>` whose resident state owns the dense
+/// hybrid scheduler after loading all weights inside the init function.
 /// Returns a `Qwen3_5Model` thin shell with the thread handle.
 pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
     let model_path = model_path.to_string();
 
-    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
         move || {
             let path = Path::new(&model_path);
 
@@ -2170,7 +2171,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 super::model::Qwen3_5ContextLimits::from_tuple(inner.paged_context_limits());
 
             Ok((
-                inner,
+                Qwen35SchedulerState::new(inner),
                 (
                     config_out,
                     model_id,
@@ -2185,7 +2186,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 ),
             ))
         },
-        handle_qwen35_cmd,
+        |state, receiver| state.drive(receiver),
     );
 
     let (

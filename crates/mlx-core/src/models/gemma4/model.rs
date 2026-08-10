@@ -1505,6 +1505,17 @@ impl Gemma4Inner {
         let num_layers = config.num_hidden_layers as usize;
         let hidden_size = config.hidden_size as u32;
         let vocab_size = config.vocab_size as u32;
+        let recurrent_state_bytes = config.recurrent_state_bytes();
+        if recurrent_state_bytes != 0 {
+            tracing::debug!(
+                target: "mlx_core::gemma4::paged",
+                event = "gemma4_recurrent_state_budget",
+                recurrent_state_bytes,
+                max_live_units = crate::engine::recurrent_state::HYBRID_LIVE_STATE_UNITS,
+                batching = "exclusive",
+                "Gemma4 rotating state is measured but remains outside fused continuous batching"
+            );
+        }
 
         let embed_tokens = Embedding::new(vocab_size, hidden_size)?;
         let final_norm = RMSNorm::new(hidden_size, Some(config.rms_norm_eps))?;
@@ -13785,6 +13796,73 @@ mod tests {
         }
     }
 
+    #[cfg(test)]
+    fn cast_paged_tiny_weights_to_bf16(inner: &mut super::Gemma4Inner) {
+        use crate::array::{DType, MxArray};
+        let cast = |array: &MxArray| -> MxArray {
+            array.astype(DType::BFloat16).expect("astype BFloat16")
+        };
+        let weight = inner.embed_tokens.get_weight();
+        inner
+            .embed_tokens
+            .set_weight(&cast(&weight))
+            .expect("embed");
+        let weight = inner.final_norm.get_weight();
+        inner
+            .final_norm
+            .set_weight(&cast(&weight))
+            .expect("final_norm");
+        if let Some(ref mut head) = inner.lm_head {
+            let weight = head.get_weight();
+            head.set_weight(&cast(&weight), "lm_head").expect("lm_head");
+        }
+        for layer in &mut inner.layers {
+            layer
+                .set_input_layernorm_weight(&cast(&layer.input_layernorm_weight()))
+                .expect("input norm");
+            layer
+                .set_post_attention_layernorm_weight(&cast(
+                    &layer.post_attention_layernorm_weight(),
+                ))
+                .expect("post attention norm");
+            layer
+                .set_pre_feedforward_layernorm_weight(&cast(
+                    &layer.pre_feedforward_layernorm_weight(),
+                ))
+                .expect("pre ffn norm");
+            layer
+                .set_post_feedforward_layernorm_weight(&cast(
+                    &layer.post_feedforward_layernorm_weight(),
+                ))
+                .expect("post ffn norm");
+            let attention = &mut layer.self_attn;
+            let weight = attention.q_proj_weight();
+            attention.set_q_proj_weight(&cast(&weight)).expect("q");
+            let weight = attention.k_proj_weight();
+            attention.set_k_proj_weight(&cast(&weight)).expect("k");
+            if let Some(weight) = attention.v_proj_weight_opt() {
+                attention.set_v_proj_weight(&cast(&weight)).expect("v");
+            }
+            let weight = attention.o_proj_weight();
+            attention.set_o_proj_weight(&cast(&weight)).expect("o");
+            let weight = attention.q_norm_weight();
+            attention.set_q_norm_weight(&cast(&weight)).expect("qn");
+            let weight = attention.k_norm_weight();
+            attention.set_k_norm_weight(&cast(&weight)).expect("kn");
+            if let crate::models::gemma4::quantized_linear::Gemma4MLPVariant::Standard(
+                ref mut mlp,
+            ) = layer.mlp
+            {
+                let weight = mlp.gate_proj_weight();
+                mlp.set_gate_proj_weight(&cast(&weight)).expect("gate");
+                let weight = mlp.up_proj_weight();
+                mlp.set_up_proj_weight(&cast(&weight)).expect("up");
+                let weight = mlp.down_proj_weight();
+                mlp.set_down_proj_weight(&cast(&weight)).expect("down");
+            }
+        }
+    }
+
     /// Smoke test for `paged_turn_sync_core` via direct helper drives.
     ///
     /// Random-init weights cast to BF16 (the paged pool's expected
@@ -13801,8 +13879,6 @@ mod tests {
             eprintln!("skipping (paged backend unavailable without Metal)");
             return;
         }
-        use crate::array::{DType, MxArray};
-
         let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Gemma4Inner::new(cfg) {
             Ok(i) => i,
@@ -13821,65 +13897,7 @@ mod tests {
             return;
         }
 
-        // Cast all weights to BF16 to match the pool dtype. Mirrors
-        // LFM2's smoke-test cast pattern.
-        let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype BFloat16") };
-        let w = inner.embed_tokens.get_weight();
-        inner.embed_tokens.set_weight(&cast(&w)).expect("embed");
-        let w = inner.final_norm.get_weight();
-        inner.final_norm.set_weight(&cast(&w)).expect("final_norm");
-        if let Some(ref mut head) = inner.lm_head {
-            let w = head.get_weight();
-            head.set_weight(&cast(&w), "lm_head").expect("lm_head");
-        }
-        for layer in inner.layers.iter_mut() {
-            // Norms.
-            layer
-                .set_input_layernorm_weight(&cast(&layer.input_layernorm_weight().clone()))
-                .ok();
-            layer
-                .set_post_attention_layernorm_weight(&cast(
-                    &layer.post_attention_layernorm_weight().clone(),
-                ))
-                .ok();
-            layer
-                .set_pre_feedforward_layernorm_weight(&cast(
-                    &layer.pre_feedforward_layernorm_weight().clone(),
-                ))
-                .ok();
-            layer
-                .set_post_feedforward_layernorm_weight(&cast(
-                    &layer.post_feedforward_layernorm_weight().clone(),
-                ))
-                .ok();
-            // Attention projections + norms.
-            let attn = &mut layer.self_attn;
-            let w = attn.q_proj_weight();
-            attn.set_q_proj_weight(&cast(&w)).expect("q");
-            let w = attn.k_proj_weight();
-            attn.set_k_proj_weight(&cast(&w)).expect("k");
-            if let Some(w) = attn.v_proj_weight_opt() {
-                attn.set_v_proj_weight(&cast(&w)).expect("v");
-            }
-            let w = attn.o_proj_weight();
-            attn.set_o_proj_weight(&cast(&w)).expect("o");
-            let w = attn.q_norm_weight();
-            attn.set_q_norm_weight(&cast(&w)).expect("qn");
-            let w = attn.k_norm_weight();
-            attn.set_k_norm_weight(&cast(&w)).expect("kn");
-            // MLP.
-            if let crate::models::gemma4::quantized_linear::Gemma4MLPVariant::Standard(
-                ref mut mlp,
-            ) = layer.mlp
-            {
-                let w = mlp.gate_proj_weight();
-                mlp.set_gate_proj_weight(&cast(&w)).expect("gate");
-                let w = mlp.up_proj_weight();
-                mlp.set_up_proj_weight(&cast(&w)).expect("up");
-                let w = mlp.down_proj_weight();
-                mlp.set_down_proj_weight(&cast(&w)).expect("down");
-            }
-        }
+        cast_paged_tiny_weights_to_bf16(&mut inner);
 
         // Adapter lifecycle.
         let prompt: Vec<u32> = vec![1, 2, 3, 4];
@@ -13934,6 +13952,152 @@ mod tests {
 
         if let Some(adapter) = inner.paged_adapter.as_mut() {
             let _ = adapter.release_request();
+        }
+    }
+
+    fn prepare_tiny_paged_request(
+        inner: &mut super::Gemma4Inner,
+        seq_id: u32,
+        prompt: &[u32],
+    ) -> Result<()> {
+        inner.caches = Some(super::init_caches_for_config(&inner.config));
+        let adapter = inner
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("tiny Gemma4 paged adapter missing"))?;
+        adapter.begin_request(seq_id).map_err(Error::from_reason)?;
+        adapter
+            .find_cached_prefix(prompt, &[], 0, false)
+            .map_err(Error::from_reason)?;
+        adapter
+            .allocate_suffix_blocks(16)
+            .map_err(Error::from_reason)?;
+        inner.run_paged_prefill_chunk(prompt, prompt, 0, 0)?;
+        Ok(())
+    }
+
+    fn tiny_exclusive_next_token(
+        inner: &mut super::Gemma4Inner,
+        seq_id: u32,
+        prompt: &[u32],
+        decode_token: u32,
+    ) -> Result<(u32, std::time::Duration)> {
+        prepare_tiny_paged_request(inner, seq_id, prompt)?;
+        let decode_started = std::time::Instant::now();
+        let logits = inner.run_paged_decode_step(decode_token)?;
+        let next = logits.argmax(-1, Some(false))?.item_at_int32(0)? as u32;
+        let decode_elapsed = decode_started.elapsed();
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("adapter prepared")
+            .release_request_and_purge_prefix_cache()
+            .map_err(Error::from_reason)?;
+        Ok((next, decode_elapsed))
+    }
+
+    /// Gemma4's N=2 entry ticket is a state-isolation oracle plus an explicit
+    /// fusion no-go. Moving the real rotating-cache vectors through the same
+    /// request table used by GDN must preserve each request's greedy token
+    /// exactly versus an exclusive replay. The production lane remains width
+    /// one: ragged rotating tails cannot be stacked without padding/masking,
+    /// and an N-times-scalar step would debit hundreds of MiB per request
+    /// without reducing model forwards.
+    #[test]
+    fn gemma4_hybrid_n2_state_table_matches_exclusive_replay_no_go() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
+        let config = super::Gemma4Config {
+            layer_types: vec![
+                "sliding_attention".to_string(),
+                "full_attention".to_string(),
+            ],
+            ..paged_tiny_config(Some(true))
+        };
+        let mut inner = match super::Gemma4Inner::new(config) {
+            Ok(inner) => inner,
+            Err(error) if error.reason.contains("No Metal device found") => {
+                eprintln!("skipping (no Metal device): {}", error.reason);
+                return;
+            }
+            Err(error) => panic!("unexpected Gemma4Inner::new failure: {}", error.reason),
+        };
+        cast_paged_tiny_weights_to_bf16(&mut inner);
+        let prompt_a = [3, 5, 7, 9];
+        let prompt_b = [4, 6, 8, 10, 12, 14];
+        let (baseline_a, exclusive_a) =
+            tiny_exclusive_next_token(&mut inner, 1, &prompt_a, 21).expect("exclusive A");
+        let (baseline_b, exclusive_b) =
+            tiny_exclusive_next_token(&mut inner, 2, &prompt_b, 22).expect("exclusive B");
+        let exclusive_elapsed = exclusive_a + exclusive_b;
+
+        let state_bytes = inner.config.recurrent_state_bytes();
+        assert!(state_bytes > 0, "hybrid fixture must debit sliding state");
+        let mut table = crate::engine::recurrent_state::RecurrentStateTable::stage2();
+        prepare_tiny_paged_request(&mut inner, 101, &prompt_a).expect("prefill A");
+        table
+            .insert_live(
+                101,
+                state_bytes,
+                inner.caches.take().expect("A rotating state"),
+            )
+            .expect("park A");
+        prepare_tiny_paged_request(&mut inner, 202, &prompt_b).expect("prefill B");
+        table
+            .insert_live(
+                202,
+                state_bytes,
+                inner.caches.take().expect("B rotating state"),
+            )
+            .expect("park B");
+        assert_eq!(table.live_len(), 2);
+        assert_eq!(table.live_bytes(), state_bytes.saturating_mul(2));
+
+        let interleaved_started = std::time::Instant::now();
+        let mut interleaved = Vec::new();
+        for (seq_id, decode_token) in [(101, 21), (202, 22)] {
+            inner
+                .paged_adapter
+                .as_mut()
+                .expect("adapter")
+                .activate_request(seq_id)
+                .expect("activate request");
+            inner.caches = Some(table.take_live(seq_id).expect("request state"));
+            let logits = inner
+                .run_paged_decode_step(decode_token)
+                .expect("interleaved decode");
+            interleaved.push(
+                logits
+                    .argmax(-1, Some(false))
+                    .unwrap()
+                    .item_at_int32(0)
+                    .unwrap(),
+            );
+            table
+                .insert_live(
+                    seq_id,
+                    state_bytes,
+                    inner.caches.take().expect("updated request state"),
+                )
+                .expect("re-park request");
+        }
+        assert_eq!(interleaved, vec![baseline_a as i32, baseline_b as i32]);
+        let interleaved_elapsed = interleaved_started.elapsed();
+        eprintln!(
+            "gemma4 N=2 no-go microbench: interleaved-scalar={:.3}ms exclusive={:.3}ms state_bytes/request={} (no fused ragged-tail operator)",
+            interleaved_elapsed.as_secs_f64() * 1_000.0,
+            exclusive_elapsed.as_secs_f64() * 1_000.0,
+            state_bytes,
+        );
+        for seq_id in [101, 202] {
+            inner
+                .paged_adapter
+                .as_mut()
+                .expect("adapter")
+                .release_request_for(seq_id)
+                .expect("release request");
         }
     }
 

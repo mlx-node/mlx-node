@@ -70,13 +70,13 @@ never discards media or the request.
 
 ## Current routing contracts
 
-| Family        | Media                                                        | Paged attention | Chat speculation                                                                  | Important constraint                                                    |
-| ------------- | ------------------------------------------------------------ | --------------- | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| Qwen3         | none                                                         | fresh and delta | none                                                                              | all paged turns use the shared paged executor                           |
+| Family        | Media                                                        | Paged attention | Chat speculation                                                                  | Important constraint                                                                                                      |
+| ------------- | ------------------------------------------------------------ | --------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Qwen3         | none                                                         | fresh and delta | none                                                                              | all paged turns use the shared paged executor                                                                             |
 | LFM2          | none                                                         | fresh and delta | none                                                                              | short-conv state is never paged: every paged turn (fresh or delta) rebuilds it from the full token stream via conv Pass-1 |
-| Qwen3.5 dense | images when encoder, processor, and paged adapter are loaded | fresh and delta | native MTP, including paged target state and supported image-context continuation | multimedia turns keep the model's VLM preparation path                  |
-| Qwen3.5 MoE   | images when encoder, processor, and paged adapter are loaded | fresh and delta | native MTP on flat target state                                                   | paged target execution takes precedence and falls back to target AR     |
-| Gemma4        | image/audio components that have a paged adapter             | fresh and delta | external draft on flat text-only state                                            | missing components retain family-specific validation errors             |
+| Qwen3.5 dense | images when encoder, processor, and paged adapter are loaded | fresh and delta | native MTP, including paged target state and supported image-context continuation | plain paged AR may use the two-row GDN scheduler; multimedia/MTP retain the ordered path                                  |
+| Qwen3.5 MoE   | images when encoder, processor, and paged adapter are loaded | fresh and delta | native MTP on flat target state                                                   | paged target execution takes precedence and falls back to target AR                                                       |
+| Gemma4        | image/audio components that have a paged adapter             | fresh and delta | external draft on flat text-only state                                            | rotating-state batching is a measured no-go; all turns retain the ordered path                                            |
 
 The table is a conformance description, not dispatch code. The source of truth
 is each model's `execution_plan()` plus its executor implementations.

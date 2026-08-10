@@ -44,6 +44,10 @@ pub(crate) struct TurnState<P> {
     /// Preemption releases the charge together with the live block table; it
     /// is restored only after the model-specific resume preparation succeeds.
     pub block_reservation_active: bool,
+    /// Constant-size recurrent/sliding state charged in the same byte budget
+    /// as future paged-block growth. Zero means this row has no hybrid state.
+    pub recurrent_state_bytes: u64,
+    pub recurrent_state_reservation_active: bool,
     pub preemptions: u32,
     pub payload: P,
     arrival_order: u64,
@@ -104,6 +108,7 @@ pub(crate) fn install_preemption_replay<P>(
     }
     turn.block_materialized_blocks = 0;
     turn.block_reservation_active = false;
+    turn.recurrent_state_reservation_active = false;
     Ok(PreemptionReplay {
         tokens,
         cached_prefix: 0,
@@ -152,6 +157,8 @@ impl<P> TurnState<P> {
             block_materialized_blocks: 0,
             block_size: 0,
             block_reservation_active: true,
+            recurrent_state_bytes: 0,
+            recurrent_state_reservation_active: true,
             preemptions: 0,
             payload,
             arrival_order: 0,
@@ -185,6 +192,12 @@ impl<P> TurnState<P> {
         self
     }
 
+    pub fn with_recurrent_state_reservation(mut self, bytes: u64) -> Self {
+        self.recurrent_state_bytes = bytes;
+        self.recurrent_state_reservation_active = true;
+        self
+    }
+
     fn unallocated_reserved_blocks(&self) -> u32 {
         if !self.block_reservation_active
             || self.block_reservation_total == 0
@@ -194,6 +207,14 @@ impl<P> TurnState<P> {
         }
         self.block_reservation_total
             .saturating_sub(self.block_materialized_blocks)
+    }
+
+    fn reserved_recurrent_state_bytes(&self) -> u64 {
+        if self.recurrent_state_reservation_active {
+            self.recurrent_state_bytes
+        } else {
+            0
+        }
     }
 }
 
@@ -210,6 +231,63 @@ pub(crate) struct BlockAdmission {
     pub admitted: bool,
     pub watermark_blocks: u32,
     pub reserved_blocks: u32,
+}
+
+/// Unified-memory view used by hybrid admission. Paged blocks and recurrent
+/// state are deliberately expressed in bytes so one cannot be admitted by a
+/// budget that ignores the other.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MemoryTelemetry {
+    pub capacity_bytes: u64,
+    pub free_bytes: u64,
+    pub reclaimable_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MemoryAdmission {
+    pub admitted: bool,
+    pub watermark_bytes: u64,
+    pub reserved_block_bytes: u64,
+    pub reserved_state_bytes: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn memory_admission_decision(
+    telemetry: MemoryTelemetry,
+    existing_unallocated_blocks: u32,
+    candidate_blocks: u32,
+    bytes_per_block: u64,
+    existing_state_bytes: u64,
+    candidate_state_bytes: u64,
+    has_live_rows: bool,
+    watermark_fraction: f64,
+) -> MemoryAdmission {
+    let fraction = if watermark_fraction.is_finite() {
+        watermark_fraction.clamp(0.0, 1.0)
+    } else {
+        0.05
+    };
+    let watermark_bytes = if has_live_rows {
+        ((telemetry.capacity_bytes as f64) * fraction).ceil() as u64
+    } else {
+        0
+    };
+    let reserved_block_bytes =
+        u64::from(existing_unallocated_blocks.saturating_add(candidate_blocks))
+            .saturating_mul(bytes_per_block);
+    let reserved_state_bytes = existing_state_bytes.saturating_add(candidate_state_bytes);
+    let available = telemetry
+        .free_bytes
+        .saturating_add(telemetry.reclaimable_bytes);
+    MemoryAdmission {
+        admitted: reserved_block_bytes
+            .saturating_add(reserved_state_bytes)
+            .saturating_add(watermark_bytes)
+            <= available,
+        watermark_bytes,
+        reserved_block_bytes,
+        reserved_state_bytes,
+    }
 }
 
 pub(crate) fn block_admission_decision(
@@ -310,6 +388,11 @@ pub(crate) struct SchedulerStats {
     pub allocated_blocks: u32,
     pub watermark_blocks: u32,
     pub reserved_blocks: u32,
+    pub memory_capacity_bytes: u64,
+    pub memory_watermark_bytes: u64,
+    pub reserved_block_bytes: u64,
+    pub reserved_state_bytes: u64,
+    pub admission_deferred_state: u64,
     pub ssd_restore_waiting: u32,
     pub ssd_restore_bytes: u64,
     pub ssd_restore_wait_micros: u64,
@@ -401,6 +484,11 @@ pub struct SchedulerStatsJs {
     pub allocated_blocks: u32,
     pub watermark_blocks: u32,
     pub reserved_blocks: u32,
+    pub memory_capacity_bytes: f64,
+    pub memory_watermark_bytes: f64,
+    pub reserved_block_bytes: f64,
+    pub reserved_state_bytes: f64,
+    pub admission_deferred_state: f64,
     pub ssd_restore_waiting: u32,
     pub ssd_restore_bytes: f64,
     pub ssd_restore_wait_ms: f64,
@@ -432,6 +520,11 @@ impl SchedulerStats {
             allocated_blocks: self.allocated_blocks,
             watermark_blocks: self.watermark_blocks,
             reserved_blocks: self.reserved_blocks,
+            memory_capacity_bytes: self.memory_capacity_bytes as f64,
+            memory_watermark_bytes: self.memory_watermark_bytes as f64,
+            reserved_block_bytes: self.reserved_block_bytes as f64,
+            reserved_state_bytes: self.reserved_state_bytes as f64,
+            admission_deferred_state: self.admission_deferred_state as f64,
             ssd_restore_waiting: self.ssd_restore_waiting,
             ssd_restore_bytes: self.ssd_restore_bytes as f64,
             ssd_restore_wait_ms: self.ssd_restore_wait_micros as f64 / 1_000.0,
@@ -569,6 +662,15 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             })
     }
 
+    fn reserved_recurrent_state_bytes(&self) -> u64 {
+        self.waiting
+            .iter()
+            .chain(self.running.iter())
+            .fold(0u64, |sum, turn| {
+                sum.saturating_add(turn.reserved_recurrent_state_bytes())
+            })
+    }
+
     pub fn observe_blocks(
         &mut self,
         telemetry: BlockTelemetry,
@@ -613,6 +715,37 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         if !decision.admitted {
             self.stats.admission_deferred_blocks =
                 self.stats.admission_deferred_blocks.saturating_add(1);
+        }
+        decision
+    }
+
+    pub fn try_reserve_memory(
+        &mut self,
+        telemetry: MemoryTelemetry,
+        candidate_blocks: u32,
+        bytes_per_block: u64,
+        resident_state_bytes: u64,
+        candidate_state_bytes: u64,
+        watermark_fraction: f64,
+    ) -> MemoryAdmission {
+        let decision = memory_admission_decision(
+            telemetry,
+            self.unallocated_reserved_blocks(),
+            candidate_blocks,
+            bytes_per_block,
+            self.reserved_recurrent_state_bytes()
+                .max(resident_state_bytes),
+            candidate_state_bytes,
+            self.has_live_turns(),
+            watermark_fraction,
+        );
+        self.stats.memory_capacity_bytes = telemetry.capacity_bytes;
+        self.stats.memory_watermark_bytes = decision.watermark_bytes;
+        self.stats.reserved_block_bytes = decision.reserved_block_bytes;
+        self.stats.reserved_state_bytes = decision.reserved_state_bytes;
+        if !decision.admitted {
+            self.stats.admission_deferred_state =
+                self.stats.admission_deferred_state.saturating_add(1);
         }
         decision
     }
@@ -675,12 +808,14 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
     pub fn prepend_preempted(&mut self, mut turn: TurnState<P>) {
         turn.status = TurnStatus::Preempted;
         turn.block_reservation_active = false;
+        turn.recurrent_state_reservation_active = false;
         self.waiting.push_front(turn);
     }
 
     /// Publish successful model-specific resume preparation.
     pub fn ready_preempted(&mut self, mut turn: TurnState<P>, waiting_for_ssd: bool) {
         turn.block_reservation_active = true;
+        turn.recurrent_state_reservation_active = true;
         if waiting_for_ssd {
             turn.status = TurnStatus::WaitingForSsd;
             self.stats.ssd_restore_waiting = self.stats.ssd_restore_waiting.saturating_add(1);
@@ -912,6 +1047,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             let mut victim = self.running.remove(index);
             victim.status = TurnStatus::Preempted;
             victim.block_reservation_active = false;
+            victim.recurrent_state_reservation_active = false;
             victim.preemptions = victim.preemptions.saturating_add(1);
             self.stats.preemptions = self.stats.preemptions.saturating_add(1);
             preempted = Some(victim);
@@ -1553,5 +1689,75 @@ mod tests {
         assert_eq!(request.num_tokens, 5);
         assert_eq!(request.prompt_tokens, 4);
         assert_eq!(request.pinned_prefill_breaks, [2, 4]);
+    }
+
+    #[test]
+    fn hybrid_memory_admission_charges_blocks_and_state_to_one_budget() {
+        const MIB: u64 = 1024 * 1024;
+        let telemetry = MemoryTelemetry {
+            capacity_bytes: 1024 * MIB,
+            free_bytes: 800 * MIB,
+            reclaimable_bytes: 0,
+        };
+        let admitted =
+            memory_admission_decision(telemetry, 2, 1, 16 * MIB, 335 * MIB, 335 * MIB, true, 0.05);
+        assert!(admitted.admitted);
+        assert_eq!(admitted.reserved_block_bytes, 48 * MIB);
+        assert_eq!(admitted.reserved_state_bytes, 670 * MIB);
+        assert_eq!(
+            admitted.watermark_bytes,
+            ((1024 * MIB) as f64 * 0.05).ceil() as u64
+        );
+
+        let blocks_only_would_fit_but_state_does_not =
+            memory_admission_decision(telemetry, 2, 1, 16 * MIB, 670 * MIB, 335 * MIB, true, 0.05);
+        assert!(!blocks_only_would_fit_but_state_does_not.admitted);
+    }
+
+    #[test]
+    fn resident_recurrent_table_bytes_survive_an_empty_scheduler_queue() {
+        const MIB: u64 = 1024 * 1024;
+        let telemetry = MemoryTelemetry {
+            capacity_bytes: 1024 * MIB,
+            free_bytes: 800 * MIB,
+            reclaimable_bytes: 0,
+        };
+        let mut scheduler = Scheduler::<(), (), ()>::new(2, 2).expect("scheduler");
+        let decision = scheduler.try_reserve_memory(telemetry, 0, 0, 335 * MIB, 335 * MIB, 0.05);
+        assert!(decision.admitted);
+        assert_eq!(decision.reserved_state_bytes, 670 * MIB);
+        assert_eq!(scheduler.stats().reserved_state_bytes, 670 * MIB);
+    }
+
+    #[test]
+    fn eight_gemma_state_candidates_admit_two_and_defer_six() {
+        const MIB: u64 = 1024 * 1024;
+        const GEMMA_STATE: u64 = 335 * MIB;
+        let telemetry = MemoryTelemetry {
+            capacity_bytes: 1024 * MIB,
+            free_bytes: 760 * MIB,
+            reclaimable_bytes: 0,
+        };
+        let mut scheduler = Scheduler::<_, (), ()>::new(8, 8).expect("scheduler");
+        let mut admitted = Vec::new();
+        let mut deferred = Vec::new();
+        for seq_id in 1..=8 {
+            let decision = scheduler.try_reserve_memory(telemetry, 0, 0, 0, GEMMA_STATE, 0.05);
+            if decision.admitted {
+                scheduler
+                    .enqueue_turn(
+                        turn(seq_id, 1, &[1], None).with_recurrent_state_reservation(GEMMA_STATE),
+                    )
+                    .unwrap();
+                admitted.push(seq_id);
+            } else {
+                deferred.push(seq_id);
+            }
+        }
+        assert_eq!(admitted, [1, 2]);
+        assert_eq!(deferred, [3, 4, 5, 6, 7, 8]);
+        assert_eq!(scheduler.waiting_len(), 2);
+        assert_eq!(scheduler.stats().admission_deferred_state, 6);
+        assert_eq!(scheduler.stats().reserved_state_bytes, 3 * GEMMA_STATE);
     }
 }

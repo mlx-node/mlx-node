@@ -1203,6 +1203,14 @@ export declare class Qwen35Model {
    */
   hasBlockPagedCache(): boolean;
   /**
+   * Native admission width for plain text AR turns. Checkpoints carrying a
+   * vision tower or native MTP head retain their ordered whole-turn path;
+   * the Stage-2 recurrent lane is enabled only for paged dense text models.
+   */
+  maxConcurrentSequences(): number;
+  /** Snapshot scheduler occupancy plus unified block/recurrent admission. */
+  schedulerStats(): Promise<SchedulerStats>;
+  /**
    * Whether this checkpoint shipped an MTP head (module loaded by
    * `persistence::apply_weights_inner`). Snapshotted at load time from
    * `Qwen35Inner::has_mtp_weights()` so the TS `ChatSession` can
@@ -4819,6 +4827,11 @@ export interface SchedulerStats {
   allocatedBlocks: number;
   watermarkBlocks: number;
   reservedBlocks: number;
+  memoryCapacityBytes: number;
+  memoryWatermarkBytes: number;
+  reservedBlockBytes: number;
+  reservedStateBytes: number;
+  admissionDeferredState: number;
   ssdRestoreWaiting: number;
   ssdRestoreBytes: number;
   ssdRestoreWaitMs: number;

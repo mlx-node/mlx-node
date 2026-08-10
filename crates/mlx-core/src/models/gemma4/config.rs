@@ -217,6 +217,20 @@ fn default_bos_token_id() -> i32 {
 }
 
 impl Gemma4Config {
+    /// BF16 bytes for one request's full set of physical sliding-window K/V
+    /// tails. KV-shared layers are aliases and therefore own no state unit.
+    pub(crate) fn recurrent_state_bytes(&self) -> u64 {
+        let physical_sliding_layers = (0..self.num_hidden_layers.max(0) as usize)
+            .filter(|&layer| self.is_sliding_layer(layer) && !self.is_kv_shared_layer(layer))
+            .count() as u64;
+        physical_sliding_layers
+            .saturating_mul(u64::try_from(self.sliding_window.max(0)).unwrap_or(0))
+            .saturating_mul(u64::try_from(self.effective_kv_heads(false).max(0)).unwrap_or(0))
+            .saturating_mul(u64::try_from(self.effective_head_dim(false).max(0)).unwrap_or(0))
+            .saturating_mul(2) // K + V
+            .saturating_mul(2) // BF16
+    }
+
     /// Effective intermediate size for a given layer.
     /// Last `num_kv_shared_layers` layers get 2x if `use_double_wide_mlp`.
     pub fn effective_intermediate_size(&self, layer_idx: usize) -> i32 {
@@ -340,6 +354,29 @@ impl Gemma4Config {
 
 #[cfg(test)]
 mod tests {
+    use super::Gemma4Config;
+
+    #[test]
+    fn sliding_state_bytes_exclude_global_and_shared_alias_layers() {
+        let config = Gemma4Config {
+            num_hidden_layers: 5,
+            num_key_value_heads: 2,
+            head_dim: 8,
+            sliding_window: 16,
+            layer_types: vec![
+                "sliding_attention".into(),
+                "full_attention".into(),
+                "sliding_attention".into(),
+                "sliding_attention".into(),
+                "full_attention".into(),
+            ],
+            num_kv_shared_layers: Some(2),
+            ..Gemma4Config::default()
+        };
+        // Physical sliding layers are 0 and 2. Layers 3/4 are shared aliases.
+        assert_eq!(config.recurrent_state_bytes(), 2 * 16 * 2 * 8 * 2 * 2);
+    }
+
     #[test]
     fn test_default_layer_types_synthesis() {
         // mlx-lm default: sliding_window_pattern=5 → 4 sliding + 1 full per cycle

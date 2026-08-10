@@ -1,7 +1,9 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
@@ -12,8 +14,8 @@ use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
 use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, MtpBackend, MtpStepper, MtpTurnSetup, PagedBackend,
-    PagedPrefix, PagedTurnSetup, ResetScope, SaveStateArgs, ThinkingSetup, TrainBackend,
-    TurnOutput, TurnSetup, WholeTurnArgs,
+    PagedPrefix, PagedTurnSetup, ResetScope, SaveStateArgs, StreamEmitter, ThinkingSetup,
+    TrainBackend, TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::{
     ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
@@ -22,15 +24,21 @@ use crate::engine::plan::{
     DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
     SpeculativePlan,
 };
+use crate::engine::recurrent_state::{HYBRID_LIVE_STATE_UNITS, RecurrentStateTable};
+use crate::engine::scheduler::{
+    PreemptionMode, PreemptionReplay, RowStepResult, Scheduler, SchedulerAction, StepExecutor,
+    StepKind, StepPlan, StepResult, TurnState, install_preemption_replay,
+    is_paged_allocation_blocked,
+};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
-use crate::model_thread::ResponseTx;
+use crate::model_thread::{LoopControl, ResponseTx, StreamTx, send_and_await};
 use crate::nn::{Embedding, Linear, RMSNorm};
-use crate::sampling::{SamplingConfig, sample};
+use crate::sampling::{SamplingConfig, check_repetition_cutoff, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
-use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
@@ -58,6 +66,9 @@ use crate::engine::{
 };
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 
+mod scheduler_state;
+pub(crate) use scheduler_state::Qwen35SchedulerState;
+
 /// Hard cap on inactive per-image feature entries retained by the vision LRU.
 /// The active request is protected from eviction even when it is larger than
 /// this cap; this prevents scan thrash while one large prompt is being built.
@@ -74,6 +85,76 @@ const VISION_SAFETY_RESERVE_MAX_BYTES: u64 = 16 * VISION_GIB;
 const VISION_CACHE_MAX_BYTES: u64 = VISION_GIB;
 const VISION_MISS_BATCH_MIN_PATCHES: u64 = 1;
 const VISION_MISS_BATCH_MAX_PATCHES: u64 = 32 * 1024;
+
+fn scheduler_max_num_seqs() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_SCHED_MAX_NUM_SEQS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(8)
+            .min(32)
+            // Hybrid state has a deliberate vLLM Mamba-style two-unit cap.
+            .min(crate::engine::recurrent_state::HYBRID_LIVE_STATE_UNITS)
+    })
+}
+
+fn scheduler_max_batched_tokens() -> u32 {
+    static VALUE: OnceLock<u32> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_SCHED_MAX_BATCHED_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(2048)
+    })
+}
+
+fn scheduler_long_prefill_tokens() -> u32 {
+    static VALUE: OnceLock<u32> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_SCHED_LONG_PREFILL_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(2048)
+    })
+}
+
+fn scheduler_per_seq_context() -> u32 {
+    static VALUE: OnceLock<u32> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_PAGED_PER_SEQ_CTX")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(32_768)
+    })
+}
+
+fn scheduler_watermark_fraction() -> f64 {
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_SCHED_WATERMARK_FRACTION")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            .unwrap_or(0.05)
+    })
+}
+
+fn scheduler_reserve_full_isl() -> bool {
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_SCHED_RESERVE_FULL_ISL").map_or(true, |value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisionMemoryCapSource {
@@ -791,6 +872,16 @@ pub(crate) struct Qwen35Inner {
     /// Paged turns run the pure-Rust eager paged forward
     /// (`paged_forward::run_paged_prefill_chunk` / `run_paged_decode_step`).
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// Request-keyed GDN state for the hybrid scheduler lane. Full-attention
+    /// K/V remains in `paged_adapter`; each table value contains only the
+    /// corresponding request's two GDN arrays at every linear layer.
+    ///
+    /// The table has the Stage-2 two-unit cap. One state may be temporarily
+    /// activated in `caches` for serial prefill/finalization, so activation
+    /// first parks the previous owner and then removes the next owner from the
+    /// table. Batched decode parks the active owner and stacks table rows.
+    scheduled_recurrent: RecurrentStateTable<Vec<Qwen3_5LayerCache>>,
+    active_scheduled_seq: Option<SeqId>,
     /// True when a paged-core turn has populated
     /// the paged adapter's `LayerKVPool` since the last flat full-attention
     /// prefill, so the flat `self.caches` full-attention slots do NOT
@@ -995,6 +1086,9 @@ pub(crate) enum Qwen35Cmd {
     /// [`crate::engine::cmd::handle_train_cmd`], which drives the
     /// [`TrainBackend`] impl on [`Qwen35Inner`].
     Train(TrainCmd),
+    SchedulerStats {
+        reply: ResponseTx<engine::SchedulerStatsJs>,
+    },
 }
 
 impl FromChatCmd for Qwen35Cmd {
@@ -1118,6 +1212,9 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         // --- Training commands ---
         Qwen35Cmd::Train(train_cmd) => {
             handle_train_cmd(inner, train_cmd);
+        }
+        Qwen35Cmd::SchedulerStats { reply } => {
+            let _ = reply.send(Ok(engine::scheduler::SchedulerStats::default().to_js()));
         }
     }
 }
@@ -1298,6 +1395,8 @@ impl Qwen35Inner {
             gdn_last_history_checkpoint: None,
             paged_finalize_failed: false,
             paged_adapter,
+            scheduled_recurrent: RecurrentStateTable::stage2(),
+            active_scheduled_seq: None,
             paged_full_attn_caches_dirty: false,
             flat_mtp_caches_desynced: false,
             flat_full_reprefill_count: 0,
@@ -1549,6 +1648,8 @@ impl Qwen35Inner {
     /// Initialize KV caches.
     pub(crate) fn init_caches_sync(&mut self) -> Result<()> {
         self.caches = Some(fresh_dense_layer_caches(&self.config));
+        self.scheduled_recurrent = RecurrentStateTable::stage2();
+        self.active_scheduled_seq = None;
         self.clear_reuse_state();
         Ok(())
     }
@@ -1561,6 +1662,8 @@ impl Qwen35Inner {
             }
         }
         self.caches = None;
+        self.scheduled_recurrent = RecurrentStateTable::stage2();
+        self.active_scheduled_seq = None;
         self.clear_reuse_state();
         // A full session reset must also clear the MTP acceptance gate
         // state: a new independent chat on this model starts fresh (probes)
@@ -1569,6 +1672,308 @@ impl Qwen35Inner {
         self.mtp_draft_attempted = 0;
         self.mtp_gated_turns = 0;
         Ok(())
+    }
+
+    /// Move the serially active request's GDN state back to the request table.
+    /// Full-attention slots are empty placeholders; their K/V remains in the
+    /// paged adapter and is never copied here.
+    fn park_active_scheduled_recurrent(&mut self) -> Result<()> {
+        let Some(seq_id) = self.active_scheduled_seq else {
+            return Ok(());
+        };
+        let bytes = self.config.recurrent_state_bytes();
+        if bytes == 0 {
+            return Err(Error::from_reason(
+                "Qwen3.5 scheduled recurrent state has zero byte size",
+            ));
+        }
+        if !self.scheduled_recurrent.can_insert_live(seq_id) {
+            return Err(Error::from_reason(format!(
+                "Qwen3.5 sequence {seq_id}: recurrent-state live-unit cap reached"
+            )));
+        }
+        self.active_scheduled_seq = None;
+        let state = self
+            .caches
+            .take()
+            .unwrap_or_else(|| fresh_dense_layer_caches(&self.config));
+        self.scheduled_recurrent
+            .insert_live(seq_id, bytes, state)
+            .expect("recurrent-state insertion was prevalidated");
+        Ok(())
+    }
+
+    fn scheduled_recurrent_units(&self) -> usize {
+        self.scheduled_recurrent.live_len() + usize::from(self.active_scheduled_seq.is_some())
+    }
+
+    fn scheduled_recurrent_bytes(&self) -> u64 {
+        let active_bytes = if self.active_scheduled_seq.is_some() {
+            self.config.recurrent_state_bytes()
+        } else {
+            0
+        };
+        self.scheduled_recurrent
+            .live_bytes()
+            .saturating_add(active_bytes)
+    }
+
+    fn has_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
+        self.active_scheduled_seq == Some(seq_id) || self.scheduled_recurrent.contains_live(seq_id)
+    }
+
+    fn can_activate_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
+        self.has_scheduled_recurrent(seq_id)
+            || self.scheduled_recurrent_units() < HYBRID_LIVE_STATE_UNITS
+    }
+
+    fn activate_scheduled_recurrent(&mut self, seq_id: SeqId) -> Result<()> {
+        if self.active_scheduled_seq == Some(seq_id) {
+            return Ok(());
+        }
+        if !self.can_activate_scheduled_recurrent(seq_id) {
+            return Err(Error::from_reason(format!(
+                "Qwen3.5 sequence {seq_id}: recurrent-state live-unit cap reached"
+            )));
+        }
+        self.park_active_scheduled_recurrent()?;
+        self.caches = Some(
+            self.scheduled_recurrent
+                .take_live(seq_id)
+                .unwrap_or_else(|| fresh_dense_layer_caches(&self.config)),
+        );
+        self.active_scheduled_seq = Some(seq_id);
+        Ok(())
+    }
+
+    /// Activate one already-prepared request for the existing scalar
+    /// prefill/finalize cores.
+    fn activate_paged_seq(&mut self, seq_id: SeqId) -> Result<()> {
+        self.paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Qwen3.5 paged adapter is unavailable"))?
+            .activate_request(seq_id)
+            .map_err(Error::from_reason)?;
+        self.activate_scheduled_recurrent(seq_id)
+    }
+
+    fn release_scheduled_recurrent_for(&mut self, seq_id: SeqId) {
+        if self.active_scheduled_seq == Some(seq_id) {
+            self.active_scheduled_seq = None;
+            self.caches = Some(fresh_dense_layer_caches(&self.config));
+        }
+        self.scheduled_recurrent.remove_live(seq_id);
+    }
+
+    fn stacked_gdn_cache(
+        &mut self,
+        seq_ids: &[SeqId],
+        layer_idx: usize,
+    ) -> Result<Qwen3_5LayerCache> {
+        self.park_active_scheduled_recurrent()?;
+        let rows = seq_ids
+            .iter()
+            .map(|&seq_id| {
+                self.scheduled_recurrent
+                    .live(seq_id)
+                    .ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "Qwen3.5 sequence {seq_id} has no recurrent state"
+                        ))
+                    })?
+                    .get(layer_idx)
+                    .and_then(|cache| match cache {
+                        Qwen3_5LayerCache::Linear(arrays) => Some(arrays),
+                        Qwen3_5LayerCache::FullAttention(_) => None,
+                    })
+                    .ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "Qwen3.5 linear layer {layer_idx} has no GDN cache"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Qwen3_5LayerCache::Linear(
+            super::arrays_cache::ArraysCache::stack_rows(&rows)?,
+        ))
+    }
+
+    fn scatter_gdn_cache(
+        &mut self,
+        seq_ids: &[SeqId],
+        layer_idx: usize,
+        combined: &Qwen3_5LayerCache,
+    ) -> Result<()> {
+        let Qwen3_5LayerCache::Linear(combined) = combined else {
+            return Err(Error::from_reason(format!(
+                "Qwen3.5 linear layer {layer_idx} returned a non-GDN cache"
+            )));
+        };
+        for (row, &seq_id) in seq_ids.iter().enumerate() {
+            let state = self.scheduled_recurrent.live_mut(seq_id).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Qwen3.5 sequence {seq_id} disappeared during GDN scatter"
+                ))
+            })?;
+            state[layer_idx] = Qwen3_5LayerCache::Linear(combined.row(row, seq_ids.len())?);
+        }
+        Ok(())
+    }
+
+    /// Execute one uniform text decode step for multiple hybrid requests.
+    /// Full-attention layers issue one paged gather over all rows; GDN layers
+    /// stack the two request-local arrays, execute once over `[N,1,H]`, then
+    /// scatter the replacement arrays back to their sequence entries.
+    fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+        if rows.is_empty() {
+            return Err(Error::from_reason(
+                "Qwen3.5 batched decode requires at least one row",
+            ));
+        }
+        if self.cached_rope_deltas.unwrap_or(0) != 0 {
+            return Err(Error::from_reason(
+                "Qwen3.5 batched decode does not admit image-derived M-RoPE state",
+            ));
+        }
+        self.park_active_scheduled_recurrent()?;
+
+        let adapter = self
+            .paged_adapter
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Qwen3.5 batched decode requires a paged adapter"))?;
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut planned_rows = Vec::with_capacity(rows.len());
+        for &(seq_id, _) in rows {
+            if !seen.insert(seq_id) {
+                return Err(Error::from_reason(format!(
+                    "Qwen3.5 batched decode received duplicate sequence {seq_id}"
+                )));
+            }
+            let position = adapter.current_token_count_for(seq_id).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Qwen3.5 batched decode received unknown sequence {seq_id}"
+                ))
+            })?;
+            planned_rows.push((seq_id, position));
+        }
+        let expected_state_bytes = self
+            .config
+            .recurrent_state_bytes()
+            .saturating_mul(rows.len() as u64);
+        if self.scheduled_recurrent.live_len() != rows.len()
+            || self.scheduled_recurrent.live_bytes() != expected_state_bytes
+        {
+            return Err(Error::from_reason(format!(
+                "Qwen3.5 batched decode state table has {} rows / {} bytes; expected {} rows / {} bytes",
+                self.scheduled_recurrent.live_len(),
+                self.scheduled_recurrent.live_bytes(),
+                rows.len(),
+                expected_state_bytes,
+            )));
+        }
+        let recurrent_snapshots = rows
+            .iter()
+            .map(|&(seq_id, _)| {
+                let state = self.scheduled_recurrent.live(seq_id).ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "Qwen3.5 sequence {seq_id} has no recurrent state before batched decode"
+                    ))
+                })?;
+                crate::models::qwen3_5::paged_forward::snapshot_materialized_linear_layer_caches(
+                    state,
+                )
+                .map(|snapshot| (seq_id, snapshot))
+                .ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "Qwen3.5 sequence {seq_id} has an unmaterialized recurrent state"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut recorded = Vec::with_capacity(rows.len());
+        for &(seq_id, token_id) in rows {
+            if let Err(error) = self
+                .paged_adapter
+                .as_mut()
+                .expect("adapter validated above")
+                .record_token_for(seq_id, token_id)
+            {
+                for &recorded_seq in recorded.iter().rev() {
+                    let adapter = self
+                        .paged_adapter
+                        .as_mut()
+                        .expect("adapter validated above");
+                    adapter
+                        .activate_request(recorded_seq)
+                        .map_err(Error::from_reason)?;
+                    adapter
+                        .rollback_last_tokens(1)
+                        .map_err(Error::from_reason)?;
+                }
+                return Err(Error::from_reason(format!(
+                    "Qwen3.5 batched decode failed to record sequence {seq_id}: {error}"
+                )));
+            }
+            recorded.push(seq_id);
+        }
+
+        let result = (|| {
+            let token_ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
+            let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
+            let input_ids = MxArray::from_uint32(&token_ids, &[rows.len() as i64, 1])?;
+            let mut hidden_states = self.embedding.forward(&input_ids)?;
+
+            for layer_idx in 0..self.layers.len() {
+                let kind = self.layer_kinds[layer_idx];
+                let mut gdn_cache =
+                    if matches!(kind, super::decoder_layer::Qwen3_5LayerKind::Linear) {
+                        Some(self.stacked_gdn_cache(&seq_ids, layer_idx)?)
+                    } else {
+                        None
+                    };
+                hidden_states = {
+                    let layer = unsafe { &mut *self.layers.as_mut_ptr().add(layer_idx) };
+                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                        Error::from_reason("Qwen3.5 paged adapter dropped during batched decode")
+                    })?;
+                    layer.forward_paged_batched(
+                        &hidden_states,
+                        kind,
+                        adapter,
+                        &planned_rows,
+                        gdn_cache.as_mut(),
+                    )?
+                };
+                if let Some(cache) = gdn_cache.as_ref() {
+                    self.scatter_gdn_cache(&seq_ids, layer_idx, cache)?;
+                }
+            }
+
+            let hidden_states = self.final_norm.forward(&hidden_states)?;
+            if let Some(head) = &self.lm_head {
+                head.forward(&hidden_states)
+            } else {
+                self.embedding.as_linear(&hidden_states)
+            }
+        })();
+        if result.is_err() {
+            for &recorded_seq in recorded.iter().rev() {
+                let adapter = self
+                    .paged_adapter
+                    .as_mut()
+                    .expect("adapter validated above");
+                if adapter.activate_request(recorded_seq).is_ok() {
+                    let _ = adapter.rollback_last_tokens(1);
+                }
+            }
+            for (seq_id, snapshot) in recurrent_snapshots {
+                self.scheduled_recurrent
+                    .insert_live(seq_id, self.config.recurrent_state_bytes(), snapshot)
+                    .expect("rollback replaces an existing recurrent row");
+            }
+        }
+        result
     }
 
     /// Clear cached token history, image key, and rope deltas.
@@ -8799,7 +9204,10 @@ impl PagedBackend for Qwen35Inner {
         // vLLM exact-prefix cap: leave at least one prompt token to prefill so
         // the decoder always has something to consume.
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        let seq_id: u32 = 0;
+        // Whole-turn callers retain sequence 0. The continuous scheduler
+        // activates a request-local recurrent row before entering this same
+        // prime core, so K/V and GDN state share one sequence identity.
+        let seq_id = self.active_scheduled_seq.unwrap_or(0);
         let block_size = {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
                 Error::from_reason(
@@ -8890,6 +9298,16 @@ impl PagedBackend for Qwen35Inner {
             cache_salt,
             continued_live_prefix,
         )?;
+        let reconciled_prefix = crate::engine::recurrent_state::reconcile_hybrid_prefix(&[
+            cached_prefix_len,
+            gdn_prefix_preparation
+                .restored_prefix_tokens
+                .saturating_add(gdn_prefix_preparation.replayed_prefix_tokens),
+        ]);
+        debug_assert_eq!(
+            reconciled_prefix, cached_prefix_len,
+            "paged K/V and GDN must agree on one hybrid prefix boundary"
+        );
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
         // GDN recurrent state now covers exactly the cached prefix (installed
         // live, restored from a cold sidecar, or replayed just above). Discharge
@@ -10620,6 +11038,28 @@ impl Qwen3_5Model {
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
+    }
+
+    /// Native admission width for plain text AR turns. Checkpoints carrying a
+    /// vision tower or native MTP head retain their ordered whole-turn path;
+    /// the Stage-2 recurrent lane is enabled only for paged dense text models.
+    #[napi]
+    pub fn max_concurrent_sequences(&self) -> u32 {
+        if self.paged_active
+            && !self.vision_active
+            && !self.mtp_active
+            && !Qwen35SchedulerState::force_serial()
+        {
+            scheduler_max_num_seqs() as u32
+        } else {
+            1
+        }
+    }
+
+    /// Snapshot scheduler occupancy plus unified block/recurrent admission.
+    #[napi]
+    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
+        send_and_await(&self.thread, |reply| Qwen35Cmd::SchedulerStats { reply }).await
     }
 
     /// Whether this checkpoint shipped an MTP head (module loaded by
@@ -13488,6 +13928,35 @@ mod paged_construction_tests {
     }
 
     #[test]
+    fn scheduled_recurrent_cap_counts_the_active_row_and_parked_rows() {
+        let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+        let bytes = inner.config.recurrent_state_bytes();
+
+        inner
+            .activate_scheduled_recurrent(1)
+            .expect("activate first row");
+        assert_eq!(inner.scheduled_recurrent_units(), 1);
+        assert_eq!(inner.scheduled_recurrent_bytes(), bytes);
+
+        inner
+            .activate_scheduled_recurrent(2)
+            .expect("park first and activate second row");
+        assert_eq!(inner.scheduled_recurrent_units(), 2);
+        assert_eq!(inner.scheduled_recurrent_bytes(), bytes * 2);
+        assert!(
+            inner.activate_scheduled_recurrent(3).is_err(),
+            "the active row must count toward the two-unit cap"
+        );
+
+        inner.release_scheduled_recurrent_for(1);
+        inner
+            .activate_scheduled_recurrent(3)
+            .expect("an idle row release opens exactly one slot");
+        assert_eq!(inner.scheduled_recurrent_units(), 2);
+        assert_eq!(inner.scheduled_recurrent_bytes(), bytes * 2);
+    }
+
+    #[test]
     fn save_model_rejects_quantized_dense_projection_before_creating_destination() {
         let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
         let weight = MxArray::zeros(&[128, 16], Some(DType::Uint32)).unwrap();
@@ -13637,6 +14106,123 @@ mod paged_construction_tests {
                 .set_down_proj_weight(&cast(&w))
                 .expect("set down_proj");
         }
+    }
+
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn dense_hybrid_n2_batched_decode_matches_scalar_replay() {
+        let Some((mut inner, cfg)) =
+            paged_inner_or_skip("dense_hybrid_n2_batched_decode_matches_scalar_replay")
+        else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+        let prompt = vec![7, 11, 13, 17];
+        for seq_id in [101, 202] {
+            inner
+                .activate_scheduled_recurrent(seq_id)
+                .expect("activate recurrent row");
+            inner.set_cache_owner_id(&format!("owner-{seq_id}"), None);
+            let prefix = inner
+                .prime_prefix_state(&prompt, true, 16, &[], seq_id as u64)
+                .expect("prime request");
+            inner
+                .paged_prefill(
+                    &prompt[prefix.effective_cached_prefix_len..],
+                    &prefix,
+                    Stream::new(DeviceType::Gpu),
+                )
+                .expect("prefill request")
+                .eval();
+            inner
+                .park_active_scheduled_recurrent()
+                .expect("park recurrent row");
+        }
+
+        let snapshots = [101, 202]
+            .into_iter()
+            .map(|seq_id| {
+                let state = inner
+                    .scheduled_recurrent
+                    .live(seq_id)
+                    .expect("prefilled recurrent row");
+                let snapshot = crate::models::qwen3_5::paged_forward::snapshot_materialized_linear_layer_caches(state)
+                    .expect("materialized GDN state");
+                (seq_id, snapshot)
+            })
+            .collect::<Vec<_>>();
+        let decode_rows = [(101, 19), (202, 23)];
+        let batched_started = Instant::now();
+        let batched = inner
+            .run_paged_decode_step_batched(&decode_rows)
+            .expect("batched hybrid decode");
+        assert_eq!(
+            batched.shape().unwrap().as_ref(),
+            [2, 1, cfg.vocab_size as i64]
+        );
+        let batched_tokens = batched
+            .argmax(-1, Some(false))
+            .unwrap()
+            .to_uint32()
+            .unwrap()
+            .to_vec();
+        let batched_elapsed = batched_started.elapsed();
+
+        for &(seq_id, _) in decode_rows.iter().rev() {
+            let adapter = inner.paged_adapter.as_mut().unwrap();
+            adapter.activate_request(seq_id).unwrap();
+            adapter.rollback_last_tokens(1).unwrap();
+        }
+        for (seq_id, snapshot) in snapshots {
+            inner
+                .scheduled_recurrent
+                .insert_live(seq_id, inner.config.recurrent_state_bytes(), snapshot)
+                .expect("restore GDN snapshot");
+        }
+
+        let serial_started = Instant::now();
+        let mut serial_rows = Vec::new();
+        for (seq_id, token_id) in decode_rows {
+            inner
+                .activate_paged_seq(seq_id)
+                .expect("activate scalar row");
+            let embed = inner.embedding.clone();
+            let logits = {
+                let caches = inner.caches.as_mut().expect("active GDN state");
+                let adapter = inner.paged_adapter.as_mut().expect("paged adapter");
+                crate::models::qwen3_5::paged_forward::run_paged_decode_step(
+                    token_id,
+                    &embed,
+                    &mut inner.layers,
+                    caches,
+                    &inner.final_norm,
+                    &inner.lm_head,
+                    &inner.layer_kinds,
+                    adapter,
+                    0,
+                )
+                .expect("scalar hybrid replay")
+            };
+            serial_rows.push(logits);
+            inner
+                .park_active_scheduled_recurrent()
+                .expect("park scalar row");
+        }
+        let serial = MxArray::concatenate_many(serial_rows.iter().collect(), Some(0)).unwrap();
+        let serial_tokens = serial
+            .argmax(-1, Some(false))
+            .unwrap()
+            .to_uint32()
+            .unwrap()
+            .to_vec();
+        let serial_elapsed = serial_started.elapsed();
+        assert_eq!(batched_tokens, serial_tokens);
+        eprintln!(
+            "qwen3.5 N=2 decode microbench: fused={:.3}ms exclusive={:.3}ms speedup={:.2}x",
+            batched_elapsed.as_secs_f64() * 1_000.0,
+            serial_elapsed.as_secs_f64() * 1_000.0,
+            serial_elapsed.as_secs_f64() / batched_elapsed.as_secs_f64().max(f64::EPSILON),
+        );
     }
 
     fn reset_paged_request(inner: &mut Qwen35Inner, prompt: &[u32]) {
