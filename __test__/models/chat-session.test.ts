@@ -213,6 +213,28 @@ describe('ChatSession', () => {
       expect(chatSessionContinue.mock.calls[0][1]?.reuseCache).toBe(true);
     });
 
+    it('assigns one stable native cache owner per session and preserves explicit owners', async () => {
+      const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
+      const first = new ChatSession(model);
+      const second = new ChatSession(model);
+
+      await first.send('first-a');
+      await first.send('first-b');
+      await second.send('second-a');
+
+      const firstOwner = chatSessionStart.mock.calls[0][1]?.cacheOwnerId;
+      const continuedOwner = chatSessionContinue.mock.calls[0][1]?.cacheOwnerId;
+      const secondOwner = chatSessionStart.mock.calls[1][1]?.cacheOwnerId;
+      expect(firstOwner).toBeTypeOf('string');
+      expect(firstOwner).not.toBe('');
+      expect(continuedOwner).toBe(firstOwner);
+      expect(secondOwner).not.toBe(firstOwner);
+
+      const explicit = new ChatSession(model, { defaultConfig: { cacheOwnerId: 'provider-owner' } });
+      await explicit.send('explicit');
+      expect(chatSessionStart.mock.calls[2][1]?.cacheOwnerId).toBe('provider-owner');
+    });
+
     // Regression guard for the Phase 3b audio-surface ABI shift. The
     // shared chat surface inserts an `audio` positional argument between
     // `images` and `config`. A QianfanOCR-shaped model (handwritten NAPI

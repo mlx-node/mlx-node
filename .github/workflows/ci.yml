@@ -278,6 +278,8 @@ jobs:
             env: MLX_TEST_MODEL_PATH
             stage0_ts: __test__/server/concurrent-stage0-e2e.test.ts
             stage1_rust: concurrent_batched_parity
+            stage1_ts: __test__/server/concurrent-stage1-e2e.test.ts
+            stage2_rust: ''
             tests: >-
               --test qwen3_paged_vs_flat_parity
               --test qwen3_cold_tier_parity
@@ -290,6 +292,8 @@ jobs:
             env: MLX_TEST_MODEL_PATH
             stage0_ts: ''
             stage1_rust: ''
+            stage1_ts: ''
+            stage2_rust: qwen3_5_concurrent_batched_parity
             tests: >-
               --test qwen3_5_paged_vs_flat_parity
               --test qwen3_5_session
@@ -327,6 +331,8 @@ jobs:
             env: MLX_TEST_MODEL_PATH MLX_TEST_LFM2_MODEL_PATH
             stage0_ts: ''
             stage1_rust: ''
+            stage1_ts: ''
+            stage2_rust: ''
             tests: >-
               --test lfm2_paged_vs_flat_parity
               --test lfm2_session
@@ -341,6 +347,8 @@ jobs:
             env: ''
             stage0_ts: ''
             stage1_rust: ''
+            stage1_ts: ''
+            stage2_rust: ''
             tests: __test__/models/gemma4-qat-e2e.test.ts
     steps:
       - uses: actions/checkout@v6
@@ -495,6 +503,19 @@ jobs:
             if [ -n "${{ matrix.stage1_rust }}" ]; then
               QWEN3_STAGE1_MODEL_PATH="$ckpt" MLX_SCHED_MAX_NUM_SEQS=8 \
                 cargo test -p mlx-core --test "${{ matrix.stage1_rust }}" \
+                  -- --ignored --test-threads=1 --nocapture
+              QWEN3_STAGE1_MODEL_PATH="$ckpt" MLX_SCHED_MAX_NUM_SEQS=8 \
+                MLX_DISABLE_PERIODIC_CLEAR=1 \
+                cargo test -p mlx-core --test "${{ matrix.stage1_rust }}" \
+                  -- --ignored --test-threads=1 --nocapture
+            fi
+            if [ -n "${{ matrix.stage1_ts }}" ]; then
+              QWEN3_STAGE1_MODEL_PATH="$ckpt" MLX_SCHED_MAX_NUM_SEQS=8 \
+                yarn test ${{ matrix.stage1_ts }}
+            fi
+            if [ -n "${{ matrix.stage2_rust }}" ]; then
+              QWEN35_STAGE2_MODEL_PATH="$ckpt" MLX_SCHED_MAX_NUM_SEQS=2 \
+                cargo test -p mlx-core --test "${{ matrix.stage2_rust }}" \
                   -- --ignored --test-threads=1 --nocapture
             fi
             if [ -n "${{ matrix.stage0_ts }}" ]; then

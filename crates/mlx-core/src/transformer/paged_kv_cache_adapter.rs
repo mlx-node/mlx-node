@@ -4239,6 +4239,7 @@ impl PagedKVCacheAdapter {
         }
 
         let mut seen = HashSet::with_capacity(rows.len());
+        let mut seen_slots = HashSet::with_capacity(rows.len());
         let mut slots = Vec::with_capacity(rows.len());
         for &(seq_id, first_logical_position) in rows {
             if !seen.insert(seq_id) {
@@ -4272,6 +4273,11 @@ impl PagedKVCacheAdapter {
                         "update_keys_values_native_batched: sequence {seq_id} position {first_logical_position} has no allocated slot"
                     )
                 })?;
+            if !seen_slots.insert(slot) {
+                return Err(format!(
+                    "update_keys_values_native_batched: sequence {seq_id} aliases physical slot {slot} with another row"
+                ));
+            }
             slots.push(slot);
         }
         let slot_mapping = MxArray::from_int64(&slots, &[rows.len() as i64])

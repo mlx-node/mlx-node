@@ -69,15 +69,19 @@ fn user_message(content: &str) -> ChatMessage {
     }
 }
 
-fn config(owner: &str) -> ChatConfig {
+fn config(owner: &str, index: usize) -> ChatConfig {
+    // Deliberately vary penalty state by row. No-op, identical penalties
+    // cannot detect a batched implementation that accidentally applies one
+    // request's token history/configuration to another row.
+    let penalized = index.is_multiple_of(2);
     ChatConfig {
         cache_owner_id: Some(owner.to_string()),
         cache_root_owner_id: Some(owner.to_string()),
-        max_new_tokens: Some(16),
+        max_new_tokens: Some(if penalized { 12 } else { 16 }),
         temperature: Some(0.0),
-        repetition_penalty: Some(1.0),
-        presence_penalty: Some(0.0),
-        frequency_penalty: Some(0.0),
+        repetition_penalty: Some(if penalized { 1.15 } else { 1.0 }),
+        presence_penalty: Some(if penalized { 0.2 } else { 0.0 }),
+        frequency_penalty: Some(if penalized { 0.1 } else { 0.0 }),
         max_consecutive_tokens: Some(0),
         max_ngram_repeats: Some(0),
         ngram_size: Some(0),
@@ -101,15 +105,23 @@ fn assert_same(expected: &ChatResult, actual: &ChatResult, prompt: &str) {
 }
 
 async fn drain_stream(
-    mut receiver: tokio::sync::mpsc::UnboundedReceiver<napi::Result<ChatStreamChunk>>,
+    receiver: tokio::sync::mpsc::UnboundedReceiver<napi::Result<ChatStreamChunk>>,
 ) -> ChatStreamChunk {
+    drain_stream_outcome(receiver)
+        .await
+        .expect("streaming scheduler row failed")
+}
+
+async fn drain_stream_outcome(
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<napi::Result<ChatStreamChunk>>,
+) -> Result<ChatStreamChunk, String> {
     while let Some(chunk) = receiver.recv().await {
-        let chunk = chunk.expect("streaming scheduler row failed");
+        let chunk = chunk.map_err(|error| error.reason)?;
         if chunk.done {
-            return chunk;
+            return Ok(chunk);
         }
     }
-    panic!("stream closed without a terminal chunk")
+    Err("stream closed without a terminal chunk".to_string())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -142,7 +154,7 @@ async fn serial_uniform_batch_and_interleaved_streams_are_token_identical() {
             model
                 .chat_session_start(
                     vec![user_message(prompt)],
-                    Some(config(&format!("serial-{index}"))),
+                    Some(config(&format!("serial-{index}"), index)),
                 )
                 .await
                 .expect("serial oracle turn"),
@@ -156,7 +168,7 @@ async fn serial_uniform_batch_and_interleaved_streams_are_token_identical() {
     let batched = join_all(prompts.iter().enumerate().map(|(index, prompt)| {
         model.chat_session_start(
             vec![user_message(prompt)],
-            Some(config(&format!("batch-{index}"))),
+            Some(config(&format!("batch-{index}"), index)),
         )
     }))
     .await;
@@ -190,6 +202,81 @@ async fn serial_uniform_batch_and_interleaved_streams_are_token_identical() {
             .collect::<Vec<_>>()
     );
 
+    model
+        .reset_caches()
+        .await
+        .expect("reset before uniform streams");
+    let mut uniform_receivers = Vec::new();
+    for (index, prompt) in prompts[..2].iter().enumerate() {
+        let (_handle, receiver) = model
+            .chat_stream_session_start_for_test(
+                vec![user_message(prompt)],
+                Some(config(&format!("uniform-stream-{index}"), index)),
+            )
+            .expect("dispatch uniform stream");
+        uniform_receivers.push(receiver);
+    }
+    let uniform_terminals = join_all(uniform_receivers.into_iter().map(drain_stream)).await;
+    for ((expected, terminal), prompt) in serial.iter().zip(uniform_terminals).zip(prompts) {
+        assert_eq!(
+            terminal.raw_text.as_deref(),
+            Some(expected.raw_text.as_str()),
+            "uniform stream raw_text mismatch for {prompt:?}"
+        );
+        assert_eq!(
+            terminal.finish_reason.as_deref(),
+            Some(expected.finish_reason.as_str())
+        );
+        assert_eq!(terminal.num_tokens, Some(expected.num_tokens));
+    }
+
+    // Cancellation is request-local in a real scheduled wave. Keep one row in
+    // a long prefill, cancel it after both commands have been dispatched, and
+    // require the healthy twin to remain byte-identical to its serial oracle.
+    model
+        .reset_caches()
+        .await
+        .expect("reset before cancel twin");
+    let cancelled_prompt = format!(
+        "Read these notes, then answer briefly: {}",
+        "scheduler cache tensor kernel ".repeat(1_024)
+    );
+    let (cancel_handle, cancel_receiver) = model
+        .chat_stream_session_start_for_test(
+            vec![user_message(&cancelled_prompt)],
+            Some(config("cancelled-twin", 0)),
+        )
+        .expect("dispatch cancellable twin");
+    let (_healthy_handle, healthy_receiver) = model
+        .chat_stream_session_start_for_test(
+            vec![user_message(prompts[1])],
+            Some(config("healthy-twin", 1)),
+        )
+        .expect("dispatch healthy twin");
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    cancel_handle.cancel();
+    let (cancelled_outcome, healthy_outcome) = tokio::join!(
+        drain_stream_outcome(cancel_receiver),
+        drain_stream_outcome(healthy_receiver)
+    );
+    assert!(
+        cancelled_outcome.is_err()
+            || cancelled_outcome
+                .as_ref()
+                .is_ok_and(|chunk| chunk.finish_reason.as_deref() == Some("cancelled")),
+        "cancelled row must fail or terminate as cancelled: {cancelled_outcome:?}"
+    );
+    let healthy = healthy_outcome.expect("healthy twin must not inherit peer cancellation");
+    assert_eq!(
+        healthy.raw_text.as_deref(),
+        Some(serial[1].raw_text.as_str())
+    );
+    assert_eq!(
+        healthy.finish_reason.as_deref(),
+        Some(serial[1].finish_reason.as_str())
+    );
+    assert_eq!(healthy.num_tokens, Some(serial[1].num_tokens));
+
     drop(model);
     let ragged_guard = RaggedStepGuard::enable();
     let ragged_model = load_with_thread(&path.to_string_lossy())
@@ -199,7 +286,7 @@ async fn serial_uniform_batch_and_interleaved_streams_are_token_identical() {
     let ragged = join_all(prompts.iter().enumerate().map(|(index, prompt)| {
         ragged_model.chat_session_start(
             vec![user_message(prompt)],
-            Some(config(&format!("ragged-{index}"))),
+            Some(config(&format!("ragged-{index}"), index)),
         )
     }))
     .await;
@@ -236,7 +323,7 @@ async fn serial_uniform_batch_and_interleaved_streams_are_token_identical() {
         let (_handle, receiver) = ragged_model
             .chat_stream_session_start_for_test(
                 vec![user_message(prompt)],
-                Some(config(&format!("stream-{index}"))),
+                Some(config(&format!("stream-{index}"), index)),
             )
             .expect("dispatch stream");
         receivers.push(receiver);

@@ -143,6 +143,7 @@ describe('repetition-cutoff handling through ChatSession.mergeConfig', () => {
     // preset carries no cutoff fields, so none appear here.
     expect(model.lastStartConfig).toEqual({
       ...LAUNCH_PRESETS.qwen3_5_moe!.sampling,
+      cacheOwnerId: expect.any(String),
       reuseCache: true,
     });
     expect(model.lastStartConfig!.maxConsecutiveTokens).toBeUndefined();

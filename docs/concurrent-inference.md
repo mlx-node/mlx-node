@@ -69,16 +69,17 @@ The stable capacity knobs are read once per process. The ragged executor switch
 is read once when a resident Qwen3 model-thread state is created, which permits
 same-binary uniform/ragged validation with separate model instances:
 
-| Knob                            | Default | Meaning                                                                                          |
-| ------------------------------- | ------- | ------------------------------------------------------------------------------------------------ |
-| `MLX_SCHED_MAX_NUM_SEQS`        | `8`     | Native running-set cap and server admission capacity (hard-clamped to 32).                       |
-| `MLX_SCHED_MAX_BATCHED_TOKENS`  | `2048`  | Total tokens planned in one scheduler step.                                                      |
-| `MLX_SCHED_LONG_PREFILL_TOKENS` | `2048`  | Maximum prefill progress for one request in one step.                                            |
-| `MLX_SCHED_WATERMARK_FRACTION`  | `0.05`  | Free-block headroom retained while work is already live.                                         |
-| `MLX_SCHED_RESERVE_FULL_ISL`    | `1`     | Reserve each admitted request's remaining prompt growth in the must-fit test.                    |
-| `MLX_SCHED_RAGGED_STEP`         | `0`     | Use one packed varlen Qwen3 forward for mixed prefill/decode slices.                             |
-| `MLX_PAGED_PER_SEQ_CTX`         | `32768` | Per-sequence context used by the pool budget formula.                                            |
-| `MLX_SERVE_FORCE_SERIAL`        | `0`     | Route eligible Qwen3/LFM2/Qwen3.5 turns through the legacy whole-turn path for A/B and rollback. |
+| Knob                             | Default | Meaning                                                                                          |
+| -------------------------------- | ------- | ------------------------------------------------------------------------------------------------ |
+| `MLX_SCHED_MAX_NUM_SEQS`         | `8`     | Native running-set cap and server admission capacity (hard-clamped to 32).                       |
+| `MLX_SCHED_MAX_BATCHED_TOKENS`   | `2048`  | Total tokens planned in one scheduler step.                                                      |
+| `MLX_SCHED_LONG_PREFILL_TOKENS`  | `2048`  | Maximum prefill progress for one request in one step.                                            |
+| `MLX_SCHED_WATERMARK_FRACTION`   | `0.05`  | Free-block headroom retained while work is already live.                                         |
+| `MLX_SCHED_RESERVE_FULL_ISL`     | `1`     | Reserve each admitted request's remaining prompt growth in the must-fit test.                    |
+| `MLX_SCHED_RAGGED_STEP`          | `0`     | Use one packed varlen Qwen3 forward for mixed prefill/decode slices.                             |
+| `MLX_PAGED_PER_SEQ_CTX`          | `32768` | Per-sequence context used by the pool budget formula.                                            |
+| `MLX_QWEN35_CONTINUOUS_BATCHING` | `0`     | Opt eligible dense text-only Qwen3.5 checkpoints into the scheduled hybrid lane.                 |
+| `MLX_SERVE_FORCE_SERIAL`         | `0`     | Route eligible Qwen3/LFM2/Qwen3.5 turns through the legacy whole-turn path for A/B and rollback. |
 
 Two reproducibility rules are deliberate:
 
@@ -88,6 +89,16 @@ Two reproducibility rules are deliberate:
 2. Each request's legal prefill break-set is pinned at admission. The shared
    budget decides when a pinned slice runs, never where it is split; this
    preserves family-specific chunk-boundary invariants.
+3. The scheduled lane treats `max_new_tokens` as an upper bound and clamps it
+   to the remaining per-sequence context. Large OpenAI/Anthropic output hints
+   therefore end at `length` instead of failing admission solely because the
+   hint exceeds the pool window.
+
+Admission remains FCFS. If the oldest request cannot yet satisfy the memory
+watermark, smaller later requests wait behind it; a preempted row likewise
+keeps its original queue position until it can resume. This deliberate
+head-of-line blocking prevents a stream of small arrivals from starving a
+large request or an ordered reset behind it.
 
 Outside the chat engine two families break the threading pattern: Harrier
 embeddings run forwards on tokio's blocking pool (`models/harrier/model.rs:104-177`),
@@ -176,6 +187,39 @@ overlap at best), and "use all GPU memory for KV" pool sizing (on unified
 memory the pool competes with the weights — see
 `docs/architecture.md` "Unified memory decides the cache hierarchy").
 
+## Validation evidence and performance boundary
+
+The real-checkpoint correctness gates run independently of the benchmark:
+
+- Qwen3-0.6B BF16: serial/uniform/ragged results are token-identical, uniform
+  and ragged streaming terminals are byte-identical, mixed per-row penalties
+  remain isolated, and a real scheduled wave reaches occupancy 8.
+- LFM2-1.2B BF16: the recurrent-state batched parity gate passes.
+- Qwen3.5-0.8B BF16: the scheduler-driven asymmetric-finish and cross-owner
+  warm-wave gate passes with occupancy 2, including on a checkpoint that has
+  installed vision and MTP modules while the tested turns explicitly select
+  plain text AR.
+- The real HTTP Stage-1 server gate observes two simultaneously active SSE
+  handlers and native decode occupancy 2. Each `ChatSession` supplies a stable,
+  request-local cache owner; without that identity native correctly falls back
+  to the legacy exclusive sequence-zero lane.
+
+Performance evidence is deliberately reported separately. On 2026-08-10, an
+Apple M5 Max with 128 GiB ran one uncooled fresh-process A/B sample against
+Qwen3-8B BF16 (4,096-token prompts, 512-token outputs). The scheduled worker
+reached occupancy 1/2/4/8 and measured aggregate speedups of 1.019x, 1.803x,
+2.786x, and 3.723x. Mixed-wave chatter p95 TTFT improved from 73.824 s to
+14.423 s. This is mechanism/directional evidence, not a claimed ship-gate
+pass: it was one run with zero cooldown, N=1 server TTFT was 1.587x the serial
+measurement, and the N=4/N=8 values are below the draft 3.0x/4.5x thresholds.
+
+The draft's qualifying checkpoint premise was also invalid: dense Qwen3
+currently rejects quantized weights, so a "dense Qwen3 8B 4-bit" run cannot be
+performed by this runtime. The loader now accepts both single-file and sharded
+dense safetensors checkpoints, but the 4-bit thresholds remain non-applicable
+until plain-Qwen3 quantized execution exists. Do not represent the BF16 sample
+above as a cooled median-of-three 4-bit result.
+
 ## Direction
 
 - **Stage 0 — robustness (landed):** H1–H4 are regression-locked: ordinary
@@ -186,6 +230,9 @@ memory the pool competes with the weights — see
   scheduler, uniform batched decode, per-row epilogue, live prefix sharing,
   block-watermark admission, asynchronous SSD restore, server semaphore, and
   same-binary forced-serial rollback path are implemented.
+  Token parity is the correctness gate; the occupancy histogram is executor
+  self-reporting and therefore not, by itself, proof that a fused forward ran.
+  The fresh-process wall-time ship gate is the independent non-vacuity check.
 - **Stage 1.5 — LFM2 hybrid entry (landed):** each live request owns a
   per-conv-layer `[l_cache-1, hidden]` recurrent-state row. Decode stacks those
   rows, runs each ShortConv once over `[N,1,H]`, and scatters the next state;
@@ -206,9 +253,15 @@ memory the pool competes with the weights — see
   dense text-only Qwen3.5 stores at most two request-local GDN units, fuses
   their `[N,1,H]` decode, and reconciles preemption through the deepest
   K/V-backed GDN checkpoint/sidecar boundary. Paged-block growth and recurrent
-  state debit one byte budget. The tiny random-weight Qwen3.5 fixture proves
-  token identity but is slower than two scalar forwards, so text-paged use
-  remains explicit opt-in and no real-checkpoint throughput win is claimed.
+  state debit one byte budget. Eligible text-only paged checkpoints opt in with
+  `MLX_QWEN35_CONTINUOUS_BATCHING=1`; MTP and media turns remain exclusive even
+  when those modules are installed. The tiny
+  random-weight Qwen3.5 fixture proves token identity but is slower than two
+  scalar forwards, so no real-checkpoint throughput win is claimed.
+  The B12 routing premise was re-derived against `gated_delta`: `Auto` uses
+  per-step GDN on every architecture, while chunked GDN is explicitly forced
+  and is ineligible for this lane. Scheduled rows therefore always use the
+  per-step recurrent-state representation described above.
   Gemma4's physical rotating K/V state is measured with the same estimator and
   its N=2 isolation oracle matches exclusive tokens, but it remains on the
   exclusive lane: pre-window requests have different tail lengths, so stacking

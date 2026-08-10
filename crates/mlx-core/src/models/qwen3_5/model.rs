@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
@@ -1824,6 +1824,17 @@ impl Qwen35Inner {
     /// Full-attention layers issue one paged gather over all rows; GDN layers
     /// stack the two request-local arrays, execute once over `[N,1,H]`, then
     /// scatter the replacement arrays back to their sequence entries.
+    fn validate_scheduled_decode_residency(&self, rows: &[(SeqId, u32)]) -> Result<()> {
+        for &(seq_id, _) in rows {
+            if self.scheduled_recurrent.live(seq_id).is_none() {
+                return Err(Error::from_reason(format!(
+                    "Qwen3.5 sequence {seq_id} has no recurrent state before batched decode"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
         if rows.is_empty() {
             return Err(Error::from_reason(
@@ -1836,6 +1847,7 @@ impl Qwen35Inner {
             ));
         }
         self.park_active_scheduled_recurrent()?;
+        self.validate_scheduled_decode_residency(rows)?;
 
         let adapter = self
             .paged_adapter
@@ -1856,29 +1868,17 @@ impl Qwen35Inner {
             })?;
             planned_rows.push((seq_id, position));
         }
-        let expected_state_bytes = self
-            .config
-            .recurrent_state_bytes()
-            .saturating_mul(rows.len() as u64);
-        if self.scheduled_recurrent.live_len() != rows.len()
-            || self.scheduled_recurrent.live_bytes() != expected_state_bytes
-        {
-            return Err(Error::from_reason(format!(
-                "Qwen3.5 batched decode state table has {} rows / {} bytes; expected {} rows / {} bytes",
-                self.scheduled_recurrent.live_len(),
-                self.scheduled_recurrent.live_bytes(),
-                rows.len(),
-                expected_state_bytes,
-            )));
-        }
+        // The table is a residency cache, not the current batch. It may also
+        // contain warm completed rows or a newly admitted prefill row. Only
+        // the rows selected for this decode must be present and materialized;
+        // stack_rows below reads exactly this filtered set.
         let recurrent_snapshots = rows
             .iter()
             .map(|&(seq_id, _)| {
-                let state = self.scheduled_recurrent.live(seq_id).ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "Qwen3.5 sequence {seq_id} has no recurrent state before batched decode"
-                    ))
-                })?;
+                let state = self
+                    .scheduled_recurrent
+                    .live(seq_id)
+                    .expect("residency validated above");
                 crate::models::qwen3_5::paged_forward::snapshot_materialized_linear_layer_caches(
                     state,
                 )
@@ -11019,6 +11019,8 @@ pub struct Qwen3_5Model {
     /// coordinator on drop, so the global cap can shrink once JS GCs
     /// the wrapper.
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
+    /// RAII debit for the native paged KV pool.
+    pub(crate) _pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
 }
 
 #[napi]
@@ -11040,14 +11042,14 @@ impl Qwen3_5Model {
         self.paged_active
     }
 
-    /// Native admission width for plain text AR turns. Checkpoints carrying a
-    /// vision tower or native MTP head retain their ordered whole-turn path;
-    /// the Stage-2 recurrent lane is enabled only for paged dense text models.
+    /// Native admission width for plain text AR turns. Installed vision and
+    /// MTP modules do not disable text batching: requests that actually carry
+    /// media or set `enable_mtp=true` are routed through the ordered exclusive
+    /// lane by the scheduler.
     #[napi]
     pub fn max_concurrent_sequences(&self) -> u32 {
         if self.paged_active
-            && !self.vision_active
-            && !self.mtp_active
+            && Qwen35SchedulerState::continuous_batching_enabled()
             && !Qwen35SchedulerState::force_serial()
         {
             scheduler_max_num_seqs() as u32

@@ -19,9 +19,8 @@ use crate::array::MxArray;
 #[cfg(test)]
 use crate::cold_tier::parse_bool_env;
 use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
-use crate::engine::persistence::prewarm_checkpoint_pages;
+use crate::engine::persistence::{load_all_safetensors, prewarm_checkpoint_pages};
 use crate::tokenizer::Qwen3Tokenizer;
-use crate::utils::safetensors::load_safetensors_lazy;
 
 use super::model::{Qwen3Cmd, Qwen3Inner, QwenSchedulerState, handle_qwen3_cmd};
 use super::{Qwen3Config, Qwen3Model};
@@ -202,8 +201,8 @@ impl Qwen3Model {
     ///
     /// This loads a model from a directory containing:
     /// - config.json: Model configuration
-    /// - weights.mlx (optional): MLX format weights with data arrays
-    /// - weights.safetensors (optional): SafeTensors format (not yet supported)
+    /// - weights.safetensors or model.safetensors (single-file SafeTensors)
+    /// - model-*-of-*.safetensors (sharded SafeTensors)
     ///
     /// # Arguments
     /// * `model_path` - Path to the model directory
@@ -437,28 +436,10 @@ fn parse_config(raw_config: &Value) -> Result<Qwen3Config> {
 
 /// Load weights from SafeTensors, mapping HuggingFace names to our naming convention.
 fn load_safetensors_mapped(path: &Path) -> Result<HashMap<String, MxArray>> {
-    let safetensors_path = if path.join("weights.safetensors").exists() {
-        path.join("weights.safetensors")
-    } else {
-        path.join("model.safetensors")
-    };
-
-    if !safetensors_path.exists() {
-        return Err(Error::new(
-            Status::InvalidArg,
-            format!(
-                "No supported weight file found in {}. Expected weights.safetensors or model.safetensors",
-                path.display()
-            ),
-        ));
-    }
-
-    info!(
-        "Loading model from SafeTensors format: {} (mmap)",
-        safetensors_path.display()
-    );
-
-    let mut param_map = load_safetensors_lazy(&safetensors_path)?;
+    // Qwen3-8B checkpoints are normally published as multiple safetensors
+    // shards. Use the shared mmap loader so the dense family accepts the same
+    // single-file and sharded layouts as LFM2/Qwen3.5/Gemma4.
+    let mut param_map = load_all_safetensors(path, false)?;
     info!("  Loaded {} tensors", param_map.len());
 
     let mut mapped_params: HashMap<String, MxArray> = HashMap::new();

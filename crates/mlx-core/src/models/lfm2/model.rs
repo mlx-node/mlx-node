@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -468,6 +468,80 @@ impl Lfm2Inner {
         })
     }
 
+    /// Rebuild the construction-time pool after weight materialization so the
+    /// Metal working-set probe caps cache residency against the already-live
+    /// model instead of independently spending the same device budget twice.
+    pub(crate) fn size_paged_pool_after_weight_load(&mut self) -> Result<()> {
+        if self.paged_adapter.is_none() {
+            return Ok(());
+        }
+        self.paged_adapter = None;
+
+        let attn_layer_count = self.config.full_attn_idxs().len() as u32;
+        let block_size = self.config.paged_block_size.unwrap_or(16);
+        let trained_context = u32::try_from(self.config.max_position_embeddings)
+            .unwrap_or(1)
+            .max(1);
+        let per_seq_context = trained_context.min(scheduler_per_seq_context());
+        let requested_tokens = per_seq_context.saturating_mul(scheduler_max_num_seqs() as u32);
+        let requested_blocks = requested_tokens.div_ceil(block_size).max(1);
+        let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+        let sizing = mlx_paged_attn::profile::load_time_pool_sizing(
+            requested_blocks,
+            attn_layer_count,
+            self.config.num_key_value_heads as u32,
+            self.config.head_dim() as u32,
+            block_size,
+            cache_dtype,
+        )
+        .map_err(|error| {
+            Error::from_reason(format!(
+                "LFM2 adaptive paged cache sizing failed safely; refusing an uncapped pool request: {error}"
+            ))
+        })?;
+        let selected_mb = sizing.selected_bytes.div_ceil(1024 * 1024).max(1) as u32;
+        let pa_config = mlx_paged_attn::PagedAttentionConfig {
+            block_size,
+            gpu_memory_mb: selected_mb,
+            head_size: self.config.head_dim() as u32,
+            num_kv_heads: self.config.num_key_value_heads as u32,
+            num_layers: attn_layer_count,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(per_seq_context),
+            max_batch_size: Some(scheduler_max_num_seqs() as u32),
+        };
+        let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+            sizing.selected_blocks,
+            block_size,
+        )));
+        let pool = mlx_paged_attn::LayerKVPool::new(pa_config, sizing.selected_blocks, cache_dtype)
+            .map_err(|error| {
+                Error::from_reason(format!("Failed to construct LFM2 KV pool: {error}"))
+            })?;
+        self.paged_adapter = Some(
+            PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size)
+                .map_err(Error::from_reason)?,
+        );
+        info!(
+            "LFM2 scheduler pool enabled: requested_blocks={}, selected_blocks={}, bytes={:.2} GiB, per_seq_context={}, max_num_seqs={}",
+            requested_blocks,
+            sizing.selected_blocks,
+            sizing.selected_bytes as f64 / (1u64 << 30) as f64,
+            per_seq_context,
+            scheduler_max_num_seqs(),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn paged_pool_allocated_bytes(&self) -> Result<u64> {
+        self.paged_adapter
+            .as_ref()
+            .map(PagedKVCacheAdapter::pool_allocated_bytes)
+            .transpose()
+            .map(|bytes| bytes.unwrap_or(0))
+            .map_err(Error::from_reason)
+    }
+
     pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
         self.tokenizer = Some(tokenizer);
     }
@@ -861,33 +935,53 @@ impl Lfm2Inner {
         self.scheduled_caches.remove(&seq_id);
     }
 
+    fn recurrent_state_bytes_per_seq(&self) -> u64 {
+        let conv_layers = self
+            .layer_kinds
+            .iter()
+            .filter(|kind| matches!(kind, Lfm2LayerKind::Conv))
+            .count() as u64;
+        conv_layers
+            .saturating_mul(self.config.conv_l_cache.saturating_sub(1).max(0) as u64)
+            .saturating_mul(self.config.hidden_size.max(0) as u64)
+            .saturating_mul(2) // production recurrent state is BF16
+    }
+
+    fn has_scheduled_caches_for(&self, seq_id: SeqId) -> bool {
+        self.active_scheduled_seq == Some(seq_id) || self.scheduled_caches.contains_key(&seq_id)
+    }
+
+    fn scheduled_recurrent_bytes(&self) -> u64 {
+        let rows =
+            self.scheduled_caches.len() as u64 + u64::from(self.active_scheduled_seq.is_some());
+        rows.saturating_mul(self.recurrent_state_bytes_per_seq())
+    }
+
     fn stacked_conv_state(
         &mut self,
         seq_ids: &[SeqId],
         layer_idx: usize,
-        dtype: crate::array::DType,
+        _dtype: crate::array::DType,
     ) -> Result<MxArray> {
         self.park_active_scheduled_caches();
         let mut states = Vec::with_capacity(seq_ids.len());
         for &seq_id in seq_ids {
-            let caches = self
-                .scheduled_caches
-                .entry(seq_id)
-                .or_insert_with(|| init_caches(&self.config));
+            let caches = self.scheduled_caches.get(&seq_id).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "LFM2 sequence {seq_id} has no scheduled convolution state"
+                ))
+            })?;
             let state = caches
                 .get(layer_idx)
                 .and_then(|cache| match cache {
                     Lfm2LayerCache::Conv(cache) => cache.get(0).cloned(),
                     Lfm2LayerCache::Attention(_) => None,
                 })
-                .unwrap_or(MxArray::zeros(
-                    &[
-                        1,
-                        i64::from(self.config.conv_l_cache - 1),
-                        i64::from(self.config.hidden_size),
-                    ],
-                    Some(dtype),
-                )?);
+                .ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "LFM2 sequence {seq_id} has no materialized convolution state for layer {layer_idx}"
+                    ))
+                })?;
             states.push(state);
         }
         MxArray::concatenate_many(states.iter().collect(), Some(0))
@@ -901,10 +995,11 @@ impl Lfm2Inner {
     ) -> Result<()> {
         for (row, &seq_id) in seq_ids.iter().enumerate() {
             let row_state = state.slice_axis(0, row as i64, row as i64 + 1)?;
-            let caches = self
-                .scheduled_caches
-                .entry(seq_id)
-                .or_insert_with(|| init_caches(&self.config));
+            let caches = self.scheduled_caches.get_mut(&seq_id).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "LFM2 sequence {seq_id} disappeared during convolution-state scatter"
+                ))
+            })?;
             let cache = caches
                 .get_mut(layer_idx)
                 .and_then(Lfm2LayerCache::as_conv_cache_mut)
@@ -1250,6 +1345,7 @@ struct PreparedLfm2ScheduledTurn {
     cancelled: Arc<AtomicBool>,
     owner_id: String,
     seq_id: SeqId,
+    newly_assigned: bool,
     reservation_blocks: u32,
     block_size: u32,
 }
@@ -1367,7 +1463,7 @@ impl Lfm2StepExecutor<'_> {
             return Ok(Self::fail(
                 turn,
                 row,
-                Error::from_reason("prefill cancelled"),
+                Error::from_reason(engine::session::CHAT_SESSION_CANCELLED),
             ));
         }
         let start = row.token_start as usize;
@@ -1653,7 +1749,7 @@ impl Lfm2StepExecutor<'_> {
         &mut self,
         plan: &StepPlan,
         running: &mut [TurnState<Lfm2ScheduledTurn>],
-    ) -> Vec<(usize, RowStepResult)> {
+    ) -> (Vec<(usize, RowStepResult)>, usize) {
         let mut work = Vec::new();
         let mut early_results = Vec::new();
         let mut batch_rows = Vec::new();
@@ -1723,6 +1819,7 @@ impl Lfm2StepExecutor<'_> {
                     .begin("forward");
             }
         }
+        let executed_decode_batch = batch_rows.len();
         let batched_logits = if batch_rows.is_empty() {
             Ok(None)
         } else {
@@ -1855,7 +1952,7 @@ impl Lfm2StepExecutor<'_> {
                 },
             ));
         }
-        results
+        (results, executed_decode_batch)
     }
 }
 
@@ -1876,8 +1973,10 @@ impl StepExecutor<Lfm2ScheduledTurn> for Lfm2StepExecutor<'_> {
             .count();
         let used_batched_decode = decode_count > 1;
         let mut batched_decode_blocked = false;
+        let mut executed_batch_rows = 0;
         if used_batched_decode {
-            let batch_results = self.execute_decode_batch(plan, running);
+            let (batch_results, actual_batch_rows) = self.execute_decode_batch(plan, running);
+            executed_batch_rows = actual_batch_rows;
             batched_decode_blocked = batch_results
                 .iter()
                 .any(|(_, result)| result.allocation_blocked);
@@ -1908,7 +2007,7 @@ impl StepExecutor<Lfm2ScheduledTurn> for Lfm2StepExecutor<'_> {
             executed_decode_batch: if batched_decode_blocked {
                 0
             } else if used_batched_decode {
-                decode_count
+                executed_batch_rows
             } else {
                 usize::from(decode_count != 0)
             },
@@ -2107,7 +2206,7 @@ impl Lfm2SchedulerState {
             );
             return None;
         }
-        let admitted =
+        let mut admitted =
             match engine::session::admit_paged_turn(&mut self.inner, messages, config, turn_kind) {
                 Ok(admitted) => admitted,
                 Err(error) => {
@@ -2125,22 +2224,26 @@ impl Lfm2SchedulerState {
         }
 
         let prompt_tokens = admitted.tokens.len() as u32;
-        let max_new_tokens = admitted.params.max_new_tokens.max(0) as u32;
+        let requested_max_new_tokens = admitted.params.max_new_tokens.max(0) as u32;
         let trained_context = u32::try_from(self.inner.config.max_position_embeddings)
             .unwrap_or(1)
             .max(1);
         let per_seq_context = trained_context.min(scheduler_per_seq_context());
-        let requested_tokens = prompt_tokens.saturating_add(max_new_tokens);
-        if requested_tokens > per_seq_context {
+        if prompt_tokens > per_seq_context
+            || (prompt_tokens == per_seq_context && requested_max_new_tokens != 0)
+        {
             Self::reply_admission_error(
                 response,
                 cancelled.as_ref(),
                 Error::from_reason(format!(
-                    "context_length_exceeded: prompt ({prompt_tokens}) + max_new_tokens ({max_new_tokens}) exceeds scheduler per-sequence context {per_seq_context}"
+                    "context_length_exceeded: prompt ({prompt_tokens}) leaves no requested generation room in scheduler per-sequence context {per_seq_context}"
                 )),
             );
             return None;
         }
+        let max_new_tokens = requested_max_new_tokens.min(per_seq_context - prompt_tokens);
+        admitted.params.max_new_tokens = max_new_tokens as i32;
+        let requested_tokens = prompt_tokens.saturating_add(max_new_tokens);
         let block_size = self
             .inner
             .paged_adapter
@@ -2183,15 +2286,37 @@ impl Lfm2SchedulerState {
             cancelled,
             owner_id,
             seq_id,
+            newly_assigned,
             reservation_blocks,
             block_size,
         }))
+    }
+
+    fn reject_prepared(&mut self, prepared: Box<PreparedLfm2ScheduledTurn>, error: Error) {
+        let PreparedLfm2ScheduledTurn {
+            response,
+            cancelled,
+            owner_id,
+            newly_assigned,
+            ..
+        } = *prepared;
+        if newly_assigned {
+            self.owner_sequences.remove(&owner_id);
+        }
+        Self::reply_admission_error(response, cancelled.as_ref(), error);
     }
 
     fn admit_prepared(
         &mut self,
         prepared: Box<PreparedLfm2ScheduledTurn>,
     ) -> std::result::Result<Option<Lfm2Admission>, Box<PreparedLfm2ScheduledTurn>> {
+        if prepared.cancelled.load(Ordering::Relaxed) {
+            self.reject_prepared(
+                prepared,
+                Error::from_reason(engine::session::CHAT_SESSION_CANCELLED),
+            );
+            return Ok(None);
+        }
         let telemetry = match self
             .inner
             .paged_adapter
@@ -2201,33 +2326,47 @@ impl Lfm2SchedulerState {
         {
             Ok(telemetry) => telemetry,
             Err(error) => {
-                Self::reply_admission_error(
-                    prepared.response,
-                    prepared.cancelled.as_ref(),
-                    Error::from_reason(error),
-                );
+                self.reject_prepared(prepared, Error::from_reason(error));
                 return Ok(None);
             }
         };
         if prepared.reservation_blocks > telemetry.total_blocks {
-            Self::reply_admission_error(
-                prepared.response,
-                prepared.cancelled.as_ref(),
-                Error::from_reason(format!(
-                    "context_length_exceeded: request requires {} paged blocks but the pool has {}",
-                    prepared.reservation_blocks, telemetry.total_blocks
-                )),
-            );
+            let error = Error::from_reason(format!(
+                "context_length_exceeded: request requires {} paged blocks but the pool has {}",
+                prepared.reservation_blocks, telemetry.total_blocks
+            ));
+            self.reject_prepared(prepared, error);
             return Ok(None);
         }
-        let decision = self.scheduler.try_reserve_blocks(
-            engine::scheduler::BlockTelemetry {
-                total_blocks: telemetry.total_blocks,
-                free_blocks: telemetry.free_blocks,
-                reclaimable_blocks: telemetry.reclaimable_blocks,
-                allocated_blocks: telemetry.allocated_blocks,
+        let bytes_per_block = match self
+            .inner
+            .paged_adapter
+            .as_ref()
+            .expect("paged route checked by caller")
+            .bytes_per_block()
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.reject_prepared(prepared, Error::from_reason(error));
+                return Ok(None);
+            }
+        };
+        let candidate_state_bytes = if self.inner.has_scheduled_caches_for(prepared.seq_id) {
+            0
+        } else {
+            self.inner.recurrent_state_bytes_per_seq()
+        };
+        let decision = self.scheduler.try_reserve_memory(
+            engine::scheduler::MemoryTelemetry {
+                capacity_bytes: u64::from(telemetry.total_blocks).saturating_mul(bytes_per_block),
+                free_bytes: u64::from(telemetry.free_blocks).saturating_mul(bytes_per_block),
+                reclaimable_bytes: u64::from(telemetry.reclaimable_blocks)
+                    .saturating_mul(bytes_per_block),
             },
             prepared.reservation_blocks,
+            bytes_per_block,
+            self.inner.scheduled_recurrent_bytes(),
+            candidate_state_bytes,
             scheduler_watermark_fraction(),
         );
         if !decision.admitted {
@@ -2240,10 +2379,14 @@ impl Lfm2SchedulerState {
             cancelled,
             owner_id,
             seq_id,
+            newly_assigned,
             reservation_blocks,
             block_size,
         } = *prepared;
         if cancelled.load(Ordering::Relaxed) {
+            if newly_assigned {
+                self.owner_sequences.remove(&owner_id);
+            }
             Self::reply_admission_error(
                 response,
                 cancelled.as_ref(),
@@ -2399,7 +2542,6 @@ impl Lfm2SchedulerState {
         }
         let turn = TurnState::new(
             seq_id,
-            u64::from(seq_id),
             admitted.tokens,
             payload.prefix.effective_cached_prefix_len as u32,
             pinned_prefill_breaks,
@@ -2407,31 +2549,82 @@ impl Lfm2SchedulerState {
             payload,
         )
         .expect("prime-derived lfm2 scheduler turn must satisfy progress invariants")
-        .with_block_reservation(reservation_blocks, materialized_blocks, block_size);
+        .with_block_reservation(reservation_blocks, materialized_blocks, block_size)
+        .with_recurrent_state_reservation(self.inner.recurrent_state_bytes_per_seq());
         Ok(Some(match restore {
             Some(restore) => Lfm2Admission::Waiting(turn, restore),
             None => Lfm2Admission::Ready(turn),
         }))
     }
 
-    fn enqueue_admission(&mut self, admission: Lfm2Admission) -> std::result::Result<(), String> {
+    fn enqueue_admission(
+        &mut self,
+        admission: Lfm2Admission,
+    ) -> std::result::Result<(), (Lfm2Admission, String)> {
         match admission {
-            Lfm2Admission::Ready(turn) => self.scheduler.enqueue_turn(turn),
+            Lfm2Admission::Ready(turn) => {
+                if self.scheduler.contains_seq(turn.seq_id) {
+                    let seq_id = turn.seq_id;
+                    return Err((
+                        Lfm2Admission::Ready(turn),
+                        format!("duplicate scheduler sequence {seq_id}"),
+                    ));
+                }
+                self.scheduler
+                    .enqueue_turn(turn)
+                    .expect("duplicate prechecked above");
+                Ok(())
+            }
             Lfm2Admission::Waiting(turn, restore) => {
                 let seq_id = turn.seq_id;
                 if self.pending_restores.contains_key(&seq_id) {
-                    return Err(format!("duplicate SSD restore for sequence {seq_id}"));
+                    return Err((
+                        Lfm2Admission::Waiting(turn, restore),
+                        format!("duplicate SSD restore for sequence {seq_id}"),
+                    ));
                 }
-                self.scheduler.enqueue_turn(turn)?;
+                if self.scheduler.contains_seq(seq_id) {
+                    return Err((
+                        Lfm2Admission::Waiting(turn, restore),
+                        format!("duplicate scheduler sequence {seq_id}"),
+                    ));
+                }
+                self.scheduler
+                    .enqueue_turn(turn)
+                    .expect("duplicate prechecked above");
                 if let Err(error) = self.scheduler.park_waiting_for_ssd(seq_id) {
-                    let _ = self.scheduler.take_waiting(seq_id);
-                    return Err(error);
+                    let turn = self
+                        .scheduler
+                        .take_waiting(seq_id)
+                        .expect("turn was just enqueued");
+                    return Err((Lfm2Admission::Waiting(turn, restore), error));
                 }
                 let replaced = self.pending_restores.insert(seq_id, restore);
                 debug_assert!(replaced.is_none(), "duplicate checked before enqueue");
                 Ok(())
             }
         }
+    }
+
+    fn reject_admission(&mut self, admission: Lfm2Admission, error: String) {
+        let mut turn = match admission {
+            Lfm2Admission::Ready(turn) | Lfm2Admission::Waiting(turn, _) => turn,
+        };
+        let cancelled = turn.cancelled.take().expect("lfm2 admission cancel flag");
+        let seq_id = turn.seq_id;
+        let owner_id = turn.payload.owner_id.clone();
+        if let Some(adapter) = self.inner.paged_adapter.as_mut() {
+            let _ = adapter.release_request_for(seq_id);
+        }
+        self.inner.release_scheduled_caches_for(seq_id);
+        self.inner.set_turn_cancel_flag(None);
+        self.owner_histories.remove(&owner_id);
+        if self.owner_sequences.get(&owner_id) == Some(&seq_id) {
+            self.owner_sequences.remove(&owner_id);
+        }
+        turn.payload
+            .response
+            .send_error(Error::from_reason(error), cancelled.as_ref());
     }
 
     fn fail_preempted(&mut self, mut turn: TurnState<Lfm2ScheduledTurn>, error: String) {
@@ -2750,6 +2943,17 @@ impl Lfm2SchedulerState {
         }
     }
 
+    fn reap_cancelled_waiters(&mut self) {
+        for mut turn in self.scheduler.take_cancelled_waiters() {
+            // For an SSD waiter, dropping the ticket cancels the outstanding
+            // restore and returns every destination block reserved for it.
+            self.pending_restores.remove(&turn.seq_id);
+            turn.payload.failure =
+                Some(Error::from_reason(engine::session::CHAT_SESSION_CANCELLED));
+            self.finish_completed(turn);
+        }
+    }
+
     fn finish_completed(&mut self, mut turn: TurnState<Lfm2ScheduledTurn>) {
         let cancelled = turn.cancelled.take().expect("lfm2 turn cancel flag");
         if let Err(error) = self.inner.activate_paged_seq(turn.seq_id) {
@@ -2847,14 +3051,18 @@ impl Lfm2SchedulerState {
         while let Ok(command) = receiver.try_recv() {
             self.pending.push_back(command);
         }
+        self.reap_cancelled_waiters();
         self.poll_restores();
 
         let mut admission_deferred = false;
-        if let Some(prepared) = self.prepared_waiting.take() {
+        if !self.scheduler.has_pending_control()
+            && let Some(prepared) = self.prepared_waiting.take()
+        {
             match self.admit_prepared(prepared) {
                 Ok(Some(admission)) => {
-                    if let Err(error) = self.enqueue_admission(admission) {
+                    if let Err((admission, error)) = self.enqueue_admission(admission) {
                         tracing::error!("lfm2 scheduler admission failed: {error}");
+                        self.reject_admission(admission, error);
                     }
                 }
                 Ok(None) => {}
@@ -2864,7 +3072,10 @@ impl Lfm2SchedulerState {
                 }
             }
         }
-        while !admission_deferred && let Some(command) = self.pending.front() {
+        while !admission_deferred
+            && !self.scheduler.has_pending_control()
+            && let Some(command) = self.pending.front()
+        {
             let must_wait_for_legacy_owner = matches!(command, Lfm2Cmd::Chat(chat)
                 if !Self::chat_has_explicit_owner(chat.as_ref()) && self.scheduler.has_work());
             if must_wait_for_legacy_owner {
@@ -2873,18 +3084,20 @@ impl Lfm2SchedulerState {
             let command = self.pending.pop_front().expect("front checked above");
             if Self::force_serial() {
                 self.scheduler.enqueue_exclusive(command);
-                continue;
+                break;
             }
             match command {
                 Lfm2Cmd::Chat(chat) => {
                     let is_reset = matches!(chat.as_ref(), ChatCmd::ResetCaches { .. });
                     if self.inner.paged_adapter.is_none() {
                         self.scheduler.enqueue_exclusive(Lfm2Cmd::Chat(chat));
+                        break;
                     } else if let Some(prepared) = self.prepare_chat(*chat) {
                         match self.admit_prepared(prepared) {
                             Ok(Some(admission)) => {
-                                if let Err(error) = self.enqueue_admission(admission) {
+                                if let Err((admission, error)) = self.enqueue_admission(admission) {
                                     tracing::error!("lfm2 scheduler admission failed: {error}");
+                                    self.reject_admission(admission, error);
                                 }
                             }
                             Ok(None) => {}
@@ -2933,6 +3146,7 @@ impl Lfm2SchedulerState {
             };
             self.scheduler.drive_once(&mut executor)
         };
+        let scheduler_idle = matches!(&action, Ok(SchedulerAction::Idle));
         let mut may_resume_preempted = true;
         match action {
             Ok(SchedulerAction::Idle) => {}
@@ -2968,6 +3182,9 @@ impl Lfm2SchedulerState {
         }
         if may_resume_preempted {
             self.try_resume_preempted();
+        }
+        if scheduler_idle && (self.scheduler.has_work() || self.prepared_waiting.is_some()) {
+            std::thread::sleep(Duration::from_millis(1));
         }
         LoopControl::Continue
     }
@@ -3665,6 +3882,9 @@ pub struct Lfm2Model {
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop.
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
+    /// RAII debit for the native paged KV pool, kept separate from weights so
+    /// the global coordinator can account both deterministic residents.
+    pub(crate) _pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
 }
 
 #[napi]
@@ -4052,6 +4272,7 @@ mod paged_adapter_construction_tests {
     //! flag wires up a real adapter without churning forward-path code.
 
     use super::{Lfm2Inner, compute_layer_kinds_for};
+    use crate::array::DType;
     use crate::models::lfm2::Lfm2Config;
 
     /// Tiny LFM2-shaped config compatible with `LayerKVPool`'s validate
@@ -4447,5 +4668,16 @@ mod paged_adapter_construction_tests {
             inner.layer_kinds, fresh,
             "cached layer classification must equal a fresh compute over the same config"
         );
+    }
+
+    #[test]
+    fn stacked_conv_state_fails_closed_for_unknown_sequence() {
+        let cfg = paged_tiny_config(Some(false));
+        let mut inner = Lfm2Inner::new(cfg).expect("construct");
+        let error = match inner.stacked_conv_state(&[99], 0, DType::BFloat16) {
+            Ok(_) => panic!("missing scheduler state must not be fabricated as zeros"),
+            Err(error) => error,
+        };
+        assert!(error.reason.contains("99"));
     }
 }

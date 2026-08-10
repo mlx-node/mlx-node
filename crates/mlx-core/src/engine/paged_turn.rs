@@ -8,8 +8,8 @@ use std::time::Instant;
 use napi::bindgen_prelude::*;
 
 use crate::engine::backend::{
-    ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, PagedTurnSetup, ResetScope,
-    StreamEmitter, ThinkingSetup, TurnOutput, WholeTurnArgs,
+    ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, PagedTurnSetup, StreamEmitter,
+    ThinkingSetup, TurnOutput, WholeTurnArgs,
 };
 use crate::engine::decode::{DecodeLoopArgs, StreamingCtx, run_decode_loop};
 use crate::engine::finalize::compute_performance_metrics;
@@ -69,7 +69,10 @@ pub(crate) fn finish_paged_turn<B: PagedBackend>(
         keep_all,
         args.reuse_cache,
     ) {
-        let _ = backend.reset_caches(ResetScope::Command);
+        // This epilogue is also used per row by continuous batching. Abort
+        // only the request that failed; a command-wide reset would destroy
+        // unrelated live peer rows.
+        backend.abort_paged_turn();
         return Err(error);
     }
 
@@ -131,7 +134,7 @@ pub(crate) fn finish_paged_turn<B: PagedBackend>(
     }) {
         Ok(result) => result,
         Err(error) => {
-            let _ = backend.reset_caches(ResetScope::Command);
+            backend.abort_paged_turn();
             return Err(error);
         }
     };
@@ -1369,16 +1372,14 @@ mod tests {
     /// (decode + `finalize_paged_turn`) DID run, and `save_paged_history`
     /// already advanced `cached_token_history` for this turn. Because the
     /// caller treats the Err turn as failed and does not append it, the
-    /// engine must roll the session back to a cold, non-live state via
-    /// `reset_caches(ResetScope::Command)` (release the kept-live request,
-    /// purge the prefix cache, null caches + history) BEFORE propagating —
+    /// engine must abort this request to a non-live state BEFORE propagating —
     /// otherwise the next delta would warm-continue onto a native cache that
-    /// holds a turn the conversation omits. The reset replaces the
-    /// mid-decode `abort_paged_turn` (a full Command reset, not a bare
-    /// release), and the error still short-circuits BEFORE the
+    /// holds a turn the conversation omits. A per-request abort is required
+    /// here because this epilogue may run while scheduled peer rows are live;
+    /// the error still short-circuits BEFORE the
     /// result-building `finalize_turn`.
     #[test]
-    fn run_paged_turn_save_error_resets_session_to_non_live() {
+    fn run_paged_turn_save_error_aborts_only_failed_request() {
         let ledger = Arc::new(Ledger::default());
         let (out, seq) = run_failing_turn(
             ledger, /* fail_prime */ false, /* fail_prefill */ false,
@@ -1398,17 +1399,15 @@ mod tests {
             seq.contains(&"save_paged_history"),
             "save_paged_history must have been attempted; got {seq:?}"
         );
-        // THE CONTRACT: a save-Err rolls the session back to non-live via the
-        // full Command reset, so the next delta cold-restarts instead of
-        // warm-continuing onto the failed turn's native cache.
+        // THE CONTRACT: a save-Err rolls this request back to non-live without
+        // globally resetting scheduled peers.
         assert!(
-            seq.contains(&"reset_caches"),
-            "save-Err after finalize must reset the session to non-live; got {seq:?}"
+            seq.contains(&"abort_paged_turn"),
+            "save-Err after finalize must abort the failed request; got {seq:?}"
         );
-        // The reset is the full Command reset, NOT the mid-decode bare release.
         assert!(
-            !seq.contains(&"abort_paged_turn"),
-            "save-Err uses reset_caches, not the mid-decode abort_paged_turn; got {seq:?}"
+            !seq.contains(&"reset_caches"),
+            "save-Err must not globally reset peer requests; got {seq:?}"
         );
         // The error short-circuits before the result-building finalize_turn.
         assert!(

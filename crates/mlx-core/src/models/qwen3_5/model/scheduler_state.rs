@@ -183,7 +183,7 @@ impl Qwen35StepExecutor<'_> {
             return Ok(Self::fail(
                 turn,
                 row,
-                Error::from_reason("prefill cancelled"),
+                Error::from_reason(engine::session::CHAT_SESSION_CANCELLED),
             ));
         }
         let start = row.token_start as usize;
@@ -471,6 +471,8 @@ impl Qwen35StepExecutor<'_> {
                 .expect("prepared row remains running");
             let row_logits = match (&logits, row.batch_index) {
                 (Err(error), Some(_)) if is_paged_allocation_blocked(&error.reason) => {
+                    let rolled_back = turn.payload.generated_tokens.pop();
+                    debug_assert_eq!(rolled_back, Some(row.token_id));
                     results.push((row.plan_index, Self::blocked(planned)));
                     continue;
                 }
@@ -579,10 +581,20 @@ pub(crate) struct Qwen35SchedulerState {
 }
 
 impl Qwen35SchedulerState {
+    pub(crate) fn continuous_batching_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("MLX_QWEN35_CONTINUOUS_BATCHING").is_ok_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+        })
+    }
+
     pub(crate) fn new(inner: Qwen35Inner) -> Self {
-        let enabled = inner.paged_adapter.is_some()
-            && inner.vision_encoder.is_none()
-            && !inner.has_mtp_weights();
+        let enabled = Self::continuous_batching_enabled() && inner.paged_adapter.is_some();
         Self {
             inner,
             enabled,
@@ -775,7 +787,7 @@ impl Qwen35SchedulerState {
             .get(&owner_id)
             .cloned()
             .unwrap_or_default();
-        let admitted =
+        let mut admitted =
             match engine::session::admit_paged_turn(&mut self.inner, messages, config, kind) {
                 Ok(admitted) => admitted,
                 Err(error) => {
@@ -803,24 +815,26 @@ impl Qwen35SchedulerState {
             return None;
         }
         let prompt_tokens = admitted.tokens.len() as u32;
-        let max_new_tokens = admitted.params.max_new_tokens.max(0) as u32;
+        let requested_max_new_tokens = admitted.params.max_new_tokens.max(0) as u32;
         let trained_context = u32::try_from(self.inner.config.max_position_embeddings)
             .unwrap_or(1)
             .max(1);
         let context = trained_context.min(scheduler_per_seq_context());
-        let requested_tokens = prompt_tokens.saturating_add(max_new_tokens);
-        if requested_tokens > context {
+        if prompt_tokens > context || (prompt_tokens == context && requested_max_new_tokens != 0) {
             if newly_assigned {
                 self.owner_sequences.remove(&owner_id);
             }
             response.send_error(
                 Error::from_reason(format!(
-                    "context_length_exceeded: prompt ({prompt_tokens}) + max_new_tokens ({max_new_tokens}) exceeds scheduler per-sequence context {context}"
+                    "context_length_exceeded: prompt ({prompt_tokens}) leaves no requested generation room in scheduler per-sequence context {context}"
                 )),
                 cancelled.as_ref(),
             );
             return None;
         }
+        let max_new_tokens = requested_max_new_tokens.min(context - prompt_tokens);
+        admitted.params.max_new_tokens = max_new_tokens as i32;
+        let requested_tokens = prompt_tokens.saturating_add(max_new_tokens);
         let block_size = self
             .inner
             .paged_adapter
@@ -1090,7 +1104,6 @@ impl Qwen35SchedulerState {
         }
         let turn = TurnState::new(
             seq_id,
-            u64::from(seq_id),
             admitted.tokens,
             payload.prefix.effective_cached_prefix_len as u32,
             breaks,
@@ -1106,6 +1119,27 @@ impl Qwen35SchedulerState {
     fn fail_preempted(&mut self, mut turn: TurnState<ScheduledTurn>, error: String) {
         turn.payload.failure = Some(Error::from_reason(error));
         self.finish_completed(turn);
+    }
+
+    fn enqueue_turn_or_reject(&mut self, mut turn: TurnState<ScheduledTurn>) {
+        if self.scheduler.contains_seq(turn.seq_id) {
+            let error = format!("duplicate scheduler sequence {}", turn.seq_id);
+            tracing::error!("Qwen3.5 scheduler admission failed: {error}");
+            turn.payload.failure = Some(Error::from_reason(error));
+            self.finish_completed(turn);
+            return;
+        }
+        self.scheduler
+            .enqueue_turn(turn)
+            .expect("duplicate prechecked above");
+    }
+
+    fn reap_cancelled_waiters(&mut self) {
+        for mut turn in self.scheduler.take_cancelled_waiters() {
+            turn.payload.failure =
+                Some(Error::from_reason(engine::session::CHAT_SESSION_CANCELLED));
+            self.finish_completed(turn);
+        }
     }
 
     /// Release both halves of a hybrid victim. Full-attention blocks remain
@@ -1408,14 +1442,15 @@ impl Qwen35SchedulerState {
         while let Ok(command) = receiver.try_recv() {
             self.pending.push_back(command);
         }
+        self.reap_cancelled_waiters();
 
         let mut deferred = false;
-        if let Some(prepared) = self.prepared_waiting.take() {
+        if !self.scheduler.has_pending_control()
+            && let Some(prepared) = self.prepared_waiting.take()
+        {
             match self.admit_prepared(prepared) {
                 Ok(Some(turn)) => {
-                    if let Err(error) = self.scheduler.enqueue_turn(turn) {
-                        tracing::error!("Qwen3.5 scheduler admission failed: {error}");
-                    }
+                    self.enqueue_turn_or_reject(turn);
                 }
                 Ok(None) => {}
                 Err(prepared) => {
@@ -1424,7 +1459,10 @@ impl Qwen35SchedulerState {
                 }
             }
         }
-        while !deferred && let Some(command) = self.pending.front() {
+        while !deferred
+            && !self.scheduler.has_pending_control()
+            && let Some(command) = self.pending.front()
+        {
             let must_wait_for_legacy_owner = matches!(command, Qwen35Cmd::Chat(chat)
                 if !Self::chat_has_explicit_owner(chat) && self.scheduler.has_work());
             if must_wait_for_legacy_owner {
@@ -1439,22 +1477,22 @@ impl Qwen35SchedulerState {
             let command = self.pending.pop_front().expect("front checked");
             if Self::force_serial() || !self.enabled {
                 self.scheduler.enqueue_exclusive(command);
-                continue;
+                break;
             }
             match command {
                 Qwen35Cmd::Chat(chat) => {
                     let is_reset = matches!(chat, ChatCmd::ResetCaches { .. });
+                    let mut exclusive = false;
                     if self.inner.paged_adapter.is_none()
                         || !Self::chat_has_explicit_owner(&chat)
                         || self.chat_requires_barrier(&chat)
                     {
                         self.scheduler.enqueue_exclusive(Qwen35Cmd::Chat(chat));
+                        exclusive = true;
                     } else if let Some(prepared) = self.prepare_chat(chat) {
                         match self.admit_prepared(prepared) {
                             Ok(Some(turn)) => {
-                                if let Err(error) = self.scheduler.enqueue_turn(turn) {
-                                    tracing::error!("Qwen3.5 scheduler admission failed: {error}");
-                                }
+                                self.enqueue_turn_or_reject(turn);
                             }
                             Ok(None) => {}
                             Err(prepared) => {
@@ -1463,7 +1501,7 @@ impl Qwen35SchedulerState {
                             }
                         }
                     }
-                    if is_reset {
+                    if is_reset || exclusive {
                         break;
                     }
                 }
@@ -1474,13 +1512,14 @@ impl Qwen35SchedulerState {
             }
         }
 
-        let mut may_resume_preempted = true;
         let action = {
             let mut executor = Qwen35StepExecutor {
                 inner: &mut self.inner,
             };
             self.scheduler.drive_once(&mut executor)
         };
+        let scheduler_idle = matches!(&action, Ok(SchedulerAction::Idle));
+        let mut may_resume_preempted = true;
         match action {
             Ok(SchedulerAction::Idle) => {}
             Ok(SchedulerAction::Exclusive(command) | SchedulerAction::Barrier(command)) => {
@@ -1512,6 +1551,9 @@ impl Qwen35SchedulerState {
         }
         if may_resume_preempted {
             self.try_resume_preempted();
+        }
+        if scheduler_idle && (self.scheduler.has_work() || self.prepared_waiting.is_some()) {
+            std::thread::sleep(Duration::from_millis(1));
         }
         LoopControl::Continue
     }
@@ -1577,5 +1619,28 @@ mod tests {
         );
         assert!(state.inner.has_scheduled_recurrent(3));
         assert!(state.inner.can_activate_scheduled_recurrent(4));
+    }
+
+    #[test]
+    fn decode_residency_accepts_extra_warm_rows() {
+        let mut inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        inner
+            .activate_scheduled_recurrent(11)
+            .expect("activate warm row");
+        inner
+            .activate_scheduled_recurrent(22)
+            .expect("park warm and activate selected row");
+        inner
+            .park_active_scheduled_recurrent()
+            .expect("park selected row");
+
+        assert_eq!(inner.scheduled_recurrent.live_len(), 2);
+        inner
+            .validate_scheduled_decode_residency(&[(22, 7)])
+            .expect("a decode subset may coexist with an extra warm row");
+        let error = inner
+            .validate_scheduled_decode_residency(&[(33, 7)])
+            .expect_err("a genuinely missing selected row must still fail closed");
+        assert!(error.reason.contains("33"));
     }
 }

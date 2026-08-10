@@ -4,8 +4,6 @@
 //! behind [`StepExecutor`], so scheduling tests do not load MLX or a model.
 //! Prefill versus decode is derived on every plan from token progress; there
 //! is deliberately no phase queue.
-#![allow(dead_code)] // B4 defines the seam; B5 wires the first production caller.
-
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +24,6 @@ pub(crate) enum TurnStatus {
 /// Request-owned state that survives across model steps.
 pub(crate) struct TurnState<P> {
     pub seq_id: SeqId,
-    pub owner_id: u64,
     pub num_computed_tokens: u32,
     pub num_tokens: u32,
     pub prompt_tokens: u32,
@@ -119,7 +116,6 @@ pub(crate) fn install_preemption_replay<P>(
 impl<P> TurnState<P> {
     pub fn new(
         seq_id: SeqId,
-        owner_id: u64,
         token_history: Vec<u32>,
         num_computed_tokens: u32,
         pinned_prefill_breaks: Vec<u32>,
@@ -144,7 +140,6 @@ impl<P> TurnState<P> {
         }
         Ok(Self {
             seq_id,
-            owner_id,
             num_computed_tokens,
             num_tokens: prompt_tokens,
             prompt_tokens,
@@ -538,6 +533,7 @@ impl SchedulerStats {
 #[derive(Debug)]
 pub(crate) enum SchedulerError<E> {
     Executor(E),
+    #[allow(dead_code)] // retained in the Debug payload surfaced by model-driver panics
     InvalidResult(String),
 }
 
@@ -546,6 +542,7 @@ pub(crate) enum SchedulerAction<P, Exclusive, Barrier> {
     Exclusive(Exclusive),
     Barrier(Barrier),
     Stepped {
+        #[cfg_attr(not(test), allow(dead_code))]
         plan: StepPlan,
         completed: Vec<TurnState<P>>,
         preempted: Option<TurnState<P>>,
@@ -628,6 +625,14 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             || !self.running.is_empty()
             || !self.exclusive_lane.is_empty()
             || !self.barriers.is_empty()
+    }
+
+    /// Whether an ordered control command is waiting for the rows ahead of it
+    /// to drain. Model drivers must not perform admission side effects while
+    /// this is true: a barrier may invalidate every cache object an admission
+    /// would otherwise attach to.
+    pub fn has_pending_control(&self) -> bool {
+        !self.exclusive_lane.is_empty() || !self.barriers.is_empty()
     }
 
     pub fn waiting_len(&self) -> usize {
@@ -792,6 +797,34 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         self.waiting.iter_mut().find(|turn| turn.seq_id == seq_id)
     }
 
+    /// Remove every cancelled admission waiter before planning. This avoids
+    /// spending a prefill slice on a dead ordinary waiter, and lets a model
+    /// drop an SSD waiter's restore ticket immediately instead of waiting for
+    /// storage I/O to finish before observing the same flag.
+    pub fn take_cancelled_waiters(&mut self) -> Vec<TurnState<P>> {
+        let mut cancelled = Vec::new();
+        let mut retained = VecDeque::with_capacity(self.waiting.len());
+        while let Some(turn) = self.waiting.pop_front() {
+            let is_cancelled_waiter =
+                matches!(turn.status, TurnStatus::Waiting | TurnStatus::WaitingForSsd)
+                    && turn
+                        .cancelled
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::Relaxed));
+            if is_cancelled_waiter {
+                if turn.status == TurnStatus::WaitingForSsd {
+                    self.stats.ssd_restore_waiting =
+                        self.stats.ssd_restore_waiting.saturating_sub(1);
+                }
+                cancelled.push(turn);
+            } else {
+                retained.push_back(turn);
+            }
+        }
+        self.waiting = retained;
+        cancelled
+    }
+
     /// Remove the oldest preempted row for model-specific cache re-preparation.
     /// Preempted rows are deliberately invisible to `admit_waiting`; the model
     /// must first establish a fresh adapter request (or an SSD restore ticket).
@@ -863,6 +896,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         Some(turn)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn running(&self) -> &[TurnState<P>] {
         &self.running
     }
@@ -871,6 +905,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         &self.stats
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn maintenance_due(&self, cadence: u64) -> bool {
         cadence != 0 && self.global_step != 0 && self.global_step.is_multiple_of(cadence)
     }
@@ -912,9 +947,20 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
 
     fn admit_waiting(&mut self) {
         let control_order = self.earliest_control_order();
+        // A preempted row keeps its original FCFS position while the model
+        // rebuilds or restores its cache. Later arrivals may not leapfrog it:
+        // doing so can keep the victim permanently unable to reacquire its
+        // reservation and, transitively, hold an ordered barrier forever.
+        let preempted_order = self
+            .waiting
+            .iter()
+            .filter(|turn| turn.status == TurnStatus::Preempted)
+            .map(|turn| turn.arrival_order)
+            .min();
         while self.running.len() < self.max_num_seqs {
             let candidate = self.waiting.iter().position(|turn| {
                 turn.status == TurnStatus::Waiting
+                    && !preempted_order.is_some_and(|order| turn.arrival_order > order)
                     && !control_order.is_some_and(|order| turn.arrival_order > order)
             });
             let Some(candidate) = candidate else {
@@ -1231,7 +1277,6 @@ mod tests {
     ) -> TurnState<&'static str> {
         TurnState::new(
             seq_id,
-            u64::from(seq_id),
             vec![1, 2, 3, 4],
             computed,
             breaks.to_vec(),
@@ -1351,6 +1396,81 @@ mod tests {
         ));
         assert!(scheduler.running().is_empty());
         assert_eq!(scheduler.waiting_len(), 1);
+    }
+
+    #[test]
+    fn pending_control_is_visible_before_it_becomes_executable() {
+        let mut scheduler = Scheduler::<_, &str, &str>::new(1, 4).expect("scheduler");
+        scheduler
+            .enqueue_turn(turn(1, 0, &[4], None))
+            .expect("enqueue older turn");
+        scheduler.enqueue_barrier("reset");
+        assert!(
+            scheduler.has_pending_control(),
+            "model admission must pause even while an older row keeps the barrier from executing"
+        );
+        let mut step = MockStep::default();
+        assert!(matches!(
+            scheduler.drive_once(&mut step).expect("older turn runs"),
+            SchedulerAction::Stepped { .. }
+        ));
+        assert!(scheduler.has_pending_control());
+    }
+
+    #[test]
+    fn later_waiter_cannot_leapfrog_preempted_fcfs_head_or_release_barrier() {
+        let mut scheduler = Scheduler::<_, (), &str>::new(1, 4).expect("scheduler");
+        scheduler
+            .enqueue_turn(turn(1, 0, &[4], None))
+            .expect("enqueue victim");
+        let victim = scheduler.take_waiting(1).expect("take victim");
+        scheduler.prepend_preempted(victim);
+        scheduler
+            .enqueue_turn(turn(2, 0, &[4], None))
+            .expect("enqueue later turn");
+        scheduler.enqueue_barrier("reset");
+
+        let mut step = MockStep::default();
+        assert!(matches!(
+            scheduler.drive_once(&mut step).expect("parked head"),
+            SchedulerAction::Idle
+        ));
+        assert!(scheduler.running().is_empty());
+        assert_eq!(scheduler.waiting_len(), 2);
+        assert!(scheduler.has_pending_control());
+
+        let victim = scheduler.take_preempted().expect("resume victim first");
+        scheduler.ready_preempted(victim, false);
+        let SchedulerAction::Stepped { plan, .. } = scheduler
+            .drive_once(&mut step)
+            .expect("resumed victim runs")
+        else {
+            panic!("expected resumed victim step");
+        };
+        assert_eq!(plan.rows[0].seq_id, 1);
+    }
+
+    #[test]
+    fn cancelled_ssd_waiter_is_reaped_without_waiting_for_io() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut scheduler = Scheduler::<_, (), ()>::new(2, 4).expect("scheduler");
+        scheduler
+            .enqueue_turn(turn(1, 0, &[4], Some(Arc::clone(&cancelled))))
+            .expect("enqueue restore waiter");
+        scheduler
+            .park_waiting_for_ssd(1)
+            .expect("park restore waiter");
+        scheduler
+            .enqueue_turn(turn(2, 0, &[4], None))
+            .expect("enqueue healthy peer");
+        cancelled.store(true, Ordering::Relaxed);
+
+        let reaped = scheduler.take_cancelled_waiters();
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].seq_id, 1);
+        assert_eq!(scheduler.stats().ssd_restore_waiting, 0);
+        assert!(scheduler.contains_seq(2));
+        assert!(!scheduler.contains_seq(1));
     }
 
     #[test]

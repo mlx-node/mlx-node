@@ -83,7 +83,7 @@
  * await session.reset();
  * ```
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import type { ChatConfig, ChatMessage, ChatResult, ToolCall, ToolCallResult, ToolDefinition } from '@mlx-node/core';
 
@@ -718,6 +718,16 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   private readonly model: M;
   private readonly system: string | undefined;
   private readonly defaultConfig: ChatConfig;
+  /**
+   * Stable native cache/scheduler identity for this JS session.
+   *
+   * Direct HTTP callers do not carry the agent provider's cacheOwnerId. If
+   * they reach a paged model without an owner, native must conservatively use
+   * the legacy exclusive lane because sequence zero cannot represent two live
+   * requests. Give every ChatSession its own identity while still allowing an
+   * explicit provider identity to override it.
+   */
+  private readonly cacheOwnerId = randomUUID();
   /** Tool definitions are conversation state for deterministic template replay. */
   private activeTools: ToolDefinition[] | undefined;
 
@@ -1788,6 +1798,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       ...overlay,
       reuseCache: true,
     };
+    if (merged.cacheOwnerId === undefined || merged.cacheOwnerId === '') {
+      merged.cacheOwnerId = this.cacheOwnerId;
+    }
     // Tools are part of the committed conversation state. Constructor
     // defaults seed that state, but must not overwrite a tool set committed by
     // a later successful turn. A current-call overlay is the only higher

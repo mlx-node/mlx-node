@@ -1203,9 +1203,10 @@ export declare class Qwen35Model {
    */
   hasBlockPagedCache(): boolean;
   /**
-   * Native admission width for plain text AR turns. Checkpoints carrying a
-   * vision tower or native MTP head retain their ordered whole-turn path;
-   * the Stage-2 recurrent lane is enabled only for paged dense text models.
+   * Native admission width for plain text AR turns. Installed vision and
+   * MTP modules do not disable text batching: requests that actually carry
+   * media or set `enable_mtp=true` are routed through the ordered exclusive
+   * lane by the scheduler.
    */
   maxConcurrentSequences(): number;
   /** Snapshot scheduler occupancy plus unified block/recurrent admission. */

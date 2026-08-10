@@ -1428,7 +1428,7 @@ impl Lfm2Inner {
     /// exactly the packed-tensor sum — no dense dequant copies to add. See
     /// `cache_limit.rs` module docs for why this deterministic measurement is
     /// preferred over a process-wide `get_active_memory()` delta.
-    pub fn load_from_dir(model_path: &str) -> Result<(Self, u64)> {
+    pub fn load_from_dir(model_path: &str) -> Result<(Self, u64, u64)> {
         let path = Path::new(model_path);
 
         // Parse config
@@ -1558,6 +1558,7 @@ impl Lfm2Inner {
             let weight_refs: Vec<&MxArray> = params.values().collect();
             crate::array::memory::materialize_weights(&weight_refs)?;
         }
+        inner.size_paged_pool_after_weight_load()?;
 
         // NOTE: the cache-limit coordinator registration happens in
         // `Lfm2Model::load_from_dir` after this returns so the guard
@@ -1582,8 +1583,9 @@ impl Lfm2Inner {
         // footprint is EXACTLY the packed-tensor sum with NO dense dequant deltas
         // to add. See `compute_weight_bytes`'s doc comment for the rationale.
         let weight_bytes: u64 = compute_weight_bytes(&params, &inner.config);
+        let pool_bytes = inner.paged_pool_allocated_bytes()?;
 
-        Ok((inner, weight_bytes))
+        Ok((inner, weight_bytes, pool_bytes))
     }
 }
 
@@ -1603,19 +1605,26 @@ impl Lfm2Model {
                 // active-memory sampling — the deterministic path is
                 // race-free against concurrent inference. See
                 // `cache_limit.rs` module docs.
-                let (inner, weight_bytes) = Lfm2Inner::load_from_dir(&model_path)?;
+                let (inner, weight_bytes, pool_bytes) = Lfm2Inner::load_from_dir(&model_path)?;
                 let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
+                let pool_cache_limit_guard = (pool_bytes != 0)
+                    .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
                 let config = inner.config.clone();
                 let paged_active = inner.paged_adapter.is_some();
                 Ok((
                     super::model::Lfm2SchedulerState::new(inner),
-                    (config, cache_limit_guard, paged_active),
+                    (
+                        config,
+                        cache_limit_guard,
+                        pool_cache_limit_guard,
+                        paged_active,
+                    ),
                 ))
             },
             |state, receiver| state.drive(receiver),
         );
 
-        let (config, cache_limit_guard, paged_active) = init_rx
+        let (config, cache_limit_guard, pool_cache_limit_guard, paged_active) = init_rx
             .await
             .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
@@ -1624,6 +1633,7 @@ impl Lfm2Model {
             config,
             paged_active,
             _cache_limit_guard: cache_limit_guard,
+            _pool_cache_limit_guard: pool_cache_limit_guard,
         })
     }
 }

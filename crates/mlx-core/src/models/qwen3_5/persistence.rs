@@ -20,6 +20,7 @@ use crate::models::quant_dispatch::{
 };
 use crate::nn::LayerNorm;
 use crate::tokenizer::Qwen3Tokenizer;
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::utils::safetensors::load_safetensors_lazy;
 use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
 use crate::vision::projector::SpatialProjector;
@@ -1802,7 +1803,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
             // coordinator. No process-wide active-memory sampling —
             // the sum of `params.values().nbytes()` is race-free and
             // deterministic. See `cache_limit.rs` module docs.
-            let load_result: Result<(Qwen35Inner, u64)> = (|| -> Result<(Qwen35Inner, u64)> {
+            let load_result: Result<(Qwen35Inner, u64, u64)> = (|| {
                 // Load config
                 let config_path = path.join("config.json");
                 let config_data = fs::read_to_string(&config_path)
@@ -2150,10 +2151,19 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 // Count only the retained BF16 correctness fallback arrays.
                 weight_bytes = weight_bytes.saturating_add(plain_fp8_residency.nbytes());
 
-                Ok((inner, weight_bytes))
+                let pool_bytes = inner
+                    .paged_adapter
+                    .as_ref()
+                    .map(PagedKVCacheAdapter::pool_allocated_bytes)
+                    .transpose()
+                    .map_err(Error::from_reason)?
+                    .unwrap_or(0);
+                Ok((inner, weight_bytes, pool_bytes))
             })();
-            let (inner, weight_bytes) = load_result?;
+            let (inner, weight_bytes, pool_bytes) = load_result?;
             let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
+            let pool_cache_limit_guard = (pool_bytes != 0)
+                .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
 
             let model_id = inner.model_id;
             let config_out = inner.config.clone();
@@ -2179,6 +2189,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     spatial_merge_size,
                     tokenizer_out,
                     cache_limit_guard,
+                    pool_cache_limit_guard,
                     paged_active,
                     mtp_active,
                     vision_active,
@@ -2196,6 +2207,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
         spatial_merge_size,
         _tokenizer,
         cache_limit_guard,
+        pool_cache_limit_guard,
         paged_active,
         mtp_active,
         vision_active,
@@ -2214,6 +2226,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
         spatial_merge_size,
         context_limits,
         _cache_limit_guard: cache_limit_guard,
+        _pool_cache_limit_guard: pool_cache_limit_guard,
     })
 }
 /// Parse Qwen3.5 dense config from JSON.

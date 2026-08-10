@@ -110,7 +110,10 @@ describe('ModelRegistry.register samplingDefaults plumbing', () => {
     const { session } = sessionReg!.getOrCreate(null, null);
     await session.send('hi');
     expect(model.startCallCount).toBe(1);
-    expect(model.lastStartConfig).toEqual({ reuseCache: true });
+    expect(model.lastStartConfig).toEqual({
+      cacheOwnerId: expect.any(String),
+      reuseCache: true,
+    });
   });
 
   it('forwards samplingDefaults into the ChatSession so send() dispatches them to chatSessionStart', async () => {
@@ -128,7 +131,11 @@ describe('ModelRegistry.register samplingDefaults plumbing', () => {
     await session.send('hi');
 
     // ChatSession.mergeConfig({}) yields `{ ...defaults, reuseCache: true }`.
-    expect(model.lastStartConfig).toEqual({ ...defaults, reuseCache: true });
+    expect(model.lastStartConfig).toEqual({
+      ...defaults,
+      cacheOwnerId: expect.any(String),
+      reuseCache: true,
+    });
   });
 
   it('honours per-call ChatConfig overlay on top of defaults (client wins on shared keys)', async () => {
@@ -145,6 +152,7 @@ describe('ModelRegistry.register samplingDefaults plumbing', () => {
 
     expect(model.lastStartConfig).toEqual({
       ...QWEN_SAMPLING_DEFAULTS.thinkingCoding,
+      cacheOwnerId: expect.any(String),
       temperature: 0.9,
       topP: 0.8,
       reuseCache: true,
@@ -165,6 +173,7 @@ describe('ModelRegistry.register samplingDefaults plumbing', () => {
     await session.send('hi');
     expect(model.lastStartConfig).toEqual({
       ...QWEN_SAMPLING_DEFAULTS.instructReasoning,
+      cacheOwnerId: expect.any(String),
       reuseCache: true,
     });
   });
@@ -184,6 +193,7 @@ describe('ModelRegistry.register samplingDefaults plumbing', () => {
     await session.send('hi');
     expect(model2.lastStartConfig).toEqual({
       ...QWEN_SAMPLING_DEFAULTS.instructGeneral,
+      cacheOwnerId: expect.any(String),
       reuseCache: true,
     });
     // The old model's chatSessionStart was never driven through the
