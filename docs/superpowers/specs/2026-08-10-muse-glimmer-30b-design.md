@@ -291,6 +291,43 @@ Ranked by probability x silence. Every one produces fluent-but-wrong output, not
     The wrapper tokens `200080/200081/200082/200083/200087` must **not** be zeroed — they
     carry real learned embeddings.
 
+13. **miniJinja cannot parse a ternary as a call keyword argument** — so the template does
+    not compile at all, and every render fails, including one that never reaches the tool
+    path. `parse_expr_noif` (`= parse_or`, `minijinja-2.23.0/src/compiler/parser.rs:671`)
+    cannot consume a trailing `if`, and the argument loop then meets the identifier `if`
+    where it demands `,` or `)`. Minimal repro:
+    `{% set n = namespace(name=a if a else '') %}` → `syntax error: unexpected identifier,
+    expected ','`. The checkpoint's tool-name fallback is exactly that shape, at byte 5737.
+    Python Jinja2 3.1.6 accepts both spellings, so the checkpoint is well-formed and
+    miniJinja is stricter. There is no syntax option, 2.23.0 is the newest release, the
+    dependency is plain crates.io with no `[patch]`. The restriction is general to all call
+    kwargs but narrow to the **ternary** — filters in kwargs parse fine, which is why
+    gemma4's `namespace(name=… | default(…))` works today. Fix: a region-aware source
+    transform that parenthesises the value, modelled on `neutralize_generation_tags`
+    (`tokenizer.rs:381`) and applied beside it at `:1401`; gated on byte-identity across
+    every other installed template. A `str::replace` would corrupt a ternary inside a
+    string literal, `{% raw %}`, or a comment.
+14. **`.get(key)` returns `Undefined` where Python returns `None`** (`tokenizer.rs:1304`),
+    so `{% if x is none %}` never fires on a missing key. This template gates its
+    `end_turn` default on exactly that, so **every plain assistant turn terminates
+    `<|eom|>` (0x6D) instead of `<|eot|>` (0x74)** — off-distribution history on every
+    multi-turn chat. `Value::from(())` matches Python; `Value::UNDEFINED` matches nothing.
+    Measured blast radius: gemma4 and Muse-Glimmer only. Qwen3/3.5/3.6/ASR, Ornith,
+    AgentWorld, agents-a1 and LFM2.5-1.2B have no `.get(` at all; LFM2.5-2.6B/8B use it
+    only for truthiness, `==` and kind-tests; qianfan / PaddleOCR-VL / Harrier ship no
+    cached template. No template anywhere applies `is defined` / `is undefined` to a
+    `.get()` result. gemma4 argues *for* the fix: our serializer never emits a top-level
+    `name`, so its `follow.get('name')` misses on every tool round trip and survival rides
+    on the `tc.id == tcid` conjunct — post-fix miniJinja is 1:1 with HF on all five
+    id-presence cases, converting quiet prompt corruption into a loud failure. Ship the
+    upstream `name` normalisation with it. `map_get_bridge_mirrors_python_dict_get`
+    (`:3195`) asserts a value that contradicts Python and must be corrected, not preserved.
+
+Traps 13 and 14 were found by writing the M0 golden gate and then confirmed independently
+with minimal reproductions. Nothing in this repo differentially byte-diffs miniJinja against
+Python Jinja2 over the installed templates; that harness would have caught both, and is
+worth building outside this project.
+
 ## 6. Cross-cutting edits
 
 Blocking / build-breaking:
@@ -305,6 +342,17 @@ Blocking / build-breaking:
 - `packages/.../__test__/models/model-loader-registry.test.ts:8-19` — `as const satisfies
   Record<ModelType, readonly string[]>`; a new `ModelType` fails `yarn typecheck` /
   `build:ts` / CI lint until the key is added.
+
+**The whole TypeScript surface lands in M1, in one commit, and cannot land earlier.**
+`ModelFamilyDescriptor.nativeModelClass` is a required field (`model-loader.ts:79`) and
+`LoadableModel = InstanceType<RegisteredModelFamily['nativeModelClass']>` (`:196`), so
+whatever fills it enters the exported public type union. Before the native class exists, a
+registry row costs either an uninstantiable placeholder in that union — with
+`discoverModels` then advertising a family whose `load` throws — or a weakening of the
+registry's types. `ModelType` derives from the registry (`:183`), so the
+`Record<ModelType, …>` key, `LAUNCH_PRESETS`, `FAMILY_TRAITS` and `supportsImages` all
+depend on the row and cannot precede it. Until then the behaviour is already correct and
+loud: `Unsupported model_type "muse_glimmer"` (`:312`). M1 adds all five sites together.
 
 Silent if missed:
 
