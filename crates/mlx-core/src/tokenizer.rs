@@ -1192,9 +1192,12 @@ impl Qwen3Tokenizer {
     /// and `raise_exception`. Extracted so template behaviour is unit-testable
     /// without constructing a tokenizer or rendering a whole conversation.
     fn install_template_helpers(env: &mut Environment<'_>) {
-        // Add the tojson filter that Qwen3's template uses
+        // Add the tojson filter that Qwen3's template uses.
+        //
+        // Separators are Python's `json.dumps` defaults, not serde_json's compact
+        // ones — see [`PythonDefaultFormatter`] for why that is prompt-visible.
         env.add_filter("tojson", |value: minijinja::Value| -> String {
-            serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
+            to_json_python_separators(&value).unwrap_or_else(|| "null".to_string())
         });
 
         // Add Python-compatible string methods that Qwen3's template uses
@@ -1882,6 +1885,66 @@ pub(crate) struct RenderContextOptions {
     /// substitutes `high` when this is undefined or empty, so leaving it `None` is
     /// not the same as sending `high` textually — it just lets the template decide.
     pub reasoning_strength: Option<String>,
+}
+
+/// Python `json.dumps` default separators: `", "` between items and `": "` after
+/// a key. serde_json's default formatter emits `,` and `:`.
+///
+/// HF renders chat templates through transformers' own `tojson`, which is
+/// `json.dumps(x, ensure_ascii=False, indent=None, separators=None,
+/// sort_keys=False)` — and with `indent=None` CPython's default separators are
+/// exactly `(", ", ": ")`. Muse-Glimmer embeds tool schemas verbatim in the
+/// system prefix and container-valued tool arguments in assistant turns, so the
+/// whitespace is prompt-visible: it moves the prompt off-distribution and
+/// byte-mismatches any HF-rendered fixture.
+///
+/// A `Formatter` rather than a post-pass over the serialized string: `,` and `:`
+/// occur inside string values too, and rewriting those would corrupt the payload
+/// (`"a,b"` is not `"a, b"`).
+struct PythonDefaultFormatter;
+
+impl serde_json::ser::Formatter for PythonDefaultFormatter {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(b": ")
+    }
+}
+
+/// Serialize `value` with [`PythonDefaultFormatter`].
+///
+/// Returns `None` on serialization failure so callers can fall back the same way
+/// `serde_json::to_string(...).unwrap_or("null")` did.
+fn to_json_python_separators<T: Serialize + ?Sized>(value: &T) -> Option<String> {
+    let mut buf = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, PythonDefaultFormatter);
+    value.serialize(&mut ser).ok()?;
+    String::from_utf8(buf).ok()
 }
 
 /// Serialize a single `ChatMessage` into the shape Jinja chat templates
@@ -3228,9 +3291,9 @@ mod tests {
         // block uses for array-typed parameter values.
         let test_template = "{%- for msg in messages -%}\n{%- if msg.role == 'assistant' and msg.tool_calls -%}\n{%- for tc in msg.tool_calls -%}\n<function={{ tc.name }}>\n{%- for name, value in tc.arguments|items -%}\n<parameter={{ name }}>{% if value is mapping or (value is sequence and value is not string) %}{{ value | tojson }}{% else %}{{ value }}{% endif %}</parameter>\n{%- endfor -%}\n</function>\n{%- endfor -%}\n{%- endif -%}\n{%- endfor -%}";
         let mut rt = Environment::new();
-        rt.add_filter("tojson", |value: minijinja::Value| -> String {
-            serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
-        });
+        // The production helper set, not a hand-rolled copy of the `tojson` filter:
+        // a local copy would keep passing while production's separators drifted.
+        super::Qwen3Tokenizer::install_template_helpers(&mut rt);
         rt.add_template("t", test_template).unwrap();
         let messages_value = vec![v.clone()];
         let rendered = rt
@@ -3708,5 +3771,64 @@ mod tests {
         )
         .expect("template renders");
         assert_eq!(unset, "NO_DATE|NO_R|hi|<bos>|True");
+    }
+
+    /// HF renders chat templates with Python's `json.dumps` defaults: transformers'
+    /// `_compile_jinja_template` installs its own `tojson`
+    /// (`ensure_ascii=False, indent=None, separators=None, sort_keys=False`), and
+    /// with `indent=None` CPython's default separators are `", "` and `": "`.
+    /// `serde_json::to_string` emits `,` and `:`. Muse-Glimmer embeds tool schemas
+    /// verbatim in the system prefix, so the whitespace is prompt-visible and any
+    /// HF-rendered fixture mismatches byte-for-byte.
+    #[test]
+    fn tojson_uses_python_json_dumps_separators() {
+        let mut env = Environment::new();
+        super::Qwen3Tokenizer::install_template_helpers(&mut env);
+        env.add_template("t", "{{ v | tojson }}").unwrap();
+        let render = |json: serde_json::Value| {
+            env.get_template("t")
+                .unwrap()
+                .render(context! { v => minijinja::Value::from_serialize(&json) })
+                .unwrap()
+        };
+
+        assert_eq!(render(serde_json::json!({"k": 1})), r#"{"k": 1}"#);
+        assert_eq!(render(serde_json::json!(["a", "b"])), r#"["a", "b"]"#);
+        assert_eq!(
+            render(serde_json::json!({"type": "object", "properties": {"n": {"type": "integer"}}})),
+            r#"{"type": "object", "properties": {"n": {"type": "integer"}}}"#
+        );
+        // Key order is insertion order, not sorted: serde_json and miniJinja are
+        // both built with `preserve_order`, and transformers passes sort_keys=False.
+        assert_eq!(
+            render(serde_json::json!({"z": 1, "a": 2})),
+            r#"{"z": 1, "a": 2}"#
+        );
+        // Scalars and nesting inside arrays.
+        assert_eq!(
+            render(serde_json::json!([1, {"a": [2, 3]}])),
+            r#"[1, {"a": [2, 3]}]"#
+        );
+        assert_eq!(render(serde_json::json!("plain")), r#""plain""#);
+        // Empty containers take no separator at all — `json.dumps({})` is `{}`, and
+        // a formatter that unconditionally writes `", "` would emit `{ }`.
+        assert_eq!(render(serde_json::json!({})), "{}");
+        assert_eq!(render(serde_json::json!([])), "[]");
+        assert_eq!(
+            render(serde_json::json!({"a": {}, "b": []})),
+            r#"{"a": {}, "b": []}"#
+        );
+        // Separators *inside* string values must survive untouched. These two are
+        // the assertions that rule out post-processing the serialized text: a
+        // `.replace(",", ", ")` pass would turn `"a,b"` into `"a, b"` and silently
+        // rewrite a tool argument's payload.
+        assert_eq!(
+            render(serde_json::json!(["a,b", "c:d"])),
+            r#"["a,b", "c:d"]"#
+        );
+        assert_eq!(
+            render(serde_json::json!({"k": "x, y: z"})),
+            r#"{"k": "x, y: z"}"#
+        );
     }
 }
