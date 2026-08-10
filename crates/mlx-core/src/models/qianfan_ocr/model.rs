@@ -69,6 +69,20 @@ fn ensure_qianfan_turn_not_cancelled(cancelled: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
+/// Normalize a cancellation that lands after the turn's final cooperative
+/// poll but before its reply is sent. The shared session engine applies the
+/// same post-turn rule: once the caller has cancelled, a completed native
+/// result is discarded and the Promise rejects with the exact cancellation
+/// sentinel instead of reporting success on a dead request.
+fn qianfan_sync_turn_reply<T>(result: Result<T>, cancelled: &AtomicBool) -> Result<T> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(Error::from_reason(
+            crate::engine::session::CHAT_SESSION_CANCELLED,
+        ));
+    }
+    result
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct QianfanPrefillPlan {
     prefix_len: usize,
@@ -268,7 +282,8 @@ pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOC
             // flushing after a request on model A discards blocks about
             // to be reused by model B. The TS idle sweeper in
             // `@mlx-node/server` handles between-turn drains.
-            let _ = reply.send(inner.chat_session_start_sync(messages, config, cancelled.as_ref()));
+            let result = inner.chat_session_start_sync(messages, config, cancelled.as_ref());
+            let _ = reply.send(qianfan_sync_turn_reply(result, cancelled.as_ref()));
         }
         QianfanOCRCmd::ChatSessionContinue {
             messages,
@@ -276,8 +291,8 @@ pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOC
             reply,
             cancelled,
         } => {
-            let _ =
-                reply.send(inner.chat_session_continue_sync(messages, config, cancelled.as_ref()));
+            let result = inner.chat_session_continue_sync(messages, config, cancelled.as_ref());
+            let _ = reply.send(qianfan_sync_turn_reply(result, cancelled.as_ref()));
         }
         QianfanOCRCmd::ChatSessionContinueTool {
             messages,
@@ -285,11 +300,9 @@ pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOC
             reply,
             cancelled,
         } => {
-            let _ = reply.send(inner.chat_session_continue_tool_sync(
-                messages,
-                config,
-                cancelled.as_ref(),
-            ));
+            let result =
+                inner.chat_session_continue_tool_sync(messages, config, cancelled.as_ref());
+            let _ = reply.send(qianfan_sync_turn_reply(result, cancelled.as_ref()));
         }
         QianfanOCRCmd::ChatStreamSessionStart {
             messages,
@@ -1940,6 +1953,10 @@ mod cancellation_tests {
         live.store(true, Ordering::Relaxed);
         let error =
             ensure_qianfan_turn_not_cancelled(&live).expect_err("cancelled turn should stop");
+        assert_eq!(error.reason, crate::engine::session::CHAT_SESSION_CANCELLED);
+
+        let error = qianfan_sync_turn_reply(Ok(()), &live)
+            .expect_err("post-turn cancellation must discard a successful result");
         assert_eq!(error.reason, crate::engine::session::CHAT_SESSION_CANCELLED);
     }
 }
