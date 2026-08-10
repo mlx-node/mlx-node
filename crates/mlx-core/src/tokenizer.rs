@@ -1101,20 +1101,11 @@ impl Qwen3Tokenizer {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn render_chat_template_jinja2_with_content_order(
-        template_str: &str,
-        messages: &[ChatMessage],
-        tools: Option<&[ToolDefinition]>,
-        add_generation_prompt: bool,
-        enable_thinking: Option<bool>,
-        bos_token: &str,
-        eos_token: &str,
-        content_order: MultimodalContentOrder,
-        existing_image_placeholder: Option<&str>,
-    ) -> std::result::Result<String, String> {
-        let mut env = Environment::new();
-
+    /// Register every helper the shipped chat templates rely on: the `tojson`
+    /// filter, Python-style string/map methods via the unknown-method callback,
+    /// and `raise_exception`. Extracted so template behaviour is unit-testable
+    /// without constructing a tokenizer or rendering a whole conversation.
+    fn install_template_helpers(env: &mut Environment<'_>) {
         // Add the tojson filter that Qwen3's template uses
         env.add_filter("tojson", |value: minijinja::Value| -> String {
             serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
@@ -1250,6 +1241,22 @@ impl Qwen3Tokenizer {
                 ))
             },
         );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_chat_template_jinja2_with_content_order(
+        template_str: &str,
+        messages: &[ChatMessage],
+        tools: Option<&[ToolDefinition]>,
+        add_generation_prompt: bool,
+        enable_thinking: Option<bool>,
+        bos_token: &str,
+        eos_token: &str,
+        content_order: MultimodalContentOrder,
+        existing_image_placeholder: Option<&str>,
+    ) -> std::result::Result<String, String> {
+        let mut env = Environment::new();
+        Self::install_template_helpers(&mut env);
 
         // Neutralize HuggingFace `{% generation %}` / `{% endgeneration %}`
         // block tags before parsing — minijinja doesn't implement them, and
