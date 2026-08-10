@@ -2970,6 +2970,11 @@ export declare function createRandomQwen35MoeCheckpoint(config: Qwen35MoeConfig,
  */
 export declare function createRandomQwen3Checkpoint(config: Qwen3Config, savePath: string): Promise<undefined>;
 
+export interface DecodeBatchOccupancyBucket {
+  occupancy: number;
+  steps: number;
+}
+
 /** Document element - either a table or paragraph */
 export interface DocumentElement {
   elementType: ElementType;
@@ -4780,6 +4785,18 @@ export interface SamplingConfig {
  * ```
  */
 export declare function saveToXlsx(text: string, filePath: string): void;
+
+/**
+ * Read-only NAPI/dashboard mirror. Counters use `f64`, matching the other
+ * native metrics snapshots and avoiding BigInt round-trips in JavaScript.
+ */
+export interface SchedulerStats {
+  globalSteps: number;
+  maxBatchOccupancy: number;
+  decodeBatchOccupancyHist: Array<DecodeBatchOccupancyBucket>;
+  admitted: number;
+  completed: number;
+}
 
 /** Enable or disable profiling globally. */
 export declare function setProfilingEnabled(enabled: boolean): void;

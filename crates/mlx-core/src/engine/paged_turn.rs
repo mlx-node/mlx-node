@@ -8,14 +8,143 @@ use std::time::Instant;
 use napi::bindgen_prelude::*;
 
 use crate::engine::backend::{
-    DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, PagedTurnSetup, ResetScope, StreamEmitter,
-    TurnOutput, WholeTurnArgs,
+    ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, PagedTurnSetup, ResetScope,
+    StreamEmitter, ThinkingSetup, TurnOutput, WholeTurnArgs,
 };
 use crate::engine::decode::{DecodeLoopArgs, StreamingCtx, run_decode_loop};
 use crate::engine::finalize::compute_performance_metrics;
-use crate::engine::params::generated_capacity_hint;
+use crate::engine::params::{ChatParams, generated_capacity_hint};
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
+use crate::engine::types::ChatConfig;
 use crate::stream::{DeviceType, Stream};
+use crate::tokenizer::Qwen3Tokenizer;
+
+/// Owned-by-the-caller state consumed by the shared paged turn epilogue.
+///
+/// Both the legacy whole-turn driver and the scheduler step driver reach this
+/// exact function. Keeping cache reconciliation/publication, history saving,
+/// residual streaming, and result construction here prevents the scheduler
+/// path from acquiring a subtly different terminal contract.
+pub(crate) struct FinishPagedTurnArgs<'a> {
+    pub tokenizer: &'a Qwen3Tokenizer,
+    pub params: &'a ChatParams,
+    pub config: &'a ChatConfig,
+    pub thinking: ThinkingSetup,
+    pub is_delta: bool,
+    pub reuse_cache: bool,
+    pub prompt_tokens: &'a [u32],
+    pub effective_cached_prefix_len: usize,
+    pub suffix_len: usize,
+    pub generated_tokens: &'a [u32],
+    pub finish_reason: String,
+    pub generation_start: Option<Instant>,
+    pub first_token_instant: Option<Instant>,
+    pub reasoning_tokens: u32,
+    pub profiler: &'a crate::decode_profiler::DecodeProfiler,
+    pub stream_skip_special: bool,
+    pub streamed_text_len: usize,
+    pub last_is_reasoning: bool,
+    pub sink: Option<&'a dyn ChunkSink>,
+    pub emitter: Option<Box<dyn StreamEmitter>>,
+}
+
+pub(crate) fn finish_paged_turn<B: PagedBackend>(
+    backend: &mut B,
+    mut args: FinishPagedTurnArgs<'_>,
+) -> Result<TurnOutput> {
+    let keep_all = args.finish_reason == "length";
+    let reconcile_ok = if args.reuse_cache {
+        backend.reconcile_paged_request_tokens(
+            args.prompt_tokens.len(),
+            args.generated_tokens,
+            keep_all,
+        )
+    } else {
+        true
+    };
+    backend.finalize_paged_turn(args.reuse_cache && reconcile_ok);
+    if let Err(error) = backend.save_paged_history(
+        args.prompt_tokens,
+        args.generated_tokens,
+        keep_all,
+        args.reuse_cache,
+    ) {
+        let _ = backend.reset_caches(ResetScope::Command);
+        return Err(error);
+    }
+
+    let perf_prefill_tokens =
+        backend.paged_perf_prefill_tokens(args.prompt_tokens.len(), args.suffix_len);
+    let performance = if args.params.report_performance {
+        compute_performance_metrics(
+            args.generation_start,
+            args.first_token_instant,
+            perf_prefill_tokens,
+            args.generated_tokens.len(),
+        )
+        .map(|mut metrics| {
+            backend.augment_performance(args.profiler, &mut metrics);
+            metrics
+        })
+    } else {
+        None
+    };
+
+    if let (Some(sink), Some(emitter)) = (args.sink, args.emitter.as_deref_mut()) {
+        let full_text = args
+            .tokenizer
+            .decode_sync(args.generated_tokens, args.stream_skip_special)
+            .unwrap_or_else(|error| {
+                tracing::warn!("Failed to decode generated tokens: {}", error);
+                String::new()
+            });
+        if full_text.len() > args.streamed_text_len {
+            emitter.on_residual(
+                &full_text[args.streamed_text_len..],
+                args.last_is_reasoning,
+                args.params.include_reasoning,
+                sink,
+            );
+        }
+    }
+
+    let reported_prompt_tokens = if args.is_delta && args.sink.is_some() {
+        let delta_len = args
+            .prompt_tokens
+            .len()
+            .saturating_sub(args.effective_cached_prefix_len);
+        backend.stream_delta_prompt_tokens(args.prompt_tokens.len(), delta_len)
+    } else {
+        args.prompt_tokens.len() as u32
+    };
+    let mut result = match backend.finalize_turn(FinalizeArgs {
+        tokenizer: args.tokenizer,
+        generated_tokens: args.generated_tokens,
+        finish_reason: args.finish_reason,
+        think_end_id: args.tokenizer.think_end_id(),
+        think_end_str: args.tokenizer.think_end_str(),
+        performance,
+        include_reasoning: args.params.include_reasoning,
+        thinking_enabled: args.thinking.enabled,
+        prompt_tokens: reported_prompt_tokens,
+        reasoning_tokens: args.reasoning_tokens,
+    }) {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = backend.reset_caches(ResetScope::Command);
+            return Err(error);
+        }
+    };
+    result.thinking_enabled =
+        crate::engine::params::resolve_enable_thinking(args.config).unwrap_or(true);
+    result.cached_tokens = args.effective_cached_prefix_len as u32;
+
+    if let (Some(sink), Some(emitter)) = (args.sink, args.emitter.as_deref_mut()) {
+        emitter.finish(&result, sink);
+        return Ok(TurnOutput::Streamed);
+    }
+    Ok(TurnOutput::Complete(Box::new(result)))
+}
 
 /// Drive one PAGED whole turn through the generic engine. Returns the
 /// same `Result<TurnOutput>` shape the `ChatBackend::run_paged_turn`
@@ -39,7 +168,6 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     let is_delta = args.plan.is_delta;
     let is_streaming = args.sink.is_some();
     let think_end_id = tokenizer.think_end_id();
-    let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
 
     // Delta turns force `reuse_cache = true` (the engine's delta guards
     // already rejected an explicit `Some(false)`); fresh turns resolve
@@ -93,7 +221,6 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     let suffix = &args.tokens[effective_cached_prefix_len..];
 
     // ---- tracker / profiler / emitter setup (== chat_turn_core) ----
-    let prompt_token_count = args.tokens.len();
     let mut token_history: Vec<u32> = args.tokens.to_vec();
     let mut generated_tokens: Vec<u32> =
         Vec::with_capacity(generated_capacity_hint(max_new_tokens));
@@ -262,173 +389,31 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
         return Err(e);
     }
 
-    // ---- save-history alignment (mirrors the FLAT save_cache_state
-    // rule). ----
-    // KEEP-ALL iff the turn hit the length budget; DROP-LAST on any other
-    // stop (EOS / cutoff / cancel) — in every non-length case the final
-    // committed token IS the boundary marker (`<|im_end|>` / cutoff) the
-    // next delta re-renders, so it must NOT be persisted. This is the
-    // EXACT FLAT rule (`finish_reason != "length"` => drop-last); the
-    // inverted form would silently truncate a CONTENT token from the
-    // conversation on a length exit.
-    let keep_all = finish_reason == "length";
-
-    // ---- perf-parity adapter reconcile (warm-continue) — run BEFORE the
-    // lifecycle finalize so registration sees the corrected token set. ----
-    // The pipelined run_decode_loop forwards the just-committed token at
-    // the loop TOP, BEFORE the stop-check (gated `step+1 < max_new`), and
-    // `run_paged_decode_step` records that token into the adapter BEFORE
-    // its forward. So on an EARLY STOP below budget the stop token's
-    // forward already ran => the adapter's `request_tokens()` holds the
-    // (dropped-from-history) stop token, while the saved history drops it.
-    // The next turn's warm-continue gate
-    // (`prompt.starts_with(request_tokens())`) would then FAIL on that
-    // trailing stop token => a needless cold prefill.
-    //
-    // `reconcile_paged_request_tokens` rolls the adapter back to the
-    // to-be-saved history length so `request_tokens()` matches the dropped
-    // history (no-op on a length exit — the `materialize_final` above
-    // already recorded the final token's K/V, so the adapter EQUALS the
-    // kept history, no surplus to roll back; and a no-op when the stop
-    // landed on the final step, whose forward never ran). Returns whether
-    // the reconcile succeeded: `true` on reconcile/no-op, `false` only if
-    // the adapter rollback FAILED (then it is left over-recorded vs the
-    // saved history). NO-OP on the non-reuse path (finalize releases the
-    // request anyway), where we keep `reconcile_ok = true`.
-    let reconcile_ok = if reuse_cache {
-        backend.reconcile_paged_request_tokens(args.tokens.len(), &generated_tokens, keep_all)
-    } else {
-        true
-    };
-
-    // ---- post-turn adapter lifecycle (== forked core's
-    // release/finalize). Runs AFTER the reconcile so registration sees the
-    // corrected token set, and AFTER the stepper drop so the request is
-    // finalized once decode's borrow is released. ----
-    // Gate keep-live on the reconcile: finalize with reuse iff BOTH the
-    // turn reuses caches AND the reconcile succeeded. On a
-    // reconcile FAILURE `finalize_paged_turn(false)` takes the
-    // release_request arm — we must NOT finalize_turn_keep_live an
-    // unreconciled / over-recorded request (its `request_tokens()` no
-    // longer matches the saved history, so a warm-continue off it would
-    // read stale trailing KV). `save_paged_history(.., reuse_cache)` below
-    // is UNCHANGED — the history is still saved so the next turn
-    // cold-prefills correctly off the persisted tokens.
-    backend.finalize_paged_turn(reuse_cache && reconcile_ok);
-
-    // ---- save paged history (NOT the FLAT save_cache_state field set;
-    // token history + image key ONLY). Computed IDENTICALLY to the FLAT
-    // save (same keep_all rule), so the paged cached_token_history matches
-    // what save_cache_state would persist. ----
-    // Fallible: a family's post-history checkpoint (MoE GDN warm-continue)
-    // can fail. On failure the request was ALREADY finalized keep-live and
-    // `save_paged_history` already advanced `cached_token_history` for this
-    // turn, but the caller treats an Err turn as failed and does not append
-    // it. Reset the session to a cold, non-live state (release the kept-live
-    // request, purge the prefix cache, null the caches + history) before
-    // propagating, so the next delta restarts from a fresh prefill instead of
-    // warm-continuing onto a native cache that holds a turn the conversation
-    // omits. Mirrors the VLM image cores' save-failure rollback.
-    if let Err(e) =
-        backend.save_paged_history(args.tokens, &generated_tokens, keep_all, reuse_cache)
-    {
-        let _ = backend.reset_caches(ResetScope::Command);
-        return Err(e);
-    }
-
-    // ---- finalize (== chat_turn_core tail) ----
-    // The `prefill_tokens_per_second` numerator is family-controlled: standard-KV
-    // families (qwen3/qwen3_5) forward only the suffix on a warm hit (default ==
-    // `suffix_len`), but lfm2 reprefills the FULL prompt through conv layers every
-    // turn so its ttft is full-prompt scale (override → `prompt_token_count`).
-    let perf_prefill_tokens = backend.paged_perf_prefill_tokens(prompt_token_count, suffix_len);
-    let performance = if report_perf {
-        compute_performance_metrics(
+    finish_paged_turn(
+        backend,
+        FinishPagedTurnArgs {
+            tokenizer: &tokenizer,
+            params: p,
+            config: args.config,
+            thinking,
+            is_delta,
+            reuse_cache,
+            prompt_tokens: args.tokens,
+            effective_cached_prefix_len,
+            suffix_len,
+            generated_tokens: &generated_tokens,
+            finish_reason,
             generation_start,
             first_token_instant,
-            perf_prefill_tokens,
-            generated_tokens.len(),
-        )
-        .map(|mut m| {
-            backend.augment_performance(&profiler, &mut m);
-            m
-        })
-    } else {
-        None
-    };
-    let reasoning_tokens = reasoning_tracker.reasoning_token_count();
-
-    // Residual flush (streaming only) — same skip-special flag as the
-    // in-loop DecodeStream so `streamed_text_len` accounting is
-    // consistent.
-    if let (Some(sink), Some(em)) = (args.sink, emitter.as_mut()) {
-        let full_text = tokenizer
-            .decode_sync(&generated_tokens, stream_skip_special)
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to decode generated tokens: {}", e);
-                String::new()
-            });
-        if full_text.len() > streamed_text_len {
-            em.on_residual(
-                &full_text[streamed_text_len..],
-                last_is_reasoning,
-                p.include_reasoning,
-                sink,
-            );
-        }
-    }
-
-    // Streaming delta turns report the family's `prompt_tokens` choice on
-    // the terminal chunk (default `full_len`); the paged path has no
-    // `prior_cached_len`, and the delta reuses the full cached history, so
-    // the full prompt length is the right delta-len source. Sync results
-    // always carry the full length.
-    let reported_prompt_tokens: u32 = if is_delta && is_streaming {
-        let delta_len = prompt_token_count.saturating_sub(effective_cached_prefix_len);
-        backend.stream_delta_prompt_tokens(prompt_token_count, delta_len)
-    } else {
-        prompt_token_count as u32
-    };
-
-    // Fallible: a family's finalize may decode the assistant text here (gemma4)
-    // and error. `finalize_paged_turn` + `save_paged_history` above ALREADY
-    // published the kept-live request and advanced `cached_token_history` for
-    // this turn, but the caller treats an Err turn as failed and does not append
-    // it. Reset the session to a cold, non-live state before propagating — the
-    // same rollback as the save_paged_history failure above — so the next delta
-    // restarts from a fresh prefill instead of warm-continuing onto a native
-    // cache that holds a turn the conversation omits.
-    let mut result = match backend.finalize_turn(FinalizeArgs {
-        tokenizer: &tokenizer,
-        generated_tokens: &generated_tokens,
-        finish_reason,
-        think_end_id,
-        think_end_str: think_end_str.as_deref(),
-        performance,
-        include_reasoning: p.include_reasoning,
-        thinking_enabled: thinking.enabled,
-        prompt_tokens: reported_prompt_tokens,
-        reasoning_tokens,
-    }) {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = backend.reset_caches(ResetScope::Command);
-            return Err(e);
-        }
-    };
-    result.thinking_enabled =
-        crate::engine::params::resolve_enable_thinking(args.config).unwrap_or(true);
-    // cached_tokens overwrite stays in the engine (AFTER finalize — the
-    // override must not fill it): it reports the matched prefix length;
-    // for delta turns the warm-continue effective_cached_prefix_len covers
-    // the full prior history.
-    result.cached_tokens = effective_cached_prefix_len as u32;
-
-    if let (Some(sink), Some(em)) = (args.sink, emitter.as_mut()) {
-        em.finish(&result, sink);
-        return Ok(TurnOutput::Streamed);
-    }
-    Ok(TurnOutput::Complete(Box::new(result)))
+            reasoning_tokens: reasoning_tracker.reasoning_token_count(),
+            profiler: &profiler,
+            stream_skip_special,
+            streamed_text_len,
+            last_is_reasoning,
+            sink: args.sink,
+            emitter,
+        },
+    )
 }
 
 #[cfg(test)]

@@ -46,7 +46,6 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
         tokio::sync::oneshot::Receiver<napi::Result<InitResult>>,
     )
     where
-        State: Send + 'static,
         Init: FnOnce() -> napi::Result<(State, InitResult)> + Send + 'static,
         InitResult: Send + 'static,
         LoopBody: FnMut(&mut State, &mut tokio::sync::mpsc::UnboundedReceiver<Cmd>) -> LoopControl

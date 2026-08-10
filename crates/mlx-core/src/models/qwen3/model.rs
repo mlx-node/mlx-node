@@ -4,9 +4,10 @@
  * Contains the model structure, forward passes, and core model methods.
  */
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -14,14 +15,19 @@ use tracing::{debug, info, warn};
 
 use crate::array::{MxArray, heavy_cleanup, synchronize_and_clear_cache};
 use crate::engine::backend::{
-    ChatBackend, DecodeStep, PagedBackend, PagedPrefix, PagedTurnSetup, ResetScope, SaveStateArgs,
-    TrainBackend, TurnOutput, TurnSetup, WholeTurnArgs,
+    ChatBackend, ChunkSink, DecodeStep, PagedBackend, PagedPrefix, PagedTurnSetup, ResetScope,
+    SaveStateArgs, StreamEmitter, TrainBackend, TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::{
     ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
 };
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
-use crate::model_thread::{ModelThread, ResponseTx, send_and_await};
+use crate::engine::scheduler::{
+    RowStepResult, Scheduler, SchedulerAction, StepExecutor, StepKind, StepPlan, StepResult,
+    TurnState,
+};
+use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
+use crate::model_thread::{LoopControl, ModelThread, ResponseTx, StreamTx, send_and_await};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{
     SamplingConfig, apply_frequency_penalty, apply_presence_penalty, apply_repetition_penalty,
@@ -252,6 +258,710 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
         Qwen3Cmd::SaveModel { save_path, reply } => {
             let _ = reply.send(inner.save_model_sync(&save_path));
         }
+    }
+}
+
+enum ScheduledReply {
+    Sync(ResponseTx<ChatResult>),
+    Stream(StreamTx<ChatStreamChunk>),
+}
+
+impl ScheduledReply {
+    fn sink(&self) -> Option<&dyn ChunkSink> {
+        match self {
+            Self::Sync(_) => None,
+            Self::Stream(stream) => Some(stream),
+        }
+    }
+
+    fn send_error(self, error: Error, cancelled: &AtomicBool) {
+        match self {
+            Self::Sync(reply) => {
+                let error = if cancelled.load(Ordering::Relaxed) {
+                    Error::from_reason(engine::session::CHAT_SESSION_CANCELLED)
+                } else {
+                    error
+                };
+                let _ = reply.send(Err(error));
+            }
+            Self::Stream(stream) => ChunkSink::send(&stream, Err(error)),
+        }
+    }
+}
+
+struct QwenScheduledTurn {
+    tokenizer: Arc<Qwen3Tokenizer>,
+    eos_id: u32,
+    config: ChatConfig,
+    params: engine::params::ChatParams,
+    thinking: engine::backend::ThinkingSetup,
+    prompt_tokens: Vec<u32>,
+    prefix: Qwen3PrefixState,
+    is_delta: bool,
+    reuse_cache: bool,
+    response: ScheduledReply,
+    generated_tokens: Vec<u32>,
+    finish_reason: String,
+    reasoning_tracker: engine::penalties::ReasoningTracker,
+    extra_eos_ids: Vec<u32>,
+    generation_start: Option<Instant>,
+    first_token_instant: Option<Instant>,
+    generation_stream: Stream,
+    profiler: crate::decode_profiler::DecodeProfiler,
+    emitter: Option<Box<dyn StreamEmitter>>,
+    stream_skip_special: bool,
+    decode_ids: Vec<u32>,
+    decode_prefix: String,
+    decode_prefix_index: usize,
+    streamed_text_len: usize,
+    last_is_reasoning: bool,
+    failure: Option<Error>,
+}
+
+struct QwenStepExecutor<'a> {
+    inner: &'a mut Qwen3Inner,
+}
+
+impl QwenStepExecutor<'_> {
+    fn fail(
+        turn: &mut TurnState<QwenScheduledTurn>,
+        row: &engine::scheduler::StepRow,
+        error: Error,
+    ) -> RowStepResult {
+        turn.payload.failure = Some(error);
+        turn.payload.profiler.snapshot_memory_after();
+        turn.payload.profiler.report();
+        RowStepResult {
+            seq_id: row.seq_id,
+            num_computed_tokens: row.num_tokens,
+            generated_token: None,
+            finished: true,
+        }
+    }
+
+    fn stream_token(turn: &mut TurnState<QwenScheduledTurn>, token_id: u32, is_reasoning: bool) {
+        let payload = &mut turn.payload;
+        let text = match tokenizers::tokenizer::step_decode_stream(
+            payload.tokenizer.inner(),
+            vec![token_id],
+            payload.stream_skip_special,
+            &mut payload.decode_ids,
+            &mut payload.decode_prefix,
+            &mut payload.decode_prefix_index,
+        ) {
+            Ok(Some(text)) => text,
+            Ok(None) => String::new(),
+            Err(_) => {
+                payload.decode_ids.clear();
+                payload.decode_prefix.clear();
+                payload.decode_prefix_index = 0;
+                let mut replayed = String::new();
+                for &token in &payload.generated_tokens {
+                    if let Ok(Some(text)) = tokenizers::tokenizer::step_decode_stream(
+                        payload.tokenizer.inner(),
+                        vec![token],
+                        payload.stream_skip_special,
+                        &mut payload.decode_ids,
+                        &mut payload.decode_prefix,
+                        &mut payload.decode_prefix_index,
+                    ) {
+                        replayed.push_str(&text);
+                    }
+                }
+                replayed
+                    .get(payload.streamed_text_len..)
+                    .unwrap_or_default()
+                    .to_string()
+            }
+        };
+        payload.streamed_text_len = payload.streamed_text_len.saturating_add(text.len());
+        if let (Some(sink), Some(emitter)) = (payload.response.sink(), payload.emitter.as_mut()) {
+            emitter.on_token_text(&text, is_reasoning, payload.params.include_reasoning, sink);
+        }
+    }
+
+    fn execute_prefill(
+        &mut self,
+        row: &engine::scheduler::StepRow,
+        turn: &mut TurnState<QwenScheduledTurn>,
+    ) -> Result<RowStepResult> {
+        if row.cancel_snapshot {
+            return Ok(Self::fail(
+                turn,
+                row,
+                Error::from_reason("prefill cancelled"),
+            ));
+        }
+        let start = row.token_start as usize;
+        let end = start.saturating_add(row.num_tokens as usize);
+        if end > turn.payload.prompt_tokens.len() {
+            return Ok(Self::fail(
+                turn,
+                row,
+                Error::from_reason("scheduler prefill slice exceeds prompt"),
+            ));
+        }
+        turn.payload.profiler.begin_prefill();
+        let logits = match self.inner.paged_prefill(
+            &turn.payload.prompt_tokens[start..end],
+            &turn.payload.prefix,
+            turn.payload.generation_stream,
+        ) {
+            Ok(logits) => logits,
+            Err(error) => return Ok(Self::fail(turn, row, error)),
+        };
+        turn.payload.profiler.end_prefill();
+        let logits = match engine::penalties::apply_all_penalties(
+            logits,
+            &turn.token_history,
+            &turn.payload.params,
+        ) {
+            Ok(logits) => logits,
+            Err(error) => return Ok(Self::fail(turn, row, error)),
+        };
+        let sampled = match sample(&logits, turn.payload.params.sampling_config) {
+            Ok(sampled) => sampled,
+            Err(error) => return Ok(Self::fail(turn, row, error)),
+        };
+        sampled.eval();
+        if turn.payload.params.report_performance {
+            turn.payload.first_token_instant = Some(Instant::now());
+        }
+        synchronize_and_clear_cache();
+
+        if turn.payload.params.max_new_tokens == 0 {
+            turn.payload.profiler.snapshot_memory_after();
+            turn.payload.profiler.report();
+            return Ok(RowStepResult {
+                seq_id: row.seq_id,
+                num_computed_tokens: row.num_tokens,
+                generated_token: None,
+                finished: true,
+            });
+        }
+        let token = match sampled.item_at_int32(0) {
+            Ok(token) => token as u32,
+            Err(error) => return Ok(Self::fail(turn, row, error)),
+        };
+        Ok(RowStepResult {
+            seq_id: row.seq_id,
+            num_computed_tokens: row.num_tokens,
+            generated_token: Some(token),
+            finished: false,
+        })
+    }
+
+    fn execute_decode(
+        &mut self,
+        row: &engine::scheduler::StepRow,
+        turn: &mut TurnState<QwenScheduledTurn>,
+    ) -> Result<RowStepResult> {
+        let Some(&token_id) = turn.token_history.last() else {
+            return Ok(Self::fail(
+                turn,
+                row,
+                Error::from_reason("scheduler decode row has no current token"),
+            ));
+        };
+        let step_idx = turn.payload.generated_tokens.len();
+        turn.payload.generated_tokens.push(token_id);
+        turn.payload.profiler.step();
+        crate::array::maybe_clear_cache_for_paged_step(step_idx as i32);
+
+        let stops_at_eos =
+            token_id == turn.payload.eos_id || turn.payload.extra_eos_ids.contains(&token_id);
+        let repetition = check_repetition_cutoff(
+            &turn.payload.generated_tokens,
+            turn.payload.params.max_consecutive_tokens,
+            turn.payload.params.max_ngram_repeats,
+            turn.payload.params.ngram_size,
+        );
+        let terminal = stops_at_eos || row.cancel_snapshot || repetition.is_some();
+        let at_length = turn.payload.generated_tokens.len()
+            >= turn.payload.params.max_new_tokens.max(0) as usize;
+
+        let next_token = if !terminal && !at_length {
+            let _stream_context = StreamContext::new(turn.payload.generation_stream);
+            turn.payload.profiler.begin("forward");
+            let mut logits = match self.inner.run_paged_decode_step(
+                token_id,
+                self.inner.layers.len(),
+                &MxArray::from_int32(&[0], &[1])?,
+            ) {
+                Ok(logits) => logits,
+                Err(error) => return Ok(Self::fail(turn, row, error)),
+            };
+            logits = match logits.squeeze(Some(&[1])) {
+                Ok(logits) => logits,
+                Err(error) => return Ok(Self::fail(turn, row, error)),
+            };
+            turn.payload.profiler.end();
+            let (sampled, budget_forced) =
+                if turn.payload.reasoning_tracker.should_force_think_end() {
+                    let forced = match turn.payload.reasoning_tracker.forced_token_id() {
+                        Ok(token) => token as i32,
+                        Err(error) => return Ok(Self::fail(turn, row, error)),
+                    };
+                    (MxArray::from_int32(&[forced], &[1])?, true)
+                } else {
+                    turn.payload.profiler.begin("rep_penalty");
+                    let logits = match engine::penalties::apply_all_penalties(
+                        logits,
+                        &turn.token_history,
+                        &turn.payload.params,
+                    ) {
+                        Ok(logits) => logits,
+                        Err(error) => return Ok(Self::fail(turn, row, error)),
+                    };
+                    turn.payload.profiler.end();
+                    turn.payload.profiler.begin("sample");
+                    let sampled = match sample(&logits, turn.payload.params.sampling_config) {
+                        Ok(sampled) => sampled,
+                        Err(error) => return Ok(Self::fail(turn, row, error)),
+                    };
+                    turn.payload.profiler.end();
+                    (sampled, false)
+                };
+            turn.payload.profiler.begin("schedule_eval");
+            MxArray::async_eval_arrays(&[&sampled]);
+            turn.payload.profiler.end();
+            let _ = budget_forced;
+            sampled.eval();
+            match sampled.item_at_int32(0) {
+                Ok(token) => Some(token as u32),
+                Err(error) => return Ok(Self::fail(turn, row, error)),
+            }
+        } else {
+            None
+        };
+
+        turn.payload.profiler.mark_first_token();
+        let is_reasoning = turn.payload.reasoning_tracker.observe_token(token_id);
+        turn.payload.last_is_reasoning = is_reasoning;
+        if row.cancel_snapshot {
+            turn.payload.finish_reason = String::from("cancelled");
+        } else {
+            if turn.payload.response.sink().is_some() {
+                Self::stream_token(turn, token_id, is_reasoning);
+            }
+            if stops_at_eos {
+                turn.payload.finish_reason = String::from("stop");
+            } else if let Some(reason) = repetition {
+                turn.payload.finish_reason = reason.to_string();
+            }
+        }
+
+        let finished = terminal || at_length;
+        if finished
+            && at_length
+            && !terminal
+            && let Err(error) = self.inner.run_paged_decode_step(
+                token_id,
+                self.inner.layers.len(),
+                &MxArray::from_int32(&[0], &[1])?,
+            )
+        {
+            return Ok(Self::fail(turn, row, error));
+        }
+        if finished {
+            turn.payload.profiler.snapshot_memory_after();
+            turn.payload.profiler.report();
+        }
+        Ok(RowStepResult {
+            seq_id: row.seq_id,
+            num_computed_tokens: row.num_tokens,
+            generated_token: (!finished).then_some(next_token).flatten(),
+            finished,
+        })
+    }
+}
+
+impl StepExecutor<QwenScheduledTurn> for QwenStepExecutor<'_> {
+    type Error = std::convert::Infallible;
+
+    fn execute(
+        &mut self,
+        plan: &StepPlan,
+        running: &mut [TurnState<QwenScheduledTurn>],
+    ) -> std::result::Result<StepResult, Self::Error> {
+        let mut results = Vec::with_capacity(plan.rows.len());
+        for row in &plan.rows {
+            let turn = running
+                .iter_mut()
+                .find(|turn| turn.seq_id == row.seq_id)
+                .expect("scheduler validated running row");
+            let result = match row.kind {
+                StepKind::Prefill => self.execute_prefill(row, turn),
+                StepKind::Decode => self.execute_decode(row, turn),
+            }
+            .unwrap_or_else(|error| Self::fail(turn, row, error));
+            results.push(result);
+        }
+        Ok(StepResult { rows: results })
+    }
+}
+
+/// Qwen3's production scheduler-owned model-thread state. B5 deliberately
+/// caps the running set at one; B6 widens the exact same executor seam.
+pub(crate) struct QwenSchedulerState {
+    inner: Qwen3Inner,
+    scheduler: Scheduler<QwenScheduledTurn, Qwen3Cmd, Qwen3Cmd>,
+    pending: VecDeque<Qwen3Cmd>,
+}
+
+impl QwenSchedulerState {
+    pub(crate) fn new(inner: Qwen3Inner) -> Self {
+        Self {
+            inner,
+            scheduler: Scheduler::new(1, u32::MAX).expect("valid qwen3 scheduler limits"),
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn force_serial() -> bool {
+        std::env::var("MLX_SERVE_FORCE_SERIAL").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    }
+
+    fn reply_admission_error(response: ScheduledReply, cancelled: &AtomicBool, error: Error) {
+        response.send_error(error, cancelled);
+    }
+
+    fn admit_chat(&mut self, command: ChatCmd) -> Option<TurnState<QwenScheduledTurn>> {
+        let (messages, config, response, cancelled, turn_kind, guard_name, stream_guard_name) =
+            match command {
+                ChatCmd::SessionStart {
+                    messages,
+                    config,
+                    reply,
+                    cancelled,
+                } => (
+                    messages,
+                    config,
+                    ScheduledReply::Sync(reply),
+                    cancelled,
+                    engine::session::TurnKind::Start,
+                    "chat_session_start",
+                    None,
+                ),
+                ChatCmd::SessionContinue {
+                    messages,
+                    config,
+                    reply,
+                    cancelled,
+                } => (
+                    messages,
+                    config,
+                    ScheduledReply::Sync(reply),
+                    cancelled,
+                    engine::session::TurnKind::Continue,
+                    "chat_session_continue",
+                    None,
+                ),
+                ChatCmd::SessionContinueTool {
+                    messages,
+                    config,
+                    reply,
+                    cancelled,
+                } => (
+                    messages,
+                    config,
+                    ScheduledReply::Sync(reply),
+                    cancelled,
+                    engine::session::TurnKind::Continue,
+                    "chat_session_continue_tool",
+                    None,
+                ),
+                ChatCmd::StreamSessionStart {
+                    messages,
+                    config,
+                    stream_tx,
+                    cancelled,
+                } => (
+                    messages,
+                    config,
+                    ScheduledReply::Stream(stream_tx),
+                    cancelled,
+                    engine::session::TurnKind::Start,
+                    "chat_stream_session_start",
+                    Some("chat_stream_session_start"),
+                ),
+                ChatCmd::StreamSessionContinue {
+                    messages,
+                    config,
+                    stream_tx,
+                    cancelled,
+                } => (
+                    messages,
+                    config,
+                    ScheduledReply::Stream(stream_tx),
+                    cancelled,
+                    engine::session::TurnKind::Continue,
+                    "chat_stream_session_continue",
+                    Some("chat_stream_session_continue"),
+                ),
+                ChatCmd::StreamSessionContinueTool {
+                    messages,
+                    config,
+                    stream_tx,
+                    cancelled,
+                } => (
+                    messages,
+                    config,
+                    ScheduledReply::Stream(stream_tx),
+                    cancelled,
+                    engine::session::TurnKind::Continue,
+                    "chat_stream_session_continue_tool",
+                    Some("chat_stream_session_continue_tool"),
+                ),
+                ChatCmd::ResetCaches { reply } => {
+                    self.scheduler
+                        .enqueue_barrier(Qwen3Cmd::Chat(ChatCmd::ResetCaches { reply }));
+                    return None;
+                }
+            };
+
+        if cancelled.load(Ordering::Relaxed) {
+            let message = stream_guard_name.map_or_else(
+                || engine::session::CHAT_SESSION_CANCELLED.to_string(),
+                |name| format!("{name} cancelled before start"),
+            );
+            Self::reply_admission_error(response, cancelled.as_ref(), Error::from_reason(message));
+            return None;
+        }
+        if config.reuse_cache == Some(false) {
+            Self::reply_admission_error(
+                response,
+                cancelled.as_ref(),
+                Error::from_reason(format!(
+                    "{guard_name} requires reuse_cache=true (leave as None or set to true). The session API only makes sense with cache reuse enabled."
+                )),
+            );
+            return None;
+        }
+        if turn_kind == engine::session::TurnKind::Continue && !self.inner.has_live_session() {
+            Self::reply_admission_error(
+                response,
+                cancelled.as_ref(),
+                Error::from_reason(format!(
+                    "{guard_name} requires an initialized session (call chatSessionStart first)"
+                )),
+            );
+            return None;
+        }
+
+        self.inner
+            .set_turn_cancel_flag(Some(Arc::clone(&cancelled)));
+        let admitted =
+            match engine::session::admit_paged_turn(&mut self.inner, messages, config, turn_kind) {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    self.inner.set_turn_cancel_flag(None);
+                    Self::reply_admission_error(response, cancelled.as_ref(), error);
+                    return None;
+                }
+            };
+        if admitted.plan.path() != engine::plan::TurnPath::Paged {
+            self.inner.set_turn_cancel_flag(None);
+            Self::reply_admission_error(
+                response,
+                cancelled.as_ref(),
+                Error::from_reason("qwen3 scheduler admitted a non-paged turn"),
+            );
+            return None;
+        }
+        let reuse_cache = admitted.plan.is_delta || admitted.params.reuse_cache;
+        let generation_start = admitted.params.report_performance.then(Instant::now);
+        let prefix = match self
+            .inner
+            .prime_prefix_state(&admitted.tokens, reuse_cache, 0, &[], 0)
+        {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                self.inner.abort_paged_turn();
+                self.inner.set_turn_cancel_flag(None);
+                Self::reply_admission_error(response, cancelled.as_ref(), error);
+                return None;
+            }
+        };
+        if prefix.suffix_len == 0 {
+            self.inner.abort_paged_turn();
+            self.inner.set_turn_cancel_flag(None);
+            Self::reply_admission_error(
+                response,
+                cancelled.as_ref(),
+                Error::from_reason("scheduler admission produced an empty prefill suffix"),
+            );
+            return None;
+        }
+        let is_streaming = response.sink().is_some();
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let mut profiler = crate::decode_profiler::DecodeProfiler::new(
+            self.inner
+                .profiler_label(admitted.plan.is_delta, is_streaming),
+            self.inner.family_name(),
+        );
+        profiler.set_prompt_tokens(prefix.suffix_len as u32);
+        profiler.snapshot_memory_before();
+        let payload = QwenScheduledTurn {
+            tokenizer: admitted.tokenizer,
+            eos_id: admitted.eos_id,
+            config: admitted.config,
+            params: admitted.params,
+            thinking: admitted.thinking,
+            prompt_tokens: admitted.tokens.clone(),
+            reuse_cache,
+            response,
+            generated_tokens: Vec::new(),
+            finish_reason: String::from("length"),
+            reasoning_tracker: engine::penalties::ReasoningTracker::from_setup(
+                &admitted.thinking,
+                admitted.think_end_id,
+            ),
+            extra_eos_ids: self.inner.extra_eos_ids(),
+            generation_start,
+            first_token_instant: None,
+            generation_stream,
+            profiler,
+            emitter: is_streaming.then(|| self.inner.stream_emitter()),
+            stream_skip_special: self.inner.stream_skip_special_tokens(),
+            decode_ids: Vec::new(),
+            decode_prefix: String::new(),
+            decode_prefix_index: 0,
+            streamed_text_len: 0,
+            last_is_reasoning: admitted.thinking.enabled,
+            failure: None,
+            prefix,
+            is_delta: admitted.plan.is_delta,
+        };
+        let prompt_len = admitted.tokens.len() as u32;
+        Some(
+            TurnState::new(
+                0,
+                0,
+                admitted.tokens,
+                payload.prefix.effective_cached_prefix_len as u32,
+                vec![prompt_len],
+                Some(cancelled),
+                payload,
+            )
+            .expect("prime-derived qwen3 scheduler turn must satisfy progress invariants"),
+        )
+    }
+
+    fn finish_completed(&mut self, mut turn: TurnState<QwenScheduledTurn>) {
+        let cancelled = turn.cancelled.take().expect("qwen3 turn cancel flag");
+        if let Some(error) = turn.payload.failure.take() {
+            self.inner.abort_paged_turn();
+            self.inner.set_turn_cancel_flag(None);
+            turn.payload.response.send_error(error, cancelled.as_ref());
+            return;
+        }
+        let sink = turn.payload.response.sink();
+        let outcome = engine::paged_turn::finish_paged_turn(
+            &mut self.inner,
+            engine::paged_turn::FinishPagedTurnArgs {
+                tokenizer: &turn.payload.tokenizer,
+                params: &turn.payload.params,
+                config: &turn.payload.config,
+                thinking: turn.payload.thinking,
+                is_delta: turn.payload.is_delta,
+                reuse_cache: turn.payload.reuse_cache,
+                prompt_tokens: &turn.payload.prompt_tokens,
+                effective_cached_prefix_len: turn.payload.prefix.effective_cached_prefix_len,
+                suffix_len: turn.payload.prefix.suffix_len,
+                generated_tokens: &turn.payload.generated_tokens,
+                finish_reason: std::mem::take(&mut turn.payload.finish_reason),
+                generation_start: turn.payload.generation_start,
+                first_token_instant: turn.payload.first_token_instant,
+                reasoning_tokens: turn.payload.reasoning_tracker.reasoning_token_count(),
+                profiler: &turn.payload.profiler,
+                stream_skip_special: turn.payload.stream_skip_special,
+                streamed_text_len: turn.payload.streamed_text_len,
+                last_is_reasoning: turn.payload.last_is_reasoning,
+                sink,
+                emitter: turn.payload.emitter.take(),
+            },
+        );
+        self.inner.set_turn_cancel_flag(None);
+        match turn.payload.response {
+            ScheduledReply::Sync(reply) => {
+                let result = if cancelled.load(Ordering::Relaxed) {
+                    Err(Error::from_reason(engine::session::CHAT_SESSION_CANCELLED))
+                } else {
+                    match outcome {
+                        Ok(TurnOutput::Complete(result)) => Ok(*result),
+                        Ok(TurnOutput::Streamed) => Err(Error::from_reason(
+                            "scheduler returned streamed output on sync turn",
+                        )),
+                        Err(error) => Err(error),
+                    }
+                };
+                let _ = reply.send(result);
+            }
+            ScheduledReply::Stream(stream) => {
+                if let Err(error) = outcome {
+                    ChunkSink::send(&stream, Err(error));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn drive(
+        &mut self,
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<Qwen3Cmd>,
+    ) -> LoopControl {
+        if !self.scheduler.has_work() && self.pending.is_empty() {
+            match receiver.blocking_recv() {
+                Some(command) => self.pending.push_back(command),
+                None => return LoopControl::Break,
+            }
+        }
+        while let Ok(command) = receiver.try_recv() {
+            self.pending.push_back(command);
+        }
+
+        if !self.scheduler.has_work()
+            && let Some(command) = self.pending.pop_front()
+        {
+            if Self::force_serial() {
+                self.scheduler.enqueue_exclusive(command);
+            } else {
+                match command {
+                    Qwen3Cmd::Chat(chat) => {
+                        if self.inner.paged_adapter.is_none() {
+                            self.scheduler.enqueue_exclusive(Qwen3Cmd::Chat(chat));
+                        } else if let Some(turn) = self.admit_chat(chat)
+                            && let Err(error) = self.scheduler.enqueue_turn(turn)
+                        {
+                            tracing::error!("qwen3 scheduler admission failed: {error}");
+                        }
+                    }
+                    barrier => self.scheduler.enqueue_barrier(barrier),
+                }
+            }
+        }
+
+        let mut executor = QwenStepExecutor {
+            inner: &mut self.inner,
+        };
+        match self.scheduler.drive_once(&mut executor) {
+            Ok(SchedulerAction::Idle) => {}
+            Ok(SchedulerAction::Exclusive(command) | SchedulerAction::Barrier(command)) => {
+                handle_qwen3_cmd(&mut self.inner, command);
+            }
+            Ok(SchedulerAction::Stepped { completed, .. }) => {
+                for turn in completed {
+                    self.finish_completed(turn);
+                }
+            }
+            Err(error) => panic!("qwen3 scheduler invariant failure: {error:?}"),
+        }
+        LoopControl::Continue
     }
 }
 

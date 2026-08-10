@@ -23,7 +23,7 @@ use crate::engine::persistence::prewarm_checkpoint_pages;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::load_safetensors_lazy;
 
-use super::model::{Qwen3Cmd, Qwen3Inner, handle_qwen3_cmd};
+use super::model::{Qwen3Cmd, Qwen3Inner, QwenSchedulerState, handle_qwen3_cmd};
 use super::{Qwen3Config, Qwen3Model};
 
 /// Validate that all required parameters were loaded with correct shapes
@@ -574,7 +574,7 @@ pub(crate) fn load_inner_for_test(model_path: &Path) -> Result<Qwen3Inner> {
 pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
     let model_path = model_path.to_string();
 
-    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
         move || {
             let path = Path::new(&model_path);
 
@@ -760,11 +760,11 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
             let tokenizer_out = Some(Arc::new(tokenizer));
 
             Ok((
-                inner,
+                QwenSchedulerState::new(inner),
                 (config_out, tokenizer_out, cache_limit_guard, paged_active),
             ))
         },
-        handle_qwen3_cmd,
+        |state, receiver| state.drive(receiver),
     );
 
     let (config, tokenizer, cache_limit_guard, paged_active) = init_rx
