@@ -445,7 +445,38 @@ green under an injected `+1` on the final norm is not a gate.
 | M5 | `mlx convert` recipe | quantized vs bf16 quality check |
 
 M0 first is deliberate: it needs no GPU, it unblocks every later test's prompt path, and
-it is where the one hard error lives.
+it is where the one hard error lives. It found two more (traps 13 and 14).
+
+### M1 requirements discovered while building M0
+
+These are not optional polish. Each came out of an adversarial round on M0 code and cannot
+be settled inside M0.
+
+- **The tool dispatcher must validate a call name against the declared tools.** The parser
+  recognises a tool call only where the recipient is a tool channel — neither `self` nor
+  `user` — which is what stops an assistant explaining ATEM syntax to a human from
+  producing a real, side-effectful call. But a recipient that merely *resembles* an answer
+  channel (`to=selfish`, `to=userX`) is literally neither, so it routes to the action side.
+  The protocol-derived alternative, requiring `recipient == invoke name` because the
+  template always renders `to=<tc.function.name>`, may conflict with the checkpoint spec's
+  `repeats: true` on `tool_calls`. So the last line of defence belongs at dispatch, where
+  the declared tool list exists.
+- **`StreamGuard::push(chunk, tokens)` takes the decoded token count from the caller.**
+  Inferring it from decoded character length was wrong, not merely imprecise: this
+  checkpoint's vocabulary holds 74 tokens longer than the old 64-character assumption,
+  including id 169871 at 113 characters and id 162250 at 112, and the guard truncated a
+  legitimate 560-character answer to 448. M1 decodes the tokens, so M1 must pass the count.
+  There is deliberately no one-argument overload.
+- **Verify `MAX_HEADER_CHARS` against the real recipient names.** It is 128, unverified; a
+  recipient over roughly 106 characters ends the turn. The rendered `# Valid recipients:`
+  list is where to check.
+- **Wire the session-pinned render options into the production chat path.** M0 pins
+  `current_date` only through the render entry point the golden tests use; the 4-argument
+  `apply_chat_template_sync` still cannot supply it.
+- **`ChatMessage` cannot carry `recipient` or `end_turn`.** The template reads both via
+  `.get`, so multi-part assistant turns and non-`user` recipients cannot be replayed. Both
+  fields would change the `#[napi(object)]` surface, so they are an M1 decision.
+- **The whole TypeScript registry surface lands here, in one commit** — see §6.
 
 ### Notes on M3 and M5
 
