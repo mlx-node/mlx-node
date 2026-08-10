@@ -63,33 +63,61 @@
 //! partial marker first: the tail is by definition the ambiguous part, and a
 //! turn that stops mid-marker must not publish the fragment.
 //!
-//! # Every bound is measured on the thing it names
+//! # The guard consumes token **ids**, and decodes them itself
 //!
-//! `max_tokens` is counted in tokens, from `tokens.len()` of the slice passed to
-//! [`StreamGuard::push`] — **derived from the data, not reported alongside it**.
-//! Two earlier shapes both failed here. Inferring the count from decoded text was
-//! a guess and the guess was wrong: 64 characters per token, while 70 tokens in
-//! this checkpoint decode to more than that, the longest to 113 — so an honest
-//! eight-token turn using them was cut off. Trusting a `tokens: usize` argument
-//! then let a caller label a 1 MiB chunk "1 token", and two of those streamed
-//! 2,097,152 characters under a cap of two. One slice entry per token is the only
-//! shape where the cap counts what it says.
+//! [`StreamGuard::push_id`] takes one sampled token id and charges exactly one
+//! token, because a token id **is** one token by construction. Three earlier
+//! shapes all failed, each in the same way — they asked the caller how many
+//! tokens some text was worth:
 //!
-//! The cap is also checked **before** the batch is buffered, and a batch that
-//! straddles it is split there, so text past `max_tokens` reaches neither a delta
-//! nor [`StreamGuard::flush`].
+//!   * inferring the count from decoded text was a guess, and the guess was wrong:
+//!     64 characters per token, while 70 tokens in this checkpoint decode to more
+//!     than that, the longest to 113, so an honest eight-token turn was cut off;
+//!   * trusting a `tokens: usize` argument let a caller label a 1 MiB chunk
+//!     "1 token", and two of those streamed 2,097,152 characters under a cap of 2;
+//!   * `push(&[&str])`, one slice entry per token, still let the caller draw the
+//!     boundaries: four separate `a` tokens collapse into the single entry
+//!     `"aaaa"`, and seven logical tokens went through under a cap of four.
 //!
-//! The header region — the one thing never released and never dropped, because the
-//! whole of it is needed to route — is bounded by `header_allowance`, **derived in
+//! A decoded string cannot carry its own token boundary, so there is no longer a
+//! way to hand this type text. `push_ids` is **implemented as repeated
+//! `push_id`**, which makes a batch/scalar divergence impossible rather than
+//! tested-against — the previous per-call buffer bound rejected a 9,280-token
+//! batch that the same ids passed one at a time streamed in full.
+//!
+//! # Bounds are enforced incrementally, never per call
+//!
+//! No legal token sequence may become an [`GuardOutcome::EndTurn`] because of how
+//! the caller grouped it. Every bound is therefore cumulative over the turn:
+//! `max_tokens` counts ids, [`MAX_TURN_CHARS`] counts retained characters, and the
+//! header region is bounded by `header_allowance` — **derived in
 //! [`StreamGuard::new`] from the longest recipient the caller declares**, not by a
 //! fixed number. A fixed 128 was the same mistake as the 64: this checkpoint's
 //! template admits tool names long enough to push an anchored header past it, so
 //! the bound rejected legal output. [`ABSOLUTE_MAX_HEADER_CHARS`] is the separate
-//! memory bound behind it. The limit is measured on the **region**, not on the
-//! buffer, so it cannot depend on how the caller chunks.
-//! [`MAX_TOKEN_CHARS`] and [`MAX_CHUNK_CHARS`] bound the buffer: `pending` only
-//! ever grows by an accepted batch, and everything else is bounded by
-//! `HOLD_BACK_CHARS` or the header allowance.
+//! memory bound behind it, and the header limit is measured on the **region**, not
+//! on the buffer, so it cannot depend on chunking either.
+//!
+//! # Provenance for the parser
+//!
+//! Because the guard sees ids, it knows which `<|…|>` characters were a real
+//! control token and which the model merely typed. It accumulates the turn's raw
+//! text and the byte spans of the control tokens it decoded, and
+//! [`StreamGuard::raw_turn`] hands both to
+//! [`super::output_parser::GeneratedTurn::from_token_spans`]. That distinction is
+//! the whole point: `<|eot|>` from token 200008 and `<|eot|>` typed as seven
+//! characters are the same bytes, and a quoted terminator was authorising real
+//! tool calls.
+//!
+//! Spans are recorded only for ids that [`StreamGuard::new`] resolved to a control
+//! literal through the tokenizer, so a span is never guessed. Omitting one costs
+//! only recognition; inventing one re-opens the bypass.
+
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::Arc;
+
+use tokenizers::Tokenizer;
 
 /// Held-back tail, in characters. Must be at least the longest entry of
 /// [`MARKER_LITERALS`] (currently `</atem:function_calls>` and
@@ -129,20 +157,24 @@ const BUILTIN_RECIPIENT_CHARS: usize = 4;
 /// protocol limit.
 const ABSOLUTE_MAX_HEADER_CHARS: usize = 4096;
 
-/// Longest decoded text one token of this checkpoint can produce, rounded up from
-/// the measured 113 (id 169871). Its purpose is to tell a real token from a
-/// caller batching many tokens behind a slice of length one — the way a token cap
-/// gets defeated. Derived, not asserted: the `#[ignore]`d
-/// `checkpoint_tokens_decode_within_the_per_token_bound` decodes every id in the
-/// real vocabulary and fails if any exceeds this, or if the longest ever drops
-/// back under 64 (the value an earlier round guessed and got wrong).
-const MAX_TOKEN_CHARS: usize = 128;
+/// Absolute bound on the characters one turn may retain, counted **cumulatively
+/// across the turn**, not per call — a bound measured per call is exactly what let
+/// a 9,280-token batch end the turn while the same ids one at a time streamed in
+/// full.
+///
+/// `max_tokens` is the primary bound; this is the memory backstop for a caller
+/// that sets `max_tokens` very high, since the retained turn text grows with every
+/// accepted token. 4 MiB is roughly 37,000 of this checkpoint's longest tokens.
+const MAX_TURN_CHARS: usize = 1 << 22;
 
-/// Second line of defence on the buffer, in characters per push. The per-token
-/// bound above already limits a push to `remaining_tokens * MAX_TOKEN_CHARS`; this
-/// keeps a very large `max_tokens` from turning one honest batch into a very large
-/// allocation.
-const MAX_CHUNK_CHARS: usize = 1 << 20;
+/// The control markers whose *provenance* the parser needs: the ones the
+/// tokenizer renders from a single special-token id, so "the model emitted the
+/// marker" and "the model typed those characters" are distinguishable.
+///
+/// The `<atem:*>` literals are deliberately absent — the template writes them as
+/// ordinary characters, so there is no id for them to have provenance from, and
+/// claiming one would be inventing a span.
+const CONTROL_MARKERS: &[&str] = &[MSG, START, EOM, EOT, EOS];
 
 /// Closes the routing header; anywhere else it is a marker the model must not
 /// be able to put into a content delta.
@@ -216,20 +248,34 @@ enum State {
     InMessage { channel: Channel, xml: bool },
 }
 
-/// Guards one assistant turn's raw text stream.
+/// Guards one assistant turn's token stream.
 ///
-/// Feed every decoded chunk to [`Self::push`] in order and call [`Self::flush`]
-/// once when the turn ends. One guard per turn; it is not resettable.
-#[derive(Debug)]
+/// Feed every sampled token id to [`Self::push_id`] in order, call [`Self::flush`]
+/// once when the turn ends, then read [`Self::raw_turn`] for the parser. One guard
+/// per turn; it is not resettable, and the retained turn text lives as long as it
+/// does.
 pub struct StreamGuard {
+    /// Decodes ids and identifies the control ones. Shared because a turn is
+    /// short-lived and the tokenizer is not.
+    tokenizer: Arc<Tokenizer>,
+    /// The ids that render a control marker, resolved through the tokenizer in
+    /// [`Self::new`]. A span is recorded only for these, so it can never be a
+    /// guess — see [`Self::raw_turn`].
+    control_ids: HashMap<u32, &'static str>,
     state: State,
     /// Stream text that is not yet unambiguous. In `AwaitingHeader` this is the
     /// whole header; in `InMessage` it is at most `HOLD_BACK_CHARS` characters
-    /// plus the current chunk.
+    /// plus the token just pushed.
     pending: String,
     /// Content that is unambiguous but not yet handed back, because the push
     /// that resolved it ended the turn.
     ready: String,
+    /// Every character this turn decoded, in order, including headers, markers,
+    /// reasoning and tool bodies. This is the parser's input, not the caller's.
+    raw: String,
+    /// Byte ranges in `raw` covering the control markers, in push order — which is
+    /// ascending and non-overlapping because `raw` only ever grows at the end.
+    control_spans: Vec<Range<usize>>,
     max_messages: usize,
     max_tokens: usize,
     /// `ANCHORED_HEADER_PREFIX` plus the longest recipient the caller declared,
@@ -237,13 +283,34 @@ pub struct StreamGuard {
     /// scan never consults a constant that the real tool list can exceed.
     header_allowance: usize,
     messages: usize,
-    /// Counted from the number of per-token pieces handed to [`Self::push`], which
-    /// is data the guard can see rather than a number it has to believe.
+    /// One per id accepted by [`Self::push_id`]. Not a number the caller supplies:
+    /// three earlier shapes all let the caller decide what counted as a token.
     tokens: usize,
     ended: bool,
 }
 
+impl std::fmt::Debug for StreamGuard {
+    /// Hand-written because `Tokenizer` is not `Debug`, and because dumping the
+    /// whole retained turn into a panic message is not useful.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamGuard")
+            .field("state", &self.state)
+            .field("pending", &self.pending)
+            .field("ready", &self.ready)
+            .field("raw_len", &self.raw.len())
+            .field("control_spans", &self.control_spans.len())
+            .field("messages", &self.messages)
+            .field("tokens", &self.tokens)
+            .field("ended", &self.ended)
+            .finish()
+    }
+}
+
 impl StreamGuard {
+    /// `tokenizer` is the checkpoint's own, because the guard decodes ids itself:
+    /// that is the only way a token count can mean tokens, and the only way a
+    /// control marker can be told from the same characters typed out.
+    ///
     /// `max_recipient_chars` is the longest `to=` value this turn can legitimately
     /// produce: the longest **configured tool name**, which the caller knows
     /// because it rendered the tool list. It is raised to
@@ -256,7 +323,12 @@ impl StreamGuard {
     /// a 129-character anchored header, which that constant refused — and refused
     /// only *after* reasoning, since the bare form was 18 characters shorter, so
     /// the same tool worked in a turn's first message and not in its second.
-    pub fn new(max_messages: usize, max_tokens: usize, max_recipient_chars: usize) -> Self {
+    pub fn new(
+        tokenizer: Arc<Tokenizer>,
+        max_messages: usize,
+        max_tokens: usize,
+        max_recipient_chars: usize,
+    ) -> Self {
         // The anchored prefix is the longer of the two, so one allowance covers a
         // bare header as well, with 18 characters of slack the byte-exact grammar
         // gives nowhere to hide.
@@ -265,10 +337,21 @@ impl StreamGuard {
             .count()
             .saturating_add(max_recipient_chars.max(BUILTIN_RECIPIENT_CHARS))
             .min(ABSOLUTE_MAX_HEADER_CHARS);
+        // Resolved once, through the tokenizer, so provenance is a lookup rather
+        // than a judgement. A marker this checkpoint does not have simply gets no
+        // spans — omitting a span costs recognition, inventing one costs safety.
+        let control_ids = CONTROL_MARKERS
+            .iter()
+            .filter_map(|marker| tokenizer.token_to_id(marker).map(|id| (id, *marker)))
+            .collect();
         Self {
+            tokenizer,
+            control_ids,
             state: State::AwaitingHeader,
             pending: String::new(),
             ready: String::new(),
+            raw: String::new(),
+            control_spans: Vec::new(),
             max_messages,
             max_tokens,
             header_allowance,
@@ -278,73 +361,66 @@ impl StreamGuard {
         }
     }
 
-    /// Consumes one decoded token. The ordinary path: every decode loop in this
-    /// crate emits one token at a time.
-    pub fn push_token(&mut self, token: &str) -> GuardOutcome {
-        self.push(&[token])
-    }
-
-    /// Consumes a batch of decoded tokens, **one slice entry per token**.
+    /// Consumes one sampled token id. **The canonical entry point** — every decode
+    /// loop in this crate already produces exactly this, one `u32` at a time
+    /// (`engine/decode.rs:245`, `engine/mtp_turn.rs:1446`).
     ///
-    /// The count is `tokens.len()`, derived from the data rather than reported
-    /// alongside it. That is the whole point of the shape: the version that took a
-    /// `tokens: usize` let a caller hand over a 1 MiB chunk labelled "1 token",
-    /// and two of those streamed 2,097,152 characters under a cap of two. An entry
-    /// longer than [`MAX_TOKEN_CHARS`] is not one token of this checkpoint, so it
-    /// ends the turn.
+    /// Charges exactly one token, always, because an id is one token by
+    /// construction. There is no way to make it charge fewer: the three previous
+    /// shapes all asked the caller how many tokens some *text* was worth, and each
+    /// was defeated in turn — most recently by collapsing four separate `a` tokens
+    /// into the single slice entry `"aaaa"`, which let seven logical tokens through
+    /// a cap of four.
     ///
-    /// The remaining allowance is checked **before** anything is buffered or
-    /// scanned. A batch that straddles the cap is split: the tokens within the
-    /// allowance are processed normally, everything past it is discarded and the
-    /// turn ends. So text beyond `max_tokens` reaches neither a delta nor
-    /// [`Self::flush`] — the previous version scanned first and its own test
-    /// pinned the cap-tripping chunk as published, which was wrong.
+    /// The allowance is checked before the id is decoded, so a token past
+    /// `max_tokens` reaches neither a delta nor [`Self::flush`], and is not
+    /// retained for the parser either.
     ///
     /// `EndTurn` is sticky: once returned, every later push returns it too, so
     /// a caller that misses the first one cannot restart a self-played turn.
-    pub fn push(&mut self, tokens: &[&str]) -> GuardOutcome {
+    pub fn push_id(&mut self, id: u32) -> GuardOutcome {
         if self.ended {
             return GuardOutcome::EndTurn;
         }
-        // Allowance first, before a single character is buffered. Everything past
-        // the cap must never exist as far as the rest of this type is concerned.
-        let remaining = self.max_tokens.saturating_sub(self.tokens);
-        let over_cap = tokens.len() > remaining;
-        let allowed = if over_cap {
-            &tokens[..remaining]
-        } else {
-            tokens
+        // Cap first, before anything is decoded or retained.
+        if self.tokens >= self.max_tokens {
+            self.ended = true;
+            return GuardOutcome::EndTurn;
+        }
+        // An id this vocabulary does not contain is not something to guess about.
+        // This is the reachable fail-closed gate: `Tokenizer::decode` *drops*
+        // unknown ids rather than failing, so without this an out-of-range id would
+        // silently charge a token and contribute nothing (measured: `decode` of an
+        // id past the vocabulary returns `Ok("")`).
+        if self.tokenizer.id_to_token(id).is_none() {
+            self.stop();
+            return GuardOutcome::EndTurn;
+        }
+        // `skip_special_tokens = false`: a control marker's characters are text the
+        // guard has to see.
+        let Ok(piece) = self.tokenizer.decode(&[id], false) else {
+            self.stop();
+            return GuardOutcome::EndTurn;
         };
-
-        // One entry is one token. An entry that cannot be is a caller batching
-        // behind a short slice, which is how the previous cap was defeated.
-        if allowed
-            .iter()
-            .any(|token| token.chars().count() > MAX_TOKEN_CHARS)
-        {
-            self.stop();
-            return GuardOutcome::EndTurn;
-        }
-        let chars: usize = allowed.iter().map(|token| token.chars().count()).sum();
-        if chars > MAX_CHUNK_CHARS {
+        // Cumulative, never per call, so no legal token sequence can end a turn
+        // because of how the caller grouped it.
+        if self.raw.len().saturating_add(piece.len()) > MAX_TURN_CHARS {
             self.stop();
             return GuardOutcome::EndTurn;
         }
 
-        self.tokens += allowed.len();
-        for token in allowed {
-            self.pending.push_str(token);
+        self.tokens += 1;
+        let at = self.raw.len();
+        self.raw.push_str(&piece);
+        if self.control_ids.contains_key(&id) {
+            // `raw` only grows at the end, so pushing in arrival order keeps the
+            // spans sorted and non-overlapping, which is what the parser asserts.
+            self.control_spans.push(at..self.raw.len());
         }
+        self.pending.push_str(&piece);
+
         self.scan();
         if self.ended {
-            return GuardOutcome::EndTurn;
-        }
-        // `over_cap` means tokens were discarded above, so the turn is finished.
-        // `ready` is kept: content produced within the allowance is legitimate and
-        // `flush` still hands it back. What was dropped never entered `pending`,
-        // so it cannot reach either.
-        if over_cap {
-            self.ended = true;
             return GuardOutcome::EndTurn;
         }
         let mut out = std::mem::take(&mut self.ready);
@@ -354,6 +430,71 @@ impl StreamGuard {
         } else {
             GuardOutcome::Emit(out)
         }
+    }
+
+    /// Consumes a batch of sampled token ids, **as repeated [`Self::push_id`]**.
+    ///
+    /// Implemented as a loop over the scalar path on purpose: batch behaviour
+    /// cannot diverge from scalar behaviour because it *is* scalar behaviour. The
+    /// version this replaces had a per-call buffer bound, which rejected a
+    /// 9,280-token batch whose ids one at a time streamed 1,048,640 characters in
+    /// full — a legal sequence turned illegal by grouping.
+    ///
+    /// Returns the **first terminal outcome** if one occurs, so the caller stops
+    /// decoding at the same id it would have stopped at scalar; otherwise the last
+    /// outcome. Content released before that point is not lost: it is put back at
+    /// the front of the pending release so [`Self::flush`] returns it, which keeps
+    /// *deltas-concatenated-plus-flush* byte-identical between the two paths. Only
+    /// the delta boundaries differ, and they must, because a batch is one call.
+    pub fn push_ids(&mut self, ids: &[u32]) -> GuardOutcome {
+        // Stickiness has to be checked here as well as in `push_id`, because an
+        // EMPTY batch never reaches the scalar path. The two-chunk cut sweep found
+        // that: at cut n/n the tail is empty, and an ended guard answered `Hold`,
+        // which tells the caller to keep decoding.
+        if self.ended {
+            return GuardOutcome::EndTurn;
+        }
+        let mut emitted = String::new();
+        for &id in ids {
+            match self.push_id(id) {
+                GuardOutcome::Emit(text) => emitted.push_str(&text),
+                GuardOutcome::Hold => {}
+                GuardOutcome::EndTurn => {
+                    self.prepend_ready(emitted);
+                    return GuardOutcome::EndTurn;
+                }
+            }
+        }
+        if emitted.is_empty() {
+            GuardOutcome::Hold
+        } else {
+            GuardOutcome::Emit(emitted)
+        }
+    }
+
+    /// Puts already-released content back in front of whatever the turn's final
+    /// scan resolved, so `flush` hands it all back in stream order.
+    fn prepend_ready(&mut self, mut earlier: String) {
+        if earlier.is_empty() {
+            return;
+        }
+        earlier.push_str(&self.ready);
+        self.ready = earlier;
+    }
+
+    /// The turn's raw text and the byte spans of the control markers in it, ready
+    /// for [`super::output_parser::GeneratedTurn::from_token_spans`].
+    ///
+    /// Offsets are **byte offsets from the start of this turn's decoded text** —
+    /// that is, into the `&str` returned here, whose first byte is the first byte
+    /// the model produced for this turn. If a caller ever re-slices this text from
+    /// a non-zero offset, it must rebase the spans by the same amount.
+    ///
+    /// A span appears only where a decoded id was resolved to a control literal in
+    /// [`Self::new`]. Characters the model merely *typed* get none, which is the
+    /// distinction the parser gates its terminators on.
+    pub fn raw_turn(&self) -> (&str, &[Range<usize>]) {
+        (&self.raw, &self.control_spans)
     }
 
     /// Drains everything releasable at end of turn: resolved content, plus the
@@ -666,39 +807,218 @@ mod tests {
     /// the long names the header-limit tests attack with — those declare their own.
     const TEST_RECIPIENT_CHARS: usize = 16;
 
-    /// Feeds `text` as ONE push, split into one slice entry per character.
+    /// Non-ASCII characters the fixtures use. Everything from `\t` to `~` is in the
+    /// synthetic vocabulary too; a character missing from both panics by name in
+    /// [`char_ids`], which is the failure mode you want when adding a fixture.
+    const EXTRA_VOCAB_CHARS: &str = "日天気を調べます。\u{1f324}\u{fe0f}\u{1f600}\u{a0}";
+
+    /// Multi-character pieces the fixtures hand over as **single** tokens, the way
+    /// a real BPE vocabulary would.
+    const TEST_PIECES: &[&str] = &[
+        " to=",
+        " to=user",
+        " to=self",
+        "user",
+        "self",
+        "answer",
+        "keep",
+        "word ",
+        "MORE",
+        "AFTER_THE_CAP",
+    ];
+
+    /// A synthetic token that decodes to 113 characters, standing in for the real
+    /// checkpoint's id 169871. `checkpoint_batch_and_scalar_agree_on_a_real_long_token`
+    /// runs the same case against the real id.
+    const LONG_113: &str = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+    /// 112 hyphens: the real id 162250's decoded text, byte for byte.
+    const LONG_112: &str = "----------------------------------------------------------------------------------------------------------------";
+
+    /// Two pieces that carry a complete control marker **plus other text inside one
+    /// token**. The real checkpoint cannot produce them — its markers are added
+    /// special tokens, which the `#[ignore]`d pin asserts — but the guard must not
+    /// *depend* on markers arriving alone, and with one scan per token that is the
+    /// only remaining way for a marker and its neighbours to land together.
     ///
-    /// One call means one scan, which is what makes the whole-chunk order
-    /// load-bearing; one entry per character means the token count is honest
-    /// (and maximally strict), so no test can accidentally depend on a batch
-    /// being counted as a single token — the hole codex found in round 3.
-    fn push_text(g: &mut StreamGuard, text: &str) -> GuardOutcome {
-        let owned: Vec<String> = text.chars().map(|c| c.to_string()).collect();
-        let tokens: Vec<&str> = owned.iter().map(String::as_str).collect();
-        g.push(&tokens)
+    /// Without these, `M27_stop_keeps_the_buffer` and
+    /// `M31_header_limit_only_when_incomplete` both survive: every other fixture
+    /// delivers a terminator with nothing behind it and a header that is
+    /// re-validated at every token, so the discard in `stop` and the unconditional
+    /// header check are never the thing that saves the turn.
+    fn merged_terminator() -> String {
+        format!("{EOT}LEAKED_AFTER_TERMINATOR")
+    }
+    fn merged_header() -> String {
+        format!("{BARE_HEADER_PREFIX}{}{MSG}", "q".repeat(200))
     }
 
-    /// Pushes `text` one character at a time — the worst case for a marker
-    /// split — and returns everything emitted, then everything flushed.
+    /// The tokenizer the default-gate tests run against: a `WordLevel` model with no
+    /// decoder, so `decode(&[id], false)` returns that id's piece exactly, plus the
+    /// five control markers as real **special** tokens.
+    ///
+    /// Synthetic because the guard now needs a tokenizer and CI has no checkpoint —
+    /// 59.5 GB never reaches it. The `#[ignore]`d checkpoint tests run the same
+    /// properties against the real vocabulary.
+    fn test_tokenizer() -> Arc<Tokenizer> {
+        static TOKENIZER: std::sync::OnceLock<Arc<Tokenizer>> = std::sync::OnceLock::new();
+        TOKENIZER
+            .get_or_init(|| {
+                let mut vocab = serde_json::Map::new();
+                let mut next = 0u32;
+                let add =
+                    |piece: String, vocab: &mut serde_json::Map<String, _>, next: &mut u32| {
+                        if !vocab.contains_key(&piece) {
+                            vocab.insert(piece, serde_json::json!(*next));
+                            *next += 1;
+                        }
+                    };
+                add("<unk>".to_string(), &mut vocab, &mut next);
+                for ch in ('\t'..='~').chain(EXTRA_VOCAB_CHARS.chars()) {
+                    add(ch.to_string(), &mut vocab, &mut next);
+                }
+                for piece in TEST_PIECES {
+                    add((*piece).to_string(), &mut vocab, &mut next);
+                }
+                for piece in [
+                    LONG_113.to_string(),
+                    LONG_112.to_string(),
+                    merged_terminator(),
+                    merged_header(),
+                ] {
+                    add(piece, &mut vocab, &mut next);
+                }
+                // The control markers, both in the model vocabulary (so the ids are
+                // ours to choose) and in `added_tokens` with `special: true`.
+                let mut added = Vec::new();
+                for marker in CONTROL_MARKERS {
+                    let id = next;
+                    add((*marker).to_string(), &mut vocab, &mut next);
+                    added.push(serde_json::json!({
+                        "id": id,
+                        "content": marker,
+                        "single_word": false,
+                        "lstrip": false,
+                        "rstrip": false,
+                        "normalized": false,
+                        "special": true,
+                    }));
+                }
+                let spec = serde_json::json!({
+                    "version": "1.0",
+                    "truncation": null,
+                    "padding": null,
+                    "added_tokens": added,
+                    "normalizer": null,
+                    "pre_tokenizer": null,
+                    "post_processor": null,
+                    // No decoder, so a single id decodes to its piece verbatim.
+                    "decoder": null,
+                    "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "<unk>" },
+                });
+                let tok: Tokenizer = spec
+                    .to_string()
+                    .parse()
+                    .expect("the synthetic tokenizer spec is valid");
+                Arc::new(tok)
+            })
+            .clone()
+    }
+
+    /// The id of one exact piece. Panics by name if it is not in the synthetic
+    /// vocabulary, so a fixture cannot silently become `<unk>`.
+    fn id_of(piece: &str) -> u32 {
+        test_tokenizer()
+            .token_to_id(piece)
+            .unwrap_or_else(|| panic!("add {piece:?} to the synthetic test vocabulary"))
+    }
+
+    /// `text` as one id per **character**, control markers included. This is how a
+    /// model *types* `<|eot|>` rather than emitting it: same bytes, no provenance.
+    fn char_ids(text: &str) -> Vec<u32> {
+        text.chars().map(|c| id_of(&c.to_string())).collect()
+    }
+
+    /// `text` as a real tokenizer would render it: **longest vocabulary match at
+    /// each position**, so a control marker is its own special id and ` to=user` is
+    /// one multi-character token, exactly as the real checkpoint encodes it (its
+    /// ` to=user` is two ids, not eight).
+    ///
+    /// Emitting one character per id here — which an earlier draft did — hid a real
+    /// mutation: with the header region growing one character at a time it is
+    /// re-validated at every character, so a laxer `classify_header` never gets to
+    /// see a region longer than a byte-prefix and `M3_accept_any_role` survived.
+    /// Real tokens jump several characters at once, and that is where header
+    /// validation has to hold.
+    fn ids_for(text: &str) -> Vec<u32> {
+        static PIECES: std::sync::OnceLock<Vec<(String, u32)>> = std::sync::OnceLock::new();
+        let pieces = PIECES.get_or_init(|| {
+            let mut all: Vec<(String, u32)> =
+                test_tokenizer().get_vocab(true).into_iter().collect();
+            // Longest first, so the match at each position is the longest one.
+            all.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+            all
+        });
+        let mut out = Vec::new();
+        let mut rest = text;
+        while !rest.is_empty() {
+            let (piece, id) = pieces
+                .iter()
+                .find(|(piece, _)| rest.starts_with(piece.as_str()))
+                .unwrap_or_else(|| panic!("no vocabulary piece matches {rest:.16?}"));
+            out.push(*id);
+            rest = &rest[piece.len()..];
+        }
+        out
+    }
+
+    /// A guard over the synthetic tokenizer.
+    fn guard(max_messages: usize, max_tokens: usize, max_recipient_chars: usize) -> StreamGuard {
+        StreamGuard::new(
+            test_tokenizer(),
+            max_messages,
+            max_tokens,
+            max_recipient_chars,
+        )
+    }
+
+    /// Feeds `text` as ONE `push_ids` call, tokenized the way the model would.
+    fn push_text(g: &mut StreamGuard, text: &str) -> GuardOutcome {
+        g.push_ids(&ids_for(text))
+    }
+
+    /// Pushes `text` one id at a time and returns everything emitted.
     fn drain_char_by_char(g: &mut StreamGuard, text: &str) -> String {
         let mut emitted = String::new();
-        for ch in text.chars() {
-            if let GuardOutcome::Emit(s) = g.push_token(&ch.to_string()) {
+        for id in ids_for(text) {
+            if let GuardOutcome::Emit(s) = g.push_id(id) {
                 emitted.push_str(&s);
             }
         }
         emitted
     }
 
-    /// Runs `text` through a fresh guard as ONE chunk, then again one character
-    /// at a time, returning `(label, emitted, flushed, last_outcome)` for each.
+    /// The two ways the fixtures encode a turn, both of which every attack is run
+    /// through: `ids_for` renders each control marker as its own special id, the
+    /// way the model emits it; `char_ids` renders everything one character per id,
+    /// the way the model would have to *type* a marker.
     ///
-    /// Both orders are load-bearing. A whole chunk is what a batching or
-    /// speculative-decode caller produces, and it is the only order in which a
-    /// terminator and the text behind it arrive together; character by character
-    /// is where a marker splits and where the header grows one impossible
-    /// character at a time. Every attack in this module was confirmed in both.
-    fn both_feed_orders(text: &str) -> [(&'static str, String, String, GuardOutcome); 2] {
+    /// Keeping both matters. `ids_for` is the real stream and the one whose
+    /// provenance the parser trusts; `char_ids` is where a marker splits across
+    /// token boundaries, which is what the hold-back exists for and what every
+    /// leak in rounds 0-2 needed.
+    fn both_encodings(text: &str) -> [(&'static str, Vec<u32>); 2] {
+        [("tokenized", ids_for(text)), ("typed", char_ids(text))]
+    }
+
+    /// Runs `text` through a fresh guard four ways — both encodings, each as one
+    /// `push_ids` batch and as one `push_id` per token — returning
+    /// `(label, emitted, flushed, last_outcome)` for each.
+    ///
+    /// The batch/scalar pair is not decoration: codex round 4 found a legal
+    /// 9,280-token batch that ended the turn while the same ids one at a time
+    /// streamed in full. Every assertion in this module now runs against both, so
+    /// a divergence cannot hide in one caller shape.
+    fn both_feed_orders(text: &str) -> Vec<(String, String, String, GuardOutcome)> {
         both_feed_orders_with(text, TEST_RECIPIENT_CHARS)
     }
 
@@ -707,30 +1027,39 @@ mod tests {
     fn both_feed_orders_with(
         text: &str,
         max_recipient_chars: usize,
-    ) -> [(&'static str, String, String, GuardOutcome); 2] {
-        let mut whole_guard = StreamGuard::new(8, 4096, max_recipient_chars);
-        let whole_last = push_text(&mut whole_guard, text);
-        let whole_emitted = match &whole_last {
-            GuardOutcome::Emit(s) => s.clone(),
-            _ => String::new(),
-        };
-        let whole_flushed = whole_guard.flush();
+    ) -> Vec<(String, String, String, GuardOutcome)> {
+        let mut out = Vec::new();
+        for (encoding, ids) in both_encodings(text) {
+            let mut batched = guard(8, 100_000, max_recipient_chars);
+            let batch_last = batched.push_ids(&ids);
+            let batch_emitted = match &batch_last {
+                GuardOutcome::Emit(s) => s.clone(),
+                _ => String::new(),
+            };
+            out.push((
+                format!("{encoding}/batch"),
+                batch_emitted,
+                batched.flush(),
+                batch_last,
+            ));
 
-        let mut split_guard = StreamGuard::new(8, 4096, max_recipient_chars);
-        let mut split_emitted = String::new();
-        let mut split_last = GuardOutcome::Hold;
-        for ch in text.chars() {
-            split_last = split_guard.push_token(&ch.to_string());
-            if let GuardOutcome::Emit(s) = &split_last {
-                split_emitted.push_str(s);
+            let mut scalar = guard(8, 100_000, max_recipient_chars);
+            let mut scalar_emitted = String::new();
+            let mut scalar_last = GuardOutcome::Hold;
+            for id in &ids {
+                scalar_last = scalar.push_id(*id);
+                if let GuardOutcome::Emit(s) = &scalar_last {
+                    scalar_emitted.push_str(s);
+                }
             }
+            out.push((
+                format!("{encoding}/scalar"),
+                scalar_emitted,
+                scalar.flush(),
+                scalar_last,
+            ));
         }
-        let split_flushed = split_guard.flush();
-
-        [
-            ("whole-chunk", whole_emitted, whole_flushed, whole_last),
-            ("character-split", split_emitted, split_flushed, split_last),
-        ]
+        out
     }
 
     /// Asserts `needle` reaches neither a content delta nor `flush`, in both feed
@@ -760,14 +1089,14 @@ mod tests {
         }
     }
 
-    /// Feeds `chunks` in order, one token reported per chunk, and returns
+    /// Feeds `chunks` of ids in order, each as one `push_ids`, and returns
     /// everything emitted, everything flushed, and the last outcome.
-    fn feed(chunks: &[&str]) -> (String, String, GuardOutcome) {
-        let mut g = StreamGuard::new(8, 100_000, TEST_RECIPIENT_CHARS);
+    fn feed_ids(chunks: &[&[u32]]) -> (String, String, GuardOutcome) {
+        let mut g = guard(8, 100_000, TEST_RECIPIENT_CHARS);
         let mut emitted = String::new();
         let mut last = GuardOutcome::Hold;
         for chunk in chunks {
-            last = push_text(&mut g, chunk);
+            last = g.push_ids(chunk);
             if let GuardOutcome::Emit(s) = &last {
                 emitted.push_str(s);
             }
@@ -775,49 +1104,45 @@ mod tests {
         (emitted, g.flush(), last)
     }
 
-    /// Every possible split of `text` into two chunks, as `(label, head, tail)`.
+    /// Every possible split of an id sequence into two `push_ids` calls.
     ///
-    /// One whole-chunk case and one character-split case are not enough: codex
-    /// found the spacing leak at *every one* of 73 two-chunk cuts, and the
-    /// terminator leak only in the whole-chunk order. The cut that matters is
-    /// whichever one happens to land inside a marker or a header, so sweep them
-    /// all.
-    fn two_chunk_cuts(text: &str) -> impl Iterator<Item = (usize, String, String)> + '_ {
-        let n = text.chars().count();
-        (0..=n).map(move |cut| {
-            (
-                cut,
-                text.chars().take(cut).collect(),
-                text.chars().skip(cut).collect(),
-            )
-        })
+    /// One batch case and one scalar case are not enough: codex found the spacing
+    /// leak at *every one* of 73 two-chunk cuts, and the terminator leak only when
+    /// a terminator and the text behind it arrived together. The cut that matters
+    /// is whichever one happens to land inside a header or a split marker, so
+    /// sweep them all — for both encodings.
+    fn two_chunk_cuts(ids: &[u32]) -> impl Iterator<Item = (usize, &[u32], &[u32])> {
+        (0..=ids.len()).map(move |cut| (cut, &ids[..cut], &ids[cut..]))
     }
 
-    /// `needle` reaches neither a delta nor `flush`, and the turn ends — whole,
-    /// character by character, and at every two-chunk cut.
+    /// `needle` reaches neither a delta nor `flush`, and the turn ends — in every
+    /// feed order and at every two-chunk cut of both encodings.
     fn assert_never_published_at_every_cut(text: &str, needle: &str, what: &str) {
         assert_never_published(text, needle);
         assert_ends_the_turn(text);
-        let n = text.chars().count();
-        for (cut, head, tail) in two_chunk_cuts(text) {
-            let (emitted, flushed, last) = feed(&[head.as_str(), tail.as_str()]);
-            assert!(
-                !emitted.contains(needle),
-                "{what}: cut {cut}/{n}: {needle:?} reached a content delta: {emitted:?}"
-            );
-            assert!(
-                !flushed.contains(needle),
-                "{what}: cut {cut}/{n}: {needle:?} reached flush: {flushed:?}"
-            );
-            assert!(
-                matches!(last, GuardOutcome::EndTurn),
-                "{what}: cut {cut}/{n}: expected EndTurn, got {last:?}"
-            );
+        for (encoding, ids) in both_encodings(text) {
+            let n = ids.len();
+            for (cut, head, tail) in two_chunk_cuts(&ids) {
+                let (emitted, flushed, last) = feed_ids(&[head, tail]);
+                assert!(
+                    !emitted.contains(needle),
+                    "{what}: {encoding} cut {cut}/{n}: {needle:?} reached a content \
+                     delta: {emitted:?}"
+                );
+                assert!(
+                    !flushed.contains(needle),
+                    "{what}: {encoding} cut {cut}/{n}: {needle:?} reached flush: {flushed:?}"
+                );
+                assert!(
+                    matches!(last, GuardOutcome::EndTurn),
+                    "{what}: {encoding} cut {cut}/{n}: expected EndTurn, got {last:?}"
+                );
+            }
         }
     }
 
     /// The anti-over-blocking control: a legal turn hands back exactly `answer`,
-    /// however it is chunked. `answer` may be `""` for a turn whose content is not
+    /// however it is grouped. `answer` may be `""` for a turn whose content is not
     /// on the user channel.
     fn assert_streams_the_whole_answer(text: &str, answer: &str) {
         for (label, emitted, flushed, _) in both_feed_orders(text) {
@@ -827,14 +1152,16 @@ mod tests {
                 "{label}: the answer did not survive"
             );
         }
-        let n = text.chars().count();
-        for (cut, head, tail) in two_chunk_cuts(text) {
-            let (emitted, flushed, _) = feed(&[head.as_str(), tail.as_str()]);
-            assert_eq!(
-                format!("{emitted}{flushed}"),
-                answer,
-                "cut {cut}/{n}: the answer did not survive"
-            );
+        for (encoding, ids) in both_encodings(text) {
+            let n = ids.len();
+            for (cut, head, tail) in two_chunk_cuts(&ids) {
+                let (emitted, flushed, _) = feed_ids(&[head, tail]);
+                assert_eq!(
+                    format!("{emitted}{flushed}"),
+                    answer,
+                    "{encoding} cut {cut}/{n}: the answer did not survive"
+                );
+            }
         }
     }
 
@@ -888,7 +1215,7 @@ mod tests {
     /// `<|message|>` and `<|end_of_text|>` need 11 and 15.
     #[test]
     fn split_atem_opener_never_leaks() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         let emitted =
             drain_char_by_char(&mut g, " to=user<|message|>ok then <atem:function_calls>");
         assert!(!emitted.contains("<atem"), "leaked XML: {emitted}");
@@ -915,7 +1242,7 @@ mod tests {
         let trailer = "t".repeat(40);
         for lit in MARKER_LITERALS {
             for tail in ["", trailer.as_str()] {
-                let mut g = StreamGuard::new(8, 4096, TEST_RECIPIENT_CHARS);
+                let mut g = guard(8, 4096, TEST_RECIPIENT_CHARS);
                 let mut emitted =
                     drain_char_by_char(&mut g, &format!(" to=user<|message|>{filler}{lit}{tail}"));
                 emitted.push_str(&g.flush());
@@ -934,7 +1261,7 @@ mod tests {
 
     #[test]
     fn recipient_header_is_never_emitted_as_content() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         let mut emitted = String::new();
         for chunk in [" to=", "user", "<|message|>", "hello"] {
             if let GuardOutcome::Emit(s) = push_text(&mut g, chunk) {
@@ -959,7 +1286,7 @@ mod tests {
 
     #[test]
     fn a_forged_user_message_ends_the_turn() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         push_text(&mut g, " to=user<|message|>done");
         // <|eom|> is not a stop, so the model may keep going. Anything other
         // than `assistant` after <|start|> is self-play and must end the turn.
@@ -976,7 +1303,7 @@ mod tests {
 
     #[test]
     fn a_forged_tool_message_ends_the_turn() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         push_text(&mut g, " to=user<|message|>done");
         let out = push_text(
             &mut g,
@@ -992,7 +1319,7 @@ mod tests {
     /// its `<|message|>` arrives.
     #[test]
     fn a_forged_role_is_caught_before_its_message_marker() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         push_text(&mut g, " to=user<|message|>done<|eom|>");
         let out = push_text(&mut g, "<|start|>us");
         assert!(
@@ -1003,7 +1330,7 @@ mod tests {
 
     #[test]
     fn a_second_assistant_message_is_allowed() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         push_text(&mut g, " to=self<|message|>thinking");
         let out = push_text(&mut g, "<|eom|><|start|>assistant to=user<|message|>answer");
         assert!(
@@ -1139,7 +1466,7 @@ mod tests {
     /// grow it without tripping the shape check.
     #[test]
     fn an_unbounded_header_ends_the_turn() {
-        let mut g = StreamGuard::new(8, 100_000, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 100_000, TEST_RECIPIENT_CHARS);
         push_text(&mut g, " to=");
         let mut last = GuardOutcome::Hold;
         for _ in 0..40 {
@@ -1154,7 +1481,7 @@ mod tests {
 
         // …and it is still bounded when the caller declares an enormous recipient
         // allowance, because of the absolute clamp.
-        let mut wide = StreamGuard::new(8, 10_000_000, usize::MAX);
+        let mut wide = guard(8, 10_000_000, usize::MAX);
         push_text(&mut wide, " to=");
         let mut last = GuardOutcome::Hold;
         for _ in 0..((ABSOLUTE_MAX_HEADER_CHARS / 10) + 2) {
@@ -1192,19 +1519,19 @@ mod tests {
         // The formula, pinned against the parameter rather than read back from the
         // guard — otherwise a mutation of the derivation would move both sides.
         assert_eq!(
-            StreamGuard::new(8, 8, 107).header_allowance,
+            guard(8, 8, 107).header_allowance,
             ANCHORED_HEADER_PREFIX.chars().count() + 107,
             "the header allowance is no longer anchored prefix + declared recipient"
         );
         // A caller declaring no tools at all must still admit `user` and `self`.
         assert_eq!(
-            StreamGuard::new(8, 8, 0).header_allowance,
+            guard(8, 8, 0).header_allowance,
             ANCHORED_HEADER_PREFIX.chars().count() + BUILTIN_RECIPIENT_CHARS,
             "a zero recipient allowance stopped admitting the built-in recipients"
         );
 
         for declared in [107usize, 125] {
-            let allowance = StreamGuard::new(8, 8, declared).header_allowance;
+            let allowance = guard(8, 8, declared).header_allowance;
             for (form, prefix) in [
                 ("bare", BARE_HEADER_PREFIX.chars().count()),
                 ("anchored", ANCHORED_HEADER_PREFIX.chars().count()),
@@ -1241,13 +1568,14 @@ mod tests {
 
                 // Attack: one character more, at every two-chunk cut.
                 let attack = format!("{}OVERLONG_BODY_0123456789", build(&format!("{at_limit}X")));
-                let n = attack.chars().count();
-                for (cut, head, tail) in two_chunk_cuts(&attack) {
-                    let mut g = StreamGuard::new(8, 100_000, declared);
+                let ids = ids_for(&attack);
+                let n = ids.len();
+                for (cut, head, tail) in two_chunk_cuts(&ids) {
+                    let mut g = guard(8, 100_000, declared);
                     let mut emitted = String::new();
                     let mut last = GuardOutcome::Hold;
-                    for part in [head.as_str(), tail.as_str()] {
-                        last = push_text(&mut g, part);
+                    for part in [head, tail] {
+                        last = g.push_ids(part);
                         if let GuardOutcome::Emit(s) = &last {
                             emitted.push_str(s);
                         }
@@ -1268,97 +1596,193 @@ mod tests {
         }
     }
 
-    // ── Codex review round 2, revised in round 3 ───────────────────────
+    // ── Codex review round 4: the interface takes ids ──────────────────
 
-    /// `max_tokens` means tokens, and the count comes from `tokens.len()` —
-    /// derived from the batch, not reported alongside it.
+    /// Codex round-4 finding 1. Under `push(&[&str])`, four separate `a` tokens
+    /// collapsed into the single entry `"aaaa"` charged **one** token, and seven
+    /// logical tokens went through a cap of four.
     ///
-    /// Round 2's version took a `tokens: usize` from the caller and this test
-    /// pinned that it was believed. Codex then showed the obvious consequence: a
-    /// caller batching honestly and a caller lying are indistinguishable to a
-    /// number. Now the same batch is the same count whoever sends it.
+    /// That shape cannot be expressed any more, so this test pins the property
+    /// instead of the attack: `n` ids charge exactly `n` tokens, whatever they
+    /// decode to and however they are grouped. The type is what prevents the
+    /// collapse — `push_id(u32)` has nowhere to put four tokens, and `push_ids`
+    /// charges one per element because it *is* repeated `push_id`.
     #[test]
-    fn the_token_count_comes_from_the_batch_not_from_the_caller() {
-        // Five tokens in one push is five tokens, past a cap of four.
-        let mut batched = StreamGuard::new(8, 4, TEST_RECIPIENT_CHARS);
-        batched.push(&[" to=user", "<|message|>"]);
-        let out = batched.push(&["a", "a", "a", "a", "a"]);
-        assert!(
-            matches!(out, GuardOutcome::EndTurn),
-            "5 batched tokens past a cap of 4 must trip, got {out:?}"
-        );
+    fn every_id_charges_exactly_one_token() {
+        let a = id_of("a");
+        // The old attack's characters, honestly four ids: still four tokens.
+        let mut g = guard(8, 100, TEST_RECIPIENT_CHARS);
+        g.push_ids(&ids_for(" to=user<|message|>"));
+        let before = g.tokens;
+        g.push_ids(&[a, a, a, a]);
+        assert_eq!(g.tokens - before, 4, "four ids must charge four tokens");
 
-        // The identical characters as two tokens stay under it.
-        let mut honest = StreamGuard::new(8, 4, TEST_RECIPIENT_CHARS);
-        honest.push(&[" to=user", "<|message|>"]);
-        let out = honest.push(&["aa", "aaa"]);
-        assert!(
-            !matches!(out, GuardOutcome::EndTurn),
-            "4 tokens at a cap of 4 must not trip, got {out:?}"
-        );
-        assert_eq!(honest.flush(), "aaaaa", "content lost");
+        // A one-character token and a 113-character token cost the same: one.
+        for piece in ["a", LONG_113] {
+            let mut g = guard(8, 100, TEST_RECIPIENT_CHARS);
+            g.push_ids(&ids_for(" to=user<|message|>"));
+            let before = g.tokens;
+            g.push_id(id_of(piece));
+            assert_eq!(
+                g.tokens - before,
+                1,
+                "a {}-character token must charge 1",
+                piece.chars().count()
+            );
+        }
+
+        // And the cap counts ids: exactly `max_tokens` go through, the next does
+        // not, whether they arrive one at a time or all at once.
+        let header = ids_for(" to=user<|message|>");
+        for batched in [false, true] {
+            let mut g = guard(8, header.len() + 4, TEST_RECIPIENT_CHARS);
+            g.push_ids(&header);
+            let body = [a, a, a, a, a];
+            let last = if batched {
+                g.push_ids(&body)
+            } else {
+                let mut last = GuardOutcome::Hold;
+                for id in body {
+                    last = g.push_id(id);
+                }
+                last
+            };
+            assert!(
+                matches!(last, GuardOutcome::EndTurn),
+                "batched={batched}: a 5th token past a cap of 4 must trip, got {last:?}"
+            );
+            assert_eq!(g.tokens, header.len() + 4, "the cap was overshot");
+            assert_eq!(g.flush(), "aaaa", "batched={batched}: content lost");
+        }
     }
 
-    /// Codex round-3 finding 1, the attack verbatim: a batching caller labelling
-    /// each 1 MiB chunk "1 token". Under the round-2 signature
-    /// `push(&big, 1)` twice, with `max_tokens = 2`, streamed
-    /// `ended=true streamed=2097152 chars` — measured before the fix.
+    /// Codex round-4 finding 2. `push` carried a **per-call** `MAX_CHUNK_CHARS`
+    /// bound, so a 9,280-entry batch of 113-character tokens — inside both the
+    /// token cap and the per-token bound — was rejected whole with `EndTurn` and
+    /// flushed nothing, while the same 9,280 tokens through `push_token` emitted
+    /// all 1,048,640 characters.
     ///
-    /// There is no label to lie with now, so the attack becomes "one slice entry
-    /// holding a megabyte", and an entry that cannot be one token of this
-    /// checkpoint ends the turn instead.
+    /// `push_ids` is now literally a loop over `push_id`, so the two cannot differ.
+    /// This runs codex's exact case at the old bound and at the real one.
     #[test]
-    fn a_batched_caller_cannot_defeat_the_token_cap() {
-        let big = "A".repeat(1 << 20);
-        let mut g = StreamGuard::new(8, 2, TEST_RECIPIENT_CHARS);
-        g.push(&[" to=user<|message|>"]);
-        let mut streamed = String::new();
-        let mut last = GuardOutcome::Hold;
-        for _ in 0..2 {
-            last = g.push(&[big.as_str()]);
-            if let GuardOutcome::Emit(s) = &last {
-                streamed.push_str(s);
-            }
-        }
-        streamed.push_str(&g.flush());
-        assert!(
-            matches!(last, GuardOutcome::EndTurn),
-            "a megabyte behind a one-entry slice must end the turn, got {last:?}"
-        );
-        assert_eq!(
-            streamed.chars().count(),
-            0,
-            "{} characters streamed under a cap of 2 tokens",
-            streamed.chars().count()
-        );
+    fn a_batch_and_the_same_ids_one_at_a_time_agree() {
+        let long = id_of(LONG_113);
+        let header = ids_for(" to=user<|message|>");
 
-        // The boundary: exactly MAX_TOKEN_CHARS is a real token of this
-        // checkpoint's shape and must stream; one more is not.
-        for (chars, want_end) in [(MAX_TOKEN_CHARS, false), (MAX_TOKEN_CHARS + 1, true)] {
-            let token = "z".repeat(chars);
-            let mut g = StreamGuard::new(8, 8, TEST_RECIPIENT_CHARS);
-            g.push(&[" to=user<|message|>"]);
-            let out = g.push(&[token.as_str()]);
+        // 9,280 x 113 = 1,048,640 characters: past the deleted 1 MiB per-call
+        // bound, comfortably inside MAX_TURN_CHARS.
+        for count in [9_280usize, MAX_TURN_CHARS / LONG_113.len() + 1] {
+            let mut ids = header.clone();
+            ids.extend(std::iter::repeat_n(long, count));
+
+            let mut batched = guard(8, ids.len() + 1, TEST_RECIPIENT_CHARS);
+            let batch_last = batched.push_ids(&ids);
+            let mut batch_out = match &batch_last {
+                GuardOutcome::Emit(s) => s.clone(),
+                _ => String::new(),
+            };
+            batch_out.push_str(&batched.flush());
+
+            let mut scalar = guard(8, ids.len() + 1, TEST_RECIPIENT_CHARS);
+            let mut scalar_out = String::new();
+            let mut scalar_last = GuardOutcome::Hold;
+            for id in &ids {
+                scalar_last = scalar.push_id(*id);
+                if let GuardOutcome::Emit(s) = &scalar_last {
+                    scalar_out.push_str(s);
+                }
+            }
+            scalar_out.push_str(&scalar.flush());
+
             assert_eq!(
-                matches!(out, GuardOutcome::EndTurn),
-                want_end,
-                "a {chars}-character token: got {out:?}"
+                batch_out.len(),
+                scalar_out.len(),
+                "count={count}: batch produced {} characters, scalar {}",
+                batch_out.len(),
+                scalar_out.len()
+            );
+            assert_eq!(batch_out, scalar_out, "count={count}: outputs differ");
+            if count == 9_280 {
+                // Codex's exact figure, asserted absolutely rather than derived from
+                // the constant — otherwise shrinking MAX_TURN_CHARS moves both sides
+                // of the comparison and the case stops meaning anything.
+                assert_eq!(
+                    batch_out.chars().count(),
+                    1_048_640,
+                    "the case codex reported no longer streams in full"
+                );
+            }
+            assert_eq!(
+                matches!(batch_last, GuardOutcome::EndTurn),
+                matches!(scalar_last, GuardOutcome::EndTurn),
+                "count={count}: one path ended the turn and the other did not \
+                 (batch {batch_last:?}, scalar {scalar_last:?})"
+            );
+            assert_eq!(
+                batched.tokens, scalar.tokens,
+                "count={count}: token counts differ"
             );
         }
     }
 
-    /// Nothing past the cap reaches a delta **or** `flush`. The batch is split at
-    /// the remaining allowance before it is buffered, so the over-cap tail never
-    /// enters the guard at all.
+    /// The cumulative memory bound, and the reason it is cumulative: the same total
+    /// must trip at the same token whether it arrives in one call or many. A
+    /// per-call bound was exactly finding 2.
+    #[test]
+    fn the_turn_character_bound_is_cumulative_not_per_call() {
+        let long = id_of(LONG_113);
+        let header = ids_for(" to=user<|message|>");
+        let header_chars: usize = 19;
+        // The first token that takes the turn past MAX_TURN_CHARS.
+        let fits = (MAX_TURN_CHARS - header_chars) / LONG_113.len();
+
+        // One at a time: trips on token `fits + 1`, having accepted `fits`.
+        let mut scalar = guard(8, usize::MAX, TEST_RECIPIENT_CHARS);
+        scalar.push_ids(&header);
+        let mut accepted = 0usize;
+        loop {
+            if matches!(scalar.push_id(long), GuardOutcome::EndTurn) {
+                break;
+            }
+            accepted += 1;
+            assert!(accepted <= fits + 1, "the turn bound never tripped");
+        }
+        assert_eq!(accepted, fits, "the cumulative bound moved");
+
+        // All in one call: the same number of tokens is accepted before it trips.
+        let mut ids = header.clone();
+        ids.extend(std::iter::repeat_n(long, fits + 1));
+        let mut batched = guard(8, usize::MAX, TEST_RECIPIENT_CHARS);
+        let out = batched.push_ids(&ids);
+        assert!(
+            matches!(out, GuardOutcome::EndTurn),
+            "the batch must trip the same bound, got {out:?}"
+        );
+        assert_eq!(
+            batched.tokens, scalar.tokens,
+            "batch and scalar disagreed about where the bound is"
+        );
+        // Nothing past the bound is retained for the parser either.
+        let (raw, _) = batched.raw_turn();
+        assert!(
+            raw.len() <= MAX_TURN_CHARS,
+            "retained {} characters, over the bound",
+            raw.len()
+        );
+    }
+
+    /// Nothing past the cap reaches a delta **or** `flush`, and nothing past it is
+    /// retained for the parser.
     ///
     /// Round 2 scanned first and checked the cap afterwards, which published the
     /// cap-tripping chunk — and its own test asserted that as correct.
     #[test]
     fn nothing_past_the_token_cap_is_buffered_or_published() {
-        let mut g = StreamGuard::new(8, 6, TEST_RECIPIENT_CHARS);
-        g.push(&[" to=user", "<|message|>"]);
+        let header = ids_for(" to=user<|message|>");
+        let mut g = guard(8, header.len() + 4, TEST_RECIPIENT_CHARS);
+        g.push_ids(&header);
         // Four tokens left; the batch has eight.
-        let out = g.push(&["k", "e", "e", "p", "D", "R", "O", "P"]);
+        let out = g.push_ids(&char_ids("keepDROP"));
         assert!(
             matches!(out, GuardOutcome::EndTurn),
             "a batch past the cap must end the turn, got {out:?}"
@@ -1368,16 +1792,285 @@ mod tests {
             flushed, "keep",
             "over-cap tokens were published: {flushed:?}"
         );
+        let (raw, _) = g.raw_turn();
+        assert!(
+            !raw.contains("DROP"),
+            "over-cap tokens were retained for the parser: {raw:?}"
+        );
 
         // Exhausted allowance: a later batch is discarded whole.
-        let mut g = StreamGuard::new(8, 2, TEST_RECIPIENT_CHARS);
-        g.push(&[" to=user", "<|message|>"]);
-        let out = g.push(&["X"]);
+        let mut g = guard(8, header.len(), TEST_RECIPIENT_CHARS);
+        g.push_ids(&header);
+        let out = g.push_ids(&char_ids("X"));
         assert!(
             matches!(out, GuardOutcome::EndTurn),
             "a batch with no allowance left must end the turn, got {out:?}"
         );
         assert_eq!(g.flush(), "", "a wholly over-cap batch was published");
+    }
+
+    /// An id outside the vocabulary ends the turn rather than being charged and
+    /// silently dropped. `Tokenizer::decode` filters unknown ids out and returns
+    /// `Ok("")`, so the guard has to check membership itself — this test also pins
+    /// that fact about `decode`, since the whole reason for the check is that the
+    /// decode error branch never fires.
+    #[test]
+    fn an_id_the_tokenizer_does_not_know_ends_the_turn() {
+        let tok = test_tokenizer();
+        let unknown = tok.get_vocab_size(true) as u32 + 1_000;
+        assert!(tok.id_to_token(unknown).is_none(), "pick a wilder id");
+        assert_eq!(
+            tok.decode(&[unknown], false).expect("decode does not fail"),
+            "",
+            "`decode` started reporting unknown ids; the membership check's reason \
+             has changed"
+        );
+
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
+        g.push_ids(&ids_for(" to=user<|message|>answer"));
+        let out = g.push_id(unknown);
+        assert!(
+            matches!(out, GuardOutcome::EndTurn),
+            "an unknown id must end the turn, got {out:?}"
+        );
+        assert_eq!(g.flush(), "", "an unknown id published buffered text");
+    }
+
+    /// The guard must not depend on a control marker arriving in a token of its own.
+    /// A single token carrying `<|eot|>` plus trailing text must publish neither —
+    /// which is what the discard in `stop` is for, and what
+    /// `strip_partial_marker` alone cannot do, because a *complete* marker
+    /// mid-buffer is not a partial one.
+    #[test]
+    fn a_token_carrying_a_terminator_and_more_publishes_neither() {
+        let merged = merged_terminator();
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut emitted = String::new();
+        for id in ids_for(" to=user<|message|>answer") {
+            if let GuardOutcome::Emit(s) = g.push_id(id) {
+                emitted.push_str(&s);
+            }
+        }
+        let out = g.push_id(id_of(&merged));
+        assert!(
+            matches!(out, GuardOutcome::EndTurn),
+            "a merged terminator must end the turn, got {out:?}"
+        );
+        emitted.push_str(&g.flush());
+        assert_eq!(
+            emitted, "answer",
+            "the merged token's marker or its tail was published: {emitted:?}"
+        );
+        // It is not a control id, so it gets no provenance either.
+        let (raw, spans) = g.raw_turn();
+        assert!(raw.contains(&merged), "the merged token was not retained");
+        assert_eq!(
+            spans.iter().map(|s| &raw[s.clone()]).collect::<Vec<_>>(),
+            vec![MSG],
+            "an ordinary token containing a marker was given the marker's provenance"
+        );
+    }
+
+    /// …and the same for the header limit: a single token carrying an over-long
+    /// recipient **and** its closing `<|message|>` must not slip past the bound.
+    /// Every other fixture re-validates the header at every token, so this is the
+    /// only case where checking the limit unconditionally is what saves the turn.
+    #[test]
+    fn a_token_carrying_an_overlong_header_and_its_marker_ends_the_turn() {
+        let merged = merged_header();
+        assert!(
+            merged.chars().count() > guard(8, 8, TEST_RECIPIENT_CHARS).header_allowance,
+            "the fixture is not past the allowance it is meant to break"
+        );
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
+        let out = g.push_id(id_of(&merged));
+        assert!(
+            matches!(out, GuardOutcome::EndTurn),
+            "an over-long header inside one token must end the turn, got {out:?}"
+        );
+        let next = g.push_ids(&char_ids("BODY_TEXT"));
+        assert!(
+            matches!(next, GuardOutcome::EndTurn),
+            "the turn restarted after an over-long header, got {next:?}"
+        );
+        assert_eq!(g.flush(), "", "the over-long header's text was published");
+    }
+
+    // ── Provenance for the parser ──────────────────────────────────────
+
+    /// The whole reason the guard takes ids: `<|eot|>` rendered from token 200008
+    /// and `<|eot|>` typed as seven characters are the same bytes, and the parser
+    /// gates its terminators on which one happened. A quoted terminator was
+    /// authorising real tool calls.
+    #[test]
+    fn a_real_control_token_gets_a_span_and_typed_characters_do_not() {
+        let turn = " to=user<|message|>answer<|eot|>";
+
+        // Emitted as real control tokens: one span per marker, covering exactly the
+        // marker's own bytes.
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
+        g.push_ids(&ids_for(turn));
+        let (raw, spans) = g.raw_turn();
+        assert_eq!(raw, turn, "the retained turn text is not the stream");
+        let marked: Vec<&str> = spans.iter().map(|s| &raw[s.clone()]).collect();
+        assert_eq!(
+            marked,
+            vec![MSG, EOT],
+            "the recorded spans do not cover exactly the control markers"
+        );
+
+        // The identical bytes, typed one character at a time: no spans at all.
+        let mut typed = guard(8, 1024, TEST_RECIPIENT_CHARS);
+        typed.push_ids(&char_ids(turn));
+        let (typed_raw, typed_spans) = typed.raw_turn();
+        assert_eq!(
+            typed_raw, turn,
+            "the two encodings must produce the same bytes"
+        );
+        assert_eq!(
+            typed_spans,
+            &[] as &[Range<usize>],
+            "typed characters were given provenance they do not have"
+        );
+    }
+
+    /// Every marker the checkpoint renders from an id gets a span, at the right
+    /// offsets, in a turn with several of them — and the sequence is sorted and
+    /// non-overlapping, which `GeneratedTurn::from_token_spans` `debug_assert`s.
+    #[test]
+    fn control_spans_are_sorted_non_overlapping_and_correctly_offset() {
+        let turn = " to=self<|message|>think<|eom|><|start|>assistant to=user\
+                    <|message|>answer<|eot|>";
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
+        g.push_ids(&ids_for(turn));
+        let (raw, spans) = g.raw_turn();
+
+        assert_eq!(
+            spans.iter().map(|s| &raw[s.clone()]).collect::<Vec<_>>(),
+            vec![MSG, EOM, START, MSG, EOT],
+            "spans do not name the markers in stream order"
+        );
+        // Offsets, derived from the fixture rather than restated.
+        for span in spans {
+            let marker = &raw[span.clone()];
+            assert!(
+                CONTROL_MARKERS.contains(&marker),
+                "span {span:?} covers {marker:?}, which is not a control marker"
+            );
+        }
+        assert!(
+            spans.windows(2).all(|w| w[0].end <= w[1].start),
+            "spans are not sorted and non-overlapping: {spans:?}"
+        );
+        assert!(
+            spans.iter().all(|s| s.end <= raw.len()),
+            "a span runs past the retained text"
+        );
+        // Offsets are relative to the start of THIS turn's text, which is what the
+        // accessor's contract says, so the first marker's span starts where the
+        // first marker starts in the fixture.
+        assert_eq!(
+            spans[0],
+            turn.find(MSG).expect("fixture has a message marker")
+                ..turn.find(MSG).unwrap() + MSG.len(),
+            "offsets are not relative to the start of the turn"
+        );
+    }
+
+    /// A marker this checkpoint has no id for gets no span, however it is written.
+    /// The `<atem:*>` surface is exactly that case — the template renders it as
+    /// ordinary characters — so claiming provenance for it would be inventing a
+    /// span, which is the failure that re-opens the bypass.
+    #[test]
+    fn the_atem_surface_never_gets_a_span() {
+        let turn = " to=t<|message|><atem:invoke name=\"t\">\
+                    <atem:parameter name=\"q\">x</atem:parameter></atem:invoke>";
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
+        g.push_ids(&ids_for(turn));
+        let (raw, spans) = g.raw_turn();
+        assert_eq!(
+            spans.iter().map(|s| &raw[s.clone()]).collect::<Vec<_>>(),
+            vec![MSG],
+            "an ATEM literal was given a span"
+        );
+        for marker in MARKER_LITERALS
+            .iter()
+            .filter(|m| m.starts_with("<atem") || m.starts_with("</atem"))
+        {
+            assert!(
+                test_tokenizer().token_to_id(marker).is_none(),
+                "{marker:?} has an id in this vocabulary, so the reasoning above \
+                 no longer holds"
+            );
+        }
+    }
+
+    /// Grouping cannot change provenance either: the same ids batched or one at a
+    /// time produce byte-identical text and identical spans.
+    #[test]
+    fn provenance_does_not_depend_on_grouping() {
+        let turn = " to=self<|message|>t<|eom|><|start|>assistant to=user<|message|>hi<|eot|>";
+        let ids = ids_for(turn);
+
+        let mut batched = guard(8, 1024, TEST_RECIPIENT_CHARS);
+        batched.push_ids(&ids);
+
+        let mut scalar = guard(8, 1024, TEST_RECIPIENT_CHARS);
+        for id in &ids {
+            scalar.push_id(*id);
+        }
+
+        assert_eq!(
+            batched.raw_turn().0,
+            scalar.raw_turn().0,
+            "batch and scalar retained different text"
+        );
+        assert_eq!(
+            batched.raw_turn().1,
+            scalar.raw_turn().1,
+            "batch and scalar recorded different spans"
+        );
+
+        // And at every two-chunk cut.
+        let n = ids.len();
+        for (cut, head, tail) in two_chunk_cuts(&ids) {
+            let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
+            g.push_ids(head);
+            g.push_ids(tail);
+            assert_eq!(
+                g.raw_turn().0,
+                batched.raw_turn().0,
+                "cut {cut}/{n}: retained text differs"
+            );
+            assert_eq!(
+                g.raw_turn().1,
+                batched.raw_turn().1,
+                "cut {cut}/{n}: spans differ"
+            );
+        }
+    }
+
+    /// The retained text is the whole turn, not the emitted content: the parser
+    /// needs the headers, the reasoning and the tool bodies the guard suppressed.
+    #[test]
+    fn the_retained_turn_keeps_what_the_guard_suppressed() {
+        let turn = " to=self<|message|>SECRET_THOUGHT<|eom|>\
+                    <|start|>assistant to=user<|message|>public<|eot|>";
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut emitted = String::new();
+        for id in ids_for(turn) {
+            if let GuardOutcome::Emit(s) = g.push_id(id) {
+                emitted.push_str(&s);
+            }
+        }
+        emitted.push_str(&g.flush());
+        assert_eq!(emitted, "public", "reasoning reached content");
+        let (raw, _) = g.raw_turn();
+        assert_eq!(raw, turn, "the parser's input lost part of the turn");
+        assert!(
+            raw.contains("SECRET_THOUGHT"),
+            "the reasoning the guard suppressed is not in the parser's input"
+        );
     }
 
     /// The number that replaced inference had to go: this checkpoint really
@@ -1387,17 +2080,16 @@ mod tests {
     /// 448 of its 560 answer characters.
     #[test]
     fn a_long_token_survives_the_token_cap() {
-        let token_162250 = "-".repeat(112);
-        let mut g = StreamGuard::new(8, 8, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 8, TEST_RECIPIENT_CHARS);
         let mut emitted = String::new();
         // Three header tokens plus five long ones is exactly the cap of eight.
-        for token in [" to=", "user", "<|message|>"] {
-            if let GuardOutcome::Emit(s) = g.push_token(token) {
+        for piece in [" to=", "user", MSG] {
+            if let GuardOutcome::Emit(s) = g.push_id(id_of(piece)) {
                 emitted.push_str(&s);
             }
         }
         for _ in 0..5 {
-            if let GuardOutcome::Emit(s) = g.push_token(&token_162250) {
+            if let GuardOutcome::Emit(s) = g.push_id(id_of(LONG_112)) {
                 emitted.push_str(&s);
             }
         }
@@ -1407,57 +2099,7 @@ mod tests {
             560,
             "a legitimate long-token answer was truncated"
         );
-        assert_eq!(emitted, token_162250.repeat(5));
-    }
-
-    /// The buffer bound, per push. Deliberately enormous, because the thing it
-    /// replaced was small enough to truncate real answers; a batch exactly at the
-    /// limit must still stream in full.
-    #[test]
-    fn an_oversize_batch_ends_the_turn() {
-        // MAX_TOKEN_CHARS-wide tokens, so the per-token bound is not what trips:
-        // 8192 x 128 is exactly MAX_CHUNK_CHARS.
-        let piece = "x".repeat(MAX_TOKEN_CHARS);
-        let pieces = MAX_CHUNK_CHARS / MAX_TOKEN_CHARS;
-        assert_eq!(
-            pieces * MAX_TOKEN_CHARS,
-            MAX_CHUNK_CHARS,
-            "not a clean split"
-        );
-        let mut batch: Vec<&str> = vec![piece.as_str(); pieces];
-        // A generous token cap, so `over_cap` cannot be what ends these turns.
-        let cap = pieces * 4;
-
-        batch.push("!");
-        let mut over = StreamGuard::new(8, cap, TEST_RECIPIENT_CHARS);
-        over.push(&[" to=user<|message|>"]);
-        let out = over.push(&batch);
-        assert!(
-            matches!(out, GuardOutcome::EndTurn),
-            "an over-size batch must end the turn, got {out:?}"
-        );
-        let flushed = over.flush();
-        assert_eq!(
-            flushed.chars().count(),
-            0,
-            "an over-size batch was published"
-        );
-
-        batch.pop();
-        let at_limit = piece.repeat(pieces);
-        let mut ok = StreamGuard::new(8, cap, TEST_RECIPIENT_CHARS);
-        ok.push(&[" to=user<|message|>"]);
-        let out = ok.push(&batch);
-        assert!(
-            !matches!(out, GuardOutcome::EndTurn),
-            "a batch at the limit must stream, got {out:?}"
-        );
-        let mut got = match out {
-            GuardOutcome::Emit(s) => s,
-            other => panic!("expected content, got {other:?}"),
-        };
-        got.push_str(&ok.flush());
-        assert_eq!(got, at_limit, "a batch at the limit lost content");
+        assert_eq!(emitted, LONG_112.repeat(5));
     }
 
     /// Codex finding 1. `trim_start()` accepted a family of spellings where the
@@ -1529,12 +2171,13 @@ mod tests {
                 "{label}: a header inside the declared allowance was refused: {last:?}"
             );
         }
-        let n = legal.chars().count();
-        for (cut, head, tail) in two_chunk_cuts(&legal) {
-            let mut g = StreamGuard::new(8, 100_000, 200);
+        let ids = ids_for(&legal);
+        let n = ids.len();
+        for (cut, head, tail) in two_chunk_cuts(&ids) {
+            let mut g = guard(8, 100_000, 200);
             let mut last = GuardOutcome::Hold;
-            for part in [head.as_str(), tail.as_str()] {
-                last = push_text(&mut g, part);
+            for part in [head, tail] {
+                last = g.push_ids(part);
             }
             assert!(
                 !matches!(last, GuardOutcome::EndTurn),
@@ -1569,8 +2212,12 @@ mod tests {
         }
     }
 
-    /// Derives [`MAX_TOKEN_CHARS`] from the real checkpoint rather than asserting a
-    /// constant, by **decoding every token id** through `tokenizers::Tokenizer`.
+    /// Keeps the synthetic vocabulary honest against the real one, by **decoding
+    /// every token id** through `tokenizers::Tokenizer`.
+    ///
+    /// [`LONG_113`] and [`LONG_112`] are stand-ins for real ids 169871 and 162250,
+    /// and the default-gate tests are only meaningful if those lengths are real —
+    /// so this asserts them against the checkpoint rather than against a comment.
     ///
     /// Codex round-3 finding 3: the round-2 version measured `model.vocab` keys,
     /// which are byte-level BPE *lexemes*, not decoded text. `Ġ`, `Ċ` and the
@@ -1584,7 +2231,7 @@ mod tests {
     /// never reaches CI.
     #[test]
     #[ignore = "requires the local Muse-Glimmer checkpoint; set MLX_TEST_MUSE_GLIMMER_MODEL_PATH and run with --ignored"]
-    fn checkpoint_tokens_decode_within_the_per_token_bound() {
+    fn checkpoint_token_lengths_match_the_synthetic_stand_ins() {
         let dir = std::env::var("MLX_TEST_MUSE_GLIMMER_MODEL_PATH")
             .expect("set MLX_TEST_MUSE_GLIMMER_MODEL_PATH to the checkpoint directory");
         let tok =
@@ -1608,7 +2255,6 @@ mod tests {
         let mut longest = 0usize;
         let mut longest_id = 0u32;
         let mut over_64 = 0usize;
-        let mut over_bound: Vec<(u32, usize)> = Vec::new();
         let mut markers_seen = 0usize;
         for id in 0..vocab_size as u32 {
             // `skip_special_tokens = false`: a special token's decoded text is
@@ -1627,31 +2273,47 @@ mod tests {
             if chars > 64 {
                 over_64 += 1;
             }
-            if chars > MAX_TOKEN_CHARS {
-                over_bound.push((id, chars));
-            }
         }
 
         assert!(
-            over_bound.is_empty(),
-            "MAX_TOKEN_CHARS = {MAX_TOKEN_CHARS} is below the checkpoint: {over_bound:?}"
-        );
-        assert!(
             longest > 64,
             "longest decoded token is only {longest} characters (id {longest_id}) — if the \
-             vocabulary really changed, revisit why MAX_TOKEN_CHARS exists at all"
+             vocabulary really changed, the synthetic stand-ins need re-deriving"
         );
-        // The measured facts, so a silent vocabulary swap is visible.
+        // The measured facts, so a silent vocabulary swap is visible — and the
+        // fixtures the default gate runs on are tied to them.
         assert_eq!(
             (longest_id, longest),
             (169871, 113),
             "the longest decoded token moved"
         );
         assert_eq!(
+            LONG_113.chars().count(),
+            longest,
+            "LONG_113 no longer stands in for the checkpoint's longest token"
+        );
+        assert_eq!(
             tok.decode(&[162250], false).unwrap().chars().count(),
             112,
             "token 162250 decoded length moved"
         );
+        assert_eq!(
+            tok.decode(&[162250], false).unwrap(),
+            LONG_112,
+            "LONG_112 is no longer id 162250's text"
+        );
+        // Provenance depends on these resolving: `StreamGuard::new` looks each one
+        // up, and a marker it cannot find simply gets no spans.
+        for marker in CONTROL_MARKERS {
+            let id = tok
+                .token_to_id(marker)
+                .unwrap_or_else(|| panic!("{marker:?} has no id in the real checkpoint"));
+            assert_eq!(
+                tok.decode(&[id], false).expect("control id decodes"),
+                *marker,
+                "control marker {marker:?} does not round-trip through its own id"
+            );
+        }
         assert_eq!(
             over_64, 70,
             "the number of tokens decoding past 64 characters moved"
@@ -1695,6 +2357,166 @@ mod tests {
         );
     }
 
+    /// Codex round-4 finding 2, against the **real** id it was reported with:
+    /// 9,280 of id 169871 is 1,048,640 characters, which the deleted per-call bound
+    /// rejected in a batch and streamed in full one at a time.
+    #[test]
+    #[ignore = "requires the local Muse-Glimmer checkpoint; set MLX_TEST_MUSE_GLIMMER_MODEL_PATH and run with --ignored"]
+    fn checkpoint_batch_and_scalar_agree_on_a_real_long_token() {
+        let dir = std::env::var("MLX_TEST_MUSE_GLIMMER_MODEL_PATH")
+            .expect("set MLX_TEST_MUSE_GLIMMER_MODEL_PATH to the checkpoint directory");
+        let tok = Arc::new(
+            Tokenizer::from_file(std::path::Path::new(&dir).join("tokenizer.json"))
+                .expect("checkpoint has a loadable tokenizer.json"),
+        );
+
+        // The turn's opening header, encoded by the real tokenizer, then 9,280 of
+        // the 113-character token.
+        let header: Vec<u32> = tok
+            .encode(" to=user", false)
+            .expect("the header encodes")
+            .get_ids()
+            .to_vec();
+        let msg = tok.token_to_id(MSG).expect("checkpoint has <|message|>");
+        let mut ids = header;
+        ids.push(msg);
+        let prefix_len = ids.len();
+        ids.extend(std::iter::repeat_n(169871u32, 9_280));
+
+        let mut batched = StreamGuard::new(tok.clone(), 8, ids.len() + 1, 16);
+        let batch_last = batched.push_ids(&ids);
+        let mut batch_out = match &batch_last {
+            GuardOutcome::Emit(s) => s.clone(),
+            _ => String::new(),
+        };
+        batch_out.push_str(&batched.flush());
+
+        let mut scalar = StreamGuard::new(tok.clone(), 8, ids.len() + 1, 16);
+        let mut scalar_out = String::new();
+        for id in &ids {
+            if let GuardOutcome::Emit(s) = scalar.push_id(*id) {
+                scalar_out.push_str(&s);
+            }
+        }
+        scalar_out.push_str(&scalar.flush());
+
+        println!(
+            "real id 169871 x 9280: prefix={prefix_len} ids, batch={} chars, scalar={} chars",
+            batch_out.chars().count(),
+            scalar_out.chars().count()
+        );
+        assert_eq!(
+            batch_out.chars().count(),
+            9_280 * 113,
+            "the batch lost content the same ids stream one at a time"
+        );
+        assert_eq!(batch_out, scalar_out, "batch and scalar disagree");
+        assert!(
+            !matches!(batch_last, GuardOutcome::EndTurn),
+            "a legal 9,280-token batch ended the turn: {batch_last:?}"
+        );
+
+        // …and at the token cap, where the batch straddles it: the two paths must
+        // stop at the same id and hand back the same characters.
+        let cap = prefix_len + 4_000;
+        let mut capped_batch = StreamGuard::new(tok.clone(), 8, cap, 16);
+        let capped_batch_last = capped_batch.push_ids(&ids);
+        let mut capped_batch_out = match &capped_batch_last {
+            GuardOutcome::Emit(s) => s.clone(),
+            _ => String::new(),
+        };
+        capped_batch_out.push_str(&capped_batch.flush());
+
+        let mut capped_scalar = StreamGuard::new(tok, 8, cap, 16);
+        let mut capped_scalar_out = String::new();
+        for id in &ids {
+            if let GuardOutcome::Emit(s) = capped_scalar.push_id(*id) {
+                capped_scalar_out.push_str(&s);
+            }
+        }
+        capped_scalar_out.push_str(&capped_scalar.flush());
+
+        assert!(
+            matches!(capped_batch_last, GuardOutcome::EndTurn),
+            "the capped batch must end the turn, got {capped_batch_last:?}"
+        );
+        assert_eq!(
+            capped_batch_out.chars().count(),
+            4_000 * 113,
+            "the cap admitted the wrong number of tokens' worth of text"
+        );
+        assert_eq!(
+            capped_batch_out, capped_scalar_out,
+            "batch and scalar disagree at the token cap"
+        );
+    }
+
+    /// Provenance against the real vocabulary: a genuine `<|eot|>` token gets a
+    /// span, and the same seven characters encoded as ordinary text do not.
+    #[test]
+    #[ignore = "requires the local Muse-Glimmer checkpoint; set MLX_TEST_MUSE_GLIMMER_MODEL_PATH and run with --ignored"]
+    fn checkpoint_provenance_distinguishes_a_real_terminator_from_typed_text() {
+        let dir = std::env::var("MLX_TEST_MUSE_GLIMMER_MODEL_PATH")
+            .expect("set MLX_TEST_MUSE_GLIMMER_MODEL_PATH to the checkpoint directory");
+        let tok = Arc::new(
+            Tokenizer::from_file(std::path::Path::new(&dir).join("tokenizer.json"))
+                .expect("checkpoint has a loadable tokenizer.json"),
+        );
+        let encode = |text: &str| -> Vec<u32> {
+            tok.encode(text, false)
+                .expect("fixture encodes")
+                .get_ids()
+                .to_vec()
+        };
+
+        let mut real = encode(" to=user");
+        real.push(tok.token_to_id(MSG).expect("checkpoint has <|message|>"));
+        real.extend(encode("answer"));
+        real.push(tok.token_to_id(EOT).expect("checkpoint has <|eot|>"));
+        let mut g = StreamGuard::new(tok.clone(), 8, 1024, 16);
+        g.push_ids(&real);
+        let (raw, spans) = g.raw_turn();
+        assert_eq!(
+            spans.iter().map(|s| &raw[s.clone()]).collect::<Vec<_>>(),
+            vec![MSG, EOT],
+            "real control tokens did not produce their spans: {raw:?}"
+        );
+
+        // The same bytes, typed rather than emitted. NOT via `encode`: the added
+        // vocabulary matches `<|eot|>` inside ordinary text and hands back the real
+        // id 200008 — which is exactly why this crate has a marker sanitizer at
+        // all. A model that *types* the marker has to sample the ordinary pieces,
+        // so the fixture is built from per-character ids, none of them special.
+        let mut typed = encode(" to=user");
+        typed.push(tok.token_to_id(MSG).expect("checkpoint has <|message|>"));
+        typed.extend(encode("answer"));
+        for ch in EOT.chars() {
+            let piece = ch.to_string();
+            let id = tok
+                .token_to_id(&piece)
+                .unwrap_or_else(|| panic!("the vocabulary has no bare {piece:?} token"));
+            assert_eq!(
+                tok.decode(&[id], false).expect("decodes"),
+                piece,
+                "the per-character id for {piece:?} does not decode to it"
+            );
+            typed.push(id);
+        }
+        let mut t = StreamGuard::new(tok, 8, 1024, 16);
+        t.push_ids(&typed);
+        let (traw, tspans) = t.raw_turn();
+        println!("typed turn: {traw:?} spans={tspans:?}");
+        assert_eq!(
+            tspans.iter().map(|s| &traw[s.clone()]).collect::<Vec<_>>(),
+            vec![MSG],
+            "typed characters were given a terminator's provenance"
+        );
+        assert!(
+            traw.contains(EOT),
+            "the fixture no longer contains the typed marker's bytes"
+        );
+    }
+
     /// Drift pin against the sibling parser. `output_parser`'s copy of these
     /// literals is not reachable as data — a `ResponseTemplate` is built from a
     /// checkpoint directory, which this guard deliberately does not need — so the
@@ -1735,7 +2557,7 @@ mod tests {
 
     #[test]
     fn reasoning_is_never_emitted_as_content() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         let secret = "REASONING_SECRET ".repeat(8);
         let mut emitted =
             drain_char_by_char(&mut g, &format!(" to=self<|message|>{secret}<|eom|>"));
@@ -1750,7 +2572,7 @@ mod tests {
     /// `<|eom|>` between them: the answer streams, the thinking does not.
     #[test]
     fn reasoning_after_unclosed_content_is_not_emitted() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         let mut emitted = drain_char_by_char(
             &mut g,
             " to=user<|message|>public<|start|>assistant to=self<|message|>REASONING_SECRET<|eom|>",
@@ -1768,7 +2590,7 @@ mod tests {
     /// content still passed.
     #[test]
     fn a_tool_call_message_is_never_emitted_as_content() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         let mut emitted = drain_char_by_char(
             &mut g,
             " to=wx.forecast<|message|>stray prose on the tool channel\n\
@@ -1789,7 +2611,7 @@ mod tests {
     /// prose streams; everything from the tag on is the call, not the answer.
     #[test]
     fn content_before_a_tool_call_streams_but_the_xml_does_not() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         let mut emitted = drain_char_by_char(
             &mut g,
             " to=user<|message|>on it<atem:invoke name=\"t\">\
@@ -1807,7 +2629,7 @@ mod tests {
     /// message, so resuming there would publish the tool payload as the answer.
     #[test]
     fn a_new_message_inside_an_unclosed_tool_body_ends_the_turn() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         push_text(
             &mut g,
             " to=t<|message|><atem:invoke name=\"t\"><atem:parameter name=\"q\">x",
@@ -1823,7 +2645,7 @@ mod tests {
 
     #[test]
     fn message_cap_ends_the_turn() {
-        let mut g = StreamGuard::new(2, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(2, 1024, TEST_RECIPIENT_CHARS);
         push_text(&mut g, " to=self<|message|>a<|eom|>");
         push_text(&mut g, "<|start|>assistant to=user<|message|>b<|eom|>");
         let out = push_text(&mut g, "<|start|>assistant to=user<|message|>c");
@@ -1835,11 +2657,12 @@ mod tests {
 
     #[test]
     fn token_cap_ends_the_turn() {
-        let mut g = StreamGuard::new(8, 4, TEST_RECIPIENT_CHARS);
-        g.push(&[" to=user<|message|>"]);
+        let mut g = guard(8, 4, TEST_RECIPIENT_CHARS);
+        g.push_id(id_of(" to=user"));
+        g.push_id(id_of(MSG));
         let mut last = GuardOutcome::Hold;
         for _ in 0..10 {
-            last = g.push_token("word ");
+            last = g.push_id(id_of("word "));
         }
         assert!(matches!(last, GuardOutcome::EndTurn), "token cap must trip");
         assert_eq!(g.tokens, 4, "the cap was overshot: {} tokens", g.tokens);
@@ -1857,16 +2680,17 @@ mod tests {
     /// cap is now applied before the batch is buffered, so `MORE` never exists.
     #[test]
     fn end_turn_is_sticky_and_publishes_nothing_after_it() {
-        let mut capped = StreamGuard::new(8, 2, TEST_RECIPIENT_CHARS);
-        capped.push_token(" to=user<|message|>");
-        capped.push_token("answer");
-        let tripped = capped.push_token("MORE");
+        let mut capped = guard(8, 3, TEST_RECIPIENT_CHARS);
+        capped.push_id(id_of(" to=user"));
+        capped.push_id(id_of(MSG));
+        capped.push_id(id_of("answer"));
+        let tripped = capped.push_id(id_of("MORE"));
         assert!(
             matches!(tripped, GuardOutcome::EndTurn),
             "token cap must trip, got {tripped:?}"
         );
         for _ in 0..3 {
-            let out = capped.push_token("AFTER_THE_CAP");
+            let out = capped.push_id(id_of("AFTER_THE_CAP"));
             assert!(
                 matches!(out, GuardOutcome::EndTurn),
                 "guard restarted: {out:?}"
@@ -1880,7 +2704,7 @@ mod tests {
         // Content within the allowance is kept; the token that hit the cap is not.
         assert_eq!(flushed, "answer");
 
-        let mut g = StreamGuard::new(1, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(1, 1024, TEST_RECIPIENT_CHARS);
         push_text(&mut g, " to=user<|message|>a<|eot|>");
         for _ in 0..3 {
             let out = push_text(&mut g, "<|start|>assistant to=user<|message|>more");
@@ -1893,7 +2717,7 @@ mod tests {
 
     #[test]
     fn eot_ends_the_turn_and_keeps_its_content() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         let out = push_text(&mut g, " to=user<|message|>answer<|eot|>");
         assert!(
             matches!(out, GuardOutcome::EndTurn),
@@ -1908,7 +2732,7 @@ mod tests {
 
     #[test]
     fn flush_releases_the_held_tail_at_end_of_turn() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         push_text(&mut g, " to=user<|message|>tail text");
         let flushed = g.flush();
         assert!(flushed.contains("tail text"), "held tail lost: {flushed}");
@@ -1916,7 +2740,7 @@ mod tests {
 
     #[test]
     fn flush_does_not_release_a_partial_marker() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         push_text(&mut g, " to=user<|message|>answer<ate");
         let flushed = g.flush();
         assert_eq!(flushed, "answer", "partial marker escaped through flush");
@@ -1924,7 +2748,7 @@ mod tests {
 
     #[test]
     fn flush_releases_nothing_from_a_reasoning_message() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         push_text(&mut g, " to=self<|message|>unfinished thought");
         let flushed = g.flush();
         assert_eq!(flushed, "", "reasoning escaped through flush: {flushed:?}");
@@ -1952,7 +2776,7 @@ mod tests {
             "fixture no longer straddles a character at the cut"
         );
 
-        let mut one_chunk = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut one_chunk = guard(8, 1024, TEST_RECIPIENT_CHARS);
         let mut emitted = match push_text(&mut one_chunk, &format!(" to=user<|message|>{body}")) {
             GuardOutcome::Emit(s) => s,
             other => panic!("expected content past the hold-back, got {other:?}"),
@@ -1963,7 +2787,7 @@ mod tests {
             "multi-byte content was corrupted in one chunk"
         );
 
-        let mut split = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut split = guard(8, 1024, TEST_RECIPIENT_CHARS);
         let mut emitted = drain_char_by_char(&mut split, &format!(" to=user<|message|>{body}"));
         emitted.push_str(&split.flush());
         assert_eq!(
@@ -1974,7 +2798,7 @@ mod tests {
 
     #[test]
     fn a_multi_byte_answer_around_a_tool_call_survives() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         let prose = "天気を調べます。🌤️ ".repeat(4);
         let mut emitted = drain_char_by_char(
             &mut g,
@@ -2011,7 +2835,7 @@ mod tests {
     /// a content delta, but the prose around it is still the answer.
     #[test]
     fn a_bare_message_marker_inside_content_is_dropped() {
-        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         let mut emitted = drain_char_by_char(
             &mut g,
             " to=user<|message|>first half <|message|> second half of the answer",
