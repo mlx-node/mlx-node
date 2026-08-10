@@ -20,7 +20,6 @@ pub struct ShortConv {
     pub(crate) in_proj: LinearProj,
     pub(crate) out_proj: LinearProj,
     l_cache: i32,
-    hidden_size: i32,
 }
 
 impl ShortConv {
@@ -54,7 +53,6 @@ impl ShortConv {
             in_proj,
             out_proj,
             l_cache,
-            hidden_size,
         })
     }
 
@@ -67,6 +65,28 @@ impl ShortConv {
     /// # Returns
     /// Output tensor [B, T, hidden_size]
     pub fn forward(&self, x: &MxArray, cache: Option<&mut ArraysCache>) -> Result<MxArray> {
+        match cache {
+            Some(cache) => {
+                let state = cache.get(0).cloned();
+                let (output, next_state) = self.forward_with_state(x, state.as_ref())?;
+                cache.set(0, next_state);
+                Ok(output)
+            }
+            None => self.forward_with_state(x, None).map(|(output, _)| output),
+        }
+    }
+
+    /// Forward with an explicit convolution-state tensor.
+    ///
+    /// `state`, when present, has shape `[B, l_cache - 1, hidden]`. Returning
+    /// the updated state separately lets the continuous-batching executor stack
+    /// independent request states into one batch, run the convolution once,
+    /// then scatter one row back to each request without sharing mutable caches.
+    pub(crate) fn forward_with_state(
+        &self,
+        x: &MxArray,
+        state: Option<&MxArray>,
+    ) -> Result<(MxArray, MxArray)> {
         // 1. Project to 3x hidden
         let bcx = self.in_proj.forward(x)?;
 
@@ -80,41 +100,18 @@ impl ShortConv {
         let bx = b_gate.mul(x_val)?;
 
         // 4. Handle padding / caching
-        let bx_padded = if let Some(cache) = cache {
-            // Decode mode: use cache for conv state
-            let state = cache.get(0);
-            if let Some(state) = state {
-                // Cache has existing state — prepend it
-                let bx_with_state = MxArray::concatenate(state, &bx, 1)?;
-                // Update cache: keep last (l_cache - 1) positions
-                let n_keep = self.l_cache - 1;
-                let total_len = bx_with_state.shape_at(1)?;
-                let new_state =
-                    bx_with_state.slice_axis(1, total_len - n_keep as i64, total_len)?;
-                cache.set(0, new_state);
-                bx_with_state
-            } else {
-                // First decode step: init state to zeros
-                let batch = bx.shape_at(0)?;
-                let n_keep = self.l_cache - 1;
-                let state = MxArray::zeros(
-                    &[batch, n_keep as i64, self.hidden_size as i64],
-                    Some(bx.dtype()?),
-                )?;
-                let bx_with_state = MxArray::concatenate(&state, &bx, 1)?;
-                // Update cache with last (l_cache - 1) positions
-                let total_len = bx_with_state.shape_at(1)?;
-                let new_state =
-                    bx_with_state.slice_axis(1, total_len - n_keep as i64, total_len)?;
-                cache.set(0, new_state);
-                bx_with_state
-            }
+        let bx_padded = if let Some(state) = state {
+            MxArray::concatenate(state, &bx, 1)?
         } else {
-            // Prefill mode: left-pad with zeros
+            // First token / prefill: left-pad with zeros.
             // pad_width for [B, T, hidden]: [(0,0), (l_cache-1, 0), (0,0)]
             let pad_amount = self.l_cache - 1;
             bx.pad(&[0, 0, pad_amount, 0, 0, 0], 0.0)?
         };
+
+        let n_keep = self.l_cache - 1;
+        let total_len = bx_padded.shape_at(1)?;
+        let next_state = bx_padded.slice_axis(1, total_len - i64::from(n_keep), total_len)?;
 
         // 5. Apply depthwise conv1d
         let conv_out = self.conv.forward(&bx_padded)?;
@@ -123,7 +120,7 @@ impl ShortConv {
         let y = c_gate.mul(&conv_out)?;
 
         // 7. Output projection
-        self.out_proj.forward(&y)
+        Ok((self.out_proj.forward(&y)?, next_state))
     }
 
     // ========== Weight setters ==========
@@ -184,5 +181,61 @@ fn set_linear_proj_bias(proj: &mut LinearProj, b: Option<&MxArray>) -> Result<()
             ql.set_bias(b.cloned());
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(actual: &MxArray, expected: &MxArray, label: &str) {
+        let actual_shape = actual.shape().unwrap();
+        let expected_shape = expected.shape().unwrap();
+        assert_eq!(actual_shape.as_ref(), expected_shape.as_ref(), "{label}");
+        let actual = actual.to_float32().unwrap();
+        let expected = expected.to_float32().unwrap();
+        // MLX may select a different floating-point GEMM tile for M=2 than
+        // for two M=1 calls. Use a scale-aware bound that is still far below
+        // the deliberately distinct state rows, so a row mix-up fails while
+        // harmless reduction-order noise does not depend on global test order.
+        let max_excess = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs() - (5e-3 + 1e-3 * b.abs()))
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_excess <= 0.0,
+            "{label} exceeded atol=5e-3, rtol=1e-3 by {max_excess}"
+        );
+    }
+
+    #[test]
+    fn explicit_batched_state_matches_independent_rows() {
+        let conv = ShortConv::new(4, 3, false).unwrap();
+        let x = MxArray::from_float32(&[0.1, 0.2, -0.3, 0.4, -0.5, 0.6, 0.7, -0.8], &[2, 1, 4])
+            .unwrap();
+        let state = MxArray::from_float32(
+            &[
+                0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, -0.01, -0.02, -0.03, -0.04, -0.05,
+                -0.06, -0.07, -0.08,
+            ],
+            &[2, 2, 4],
+        )
+        .unwrap();
+        let (batched_output, batched_state) = conv.forward_with_state(&x, Some(&state)).unwrap();
+
+        let mut outputs = Vec::new();
+        let mut states = Vec::new();
+        for row in 0..2 {
+            let row_x = x.slice_axis(0, row, row + 1).unwrap();
+            let row_state = state.slice_axis(0, row, row + 1).unwrap();
+            let (output, next_state) = conv.forward_with_state(&row_x, Some(&row_state)).unwrap();
+            outputs.push(output);
+            states.push(next_state);
+        }
+        let serial_output = MxArray::concatenate_many(outputs.iter().collect(), Some(0)).unwrap();
+        let serial_state = MxArray::concatenate_many(states.iter().collect(), Some(0)).unwrap();
+        assert_close(&batched_output, &serial_output, "output");
+        assert_close(&batched_state, &serial_state, "state");
     }
 }

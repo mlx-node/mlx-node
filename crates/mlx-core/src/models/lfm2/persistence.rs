@@ -1595,7 +1595,7 @@ impl Lfm2Model {
     pub async fn load_from_dir(model_path: &str) -> Result<Self> {
         let model_path = model_path.to_string();
 
-        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
             move || {
                 // `Lfm2Inner::load_from_dir` returns a deterministic
                 // weight-byte total alongside the inner; register it
@@ -1607,9 +1607,12 @@ impl Lfm2Model {
                 let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
                 let config = inner.config.clone();
                 let paged_active = inner.paged_adapter.is_some();
-                Ok((inner, (config, cache_limit_guard, paged_active)))
+                Ok((
+                    super::model::Lfm2SchedulerState::new(inner),
+                    (config, cache_limit_guard, paged_active),
+                ))
             },
-            crate::engine::cmd::handle_chat_cmd::<Lfm2Inner>,
+            |state, receiver| state.drive(receiver),
         );
 
         let (config, cache_limit_guard, paged_active) = init_rx

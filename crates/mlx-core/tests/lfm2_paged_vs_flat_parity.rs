@@ -440,9 +440,13 @@ async fn lfm2_paged_vs_flat_length_exit_parity() {
 // rebuilds conv over the 23-token prefix via run_conv_only_prefill (the fixed
 // path).
 //
-// TWO independent hole-free ORACLES, cross-checked (assert flat==cold):
-//   * FLAT two-turn — carries conv across turns.
-//   * COLD paged self-reference — cached_prefix_len==0, never runs Pass-1.
+// AUTHORITATIVE ORACLE:
+//   * FLAT two-turn — carries the incremental conv state across turns.
+//
+// A cold paged Pass-1 reconstruction is deliberately NOT an oracle: batched
+// reconstruction and incremental T=1 state differ by roughly 40 ULP on bf16,
+// enough to flip a near-tied greedy token. Carried state is now the sole model
+// behavior; the old reconstruction-compatibility switch has been removed.
 // Compare `raw_text` NOT `text`: the divergent tokens live inside the reasoning
 // span, which `text` strips (comparing `text` could match two empties + MASK).
 // Reachability gate: `cached_tokens>0` proves turn 2 took the live-continue
@@ -543,7 +547,7 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
 
     drop(warm_model);
 
-    // ---- DIAGNOSTIC ORACLE A: FLAT two-turn (the real P4-2 bar) ----
+    // ---- AUTHORITATIVE ORACLE: FLAT carried-state two-turn ----
     let flat_dir = match clone_model_dir(&src, "lfm2-flat-warmcont", false) {
         Ok(p) => p,
         Err(e) => panic!("failed to clone flat-oracle dir: {e}"),
@@ -579,46 +583,7 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
     );
     drop(flat_model);
 
-    // ---- DIAGNOSTIC ORACLE B: COLD paged self-reference (re-prefill) ----
-    let cold_dir = match clone_model_dir(&src, "lfm2-paged-warmcont-cold", true) {
-        Ok(p) => p,
-        Err(e) => panic!("failed to clone paged cold-oracle dir: {e}"),
-    };
-    let cold_model = Lfm2Model::load_from_dir(&cold_dir.to_string_lossy())
-        .await
-        .expect("failed to load paged cold-oracle LFM2 model");
-    let r2_cold = cold_model
-        .chat_session_start(
-            vec![
-                user_message(user1),
-                assistant_message(&r1),
-                user_message(user2),
-            ],
-            Some(parity_chat_config(MAX_NEW_TURN2)),
-        )
-        .await
-        .expect("cold-oracle turn 2 paged chat_session_start failed");
-    eprintln!(
-        "[warm-cont] turn2 COLD oracle: num_tokens={} cached_tokens={} finish={} raw_text={:?}",
-        r2_cold.num_tokens, r2_cold.cached_tokens, r2_cold.finish_reason, r2_cold.raw_text,
-    );
-    drop(cold_model);
-
-    // Oracle sanity: the two INDEPENDENT hole-free oracles must agree
-    // (flat carries conv across turns; cold paged re-prefills from scratch).
-    // If they disagree the test scaffold itself is broken, not the fix.
-    assert_eq!(
-        r2_flat.raw_text, r2_cold.raw_text,
-        "oracle disagreement: FLAT two-turn != COLD paged full-prefill — the test's \
-         reference is unsound, fix the harness before trusting the bite below",
-    );
-
-    // THE BITE: warm paged-CONTINUE must equal the hole-free oracle.
-    //   - PRE-fix (conv Pass-1 identity-passthrough of attention layers):
-    //     downstream conv state drifts → warm diverges from flat/cold (~14 tokens
-    //     into turn 2) → this assertion FAILS.
-    //   - POST-fix (run_conv_only_prefill runs attention as a flat causal
-    //     self-prefill): warm == flat == cold byte-for-byte → PASSES.
+    // THE BITE: warm paged continuation must equal the carried-state oracle.
     if r2_warm.raw_text != r2_flat.raw_text {
         let first_diff = r2_warm
             .raw_text
@@ -628,7 +593,7 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
             .position(|(a, b)| a != b);
         panic!(
             "PAGED-CONTINUE BOUNDARY DIVERGENCE: warm paged-continue turn-2 != flat oracle \
-             (conv Pass-1 attention-skip drifted downstream conv state). \
+             (sequence-private carried conv state drifted). \
              first_diff_byte={first_diff:?}\n\
              WARM (cached={}) raw_text={:?}\n\
              FLAT (cached={}) raw_text={:?}",
@@ -637,7 +602,7 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
     }
 
     eprintln!(
-        "[PASS] paged-continue == flat == cold on the budget-forced length-exit boundary \
+        "[PASS] paged carried-state continue == flat carried-state oracle on the budget-forced boundary \
          (warm cached={})",
         r2_warm.cached_tokens,
     );
@@ -1378,8 +1343,9 @@ async fn lfm2_flat_delta_memory_probe_content() {
 // Telemetry regression: LFM2 paged prefillTokensPerSecond must be full-prompt
 // scale, not attention-suffix scale, on a warm cross-request prefix-cache hit.
 //
-// The paged prefill reprocesses the FULL prompt through the conv layers every
-// turn (run_paged_prefill_chunk Pass 1), so ttft measures full-prompt work.
+// An identical resend cannot reuse carried state because the exact-match
+// prefix lookup is capped at len-1; it therefore reprocesses the FULL prompt
+// through Pass 1, so ttft measures full-prompt work.
 // The pre-fix code divided that ttft into the attention SUFFIX
 // (tokens.len()-cached_prefix_len), under-reporting prefill tok/s by the
 // cache-hit ratio (~37 vs ~thousands). This guards the fix that uses the
@@ -1423,8 +1389,9 @@ async fn lfm2_paged_prefill_tps_is_full_prompt_scale_on_warm_reuse() {
     // Turn 2: a FRESH paged session re-submitting the IDENTICAL prompt. On a
     // paged model the BlockAllocator reuses the content-addressed prefix, so
     // `cached_tokens` covers ~the whole prompt while the new attention suffix is
-    // tiny — yet paged prefill still reprocesses the FULL prompt through the conv
-    // layers (run_paged_prefill_chunk Pass 1), so ttft stays full-prompt scale.
+    // tiny. The len-1 exact-resend cap prevents the carried-state proof, so
+    // paged prefill reprocesses the FULL prompt through Pass 1 and ttft stays
+    // full-prompt scale.
     // This exercises the fresh-turn paged START path (`run_paged_turn` →
     // `paged_prefill`) that the telemetry fix touches. (The
     // `chat_session_continue` delta path now ALSO runs paged — see the

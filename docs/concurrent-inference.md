@@ -1,7 +1,7 @@
 # Concurrent inference
 
 How mlx-node behaves when several chat requests are in flight at once and how
-the dense-Qwen3 continuous-batching lane is built. The original findings came
+the dense-Qwen3 and LFM2 continuous-batching lanes are built. The original findings came
 from an adversarially verified review of `main` @ `2d1fe60e` (2026-08-08): 25
 load-bearing claims, 19 confirmed, 6 corrected, 0 refuted. This document now
 describes the Stage 0 robustness work and the landed Stage 1 scheduler. The
@@ -19,13 +19,13 @@ paged decode clear-cache interval is 1024 steps
 
 ## Current status
 
-- Different sessions on one eligible dense Qwen3 paged model may overlap. The
+- Different sessions on one eligible dense Qwen3 or LFM2 paged model may overlap. The
   server admits up to the native scheduler's sequence capacity (8 by default),
   and the model thread advances them together. A single `ChatSession` still
   allows only one turn in flight.
-- Flat-cache, multimodal, speculative, hybrid-family, training, save, and reset
-  commands stay in the byte-compatible exclusive/barrier lanes. A forced-serial
-  A/B switch keeps the old whole-turn path available.
+- Flat-cache, multimodal, speculative, non-LFM2 hybrid-family, training, save,
+  and reset commands stay in the byte-compatible exclusive/barrier lanes. A
+  forced-serial A/B switch keeps the old whole-turn path available.
 - Different loaded models continue to run in parallel, one native model thread
   per model.
 
@@ -48,15 +48,15 @@ the next plan. Decode-first is a priority inside that one plan, keeping
 interactive rows moving before a long newly admitted prefill consumes the
 step's remaining token budget.
 
-| Layer         | Current mechanism                                                                                                                                                                                                                                                                                                           |
-| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Server        | `/v1/responses` and `/v1/messages` select `withAdmission` only when a paged model explicitly reports a capacity greater than one. Every other model uses the existing `withExclusive` lane. Both routes retain their admission slot through terminal visibility or disconnect.                                              |
-| Admission     | `SessionRegistry` is a FIFO counting semaphore for the batched lane. Active, queued, and pre-dispatch requests share the existing bounded budget; overflow still returns 429 plus `Retry-After: 1`. The default is 16 queued requests unless config or `MLX_MAX_QUEUE_DEPTH_PER_MODEL` overrides it or selects `unbounded`. |
-| Native thread | One scheduler and executor live beside the model on its dedicated OS thread; `MxArray` never crosses threads. Idle waits block, while busy periods poll commands only between steps.                                                                                                                                        |
-| Scheduler     | One global token ceiling serves decode rows first, then pinned prefill slices. Exclusive commands run only with an empty running set; reset/generate/save/train are barriers. Block watermark and already-promised growth can defer admission before allocation pressure.                                                   |
-| Cache         | `PagedKVCacheAdapter` owns a request table keyed by sequence id over one refcounted block pool. Live requests can share verified prefix blocks. SSD restore is asynchronous: `WaitingForSsd` rows park while runnable peers continue.                                                                                       |
-| Executor      | Dense Qwen3 performs one batched `[N,1]` decode forward for eligible rows and a bounded prefill dispatch when budget remains. Each row keeps its own history, penalties, sampling config, stop state, stream sink, and cancellation snapshot.                                                                               |
-| Transport     | SSE writes honor Node backpressure and stop native pulls until drain or close. The 30-second default drain deadline aborts a connected stalled peer and releases admission.                                                                                                                                                 |
+| Layer         | Current mechanism                                                                                                                                                                                                                                                                                                                    |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Server        | `/v1/responses` and `/v1/messages` select `withAdmission` only when a paged model explicitly reports a capacity greater than one. Every other model uses the existing `withExclusive` lane. Both routes retain their admission slot through terminal visibility or disconnect.                                                       |
+| Admission     | `SessionRegistry` is a FIFO counting semaphore for the batched lane. Active, queued, and pre-dispatch requests share the existing bounded budget; overflow still returns 429 plus `Retry-After: 1`. The default is 16 queued requests unless config or `MLX_MAX_QUEUE_DEPTH_PER_MODEL` overrides it or selects `unbounded`.          |
+| Native thread | One scheduler and executor live beside the model on its dedicated OS thread; `MxArray` never crosses threads. Idle waits block, while busy periods poll commands only between steps.                                                                                                                                                 |
+| Scheduler     | One global token ceiling serves decode rows first, then pinned prefill slices. Exclusive commands run only with an empty running set; reset/generate/save/train are barriers. Block watermark and already-promised growth can defer admission before allocation pressure.                                                            |
+| Cache         | `PagedKVCacheAdapter` owns a request table keyed by sequence id over one refcounted block pool. Live requests can share verified prefix blocks. SSD restore is asynchronous: `WaitingForSsd` rows park while runnable peers continue.                                                                                                |
+| Executor      | Dense Qwen3 and LFM2 perform one batched `[N,1]` decode forward for eligible rows and a bounded prefill dispatch when budget remains. LFM2 additionally stacks/scatters one private ShortConv state row per request. Each row keeps its own history, penalties, sampling config, stop state, stream sink, and cancellation snapshot. |
+| Transport     | SSE writes honor Node backpressure and stop native pulls until drain or close. The 30-second default drain deadline aborts a connected stalled peer and releases admission.                                                                                                                                                          |
 
 Per-request prefix verification remains all-or-nothing. A miss releases and
 rebuilds only that sequence's slot; it never resets a peer. Batched admission
@@ -67,15 +67,15 @@ correctness is independent of the warm single-slot registry.
 
 The native knobs are read once per process:
 
-| Knob                            | Default | Meaning                                                                             |
-| ------------------------------- | ------- | ----------------------------------------------------------------------------------- |
-| `MLX_SCHED_MAX_NUM_SEQS`        | `8`     | Native running-set cap and server admission capacity (hard-clamped to 32).          |
-| `MLX_SCHED_MAX_BATCHED_TOKENS`  | `2048`  | Total tokens planned in one scheduler step.                                         |
-| `MLX_SCHED_LONG_PREFILL_TOKENS` | `2048`  | Maximum prefill progress for one request in one step.                               |
-| `MLX_SCHED_WATERMARK_FRACTION`  | `0.05`  | Free-block headroom retained while work is already live.                            |
-| `MLX_SCHED_RESERVE_FULL_ISL`    | `1`     | Reserve each admitted request's remaining prompt growth in the must-fit test.       |
-| `MLX_PAGED_PER_SEQ_CTX`         | `32768` | Per-sequence context used by the pool budget formula.                               |
-| `MLX_SERVE_FORCE_SERIAL`        | `0`     | Route eligible Qwen3 turns through the legacy whole-turn path for A/B and rollback. |
+| Knob                            | Default | Meaning                                                                                  |
+| ------------------------------- | ------- | ---------------------------------------------------------------------------------------- |
+| `MLX_SCHED_MAX_NUM_SEQS`        | `8`     | Native running-set cap and server admission capacity (hard-clamped to 32).               |
+| `MLX_SCHED_MAX_BATCHED_TOKENS`  | `2048`  | Total tokens planned in one scheduler step.                                              |
+| `MLX_SCHED_LONG_PREFILL_TOKENS` | `2048`  | Maximum prefill progress for one request in one step.                                    |
+| `MLX_SCHED_WATERMARK_FRACTION`  | `0.05`  | Free-block headroom retained while work is already live.                                 |
+| `MLX_SCHED_RESERVE_FULL_ISL`    | `1`     | Reserve each admitted request's remaining prompt growth in the must-fit test.            |
+| `MLX_PAGED_PER_SEQ_CTX`         | `32768` | Per-sequence context used by the pool budget formula.                                    |
+| `MLX_SERVE_FORCE_SERIAL`        | `0`     | Route eligible Qwen3/LFM2 turns through the legacy whole-turn path for A/B and rollback. |
 
 Two reproducibility rules are deliberate:
 
@@ -106,12 +106,13 @@ the realistic 2–8 concurrent range.
 ```text
 server admission       ✓ counting semaphore for eligible paged models
 phase-free scheduler   ✓ token budget, watermark, occupancy histogram
-Qwen3 adapter          ✓ per-sequence request table + shared prefix blocks
-Qwen3 executor         ✓ one uniform [N,1] decode forward
+Qwen3/LFM2 adapters    ✓ per-sequence request table + shared prefix blocks
+Qwen3/LFM2 executors   ✓ one uniform [N,1] decode forward
+LFM2 recurrent state   ✓ private [l_cache-1, hidden] row per conv layer/request
 BlockAllocator         ✓ refcounts + prefix hash (vLLM-style pool)
 FFI / Metal kernels    ✓ num_seqs = q.shape(0), grid.y = sequence
 ragged mixed step      △ Stage 2, behind StepExecutor seam
-hybrid recurrent state △ Stage 1.5/2, currently exclusive
+wider hybrid state     △ Stage 2, GDN/Gemma4 currently exclusive
 ```
 
 - Kernels/FFI: `crates/mlx-paged-attn/metal/attention/paged_attention.metal:762-806`,
@@ -122,7 +123,8 @@ hybrid recurrent state △ Stage 1.5/2, currently exclusive
   per-model-instance, not process-global.
 - The adapter request table and batched metadata are in
   `crates/mlx-core/src/transformer/paged_kv_cache_adapter.rs`; the dense Qwen3
-  executor is in `models/qwen3/model.rs`.
+  executor is in `models/qwen3/model.rs`, and LFM2's hybrid executor/state table
+  is in `models/lfm2/model.rs`.
 
 Remaining scaffolding:
 
@@ -153,13 +155,13 @@ multi-model-hostile in `engine/cmd.rs:186-190`).
 
 ## Yardstick: vLLM v1
 
-| Mechanism                                                                   | vLLM v1                                          | mlx-node today                                                                                             |
-| --------------------------------------------------------------------------- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
-| Continuous batching (one shared forward per step; no prefill/decode phases) | Core scheduler loop                              | Dense Qwen3 uniform decode; other families remain exclusive                                                |
-| Per-step token budget + chunked prefill                                     | Enabled by default                               | One 2048-token ceiling with decode-first planning and pinned per-request breaks                            |
-| Live prefix sharing                                                         | Chained hashes, refcounts, and LRU               | Refcounted block pool across live Qwen3 sequences, plus an asynchronous SSD cold tier                      |
-| Admission / preemption                                                      | `max_num_seqs`, watermark, preempt-and-recompute | Sequence cap and reserve-aware watermark admission; defers instead of preempting today                     |
-| Backend seam                                                                | Scheduler drives platform-specific workers       | `StepExecutor` separates scheduler policy from dense-Qwen3 execution; ragged and hybrid executors are next |
+| Mechanism                                                                   | vLLM v1                                          | mlx-node today                                                                                                  |
+| --------------------------------------------------------------------------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| Continuous batching (one shared forward per step; no prefill/decode phases) | Core scheduler loop                              | Dense Qwen3 and LFM2 uniform decode; other families remain exclusive                                            |
+| Per-step token budget + chunked prefill                                     | Enabled by default                               | One 2048-token ceiling with decode-first planning and pinned per-request breaks                                 |
+| Live prefix sharing                                                         | Chained hashes, refcounts, and LRU               | Refcounted block pools across live Qwen3/LFM2 sequences; Qwen3 also has an asynchronous SSD cold tier           |
+| Admission / preemption                                                      | `max_num_seqs`, watermark, preempt-and-recompute | Sequence cap and reserve-aware watermark admission; defers instead of preempting today                          |
+| Backend seam                                                                | Scheduler drives platform-specific workers       | `StepExecutor` separates scheduler policy from Qwen3/LFM2 execution; ragged and wider hybrid executors are next |
 
 What does not transfer: CUDA-graph padding (MLX lazy graphs play that role),
 the multi-process ZMQ split (a scheduler thread suffices at this scale),
@@ -178,8 +180,10 @@ memory the pool competes with the weights — see
   scheduler, uniform batched decode, per-row epilogue, live prefix sharing,
   block-watermark admission, asynchronous SSD restore, server semaphore, and
   same-binary forced-serial rollback path are implemented.
-- **Stage 1.5 — hybrid entry:** give LFM2 a per-request convolution-state table
-  and admit it to the batched lane without changing the scheduler policy.
+- **Stage 1.5 — LFM2 hybrid entry (landed):** each live request owns a
+  per-conv-layer `[l_cache-1, hidden]` recurrent-state row. Decode stacks those
+  rows, runs each ShortConv once over `[N,1,H]`, and scatters the next state;
+  cached-prefix Pass 1 runs at most once per admission.
 - **Stage 2 — preemption and wider execution:** add recompute-first LIFO
   preemption with measured SSD escalation, swap in a ragged mixed-token
   executor behind `StepExecutor`, then debit per-request recurrent-state tables

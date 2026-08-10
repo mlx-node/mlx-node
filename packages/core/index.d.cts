@@ -559,6 +559,10 @@ export declare class Lfm2Model {
   hasBlockPagedCache(): boolean;
   /** Get the model configuration. */
   getConfig(): Lfm2Config;
+  /** Native admission capacity for the server's per-model semaphore. */
+  maxConcurrentSequences(): number;
+  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
+  schedulerStats(): Promise<SchedulerStats>;
   /** Estimated number of model parameters. */
   numParameters(): number;
   /**

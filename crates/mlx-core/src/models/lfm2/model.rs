@@ -1,25 +1,37 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use tracing::info;
 
-use crate::array::MxArray;
+use crate::array::{MxArray, synchronize_and_clear_cache};
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::ThinkingPolicy;
 use crate::engine::backend::{
-    ChatBackend, DecodeStep, PagedBackend, PagedPrefix, PagedTurnSetup, ResetScope, SaveStateArgs,
-    TurnOutput, TurnSetup, WholeTurnArgs,
+    ChatBackend, ChunkSink, DecodeStep, PagedBackend, PagedPrefix, PagedTurnSetup, ResetScope,
+    SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
 };
-use crate::engine::cmd::ChatCmd;
+use crate::engine::cmd::{ChatCmd, FromChatCmd, handle_chat_cmd};
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
-use crate::engine::types::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
+use crate::engine::scheduler::{
+    RowStepResult, Scheduler, SchedulerAction, StepExecutor, StepKind, StepPlan, StepResult,
+    TurnState,
+};
+use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
+use crate::engine::{self};
+use crate::model_thread::{LoopControl, ResponseTx, StreamTx, send_and_await};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::profiling::PerformanceMetrics;
-use crate::stream::{Stream, StreamContext};
+use crate::sampling::{check_repetition_cutoff, sample};
+use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
-use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+use crate::transformer::paged_kv_cache_adapter::{
+    PagedKVCacheAdapter, PagedRestorePoll, PagedRestoreTicket, PagedTurnAdmission, SeqId,
+};
 
 use super::config::Lfm2Config;
 use super::decoder_layer::{Lfm2DecoderLayer, Lfm2LayerKind};
@@ -40,24 +52,97 @@ fn last_token_slice_enabled() -> bool {
     *CACHED.get_or_init(|| std::env::var_os("MLX_LFM2_DISABLE_LAST_TOKEN_SLICE").is_none())
 }
 
-/// Whether the warm paged-turn conv-state reuse fast path is enabled.
-///
-/// OPT-IN, DEFAULT OFF. When ON, a qualifying warm continuation (see
-/// [`conv_state_reusable`]) reuses `self.caches`'s live incremental conv
-/// state instead of reconstructing it via a full re-embed + causal-SDPA pass
-/// over the whole cached prefix, skipping the redundant Pass 1. It ships
-/// opt-in because the reused incremental conv state differs MATERIALLY from
-/// the single-pass reconstruction it replaces (~40 ULP, enough to flip a
-/// near-tie argmax) — LFM2 ShortConv `in_proj` produces different bf16 for a
-/// T=1 incremental step vs the batched reconstruction input — so it is a real
-/// behavior change (arguably closer to flat continuous generation) that stays
-/// disabled until a conv oracle validates enabling it by default. Read once on
-/// first call and cached; subsequent reads hit the `OnceLock` fast path.
-fn conv_state_reuse_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        crate::inference_trace::env_flag_enabled_or_default("MLX_LFM2_CONV_STATE_REUSE", false)
+fn scheduler_max_num_seqs() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_SCHED_MAX_NUM_SEQS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(8)
+            .min(32)
     })
+}
+
+fn scheduler_max_batched_tokens() -> u32 {
+    static VALUE: OnceLock<u32> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_SCHED_MAX_BATCHED_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(2048)
+    })
+}
+
+fn scheduler_long_prefill_tokens() -> u32 {
+    static VALUE: OnceLock<u32> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_SCHED_LONG_PREFILL_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(2048)
+    })
+}
+
+fn scheduler_per_seq_context() -> u32 {
+    static VALUE: OnceLock<u32> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_PAGED_PER_SEQ_CTX")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(32_768)
+    })
+}
+
+fn scheduler_watermark_fraction() -> f64 {
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_SCHED_WATERMARK_FRACTION")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            .unwrap_or(0.05)
+    })
+}
+
+fn scheduler_reserve_full_isl() -> bool {
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_SCHED_RESERVE_FULL_ISL").map_or(true, |value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+    })
+}
+
+/// Commands owned by the LFM2 scheduler thread. Chat variants are lifted from
+/// the model-neutral API; scheduler telemetry is a barrier so it observes a
+/// coherent step boundary.
+pub(crate) enum Lfm2Cmd {
+    Chat(Box<ChatCmd>),
+    SchedulerStats {
+        reply: ResponseTx<engine::SchedulerStatsJs>,
+    },
+}
+
+impl FromChatCmd for Lfm2Cmd {
+    fn from_chat(cmd: ChatCmd) -> Self {
+        Self::Chat(Box::new(cmd))
+    }
+}
+
+fn handle_lfm2_cmd(inner: &mut Lfm2Inner, command: Lfm2Cmd) {
+    match command {
+        Lfm2Cmd::Chat(command) => handle_chat_cmd(inner, *command),
+        Lfm2Cmd::SchedulerStats { reply } => {
+            let _ = reply.send(Ok(engine::scheduler::SchedulerStats::default().to_js()));
+        }
+    }
 }
 
 /// Internal model state owned exclusively by the dedicated model thread.
@@ -71,10 +156,10 @@ pub(crate) struct Lfm2Inner {
     /// turn epilogue on every exit path.
     /// Polled at the top of each flat `chunked_prefill` chunk; `true`
     /// aborts with the distinguished `"prefill cancelled"` error, riding
-    /// the engine's fail-closed prefill-`Err` arm. The lfm2 PAGED prefill
-    /// performs a full cached-prefix convolution replay in Pass 1 and a
+    /// the engine's fail-closed prefill-`Err` arm. An LFM2 paged miss may
+    /// perform a full cached-prefix convolution replay in Pass 1 before the
     /// single-shot suffix forward in Pass 2; neither has an internal chunk
-    /// boundary, so both remain documented uncancellable windows.
+    /// boundary, so each dispatched slice remains an uncancellable window.
     pub(crate) turn_cancel: Option<Arc<AtomicBool>>,
     /// Turn-constant layer classification (`FullAttention` vs `Conv`),
     /// computed once in [`Self::new`] instead of re-derived on every paged
@@ -108,6 +193,12 @@ pub(crate) struct Lfm2Inner {
     /// not by absolute layer index. `Lfm2DecoderLayer::forward_paged_or_flat`
     /// performs the per-layer dispatch.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// Per-request recurrent state for the scheduler lane. The legacy
+    /// whole-turn path continues to use `caches`; scheduled execution swaps one
+    /// request into that field for serial prefill/finalize and stacks rows
+    /// directly from this table for batched decode.
+    scheduled_caches: HashMap<SeqId, Vec<Lfm2LayerCache>>,
+    active_scheduled_seq: Option<SeqId>,
     /// Sampling + stop-token defaults parsed from the checkpoint's
     /// `generation_config.json` at load time. Empty for checkpoints that
     /// ship no such file. Consumed by the [`ChatBackend`] sampling/EOS
@@ -209,11 +300,9 @@ pub(crate) fn classify_prefix_cache_decision(
 /// mirrors [`classify_prefix_cache_decision`]'s exact-match-is-miss
 /// invariant: LFM2 has no safe "rewind by one" primitive.
 ///
-/// This predicate only gates the fast path when [`conv_state_reuse_enabled`]
-/// is also true (opt-in via `MLX_LFM2_CONV_STATE_REUSE`, DEFAULT OFF): the
-/// reused live conv state differs materially (~40 ULP, near-tie argmax may
-/// flip) from the single-pass reconstruction it replaces, so it stays off
-/// until an oracle validates it.
+/// Both the legacy whole-turn path and the scheduler consume this predicate
+/// directly. The sole oracle is the carried incremental state produced by that
+/// sequence's preceding tokens, never a numerically different reconstruction.
 #[inline]
 fn conv_state_reusable(
     plan: &[u32],
@@ -369,6 +458,8 @@ impl Lfm2Inner {
             cached_token_history: Vec::new(),
             cached_image_key: None,
             paged_adapter,
+            scheduled_caches: HashMap::new(),
+            active_scheduled_seq: None,
             // Empty until the load path parses `generation_config.json`
             // (set via `set_gen_defaults` in `persistence.rs`).
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
@@ -481,6 +572,8 @@ impl Lfm2Inner {
     /// (see [`ChatBackend::reset_caches`]).
     fn reset_caches_internal(&mut self) {
         self.caches = init_caches(&self.config);
+        self.scheduled_caches.clear();
+        self.active_scheduled_seq = None;
         self.cached_token_history.clear();
         self.cached_image_key = None;
         // Drop any live paged-adapter request. Without this, a
@@ -493,7 +586,7 @@ impl Lfm2Inner {
         // cache; the EXPLICIT command reset purges them on top of this
         // (`ResetScope::Command` branch of the trait impl).
         if let Some(adapter) = self.paged_adapter.as_mut() {
-            let _ = adapter.release_request();
+            let _ = adapter.release_all_requests();
         }
     }
 
@@ -545,12 +638,11 @@ impl Lfm2Inner {
     /// hit length. `skip_conv_reconstruction` is
     /// [`conv_state_reusable`]'s verdict from `prime_prefix_state`
     /// (threaded through [`Lfm2PrefixState::conv_state_reusable`]),
-    /// and is only ever `true` when the opt-in `MLX_LFM2_CONV_STATE_REUSE`
-    /// flag is set ([`conv_state_reuse_enabled`], DEFAULT OFF): when `true`,
-    /// `self.caches`'s conv-layer state is already known to be at the
-    /// `cached_prefix_len` boundary, so Pass 1 is skipped entirely and Pass 2
-    /// runs directly on the live caches. Default-off ⇒ always `false` ⇒ Pass 1
-    /// reconstruction always runs (byte-identical to prior behavior).
+    /// is true when `self.caches`'s conv-layer state is already known to be at
+    /// the `cached_prefix_len` boundary. The legacy path proves this against
+    /// its one live history; the scheduler proves it against exact owner
+    /// history plus the sequence-keyed recurrent-state table. In either case
+    /// Pass 1 is skipped and Pass 2 runs on the carried state.
     ///
     /// Returns the last position's logits squeezed to `[vocab]`.
     fn run_paged_prefill_chunk(
@@ -724,6 +816,107 @@ impl Lfm2Inner {
         Ok(last)
     }
 
+    fn park_active_scheduled_caches(&mut self) {
+        let Some(seq_id) = self.active_scheduled_seq.take() else {
+            return;
+        };
+        let replacement = init_caches(&self.config);
+        let caches = std::mem::replace(&mut self.caches, replacement);
+        self.scheduled_caches.insert(seq_id, caches);
+    }
+
+    fn activate_paged_seq(&mut self, seq_id: SeqId) -> Result<()> {
+        self.paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("lfm2 paged adapter is unavailable"))?
+            .activate_request(seq_id)
+            .map_err(Error::from_reason)?;
+        if self.active_scheduled_seq == Some(seq_id) {
+            return Ok(());
+        }
+        self.park_active_scheduled_caches();
+        self.caches = self
+            .scheduled_caches
+            .remove(&seq_id)
+            .unwrap_or_else(|| init_caches(&self.config));
+        self.active_scheduled_seq = Some(seq_id);
+        Ok(())
+    }
+
+    fn reset_scheduled_caches_for(&mut self, seq_id: SeqId) {
+        if self.active_scheduled_seq == Some(seq_id) {
+            self.caches = init_caches(&self.config);
+        } else {
+            self.scheduled_caches
+                .insert(seq_id, init_caches(&self.config));
+        }
+    }
+
+    fn release_scheduled_caches_for(&mut self, seq_id: SeqId) {
+        if self.active_scheduled_seq == Some(seq_id) {
+            self.active_scheduled_seq = None;
+            self.caches = init_caches(&self.config);
+        }
+        self.scheduled_caches.remove(&seq_id);
+    }
+
+    fn stacked_conv_state(
+        &mut self,
+        seq_ids: &[SeqId],
+        layer_idx: usize,
+        dtype: crate::array::DType,
+    ) -> Result<MxArray> {
+        self.park_active_scheduled_caches();
+        let mut states = Vec::with_capacity(seq_ids.len());
+        for &seq_id in seq_ids {
+            let caches = self
+                .scheduled_caches
+                .entry(seq_id)
+                .or_insert_with(|| init_caches(&self.config));
+            let state = caches
+                .get(layer_idx)
+                .and_then(|cache| match cache {
+                    Lfm2LayerCache::Conv(cache) => cache.get(0).cloned(),
+                    Lfm2LayerCache::Attention(_) => None,
+                })
+                .unwrap_or(MxArray::zeros(
+                    &[
+                        1,
+                        i64::from(self.config.conv_l_cache - 1),
+                        i64::from(self.config.hidden_size),
+                    ],
+                    Some(dtype),
+                )?);
+            states.push(state);
+        }
+        MxArray::concatenate_many(states.iter().collect(), Some(0))
+    }
+
+    fn scatter_conv_state(
+        &mut self,
+        seq_ids: &[SeqId],
+        layer_idx: usize,
+        state: &MxArray,
+    ) -> Result<()> {
+        for (row, &seq_id) in seq_ids.iter().enumerate() {
+            let row_state = state.slice_axis(0, row as i64, row as i64 + 1)?;
+            let caches = self
+                .scheduled_caches
+                .entry(seq_id)
+                .or_insert_with(|| init_caches(&self.config));
+            let cache = caches
+                .get_mut(layer_idx)
+                .and_then(Lfm2LayerCache::as_conv_cache_mut)
+                .ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "LFM2 layer {layer_idx} has no convolution-state slot"
+                    ))
+                })?;
+            cache.set(0, row_state);
+        }
+        Ok(())
+    }
+
     /// Run one paged decode step: feed `[token_id]` through the model.
     fn run_paged_decode_step(&mut self, token_id: u32) -> Result<MxArray> {
         // Record the new token + capture its logical position BEFORE
@@ -813,6 +1006,97 @@ impl Lfm2Inner {
         Ok(logits)
     }
 
+    /// Run one uniform paged decode step for multiple LFM2 requests.
+    /// Attention and ShortConv layers both execute once over `[N,1,H]`; the
+    /// convolution state is stacked/scattered around each conv layer.
+    fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+        if rows.is_empty() {
+            return Err(Error::from_reason(
+                "run_paged_decode_step_batched requires at least one row",
+            ));
+        }
+        self.park_active_scheduled_caches();
+        let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+            Error::from_reason("run_paged_decode_step_batched: paged adapter is unavailable")
+        })?;
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut planned_rows = Vec::with_capacity(rows.len());
+        for &(seq_id, _) in rows {
+            if !seen.insert(seq_id) {
+                return Err(Error::from_reason(format!(
+                    "run_paged_decode_step_batched received duplicate sequence {seq_id}"
+                )));
+            }
+            let position = adapter.current_token_count_for(seq_id).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "run_paged_decode_step_batched: unknown sequence {seq_id}"
+                ))
+            })?;
+            planned_rows.push((seq_id, position));
+        }
+
+        let mut recorded = Vec::with_capacity(rows.len());
+        for &(seq_id, token_id) in rows {
+            let result = self
+                .paged_adapter
+                .as_mut()
+                .expect("adapter validated above")
+                .record_token_for(seq_id, token_id);
+            if let Err(error) = result {
+                for &recorded_seq in recorded.iter().rev() {
+                    let adapter = self
+                        .paged_adapter
+                        .as_mut()
+                        .expect("adapter validated above");
+                    adapter
+                        .activate_request(recorded_seq)
+                        .map_err(Error::from_reason)?;
+                    adapter
+                        .rollback_last_tokens(1)
+                        .map_err(Error::from_reason)?;
+                }
+                return Err(Error::from_reason(format!(
+                    "run_paged_decode_step_batched failed to record sequence {seq_id}: {error}"
+                )));
+            }
+            recorded.push(seq_id);
+        }
+
+        let token_ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
+        let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
+        let input_ids = MxArray::from_uint32(&token_ids, &[rows.len() as i64, 1])?;
+        let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
+        for layer_idx in 0..self.layers.len() {
+            let kind = self.layer_kinds[layer_idx];
+            let layer: &Lfm2DecoderLayer = unsafe { &*self.layers.as_ptr().add(layer_idx) };
+            let conv_state = if kind == Lfm2LayerKind::Conv {
+                Some(self.stacked_conv_state(&seq_ids, layer_idx, hidden_states.dtype()?)?)
+            } else {
+                None
+            };
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_decode_step_batched: paged adapter dropped")
+            })?;
+            let (next_hidden, next_conv_state) = layer.forward_paged_or_flat_batched(
+                &hidden_states,
+                kind,
+                adapter,
+                &planned_rows,
+                conv_state.as_ref(),
+            )?;
+            hidden_states = next_hidden;
+            if let Some(state) = next_conv_state {
+                self.scatter_conv_state(&seq_ids, layer_idx, &state)?;
+            }
+        }
+        hidden_states = self.embedding_norm.forward(&hidden_states)?;
+        if let Some(ref head) = self.lm_head {
+            head.forward(&hidden_states)
+        } else {
+            self.embed_tokens.as_linear(&hidden_states)
+        }
+    }
+
     /// Forward the cached prefix tokens through ALL layers (conv state
     /// updated in-place; attention run as a flat causal self-prefill whose
     /// K/V are discarded — the prefix K/V already live in the paged pool).
@@ -899,6 +1183,1466 @@ impl Lfm2Inner {
 /// Eager flat decode stepper for one lfm2 turn (built by
 /// [`ChatBackend::begin_decode`]). Each `forward` runs the native
 /// [`Lfm2Inner::forward`].
+enum Lfm2ScheduledReply {
+    Sync(ResponseTx<ChatResult>),
+    Stream(StreamTx<ChatStreamChunk>),
+}
+
+impl Lfm2ScheduledReply {
+    fn sink(&self) -> Option<&dyn ChunkSink> {
+        match self {
+            Self::Sync(_) => None,
+            Self::Stream(stream) => Some(stream),
+        }
+    }
+
+    fn send_error(self, error: Error, cancelled: &AtomicBool) {
+        match self {
+            Self::Sync(reply) => {
+                let error = if cancelled.load(Ordering::Relaxed) {
+                    Error::from_reason(engine::session::CHAT_SESSION_CANCELLED)
+                } else {
+                    error
+                };
+                let _ = reply.send(Err(error));
+            }
+            Self::Stream(stream) => ChunkSink::send(&stream, Err(error)),
+        }
+    }
+}
+
+struct Lfm2ScheduledTurn {
+    owner_id: String,
+    tokenizer: Arc<Qwen3Tokenizer>,
+    eos_id: u32,
+    config: ChatConfig,
+    params: engine::params::ChatParams,
+    thinking: engine::backend::ThinkingSetup,
+    prompt_tokens: Vec<u32>,
+    prefix: Lfm2PrefixState,
+    is_delta: bool,
+    reuse_cache: bool,
+    response: Lfm2ScheduledReply,
+    generated_tokens: Vec<u32>,
+    finish_reason: String,
+    reasoning_tracker: engine::penalties::ReasoningTracker,
+    extra_eos_ids: Vec<u32>,
+    generation_start: Option<Instant>,
+    first_token_instant: Option<Instant>,
+    generation_stream: Stream,
+    profiler: DecodeProfiler,
+    emitter: Option<Box<dyn StreamEmitter>>,
+    stream_skip_special: bool,
+    decode_ids: Vec<u32>,
+    decode_prefix: String,
+    decode_prefix_index: usize,
+    streamed_text_len: usize,
+    last_is_reasoning: bool,
+    failure: Option<Error>,
+    allocation_failed: bool,
+}
+
+struct PreparedLfm2ScheduledTurn {
+    admitted: engine::session::AdmittedPagedTurn,
+    response: Lfm2ScheduledReply,
+    cancelled: Arc<AtomicBool>,
+    owner_id: String,
+    seq_id: SeqId,
+    reservation_blocks: u32,
+    block_size: u32,
+}
+
+enum Lfm2Admission {
+    Ready(TurnState<Lfm2ScheduledTurn>),
+    Waiting(TurnState<Lfm2ScheduledTurn>, PagedRestoreTicket),
+}
+
+struct Lfm2StepExecutor<'a> {
+    inner: &'a mut Lfm2Inner,
+}
+
+struct Lfm2PreparedDecodeRow {
+    plan_index: usize,
+    seq_id: SeqId,
+    token_id: u32,
+    terminal: bool,
+    at_length: bool,
+    stops_at_eos: bool,
+    cancelled: bool,
+    repetition: Option<&'static str>,
+    batch_index: Option<usize>,
+}
+
+impl Lfm2StepExecutor<'_> {
+    fn fail(
+        turn: &mut TurnState<Lfm2ScheduledTurn>,
+        row: &engine::scheduler::StepRow,
+        error: Error,
+    ) -> RowStepResult {
+        turn.payload.allocation_failed |= error.reason.contains("could not reserve")
+            || error.reason.contains("failed to record sequence")
+            || error.reason.contains("paged cache capacity");
+        turn.payload.failure = Some(error);
+        turn.payload.profiler.snapshot_memory_after();
+        turn.payload.profiler.report();
+        RowStepResult {
+            seq_id: row.seq_id,
+            num_computed_tokens: row.num_tokens,
+            generated_token: None,
+            finished: true,
+        }
+    }
+
+    fn stream_token(turn: &mut TurnState<Lfm2ScheduledTurn>, token_id: u32, is_reasoning: bool) {
+        let payload = &mut turn.payload;
+        let text = match tokenizers::tokenizer::step_decode_stream(
+            payload.tokenizer.inner(),
+            vec![token_id],
+            payload.stream_skip_special,
+            &mut payload.decode_ids,
+            &mut payload.decode_prefix,
+            &mut payload.decode_prefix_index,
+        ) {
+            Ok(Some(text)) => text,
+            Ok(None) => String::new(),
+            Err(_) => {
+                payload.decode_ids.clear();
+                payload.decode_prefix.clear();
+                payload.decode_prefix_index = 0;
+                let mut replayed = String::new();
+                for &token in &payload.generated_tokens {
+                    if let Ok(Some(text)) = tokenizers::tokenizer::step_decode_stream(
+                        payload.tokenizer.inner(),
+                        vec![token],
+                        payload.stream_skip_special,
+                        &mut payload.decode_ids,
+                        &mut payload.decode_prefix,
+                        &mut payload.decode_prefix_index,
+                    ) {
+                        replayed.push_str(&text);
+                    }
+                }
+                replayed
+                    .get(payload.streamed_text_len..)
+                    .unwrap_or_default()
+                    .to_string()
+            }
+        };
+        payload.streamed_text_len = payload.streamed_text_len.saturating_add(text.len());
+        if let (Some(sink), Some(emitter)) = (payload.response.sink(), payload.emitter.as_mut()) {
+            emitter.on_token_text(&text, is_reasoning, payload.params.include_reasoning, sink);
+        }
+    }
+
+    fn execute_prefill(
+        &mut self,
+        row: &engine::scheduler::StepRow,
+        turn: &mut TurnState<Lfm2ScheduledTurn>,
+    ) -> Result<RowStepResult> {
+        if row.cancel_snapshot {
+            return Ok(Self::fail(
+                turn,
+                row,
+                Error::from_reason("prefill cancelled"),
+            ));
+        }
+        let start = row.token_start as usize;
+        let end = start.saturating_add(row.num_tokens as usize);
+        if end > turn.payload.prompt_tokens.len() {
+            return Ok(Self::fail(
+                turn,
+                row,
+                Error::from_reason("scheduler prefill slice exceeds prompt"),
+            ));
+        }
+        if let Err(error) = self.inner.activate_paged_seq(row.seq_id) {
+            return Ok(Self::fail(turn, row, error));
+        }
+        self.inner
+            .set_turn_cancel_flag(turn.cancelled.as_ref().map(Arc::clone));
+        turn.payload.profiler.begin_prefill();
+        let first_chunk = start == turn.payload.prefix.effective_cached_prefix_len;
+        let step_prefix = Lfm2PrefixState {
+            effective_cached_prefix_len: start,
+            suffix_len: row.num_tokens as usize,
+            full_tokens: turn.payload.prompt_tokens.clone(),
+            // Rebuild the cached-prefix conv state once on the first scheduler
+            // prefill chunk. Every later chunk carries the state produced by
+            // its predecessor and must not replay Pass 1 again.
+            conv_state_reusable: !first_chunk || turn.payload.prefix.conv_state_reusable,
+        };
+        let logits = match self.inner.paged_prefill(
+            &turn.payload.prompt_tokens[start..end],
+            &step_prefix,
+            turn.payload.generation_stream,
+        ) {
+            Ok(logits) => logits,
+            Err(error) => return Ok(Self::fail(turn, row, error)),
+        };
+        turn.payload.profiler.end_prefill();
+        if end < turn.payload.prompt_tokens.len() {
+            synchronize_and_clear_cache();
+            return Ok(RowStepResult {
+                seq_id: row.seq_id,
+                num_computed_tokens: row.num_tokens,
+                generated_token: None,
+                finished: false,
+            });
+        }
+        let logits = match engine::penalties::apply_all_penalties(
+            logits,
+            &turn.token_history,
+            &turn.payload.params,
+        ) {
+            Ok(logits) => logits,
+            Err(error) => return Ok(Self::fail(turn, row, error)),
+        };
+        let sampled = match sample(&logits, turn.payload.params.sampling_config) {
+            Ok(sampled) => sampled,
+            Err(error) => return Ok(Self::fail(turn, row, error)),
+        };
+        sampled.eval();
+        if turn.payload.params.report_performance {
+            turn.payload.first_token_instant = Some(Instant::now());
+        }
+        synchronize_and_clear_cache();
+        if turn.payload.params.max_new_tokens == 0 {
+            turn.payload.profiler.snapshot_memory_after();
+            turn.payload.profiler.report();
+            return Ok(RowStepResult {
+                seq_id: row.seq_id,
+                num_computed_tokens: row.num_tokens,
+                generated_token: None,
+                finished: true,
+            });
+        }
+        let token = match sampled.item_at_int32(0) {
+            Ok(token) => token as u32,
+            Err(error) => return Ok(Self::fail(turn, row, error)),
+        };
+        Ok(RowStepResult {
+            seq_id: row.seq_id,
+            num_computed_tokens: row.num_tokens,
+            generated_token: Some(token),
+            finished: false,
+        })
+    }
+
+    fn finish_decode_row(
+        turn: &mut TurnState<Lfm2ScheduledTurn>,
+        prepared: &Lfm2PreparedDecodeRow,
+    ) {
+        turn.payload.profiler.mark_first_token();
+        let is_reasoning = turn
+            .payload
+            .reasoning_tracker
+            .observe_token(prepared.token_id);
+        turn.payload.last_is_reasoning = is_reasoning;
+        if prepared.stops_at_eos {
+            // LFM2's native contract checks EOS before streaming so the stop
+            // token never leaks, and EOS wins an EOS+cancel race.
+            turn.payload.finish_reason = String::from("stop");
+        } else if prepared.cancelled {
+            turn.payload.finish_reason = String::from("cancelled");
+        } else {
+            if turn.payload.response.sink().is_some() {
+                Self::stream_token(turn, prepared.token_id, is_reasoning);
+            }
+            if let Some(reason) = prepared.repetition {
+                turn.payload.finish_reason = reason.to_string();
+            }
+        }
+    }
+
+    fn execute_decode(
+        &mut self,
+        row: &engine::scheduler::StepRow,
+        turn: &mut TurnState<Lfm2ScheduledTurn>,
+    ) -> Result<RowStepResult> {
+        let Some(&token_id) = turn.token_history.last() else {
+            return Ok(Self::fail(
+                turn,
+                row,
+                Error::from_reason("scheduler decode row has no current token"),
+            ));
+        };
+        if let Err(error) = self.inner.activate_paged_seq(row.seq_id) {
+            return Ok(Self::fail(turn, row, error));
+        }
+        let step_idx = turn.payload.generated_tokens.len();
+        turn.payload.generated_tokens.push(token_id);
+        turn.payload.profiler.step();
+        crate::array::maybe_clear_cache_for_paged_step(step_idx as i32);
+        let stops_at_eos =
+            token_id == turn.payload.eos_id || turn.payload.extra_eos_ids.contains(&token_id);
+        let repetition = check_repetition_cutoff(
+            &turn.payload.generated_tokens,
+            turn.payload.params.max_consecutive_tokens,
+            turn.payload.params.max_ngram_repeats,
+            turn.payload.params.ngram_size,
+        );
+        let terminal = stops_at_eos || row.cancel_snapshot || repetition.is_some();
+        let at_length = turn.payload.generated_tokens.len()
+            >= turn.payload.params.max_new_tokens.max(0) as usize;
+
+        let next_token = if !terminal && !at_length {
+            let _stream_context = StreamContext::new(turn.payload.generation_stream);
+            turn.payload.profiler.begin("forward");
+            let mut logits = match self
+                .inner
+                .run_paged_decode_step(token_id)
+                .and_then(|logits| logits.squeeze(Some(&[1])))
+            {
+                Ok(logits) => logits,
+                Err(error) => return Ok(Self::fail(turn, row, error)),
+            };
+            turn.payload.profiler.end();
+            let sampled = if turn.payload.reasoning_tracker.should_force_think_end() {
+                let forced = match turn.payload.reasoning_tracker.forced_token_id() {
+                    Ok(token) => token as i32,
+                    Err(error) => return Ok(Self::fail(turn, row, error)),
+                };
+                match MxArray::from_int32(&[forced], &[1]) {
+                    Ok(sampled) => sampled,
+                    Err(error) => return Ok(Self::fail(turn, row, error)),
+                }
+            } else {
+                turn.payload.profiler.begin("rep_penalty");
+                logits = match engine::penalties::apply_all_penalties(
+                    logits,
+                    &turn.token_history,
+                    &turn.payload.params,
+                ) {
+                    Ok(logits) => logits,
+                    Err(error) => return Ok(Self::fail(turn, row, error)),
+                };
+                turn.payload.profiler.end();
+                turn.payload.profiler.begin("sample");
+                let sampled = match sample(&logits, turn.payload.params.sampling_config) {
+                    Ok(sampled) => sampled,
+                    Err(error) => return Ok(Self::fail(turn, row, error)),
+                };
+                turn.payload.profiler.end();
+                sampled
+            };
+            turn.payload.profiler.begin("schedule_eval");
+            MxArray::async_eval_arrays(&[&sampled]);
+            turn.payload.profiler.end();
+            sampled.eval();
+            match sampled.item_at_int32(0) {
+                Ok(token) => Some(token as u32),
+                Err(error) => return Ok(Self::fail(turn, row, error)),
+            }
+        } else {
+            None
+        };
+
+        let prepared = Lfm2PreparedDecodeRow {
+            plan_index: 0,
+            seq_id: row.seq_id,
+            token_id,
+            terminal,
+            at_length,
+            stops_at_eos,
+            cancelled: row.cancel_snapshot,
+            repetition,
+            batch_index: None,
+        };
+        Self::finish_decode_row(turn, &prepared);
+        let finished = terminal || at_length;
+        if finished {
+            turn.payload.profiler.snapshot_memory_after();
+            turn.payload.profiler.report();
+        }
+        Ok(RowStepResult {
+            seq_id: row.seq_id,
+            num_computed_tokens: row.num_tokens,
+            generated_token: (!finished).then_some(next_token).flatten(),
+            finished,
+        })
+    }
+
+    fn execute_decode_batch(
+        &mut self,
+        plan: &StepPlan,
+        running: &mut [TurnState<Lfm2ScheduledTurn>],
+    ) -> Vec<(usize, RowStepResult)> {
+        let mut work = Vec::new();
+        let mut early_results = Vec::new();
+        let mut batch_rows = Vec::new();
+        for (plan_index, row) in plan
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.kind == StepKind::Decode)
+        {
+            let turn = running
+                .iter_mut()
+                .find(|turn| turn.seq_id == row.seq_id)
+                .expect("scheduler validated decode row");
+            let Some(&token_id) = turn.token_history.last() else {
+                early_results.push((
+                    plan_index,
+                    Self::fail(
+                        turn,
+                        row,
+                        Error::from_reason("scheduler decode row has no current token"),
+                    ),
+                ));
+                continue;
+            };
+            turn.payload.generated_tokens.push(token_id);
+            turn.payload.profiler.step();
+            let stops_at_eos =
+                token_id == turn.payload.eos_id || turn.payload.extra_eos_ids.contains(&token_id);
+            let repetition = check_repetition_cutoff(
+                &turn.payload.generated_tokens,
+                turn.payload.params.max_consecutive_tokens,
+                turn.payload.params.max_ngram_repeats,
+                turn.payload.params.ngram_size,
+            );
+            let terminal = stops_at_eos || row.cancel_snapshot || repetition.is_some();
+            let at_length = turn.payload.generated_tokens.len()
+                >= turn.payload.params.max_new_tokens.max(0) as usize;
+            // Unlike pure-KV Qwen, LFM2 cannot materialize the last length
+            // token: doing so advances the non-invertible conv state beyond
+            // the history that finalize saves. Only live rows enter the batch.
+            let batch_index = (!terminal && !at_length).then(|| {
+                let index = batch_rows.len();
+                batch_rows.push((row.seq_id, token_id));
+                index
+            });
+            work.push(Lfm2PreparedDecodeRow {
+                plan_index,
+                seq_id: row.seq_id,
+                token_id,
+                terminal,
+                at_length,
+                stops_at_eos,
+                cancelled: row.cancel_snapshot,
+                repetition,
+                batch_index,
+            });
+        }
+
+        crate::array::maybe_clear_cache_for_paged_step(plan.global_step as i32);
+        for row in &work {
+            if row.batch_index.is_some() {
+                running
+                    .iter_mut()
+                    .find(|turn| turn.seq_id == row.seq_id)
+                    .expect("prepared decode row remains running")
+                    .payload
+                    .profiler
+                    .begin("forward");
+            }
+        }
+        let batched_logits = if batch_rows.is_empty() {
+            Ok(None)
+        } else {
+            let _stream_context = StreamContext::new(Stream::default(DeviceType::Gpu));
+            self.inner
+                .run_paged_decode_step_batched(&batch_rows)
+                .map(Some)
+        };
+        for row in &work {
+            if row.batch_index.is_some() {
+                running
+                    .iter_mut()
+                    .find(|turn| turn.seq_id == row.seq_id)
+                    .expect("prepared decode row remains running")
+                    .payload
+                    .profiler
+                    .end();
+            }
+        }
+
+        let mut results = early_results;
+        for row in work {
+            let planned = &plan.rows[row.plan_index];
+            let turn = running
+                .iter_mut()
+                .find(|turn| turn.seq_id == row.seq_id)
+                .expect("prepared decode row remains running");
+            let logits = match (&batched_logits, row.batch_index) {
+                (Err(error), Some(_)) => {
+                    results.push((
+                        row.plan_index,
+                        Self::fail(turn, planned, Error::from_reason(error.reason.clone())),
+                    ));
+                    continue;
+                }
+                (Ok(Some(logits)), Some(batch_index)) => {
+                    match logits
+                        .slice_axis(0, batch_index as i64, batch_index as i64 + 1)
+                        .and_then(|row| row.squeeze(Some(&[1])))
+                    {
+                        Ok(logits) => Some(logits),
+                        Err(error) => {
+                            results.push((row.plan_index, Self::fail(turn, planned, error)));
+                            continue;
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let next_token = if let Some(mut logits) = logits {
+                let sampled = if turn.payload.reasoning_tracker.should_force_think_end() {
+                    let forced = match turn.payload.reasoning_tracker.forced_token_id() {
+                        Ok(token) => token as i32,
+                        Err(error) => {
+                            results.push((row.plan_index, Self::fail(turn, planned, error)));
+                            continue;
+                        }
+                    };
+                    match MxArray::from_int32(&[forced], &[1]) {
+                        Ok(sampled) => sampled,
+                        Err(error) => {
+                            results.push((row.plan_index, Self::fail(turn, planned, error)));
+                            continue;
+                        }
+                    }
+                } else {
+                    turn.payload.profiler.begin("rep_penalty");
+                    logits = match engine::penalties::apply_all_penalties(
+                        logits,
+                        &turn.token_history,
+                        &turn.payload.params,
+                    ) {
+                        Ok(logits) => logits,
+                        Err(error) => {
+                            results.push((row.plan_index, Self::fail(turn, planned, error)));
+                            continue;
+                        }
+                    };
+                    turn.payload.profiler.end();
+                    turn.payload.profiler.begin("sample");
+                    let sampled = match sample(&logits, turn.payload.params.sampling_config) {
+                        Ok(sampled) => sampled,
+                        Err(error) => {
+                            results.push((row.plan_index, Self::fail(turn, planned, error)));
+                            continue;
+                        }
+                    };
+                    turn.payload.profiler.end();
+                    sampled
+                };
+                turn.payload.profiler.begin("schedule_eval");
+                MxArray::async_eval_arrays(&[&sampled, &logits]);
+                turn.payload.profiler.end();
+                sampled.eval();
+                match sampled.item_at_int32(0) {
+                    Ok(token) => Some(token as u32),
+                    Err(error) => {
+                        results.push((row.plan_index, Self::fail(turn, planned, error)));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            Self::finish_decode_row(turn, &row);
+            let finished = row.terminal || row.at_length;
+            if finished {
+                turn.payload.profiler.snapshot_memory_after();
+                turn.payload.profiler.report();
+            }
+            results.push((
+                row.plan_index,
+                RowStepResult {
+                    seq_id: row.seq_id,
+                    num_computed_tokens: planned.num_tokens,
+                    generated_token: (!finished).then_some(next_token).flatten(),
+                    finished,
+                },
+            ));
+        }
+        results
+    }
+}
+
+impl StepExecutor<Lfm2ScheduledTurn> for Lfm2StepExecutor<'_> {
+    type Error = std::convert::Infallible;
+
+    fn execute(
+        &mut self,
+        plan: &StepPlan,
+        running: &mut [TurnState<Lfm2ScheduledTurn>],
+    ) -> std::result::Result<StepResult, Self::Error> {
+        let mut results = Vec::with_capacity(plan.rows.len());
+        results.resize_with(plan.rows.len(), || None);
+        let decode_count = plan
+            .rows
+            .iter()
+            .filter(|row| row.kind == StepKind::Decode)
+            .count();
+        let used_batched_decode = decode_count > 1;
+        if used_batched_decode {
+            for (index, result) in self.execute_decode_batch(plan, running) {
+                results[index] = Some(result);
+            }
+        }
+        for (index, row) in plan.rows.iter().enumerate() {
+            if results[index].is_some() {
+                continue;
+            }
+            let turn = running
+                .iter_mut()
+                .find(|turn| turn.seq_id == row.seq_id)
+                .expect("scheduler validated running row");
+            let result = match row.kind {
+                StepKind::Prefill => self.execute_prefill(row, turn),
+                StepKind::Decode => self.execute_decode(row, turn),
+            }
+            .unwrap_or_else(|error| Self::fail(turn, row, error));
+            results[index] = Some(result);
+        }
+        Ok(StepResult {
+            rows: results
+                .into_iter()
+                .map(|result| result.expect("every planned row executed"))
+                .collect(),
+            executed_decode_batch: if used_batched_decode {
+                decode_count
+            } else {
+                usize::from(decode_count != 0)
+            },
+            rows_alloc_evicted: running
+                .iter()
+                .filter(|turn| turn.payload.allocation_failed)
+                .count() as u32,
+        })
+    }
+}
+
+/// Scheduler-owned LFM2 state. Attention K/V stays in the paged adapter;
+/// recurrent ShortConv state stays in `Lfm2Inner::scheduled_caches`, keyed by
+/// the same sequence id. Prefill remains chunked/serial while decode rows are
+/// fused whenever at least two runnable requests share a step.
+pub(crate) struct Lfm2SchedulerState {
+    inner: Lfm2Inner,
+    scheduler: Scheduler<Lfm2ScheduledTurn, Lfm2Cmd, Lfm2Cmd>,
+    pending: VecDeque<Lfm2Cmd>,
+    prepared_waiting: Option<Box<PreparedLfm2ScheduledTurn>>,
+    pending_restores: HashMap<SeqId, PagedRestoreTicket>,
+    owner_sequences: HashMap<String, SeqId>,
+    owner_histories: HashMap<String, Vec<u32>>,
+    next_seq_id: SeqId,
+}
+
+impl Lfm2SchedulerState {
+    pub(crate) fn new(inner: Lfm2Inner) -> Self {
+        Self {
+            inner,
+            scheduler: Scheduler::new(scheduler_max_num_seqs(), scheduler_max_batched_tokens())
+                .expect("validated lfm2 scheduler limits"),
+            pending: VecDeque::new(),
+            prepared_waiting: None,
+            pending_restores: HashMap::new(),
+            owner_sequences: HashMap::new(),
+            owner_histories: HashMap::new(),
+            next_seq_id: 1,
+        }
+    }
+
+    fn force_serial() -> bool {
+        std::env::var("MLX_SERVE_FORCE_SERIAL").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    }
+
+    fn chat_has_explicit_owner(command: &ChatCmd) -> bool {
+        let config = match command {
+            ChatCmd::SessionStart { config, .. }
+            | ChatCmd::SessionContinue { config, .. }
+            | ChatCmd::SessionContinueTool { config, .. }
+            | ChatCmd::StreamSessionStart { config, .. }
+            | ChatCmd::StreamSessionContinue { config, .. }
+            | ChatCmd::StreamSessionContinueTool { config, .. } => config,
+            ChatCmd::ResetCaches { .. } => return true,
+        };
+        config
+            .cache_owner_id
+            .as_deref()
+            .is_some_and(|owner| !owner.is_empty())
+    }
+
+    fn reply_admission_error(response: Lfm2ScheduledReply, cancelled: &AtomicBool, error: Error) {
+        response.send_error(error, cancelled);
+    }
+
+    fn prepare_chat(&mut self, command: ChatCmd) -> Option<Box<PreparedLfm2ScheduledTurn>> {
+        let (messages, config, response, cancelled, turn_kind, guard_name, stream_guard_name) =
+            match command {
+                ChatCmd::SessionStart {
+                    messages,
+                    config,
+                    reply,
+                    cancelled,
+                } => (
+                    messages,
+                    config,
+                    Lfm2ScheduledReply::Sync(reply),
+                    cancelled,
+                    engine::session::TurnKind::Start,
+                    "chat_session_start",
+                    None,
+                ),
+                ChatCmd::SessionContinue {
+                    messages,
+                    config,
+                    reply,
+                    cancelled,
+                } => (
+                    messages,
+                    config,
+                    Lfm2ScheduledReply::Sync(reply),
+                    cancelled,
+                    engine::session::TurnKind::Continue,
+                    "chat_session_continue",
+                    None,
+                ),
+                ChatCmd::SessionContinueTool {
+                    messages,
+                    config,
+                    reply,
+                    cancelled,
+                } => (
+                    messages,
+                    config,
+                    Lfm2ScheduledReply::Sync(reply),
+                    cancelled,
+                    engine::session::TurnKind::Continue,
+                    "chat_session_continue_tool",
+                    None,
+                ),
+                ChatCmd::StreamSessionStart {
+                    messages,
+                    config,
+                    stream_tx,
+                    cancelled,
+                } => (
+                    messages,
+                    config,
+                    Lfm2ScheduledReply::Stream(stream_tx),
+                    cancelled,
+                    engine::session::TurnKind::Start,
+                    "chat_stream_session_start",
+                    Some("chat_stream_session_start"),
+                ),
+                ChatCmd::StreamSessionContinue {
+                    messages,
+                    config,
+                    stream_tx,
+                    cancelled,
+                } => (
+                    messages,
+                    config,
+                    Lfm2ScheduledReply::Stream(stream_tx),
+                    cancelled,
+                    engine::session::TurnKind::Continue,
+                    "chat_stream_session_continue",
+                    Some("chat_stream_session_continue"),
+                ),
+                ChatCmd::StreamSessionContinueTool {
+                    messages,
+                    config,
+                    stream_tx,
+                    cancelled,
+                } => (
+                    messages,
+                    config,
+                    Lfm2ScheduledReply::Stream(stream_tx),
+                    cancelled,
+                    engine::session::TurnKind::Continue,
+                    "chat_stream_session_continue_tool",
+                    Some("chat_stream_session_continue_tool"),
+                ),
+                ChatCmd::ResetCaches { reply } => {
+                    self.scheduler
+                        .enqueue_barrier(Lfm2Cmd::Chat(Box::new(ChatCmd::ResetCaches { reply })));
+                    return None;
+                }
+            };
+
+        let owner_id = config.cache_owner_id.clone().unwrap_or_default();
+        self.inner.cached_token_history = self
+            .owner_histories
+            .get(&owner_id)
+            .cloned()
+            .unwrap_or_default();
+        if cancelled.load(Ordering::Relaxed) {
+            let message = stream_guard_name.map_or_else(
+                || engine::session::CHAT_SESSION_CANCELLED.to_string(),
+                |name| format!("{name} cancelled before start"),
+            );
+            Self::reply_admission_error(response, cancelled.as_ref(), Error::from_reason(message));
+            return None;
+        }
+        if config.reuse_cache == Some(false) {
+            Self::reply_admission_error(
+                response,
+                cancelled.as_ref(),
+                Error::from_reason(format!(
+                    "{guard_name} requires reuse_cache=true (leave as None or set to true). The session API only makes sense with cache reuse enabled."
+                )),
+            );
+            return None;
+        }
+        if turn_kind == engine::session::TurnKind::Continue && !self.inner.has_live_session() {
+            Self::reply_admission_error(
+                response,
+                cancelled.as_ref(),
+                Error::from_reason(format!(
+                    "{guard_name} requires an initialized session (call chatSessionStart first)"
+                )),
+            );
+            return None;
+        }
+        let admitted =
+            match engine::session::admit_paged_turn(&mut self.inner, messages, config, turn_kind) {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    Self::reply_admission_error(response, cancelled.as_ref(), error);
+                    return None;
+                }
+            };
+        if admitted.plan.path() != engine::plan::TurnPath::Paged {
+            Self::reply_admission_error(
+                response,
+                cancelled.as_ref(),
+                Error::from_reason("lfm2 scheduler admitted a non-paged turn"),
+            );
+            return None;
+        }
+
+        let prompt_tokens = admitted.tokens.len() as u32;
+        let max_new_tokens = admitted.params.max_new_tokens.max(0) as u32;
+        let trained_context = u32::try_from(self.inner.config.max_position_embeddings)
+            .unwrap_or(1)
+            .max(1);
+        let per_seq_context = trained_context.min(scheduler_per_seq_context());
+        let requested_tokens = prompt_tokens.saturating_add(max_new_tokens);
+        if requested_tokens > per_seq_context {
+            Self::reply_admission_error(
+                response,
+                cancelled.as_ref(),
+                Error::from_reason(format!(
+                    "context_length_exceeded: prompt ({prompt_tokens}) + max_new_tokens ({max_new_tokens}) exceeds scheduler per-sequence context {per_seq_context}"
+                )),
+            );
+            return None;
+        }
+        let block_size = self
+            .inner
+            .paged_adapter
+            .as_ref()
+            .expect("paged route checked by caller")
+            .block_size();
+        let full_reservation_blocks = requested_tokens.div_ceil(block_size);
+        let reservation_blocks = if scheduler_reserve_full_isl() {
+            full_reservation_blocks
+        } else {
+            prompt_tokens
+                .div_ceil(block_size)
+                .saturating_add(u32::from(max_new_tokens != 0))
+                .min(full_reservation_blocks)
+        };
+        let (seq_id, newly_assigned) = if owner_id.is_empty() {
+            (0, false)
+        } else if let Some(&seq_id) = self.owner_sequences.get(&owner_id) {
+            (seq_id, false)
+        } else {
+            let seq_id = self.next_seq_id;
+            self.next_seq_id = self.next_seq_id.saturating_add(1);
+            self.owner_sequences.insert(owner_id.clone(), seq_id);
+            (seq_id, true)
+        };
+        if self.scheduler.contains_seq(seq_id) {
+            if newly_assigned {
+                self.owner_sequences.remove(&owner_id);
+            }
+            Self::reply_admission_error(
+                response,
+                cancelled.as_ref(),
+                Error::from_reason("chat session already has an in-flight scheduled turn"),
+            );
+            return None;
+        }
+        Some(Box::new(PreparedLfm2ScheduledTurn {
+            admitted,
+            response,
+            cancelled,
+            owner_id,
+            seq_id,
+            reservation_blocks,
+            block_size,
+        }))
+    }
+
+    fn admit_prepared(
+        &mut self,
+        prepared: Box<PreparedLfm2ScheduledTurn>,
+    ) -> std::result::Result<Option<Lfm2Admission>, Box<PreparedLfm2ScheduledTurn>> {
+        let telemetry = match self
+            .inner
+            .paged_adapter
+            .as_ref()
+            .expect("paged route checked by caller")
+            .block_telemetry()
+        {
+            Ok(telemetry) => telemetry,
+            Err(error) => {
+                Self::reply_admission_error(
+                    prepared.response,
+                    prepared.cancelled.as_ref(),
+                    Error::from_reason(error),
+                );
+                return Ok(None);
+            }
+        };
+        if prepared.reservation_blocks > telemetry.total_blocks {
+            Self::reply_admission_error(
+                prepared.response,
+                prepared.cancelled.as_ref(),
+                Error::from_reason(format!(
+                    "context_length_exceeded: request requires {} paged blocks but the pool has {}",
+                    prepared.reservation_blocks, telemetry.total_blocks
+                )),
+            );
+            return Ok(None);
+        }
+        let decision = self.scheduler.try_reserve_blocks(
+            engine::scheduler::BlockTelemetry {
+                total_blocks: telemetry.total_blocks,
+                free_blocks: telemetry.free_blocks,
+                reclaimable_blocks: telemetry.reclaimable_blocks,
+                allocated_blocks: telemetry.allocated_blocks,
+            },
+            prepared.reservation_blocks,
+            scheduler_watermark_fraction(),
+        );
+        if !decision.admitted {
+            return Err(prepared);
+        }
+
+        let PreparedLfm2ScheduledTurn {
+            admitted,
+            response,
+            cancelled,
+            owner_id,
+            seq_id,
+            reservation_blocks,
+            block_size,
+        } = *prepared;
+        if cancelled.load(Ordering::Relaxed) {
+            Self::reply_admission_error(
+                response,
+                cancelled.as_ref(),
+                Error::from_reason(engine::session::CHAT_SESSION_CANCELLED),
+            );
+            return Ok(None);
+        }
+        let owner_history = self
+            .owner_histories
+            .get(&owner_id)
+            .cloned()
+            .unwrap_or_default();
+        self.inner.cached_token_history = owner_history.clone();
+        self.inner.set_cache_owner_id(
+            &admitted.params.cache_owner_id,
+            admitted.params.cache_root_owner_id.as_deref(),
+        );
+        self.inner
+            .set_turn_cancel_flag(Some(Arc::clone(&cancelled)));
+        let reuse_cache = admitted.plan.is_delta || admitted.params.reuse_cache;
+        let generation_start = admitted.params.report_performance.then(Instant::now);
+        let total_budget = admitted.tokens.len() as u32;
+        let prefix_admission = match self
+            .inner
+            .paged_adapter
+            .as_mut()
+            .expect("paged route checked by caller")
+            .prepare_turn_with_async_restore(
+                seq_id,
+                &admitted.tokens,
+                total_budget,
+                reuse_cache,
+                &[],
+                0,
+                false,
+                total_budget.saturating_sub(1),
+            ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                self.inner.abort_paged_turn();
+                self.inner.release_scheduled_caches_for(seq_id);
+                self.inner.set_turn_cancel_flag(None);
+                Self::reply_admission_error(
+                    response,
+                    cancelled.as_ref(),
+                    Error::from_reason(error),
+                );
+                return Ok(None);
+            }
+        };
+        let (turn_plan, restore) = match prefix_admission {
+            PagedTurnAdmission::Ready(plan) => (plan, None),
+            PagedTurnAdmission::Waiting {
+                provisional,
+                restore,
+            } => (provisional, Some(restore)),
+        };
+        let conv_state_reusable = conv_state_reusable(
+            &admitted.tokens,
+            &owner_history,
+            turn_plan.cached_prefix_len as usize,
+        );
+        // A provisional SSD plan is not authoritative. Preserve the owner's
+        // carried conv state until `poll_restores` returns the final prefix;
+        // eagerly resetting here would make a later exact owner hit claim the
+        // (now destroyed) state was reusable.
+        if restore.is_none() && !conv_state_reusable {
+            self.inner.reset_scheduled_caches_for(seq_id);
+        }
+        let prefix = Lfm2PrefixState {
+            effective_cached_prefix_len: turn_plan.cached_prefix_len as usize,
+            suffix_len: turn_plan.suffix_len as usize,
+            full_tokens: admitted.tokens.clone(),
+            conv_state_reusable,
+        };
+        if prefix.suffix_len == 0 {
+            self.inner.abort_paged_turn();
+            self.inner.release_scheduled_caches_for(seq_id);
+            self.inner.set_turn_cancel_flag(None);
+            Self::reply_admission_error(
+                response,
+                cancelled.as_ref(),
+                Error::from_reason("scheduler admission produced an empty prefill suffix"),
+            );
+            return Ok(None);
+        }
+        let materialized_blocks = self
+            .inner
+            .paged_adapter
+            .as_ref()
+            .and_then(|adapter| adapter.block_table_for(seq_id))
+            .map(|table| table.num_blocks() as u32)
+            .unwrap_or(0)
+            .saturating_add(
+                restore
+                    .as_ref()
+                    .map_or(0, PagedRestoreTicket::reserved_blocks),
+            );
+        let is_streaming = response.sink().is_some();
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let mut profiler = DecodeProfiler::new(
+            self.inner
+                .profiler_label(admitted.plan.is_delta, is_streaming),
+            self.inner.family_name(),
+        );
+        profiler.set_prompt_tokens(if conv_state_reusable {
+            prefix.suffix_len as u32
+        } else {
+            admitted.tokens.len() as u32
+        });
+        profiler.snapshot_memory_before();
+        let payload = Lfm2ScheduledTurn {
+            owner_id,
+            tokenizer: admitted.tokenizer,
+            eos_id: admitted.eos_id,
+            config: admitted.config,
+            params: admitted.params,
+            thinking: admitted.thinking,
+            prompt_tokens: admitted.tokens.clone(),
+            prefix,
+            is_delta: admitted.plan.is_delta,
+            reuse_cache,
+            response,
+            generated_tokens: Vec::new(),
+            finish_reason: String::from("length"),
+            reasoning_tracker: engine::penalties::ReasoningTracker::from_setup(
+                &admitted.thinking,
+                admitted.think_end_id,
+            ),
+            extra_eos_ids: self.inner.extra_eos_ids(),
+            generation_start,
+            first_token_instant: None,
+            generation_stream,
+            profiler,
+            emitter: is_streaming.then(|| self.inner.stream_emitter()),
+            stream_skip_special: self.inner.stream_skip_special_tokens(),
+            decode_ids: Vec::new(),
+            decode_prefix: String::new(),
+            decode_prefix_index: 0,
+            streamed_text_len: 0,
+            last_is_reasoning: admitted.thinking.enabled,
+            failure: None,
+            allocation_failed: false,
+        };
+        let prompt_len = admitted.tokens.len() as u32;
+        let long_prefill_tokens = scheduler_long_prefill_tokens();
+        let mut pinned_prefill_breaks = Vec::new();
+        let mut boundary = payload.prefix.effective_cached_prefix_len as u32;
+        while boundary < prompt_len {
+            boundary = boundary.saturating_add(long_prefill_tokens).min(prompt_len);
+            pinned_prefill_breaks.push(boundary);
+        }
+        let turn = TurnState::new(
+            seq_id,
+            u64::from(seq_id),
+            admitted.tokens,
+            payload.prefix.effective_cached_prefix_len as u32,
+            pinned_prefill_breaks,
+            Some(cancelled),
+            payload,
+        )
+        .expect("prime-derived lfm2 scheduler turn must satisfy progress invariants")
+        .with_block_reservation(reservation_blocks, materialized_blocks, block_size);
+        Ok(Some(match restore {
+            Some(restore) => Lfm2Admission::Waiting(turn, restore),
+            None => Lfm2Admission::Ready(turn),
+        }))
+    }
+
+    fn enqueue_admission(&mut self, admission: Lfm2Admission) -> std::result::Result<(), String> {
+        match admission {
+            Lfm2Admission::Ready(turn) => self.scheduler.enqueue_turn(turn),
+            Lfm2Admission::Waiting(turn, restore) => {
+                let seq_id = turn.seq_id;
+                if self.pending_restores.contains_key(&seq_id) {
+                    return Err(format!("duplicate SSD restore for sequence {seq_id}"));
+                }
+                self.scheduler.enqueue_turn(turn)?;
+                if let Err(error) = self.scheduler.park_waiting_for_ssd(seq_id) {
+                    let _ = self.scheduler.take_waiting(seq_id);
+                    return Err(error);
+                }
+                let replaced = self.pending_restores.insert(seq_id, restore);
+                debug_assert!(replaced.is_none(), "duplicate checked before enqueue");
+                Ok(())
+            }
+        }
+    }
+
+    fn poll_restores(&mut self) {
+        let seq_ids: Vec<SeqId> = self.pending_restores.keys().copied().collect();
+        for seq_id in seq_ids {
+            let cancelled = self
+                .scheduler
+                .waiting_turn_mut(seq_id)
+                .and_then(|turn| turn.cancelled.as_ref())
+                .is_some_and(|cancelled| cancelled.load(Ordering::Relaxed));
+            if cancelled {
+                self.pending_restores.remove(&seq_id);
+                if let Some(mut turn) = self.scheduler.take_waiting(seq_id) {
+                    turn.payload.failure =
+                        Some(Error::from_reason(engine::session::CHAT_SESSION_CANCELLED));
+                    self.finish_completed(turn);
+                }
+                continue;
+            }
+            let outcome = {
+                let Some(restore) = self.pending_restores.get_mut(&seq_id) else {
+                    continue;
+                };
+                self.inner
+                    .paged_adapter
+                    .as_mut()
+                    .expect("pending restore requires paged adapter")
+                    .poll_restore(restore)
+            };
+            match outcome {
+                Ok(PagedRestorePoll::Pending) => continue,
+                Ok(PagedRestorePoll::Ready {
+                    plan,
+                    bytes_restored,
+                    wait,
+                }) => {
+                    self.pending_restores.remove(&seq_id);
+                    let materialized_blocks = self
+                        .inner
+                        .paged_adapter
+                        .as_ref()
+                        .and_then(|adapter| adapter.block_table_for(seq_id))
+                        .map(|table| table.num_blocks() as u32)
+                        .unwrap_or(0);
+                    let long_prefill_tokens = scheduler_long_prefill_tokens();
+                    let Some(turn) = self.scheduler.waiting_turn_mut(seq_id) else {
+                        tracing::error!("SSD restore completed for missing LFM2 sequence {seq_id}");
+                        let _ = self
+                            .inner
+                            .paged_adapter
+                            .as_mut()
+                            .expect("completed restore requires paged adapter")
+                            .release_request_for(seq_id);
+                        self.inner.release_scheduled_caches_for(seq_id);
+                        continue;
+                    };
+                    let owner_history = self
+                        .owner_histories
+                        .get(&turn.payload.owner_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let reusable = conv_state_reusable(
+                        &turn.payload.prompt_tokens,
+                        &owner_history,
+                        plan.cached_prefix_len as usize,
+                    );
+                    if !reusable {
+                        self.inner.reset_scheduled_caches_for(seq_id);
+                    }
+                    turn.num_computed_tokens = plan.cached_prefix_len;
+                    turn.block_materialized_blocks = materialized_blocks;
+                    turn.payload.prefix = Lfm2PrefixState {
+                        effective_cached_prefix_len: plan.cached_prefix_len as usize,
+                        suffix_len: plan.suffix_len as usize,
+                        full_tokens: turn.payload.prompt_tokens.clone(),
+                        conv_state_reusable: reusable,
+                    };
+                    turn.payload.profiler.set_prompt_tokens(if reusable {
+                        plan.suffix_len
+                    } else {
+                        turn.prompt_tokens
+                    });
+                    turn.pinned_prefill_breaks.clear();
+                    let mut boundary = plan.cached_prefix_len;
+                    while boundary < turn.prompt_tokens {
+                        boundary = boundary
+                            .saturating_add(long_prefill_tokens)
+                            .min(turn.prompt_tokens);
+                        turn.pinned_prefill_breaks.push(boundary);
+                    }
+                    if let Err(error) = self.scheduler.wake_from_ssd(seq_id, bytes_restored, wait) {
+                        tracing::error!("failed to wake LFM2 SSD restore {seq_id}: {error}");
+                    }
+                }
+                Err(error) => {
+                    self.pending_restores.remove(&seq_id);
+                    let Some(mut turn) = self.scheduler.take_waiting(seq_id) else {
+                        tracing::error!(
+                            "failed SSD restore for missing LFM2 sequence {seq_id}: {error}"
+                        );
+                        continue;
+                    };
+                    turn.payload.failure = Some(Error::from_reason(error));
+                    self.finish_completed(turn);
+                }
+            }
+        }
+    }
+
+    fn finish_completed(&mut self, mut turn: TurnState<Lfm2ScheduledTurn>) {
+        let cancelled = turn.cancelled.take().expect("lfm2 turn cancel flag");
+        if let Err(error) = self.inner.activate_paged_seq(turn.seq_id) {
+            self.inner.set_turn_cancel_flag(None);
+            self.inner.release_scheduled_caches_for(turn.seq_id);
+            self.owner_histories.remove(&turn.payload.owner_id);
+            self.owner_sequences.remove(&turn.payload.owner_id);
+            turn.payload.response.send_error(error, cancelled.as_ref());
+            return;
+        }
+        if let Some(error) = turn.payload.failure.take() {
+            self.inner.abort_paged_turn();
+            self.inner.release_scheduled_caches_for(turn.seq_id);
+            self.inner.set_turn_cancel_flag(None);
+            self.owner_histories.remove(&turn.payload.owner_id);
+            self.owner_sequences.remove(&turn.payload.owner_id);
+            turn.payload.response.send_error(error, cancelled.as_ref());
+            return;
+        }
+        self.inner.last_paged_prefill_reused_conv_state = turn.payload.prefix.conv_state_reusable;
+        let sink = turn.payload.response.sink();
+        let outcome = engine::paged_turn::finish_paged_turn(
+            &mut self.inner,
+            engine::paged_turn::FinishPagedTurnArgs {
+                tokenizer: &turn.payload.tokenizer,
+                params: &turn.payload.params,
+                config: &turn.payload.config,
+                thinking: turn.payload.thinking,
+                is_delta: turn.payload.is_delta,
+                reuse_cache: turn.payload.reuse_cache,
+                prompt_tokens: &turn.payload.prompt_tokens,
+                effective_cached_prefix_len: turn.payload.prefix.effective_cached_prefix_len,
+                suffix_len: turn.payload.prefix.suffix_len,
+                generated_tokens: &turn.payload.generated_tokens,
+                finish_reason: std::mem::take(&mut turn.payload.finish_reason),
+                generation_start: turn.payload.generation_start,
+                first_token_instant: turn.payload.first_token_instant,
+                reasoning_tokens: turn.payload.reasoning_tracker.reasoning_token_count(),
+                profiler: &turn.payload.profiler,
+                stream_skip_special: turn.payload.stream_skip_special,
+                streamed_text_len: turn.payload.streamed_text_len,
+                last_is_reasoning: turn.payload.last_is_reasoning,
+                sink,
+                emitter: turn.payload.emitter.take(),
+            },
+        );
+        if outcome.is_ok() && turn.payload.reuse_cache {
+            self.owner_histories.insert(
+                turn.payload.owner_id.clone(),
+                self.inner.cached_token_history.clone(),
+            );
+            self.inner.park_active_scheduled_caches();
+        } else {
+            self.inner.release_scheduled_caches_for(turn.seq_id);
+            if outcome.is_err() {
+                self.owner_histories.remove(&turn.payload.owner_id);
+                self.owner_sequences.remove(&turn.payload.owner_id);
+            }
+        }
+        self.inner.set_turn_cancel_flag(None);
+        match turn.payload.response {
+            Lfm2ScheduledReply::Sync(reply) => {
+                let result = if cancelled.load(Ordering::Relaxed) {
+                    Err(Error::from_reason(engine::session::CHAT_SESSION_CANCELLED))
+                } else {
+                    match outcome {
+                        Ok(TurnOutput::Complete(result)) => Ok(*result),
+                        Ok(TurnOutput::Streamed) => Err(Error::from_reason(
+                            "scheduler returned streamed output on sync turn",
+                        )),
+                        Err(error) => Err(error),
+                    }
+                };
+                let _ = reply.send(result);
+            }
+            Lfm2ScheduledReply::Stream(stream) => {
+                if let Err(error) = outcome {
+                    ChunkSink::send(&stream, Err(error));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn drive(
+        &mut self,
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<Lfm2Cmd>,
+    ) -> LoopControl {
+        if !self.scheduler.has_work() && self.pending.is_empty() && self.prepared_waiting.is_none()
+        {
+            match receiver.blocking_recv() {
+                Some(command) => self.pending.push_back(command),
+                None => return LoopControl::Break,
+            }
+        }
+        while let Ok(command) = receiver.try_recv() {
+            self.pending.push_back(command);
+        }
+        self.poll_restores();
+
+        let mut admission_deferred = false;
+        if let Some(prepared) = self.prepared_waiting.take() {
+            match self.admit_prepared(prepared) {
+                Ok(Some(admission)) => {
+                    if let Err(error) = self.enqueue_admission(admission) {
+                        tracing::error!("lfm2 scheduler admission failed: {error}");
+                    }
+                }
+                Ok(None) => {}
+                Err(prepared) => {
+                    self.prepared_waiting = Some(prepared);
+                    admission_deferred = true;
+                }
+            }
+        }
+        while !admission_deferred && let Some(command) = self.pending.front() {
+            let must_wait_for_legacy_owner = matches!(command, Lfm2Cmd::Chat(chat)
+                if !Self::chat_has_explicit_owner(chat.as_ref()) && self.scheduler.has_work());
+            if must_wait_for_legacy_owner {
+                break;
+            }
+            let command = self.pending.pop_front().expect("front checked above");
+            if Self::force_serial() {
+                self.scheduler.enqueue_exclusive(command);
+                continue;
+            }
+            match command {
+                Lfm2Cmd::Chat(chat) => {
+                    let is_reset = matches!(chat.as_ref(), ChatCmd::ResetCaches { .. });
+                    if self.inner.paged_adapter.is_none() {
+                        self.scheduler.enqueue_exclusive(Lfm2Cmd::Chat(chat));
+                    } else if let Some(prepared) = self.prepare_chat(*chat) {
+                        match self.admit_prepared(prepared) {
+                            Ok(Some(admission)) => {
+                                if let Err(error) = self.enqueue_admission(admission) {
+                                    tracing::error!("lfm2 scheduler admission failed: {error}");
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(prepared) => {
+                                self.prepared_waiting = Some(prepared);
+                                admission_deferred = true;
+                            }
+                        }
+                    }
+                    if is_reset {
+                        break;
+                    }
+                }
+                barrier => {
+                    self.scheduler.enqueue_barrier(barrier);
+                    break;
+                }
+            }
+        }
+
+        if let Some(adapter) = self.inner.paged_adapter.as_ref() {
+            match adapter.block_telemetry() {
+                Ok(telemetry) => self.scheduler.observe_blocks(
+                    engine::scheduler::BlockTelemetry {
+                        total_blocks: telemetry.total_blocks,
+                        free_blocks: telemetry.free_blocks,
+                        reclaimable_blocks: telemetry.reclaimable_blocks,
+                        allocated_blocks: telemetry.allocated_blocks,
+                    },
+                    scheduler_watermark_fraction(),
+                ),
+                Err(error) => {
+                    tracing::warn!("lfm2 scheduler telemetry unavailable: {error}");
+                    engine::scheduler::BlockAdmission {
+                        admitted: false,
+                        watermark_blocks: 0,
+                        reserved_blocks: 0,
+                    }
+                }
+            };
+        }
+
+        let mut executor = Lfm2StepExecutor {
+            inner: &mut self.inner,
+        };
+        match self.scheduler.drive_once(&mut executor) {
+            Ok(SchedulerAction::Idle) => {}
+            Ok(SchedulerAction::Exclusive(command) | SchedulerAction::Barrier(command)) => {
+                if let Lfm2Cmd::SchedulerStats { reply } = command {
+                    let _ = reply.send(Ok(self.scheduler.stats().to_js()));
+                    return LoopControl::Continue;
+                }
+                let reset = matches!(
+                    command,
+                    Lfm2Cmd::Chat(ref chat) if matches!(chat.as_ref(), ChatCmd::ResetCaches { .. })
+                );
+                handle_lfm2_cmd(&mut self.inner, command);
+                if reset {
+                    self.owner_sequences.clear();
+                    self.owner_histories.clear();
+                }
+            }
+            Ok(SchedulerAction::Stepped { completed, .. }) => {
+                for turn in completed {
+                    self.finish_completed(turn);
+                }
+            }
+            Err(error) => panic!("lfm2 scheduler invariant failure: {error:?}"),
+        }
+        LoopControl::Continue
+    }
+}
+
 pub(crate) struct Lfm2Decode<'a> {
     inner: &'a mut Lfm2Inner,
 }
@@ -1087,10 +2831,10 @@ impl ChatBackend for Lfm2Inner {
                 // plan resolves, so a delta reaches `run_paged_turn` as the
                 // same strict extension a resent growing conversation
                 // produces: the adapter warm-continues the live request and
-                // conv Pass-1 (`run_conv_only_prefill`) rebuilds short-conv
-                // state over the cached prefix. The short-conv state itself
-                // is still never represented by the adapter — it is
-                // reconstructed from tokens every paged turn. Declaring
+                // exact-owner turns carry their incremental ShortConv state.
+                // Foreign/partial prefix hits rebuild that state once via
+                // Pass 1 (`run_conv_only_prefill`). The ShortConv state itself
+                // is never represented by the paged adapter. Declaring
                 // `supports_delta: false` would route deltas to the flat
                 // tail, which tail-prefills onto EMPTY flat attention KV
                 // (paged turns never fill it) while conv state sits at the
@@ -1141,8 +2885,9 @@ impl ChatBackend for Lfm2Inner {
         // before plan resolution) and the engine forces `reuse_cache = true`,
         // so `prime_prefix_state` sees the exact strict-extension shape a
         // resent growing conversation produces — the adapter warm-continues
-        // the live request and `run_paged_prefill_chunk` Pass-1 rebuilds
-        // conv state over the cached prefix.
+        // the live request and `run_paged_prefill_chunk` carries the exact
+        // incremental conv state (or performs one fail-closed Pass-1 rebuild
+        // for a foreign/partial prefix hit).
         //
         // The model-neutral `run_paged_turn` drives the whole turn
         // through `<Lfm2Inner as PagedBackend>` (prime → prefill →
@@ -1227,9 +2972,10 @@ impl DecodeStep for Lfm2PagedDecode<'_> {
     // `<Lfm2Inner as PagedBackend>::save_paged_history`), so no extra forward
     // is needed.
     //
-    // `end_decode` — DO NOT override (default Ok(())). lfm2 PAGED reprefills
-    // conv from token 0 every turn, so there is nothing to export back into
-    // `self.caches`.
+    // `end_decode` — DO NOT override (default Ok(())). The decode loop updates
+    // the active request's convolution state in place. The scheduler parks that
+    // state in its sequence-keyed table after finalization; the legacy lane
+    // leaves it in `self.caches` for the next exact-owner continuation.
 }
 
 /// lfm2 paged prefix state — the effective prefix/suffix split from
@@ -1323,13 +3069,10 @@ impl PagedBackend for Lfm2Inner {
         // foreign/partial prefix hit) falls through to the existing
         // unconditional reset — `run_paged_turn` is family-neutral and will
         // NOT do this for us; skip it and conv state goes stale across
-        // turns. Gated OFF by default (`conv_state_reuse_enabled`): reusing the
-        // live incremental conv state differs materially (~40 ULP, near-tie
-        // argmax may flip) from the reconstruction it replaces, so the flag
-        // stays off until an oracle validates it — flag off ⇒ `reused_conv_state
-        // == false` ⇒ the unconditional reset below always runs (pre-fix path).
-        let reused_conv_state = conv_state_reuse_enabled()
-            && conv_state_reusable(plan, &self.cached_token_history, cached_prefix_len);
+        // turns. Carried incremental state is the sole oracle; the former
+        // opt-in reconstruction-compatibility switch was removed.
+        let reused_conv_state =
+            conv_state_reusable(plan, &self.cached_token_history, cached_prefix_len);
         if !reused_conv_state {
             self.caches = init_caches(&self.config);
             self.cached_token_history.clear();
@@ -1400,23 +3143,22 @@ impl PagedBackend for Lfm2Inner {
         // `cached_token_history.len()` records (e.g. Pass 2 or a decode step
         // ran partway before the error). Clearing `cached_token_history`
         // forces the NEXT `prime_prefix_state` call's length/content check
-        // to fail closed (`> 0` guard), taking the unconditional
-        // `init_caches` reset — the same safe rebuild every paged turn got
-        // before this fast path existed.
+        // to fail closed (`> 0` guard), taking the `init_caches` reset and
+        // one safe Pass-1 rebuild.
         self.cached_token_history.clear();
     }
 
     fn paged_perf_prefill_tokens(&self, prompt_token_count: usize, suffix_len: usize) -> usize {
-        // lfm2 reprefills the FULL prompt through conv layers on a normal
-        // warm attention-prefix hit (`run_paged_prefill_chunk` Pass-1), so
+        // LFM2 reprefills the FULL prompt through conv layers on a foreign or
+        // partial attention-prefix hit (`run_paged_prefill_chunk` Pass-1), so
         // ttft measures full-prompt work and the throughput numerator must
         // be the FULL prompt — NOT the attention suffix (pinned by the
         // `lfm2_paged_prefill_tps_is_full_prompt_scale_on_warm_reuse` guard).
         // The default (`suffix_len`) is the standard-KV qwen behavior, which
         // would under-report lfm2's prefill tok/s by the cache-hit ratio.
         //
-        // EXCEPTION: when `prime_prefix_state` took the conv-state-reuse
-        // fast path this turn (`last_paged_prefill_reused_conv_state`),
+        // When `prime_prefix_state` took the exact-owner carried-state path
+        // this turn (`last_paged_prefill_reused_conv_state`),
         // Pass 1 never ran — the ACTUAL prefill work this turn was
         // suffix-scale, so reporting the full-prompt count here would
         // inflate `prefill_tokens_per_second` by the cache-hit ratio
@@ -1577,12 +3319,11 @@ fn eval_lfm2_caches(caches: &[Lfm2LayerCache]) -> Result<()> {
 /// commands via channels and await responses.
 #[napi]
 pub struct Lfm2Model {
-    /// Dedicated model thread owning `Lfm2Inner`. lfm2 is chat-only (no
-    /// training/generate variants), so the thread dispatches the
-    /// model-neutral [`ChatCmd`] directly via
-    /// `engine::cmd::handle_chat_cmd::<Lfm2Inner>` — no per-family
-    /// command enum.
-    pub(crate) thread: crate::model_thread::ModelThread<ChatCmd>,
+    /// Dedicated model thread owning `Lfm2SchedulerState`. LFM2 is chat-only
+    /// (no training/generate variants); `Lfm2Cmd` wraps the model-neutral chat
+    /// protocol and adds scheduler telemetry without exposing model state
+    /// outside the thread.
+    pub(crate) thread: crate::model_thread::ModelThread<Lfm2Cmd>,
     pub(crate) config: Lfm2Config,
     /// Snapshot of `Lfm2Inner::paged_adapter.is_some()` captured at
     /// construction time. The block-paged KV adapter is wired up once at
@@ -1649,12 +3390,13 @@ impl Lfm2Model {
         let cancelled_inner = cancelled.clone();
         let (stream_tx, stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
-        self.thread.send(ChatCmd::StreamSessionStart {
-            messages,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
+        self.thread
+            .send(Lfm2Cmd::Chat(Box::new(ChatCmd::StreamSessionStart {
+                messages,
+                config,
+                stream_tx,
+                cancelled: cancelled_inner,
+            })))?;
         Ok((ChatStreamHandle { cancelled }, stream_rx))
     }
 
@@ -1675,12 +3417,13 @@ impl Lfm2Model {
         let cancelled_inner = cancelled.clone();
         let (stream_tx, stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
-        self.thread.send(ChatCmd::StreamSessionContinue {
-            messages,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
+        self.thread
+            .send(Lfm2Cmd::Chat(Box::new(ChatCmd::StreamSessionContinue {
+                messages,
+                config,
+                stream_tx,
+                cancelled: cancelled_inner,
+            })))?;
         Ok((ChatStreamHandle { cancelled }, stream_rx))
     }
 
@@ -1688,6 +3431,22 @@ impl Lfm2Model {
     #[napi]
     pub fn get_config(&self) -> Lfm2Config {
         self.config.clone()
+    }
+
+    /// Native admission capacity for the server's per-model semaphore.
+    #[napi]
+    pub fn max_concurrent_sequences(&self) -> u32 {
+        if self.paged_active && !Lfm2SchedulerState::force_serial() {
+            scheduler_max_num_seqs() as u32
+        } else {
+            1
+        }
+    }
+
+    /// Snapshot scheduler occupancy and paged-pool admission telemetry.
+    #[napi]
+    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
+        send_and_await(&self.thread, |reply| Lfm2Cmd::SchedulerStats { reply }).await
     }
 
     /// Estimated number of model parameters.
@@ -1739,7 +3498,7 @@ impl Lfm2Model {
 
 crate::models::chat_napi::chat_napi_surface! {
     class: Lfm2Model,
-    thread_cmd: crate::engine::cmd::ChatCmd,
+    thread_cmd: crate::models::lfm2::model::Lfm2Cmd,
     thread: direct,
     image_guard: text_only,
     ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
