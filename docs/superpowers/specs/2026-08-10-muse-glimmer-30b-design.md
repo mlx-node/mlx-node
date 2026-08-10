@@ -265,11 +265,22 @@ Ranked by probability x silence. Every one produces fluent-but-wrong output, not
 9. **Vision RoPE axis order / 1-based positions.** `flip(-1) + 1` gives `(w,h)` 1-based,
    `freq = [fw,fh,fw,fh]`. Assert `inv_freq.len()*4 == head_dim` so a config change fails
    loudly.
-10. **Stop-token set.** Three sources disagree and only `generation_config.json` is right:
-    it lists `[200001, 200008]`, while `config.json text_config.eos_token_id` is `200001`
-    alone and `tokenizer_config.json eos_token` is `<|end_of_text|>`. `tokenizer.rs:596-626`
-    resolves eos from `tokenizer_config` only, so `tokenizer.get_eos_token_id()` never
-    stops on `<|eot|>`.
+10. **Stop-token set — and it is NOT wired through the tokenizer.** Three sources disagree
+    and only `generation_config.json` is right: it lists `[200001, 200008]`, while
+    `config.json text_config.eos_token_id` is `200001` alone and `tokenizer_config.json
+    eos_token` is `<|end_of_text|>`. Nothing on the decode path reads
+    `resolve_special_tokens` / `tokenizer.get_eos_token_id()`; the stop site is
+    `engine/decode.rs`'s `stops_at_eos = token_id == eos_id ||
+    extra_eos_ids.contains(&token_id)`, resolved once per turn from two `ChatBackend`
+    hooks. M1 contract: `session_eos_id` (`backend.rs:675`) returns `<|eot|>` 200008;
+    `extra_eos_ids` (`backend.rs:947`) returns `gen_defaults.eos_token_ids`, populated at
+    load by `parse_generation_defaults` (`persistence.rs:947`). Both overrides are
+    mandatory: omitting `extra_eos_ids` **silently** drops `200001` (the trait default is
+    `Vec::new()`, and `[].contains()` is always false, so turns stop only on `<|eot|>`),
+    and inheriting the ChatML `session_eos_id` (`tok.im_end_id()`) **hard-errors every
+    turn** rather than resolving the wrong id, because this checkpoint has no
+    `<|im_end|>` — copy gemma4's `turn_end_id()` override (`gemma4/model.rs:7314`).
+    `<|eom|>` 200007 must stay OUT of the set: it ends a message, not a turn.
 11. **Quantization reaches the cross-modal bridge.** `convert.rs` has zero occurrences of
     `vision_adapter` / `vision_projection` and neither matches any skip substring, so the
     most sensitive tensors in a VLM get packed for 0.139 GB. Also
