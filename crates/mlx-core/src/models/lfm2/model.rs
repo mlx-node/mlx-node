@@ -1843,6 +1843,27 @@ impl Lfm2StepExecutor<'_> {
         let allocation_blocked = batched_logits
             .as_ref()
             .is_err_and(|error| is_paged_allocation_blocked(&error.reason));
+        let greedy_tokens: std::result::Result<Option<Vec<u32>>, String> = match &batched_logits {
+            Ok(Some(logits))
+                if !work.is_empty()
+                    && work
+                        .iter()
+                        .filter(|row| row.batch_index.is_some())
+                        .all(|row| {
+                            let turn = running
+                                .iter()
+                                .find(|turn| turn.seq_id == row.seq_id)
+                                .expect("prepared decode row remains running");
+                            engine::batch_sampling::can_batch_greedy(&turn.payload.params)
+                                && !turn.payload.reasoning_tracker.force_think_end_pending()
+                        }) =>
+            {
+                engine::batch_sampling::batch_greedy_tokens(logits)
+                    .map(Some)
+                    .map_err(|error| error.reason)
+            }
+            _ => Ok(None),
+        };
         let mut results = early_results;
         for row in work {
             let planned = &plan.rows[row.plan_index];
@@ -1850,6 +1871,17 @@ impl Lfm2StepExecutor<'_> {
                 .iter_mut()
                 .find(|turn| turn.seq_id == row.seq_id)
                 .expect("prepared decode row remains running");
+            let greedy_next = match (&greedy_tokens, row.batch_index) {
+                (Ok(Some(tokens)), Some(batch_index)) => Some(tokens[batch_index]),
+                (Err(error), Some(_)) => {
+                    results.push((
+                        row.plan_index,
+                        Self::fail(turn, planned, Error::from_reason(error.clone())),
+                    ));
+                    continue;
+                }
+                _ => None,
+            };
             let logits = match (&batched_logits, row.batch_index) {
                 (Err(_), Some(_)) if allocation_blocked => {
                     let popped = turn.payload.generated_tokens.pop();
@@ -1864,6 +1896,7 @@ impl Lfm2StepExecutor<'_> {
                     ));
                     continue;
                 }
+                (Ok(Some(_)), Some(_)) if greedy_next.is_some() => None,
                 (Ok(Some(logits)), Some(batch_index)) => {
                     match logits
                         .slice_axis(0, batch_index as i64, batch_index as i64 + 1)
@@ -1878,7 +1911,9 @@ impl Lfm2StepExecutor<'_> {
                 }
                 _ => None,
             };
-            let next_token = if let Some(mut logits) = logits {
+            let next_token = if greedy_next.is_some() {
+                greedy_next
+            } else if let Some(mut logits) = logits {
                 let sampled = if turn.payload.reasoning_tracker.should_force_think_end() {
                     let forced = match turn.payload.reasoning_tracker.forced_token_id() {
                         Ok(token) => token as i32,
@@ -2458,7 +2493,7 @@ impl Lfm2SchedulerState {
                 total_budget,
                 reuse_cache,
                 &[],
-                0,
+                admitted.params.cache_salt,
                 false,
                 total_budget.saturating_sub(1),
             ) {
@@ -2708,7 +2743,12 @@ impl Lfm2SchedulerState {
             .paged_adapter
             .as_mut()
             .expect("lfm2 paged adapter checked above")
-            .register_full_blocks_for_reuse_for(turn.seq_id, &[], 0, mode == PreemptionMode::Ssd)
+            .register_full_blocks_for_reuse_for(
+                turn.seq_id,
+                &[],
+                turn.payload.params.cache_salt,
+                mode == PreemptionMode::Ssd,
+            )
             .and_then(|_| {
                 self.inner
                     .paged_adapter
@@ -2796,7 +2836,7 @@ impl Lfm2SchedulerState {
                 target,
                 true,
                 &[],
-                0,
+                turn.payload.params.cache_salt,
                 false,
                 target.saturating_sub(1),
             );
@@ -3716,7 +3756,7 @@ impl PagedBackend for Lfm2Inner {
         Ok(Lfm2PagedDecode { inner: self })
     }
 
-    fn finalize_paged_turn(&mut self, reuse_cache: bool) {
+    fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
         // Terminal lifecycle. Success: keep the request live across turns
         // when reuse is on so the next turn's `continue_turn` builds on the
         // partial trailing block's live K/V; otherwise register full blocks
@@ -3724,9 +3764,9 @@ impl PagedBackend for Lfm2Inner {
         // failure must not mask the turn result).
         if let Some(adapter) = self.paged_adapter.as_mut() {
             if reuse_cache {
-                let _ = adapter.finalize_turn_keep_live(&[], 0);
+                let _ = adapter.finalize_turn_keep_live(&[], cache_salt);
             } else {
-                let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+                let _ = adapter.register_full_blocks_for_reuse(&[], cache_salt);
                 let _ = adapter.release_request();
             }
         }
@@ -3988,13 +4028,14 @@ impl Lfm2Model {
         config: Option<ChatConfig>,
     ) -> Result<(
         ChatStreamHandle,
-        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
+        tokio::sync::mpsc::Receiver<Result<ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
         self.thread
             .send(Lfm2Cmd::Chat(Box::new(ChatCmd::StreamSessionStart {
                 messages,
@@ -4015,13 +4056,14 @@ impl Lfm2Model {
         config: Option<ChatConfig>,
     ) -> Result<(
         ChatStreamHandle,
-        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
+        tokio::sync::mpsc::Receiver<Result<ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
         self.thread
             .send(Lfm2Cmd::Chat(Box::new(ChatCmd::StreamSessionContinue {
                 messages,

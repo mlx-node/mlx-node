@@ -493,6 +493,7 @@ mod tests {
 
     fn greedy_config(mtp_depth: Option<i32>) -> ChatConfig {
         ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             mtp_depth,

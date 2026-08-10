@@ -75,6 +75,7 @@ fn config(owner: &str, index: usize) -> ChatConfig {
     // request's token history/configuration to another row.
     let penalized = index.is_multiple_of(2);
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: Some(owner.to_string()),
         cache_root_owner_id: Some(owner.to_string()),
         max_new_tokens: Some(if penalized { 12 } else { 16 }),
@@ -105,7 +106,7 @@ fn assert_same(expected: &ChatResult, actual: &ChatResult, prompt: &str) {
 }
 
 async fn drain_stream(
-    receiver: tokio::sync::mpsc::UnboundedReceiver<napi::Result<ChatStreamChunk>>,
+    receiver: tokio::sync::mpsc::Receiver<napi::Result<ChatStreamChunk>>,
 ) -> ChatStreamChunk {
     drain_stream_outcome(receiver)
         .await
@@ -113,7 +114,7 @@ async fn drain_stream(
 }
 
 async fn drain_stream_outcome(
-    mut receiver: tokio::sync::mpsc::UnboundedReceiver<napi::Result<ChatStreamChunk>>,
+    mut receiver: tokio::sync::mpsc::Receiver<napi::Result<ChatStreamChunk>>,
 ) -> Result<ChatStreamChunk, String> {
     while let Some(chunk) = receiver.recv().await {
         let chunk = chunk.map_err(|error| error.reason)?;

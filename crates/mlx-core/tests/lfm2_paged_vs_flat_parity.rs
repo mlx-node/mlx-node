@@ -111,6 +111,7 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
 
 fn parity_chat_config(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
@@ -182,6 +183,7 @@ fn assistant_message(result: &ChatResult) -> ChatMessage {
 /// token-exact (turn-2's prompt strict-extends the persisted history).
 fn budget_force_chat_config(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         thinking_token_budget: Some(0),
@@ -1010,6 +1012,7 @@ fn states_number_rejects_digits_inside_a_longer_number() {
 /// [`answer_surface`]. The budget bounds reasoning length, nothing more.
 fn memory_probe_chat_config() -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         thinking_token_budget: Some(128),

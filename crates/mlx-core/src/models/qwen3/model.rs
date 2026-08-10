@@ -1006,6 +1006,33 @@ impl QwenStepExecutor<'_> {
         let allocation_blocked = batched_logits
             .as_ref()
             .is_err_and(|error| is_paged_allocation_blocked(&error.reason));
+        let greedy_tokens: std::result::Result<Option<Vec<u32>>, String> = match &batched_logits {
+            Ok(Some(logits)) => {
+                let has_sampling_rows = work
+                    .iter()
+                    .any(|row| row.batch_index.is_some() && !row.at_length);
+                if has_sampling_rows
+                    && work
+                        .iter()
+                        .filter(|row| row.batch_index.is_some() && !row.at_length)
+                        .all(|row| {
+                            let turn = running
+                                .iter()
+                                .find(|turn| turn.seq_id == row.seq_id)
+                                .expect("prepared decode row remains running");
+                            engine::batch_sampling::can_batch_greedy(&turn.payload.params)
+                                && !turn.payload.reasoning_tracker.force_think_end_pending()
+                        })
+                {
+                    engine::batch_sampling::batch_greedy_tokens(logits)
+                        .map(Some)
+                        .map_err(|error| error.reason)
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        };
         let mut results = early_results;
         for row in work {
             let planned = &plan.rows[row.plan_index];
@@ -1013,6 +1040,21 @@ impl QwenStepExecutor<'_> {
                 .iter_mut()
                 .find(|turn| turn.seq_id == row.seq_id)
                 .expect("prepared decode row remains running");
+            let greedy_next = if row.at_length {
+                None
+            } else {
+                match (&greedy_tokens, row.batch_index) {
+                    (Ok(Some(tokens)), Some(batch_index)) => Some(tokens[batch_index]),
+                    (Err(error), Some(_)) => {
+                        results.push((
+                            row.plan_index,
+                            Self::fail(turn, planned, Error::from_reason(error.clone())),
+                        ));
+                        continue;
+                    }
+                    _ => None,
+                }
+            };
             let logits = match (&batched_logits, row.batch_index) {
                 (Err(_), Some(_)) if allocation_blocked => {
                     let popped = turn.payload.generated_tokens.pop();
@@ -1027,6 +1069,7 @@ impl QwenStepExecutor<'_> {
                     ));
                     continue;
                 }
+                (Ok(Some(_)), Some(_)) if greedy_next.is_some() => None,
                 (Ok(Some(logits)), Some(batch_index)) if !row.at_length => {
                     match logits
                         .slice_axis(0, batch_index as i64, batch_index as i64 + 1)
@@ -1042,7 +1085,9 @@ impl QwenStepExecutor<'_> {
                 _ => None,
             };
 
-            let next_token = if let Some(mut logits) = logits {
+            let next_token = if greedy_next.is_some() {
+                greedy_next
+            } else if let Some(mut logits) = logits {
                 let (sampled, budget_forced) =
                     if turn.payload.reasoning_tracker.should_force_think_end() {
                         let forced = match turn.payload.reasoning_tracker.forced_token_id() {
@@ -1967,7 +2012,7 @@ impl QwenSchedulerState {
                 total_budget,
                 reuse_cache,
                 &[],
-                0,
+                admitted.params.cache_salt,
                 false,
                 total_budget.saturating_sub(1),
             ) {
@@ -2195,7 +2240,12 @@ impl QwenSchedulerState {
             .paged_adapter
             .as_mut()
             .expect("qwen3 paged adapter checked above")
-            .register_full_blocks_for_reuse_for(turn.seq_id, &[], 0, mode == PreemptionMode::Ssd)
+            .register_full_blocks_for_reuse_for(
+                turn.seq_id,
+                &[],
+                turn.payload.params.cache_salt,
+                mode == PreemptionMode::Ssd,
+            )
             .and_then(|_| {
                 self.inner
                     .paged_adapter
@@ -2282,7 +2332,7 @@ impl QwenSchedulerState {
                 target,
                 true,
                 &[],
-                0,
+                turn.payload.params.cache_salt,
                 false,
                 target.saturating_sub(1),
             );
@@ -5811,7 +5861,7 @@ impl PagedBackend for Qwen3Inner {
         })
     }
 
-    fn finalize_paged_turn(&mut self, reuse_cache: bool) {
+    fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
         // Terminal lifecycle for the paged turn. Success: keep the request
         // live across turns when reuse is on so the next turn's
         // `continue_turn` builds on the partial trailing block's live K/V;
@@ -5820,9 +5870,9 @@ impl PagedBackend for Qwen3Inner {
         // result).
         if let Some(adapter) = self.paged_adapter.as_mut() {
             if reuse_cache {
-                let _ = adapter.finalize_turn_keep_live(&[], 0);
+                let _ = adapter.finalize_turn_keep_live(&[], cache_salt);
             } else {
-                let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+                let _ = adapter.register_full_blocks_for_reuse(&[], cache_salt);
                 let _ = adapter.release_request();
             }
         }
@@ -6313,13 +6363,14 @@ impl Qwen3Model {
         config: Option<crate::engine::types::ChatConfig>,
     ) -> Result<(
         crate::engine::types::ChatStreamHandle,
-        tokio::sync::mpsc::UnboundedReceiver<Result<crate::engine::types::ChatStreamChunk>>,
+        tokio::sync::mpsc::Receiver<Result<crate::engine::types::ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<crate::engine::types::ChatStreamChunk>>();
+        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
         self.thread
             .send(Qwen3Cmd::Chat(ChatCmd::StreamSessionStart {
                 messages,
@@ -6343,13 +6394,14 @@ impl Qwen3Model {
         config: Option<crate::engine::types::ChatConfig>,
     ) -> Result<(
         crate::engine::types::ChatStreamHandle,
-        tokio::sync::mpsc::UnboundedReceiver<Result<crate::engine::types::ChatStreamChunk>>,
+        tokio::sync::mpsc::Receiver<Result<crate::engine::types::ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<crate::engine::types::ChatStreamChunk>>();
+        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
         self.thread
             .send(Qwen3Cmd::Chat(ChatCmd::StreamSessionContinue {
                 messages,

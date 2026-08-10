@@ -2901,7 +2901,7 @@ impl Gemma4Model {
                 let model_id = inner.model_id;
                 let has_vision = inner.image_path_loaded();
                 let has_audio = inner.embed_audio.is_some();
-                let paged_active = inner.paged_adapter.is_some();
+                let paged_active = inner.kv_cache_coordinator.is_some();
                 let draft_active = inner.draft.is_some();
                 Ok((
                     inner,

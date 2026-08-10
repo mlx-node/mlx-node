@@ -5,6 +5,7 @@
 //! generated-capacity budget helpers.
 
 use napi::bindgen_prelude::*;
+use sha2::{Digest, Sha256};
 
 use crate::engine::types::ChatConfig;
 use crate::sampling::SamplingConfig;
@@ -139,6 +140,9 @@ pub(crate) fn apply_generation_defaults(cfg: &mut ChatConfig, d: &ModelGeneratio
 /// Extracted chat parameters with defaults applied.
 #[derive(Clone)]
 pub(crate) struct ChatParams {
+    /// Hashed physical prefix-cache security domain. Zero is the shared
+    /// default domain used when the request omits `ChatConfig.cacheSalt`.
+    pub cache_salt: u64,
     /// Logical owner for model-global auxiliary caches (currently Qwen3.5
     /// dense/MoE GDN checkpoints). Empty means an unscoped legacy caller.
     /// Deliberately separate from the paged-attention cache salt so owners can
@@ -282,6 +286,7 @@ pub(crate) fn resolve_include_reasoning(config: &ChatConfig) -> bool {
 /// Extract ChatConfig fields into flat variables with defaults.
 pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
     ChatParams {
+        cache_salt: cache_salt(config.cache_salt.as_deref()),
         cache_owner_id: config.cache_owner_id.clone().unwrap_or_default(),
         cache_root_owner_id: config.cache_root_owner_id.clone(),
         // Nonpositive budgets clamp to 0 (AR-equivalent empty completion)
@@ -336,6 +341,35 @@ pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
         // `mtpAdaptiveDepth` always wins. See
         // `ChatParams::mtp_adaptive_depth` docs.
         mtp_adaptive_depth: config.mtp_adaptive_depth.unwrap_or(false),
+    }
+}
+
+/// Reduce the public string cache domain to the adapter's compact identity.
+/// SHA-256 avoids exposing caller strings in allocator metadata; the leading
+/// 64 bits are sufficient for the existing `u64` cache-hash contract. Reserve
+/// zero as the no-domain sentinel even for the vanishingly unlikely digest
+/// prefix of all zeroes.
+pub(crate) fn cache_salt(value: Option<&str>) -> u64 {
+    let Some(value) = value else {
+        return 0;
+    };
+    let digest = Sha256::digest(value.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(bytes).max(1)
+}
+
+#[cfg(test)]
+mod cache_salt_tests {
+    use super::cache_salt;
+
+    #[test]
+    fn cache_salt_is_stable_distinct_and_reserves_zero_for_shared_cache() {
+        assert_eq!(cache_salt(None), 0);
+        let tenant_a = cache_salt(Some("tenant-a/high-entropy-secret"));
+        assert_ne!(tenant_a, 0);
+        assert_eq!(tenant_a, cache_salt(Some("tenant-a/high-entropy-secret")));
+        assert_ne!(tenant_a, cache_salt(Some("tenant-b/high-entropy-secret")));
     }
 }
 
@@ -399,6 +433,7 @@ mod mtp_params_tests {
 
     fn base_config() -> ChatConfig {
         ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             max_new_tokens: None,

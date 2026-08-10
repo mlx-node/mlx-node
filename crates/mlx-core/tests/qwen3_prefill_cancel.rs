@@ -229,7 +229,7 @@ struct TurnOutcome {
 }
 
 async fn drain_turn_inner(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<napi::Result<ChatStreamChunk>>,
+    mut rx: tokio::sync::mpsc::Receiver<napi::Result<ChatStreamChunk>>,
     started: Instant,
 ) -> TurnOutcome {
     let mut outcome = TurnOutcome {
@@ -269,7 +269,7 @@ async fn drain_turn_inner(
 }
 
 async fn drain_turn(
-    rx: tokio::sync::mpsc::UnboundedReceiver<napi::Result<ChatStreamChunk>>,
+    rx: tokio::sync::mpsc::Receiver<napi::Result<ChatStreamChunk>>,
     started: Instant,
 ) -> TurnOutcome {
     tokio::time::timeout(DRAIN_TIMEOUT, drain_turn_inner(rx, started))

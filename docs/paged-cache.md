@@ -11,8 +11,24 @@ Routing is per-model via the `use_block_paged_cache: Option<bool>` config field.
 | `BlockAllocator`      | `crates/mlx-paged-attn/src/block_allocator.rs`              | Logical lifecycle — per-block refcounts, LRU eviction, prefix-hash table for cross-request reuse                                                                                                    |
 | `LayerKVPool`         | `crates/mlx-paged-attn/src/layer_kv_pool.rs`                | Physical storage — per-layer Metal K and V `Buffer` pairs sized to `paged_cache_memory_mb`                                                                                                          |
 | `PagedKVCacheAdapter` | `crates/mlx-core/src/transformer/paged_kv_cache_adapter.rs` | Session-friendly wrapper. Per-request lifecycle: `reset_for_new_request` → `find_cached_prefix` → `allocate_suffix_blocks` → `record_tokens` → `register_full_blocks_for_reuse` → `release_request` |
+| `KVCacheCoordinator`  | `crates/mlx-core/src/transformer/kv_cache_spec.rs`          | Keeps declared cache groups, per-layer physical routes, and one runtime manager per group aligned. Gemma4 uses it as the owner of the paged full-attention manager and sliding-window group metadata. |
 
 `BlockAllocator` and `LayerKVPool` are intentionally split so the legacy `CacheEngineManager` path (used by `use_paged_attention`, a different flag — see below) is unaffected. `paged_cache_memory_mb` defaults to 2048 when `None`.
+
+## Prefix-cache security domains
+
+The native `ChatConfig.cacheSalt` field (Responses and Anthropic APIs:
+`cache_salt`) separates content-addressed KV reuse between security domains.
+The runtime hashes the caller-provided string with SHA-256 into the allocator's
+compact domain id and uses the same id for both prefix lookup and block
+publication. Omitting it retains the shared default domain for trusted
+single-tenant use.
+
+This is intentionally different from `prompt_cache_key` and `cacheOwnerId`:
+those select a warm conversation/session, while `cacheSalt` controls whether
+identical token blocks may be physically shared at all. Multi-tenant servers
+should derive a stable, high-entropy value from authenticated tenant identity
+rather than accepting an arbitrary client-selected namespace.
 
 ## Per-model support matrix
 

@@ -120,6 +120,36 @@ describe('mapRequest', () => {
     expect(config.maxNewTokens).toBe(256);
   });
 
+  it('maps cache_salt to the native prefix-cache security domain', () => {
+    const { config } = mapRequest({
+      model: 'test-model',
+      input: 'Hello',
+      cache_salt: 'tenant-a/high-entropy-secret',
+    });
+
+    expect(config.cacheSalt).toBe('tenant-a/high-entropy-secret');
+  });
+
+  it('rejects a non-string cache_salt at the runtime boundary', () => {
+    expect(() =>
+      mapRequest({
+        model: 'test-model',
+        input: 'Hello',
+        cache_salt: 42,
+      } as unknown as Parameters<typeof mapRequest>[0]),
+    ).toThrow('cache_salt must be a string');
+  });
+
+  it('rejects an empty cache_salt', () => {
+    expect(() =>
+      mapRequest({
+        model: 'test',
+        input: 'hello',
+        cache_salt: '',
+      }),
+    ).toThrow('cache_salt must not be empty');
+  });
+
   it('maps temperature to config', () => {
     const { config } = mapRequest({
       model: 'test-model',

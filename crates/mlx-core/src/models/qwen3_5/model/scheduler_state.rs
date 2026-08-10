@@ -463,12 +463,43 @@ impl Qwen35StepExecutor<'_> {
                     .end();
             }
         }
+        let greedy_tokens: std::result::Result<Option<Vec<u32>>, String> = match &logits {
+            Ok(Some(logits))
+                if work
+                    .iter()
+                    .filter(|row| row.batch_index.is_some())
+                    .all(|row| {
+                        let turn = running
+                            .iter()
+                            .find(|turn| turn.seq_id == row.seq_id)
+                            .expect("prepared row remains running");
+                        engine::batch_sampling::can_batch_greedy(&turn.payload.params)
+                            && !turn.payload.reasoning_tracker.force_think_end_pending()
+                    }) =>
+            {
+                engine::batch_sampling::batch_greedy_tokens(logits)
+                    .map(Some)
+                    .map_err(|error| error.reason)
+            }
+            _ => Ok(None),
+        };
         for row in work {
             let planned = &plan.rows[row.plan_index];
             let turn = running
                 .iter_mut()
                 .find(|turn| turn.seq_id == row.seq_id)
                 .expect("prepared row remains running");
+            let greedy_next = match (&greedy_tokens, row.batch_index) {
+                (Ok(Some(tokens)), Some(index)) => Some(tokens[index]),
+                (Err(error), Some(_)) => {
+                    results.push((
+                        row.plan_index,
+                        Self::fail(turn, planned, Error::from_reason(error.clone())),
+                    ));
+                    continue;
+                }
+                _ => None,
+            };
             let row_logits = match (&logits, row.batch_index) {
                 (Err(error), Some(_)) if is_paged_allocation_blocked(&error.reason) => {
                     let rolled_back = turn.payload.generated_tokens.pop();
@@ -483,6 +514,7 @@ impl Qwen35StepExecutor<'_> {
                     ));
                     continue;
                 }
+                (Ok(Some(_)), Some(_)) if greedy_next.is_some() => None,
                 (Ok(Some(logits)), Some(index)) => match logits
                     .slice_axis(0, index as i64, index as i64 + 1)
                     .and_then(|row| row.squeeze(Some(&[1])))
@@ -495,15 +527,19 @@ impl Qwen35StepExecutor<'_> {
                 },
                 _ => None,
             };
-            let next = match row_logits {
-                Some(logits) => match Self::sample_next(turn, logits) {
-                    Ok(token) => Some(token),
-                    Err(error) => {
-                        results.push((row.plan_index, Self::fail(turn, planned, error)));
-                        continue;
-                    }
-                },
-                None => None,
+            let next = if greedy_next.is_some() {
+                greedy_next
+            } else {
+                match row_logits {
+                    Some(logits) => match Self::sample_next(turn, logits) {
+                        Ok(token) => Some(token),
+                        Err(error) => {
+                            results.push((row.plan_index, Self::fail(turn, planned, error)));
+                            continue;
+                        }
+                    },
+                    None => None,
+                }
             };
             turn.payload.profiler.step();
             Self::finish_decode_row(turn, &row);
@@ -1054,22 +1090,24 @@ impl Qwen35SchedulerState {
         );
         self.inner
             .set_turn_cancel_flag(Some(Arc::clone(&cancelled)));
-        let prefix =
-            match self
-                .inner
-                .prime_prefix_state(&admitted.tokens, true, block_size as usize, &[], 0)
-            {
-                Ok(prefix) => prefix,
-                Err(error) => {
-                    self.inner.abort_paged_turn();
-                    self.inner.release_scheduled_recurrent_for(seq_id);
-                    self.inner.set_turn_cancel_flag(None);
-                    self.owner_histories.remove(&owner_id);
-                    self.owner_sequences.remove(&owner_id);
-                    response.send_error(error, cancelled.as_ref());
-                    return Ok(None);
-                }
-            };
+        let prefix = match self.inner.prime_prefix_state(
+            &admitted.tokens,
+            true,
+            block_size as usize,
+            &[],
+            admitted.params.cache_salt,
+        ) {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                self.inner.abort_paged_turn();
+                self.inner.release_scheduled_recurrent_for(seq_id);
+                self.inner.set_turn_cancel_flag(None);
+                self.owner_histories.remove(&owner_id);
+                self.owner_sequences.remove(&owner_id);
+                response.send_error(error, cancelled.as_ref());
+                return Ok(None);
+            }
+        };
         if prefix.suffix_len == 0 {
             self.inner.abort_paged_turn();
             self.inner.release_scheduled_recurrent_for(seq_id);
@@ -1226,7 +1264,12 @@ impl Qwen35SchedulerState {
             .paged_adapter
             .as_mut()
             .expect("Qwen3.5 paged adapter checked above")
-            .register_full_blocks_for_reuse_for(turn.seq_id, &[], 0, mode == PreemptionMode::Ssd)
+            .register_full_blocks_for_reuse_for(
+                turn.seq_id,
+                &[],
+                turn.payload.params.cache_salt,
+                mode == PreemptionMode::Ssd,
+            )
             .and_then(|_| {
                 self.inner
                     .paged_adapter
@@ -1331,7 +1374,7 @@ impl Qwen35SchedulerState {
             true,
             turn.block_size as usize,
             &[],
-            0,
+            turn.payload.params.cache_salt,
         ) {
             Ok(prefix) => prefix,
             Err(error) if is_paged_allocation_blocked(&error.reason) => {

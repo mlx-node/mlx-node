@@ -118,6 +118,14 @@ export interface ResponsesAPIRequest {
   previous_response_id?: string;
   store?: boolean;
   /**
+   * Security domain for native content-addressed prefix-cache reuse.
+   * Identical prompts only share physical KV blocks when this non-empty value
+   * is also identical. Multi-tenant callers should derive a high-entropy stable value
+   * from the authenticated tenant identity. This is independent from
+   * `prompt_cache_key`, which controls warm conversation affinity.
+   */
+  cache_salt?: string;
+  /**
    * Stable caller-supplied key identifying the logical conversation for
    * warm-session reuse across stateless turns. Stateless agent clients
    * (pi-mono, Aider, Codex CLI, etc.) own the conversation history

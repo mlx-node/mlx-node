@@ -623,6 +623,7 @@ mod paged_context_capacity_tests {
 
     fn make_params(max_new_tokens: i32) -> engine::ChatParams {
         extract_chat_params(&ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             max_new_tokens: Some(max_new_tokens),
@@ -2041,6 +2042,7 @@ impl Qwen35Inner {
     fn finalize_dense_manual_paged_turn(
         &mut self,
         image_token_positions: &[(u32, u64)],
+        cache_salt: u64,
     ) -> Result<()> {
         let finalize_result = self
             .paged_adapter
@@ -2052,7 +2054,7 @@ impl Qwen35Inner {
                     adapter.block_size(),
                     image_token_positions,
                 );
-                adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0)
+                adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, cache_salt)
             });
         match finalize_result {
             Ok(_) => {
@@ -2650,7 +2652,7 @@ impl Qwen35Inner {
         // Deepest same-owner in-memory GDN checkpoint whose block-hash chain
         // matches this request and whose prefix the KV chain reaches. `cache_salt`
         // is 0 here to match the KV-chain finalize
-        // (`finalize_turn_keep_live_per_block(.., 0)`) and the in-memory publish,
+        // (`finalize_turn_keep_live_per_block`) and the in-memory publish,
         // so the restore walk — which chains the sidecar under the SAME salt as
         // the KV blocks — can select it.
         let (idx, boundary) = match select_gdn_sidecar_boundary(
@@ -4440,7 +4442,7 @@ impl Qwen35Inner {
         };
         let lookup_extra_keys =
             engine::build_paged_extra_keys(tokens.len(), block_size, image_positions);
-        let cache_salt = 0;
+        let cache_salt = p.cache_salt;
         // vLLM exact-prefix cap — see qwen3/model.rs:paged_turn_sync_core.
         // Ensures every paged turn has at least one suffix token to prefill,
         // even when the live cache (or a prior request's residue) already
@@ -4589,7 +4591,7 @@ impl Qwen35Inner {
         let (generated_tokens, finish_reason, mtp_profiler) = match forward_result {
             Ok(t) => {
                 let image_token_positions = self.cached_paged_image_token_positions.clone();
-                self.finalize_dense_manual_paged_turn(&image_token_positions)?;
+                self.finalize_dense_manual_paged_turn(&image_token_positions, cache_salt)?;
                 t
             }
             Err(e) => {
@@ -5247,7 +5249,7 @@ impl Qwen35Inner {
         // already-successful generation output.
         let keep_live_ok = p.reuse_cache
             && self
-                .finalize_dense_manual_paged_turn(&image_token_positions)
+                .finalize_dense_manual_paged_turn(&image_token_positions, p.cache_salt)
                 .is_ok();
         let continuable = if keep_live_ok {
             self.cached_token_history = full_history;
@@ -5639,7 +5641,7 @@ impl Qwen35Inner {
         // failure downgrades to NON-continuable rather than discarding output.
         let keep_live_ok = p.reuse_cache
             && self
-                .finalize_dense_manual_paged_turn(&image_token_positions)
+                .finalize_dense_manual_paged_turn(&image_token_positions, p.cache_salt)
                 .is_ok();
         let continuable = if keep_live_ok {
             self.cached_token_history = full_history;
@@ -5856,7 +5858,7 @@ impl Qwen35Inner {
         };
         let lookup_extra_keys =
             engine::build_paged_extra_keys(tokens.len(), block_size, image_positions);
-        let cache_salt = 0;
+        let cache_salt = p.cache_salt;
         // See `paged_turn_sync_core` for the vLLM exact-prefix cap rationale.
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let live_ready;
@@ -6057,7 +6059,7 @@ impl Qwen35Inner {
         let (generated_tokens, finish_reason, decode_profiler) = match result {
             Ok(t) => {
                 let image_token_positions = self.cached_paged_image_token_positions.clone();
-                self.finalize_dense_manual_paged_turn(&image_token_positions)?;
+                self.finalize_dense_manual_paged_turn(&image_token_positions, cache_salt)?;
                 t
             }
             Err(e) => {
@@ -9414,7 +9416,7 @@ impl PagedBackend for Qwen35Inner {
         Ok(Qwen35PagedDecode { inner: self })
     }
 
-    fn finalize_paged_turn(&mut self, reuse_cache: bool) {
+    fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
         // Terminal lifecycle block of a paged turn. Success: keep the request
         // live across turns when reuse is on, using PER-BLOCK extra keys (NOT
         // qwen3's empty `&[]`), so the next turn's continue builds on the
@@ -9434,7 +9436,7 @@ impl PagedBackend for Qwen35Inner {
                     &self.cached_paged_image_token_positions,
                 );
                 adapter
-                    .finalize_turn_keep_live_per_block(&finalize_extra_keys, 0)
+                    .finalize_turn_keep_live_per_block(&finalize_extra_keys, cache_salt)
                     .err()
             }
             Some(adapter) => {
@@ -9450,7 +9452,7 @@ impl PagedBackend for Qwen35Inner {
                 // adapter's cold-chain frontier to 0.
                 release_pending = true;
                 adapter
-                    .register_full_blocks_for_reuse_per_block(&finalize_extra_keys, 0)
+                    .register_full_blocks_for_reuse_per_block(&finalize_extra_keys, cache_salt)
                     .err()
             }
             None => Some("paged_adapter is None during dense finalization".to_owned()),
@@ -11185,13 +11187,14 @@ impl Qwen3_5Model {
         config: Option<ChatConfig>,
     ) -> Result<(
         ChatStreamHandle,
-        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
+        tokio::sync::mpsc::Receiver<Result<ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
         self.thread
             .send(Qwen35Cmd::Chat(ChatCmd::StreamSessionStart {
                 messages,
@@ -11211,13 +11214,14 @@ impl Qwen3_5Model {
         config: Option<ChatConfig>,
     ) -> Result<(
         ChatStreamHandle,
-        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
+        tokio::sync::mpsc::Receiver<Result<ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
         self.thread
             .send(Qwen35Cmd::Chat(ChatCmd::StreamSessionContinue {
                 messages,
@@ -14884,7 +14888,7 @@ mod paged_construction_tests {
         // for registration/evaluation/release failures without allocating a
         // Metal LayerKVPool in this unit test.
         <Qwen35Inner as crate::engine::backend::PagedBackend>::finalize_paged_turn(
-            &mut inner, true,
+            &mut inner, true, 0,
         );
         assert!(inner.paged_finalize_failed);
         assert!(inner.caches.is_none());
@@ -14931,7 +14935,7 @@ mod paged_construction_tests {
         seed_dense_paged_image_session(&mut inner);
 
         let error = inner
-            .finalize_dense_manual_paged_turn(&[(1, 0xA11C), (2, 0xA11C)])
+            .finalize_dense_manual_paged_turn(&[(1, 0xA11C), (2, 0xA11C)], 0)
             .expect_err("missing adapter must fail manual finalization");
         assert!(error.to_string().contains("paged finalization failed"));
         assert!(inner.caches.is_none());
@@ -14988,6 +14992,7 @@ mod paged_construction_tests {
     #[test]
     fn test_qwen35_planned_decoder_overrides_raw_mtp_flag() {
         let mut config = ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             enable_mtp: Some(true),
@@ -15731,7 +15736,7 @@ mod paged_construction_tests {
         let _serialized = crate::cold_tier::sidecar_counter_test_lock();
         let before = crate::cold_tier::cold_sidecar_telemetry();
         inner
-            .finalize_dense_manual_paged_turn(&[])
+            .finalize_dense_manual_paged_turn(&[], 0)
             .expect("manual paged finalization must succeed");
         let after = crate::cold_tier::cold_sidecar_telemetry();
 
@@ -15796,7 +15801,7 @@ mod paged_construction_tests {
         let _serialized = crate::cold_tier::sidecar_counter_test_lock();
         let before = crate::cold_tier::cold_sidecar_telemetry();
         inner
-            .finalize_dense_manual_paged_turn(&[(4, 99)])
+            .finalize_dense_manual_paged_turn(&[(4, 99)], 0)
             .expect("manual paged finalization must succeed");
         let after = crate::cold_tier::cold_sidecar_telemetry();
 

@@ -427,6 +427,15 @@ export function mapAnthropicRequest(
     reportPerformance: true,
   };
 
+  if (req.cache_salt != null) {
+    if (typeof req.cache_salt !== 'string') {
+      throw new Error('cache_salt must be a string');
+    }
+    if (req.cache_salt.length === 0) {
+      throw new Error('cache_salt must not be empty');
+    }
+    config.cacheSalt = req.cache_salt;
+  }
   if (req.max_tokens != null) {
     config.maxNewTokens = req.max_tokens;
   }

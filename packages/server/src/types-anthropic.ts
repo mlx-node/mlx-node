@@ -98,6 +98,12 @@ export interface AnthropicMessagesRequest {
   stream?: boolean;
   stop_sequences?: string[];
   metadata?: { user_id?: string };
+  /**
+   * MLX-Node extension matching vLLM's Anthropic surface. Separates native
+   * content-addressed prefix-cache reuse between security domains. The value
+   * must be non-empty, stable for the tenant, secret, and unpredictable.
+   */
+  cache_salt?: string;
   output_config?: {
     format?: {
       type?: string;

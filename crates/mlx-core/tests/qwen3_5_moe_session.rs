@@ -27,6 +27,7 @@ use mlx_core::tokenizer::{ChatMessage, ToolCall};
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
@@ -312,7 +313,7 @@ async fn moe_session_path_keeps_ttft_flat_across_turns() {
 /// or final). The final `done: true` chunk must be observed or the
 /// helper panics.
 async fn drain_stream_turn(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<napi::Result<ChatStreamChunk>>,
+    mut rx: tokio::sync::mpsc::Receiver<napi::Result<ChatStreamChunk>>,
 ) -> (Vec<ChatStreamChunk>, f64, bool) {
     let start = Instant::now();
     let mut chunks = Vec::new();
@@ -491,6 +492,7 @@ async fn moe_stream_session_cancellation_preserves_cache_for_next_turn() {
 
     // Turn 1: run a normal session-start stream to prime the cache.
     let turn1_cfg = ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(128),

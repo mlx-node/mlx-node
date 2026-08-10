@@ -197,7 +197,7 @@ pub(crate) trait DecodeStep {
 ///   * the per-family `StreamSender(StreamTx<ChatStreamChunk>)` mpsc
 ///     wrappers (`models/lfm2/model.rs`, `models/qwen3/model.rs`,
 ///     `models/qwen3_5/model.rs`, `models/qwen3_5_moe/model.rs`) whose
-///     `call` forwards to `UnboundedSender::send` and ignores the mode;
+///     `call` forwards to the request's bounded mailbox and ignores the mode;
 ///   * the raw `ThreadsafeFunction<ChatStreamChunk, ()>` used by the
 ///     `pump_stream_to_callback` helpers, always invoked `NonBlocking`.
 pub(crate) trait ChunkSink {
@@ -214,11 +214,10 @@ impl ChunkSink for ThreadsafeFunction<ChatStreamChunk, ()> {
 
 impl ChunkSink for crate::model_thread::StreamTx<ChatStreamChunk> {
     fn send(&self, chunk: Result<ChatStreamChunk>) {
-        // Explicit path: the inherent `UnboundedSender::send` would
-        // shadow this trait method inside its own impl. A closed
-        // receiver drops the chunk — same policy as the per-family
-        // `StreamSender` wrappers.
-        let _ = tokio::sync::mpsc::UnboundedSender::send(self, chunk);
+        // A closed receiver drops the chunk — same policy as the per-family
+        // `StreamSender` wrappers. A full receiver backpressures the dedicated
+        // model thread, never a Tokio runtime worker.
+        let _ = crate::model_thread::StreamTx::send(self, chunk);
     }
 }
 
@@ -1264,10 +1263,11 @@ pub(crate) trait PagedBackend: ChatBackend {
     /// == the `match forward_result { Ok => finalize_keep_live |
     /// register+release, Err => release }` block in the forked cores. The
     /// engine passes the turn's (delta-forced) `reuse_cache`; the impl
-    /// owns the `(extra_keys, cache_salt)` it registers with (qwen3:
-    /// `(&[], 0)`). Infallible — the forked cores `let _ =` every
+    /// owns the `(extra_keys, cache_salt)` it registers with (qwen3 uses
+    /// empty extra keys plus the request's cache domain). Infallible — the
+    /// forked cores `let _ =` every
     /// lifecycle call (a teardown failure must not mask the turn result).
-    fn finalize_paged_turn(&mut self, reuse_cache: bool);
+    fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64);
 
     /// Persist the session's token history for the next turn's delta
     /// (paged analog of [`ChatBackend::save_cache_state`]).

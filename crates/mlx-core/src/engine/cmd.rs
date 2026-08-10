@@ -1006,6 +1006,7 @@ mod mock_backend_tests {
 
     fn greedy_config() -> ChatConfig {
         ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             temperature: Some(0.0),
@@ -1268,6 +1269,7 @@ mod mock_backend_tests {
             cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: ChatConfig {
+                cache_salt: None,
                 cache_owner_id: None,
                 cache_root_owner_id: None,
                 temperature: Some(0.0),
@@ -1353,14 +1355,16 @@ mod mock_backend_tests {
             MockBackend::new(vec![vec![TOK_HELLO, TOK_THINK_END, TOK_WORLD, TOK_IM_END]]);
 
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
 
         handle_chat_cmd(
             &mut backend,
             ChatCmd::StreamSessionStart {
                 messages: user_messages("hello"),
                 config: ChatConfig {
+                    cache_salt: None,
                     cache_owner_id: None,
                     cache_root_owner_id: None,
                     temperature: Some(0.0),
@@ -1437,8 +1441,9 @@ mod mock_backend_tests {
 
         let stream_turn = |backend: &mut MockBackend, pre_cancelled: bool| {
             let cancelled = Arc::new(AtomicBool::new(pre_cancelled));
-            let (stream_tx, mut stream_rx) =
-                tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+            let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(
+                crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+            );
             handle_chat_cmd(
                 backend,
                 ChatCmd::StreamSessionStart {
@@ -1635,6 +1640,7 @@ mod mock_backend_tests {
             cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: ChatConfig {
+                cache_salt: None,
                 cache_owner_id: None,
                 cache_root_owner_id: None,
                 reuse_cache: Some(false),
@@ -2069,6 +2075,7 @@ mod mock_backend_tests {
 
         // Explicit request value wins over the model default.
         let explicit = ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             temperature: Some(0.0),
@@ -2116,6 +2123,7 @@ mod mock_backend_tests {
         };
 
         let mut cfg = ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             temperature: Some(0.9), // explicit → must survive
@@ -2165,6 +2173,7 @@ mod mock_backend_tests {
 
         // (b) do_sample:false + explicit request temperature → request wins.
         let mut cfg = ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             temperature: Some(0.8),
@@ -2267,8 +2276,9 @@ mod mock_backend_tests {
 
         // Turn 2: streaming continue.
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
         let mut messages = user_messages("hello");
         messages.push(assistant_message(&r1));
         messages.extend(user_messages("again"));
@@ -2306,8 +2316,9 @@ mod mock_backend_tests {
         let mut backend = MockBackend::new(vec![]);
 
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
         handle_chat_cmd(
             &mut backend,
             ChatCmd::StreamSessionContinue {
@@ -2343,8 +2354,9 @@ mod mock_backend_tests {
         backend.paged_complete_knob = true;
 
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
         handle_chat_cmd(
             &mut backend,
             ChatCmd::StreamSessionStart {
@@ -2628,8 +2640,9 @@ mod mock_backend_tests {
         messages[0].images = Some(vec![Uint8Array::new(vec![1, 2, 3])]);
 
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
         handle_chat_cmd(
             &mut backend,
             ChatCmd::StreamSessionStart {

@@ -1305,6 +1305,7 @@ mod decode_loop_sync_cancel_tests {
     /// engine turn tests' `greedy_params`.
     fn greedy_params(max_new_tokens: i32) -> ChatParams {
         ChatParams {
+            cache_salt: 0,
             cache_owner_id: String::new(),
             cache_root_owner_id: None,
             max_new_tokens,

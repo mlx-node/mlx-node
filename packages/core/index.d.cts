@@ -2384,6 +2384,14 @@ export declare function calibrateActivationAmaxRaw(
 /** Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
 export interface ChatConfig {
   /**
+   * Security domain for content-addressed paged-KV prefix reuse.
+   * Requests with different values cannot reuse each other's cached
+   * prefixes even when their token sequences are identical. This is
+   * deliberately separate from `cache_owner_id`, which controls logical
+   * session/recurrent-state ownership rather than physical KV sharing.
+   */
+  cacheSalt?: string | undefined;
+  /**
    * Internal logical cache owner. The agent provider forwards Pi's stable
    * session id so model-global GDN sidecars can retain parent and child
    * branches independently. This does not namespace the physical paged KV

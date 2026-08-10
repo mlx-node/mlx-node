@@ -26,6 +26,7 @@ use mlx_core::tokenizer::ChatMessage;
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),

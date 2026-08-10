@@ -138,6 +138,7 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
 /// pinned to the values the parity gate cares about.
 fn parity_chat_config(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),

@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! let cancelled = Arc::new(AtomicBool::new(false));
-//! let (stream_tx, stream_rx) = unbounded_channel();
+//! let (stream_tx, stream_rx) = stream_channel(CHAT_STREAM_NATIVE_QUEUE_LIMIT);
 //! self.thread.send(Cmd::Stream… { …, stream_tx, cancelled: cancelled.clone() })?;
 //! let callback = Arc::new(callback);
 //! tokio::spawn(async move {
@@ -24,12 +24,15 @@ use napi::Status;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 
 use crate::engine::types::{ChatStreamChunk, ChatStreamHandle};
-use crate::model_thread::StreamTx;
+use crate::model_thread::{StreamTx, stream_channel};
 
 /// Bound both the N-API callback queue and the mirrored JS adapter queue.
 /// A full callback queue cancels the turn instead of relocating HTTP
 /// backpressure into an unbounded native-to-JS backlog.
 pub(crate) const CHAT_STREAM_CALLBACK_QUEUE_LIMIT: usize = 64;
+/// Bound the model-thread-to-Tokio handoff independently from the N-API
+/// callback queue. Both limits are per request.
+pub(crate) const CHAT_STREAM_NATIVE_QUEUE_LIMIT: usize = 64;
 pub(crate) type ChatStreamCallback = ThreadsafeFunction<
     ChatStreamChunk,
     (),
@@ -62,8 +65,7 @@ pub(crate) struct ChatStreamPlumbing {
 /// its own.
 pub(crate) fn start_chat_stream(callback: ChatStreamCallback) -> ChatStreamPlumbing {
     let cancelled = Arc::new(AtomicBool::new(false));
-    let (stream_tx, stream_rx) =
-        tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+    let (stream_tx, stream_rx) = stream_channel(CHAT_STREAM_NATIVE_QUEUE_LIMIT);
     spawn_stream_pump(stream_rx, callback, Arc::clone(&cancelled));
     ChatStreamPlumbing {
         cancelled: cancelled.clone(),
@@ -79,7 +81,7 @@ pub(crate) fn start_chat_stream(callback: ChatStreamCallback) -> ChatStreamPlumb
 /// enqueue a terminal backlog error once JavaScript resumes; this preserves a
 /// fixed memory bound without parking a Tokio runtime worker.
 pub(crate) fn spawn_stream_pump(
-    mut stream_rx: tokio::sync::mpsc::UnboundedReceiver<napi::Result<ChatStreamChunk>>,
+    mut stream_rx: tokio::sync::mpsc::Receiver<napi::Result<ChatStreamChunk>>,
     callback: ChatStreamCallback,
     cancelled: Arc<AtomicBool>,
 ) {

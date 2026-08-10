@@ -55,8 +55,8 @@ step's remaining token budget.
 | Native thread | One scheduler and executor live beside the model on its dedicated OS thread; `MxArray` never crosses threads. Idle waits block, while busy periods poll commands only between steps.                                                                                                                                                                                                                                                                                                    |
 | Scheduler     | One global token ceiling serves decode rows first, then pinned prefill slices. Exclusive commands run only with an empty running set; reset/generate/save/train are barriers. Block growth and hybrid recurrent-state bytes share one unified-memory admission watermark; an actual lazy-allocation squeeze preempts exactly one newest running victim.                                                                                                                                 |
 | Cache         | `PagedKVCacheAdapter` owns a request table keyed by sequence id over one refcounted block pool. A preempted victim publishes its verified full blocks, releases its live table, and resumes from the deepest surviving prefix. SSD restore is asynchronous: `WaitingForSsd` rows park while runnable peers continue.                                                                                                                                                                    |
-| Executor      | Dense Qwen3 defaults to uniform `[N,1]` decode plus bounded prefill; `MLX_SCHED_RAGGED_STEP=1` instead packs every planned slice, uses real `cu_seqlens_q`, and projects logits only at each request's final query. LFM2 stacks/scatters private ShortConv rows. Dense text-only Qwen3.5 stacks/scatters private GDN conv+recurrent rows while full-attention layers perform one paged gather. Every request retains private penalties, sampling, stop, stream, and cancellation state. |
-| Transport     | SSE writes honor Node backpressure and stop native pulls until drain or close. The 30-second default drain deadline aborts a connected stalled peer and releases admission.                                                                                                                                                                                                                                                                                                             |
+| Executor      | Dense Qwen3 defaults to uniform `[N,1]` decode plus bounded prefill; `MLX_SCHED_RAGGED_STEP=1` instead packs every planned slice, uses real `cu_seqlens_q`, and projects logits only at each request's final query. LFM2 stacks/scatters private ShortConv rows. Dense text-only Qwen3.5 stacks/scatters private GDN conv+recurrent rows while full-attention layers perform one paged gather. Eligible all-greedy rows stay batched through one argmax/eval epilogue; mixed sampling or penalties retain the scalar per-row path. Every request retains private penalties, sampling, stop, stream, and cancellation state. |
+| Transport     | SSE writes honor Node backpressure and stop native pulls until drain or close. The 30-second default drain deadline aborts a connected stalled peer and releases admission. The model-thread output mailbox, native callback queue, and JS callback queue are independently capped at 64 events.                                                                                                                                                                                                                                                                                                                            |
 
 Per-request prefix verification remains all-or-nothing. A miss releases and
 rebuilds only that sequence's slot; it never resets a peer. Batched admission
@@ -169,7 +169,7 @@ The tuned grouped D256/D512 long-context kernels remain gated to
 | H1  | Event-loop freeze after a streaming abort — **fixed**          | `resetCaches()` is async NAPI and waits on the model command channel without blocking Node. Streaming and synchronous chat turns install a turn cancel flag; flat/paged prefill, MTP/hidden-prefill helpers, and GDN materialized replay poll it at chunk boundaries and fail closed without publishing partial cache state. Residual: a single-shot prefill remains atomic, but a queued reset still parks only its promise, never the event loop. (`models/chat_napi.rs:77`, `engine/backend.rs:868`, family `turn_cancel` checkpoints.)                                                                                                                        |
 | H2  | Non-streaming requests cannot be cancelled — **fixed**         | Public LM calls keep their ordinary names and accept the platform-native `AbortSignal`; `ChatSession` send paths pass `opts.signal`. Internally, the wrapper bridges to a two-phase native operation with one shared atomic flag. All supported session models, including Qianfan-OCR, poll it at safepoints. Both HTTP endpoints abort on disconnect and skip dispatch when the peer is already dead. Cancelled turns reject exactly with `"chat session cancelled"` and roll JS history back.                                                                                                                                                                   |
 | H3  | Unbounded queue by default — **fixed**                         | `createServer` defaults the per-model cap to 16 waiters; env/config/host options can override or explicitly select `'unbounded'`. The coordinator bounds arrivals during cold load before a `SessionRegistry` exists. After resolution, pre-dispatch permits and FIFO waiters share the same atomic budget. Over-cap requests get 429 + `Retry-After: 1` with separate queue/pre-dispatch diagnostics.                                                                                                                                                                                                                                                            |
-| H4  | SSE ignores backpressure — **fixed with bounded cancellation** | Endpoints stop pulling when `res.write()` returns false and wait close-safely for drain. A 30s default drain deadline converts a connected stalled peer into a sticky abort and destroys the transport, so an admission slot cannot be held forever. Native TSFN delivery and the JS callback queue each have a 64-event ceiling; overflow cancels the turn. The model-thread `StreamTx` remains an unbounded implementation seam, but once the bounded bridge fills its receiver is dropped and the producer exits at a cooperative safepoint rather than growing for the lifetime of the connection. A scheduler-owned bounded output ring remains future work. |
+| H4  | SSE ignores backpressure — **fixed with bounded cancellation** | Endpoints stop pulling when `res.write()` returns false and wait close-safely for drain. A 30s default drain deadline converts a connected stalled peer into a sticky abort and destroys the transport, so an admission slot cannot be held forever. The model-thread mailbox, native TSFN delivery, and JS callback queue each have a 64-event ceiling. A full model-thread mailbox backpressures only its dedicated producer OS thread; close or callback overflow drops the receiver, wakes that producer, and cancels the turn. There is no remaining unbounded request-output queue. |
 
 Cross-model residual coupling is perf-class, not correctness: the process-wide
 Metal wired limit is set/restored per turn (`crates/mlx-core/src/stream.rs:142-262`),
@@ -193,6 +193,28 @@ async-scheduling depth > 1 (one Metal command queue + lazy eval → one-step
 overlap at best), and "use all GPU memory for KV" pool sizing (on unified
 memory the pool competes with the weights — see
 `docs/architecture.md` "Unified memory decides the cache hierarchy").
+
+### Architecture follow-up after the vLLM comparison
+
+Four additional mechanisms fit the single-process MLX runtime:
+
+- The request-output path is bounded end to end. `StreamTx` backpressures only
+  the model's dedicated OS thread, while the Tokio forwarding pump remains
+  runnable and can observe close/cancellation.
+- The common deterministic decode case keeps `[batch, vocab]` logits intact
+  through one argmax and one device evaluation. Any stochastic row, active
+  penalty, or forced reasoning token sends the whole step through the existing
+  scalar sampler, preserving request-local semantics.
+- `ChatConfig.cacheSalt` and the Responses/Anthropic `cache_salt` fields define
+  an explicit prefix-cache security domain. The SHA-256-derived compact domain
+  is threaded unchanged through lookup and publication and is independent from
+  `prompt_cache_key`/session ownership.
+- `KVCacheCoordinator` owns the runtime manager aligned with every compatible
+  `KVCacheGroup` and the authoritative per-layer routes. Gemma4 now consumes
+  those routes directly: its full-attention group owns the paged adapter and
+  its sliding-window group records the rotating-cache admission bound. The
+  current Gemma4 physical implementation still supports one full-attention
+  layout; multiple full layouts and paged sliding eviction are not claimed.
 
 ## Validation evidence and performance boundary
 

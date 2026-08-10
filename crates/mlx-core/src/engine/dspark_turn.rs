@@ -1349,6 +1349,7 @@ mod tests {
     /// drives the loop's batched-argmax fast path.
     fn greedy_params() -> ChatParams {
         ChatParams {
+            cache_salt: 0,
             cache_owner_id: String::new(),
             cache_root_owner_id: None,
             max_new_tokens: 64,

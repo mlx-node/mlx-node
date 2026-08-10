@@ -32,6 +32,7 @@ use napi::bindgen_prelude::Uint8Array;
 
 fn cfg(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),

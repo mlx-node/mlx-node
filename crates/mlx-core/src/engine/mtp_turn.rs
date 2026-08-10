@@ -2932,6 +2932,7 @@ mod tests {
     /// meaningfully; the rest are inert.
     fn greedy_params() -> ChatParams {
         ChatParams {
+            cache_salt: 0,
             cache_owner_id: String::new(),
             cache_root_owner_id: None,
             max_new_tokens: 64,

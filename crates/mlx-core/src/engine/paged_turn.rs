@@ -62,7 +62,7 @@ pub(crate) fn finish_paged_turn<B: PagedBackend>(
     } else {
         true
     };
-    backend.finalize_paged_turn(args.reuse_cache && reconcile_ok);
+    backend.finalize_paged_turn(args.reuse_cache && reconcile_ok, args.params.cache_salt);
     if let Err(error) = backend.save_paged_history(
         args.prompt_tokens,
         args.generated_tokens,
@@ -201,7 +201,7 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     // `&mut backend` directly. Safe in both sub-cases: if the adapter was
     // `None` (prime failed on the None check) abort is a no-op; if
     // prepare_turn failed mid-mutation abort releases the live request.
-    let prefix = match backend.prime_prefix_state(args.tokens, reuse_cache, 0, &[], 0) {
+    let prefix = match backend.prime_prefix_state(args.tokens, reuse_cache, 0, &[], p.cache_salt) {
         Ok(prefix) => prefix,
         Err(e) => {
             backend.abort_paged_turn();
@@ -432,6 +432,7 @@ mod tests {
 
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU64;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
@@ -627,6 +628,8 @@ mod tests {
         /// `reconcile_paged_request_tokens` rolls back the surplus — the
         /// faithful adapter-cursor model the history tests assert on.
         adapter_cursor: Arc<AtomicUsize>,
+        prime_cache_salt: Arc<AtomicU64>,
+        finalize_cache_salt: Arc<AtomicU64>,
         /// Last `save_paged_history` capture (+ the trim it produced).
         saved: Arc<std::sync::Mutex<Option<SavedHistory>>>,
         /// Optional cancel flag + 1-based flip index forwarded to the
@@ -727,13 +730,14 @@ mod tests {
             _reuse_cache: bool,
             _block_size: usize,
             _extra_keys: &[u64],
-            _cache_salt: u64,
+            cache_salt: u64,
         ) -> Result<Self::PrefixState> {
             // Record the call FIRST (a live-request mutation has happened —
             // the adapter is reset + prefix blocks attached) THEN fail, so the
             // abort-path test sees prime_prefix_state in the ledger followed by
             // abort_paged_turn and NOT paged_prefill.
             self.ledger.push("prime_prefix_state");
+            self.prime_cache_salt.store(cache_salt, Ordering::Relaxed);
             if self.fail_prime {
                 return Err(Error::from_reason("mock prime failure"));
             }
@@ -785,8 +789,10 @@ mod tests {
             })
         }
 
-        fn finalize_paged_turn(&mut self, _reuse_cache: bool) {
+        fn finalize_paged_turn(&mut self, _reuse_cache: bool, cache_salt: u64) {
             self.ledger.push("finalize_paged_turn");
+            self.finalize_cache_salt
+                .store(cache_salt, Ordering::Relaxed);
         }
 
         fn abort_paged_turn(&mut self) {
@@ -903,6 +909,8 @@ mod tests {
         let ledger = Arc::new(Ledger::default());
         let forward_count = Arc::new(AtomicUsize::new(0));
         let tokenizer = tiny_qwen3_tokenizer();
+        let prime_cache_salt = Arc::new(AtomicU64::new(0));
+        let finalize_cache_salt = Arc::new(AtomicU64::new(0));
 
         let mut backend = MockBackend {
             ledger: ledger.clone(),
@@ -916,6 +924,8 @@ mod tests {
             fail_forward_on: None,
             fail_save: false,
             adapter_cursor: Arc::new(AtomicUsize::new(0)),
+            prime_cache_salt: prime_cache_salt.clone(),
+            finalize_cache_salt: finalize_cache_salt.clone(),
             saved: Arc::new(std::sync::Mutex::new(None)),
             cancel: None,
             flip_on_forward: None,
@@ -923,6 +933,7 @@ mod tests {
 
         // T=0 greedy params, profiling OFF, no cutoffs, budget MAX_NEW.
         let config = ChatConfig {
+            cache_salt: Some("tenant-a/high-entropy-secret".to_string()),
             cache_owner_id: None,
             cache_root_owner_id: None,
             temperature: Some(0.0),
@@ -932,6 +943,7 @@ mod tests {
             ..Default::default()
         };
         let p = crate::engine::params::extract_chat_params(&config);
+        assert_ne!(p.cache_salt, 0);
         let thinking = ThinkingSetup {
             enabled: false,
             budget: None,
@@ -964,6 +976,16 @@ mod tests {
                 panic!("sync turn must return Complete, not Streamed")
             }
         }
+        assert_eq!(
+            prime_cache_salt.load(Ordering::Relaxed),
+            p.cache_salt,
+            "prefix lookup must use the request cache domain"
+        );
+        assert_eq!(
+            finalize_cache_salt.load(Ordering::Relaxed),
+            p.cache_salt,
+            "prefix publication must use the same request cache domain"
+        );
 
         // Pipelined invariant: the final step builds no next-graph, so
         // `forward` fires exactly MAX_NEW - 1 times.
@@ -1065,6 +1087,8 @@ mod tests {
             fail_forward_on: None,
             fail_save: false,
             adapter_cursor: Arc::new(AtomicUsize::new(0)),
+            prime_cache_salt: Arc::new(AtomicU64::new(0)),
+            finalize_cache_salt: Arc::new(AtomicU64::new(0)),
             saved: Arc::new(std::sync::Mutex::new(None)),
             cancel: Some(cancelled.clone()),
             // Flip during the 2nd decode forward == step_idx 1's forward.
@@ -1072,6 +1096,7 @@ mod tests {
         };
 
         let config = ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             temperature: Some(0.0),
@@ -1202,12 +1227,15 @@ mod tests {
             fail_forward_on,
             fail_save,
             adapter_cursor: Arc::new(AtomicUsize::new(0)),
+            prime_cache_salt: Arc::new(AtomicU64::new(0)),
+            finalize_cache_salt: Arc::new(AtomicU64::new(0)),
             saved: Arc::new(std::sync::Mutex::new(None)),
             cancel: None,
             flip_on_forward: None,
         };
 
         let config = ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             temperature: Some(0.0),
@@ -1462,12 +1490,15 @@ mod tests {
             fail_forward_on: None,
             fail_save: false,
             adapter_cursor: adapter_cursor.clone(),
+            prime_cache_salt: Arc::new(AtomicU64::new(0)),
+            finalize_cache_salt: Arc::new(AtomicU64::new(0)),
             saved: saved.clone(),
             cancel: None,
             flip_on_forward: None,
         };
 
         let config = ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             temperature: Some(0.0),

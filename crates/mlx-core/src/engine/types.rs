@@ -17,6 +17,13 @@ use crate::tools::ToolCallResult;
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct ChatConfig {
+    /// Security domain for content-addressed paged-KV prefix reuse.
+    /// Requests with different values cannot reuse each other's cached
+    /// prefixes even when their token sequences are identical. This is
+    /// deliberately separate from `cache_owner_id`, which controls logical
+    /// session/recurrent-state ownership rather than physical KV sharing.
+    #[napi(ts_type = "string | undefined")]
+    pub cache_salt: Option<String>,
     /// Internal logical cache owner. The agent provider forwards Pi's stable
     /// session id so model-global GDN sidecars can retain parent and child
     /// branches independently. This does not namespace the physical paged KV

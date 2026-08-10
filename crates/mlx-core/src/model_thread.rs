@@ -2,15 +2,62 @@
 //!
 //! Each model instance gets its own OS thread that owns all model state
 //! (weights, KV caches, tokenizer). Commands are sent via an unbounded
-//! MPSC channel and responses flow back through oneshot or streaming
-//! channels. This keeps model state off the NAPI/Tokio threads and
-//! avoids `Send + Sync` requirements on MLX arrays.
+//! MPSC channel and responses flow back through oneshot or bounded streaming
+//! mailboxes. This keeps model state off the NAPI/Tokio threads, avoids
+//! `Send + Sync` requirements on MLX arrays, and prevents a slow consumer
+//! from turning token output into an unbounded native allocation.
 
 /// Oneshot sender for request–response commands.
 pub type ResponseTx<T> = tokio::sync::oneshot::Sender<napi::Result<T>>;
 
-/// Unbounded sender for streaming commands (e.g. token-by-token output).
-pub type StreamTx<T> = tokio::sync::mpsc::UnboundedSender<napi::Result<T>>;
+/// Producer side of one request's bounded streaming mailbox.
+///
+/// Model execution runs on a dedicated OS thread, so once the mailbox is full
+/// it is safe to block that producer until the async forwarding pump drains a
+/// slot. The Tokio runtime is never blocked. If the consumer has gone away,
+/// `send` returns the unsent item just like the standard channel sender.
+#[derive(Debug)]
+pub struct StreamTx<T> {
+    inner: tokio::sync::mpsc::Sender<napi::Result<T>>,
+}
+
+impl<T> Clone for StreamTx<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T> StreamTx<T> {
+    pub fn send(
+        &self,
+        item: napi::Result<T>,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<napi::Result<T>>> {
+        match self.inner.try_send(item) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(item)) => {
+                Err(tokio::sync::mpsc::error::SendError(item))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
+                self.inner.blocking_send(item)
+            }
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+}
+
+/// Create one bounded request-output mailbox.
+pub fn stream_channel<T>(
+    capacity: usize,
+) -> (StreamTx<T>, tokio::sync::mpsc::Receiver<napi::Result<T>>) {
+    assert!(capacity > 0, "stream mailbox capacity must be non-zero");
+    let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+    (StreamTx { inner: tx }, rx)
+}
 
 /// A dedicated OS thread that owns model state and processes commands.
 ///
@@ -222,7 +269,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{LoopControl, ModelThread, ResponseTx, send_and_await};
+    use super::{LoopControl, ModelThread, ResponseTx, send_and_await, stream_channel};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -234,6 +281,45 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn stream_mailbox_backpressures_at_its_fixed_capacity() {
+        let (tx, mut rx) = stream_channel::<u32>(1);
+        tx.send(Ok(1)).expect("first mailbox slot");
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            entered_tx.send(()).expect("announce blocked send");
+            tx.send(Ok(2)).expect("second mailbox slot after drain");
+            done_tx.send(()).expect("announce completed send");
+        });
+
+        entered_rx.recv().expect("producer did not start");
+        assert!(
+            matches!(
+                done_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "the producer advanced past a full one-item mailbox"
+        );
+        assert_eq!(
+            rx.blocking_recv()
+                .expect("first item missing")
+                .expect("first item failed"),
+            1
+        );
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("producer did not resume after the consumer drained a slot");
+        assert_eq!(
+            rx.blocking_recv()
+                .expect("second item missing")
+                .expect("second item failed"),
+            2
+        );
+        producer.join().expect("producer panicked");
     }
 
     #[test]

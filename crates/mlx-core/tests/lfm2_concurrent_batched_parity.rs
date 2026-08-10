@@ -39,6 +39,7 @@ fn user_message(content: &str) -> ChatMessage {
 
 fn config(owner: &str) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: Some(owner.to_string()),
         cache_root_owner_id: Some(owner.to_string()),
         max_new_tokens: Some(24),
