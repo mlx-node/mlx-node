@@ -4822,6 +4822,9 @@ export interface SchedulerStats {
   ssdRestoreWaiting: number;
   ssdRestoreBytes: number;
   ssdRestoreWaitMs: number;
+  preemptions: number;
+  preemptionsRecompute: number;
+  preemptionsSsd: number;
 }
 
 /** Enable or disable profiling globally. */

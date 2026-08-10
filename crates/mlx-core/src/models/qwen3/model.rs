@@ -24,8 +24,9 @@ use crate::engine::cmd::{
 };
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::engine::scheduler::{
-    RowStepResult, Scheduler, SchedulerAction, StepExecutor, StepKind, StepPlan, StepResult,
-    TurnState,
+    PreemptionMode, PreemptionReplay, RowStepResult, Scheduler, SchedulerAction, StepExecutor,
+    StepKind, StepPlan, StepResult, TurnState, install_preemption_replay,
+    is_paged_allocation_blocked,
 };
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::model_thread::{LoopControl, ModelThread, ResponseTx, StreamTx, send_and_await};
@@ -395,6 +396,7 @@ struct QwenScheduledTurn {
     last_is_reasoning: bool,
     failure: Option<Error>,
     allocation_failed: bool,
+    preemption_replay: Option<PreemptionReplay>,
 }
 
 struct PreparedQwenScheduledTurn {
@@ -429,6 +431,26 @@ struct PreparedDecodeRow {
 }
 
 impl QwenStepExecutor<'_> {
+    fn blocked(row: &engine::scheduler::StepRow) -> RowStepResult {
+        RowStepResult {
+            seq_id: row.seq_id,
+            num_computed_tokens: 0,
+            generated_token: None,
+            finished: false,
+            allocation_blocked: true,
+            prefill_micros: 0,
+        }
+    }
+
+    fn elapsed_micros(started: Instant) -> u64 {
+        started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX)
+            .max(1)
+    }
+
     fn fail(
         turn: &mut TurnState<QwenScheduledTurn>,
         row: &engine::scheduler::StepRow,
@@ -445,6 +467,8 @@ impl QwenStepExecutor<'_> {
             num_computed_tokens: row.num_tokens,
             generated_token: None,
             finished: true,
+            allocation_blocked: false,
+            prefill_micros: 0,
         }
     }
 
@@ -503,7 +527,14 @@ impl QwenStepExecutor<'_> {
         }
         let start = row.token_start as usize;
         let end = start.saturating_add(row.num_tokens as usize);
-        if end > turn.payload.prompt_tokens.len() {
+        let source_len = turn
+            .payload
+            .preemption_replay
+            .as_ref()
+            .map_or(turn.payload.prompt_tokens.len(), |replay| {
+                replay.tokens.len()
+            });
+        if end > source_len {
             return Ok(Self::fail(
                 turn,
                 row,
@@ -515,29 +546,62 @@ impl QwenStepExecutor<'_> {
         }
         self.inner
             .set_turn_cancel_flag(turn.cancelled.as_ref().map(Arc::clone));
+        let prefill_started = Instant::now();
         turn.payload.profiler.begin_prefill();
         let step_prefix = Qwen3PrefixState {
             effective_cached_prefix_len: start,
             suffix_len: row.num_tokens as usize,
         };
-        let logits = match self.inner.paged_prefill(
-            &turn.payload.prompt_tokens[start..end],
-            &step_prefix,
-            turn.payload.generation_stream,
-        ) {
+        let logits = match if let Some(replay) = turn.payload.preemption_replay.as_ref() {
+            self.inner.paged_prefill(
+                &replay.tokens[start..end],
+                &step_prefix,
+                turn.payload.generation_stream,
+            )
+        } else {
+            self.inner.paged_prefill(
+                &turn.payload.prompt_tokens[start..end],
+                &step_prefix,
+                turn.payload.generation_stream,
+            )
+        } {
             Ok(logits) => logits,
+            Err(error) if is_paged_allocation_blocked(&error.reason) => {
+                turn.payload.profiler.end_prefill();
+                return Ok(Self::blocked(row));
+            }
             Err(error) => return Ok(Self::fail(turn, row, error)),
         };
         turn.payload.profiler.end_prefill();
-        if end < turn.payload.prompt_tokens.len() {
+        if end < source_len {
             synchronize_and_clear_cache();
             return Ok(RowStepResult {
                 seq_id: row.seq_id,
                 num_computed_tokens: row.num_tokens,
                 generated_token: None,
                 finished: false,
+                allocation_blocked: false,
+                prefill_micros: Self::elapsed_micros(prefill_started),
             });
         }
+        if turn
+            .payload
+            .preemption_replay
+            .as_ref()
+            .is_some_and(|replay| replay.suppress_sample)
+        {
+            synchronize_and_clear_cache();
+            turn.payload.preemption_replay = None;
+            return Ok(RowStepResult {
+                seq_id: row.seq_id,
+                num_computed_tokens: row.num_tokens,
+                generated_token: None,
+                finished: false,
+                allocation_blocked: false,
+                prefill_micros: Self::elapsed_micros(prefill_started),
+            });
+        }
+        turn.payload.preemption_replay = None;
         let logits = match engine::penalties::apply_all_penalties(
             logits,
             &turn.token_history,
@@ -564,6 +628,8 @@ impl QwenStepExecutor<'_> {
                 num_computed_tokens: row.num_tokens,
                 generated_token: None,
                 finished: true,
+                allocation_blocked: false,
+                prefill_micros: Self::elapsed_micros(prefill_started),
             });
         }
         let token = match sampled.item_at_int32(0) {
@@ -575,6 +641,8 @@ impl QwenStepExecutor<'_> {
             num_computed_tokens: row.num_tokens,
             generated_token: Some(token),
             finished: false,
+            allocation_blocked: false,
+            prefill_micros: Self::elapsed_micros(prefill_started),
         })
     }
 
@@ -595,7 +663,6 @@ impl QwenStepExecutor<'_> {
         }
         let step_idx = turn.payload.generated_tokens.len();
         turn.payload.generated_tokens.push(token_id);
-        turn.payload.profiler.step();
         crate::array::maybe_clear_cache_for_paged_step(step_idx as i32);
 
         let stops_at_eos =
@@ -610,22 +677,34 @@ impl QwenStepExecutor<'_> {
         let at_length = turn.payload.generated_tokens.len()
             >= turn.payload.params.max_new_tokens.max(0) as usize;
 
-        let next_token = if !terminal && !at_length {
+        let forward_logits = if !terminal {
             let _stream_context = StreamContext::new(turn.payload.generation_stream);
             turn.payload.profiler.begin("forward");
-            let mut logits = match self.inner.run_paged_decode_step(
+            let logits = match self.inner.run_paged_decode_step(
                 token_id,
                 self.inner.layers.len(),
                 &MxArray::from_int32(&[0], &[1])?,
             ) {
                 Ok(logits) => logits,
+                Err(error) if is_paged_allocation_blocked(&error.reason) => {
+                    turn.payload.profiler.end();
+                    let popped = turn.payload.generated_tokens.pop();
+                    debug_assert_eq!(popped, Some(token_id));
+                    return Ok(Self::blocked(row));
+                }
                 Err(error) => return Ok(Self::fail(turn, row, error)),
             };
-            logits = match logits.squeeze(Some(&[1])) {
+            let logits = match logits.squeeze(Some(&[1])) {
                 Ok(logits) => logits,
                 Err(error) => return Ok(Self::fail(turn, row, error)),
             };
             turn.payload.profiler.end();
+            Some(logits)
+        } else {
+            None
+        };
+
+        let next_token = if !at_length && let Some(logits) = forward_logits {
             let (sampled, budget_forced) =
                 if turn.payload.reasoning_tracker.should_force_think_end() {
                     let forced = match turn.payload.reasoning_tracker.forced_token_id() {
@@ -665,6 +744,7 @@ impl QwenStepExecutor<'_> {
             None
         };
 
+        turn.payload.profiler.step();
         turn.payload.profiler.mark_first_token();
         let is_reasoning = turn.payload.reasoning_tracker.observe_token(token_id);
         turn.payload.last_is_reasoning = is_reasoning;
@@ -682,17 +762,6 @@ impl QwenStepExecutor<'_> {
         }
 
         let finished = terminal || at_length;
-        if finished
-            && at_length
-            && !terminal
-            && let Err(error) = self.inner.run_paged_decode_step(
-                token_id,
-                self.inner.layers.len(),
-                &MxArray::from_int32(&[0], &[1])?,
-            )
-        {
-            return Ok(Self::fail(turn, row, error));
-        }
         if finished {
             turn.payload.profiler.snapshot_memory_after();
             turn.payload.profiler.report();
@@ -702,6 +771,8 @@ impl QwenStepExecutor<'_> {
             num_computed_tokens: row.num_tokens,
             generated_token: (!finished).then_some(next_token).flatten(),
             finished,
+            allocation_blocked: false,
+            prefill_micros: 0,
         })
     }
 
@@ -735,7 +806,6 @@ impl QwenStepExecutor<'_> {
                 continue;
             };
             turn.payload.generated_tokens.push(token_id);
-            turn.payload.profiler.step();
             let stops_at_eos =
                 token_id == turn.payload.eos_id || turn.payload.extra_eos_ids.contains(&token_id);
             let repetition = check_repetition_cutoff(
@@ -806,6 +876,9 @@ impl QwenStepExecutor<'_> {
             }
         }
 
+        let allocation_blocked = batched_logits
+            .as_ref()
+            .is_err_and(|error| is_paged_allocation_blocked(&error.reason));
         let mut results = early_results;
         for row in work {
             let planned = &plan.rows[row.plan_index];
@@ -814,6 +887,12 @@ impl QwenStepExecutor<'_> {
                 .find(|turn| turn.seq_id == row.seq_id)
                 .expect("prepared decode row remains running");
             let logits = match (&batched_logits, row.batch_index) {
+                (Err(_), Some(_)) if allocation_blocked => {
+                    let popped = turn.payload.generated_tokens.pop();
+                    debug_assert_eq!(popped, Some(row.token_id));
+                    results.push((row.plan_index, Self::blocked(planned)));
+                    continue;
+                }
                 (Err(error), Some(_)) => {
                     results.push((
                         row.plan_index,
@@ -894,6 +973,7 @@ impl QwenStepExecutor<'_> {
                 None
             };
 
+            turn.payload.profiler.step();
             turn.payload.profiler.mark_first_token();
             let is_reasoning = turn.payload.reasoning_tracker.observe_token(row.token_id);
             turn.payload.last_is_reasoning = is_reasoning;
@@ -921,6 +1001,8 @@ impl QwenStepExecutor<'_> {
                     num_computed_tokens: planned.num_tokens,
                     generated_token: (!finished).then_some(next_token).flatten(),
                     finished,
+                    allocation_blocked: false,
+                    prefill_micros: 0,
                 },
             ));
         }
@@ -944,8 +1026,13 @@ impl StepExecutor<QwenScheduledTurn> for QwenStepExecutor<'_> {
             .filter(|row| row.kind == StepKind::Decode)
             .count();
         let used_batched_decode = decode_count > 1;
+        let mut batched_decode_blocked = false;
         if used_batched_decode {
-            for (index, result) in self.execute_decode_batch(plan, running) {
+            let batch_results = self.execute_decode_batch(plan, running);
+            batched_decode_blocked = batch_results
+                .iter()
+                .any(|(_, result)| result.allocation_blocked);
+            for (index, result) in batch_results {
                 results[index] = Some(result);
             }
         }
@@ -969,7 +1056,9 @@ impl StepExecutor<QwenScheduledTurn> for QwenStepExecutor<'_> {
                 .into_iter()
                 .map(|result| result.expect("every planned row executed"))
                 .collect(),
-            executed_decode_batch: if used_batched_decode {
+            executed_decode_batch: if batched_decode_blocked {
+                0
+            } else if used_batched_decode {
                 decode_count
             } else {
                 usize::from(decode_count != 0)
@@ -1427,6 +1516,7 @@ impl QwenSchedulerState {
             last_is_reasoning: admitted.thinking.enabled,
             failure: None,
             allocation_failed: false,
+            preemption_replay: None,
             prefix,
             is_delta: admitted.plan.is_delta,
         };
@@ -1472,6 +1562,208 @@ impl QwenSchedulerState {
                 debug_assert!(replaced.is_none(), "duplicate checked before enqueue");
                 Ok(())
             }
+        }
+    }
+
+    fn fail_preempted(&mut self, mut turn: TurnState<QwenScheduledTurn>, error: String) {
+        turn.payload.failure = Some(Error::from_reason(error));
+        self.finish_completed(turn);
+    }
+
+    fn handle_preempted(&mut self, mut turn: TurnState<QwenScheduledTurn>) {
+        let prefix_tokens = turn.num_computed_tokens;
+        let prompt_tokens = turn.payload.prompt_tokens.clone();
+        let replay = match install_preemption_replay(
+            &mut turn,
+            &prompt_tokens,
+            scheduler_long_prefill_tokens(),
+        ) {
+            Ok(replay) => replay,
+            Err(error) => {
+                self.fail_preempted(turn, error);
+                return;
+            }
+        };
+        let (bytes_per_block, has_cold_tier) = match self.inner.paged_adapter.as_ref() {
+            Some(adapter) => match adapter.bytes_per_block() {
+                Ok(bytes) => (bytes, adapter.cold_tier().is_some()),
+                Err(error) => {
+                    self.fail_preempted(turn, error);
+                    return;
+                }
+            },
+            None => {
+                self.fail_preempted(turn, "qwen3 paged adapter is unavailable".to_string());
+                return;
+            }
+        };
+        let mut mode =
+            self.scheduler
+                .preemption_mode(prefix_tokens, turn.block_size, bytes_per_block);
+        if mode == PreemptionMode::Ssd && !has_cold_tier {
+            mode = PreemptionMode::Recompute;
+        }
+        let lifecycle = self
+            .inner
+            .paged_adapter
+            .as_mut()
+            .expect("qwen3 paged adapter checked above")
+            .register_full_blocks_for_reuse_for(turn.seq_id, &[], 0, mode == PreemptionMode::Ssd)
+            .and_then(|_| {
+                self.inner
+                    .paged_adapter
+                    .as_mut()
+                    .expect("qwen3 paged adapter checked above")
+                    .release_request_for(turn.seq_id)
+                    .map(|_| ())
+            });
+        if let Err(error) = lifecycle {
+            let _ = self
+                .inner
+                .paged_adapter
+                .as_mut()
+                .expect("qwen3 paged adapter checked above")
+                .release_request_for(turn.seq_id);
+            self.fail_preempted(turn, error);
+            return;
+        }
+        turn.payload.preemption_replay = Some(replay);
+        self.scheduler.record_preemption_mode(mode);
+        self.scheduler.prepend_preempted(turn);
+    }
+
+    fn try_resume_preempted(&mut self) {
+        let Some(mut turn) = self.scheduler.take_preempted() else {
+            return;
+        };
+        if turn
+            .cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
+        {
+            self.fail_preempted(turn, engine::session::CHAT_SESSION_CANCELLED.to_string());
+            return;
+        }
+        let telemetry = match self
+            .inner
+            .paged_adapter
+            .as_ref()
+            .expect("preempted qwen3 turn requires paged adapter")
+            .block_telemetry()
+        {
+            Ok(telemetry) => telemetry,
+            Err(error) => {
+                self.fail_preempted(turn, error);
+                return;
+            }
+        };
+        let decision = self.scheduler.try_reserve_blocks(
+            engine::scheduler::BlockTelemetry {
+                total_blocks: telemetry.total_blocks,
+                free_blocks: telemetry.free_blocks,
+                reclaimable_blocks: telemetry.reclaimable_blocks,
+                allocated_blocks: telemetry.allocated_blocks,
+            },
+            turn.block_reservation_total,
+            scheduler_watermark_fraction(),
+        );
+        if !decision.admitted {
+            self.scheduler.prepend_preempted(turn);
+            return;
+        }
+        let Some(replay) = turn.payload.preemption_replay.as_ref() else {
+            self.fail_preempted(
+                turn,
+                "qwen3 preempted turn is missing replay state".to_string(),
+            );
+            return;
+        };
+        let replay_tokens = replay.tokens.clone();
+        let target = replay_tokens.len() as u32;
+        self.inner.set_cache_owner_id(
+            &turn.payload.params.cache_owner_id,
+            turn.payload.params.cache_root_owner_id.as_deref(),
+        );
+        let admission = self
+            .inner
+            .paged_adapter
+            .as_mut()
+            .expect("preempted qwen3 turn requires paged adapter")
+            .prepare_turn_with_async_restore(
+                turn.seq_id,
+                &replay_tokens,
+                target,
+                true,
+                &[],
+                0,
+                false,
+                target.saturating_sub(1),
+            );
+        let admission = match admission {
+            Ok(admission) => admission,
+            Err(error) if is_paged_allocation_blocked(&error) => {
+                let _ = self
+                    .inner
+                    .paged_adapter
+                    .as_mut()
+                    .expect("preempted qwen3 turn requires paged adapter")
+                    .release_request_for(turn.seq_id);
+                self.scheduler.prepend_preempted(turn);
+                return;
+            }
+            Err(error) => {
+                let _ = self
+                    .inner
+                    .paged_adapter
+                    .as_mut()
+                    .expect("preempted qwen3 turn requires paged adapter")
+                    .release_request_for(turn.seq_id);
+                self.fail_preempted(turn, error);
+                return;
+            }
+        };
+        let (plan, restore) = match admission {
+            PagedTurnAdmission::Ready(plan) => (plan, None),
+            PagedTurnAdmission::Waiting {
+                provisional,
+                restore,
+            } => (provisional, Some(restore)),
+        };
+        let materialized_blocks = self
+            .inner
+            .paged_adapter
+            .as_ref()
+            .and_then(|adapter| adapter.block_table_for(turn.seq_id))
+            .map(|table| table.num_blocks() as u32)
+            .unwrap_or(0)
+            .saturating_add(
+                restore
+                    .as_ref()
+                    .map_or(0, PagedRestoreTicket::reserved_blocks),
+            );
+        turn.num_computed_tokens = plan.cached_prefix_len;
+        turn.block_materialized_blocks = materialized_blocks;
+        turn.pinned_prefill_breaks.clear();
+        let mut boundary = plan.cached_prefix_len;
+        while boundary < target {
+            boundary = boundary
+                .saturating_add(scheduler_long_prefill_tokens())
+                .min(target);
+            turn.pinned_prefill_breaks.push(boundary);
+        }
+        turn.payload
+            .preemption_replay
+            .as_mut()
+            .expect("replay checked above")
+            .cached_prefix = plan.cached_prefix_len;
+        match restore {
+            Some(restore) => {
+                let seq_id = turn.seq_id;
+                let replaced = self.pending_restores.insert(seq_id, restore);
+                debug_assert!(replaced.is_none(), "preempted restore must be unique");
+                self.scheduler.ready_preempted(turn, true);
+            }
+            None => self.scheduler.ready_preempted(turn, false),
         }
     }
 
@@ -1534,11 +1826,15 @@ impl QwenSchedulerState {
                     };
                     turn.num_computed_tokens = plan.cached_prefix_len;
                     turn.block_materialized_blocks = materialized_blocks;
-                    turn.payload.prefix = Qwen3PrefixState {
-                        effective_cached_prefix_len: plan.cached_prefix_len as usize,
-                        suffix_len: plan.suffix_len as usize,
-                    };
-                    turn.payload.profiler.set_prompt_tokens(plan.suffix_len);
+                    if let Some(replay) = turn.payload.preemption_replay.as_mut() {
+                        replay.cached_prefix = plan.cached_prefix_len;
+                    } else {
+                        turn.payload.prefix = Qwen3PrefixState {
+                            effective_cached_prefix_len: plan.cached_prefix_len as usize,
+                            suffix_len: plan.suffix_len as usize,
+                        };
+                        turn.payload.profiler.set_prompt_tokens(plan.suffix_len);
+                    }
                     turn.pinned_prefill_breaks.clear();
                     let mut boundary = plan.cached_prefix_len;
                     while boundary < turn.prompt_tokens {
@@ -1734,10 +2030,14 @@ impl QwenSchedulerState {
             }
         }
 
-        let mut executor = QwenStepExecutor {
-            inner: &mut self.inner,
+        let action = {
+            let mut executor = QwenStepExecutor {
+                inner: &mut self.inner,
+            };
+            self.scheduler.drive_once(&mut executor)
         };
-        match self.scheduler.drive_once(&mut executor) {
+        let mut may_resume_preempted = true;
+        match action {
             Ok(SchedulerAction::Idle) => {}
             Ok(SchedulerAction::Exclusive(command) | SchedulerAction::Barrier(command)) => {
                 if let Qwen3Cmd::SchedulerStats { reply } = command {
@@ -1751,12 +2051,23 @@ impl QwenSchedulerState {
                     self.owner_histories.clear();
                 }
             }
-            Ok(SchedulerAction::Stepped { completed, .. }) => {
+            Ok(SchedulerAction::Stepped {
+                completed,
+                preempted,
+                ..
+            }) => {
                 for turn in completed {
                     self.finish_completed(turn);
                 }
+                if let Some(turn) = preempted {
+                    self.handle_preempted(turn);
+                    may_resume_preempted = false;
+                }
             }
             Err(error) => panic!("qwen3 scheduler invariant failure: {error:?}"),
+        }
+        if may_resume_preempted {
+            self.try_resume_preempted();
         }
         LoopControl::Continue
     }

@@ -18,6 +18,7 @@ use napi_derive::napi;
 pub(crate) enum TurnStatus {
     Waiting,
     Running,
+    Preempted,
     WaitingForSsd,
     Draining,
 }
@@ -39,8 +40,75 @@ pub(crate) struct TurnState<P> {
     pub block_reservation_total: u32,
     pub block_materialized_blocks: u32,
     pub block_size: u32,
+    /// Whether this row's future-growth reservation is currently charged.
+    /// Preemption releases the charge together with the live block table; it
+    /// is restored only after the model-specific resume preparation succeeds.
+    pub block_reservation_active: bool,
+    pub preemptions: u32,
     pub payload: P,
     arrival_order: u64,
+}
+
+/// Model-owned replay description installed after a victim releases its live
+/// cache. Decode preemption rebuilds only the already-computed history and then
+/// returns to the pending token; prefill preemption rebuilds the original
+/// prompt and still samples its first output token.
+pub(crate) struct PreemptionReplay {
+    pub tokens: Vec<u32>,
+    pub cached_prefix: u32,
+    pub suppress_sample: bool,
+}
+
+/// Rewind scheduler-visible progress after a victim releases its live cache.
+/// The final known decode token remains pending in `token_history`; replay only
+/// rebuilds the tokens that were already computed and never emits them again.
+pub(crate) fn install_preemption_replay<P>(
+    turn: &mut TurnState<P>,
+    original_prompt: &[u32],
+    long_prefill_tokens: u32,
+) -> Result<PreemptionReplay, String> {
+    if long_prefill_tokens == 0 {
+        return Err("preemption replay chunk size must be positive".to_string());
+    }
+    let original_prompt_len = u32::try_from(original_prompt.len())
+        .map_err(|_| "preemption prompt length exceeds u32::MAX".to_string())?;
+    let (tokens, target, suppress_sample) = if turn.num_computed_tokens < original_prompt_len {
+        (original_prompt.to_vec(), original_prompt_len, false)
+    } else {
+        let target = turn.num_computed_tokens;
+        let target_usize = usize::try_from(target)
+            .map_err(|_| "preemption replay target exceeds usize::MAX".to_string())?;
+        if target_usize > turn.token_history.len() {
+            return Err(format!(
+                "request {}: preemption replay target {target} exceeds token history {}",
+                turn.seq_id,
+                turn.token_history.len()
+            ));
+        }
+        (turn.token_history[..target_usize].to_vec(), target, true)
+    };
+    if target == 0 {
+        return Err(format!(
+            "request {}: preemption replay cannot target an empty prefix",
+            turn.seq_id
+        ));
+    }
+
+    turn.num_computed_tokens = 0;
+    turn.prompt_tokens = target;
+    turn.pinned_prefill_breaks.clear();
+    let mut boundary = 0;
+    while boundary < target {
+        boundary = boundary.saturating_add(long_prefill_tokens).min(target);
+        turn.pinned_prefill_breaks.push(boundary);
+    }
+    turn.block_materialized_blocks = 0;
+    turn.block_reservation_active = false;
+    Ok(PreemptionReplay {
+        tokens,
+        cached_prefix: 0,
+        suppress_sample,
+    })
 }
 
 impl<P> TurnState<P> {
@@ -83,6 +151,8 @@ impl<P> TurnState<P> {
             block_reservation_total: 0,
             block_materialized_blocks: 0,
             block_size: 0,
+            block_reservation_active: true,
+            preemptions: 0,
             payload,
             arrival_order: 0,
         })
@@ -116,7 +186,10 @@ impl<P> TurnState<P> {
     }
 
     fn unallocated_reserved_blocks(&self) -> u32 {
-        if self.block_reservation_total == 0 || self.block_size == 0 {
+        if !self.block_reservation_active
+            || self.block_reservation_total == 0
+            || self.block_size == 0
+        {
             return 0;
         }
         self.block_reservation_total
@@ -195,6 +268,11 @@ pub(crate) struct RowStepResult {
     pub num_computed_tokens: u32,
     pub generated_token: Option<u32>,
     pub finished: bool,
+    /// The row made no progress because its lazy block growth could not be
+    /// satisfied. This is scheduler policy, not a terminal model error.
+    pub allocation_blocked: bool,
+    /// Wall time attributable to a successful prefill/recompute slice.
+    pub prefill_micros: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -235,6 +313,69 @@ pub(crate) struct SchedulerStats {
     pub ssd_restore_waiting: u32,
     pub ssd_restore_bytes: u64,
     pub ssd_restore_wait_micros: u64,
+    pub preemptions: u64,
+    pub preemptions_recompute: u64,
+    pub preemptions_ssd: u64,
+    pub prefill_tokens: u64,
+    pub prefill_micros: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreemptionMode {
+    Recompute,
+    Ssd,
+}
+
+pub(crate) fn is_paged_allocation_blocked(reason: &str) -> bool {
+    reason.contains("paged decode could not reserve")
+        || reason.contains("paged cache could not reserve")
+}
+
+const SSD_PREEMPT_MIN_BLOCKS: u64 = 64;
+const SSD_PREEMPT_FIXED_MICROS: u128 = 2_000;
+const SSD_PREEMPT_MARGIN_NUMERATOR: u128 = 5;
+const SSD_PREEMPT_MARGIN_DENOMINATOR: u128 = 4;
+
+/// Select SSD escalation only for a long prefix and only when live measurements
+/// predict a clear win over recomputation. Missing measurements fail closed to
+/// vLLM-v1-style recompute preemption.
+pub(crate) fn select_preemption_mode(
+    prefix_tokens: u32,
+    block_size: u32,
+    bytes_per_block: u64,
+    prefill_tokens: u64,
+    prefill_micros: u64,
+    restore_bytes: u64,
+    restore_micros: u64,
+) -> PreemptionMode {
+    if block_size == 0
+        || bytes_per_block == 0
+        || prefill_tokens == 0
+        || prefill_micros == 0
+        || restore_bytes == 0
+        || restore_micros == 0
+    {
+        return PreemptionMode::Recompute;
+    }
+    let full_blocks = u64::from(prefix_tokens / block_size);
+    if full_blocks < SSD_PREEMPT_MIN_BLOCKS {
+        return PreemptionMode::Recompute;
+    }
+    let restore_payload = u128::from(full_blocks).saturating_mul(u128::from(bytes_per_block));
+    let predicted_restore = restore_payload
+        .saturating_mul(u128::from(restore_micros))
+        .div_ceil(u128::from(restore_bytes))
+        .saturating_add(SSD_PREEMPT_FIXED_MICROS);
+    let predicted_recompute = u128::from(prefix_tokens)
+        .saturating_mul(u128::from(prefill_micros))
+        .div_ceil(u128::from(prefill_tokens));
+    if predicted_restore.saturating_mul(SSD_PREEMPT_MARGIN_NUMERATOR)
+        < predicted_recompute.saturating_mul(SSD_PREEMPT_MARGIN_DENOMINATOR)
+    {
+        PreemptionMode::Ssd
+    } else {
+        PreemptionMode::Recompute
+    }
 }
 
 #[napi(object, js_name = "DecodeBatchOccupancyBucket")]
@@ -263,6 +404,9 @@ pub struct SchedulerStatsJs {
     pub ssd_restore_waiting: u32,
     pub ssd_restore_bytes: f64,
     pub ssd_restore_wait_ms: f64,
+    pub preemptions: f64,
+    pub preemptions_recompute: f64,
+    pub preemptions_ssd: f64,
 }
 
 impl SchedulerStats {
@@ -291,6 +435,9 @@ impl SchedulerStats {
             ssd_restore_waiting: self.ssd_restore_waiting,
             ssd_restore_bytes: self.ssd_restore_bytes as f64,
             ssd_restore_wait_ms: self.ssd_restore_wait_micros as f64 / 1_000.0,
+            preemptions: self.preemptions as f64,
+            preemptions_recompute: self.preemptions_recompute as f64,
+            preemptions_ssd: self.preemptions_ssd as f64,
         }
     }
 }
@@ -308,6 +455,7 @@ pub(crate) enum SchedulerAction<P, Exclusive, Barrier> {
     Stepped {
         plan: StepPlan,
         completed: Vec<TurnState<P>>,
+        preempted: Option<TurnState<P>>,
     },
 }
 
@@ -511,6 +659,66 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         self.waiting.iter_mut().find(|turn| turn.seq_id == seq_id)
     }
 
+    /// Remove the oldest preempted row for model-specific cache re-preparation.
+    /// Preempted rows are deliberately invisible to `admit_waiting`; the model
+    /// must first establish a fresh adapter request (or an SSD restore ticket).
+    pub fn take_preempted(&mut self) -> Option<TurnState<P>> {
+        let index = self
+            .waiting
+            .iter()
+            .position(|turn| turn.status == TurnStatus::Preempted)?;
+        self.waiting.remove(index)
+    }
+
+    /// Put a victim at the head of the FCFS queue without assigning a new
+    /// arrival order. It cannot be admitted until `ready_preempted` succeeds.
+    pub fn prepend_preempted(&mut self, mut turn: TurnState<P>) {
+        turn.status = TurnStatus::Preempted;
+        turn.block_reservation_active = false;
+        self.waiting.push_front(turn);
+    }
+
+    /// Publish successful model-specific resume preparation.
+    pub fn ready_preempted(&mut self, mut turn: TurnState<P>, waiting_for_ssd: bool) {
+        turn.block_reservation_active = true;
+        if waiting_for_ssd {
+            turn.status = TurnStatus::WaitingForSsd;
+            self.stats.ssd_restore_waiting = self.stats.ssd_restore_waiting.saturating_add(1);
+        } else {
+            turn.status = TurnStatus::Waiting;
+        }
+        self.waiting.push_front(turn);
+    }
+
+    pub fn preemption_mode(
+        &self,
+        prefix_tokens: u32,
+        block_size: u32,
+        bytes_per_block: u64,
+    ) -> PreemptionMode {
+        select_preemption_mode(
+            prefix_tokens,
+            block_size,
+            bytes_per_block,
+            self.stats.prefill_tokens,
+            self.stats.prefill_micros,
+            self.stats.ssd_restore_bytes,
+            self.stats.ssd_restore_wait_micros,
+        )
+    }
+
+    pub fn record_preemption_mode(&mut self, mode: PreemptionMode) {
+        match mode {
+            PreemptionMode::Recompute => {
+                self.stats.preemptions_recompute =
+                    self.stats.preemptions_recompute.saturating_add(1);
+            }
+            PreemptionMode::Ssd => {
+                self.stats.preemptions_ssd = self.stats.preemptions_ssd.saturating_add(1);
+            }
+        }
+    }
+
     pub fn take_waiting(&mut self, seq_id: SeqId) -> Option<TurnState<P>> {
         let index = self.waiting.iter().position(|turn| turn.seq_id == seq_id)?;
         let turn = self.waiting.remove(index)?;
@@ -663,6 +871,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         let result = executor
             .execute(&plan, &mut self.running)
             .map_err(SchedulerError::Executor)?;
+        let allocation_blocked = result.rows.iter().any(|row| row.allocation_blocked);
         let executed_decode_batch = result.executed_decode_batch;
         let rows_alloc_evicted = result.rows_alloc_evicted;
         let planned_decode_rows = plan
@@ -693,6 +902,21 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                 .or_default() += 1;
         }
 
+        let mut preempted = None;
+        if allocation_blocked
+            && let Some(index) = self
+                .running
+                .iter()
+                .rposition(|turn| turn.status == TurnStatus::Running)
+        {
+            let mut victim = self.running.remove(index);
+            victim.status = TurnStatus::Preempted;
+            victim.block_reservation_active = false;
+            victim.preemptions = victim.preemptions.saturating_add(1);
+            self.stats.preemptions = self.stats.preemptions.saturating_add(1);
+            preempted = Some(victim);
+        }
+
         let mut completed = Vec::new();
         let mut retained = Vec::with_capacity(self.running.len());
         for turn in self.running.drain(..) {
@@ -704,7 +928,11 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             }
         }
         self.running = retained;
-        Ok(SchedulerAction::Stepped { plan, completed })
+        Ok(SchedulerAction::Stepped {
+            plan,
+            completed,
+            preempted,
+        })
     }
 
     fn apply_result(&mut self, plan: &StepPlan, result: StepResult) -> Result<(), String> {
@@ -726,7 +954,17 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             if !seen.insert(output.seq_id) {
                 return Err(format!("executor returned duplicate row {}", output.seq_id));
             }
-            if output.num_computed_tokens != planned.num_tokens {
+            if output.allocation_blocked {
+                if output.num_computed_tokens != 0
+                    || output.generated_token.is_some()
+                    || output.finished
+                {
+                    return Err(format!(
+                        "blocked executor row {} must report zero progress and remain live",
+                        output.seq_id
+                    ));
+                }
+            } else if output.num_computed_tokens != planned.num_tokens {
                 return Err(format!(
                     "executor row {} computed {} tokens for a {}-token slice",
                     output.seq_id, output.num_computed_tokens, planned.num_tokens
@@ -774,6 +1012,16 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             if output.finished {
                 turn.status = TurnStatus::Draining;
             }
+            if output.prefill_micros != 0 {
+                self.stats.prefill_tokens = self
+                    .stats
+                    .prefill_tokens
+                    .saturating_add(u64::from(output.num_computed_tokens));
+                self.stats.prefill_micros = self
+                    .stats
+                    .prefill_micros
+                    .saturating_add(output.prefill_micros);
+            }
         }
         Ok(())
     }
@@ -787,6 +1035,7 @@ mod tests {
     struct MockStep {
         plans: Vec<StepPlan>,
         finish: HashSet<SeqId>,
+        allocation_blocked: HashSet<SeqId>,
         next_token: u32,
     }
 
@@ -811,9 +1060,18 @@ mod tests {
                         });
                     RowStepResult {
                         seq_id: row.seq_id,
-                        num_computed_tokens: row.num_tokens,
-                        generated_token,
-                        finished: self.finish.contains(&row.seq_id) || row.cancel_snapshot,
+                        num_computed_tokens: if self.allocation_blocked.contains(&row.seq_id) {
+                            0
+                        } else {
+                            row.num_tokens
+                        },
+                        generated_token: (!self.allocation_blocked.contains(&row.seq_id))
+                            .then_some(generated_token)
+                            .flatten(),
+                        finished: !self.allocation_blocked.contains(&row.seq_id)
+                            && (self.finish.contains(&row.seq_id) || row.cancel_snapshot),
+                        allocation_blocked: self.allocation_blocked.contains(&row.seq_id),
+                        prefill_micros: u64::from(row.kind == StepKind::Prefill),
                     }
                 })
                 .collect();
@@ -972,8 +1230,9 @@ mod tests {
         }
         cancel.store(true, Ordering::Relaxed);
         let mut step = MockStep::default();
-        let SchedulerAction::Stepped { plan, completed } =
-            scheduler.drive_once(&mut step).expect("step")
+        let SchedulerAction::Stepped {
+            plan, completed, ..
+        } = scheduler.drive_once(&mut step).expect("step")
         else {
             panic!("expected step");
         };
@@ -1152,5 +1411,147 @@ mod tests {
             )
             .admitted
         );
+    }
+
+    #[test]
+    fn allocation_squeeze_preempts_exactly_one_lifo_victim_without_same_step_readmit() {
+        let mut scheduler = Scheduler::<_, (), ()>::new(3, 3).expect("scheduler");
+        for seq_id in [1, 2, 3] {
+            let mut request = turn(seq_id, 4, &[4], None).with_block_reservation(8, 4, 1);
+            request.token_history.push(9);
+            request.num_tokens += 1;
+            scheduler.enqueue_turn(request).expect("enqueue");
+        }
+        let mut step = MockStep::default();
+        step.allocation_blocked.insert(1);
+        let SchedulerAction::Stepped {
+            plan, preempted, ..
+        } = scheduler.drive_once(&mut step).expect("squeeze step")
+        else {
+            panic!("expected step");
+        };
+        assert_eq!(
+            plan.rows.iter().map(|row| row.seq_id).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        let victim = preempted.expect("one victim");
+        assert_eq!(victim.seq_id, 3, "newest running row is the LIFO victim");
+        assert_eq!(victim.status, TurnStatus::Preempted);
+        assert!(!victim.block_reservation_active);
+        assert_eq!(victim.preemptions, 1);
+        assert_eq!(
+            scheduler
+                .running()
+                .iter()
+                .map(|turn| turn.seq_id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(
+            scheduler.waiting_len(),
+            0,
+            "victim is returned to the model before requeue"
+        );
+        assert_eq!(scheduler.stats().preemptions, 1);
+
+        scheduler.prepend_preempted(victim);
+        step.allocation_blocked.clear();
+        let SchedulerAction::Stepped { plan, .. } =
+            scheduler.drive_once(&mut step).expect("survivor retry")
+        else {
+            panic!("expected survivor step");
+        };
+        assert_eq!(
+            plan.rows.iter().map(|row| row.seq_id).collect::<Vec<_>>(),
+            [1, 2],
+            "preempted row cannot re-enter until model-specific resume preparation"
+        );
+        let mut victim = scheduler.take_preempted().expect("preempted victim");
+        victim.num_computed_tokens = 4; // deepest verified hot-prefix hit
+        victim.block_materialized_blocks = 4;
+        scheduler.ready_preempted(victim, false);
+        assert_eq!(scheduler.waiting_len(), 1);
+    }
+
+    #[test]
+    fn ssd_escalation_requires_a_long_prefix_and_measured_cost_win() {
+        let fast_restore = (64 * 1024 * 1024, 20_000);
+        let slow_prefill = (4096, 400_000);
+        assert_eq!(
+            select_preemption_mode(
+                32 * 16,
+                16,
+                64 * 1024,
+                slow_prefill.0,
+                slow_prefill.1,
+                fast_restore.0,
+                fast_restore.1,
+            ),
+            PreemptionMode::Recompute,
+            "short prefixes do not pay SSD fixed/capture overhead"
+        );
+        assert_eq!(
+            select_preemption_mode(
+                128 * 16,
+                16,
+                64 * 1024,
+                slow_prefill.0,
+                slow_prefill.1,
+                fast_restore.0,
+                fast_restore.1,
+            ),
+            PreemptionMode::Ssd,
+            "a long prefix escalates when measured restore throughput wins"
+        );
+        assert_eq!(
+            select_preemption_mode(128 * 16, 16, 64 * 1024, 0, 0, 0, 0),
+            PreemptionMode::Recompute,
+            "missing measurements fail closed to recompute"
+        );
+        assert_eq!(
+            select_preemption_mode(
+                128 * 16,
+                16,
+                64 * 1024,
+                4096,
+                40_000,
+                64 * 1024 * 1024,
+                800_000,
+            ),
+            PreemptionMode::Recompute,
+            "the cost branch rejects a measured SSD loss"
+        );
+    }
+
+    #[test]
+    fn prefill_preemption_replays_the_original_prompt_and_still_samples() {
+        let mut request = turn(9, 2, &[2, 4], None).with_block_reservation(8, 2, 1);
+        let replay =
+            install_preemption_replay(&mut request, &[1, 2, 3, 4], 3).expect("prefill replay");
+        assert_eq!(replay.tokens, [1, 2, 3, 4]);
+        assert_eq!(replay.cached_prefix, 0);
+        assert!(!replay.suppress_sample);
+        assert_eq!(request.num_computed_tokens, 0);
+        assert_eq!(request.num_tokens, 4);
+        assert_eq!(request.prompt_tokens, 4);
+        assert_eq!(request.pinned_prefill_breaks, [3, 4]);
+        assert_eq!(request.block_materialized_blocks, 0);
+        assert!(!request.block_reservation_active);
+    }
+
+    #[test]
+    fn decode_preemption_replays_only_computed_history_and_keeps_pending_token() {
+        let mut request = turn(10, 4, &[4], None).with_block_reservation(8, 4, 1);
+        request.token_history.push(99);
+        request.num_tokens += 1;
+        let replay =
+            install_preemption_replay(&mut request, &[1, 2, 3, 4], 2).expect("decode replay");
+        assert_eq!(replay.tokens, [1, 2, 3, 4]);
+        assert!(replay.suppress_sample);
+        assert_eq!(request.token_history, [1, 2, 3, 4, 99]);
+        assert_eq!(request.num_computed_tokens, 0);
+        assert_eq!(request.num_tokens, 5);
+        assert_eq!(request.prompt_tokens, 4);
+        assert_eq!(request.pinned_prefill_breaks, [2, 4]);
     }
 }

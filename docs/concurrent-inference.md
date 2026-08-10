@@ -53,8 +53,8 @@ step's remaining token budget.
 | Server        | `/v1/responses` and `/v1/messages` select `withAdmission` only when a paged model explicitly reports a capacity greater than one. Every other model uses the existing `withExclusive` lane. Both routes retain their admission slot through terminal visibility or disconnect.                                                       |
 | Admission     | `SessionRegistry` is a FIFO counting semaphore for the batched lane. Active, queued, and pre-dispatch requests share the existing bounded budget; overflow still returns 429 plus `Retry-After: 1`. The default is 16 queued requests unless config or `MLX_MAX_QUEUE_DEPTH_PER_MODEL` overrides it or selects `unbounded`.          |
 | Native thread | One scheduler and executor live beside the model on its dedicated OS thread; `MxArray` never crosses threads. Idle waits block, while busy periods poll commands only between steps.                                                                                                                                                 |
-| Scheduler     | One global token ceiling serves decode rows first, then pinned prefill slices. Exclusive commands run only with an empty running set; reset/generate/save/train are barriers. Block watermark and already-promised growth can defer admission before allocation pressure.                                                            |
-| Cache         | `PagedKVCacheAdapter` owns a request table keyed by sequence id over one refcounted block pool. Live requests can share verified prefix blocks. SSD restore is asynchronous: `WaitingForSsd` rows park while runnable peers continue.                                                                                                |
+| Scheduler     | One global token ceiling serves decode rows first, then pinned prefill slices. Exclusive commands run only with an empty running set; reset/generate/save/train are barriers. Block watermark and already-promised growth gate admission; an actual lazy-allocation squeeze preempts exactly one newest running victim.              |
+| Cache         | `PagedKVCacheAdapter` owns a request table keyed by sequence id over one refcounted block pool. A preempted victim publishes its verified full blocks, releases its live table, and resumes from the deepest surviving prefix. SSD restore is asynchronous: `WaitingForSsd` rows park while runnable peers continue.                 |
 | Executor      | Dense Qwen3 and LFM2 perform one batched `[N,1]` decode forward for eligible rows and a bounded prefill dispatch when budget remains. LFM2 additionally stacks/scatters one private ShortConv state row per request. Each row keeps its own history, penalties, sampling config, stop state, stream sink, and cancellation snapshot. |
 | Transport     | SSE writes honor Node backpressure and stop native pulls until drain or close. The 30-second default drain deadline aborts a connected stalled peer and releases admission.                                                                                                                                                          |
 
@@ -106,6 +106,7 @@ the realistic 2–8 concurrent range.
 ```text
 server admission       ✓ counting semaphore for eligible paged models
 phase-free scheduler   ✓ token budget, watermark, occupancy histogram
+recompute preemption   ✓ LIFO victim, no same-step readmit, hot-prefix resume
 Qwen3/LFM2 adapters    ✓ per-sequence request table + shared prefix blocks
 Qwen3/LFM2 executors   ✓ one uniform [N,1] decode forward
 LFM2 recurrent state   ✓ private [l_cache-1, hidden] row per conv layer/request
@@ -155,13 +156,13 @@ multi-model-hostile in `engine/cmd.rs:186-190`).
 
 ## Yardstick: vLLM v1
 
-| Mechanism                                                                   | vLLM v1                                          | mlx-node today                                                                                                  |
-| --------------------------------------------------------------------------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
-| Continuous batching (one shared forward per step; no prefill/decode phases) | Core scheduler loop                              | Dense Qwen3 and LFM2 uniform decode; other families remain exclusive                                            |
-| Per-step token budget + chunked prefill                                     | Enabled by default                               | One 2048-token ceiling with decode-first planning and pinned per-request breaks                                 |
-| Live prefix sharing                                                         | Chained hashes, refcounts, and LRU               | Refcounted block pools across live Qwen3/LFM2 sequences; Qwen3 also has an asynchronous SSD cold tier           |
-| Admission / preemption                                                      | `max_num_seqs`, watermark, preempt-and-recompute | Sequence cap and reserve-aware watermark admission; defers instead of preempting today                          |
-| Backend seam                                                                | Scheduler drives platform-specific workers       | `StepExecutor` separates scheduler policy from Qwen3/LFM2 execution; ragged and wider hybrid executors are next |
+| Mechanism                                                                   | vLLM v1                                          | mlx-node today                                                                                                          |
+| --------------------------------------------------------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| Continuous batching (one shared forward per step; no prefill/decode phases) | Core scheduler loop                              | Dense Qwen3 and LFM2 uniform decode; other families remain exclusive                                                    |
+| Per-step token budget + chunked prefill                                     | Enabled by default                               | One 2048-token ceiling with decode-first planning and pinned per-request breaks                                         |
+| Live prefix sharing                                                         | Chained hashes, refcounts, and LRU               | Refcounted block pools across live Qwen3/LFM2 sequences; Qwen3 also has an asynchronous SSD cold tier                   |
+| Admission / preemption                                                      | `max_num_seqs`, watermark, preempt-and-recompute | Sequence cap, reserve-aware watermark, and allocation-squeeze LIFO recompute; measured long prefixes may capture to SSD |
+| Backend seam                                                                | Scheduler drives platform-specific workers       | `StepExecutor` separates scheduler policy from Qwen3/LFM2 execution; ragged and wider hybrid executors are next         |
 
 What does not transfer: CUDA-graph padding (MLX lazy graphs play that role),
 the multi-process ZMQ split (a scheduler thread suffices at this scale),
@@ -184,7 +185,12 @@ memory the pool competes with the weights — see
   per-conv-layer `[l_cache-1, hidden]` recurrent-state row. Decode stacks those
   rows, runs each ShortConv once over `[N,1,H]`, and scatters the next state;
   cached-prefix Pass 1 runs at most once per admission.
-- **Stage 2 — preemption and wider execution:** add recompute-first LIFO
-  preemption with measured SSD escalation, swap in a ragged mixed-token
-  executor behind `StepExecutor`, then debit per-request recurrent-state tables
-  for GDN and Gemma4 against the same admission budget.
+- **Stage 2a — preemption (landed):** a genuine paged allocation squeeze pops
+  the newest running victim, publishes verified hot hashes, releases its live
+  table, and prepends it for replay without same-step readmission. Recompute is
+  the default; only a long prefix with measured restore throughput that beats
+  measured prefill cost escalates to asynchronous SSD capture. Public scheduler
+  stats expose total, recompute, and SSD preemption counters.
+- **Stage 2b/2c — wider execution:** swap in a ragged mixed-token executor
+  behind `StepExecutor`, then debit per-request recurrent-state tables for GDN
+  and Gemma4 against the same admission budget.

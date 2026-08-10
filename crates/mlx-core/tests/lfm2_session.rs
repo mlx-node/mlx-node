@@ -475,13 +475,13 @@ async fn lfm2_stream_session_path_keeps_ttft_flat_across_turns() {
     // which this streaming twin was left out of.
     //
     // The TTFT ratio it replaces did not merely flake, it contradicted the
-    // architecture. lfm2 reprefills the FULL prompt through its conv layers
-    // every turn (`paged_perf_prefill_tokens`, lfm2/model.rs — the
-    // conv-state-reuse fast path is gated OFF by default), so TTFT is
-    // full-prompt scale BY DESIGN and grows with context. The CI failure that
-    // prompted this read turn2=329.1ms turn4=748.5ms, a 2.27x ratio that
-    // tracks the prompt growth between those turns: correct code failing a
-    // bound it can never satisfy. Raising the constant only postpones it.
+    // architecture. On a foreign or partial attention-prefix hit, lfm2 must
+    // reprefill the FULL prompt through its conv layers
+    // (`paged_perf_prefill_tokens`, lfm2/model.rs), so TTFT can remain
+    // full-prompt scale and grow with context. The CI failure that prompted
+    // this read turn2=329.1ms turn4=748.5ms, a 2.27x ratio that tracks the
+    // prompt growth between those turns: correct code failing a bound it can
+    // never satisfy. Raising the constant only postpones it.
     //
     // TTFT is still measured and printed above, so the perf trail stays in the
     // CI log; it just no longer gates.

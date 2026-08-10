@@ -6027,6 +6027,15 @@ impl PagedKVCacheAdapter {
         extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<u32, String> {
+        self.register_full_blocks_for_reuse_inner(extra_keys, cache_salt, true)
+    }
+
+    fn register_full_blocks_for_reuse_inner(
+        &mut self,
+        extra_keys: &[u64],
+        cache_salt: u64,
+        capture_cold: bool,
+    ) -> Result<u32, String> {
         // Never publish blocks computed on top of a prefix whose out-of-pool
         // half nobody established — that would hand the same unsound resume
         // point to every later request.
@@ -6108,7 +6117,7 @@ impl PagedKVCacheAdapter {
 
         // Persist the same chain to the SSD cold tier (see
         // [`ColdTierWalk::capture_chain`]).
-        if let Some(cold) = self.cold_tier.as_ref() {
+        if capture_cold && let Some(cold) = self.cold_tier.as_ref() {
             let outcome = ColdTierWalk {
                 cold,
                 pool: &self.layer_kv_pool,
@@ -6137,6 +6146,19 @@ impl PagedKVCacheAdapter {
         // (≤ num_full_blocks), which is bounded by allocator capacity —
         // far below u32::MAX in any realistic deployment.
         Ok(registered as u32)
+    }
+
+    /// Activate and publish one logical request, selecting whether its full
+    /// hot-prefix chain is also offered to the SSD writer.
+    pub(crate) fn register_full_blocks_for_reuse_for(
+        &mut self,
+        seq_id: SeqId,
+        extra_keys: &[u64],
+        cache_salt: u64,
+        capture_cold: bool,
+    ) -> Result<u32, String> {
+        self.activate_request(seq_id)?;
+        self.register_full_blocks_for_reuse_inner(extra_keys, cache_salt, capture_cold)
     }
 
     /// Per-block-extra_keys variant of
@@ -6755,6 +6777,18 @@ impl PagedKVCacheAdapter {
             self.layer_kv_pool.cache_dtype(),
         )
         .map(|bytes| bytes.saturating_mul(self.layer_kv_pool.num_blocks() as u64))
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn bytes_per_block(&self) -> Result<u64, String> {
+        let config = self.layer_kv_pool.config();
+        mlx_paged_attn::profile::bytes_per_block(
+            self.layer_kv_pool.num_layers() as u32,
+            config.num_kv_heads,
+            config.head_size,
+            config.block_size,
+            self.layer_kv_pool.cache_dtype(),
+        )
         .map_err(|error| error.to_string())
     }
 
@@ -8254,6 +8288,46 @@ mod tests {
             sidecar_policy: None,
         });
         Some((adapter, manager, root))
+    }
+
+    #[test]
+    fn recompute_preemption_publishes_hot_prefix_without_ssd_capture() {
+        let Some((mut adapter, manager, root)) = cold_capture_fixture("preempt-hot-only", 8, 4, 4)
+        else {
+            eprintln!(
+                "skipping recompute_preemption_publishes_hot_prefix_without_ssd_capture: Metal unavailable"
+            );
+            return;
+        };
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        adapter.reset_for_new_request(17).unwrap();
+        adapter.allocate_suffix_blocks(tokens.len() as u32).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        assert_eq!(
+            adapter
+                .register_full_blocks_for_reuse_for(17, &[], 0, false)
+                .unwrap(),
+            2
+        );
+        let capture = adapter.cold_capture();
+        assert_eq!(capture.blocks, 0);
+        assert_eq!(capture.enqueued, 0);
+        assert_eq!(
+            manager.stats().enqueued,
+            0,
+            "recompute must not enqueue SSD writes"
+        );
+
+        adapter.release_request_for(17).unwrap();
+        adapter.reset_for_new_request(18).unwrap();
+        let hit = adapter.find_cached_prefix(&tokens, &[], 0, false).unwrap();
+        assert_eq!(hit.cached_token_count, tokens.len() as u32);
+        assert_eq!(
+            hit.blocks.len(),
+            2,
+            "released victim leaves a verified hot prefix"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Fill the writer queue and PROVE it is full, by offering ballast blocks
