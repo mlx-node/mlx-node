@@ -2066,12 +2066,45 @@ impl Lfm2SchedulerState {
             | ChatCmd::StreamSessionStart { config, .. }
             | ChatCmd::StreamSessionContinue { config, .. }
             | ChatCmd::StreamSessionContinueTool { config, .. } => config,
-            ChatCmd::ResetCaches { .. } => return true,
+            ChatCmd::ResetCaches { .. } | ChatCmd::ReleaseCacheOwner { .. } => return true,
         };
         config
             .cache_owner_id
             .as_deref()
             .is_some_and(|owner| !owner.is_empty())
+    }
+
+    fn cache_owner_release_blocked(&self, owner_id: &str) -> bool {
+        let Some(&seq_id) = self.owner_sequences.get(owner_id) else {
+            return false;
+        };
+        self.scheduler.contains_seq(seq_id)
+            || self
+                .prepared_waiting
+                .as_ref()
+                .is_some_and(|prepared| prepared.owner_id == owner_id)
+    }
+
+    fn release_cache_owner_now(&mut self, owner_id: &str) -> Result<()> {
+        let Some(&seq_id) = self.owner_sequences.get(owner_id) else {
+            self.owner_histories.remove(owner_id);
+            return Ok(());
+        };
+        let release_error = self.inner.paged_adapter.as_mut().and_then(|adapter| {
+            if adapter.block_table_for(seq_id).is_some() {
+                adapter.release_request_for(seq_id).err()
+            } else {
+                None
+            }
+        });
+        self.inner.release_scheduled_caches_for(seq_id);
+        if let Some(error) = release_error {
+            return Err(Error::from_reason(error));
+        }
+        self.pending_restores.remove(&seq_id);
+        self.owner_sequences.remove(owner_id);
+        self.owner_histories.remove(owner_id);
+        Ok(())
     }
 
     fn reply_admission_error(response: Lfm2ScheduledReply, cancelled: &AtomicBool, error: Error) {
@@ -2170,6 +2203,9 @@ impl Lfm2SchedulerState {
                         .enqueue_barrier(Lfm2Cmd::Chat(Box::new(ChatCmd::ResetCaches { reply })));
                     return None;
                 }
+                ChatCmd::ReleaseCacheOwner { .. } => {
+                    unreachable!("cache-owner release is handled before turn preparation")
+                }
             };
 
         let owner_id = config.cache_owner_id.clone().unwrap_or_default();
@@ -2229,19 +2265,21 @@ impl Lfm2SchedulerState {
             .unwrap_or(1)
             .max(1);
         let per_seq_context = trained_context.min(scheduler_per_seq_context());
-        if prompt_tokens > per_seq_context
-            || (prompt_tokens == per_seq_context && requested_max_new_tokens != 0)
-        {
-            Self::reply_admission_error(
-                response,
-                cancelled.as_ref(),
-                Error::from_reason(format!(
-                    "context_length_exceeded: prompt ({prompt_tokens}) leaves no requested generation room in scheduler per-sequence context {per_seq_context}"
-                )),
-            );
-            return None;
-        }
-        let max_new_tokens = requested_max_new_tokens.min(per_seq_context - prompt_tokens);
+        let max_new_tokens = match engine::scheduler::clamp_scheduled_output_tokens(
+            prompt_tokens,
+            requested_max_new_tokens,
+            per_seq_context,
+        ) {
+            Ok(max_new_tokens) => max_new_tokens,
+            Err(error) => {
+                Self::reply_admission_error(
+                    response,
+                    cancelled.as_ref(),
+                    Error::from_reason(error),
+                );
+                return None;
+            }
+        };
         admitted.params.max_new_tokens = max_new_tokens as i32;
         let requested_tokens = prompt_tokens.saturating_add(max_new_tokens);
         let block_size = self
@@ -2560,15 +2598,15 @@ impl Lfm2SchedulerState {
     fn enqueue_admission(
         &mut self,
         admission: Lfm2Admission,
-    ) -> std::result::Result<(), (Lfm2Admission, String)> {
+    ) -> std::result::Result<(), Box<(Lfm2Admission, String)>> {
         match admission {
             Lfm2Admission::Ready(turn) => {
                 if self.scheduler.contains_seq(turn.seq_id) {
                     let seq_id = turn.seq_id;
-                    return Err((
+                    return Err(Box::new((
                         Lfm2Admission::Ready(turn),
                         format!("duplicate scheduler sequence {seq_id}"),
-                    ));
+                    )));
                 }
                 self.scheduler
                     .enqueue_turn(turn)
@@ -2578,16 +2616,16 @@ impl Lfm2SchedulerState {
             Lfm2Admission::Waiting(turn, restore) => {
                 let seq_id = turn.seq_id;
                 if self.pending_restores.contains_key(&seq_id) {
-                    return Err((
+                    return Err(Box::new((
                         Lfm2Admission::Waiting(turn, restore),
                         format!("duplicate SSD restore for sequence {seq_id}"),
-                    ));
+                    )));
                 }
                 if self.scheduler.contains_seq(seq_id) {
-                    return Err((
+                    return Err(Box::new((
                         Lfm2Admission::Waiting(turn, restore),
                         format!("duplicate scheduler sequence {seq_id}"),
-                    ));
+                    )));
                 }
                 self.scheduler
                     .enqueue_turn(turn)
@@ -2597,7 +2635,7 @@ impl Lfm2SchedulerState {
                         .scheduler
                         .take_waiting(seq_id)
                         .expect("turn was just enqueued");
-                    return Err((Lfm2Admission::Waiting(turn, restore), error));
+                    return Err(Box::new((Lfm2Admission::Waiting(turn, restore), error)));
                 }
                 let replaced = self.pending_restores.insert(seq_id, restore);
                 debug_assert!(replaced.is_none(), "duplicate checked before enqueue");
@@ -3060,7 +3098,8 @@ impl Lfm2SchedulerState {
         {
             match self.admit_prepared(prepared) {
                 Ok(Some(admission)) => {
-                    if let Err((admission, error)) = self.enqueue_admission(admission) {
+                    if let Err(failure) = self.enqueue_admission(admission) {
+                        let (admission, error) = *failure;
                         tracing::error!("lfm2 scheduler admission failed: {error}");
                         self.reject_admission(admission, error);
                     }
@@ -3082,11 +3121,27 @@ impl Lfm2SchedulerState {
                 break;
             }
             let command = self.pending.pop_front().expect("front checked above");
-            if Self::force_serial() {
+            if Self::force_serial()
+                && !matches!(command, Lfm2Cmd::Chat(ref chat) if matches!(chat.as_ref(), ChatCmd::ReleaseCacheOwner { .. }))
+            {
                 self.scheduler.enqueue_exclusive(command);
                 break;
             }
             match command {
+                Lfm2Cmd::Chat(chat)
+                    if matches!(chat.as_ref(), ChatCmd::ReleaseCacheOwner { .. }) =>
+                {
+                    let ChatCmd::ReleaseCacheOwner { owner_id, reply } = *chat else {
+                        unreachable!("guarded release command")
+                    };
+                    if self.cache_owner_release_blocked(&owner_id) {
+                        self.pending.push_front(Lfm2Cmd::Chat(Box::new(
+                            ChatCmd::ReleaseCacheOwner { owner_id, reply },
+                        )));
+                        break;
+                    }
+                    let _ = reply.send(self.release_cache_owner_now(&owner_id));
+                }
                 Lfm2Cmd::Chat(chat) => {
                     let is_reset = matches!(chat.as_ref(), ChatCmd::ResetCaches { .. });
                     if self.inner.paged_adapter.is_none() {
@@ -3095,7 +3150,8 @@ impl Lfm2SchedulerState {
                     } else if let Some(prepared) = self.prepare_chat(*chat) {
                         match self.admit_prepared(prepared) {
                             Ok(Some(admission)) => {
-                                if let Err((admission, error)) = self.enqueue_admission(admission) {
+                                if let Err(failure) = self.enqueue_admission(admission) {
+                                    let (admission, error) = *failure;
                                     tracing::error!("lfm2 scheduler admission failed: {error}");
                                     self.reject_admission(admission, error);
                                 }
@@ -4271,7 +4327,7 @@ mod paged_adapter_construction_tests {
     //! "default = no allocation" invariant and verify that flipping the
     //! flag wires up a real adapter without churning forward-path code.
 
-    use super::{Lfm2Inner, compute_layer_kinds_for};
+    use super::{Lfm2Inner, Lfm2SchedulerState, compute_layer_kinds_for};
     use crate::array::DType;
     use crate::models::lfm2::Lfm2Config;
 
@@ -4668,6 +4724,25 @@ mod paged_adapter_construction_tests {
             inner.layer_kinds, fresh,
             "cached layer classification must equal a fresh compute over the same config"
         );
+    }
+
+    #[test]
+    fn cache_owner_release_drops_history_sequence_and_recurrent_state() {
+        let inner = Lfm2Inner::new(paged_tiny_config(Some(false))).expect("construct");
+        let mut state = Lfm2SchedulerState::new(inner);
+        state.owner_sequences.insert("stateless-owner".into(), 9);
+        state
+            .owner_histories
+            .insert("stateless-owner".into(), vec![7, 8]);
+        state.inner.reset_scheduled_caches_for(9);
+
+        state
+            .release_cache_owner_now("stateless-owner")
+            .expect("release owner");
+
+        assert!(!state.owner_sequences.contains_key("stateless-owner"));
+        assert!(!state.owner_histories.contains_key("stateless-owner"));
+        assert!(!state.inner.has_scheduled_caches_for(9));
     }
 
     #[test]

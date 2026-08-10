@@ -24,6 +24,17 @@ type SchedulerStatsModel = SessionCapableModel & {
   schedulerStats(): Promise<{ maxBatchOccupancy: number }>;
 };
 
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    if (predicate()) return;
+    await delay(10);
+  }
+  throw new Error(`${label} (>${timeoutMs}ms)`);
+}
+
 function isStage1Model(model: LoadableModel): model is LoadableModel & SchedulerStatsModel {
   const candidate = model as Partial<SchedulerStatsModel>;
   return (
@@ -37,6 +48,7 @@ function isStage1Model(model: LoadableModel): model is LoadableModel & Scheduler
 function instrumentStreams(target: SchedulerStatsModel): {
   model: SchedulerStatsModel;
   peakActive: () => number;
+  releasedOwners: () => readonly string[];
 } {
   const streamMethods = new Set<PropertyKey>([
     'chatStreamSessionStart',
@@ -45,9 +57,16 @@ function instrumentStreams(target: SchedulerStatsModel): {
   ]);
   let active = 0;
   let peak = 0;
+  const releasedOwners: string[] = [];
   const model = new Proxy(target, {
     get(nativeModel, property) {
       const value = Reflect.get(nativeModel, property, nativeModel) as unknown;
+      if (property === 'releaseCacheOwner' && typeof value === 'function') {
+        return async (ownerId: string): Promise<void> => {
+          await (value as (ownerId: string) => Promise<void>).call(nativeModel, ownerId);
+          releasedOwners.push(ownerId);
+        };
+      }
       if (streamMethods.has(property) && typeof value === 'function') {
         return async function* (...args: unknown[]): AsyncGenerator<ChatStreamEvent> {
           active += 1;
@@ -66,7 +85,7 @@ function instrumentStreams(target: SchedulerStatsModel): {
       return typeof value === 'function' ? value.bind(nativeModel) : value;
     },
   }) as SchedulerStatsModel;
-  return { model, peakActive: () => peak };
+  return { model, peakActive: () => peak, releasedOwners: () => releasedOwners };
 }
 
 async function postStream(baseUrl: string, input: string): Promise<string> {
@@ -92,12 +111,31 @@ async function postStream(baseUrl: string, input: string): Promise<string> {
   }
 }
 
+async function postMessage(
+  baseUrl: string,
+  input: string,
+): Promise<{ content?: Array<{ type?: string; text?: string }> }> {
+  const response = await fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: MODEL_NAME,
+      messages: [{ role: 'user', content: input }],
+      max_tokens: 16,
+      temperature: 0,
+    }),
+  });
+  expect(response.status).toBe(200);
+  return (await response.json()) as { content?: Array<{ type?: string; text?: string }> };
+}
+
 const stage1Describe = MODEL_ENV_PRESENT ? describe.sequential : describe.skip;
 
 stage1Describe('Stage-1 real-model server admission', () => {
   let instance: ServerInstance;
   let nativeModel: SchedulerStatsModel;
   let peakActive: () => number;
+  let releasedOwners: () => readonly string[];
   let baseUrl: string;
 
   beforeAll(async () => {
@@ -131,6 +169,7 @@ stage1Describe('Stage-1 real-model server admission', () => {
         nativeModel = loaded;
         const instrumented = instrumentStreams(loaded);
         peakActive = instrumented.peakActive;
+        releasedOwners = instrumented.releasedOwners;
         return instrumented.model;
       },
     });
@@ -162,5 +201,31 @@ stage1Describe('Stage-1 real-model server admission', () => {
     expect(peakActive(), `native stream peak; scheduler occupancy=${stats.maxBatchOccupancy}`).toBe(2);
     expect(stats.maxBatchOccupancy).toBeGreaterThanOrEqual(2);
     expect(instance.registry.getSessionRegistry(MODEL_NAME)?.queueDepth).toBe(0);
+  }, 45_000);
+
+  it('releases each stateless Messages cache owner after its response', async () => {
+    const before = releasedOwners().length;
+    const [first, second] = await Promise.all([
+      postMessage(baseUrl, 'Reply with one short word for red.'),
+      postMessage(baseUrl, 'Reply with one short word for blue.'),
+    ]);
+
+    expect(first.content).toBeInstanceOf(Array);
+    expect(second.content).toBeInstanceOf(Array);
+    await waitUntil(
+      () =>
+        releasedOwners().length === before + 2 &&
+        instance.registry.getSessionRegistry(MODEL_NAME)?.queueDepth === 0 &&
+        instance.registry.getSessionRegistry(MODEL_NAME)?.preDispatchAdmitCount === 0 &&
+        instance.health().work.inFlight === 0,
+      'stateless owner release and request accounting did not settle',
+    );
+    const released = releasedOwners().slice(before);
+    expect(released).toHaveLength(2);
+    expect(released.every((owner) => owner.length > 0)).toBe(true);
+    expect(new Set(released).size).toBe(2);
+    expect(instance.registry.getSessionRegistry(MODEL_NAME)?.queueDepth).toBe(0);
+    expect(instance.registry.getSessionRegistry(MODEL_NAME)?.preDispatchAdmitCount).toBe(0);
+    expect(instance.health().work.inFlight).toBe(0);
   }, 45_000);
 });

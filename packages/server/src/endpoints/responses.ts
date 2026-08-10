@@ -1748,6 +1748,9 @@ export async function handleCreateResponse(
   /** Lazy-load hook. See the call site below and `ServerConfig.resolveModel`. */
   resolveModel?: (name: string) => Promise<void>,
 ): Promise<void> {
+  if (modelWorkCoordinator) {
+    registry.setModelLoadAdmissionCoordinator(modelWorkCoordinator);
+  }
   const handlerStartedAt = Date.now();
 
   // Validate required fields
@@ -1857,7 +1860,7 @@ export async function handleCreateResponse(
     }
   } else if (resolveModel && modelWorkCoordinator) {
     try {
-      modelLoadAdmission = modelWorkCoordinator.beginRequestLoadAdmission();
+      modelLoadAdmission = modelWorkCoordinator.beginRequestLoadAdmission(body.model);
     } catch (err) {
       if (err instanceof ModelLoadQueueFullError) {
         sendRateLimit(
@@ -1935,6 +1938,19 @@ export async function handleCreateResponse(
     return;
   }
   const leaseModel = lease.model;
+  if (modelLoadAdmission) {
+    try {
+      preDispatchAdmission = modelLoadAdmission.transferToResident(lease.registry);
+    } catch (err) {
+      registry.releaseDispatchLease(leaseModel);
+      modelLoadAdmission.release();
+      if (err instanceof QueueFullError) {
+        sendRateLimit(res, `${err.message}. Retry after 1s.`);
+        return;
+      }
+      throw err;
+    }
+  }
   // AbortController wired to disconnect events, declared at handler
   // scope so the outer `finally` can always detach even on early
   // return. Listeners attach only after the pre-lock validation gates
@@ -2583,9 +2599,6 @@ export async function handleCreateResponse(
     try {
       const mutexQueuedAt = Date.now();
       const runInference = () => {
-        // No await or callback can interleave between releasing the cold-load
-        // unit and synchronously entering the resident FIFO.
-        modelLoadAdmission?.release();
         return withAdmissionControlledInference(sessionReg, modelWorkCoordinator, preDispatchAdmission, async () => {
           const serverTiming: ServerTimingForUsage = {
             server_queue_ms: Date.now() - mutexQueuedAt,

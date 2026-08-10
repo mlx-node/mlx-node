@@ -439,6 +439,8 @@ export interface SessionCapableModel {
    * relative to subsequent session calls.
    */
   resetCaches(): void | Promise<void>;
+  /** Release scheduler-owned state for one logical session owner. */
+  releaseCacheOwner?(ownerId: string): void | Promise<void>;
   /**
    * Whether the underlying native model has the block-paged KV cache
    * adapter (`PagedKVCacheAdapter` + `BlockAllocator` + `LayerKVPool`)
@@ -728,6 +730,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * explicit provider identity to override it.
    */
   private readonly cacheOwnerId = randomUUID();
+  /** Every native owner used by this session, normally the UUID above. */
+  private readonly nativeCacheOwnerIds = new Set<string>();
+  private disposed = false;
   /** Tool definitions are conversation state for deterministic template replay. */
   private activeTools: ToolDefinition[] | undefined;
 
@@ -1424,6 +1429,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * rejects, no JS state is wiped and the guard is released.
    */
   async reset(): Promise<void> {
+    if (this.disposed) {
+      throw new Error('ChatSession: session has been disposed');
+    }
     if (this.inFlight) {
       throw new Error('ChatSession: cannot reset() while a send() is in flight; await the previous call first');
     }
@@ -1437,6 +1445,38 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       this.unresolvedOkToolCallCount = null;
       this.needsFullReplay = false;
       this.activeTools = this.defaultConfig.tools;
+    } finally {
+      this.inFlight = false;
+    }
+  }
+
+  /**
+   * Permanently dispose this JS session and release every native scheduler
+   * owner it used. The operation is awaited and idempotent; it rejects while
+   * a turn is in flight so native state cannot be torn down mid-decode.
+   */
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+    if (this.inFlight) {
+      throw new Error('ChatSession: cannot dispose() while a send() is in flight; await the previous call first');
+    }
+    this.inFlight = true;
+    try {
+      if (this.model.releaseCacheOwner) {
+        for (const ownerId of Array.from(this.nativeCacheOwnerIds)) {
+          await this.model.releaseCacheOwner(ownerId);
+          this.nativeCacheOwnerIds.delete(ownerId);
+        }
+      } else {
+        this.nativeCacheOwnerIds.clear();
+      }
+      this.disposed = true;
+      this.history = [];
+      this.lastImagesKey = null;
+      this.lastAudioKey = null;
+      this.turnCount = 0;
+      this.unresolvedOkToolCallCount = null;
+      this.needsFullReplay = false;
     } finally {
       this.inFlight = false;
     }
@@ -1793,6 +1833,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * not in-checkpoint MTP heads).
    */
   private mergeConfig(overlay: ChatConfig | undefined): ChatConfig {
+    if (this.disposed) {
+      throw new Error('ChatSession: session has been disposed');
+    }
     const merged: ChatConfig = {
       ...this.defaultConfig,
       ...overlay,
@@ -1801,6 +1844,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     if (merged.cacheOwnerId === undefined || merged.cacheOwnerId === '') {
       merged.cacheOwnerId = this.cacheOwnerId;
     }
+    this.nativeCacheOwnerIds.add(merged.cacheOwnerId);
     // Tools are part of the committed conversation state. Constructor
     // defaults seed that state, but must not overwrite a tool set committed by
     // a later successful turn. A current-call overlay is the only higher

@@ -1,6 +1,6 @@
 //! Shared model-thread command enum + dispatcher.
 //!
-//! [`ChatCmd`] is the model-neutral chat command: a 7-variant shape with
+//! [`ChatCmd`] is the model-neutral chat command: an 8-variant shape with
 //! the per-turn payload fields. [`handle_chat_cmd`] dispatches each arm
 //! to the corresponding generic session core from
 //! [`crate::engine::session`].
@@ -99,6 +99,13 @@ pub(crate) enum ChatCmd {
     /// tests and session-management code can start from a known clean
     /// state between turns.
     ResetCaches { reply: ResponseTx<()> },
+    /// Release scheduler-owned state for one logical chat-session owner.
+    /// Stateless HTTP sessions call this after their terminal response so
+    /// completed owners cannot pin paged block tables or history forever.
+    ReleaseCacheOwner {
+        owner_id: String,
+        reply: ResponseTx<()>,
+    },
 }
 
 /// Lifts a [`ChatCmd`] into a family's thread-command type.
@@ -258,6 +265,9 @@ pub(crate) fn handle_chat_cmd<B: ChatBackend>(backend: &mut B, cmd: ChatCmd) {
         }
         ChatCmd::ResetCaches { reply } => {
             let _ = reply.send(backend.reset_caches(ResetScope::Command));
+        }
+        ChatCmd::ReleaseCacheOwner { owner_id, reply } => {
+            let _ = reply.send(backend.release_cache_owner(&owner_id));
         }
     }
 }

@@ -1597,12 +1597,44 @@ impl QwenSchedulerState {
             | ChatCmd::StreamSessionStart { config, .. }
             | ChatCmd::StreamSessionContinue { config, .. }
             | ChatCmd::StreamSessionContinueTool { config, .. } => config,
-            ChatCmd::ResetCaches { .. } => return true,
+            ChatCmd::ResetCaches { .. } | ChatCmd::ReleaseCacheOwner { .. } => return true,
         };
         config
             .cache_owner_id
             .as_deref()
             .is_some_and(|owner| !owner.is_empty())
+    }
+
+    fn cache_owner_release_blocked(&self, owner_id: &str) -> bool {
+        let Some(&seq_id) = self.owner_sequences.get(owner_id) else {
+            return false;
+        };
+        self.scheduler.contains_seq(seq_id)
+            || self
+                .prepared_waiting
+                .as_ref()
+                .is_some_and(|prepared| prepared.owner_id == owner_id)
+    }
+
+    fn release_cache_owner_now(&mut self, owner_id: &str) -> Result<()> {
+        let Some(&seq_id) = self.owner_sequences.get(owner_id) else {
+            self.owner_histories.remove(owner_id);
+            return Ok(());
+        };
+        let release_error = self.inner.paged_adapter.as_mut().and_then(|adapter| {
+            if adapter.block_table_for(seq_id).is_some() {
+                adapter.release_request_for(seq_id).err()
+            } else {
+                None
+            }
+        });
+        if let Some(error) = release_error {
+            return Err(Error::from_reason(error));
+        }
+        self.pending_restores.remove(&seq_id);
+        self.owner_sequences.remove(owner_id);
+        self.owner_histories.remove(owner_id);
+        Ok(())
     }
 
     fn reply_admission_error(response: ScheduledReply, cancelled: &AtomicBool, error: Error) {
@@ -1701,6 +1733,9 @@ impl QwenSchedulerState {
                         .enqueue_barrier(Qwen3Cmd::Chat(ChatCmd::ResetCaches { reply }));
                     return None;
                 }
+                ChatCmd::ReleaseCacheOwner { .. } => {
+                    unreachable!("cache-owner release is handled before turn preparation")
+                }
             };
 
         let owner_id = config.cache_owner_id.clone().unwrap_or_default();
@@ -1761,19 +1796,21 @@ impl QwenSchedulerState {
             .unwrap_or(1)
             .max(1);
         let per_seq_context = trained_context.min(scheduler_per_seq_context());
-        if prompt_tokens > per_seq_context
-            || (prompt_tokens == per_seq_context && requested_max_new_tokens != 0)
-        {
-            Self::reply_admission_error(
-                response,
-                cancelled.as_ref(),
-                Error::from_reason(format!(
-                    "context_length_exceeded: prompt ({prompt_tokens}) leaves no requested generation room in scheduler per-sequence context {per_seq_context}"
-                )),
-            );
-            return None;
-        }
-        let max_new_tokens = requested_max_new_tokens.min(per_seq_context - prompt_tokens);
+        let max_new_tokens = match engine::scheduler::clamp_scheduled_output_tokens(
+            prompt_tokens,
+            requested_max_new_tokens,
+            per_seq_context,
+        ) {
+            Ok(max_new_tokens) => max_new_tokens,
+            Err(error) => {
+                Self::reply_admission_error(
+                    response,
+                    cancelled.as_ref(),
+                    Error::from_reason(error),
+                );
+                return None;
+            }
+        };
         admitted.params.max_new_tokens = max_new_tokens as i32;
         let requested_tokens = prompt_tokens.saturating_add(max_new_tokens);
         let block_size = self
@@ -2049,15 +2086,15 @@ impl QwenSchedulerState {
     fn enqueue_admission(
         &mut self,
         admission: QwenAdmission,
-    ) -> std::result::Result<(), (QwenAdmission, String)> {
+    ) -> std::result::Result<(), Box<(QwenAdmission, String)>> {
         match admission {
             QwenAdmission::Ready(turn) => {
                 if self.scheduler.contains_seq(turn.seq_id) {
                     let seq_id = turn.seq_id;
-                    return Err((
+                    return Err(Box::new((
                         QwenAdmission::Ready(turn),
                         format!("duplicate scheduler sequence {seq_id}"),
-                    ));
+                    )));
                 }
                 self.scheduler
                     .enqueue_turn(turn)
@@ -2067,16 +2104,16 @@ impl QwenSchedulerState {
             QwenAdmission::Waiting(turn, restore) => {
                 let seq_id = turn.seq_id;
                 if self.pending_restores.contains_key(&seq_id) {
-                    return Err((
+                    return Err(Box::new((
                         QwenAdmission::Waiting(turn, restore),
                         format!("duplicate SSD restore for sequence {seq_id}"),
-                    ));
+                    )));
                 }
                 if self.scheduler.contains_seq(seq_id) {
-                    return Err((
+                    return Err(Box::new((
                         QwenAdmission::Waiting(turn, restore),
                         format!("duplicate scheduler sequence {seq_id}"),
-                    ));
+                    )));
                 }
                 self.scheduler
                     .enqueue_turn(turn)
@@ -2086,7 +2123,7 @@ impl QwenSchedulerState {
                         .scheduler
                         .take_waiting(seq_id)
                         .expect("turn was just enqueued");
-                    return Err((QwenAdmission::Waiting(turn, restore), error));
+                    return Err(Box::new((QwenAdmission::Waiting(turn, restore), error)));
                 }
                 let replaced = self.pending_restores.insert(seq_id, restore);
                 debug_assert!(replaced.is_none(), "duplicate checked before enqueue");
@@ -2520,7 +2557,8 @@ impl QwenSchedulerState {
         {
             match self.admit_prepared(prepared) {
                 Ok(Some(admission)) => {
-                    if let Err((admission, error)) = self.enqueue_admission(admission) {
+                    if let Err(failure) = self.enqueue_admission(admission) {
+                        let (admission, error) = *failure;
                         tracing::error!("qwen3 scheduler admission failed: {error}");
                         self.reject_admission(admission, error);
                     }
@@ -2543,11 +2581,24 @@ impl QwenSchedulerState {
                 break;
             }
             let command = self.pending.pop_front().expect("front checked above");
-            if Self::force_serial() {
+            if Self::force_serial()
+                && !matches!(command, Qwen3Cmd::Chat(ChatCmd::ReleaseCacheOwner { .. }))
+            {
                 self.scheduler.enqueue_exclusive(command);
                 break;
             }
             match command {
+                Qwen3Cmd::Chat(ChatCmd::ReleaseCacheOwner { owner_id, reply }) => {
+                    if self.cache_owner_release_blocked(&owner_id) {
+                        self.pending
+                            .push_front(Qwen3Cmd::Chat(ChatCmd::ReleaseCacheOwner {
+                                owner_id,
+                                reply,
+                            }));
+                        break;
+                    }
+                    let _ = reply.send(self.release_cache_owner_now(&owner_id));
+                }
                 Qwen3Cmd::Chat(chat) => {
                     let is_reset = matches!(&chat, ChatCmd::ResetCaches { .. });
                     if self.inner.paged_adapter.is_none() {
@@ -2556,7 +2607,8 @@ impl QwenSchedulerState {
                     } else if let Some(prepared) = self.prepare_chat(chat) {
                         match self.admit_prepared(prepared) {
                             Ok(Some(admission)) => {
-                                if let Err((admission, error)) = self.enqueue_admission(admission) {
+                                if let Err(failure) = self.enqueue_admission(admission) {
+                                    let (admission, error) = *failure;
                                     tracing::error!("qwen3 scheduler admission failed: {error}");
                                     self.reject_admission(admission, error);
                                 }
@@ -7079,6 +7131,28 @@ mod tests {
             inner.paged_adapter.is_none(),
             "paged_adapter must be None when use_block_paged_cache is Some(false)"
         );
+    }
+
+    #[test]
+    fn scheduler_cache_owner_release_drops_sequence_and_history() {
+        let inner = super::Qwen3Inner::new(paged_tiny_config(Some(false)))
+            .expect("construct scheduler inner without paged allocation");
+        let mut state = super::QwenSchedulerState::new(inner);
+        state.owner_sequences.insert("stateless-owner".into(), 41);
+        state
+            .owner_histories
+            .insert("stateless-owner".into(), vec![1, 2, 3]);
+
+        state
+            .release_cache_owner_now("stateless-owner")
+            .expect("release owner");
+
+        assert!(!state.owner_sequences.contains_key("stateless-owner"));
+        assert!(!state.owner_histories.contains_key("stateless-owner"));
+        // Idempotent disposal is required by ChatSession.dispose().
+        state
+            .release_cache_owner_now("stateless-owner")
+            .expect("release absent owner");
     }
 
     /// Default-flag construction (`None`) must allocate the block-paged

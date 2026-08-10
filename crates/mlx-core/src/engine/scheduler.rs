@@ -12,6 +12,25 @@ use std::time::Duration;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
 use napi_derive::napi;
 
+/// Clamp a scheduled turn's requested output to the fixed per-sequence
+/// context window. The scheduled path must reserve every generated token,
+/// unlike the whole-turn helper whose final sampled token is never forwarded
+/// again, so a prompt that already fills the window has no generation room.
+pub(crate) fn clamp_scheduled_output_tokens(
+    prompt_tokens: u32,
+    requested_max_new_tokens: u32,
+    per_seq_context: u32,
+) -> Result<u32, String> {
+    if prompt_tokens > per_seq_context
+        || (prompt_tokens == per_seq_context && requested_max_new_tokens != 0)
+    {
+        return Err(format!(
+            "context_length_exceeded: prompt ({prompt_tokens}) leaves no requested generation room in scheduler per-sequence context {per_seq_context}"
+        ));
+    }
+    Ok(requested_max_new_tokens.min(per_seq_context - prompt_tokens))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TurnStatus {
     Waiting,
@@ -1212,6 +1231,21 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduled_output_hint_clamps_to_remaining_context() {
+        assert_eq!(clamp_scheduled_output_tokens(48, 100, 64), Ok(16));
+        assert_eq!(clamp_scheduled_output_tokens(48, 10, 64), Ok(10));
+    }
+
+    #[test]
+    fn scheduled_output_hint_rejects_a_prompt_without_generation_room() {
+        let full = clamp_scheduled_output_tokens(64, 1, 64).unwrap_err();
+        assert!(full.starts_with("context_length_exceeded: prompt (64)"));
+
+        let oversized = clamp_scheduled_output_tokens(65, 1, 64).unwrap_err();
+        assert!(oversized.starts_with("context_length_exceeded: prompt (65)"));
+    }
 
     #[derive(Default)]
     struct MockStep {

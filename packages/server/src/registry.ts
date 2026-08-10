@@ -42,6 +42,11 @@ import type { SessionCapableModel } from '@mlx-node/lm';
 
 import { SessionRegistry } from './session-registry.js';
 
+interface ModelLoadAdmissionCoordinator {
+  bindRequestLoadAdmissions(modelId: string, registry: SessionRegistry): void;
+  unbindRequestLoadAdmissions(modelId: string, registry: SessionRegistry): void;
+}
+
 function concurrentDispatchCapacity(model: ServableModel): number {
   if (model.hasBlockPagedCache?.() !== true) return 1;
   const reported = model.maxConcurrentSequences?.();
@@ -195,9 +200,31 @@ export class ModelRegistry {
    * hard-timeouts have fired.
    */
   private readonly retiredInstanceIds = new WeakMap<ServableModel, { instanceId: number; outstandingCount: number }>();
+  private modelLoadAdmissionCoordinator: ModelLoadAdmissionCoordinator | undefined;
 
   constructor(opts?: ModelRegistryOptions) {
     this.maxQueueDepth = opts?.maxQueueDepth;
+  }
+
+  /**
+   * Connect cold-load admission to name registration. The coordinator is
+   * attached by the HTTP handler before dispatch; existing names are
+   * published immediately and future `register`/`unregister` calls keep the
+   * mapping current.
+   */
+  setModelLoadAdmissionCoordinator(coordinator: ModelLoadAdmissionCoordinator | undefined): void {
+    if (this.modelLoadAdmissionCoordinator === coordinator) return;
+    if (this.modelLoadAdmissionCoordinator) {
+      for (const [name, entry] of this.models) {
+        this.modelLoadAdmissionCoordinator.unbindRequestLoadAdmissions(name, entry.sessionRegistry);
+      }
+    }
+    this.modelLoadAdmissionCoordinator = coordinator;
+    if (coordinator) {
+      for (const [name, entry] of this.models) {
+        coordinator.bindRequestLoadAdmissions(name, entry.sessionRegistry);
+      }
+    }
   }
 
   /**
@@ -241,11 +268,13 @@ export class ModelRegistry {
       if (opts && 'maxOutputTokens' in opts) {
         existing.sessionRegistry.setMaxOutputTokens(maxOutputTokens);
       }
+      this.modelLoadAdmissionCoordinator?.bindRequestLoadAdmissions(name, existing.sessionRegistry);
       return;
     }
     if (existing) {
       // Same name, different model: release the old model's refcount
       // before installing the new binding.
+      this.modelLoadAdmissionCoordinator?.unbindRequestLoadAdmissions(name, existing.sessionRegistry);
       this.dropNameReference(existing.model);
     }
 
@@ -313,6 +342,7 @@ export class ModelRegistry {
       createdAt: Math.floor(Date.now() / 1000),
       sessionRegistry: binding.registry,
     });
+    this.modelLoadAdmissionCoordinator?.bindRequestLoadAdmissions(name, binding.registry);
   }
 
   /**
@@ -329,6 +359,7 @@ export class ModelRegistry {
   unregister(name: string): boolean {
     const entry = this.models.get(name);
     if (!entry) return false;
+    this.modelLoadAdmissionCoordinator?.unbindRequestLoadAdmissions(name, entry.sessionRegistry);
     this.models.delete(name);
     this.dropNameReference(entry.model);
     return true;

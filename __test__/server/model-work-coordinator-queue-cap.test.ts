@@ -7,9 +7,10 @@ import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
 import { handleCreateResponse } from '../../packages/server/src/endpoints/responses.js';
-import { ModelWorkCoordinator } from '../../packages/server/src/model-work-coordinator.js';
+import { ModelLoadQueueFullError, ModelWorkCoordinator } from '../../packages/server/src/model-work-coordinator.js';
 import { ModelRegistry } from '../../packages/server/src/registry.js';
 import { DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL } from '../../packages/server/src/server.js';
+import { QueueFullError } from '../../packages/server/src/session-registry.js';
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -131,6 +132,47 @@ async function waitForQueueDepth(registry: ModelRegistry, modelName: string, exp
 }
 
 describe('ModelWorkCoordinator + SessionRegistry queue cap', () => {
+  it('keys cold-load admission independently by requested model', () => {
+    const coordinator = new ModelWorkCoordinator(1);
+    const a1 = coordinator.beginRequestLoadAdmission('model-a');
+    const a2 = coordinator.beginRequestLoadAdmission('model-a');
+    expect(() => coordinator.beginRequestLoadAdmission('model-a')).toThrow(ModelLoadQueueFullError);
+
+    const b1 = coordinator.beginRequestLoadAdmission('model-b');
+    expect(coordinator.requestLoadAdmissionCount).toBe(3);
+
+    a1.release();
+    a2.release();
+    b1.release();
+    expect(coordinator.requestLoadAdmissionCount).toBe(0);
+  });
+
+  it('transfers every cold permit into the resident registry at registration', async () => {
+    const coordinator = new ModelWorkCoordinator(1);
+    const registry = new ModelRegistry({ maxQueueDepth: 1 });
+    registry.setModelLoadAdmissionCoordinator(coordinator);
+    const coldA = coordinator.beginRequestLoadAdmission('cold-model');
+    const coldB = coordinator.beginRequestLoadAdmission('cold-model');
+
+    registry.register('cold-model', createModel());
+    const sessionReg = registry.getSessionRegistry('cold-model')!;
+    expect(coordinator.requestLoadAdmissionCount).toBe(0);
+    expect(sessionReg.preDispatchAdmitCount).toBe(2);
+    expect(() => sessionReg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+
+    const releaseHolder = deferred();
+    const holder = sessionReg.withExclusive(async () => releaseHolder.promise, coldA.transferToResident(sessionReg));
+    const waiter = sessionReg.withExclusive(async () => {}, coldB.transferToResident(sessionReg));
+    coldA.release();
+    coldB.release();
+    expect(sessionReg.preDispatchAdmitCount).toBe(0);
+    expect(sessionReg.queueDepth).toBe(1);
+
+    releaseHolder.resolve(undefined);
+    await Promise.all([holder, waiter]);
+    expect(sessionReg.queueDepth).toBe(0);
+  });
+
   it('POST /v1/messages enforces the per-model queue cap before waiting behind a model-load writer', async () => {
     const registry = new ModelRegistry({ maxQueueDepth: 1 });
     registry.register('cap-model', createModel());

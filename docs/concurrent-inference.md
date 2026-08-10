@@ -81,6 +81,11 @@ same-binary uniform/ragged validation with separate model instances:
 | `MLX_QWEN35_CONTINUOUS_BATCHING` | `0`     | Opt eligible dense text-only Qwen3.5 checkpoints into the scheduled hybrid lane.                 |
 | `MLX_SERVE_FORCE_SERIAL`         | `0`     | Route eligible Qwen3/LFM2/Qwen3.5 turns through the legacy whole-turn path for A/B and rollback. |
 
+`MLX_SERVE_FORCE_SERIAL` is a process-start test/rollback switch, not a
+production hot-reconfiguration API. Set it before model registration; changing
+it later can only fail safe because the server admission width was fixed when
+the resident `SessionRegistry` was created.
+
 Two reproducibility rules are deliberate:
 
 1. Only greedy `temperature = 0` output is schedule-invariant. With sampling,
@@ -98,7 +103,9 @@ Admission remains FCFS. If the oldest request cannot yet satisfy the memory
 watermark, smaller later requests wait behind it; a preempted row likewise
 keeps its original queue position until it can resume. This deliberate
 head-of-line blocking prevents a stream of small arrivals from starving a
-large request or an ordered reset behind it.
+large request or an ordered reset behind it. A `WaitingForSsd` row remains
+charged because its reserved destination blocks and future-growth reservation
+still consume the same unified-memory budget while I/O is parked.
 
 Outside the chat engine two families break the threading pattern: Harrier
 embeddings run forwards on tokio's blocking pool (`models/harrier/model.rs:104-177`),
@@ -242,7 +249,10 @@ above as a cooled median-of-three 4-bit result.
   table, and prepends it for replay without same-step readmission. Recompute is
   the default; only a long prefix with measured restore throughput that beats
   measured prefill cost escalates to asynchronous SSD capture. Public scheduler
-  stats expose total, recompute, and SSD preemption counters.
+  stats expose total, recompute, and SSD preemption counters. The comparator is
+  intentionally conservative under allocation pressure; it is a tuning policy,
+  and measured restore/prefill telemetry—not a semantic guarantee—decides the
+  cheaper path.
 - **Stage 2b — ragged Qwen3 (env-gated):** `MLX_SCHED_RAGGED_STEP=1` packs
   decode rows and prefill slices into one token stream, writes K/V once per
   layer, and passes genuine cumulative query boundaries to varlen attention.

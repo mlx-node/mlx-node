@@ -221,6 +221,11 @@ export declare class Gemma4Model {
    */
   resetCaches(): Promise<void>;
   /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
+  /**
    * Start a new chat session.
    *
    * Renders the complete conversation through the loaded chat
@@ -571,6 +576,11 @@ export declare class Lfm2Model {
    * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
    */
   resetCaches(): Promise<void>;
+  /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
   /**
    * Start a new chat session.
    *
@@ -1275,6 +1285,11 @@ export declare class Qwen35Model {
    */
   resetCaches(): Promise<void>;
   /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
+  /**
    * Start a new chat session.
    *
    * Renders the complete conversation through the loaded chat
@@ -1415,6 +1430,11 @@ export declare class Qwen35MoeModel {
    * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
    */
   resetCaches(): Promise<void>;
+  /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
   /**
    * Start a new chat session.
    *
@@ -1647,6 +1667,11 @@ export declare class Qwen3Model {
    */
   resetCaches(): Promise<void>;
   /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
+  /**
    * Start a new chat session.
    *
    * Renders the complete conversation through the loaded chat
@@ -1716,8 +1741,8 @@ export declare class Qwen3Model {
    *
    * This loads a model from a directory containing:
    * - config.json: Model configuration
-   * - weights.mlx (optional): MLX format weights with data arrays
-   * - weights.safetensors (optional): SafeTensors format (not yet supported)
+   * - weights.safetensors or model.safetensors (single-file SafeTensors)
+   * - model-*-of-*.safetensors (sharded SafeTensors)
    *
    * # Arguments
    * * `model_path` - Path to the model directory

@@ -1,7 +1,7 @@
 //! Declarative generator for the per-family chat NAPI surface.
 //!
 //! Every language-model `#[napi]` class (`Qwen3Model`, `Qwen3_5Model`,
-//! `Qwen3_5MoeModel`, `Gemma4Model`, `Lfm2Model`) exposes the same ten
+//! `Qwen3_5MoeModel`, `Gemma4Model`, `Lfm2Model`) exposes the same eleven
 //! chat-surface methods — `reset_caches`, `chat_session_start`,
 //! `chat_session_continue`, `chat_session_continue_tool`, their
 //! three internal `begin_chat_session_*` operations (H2 — return a
@@ -14,7 +14,7 @@
 //! forwarding shims.
 //!
 //! [`chat_napi_surface!`] emits one dedicated `#[napi] impl $Class`
-//! block carrying those ten methods. napi-rs allows multiple
+//! block carrying those eleven methods. napi-rs allows multiple
 //! `#[napi] impl` blocks per class, so each family keeps its own
 //! hand-written block (`load`, `generate`, `save_*`, `has_mtp_weights`,
 //! `has_block_paged_cache`, …) and adds one macro invocation for the
@@ -54,7 +54,7 @@
 //! `ChatConfig | null`). Passing them in keeps the emitted strings
 //! byte-identical to the hand-written originals.
 
-/// Emit the ten-method chat NAPI surface for one model class.
+/// Emit the eleven-method chat NAPI surface for one model class.
 ///
 /// See the module docs for the axis breakdown. `$Class` is the NAPI
 /// class, `$thread_cmd` its model-thread command type.
@@ -76,6 +76,19 @@ macro_rules! chat_napi_surface {
             #[napi]
             pub async fn reset_caches(&self) -> ::napi::Result<()> {
                 $crate::models::chat_napi::chat_napi_thread_reset!(self, $thread_mode, $thread_cmd)
+            }
+
+            /// Release scheduler-owned KV/history state for one logical
+            /// session owner without purging content-addressed prefix blocks.
+            #[napi]
+            pub async fn release_cache_owner(&self, owner_id: String) -> ::napi::Result<()> {
+                $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
+                $crate::model_thread::send_and_await(thread, |reply| {
+                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
+                        $crate::engine::cmd::ChatCmd::ReleaseCacheOwner { owner_id, reply },
+                    )
+                })
+                .await
             }
 
             /// Start a new chat session.

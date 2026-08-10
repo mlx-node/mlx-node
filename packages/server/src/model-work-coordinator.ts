@@ -1,4 +1,5 @@
 import type { ModelLoadRecord } from './health.js';
+import type { PreDispatchAdmission, SessionRegistry } from './session-registry.js';
 
 /**
  * Render a thrown value for {@link ModelLoadRecord.error}.
@@ -52,10 +53,25 @@ export interface ModelLoadOutcome<T> {
   ownMs: number;
 }
 
-/** A bounded request admission retained until the resident FIFO placement. */
+/** A bounded request admission transferred into the resident FIFO budget. */
 export interface ModelLoadAdmission {
-  /** Idempotently release this request's pre-resolution budget unit. */
+  /**
+   * Atomically move this request from the cold-load budget into the
+   * resident model's ordinary pre-dispatch budget. Idempotent for the same
+   * registry; transferring after a hot-swap releases the old reservation
+   * before charging the new binding.
+   */
+  transferToResident(registry: SessionRegistry): PreDispatchAdmission;
+  /** Idempotently release this request's current cold or resident unit. */
   release(): void;
+}
+
+interface ModelLoadAdmissionState {
+  released: boolean;
+  coldCounted: boolean;
+  residentRegistry?: SessionRegistry;
+  residentAdmission?: PreDispatchAdmission;
+  transferError?: unknown;
 }
 
 /** Raised synchronously when unresolved model-load traffic is over capacity. */
@@ -87,6 +103,14 @@ export class ModelWorkCoordinator {
   private readonly readerWaiters: Array<() => void> = [];
   private readonly writerWaiters: Array<() => void> = [];
   private requestLoadAdmissions = 0;
+  /** Outstanding permits grouped by the requested model name. */
+  private readonly requestLoadAdmissionsByModel = new Map<string, Set<ModelLoadAdmissionState>>();
+  /**
+   * Resident bindings published synchronously by `ModelRegistry.register`.
+   * Publishing transfers every already-admitted cold request before another
+   * request can spend the resident budget independently.
+   */
+  private readonly residentRegistriesByModel = new Map<string, SessionRegistry>();
   private readonly maxRequestLoadQueueDepth: number | undefined;
   /**
    * Most recent settled load bracket. Retained here because the coordinator
@@ -106,24 +130,126 @@ export class ModelWorkCoordinator {
    * Bound requests that arrive before a model has a resident
    * `SessionRegistry`. The capacity mirrors the resident FIFO: `limit`
    * waiters plus one owner/runner. Callers retain the permit through every
-   * pre-lock await and release it immediately before synchronously entering
-   * `SessionRegistry.withExclusive`.
+   * pre-lock await; registration synchronously transfers it into the resident
+   * `SessionRegistry` budget before any later arrival can spend that capacity.
    */
-  beginRequestLoadAdmission(): ModelLoadAdmission {
+  beginRequestLoadAdmission(modelId: string): ModelLoadAdmission {
     const limit = this.maxRequestLoadQueueDepth;
-    if (limit !== undefined && this.requestLoadAdmissions >= limit + 1) {
-      throw new ModelLoadQueueFullError(this.requestLoadAdmissions, limit);
+    const admissions = this.requestLoadAdmissionsByModel.get(modelId) ?? new Set<ModelLoadAdmissionState>();
+    let coldFootprint = 0;
+    for (const admission of admissions) {
+      if (!admission.released && admission.coldCounted) coldFootprint += 1;
     }
+    if (limit !== undefined && coldFootprint >= limit + 1) {
+      throw new ModelLoadQueueFullError(coldFootprint, limit);
+    }
+    if (!this.requestLoadAdmissionsByModel.has(modelId)) {
+      this.requestLoadAdmissionsByModel.set(modelId, admissions);
+    }
+    const state: ModelLoadAdmissionState = {
+      released: false,
+      coldCounted: true,
+    };
+    admissions.add(state);
     this.requestLoadAdmissions += 1;
-    let released = false;
-    return {
+    const admission: ModelLoadAdmission = {
+      transferToResident: (registry): PreDispatchAdmission => this.transferAdmission(state, registry),
       release: (): void => {
-        if (released) return;
-        released = true;
-        this.requestLoadAdmissions -= 1;
-        if (this.requestLoadAdmissions < 0) this.requestLoadAdmissions = 0;
+        if (state.released) return;
+        state.released = true;
+        state.residentAdmission?.release();
+        state.residentAdmission = undefined;
+        state.residentRegistry = undefined;
+        if (state.coldCounted) {
+          state.coldCounted = false;
+          this.requestLoadAdmissions -= 1;
+          if (this.requestLoadAdmissions < 0) this.requestLoadAdmissions = 0;
+        }
+        const active = this.requestLoadAdmissionsByModel.get(modelId);
+        active?.delete(state);
+        if (active?.size === 0) this.requestLoadAdmissionsByModel.delete(modelId);
       },
     };
+    const resident = this.residentRegistriesByModel.get(modelId);
+    if (resident) {
+      try {
+        this.transferAdmission(state, resident);
+      } catch {
+        // Preserve the failure on `state`; the handler observes it from its
+        // explicit transfer after resolving the binding and returns 429.
+      }
+    }
+    return admission;
+  }
+
+  /**
+   * Publish a requested model name's resident admission lane. Called
+   * synchronously from `ModelRegistry.register`, so every outstanding cold
+   * permit moves into the registry before a later arrival can be admitted
+   * against an apparently empty resident budget.
+   */
+  bindRequestLoadAdmissions(modelId: string, registry: SessionRegistry): void {
+    this.residentRegistriesByModel.set(modelId, registry);
+    const admissions = this.requestLoadAdmissionsByModel.get(modelId);
+    if (!admissions) return;
+    for (const admission of admissions) {
+      if (admission.released) continue;
+      try {
+        this.transferAdmission(admission, registry);
+      } catch {
+        // A cold request that cannot fit after an alias/hot-swap transition is
+        // marked fail-closed. Its handler will surface the stored QueueFullError
+        // rather than running outside either budget.
+      }
+    }
+  }
+
+  /** Forget a name only when it still points at the supplied binding. */
+  unbindRequestLoadAdmissions(modelId: string, registry: SessionRegistry): void {
+    if (this.residentRegistriesByModel.get(modelId) === registry) {
+      this.residentRegistriesByModel.delete(modelId);
+    }
+  }
+
+  private transferAdmission(state: ModelLoadAdmissionState, registry: SessionRegistry): PreDispatchAdmission {
+    if (state.released) {
+      throw new Error('Model load admission has already been released');
+    }
+    if (state.residentRegistry === registry && state.transferError !== undefined) {
+      throw state.transferError;
+    }
+    if (state.residentRegistry === registry && state.residentAdmission) {
+      return state.residentAdmission;
+    }
+    if (state.residentAdmission) {
+      state.residentAdmission.release();
+      state.residentAdmission = undefined;
+      state.residentRegistry = undefined;
+    }
+    state.transferError = undefined;
+    try {
+      const residentAdmission = registry.beginPreDispatchAdmission();
+      state.residentRegistry = registry;
+      state.residentAdmission = residentAdmission;
+      if (state.coldCounted) {
+        state.coldCounted = false;
+        this.requestLoadAdmissions -= 1;
+        if (this.requestLoadAdmissions < 0) this.requestLoadAdmissions = 0;
+      }
+      return residentAdmission;
+    } catch (error) {
+      // This permit is now a rejected resident transition, not an invisible
+      // cold unit. Remove its cold charge; `transferToResident` rethrows the
+      // exact resident error when the owning request resumes.
+      if (state.coldCounted) {
+        state.coldCounted = false;
+        this.requestLoadAdmissions -= 1;
+        if (this.requestLoadAdmissions < 0) this.requestLoadAdmissions = 0;
+      }
+      state.transferError = error;
+      state.residentRegistry = registry;
+      throw error;
+    }
   }
 
   /** Read-only unresolved/pre-FIFO request footprint for diagnostics/tests. */

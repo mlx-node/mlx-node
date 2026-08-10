@@ -625,7 +625,7 @@ impl Qwen35SchedulerState {
             | ChatCmd::StreamSessionStart { config, .. }
             | ChatCmd::StreamSessionContinue { config, .. }
             | ChatCmd::StreamSessionContinueTool { config, .. } => Some(config),
-            ChatCmd::ResetCaches { .. } => None,
+            ChatCmd::ResetCaches { .. } | ChatCmd::ReleaseCacheOwner { .. } => None,
         }
     }
 
@@ -646,7 +646,7 @@ impl Qwen35SchedulerState {
             | ChatCmd::SessionContinueTool { messages, .. }
             | ChatCmd::StreamSessionContinue { messages, .. }
             | ChatCmd::StreamSessionContinueTool { messages, .. } => (messages, true),
-            ChatCmd::ResetCaches { .. } => return true,
+            ChatCmd::ResetCaches { .. } | ChatCmd::ReleaseCacheOwner { .. } => return true,
         };
         let has_media = messages.iter().any(|message| {
             message
@@ -662,6 +662,38 @@ impl Qwen35SchedulerState {
             .and_then(|config| config.cache_owner_id.as_deref())
             .is_some_and(|owner| self.owner_sequences.contains_key(owner));
         has_media || (is_continue && !owner_known)
+    }
+
+    fn cache_owner_release_blocked(&self, owner_id: &str) -> bool {
+        let Some(&seq_id) = self.owner_sequences.get(owner_id) else {
+            return false;
+        };
+        self.scheduler.contains_seq(seq_id)
+            || self
+                .prepared_waiting
+                .as_ref()
+                .is_some_and(|prepared| prepared.owner_id == owner_id)
+    }
+
+    fn release_cache_owner_now(&mut self, owner_id: &str) -> Result<()> {
+        let Some(&seq_id) = self.owner_sequences.get(owner_id) else {
+            self.owner_histories.remove(owner_id);
+            return Ok(());
+        };
+        let release_error = self.inner.paged_adapter.as_mut().and_then(|adapter| {
+            if adapter.block_table_for(seq_id).is_some() {
+                adapter.release_request_for(seq_id).err()
+            } else {
+                None
+            }
+        });
+        self.inner.release_scheduled_recurrent_for(seq_id);
+        if let Some(error) = release_error {
+            return Err(Error::from_reason(error));
+        }
+        self.owner_sequences.remove(owner_id);
+        self.owner_histories.remove(owner_id);
+        Ok(())
     }
 
     fn prepare_chat(&mut self, command: ChatCmd) -> Option<Box<PreparedTurn>> {
@@ -734,6 +766,9 @@ impl Qwen35SchedulerState {
                 self.scheduler
                     .enqueue_barrier(Qwen35Cmd::Chat(ChatCmd::ResetCaches { reply }));
                 return None;
+            }
+            ChatCmd::ReleaseCacheOwner { .. } => {
+                unreachable!("cache-owner release is handled before turn preparation")
             }
         };
         if cancelled.load(Ordering::Relaxed) {
@@ -820,19 +855,20 @@ impl Qwen35SchedulerState {
             .unwrap_or(1)
             .max(1);
         let context = trained_context.min(scheduler_per_seq_context());
-        if prompt_tokens > context || (prompt_tokens == context && requested_max_new_tokens != 0) {
-            if newly_assigned {
-                self.owner_sequences.remove(&owner_id);
+        let max_new_tokens = match engine::scheduler::clamp_scheduled_output_tokens(
+            prompt_tokens,
+            requested_max_new_tokens,
+            context,
+        ) {
+            Ok(max_new_tokens) => max_new_tokens,
+            Err(error) => {
+                if newly_assigned {
+                    self.owner_sequences.remove(&owner_id);
+                }
+                response.send_error(Error::from_reason(error), cancelled.as_ref());
+                return None;
             }
-            response.send_error(
-                Error::from_reason(format!(
-                    "context_length_exceeded: prompt ({prompt_tokens}) leaves no requested generation room in scheduler per-sequence context {context}"
-                )),
-                cancelled.as_ref(),
-            );
-            return None;
-        }
-        let max_new_tokens = requested_max_new_tokens.min(context - prompt_tokens);
+        };
         admitted.params.max_new_tokens = max_new_tokens as i32;
         let requested_tokens = prompt_tokens.saturating_add(max_new_tokens);
         let block_size = self
@@ -1468,18 +1504,31 @@ impl Qwen35SchedulerState {
             if must_wait_for_legacy_owner {
                 break;
             }
-            if matches!(command, Qwen35Cmd::Chat(_))
+            if matches!(command, Qwen35Cmd::Chat(chat) if !matches!(chat, ChatCmd::ReleaseCacheOwner { .. }))
                 && self.scheduler.waiting_len() + self.scheduler.running_len()
                     >= self.scheduler.max_num_seqs()
             {
                 break;
             }
             let command = self.pending.pop_front().expect("front checked");
-            if Self::force_serial() || !self.enabled {
+            if (Self::force_serial() || !self.enabled)
+                && !matches!(command, Qwen35Cmd::Chat(ChatCmd::ReleaseCacheOwner { .. }))
+            {
                 self.scheduler.enqueue_exclusive(command);
                 break;
             }
             match command {
+                Qwen35Cmd::Chat(ChatCmd::ReleaseCacheOwner { owner_id, reply }) => {
+                    if self.cache_owner_release_blocked(&owner_id) {
+                        self.pending
+                            .push_front(Qwen35Cmd::Chat(ChatCmd::ReleaseCacheOwner {
+                                owner_id,
+                                reply,
+                            }));
+                        break;
+                    }
+                    let _ = reply.send(self.release_cache_owner_now(&owner_id));
+                }
                 Qwen35Cmd::Chat(chat) => {
                     let is_reset = matches!(chat, ChatCmd::ResetCaches { .. });
                     let mut exclusive = false;
@@ -1619,6 +1668,28 @@ mod tests {
         );
         assert!(state.inner.has_scheduled_recurrent(3));
         assert!(state.inner.can_activate_scheduled_recurrent(4));
+    }
+
+    #[test]
+    fn cache_owner_release_drops_history_sequence_and_recurrent_state() {
+        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let mut state = Qwen35SchedulerState::new(inner);
+        state.owner_sequences.insert("stateless-owner".into(), 9);
+        state
+            .owner_histories
+            .insert("stateless-owner".into(), vec![7, 8]);
+        state
+            .inner
+            .activate_scheduled_recurrent(9)
+            .expect("activate owner recurrent state");
+
+        state
+            .release_cache_owner_now("stateless-owner")
+            .expect("release owner");
+
+        assert!(!state.owner_sequences.contains_key("stateless-owner"));
+        assert!(!state.owner_histories.contains_key("stateless-owner"));
+        assert!(!state.inner.has_scheduled_recurrent(9));
     }
 
     #[test]

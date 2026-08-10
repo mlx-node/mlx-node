@@ -1031,6 +1031,9 @@ export async function handleCreateMessage(
   resolveModel?: (name: string) => Promise<void>,
   modelWorkCoordinator?: ModelWorkCoordinator,
 ): Promise<void> {
+  if (modelWorkCoordinator) {
+    registry.setModelLoadAdmissionCoordinator(modelWorkCoordinator);
+  }
   const handlerStartedAt = Date.now();
   let serverModelResolveMs: number | undefined;
   // Split observability for the resolve path: a request that arrives
@@ -1132,7 +1135,7 @@ export async function handleCreateMessage(
     }
   } else if (resolveModel && modelWorkCoordinator) {
     try {
-      modelLoadAdmission = modelWorkCoordinator.beginRequestLoadAdmission();
+      modelLoadAdmission = modelWorkCoordinator.beginRequestLoadAdmission(body.model);
     } catch (err) {
       if (err instanceof ModelLoadQueueFullError) {
         sendAnthropicRateLimit(
@@ -1230,6 +1233,19 @@ export async function handleCreateMessage(
     return;
   }
   const leaseModel = lease.model;
+  if (modelLoadAdmission) {
+    try {
+      preDispatchAdmission = modelLoadAdmission.transferToResident(lease.registry);
+    } catch (err) {
+      registry.releaseDispatchLease(leaseModel);
+      modelLoadAdmission.release();
+      if (err instanceof QueueFullError) {
+        sendAnthropicRateLimit(res, `${err.message}. Retry after 1s.`);
+        return;
+      }
+      throw err;
+    }
+  }
   // AbortController wired to disconnect events. Declared at function scope
   // so the outer `finally` can detach listeners on early returns; the
   // `abortListenersAttached` flag gates the detach so pre-validation exits
@@ -1364,9 +1380,6 @@ export async function handleCreateMessage(
     try {
       const mutexQueuedAt = Date.now();
       const runInference = () => {
-        // No await or callback can interleave between releasing the cold-load
-        // unit and synchronously entering the resident FIFO.
-        modelLoadAdmission?.release();
         return withAdmissionControlledInference(sessionReg, modelWorkCoordinator, preDispatchAdmission, async () => {
           const serverTiming: ServerTimingForUsage = {
             server_model_resolve_ms: serverModelResolveMs,
@@ -1554,9 +1567,11 @@ export async function handleCreateMessage(
               // Warm-slot adopt/drop only applies to the non-paged
               // path. On the paged path the JS-side warm slot plays no
               // role (block reuse is content-addressed in native), so
-              // we never touch it — the fresh `ChatSession` allocated
-              // for this request is dropped on the floor and GC'd once
-              // the handler scope exits.
+              // we never touch it. The fresh `ChatSession` is explicitly
+              // disposed in the `finally` below so its native scheduler owner
+              // and live paged request are released before the handler leaves
+              // the admission lane; GC alone cannot perform that native
+              // lifecycle transition.
               //
               // Non-paged dual-gate adopt: BOTH the producer-side commit
               // signal (`outcome.wasCommitted()`, which reads
@@ -1700,6 +1715,15 @@ export async function handleCreateMessage(
               } catch {
                 // Already closed.
               }
+            }
+          } finally {
+            // Paged Messages sessions are deliberately stateless and never
+            // adopted into the JS registry. Explicitly release their native
+            // scheduler owner before leaving the admission lane; merely
+            // dropping the JS wrapper would otherwise retain the owner's
+            // history and live paged sequence forever.
+            if (pagedActive) {
+              await session.dispose();
             }
           }
         });

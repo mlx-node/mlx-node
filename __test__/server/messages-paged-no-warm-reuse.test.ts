@@ -147,6 +147,7 @@ function createMockModel(paged: boolean, result: ChatResult = makeChatResult()):
     chatStreamSessionContinue: vi.fn(() => fallbackStream()),
     chatStreamSessionContinueTool: vi.fn(() => fallbackStream()),
     resetCaches: vi.fn().mockResolvedValue(undefined),
+    releaseCacheOwner: vi.fn().mockResolvedValue(undefined),
     hasBlockPagedCache: vi.fn(() => paged),
   } as unknown as SessionCapableModel;
 }
@@ -241,6 +242,11 @@ describe('handleCreateMessage — paged-active warm-slot bypass', () => {
     // native reset because that clears MoE GDN prefix checkpoints between
     // otherwise cacheable stateless turns.
     expect(mockModel.resetCaches).not.toHaveBeenCalled();
+    const releaseCacheOwner = Reflect.get(mockModel, 'releaseCacheOwner') as ReturnType<typeof vi.fn>;
+    expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
+    expect(releaseCacheOwner).toHaveBeenCalledWith(
+      (mockModel.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0][1].cacheOwnerId,
+    );
     // Pre-dispatch header is `fresh` because `lookup.hit` is always
     // false on the paged path; no `cachedTokens > 0` promotion fired
     // because the mock returned `cachedTokens: 0`.
@@ -448,5 +454,7 @@ describe('handleCreateMessage — paged-active warm-slot bypass', () => {
     expect(first.getBody()).toContain('message_start');
     expect(second.getBody()).toContain('message_start');
     expect(registry.getSessionRegistry('paged-model')?.queueDepth).toBe(0);
+    const releaseCacheOwner = Reflect.get(concurrent.model, 'releaseCacheOwner') as ReturnType<typeof vi.fn>;
+    expect(releaseCacheOwner).toHaveBeenCalledTimes(2);
   });
 });

@@ -666,6 +666,14 @@ pub(crate) trait ChatBackend {
     /// blocks remain safely shareable by exact content hash.
     fn set_cache_owner_id(&mut self, _owner_id: &str, _root_owner_id: Option<&str>) {}
 
+    /// Release model-local state associated with one logical cache owner.
+    /// Scheduler-backed families intercept the command before this generic
+    /// hook; non-scheduler families have no per-owner table and keep the
+    /// no-op default.
+    fn release_cache_owner(&mut self, _owner_id: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Session stop-token id. == the `<|im_end|>` resolution in
     /// the session entries (`tokenizer.im_end_id().ok_or(..)`) for the
     /// ChatML families; Gemma4 resolves `<end_of_turn>` instead.
