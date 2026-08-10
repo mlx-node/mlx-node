@@ -39,7 +39,8 @@ use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::training_model::ModelType;
 use crate::transformer::paged_kv_cache_adapter::{
-    PagedKVCacheAdapter, PagedRestorePoll, PagedRestoreTicket, PagedTurnAdmission, SeqId,
+    PagedKVCacheAdapter, PagedRaggedRow, PagedRestorePoll, PagedRestoreTicket, PagedTurnAdmission,
+    SeqId,
 };
 use crate::transformer::{KVCache, TransformerBlock};
 
@@ -111,6 +112,15 @@ fn scheduler_reserve_full_isl() -> bool {
                 "0" | "false" | "no" | "off"
             )
         })
+    })
+}
+
+fn scheduler_ragged_step_enabled() -> bool {
+    std::env::var("MLX_SCHED_RAGGED_STEP").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
     })
 }
 
@@ -416,6 +426,7 @@ enum QwenAdmission {
 
 struct QwenStepExecutor<'a> {
     inner: &'a mut Qwen3Inner,
+    ragged_step: bool,
 }
 
 struct PreparedDecodeRow {
@@ -428,6 +439,21 @@ struct PreparedDecodeRow {
     cancelled: bool,
     repetition: Option<&'static str>,
     batch_index: Option<usize>,
+}
+
+enum PreparedRaggedKind {
+    Prefill {
+        end: usize,
+        source_len: usize,
+        suppress_sample: bool,
+    },
+    Decode(PreparedDecodeRow),
+}
+
+struct PreparedRaggedRow {
+    plan_index: usize,
+    seq_id: SeqId,
+    kind: PreparedRaggedKind,
 }
 
 impl QwenStepExecutor<'_> {
@@ -776,6 +802,86 @@ impl QwenStepExecutor<'_> {
         })
     }
 
+    /// Apply the request-local sampling and streaming epilogue after a decode
+    /// row's current token has already been staged in `generated_tokens`.
+    fn finish_prepared_decode(
+        row: &PreparedDecodeRow,
+        planned: &engine::scheduler::StepRow,
+        turn: &mut TurnState<QwenScheduledTurn>,
+        mut logits: Option<MxArray>,
+    ) -> RowStepResult {
+        let next_token = if let Some(mut logits) = logits.take() {
+            let sampled = if turn.payload.reasoning_tracker.should_force_think_end() {
+                let forced = match turn.payload.reasoning_tracker.forced_token_id() {
+                    Ok(token) => token as i32,
+                    Err(error) => return Self::fail(turn, planned, error),
+                };
+                match MxArray::from_int32(&[forced], &[1]) {
+                    Ok(sampled) => sampled,
+                    Err(error) => return Self::fail(turn, planned, error),
+                }
+            } else {
+                turn.payload.profiler.begin("rep_penalty");
+                logits = match engine::penalties::apply_all_penalties(
+                    logits,
+                    &turn.token_history,
+                    &turn.payload.params,
+                ) {
+                    Ok(logits) => logits,
+                    Err(error) => return Self::fail(turn, planned, error),
+                };
+                turn.payload.profiler.end();
+                turn.payload.profiler.begin("sample");
+                let sampled = match sample(&logits, turn.payload.params.sampling_config) {
+                    Ok(sampled) => sampled,
+                    Err(error) => return Self::fail(turn, planned, error),
+                };
+                turn.payload.profiler.end();
+                sampled
+            };
+            turn.payload.profiler.begin("schedule_eval");
+            MxArray::async_eval_arrays(&[&sampled, &logits]);
+            turn.payload.profiler.end();
+            sampled.eval();
+            match sampled.item_at_int32(0) {
+                Ok(token) => Some(token as u32),
+                Err(error) => return Self::fail(turn, planned, error),
+            }
+        } else {
+            None
+        };
+
+        turn.payload.profiler.step();
+        turn.payload.profiler.mark_first_token();
+        let is_reasoning = turn.payload.reasoning_tracker.observe_token(row.token_id);
+        turn.payload.last_is_reasoning = is_reasoning;
+        if row.cancelled {
+            turn.payload.finish_reason = String::from("cancelled");
+        } else {
+            if turn.payload.response.sink().is_some() {
+                Self::stream_token(turn, row.token_id, is_reasoning);
+            }
+            if row.stops_at_eos {
+                turn.payload.finish_reason = String::from("stop");
+            } else if let Some(reason) = row.repetition {
+                turn.payload.finish_reason = reason.to_string();
+            }
+        }
+        let finished = row.terminal || row.at_length;
+        if finished {
+            turn.payload.profiler.snapshot_memory_after();
+            turn.payload.profiler.report();
+        }
+        RowStepResult {
+            seq_id: row.seq_id,
+            num_computed_tokens: planned.num_tokens,
+            generated_token: (!finished).then_some(next_token).flatten(),
+            finished,
+            allocation_blocked: false,
+            prefill_micros: 0,
+        }
+    }
+
     fn execute_decode_batch(
         &mut self,
         plan: &StepPlan,
@@ -1008,6 +1114,333 @@ impl QwenStepExecutor<'_> {
         }
         results
     }
+
+    fn execute_ragged(
+        &mut self,
+        plan: &StepPlan,
+        running: &mut [TurnState<QwenScheduledTurn>],
+    ) -> StepResult {
+        let mut results = Vec::with_capacity(plan.rows.len());
+        results.resize_with(plan.rows.len(), || None);
+        let mut forward_rows = Vec::new();
+        let mut work = Vec::new();
+        let mut terminal_decodes = Vec::new();
+
+        for (plan_index, row) in plan.rows.iter().enumerate() {
+            let turn = running
+                .iter_mut()
+                .find(|turn| turn.seq_id == row.seq_id)
+                .expect("scheduler validated ragged row");
+            match row.kind {
+                StepKind::Prefill => {
+                    if row.cancel_snapshot {
+                        results[plan_index] = Some(Self::fail(
+                            turn,
+                            row,
+                            Error::from_reason("prefill cancelled"),
+                        ));
+                        continue;
+                    }
+                    let start = row.token_start as usize;
+                    let end = start.saturating_add(row.num_tokens as usize);
+                    let source_len = turn
+                        .payload
+                        .preemption_replay
+                        .as_ref()
+                        .map_or(turn.payload.prompt_tokens.len(), |replay| {
+                            replay.tokens.len()
+                        });
+                    if end > source_len {
+                        results[plan_index] = Some(Self::fail(
+                            turn,
+                            row,
+                            Error::from_reason("scheduler prefill slice exceeds prompt"),
+                        ));
+                        continue;
+                    }
+                    let tokens = turn.payload.preemption_replay.as_ref().map_or_else(
+                        || turn.payload.prompt_tokens[start..end].to_vec(),
+                        |replay| replay.tokens[start..end].to_vec(),
+                    );
+                    let suppress_sample = turn
+                        .payload
+                        .preemption_replay
+                        .as_ref()
+                        .is_some_and(|replay| replay.suppress_sample);
+                    turn.payload.profiler.begin_prefill();
+                    forward_rows.push((row.seq_id, tokens));
+                    work.push(PreparedRaggedRow {
+                        plan_index,
+                        seq_id: row.seq_id,
+                        kind: PreparedRaggedKind::Prefill {
+                            end,
+                            source_len,
+                            suppress_sample,
+                        },
+                    });
+                }
+                StepKind::Decode => {
+                    let Some(&token_id) = turn.token_history.last() else {
+                        results[plan_index] = Some(Self::fail(
+                            turn,
+                            row,
+                            Error::from_reason("scheduler decode row has no current token"),
+                        ));
+                        continue;
+                    };
+                    turn.payload.generated_tokens.push(token_id);
+                    let stops_at_eos = token_id == turn.payload.eos_id
+                        || turn.payload.extra_eos_ids.contains(&token_id);
+                    let repetition = check_repetition_cutoff(
+                        &turn.payload.generated_tokens,
+                        turn.payload.params.max_consecutive_tokens,
+                        turn.payload.params.max_ngram_repeats,
+                        turn.payload.params.ngram_size,
+                    );
+                    let terminal = stops_at_eos || row.cancel_snapshot || repetition.is_some();
+                    let at_length = turn.payload.generated_tokens.len()
+                        >= turn.payload.params.max_new_tokens.max(0) as usize;
+                    let prepared = PreparedDecodeRow {
+                        plan_index,
+                        seq_id: row.seq_id,
+                        token_id,
+                        terminal,
+                        at_length,
+                        stops_at_eos,
+                        cancelled: row.cancel_snapshot,
+                        repetition,
+                        batch_index: None,
+                    };
+                    if terminal {
+                        terminal_decodes.push(prepared);
+                    } else {
+                        turn.payload.profiler.begin("forward");
+                        forward_rows.push((row.seq_id, vec![token_id]));
+                        work.push(PreparedRaggedRow {
+                            plan_index,
+                            seq_id: row.seq_id,
+                            kind: PreparedRaggedKind::Decode(prepared),
+                        });
+                    }
+                }
+            }
+        }
+
+        let decode_occupancy = work
+            .iter()
+            .filter(|row| matches!(row.kind, PreparedRaggedKind::Decode(_)))
+            .count();
+        if decode_occupancy != 0 {
+            crate::array::maybe_clear_cache_for_paged_step(plan.global_step as i32);
+        }
+        let prefill_count = work
+            .iter()
+            .filter(|row| matches!(row.kind, PreparedRaggedKind::Prefill { .. }))
+            .count();
+        let forward_started = Instant::now();
+        let forward_result = if forward_rows.is_empty() {
+            Ok(None)
+        } else {
+            let stream = running
+                .iter()
+                .find(|turn| turn.seq_id == work[0].seq_id)
+                .expect("ragged work row remains running")
+                .payload
+                .generation_stream;
+            let _stream_context = StreamContext::new(stream);
+            self.inner
+                .run_paged_ragged_step(&forward_rows, prefill_count != 0)
+                .map(Some)
+        };
+        for row in &work {
+            let turn = running
+                .iter_mut()
+                .find(|turn| turn.seq_id == row.seq_id)
+                .expect("ragged work row remains running");
+            match row.kind {
+                PreparedRaggedKind::Prefill { .. } => turn.payload.profiler.end_prefill(),
+                PreparedRaggedKind::Decode(_) => turn.payload.profiler.end(),
+            }
+        }
+
+        let allocation_blocked = forward_result
+            .as_ref()
+            .is_err_and(|error| is_paged_allocation_blocked(&error.reason));
+        match &forward_result {
+            Err(_) if allocation_blocked => {
+                for row in &work {
+                    let turn = running
+                        .iter_mut()
+                        .find(|turn| turn.seq_id == row.seq_id)
+                        .expect("ragged work row remains running");
+                    if let PreparedRaggedKind::Decode(decode) = &row.kind {
+                        let popped = turn.payload.generated_tokens.pop();
+                        debug_assert_eq!(popped, Some(decode.token_id));
+                    }
+                    results[row.plan_index] = Some(Self::blocked(&plan.rows[row.plan_index]));
+                }
+            }
+            Err(error) => {
+                for row in &work {
+                    let turn = running
+                        .iter_mut()
+                        .find(|turn| turn.seq_id == row.seq_id)
+                        .expect("ragged work row remains running");
+                    results[row.plan_index] = Some(Self::fail(
+                        turn,
+                        &plan.rows[row.plan_index],
+                        Error::from_reason(error.reason.clone()),
+                    ));
+                }
+            }
+            Ok(Some(logits)) => {
+                for (logits_index, row) in work.iter().enumerate() {
+                    let planned = &plan.rows[row.plan_index];
+                    let turn = running
+                        .iter_mut()
+                        .find(|turn| turn.seq_id == row.seq_id)
+                        .expect("ragged work row remains running");
+                    let row_logits = match logits
+                        .slice_axis(0, logits_index as i64, logits_index as i64 + 1)
+                        .and_then(|logits_row| match &row.kind {
+                            PreparedRaggedKind::Decode(_) => logits_row.squeeze(Some(&[1])),
+                            PreparedRaggedKind::Prefill { .. } => logits_row.squeeze(Some(&[0, 1])),
+                        }) {
+                        Ok(logits) => logits,
+                        Err(error) => {
+                            results[row.plan_index] = Some(Self::fail(turn, planned, error));
+                            continue;
+                        }
+                    };
+                    let result = match &row.kind {
+                        PreparedRaggedKind::Decode(decode) => {
+                            let logits = (!decode.at_length).then_some(row_logits);
+                            Self::finish_prepared_decode(decode, planned, turn, logits)
+                        }
+                        PreparedRaggedKind::Prefill {
+                            end,
+                            source_len,
+                            suppress_sample,
+                        } => {
+                            if end < source_len {
+                                RowStepResult {
+                                    seq_id: row.seq_id,
+                                    num_computed_tokens: planned.num_tokens,
+                                    generated_token: None,
+                                    finished: false,
+                                    allocation_blocked: false,
+                                    prefill_micros: 0,
+                                }
+                            } else if *suppress_sample {
+                                turn.payload.preemption_replay = None;
+                                RowStepResult {
+                                    seq_id: row.seq_id,
+                                    num_computed_tokens: planned.num_tokens,
+                                    generated_token: None,
+                                    finished: false,
+                                    allocation_blocked: false,
+                                    prefill_micros: 0,
+                                }
+                            } else {
+                                turn.payload.preemption_replay = None;
+                                let penalized = match engine::penalties::apply_all_penalties(
+                                    row_logits,
+                                    &turn.token_history,
+                                    &turn.payload.params,
+                                ) {
+                                    Ok(logits) => logits,
+                                    Err(error) => {
+                                        results[row.plan_index] =
+                                            Some(Self::fail(turn, planned, error));
+                                        continue;
+                                    }
+                                };
+                                let sampled =
+                                    match sample(&penalized, turn.payload.params.sampling_config) {
+                                        Ok(sampled) => sampled,
+                                        Err(error) => {
+                                            results[row.plan_index] =
+                                                Some(Self::fail(turn, planned, error));
+                                            continue;
+                                        }
+                                    };
+                                sampled.eval();
+                                if turn.payload.params.report_performance {
+                                    turn.payload.first_token_instant = Some(Instant::now());
+                                }
+                                if turn.payload.params.max_new_tokens == 0 {
+                                    turn.payload.profiler.snapshot_memory_after();
+                                    turn.payload.profiler.report();
+                                    RowStepResult {
+                                        seq_id: row.seq_id,
+                                        num_computed_tokens: planned.num_tokens,
+                                        generated_token: None,
+                                        finished: true,
+                                        allocation_blocked: false,
+                                        prefill_micros: 0,
+                                    }
+                                } else {
+                                    match sampled.item_at_int32(0) {
+                                        Ok(token) => RowStepResult {
+                                            seq_id: row.seq_id,
+                                            num_computed_tokens: planned.num_tokens,
+                                            generated_token: Some(token as u32),
+                                            finished: false,
+                                            allocation_blocked: false,
+                                            prefill_micros: 0,
+                                        },
+                                        Err(error) => Self::fail(turn, planned, error),
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    results[row.plan_index] = Some(result);
+                }
+                synchronize_and_clear_cache();
+                if prefill_count != 0 {
+                    let prefill_micros = Self::elapsed_micros(forward_started)
+                        .div_ceil(prefill_count as u64)
+                        .max(1);
+                    for row in &work {
+                        if matches!(&row.kind, PreparedRaggedKind::Prefill { .. })
+                            && let Some(result) = results[row.plan_index].as_mut()
+                            && !result.allocation_blocked
+                        {
+                            result.prefill_micros = prefill_micros;
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+        }
+
+        for decode in terminal_decodes {
+            let planned = &plan.rows[decode.plan_index];
+            let turn = running
+                .iter_mut()
+                .find(|turn| turn.seq_id == decode.seq_id)
+                .expect("terminal ragged decode remains running");
+            results[decode.plan_index] =
+                Some(Self::finish_prepared_decode(&decode, planned, turn, None));
+        }
+
+        StepResult {
+            rows: results
+                .into_iter()
+                .map(|result| result.expect("every ragged plan row executed"))
+                .collect(),
+            executed_decode_batch: if allocation_blocked {
+                0
+            } else {
+                decode_occupancy
+            },
+            rows_alloc_evicted: running
+                .iter()
+                .filter(|turn| turn.payload.allocation_failed)
+                .count() as u32,
+        }
+    }
 }
 
 impl StepExecutor<QwenScheduledTurn> for QwenStepExecutor<'_> {
@@ -1018,6 +1451,9 @@ impl StepExecutor<QwenScheduledTurn> for QwenStepExecutor<'_> {
         plan: &StepPlan,
         running: &mut [TurnState<QwenScheduledTurn>],
     ) -> std::result::Result<StepResult, Self::Error> {
+        if self.ragged_step {
+            return Ok(self.execute_ragged(plan, running));
+        }
         let mut results = Vec::with_capacity(plan.rows.len());
         results.resize_with(plan.rows.len(), || None);
         let decode_count = plan
@@ -1082,6 +1518,9 @@ pub(crate) struct QwenSchedulerState {
     owner_sequences: HashMap<String, SeqId>,
     owner_histories: HashMap<String, Vec<u32>>,
     next_seq_id: SeqId,
+    /// Read exactly once when this resident model-thread state is created.
+    /// Tests may construct separate model instances for same-binary A/B.
+    ragged_step: bool,
 }
 
 impl QwenSchedulerState {
@@ -1098,6 +1537,7 @@ impl QwenSchedulerState {
             owner_sequences: HashMap::new(),
             owner_histories: HashMap::new(),
             next_seq_id: 1,
+            ragged_step: scheduler_ragged_step_enabled(),
         }
     }
 
@@ -2033,6 +2473,7 @@ impl QwenSchedulerState {
         let action = {
             let mut executor = QwenStepExecutor {
                 inner: &mut self.inner,
+                ragged_step: self.ragged_step,
             };
             self.scheduler.drive_once(&mut executor)
         };
@@ -2793,7 +3234,7 @@ impl Qwen3Inner {
             planned_rows.push((seq_id, position));
         }
 
-        let mut recorded = Vec::with_capacity(rows.len());
+        let mut recorded: Vec<SeqId> = Vec::with_capacity(rows.len());
         for &(seq_id, token) in rows {
             let result = self
                 .paged_adapter
@@ -2842,6 +3283,132 @@ impl Qwen3Inner {
                 &planned_rows,
             )?;
         }
+        hidden_states = self.final_norm.forward(&hidden_states)?;
+        if self.config.tie_word_embeddings {
+            let embedding_weight = self.embedding.get_weight();
+            hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)
+        } else {
+            self.lm_head.forward(&hidden_states)
+        }
+    }
+
+    /// Execute the scheduler's mixed token-budget plan as one packed varlen
+    /// model forward. Each tuple carries one request's contiguous scheduled
+    /// token slice; returned logits contain only that slice's final query row,
+    /// in the same request order.
+    pub(crate) fn run_paged_ragged_step(
+        &mut self,
+        rows: &[(SeqId, Vec<u32>)],
+        contains_prefill: bool,
+    ) -> Result<MxArray> {
+        if rows.is_empty() {
+            return Err(Error::from_reason(
+                "run_paged_ragged_step requires at least one row",
+            ));
+        }
+        let adapter = self
+            .paged_adapter
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("run_paged_ragged_step: paged_adapter is None"))?;
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut planned_rows = Vec::with_capacity(rows.len());
+        let mut total_queries = 0u32;
+        for (seq_id, tokens) in rows {
+            if !seen.insert(*seq_id) {
+                return Err(Error::from_reason(format!(
+                    "run_paged_ragged_step received duplicate sequence {seq_id}"
+                )));
+            }
+            let query_len = u32::try_from(tokens.len()).map_err(|_| {
+                Error::from_reason(format!(
+                    "run_paged_ragged_step: sequence {seq_id} query length exceeds u32::MAX"
+                ))
+            })?;
+            if query_len == 0 {
+                return Err(Error::from_reason(format!(
+                    "run_paged_ragged_step: sequence {seq_id} has an empty token slice"
+                )));
+            }
+            let position = adapter.current_token_count_for(*seq_id).ok_or_else(|| {
+                Error::from_reason(format!("run_paged_ragged_step: unknown sequence {seq_id}"))
+            })?;
+            total_queries = total_queries
+                .checked_add(query_len)
+                .ok_or_else(|| Error::from_reason("run_paged_ragged_step query count overflow"))?;
+            planned_rows.push(PagedRaggedRow {
+                seq_id: *seq_id,
+                first_logical_position: position,
+                query_len,
+            });
+        }
+
+        let mut recorded: Vec<usize> = Vec::with_capacity(rows.len());
+        for (row_index, (seq_id, tokens)) in rows.iter().enumerate() {
+            let result = self
+                .paged_adapter
+                .as_mut()
+                .expect("adapter validated above")
+                .record_tokens_for(*seq_id, tokens);
+            if let Err(error) = result {
+                for &recorded_index in recorded.iter().rev() {
+                    let recorded_row = planned_rows[recorded_index];
+                    let adapter = self
+                        .paged_adapter
+                        .as_mut()
+                        .expect("adapter validated above");
+                    adapter.activate_request(recorded_row.seq_id).map_err(|rollback| {
+                        Error::from_reason(format!(
+                            "run_paged_ragged_step: record failed for sequence {seq_id}: {error}; rollback activation for sequence {} also failed: {rollback}",
+                            recorded_row.seq_id
+                        ))
+                    })?;
+                    adapter
+                        .rollback_last_tokens(recorded_row.query_len)
+                        .map_err(|rollback| {
+                            Error::from_reason(format!(
+                                "run_paged_ragged_step: record failed for sequence {seq_id}: {error}; rollback for sequence {} also failed: {rollback}",
+                                recorded_row.seq_id
+                            ))
+                        })?;
+                }
+                return Err(Error::from_reason(format!(
+                    "run_paged_ragged_step: failed to record sequence {seq_id}: {error}"
+                )));
+            }
+            recorded.push(row_index);
+        }
+
+        let mut token_ids = Vec::with_capacity(total_queries as usize);
+        let mut last_indices = Vec::with_capacity(rows.len());
+        let mut offset = 0u32;
+        for (_, tokens) in rows {
+            token_ids.extend_from_slice(tokens);
+            offset = offset.saturating_add(tokens.len() as u32);
+            last_indices.push((offset - 1) as i32);
+        }
+        let input_ids = MxArray::from_uint32(&token_ids, &[i64::from(total_queries), 1])?;
+        let mut hidden_states = self.embedding.forward(&input_ids)?;
+        for layer_idx in 0..self.layers.len() {
+            let layer: &TransformerBlock = unsafe {
+                let pointer = self.layers.as_ptr().add(layer_idx);
+                &*pointer
+            };
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_ragged_step: paged_adapter dropped")
+            })?;
+            hidden_states = layer.forward_paged_adapter_ragged(
+                &hidden_states,
+                adapter,
+                layer_idx as u32,
+                &planned_rows,
+            )?;
+            if contains_prefill {
+                crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
+            }
+        }
+
+        let last_indices = MxArray::from_int32(&last_indices, &[rows.len() as i64])?;
+        hidden_states = hidden_states.take(&last_indices, 0)?;
         hidden_states = self.final_norm.forward(&hidden_states)?;
         if self.config.tie_word_embeddings {
             let embedding_weight = self.embedding.get_weight();
@@ -6762,6 +7329,187 @@ mod tests {
             .expect("serial adapter")
             .release_all_requests()
             .expect("release serial rows");
+    }
+
+    #[test]
+    fn ragged_mixed_prefill_and_decode_matches_serial_row_tokens() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
+        let config = paged_tiny_config(Some(true));
+        let mut ragged = match super::Qwen3Inner::new(config.clone()) {
+            Ok(inner) => inner,
+            Err(error) if error.to_string().contains("No Metal device") => {
+                eprintln!("skipping (no Metal device): {error}");
+                return;
+            }
+            Err(error) => panic!("ragged inner construction failed: {error}"),
+        };
+        cast_paged_inner_to_bf16(&mut ragged);
+        let mut serial = super::Qwen3Inner::new(config.clone()).expect("serial inner");
+        serial.embedding = ragged.embedding.clone();
+        serial.layers = ragged.layers.clone();
+        serial.final_norm = ragged.final_norm.clone();
+        serial.lm_head = ragged.lm_head.clone();
+
+        let decode_prompt = vec![10, 20, 30, 40];
+        for inner in [&mut ragged, &mut serial] {
+            if let Err(error) = prime_paged_request(inner, 11, &decode_prompt) {
+                let message = error.to_string();
+                if message.contains("Metal GPU not available")
+                    || message.contains("No Metal device")
+                {
+                    eprintln!("skipping ragged mixed step: {message}");
+                    return;
+                }
+                panic!("decode request prime failed: {message}");
+            }
+            let adapter = inner.paged_adapter.as_mut().expect("paged adapter");
+            adapter.begin_request(22).expect("begin prefill row");
+            adapter
+                .allocate_suffix_blocks_for(22, 3)
+                .expect("allocate prefill row");
+        }
+
+        let ragged_started = Instant::now();
+        let ragged_logits = ragged
+            .run_paged_ragged_step(&[(11, vec![50]), (22, vec![7, 8, 9])], true)
+            .expect("one mixed ragged forward");
+        ragged_logits.eval();
+        let ragged_elapsed = ragged_started.elapsed();
+        assert_eq!(
+            ragged_logits.shape().expect("ragged shape").as_ref(),
+            [2, 1, config.vocab_size as i64]
+        );
+
+        let positions = MxArray::from_int32(&[0], &[1]).expect("positions");
+        let serial_started = Instant::now();
+        serial
+            .paged_adapter
+            .as_mut()
+            .expect("serial adapter")
+            .activate_request(11)
+            .expect("activate serial decode");
+        let serial_decode = serial
+            .run_paged_decode_step(50, serial.layers.len(), &positions)
+            .expect("serial decode");
+        serial
+            .paged_adapter
+            .as_mut()
+            .expect("serial adapter")
+            .activate_request(22)
+            .expect("activate serial prefill");
+        let serial_prefill_hidden = serial
+            .run_paged_prefill_one_chunk(&[7, 8, 9], 0, serial.layers.len(), &positions)
+            .expect("serial prefill");
+        let serial_prefill = serial
+            .project_last_token_logits(&serial_prefill_hidden)
+            .expect("serial prefill logits")
+            .reshape(&[1, 1, config.vocab_size as i64])
+            .expect("prefill logits row");
+        let serial_logits = MxArray::concatenate(&serial_decode, &serial_prefill, 0)
+            .expect("concatenate serial rows");
+        serial_logits.eval();
+        let serial_elapsed = serial_started.elapsed();
+        eprintln!(
+            "mixed-step cold wall: ragged_one_forward={:.2}ms serial_two_forwards={:.2}ms speedup={:.2}x",
+            ragged_elapsed.as_secs_f64() * 1_000.0,
+            serial_elapsed.as_secs_f64() * 1_000.0,
+            serial_elapsed.as_secs_f64() / ragged_elapsed.as_secs_f64()
+        );
+        let ragged_tokens = ragged_logits
+            .argmax(-1, Some(false))
+            .expect("ragged argmax")
+            .to_uint32()
+            .expect("ragged tokens")
+            .to_vec();
+        let serial_tokens = serial_logits
+            .argmax(-1, Some(false))
+            .expect("serial argmax")
+            .to_uint32()
+            .expect("serial tokens")
+            .to_vec();
+        assert_eq!(
+            ragged_tokens, serial_tokens,
+            "mixed ragged logits selected the wrong request boundary"
+        );
+        assert_eq!(
+            ragged
+                .paged_adapter
+                .as_ref()
+                .expect("ragged adapter")
+                .current_token_count_for(11),
+            Some(5)
+        );
+        assert_eq!(
+            ragged
+                .paged_adapter
+                .as_ref()
+                .expect("ragged adapter")
+                .current_token_count_for(22),
+            Some(3)
+        );
+
+        // The first call above includes one-time Metal graph/kernel setup.
+        // Time a second equivalent mixed step after both routes are warm so
+        // the log compares executor shape rather than compilation order.
+        let ragged_steady_started = Instant::now();
+        let ragged_steady = ragged
+            .run_paged_ragged_step(&[(11, vec![51]), (22, vec![10, 11, 12])], true)
+            .expect("warm ragged mixed forward");
+        ragged_steady.eval();
+        let ragged_steady_elapsed = ragged_steady_started.elapsed();
+
+        let serial_steady_started = Instant::now();
+        serial
+            .paged_adapter
+            .as_mut()
+            .expect("serial adapter")
+            .activate_request(11)
+            .expect("activate steady serial decode");
+        let serial_steady_decode = serial
+            .run_paged_decode_step(51, serial.layers.len(), &positions)
+            .expect("steady serial decode");
+        serial
+            .paged_adapter
+            .as_mut()
+            .expect("serial adapter")
+            .activate_request(22)
+            .expect("activate steady serial prefill");
+        let serial_steady_prefill_hidden = serial
+            .run_paged_prefill_one_chunk(&[10, 11, 12], 3, serial.layers.len(), &positions)
+            .expect("steady serial prefill");
+        let serial_steady_prefill = serial
+            .project_last_token_logits(&serial_steady_prefill_hidden)
+            .expect("steady serial prefill logits")
+            .reshape(&[1, 1, config.vocab_size as i64])
+            .expect("steady prefill logits row");
+        let serial_steady = MxArray::concatenate(&serial_steady_decode, &serial_steady_prefill, 0)
+            .expect("concatenate steady serial rows");
+        serial_steady.eval();
+        let serial_steady_elapsed = serial_steady_started.elapsed();
+        assert_eq!(
+            ragged_steady
+                .argmax(-1, Some(false))
+                .expect("steady ragged argmax")
+                .to_uint32()
+                .expect("steady ragged tokens")
+                .to_vec(),
+            serial_steady
+                .argmax(-1, Some(false))
+                .expect("steady serial argmax")
+                .to_uint32()
+                .expect("steady serial tokens")
+                .to_vec(),
+            "warm mixed ragged step diverged from serial rows"
+        );
+        eprintln!(
+            "mixed-step warm wall: ragged_one_forward={:.2}ms serial_two_forwards={:.2}ms speedup={:.2}x",
+            ragged_steady_elapsed.as_secs_f64() * 1_000.0,
+            serial_steady_elapsed.as_secs_f64() * 1_000.0,
+            serial_steady_elapsed.as_secs_f64() / ragged_steady_elapsed.as_secs_f64()
+        );
     }
 
     /// `use_block_paged_cache: true` round-trips correctly through serde —

@@ -24,6 +24,24 @@ impl ForceSerialGuard {
     }
 }
 
+struct RaggedStepGuard;
+
+impl RaggedStepGuard {
+    fn enable() -> Self {
+        // The uniform model thread is dropped before this process-level test
+        // switch. The replacement resident model reads the mode once during
+        // construction, giving us a same-binary three-way oracle.
+        unsafe { std::env::set_var("MLX_SCHED_RAGGED_STEP", "1") };
+        Self
+    }
+}
+
+impl Drop for RaggedStepGuard {
+    fn drop(&mut self) {
+        unsafe { std::env::remove_var("MLX_SCHED_RAGGED_STEP") };
+    }
+}
+
 impl Drop for ForceSerialGuard {
     fn drop(&mut self) {
         unsafe { std::env::remove_var("MLX_SERVE_FORCE_SERIAL") };
@@ -172,10 +190,50 @@ async fn serial_uniform_batch_and_interleaved_streams_are_token_identical() {
             .collect::<Vec<_>>()
     );
 
-    model.reset_caches().await.expect("reset before streams");
+    drop(model);
+    let ragged_guard = RaggedStepGuard::enable();
+    let ragged_model = load_with_thread(&path.to_string_lossy())
+        .await
+        .expect("load ragged qwen3");
+    let ragged_started = Instant::now();
+    let ragged = join_all(prompts.iter().enumerate().map(|(index, prompt)| {
+        ragged_model.chat_session_start(
+            vec![user_message(prompt)],
+            Some(config(&format!("ragged-{index}"))),
+        )
+    }))
+    .await;
+    let ragged_elapsed = ragged_started.elapsed();
+    for ((expected, actual), prompt) in serial.iter().zip(ragged).zip(prompts) {
+        assert_same(expected, &actual.expect("ragged turn"), prompt);
+    }
+    let ragged_stats = ragged_model
+        .scheduler_stats()
+        .await
+        .expect("ragged scheduler stats");
+    assert!(
+        ragged_stats.max_batch_occupancy >= 8,
+        "expected a real N=8 ragged decode step, stats max={} hist={:?}",
+        ragged_stats.max_batch_occupancy,
+        ragged_stats
+            .decode_batch_occupancy_hist
+            .iter()
+            .map(|bucket| (bucket.occupancy, bucket.steps))
+            .collect::<Vec<_>>()
+    );
+    eprintln!(
+        "stage2 ragged N=8 wall={:.2}ms, uniform/ragged={:.2}x",
+        ragged_elapsed.as_secs_f64() * 1_000.0,
+        batched_elapsed.as_secs_f64() / ragged_elapsed.as_secs_f64()
+    );
+
+    ragged_model
+        .reset_caches()
+        .await
+        .expect("reset before streams");
     let mut receivers = Vec::new();
     for (index, prompt) in prompts[..2].iter().enumerate() {
-        let (_handle, receiver) = model
+        let (_handle, receiver) = ragged_model
             .chat_stream_session_start_for_test(
                 vec![user_message(prompt)],
                 Some(config(&format!("stream-{index}"))),
@@ -196,4 +254,6 @@ async fn serial_uniform_batch_and_interleaved_streams_are_token_identical() {
         );
         assert_eq!(terminal.num_tokens, Some(expected.num_tokens));
     }
+    drop(ragged_model);
+    drop(ragged_guard);
 }

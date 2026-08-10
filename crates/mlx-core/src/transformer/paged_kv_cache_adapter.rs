@@ -1578,6 +1578,18 @@ pub struct ColdCaptureOutcome {
 
 pub type SeqId = u32;
 
+/// One request-local slice inside a packed ragged scheduler step.
+///
+/// Query rows for each entry are contiguous in scheduler order. The adapter
+/// uses `first_logical_position` both for K/V slot writes and to verify that
+/// the request cursor was advanced by exactly `query_len` before execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PagedRaggedRow {
+    pub seq_id: SeqId,
+    pub first_logical_position: u32,
+    pub query_len: u32,
+}
+
 /// All state whose meaning is scoped to one logical sequence.
 ///
 /// `PagedKVCacheAdapter` keeps the selected sequence in a hot workspace so
@@ -3567,6 +3579,19 @@ impl PagedKVCacheAdapter {
         self.record_tokens(&[token])
     }
 
+    /// Record one scheduler-owned slice against exactly one sequence.
+    /// Allocation is atomic for the slice: exhaustion leaves the request
+    /// cursor unchanged, allowing the executor to roll back earlier peers and
+    /// hand the squeeze to scheduler preemption policy.
+    pub(crate) fn record_tokens_for(
+        &mut self,
+        seq_id: SeqId,
+        tokens: &[u32],
+    ) -> Result<(), String> {
+        self.activate_request(seq_id)?;
+        self.record_tokens(tokens)
+    }
+
     /// Roll back the most recent `n` tokens from `request_tokens` and
     /// `block_table.num_tokens`. Used by the C++ compiled-paged dispatcher
     /// when a forward step fails after `record_tokens` has already advanced
@@ -4302,6 +4327,129 @@ impl PagedKVCacheAdapter {
         self.replace_native_pool_arrays(layer_idx, k_out, v_out)
     }
 
+    /// One graph-native K/V write for packed ragged prefill/decode slices.
+    /// Query tokens are laid out as the concatenation of `rows`, in order.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn update_keys_values_native_ragged(
+        &mut self,
+        layer_idx: u32,
+        keys: &MxArray,
+        values: &MxArray,
+        rows: &[PagedRaggedRow],
+    ) -> Result<(), String> {
+        if rows.is_empty() {
+            return Err("update_keys_values_native_ragged requires at least one row".to_string());
+        }
+        if layer_idx as usize >= self.layer_kv_pool.num_layers() {
+            return Err(format!(
+                "update_keys_values_native_ragged: layer_idx {layer_idx} out of range (num_layers = {})",
+                self.layer_kv_pool.num_layers()
+            ));
+        }
+        let total_queries = rows.iter().try_fold(0u32, |total, row| {
+            if row.query_len == 0 {
+                return Err(format!(
+                    "update_keys_values_native_ragged: sequence {} has an empty query slice",
+                    row.seq_id
+                ));
+            }
+            total
+                .checked_add(row.query_len)
+                .ok_or_else(|| "update_keys_values_native_ragged query count overflow".to_string())
+        })?;
+        let keys_meta = KvTensorMeta::from_array(keys, "keys")?;
+        let values_meta = KvTensorMeta::from_array(values, "values")?;
+        let info = validate_kv_input(&keys_meta, &values_meta, self.layer_kv_pool.config())?;
+        if info.num_tokens != total_queries {
+            return Err(format!(
+                "update_keys_values_native_ragged: keys/values contain {} query rows but metadata names {total_queries}",
+                info.num_tokens
+            ));
+        }
+
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut slots = Vec::with_capacity(total_queries as usize);
+        for row in rows {
+            if !seen.insert(row.seq_id) {
+                return Err(format!(
+                    "update_keys_values_native_ragged received duplicate sequence {}",
+                    row.seq_id
+                ));
+            }
+            if self.active_seq != Some(row.seq_id) && !self.requests.contains_key(&row.seq_id) {
+                return Err(format!(
+                    "update_keys_values_native_ragged: unknown sequence {}",
+                    row.seq_id
+                ));
+            }
+            self.activate_request(row.seq_id)?;
+            let current = self.request_tokens.len() as u32;
+            let expected_first = current.checked_sub(row.query_len).ok_or_else(|| {
+                format!(
+                    "update_keys_values_native_ragged: sequence {} recorded {current} tokens for query length {}",
+                    row.seq_id, row.query_len
+                )
+            })?;
+            if row.first_logical_position != expected_first {
+                return Err(format!(
+                    "update_keys_values_native_ragged: sequence {} position {} does not align with its recorded suffix (expected {expected_first}, current_token_count {current}, query_len {})",
+                    row.seq_id, row.first_logical_position, row.query_len
+                ));
+            }
+            slots.extend(self.build_slot_mapping(row.first_logical_position, row.query_len)?);
+        }
+        let slot_mapping = MxArray::from_int64(&slots, &[i64::from(total_queries)])
+            .map_err(|error| format!("update_keys_values_native_ragged slot_mapping: {error}"))?;
+        MxArray::eval_arrays(&[&slot_mapping]).map_err(|error| {
+            format!("update_keys_values_native_ragged slot_mapping eval: {error}")
+        })?;
+
+        let (k_pool, v_pool) = self.native_pool_arrays_for_layer(layer_idx)?;
+        let k_scale = self.k_scale_array(layer_idx)?;
+        let v_scale = self.v_scale_array(layer_idx)?;
+        let mut out_k_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_v_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            mlx_sys::mlx_paged_kv_write_forward(
+                k_pool.as_raw_ptr(),
+                v_pool.as_raw_ptr(),
+                keys.as_raw_ptr(),
+                values.as_raw_ptr(),
+                slot_mapping.as_raw_ptr(),
+                k_scale.as_raw_ptr(),
+                v_scale.as_raw_ptr(),
+                self.block_size as i32,
+                self.layer_kv_pool.config().num_kv_heads as i32,
+                self.layer_kv_pool.config().head_size as i32,
+                self.kv_dtype_raw()?,
+                &mut out_k_pool,
+                &mut out_v_pool,
+            )
+        };
+        if !ok || out_k_pool.is_null() || out_v_pool.is_null() {
+            unsafe {
+                if !out_k_pool.is_null() {
+                    mlx_sys::mlx_array_delete(out_k_pool);
+                }
+                if !out_v_pool.is_null() {
+                    mlx_sys::mlx_array_delete(out_v_pool);
+                }
+            }
+            return Err(format!(
+                "update_keys_values_native_ragged: mlx_paged_kv_write_forward returned null (layer={layer_idx}, queries={total_queries})"
+            ));
+        }
+        let k_out = MxArray::from_handle(out_k_pool, "paged_kv_write_forward ragged k_pool")
+            .map_err(|error| {
+                format!("update_keys_values_native_ragged: failed to wrap k_pool output: {error}")
+            })?;
+        let v_out = MxArray::from_handle(out_v_pool, "paged_kv_write_forward ragged v_pool")
+            .map_err(|error| {
+                format!("update_keys_values_native_ragged: failed to wrap v_pool output: {error}")
+            })?;
+        self.replace_native_pool_arrays(layer_idx, k_out, v_out)
+    }
+
     /// Non-macOS stub: the underlying Metal kernel is macOS-only. Calling
     /// this on another platform is a programming error rather than a
     /// runtime fallback.
@@ -4337,6 +4485,20 @@ impl PagedKVCacheAdapter {
     ) -> Result<(), String> {
         Err(
             "update_keys_values_native_batched is only supported on macOS (Metal backend)"
+                .to_string(),
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn update_keys_values_native_ragged(
+        &mut self,
+        _layer_idx: u32,
+        _keys: &MxArray,
+        _values: &MxArray,
+        _rows: &[PagedRaggedRow],
+    ) -> Result<(), String> {
+        Err(
+            "update_keys_values_native_ragged is only supported on macOS (Metal backend)"
                 .to_string(),
         )
     }
@@ -4534,6 +4696,52 @@ impl PagedKVCacheAdapter {
         Ok((block_tables, seq_lens, max_context_len))
     }
 
+    /// Materialize the real cumulative-query metadata for one packed ragged
+    /// step. Block tables and context lengths remain request-local rows;
+    /// `cu_seqlens_q` maps the packed query stream back to those rows.
+    #[cfg(target_os = "macos")]
+    fn ragged_attention_inputs(
+        &mut self,
+        rows: &[PagedRaggedRow],
+    ) -> Result<(MxArray, MxArray, MxArray, u32, u32), String> {
+        if rows.is_empty() {
+            return Err("ragged_attention_inputs requires at least one row".to_string());
+        }
+        let seq_ids = rows.iter().map(|row| row.seq_id).collect::<Vec<_>>();
+        let (block_tables, seq_lens, max_context_len) =
+            self.decode_attention_inputs_batched(&seq_ids)?;
+        let mut total_queries = 0u32;
+        let mut cumulative = Vec::with_capacity(rows.len() + 1);
+        cumulative.push(0i32);
+        for row in rows {
+            if row.query_len == 0 {
+                return Err(format!(
+                    "ragged_attention_inputs: sequence {} has an empty query slice",
+                    row.seq_id
+                ));
+            }
+            total_queries = total_queries
+                .checked_add(row.query_len)
+                .ok_or_else(|| "ragged_attention_inputs query count overflow".to_string())?;
+            cumulative.push(
+                i32::try_from(total_queries).map_err(|_| {
+                    "ragged_attention_inputs query count exceeds i32::MAX".to_string()
+                })?,
+            );
+        }
+        let cu_seqlens_q = MxArray::from_int32(&cumulative, &[cumulative.len() as i64])
+            .map_err(|error| format!("ragged_attention_inputs cu_seqlens_q: {error}"))?;
+        MxArray::eval_arrays(&[&cu_seqlens_q])
+            .map_err(|error| format!("ragged_attention_inputs metadata eval: {error}"))?;
+        Ok((
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+            max_context_len,
+            total_queries,
+        ))
+    }
+
     /// Graph-native decode attention. Unlike [`Self::gather_kv_for_decode`],
     /// this consumes the MLX K/V pool arrays tracked in `native_pool_arrays`,
     /// so a lazy native `paged_kv_write` can feed the attention read through
@@ -4659,6 +4867,117 @@ impl PagedKVCacheAdapter {
         })
     }
 
+    /// Graph-native varlen attention for mixed prefill/decode slices.
+    ///
+    /// `queries` is `[sum(query_len), num_query_heads, head_size]` and follows
+    /// the exact row order in `rows`. The kernel derives each query's causal
+    /// logical position from the request's final `seq_len` and the real
+    /// `cu_seqlens_q` boundaries.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn gather_kv_for_ragged_graph(
+        &mut self,
+        layer_idx: u32,
+        queries: &MxArray,
+        rows: &[PagedRaggedRow],
+        scale: f32,
+        softcap: f32,
+    ) -> Result<MxArray, String> {
+        if layer_idx as usize >= self.layer_kv_pool.num_layers() {
+            return Err(format!(
+                "gather_kv_for_ragged_graph: layer_idx {layer_idx} out of range (num_layers = {})",
+                self.layer_kv_pool.num_layers()
+            ));
+        }
+        let q_meta = KvTensorMeta::from_array(queries, "ragged_queries")?;
+        if q_meta.ndim != 3 || q_meta.shape.len() != 3 {
+            return Err(format!(
+                "gather_kv_for_ragged_graph: queries must be [total_queries, num_query_heads, head_size], got ndim {} shape {:?}",
+                q_meta.ndim, q_meta.shape
+            ));
+        }
+        if q_meta.shape[1] <= 0 {
+            return Err("gather_kv_for_ragged_graph requires at least one query head".to_string());
+        }
+        if q_meta.shape[2] != self.layer_kv_pool.config().head_size as i64 {
+            return Err(format!(
+                "gather_kv_for_ragged_graph: query head size {} does not match pool head size {}",
+                q_meta.shape[2],
+                self.layer_kv_pool.config().head_size
+            ));
+        }
+        let query_dtype = match q_meta.dtype {
+            DType::Float16 => mlx_paged_attn::metal::MetalDtype::Float16,
+            DType::BFloat16 => mlx_paged_attn::metal::MetalDtype::BFloat16,
+            other => {
+                return Err(format!(
+                    "gather_kv_for_ragged_graph: unsupported query dtype {other:?} (expected Float16 or BFloat16)"
+                ));
+            }
+        };
+        let cache_dtype = self.layer_kv_pool.cache_dtype();
+        if !cache_dtype.is_fp8() && query_dtype != cache_dtype {
+            return Err(format!(
+                "gather_kv_for_ragged_graph: query_dtype ({query_dtype:?}) must equal cache_dtype ({cache_dtype:?}) for non-FP8 caches"
+            ));
+        }
+        let (block_tables, seq_lens, cu_seqlens_q, max_context_len, total_queries) =
+            self.ragged_attention_inputs(rows)?;
+        if q_meta.shape[0] != i64::from(total_queries) {
+            return Err(format!(
+                "gather_kv_for_ragged_graph: query rows {} do not match metadata total {total_queries}",
+                q_meta.shape[0]
+            ));
+        }
+        let num_query_heads = u32::try_from(q_meta.shape[1])
+            .map_err(|_| "gather_kv_for_ragged_graph query head count overflow".to_string())?;
+        if !paged_attention_v2_aux_fits(
+            PagedAttentionV2Layout::Varlen,
+            total_queries,
+            num_query_heads,
+            self.layer_kv_pool.config().num_kv_heads,
+            max_context_len,
+            self.layer_kv_pool.config().head_size,
+        ) {
+            return Err(format!(
+                "gather_kv_for_ragged_graph: paged-attention V2 metadata or auxiliary buffer would exceed INT_MAX (total_queries={total_queries}, num_query_heads={num_query_heads}, max_context_len={max_context_len})"
+            ));
+        }
+
+        let (k_pool, v_pool) = self.native_pool_arrays_for_layer(layer_idx)?;
+        let k_scale = self.k_scale_array(layer_idx)?;
+        let v_scale = self.v_scale_array(layer_idx)?;
+        let graph_softcap = if softcap == 1.0 { 0.0 } else { softcap };
+        let raw = unsafe {
+            mlx_sys::mlx_paged_attention_varlen_forward(
+                queries.as_raw_ptr(),
+                k_pool.as_raw_ptr(),
+                v_pool.as_raw_ptr(),
+                block_tables.as_raw_ptr(),
+                seq_lens.as_raw_ptr(),
+                cu_seqlens_q.as_raw_ptr(),
+                k_scale.as_raw_ptr(),
+                v_scale.as_raw_ptr(),
+                scale,
+                graph_softcap,
+                0,
+                self.block_size as i32,
+                num_query_heads as i32,
+                self.layer_kv_pool.config().num_kv_heads as i32,
+                self.layer_kv_pool.config().head_size as i32,
+                self.kv_dtype_raw()?,
+            )
+        };
+        if raw.is_null() {
+            return Err(format!(
+                "gather_kv_for_ragged_graph: mlx_paged_attention_varlen_forward returned null (layer={layer_idx}, sequences={}, total_queries={total_queries}, max_context_len={max_context_len})",
+                rows.len()
+            ));
+        }
+        MxArray::from_handle(raw, "gather_kv_for_ragged_graph").map_err(|error| {
+            format!("gather_kv_for_ragged_graph: failed to wrap output array: {error}")
+        })
+    }
+
     #[cfg(not(target_os = "macos"))]
     pub fn gather_kv_for_decode_graph_batched(
         &mut self,
@@ -4672,6 +4991,18 @@ impl PagedKVCacheAdapter {
             "gather_kv_for_decode_graph_batched is only supported on macOS (Metal backend)"
                 .to_string(),
         )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn gather_kv_for_ragged_graph(
+        &mut self,
+        _layer_idx: u32,
+        _queries: &MxArray,
+        _rows: &[PagedRaggedRow],
+        _scale: f32,
+        _softcap: f32,
+    ) -> Result<MxArray, String> {
+        Err("gather_kv_for_ragged_graph is only supported on macOS (Metal backend)".to_string())
     }
 
     /// Route-hinted graph-native decode attention. The hint is captured in the
@@ -10782,6 +11113,58 @@ mod tests {
             error.contains("sequence 2 position 6") && error.contains("expected 7"),
             "got: {error}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ragged_metadata_and_native_write_preserve_real_query_boundaries() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!(
+                "skipping ragged_metadata_and_native_write_preserve_real_query_boundaries: Metal unavailable"
+            );
+            return;
+        };
+        adapter.begin_request(1).unwrap();
+        adapter.allocate_suffix_blocks_for(1, 4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        adapter.begin_request(2).unwrap();
+        adapter.allocate_suffix_blocks_for(2, 8).unwrap();
+        adapter
+            .record_tokens(&[10, 11, 12, 13, 14, 15, 16, 17])
+            .unwrap();
+        let rows = [
+            PagedRaggedRow {
+                seq_id: 1,
+                first_logical_position: 2,
+                query_len: 2,
+            },
+            PagedRaggedRow {
+                seq_id: 2,
+                first_logical_position: 5,
+                query_len: 3,
+            },
+        ];
+        let (_, lens, cu_seqlens_q, max_context, total_queries) =
+            adapter.ragged_attention_inputs(&rows).unwrap();
+        assert_eq!(lens.to_int32().unwrap().as_ref(), &[4, 8]);
+        assert_eq!(cu_seqlens_q.to_int32().unwrap().as_ref(), &[0, 2, 5]);
+        assert_eq!(max_context, 8);
+        assert_eq!(total_queries, 5);
+
+        let keys = MxArray::zeros(&[5, 1, 32], Some(DType::Float16)).unwrap();
+        let values = MxArray::zeros(&[5, 1, 32], Some(DType::Float16)).unwrap();
+        let mut wrong = rows;
+        wrong[1].first_logical_position = 4;
+        let error = adapter
+            .update_keys_values_native_ragged(0, &keys, &values, &wrong)
+            .expect_err("B's three-token suffix begins at 5");
+        assert!(
+            error.contains("sequence 2 position 4") && error.contains("expected 5"),
+            "got: {error}"
+        );
+        adapter
+            .update_keys_values_native_ragged(0, &keys, &values, &rows)
+            .expect("real ragged slot mapping must write once");
     }
 
     #[test]
