@@ -145,6 +145,9 @@ pub(crate) enum Qwen3Cmd {
         save_path: String,
         reply: ResponseTx<()>,
     },
+    SchedulerStats {
+        reply: ResponseTx<engine::SchedulerStatsJs>,
+    },
 }
 
 impl FromChatCmd for Qwen3Cmd {
@@ -258,6 +261,9 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
         Qwen3Cmd::SaveModel { save_path, reply } => {
             let _ = reply.send(inner.save_model_sync(&save_path));
         }
+        Qwen3Cmd::SchedulerStats { reply } => {
+            let _ = reply.send(Ok(engine::scheduler::SchedulerStats::default().to_js()));
+        }
     }
 }
 
@@ -290,6 +296,7 @@ impl ScheduledReply {
 }
 
 struct QwenScheduledTurn {
+    owner_id: String,
     tokenizer: Arc<Qwen3Tokenizer>,
     eos_id: u32,
     config: ChatConfig,
@@ -320,6 +327,18 @@ struct QwenScheduledTurn {
 
 struct QwenStepExecutor<'a> {
     inner: &'a mut Qwen3Inner,
+}
+
+struct PreparedDecodeRow {
+    plan_index: usize,
+    seq_id: SeqId,
+    token_id: u32,
+    terminal: bool,
+    at_length: bool,
+    stops_at_eos: bool,
+    cancelled: bool,
+    repetition: Option<&'static str>,
+    batch_index: Option<usize>,
 }
 
 impl QwenStepExecutor<'_> {
@@ -401,16 +420,34 @@ impl QwenStepExecutor<'_> {
                 Error::from_reason("scheduler prefill slice exceeds prompt"),
             ));
         }
+        if let Err(error) = self.inner.activate_paged_seq(row.seq_id) {
+            return Ok(Self::fail(turn, row, error));
+        }
+        self.inner
+            .set_turn_cancel_flag(turn.cancelled.as_ref().map(Arc::clone));
         turn.payload.profiler.begin_prefill();
+        let step_prefix = Qwen3PrefixState {
+            effective_cached_prefix_len: start,
+            suffix_len: row.num_tokens as usize,
+        };
         let logits = match self.inner.paged_prefill(
             &turn.payload.prompt_tokens[start..end],
-            &turn.payload.prefix,
+            &step_prefix,
             turn.payload.generation_stream,
         ) {
             Ok(logits) => logits,
             Err(error) => return Ok(Self::fail(turn, row, error)),
         };
         turn.payload.profiler.end_prefill();
+        if end < turn.payload.prompt_tokens.len() {
+            synchronize_and_clear_cache();
+            return Ok(RowStepResult {
+                seq_id: row.seq_id,
+                num_computed_tokens: row.num_tokens,
+                generated_token: None,
+                finished: false,
+            });
+        }
         let logits = match engine::penalties::apply_all_penalties(
             logits,
             &turn.token_history,
@@ -463,6 +500,9 @@ impl QwenStepExecutor<'_> {
                 Error::from_reason("scheduler decode row has no current token"),
             ));
         };
+        if let Err(error) = self.inner.activate_paged_seq(row.seq_id) {
+            return Ok(Self::fail(turn, row, error));
+        }
         let step_idx = turn.payload.generated_tokens.len();
         turn.payload.generated_tokens.push(token_id);
         turn.payload.profiler.step();
@@ -574,6 +614,228 @@ impl QwenStepExecutor<'_> {
             finished,
         })
     }
+
+    fn execute_decode_batch(
+        &mut self,
+        plan: &StepPlan,
+        running: &mut [TurnState<QwenScheduledTurn>],
+    ) -> Vec<(usize, RowStepResult)> {
+        let mut work = Vec::new();
+        let mut early_results = Vec::new();
+        let mut batch_rows = Vec::new();
+        let decode_rows = plan
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.kind == StepKind::Decode);
+        for (plan_index, row) in decode_rows {
+            let turn = running
+                .iter_mut()
+                .find(|turn| turn.seq_id == row.seq_id)
+                .expect("scheduler validated decode row");
+            let Some(&token_id) = turn.token_history.last() else {
+                early_results.push((
+                    plan_index,
+                    Self::fail(
+                        turn,
+                        row,
+                        Error::from_reason("scheduler decode row has no current token"),
+                    ),
+                ));
+                continue;
+            };
+            turn.payload.generated_tokens.push(token_id);
+            turn.payload.profiler.step();
+            let stops_at_eos =
+                token_id == turn.payload.eos_id || turn.payload.extra_eos_ids.contains(&token_id);
+            let repetition = check_repetition_cutoff(
+                &turn.payload.generated_tokens,
+                turn.payload.params.max_consecutive_tokens,
+                turn.payload.params.max_ngram_repeats,
+                turn.payload.params.ngram_size,
+            );
+            let terminal = stops_at_eos || row.cancel_snapshot || repetition.is_some();
+            let at_length = turn.payload.generated_tokens.len()
+                >= turn.payload.params.max_new_tokens.max(0) as usize;
+            let batch_index = (!terminal).then(|| {
+                let index = batch_rows.len();
+                batch_rows.push((row.seq_id, token_id));
+                index
+            });
+            work.push(PreparedDecodeRow {
+                plan_index,
+                seq_id: row.seq_id,
+                token_id,
+                terminal,
+                at_length,
+                stops_at_eos,
+                cancelled: row.cancel_snapshot,
+                repetition,
+                batch_index,
+            });
+        }
+
+        crate::array::maybe_clear_cache_for_paged_step(plan.global_step as i32);
+        for row in &work {
+            let turn = running
+                .iter_mut()
+                .find(|turn| turn.seq_id == row.seq_id)
+                .expect("prepared decode row remains running");
+            if row.batch_index.is_some() {
+                turn.payload.profiler.begin("forward");
+            }
+        }
+        let batched_logits = if batch_rows.is_empty() {
+            Ok(None)
+        } else {
+            let first_stream = work
+                .iter()
+                .find_map(|row| {
+                    row.batch_index.map(|_| {
+                        running
+                            .iter()
+                            .find(|turn| turn.seq_id == row.seq_id)
+                            .expect("prepared row")
+                            .payload
+                            .generation_stream
+                    })
+                })
+                .expect("non-empty batch has a stream");
+            let _stream_context = StreamContext::new(first_stream);
+            self.inner
+                .run_paged_decode_step_batched(&batch_rows)
+                .map(Some)
+        };
+        for row in &work {
+            let turn = running
+                .iter_mut()
+                .find(|turn| turn.seq_id == row.seq_id)
+                .expect("prepared decode row remains running");
+            if row.batch_index.is_some() {
+                turn.payload.profiler.end();
+            }
+        }
+
+        let mut results = early_results;
+        for row in work {
+            let planned = &plan.rows[row.plan_index];
+            let turn = running
+                .iter_mut()
+                .find(|turn| turn.seq_id == row.seq_id)
+                .expect("prepared decode row remains running");
+            let logits = match (&batched_logits, row.batch_index) {
+                (Err(error), Some(_)) => {
+                    results.push((
+                        row.plan_index,
+                        Self::fail(turn, planned, Error::from_reason(error.reason.clone())),
+                    ));
+                    continue;
+                }
+                (Ok(Some(logits)), Some(batch_index)) if !row.at_length => {
+                    match logits
+                        .slice_axis(0, batch_index as i64, batch_index as i64 + 1)
+                        .and_then(|row| row.squeeze(Some(&[1])))
+                    {
+                        Ok(logits) => Some(logits),
+                        Err(error) => {
+                            results.push((row.plan_index, Self::fail(turn, planned, error)));
+                            continue;
+                        }
+                    }
+                }
+                _ => None,
+            };
+
+            let next_token = if let Some(mut logits) = logits {
+                let (sampled, budget_forced) =
+                    if turn.payload.reasoning_tracker.should_force_think_end() {
+                        let forced = match turn.payload.reasoning_tracker.forced_token_id() {
+                            Ok(token) => token as i32,
+                            Err(error) => {
+                                results.push((row.plan_index, Self::fail(turn, planned, error)));
+                                continue;
+                            }
+                        };
+                        match MxArray::from_int32(&[forced], &[1]) {
+                            Ok(sampled) => (sampled, true),
+                            Err(error) => {
+                                results.push((row.plan_index, Self::fail(turn, planned, error)));
+                                continue;
+                            }
+                        }
+                    } else {
+                        turn.payload.profiler.begin("rep_penalty");
+                        logits = match engine::penalties::apply_all_penalties(
+                            logits,
+                            &turn.token_history,
+                            &turn.payload.params,
+                        ) {
+                            Ok(logits) => logits,
+                            Err(error) => {
+                                results.push((row.plan_index, Self::fail(turn, planned, error)));
+                                continue;
+                            }
+                        };
+                        turn.payload.profiler.end();
+                        turn.payload.profiler.begin("sample");
+                        let sampled = match sample(&logits, turn.payload.params.sampling_config) {
+                            Ok(sampled) => sampled,
+                            Err(error) => {
+                                results.push((row.plan_index, Self::fail(turn, planned, error)));
+                                continue;
+                            }
+                        };
+                        turn.payload.profiler.end();
+                        (sampled, false)
+                    };
+                turn.payload.profiler.begin("schedule_eval");
+                MxArray::async_eval_arrays(&[&sampled, &logits]);
+                turn.payload.profiler.end();
+                let _ = budget_forced;
+                sampled.eval();
+                match sampled.item_at_int32(0) {
+                    Ok(token) => Some(token as u32),
+                    Err(error) => {
+                        results.push((row.plan_index, Self::fail(turn, planned, error)));
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
+            turn.payload.profiler.mark_first_token();
+            let is_reasoning = turn.payload.reasoning_tracker.observe_token(row.token_id);
+            turn.payload.last_is_reasoning = is_reasoning;
+            if row.cancelled {
+                turn.payload.finish_reason = String::from("cancelled");
+            } else {
+                if turn.payload.response.sink().is_some() {
+                    Self::stream_token(turn, row.token_id, is_reasoning);
+                }
+                if row.stops_at_eos {
+                    turn.payload.finish_reason = String::from("stop");
+                } else if let Some(reason) = row.repetition {
+                    turn.payload.finish_reason = reason.to_string();
+                }
+            }
+            let finished = row.terminal || row.at_length;
+            if finished {
+                turn.payload.profiler.snapshot_memory_after();
+                turn.payload.profiler.report();
+            }
+            results.push((
+                row.plan_index,
+                RowStepResult {
+                    seq_id: row.seq_id,
+                    num_computed_tokens: planned.num_tokens,
+                    generated_token: (!finished).then_some(next_token).flatten(),
+                    finished,
+                },
+            ));
+        }
+        results
+    }
 }
 
 impl StepExecutor<QwenScheduledTurn> for QwenStepExecutor<'_> {
@@ -585,7 +847,22 @@ impl StepExecutor<QwenScheduledTurn> for QwenStepExecutor<'_> {
         running: &mut [TurnState<QwenScheduledTurn>],
     ) -> std::result::Result<StepResult, Self::Error> {
         let mut results = Vec::with_capacity(plan.rows.len());
-        for row in &plan.rows {
+        results.resize_with(plan.rows.len(), || None);
+        let decode_count = plan
+            .rows
+            .iter()
+            .filter(|row| row.kind == StepKind::Decode)
+            .count();
+        let used_batched_decode = decode_count > 1;
+        if used_batched_decode {
+            for (index, result) in self.execute_decode_batch(plan, running) {
+                results[index] = Some(result);
+            }
+        }
+        for (index, row) in plan.rows.iter().enumerate() {
+            if results[index].is_some() {
+                continue;
+            }
             let turn = running
                 .iter_mut()
                 .find(|turn| turn.seq_id == row.seq_id)
@@ -595,9 +872,19 @@ impl StepExecutor<QwenScheduledTurn> for QwenStepExecutor<'_> {
                 StepKind::Decode => self.execute_decode(row, turn),
             }
             .unwrap_or_else(|error| Self::fail(turn, row, error));
-            results.push(result);
+            results[index] = Some(result);
         }
-        Ok(StepResult { rows: results })
+        Ok(StepResult {
+            rows: results
+                .into_iter()
+                .map(|result| result.expect("every planned row executed"))
+                .collect(),
+            executed_decode_batch: if used_batched_decode {
+                decode_count
+            } else {
+                usize::from(decode_count != 0)
+            },
+        })
     }
 }
 
@@ -607,14 +894,31 @@ pub(crate) struct QwenSchedulerState {
     inner: Qwen3Inner,
     scheduler: Scheduler<QwenScheduledTurn, Qwen3Cmd, Qwen3Cmd>,
     pending: VecDeque<Qwen3Cmd>,
+    owner_sequences: HashMap<String, SeqId>,
+    owner_histories: HashMap<String, Vec<u32>>,
+    next_seq_id: SeqId,
 }
 
 impl QwenSchedulerState {
     pub(crate) fn new(inner: Qwen3Inner) -> Self {
+        let max_num_seqs = std::env::var("MLX_SCHED_MAX_NUM_SEQS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(8);
+        let max_num_batched_tokens = std::env::var("MLX_SCHED_MAX_BATCHED_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(2048);
         Self {
             inner,
-            scheduler: Scheduler::new(1, u32::MAX).expect("valid qwen3 scheduler limits"),
+            scheduler: Scheduler::new(max_num_seqs, max_num_batched_tokens)
+                .expect("validated qwen3 scheduler limits"),
             pending: VecDeque::new(),
+            owner_sequences: HashMap::new(),
+            owner_histories: HashMap::new(),
+            next_seq_id: 1,
         }
     }
 
@@ -625,6 +929,22 @@ impl QwenSchedulerState {
                 "1" | "true" | "yes" | "on"
             )
         })
+    }
+
+    fn chat_has_explicit_owner(command: &ChatCmd) -> bool {
+        let config = match command {
+            ChatCmd::SessionStart { config, .. }
+            | ChatCmd::SessionContinue { config, .. }
+            | ChatCmd::SessionContinueTool { config, .. }
+            | ChatCmd::StreamSessionStart { config, .. }
+            | ChatCmd::StreamSessionContinue { config, .. }
+            | ChatCmd::StreamSessionContinueTool { config, .. } => config,
+            ChatCmd::ResetCaches { .. } => return true,
+        };
+        config
+            .cache_owner_id
+            .as_deref()
+            .is_some_and(|owner| !owner.is_empty())
     }
 
     fn reply_admission_error(response: ScheduledReply, cancelled: &AtomicBool, error: Error) {
@@ -725,6 +1045,13 @@ impl QwenSchedulerState {
                 }
             };
 
+        let owner_id = config.cache_owner_id.clone().unwrap_or_default();
+        self.inner.cached_token_history = self
+            .owner_histories
+            .get(&owner_id)
+            .cloned()
+            .unwrap_or_default();
+
         if cancelled.load(Ordering::Relaxed) {
             let message = stream_guard_name.map_or_else(
                 || engine::session::CHAT_SESSION_CANCELLED.to_string(),
@@ -775,19 +1102,39 @@ impl QwenSchedulerState {
             return None;
         }
         let reuse_cache = admitted.plan.is_delta || admitted.params.reuse_cache;
-        let generation_start = admitted.params.report_performance.then(Instant::now);
-        let prefix = match self
-            .inner
-            .prime_prefix_state(&admitted.tokens, reuse_cache, 0, &[], 0)
-        {
-            Ok(prefix) => prefix,
-            Err(error) => {
-                self.inner.abort_paged_turn();
-                self.inner.set_turn_cancel_flag(None);
-                Self::reply_admission_error(response, cancelled.as_ref(), error);
-                return None;
-            }
+        let seq_id = if owner_id.is_empty() {
+            0
+        } else if let Some(&seq_id) = self.owner_sequences.get(&owner_id) {
+            seq_id
+        } else {
+            let seq_id = self.next_seq_id;
+            self.next_seq_id = self.next_seq_id.saturating_add(1);
+            self.owner_sequences.insert(owner_id.clone(), seq_id);
+            seq_id
         };
+        if self.scheduler.contains_seq(seq_id) {
+            self.inner.set_turn_cancel_flag(None);
+            Self::reply_admission_error(
+                response,
+                cancelled.as_ref(),
+                Error::from_reason("chat session already has an in-flight scheduled turn"),
+            );
+            return None;
+        }
+        let generation_start = admitted.params.report_performance.then(Instant::now);
+        let prefix =
+            match self
+                .inner
+                .prime_prefix_state_for(seq_id, &admitted.tokens, reuse_cache, &[], 0)
+            {
+                Ok(prefix) => prefix,
+                Err(error) => {
+                    self.inner.abort_paged_turn();
+                    self.inner.set_turn_cancel_flag(None);
+                    Self::reply_admission_error(response, cancelled.as_ref(), error);
+                    return None;
+                }
+            };
         if prefix.suffix_len == 0 {
             self.inner.abort_paged_turn();
             self.inner.set_turn_cancel_flag(None);
@@ -808,6 +1155,7 @@ impl QwenSchedulerState {
         profiler.set_prompt_tokens(prefix.suffix_len as u32);
         profiler.snapshot_memory_before();
         let payload = QwenScheduledTurn {
+            owner_id,
             tokenizer: admitted.tokenizer,
             eos_id: admitted.eos_id,
             config: admitted.config,
@@ -839,13 +1187,24 @@ impl QwenSchedulerState {
             is_delta: admitted.plan.is_delta,
         };
         let prompt_len = admitted.tokens.len() as u32;
+        let long_prefill_tokens = std::env::var("MLX_SCHED_LONG_PREFILL_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(2048);
+        let mut pinned_prefill_breaks = Vec::new();
+        let mut boundary = payload.prefix.effective_cached_prefix_len as u32;
+        while boundary < prompt_len {
+            boundary = boundary.saturating_add(long_prefill_tokens).min(prompt_len);
+            pinned_prefill_breaks.push(boundary);
+        }
         Some(
             TurnState::new(
-                0,
-                0,
+                seq_id,
+                u64::from(seq_id),
                 admitted.tokens,
                 payload.prefix.effective_cached_prefix_len as u32,
-                vec![prompt_len],
+                pinned_prefill_breaks,
                 Some(cancelled),
                 payload,
             )
@@ -855,9 +1214,16 @@ impl QwenSchedulerState {
 
     fn finish_completed(&mut self, mut turn: TurnState<QwenScheduledTurn>) {
         let cancelled = turn.cancelled.take().expect("qwen3 turn cancel flag");
+        if let Err(error) = self.inner.activate_paged_seq(turn.seq_id) {
+            self.inner.set_turn_cancel_flag(None);
+            turn.payload.response.send_error(error, cancelled.as_ref());
+            return;
+        }
         if let Some(error) = turn.payload.failure.take() {
             self.inner.abort_paged_turn();
             self.inner.set_turn_cancel_flag(None);
+            self.owner_histories.remove(&turn.payload.owner_id);
+            self.owner_sequences.remove(&turn.payload.owner_id);
             turn.payload.response.send_error(error, cancelled.as_ref());
             return;
         }
@@ -887,6 +1253,15 @@ impl QwenSchedulerState {
                 emitter: turn.payload.emitter.take(),
             },
         );
+        if outcome.is_ok() && turn.payload.reuse_cache {
+            self.owner_histories.insert(
+                turn.payload.owner_id.clone(),
+                self.inner.cached_token_history.clone(),
+            );
+        } else if outcome.is_err() {
+            self.owner_histories.remove(&turn.payload.owner_id);
+            self.owner_sequences.remove(&turn.payload.owner_id);
+        }
         self.inner.set_turn_cancel_flag(None);
         match turn.payload.response {
             ScheduledReply::Sync(reply) => {
@@ -925,24 +1300,28 @@ impl QwenSchedulerState {
             self.pending.push_back(command);
         }
 
-        if !self.scheduler.has_work()
-            && let Some(command) = self.pending.pop_front()
-        {
+        while let Some(command) = self.pending.front() {
+            let must_wait_for_legacy_owner = matches!(command, Qwen3Cmd::Chat(chat)
+                if !Self::chat_has_explicit_owner(chat) && self.scheduler.has_work());
+            if must_wait_for_legacy_owner {
+                break;
+            }
+            let command = self.pending.pop_front().expect("front checked above");
             if Self::force_serial() {
                 self.scheduler.enqueue_exclusive(command);
-            } else {
-                match command {
-                    Qwen3Cmd::Chat(chat) => {
-                        if self.inner.paged_adapter.is_none() {
-                            self.scheduler.enqueue_exclusive(Qwen3Cmd::Chat(chat));
-                        } else if let Some(turn) = self.admit_chat(chat)
-                            && let Err(error) = self.scheduler.enqueue_turn(turn)
-                        {
-                            tracing::error!("qwen3 scheduler admission failed: {error}");
-                        }
+                continue;
+            }
+            match command {
+                Qwen3Cmd::Chat(chat) => {
+                    if self.inner.paged_adapter.is_none() {
+                        self.scheduler.enqueue_exclusive(Qwen3Cmd::Chat(chat));
+                    } else if let Some(turn) = self.admit_chat(chat)
+                        && let Err(error) = self.scheduler.enqueue_turn(turn)
+                    {
+                        tracing::error!("qwen3 scheduler admission failed: {error}");
                     }
-                    barrier => self.scheduler.enqueue_barrier(barrier),
                 }
+                barrier => self.scheduler.enqueue_barrier(barrier),
             }
         }
 
@@ -952,7 +1331,16 @@ impl QwenSchedulerState {
         match self.scheduler.drive_once(&mut executor) {
             Ok(SchedulerAction::Idle) => {}
             Ok(SchedulerAction::Exclusive(command) | SchedulerAction::Barrier(command)) => {
+                if let Qwen3Cmd::SchedulerStats { reply } = command {
+                    let _ = reply.send(Ok(self.scheduler.stats().to_js()));
+                    return LoopControl::Continue;
+                }
+                let reset = matches!(command, Qwen3Cmd::Chat(ChatCmd::ResetCaches { .. }));
                 handle_qwen3_cmd(&mut self.inner, command);
+                if reset {
+                    self.owner_sequences.clear();
+                    self.owner_histories.clear();
+                }
             }
             Ok(SchedulerAction::Stepped { completed, .. }) => {
                 for turn in completed {
@@ -1065,7 +1453,14 @@ impl Qwen3Inner {
                 // (KvScaleManager); always false here.
                 use_fp8_cache: Some(false),
                 max_seq_len: Some(config.max_position_embeddings as u32),
-                max_batch_size: Some(32),
+                max_batch_size: Some(
+                    std::env::var("MLX_SCHED_MAX_NUM_SEQS")
+                        .ok()
+                        .and_then(|value| value.parse::<u32>().ok())
+                        .filter(|&value| value > 0)
+                        .unwrap_or(8)
+                        .min(32),
+                ),
             };
 
             let num_blocks = pa_config.calculate_num_blocks();
@@ -1252,7 +1647,7 @@ impl Qwen3Inner {
         // cache; the EXPLICIT command reset purges them on top of this
         // (`ResetScope::Command` branch of `ChatBackend::reset_caches`).
         if let Some(adapter) = self.paged_adapter.as_mut() {
-            let _ = adapter.release_request();
+            let _ = adapter.release_all_requests();
         }
         Ok(())
     }
@@ -3785,6 +4180,52 @@ impl PagedPrefix for Qwen3PrefixState {
     }
 }
 
+impl Qwen3Inner {
+    fn prime_prefix_state_for(
+        &mut self,
+        seq_id: SeqId,
+        plan: &[u32],
+        reuse_cache: bool,
+        extra_keys: &[u64],
+        cache_salt: u64,
+    ) -> Result<Qwen3PrefixState> {
+        let total_budget = plan.len() as u32;
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
+        let turn_plan = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| {
+                Error::from_reason(
+                    "prime_prefix_state: paged_adapter is None — caller must check \
+                     use_block_paged_cache before dispatch",
+                )
+            })?
+            .prepare_turn_with_max_cache_hit_tokens(
+                seq_id,
+                plan,
+                total_budget,
+                reuse_cache,
+                extra_keys,
+                cache_salt,
+                false,
+                max_cache_hit_tokens,
+            )
+            .map_err(Error::from_reason)?;
+        Ok(Qwen3PrefixState {
+            effective_cached_prefix_len: turn_plan.cached_prefix_len as usize,
+            suffix_len: turn_plan.suffix_len as usize,
+        })
+    }
+
+    fn activate_paged_seq(&mut self, seq_id: SeqId) -> Result<()> {
+        self.paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("qwen3 paged adapter is unavailable"))?
+            .activate_request(seq_id)
+            .map_err(Error::from_reason)
+    }
+}
+
 impl PagedBackend for Qwen3Inner {
     type PagedDecode<'a>
         = Qwen3PagedDecode<'a>
@@ -3800,42 +4241,7 @@ impl PagedBackend for Qwen3Inner {
         extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<Self::PrefixState> {
-        // Lazy decode allocation: pass the prompt length only (decode
-        // blocks grow on-demand via `record_tokens`). vLLM-style
-        // exact-prefix cap: leave at least one prompt token to prefill so
-        // the decoder always has something to consume.
-        let total_budget = plan.len() as u32;
-        let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        // Per-turn seq_id: the adapter is single-request and
-        // `reset_for_new_request` makes the previous seq_id irrelevant.
-        let seq_id: u32 = 0;
-        // Adapter-owned warm-continue / cold-start lifecycle (suffix
-        // blocks are allocated inside prepare_turn — do NOT call
-        // `allocate_suffix_blocks` again).
-        let turn_plan = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| {
-                napi::Error::from_reason(
-                    "prime_prefix_state: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
-                )
-            })?
-            .prepare_turn_with_max_cache_hit_tokens(
-                seq_id,
-                plan,
-                total_budget,
-                reuse_cache,
-                extra_keys,
-                cache_salt,
-                false,
-                max_cache_hit_tokens,
-            )
-            .map_err(napi::Error::from_reason)?;
-        Ok(Qwen3PrefixState {
-            effective_cached_prefix_len: turn_plan.cached_prefix_len as usize,
-            suffix_len: turn_plan.suffix_len as usize,
-        })
+        self.prime_prefix_state_for(0, plan, reuse_cache, extra_keys, cache_salt)
     }
 
     fn paged_prefill(
@@ -4325,6 +4731,13 @@ impl Qwen3Model {
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
+    }
+
+    /// Snapshot continuous-batching scheduler counters after all commands
+    /// already ahead of this query have drained.
+    #[napi]
+    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
+        send_and_await(&self.thread, |reply| Qwen3Cmd::SchedulerStats { reply }).await
     }
 
     // ---------------------------------------------------------------

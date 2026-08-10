@@ -128,6 +128,10 @@ pub(crate) struct RowStepResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StepResult {
     pub rows: Vec<RowStepResult>,
+    /// Largest decode forward the executor actually fused in this step.
+    /// This is executor-reported rather than inferred from the plan so a
+    /// silent N-times-scalar fallback cannot fake occupancy telemetry.
+    pub executed_decode_batch: usize,
 }
 
 pub(crate) trait StepExecutor<P> {
@@ -283,6 +287,21 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         self.waiting.len()
     }
 
+    pub fn running_len(&self) -> usize {
+        self.running.len()
+    }
+
+    pub fn max_num_seqs(&self) -> usize {
+        self.max_num_seqs
+    }
+
+    pub fn contains_seq(&self, seq_id: SeqId) -> bool {
+        self.waiting
+            .iter()
+            .chain(self.running.iter())
+            .any(|turn| turn.seq_id == seq_id)
+    }
+
     pub fn park_waiting_for_ssd(&mut self, seq_id: SeqId) -> Result<(), String> {
         let turn = self
             .waiting
@@ -384,37 +403,47 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         }
         let mut budget = self.max_num_batched_tokens;
         let mut rows = Vec::with_capacity(self.running.len());
-        for turn in &self.running {
-            if budget == 0 || turn.status != TurnStatus::Running {
-                continue;
+        // Decode-first is a priority within ONE phase-free plan, not a decode
+        // queue. Every row's kind is still derived from token progress. This
+        // matches vLLM v1's running-first budget shape and prevents a long
+        // newly admitted prefill from consuming the step budget ahead of an
+        // already interactive decode row.
+        for planned_kind in [StepKind::Decode, StepKind::Prefill] {
+            for turn in &self.running {
+                if budget == 0 || turn.status != TurnStatus::Running {
+                    continue;
+                }
+                let pending = turn.num_tokens.saturating_sub(turn.num_computed_tokens);
+                if pending == 0 {
+                    continue;
+                }
+                let kind = if turn.num_computed_tokens < turn.prompt_tokens {
+                    StepKind::Prefill
+                } else {
+                    StepKind::Decode
+                };
+                if kind != planned_kind {
+                    continue;
+                }
+                let row_limit = match kind {
+                    StepKind::Prefill => turn
+                        .next_prefill_boundary()
+                        .saturating_sub(turn.num_computed_tokens),
+                    StepKind::Decode => 1,
+                };
+                let num_tokens = pending.min(row_limit).min(budget);
+                if num_tokens == 0 {
+                    continue;
+                }
+                rows.push(StepRow {
+                    seq_id: turn.seq_id,
+                    kind,
+                    token_start: turn.num_computed_tokens,
+                    num_tokens,
+                    cancel_snapshot: turn.cancel_snapshot,
+                });
+                budget -= num_tokens;
             }
-            let pending = turn.num_tokens.saturating_sub(turn.num_computed_tokens);
-            if pending == 0 {
-                continue;
-            }
-            let kind = if turn.num_computed_tokens < turn.prompt_tokens {
-                StepKind::Prefill
-            } else {
-                StepKind::Decode
-            };
-            let row_limit = match kind {
-                StepKind::Prefill => turn
-                    .next_prefill_boundary()
-                    .saturating_sub(turn.num_computed_tokens),
-                StepKind::Decode => 1,
-            };
-            let num_tokens = pending.min(row_limit).min(budget);
-            if num_tokens == 0 {
-                continue;
-            }
-            rows.push(StepRow {
-                seq_id: turn.seq_id,
-                kind,
-                token_start: turn.num_computed_tokens,
-                num_tokens,
-                cancel_snapshot: turn.cancel_snapshot,
-            });
-            budget -= num_tokens;
         }
         StepPlan {
             global_step: self.global_step,
@@ -444,15 +473,22 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         let result = executor
             .execute(&plan, &mut self.running)
             .map_err(SchedulerError::Executor)?;
-        self.apply_result(&plan, result)
-            .map_err(SchedulerError::InvalidResult)?;
-        self.global_step = self.global_step.saturating_add(1);
-        self.stats.global_steps = self.global_step;
-        let decode_occupancy = plan
+        let executed_decode_batch = result.executed_decode_batch;
+        let planned_decode_rows = plan
             .rows
             .iter()
             .filter(|row| row.kind == StepKind::Decode)
             .count();
+        if executed_decode_batch > planned_decode_rows {
+            return Err(SchedulerError::InvalidResult(format!(
+                "executor reported decode occupancy {executed_decode_batch} for {planned_decode_rows} planned decode rows"
+            )));
+        }
+        self.apply_result(&plan, result)
+            .map_err(SchedulerError::InvalidResult)?;
+        self.global_step = self.global_step.saturating_add(1);
+        self.stats.global_steps = self.global_step;
+        let decode_occupancy = executed_decode_batch;
         if decode_occupancy != 0 {
             self.stats.max_batch_occupancy = self.stats.max_batch_occupancy.max(decode_occupancy);
             *self
@@ -581,7 +617,14 @@ mod tests {
                     }
                 })
                 .collect();
-            Ok(StepResult { rows })
+            Ok(StepResult {
+                rows,
+                executed_decode_batch: plan
+                    .rows
+                    .iter()
+                    .filter(|row| row.kind == StepKind::Decode)
+                    .count(),
+            })
         }
     }
 

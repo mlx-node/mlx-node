@@ -277,6 +277,7 @@ jobs:
             kind: cargo
             env: MLX_TEST_MODEL_PATH
             stage0_ts: __test__/server/concurrent-stage0-e2e.test.ts
+            stage1_rust: concurrent_batched_parity
             tests: >-
               --test qwen3_paged_vs_flat_parity
               --test qwen3_cold_tier_parity
@@ -288,6 +289,7 @@ jobs:
             kind: cargo
             env: MLX_TEST_MODEL_PATH
             stage0_ts: ''
+            stage1_rust: ''
             tests: >-
               --test qwen3_5_paged_vs_flat_parity
               --test qwen3_5_session
@@ -324,6 +326,7 @@ jobs:
             kind: cargo
             env: MLX_TEST_MODEL_PATH MLX_TEST_LFM2_MODEL_PATH
             stage0_ts: ''
+            stage1_rust: ''
             tests: >-
               --test lfm2_paged_vs_flat_parity
               --test lfm2_session
@@ -337,6 +340,7 @@ jobs:
             kind: ts
             env: ''
             stage0_ts: ''
+            stage1_rust: ''
             tests: __test__/models/gemma4-qat-e2e.test.ts
     steps:
       - uses: actions/checkout@v6
@@ -487,6 +491,11 @@ jobs:
                 grep 'skipping ' /tmp/lib_tests.log
                 exit 1
               fi
+            fi
+            if [ -n "${{ matrix.stage1_rust }}" ]; then
+              QWEN3_STAGE1_MODEL_PATH="$ckpt" MLX_SCHED_MAX_NUM_SEQS=8 \
+                cargo test -p mlx-core --test "${{ matrix.stage1_rust }}" \
+                  -- --ignored --test-threads=1 --nocapture
             fi
             if [ -n "${{ matrix.stage0_ts }}" ]; then
               QWEN3_STAGE0_MODEL_PATH="$ckpt" MLX_PAGED_PREFILL_CHUNK_SIZE=512 \

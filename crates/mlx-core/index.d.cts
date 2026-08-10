@@ -1523,6 +1523,11 @@ export declare class Qwen3Model {
    * runtime-routing decision.
    */
   hasBlockPagedCache(): boolean;
+  /**
+   * Snapshot continuous-batching scheduler counters after all commands
+   * already ahead of this query have drained.
+   */
+  schedulerStats(): Promise<SchedulerStats>;
   /** Get model configuration */
   getConfig(): Qwen3Config;
   /**

@@ -32,3 +32,4 @@ pub(crate) use cache::*;
 pub(crate) use finalize::*;
 pub(crate) use params::*;
 pub(crate) use penalties::*;
+pub use scheduler::{DecodeBatchOccupancyBucketJs, SchedulerStatsJs};
