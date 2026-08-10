@@ -283,6 +283,39 @@ describe('handleCreateMessage — paged-active warm-slot bypass', () => {
     expect(getHeaders()['x-cached-tokens']).toBe('42');
   });
 
+  it('keeps a delivered Messages response successful when owner cleanup rejects', async () => {
+    const registry = new ModelRegistry();
+    const mockModel = createMockModel(/* paged */ true);
+    const releaseCacheOwner = Reflect.get(mockModel, 'releaseCacheOwner') as ReturnType<typeof vi.fn>;
+    releaseCacheOwner.mockRejectedValueOnce(new Error('simulated owner cleanup failure'));
+    registry.register('paged-model', mockModel);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      const { res, getStatus, getBody } = createMockRes();
+      await expect(
+        handleCreateMessage(
+          res,
+          {
+            model: 'paged-model',
+            messages: [{ role: 'user', content: 'hi' }],
+            max_tokens: 16,
+          },
+          registry,
+        ),
+      ).resolves.toBeUndefined();
+
+      expect(getStatus()).toBe(200);
+      expect(JSON.parse(getBody())).toMatchObject({ type: 'message' });
+      expect(errorSpy).toHaveBeenCalledWith(
+        '[messages] failed to release an unretained chat-session cache owner:',
+        expect.objectContaining({ message: 'simulated owner cleanup failure' }),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it('paged-active path does NOT consult the warm slot even when one is pre-seeded with byte-equal instructions', async () => {
     // Adversarial: pre-seed a warm entry with `instructions === sysA`
     // so a non-paged model would have leased it. Then dispatch a

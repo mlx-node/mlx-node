@@ -129,6 +129,21 @@ async function postMessage(
   return (await response.json()) as { content?: Array<{ type?: string; text?: string }> };
 }
 
+async function postResponse(baseUrl: string, input: string): Promise<{ id?: string; output_text?: string }> {
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: MODEL_NAME,
+      input,
+      temperature: 0,
+      max_output_tokens: 16,
+    }),
+  });
+  expect(response.status).toBe(200);
+  return (await response.json()) as { id?: string; output_text?: string };
+}
+
 const stage1Describe = MODEL_ENV_PRESENT ? describe.sequential : describe.skip;
 
 stage1Describe('Stage-1 real-model server admission', () => {
@@ -227,5 +242,24 @@ stage1Describe('Stage-1 real-model server admission', () => {
     expect(instance.registry.getSessionRegistry(MODEL_NAME)?.queueDepth).toBe(0);
     expect(instance.registry.getSessionRegistry(MODEL_NAME)?.preDispatchAdmitCount).toBe(0);
     expect(instance.health().work.inFlight).toBe(0);
+  }, 45_000);
+
+  it('releases the prior Responses owner when a stateless chain replaces the warm slot', async () => {
+    const first = await postResponse(baseUrl, 'Reply with one short word for circle.');
+    const afterFirst = releasedOwners().length;
+    const second = await postResponse(baseUrl, 'Reply with one short word for square.');
+
+    expect(first.id).toMatch(/^resp_/u);
+    expect(second.id).toMatch(/^resp_/u);
+    expect(second.id).not.toBe(first.id);
+    await waitUntil(
+      () =>
+        releasedOwners().length === afterFirst + 1 &&
+        instance.registry.getSessionRegistry(MODEL_NAME)?.queueDepth === 0 &&
+        instance.registry.getSessionRegistry(MODEL_NAME)?.preDispatchAdmitCount === 0 &&
+        instance.health().work.inFlight === 0,
+      'Responses owner replacement and request accounting did not settle',
+    );
+    expect(releasedOwners().slice(afterFirst)).toHaveLength(1);
   }, 45_000);
 });

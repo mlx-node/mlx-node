@@ -2097,10 +2097,10 @@ impl Lfm2SchedulerState {
                 None
             }
         });
-        self.inner.release_scheduled_caches_for(seq_id);
         if let Some(error) = release_error {
             return Err(Error::from_reason(error));
         }
+        self.inner.release_scheduled_caches_for(seq_id);
         self.pending_restores.remove(&seq_id);
         self.owner_sequences.remove(owner_id);
         self.owner_histories.remove(owner_id);

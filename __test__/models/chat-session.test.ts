@@ -124,7 +124,7 @@ function makeMockModel() {
     yield finalChunk('tool-reply');
   });
   const resetCaches = vi.fn(() => Promise.resolve(undefined));
-  const releaseCacheOwner = vi.fn(() => Promise.resolve(undefined));
+  const releaseCacheOwner = vi.fn((_ownerId: string) => Promise.resolve(undefined));
 
   const model: SessionCapableModel = {
     chatSessionStart,
@@ -252,6 +252,25 @@ describe('ChatSession', () => {
       expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
       expect(releaseCacheOwner).toHaveBeenCalledWith(owner);
       await expect(session.send('after dispose')).rejects.toThrow('session has been disposed');
+    });
+
+    it('dispose attempts every native owner and keeps only failed owners retryable', async () => {
+      const { model, releaseCacheOwner } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.send('first', { config: { cacheOwnerId: 'owner-a' } });
+      await session.send('second', { config: { cacheOwnerId: 'owner-b' } });
+      releaseCacheOwner.mockImplementation((ownerId: string) =>
+        ownerId === 'owner-a' ? Promise.reject(new Error('owner-a release failed')) : Promise.resolve(undefined),
+      );
+
+      await expect(session.dispose()).rejects.toThrow('owner-a release failed');
+      expect(releaseCacheOwner.mock.calls.map(([ownerId]) => ownerId)).toEqual(['owner-a', 'owner-b']);
+
+      releaseCacheOwner.mockResolvedValue(undefined);
+      await session.dispose();
+      expect(releaseCacheOwner.mock.calls.map(([ownerId]) => ownerId)).toEqual(['owner-a', 'owner-b', 'owner-a']);
+      await expect(session.send('after retry')).rejects.toThrow('session has been disposed');
     });
 
     // Regression guard for the Phase 3b audio-surface ABI shift. The

@@ -173,6 +173,91 @@ describe('ModelWorkCoordinator + SessionRegistry queue cap', () => {
     expect(sessionReg.queueDepth).toBe(0);
   });
 
+  it('fails excess cold-to-resident transfers closed and keeps that request rejected', () => {
+    const coordinator = new ModelWorkCoordinator();
+    const registry = new ModelRegistry({ maxQueueDepth: 1 });
+    registry.setModelLoadAdmissionCoordinator(coordinator);
+    const first = coordinator.beginRequestLoadAdmission('cold-model');
+    const second = coordinator.beginRequestLoadAdmission('cold-model');
+    const rejected = coordinator.beginRequestLoadAdmission('cold-model');
+
+    registry.register('cold-model', createModel());
+    const sessionReg = registry.getSessionRegistry('cold-model')!;
+    expect(sessionReg.preDispatchAdmitCount).toBe(2);
+    expect(coordinator.requestLoadAdmissionCount).toBe(0);
+    expect(() => rejected.transferToResident(sessionReg)).toThrow(QueueFullError);
+
+    first.release();
+    expect(sessionReg.preDispatchAdmitCount).toBe(1);
+    // The rejected request does not opportunistically re-enter after another
+    // caller frees capacity; its endpoint returns the stored 429 and the client
+    // must retry as a new request.
+    expect(() => rejected.transferToResident(sessionReg)).toThrow(QueueFullError);
+
+    second.release();
+    rejected.release();
+    expect(sessionReg.preDispatchAdmitCount).toBe(0);
+  });
+
+  it('moves a live cold admission to a replacement resident registry on hot swap', () => {
+    const coordinator = new ModelWorkCoordinator();
+    const modelA = createModel();
+    const modelB = createModel();
+    const registryA = new ModelRegistry({ maxQueueDepth: 1 });
+    const registryB = new ModelRegistry({ maxQueueDepth: 1 });
+    registryA.register('model-a', modelA);
+    registryB.register('model-b', modelB);
+    const laneA = registryA.getSessionRegistry('model-a')!;
+    const laneB = registryB.getSessionRegistry('model-b')!;
+    const admission = coordinator.beginRequestLoadAdmission('logical-model');
+
+    coordinator.bindRequestLoadAdmissions('logical-model', laneA);
+    expect(laneA.preDispatchAdmitCount).toBe(1);
+    expect(laneB.preDispatchAdmitCount).toBe(0);
+
+    coordinator.bindRequestLoadAdmissions('logical-model', laneB);
+    expect(laneA.preDispatchAdmitCount).toBe(0);
+    expect(laneB.preDispatchAdmitCount).toBe(1);
+    expect(admission.transferToResident(laneB)).toBeDefined();
+
+    admission.release();
+    expect(laneB.preDispatchAdmitCount).toBe(0);
+  });
+
+  it('maps a resident-transfer failure to the exact Responses 429 envelope', async () => {
+    const coordinator = new ModelWorkCoordinator();
+    const registry = new ModelRegistry({ maxQueueDepth: 1 });
+    registry.setModelLoadAdmissionCoordinator(coordinator);
+    registry.register('cap-model', createModel());
+    const sessionReg = registry.getSessionRegistry('cap-model')!;
+    const first = sessionReg.beginPreDispatchAdmission();
+    const second = sessionReg.beginPreDispatchAdmission();
+
+    try {
+      const mock = createMockRes();
+      await handleCreateResponse(
+        mock.res,
+        { model: 'cap-model', input: 'over transferred capacity' },
+        registry,
+        null,
+        undefined,
+        undefined,
+        null,
+        coordinator,
+      );
+      await mock.waitForEnd();
+
+      expect(mock.getStatus()).toBe(429);
+      expect(mock.getHeaders()['retry-after']).toBe('1');
+      const parsed = JSON.parse(mock.getBody());
+      expect(parsed.error.type).toBe('rate_limit_error');
+      expect(parsed.error.code).toBe('queue_full');
+    } finally {
+      first.release();
+      second.release();
+    }
+  });
+
   it('POST /v1/messages enforces the per-model queue cap before waiting behind a model-load writer', async () => {
     const registry = new ModelRegistry({ maxQueueDepth: 1 });
     registry.register('cap-model', createModel());

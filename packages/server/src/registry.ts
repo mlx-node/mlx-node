@@ -412,6 +412,7 @@ export class ModelRegistry {
    * persists that crossed the safety breaker.
    */
   private finalizeBindingTeardown(model: ServableModel): void {
+    this.sessionRegistriesByModel.get(model)?.registry.clear();
     this.sessionRegistriesByModel.delete(model);
     this.instanceIds.delete(model);
   }

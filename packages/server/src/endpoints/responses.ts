@@ -2737,82 +2737,6 @@ export async function handleCreateResponse(
             return;
           }
 
-          const pagedActive = leaseModel.hasBlockPagedCache?.() === true;
-          const lookup = sessionReg.getOrCreate(
-            previousResponseId ?? null,
-            requestedInstructions,
-            effectivePromptCacheKey,
-          );
-          const session = lookup.session;
-          // `X-Session-Cache` observability header: classify this turn as
-          // `fresh` (no `previous_response_id` on the request and tier-2
-          // prompt-cache-key did not hit), `hit` (prev-id warm-cache
-          // lease consumed on tier 1), `prefix_hit` (tier-2 warm-cache
-          // lease consumed — only promoted from `fresh` later once the
-          // native `cachedTokens > 0` confirms real prefix reuse), or
-          // `cold_replay` (request carried `previous_response_id` but
-          // the warm entry was missing / expired / instructions-
-          // mismatched / already leased, OR the request shape is
-          // ineligible for the hot path — the endpoint will rebuild the
-          // session from the `ResponseStore` below). Set before any
-          // `writeHead` / SSE `beginSSE` so both JSON and SSE responses
-          // carry it. See `endpoints/messages.ts` for the matching
-          // emission on `/v1/messages`.
-          //
-          // The `prefix_hit` promotion and the companion
-          // `X-Cached-Tokens: N` header both depend on the native
-          // ChatResult's `cachedTokens` field, which is only authoritative
-          // AFTER the native dispatch completes. We therefore emit the
-          // initial `fresh` / `hit` / `cold_replay` value here and let
-          // the post-dispatch branch below promote a `fresh`+tier2-hit
-          // classification to `prefix_hit` once the cached-tokens count
-          // is known.
-          const tier2Hit = previousResponseId == null && lookup.hit;
-          // Optimistic pre-dispatch classification. SSE flushes headers on
-          // `beginSSE` inside `handleStreamingNative`, so the streaming
-          // path has exactly one shot to commit the header value — before
-          // the dispatch runs, i.e. BEFORE the native prefix verifier has
-          // reported whether any tokens were actually reused.
-          //
-          // For non-streaming we still commit optimistically to
-          // `prefix_hit` on tier-2 hit and demote to `fresh` post-dispatch
-          // if `cachedTokens === 0` (template drift, tokenizer change,
-          // image-set change, etc.) — `res.end` has not fired yet so the
-          // header is still settable.
-          //
-          // For streaming we deliberately do NOT promote to `prefix_hit`
-          // on tier-2 hit. Once SSE headers flush they cannot be
-          // corrected, and a false-positive `prefix_hit` would contradict
-          // consumers that read `cachedTokens` from the terminal event.
-          // Approach B (this path): emit `fresh` on streaming even when
-          // tier-2 found a warm session — the cache reuse still happens,
-          // only the observability header is conservative. A future
-          // refactor can thread `cached_tokens` through the native
-          // streaming `start` chunk so the server knows authoritatively
-          // before `beginSSE()` flushes, at which point streaming can
-          // commit `prefix_hit` too (Approach A). Until then,
-          // `prefix_hit` is a non-streaming-only signal.
-          const isStreaming = mappedBody.stream === true;
-          // Prev-id branch classification. A tier-1 HIT is labeled `hit`
-          // regardless of whether the request is hot-path-eligible: the
-          // warm native KV cache is reused in both paths (the cheap
-          // `send` / `sendToolResult` delta on the eligible branch; the
-          // full-history `primeHistory` + `startFromHistory*` replay on
-          // the ineligible branch, where `resetPreservingNativeCacheForWarmReuse`
-          // keeps the cache alive for `verify_cache_prefix_direct` to
-          // recover). Only a registry MISS on the prev-id branch
-          // downgrades to `cold_replay` (no warm cache to reuse, the
-          // request must rebuild from `ResponseStore`).
-          let sessionCacheStatus: SessionCacheStatus =
-            previousResponseId == null
-              ? tier2Hit && !isStreaming
-                ? 'prefix_hit'
-                : 'fresh'
-              : lookup.hit
-                ? 'hit'
-                : 'cold_replay';
-          res.setHeader('X-Session-Cache', sessionCacheStatus);
-
           // Multi-tool-call fan-out gate.
           //
           // The chat-session API cannot interleave tool results for a
@@ -3019,6 +2943,29 @@ export async function handleCreateResponse(
           // the now-canonical `messages`.
           newInputMessages = messages.slice(priorOffset);
 
+          // Lease only after every request-shape validation has passed. Once a
+          // session is removed from the warm slot, the try/finally below owns
+          // it until a clean turn adopts it again.
+          const pagedActive = leaseModel.hasBlockPagedCache?.() === true;
+          const lookup = sessionReg.getOrCreate(
+            previousResponseId ?? null,
+            requestedInstructions,
+            effectivePromptCacheKey,
+          );
+          const session = lookup.session;
+          await sessionReg.flushPendingDisposals();
+          let sessionRetained = false;
+          let sessionCleanupStarted = false;
+          const disposeUnretainedSession = async (): Promise<void> => {
+            if (sessionRetained || sessionCleanupStarted) return;
+            sessionCleanupStarted = true;
+            try {
+              await sessionReg.disposeSession(session);
+            } catch (error) {
+              console.error('[responses] failed to release an unretained chat-session cache owner:', error);
+            }
+          };
+
           // Visibility / wire-format tracker shared between the handler
           // body and the outer catch. Declared outside the `try` so the
           // catch can branch on `responseMode` (JSON vs SSE) and know
@@ -3027,6 +2974,20 @@ export async function handleCreateResponse(
           const visibility = createVisibility();
 
           try {
+            const tier2Hit = previousResponseId == null && lookup.hit;
+            const isStreaming = mappedBody.stream === true;
+            // Streaming headers are conservative because native cached-token
+            // evidence is not available until after SSE headers have flushed.
+            let sessionCacheStatus: SessionCacheStatus =
+              previousResponseId == null
+                ? tier2Hit && !isStreaming
+                  ? 'prefix_hit'
+                  : 'fresh'
+                : lookup.hit
+                  ? 'hit'
+                  : 'cold_replay';
+            res.setHeader('X-Session-Cache', sessionCacheStatus);
+
             // `runSession*` plumbs an honest commit signal out of the helper:
             // `ChatSession` only advances `turns` on a successful non-error
             // final chunk (streaming) or a resolved native promise
@@ -3641,6 +3602,7 @@ export async function handleCreateResponse(
               // corruption the precedence rule was explicitly designed
               // to prevent. Keep adopt's key aligned with lookup's key.
               sessionReg.adopt(responseId, session, requestedInstructions, effectivePromptCacheKey);
+              sessionRetained = true;
             }
 
             // Rethrow handler errors when the client hasn't seen a
@@ -3710,6 +3672,9 @@ export async function handleCreateResponse(
                 // Already closed / destroyed.
               }
             }
+          } finally {
+            await disposeUnretainedSession();
+            await sessionReg.flushPendingDisposals();
           }
         });
       };

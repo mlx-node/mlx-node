@@ -1454,6 +1454,11 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * Permanently dispose this JS session and release every native scheduler
    * owner it used. The operation is awaited and idempotent; it rejects while
    * a turn is in flight so native state cannot be torn down mid-decode.
+   *
+   * A caller-supplied `cacheOwnerId` becomes owned by this session just like
+   * the generated default owner. Do not share an explicit owner id between
+   * independently disposed sessions: disposing either session releases that
+   * owner's native scheduler state for both.
    */
   async dispose(): Promise<void> {
     if (this.disposed) return;
@@ -1462,14 +1467,22 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     }
     this.inFlight = true;
     try {
+      let firstReleaseError: unknown;
+      let hadReleaseError = false;
       if (this.model.releaseCacheOwner) {
         for (const ownerId of Array.from(this.nativeCacheOwnerIds)) {
-          await this.model.releaseCacheOwner(ownerId);
-          this.nativeCacheOwnerIds.delete(ownerId);
+          try {
+            await this.model.releaseCacheOwner(ownerId);
+            this.nativeCacheOwnerIds.delete(ownerId);
+          } catch (error) {
+            if (!hadReleaseError) firstReleaseError = error;
+            hadReleaseError = true;
+          }
         }
       } else {
         this.nativeCacheOwnerIds.clear();
       }
+      if (hadReleaseError) throw firstReleaseError;
       this.disposed = true;
       this.history = [];
       this.lastImagesKey = null;

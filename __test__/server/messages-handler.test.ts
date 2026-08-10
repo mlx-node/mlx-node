@@ -5731,9 +5731,10 @@ describe('handleCreateMessage', () => {
       //   * Identity witness: `primeHistory` runs on the SAME
       //     pre-seeded session instance on turn 1 — proves the warm
       //     hit actually leased it.
-      //   * Committed-producer witness: `warmSession.turns === 1` after
-      //     the failure — names the exact path under test (commit
-      //     fired despite the writer-side failure).
+      //   * Committed-producer witness: disposal observes
+      //     `warmSession.turns === 1` before it clears the dead wrapper —
+      //     names the exact path under test (commit fired despite the
+      //     writer-side failure).
       //   * Failed wire: `error` event without a `message_stop`.
       //   * Slot drop: `sessionReg.size === 0` after the failure —
       //     the leased session was NOT re-adopted under the sentinel.
@@ -5805,6 +5806,12 @@ describe('handleCreateMessage', () => {
       const warmSession = new ChatSession(mockModel);
       sessionReg.adopt('warm-prefix', warmSession, 'sysA', null);
       expect(sessionReg.size).toBe(1);
+      let turnsAtDispose = -1;
+      const originalDispose = warmSession.dispose.bind(warmSession);
+      const disposeSpy = vi.spyOn(warmSession, 'dispose').mockImplementation(async () => {
+        turnsAtDispose = warmSession.turns;
+        await originalDispose();
+      });
 
       // Identity witness: spy on the prototype (matches the
       // 3-turn streaming test pattern). The streaming dispatcher
@@ -5845,12 +5852,14 @@ describe('handleCreateMessage', () => {
         // where the warm hit is silently bypassed.
         expect(primeHistorySpy).toHaveBeenCalledTimes(1);
         expect(primeHistorySpy.mock.contexts[0]).toBe(warmSession);
-        // Committed-producer witness: turnCount advanced on the warm
-        // session even though the wire emitted `error`. This is the
+        // Committed-producer witness: disposal saw turnCount advance on
+        // the warm session even though the wire emitted `error`. This is the
         // exact `wasCommitted() === true && streamResult.ok === false`
         // scenario the dual-gate exists to drop. A regression that
         // adopts on `wasCommitted()` alone would slip past this turn.
-        expect(warmSession.turns).toBe(1);
+        expect(disposeSpy).toHaveBeenCalledTimes(1);
+        expect(turnsAtDispose).toBe(1);
+        await expect(warmSession.send('disposed session')).rejects.toThrow('session has been disposed');
         // Slot dropped — the committed-but-failed warm session was
         // NOT re-adopted under the sentinel.
         expect(sessionReg.size).toBe(0);
@@ -5890,6 +5899,7 @@ describe('handleCreateMessage', () => {
         expect(primeHistorySpy).toHaveBeenCalledTimes(2);
         expect(primeHistorySpy.mock.contexts[1]).not.toBe(warmSession);
       } finally {
+        disposeSpy.mockRestore();
         primeHistorySpy.mockRestore();
       }
     });

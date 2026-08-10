@@ -1488,6 +1488,8 @@ export async function handleCreateMessage(
           const pagedActive = leaseModel.hasBlockPagedCache?.() === true;
           const lookup = pagedActive ? sessionReg.createFreshSession() : sessionReg.getOrCreateWarmAny(requestedSystem);
           const session = lookup.session;
+          await sessionReg.flushPendingDisposals();
+          let sessionRetained = false;
           // `X-Session-Cache` observability header.
           //
           // Non-paged path:
@@ -1598,6 +1600,7 @@ export async function handleCreateMessage(
               if (!pagedActive) {
                 if (streamResult.ok && outcome.wasCommitted() && !streamResult.suppressedToolCalls) {
                   sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null);
+                  sessionRetained = true;
                 } else {
                   sessionReg.drop(MESSAGES_WARM_SLOT_ID);
                 }
@@ -1671,6 +1674,7 @@ export async function handleCreateMessage(
               if (!pagedActive) {
                 if (outcome.committed && !hasSuppressedToolCalls(result, body)) {
                   sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null);
+                  sessionRetained = true;
                 } else {
                   sessionReg.drop(MESSAGES_WARM_SLOT_ID);
                 }
@@ -1717,14 +1721,18 @@ export async function handleCreateMessage(
               }
             }
           } finally {
-            // Paged Messages sessions are deliberately stateless and never
-            // adopted into the JS registry. Explicitly release their native
-            // scheduler owner before leaving the admission lane; merely
-            // dropping the JS wrapper would otherwise retain the owner's
-            // history and live paged sequence forever.
-            if (pagedActive) {
-              await session.dispose();
+            // Every session that was not retained in the warm registry owns
+            // request-local native state and must be released before leaving
+            // the admission lane. Cleanup failure must not replace a terminal
+            // response already delivered to the client.
+            if (!sessionRetained) {
+              try {
+                await sessionReg.disposeSession(session);
+              } catch (error) {
+                console.error('[messages] failed to release an unretained chat-session cache owner:', error);
+              }
             }
+            await sessionReg.flushPendingDisposals();
           }
         });
       };

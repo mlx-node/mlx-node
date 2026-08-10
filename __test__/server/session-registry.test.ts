@@ -52,7 +52,12 @@ function makeMockModel(): SessionCapableModel {
       yield finalEvent;
     },
     resetCaches: () => Promise.resolve(),
+    releaseCacheOwner: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
+}
+
+function releaseOwnerSpy(model: SessionCapableModel): ReturnType<typeof vi.fn> {
+  return Reflect.get(model, 'releaseCacheOwner') as ReturnType<typeof vi.fn>;
 }
 
 describe('SessionRegistry', () => {
@@ -281,6 +286,64 @@ describe('SessionRegistry', () => {
     expect(fresh.session).not.toBe(sA);
     expect(fresh.hit).toBe(false);
     expect(reg.size).toBe(0);
+  });
+
+  it('disposes an evicted session but never disposes the session leased on a hit', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model });
+    const evicted = new ChatSession(model);
+    await evicted.send('evicted');
+    reg.adopt('evicted', evicted, null);
+
+    reg.getOrCreate(null, null);
+    await reg.flushPendingDisposals();
+    expect(releaseOwnerSpy(model)).toHaveBeenCalledTimes(1);
+
+    const leased = new ChatSession(model);
+    await leased.send('leased');
+    reg.adopt('leased', leased, null);
+    const hit = reg.getOrCreate('leased', null);
+    await reg.flushPendingDisposals();
+    expect(hit.session).toBe(leased);
+    expect(releaseOwnerSpy(model)).toHaveBeenCalledTimes(1);
+    await expect(leased.send('still usable')).resolves.toBeDefined();
+  });
+
+  it('disposes sessions removed by adopt replacement, drop, sweep, and clear', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, ttlSec: 60 });
+    const makeOwnedSession = async (ownerId: string): Promise<ChatSession<SessionCapableModel>> => {
+      const session = new ChatSession(model);
+      await session.send(ownerId, { config: { cacheOwnerId: ownerId } });
+      return session;
+    };
+
+    const replaced = await makeOwnedSession('replaced');
+    const replacement = await makeOwnedSession('replacement');
+    reg.adopt('old', replaced, null);
+    reg.adopt('new', replacement, null);
+    await reg.flushPendingDisposals();
+
+    reg.drop('new');
+    await reg.flushPendingDisposals();
+
+    const expired = await makeOwnedSession('expired');
+    reg.adopt('expired', expired, null);
+    vi.advanceTimersByTime(61_000);
+    reg.sweep();
+    await reg.flushPendingDisposals();
+
+    const cleared = await makeOwnedSession('cleared');
+    reg.adopt('cleared', cleared, null);
+    reg.clear();
+    await reg.flushPendingDisposals();
+
+    expect(releaseOwnerSpy(model).mock.calls.map(([ownerId]) => ownerId)).toEqual([
+      'replaced',
+      'replacement',
+      'expired',
+      'cleared',
+    ]);
   });
 
   it('adopt overwrites an existing key and refreshes expiry', () => {

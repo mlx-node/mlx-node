@@ -88,6 +88,24 @@ describe('ModelRegistry', () => {
     expect(registry.get('model-a')).toBeUndefined();
   });
 
+  it('disposes the warm session when the final model binding is torn down', async () => {
+    const registry = new ModelRegistry();
+    const releaseCacheOwner = vi.fn((_ownerId: string) => Promise.resolve(undefined));
+    const model = Object.assign(createMockSessionModel(), { releaseCacheOwner });
+    registry.register('model-a', model);
+    const sessionRegistry = registry.getSessionRegistry('model-a')!;
+    const { session } = sessionRegistry.getOrCreate(null, null);
+    await session.send('warm owner');
+    const ownerId = (model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0][1].cacheOwnerId;
+    sessionRegistry.adopt('warm-response', session, null);
+
+    expect(registry.unregister('model-a')).toBe(true);
+    await sessionRegistry.flushPendingDisposals();
+
+    expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
+    expect(releaseCacheOwner).toHaveBeenCalledWith(ownerId);
+  });
+
   it('returns false when unregistering a non-existent model', () => {
     const registry = new ModelRegistry();
     expect(registry.unregister('nonexistent')).toBe(false);

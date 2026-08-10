@@ -494,6 +494,15 @@ export class SessionRegistry {
    */
   private readonly entries: Map<string, SessionEntry> = new Map();
   /**
+   * Eviction is synchronous at the map boundary, but releasing a native
+   * scheduler owner is asynchronous. Start every disposal immediately and
+   * retain its promise so endpoint admission lanes can wait for command-order
+   * visibility before dispatching a replacement turn.
+   */
+  private readonly pendingDisposals = new Set<Promise<void>>();
+  private readonly disposalBySession = new WeakMap<ChatSession<SessionCapableModel>, Promise<void>>();
+  private readonly failedDisposals = new Set<ChatSession<SessionCapableModel>>();
+  /**
    * Shared sentinel representing "the execution chain is idle" — a
    * pre-resolved promise. `execLock` starts at this value and is
    * reset to it whenever the last holder releases without a
@@ -549,6 +558,58 @@ export class SessionRegistry {
     return new ChatSession(this.model, {
       defaultConfig: this.samplingDefaults,
     });
+  }
+
+  private scheduleDispose(session: ChatSession<SessionCapableModel>): void {
+    if (this.disposalBySession.has(session)) return;
+
+    const disposal = this.disposeSession(session)
+      .catch((error: unknown) => {
+        console.error('[server] failed to release an evicted chat-session cache owner:', error);
+      })
+      .finally(() => {
+        this.pendingDisposals.delete(disposal);
+        this.disposalBySession.delete(session);
+      });
+    this.disposalBySession.set(session, disposal);
+    this.pendingDisposals.add(disposal);
+  }
+
+  /**
+   * Dispose one leased session while retaining failed cleanup for a later
+   * registry flush. `ChatSession.dispose()` removes successful owners as it
+   * goes, so a retry only revisits owners whose native release failed.
+   */
+  async disposeSession(session: ChatSession<SessionCapableModel>): Promise<void> {
+    try {
+      await session.dispose();
+      this.failedDisposals.delete(session);
+    } catch (error) {
+      this.failedDisposals.add(session);
+      throw error;
+    }
+  }
+
+  /** Remove every cached entry except an optional session being leased. */
+  private evictEntriesExcept(keep?: ChatSession<SessionCapableModel>): void {
+    for (const entry of this.entries.values()) {
+      if (entry.session !== keep) this.scheduleDispose(entry.session);
+    }
+    this.entries.clear();
+  }
+
+  /**
+   * Wait until every disposal scheduled so far has settled. Disposals log and
+   * absorb their own failures so cleanup cannot rewrite a response that has
+   * already reached the client.
+   */
+  async flushPendingDisposals(): Promise<void> {
+    const retries = Array.from(this.failedDisposals);
+    this.failedDisposals.clear();
+    for (const session of retries) this.scheduleDispose(session);
+    while (this.pendingDisposals.size > 0) {
+      await Promise.all(this.pendingDisposals);
+    }
   }
 
   /**
@@ -777,18 +838,18 @@ export class SessionRegistry {
     if (previousResponseId !== null) {
       const entry = this.entries.get(previousResponseId);
       if (entry === undefined) {
-        this.entries.clear();
+        this.evictEntriesExcept();
         return { session: this.newSession(), hit: false };
       }
       if (entry.expiresAt < nowSec()) {
-        this.entries.clear();
+        this.evictEntriesExcept();
         return { session: this.newSession(), hit: false };
       }
       // Prefix-state mismatch forces cold replay so the new
       // instructions are re-primed; without this guard, output would
       // silently depend on cache state instead of request contents.
       if (entry.instructions !== requestedInstructions) {
-        this.entries.clear();
+        this.evictEntriesExcept();
         return { session: this.newSession(), hit: false };
       }
       // Tier-1 hit: clear and hand the session out as a single-use
@@ -797,7 +858,7 @@ export class SessionRegistry {
       // that even on a prev-id tier-1 MISS we do NOT fall through to
       // tier 2 — see the docstring above for the precedence
       // rationale.
-      this.entries.clear();
+      this.evictEntriesExcept(entry.session);
       return { session: entry.session, hit: true };
     }
 
@@ -826,7 +887,7 @@ export class SessionRegistry {
         if (entry.instructions !== requestedInstructions) continue;
         // Tier-2 hit: clear and lease (same single-warm / single-use
         // semantics as tier 1).
-        this.entries.clear();
+        this.evictEntriesExcept(entry.session);
         return { session: entry.session, hit: true };
       }
     }
@@ -834,7 +895,7 @@ export class SessionRegistry {
     // Fall through: fresh session. Clear any leftover entry so a
     // later lookup cannot hand out a wrapper whose assumed state has
     // been overwritten by this dispatch.
-    this.entries.clear();
+    this.evictEntriesExcept();
     return { session: this.newSession(), hit: false };
   }
 
@@ -960,13 +1021,13 @@ export class SessionRegistry {
       if (entry.expiresAt < nowSec()) continue;
       if (entry.instructions !== requestedInstructions) continue;
       // Hit: clear and lease (single-use semantics, same as tiers 1/2).
-      this.entries.clear();
+      this.evictEntriesExcept(entry.session);
       return { session: entry.session, hit: true };
     }
     // Miss (no entry, expired, or instructions drift). Clear the map
     // so a stale wrapper cannot leak into a later lookup, and return
     // a fresh session.
-    this.entries.clear();
+    this.evictEntriesExcept();
     return { session: this.newSession(), hit: false };
   }
 
@@ -1000,7 +1061,7 @@ export class SessionRegistry {
     // short / absent) `scopePromptCacheKey` returns `null`, which
     // disables this entry from ever matching a tier-2 lookup — the
     // raw caller-supplied key is NEVER stored.
-    this.entries.clear();
+    this.evictEntriesExcept(session);
     this.entries.set(responseId, {
       session,
       instructions,
@@ -1013,7 +1074,10 @@ export class SessionRegistry {
    * Remove a session by response id. No-op if the key is not present.
    */
   drop(responseId: string): void {
+    const entry = this.entries.get(responseId);
+    if (entry === undefined) return;
     this.entries.delete(responseId);
+    this.scheduleDispose(entry.session);
   }
 
   /**
@@ -1026,13 +1090,14 @@ export class SessionRegistry {
     for (const [key, entry] of this.entries) {
       if (entry.expiresAt < cutoff) {
         this.entries.delete(key);
+        this.scheduleDispose(entry.session);
       }
     }
   }
 
   /** Empty the registry. Useful at shutdown and in tests. */
   clear(): void {
-    this.entries.clear();
+    this.evictEntriesExcept();
   }
 
   /**

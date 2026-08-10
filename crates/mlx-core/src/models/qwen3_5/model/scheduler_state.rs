@@ -635,6 +635,11 @@ impl Qwen35SchedulerState {
             .is_some_and(|owner| !owner.is_empty())
     }
 
+    fn chat_requires_legacy_owner_drain(command: &ChatCmd) -> bool {
+        !matches!(command, ChatCmd::ReleaseCacheOwner { .. })
+            && !Self::chat_has_explicit_owner(command)
+    }
+
     fn chat_requires_barrier(&self, command: &ChatCmd) -> bool {
         if Self::chat_config(command).is_some_and(|config| config.enable_mtp == Some(true)) {
             return true;
@@ -687,10 +692,10 @@ impl Qwen35SchedulerState {
                 None
             }
         });
-        self.inner.release_scheduled_recurrent_for(seq_id);
         if let Some(error) = release_error {
             return Err(Error::from_reason(error));
         }
+        self.inner.release_scheduled_recurrent_for(seq_id);
         self.owner_sequences.remove(owner_id);
         self.owner_histories.remove(owner_id);
         Ok(())
@@ -1500,7 +1505,8 @@ impl Qwen35SchedulerState {
             && let Some(command) = self.pending.front()
         {
             let must_wait_for_legacy_owner = matches!(command, Qwen35Cmd::Chat(chat)
-                if !Self::chat_has_explicit_owner(chat) && self.scheduler.has_work());
+                if Self::chat_requires_legacy_owner_drain(chat)
+                    && self.scheduler.has_work());
             if must_wait_for_legacy_owner {
                 break;
             }
@@ -1690,6 +1696,19 @@ mod tests {
         assert!(!state.owner_sequences.contains_key("stateless-owner"));
         assert!(!state.owner_histories.contains_key("stateless-owner"));
         assert!(!state.inner.has_scheduled_recurrent(9));
+    }
+
+    #[test]
+    fn cache_owner_release_bypasses_unrelated_legacy_owner_drain() {
+        let (reply, _result) = tokio::sync::oneshot::channel();
+        let command = ChatCmd::ReleaseCacheOwner {
+            owner_id: "completed-owner".into(),
+            reply,
+        };
+        assert!(
+            !Qwen35SchedulerState::chat_requires_legacy_owner_drain(&command),
+            "per-owner release must reach cache_owner_release_blocked instead of waiting for every unrelated sequence"
+        );
     }
 
     #[test]

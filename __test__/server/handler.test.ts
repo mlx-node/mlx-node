@@ -2513,6 +2513,34 @@ describe('createHandler', () => {
       expect(sessionReg!.size).toBe(0);
     });
 
+    it('releases the prior Responses owner when a stateless turn replaces the warm slot', async () => {
+      const registry = new ModelRegistry();
+      const releaseCacheOwner = vi.fn((_ownerId: string) => Promise.resolve(undefined));
+      const mockModel = Object.assign(createMockModel(), { releaseCacheOwner });
+      registry.register('test-model', mockModel);
+      const handler = createHandler(registry);
+
+      const first = createMockRes();
+      await handler(createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'first chain' }), first.res);
+      await first.waitForEnd();
+      const firstOwner = (mockModel.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0][1].cacheOwnerId;
+
+      const second = createMockRes();
+      await handler(
+        createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'replacement chain' }),
+        second.res,
+      );
+      await second.waitForEnd();
+      const secondOwner = (mockModel.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[1][1].cacheOwnerId;
+
+      expect(first.getStatus()).toBe(200);
+      expect(second.getStatus()).toBe(200);
+      expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
+      expect(releaseCacheOwner).toHaveBeenCalledWith(firstOwner);
+      expect(secondOwner).not.toBe(firstOwner);
+      expect(registry.getSessionRegistry('test-model')?.size).toBe(1);
+    });
+
     it('does not adopt the session when a streaming turn exhausts without a done event', async () => {
       // Iteration-16 adopt gate + iteration-18 persist/SSE gate:
       //
@@ -11086,7 +11114,10 @@ describe('createHandler', () => {
       // session must NOT be adopted under the responseId the client
       // never saw. The client should receive a 500 error.
       const registry = new ModelRegistry();
-      const mockModel = createMockModel(makeChatResult({ text: 'committed reply' }));
+      const releaseCacheOwner = vi.fn((_ownerId: string) => Promise.resolve(undefined));
+      const mockModel = Object.assign(createMockModel(makeChatResult({ text: 'committed reply' })), {
+        releaseCacheOwner,
+      });
       registry.register('test-model', mockModel);
 
       const handler = createHandler(registry);
@@ -11129,6 +11160,9 @@ describe('createHandler', () => {
       const sessionReg = registry.getSessionRegistry('test-model');
       expect(sessionReg).toBeDefined();
       expect(sessionReg!.size).toBe(0);
+      const failedOwner = (mockModel.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0][1].cacheOwnerId;
+      expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
+      expect(releaseCacheOwner).toHaveBeenCalledWith(failedOwner);
     });
 
     it('committed non-streaming handler crash AFTER writeHead but before end does not adopt under unseen id', async () => {

@@ -7155,6 +7155,63 @@ mod tests {
             .expect("release absent owner");
     }
 
+    #[test]
+    fn scheduler_cache_owner_release_frees_paged_row_but_preserves_prefix() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping owner-release paged test (paged backend unavailable)");
+            return;
+        }
+        let mut inner = match super::Qwen3Inner::new(paged_tiny_config(Some(true))) {
+            Ok(inner) => inner,
+            Err(error) if error.reason.contains("No Metal device found") => {
+                eprintln!("skipping owner-release paged test (no Metal device)");
+                return;
+            }
+            Err(error) => panic!("construct paged scheduler inner: {error}"),
+        };
+        cast_paged_inner_to_bf16(&mut inner);
+        let prompt = (2..=33).collect::<Vec<u32>>();
+        prime_paged_request(&mut inner, 41, &prompt).expect("prime owner row");
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("paged adapter")
+            .finalize_turn_keep_live(&[], 0)
+            .expect("publish owner prefix");
+
+        let mut state = super::QwenSchedulerState::new(inner);
+        state.owner_sequences.insert("stateless-owner".into(), 41);
+        state
+            .owner_histories
+            .insert("stateless-owner".into(), prompt.clone());
+        assert!(
+            state
+                .inner
+                .paged_adapter
+                .as_ref()
+                .expect("paged adapter")
+                .block_table_for(41)
+                .is_some()
+        );
+
+        state
+            .release_cache_owner_now("stateless-owner")
+            .expect("release paged owner");
+        let adapter = state.inner.paged_adapter.as_mut().expect("paged adapter");
+        assert!(adapter.block_table_for(41).is_none());
+        adapter.begin_request(42).expect("begin prefix probe");
+        let hit = adapter
+            .find_cached_prefix(&prompt, &[], 0, false)
+            .expect("probe released prefix");
+        assert_eq!(
+            hit.cached_token_count, 32,
+            "owner-private row must be freed without purging content-addressed prefix blocks"
+        );
+        adapter
+            .release_request_for(42)
+            .expect("release prefix probe");
+    }
+
     /// Default-flag construction (`None`) must allocate the block-paged
     /// adapter under the new default-on policy (`unwrap_or(true)`).
     /// Allocates a `LayerKVPool`, so requires Metal — gracefully skips on
