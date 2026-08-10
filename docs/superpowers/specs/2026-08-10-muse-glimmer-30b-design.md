@@ -452,24 +452,41 @@ it is where the one hard error lives. It found two more (traps 13 and 14).
 These are not optional polish. Each came out of an adversarial round on M0 code and cannot
 be settled inside M0.
 
-- **The tool dispatcher must validate a call name against the declared tools.** The parser
-  recognises a tool call only where the recipient is a tool channel — neither `self` nor
-  `user` — which is what stops an assistant explaining ATEM syntax to a human from
-  producing a real, side-effectful call. But a recipient that merely *resembles* an answer
-  channel (`to=selfish`, `to=userX`) is literally neither, so it routes to the action side.
-  The protocol-derived alternative, requiring `recipient == invoke name` because the
-  template always renders `to=<tc.function.name>`, may conflict with the checkpoint spec's
-  `repeats: true` on `tool_calls`. So the last line of defence belongs at dispatch, where
-  the declared tool list exists.
-- **`StreamGuard::push(chunk, tokens)` takes the decoded token count from the caller.**
-  Inferring it from decoded character length was wrong, not merely imprecise: this
-  checkpoint's vocabulary holds 74 tokens longer than the old 64-character assumption,
-  including id 169871 at 113 characters and id 162250 at 112, and the guard truncated a
-  legitimate 560-character answer to 448. M1 decodes the tokens, so M1 must pass the count.
-  There is deliberately no one-argument overload.
-- **Verify `MAX_HEADER_CHARS` against the real recipient names.** It is 128, unverified; a
-  recipient over roughly 106 characters ends the turn. The rendered `# Valid recipients:`
-  list is where to check.
+- **Token provenance must reach the output parser, and M1 must produce it.** This is the
+  one M0 finding that could not be fixed inside M0's own layer. `<|eot|>` rendered from
+  real token 200008 and `<|eot|>` written as seven literal characters are *the same bytes*
+  once a `&str` reaches the parser, so a message terminator quoted inside an answer let the
+  anchored tool call after it execute — `rm {path:"/"}` out of explanatory prose. Every
+  signal the parser could add is itself made of those bytes, so the fix is a signature, not
+  a rule: the parser takes the byte ranges where a genuine special-token rendering
+  occurred, and treats a terminator or an anchor as a boundary only inside one of them.
+  Whatever consumes the token stream — the streaming guard is the natural place — has to
+  build those spans, because it is the last layer that still has token ids. A parser that
+  can emit an executable call from an un-provenanced string is the wrong shape regardless
+  of how careful its rules are.
+- **A tool call is recognised only where the recipient is a tool channel, and every
+  accepted invoke name must equal that recipient.** This supersedes an earlier reading that
+  put the check at dispatch. Dispatcher validation cannot recover a discarded recipient: it
+  sees `rm`, which may be legitimately declared, and cannot know the message was addressed
+  to `userX`. Equality is protocol fidelity rather than a restriction — `chat_template.jinja`
+  builds `'<|start|>assistant to=' + tc.function.name` and `render_atem`'s invoke tag from
+  the *same string*, one call per message. The spec's `repeats: true` permits repeated
+  matches and repeated messages; it does not license a different invoke name under one
+  recipient. Keep registry validation at dispatch as defence in depth, not as the control.
+- **The guard takes decoded tokens, not a count and not a chunk.** Inferring the count from
+  decoded character length was wrong, not merely imprecise: **70 decoded tokens exceed the
+  old 64-character assumption** (id 169871 at 113 characters, id 162250 at 112), and the
+  guard truncated a legitimate 560-character answer to 448. Note the measurement trap —
+  74 *raw BPE lexemes* exceed 64 characters but only 70 *decoded* tokens do, and counting
+  vocabulary keys instead of decoded output is what produced the wrong figure first time.
+  Trusting a caller-supplied number is not enforcement either: a slice with one entry per
+  token is, which is why `push(&[&str])` and `push_token(&str)` replaced it.
+- **Size the header allowance from the longest configured recipient.** A fixed 128 was the
+  same mistake as the fixed 64: a 107-character advertised tool name produces a
+  129-character anchored header, and the same legal name was accepted or refused depending
+  on which header carried it. `FunctionDefinition` accepts unrestricted strings, so either
+  derive the allowance per turn or document and enforce a maximum before rendering. Keep a
+  separate absolute memory bound.
 - **Wire the session-pinned render options into the production chat path.** M0 pins
   `current_date` only through the render entry point the golden tests use; the 4-argument
   `apply_chat_template_sync` still cannot supply it.
