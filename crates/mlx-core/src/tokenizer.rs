@@ -972,6 +972,7 @@ impl Qwen3Tokenizer {
                             &eos_str,
                             content_order,
                             existing_image_placeholder.as_deref(),
+                            RenderContextOptions::default(),
                         )
                     }
                     .map_err(Error::from_reason)?;
@@ -1182,6 +1183,7 @@ impl Qwen3Tokenizer {
             eos_token,
             MultimodalContentOrder::TextThenMedia,
             None,
+            RenderContextOptions::default(),
         )
     }
 
@@ -1349,6 +1351,29 @@ impl Qwen3Tokenizer {
         );
     }
 
+    /// Turn [`RenderContextOptions`] into the extra half of the render context.
+    ///
+    /// Only the keys the caller actually set are inserted, so an unset one stays
+    /// **undefined** in the template rather than resolving to an empty string.
+    /// A template guarding on a bare `is defined` would otherwise take the `if`
+    /// branch and emit a hollow `Current date: .`. Muse-Glimmer's own guard is
+    /// `{%- if current_date is defined and current_date -%}` (see
+    /// `.cache/models/muse-glimmer-30b/chat_template.jinja`), so there both
+    /// spellings coincide — absent is the one that is right either way.
+    fn build_render_context(opts: RenderContextOptions) -> minijinja::Value {
+        let mut map = std::collections::BTreeMap::<String, minijinja::Value>::new();
+        if let Some(date) = opts.current_date {
+            map.insert("current_date".into(), minijinja::Value::from(date));
+        }
+        if let Some(strength) = opts.reasoning_strength {
+            map.insert(
+                "reasoning_strength".into(),
+                minijinja::Value::from(strength),
+            );
+        }
+        minijinja::Value::from_serialize(&map)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_chat_template_jinja2_with_content_order(
         template_str: &str,
@@ -1360,6 +1385,7 @@ impl Qwen3Tokenizer {
         eos_token: &str,
         content_order: MultimodalContentOrder,
         existing_image_placeholder: Option<&str>,
+        render_ctx: RenderContextOptions,
     ) -> std::result::Result<String, String> {
         let mut env = Environment::new();
         Self::install_template_helpers(&mut env);
@@ -1458,6 +1484,12 @@ impl Qwen3Tokenizer {
         // Templates that don't read `preserve_thinking` (e.g. Qwen3
         // non-thinking, LFM2, Gemma4) ignore the extra key — minijinja
         // treats unknown variables in `context!` as a no-op on access.
+        //
+        // `..build_render_context(...)` merges the caller's optional globals in as
+        // a fallback layer (precedence is left to right, so nothing above can be
+        // shadowed). A key the caller left unset is absent from that layer and
+        // therefore still `undefined` to the template — see
+        // [`RenderContextOptions`].
         let ctx = context! {
             messages => messages_value,
             tools => tools_value,
@@ -1469,6 +1501,7 @@ impl Qwen3Tokenizer {
             keep_past_thinking => true,
             bos_token => bos_token,
             eos_token => eos_token,
+            ..Self::build_render_context(render_ctx),
         };
 
         tmpl.render(ctx)
@@ -1685,6 +1718,7 @@ impl Qwen3Tokenizer {
             enable_thinking,
             content_order,
             existing_image_placeholder,
+            RenderContextOptions::default(),
         )?;
 
         // Encode the formatted text (don't add extra special tokens)
@@ -1711,6 +1745,7 @@ impl Qwen3Tokenizer {
             enable_thinking,
             MultimodalContentOrder::TextThenMedia,
             None,
+            RenderContextOptions::default(),
         )
     }
 
@@ -1723,6 +1758,7 @@ impl Qwen3Tokenizer {
         enable_thinking: Option<bool>,
         content_order: MultimodalContentOrder,
         existing_image_placeholder: Option<&str>,
+        render_ctx: RenderContextOptions,
     ) -> Result<String> {
         let add_prompt = add_generation_prompt.unwrap_or(true);
 
@@ -1751,6 +1787,7 @@ impl Qwen3Tokenizer {
             &eos_str,
             content_order,
             existing_image_placeholder,
+            render_ctx,
         )
         .map_err(Error::from_reason)
     }
@@ -1822,6 +1859,29 @@ pub enum MultimodalContentOrder {
     TextThenMedia,
     #[napi(value = "imagesThenText")]
     ImagesThenText,
+}
+
+/// Caller-supplied template globals that no template can derive on its own.
+///
+/// Both keys are `Option` and an unset one is left **out** of the render context
+/// entirely rather than passed as an empty string, because the templates that
+/// read them branch on definedness.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct RenderContextOptions {
+    /// The date the template prints as `Current date: {{ current_date }}.` at the
+    /// very front of the system message.
+    ///
+    /// HF supplies it, and its templates fall back to `strftime_now(...)` — a
+    /// global `transformers` registers and miniJinja does not, so unset the whole
+    /// line silently vanishes and the prompt matches no HF-rendered reference.
+    /// We still never read the system clock for it: the line sits in the prompt
+    /// *prefix*, so a value that rolls over mid-session invalidates every
+    /// prefix-reuse and cold-tier entry behind it. The caller pins it per session.
+    pub current_date: Option<String>,
+    /// Reasoning budget hint (`low` / `medium` / `high`). Muse-Glimmer's template
+    /// substitutes `high` when this is undefined or empty, so leaving it `None` is
+    /// not the same as sending `high` textually — it just lets the template decide.
+    pub reasoning_strength: Option<String>,
 }
 
 /// Serialize a single `ChatMessage` into the shape Jinja chat templates
@@ -1974,6 +2034,11 @@ fn encoding_to_uint32_array<'env>(
 mod tests {
     use super::*;
     use minijinja::{Environment, context};
+
+    /// Probes definedness the way Muse-Glimmer's template does — `is defined`,
+    /// not truthiness — so an empty string would still take the `if` branch.
+    const DEFINEDNESS_PROBE_TEMPLATE: &str = "{% if current_date is defined %}D={{ current_date }}{% else %}NONE{% endif %}\
+         |{% if reasoning_strength is defined %}R={{ reasoning_strength }}{% else %}NONE{% endif %}";
 
     struct TestModelDir(std::path::PathBuf);
 
@@ -2209,6 +2274,7 @@ mod tests {
             "",
             MultimodalContentOrder::ImagesThenText,
             None,
+            super::RenderContextOptions::default(),
         )
         .expect("template renders");
 
@@ -2230,6 +2296,7 @@ mod tests {
             "",
             MultimodalContentOrder::ImagesThenText,
             None,
+            super::RenderContextOptions::default(),
         )
         .expect("Qianfan-style checkpoint template renders");
 
@@ -2269,6 +2336,7 @@ mod tests {
             "",
             MultimodalContentOrder::ImagesThenText,
             Some("<image>"),
+            super::RenderContextOptions::default(),
         )
         .expect("Qianfan-style checkpoint template renders");
 
@@ -3546,5 +3614,99 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(actual_set, expected_set);
+    }
+
+    /// Muse-Glimmer's template opens the system message with
+    /// `Current date: {{ current_date }}.`, guarded by `is defined` and falling
+    /// back to `strftime_now(...)` — a function HF registers and miniJinja does
+    /// not. The value therefore has to arrive from the caller as a real context
+    /// key or the line silently vanishes from every rendered prompt.
+    #[test]
+    fn render_context_pins_current_date() {
+        let mut env = Environment::new();
+        super::Qwen3Tokenizer::install_template_helpers(&mut env);
+        env.add_template("t", DEFINEDNESS_PROBE_TEMPLATE).unwrap();
+        let ctx = super::Qwen3Tokenizer::build_render_context(super::RenderContextOptions {
+            current_date: Some("2026-08-10".to_string()),
+            reasoning_strength: Some("low".to_string()),
+        });
+        assert_eq!(
+            env.get_template("t").unwrap().render(&ctx).unwrap(),
+            "D=2026-08-10|R=low"
+        );
+    }
+
+    /// An unset value must be **absent** from the context, not present-and-empty.
+    /// This probe guards on a bare `is defined`, which `Some(String::new())` satisfies,
+    /// so it pins the contract at its strictest: unset means undefined, full stop.
+    /// (Muse-Glimmer's own guard is `is defined and current_date`, which rejects the
+    /// empty string as well, so there the two forms coincide. Nothing guarantees the
+    /// next template will spell it that way.)
+    #[test]
+    fn render_context_omits_current_date_when_unset() {
+        let mut env = Environment::new();
+        super::Qwen3Tokenizer::install_template_helpers(&mut env);
+        env.add_template("t", DEFINEDNESS_PROBE_TEMPLATE).unwrap();
+        let ctx = super::Qwen3Tokenizer::build_render_context(super::RenderContextOptions {
+            current_date: None,
+            reasoning_strength: None,
+        });
+        assert_eq!(
+            env.get_template("t").unwrap().render(&ctx).unwrap(),
+            "NONE|NONE"
+        );
+        // Every existing call site passes `default()`, so pin that it really is
+        // all-`None` rather than trusting the derive to stay that way.
+        let ctx =
+            super::Qwen3Tokenizer::build_render_context(super::RenderContextOptions::default());
+        assert_eq!(
+            env.get_template("t").unwrap().render(&ctx).unwrap(),
+            "NONE|NONE"
+        );
+    }
+
+    /// `build_render_context` in isolation proves nothing about the prompt: if the
+    /// map is never merged into the `context!` the production renderer builds, the
+    /// template still sees both keys as undefined and the two tests above pass
+    /// anyway. So drive the real renderer — and pin that pre-existing keys still
+    /// resolve, because merging turns the context root into a `MergeDict`.
+    #[test]
+    fn render_context_keys_reach_the_production_renderer() {
+        let template = "{% if current_date is defined %}D={{ current_date }}{% else %}NO_DATE{% endif %}\
+                        |{% if reasoning_strength is defined %}R={{ reasoning_strength }}{% else %}NO_R{% endif %}\
+                        |{{ messages[0].content }}|{{ bos_token }}|{{ enable_thinking }}";
+
+        let pinned = Qwen3Tokenizer::render_chat_template_jinja2_with_content_order(
+            template,
+            &[user_msg("hi", 0)],
+            None,
+            false,
+            None,
+            "<bos>",
+            "",
+            MultimodalContentOrder::TextThenMedia,
+            None,
+            super::RenderContextOptions {
+                current_date: Some("2026-08-10".to_string()),
+                reasoning_strength: Some("low".to_string()),
+            },
+        )
+        .expect("template renders");
+        assert_eq!(pinned, "D=2026-08-10|R=low|hi|<bos>|True");
+
+        let unset = Qwen3Tokenizer::render_chat_template_jinja2_with_content_order(
+            template,
+            &[user_msg("hi", 0)],
+            None,
+            false,
+            None,
+            "<bos>",
+            "",
+            MultimodalContentOrder::TextThenMedia,
+            None,
+            super::RenderContextOptions::default(),
+        )
+        .expect("template renders");
+        assert_eq!(unset, "NO_DATE|NO_R|hi|<bos>|True");
     }
 }
