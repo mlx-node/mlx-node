@@ -1651,7 +1651,25 @@ impl Qwen3Tokenizer {
                                 "get key must be a string",
                             )
                         })?;
-                        let default = args.get(1).cloned().unwrap_or(minijinja::Value::UNDEFINED);
+                        // Python's `dict.get(missing)` returns `None`, NOT an
+                        // undefined. The difference is prompt-visible: minijinja's
+                        // `x is none` is false for an undefined, so a template
+                        // gating a default on `is none` silently skips it.
+                        // Muse-Glimmer's assistant branch is exactly that
+                        //   {%- set end_turn = message.get('end_turn') -%}
+                        //   {%- if end_turn is none -%}… default …{%- endif -%}
+                        // and the missed default terminated every plain assistant
+                        // turn `<|eom|>` where the checkpoint expects `<|eot|>`.
+                        //
+                        // Across all 25 ways a template can consume a `.get` miss,
+                        // 9 differ between the two spellings, and on every one of
+                        // those 9 `none` matches Python Jinja2 while `UNDEFINED`
+                        // matches neither engine — so this can only move a template
+                        // TOWARD HF parity. `|default(…)` is one of the 9: it fires
+                        // on undefined only, in both engines, so a missing key now
+                        // reaches the template as `none` there too, exactly as HF
+                        // hands it over.
+                        let default = args.get(1).cloned().unwrap_or(minijinja::Value::from(()));
                         match value.get_attr(key_str) {
                             Ok(v) if !v.is_undefined() => Ok(v),
                             _ => Ok(default),
@@ -1803,23 +1821,11 @@ impl Qwen3Tokenizer {
                 .collect()
         });
 
-        // Convert messages to JSON-serializable format (already sanitized by caller)
-        let messages_value: Vec<serde_json::Value> = messages
-            .iter()
-            .map(|message| {
-                if content_order == MultimodalContentOrder::TextThenMedia
-                    && existing_image_placeholder.is_none()
-                {
-                    serialize_message_for_jinja(message)
-                } else {
-                    serialize_message_for_jinja_with_policy(
-                        message,
-                        content_order,
-                        existing_image_placeholder,
-                    )
-                }
-            })
-            .collect();
+        // Convert messages to JSON-serializable format (already sanitized by caller).
+        // Whole-conversation rather than per-message, because a tool message's
+        // function name lives on the call it answers.
+        let messages_value =
+            serialize_messages_for_jinja(messages, content_order, existing_image_placeholder);
 
         // Build context for Jinja2 template
         // Note: enable_thinking defaults to true to allow model to think naturally.
@@ -2316,21 +2322,76 @@ fn to_json_python_separators<T: Serialize + ?Sized>(value: &T) -> Option<String>
 ///
 /// `msg.images` is `#[serde(skip)]` so a direct `serde_json::to_value(msg)`
 /// would drop images entirely, which is why this helper exists.
-pub(crate) fn serialize_message_for_jinja(msg: &ChatMessage) -> serde_json::Value {
+///
+/// Test-only since the tool-message `name` normalisation landed: resolving that
+/// name needs the WHOLE conversation, so the render path now goes through
+/// [`serialize_messages_for_jinja`] and nothing in production serializes one
+/// message on its own. Kept because the per-field unit tests below read far more
+/// clearly one message at a time.
+#[cfg(test)]
+fn serialize_message_for_jinja(msg: &ChatMessage) -> serde_json::Value {
     serialize_message_for_jinja_with_order(msg, MultimodalContentOrder::TextThenMedia)
 }
 
+/// Test-only, for the same reason as [`serialize_message_for_jinja`].
+#[cfg(test)]
 fn serialize_message_for_jinja_with_order(
     msg: &ChatMessage,
     content_order: MultimodalContentOrder,
 ) -> serde_json::Value {
-    serialize_message_for_jinja_with_policy(msg, content_order, None)
+    serialize_message_for_jinja_with_policy(msg, content_order, None, None)
+}
+
+/// Serialize a whole conversation, resolving each `tool`-role message's function
+/// `name` from the tool call it answers.
+///
+/// [`ChatMessage`] has no `name` field, so the per-message serializer emits none —
+/// yet HF-shaped templates look for exactly that key on a tool message:
+/// Gemma4 opens with `namespace(name=follow.get('name') | default('unknown'))`
+/// and Muse-Glimmer with `{%- set tname = message.get('name') -%}`. Both then run
+/// a rescue loop that matches `tool_call.id` against `message.tool_call_id`, so
+/// today survival rides entirely on that id conjunct: whenever the two ids are
+/// asymmetric or disagree, Gemma4 emits a bogus `response:unknown` — a wrong tool
+/// name in the prompt — where HF raises. Filling `name` in puts every well-formed
+/// round trip on the direct path in BOTH engines, and because the fill happens
+/// before the template runs, minijinja and HF see byte-identical input.
+///
+/// Only a call that appeared EARLIER can be answered, and a later call reusing an
+/// id wins for the messages after it — which is what the templates' own rescue
+/// loops do, overwriting on every match rather than stopping at the first.
+fn serialize_messages_for_jinja(
+    messages: &[ChatMessage],
+    content_order: MultimodalContentOrder,
+    existing_image_placeholder: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let mut name_by_call_id: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let resolved_tool_name = (msg.role == "tool")
+            .then_some(msg.tool_call_id.as_deref())
+            .flatten()
+            .and_then(|id| name_by_call_id.get(id).copied());
+        out.push(serialize_message_for_jinja_with_policy(
+            msg,
+            content_order,
+            existing_image_placeholder,
+            resolved_tool_name,
+        ));
+        for call in msg.tool_calls.iter().flatten() {
+            if let Some(id) = call.id.as_deref() {
+                name_by_call_id.insert(id, call.name.as_str());
+            }
+        }
+    }
+    out
 }
 
 fn serialize_message_for_jinja_with_policy(
     msg: &ChatMessage,
     content_order: MultimodalContentOrder,
     existing_image_placeholder: Option<&str>,
+    resolved_tool_name: Option<&str>,
 ) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("role".to_string(), serde_json::json!(msg.role));
@@ -2377,6 +2438,13 @@ fn serialize_message_for_jinja_with_policy(
         obj.insert("content".to_string(), serde_json::Value::Array(parts));
     } else {
         obj.insert("content".to_string(), serde_json::json!(msg.content));
+    }
+
+    // The tool-message `name` [`serialize_messages_for_jinja`] resolved from the
+    // answered call. Absent when nothing matched, so a template's own fallback
+    // still decides — we never invent a name.
+    if let Some(name) = resolved_tool_name {
+        obj.insert("name".to_string(), serde_json::json!(name));
     }
 
     if let Some(tool_calls) = &msg.tool_calls {
@@ -2731,6 +2799,7 @@ mod tests {
             &msg,
             MultimodalContentOrder::ImagesThenText,
             Some("<image>"),
+            None,
         );
         let parts = value["content"]
             .as_array()
@@ -3928,9 +3997,300 @@ mod tests {
             "<eos>",
         )
         .unwrap();
-        // Undefined keys render to the empty string by default —
-        // matching Python-Jinja behaviour for `dict.get(missing)`.
-        assert_eq!(rendered, "assistant||fallback|because");
+        // A missing key is `None`, which prints as `None` — exactly what Python
+        // Jinja2 renders for `dict.get(missing)`. Checked independently against
+        // jinja2 3.1.6: `'assistant|None|fallback|because'`.
+        //
+        // This assertion previously read `"assistant||fallback|because"` and its
+        // comment claimed that WAS Python's behaviour. It is not: the empty string
+        // is what an *undefined* prints, and the difference is not cosmetic —
+        // `undefined is none` is false, so a template gating a default on `is none`
+        // skipped it. That is the bug this test's own name describes.
+        assert_eq!(rendered, "assistant|None|fallback|because");
+    }
+
+    /// The consumption path the terminator bug actually rode on: a template that
+    /// gates a default on `is none`, not on truthiness. `dict.get(missing)` must
+    /// take the `none` branch, as Python Jinja2 does.
+    #[test]
+    fn map_get_miss_is_none_not_undefined() {
+        let msg = ChatMessage {
+            role: "assistant".to_string(),
+            content: "hello".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        };
+        // All four probes at once, so a partial fix cannot pass: `none` IS defined,
+        // where an undefined is not.
+        let template = "{% set m = messages[0] %}\
+            {% if m.get('missing') is none %}NONE{% else %}NOT_NONE{% endif %}\
+            |{% if m.get('missing') is defined %}DEFINED{% else %}UNDEFINED{% endif %}\
+            |{{ m.get('missing') | default('FB') }}\
+            |{{ m.get('missing') | default('FB', true) }}";
+        let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+            template,
+            std::slice::from_ref(&msg),
+            None,
+            false,
+            None,
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap();
+        // Python Jinja2 on the same template: NONE|DEFINED|None|FB. `|default`
+        // fires on undefined only — in BOTH engines — so a `none` reaches it
+        // untouched, and only the boolean-mode `default` substitutes.
+        assert_eq!(rendered, "NONE|DEFINED|None|FB");
+    }
+
+    /// Gemma4's tool-name resolution, copied verbatim from
+    /// `.cache/models/gemma-4-12b-it/chat_template.jinja:280` and the rescue loop
+    /// under it. Kept as source here rather than behind the checkpoint, so the
+    /// property is gated in CI too.
+    ///
+    /// `message` is the assistant whose `tool_calls` are scanned; `follow` is the
+    /// tool message answering one of them. Gemma4 scans only that ONE assistant's
+    /// calls, which is why a result arriving after an interleaved assistant turn
+    /// has nothing but `follow.get('name')` to go on.
+    const GEMMA4_TOOL_NAME_RESOLUTION: &str = "\
+        {%- set ns_tname = namespace(name=follow.get('name') | default('unknown')) -%}\
+        {%- for tc in message['tool_calls'] -%}\
+        {%- if tc.get('id') == follow.get('tool_call_id') -%}\
+        {%- set ns_tname.name = tc['function']['name'] -%}\
+        {%- endif -%}\
+        {%- endfor -%}\
+        {{- 'response:' + ns_tname.name -}}";
+
+    /// Captured from `gemma-4-12b-it/chat_template.jinja` — see
+    /// [`gemma4_multi_turn_and_tool_round_trip_bytes_are_pinned`].
+    const GEMMA4_MULTI_TURN_GOLDEN: &str = "<bos><|turn>user\nhi<turn|>\n\
+        <|turn>model\nHi there.<turn|>\n\
+        <|turn>user\nwhat is 2+2?<turn|>\n\
+        <|turn>model\n<|channel>thought\n<channel|>";
+    const GEMMA4_TOOL_ROUND_TRIP_GOLDEN: &str = "<bos><|turn>user\ndo it<turn|>\n\
+        <|turn>model\n<|tool_call>call:do_thing{value:42}<tool_call|>\
+        <|tool_response>response:do_thing{value:<|\"|>42<|\"|>}<tool_response|>";
+
+    fn tool_call(id: Option<&str>, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.map(str::to_string),
+            name: name.to_string(),
+            arguments: r#"{"value": 42}"#.to_string(),
+        }
+    }
+
+    fn assistant_calling(calls: Vec<ToolCall>) -> ChatMessage {
+        let mut msg = user_msg("", 0);
+        msg.role = "assistant".to_string();
+        msg.tool_calls = Some(calls);
+        msg
+    }
+
+    fn tool_reply(tool_call_id: Option<&str>) -> ChatMessage {
+        let mut msg = user_msg("42", 0);
+        msg.role = "tool".to_string();
+        msg.tool_call_id = tool_call_id.map(str::to_string);
+        msg
+    }
+
+    /// The `.get` fix's required companion. `ChatMessage` has no `name` field, so
+    /// our serializer never emitted one and `follow.get('name')` missed on EVERY
+    /// Gemma4 tool round trip — survival rode entirely on the rescue loop's id
+    /// conjunct.
+    ///
+    /// Two shapes, and the second is the one that makes the normalisation
+    /// load-bearing rather than cosmetic:
+    ///
+    /// 1. Adjacent call, ids symmetric: the rescue succeeds either way, so the
+    ///    bytes are unchanged from before this commit (independently measured:
+    ///    `response:do_thing` today, and under HF).
+    /// 2. The result answers an EARLIER assistant turn's call, so the rescue loop —
+    ///    which sees only the adjacent assistant's calls — finds nothing. Without
+    ///    the normalisation `ns_tname.name` stays `none` and `'response:' + none`
+    ///    is a hard render error; with it the real function name is already there.
+    #[test]
+    fn gemma4_tool_round_trip_resolves_the_real_function_name() {
+        let render = |messages: &[ChatMessage], message: usize, follow: usize| {
+            let template = format!(
+                "{{%- set message = messages[{message}] -%}}\
+                 {{%- set follow = messages[{follow}] -%}}{GEMMA4_TOOL_NAME_RESOLUTION}"
+            );
+            Qwen3Tokenizer::render_chat_template_jinja2(
+                &template, messages, None, false, None, "<bos>", "<eos>",
+            )
+        };
+
+        // 1. Adjacent, symmetric ids — byte-identical to pre-fix behaviour.
+        let adjacent = [
+            user_msg("do it", 0),
+            assistant_calling(vec![tool_call(Some("call_1"), "do_thing")]),
+            tool_reply(Some("call_1")),
+        ];
+        assert_eq!(
+            render(&adjacent, 1, 2).expect("adjacent round trip renders"),
+            "response:do_thing",
+        );
+
+        // 2. The result answers the FIRST assistant's call, and the assistant the
+        // rescue loop scans made a different call.
+        let interleaved = [
+            user_msg("do it", 0),
+            assistant_calling(vec![tool_call(Some("call_1"), "do_thing")]),
+            assistant_calling(vec![tool_call(Some("call_2"), "other_thing")]),
+            tool_reply(Some("call_1")),
+        ];
+        assert_eq!(
+            render(&interleaved, 2, 3).expect("interleaved round trip renders"),
+            "response:do_thing",
+            "the name must come from the call this result answers, not from the \
+             assistant turn that happens to sit next to it",
+        );
+    }
+
+    /// The normalisation must never INVENT a name: an id that matches nothing, or
+    /// no id at all, leaves the key absent so the template's own fallback decides.
+    /// That is what keeps us 1:1 with HF — which raises on exactly these shapes —
+    /// instead of papering over them with a wrong tool name in the prompt.
+    #[test]
+    fn tool_message_name_is_only_filled_in_when_the_call_id_resolves() {
+        let resolved = |messages: &[ChatMessage], at: usize| {
+            serialize_messages_for_jinja(messages, MultimodalContentOrder::TextThenMedia, None)[at]
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+
+        let matched = [
+            assistant_calling(vec![tool_call(Some("call_1"), "do_thing")]),
+            tool_reply(Some("call_1")),
+        ];
+        assert_eq!(resolved(&matched, 1), Some("do_thing".to_string()));
+        // …and never on the assistant that made the call.
+        assert_eq!(resolved(&matched, 0), None);
+
+        // `(label, messages, index of the tool message)`.
+        for (label, messages, tool_at) in [
+            (
+                "id present on neither side",
+                vec![
+                    assistant_calling(vec![tool_call(None, "do_thing")]),
+                    tool_reply(None),
+                ],
+                1,
+            ),
+            (
+                "call carries an id, the reply does not",
+                vec![
+                    assistant_calling(vec![tool_call(Some("call_1"), "do_thing")]),
+                    tool_reply(None),
+                ],
+                1,
+            ),
+            (
+                "reply carries an id, the call does not",
+                vec![
+                    assistant_calling(vec![tool_call(None, "do_thing")]),
+                    tool_reply(Some("call_1")),
+                ],
+                1,
+            ),
+            (
+                "ids disagree",
+                vec![
+                    assistant_calling(vec![tool_call(Some("call_1"), "do_thing")]),
+                    tool_reply(Some("call_X")),
+                ],
+                1,
+            ),
+            (
+                "the call comes AFTER the reply",
+                vec![
+                    tool_reply(Some("call_1")),
+                    assistant_calling(vec![tool_call(Some("call_1"), "do_thing")]),
+                ],
+                0,
+            ),
+        ] {
+            // Sanity: the index really does point at the tool message, so the
+            // assertion below cannot pass by inspecting the wrong one.
+            assert_eq!(messages[tool_at].role, "tool", "{label}: wrong index");
+            assert_eq!(resolved(&messages, tool_at), None, "{label}");
+        }
+
+        // A non-tool role is never given a name, even holding a matching id.
+        let mut assistant_with_id = user_msg("x", 0);
+        assistant_with_id.role = "assistant".to_string();
+        assistant_with_id.tool_call_id = Some("call_1".to_string());
+        let mixed = [
+            assistant_calling(vec![tool_call(Some("call_1"), "do_thing")]),
+            assistant_with_id,
+        ];
+        assert_eq!(
+            resolved(&mixed, 1),
+            None,
+            "only a tool-role message gets a name"
+        );
+    }
+
+    /// Gemma4 byte regression. The `.get` change is cross-family, and Gemma4 is the
+    /// only other family it reaches, so pin what that family's prompt actually
+    /// renders to. Opt in with
+    /// `MLX_TEST_GEMMA4_TEMPLATE_PATH=/path/to/gemma-4-*/chat_template.jinja`.
+    #[test]
+    #[ignore = "requires a local Gemma4 checkpoint; set MLX_TEST_GEMMA4_TEMPLATE_PATH to its chat_template.jinja"]
+    fn gemma4_multi_turn_and_tool_round_trip_bytes_are_pinned() {
+        let Ok(path) = std::env::var("MLX_TEST_GEMMA4_TEMPLATE_PATH") else {
+            panic!("set MLX_TEST_GEMMA4_TEMPLATE_PATH to a Gemma4 chat_template.jinja");
+        };
+        let tmpl = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+
+        let mut assistant = user_msg("Hi there.", 0);
+        assistant.role = "assistant".to_string();
+        let chat = [user_msg("hi", 0), assistant, user_msg("what is 2+2?", 0)];
+        let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+            &tmpl,
+            &chat,
+            None,
+            true,
+            Some(false),
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap_or_else(|e| panic!("Gemma4 multi-turn render failed: {e}"));
+        assert_eq!(
+            rendered, GEMMA4_MULTI_TURN_GOLDEN,
+            "Gemma4 multi-turn bytes moved"
+        );
+
+        let round_trip = [
+            user_msg("do it", 0),
+            assistant_calling(vec![tool_call(Some("call_1"), "do_thing")]),
+            tool_reply(Some("call_1")),
+        ];
+        let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+            &tmpl,
+            &round_trip,
+            None,
+            true,
+            Some(false),
+            "<bos>",
+            "<eos>",
+        )
+        .unwrap_or_else(|e| panic!("Gemma4 tool round trip render failed: {e}"));
+        assert_eq!(
+            rendered, GEMMA4_TOOL_ROUND_TRIP_GOLDEN,
+            "Gemma4 tool round trip bytes moved",
+        );
+        // The whole point of the normalisation: the real name, never `unknown`.
+        assert!(
+            rendered.contains("response:do_thing") && !rendered.contains("response:unknown"),
+            "got: {rendered}",
+        );
     }
 
     #[test]
