@@ -65,22 +65,31 @@
 //!
 //! # Every bound is measured on the thing it names
 //!
-//! `max_tokens` is counted from the token count the caller passes to
-//! [`StreamGuard::push`], because the caller is the one that decoded them.
-//! Inferring it from decoded text was a guess and the guess was wrong: an earlier
-//! version allowed 64 characters per token, and **74 tokens in this checkpoint
-//! decode to more than that**, the longest to 113 characters — so an honest
-//! eight-token turn using them was cut off after 448 of 560 characters.
-//! `max_tokens_is_counted_from_the_callers_token_count` and the `#[ignore]`d
-//! `checkpoint_has_tokens_far_longer_than_any_per_token_character_guess` pin both
-//! halves of that.
+//! `max_tokens` is counted in tokens, from `tokens.len()` of the slice passed to
+//! [`StreamGuard::push`] — **derived from the data, not reported alongside it**.
+//! Two earlier shapes both failed here. Inferring the count from decoded text was
+//! a guess and the guess was wrong: 64 characters per token, while 70 tokens in
+//! this checkpoint decode to more than that, the longest to 113 — so an honest
+//! eight-token turn using them was cut off. Trusting a `tokens: usize` argument
+//! then let a caller label a 1 MiB chunk "1 token", and two of those streamed
+//! 2,097,152 characters under a cap of two. One slice entry per token is the only
+//! shape where the cap counts what it says.
 //!
-//! [`MAX_HEADER_CHARS`] bounds the header region — the one thing that is never
-//! released and never dropped, because the whole of it is needed to route — and it
-//! is measured on the **region**, not on the buffer, so it cannot depend on how
-//! the caller chunks. [`MAX_CHUNK_CHARS`] is the buffer bound: `pending` only ever
-//! grows by a chunk, and everything else is bounded by `HOLD_BACK_CHARS` or the
-//! header limit.
+//! The cap is also checked **before** the batch is buffered, and a batch that
+//! straddles it is split there, so text past `max_tokens` reaches neither a delta
+//! nor [`StreamGuard::flush`].
+//!
+//! The header region — the one thing never released and never dropped, because the
+//! whole of it is needed to route — is bounded by `header_allowance`, **derived in
+//! [`StreamGuard::new`] from the longest recipient the caller declares**, not by a
+//! fixed number. A fixed 128 was the same mistake as the 64: this checkpoint's
+//! template admits tool names long enough to push an anchored header past it, so
+//! the bound rejected legal output. [`ABSOLUTE_MAX_HEADER_CHARS`] is the separate
+//! memory bound behind it. The limit is measured on the **region**, not on the
+//! buffer, so it cannot depend on how the caller chunks.
+//! [`MAX_TOKEN_CHARS`] and [`MAX_CHUNK_CHARS`] bound the buffer: `pending` only
+//! ever grows by an accepted batch, and everything else is bounded by
+//! `HOLD_BACK_CHARS` or the header allowance.
 
 /// Held-back tail, in characters. Must be at least the longest entry of
 /// [`MARKER_LITERALS`] (currently `</atem:function_calls>` and
@@ -110,23 +119,29 @@ pub const MARKER_LITERALS: &[&str] = &[
     "</atem:parameter>",
 ];
 
-/// Longest header the protocol can produce is `<|start|>assistant to=` plus a
-/// recipient (a tool name), so 128 characters is generous. Measured on the header
-/// **region** every time the scan looks at one, whether or not its closing
-/// `<|message|>` has arrived — checking it only in the incomplete case made the
-/// limit chunk-dependent, and a 200-character recipient batched together with its
-/// marker sailed straight past it.
-const MAX_HEADER_CHARS: usize = 128;
+/// `user` and `self` are in the protocol, so they must fit whatever tool list the
+/// caller declares — including none at all.
+const BUILTIN_RECIPIENT_CHARS: usize = 4;
 
-/// Largest single chunk the guard accepts, in characters, and therefore the bound
-/// on everything it buffers: `pending` only ever grows by a chunk, and the scan
-/// leaves at most [`HOLD_BACK_CHARS`] (in a message) or [`MAX_HEADER_CHARS`] (in a
-/// header) behind.
-///
-/// A memory bound, deliberately **not** a token proxy. It sits far above any
-/// plausible batched turn — 4096 tokens times this checkpoint's longest
-/// 113-character token is about 463k — because the predecessor that *was* a token
-/// proxy (64 characters per token) truncated real output.
+/// Absolute bound on the header region, whatever recipient allowance the caller
+/// asks for. Purely a memory bound: it exists so an unbounded header stays
+/// impossible even if `max_recipient_chars` arrives absurd, not to express any
+/// protocol limit.
+const ABSOLUTE_MAX_HEADER_CHARS: usize = 4096;
+
+/// Longest decoded text one token of this checkpoint can produce, rounded up from
+/// the measured 113 (id 169871). Its purpose is to tell a real token from a
+/// caller batching many tokens behind a slice of length one — the way a token cap
+/// gets defeated. Derived, not asserted: the `#[ignore]`d
+/// `checkpoint_tokens_decode_within_the_per_token_bound` decodes every id in the
+/// real vocabulary and fails if any exceeds this, or if the longest ever drops
+/// back under 64 (the value an earlier round guessed and got wrong).
+const MAX_TOKEN_CHARS: usize = 128;
+
+/// Second line of defence on the buffer, in characters per push. The per-token
+/// bound above already limits a push to `remaining_tokens * MAX_TOKEN_CHARS`; this
+/// keeps a very large `max_tokens` from turning one honest batch into a very large
+/// allocation.
 const MAX_CHUNK_CHARS: usize = 1 << 20;
 
 /// Closes the routing header; anywhere else it is a marker the model must not
@@ -143,7 +158,6 @@ const EOS: &str = "<|end_of_text|>";
 /// Detection prefixes for the whole `<atem:*>` surface.
 const ATEM_OPEN: &str = "<atem:";
 const ATEM_CLOSE: &str = "</atem:";
-/// The only way a header may open: `<|start|>` immediately followed by the only
 /// The turn's **first** header, byte for byte: one ASCII space then `to=`. Its
 /// `<|start|>assistant` came from the generation prompt, not the stream.
 const BARE_HEADER_PREFIX: &str = " to=";
@@ -218,67 +232,118 @@ pub struct StreamGuard {
     ready: String,
     max_messages: usize,
     max_tokens: usize,
+    /// `ANCHORED_HEADER_PREFIX` plus the longest recipient the caller declared,
+    /// clamped by [`ABSOLUTE_MAX_HEADER_CHARS`]. Derived in [`Self::new`] so the
+    /// scan never consults a constant that the real tool list can exceed.
+    header_allowance: usize,
     messages: usize,
-    /// Summed from the counts the caller passes to [`Self::push`], not inferred
-    /// from how much text arrived.
+    /// Counted from the number of per-token pieces handed to [`Self::push`], which
+    /// is data the guard can see rather than a number it has to believe.
     tokens: usize,
     ended: bool,
 }
 
 impl StreamGuard {
-    pub fn new(max_messages: usize, max_tokens: usize) -> Self {
+    /// `max_recipient_chars` is the longest `to=` value this turn can legitimately
+    /// produce: the longest **configured tool name**, which the caller knows
+    /// because it rendered the tool list. It is raised to
+    /// [`BUILTIN_RECIPIENT_CHARS`] so `user` and `self` always fit, and the
+    /// resulting header allowance is clamped by [`ABSOLUTE_MAX_HEADER_CHARS`].
+    ///
+    /// It exists because the fixed 128-character header limit it replaces was the
+    /// same mistake as the 64-character-per-token budget before it: a made-up
+    /// number the real system exceeds. A 107-character advertised tool name makes
+    /// a 129-character anchored header, which that constant refused — and refused
+    /// only *after* reasoning, since the bare form was 18 characters shorter, so
+    /// the same tool worked in a turn's first message and not in its second.
+    pub fn new(max_messages: usize, max_tokens: usize, max_recipient_chars: usize) -> Self {
+        // The anchored prefix is the longer of the two, so one allowance covers a
+        // bare header as well, with 18 characters of slack the byte-exact grammar
+        // gives nowhere to hide.
+        let header_allowance = ANCHORED_HEADER_PREFIX
+            .chars()
+            .count()
+            .saturating_add(max_recipient_chars.max(BUILTIN_RECIPIENT_CHARS))
+            .min(ABSOLUTE_MAX_HEADER_CHARS);
         Self {
             state: State::AwaitingHeader,
             pending: String::new(),
             ready: String::new(),
             max_messages,
             max_tokens,
+            header_allowance,
             messages: 0,
             tokens: 0,
             ended: false,
         }
     }
 
-    /// Consumes one chunk of raw generated text and the number of decoded tokens
-    /// it carries.
+    /// Consumes one decoded token. The ordinary path: every decode loop in this
+    /// crate emits one token at a time.
+    pub fn push_token(&mut self, token: &str) -> GuardOutcome {
+        self.push(&[token])
+    }
+
+    /// Consumes a batch of decoded tokens, **one slice entry per token**.
     ///
-    /// `tokens` comes from the caller because only the caller knows it — it
-    /// decoded them. Do not pass a length, a character count, or an estimate.
-    /// Batching is allowed: pass the number of tokens in the chunk and
-    /// `max_tokens` still means tokens. A non-empty chunk is counted as at least
-    /// one token whatever is passed, so under-reporting cannot make `max_tokens`
-    /// unenforceable; over-reporting only ends the turn sooner.
+    /// The count is `tokens.len()`, derived from the data rather than reported
+    /// alongside it. That is the whole point of the shape: the version that took a
+    /// `tokens: usize` let a caller hand over a 1 MiB chunk labelled "1 token",
+    /// and two of those streamed 2,097,152 characters under a cap of two. An entry
+    /// longer than [`MAX_TOKEN_CHARS`] is not one token of this checkpoint, so it
+    /// ends the turn.
+    ///
+    /// The remaining allowance is checked **before** anything is buffered or
+    /// scanned. A batch that straddles the cap is split: the tokens within the
+    /// allowance are processed normally, everything past it is discarded and the
+    /// turn ends. So text beyond `max_tokens` reaches neither a delta nor
+    /// [`Self::flush`] — the previous version scanned first and its own test
+    /// pinned the cap-tripping chunk as published, which was wrong.
     ///
     /// `EndTurn` is sticky: once returned, every later push returns it too, so
     /// a caller that misses the first one cannot restart a self-played turn.
-    ///
-    /// A chunk longer than [`MAX_CHUNK_CHARS`] is dropped unscanned and the turn
-    /// ends — that is a caller-contract violation, not model output, and it is the
-    /// bound on everything this type buffers.
-    pub fn push(&mut self, chunk: &str, tokens: usize) -> GuardOutcome {
+    pub fn push(&mut self, tokens: &[&str]) -> GuardOutcome {
         if self.ended {
             return GuardOutcome::EndTurn;
         }
-        // A non-empty chunk carries at least one token whatever the caller says;
-        // a reported zero would otherwise leave `max_tokens` unenforceable.
-        let tokens = if chunk.is_empty() {
-            tokens
+        // Allowance first, before a single character is buffered. Everything past
+        // the cap must never exist as far as the rest of this type is concerned.
+        let remaining = self.max_tokens.saturating_sub(self.tokens);
+        let over_cap = tokens.len() > remaining;
+        let allowed = if over_cap {
+            &tokens[..remaining]
         } else {
-            tokens.max(1)
+            tokens
         };
-        self.tokens = self.tokens.saturating_add(tokens);
-        if chunk.chars().count() > MAX_CHUNK_CHARS {
+
+        // One entry is one token. An entry that cannot be is a caller batching
+        // behind a short slice, which is how the previous cap was defeated.
+        if allowed
+            .iter()
+            .any(|token| token.chars().count() > MAX_TOKEN_CHARS)
+        {
             self.stop();
             return GuardOutcome::EndTurn;
         }
-        self.pending.push_str(chunk);
+        let chars: usize = allowed.iter().map(|token| token.chars().count()).sum();
+        if chars > MAX_CHUNK_CHARS {
+            self.stop();
+            return GuardOutcome::EndTurn;
+        }
+
+        self.tokens += allowed.len();
+        for token in allowed {
+            self.pending.push_str(token);
+        }
         self.scan();
         if self.ended {
             return GuardOutcome::EndTurn;
         }
-        // Checked after the scan so a capped turn keeps the content it already
-        // produced; `flush` still hands it back.
-        if self.tokens > self.max_tokens {
+        // `over_cap` means tokens were discarded above, so the turn is finished.
+        // `ready` is kept: content produced within the allowance is legitimate and
+        // `flush` still hands it back. What was dropped never entered `pending`,
+        // so it cannot reach either.
+        if over_cap {
             self.ended = true;
             return GuardOutcome::EndTurn;
         }
@@ -337,8 +402,9 @@ impl StreamGuard {
                     // caller chunks. Checking it only in the no-marker case let a
                     // 200-character recipient batched with its own `<|message|>`
                     // straight through, while the identical character-split input
-                    // ended the turn.
-                    if region.chars().count() > MAX_HEADER_CHARS {
+                    // ended the turn. The allowance is derived from the caller's
+                    // longest recipient, so a legal long tool name is not rejected.
+                    if region.chars().count() > self.header_allowance {
                         self.stop();
                         return;
                     }
@@ -595,12 +661,29 @@ mod tests {
 
     use std::collections::BTreeSet;
 
+    /// Recipient allowance for guards in these tests. Comfortably over the
+    /// checkpoint's own `user`/`self` and the `wx.forecast` fixture, and well under
+    /// the long names the header-limit tests attack with — those declare their own.
+    const TEST_RECIPIENT_CHARS: usize = 16;
+
+    /// Feeds `text` as ONE push, split into one slice entry per character.
+    ///
+    /// One call means one scan, which is what makes the whole-chunk order
+    /// load-bearing; one entry per character means the token count is honest
+    /// (and maximally strict), so no test can accidentally depend on a batch
+    /// being counted as a single token — the hole codex found in round 3.
+    fn push_text(g: &mut StreamGuard, text: &str) -> GuardOutcome {
+        let owned: Vec<String> = text.chars().map(|c| c.to_string()).collect();
+        let tokens: Vec<&str> = owned.iter().map(String::as_str).collect();
+        g.push(&tokens)
+    }
+
     /// Pushes `text` one character at a time — the worst case for a marker
     /// split — and returns everything emitted, then everything flushed.
     fn drain_char_by_char(g: &mut StreamGuard, text: &str) -> String {
         let mut emitted = String::new();
         for ch in text.chars() {
-            if let GuardOutcome::Emit(s) = g.push(&ch.to_string(), 1) {
+            if let GuardOutcome::Emit(s) = g.push_token(&ch.to_string()) {
                 emitted.push_str(&s);
             }
         }
@@ -616,19 +699,28 @@ mod tests {
     /// is where a marker splits and where the header grows one impossible
     /// character at a time. Every attack in this module was confirmed in both.
     fn both_feed_orders(text: &str) -> [(&'static str, String, String, GuardOutcome); 2] {
-        let mut whole_guard = StreamGuard::new(8, 4096);
-        let whole_last = whole_guard.push(text, 1);
+        both_feed_orders_with(text, TEST_RECIPIENT_CHARS)
+    }
+
+    /// [`both_feed_orders`] with an explicit recipient allowance, for the tests
+    /// that are about the header limit itself.
+    fn both_feed_orders_with(
+        text: &str,
+        max_recipient_chars: usize,
+    ) -> [(&'static str, String, String, GuardOutcome); 2] {
+        let mut whole_guard = StreamGuard::new(8, 4096, max_recipient_chars);
+        let whole_last = push_text(&mut whole_guard, text);
         let whole_emitted = match &whole_last {
             GuardOutcome::Emit(s) => s.clone(),
             _ => String::new(),
         };
         let whole_flushed = whole_guard.flush();
 
-        let mut split_guard = StreamGuard::new(8, 4096);
+        let mut split_guard = StreamGuard::new(8, 4096, max_recipient_chars);
         let mut split_emitted = String::new();
         let mut split_last = GuardOutcome::Hold;
         for ch in text.chars() {
-            split_last = split_guard.push(&ch.to_string(), 1);
+            split_last = split_guard.push_token(&ch.to_string());
             if let GuardOutcome::Emit(s) = &split_last {
                 split_emitted.push_str(s);
             }
@@ -671,11 +763,11 @@ mod tests {
     /// Feeds `chunks` in order, one token reported per chunk, and returns
     /// everything emitted, everything flushed, and the last outcome.
     fn feed(chunks: &[&str]) -> (String, String, GuardOutcome) {
-        let mut g = StreamGuard::new(8, 100_000);
+        let mut g = StreamGuard::new(8, 100_000, TEST_RECIPIENT_CHARS);
         let mut emitted = String::new();
         let mut last = GuardOutcome::Hold;
         for chunk in chunks {
-            last = g.push(chunk, 1);
+            last = push_text(&mut g, chunk);
             if let GuardOutcome::Emit(s) = &last {
                 emitted.push_str(s);
             }
@@ -796,7 +888,7 @@ mod tests {
     /// `<|message|>` and `<|end_of_text|>` need 11 and 15.
     #[test]
     fn split_atem_opener_never_leaks() {
-        let mut g = StreamGuard::new(8, 1024);
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
         let emitted =
             drain_char_by_char(&mut g, " to=user<|message|>ok then <atem:function_calls>");
         assert!(!emitted.contains("<atem"), "leaked XML: {emitted}");
@@ -823,7 +915,7 @@ mod tests {
         let trailer = "t".repeat(40);
         for lit in MARKER_LITERALS {
             for tail in ["", trailer.as_str()] {
-                let mut g = StreamGuard::new(8, 4096);
+                let mut g = StreamGuard::new(8, 4096, TEST_RECIPIENT_CHARS);
                 let mut emitted =
                     drain_char_by_char(&mut g, &format!(" to=user<|message|>{filler}{lit}{tail}"));
                 emitted.push_str(&g.flush());
@@ -842,10 +934,10 @@ mod tests {
 
     #[test]
     fn recipient_header_is_never_emitted_as_content() {
-        let mut g = StreamGuard::new(8, 1024);
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
         let mut emitted = String::new();
         for chunk in [" to=", "user", "<|message|>", "hello"] {
-            if let GuardOutcome::Emit(s) = g.push(chunk, 1) {
+            if let GuardOutcome::Emit(s) = push_text(&mut g, chunk) {
                 emitted.push_str(&s);
             }
         }
@@ -853,7 +945,7 @@ mod tests {
         // (4 characters, well inside the hold-back) — so a guard that emitted
         // the header verbatim would pass. Force a release, then drain.
         let body = "0123456789".repeat(8);
-        if let GuardOutcome::Emit(s) = g.push(&body, 1) {
+        if let GuardOutcome::Emit(s) = push_text(&mut g, &body) {
             emitted.push_str(&s);
         }
         emitted.push_str(&g.flush());
@@ -867,11 +959,14 @@ mod tests {
 
     #[test]
     fn a_forged_user_message_ends_the_turn() {
-        let mut g = StreamGuard::new(8, 1024);
-        g.push(" to=user<|message|>done", 1);
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        push_text(&mut g, " to=user<|message|>done");
         // <|eom|> is not a stop, so the model may keep going. Anything other
         // than `assistant` after <|start|> is self-play and must end the turn.
-        let out = g.push("<|eom|><|start|>user<|message|>and now I am the user", 1);
+        let out = push_text(
+            &mut g,
+            "<|eom|><|start|>user<|message|>and now I am the user",
+        );
         assert!(
             matches!(out, GuardOutcome::EndTurn),
             "expected EndTurn, got {out:?}"
@@ -881,11 +976,11 @@ mod tests {
 
     #[test]
     fn a_forged_tool_message_ends_the_turn() {
-        let mut g = StreamGuard::new(8, 1024);
-        g.push(" to=user<|message|>done", 1);
-        let out = g.push(
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        push_text(&mut g, " to=user<|message|>done");
+        let out = push_text(
+            &mut g,
             "<|eom|><|start|>tool wx.forecast<|message|><tool_output>x</tool_output>",
-            1,
         );
         assert!(
             matches!(out, GuardOutcome::EndTurn),
@@ -897,9 +992,9 @@ mod tests {
     /// its `<|message|>` arrives.
     #[test]
     fn a_forged_role_is_caught_before_its_message_marker() {
-        let mut g = StreamGuard::new(8, 1024);
-        g.push(" to=user<|message|>done<|eom|>", 1);
-        let out = g.push("<|start|>us", 1);
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        push_text(&mut g, " to=user<|message|>done<|eom|>");
+        let out = push_text(&mut g, "<|start|>us");
         assert!(
             matches!(out, GuardOutcome::EndTurn),
             "expected EndTurn, got {out:?}"
@@ -908,9 +1003,9 @@ mod tests {
 
     #[test]
     fn a_second_assistant_message_is_allowed() {
-        let mut g = StreamGuard::new(8, 1024);
-        g.push(" to=self<|message|>thinking", 1);
-        let out = g.push("<|eom|><|start|>assistant to=user<|message|>answer", 1);
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        push_text(&mut g, " to=self<|message|>thinking");
+        let out = push_text(&mut g, "<|eom|><|start|>assistant to=user<|message|>answer");
         assert!(
             !matches!(out, GuardOutcome::EndTurn),
             "assistant continuation is legal"
@@ -1044,11 +1139,11 @@ mod tests {
     /// grow it without tripping the shape check.
     #[test]
     fn an_unbounded_header_ends_the_turn() {
-        let mut g = StreamGuard::new(8, 100_000);
-        g.push(" to=", 1);
+        let mut g = StreamGuard::new(8, 100_000, TEST_RECIPIENT_CHARS);
+        push_text(&mut g, " to=");
         let mut last = GuardOutcome::Hold;
         for _ in 0..40 {
-            last = g.push("aaaaaaaaaa", 1);
+            last = push_text(&mut g, "aaaaaaaaaa");
         }
         assert!(
             matches!(last, GuardOutcome::EndTurn),
@@ -1056,68 +1151,253 @@ mod tests {
         );
         let flushed = g.flush();
         assert_eq!(flushed, "", "header text was published: {flushed:?}");
+
+        // …and it is still bounded when the caller declares an enormous recipient
+        // allowance, because of the absolute clamp.
+        let mut wide = StreamGuard::new(8, 10_000_000, usize::MAX);
+        push_text(&mut wide, " to=");
+        let mut last = GuardOutcome::Hold;
+        for _ in 0..((ABSOLUTE_MAX_HEADER_CHARS / 10) + 2) {
+            last = push_text(&mut wide, "aaaaaaaaaa");
+        }
+        assert!(
+            matches!(last, GuardOutcome::EndTurn),
+            "an absurd max_recipient_chars made the header unbounded, got {last:?}"
+        );
+        assert_eq!(wide.flush(), "", "header text was published");
     }
 
-    // ── Codex review round 2 ───────────────────────────────────────────
-
-    /// `max_tokens` means tokens, taken from the caller, because the caller is
-    /// what decoded them. The predecessor counted `push` calls and then tried to
-    /// police batching with a 64-character-per-token budget — see
-    /// `a_long_token_survives_the_token_cap` for why that number was wrong.
+    /// Codex round-3 finding 2. The bound was a fixed `MAX_HEADER_CHARS = 128`,
+    /// which the checkpoint's own template can exceed: a 107-character tool name
+    /// makes an anchored header of 129 characters. Measured before the fix —
+    /// `anchored_header=129 chars rejected=true bare_header=111 chars
+    /// rejected=false` — the same legal name was accepted or refused depending on
+    /// which header carried it, which is not a property of anything.
+    ///
+    /// So the allowance is derived from the longest recipient the caller declares.
+    /// Both limits get a control **and** an attack one character past it, with a
+    /// long name in each: a bound that is only ever exercised by `wx.forecast`
+    /// is not exercised at all.
+    ///
+    /// One allowance covers both header forms, sized on the **anchored** prefix
+    /// because that is the longer one and because a turn's first header may
+    /// legally carry the anchor too. A bare header therefore gets the difference
+    /// (18 characters) as slack, which is why the attack below is derived per form
+    /// rather than from `len` — the first draft of this test asserted
+    /// `len + 1` was refused in both forms and was wrong about the bare one.
+    /// Slack costs nothing: the bound is a memory bound, and it is
+    /// `classify_header` that decides whether a region is a header at all.
     #[test]
-    fn max_tokens_is_counted_from_the_callers_token_count() {
-        // Five tokens in one chunk is five tokens.
-        let mut batched = StreamGuard::new(8, 4);
-        batched.push(" to=user<|message|>", 1);
-        let out = batched.push("aaaaa", 5);
+    fn a_long_declared_recipient_is_routed_at_both_header_limits() {
+        // The formula, pinned against the parameter rather than read back from the
+        // guard — otherwise a mutation of the derivation would move both sides.
+        assert_eq!(
+            StreamGuard::new(8, 8, 107).header_allowance,
+            ANCHORED_HEADER_PREFIX.chars().count() + 107,
+            "the header allowance is no longer anchored prefix + declared recipient"
+        );
+        // A caller declaring no tools at all must still admit `user` and `self`.
+        assert_eq!(
+            StreamGuard::new(8, 8, 0).header_allowance,
+            ANCHORED_HEADER_PREFIX.chars().count() + BUILTIN_RECIPIENT_CHARS,
+            "a zero recipient allowance stopped admitting the built-in recipients"
+        );
+
+        for declared in [107usize, 125] {
+            let allowance = StreamGuard::new(8, 8, declared).header_allowance;
+            for (form, prefix) in [
+                ("bare", BARE_HEADER_PREFIX.chars().count()),
+                ("anchored", ANCHORED_HEADER_PREFIX.chars().count()),
+            ] {
+                let build = |name: &str| {
+                    if form == "anchored" {
+                        format!(
+                            " to=self<|message|>t<|eom|><|start|>assistant to={name}<|message|>"
+                        )
+                    } else {
+                        format!(" to={name}<|message|>")
+                    }
+                };
+
+                // Control: a long recipient exactly at this form's limit routes,
+                // in both feed orders. It is a tool name, so nothing is content —
+                // but the turn must live.
+                let at_limit = "o".repeat(allowance - prefix);
+                for (label, emitted, flushed, last) in
+                    both_feed_orders_with(&format!("{}BODY", build(&at_limit)), declared)
+                {
+                    assert!(
+                        !matches!(last, GuardOutcome::EndTurn),
+                        "{label}: a {}-character recipient at the {form} limit was \
+                         refused: {last:?}",
+                        at_limit.chars().count()
+                    );
+                    assert_eq!(
+                        format!("{emitted}{flushed}"),
+                        "",
+                        "{label}: tool-channel text was published"
+                    );
+                }
+
+                // Attack: one character more, at every two-chunk cut.
+                let attack = format!("{}OVERLONG_BODY_0123456789", build(&format!("{at_limit}X")));
+                let n = attack.chars().count();
+                for (cut, head, tail) in two_chunk_cuts(&attack) {
+                    let mut g = StreamGuard::new(8, 100_000, declared);
+                    let mut emitted = String::new();
+                    let mut last = GuardOutcome::Hold;
+                    for part in [head.as_str(), tail.as_str()] {
+                        last = push_text(&mut g, part);
+                        if let GuardOutcome::Emit(s) = &last {
+                            emitted.push_str(s);
+                        }
+                    }
+                    emitted.push_str(&g.flush());
+                    assert!(
+                        matches!(last, GuardOutcome::EndTurn),
+                        "{form} cut {cut}/{n}: a recipient past the allowance was \
+                         accepted: {last:?}"
+                    );
+                    assert!(
+                        !emitted.contains("OVERLONG"),
+                        "{form} cut {cut}/{n}: over-long header's body was \
+                         published: {emitted:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // ── Codex review round 2, revised in round 3 ───────────────────────
+
+    /// `max_tokens` means tokens, and the count comes from `tokens.len()` —
+    /// derived from the batch, not reported alongside it.
+    ///
+    /// Round 2's version took a `tokens: usize` from the caller and this test
+    /// pinned that it was believed. Codex then showed the obvious consequence: a
+    /// caller batching honestly and a caller lying are indistinguishable to a
+    /// number. Now the same batch is the same count whoever sends it.
+    #[test]
+    fn the_token_count_comes_from_the_batch_not_from_the_caller() {
+        // Five tokens in one push is five tokens, past a cap of four.
+        let mut batched = StreamGuard::new(8, 4, TEST_RECIPIENT_CHARS);
+        batched.push(&[" to=user", "<|message|>"]);
+        let out = batched.push(&["a", "a", "a", "a", "a"]);
         assert!(
             matches!(out, GuardOutcome::EndTurn),
             "5 batched tokens past a cap of 4 must trip, got {out:?}"
         );
 
-        // The identical characters, honestly one token, do not trip it.
-        let mut honest = StreamGuard::new(8, 4);
-        honest.push(" to=user<|message|>", 1);
-        let out = honest.push("aaaaa", 1);
+        // The identical characters as two tokens stay under it.
+        let mut honest = StreamGuard::new(8, 4, TEST_RECIPIENT_CHARS);
+        honest.push(&[" to=user", "<|message|>"]);
+        let out = honest.push(&["aa", "aaa"]);
         assert!(
             !matches!(out, GuardOutcome::EndTurn),
-            "2 tokens under a cap of 4 must not trip, got {out:?}"
+            "4 tokens at a cap of 4 must not trip, got {out:?}"
         );
         assert_eq!(honest.flush(), "aaaaa", "content lost");
     }
 
-    /// A caller reporting zero cannot make `max_tokens` unenforceable.
+    /// Codex round-3 finding 1, the attack verbatim: a batching caller labelling
+    /// each 1 MiB chunk "1 token". Under the round-2 signature
+    /// `push(&big, 1)` twice, with `max_tokens = 2`, streamed
+    /// `ended=true streamed=2097152 chars` — measured before the fix.
+    ///
+    /// There is no label to lie with now, so the attack becomes "one slice entry
+    /// holding a megabyte", and an entry that cannot be one token of this
+    /// checkpoint ends the turn instead.
     #[test]
-    fn a_caller_that_under_reports_tokens_still_hits_the_cap() {
-        let mut g = StreamGuard::new(8, 3);
-        g.push(" to=user<|message|>", 0);
+    fn a_batched_caller_cannot_defeat_the_token_cap() {
+        let big = "A".repeat(1 << 20);
+        let mut g = StreamGuard::new(8, 2, TEST_RECIPIENT_CHARS);
+        g.push(&[" to=user<|message|>"]);
+        let mut streamed = String::new();
         let mut last = GuardOutcome::Hold;
-        for _ in 0..10 {
-            last = g.push("word ", 0);
+        for _ in 0..2 {
+            last = g.push(&[big.as_str()]);
+            if let GuardOutcome::Emit(s) = &last {
+                streamed.push_str(s);
+            }
         }
+        streamed.push_str(&g.flush());
         assert!(
             matches!(last, GuardOutcome::EndTurn),
-            "a reported zero defeated max_tokens, got {last:?}"
+            "a megabyte behind a one-entry slice must end the turn, got {last:?}"
         );
+        assert_eq!(
+            streamed.chars().count(),
+            0,
+            "{} characters streamed under a cap of 2 tokens",
+            streamed.chars().count()
+        );
+
+        // The boundary: exactly MAX_TOKEN_CHARS is a real token of this
+        // checkpoint's shape and must stream; one more is not.
+        for (chars, want_end) in [(MAX_TOKEN_CHARS, false), (MAX_TOKEN_CHARS + 1, true)] {
+            let token = "z".repeat(chars);
+            let mut g = StreamGuard::new(8, 8, TEST_RECIPIENT_CHARS);
+            g.push(&[" to=user<|message|>"]);
+            let out = g.push(&[token.as_str()]);
+            assert_eq!(
+                matches!(out, GuardOutcome::EndTurn),
+                want_end,
+                "a {chars}-character token: got {out:?}"
+            );
+        }
+    }
+
+    /// Nothing past the cap reaches a delta **or** `flush`. The batch is split at
+    /// the remaining allowance before it is buffered, so the over-cap tail never
+    /// enters the guard at all.
+    ///
+    /// Round 2 scanned first and checked the cap afterwards, which published the
+    /// cap-tripping chunk — and its own test asserted that as correct.
+    #[test]
+    fn nothing_past_the_token_cap_is_buffered_or_published() {
+        let mut g = StreamGuard::new(8, 6, TEST_RECIPIENT_CHARS);
+        g.push(&[" to=user", "<|message|>"]);
+        // Four tokens left; the batch has eight.
+        let out = g.push(&["k", "e", "e", "p", "D", "R", "O", "P"]);
+        assert!(
+            matches!(out, GuardOutcome::EndTurn),
+            "a batch past the cap must end the turn, got {out:?}"
+        );
+        let flushed = g.flush();
+        assert_eq!(
+            flushed, "keep",
+            "over-cap tokens were published: {flushed:?}"
+        );
+
+        // Exhausted allowance: a later batch is discarded whole.
+        let mut g = StreamGuard::new(8, 2, TEST_RECIPIENT_CHARS);
+        g.push(&[" to=user", "<|message|>"]);
+        let out = g.push(&["X"]);
+        assert!(
+            matches!(out, GuardOutcome::EndTurn),
+            "a batch with no allowance left must end the turn, got {out:?}"
+        );
+        assert_eq!(g.flush(), "", "a wholly over-cap batch was published");
     }
 
     /// The number that replaced inference had to go: this checkpoint really
     /// contains a token decoding to 112 hyphens (162250) and one decoding to 113
-    /// characters (169871), and 74 tokens in total run past 64 characters. Under
+    /// characters (169871), and 70 tokens in total run past 64 characters. Under
     /// the old 64-character-per-token budget this honest eight-token turn returned
     /// 448 of its 560 answer characters.
     #[test]
     fn a_long_token_survives_the_token_cap() {
         let token_162250 = "-".repeat(112);
-        let mut g = StreamGuard::new(8, 8);
+        let mut g = StreamGuard::new(8, 8, TEST_RECIPIENT_CHARS);
         let mut emitted = String::new();
-        for chunk in [" to=", "user", "<|message|>"] {
-            if let GuardOutcome::Emit(s) = g.push(chunk, 1) {
+        // Three header tokens plus five long ones is exactly the cap of eight.
+        for token in [" to=", "user", "<|message|>"] {
+            if let GuardOutcome::Emit(s) = g.push_token(token) {
                 emitted.push_str(&s);
             }
         }
         for _ in 0..5 {
-            if let GuardOutcome::Emit(s) = g.push(&token_162250, 1) {
+            if let GuardOutcome::Emit(s) = g.push_token(&token_162250) {
                 emitted.push_str(&s);
             }
         }
@@ -1130,35 +1410,54 @@ mod tests {
         assert_eq!(emitted, token_162250.repeat(5));
     }
 
-    /// The buffer bound. Deliberately enormous, because the thing it replaced was
-    /// small enough to truncate real answers; a chunk exactly at the limit must
-    /// still stream in full.
+    /// The buffer bound, per push. Deliberately enormous, because the thing it
+    /// replaced was small enough to truncate real answers; a batch exactly at the
+    /// limit must still stream in full.
     #[test]
-    fn an_oversize_chunk_ends_the_turn() {
-        let mut over = StreamGuard::new(8, 1_000_000);
-        over.push(" to=user<|message|>", 1);
-        let out = over.push(&"x".repeat(MAX_CHUNK_CHARS + 1), 1);
+    fn an_oversize_batch_ends_the_turn() {
+        // MAX_TOKEN_CHARS-wide tokens, so the per-token bound is not what trips:
+        // 8192 x 128 is exactly MAX_CHUNK_CHARS.
+        let piece = "x".repeat(MAX_TOKEN_CHARS);
+        let pieces = MAX_CHUNK_CHARS / MAX_TOKEN_CHARS;
+        assert_eq!(
+            pieces * MAX_TOKEN_CHARS,
+            MAX_CHUNK_CHARS,
+            "not a clean split"
+        );
+        let mut batch: Vec<&str> = vec![piece.as_str(); pieces];
+        // A generous token cap, so `over_cap` cannot be what ends these turns.
+        let cap = pieces * 4;
+
+        batch.push("!");
+        let mut over = StreamGuard::new(8, cap, TEST_RECIPIENT_CHARS);
+        over.push(&[" to=user<|message|>"]);
+        let out = over.push(&batch);
         assert!(
             matches!(out, GuardOutcome::EndTurn),
-            "an over-size chunk must end the turn, got {out:?}"
+            "an over-size batch must end the turn, got {out:?}"
         );
         let flushed = over.flush();
-        assert_eq!(flushed, "", "an over-size chunk was published");
+        assert_eq!(
+            flushed.chars().count(),
+            0,
+            "an over-size batch was published"
+        );
 
-        let at_limit = "y".repeat(MAX_CHUNK_CHARS);
-        let mut ok = StreamGuard::new(8, 1_000_000);
-        ok.push(" to=user<|message|>", 1);
-        let out = ok.push(&at_limit, 1);
+        batch.pop();
+        let at_limit = piece.repeat(pieces);
+        let mut ok = StreamGuard::new(8, cap, TEST_RECIPIENT_CHARS);
+        ok.push(&[" to=user<|message|>"]);
+        let out = ok.push(&batch);
         assert!(
             !matches!(out, GuardOutcome::EndTurn),
-            "a chunk at the limit must stream, got {out:?}"
+            "a batch at the limit must stream, got {out:?}"
         );
         let mut got = match out {
             GuardOutcome::Emit(s) => s,
             other => panic!("expected content, got {other:?}"),
         };
         got.push_str(&ok.flush());
-        assert_eq!(got, at_limit, "a chunk at the limit lost content");
+        assert_eq!(got, at_limit, "a batch at the limit lost content");
     }
 
     /// Codex finding 1. `trim_start()` accepted a family of spellings where the
@@ -1219,15 +1518,29 @@ mod tests {
         let attack = format!(" to={}<|message|>BODY_TEXT", "a".repeat(200));
         assert_never_published_at_every_cut(&attack, "BODY_TEXT", "200-char recipient");
 
-        // The control: a recipient just inside the limit still routes. It is a
-        // tool name, so nothing is emitted, but the turn must not end.
-        let inside = "b".repeat(MAX_HEADER_CHARS - BARE_HEADER_PREFIX.len());
-        let mut g = StreamGuard::new(8, 4096);
-        let out = g.push(&format!(" to={inside}<|message|>body"), 1);
-        assert!(
-            !matches!(out, GuardOutcome::EndTurn),
-            "a header inside the limit was refused, got {out:?}"
-        );
+        // The control: a recipient exactly at the declared allowance still routes,
+        // whichever way it is chunked. It is a tool name, so nothing is emitted,
+        // but the turn must not end.
+        let inside = "b".repeat(200);
+        let legal = format!(" to={inside}<|message|>body");
+        for (label, _, _, last) in both_feed_orders_with(&legal, 200) {
+            assert!(
+                !matches!(last, GuardOutcome::EndTurn),
+                "{label}: a header inside the declared allowance was refused: {last:?}"
+            );
+        }
+        let n = legal.chars().count();
+        for (cut, head, tail) in two_chunk_cuts(&legal) {
+            let mut g = StreamGuard::new(8, 100_000, 200);
+            let mut last = GuardOutcome::Hold;
+            for part in [head.as_str(), tail.as_str()] {
+                last = push_text(&mut g, part);
+            }
+            assert!(
+                !matches!(last, GuardOutcome::EndTurn),
+                "cut {cut}/{n}: a header inside the declared allowance was refused: {last:?}"
+            );
+        }
     }
 
     /// Pins both literal prefixes and their decomposition, so nobody can widen the
@@ -1256,46 +1569,129 @@ mod tests {
         }
     }
 
-    /// Derives from the real checkpoint the fact that killed the per-token
-    /// character guess, rather than asserting a constant. Local-only, like every
-    /// other real-checkpoint gate in this family: 59.5 GB never reaches CI, so the
-    /// tokenizer file is read directly.
+    /// Derives [`MAX_TOKEN_CHARS`] from the real checkpoint rather than asserting a
+    /// constant, by **decoding every token id** through `tokenizers::Tokenizer`.
+    ///
+    /// Codex round-3 finding 3: the round-2 version measured `model.vocab` keys,
+    /// which are byte-level BPE *lexemes*, not decoded text. `Ġ`, `Ċ` and the
+    /// `Ġ`-per-space encoding make a lexeme longer than what it decodes to, so the
+    /// count was inflated — 74 lexemes over 64 characters, but only 70 tokens
+    /// decode past it. The two spot-checked ids are unaffected (112 and 113 either
+    /// way, both being runs of ASCII that byte-level BPE leaves alone), which is
+    /// exactly why the error survived a round.
+    ///
+    /// Local-only, like every other real-checkpoint gate in this family: 59.5 GB
+    /// never reaches CI.
     #[test]
     #[ignore = "requires the local Muse-Glimmer checkpoint; set MLX_TEST_MUSE_GLIMMER_MODEL_PATH and run with --ignored"]
-    fn checkpoint_has_tokens_far_longer_than_any_per_token_character_guess() {
+    fn checkpoint_tokens_decode_within_the_per_token_bound() {
         let dir = std::env::var("MLX_TEST_MUSE_GLIMMER_MODEL_PATH")
             .expect("set MLX_TEST_MUSE_GLIMMER_MODEL_PATH to the checkpoint directory");
+        let tok =
+            tokenizers::Tokenizer::from_file(std::path::Path::new(&dir).join("tokenizer.json"))
+                .expect("checkpoint has a loadable tokenizer.json");
+        let vocab_size = tok.get_vocab_size(true);
+
+        // `skip_special_tokens = false` throughout, because the guard buffers a
+        // control marker's characters like any other text. Pinned here: with
+        // skipping on, these decode to nothing. (Measured: flipping the flag alone
+        // moves neither count below, so without this assertion the argument would
+        // be unpinned — a mutation to it survived until this was added.)
+        for (id, text) in [(200001u32, EOS), (200007, EOM), (200008, EOT)] {
+            assert_eq!(
+                tok.decode(&[id], false).expect("special id decodes"),
+                text,
+                "special id {id} no longer decodes to {text:?} with skipping off"
+            );
+        }
+
+        let mut longest = 0usize;
+        let mut longest_id = 0u32;
+        let mut over_64 = 0usize;
+        let mut over_bound: Vec<(u32, usize)> = Vec::new();
+        let mut markers_seen = 0usize;
+        for id in 0..vocab_size as u32 {
+            // `skip_special_tokens = false`: a special token's decoded text is
+            // still text this guard has to buffer.
+            let Ok(text) = tok.decode(&[id], false) else {
+                continue;
+            };
+            if text.starts_with("<|") && text.ends_with("|>") {
+                markers_seen += 1;
+            }
+            let chars = text.chars().count();
+            if chars > longest {
+                longest = chars;
+                longest_id = id;
+            }
+            if chars > 64 {
+                over_64 += 1;
+            }
+            if chars > MAX_TOKEN_CHARS {
+                over_bound.push((id, chars));
+            }
+        }
+
+        assert!(
+            over_bound.is_empty(),
+            "MAX_TOKEN_CHARS = {MAX_TOKEN_CHARS} is below the checkpoint: {over_bound:?}"
+        );
+        assert!(
+            longest > 64,
+            "longest decoded token is only {longest} characters (id {longest_id}) — if the \
+             vocabulary really changed, revisit why MAX_TOKEN_CHARS exists at all"
+        );
+        // The measured facts, so a silent vocabulary swap is visible.
+        assert_eq!(
+            (longest_id, longest),
+            (169871, 113),
+            "the longest decoded token moved"
+        );
+        assert_eq!(
+            tok.decode(&[162250], false).unwrap().chars().count(),
+            112,
+            "token 162250 decoded length moved"
+        );
+        assert_eq!(
+            over_64, 70,
+            "the number of tokens decoding past 64 characters moved"
+        );
+        // Pins `skip_special_tokens = false` on the sweep itself. Flipping it does
+        // not move any count above — every control marker is short — so without
+        // this the argument was unpinned and a mutation of it survived. With
+        // skipping on, all 2048 of the checkpoint's `<|…|>` ids decode to nothing.
+        assert_eq!(
+            markers_seen, 2048,
+            "the checkpoint's control-marker block moved, or the sweep stopped \
+             decoding special tokens"
+        );
+
+        // The contrast that makes finding 3 permanent: the same vocabulary counted
+        // as raw BPE lexemes gives the wrong 74. Kept so nobody re-derives the
+        // number the cheap way and thinks the two measurements agree.
         let raw = std::fs::read_to_string(std::path::Path::new(&dir).join("tokenizer.json"))
             .expect("checkpoint has a tokenizer.json");
         let json: serde_json::Value =
             serde_json::from_str(&raw).expect("tokenizer.json is valid JSON");
-        let vocab = json["model"]["vocab"]
+        let lexemes_over_64 = json["model"]["vocab"]
             .as_object()
-            .expect("tokenizer.json has model.vocab");
-
-        let mut longest = 0usize;
-        let mut over_64 = 0usize;
-        let mut by_id: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
-        for (token, id) in vocab {
-            let chars = token.chars().count();
-            longest = longest.max(chars);
-            if chars > 64 {
-                over_64 += 1;
-            }
-            if let Some(id) = id.as_u64().filter(|id| *id == 169871 || *id == 162250) {
-                by_id.insert(id, chars);
-            }
-        }
-        assert!(
-            longest > 64,
-            "longest token is only {longest} characters — if the vocabulary really \
-             changed, revisit why MAX_CHUNK_CHARS exists at all"
+            .expect("tokenizer.json has model.vocab")
+            .keys()
+            .filter(|k| k.chars().count() > 64)
+            .count();
+        println!(
+            "decoded tokens over 64 chars: {over_64}; raw BPE lexemes over 64 chars: \
+             {lexemes_over_64}; longest decoded: id {longest_id} at {longest} chars; \
+             `<|…|>` markers decoded: {markers_seen}"
         );
-        assert_eq!(by_id.get(&169871), Some(&113), "token 169871 length moved");
-        assert_eq!(by_id.get(&162250), Some(&112), "token 162250 length moved");
+        assert_eq!(
+            lexemes_over_64, 74,
+            "the lexeme count moved too — re-derive both numbers"
+        );
         assert!(
-            over_64 >= 74,
-            "only {over_64} tokens exceed 64 characters, expected at least 74"
+            lexemes_over_64 > over_64,
+            "lexemes no longer overstate the decoded count; the reason this test \
+             decodes instead of measuring keys may have gone away"
         );
     }
 
@@ -1339,7 +1735,7 @@ mod tests {
 
     #[test]
     fn reasoning_is_never_emitted_as_content() {
-        let mut g = StreamGuard::new(8, 1024);
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
         let secret = "REASONING_SECRET ".repeat(8);
         let mut emitted =
             drain_char_by_char(&mut g, &format!(" to=self<|message|>{secret}<|eom|>"));
@@ -1354,7 +1750,7 @@ mod tests {
     /// `<|eom|>` between them: the answer streams, the thinking does not.
     #[test]
     fn reasoning_after_unclosed_content_is_not_emitted() {
-        let mut g = StreamGuard::new(8, 1024);
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
         let mut emitted = drain_char_by_char(
             &mut g,
             " to=user<|message|>public<|start|>assistant to=self<|message|>REASONING_SECRET<|eom|>",
@@ -1372,7 +1768,7 @@ mod tests {
     /// content still passed.
     #[test]
     fn a_tool_call_message_is_never_emitted_as_content() {
-        let mut g = StreamGuard::new(8, 1024);
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
         let mut emitted = drain_char_by_char(
             &mut g,
             " to=wx.forecast<|message|>stray prose on the tool channel\n\
@@ -1393,7 +1789,7 @@ mod tests {
     /// prose streams; everything from the tag on is the call, not the answer.
     #[test]
     fn content_before_a_tool_call_streams_but_the_xml_does_not() {
-        let mut g = StreamGuard::new(8, 1024);
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
         let mut emitted = drain_char_by_char(
             &mut g,
             " to=user<|message|>on it<atem:invoke name=\"t\">\
@@ -1411,12 +1807,12 @@ mod tests {
     /// message, so resuming there would publish the tool payload as the answer.
     #[test]
     fn a_new_message_inside_an_unclosed_tool_body_ends_the_turn() {
-        let mut g = StreamGuard::new(8, 1024);
-        g.push(
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        push_text(
+            &mut g,
             " to=t<|message|><atem:invoke name=\"t\"><atem:parameter name=\"q\">x",
-            1,
         );
-        let out = g.push("<|start|>assistant to=user<|message|>SENT_TO_TOOL", 1);
+        let out = push_text(&mut g, "<|start|>assistant to=user<|message|>SENT_TO_TOOL");
         assert!(
             matches!(out, GuardOutcome::EndTurn),
             "expected EndTurn, got {out:?}"
@@ -1427,10 +1823,10 @@ mod tests {
 
     #[test]
     fn message_cap_ends_the_turn() {
-        let mut g = StreamGuard::new(2, 1024);
-        g.push(" to=self<|message|>a<|eom|>", 1);
-        g.push("<|start|>assistant to=user<|message|>b<|eom|>", 1);
-        let out = g.push("<|start|>assistant to=user<|message|>c", 1);
+        let mut g = StreamGuard::new(2, 1024, TEST_RECIPIENT_CHARS);
+        push_text(&mut g, " to=self<|message|>a<|eom|>");
+        push_text(&mut g, "<|start|>assistant to=user<|message|>b<|eom|>");
+        let out = push_text(&mut g, "<|start|>assistant to=user<|message|>c");
         assert!(
             matches!(out, GuardOutcome::EndTurn),
             "message cap must trip"
@@ -1439,13 +1835,14 @@ mod tests {
 
     #[test]
     fn token_cap_ends_the_turn() {
-        let mut g = StreamGuard::new(8, 4);
-        g.push(" to=user<|message|>", 1);
+        let mut g = StreamGuard::new(8, 4, TEST_RECIPIENT_CHARS);
+        g.push(&[" to=user<|message|>"]);
         let mut last = GuardOutcome::Hold;
         for _ in 0..10 {
-            last = g.push("word ", 1);
+            last = g.push_token("word ");
         }
         assert!(matches!(last, GuardOutcome::EndTurn), "token cap must trip");
+        assert_eq!(g.tokens, 4, "the cap was overshot: {} tokens", g.tokens);
     }
 
     /// Two halves. Repeated pushes after a terminator keep returning `EndTurn`;
@@ -1453,18 +1850,23 @@ mod tests {
     /// reaches `flush`. Only the first half is insensitive to dropping the
     /// early return, because an unconsumed `<|eot|>` stays in the buffer and is
     /// simply re-detected on every later scan.
+    ///
+    /// Round 2 wrote the last assertion as `"answerMORE"` with the comment "the
+    /// chunk that tripped the cap is kept". That was pinning a leak: `MORE` is the
+    /// token past `max_tokens`, and the coordinator withdrew approval of it. The
+    /// cap is now applied before the batch is buffered, so `MORE` never exists.
     #[test]
     fn end_turn_is_sticky_and_publishes_nothing_after_it() {
-        let mut capped = StreamGuard::new(8, 2);
-        capped.push(" to=user<|message|>", 1);
-        capped.push("answer", 1);
-        let tripped = capped.push("MORE", 1);
+        let mut capped = StreamGuard::new(8, 2, TEST_RECIPIENT_CHARS);
+        capped.push_token(" to=user<|message|>");
+        capped.push_token("answer");
+        let tripped = capped.push_token("MORE");
         assert!(
             matches!(tripped, GuardOutcome::EndTurn),
             "token cap must trip, got {tripped:?}"
         );
         for _ in 0..3 {
-            let out = capped.push("AFTER_THE_CAP", 1);
+            let out = capped.push_token("AFTER_THE_CAP");
             assert!(
                 matches!(out, GuardOutcome::EndTurn),
                 "guard restarted: {out:?}"
@@ -1475,13 +1877,13 @@ mod tests {
             !flushed.contains("AFTER_THE_CAP"),
             "text generated past the cap was published: {flushed:?}"
         );
-        // The chunk that tripped the cap is kept; everything after it is not.
-        assert_eq!(flushed, "answerMORE");
+        // Content within the allowance is kept; the token that hit the cap is not.
+        assert_eq!(flushed, "answer");
 
-        let mut g = StreamGuard::new(1, 1024);
-        g.push(" to=user<|message|>a<|eot|>", 1);
+        let mut g = StreamGuard::new(1, 1024, TEST_RECIPIENT_CHARS);
+        push_text(&mut g, " to=user<|message|>a<|eot|>");
         for _ in 0..3 {
-            let out = g.push("<|start|>assistant to=user<|message|>more", 1);
+            let out = push_text(&mut g, "<|start|>assistant to=user<|message|>more");
             assert!(
                 matches!(out, GuardOutcome::EndTurn),
                 "guard restarted: {out:?}"
@@ -1491,8 +1893,8 @@ mod tests {
 
     #[test]
     fn eot_ends_the_turn_and_keeps_its_content() {
-        let mut g = StreamGuard::new(8, 1024);
-        let out = g.push(" to=user<|message|>answer<|eot|>", 1);
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let out = push_text(&mut g, " to=user<|message|>answer<|eot|>");
         assert!(
             matches!(out, GuardOutcome::EndTurn),
             "expected EndTurn, got {out:?}"
@@ -1506,24 +1908,24 @@ mod tests {
 
     #[test]
     fn flush_releases_the_held_tail_at_end_of_turn() {
-        let mut g = StreamGuard::new(8, 1024);
-        g.push(" to=user<|message|>tail text", 1);
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        push_text(&mut g, " to=user<|message|>tail text");
         let flushed = g.flush();
         assert!(flushed.contains("tail text"), "held tail lost: {flushed}");
     }
 
     #[test]
     fn flush_does_not_release_a_partial_marker() {
-        let mut g = StreamGuard::new(8, 1024);
-        g.push(" to=user<|message|>answer<ate", 1);
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        push_text(&mut g, " to=user<|message|>answer<ate");
         let flushed = g.flush();
         assert_eq!(flushed, "answer", "partial marker escaped through flush");
     }
 
     #[test]
     fn flush_releases_nothing_from_a_reasoning_message() {
-        let mut g = StreamGuard::new(8, 1024);
-        g.push(" to=self<|message|>unfinished thought", 1);
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        push_text(&mut g, " to=self<|message|>unfinished thought");
         let flushed = g.flush();
         assert_eq!(flushed, "", "reasoning escaped through flush: {flushed:?}");
     }
@@ -1550,8 +1952,8 @@ mod tests {
             "fixture no longer straddles a character at the cut"
         );
 
-        let mut one_chunk = StreamGuard::new(8, 1024);
-        let mut emitted = match one_chunk.push(&format!(" to=user<|message|>{body}"), 1) {
+        let mut one_chunk = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut emitted = match push_text(&mut one_chunk, &format!(" to=user<|message|>{body}")) {
             GuardOutcome::Emit(s) => s,
             other => panic!("expected content past the hold-back, got {other:?}"),
         };
@@ -1561,7 +1963,7 @@ mod tests {
             "multi-byte content was corrupted in one chunk"
         );
 
-        let mut split = StreamGuard::new(8, 1024);
+        let mut split = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
         let mut emitted = drain_char_by_char(&mut split, &format!(" to=user<|message|>{body}"));
         emitted.push_str(&split.flush());
         assert_eq!(
@@ -1572,7 +1974,7 @@ mod tests {
 
     #[test]
     fn a_multi_byte_answer_around_a_tool_call_survives() {
-        let mut g = StreamGuard::new(8, 1024);
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
         let prose = "天気を調べます。🌤️ ".repeat(4);
         let mut emitted = drain_char_by_char(
             &mut g,
@@ -1609,7 +2011,7 @@ mod tests {
     /// a content delta, but the prose around it is still the answer.
     #[test]
     fn a_bare_message_marker_inside_content_is_dropped() {
-        let mut g = StreamGuard::new(8, 1024);
+        let mut g = StreamGuard::new(8, 1024, TEST_RECIPIENT_CHARS);
         let mut emitted = drain_char_by_char(
             &mut g,
             " to=user<|message|>first half <|message|> second half of the answer",
