@@ -22,7 +22,65 @@ pub struct ModelThread<Cmd: Send + 'static> {
     _handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Result of one scheduler-owned model-thread loop iteration.
+#[allow(dead_code)] // B4 scheduler seam; B5 wires the Qwen3 model loop.
+pub(crate) enum LoopControl {
+    Continue,
+    Break,
+}
+
 impl<Cmd: Send + 'static> ModelThread<Cmd> {
+    /// Spawn a model thread whose loop owns the command receiver.
+    ///
+    /// Unlike [`Self::spawn_with_init`], this variant does not consume one
+    /// command and hand it to a whole-turn handler. The loop body may
+    /// `blocking_recv` while idle and `try_recv` between active scheduler
+    /// steps, which is the required shape for continuous batching without a
+    /// polling thread or a busy wait.
+    #[allow(dead_code)] // B4 scheduler seam; B5 wires the Qwen3 model loop.
+    pub(crate) fn spawn_with_scheduler<State, Init, InitResult, LoopBody>(
+        init_fn: Init,
+        mut loop_body: LoopBody,
+    ) -> (
+        Self,
+        tokio::sync::oneshot::Receiver<napi::Result<InitResult>>,
+    )
+    where
+        State: Send + 'static,
+        Init: FnOnce() -> napi::Result<(State, InitResult)> + Send + 'static,
+        InitResult: Send + 'static,
+        LoopBody: FnMut(&mut State, &mut tokio::sync::mpsc::UnboundedReceiver<Cmd>) -> LoopControl
+            + Send
+            + 'static,
+    {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
+        let (init_tx, init_rx) = tokio::sync::oneshot::channel();
+        let handle = std::thread::Builder::new()
+            .name("mlx-model".into())
+            .spawn(move || {
+                let mut state = match init_fn() {
+                    Ok((state, init_result)) => {
+                        let _ = init_tx.send(Ok(init_result));
+                        state
+                    }
+                    Err(error) => {
+                        let _ = init_tx.send(Err(error));
+                        return;
+                    }
+                };
+                while matches!(loop_body(&mut state, &mut cmd_rx), LoopControl::Continue) {}
+            })
+            .expect("failed to spawn mlx-model thread");
+
+        (
+            Self {
+                cmd_tx: Some(cmd_tx),
+                _handle: Some(handle),
+            },
+            init_rx,
+        )
+    }
+
     /// Spawn a dedicated model thread with an initialization phase.
     ///
     /// 1. The thread runs `init_fn` which returns `(State, InitResult)`.
@@ -165,7 +223,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelThread, ResponseTx, send_and_await};
+    use super::{LoopControl, ModelThread, ResponseTx, send_and_await};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -207,6 +265,44 @@ mod tests {
             .shutdown_and_join()
             .expect("exclusive shutdown should join the worker");
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn scheduler_spawn_hands_receiver_ownership_to_the_loop() {
+        enum Cmd {
+            Add(i32, ResponseTx<i32>),
+            Stop,
+        }
+        let (mut model_thread, init_rx) = ModelThread::<Cmd>::spawn_with_scheduler(
+            || Ok((40, ())),
+            |state, receiver| match receiver.blocking_recv() {
+                Some(Cmd::Add(value, reply)) => {
+                    *state += value;
+                    let _ = reply.send(Ok(*state));
+                    LoopControl::Continue
+                }
+                Some(Cmd::Stop) | None => LoopControl::Break,
+            },
+        );
+        init_rx
+            .blocking_recv()
+            .expect("model init channel closed")
+            .expect("model init failed");
+        let (reply, result) = tokio::sync::oneshot::channel();
+        model_thread
+            .send(Cmd::Add(2, reply))
+            .expect("send scheduler command");
+        assert_eq!(
+            result
+                .blocking_recv()
+                .expect("reply channel closed")
+                .expect("command failed"),
+            42
+        );
+        model_thread.send(Cmd::Stop).expect("send stop");
+        model_thread
+            .shutdown_and_join()
+            .expect("scheduler loop should join");
     }
 
     /// H1a shape pin: a reset-style command queued behind an in-flight
