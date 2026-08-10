@@ -3463,4 +3463,88 @@ mod tests {
             "benign text was destroyed: {clean}"
         );
     }
+
+    /// Per-marker coverage, driven from the constant so it cannot drift.
+    ///
+    /// `marker_sanitizer_strips_every_supplied_marker` loops the whole list over a
+    /// single fixture, but that fixture contains only `<|eot|>`, `<|start|>` and
+    /// `<|message|>` — the other 12 assertions are vacuous, and a sanitizer that
+    /// skipped `<|image|>` outright passed it. `assert!(!haystack.contains(needle))`
+    /// over a haystack that never contained the needle is not a test. Here every
+    /// marker gets a fixture that genuinely contains it, and the guard below makes
+    /// vacuity itself a failure rather than a silent pass.
+    #[test]
+    fn marker_sanitizer_strips_each_marker_individually() {
+        for marker in super::MUSE_GLIMMER_CONTROL_MARKERS {
+            let hostile = format!("before{marker}after");
+            assert!(
+                hostile.contains(marker),
+                "fixture for {marker} does not contain it — the next assertion would be vacuous"
+            );
+            let clean = super::Qwen3Tokenizer::sanitize_marker_content(
+                &hostile,
+                super::MUSE_GLIMMER_CONTROL_MARKERS,
+            );
+            assert!(!clean.contains(marker), "marker {marker} survived: {clean}");
+            // Nothing but the marker may be touched: one space where it stood, and
+            // both benign halves intact.
+            assert_eq!(
+                clean, "before after",
+                "sanitizing {marker} damaged the surrounding text"
+            );
+        }
+    }
+
+    /// Pin the constant against an independent literal transcription of the spec's
+    /// "Non-reserved special tokens — exactly 15" table in
+    /// `docs/superpowers/specs/2026-08-10-muse-glimmer-30b-design.md`.
+    ///
+    /// Written out here rather than derived from the constant: that is the whole
+    /// point. A test that iterates the constant to check the constant agrees with
+    /// whatever the constant says, so deleting an entry would weaken the sanitizer
+    /// and its own test together and no gate would notice.
+    #[test]
+    fn marker_sanitizer_list_matches_spec_token_table() {
+        // Trailing ids are the spec table's, so the transcription can be cross-checked
+        // against it by eye without leaving this file.
+        let expected: [&str; 15] = [
+            "<|begin_of_text|>",       // 200000
+            "<|end_of_text|>",         // 200001 (stop)
+            "<|eom|>",                 // 200007 (NOT a stop)
+            "<|eot|>",                 // 200008 (stop)
+            "<|finetune_right_pad|>",  // 200018
+            "<|start|>",               // 200022
+            "<|message|>",             // 200023
+            "<|image_start|>",         // 200080
+            "<|image_end|>",           // 200081
+            "<|vid_start|>",           // 200082
+            "<|vid_end|>",             // 200083
+            "<|vid_frame_separator|>", // 200087
+            "<|image|>",               // 200090 (decoy, unused)
+            "<|video|>",               // 200091
+            "<|patch|>",               // 200092
+        ];
+        let expected_set: std::collections::BTreeSet<&str> = expected.iter().copied().collect();
+        // A typo'd duplicate in `expected` would silently shrink the comparison set and
+        // let a missing marker through, so pin the transcription's own size first.
+        assert_eq!(
+            expected_set.len(),
+            15,
+            "the expected list has a duplicate, which would weaken the set comparison"
+        );
+
+        // Length is asserted against the slice, not the set, so a duplicated entry in
+        // the constant is caught rather than deduped away.
+        assert_eq!(
+            super::MUSE_GLIMMER_CONTROL_MARKERS.len(),
+            15,
+            "the spec table is exactly 15 non-reserved special tokens"
+        );
+        // Compared as sets, so the constant is free to reorder.
+        let actual_set: std::collections::BTreeSet<&str> = super::MUSE_GLIMMER_CONTROL_MARKERS
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(actual_set, expected_set);
+    }
 }
