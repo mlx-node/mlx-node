@@ -113,6 +113,13 @@ use serde::Deserialize;
 use std::ops::Range;
 use std::path::Path;
 
+// The parser names the guard, rather than the other way round, because the guard is
+// what makes provenance real. `GeneratedTurn::from_guard` is the only non-private
+// way to build one, so this edge is the security boundary; see that method. Nothing
+// here reads the guard's private state — `raw_turn()` is its public accessor — so the
+// two modules stay independent apart from that one signature.
+use super::stream_guard::StreamGuard;
+
 // ── On-disk spec ───────────────────────────────────────────────────
 
 /// `close` is a bare string on `reasoning_content`/`tool_calls` and a list on
@@ -352,12 +359,29 @@ pub struct ParsedToolCall {
 ///
 /// Nothing in the type says those ranges index that string or came from a
 /// tokenizer, and no rule inside `parse` can check it — so the contract is enforced
-/// by VISIBILITY instead. [`Self::from_token_spans`] is `pub(super)`, and
-/// `super::stream_guard::StreamGuard::generated_turn` is the only way to obtain one
-/// of these outside this module: the guard sees token ids, so its spans are a
-/// lookup rather than a judgement. A `pub` constructor let any caller assert
-/// provenance it never verified — including someone reinventing the test helper in
-/// production, which is exactly the shape that would compile and pass review.
+/// by VISIBILITY instead, and the ONLY non-private constructor is
+/// [`Self::from_guard`], which takes a [`StreamGuard`] rather than spans. Forging
+/// provenance therefore requires forging a guard, and a guard's spans are minted
+/// inside it from `id_to_token` lookups against the checkpoint's own vocabulary.
+///
+/// # Why `pub(super)` was not enough, measured
+///
+/// Round 5 made the raw-span constructor `pub(super)` and this doc claimed the
+/// boundary was structural. It was not. `output_parser` lives in
+/// `models::muse_glimmer`, so `pub(super)` exposed the constructor to every present
+/// and future SIBLING — `config.rs`, `stream_guard.rs`, and above all M1's
+/// `model.rs`, which is the exact consumer the boundary exists for. Reproduced with
+/// an ordinary non-test sibling function holding no guard and no tokenizer:
+///
+/// ```text
+/// ParsedTurn { reasoning: None, content: None,
+///              tool_calls: [ParsedToolCall { name: "rm", arguments: {"path": "/"} }] }
+/// ```
+///
+/// Typed marker text regained structural authority through a plain sibling call,
+/// which is the whole bypass this type exists to close. The assertions below check
+/// ordering and bounds; nothing in them can check token ORIGIN, so no assertion
+/// could have caught it. Only the signature can.
 #[derive(Debug, Clone, Copy)]
 pub struct GeneratedTurn<'a> {
     text: &'a str,
@@ -365,14 +389,33 @@ pub struct GeneratedTurn<'a> {
 }
 
 impl<'a> GeneratedTurn<'a> {
+    /// **The production constructor.** Takes the guard that decoded the turn, so the
+    /// text and the spans are the same guard's state and cannot be mixed: both come
+    /// from one [`StreamGuard::raw_turn`] call, and the borrow keeps them married for
+    /// the turn's whole life.
+    ///
+    /// `pub` is safe here in the way `pub(super)` on a raw-span constructor never
+    /// was, because the argument is unforgeable: a `&StreamGuard` can only come from
+    /// `StreamGuard::new` plus `push_id`, and every span it holds was recorded by
+    /// resolving a decoded id through the checkpoint's tokenizer. A caller can pass a
+    /// guard that saw a strange stream; it cannot pass provenance the tokenizer did
+    /// not report.
+    ///
+    /// Read it after `StreamGuard::flush`, when the turn is frozen.
+    pub fn from_guard(guard: &'a StreamGuard) -> Self {
+        let (text, control_spans) = guard.raw_turn();
+        Self::from_token_spans(text, control_spans)
+    }
+
     /// `text` as decoded, and the spans within it that real control-marker tokens
     /// produced.
     ///
-    /// `pub(super)` on purpose: `super::stream_guard::StreamGuard::generated_turn`
-    /// is the intended and only production caller, and this module's own tests are
-    /// the only other one. See the type's contract above for why a `pub`
-    /// constructor was itself the defect.
-    pub(super) fn from_token_spans(text: &'a str, control_spans: &'a [Range<usize>]) -> Self {
+    /// **Module-private, and that privacy IS the boundary.** [`Self::from_guard`] is
+    /// its only non-test caller; this module's own `tests` reach it as a child module,
+    /// which is the fixture path the parser's 60-odd span tests need. A sibling
+    /// cannot name it at all — not `stream_guard`, not M1's `model.rs`. See the
+    /// type's contract for the sibling forgery this replaced.
+    fn from_token_spans(text: &'a str, control_spans: &'a [Range<usize>]) -> Self {
         debug_assert!(
             control_spans.windows(2).all(|w| w[0].end <= w[1].start),
             "control_spans must be sorted and non-overlapping"

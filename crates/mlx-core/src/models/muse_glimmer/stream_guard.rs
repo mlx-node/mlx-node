@@ -617,20 +617,24 @@ impl StreamGuard {
     /// The turn as the parser takes it: the decoded text plus the provenance of its
     /// control markers, ready for `output_parser::ResponseTemplate::parse`.
     ///
-    /// **The only way to build a
-    /// [`GeneratedTurn`](super::output_parser::GeneratedTurn) outside
-    /// `super::output_parser`**, and that is the point. Its constructor is
-    /// `pub(super)`, so no caller can assert provenance it never verified: these
-    /// spans come from ids this guard resolved through the checkpoint's own
-    /// tokenizer in [`Self::new`], which is the one place in the system where
-    /// `<|eot|>` from token 200008 and `<|eot|>` typed as seven characters are still
-    /// distinguishable. A caller reinventing the parser's `#[cfg(test)]` fixture
-    /// helper in production would have compiled, passed review, and re-opened the
-    /// bypass — so the type system refuses it instead.
+    /// Sugar for
+    /// [`GeneratedTurn::from_guard`](super::output_parser::GeneratedTurn::from_guard),
+    /// which is where the boundary lives: the parser's raw-span constructor is
+    /// module-PRIVATE, so the only way anything outside `output_parser` — this guard
+    /// included — can build one is by handing over a guard.
+    ///
+    /// That is stronger than what round 5 shipped. A `pub(super)` raw-span
+    /// constructor was reachable from every sibling in `models::muse_glimmer`,
+    /// including M1's future `model.rs`, and a non-test sibling holding no guard and
+    /// no tokenizer really did parse typed text into `rm { path: "/" }`. Requiring
+    /// the guard means forging provenance requires forging a guard, and these spans
+    /// come from ids resolved through the checkpoint's own tokenizer in
+    /// [`Self::new`] — the one place where `<|eot|>` from token 200008 and `<|eot|>`
+    /// typed as seven characters are still distinguishable.
     ///
     /// Read it after [`Self::flush`], when the turn is frozen.
     pub fn generated_turn(&self) -> super::output_parser::GeneratedTurn<'_> {
-        super::output_parser::GeneratedTurn::from_token_spans(&self.raw, &self.control_spans)
+        super::output_parser::GeneratedTurn::from_guard(self)
     }
 
     /// Drains everything releasable at end of turn: resolved content, plus the
@@ -3854,7 +3858,9 @@ mod tests {
     // `push_id`* then `flush` then `parse` — and asserts the two sides agree about
     // it. None of them needs the checkpoint.
 
-    use crate::models::muse_glimmer::output_parser::{ParsedTurn, ResponseTemplate, SPEC_JSON};
+    use crate::models::muse_glimmer::output_parser::{
+        GeneratedTurn, ParsedTurn, ResponseTemplate, SPEC_JSON,
+    };
 
     /// What one turn looked like on both sides of the seam.
     struct Seam {
@@ -3954,14 +3960,22 @@ mod tests {
         s
     }
 
-    /// [`StreamGuard::generated_turn`] is the minting boundary: it reports the same
-    /// two halves `raw_turn` does, and it keeps reporting them after `flush`.
+    /// `GeneratedTurn::from_guard` is the minting boundary, and
+    /// [`StreamGuard::generated_turn`] is sugar over it: both report the two halves
+    /// `raw_turn` does, and both keep reporting them after `flush`.
     ///
-    /// The property that matters cannot be tested at all, only compiled — a caller
-    /// outside this module has no other way to build a `GeneratedTurn`, because
-    /// `from_token_spans` is `pub(super)`. What IS testable is that the production
-    /// accessor agrees with the data accessor and that a finalised turn stays
-    /// finalised through it, since that is the text tool calls are authorised from.
+    /// The property that matters is compile-time and no runtime test can state it —
+    /// there is no other constructor to call, because the raw-span one is
+    /// module-private to `output_parser`. Round 2 verified that by REPRODUCTION
+    /// rather than by reading the visibility rules: a non-test sibling function in
+    /// this very file, holding no guard, parsed typed text into
+    /// `rm { path: "/" }` while the constructor was `pub(super)`, and the identical
+    /// function now fails to compile with `E0624: associated function
+    /// from_token_spans is private`. Both spellings are recorded in the report.
+    ///
+    /// What IS testable, and asserted here: the two accessors agree, the guard-taking
+    /// constructor is reachable and equivalent, and a finalised turn stays finalised
+    /// through both — that being the text tool calls are authorised from.
     #[test]
     fn generated_turn_reports_the_frozen_turn_the_guard_recorded() {
         let turn = " to=user<|message|>answer<|eot|>";
@@ -3971,17 +3985,20 @@ mod tests {
 
         let (raw, spans) = g.raw_turn();
         assert_eq!(g.generated_turn().text(), raw);
-        assert_eq!(
-            response_template()
-                .parse(g.generated_turn())
-                .content
-                .as_deref(),
-            Some("answer")
-        );
+        // The constructor itself, called the way M1 may call it. Same turn, so the
+        // sugar cannot drift from the boundary.
+        assert_eq!(GeneratedTurn::from_guard(&g).text(), raw);
+        for built in [g.generated_turn(), GeneratedTurn::from_guard(&g)] {
+            assert_eq!(
+                response_template().parse(built).content.as_deref(),
+                Some("answer")
+            );
+        }
         // A late id cannot move it, so two reads of the same guard agree.
         let frozen = (raw.to_string(), spans.to_vec());
         assert!(matches!(g.push_id(id_of("answer")), GuardOutcome::EndTurn));
         assert_eq!(g.generated_turn().text(), frozen.0);
+        assert_eq!(GeneratedTurn::from_guard(&g).text(), frozen.0);
         assert_eq!(g.raw_turn().1, frozen.1.as_slice());
     }
 
