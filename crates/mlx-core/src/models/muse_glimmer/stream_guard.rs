@@ -4237,4 +4237,134 @@ mod tests {
         );
         assert!(matches!(s.last, GuardOutcome::EndTurn), "got {:?}", s.last);
     }
+
+    /// The seam against the REAL vocabulary and the REAL `response_template`, and
+    /// the fidelity pin for the fact the anchor fix rests on.
+    ///
+    /// Everything above runs on a synthetic tokenizer, so on its own it proves the
+    /// two modules self-consistent rather than right about this checkpoint. The
+    /// claim that has to be true of the checkpoint is that `<|start|>assistant` is
+    /// NOT one token: if some vocabulary key rendered the pair, the old whole-anchor
+    /// gate would have been merely unlucky rather than impossible, and this fix
+    /// would be the wrong shape.
+    ///
+    /// Measured here: `<|start|>` is added-token 200022, `assistant` is the ordinary
+    /// 140680, and the only keys containing `start|>` are `<|start|>`,
+    /// `<|image_start|>` and `<|vid_start|>` — none of them a marker plus a role.
+    ///
+    /// Then one full turn — reasoning, a tool call, an answer — encoded by the real
+    /// tokenizer, streamed through the guard and parsed with the real spec.
+    #[test]
+    #[ignore = "requires the local Muse-Glimmer checkpoint; set MLX_TEST_MUSE_GLIMMER_MODEL_PATH and run with --ignored"]
+    fn checkpoint_no_token_renders_the_anchor_and_a_real_turn_parses() {
+        let dir = std::env::var("MLX_TEST_MUSE_GLIMMER_MODEL_PATH")
+            .expect("set MLX_TEST_MUSE_GLIMMER_MODEL_PATH to the checkpoint directory");
+        let path = std::path::Path::new(&dir);
+        let tok = Arc::new(
+            Tokenizer::from_file(path.join("tokenizer.json"))
+                .expect("checkpoint has a loadable tokenizer.json"),
+        );
+
+        // The anchor is a token plus text, and nothing in the vocabulary is both.
+        assert_eq!(
+            tok.token_to_id(START),
+            Some(200022),
+            "the <|start|> marker's id moved"
+        );
+        assert_eq!(
+            tok.token_to_id("assistant"),
+            Some(140680),
+            "the assistant role's ordinary id moved"
+        );
+        let anchor = "<|start|>assistant";
+        assert!(
+            tok.token_to_id(anchor).is_none(),
+            "{anchor:?} has an id, so the whole-anchor provenance gate was not \
+             impossible after all and this fix is the wrong shape"
+        );
+        let spelled: Vec<String> = tok
+            .get_vocab(true)
+            .into_keys()
+            .filter(|k| k.contains("start|>"))
+            .collect();
+        assert!(
+            spelled.iter().all(|k| k.ends_with("start|>")),
+            "some token renders <|start|> followed by more text: {spelled:?}"
+        );
+        println!("keys containing 'start|>': {spelled:?}");
+
+        // …so a whole turn, on the real spec, has to come through the seam intact.
+        let template = ResponseTemplate::from_tokenizer_config(path)
+            .expect("the real response_template compiles");
+        let turn = " to=self<|message|>check the tool first<|eom|>\
+                    <|start|>assistant to=wx.forecast<|message|><atem:function_calls>\n\
+                    <atem:invoke name=\"wx.forecast\">\n\
+                    <atem:parameter name=\"city\">Paris</atem:parameter>\n\
+                    </atem:invoke>\n</atem:function_calls><|eom|>\
+                    <|start|>assistant to=user<|message|>Rain tomorrow.<|eot|>";
+        let ids: Vec<u32> = tok
+            .encode(turn, false)
+            .expect("the turn encodes")
+            .get_ids()
+            .to_vec();
+
+        let mut g = StreamGuard::new(tok.clone(), 8, 4096, 16);
+        let mut streamed = String::new();
+        for id in &ids {
+            match g.push_id(*id) {
+                GuardOutcome::Emit(s) => streamed.push_str(&s),
+                GuardOutcome::Hold => {}
+                GuardOutcome::EndTurn => break,
+            }
+        }
+        streamed.push_str(&g.flush());
+        let parsed = template.parse(g.generated_turn());
+        println!("CHECKPOINT seam: streamed={streamed:?} parsed={parsed:?}");
+
+        assert_eq!(parsed.reasoning.as_deref(), Some("check the tool first"));
+        assert_eq!(
+            parsed
+                .tool_calls
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wx.forecast"],
+            "the real checkpoint's tool call did not survive the seam"
+        );
+        assert_eq!(
+            parsed.tool_calls[0].arguments["city"],
+            serde_json::json!("Paris")
+        );
+        // The guard is fail-closed at a tool body's `<|eom|>`, so the answer after it
+        // is not generated — the same behaviour `repeated_tool_calls_survive_the_seam`
+        // pins on the synthetic fixture, asserted here against the real vocabulary so
+        // the two cannot drift.
+        assert_eq!(streamed, "", "a tool turn streamed content");
+        assert_eq!(parsed.content, None, "got {parsed:?}");
+
+        // Reasoning then a plain answer, with no tool message between them, streams
+        // and parses to the same bytes — the case the dead anchor gate broke.
+        let answer_turn = " to=self<|message|>think<|eom|>\
+                           <|start|>assistant to=user<|message|>Rain tomorrow.<|eot|>";
+        let answer_ids: Vec<u32> = tok
+            .encode(answer_turn, false)
+            .expect("the turn encodes")
+            .get_ids()
+            .to_vec();
+        let mut g = StreamGuard::new(tok, 8, 4096, 16);
+        let mut streamed = String::new();
+        for id in &answer_ids {
+            match g.push_id(*id) {
+                GuardOutcome::Emit(s) => streamed.push_str(&s),
+                GuardOutcome::Hold => {}
+                GuardOutcome::EndTurn => break,
+            }
+        }
+        streamed.push_str(&g.flush());
+        let parsed = template.parse(g.generated_turn());
+        println!("CHECKPOINT seam answer: streamed={streamed:?} parsed={parsed:?}");
+        assert_eq!(parsed.reasoning.as_deref(), Some("think"));
+        assert_eq!(parsed.content.as_deref(), Some("Rain tomorrow."));
+        assert_eq!(streamed, "Rain tomorrow.");
+    }
 }

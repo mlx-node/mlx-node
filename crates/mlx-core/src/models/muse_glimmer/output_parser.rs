@@ -730,9 +730,12 @@ const MESSAGE_MARKER: &str = "<|message|>";
 /// token followed by nine ordinary characters — and that is the whole of why
 /// [`GeneratedTurn::next_token_prefixed_marker`] exists.
 ///
-/// Measured against the checkpoint: `<|start|>` is id 200022, `assistant` is the
-/// ordinary id 140680, and NO key in the vocabulary contains the substring
-/// `start|>`. So no tokenizer can ever produce one span covering the pair, and a
+/// Measured against the checkpoint, and pinned by
+/// `stream_guard`'s `checkpoint_no_token_renders_the_anchor_and_a_real_turn_parses`:
+/// `<|start|>` is added-token id 200022, `assistant` is the ordinary id 140680, and
+/// the only vocabulary keys containing `start|>` at all are the markers
+/// `<|start|>`, `<|image_start|>` and `<|vid_start|>` — no token renders `<|start|>`
+/// plus a role. So no tokenizer can ever produce one span covering the pair, and a
 /// parser that demanded one recognised no message boundary at all. Provenance is
 /// required for these nine bytes; the role behind them is matched literally,
 /// exactly as [`AFTER_ANCHOR_PREFIXES`] already treats the space after it.
