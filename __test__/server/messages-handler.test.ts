@@ -5,6 +5,7 @@ import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
+import { ModelWorkCoordinator } from '../../packages/server/src/model-work-coordinator.js';
 import { ModelRegistry } from '../../packages/server/src/registry.js';
 
 // ---------------------------------------------------------------------------
@@ -4539,6 +4540,8 @@ describe('handleCreateMessage', () => {
       // Unlike `/v1/responses`, the Anthropic path has no later stored-identity check,
       // so the in-mutex re-read is the only line of defence — it rejects 400 on drift.
       const registry = new ModelRegistry();
+      const coordinator = new ModelWorkCoordinator();
+      const resolveModel = vi.fn(async () => {});
       const originalModel = createMockModel(makeChatResult({ text: 'original' }));
       const swappedModel = createMockModel(makeChatResult({ text: 'swapped' }));
 
@@ -4567,6 +4570,10 @@ describe('handleCreateMessage', () => {
           max_tokens: 100,
         },
         registry,
+        undefined,
+        null,
+        resolveModel,
+        coordinator,
       );
 
       // Yield so the blocker enters `withExclusive` and awaits
@@ -4587,12 +4594,18 @@ describe('handleCreateMessage', () => {
           max_tokens: 100,
         },
         registry,
+        undefined,
+        null,
+        resolveModel,
+        coordinator,
       );
 
       // Yield so the queued request reaches the mutex await.
       await Promise.resolve();
       await Promise.resolve();
       await Promise.resolve();
+      expect(resolveModel).not.toHaveBeenCalled();
+      expect(coordinator.waitingWriters).toBe(0);
 
       // Hot-swap the binding STRICTLY between the queued
       // request's pre-lock snapshot and the moment it wins the

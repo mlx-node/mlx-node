@@ -1192,6 +1192,7 @@ mod tests {
         // Gemma4's grouped full/sliding paged layout has no atomic multi-group
         // cold restore contract yet. The former rotating sidecar is obsolete.
         assert!(!cold_restore_supported("gemma4"));
+        assert!(!resolve_persist_cold("gemma4", Some("1"), Some(true)));
         // Hybrid, admitted only because its out-of-pool GDN recurrent state is
         // persisted as a `ColdGroup::GdnState` sidecar AND its restart-parity
         // gate passes on real weights

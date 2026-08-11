@@ -970,6 +970,8 @@ describe('pre-dispatch permit lifetime (pre-lock async work)', () => {
 
   it('releases the permit on the binding-changed 400 exit', async () => {
     const registry = new ModelRegistry({ maxQueueDepth: 1 });
+    const coordinator = new ModelWorkCoordinator();
+    const resolveModel = vi.fn(async () => {});
     registry.register('m', createModel());
     const oldReg = registry.getSessionRegistry('m')!;
 
@@ -991,10 +993,13 @@ describe('pre-dispatch permit lifetime (pre-lock async work)', () => {
       undefined,
       undefined,
       null,
-      undefined,
+      coordinator,
+      resolveModel,
     );
     await tick();
     expect(oldReg.preDispatchAdmitCount).toBe(1);
+    expect(resolveModel).not.toHaveBeenCalled();
+    expect(coordinator.waitingWriters).toBe(0);
 
     // Hot-swap while the continuation is parked at getChain: the name now
     // points at a DIFFERENT model instance, so the post-await binding

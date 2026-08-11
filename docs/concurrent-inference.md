@@ -25,9 +25,10 @@ paged decode clear-cache interval is 1024 steps
   `ChatSession` still allows only one turn in flight.
 - Flat-cache, training, save, and reset commands stay in exclusive/barrier
   lanes. Gemma4 ordinary text rows use grouped full/sliding paged KV and fused
-  decode; media and MTP/DSpark owners are request-classified barriers because
-  their residual/draft shapes remain request-specific. Loading a Gemma4 draft
-  no longer disables ordinary batched owners on that resident target.
+  decode; media and MTP/DSpark owners use the ordered exclusive lane because
+  their residual/draft shapes remain request-specific, while reset and stats
+  commands are barriers. Loading a Gemma4 draft no longer disables ordinary
+  batched owners on that resident target.
 - Different loaded models continue to run in parallel, one native model thread
   per model.
 
@@ -139,7 +140,7 @@ Qwen3.5 GDN state      ✓ private conv + recurrent row per linear layer/request
 BlockAllocator         ✓ refcounts + prefix hash (vLLM-style pool)
 FFI / Metal kernels    ✓ num_seqs = q.shape(0), grid.y = sequence
 ragged mixed step      ✓ Qwen3 env-gated SEAM B executor swap; scheduler unchanged
-Gemma4 owner routing         ✓ paged AR/media; flat MTP/DSpark barrier per owner
+Gemma4 owner routing         ✓ paged text AR; media + flat MTP/DSpark exclusive per owner
 ```
 
 - Kernels/FFI: `crates/mlx-paged-attn/metal/attention/paged_attention.metal:762-806`,
@@ -322,5 +323,6 @@ above as a cooled median-of-three 4-bit result.
   and ordinary rows execute one fused `[N,1]` forward. Dynamic recompute
   preemption shares the full-group pool instead of statically partitioning one
   maximum context per request. Media and MTP/DSpark commands remain ordered
-  barriers, but coexist on the same loaded target through request-local owner
-  lanes rather than globally disabling batching.
+  exclusive work, but coexist on the same loaded target through request-local
+  owner lanes rather than globally disabling batching. Reset and stats remain
+  true barriers.
