@@ -1526,6 +1526,64 @@ struct Gemma4GroupedSlidingColdCheckpoint {
     layer_kv: Vec<(MxArray, MxArray)>,
 }
 
+/// Select the deepest scheduler snapshot covered by the persisted full-K/V
+/// frontier, or reconstruct that same anchor from the still-live grouped
+/// sliding adapters.
+///
+/// The scheduler normally captures every cold anchor before pruning. Finalize
+/// must not depend exclusively on that transient deque, though: a turn can
+/// reach finalize without retaining an intermediate snapshot while the anchor
+/// is still present in the live sliding window. Reading it here is exact (the
+/// adapter addresses absolute token ranges), and returning `None` once it has
+/// rotated out preserves the fail-closed full+sliding restore contract.
+fn resolve_grouped_sliding_cold_checkpoint(
+    checkpoints: Option<&VecDeque<Gemma4GroupedSlidingColdCheckpoint>>,
+    anchors: &[u32],
+    frontier: u32,
+    request_tokens: &[u32],
+    mut read_live_anchor: impl FnMut(
+        u32,
+    )
+        -> std::result::Result<Option<Vec<(MxArray, MxArray)>>, String>,
+) -> std::result::Result<Option<Gemma4GroupedSlidingColdCheckpoint>, String> {
+    if let Some(checkpoint) = checkpoints.and_then(|checkpoints| {
+        checkpoints.iter().rev().find(|checkpoint| {
+            checkpoint.boundary <= frontier
+                && request_tokens
+                    .get(..checkpoint.boundary as usize)
+                    .is_some_and(|tokens| tokens == checkpoint.tokens)
+        })
+    }) {
+        return Ok(Some(checkpoint.clone()));
+    }
+
+    let Some(boundary) = anchors
+        .iter()
+        .rev()
+        .copied()
+        .find(|&boundary| boundary <= frontier && boundary as usize <= request_tokens.len())
+    else {
+        return Ok(None);
+    };
+    let Some(layer_kv) = read_live_anchor(boundary)? else {
+        return Ok(None);
+    };
+    let tokens = request_tokens
+        .get(..boundary as usize)
+        .ok_or_else(|| {
+            format!(
+                "Gemma4 grouped cold anchor {boundary} exceeds request length {}",
+                request_tokens.len()
+            )
+        })?
+        .to_vec();
+    Ok(Some(Gemma4GroupedSlidingColdCheckpoint {
+        boundary,
+        tokens,
+        layer_kv,
+    }))
+}
+
 /// Everything a publishing site honestly knows about a checkpoint it just
 /// produced. `cold_anchor_rung` is deliberately NOT among those fields.
 ///
@@ -2834,12 +2892,71 @@ impl Gemma4Inner {
     }
 
     fn capture_grouped_sliding_cold_sidecar(
-        &self,
+        &mut self,
         seq_id: u32,
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) {
         crate::cold_tier::cold_sidecar_counters().record_capture_reached();
+        let Some((block_size, frontier, request_tokens, anchors)) =
+            self.kv_cache_coordinator.as_ref().and_then(|coordinator| {
+                let full = coordinator.full_adapter();
+                let cold = full.cold_tier()?;
+                if cold
+                    .sidecar_policy
+                    .as_ref()
+                    .is_none_or(|policy| policy.group() != mlx_paged_attn::ColdGroup::SlidingWindow)
+                {
+                    return None;
+                }
+                let block_size = full.block_size();
+                let request_tokens = full.request_tokens_for(seq_id)?.to_vec();
+                let anchors = gemma4_sliding_retention_caps_for_cold_tier(
+                    &self.config,
+                    Some(cold),
+                    block_size,
+                )
+                .anchors
+                .as_slice()
+                .to_vec();
+                Some((
+                    block_size,
+                    full.cold_captured_blocks().saturating_mul(block_size),
+                    request_tokens,
+                    anchors,
+                ))
+            })
+        else {
+            return;
+        };
+        let checkpoints = self.grouped_sliding_cold_checkpoints.get(&seq_id).cloned();
+        let checkpoint = resolve_grouped_sliding_cold_checkpoint(
+            checkpoints.as_ref(),
+            &anchors,
+            frontier,
+            &request_tokens,
+            |boundary| {
+                self.kv_cache_coordinator
+                    .as_mut()
+                    .ok_or_else(|| {
+                        "Gemma4 grouped cold capture lost its KV coordinator".to_string()
+                    })?
+                    .read_sliding_groups_at(seq_id, boundary)
+            },
+        );
+        let Some(checkpoint) = (match checkpoint {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                tracing::debug!(
+                    target: "mlx_core::gemma4::paged",
+                    "Gemma4 grouped sliding live-anchor capture failed: {error}"
+                );
+                None
+            }
+        }) else {
+            crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
+            return;
+        };
         let Some(coordinator) = self.kv_cache_coordinator.as_ref() else {
             return;
         };
@@ -2847,37 +2964,12 @@ impl Gemma4Inner {
         let Some(cold) = full.cold_tier() else {
             return;
         };
-        if cold
-            .sidecar_policy
-            .as_ref()
-            .is_none_or(|policy| policy.group() != mlx_paged_attn::ColdGroup::SlidingWindow)
-        {
-            return;
-        }
         let Some(geometry) = sliding_sidecar::geometry(&self.config) else {
-            return;
-        };
-        let block_size = full.block_size();
-        let frontier = full.cold_captured_blocks().saturating_mul(block_size);
-        let Some(request_tokens) = full.request_tokens_for(seq_id) else {
-            return;
-        };
-        let Some(checkpoints) = self.grouped_sliding_cold_checkpoints.get(&seq_id) else {
-            crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
-            return;
-        };
-        let Some(checkpoint) = checkpoints.iter().rev().find(|checkpoint| {
-            checkpoint.boundary <= frontier
-                && request_tokens
-                    .get(..checkpoint.boundary as usize)
-                    .is_some_and(|tokens| tokens == checkpoint.tokens)
-        }) else {
-            crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
             return;
         };
         let Some(key) = gemma4_sliding_cold_sidecar_chain_key(
             cold.fingerprint,
-            request_tokens,
+            &request_tokens,
             extra_keys_per_block,
             block_size,
             checkpoint.boundary,
@@ -11268,6 +11360,44 @@ mod tests {
     use crate::models::gemma4::output_parser::{StreamSegment, parse_gemma4_output};
 
     #[test]
+    fn grouped_cold_finalize_recovers_a_missing_scheduler_snapshot_from_live_state() {
+        let request_tokens = (0..160).collect::<Vec<u32>>();
+        let mut reads = Vec::new();
+        let checkpoint = resolve_grouped_sliding_cold_checkpoint(
+            None,
+            &[64, 256, 1024],
+            96,
+            &request_tokens,
+            |boundary| {
+                reads.push(boundary);
+                Ok(Some(Vec::new()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(reads, vec![64]);
+        assert_eq!(checkpoint.boundary, 64);
+        assert_eq!(checkpoint.tokens, request_tokens[..64]);
+        assert!(checkpoint.layer_kv.is_empty());
+    }
+
+    #[test]
+    fn grouped_cold_finalize_does_not_fabricate_a_rotated_out_anchor() {
+        let request_tokens = (0..640).collect::<Vec<u32>>();
+        let checkpoint = resolve_grouped_sliding_cold_checkpoint(
+            None,
+            &[64, 256, 1024],
+            512,
+            &request_tokens,
+            |_boundary| Ok(None),
+        )
+        .unwrap();
+
+        assert!(checkpoint.is_none());
+    }
+
+    #[test]
     fn sliding_sidecar_chain_isolated_by_cache_salt() {
         let fingerprint = mlx_paged_attn::ColdCacheFingerprint::from_components([
             b"gemma4-sidecar-salt-test".as_slice(),
@@ -13245,9 +13375,10 @@ mod tests {
             ),
             (
                 "gemma4_sliding_retention_caps_for_cold_tier(",
-                5,
-                "defined once, called from the grouped checkpoint publisher, the scheduler's \
-                 anchor query, `gemma4_sliding_retention_caps_for_turn`, and \
+                6,
+                "defined once, called from the grouped checkpoint publisher, grouped finalize's \
+                 live-anchor fallback, the scheduler's anchor query, \
+                 `gemma4_sliding_retention_caps_for_turn`, and \
                  `gemma4_sliding_decode_boundary_plan`",
             ),
             (
@@ -13265,12 +13396,12 @@ mod tests {
             ),
             (
                 "cold_tier()",
-                6,
-                "the grouped publisher, scheduler anchor query, grouped sidecar capture, \
-                 `gemma4_sliding_retention_caps_for_turn`, decode publisher, and legacy \
-                 test-only sidecar capture each borrow the live cold-tier context. Passing \
-                 a literal `None` at any decision/capture seam disconnects persistence while \
-                 leaving the pure derivation untouched",
+                7,
+                "the grouped publisher, scheduler anchor query, grouped sidecar capture \
+                 metadata, grouped sidecar enqueue, `gemma4_sliding_retention_caps_for_turn`, \
+                 decode publisher, and legacy test-only sidecar capture each borrow the live \
+                 cold-tier context. Passing a literal `None` at any decision/capture seam \
+                 disconnects persistence while leaving the pure derivation untouched",
             ),
         ] {
             assert_eq!(
