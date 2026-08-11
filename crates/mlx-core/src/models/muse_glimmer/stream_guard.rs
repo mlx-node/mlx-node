@@ -593,8 +593,7 @@ impl StreamGuard {
         self.ready = earlier;
     }
 
-    /// The turn's raw text and the byte spans of the control markers in it, ready
-    /// for [`super::output_parser::GeneratedTurn::from_token_spans`].
+    /// The turn's raw text and the byte spans of the control markers in it.
     ///
     /// Offsets are **byte offsets from the start of this turn's decoded text** —
     /// that is, into the `&str` returned here, whose first byte is the first byte
@@ -608,8 +607,30 @@ impl StreamGuard {
     /// **Frozen once [`Self::flush`] has run.** Nothing a caller does afterwards can
     /// change it, which is the property the parser depends on: it authorises tool
     /// calls from this text, so it must not be reading a turn that is still moving.
+    ///
+    /// This is the two halves as data; [`Self::generated_turn`] is what to hand the
+    /// parser.
     pub fn raw_turn(&self) -> (&str, &[Range<usize>]) {
         (&self.raw, &self.control_spans)
+    }
+
+    /// The turn as the parser takes it: the decoded text plus the provenance of its
+    /// control markers, ready for `output_parser::ResponseTemplate::parse`.
+    ///
+    /// **The only way to build a
+    /// [`GeneratedTurn`](super::output_parser::GeneratedTurn) outside
+    /// `super::output_parser`**, and that is the point. Its constructor is
+    /// `pub(super)`, so no caller can assert provenance it never verified: these
+    /// spans come from ids this guard resolved through the checkpoint's own
+    /// tokenizer in [`Self::new`], which is the one place in the system where
+    /// `<|eot|>` from token 200008 and `<|eot|>` typed as seven characters are still
+    /// distinguishable. A caller reinventing the parser's `#[cfg(test)]` fixture
+    /// helper in production would have compiled, passed review, and re-opened the
+    /// bypass — so the type system refuses it instead.
+    ///
+    /// Read it after [`Self::flush`], when the turn is frozen.
+    pub fn generated_turn(&self) -> super::output_parser::GeneratedTurn<'_> {
+        super::output_parser::GeneratedTurn::from_token_spans(&self.raw, &self.control_spans)
     }
 
     /// Drains everything releasable at end of turn: resolved content, plus the
@@ -3833,9 +3854,7 @@ mod tests {
     // `push_id`* then `flush` then `parse` — and asserts the two sides agree about
     // it. None of them needs the checkpoint.
 
-    use crate::models::muse_glimmer::output_parser::{
-        GeneratedTurn, ParsedTurn, ResponseTemplate, SPEC_JSON,
-    };
+    use crate::models::muse_glimmer::output_parser::{ParsedTurn, ResponseTemplate, SPEC_JSON};
 
     /// What one turn looked like on both sides of the seam.
     struct Seam {
@@ -3882,8 +3901,11 @@ mod tests {
             }
         }
         streamed.push_str(&g.flush());
-        let (raw, spans) = g.raw_turn();
-        let parsed = response_template().parse(GeneratedTurn::from_token_spans(raw, spans));
+        // `generated_turn`, not `from_token_spans`: this is the production path, and
+        // after fix round 5 it is the ONLY one — the constructor is `pub(super)`, so
+        // a caller cannot hand the parser spans it made up. Going through it here is
+        // also what keeps these tests honest about what a real caller can do.
+        let parsed = response_template().parse(g.generated_turn());
         Seam {
             streamed,
             parsed,
@@ -3930,6 +3952,37 @@ mod tests {
             s.push_str(&tc.arguments.to_string());
         }
         s
+    }
+
+    /// [`StreamGuard::generated_turn`] is the minting boundary: it reports the same
+    /// two halves `raw_turn` does, and it keeps reporting them after `flush`.
+    ///
+    /// The property that matters cannot be tested at all, only compiled — a caller
+    /// outside this module has no other way to build a `GeneratedTurn`, because
+    /// `from_token_spans` is `pub(super)`. What IS testable is that the production
+    /// accessor agrees with the data accessor and that a finalised turn stays
+    /// finalised through it, since that is the text tool calls are authorised from.
+    #[test]
+    fn generated_turn_reports_the_frozen_turn_the_guard_recorded() {
+        let turn = " to=user<|message|>answer<|eot|>";
+        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
+        g.push_ids(&ids_for(turn));
+        g.flush();
+
+        let (raw, spans) = g.raw_turn();
+        assert_eq!(g.generated_turn().text(), raw);
+        assert_eq!(
+            response_template()
+                .parse(g.generated_turn())
+                .content
+                .as_deref(),
+            Some("answer")
+        );
+        // A late id cannot move it, so two reads of the same guard agree.
+        let frozen = (raw.to_string(), spans.to_vec());
+        assert!(matches!(g.push_id(id_of("answer")), GuardOutcome::EndTurn));
+        assert_eq!(g.generated_turn().text(), frozen.0);
+        assert_eq!(g.raw_turn().1, frozen.1.as_slice());
     }
 
     /// Reasoning then an answer: the shape every real turn has.

@@ -339,7 +339,7 @@ pub struct ParsedToolCall {
 /// control-marker token ids. Everything else in `text` is prose, whatever it looks
 /// like.
 ///
-/// # The caller's contract
+/// # The contract, and who is allowed to meet it
 ///
 /// - `control_spans` must be sorted by `start` and non-overlapping (binary
 ///   searched; `debug_assert`ed).
@@ -350,8 +350,14 @@ pub struct ParsedToolCall {
 ///   cannot detect, and it re-opens the bypass. Reporting too FEW is safe: it can
 ///   only cost recognition, never grant it.
 ///
-/// M1's streaming path is the first real caller; `super::stream_guard` is where
-/// these spans have to be built, because it is the layer that sees token ids.
+/// Nothing in the type says those ranges index that string or came from a
+/// tokenizer, and no rule inside `parse` can check it — so the contract is enforced
+/// by VISIBILITY instead. [`Self::from_token_spans`] is `pub(super)`, and
+/// `super::stream_guard::StreamGuard::generated_turn` is the only way to obtain one
+/// of these outside this module: the guard sees token ids, so its spans are a
+/// lookup rather than a judgement. A `pub` constructor let any caller assert
+/// provenance it never verified — including someone reinventing the test helper in
+/// production, which is exactly the shape that would compile and pass review.
 #[derive(Debug, Clone, Copy)]
 pub struct GeneratedTurn<'a> {
     text: &'a str,
@@ -359,9 +365,14 @@ pub struct GeneratedTurn<'a> {
 }
 
 impl<'a> GeneratedTurn<'a> {
-    /// The production entry point: `text` as decoded, and the spans within it that
-    /// real control-marker tokens produced.
-    pub fn from_token_spans(text: &'a str, control_spans: &'a [Range<usize>]) -> Self {
+    /// `text` as decoded, and the spans within it that real control-marker tokens
+    /// produced.
+    ///
+    /// `pub(super)` on purpose: `super::stream_guard::StreamGuard::generated_turn`
+    /// is the intended and only production caller, and this module's own tests are
+    /// the only other one. See the type's contract above for why a `pub`
+    /// constructor was itself the defect.
+    pub(super) fn from_token_spans(text: &'a str, control_spans: &'a [Range<usize>]) -> Self {
         debug_assert!(
             control_spans.windows(2).all(|w| w[0].end <= w[1].start),
             "control_spans must be sorted and non-overlapping"
