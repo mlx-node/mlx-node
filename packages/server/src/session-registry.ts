@@ -599,16 +599,23 @@ export class SessionRegistry {
   }
 
   /**
-   * Wait until every disposal scheduled so far has settled. Disposals log and
+   * Wait until every disposal scheduled so far has settled, retrying each
+   * failure discovered during this flush once. A persistent failure remains
+   * recorded for a later flush instead of spinning forever. Disposals log and
    * absorb their own failures so cleanup cannot rewrite a response that has
    * already reached the client.
    */
   async flushPendingDisposals(): Promise<void> {
-    const retries = Array.from(this.failedDisposals);
-    this.failedDisposals.clear();
-    for (const session of retries) this.scheduleDispose(session);
-    while (this.pendingDisposals.size > 0) {
-      await Promise.all(this.pendingDisposals);
+    const retried = new Set<ChatSession<SessionCapableModel>>();
+    while (true) {
+      const retries = Array.from(this.failedDisposals).filter((session) => !retried.has(session));
+      for (const session of retries) {
+        this.failedDisposals.delete(session);
+        retried.add(session);
+        this.scheduleDispose(session);
+      }
+      if (this.pendingDisposals.size === 0) return;
+      await Promise.all(Array.from(this.pendingDisposals));
     }
   }
 

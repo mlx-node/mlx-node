@@ -346,6 +346,26 @@ describe('SessionRegistry', () => {
     ]);
   });
 
+  it('retries a disposal failure discovered while the flush is awaiting it', async () => {
+    const model = makeMockModel();
+    const releaseCacheOwner = releaseOwnerSpy(model);
+    releaseCacheOwner.mockRejectedValueOnce(new Error('transient release failure')).mockResolvedValue(undefined);
+    const reg = new SessionRegistry({ model });
+    const session = new ChatSession(model);
+    await session.send('owned', { config: { cacheOwnerId: 'owner-a' } });
+    reg.adopt('owned', session, null);
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      reg.clear();
+      await reg.flushPendingDisposals();
+    } finally {
+      consoleError.mockRestore();
+    }
+
+    expect(releaseCacheOwner.mock.calls.map(([ownerId]) => ownerId)).toEqual(['owner-a', 'owner-a']);
+  });
+
   it('adopt overwrites an existing key and refreshes expiry', () => {
     const model = makeMockModel();
     const reg = new SessionRegistry({ model, ttlSec: 60 });
