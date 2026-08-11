@@ -2344,6 +2344,7 @@ impl Qwen35Inner {
     fn publish_dense_gdn_materialized_prefix_checkpoint(
         &mut self,
         tokens: &[u32],
+        cache_salt: u64,
         checkpoints: Vec<super::paged_forward::MaterializedGdnPrefixCheckpoint>,
     ) {
         let Some(block_size) = self
@@ -2361,7 +2362,7 @@ impl Qwen35Inner {
         self.publish_dense_gdn_materialized_prefix_checkpoint_with_keys(
             tokens,
             &extra_keys,
-            0,
+            cache_salt,
             checkpoints,
         );
     }
@@ -3038,6 +3039,7 @@ impl Qwen35Inner {
         reuse_cache: bool,
         allow_live_continue: bool,
         image_key: u64,
+        cache_salt: u64,
     ) -> Result<engine::VlmPagedPrefixResolution> {
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let candidate_plan_result = match self.paged_adapter.as_mut() {
@@ -3048,7 +3050,7 @@ impl Qwen35Inner {
                     total_budget,
                     allow_live_continue,
                     extra_keys_per_block,
-                    0,
+                    cache_salt,
                     !reuse_cache,
                     max_cache_hit_tokens,
                 )
@@ -3070,7 +3072,7 @@ impl Qwen35Inner {
             candidate_plan.cached_prefix_len,
             block_size,
             extra_keys_per_block,
-            0,
+            cache_salt,
             candidate_plan.continued_live_prefix,
             image_key,
         ) {
@@ -3094,7 +3096,7 @@ impl Qwen35Inner {
                         tokens,
                         total_budget,
                         extra_keys_per_block,
-                        0,
+                        cache_salt,
                     )
             });
         match resolution {
@@ -4747,7 +4749,7 @@ impl Qwen35Inner {
         if let Some(profiler) = mtp_profiler.as_mut() {
             profiler.end_prefill();
         }
-        self.publish_dense_gdn_materialized_prefix_checkpoint(tokens, gdn_checkpoint);
+        self.publish_dense_gdn_materialized_prefix_checkpoint(tokens, p.cache_salt, gdn_checkpoint);
 
         // First-token sample.
         let mut token_history: Vec<u32> = tokens.to_vec();
@@ -5061,6 +5063,7 @@ impl Qwen35Inner {
             p.reuse_cache,
             p.reuse_cache && same_live_image,
             image_cache_key,
+            p.cache_salt,
         )?;
         let plan = prefix_resolution.effective_plan;
         let cached_prefix_len = plan.cached_prefix_len;
@@ -5125,7 +5128,7 @@ impl Qwen35Inner {
             self.publish_dense_gdn_materialized_prefix_checkpoint_with_keys(
                 &expanded_tokens,
                 &lookup_extra_keys,
-                0,
+                p.cache_salt,
                 gdn_checkpoint,
             );
 
@@ -5434,6 +5437,7 @@ impl Qwen35Inner {
             p.reuse_cache,
             p.reuse_cache && same_live_image,
             image_cache_key,
+            p.cache_salt,
         )?;
         let plan = prefix_resolution.effective_plan;
         let cached_prefix_len = plan.cached_prefix_len;
@@ -5498,7 +5502,7 @@ impl Qwen35Inner {
             self.publish_dense_gdn_materialized_prefix_checkpoint_with_keys(
                 &expanded_tokens,
                 &lookup_extra_keys,
-                0,
+                p.cache_salt,
                 gdn_checkpoint,
             );
 
@@ -6354,7 +6358,7 @@ impl Qwen35Inner {
         if let Some(profiler) = mtp_profiler.as_mut() {
             profiler.end_prefill();
         }
-        self.publish_dense_gdn_materialized_prefix_checkpoint(tokens, gdn_checkpoint);
+        self.publish_dense_gdn_materialized_prefix_checkpoint(tokens, p.cache_salt, gdn_checkpoint);
 
         let mut token_history: Vec<u32> = tokens.to_vec();
         let last_logits = apply_all_penalties(last_logits, &token_history, p)?;
@@ -9176,6 +9180,7 @@ pub(crate) struct Qwen35PrefixState {
     effective_cached_prefix_len: usize,
     suffix_len: usize,
     full_tokens: Vec<u32>,
+    cache_salt: u64,
     gdn_prefix_already_primed: bool,
 }
 
@@ -9353,6 +9358,7 @@ impl PagedBackend for Qwen35Inner {
             effective_cached_prefix_len: cached_prefix_len as usize,
             suffix_len,
             full_tokens: plan.to_vec(),
+            cache_salt,
             gdn_prefix_already_primed,
         })
     }
@@ -9410,7 +9416,11 @@ impl PagedBackend for Qwen35Inner {
                 turn_cancel.as_deref(),
             )?
         };
-        self.publish_dense_gdn_materialized_prefix_checkpoint(&prefix.full_tokens, checkpoint);
+        self.publish_dense_gdn_materialized_prefix_checkpoint(
+            &prefix.full_tokens,
+            prefix.cache_salt,
+            checkpoint,
+        );
         Ok(logits)
     }
 
@@ -14969,6 +14979,7 @@ mod paged_construction_tests {
                 true,
                 true,
                 0xD35E,
+                0,
             )
             .expect_err("missing adapter must fail VLM prefix preparation");
         assert!(inner.caches.is_none());
@@ -15436,23 +15447,28 @@ mod paged_construction_tests {
             .expect("paged_adapter")
             .block_size();
         let extra_keys = engine::build_paged_extra_keys(prompt.len(), block_size, &[]);
-        assert!(inner.remember_dense_gdn_materialized_prefix_checkpoint(
+        let cache_salt = 59;
+        inner.publish_dense_gdn_materialized_prefix_checkpoint(
             &prompt,
-            block_size,
-            &extra_keys,
-            0,
-            checkpoint,
-        ));
+            cache_salt,
+            vec![checkpoint],
+        );
         inner.active_cache_owner_id = "child-session".to_owned();
         assert!(
             inner
-                .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, 0)
+                .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, cache_salt,)
                 .is_none(),
             "an exact token/hash checkpoint owned by another session must not restore"
         );
         inner.active_cache_owner_id.clear();
+        assert!(
+            inner
+                .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, 0)
+                .is_none(),
+            "the salted publisher must not silently store the checkpoint in domain zero"
+        );
         let restored = inner
-            .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, 0)
+            .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, cache_salt)
             .expect("exact checkpoint restore");
         assert_eq!(restored.0, 16);
         assert!(dense_paged_linear_caches_ready(
@@ -15460,7 +15476,7 @@ mod paged_construction_tests {
             Some(&restored.1)
         ));
         let prepared = inner
-            .prepare_dense_gdn_prefix_state(&prompt, 16, block_size, &extra_keys, 0, false)
+            .prepare_dense_gdn_prefix_state(&prompt, 16, block_size, &extra_keys, cache_salt, false)
             .expect("prepare one-block rollback checkpoint");
         assert_eq!(prepared.state, "checkpoint");
         assert!(prepared.already_primed);
@@ -15468,7 +15484,7 @@ mod paged_construction_tests {
         assert_eq!(prepared.replayed_prefix_tokens, 0);
 
         let prepared = inner
-            .prepare_dense_gdn_prefix_state(&prompt, 32, block_size, &extra_keys, 0, false)
+            .prepare_dense_gdn_prefix_state(&prompt, 32, block_size, &extra_keys, cache_salt, false)
             .expect("prepare full-boundary hit from stable checkpoint");
         assert_eq!(prepared.state, "checkpoint_replay_materialized");
         assert!(prepared.already_primed);
@@ -15476,7 +15492,7 @@ mod paged_construction_tests {
         assert_eq!(prepared.replayed_prefix_tokens, 16);
 
         let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+        let _ = adapter.register_full_blocks_for_reuse(&[], cache_salt);
         adapter.release_request().expect("release_request");
     }
 

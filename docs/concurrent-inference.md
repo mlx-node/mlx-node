@@ -1,7 +1,7 @@
 # Concurrent inference
 
 How mlx-node behaves when several chat requests are in flight at once and how
-the dense-Qwen3 and LFM2 continuous-batching lanes are built. The original findings came
+the dense and hybrid continuous-batching lanes are built. The original findings came
 from an adversarially verified review of `main` @ `2d1fe60e` (2026-08-08): 25
 load-bearing claims, 19 confirmed, 6 corrected, 0 refuted. This document now
 describes the Stage 0 robustness work and the landed Stage 1 scheduler. The
@@ -19,13 +19,15 @@ paged decode clear-cache interval is 1024 steps
 
 ## Current status
 
-- Different sessions on one eligible dense Qwen3 or LFM2 paged model may overlap. The
-  server admits up to the native scheduler's sequence capacity (8 by default),
-  and the model thread advances them together. A single `ChatSession` still
-  allows only one turn in flight.
-- Flat-cache, multimodal, speculative, non-LFM2 hybrid-family, training, save,
-  and reset commands stay in the byte-compatible exclusive/barrier lanes. A
-  forced-serial A/B switch keeps the old whole-turn path available.
+- Different sessions on one eligible Qwen3, LFM2, Qwen3.5, or Gemma4 paged
+  model may overlap. The server admits up to the native scheduler's physical
+  sequence capacity, and the model thread advances them together. A single
+  `ChatSession` still allows only one turn in flight.
+- Flat-cache, training, save, and reset commands stay in exclusive/barrier
+  lanes. Gemma4 ordinary text rows use grouped full/sliding paged KV and fused
+  decode; media and MTP/DSpark owners are request-classified barriers because
+  their residual/draft shapes remain request-specific. Loading a Gemma4 draft
+  no longer disables ordinary batched owners on that resident target.
 - Different loaded models continue to run in parallel, one native model thread
   per model.
 
@@ -48,15 +50,15 @@ the next plan. Decode-first is a priority inside that one plan, keeping
 interactive rows moving before a long newly admitted prefill consumes the
 step's remaining token budget.
 
-| Layer         | Current mechanism                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Server        | `/v1/responses` and `/v1/messages` select `withAdmission` only when a paged model explicitly reports a capacity greater than one. Every other model uses the existing `withExclusive` lane. Both routes retain their admission slot through terminal visibility or disconnect.                                                                                                                                                                                                                                                                                                                                              |
-| Admission     | `SessionRegistry` is a FIFO counting semaphore for the batched lane. Active, queued, and pre-dispatch requests share the existing bounded budget; overflow still returns 429 plus `Retry-After: 1`. The default is 16 queued requests unless config or `MLX_MAX_QUEUE_DEPTH_PER_MODEL` overrides it or selects `unbounded`.                                                                                                                                                                                                                                                                                                 |
-| Native thread | One scheduler and executor live beside the model on its dedicated OS thread; `MxArray` never crosses threads. Idle waits block, while busy periods poll commands only between steps.                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| Scheduler     | One global token ceiling serves decode rows first, then pinned prefill slices. Exclusive commands run only with an empty running set; reset/generate/save/train are barriers. Block growth and hybrid recurrent-state bytes share one unified-memory admission watermark; an actual lazy-allocation squeeze preempts exactly one newest running victim.                                                                                                                                                                                                                                                                     |
-| Cache         | `PagedKVCacheAdapter` owns a request table keyed by sequence id over one refcounted block pool. A preempted victim publishes its verified full blocks, releases its live table, and resumes from the deepest surviving prefix. SSD restore is asynchronous: `WaitingForSsd` rows park while runnable peers continue.                                                                                                                                                                                                                                                                                                        |
-| Executor      | Dense Qwen3 defaults to uniform `[N,1]` decode plus bounded prefill; `MLX_SCHED_RAGGED_STEP=1` instead packs every planned slice, uses real `cu_seqlens_q`, and projects logits only at each request's final query. LFM2 stacks/scatters private ShortConv rows. Dense text-only Qwen3.5 stacks/scatters private GDN conv+recurrent rows while full-attention layers perform one paged gather. Eligible all-greedy rows stay batched through one argmax/eval epilogue; mixed sampling or penalties retain the scalar per-row path. Every request retains private penalties, sampling, stop, stream, and cancellation state. |
-| Transport     | SSE writes honor Node backpressure and stop native pulls until drain or close. The 30-second default drain deadline aborts a connected stalled peer and releases admission. The chat model-thread output mailbox, native callback queue, and JS callback queue are independently capped at 64 events.                                                                                                                                                                                                                                                                                                                       |
+| Layer         | Current mechanism                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Server        | `/v1/responses` and `/v1/messages` select `withAdmission` only when a paged model explicitly reports a capacity greater than one. Every other model uses the existing `withExclusive` lane. Both routes retain their admission slot through terminal visibility or disconnect.                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Admission     | `SessionRegistry` is a FIFO counting semaphore for the batched lane. Active, queued, and pre-dispatch requests share the existing bounded budget; overflow still returns 429 plus `Retry-After: 1`. The default is 16 queued requests unless config or `MLX_MAX_QUEUE_DEPTH_PER_MODEL` overrides it or selects `unbounded`.                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Native thread | One scheduler and executor live beside the model on its dedicated OS thread; `MxArray` never crosses threads. Idle waits block, while busy periods poll commands only between steps.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Scheduler     | One global token ceiling serves decode rows first, then pinned prefill slices. Exclusive commands run only with an empty running set; reset/generate/save/train are barriers. Block growth and hybrid recurrent-state bytes share one unified-memory admission watermark; an actual lazy-allocation squeeze preempts exactly one newest running victim.                                                                                                                                                                                                                                                                                                                                                                        |
+| Cache         | `PagedKVCacheAdapter` owns a request table keyed by sequence id over a refcounted block pool. Hybrid families add one manager per compatible KV group. Gemma4 owns distinct full/sliding pools; expired sliding blocks become null sentinels so logical positions remain absolute. A preempted victim releases its live tables and replays safely. SSD restore is asynchronous where the family has a complete persisted-state contract.                                                                                                                                                                                                                                                                                       |
+| Executor      | Dense Qwen3 defaults to uniform `[N,1]` decode plus bounded prefill; `MLX_SCHED_RAGGED_STEP=1` instead packs every planned slice. LFM2 stacks/scatters private ShortConv rows. Dense text-only Qwen3.5 stacks/scatters private GDN rows. Gemma4 fuses ordinary `[N,1]` rows through full and sliding paged groups, including KV-shared anchors and PLE. Eligible all-greedy rows stay batched through one argmax/eval epilogue; mixed sampling or penalties retain scalar per-row semantics. `schedulerStats().fusedGreedyEpilogueSteps` counts executor-confirmed fused epilogues rather than inferring them from planned occupancy. Every request retains private penalties, sampling, stop, stream, and cancellation state. |
+| Transport     | SSE writes honor Node backpressure and stop native pulls until drain or close. The 30-second default drain deadline aborts a connected stalled peer and releases admission. The chat model-thread output mailbox, native callback queue, and JS callback queue are independently capped at 64 events.                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
 Per-request prefix verification remains all-or-nothing. A miss releases and
 rebuilds only that sequence's slot; it never resets a peer. Batched admission
@@ -79,7 +81,7 @@ same-binary uniform/ragged validation with separate model instances:
 | `MLX_SCHED_RAGGED_STEP`          | `0`     | Use one packed varlen Qwen3 forward for mixed prefill/decode slices.                             |
 | `MLX_PAGED_PER_SEQ_CTX`          | `32768` | Per-sequence context used by the pool budget formula.                                            |
 | `MLX_QWEN35_CONTINUOUS_BATCHING` | `0`     | Opt eligible dense text-only Qwen3.5 checkpoints into the scheduled hybrid lane.                 |
-| `MLX_SERVE_FORCE_SERIAL`         | `0`     | Route eligible Qwen3/LFM2/Qwen3.5 turns through the legacy whole-turn path for A/B and rollback. |
+| `MLX_SERVE_FORCE_SERIAL`         | `0`     | Route eligible Qwen3/LFM2/Qwen3.5/Gemma4 turns through the whole-turn path for A/B and rollback. |
 
 `MLX_SERVE_FORCE_SERIAL` is a process-start test/rollback switch, not a
 production hot-reconfiguration API. Set it before model registration; changing
@@ -129,13 +131,15 @@ server admission       ✓ counting semaphore for eligible paged models
 phase-free scheduler   ✓ token budget, watermark, occupancy histogram
 recompute preemption   ✓ LIFO victim, no same-step readmit, hot-prefix resume
 Qwen3/LFM2/Qwen3.5 adapters  ✓ per-sequence request table + shared prefix blocks
+Gemma4 grouped adapters      ✓ full + sliding pools, null-block retirement
 Qwen3/LFM2/Qwen3.5 executors ✓ one uniform [N,1] decode forward
+Gemma4 executor              ✓ one fused [N,1] hybrid decode forward
 LFM2 recurrent state   ✓ private [l_cache-1, hidden] row per conv layer/request
 Qwen3.5 GDN state      ✓ private conv + recurrent row per linear layer/request
 BlockAllocator         ✓ refcounts + prefix hash (vLLM-style pool)
 FFI / Metal kernels    ✓ num_seqs = q.shape(0), grid.y = sequence
 ragged mixed step      ✓ Qwen3 env-gated SEAM B executor swap; scheduler unchanged
-Gemma4 rotating state  measured no-go: isolated N=2 rows pass, fused ragged tails do not
+Gemma4 owner routing         ✓ paged AR/media; flat MTP/DSpark barrier per owner
 ```
 
 - Kernels/FFI: `crates/mlx-paged-attn/metal/attention/paged_attention.metal:762-806`,
@@ -181,11 +185,11 @@ multi-model-hostile in `engine/cmd.rs:186-190`).
 
 | Mechanism                                                                   | vLLM v1                                          | mlx-node today                                                                                                          |
 | --------------------------------------------------------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| Continuous batching (one shared forward per step; no prefill/decode phases) | Core scheduler loop                              | Qwen3 has an env-gated mixed varlen executor; Qwen3/LFM2 retain the uniform default; other families remain exclusive    |
+| Continuous batching (one shared forward per step; no prefill/decode phases) | Core scheduler loop                              | Qwen3, LFM2, Qwen3.5, and ordinary Gemma4 text rows use family executors behind one scheduler contract                  |
 | Per-step token budget + chunked prefill                                     | Enabled by default                               | One 2048-token ceiling with decode-first planning and pinned per-request breaks                                         |
 | Live prefix sharing                                                         | Chained hashes, refcounts, and LRU               | Refcounted block pools across live Qwen3/LFM2 sequences; Qwen3 also has an asynchronous SSD cold tier                   |
 | Admission / preemption                                                      | `max_num_seqs`, watermark, preempt-and-recompute | Sequence cap, reserve-aware watermark, and allocation-squeeze LIFO recompute; measured long prefixes may capture to SSD |
-| Backend seam                                                                | Scheduler drives platform-specific workers       | `StepExecutor` let Qwen3 replace uniform execution with ragged varlen without any scheduler change; wider hybrids next  |
+| Backend seam                                                                | Scheduler drives platform-specific workers       | `StepExecutor` lets dense, recurrent, GDN, and Gemma4 grouped-KV workers share one scheduler contract                   |
 
 What does not transfer: CUDA-graph padding (MLX lazy graphs play that role),
 the multi-process ZMQ split (a scheduler thread suffices at this scale),
@@ -211,12 +215,12 @@ Four additional mechanisms fit the single-process MLX runtime:
   an explicit prefix-cache security domain. The SHA-256-derived compact domain
   is threaded unchanged through lookup and publication and is independent from
   `prompt_cache_key`/session ownership.
-- `KVCacheCoordinator` owns the runtime manager aligned with every compatible
-  `KVCacheGroup` and the authoritative per-layer routes. Gemma4 now consumes
-  those routes directly: its full-attention group owns the paged adapter and
-  its sliding-window group records the rotating-cache admission bound. The
-  current Gemma4 physical implementation still supports one full-attention
-  layout; multiple full layouts and paged sliding eviction are not claimed.
+- `KVCacheCoordinator` owns one runtime manager aligned with every compatible
+  `KVCacheGroup` and the authoritative per-layer routes. Gemma4 consumes those
+  routes directly: full and sliding groups own separate physical pools;
+  KV-shared layers alias their anchor; sliding eviction preserves logical table
+  width with a null block. Cross-owner Gemma4 prefix reuse remains disabled
+  until every group can reconcile the same reusable boundary.
 
 ## Validation evidence and performance boundary
 
@@ -224,12 +228,18 @@ The real-checkpoint correctness gates run independently of the benchmark:
 
 - Qwen3-0.6B BF16: serial/uniform/ragged results are token-identical, uniform
   and ragged streaming terminals are byte-identical, mixed per-row penalties
-  remain isolated, and a real scheduled wave reaches occupancy 8.
+  remain isolated, a real scheduled wave reaches occupancy 8, and the
+  penalty-free N=2 gate requires the fused-greedy engagement counter to
+  advance rather than accepting scalar-fallback parity.
 - LFM2-1.2B BF16: the recurrent-state batched parity gate passes.
 - Qwen3.5-0.8B BF16: the scheduler-driven asymmetric-finish and cross-owner
   warm-wave gate passes with occupancy 2, including on a checkpoint that has
   installed vision and MTP modules while the tested turns explicitly select
   plain text AR.
+- Gemma-4-E2B-IT: serial and concurrent starts plus continuations are
+  byte-identical at T=0, and native scheduler telemetry records a genuine
+  occupancy-2 fused decode wave. A direct random-weight N=2 hybrid forward also
+  matches the two serial argmax rows through full/sliding/KV-shared routing.
 - The real HTTP Stage-1 server gate observes two simultaneously active SSE
   handlers and native decode occupancy 2. Each `ChatSession` supplies a stable,
   request-local cache owner; without that identity native correctly falls back
@@ -290,7 +300,7 @@ above as a cooled median-of-three 4-bit result.
   Logits are selected at `query_start_loc[1:] - 1`. The scheduler is unchanged;
   the random-weight mixed-step oracle proves a real one-forward decode+prefill
   path, though its tiny model is not a throughput gate.
-- **Stage 2c — wider hybrid execution (landed with one architectural no-go):**
+- **Stage 2c — wider hybrid execution (landed):**
   dense text-only Qwen3.5 stores at most two request-local GDN units, fuses
   their `[N,1,H]` decode, and reconciles preemption through the deepest
   K/V-backed GDN checkpoint/sidecar boundary. Paged-block growth and recurrent
@@ -303,8 +313,11 @@ above as a cooled median-of-three 4-bit result.
   per-step GDN on every architecture, while chunked GDN is explicitly forced
   and is ineligible for this lane. Scheduled rows therefore always use the
   per-step recurrent-state representation described above.
-  Gemma4's physical rotating K/V state is measured with the same estimator and
-  its N=2 isolation oracle matches exclusive tokens, but it remains on the
-  exclusive lane: pre-window requests have different tail lengths, so stacking
-  requires semantic padding/masking, while an N-times-scalar step would retain
-  roughly 335 MiB/request on 12B without saving a weight stream.
+  Gemma4 replaces the former per-row rotating-cache no-go with a vLLM-style
+  hybrid coordinator: full and sliding groups have paged storage, expired
+  sliding blocks become null sentinels, KV-shared layers alias physical anchors,
+  and ordinary rows execute one fused `[N,1]` forward. Dynamic recompute
+  preemption shares the full-group pool instead of statically partitioning one
+  maximum context per request. Media and MTP/DSpark commands remain ordered
+  barriers, but coexist on the same loaded target through request-local owner
+  lanes rather than globally disabling batching.

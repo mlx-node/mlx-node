@@ -492,7 +492,7 @@ fn extract_audio_from_messages(messages: &[ChatMessage]) -> Vec<Vec<u8>> {
     all_audio
 }
 
-fn media_capabilities_from_messages(messages: &[ChatMessage]) -> MediaCapabilities {
+pub(crate) fn media_capabilities_from_messages(messages: &[ChatMessage]) -> MediaCapabilities {
     MediaCapabilities {
         images: messages.iter().any(|message| {
             message

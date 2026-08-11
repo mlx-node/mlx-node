@@ -887,7 +887,7 @@ impl QwenStepExecutor<'_> {
         &mut self,
         plan: &StepPlan,
         running: &mut [TurnState<QwenScheduledTurn>],
-    ) -> (Vec<(usize, RowStepResult)>, usize) {
+    ) -> (Vec<(usize, RowStepResult)>, usize, usize) {
         let mut work = Vec::new();
         let mut early_results = Vec::new();
         let mut batch_rows = Vec::new();
@@ -1036,6 +1036,15 @@ impl QwenStepExecutor<'_> {
             }
             _ => Ok(None),
         };
+        let executed_greedy_epilogue_batch = greedy_tokens
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map_or(0, |_| {
+                work.iter()
+                    .filter(|row| row.batch_index.is_some() && !row.at_length)
+                    .count()
+            });
         let mut results = early_results;
         for row in work {
             let planned = &plan.rows[row.plan_index];
@@ -1181,7 +1190,11 @@ impl QwenStepExecutor<'_> {
                 },
             ));
         }
-        (results, executed_decode_batch)
+        (
+            results,
+            executed_decode_batch,
+            executed_greedy_epilogue_batch,
+        )
     }
 
     fn execute_ragged(
@@ -1520,6 +1533,7 @@ impl QwenStepExecutor<'_> {
             } else {
                 decode_occupancy
             },
+            executed_greedy_epilogue_batch: 0,
             rows_alloc_evicted: running
                 .iter()
                 .filter(|turn| turn.payload.allocation_failed)
@@ -1549,9 +1563,12 @@ impl StepExecutor<QwenScheduledTurn> for QwenStepExecutor<'_> {
         let used_batched_decode = decode_count > 1;
         let mut batched_decode_blocked = false;
         let mut executed_batch_rows = 0;
+        let mut executed_greedy_epilogue_batch = 0;
         if used_batched_decode {
-            let (batch_results, actual_batch_rows) = self.execute_decode_batch(plan, running);
+            let (batch_results, actual_batch_rows, actual_greedy_epilogue_batch) =
+                self.execute_decode_batch(plan, running);
             executed_batch_rows = actual_batch_rows;
+            executed_greedy_epilogue_batch = actual_greedy_epilogue_batch;
             batched_decode_blocked = batch_results
                 .iter()
                 .any(|(_, result)| result.allocation_blocked);
@@ -1594,6 +1611,11 @@ impl StepExecutor<QwenScheduledTurn> for QwenStepExecutor<'_> {
                 executed_batch_rows
             } else {
                 scalar_decode_occupancy
+            },
+            executed_greedy_epilogue_batch: if batched_decode_blocked {
+                0
+            } else {
+                executed_greedy_epilogue_batch
             },
             rows_alloc_evicted: running
                 .iter()

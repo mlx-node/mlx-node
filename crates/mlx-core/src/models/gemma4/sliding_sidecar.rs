@@ -66,7 +66,9 @@
 use mlx_paged_attn::{ColdGroup, ColdSidecarLayout, ColdSidecarPolicy};
 use napi::bindgen_prelude::*;
 
-use crate::array::{DType, MxArray};
+#[cfg(test)]
+use crate::array::DType;
+use crate::array::MxArray;
 use crate::transformer::rotating_kv_cache::RotatingKVCacheSnapshot;
 
 use super::config::Gemma4Config;
@@ -257,6 +259,7 @@ pub(crate) fn policy(config: &Gemma4Config) -> Option<ColdSidecarPolicy> {
 /// a live rotating cache holds at that offset, so a sub-window boundary has a
 /// legal layout and a restorable state. Zero is still refused: it describes an
 /// empty payload, which `ColdSidecar::validate` rejects anyway.
+#[cfg(test)]
 pub(crate) fn boundary_is_representable(
     geo: &SlidingSidecarGeometry,
     boundary_tokens: u32,
@@ -291,6 +294,7 @@ pub(crate) fn boundary_is_representable(
 /// (`materialize_gemma4_sliding_snapshots` = `copy()` + `eval_arrays`); the
 /// `copy` is mandatory because `temporal_order` can hand back a clone that
 /// ALIASES live storage which the single-token update path rewrites in place.
+#[cfg(test)]
 pub(crate) fn encode_tensors(
     config: &Gemma4Config,
     geo: &SlidingSidecarGeometry,

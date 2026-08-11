@@ -1663,6 +1663,19 @@ pub struct PagedKVCacheAdapter {
     allocator: Arc<Mutex<BlockAllocator>>,
     layer_kv_pool: Arc<LayerKVPool>,
     block_size: u32,
+    /// Positive for a scheduler-owned sliding-window group. Such a group
+    /// keeps the logical block table dense (old positions map to one reserved
+    /// null block) while releasing physical blocks that are wholly left of
+    /// the live window. `0` retains the ordinary full-attention semantics.
+    sliding_window: u32,
+    /// Logical context limit. Full-attention adapters derive this from their
+    /// physical pool; sliding adapters decouple it from the bounded live pool.
+    logical_max_tokens: u32,
+    /// Permanently reserved placeholder used by sparse sliding block tables.
+    /// It is never written or freed through a request lifecycle; the paged
+    /// attention mask guarantees placeholder positions are outside the live
+    /// window before their original physical block is reclaimed.
+    null_block: Option<Arc<PhysicalBlock>>,
 
     /// Parked logical requests keyed exactly like vLLM's `req_to_blocks`.
     /// The selected request lives in the hot fields below and is identified by
@@ -1997,6 +2010,43 @@ impl PagedKVCacheAdapter {
         layer_kv_pool: Arc<LayerKVPool>,
         block_size: u32,
     ) -> Result<Self, String> {
+        Self::new_with_attention_kind(allocator, layer_kv_pool, block_size, 0, None)
+    }
+
+    /// Construct a bounded physical manager for one sliding-window KV group.
+    ///
+    /// Logical positions remain absolute up to `logical_max_tokens`; old
+    /// physical blocks are replaced by a reserved null block after evaluation
+    /// once every token in that block is older than `sliding_window`.
+    pub fn new_sliding(
+        allocator: Arc<Mutex<BlockAllocator>>,
+        layer_kv_pool: Arc<LayerKVPool>,
+        block_size: u32,
+        sliding_window: u32,
+        logical_max_tokens: u32,
+    ) -> Result<Self, String> {
+        if sliding_window == 0 {
+            return Err("sliding_window must be positive".to_string());
+        }
+        if logical_max_tokens == 0 {
+            return Err("logical_max_tokens must be positive".to_string());
+        }
+        Self::new_with_attention_kind(
+            allocator,
+            layer_kv_pool,
+            block_size,
+            sliding_window,
+            Some(logical_max_tokens),
+        )
+    }
+
+    fn new_with_attention_kind(
+        allocator: Arc<Mutex<BlockAllocator>>,
+        layer_kv_pool: Arc<LayerKVPool>,
+        block_size: u32,
+        sliding_window: u32,
+        logical_max_tokens: Option<u32>,
+    ) -> Result<Self, String> {
         let (allocator_block_size, allocator_num_blocks) = {
             let guard = allocator
                 .lock()
@@ -2023,12 +2073,27 @@ impl PagedKVCacheAdapter {
                 layer_kv_pool.num_blocks()
             ));
         }
+        let physical_capacity_tokens = layer_kv_pool.num_blocks().saturating_mul(block_size);
+        let logical_max_tokens = logical_max_tokens.unwrap_or(physical_capacity_tokens);
+        let null_block = if sliding_window == 0 {
+            None
+        } else {
+            let mut guard = allocator
+                .lock()
+                .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+            Some(guard.allocate().ok_or_else(|| {
+                "sliding-window adapter requires one reserved null block".to_string()
+            })?)
+        };
         #[cfg(target_os = "macos")]
         let num_layers = layer_kv_pool.num_layers();
         Ok(Self {
             allocator,
             layer_kv_pool,
             block_size,
+            sliding_window,
+            logical_max_tokens,
+            null_block,
             requests: HashMap::new(),
             active_seq: None,
             block_table: None,
@@ -2385,6 +2450,24 @@ impl PagedKVCacheAdapter {
         self.requests
             .get(&seq_id)
             .map(|state| state.request_tokens.len() as u32)
+    }
+
+    pub fn request_tokens_for(&self, seq_id: SeqId) -> Option<&[u32]> {
+        if self.active_seq == Some(seq_id) {
+            return Some(&self.request_tokens);
+        }
+        self.requests
+            .get(&seq_id)
+            .map(|state| state.request_tokens.as_slice())
+    }
+
+    pub fn is_live_for_continue_for(&self, seq_id: SeqId) -> bool {
+        if self.active_seq == Some(seq_id) {
+            return self.is_live_for_continue();
+        }
+        self.requests
+            .get(&seq_id)
+            .is_some_and(|state| state.block_table.num_tokens() > 0 && state.already_registered)
     }
 
     pub fn block_table_for(&self, seq_id: SeqId) -> Option<&SequenceBlockTable> {
@@ -3545,6 +3628,66 @@ impl PagedKVCacheAdapter {
             block_table.add_block(block);
         }
         Ok(to_allocate)
+    }
+
+    /// Release physical blocks that are wholly older than this adapter's
+    /// sliding window while preserving an absolute-position block table.
+    ///
+    /// Old entries are replaced with the one reserved null block. The Metal
+    /// kernel receives the original context length and absolute logical block
+    /// indices, but masks every placeholder position before dereferencing its
+    /// K/V. Pending native writes are evaluated before any block id can be
+    /// returned to the allocator and reused by another sequence.
+    pub fn prune_sliding_window_for(&mut self, seq_id: SeqId) -> Result<u32, String> {
+        if self.sliding_window == 0 {
+            return Ok(0);
+        }
+        self.activate_request(seq_id)?;
+        #[cfg(target_os = "macos")]
+        self.eval_pending_pool_writes()?;
+
+        let null_block = self
+            .null_block
+            .as_ref()
+            .ok_or_else(|| "sliding adapter is missing its reserved null block".to_string())?
+            .clone();
+        let null_id = null_block.block_id;
+        let table = self
+            .block_table
+            .as_mut()
+            .ok_or_else(|| "prune_sliding_window_for called before begin_request".to_string())?;
+        let cutoff = table.num_tokens().saturating_sub(self.sliding_window);
+        let first_live_block = cutoff / self.block_size;
+        let replace_count = usize::try_from(first_live_block)
+            .unwrap_or(usize::MAX)
+            .min(table.num_blocks());
+        let mut released = Vec::new();
+        for index in 0..replace_count {
+            let Some(block) = table.blocks().get(index) else {
+                break;
+            };
+            if block.block_id == null_id {
+                continue;
+            }
+            released.push(Arc::clone(block));
+            let replaced = table.replace_block(index, Arc::clone(&null_block));
+            debug_assert!(replaced);
+        }
+        if released.is_empty() {
+            return Ok(0);
+        }
+        let released_count = released.len() as u32;
+        let mut guard = self
+            .allocator
+            .lock()
+            .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+        for block in released {
+            guard.free(block);
+        }
+        drop(guard);
+        #[cfg(target_os = "macos")]
+        self.clear_attention_inputs_caches();
+        Ok(released_count)
     }
 
     /// Record tokens emitted/consumed in this request. Updates
@@ -4881,7 +5024,7 @@ impl PagedKVCacheAdapter {
                 v_scale.as_raw_ptr(),
                 scale,
                 graph_softcap,
-                0,
+                self.sliding_window as i32,
                 self.block_size as i32,
                 q_meta.shape[1] as i32,
                 self.layer_kv_pool.config().num_kv_heads as i32,
@@ -4992,7 +5135,7 @@ impl PagedKVCacheAdapter {
                 v_scale.as_raw_ptr(),
                 scale,
                 graph_softcap,
-                0,
+                self.sliding_window as i32,
                 self.block_size as i32,
                 num_query_heads as i32,
                 self.layer_kv_pool.config().num_kv_heads as i32,
@@ -5101,7 +5244,7 @@ impl PagedKVCacheAdapter {
                 v_scale.as_raw_ptr(),
                 scale,
                 graph_softcap,
-                0,
+                self.sliding_window as i32,
                 self.block_size as i32,
                 num_query_heads as i32,
                 self.layer_kv_pool.config().num_kv_heads as i32,
@@ -5272,7 +5415,7 @@ impl PagedKVCacheAdapter {
                 num_query_heads,
                 scale,
                 softcap,
-                0,
+                self.sliding_window as i32,
                 k_scale,
                 v_scale,
                 raw_route_hint,
@@ -5846,7 +5989,7 @@ impl PagedKVCacheAdapter {
                 v_scale.as_raw_ptr(),
                 scale,
                 0.0, // softcap disabled in the MLX C++ paged_attention factory.
-                0,   // sliding-window disabled for Qwen3.5 full attention.
+                self.sliding_window as i32,
                 self.block_size as i32,
                 num_query_heads as i32,
                 self.layer_kv_pool.config().num_kv_heads as i32,
@@ -6680,7 +6823,13 @@ impl PagedKVCacheAdapter {
             return Ok(0);
         };
 
-        let blocks = table.blocks().to_vec();
+        let null_id = self.null_block.as_ref().map(|block| block.block_id);
+        let blocks = table
+            .blocks()
+            .iter()
+            .filter(|block| Some(block.block_id) != null_id)
+            .cloned()
+            .collect::<Vec<_>>();
         let count = blocks.len() as u32;
 
         // Acquire the allocator before taking `block_table`. If locking fails,
@@ -6996,6 +7145,23 @@ impl PagedKVCacheAdapter {
         }
         let prior_token_count = self.request_tokens.len() as u32;
 
+        if self.sliding_window != 0 {
+            if total_budget > self.logical_max_tokens {
+                return Err(format!(
+                    "context_length_exceeded: requested {total_budget} tokens, sliding cache \
+                     logical capacity is {}",
+                    self.logical_max_tokens
+                ));
+            }
+            self.already_registered = false;
+            self.prefix_lookup_done = true;
+            self.aux_prefix_unbacked = false;
+            self.restored_sidecar = None;
+            #[cfg(target_os = "macos")]
+            self.clear_active_request_graph_state();
+            return Ok((prior_token_count, 0));
+        }
+
         // Allocate any new blocks needed to cover the budget. The adapter's
         // existing block_table already covers `request_tokens.len()` tokens
         // (with possibly a partial trailing block). `allocate_suffix_blocks`
@@ -7079,6 +7245,26 @@ impl PagedKVCacheAdapter {
         self.block_table.is_some() && self.already_registered
     }
 
+    /// Finalize a sliding group without publishing null-containing logical
+    /// blocks into the content-addressed full-prefix cache.
+    pub fn finalize_turn_keep_live_no_prefix(&mut self) -> Result<(), String> {
+        if self.sliding_window == 0 {
+            return Err("finalize_turn_keep_live_no_prefix requires a sliding adapter".to_string());
+        }
+        if self.block_table.is_none() {
+            return Err(
+                "finalize_turn_keep_live_no_prefix called before begin_request".to_string(),
+            );
+        }
+        #[cfg(target_os = "macos")]
+        self.eval_pending_pool_writes()?;
+        self.already_registered = true;
+        self.prefix_lookup_done = true;
+        #[cfg(target_os = "macos")]
+        self.clear_active_request_graph_state();
+        Ok(())
+    }
+
     // ------------------------ Getters ------------------------
 
     pub fn block_size(&self) -> u32 {
@@ -7087,9 +7273,12 @@ impl PagedKVCacheAdapter {
 
     /// Hard token capacity of this adapter's physical KV pool.
     pub fn max_capacity_tokens(&self) -> u32 {
-        self.layer_kv_pool
-            .num_blocks()
-            .saturating_mul(self.block_size)
+        self.logical_max_tokens
+    }
+
+    /// Positive when this adapter owns a bounded sliding-window group.
+    pub fn sliding_window(&self) -> u32 {
+        self.sliding_window
     }
 
     /// Number of physical blocks shared by the allocator and layer pool.
@@ -7393,6 +7582,12 @@ impl PagedKVCacheAdapter {
     /// means the cache requires dequantization and cannot feed plain MLX
     /// SDPA directly.
     pub(crate) fn prefill_sdpa_cache_dtype(&self) -> Option<DType> {
+        if self.sliding_window != 0 {
+            // A dense gather would materialize the null placeholders. Sliding
+            // groups must remain on the paged kernel, which applies the window
+            // before touching those entries.
+            return None;
+        }
         match self.layer_kv_pool.cache_dtype() {
             mlx_paged_attn::metal::MetalDtype::Float16 => Some(DType::Float16),
             mlx_paged_attn::metal::MetalDtype::BFloat16 => Some(DType::BFloat16),
@@ -7419,7 +7614,14 @@ impl PagedKVCacheAdapter {
     pub fn num_allocated_blocks(&self) -> usize {
         self.block_table
             .as_ref()
-            .map(|t| t.num_blocks())
+            .map(|table| {
+                let null_id = self.null_block.as_ref().map(|block| block.block_id);
+                table
+                    .blocks()
+                    .iter()
+                    .filter(|block| Some(block.block_id) != null_id)
+                    .count()
+            })
             .unwrap_or(0)
     }
 
@@ -8270,6 +8472,87 @@ mod tests {
         block_size: u32,
     ) -> Option<PagedKVCacheAdapter> {
         Some(maybe_make_adapter(allocator, block_size)?.expect("adapter ctor must succeed"))
+    }
+
+    fn maybe_sliding_adapter(
+        num_blocks: u32,
+        block_size: u32,
+        sliding_window: u32,
+        logical_max_tokens: u32,
+    ) -> Option<PagedKVCacheAdapter> {
+        let allocator = new_allocator(num_blocks, block_size);
+        let pool = maybe_test_pool(num_blocks, block_size)?;
+        Some(
+            PagedKVCacheAdapter::new_sliding(
+                allocator,
+                pool,
+                block_size,
+                sliding_window,
+                logical_max_tokens,
+            )
+            .expect("sliding adapter ctor must succeed"),
+        )
+    }
+
+    #[test]
+    fn sliding_adapter_reclaims_expired_blocks_but_keeps_absolute_positions() {
+        let Some(mut adapter) = maybe_sliding_adapter(6, 4, 8, 64) else {
+            return;
+        };
+        adapter.reset_for_new_request(7).unwrap();
+        for chunk in 0..6u32 {
+            let tokens = (chunk * 4..chunk * 4 + 4).collect::<Vec<_>>();
+            adapter.record_tokens(&tokens).unwrap();
+            adapter.prune_sliding_window_for(7).unwrap();
+            assert!(
+                adapter.num_allocated_blocks() <= 3,
+                "two live window blocks plus at most one boundary block"
+            );
+        }
+        let table = adapter.block_table_for(7).expect("request table");
+        assert_eq!(table.num_tokens(), 24);
+        assert_eq!(table.num_blocks(), 6, "logical block indices stay absolute");
+        let null_id = adapter.null_block.as_ref().unwrap().block_id;
+        assert!(
+            table.blocks()[..4]
+                .iter()
+                .all(|block| block.block_id == null_id),
+            "every block wholly left of the live window is a null placeholder"
+        );
+        assert!(
+            table.blocks()[4..]
+                .iter()
+                .all(|block| block.block_id != null_id),
+            "the live window must remain physically backed"
+        );
+    }
+
+    #[test]
+    fn sliding_adapter_isolates_rows_and_continues_one_live_owner() {
+        let Some(mut adapter) = maybe_sliding_adapter(8, 4, 8, 64) else {
+            return;
+        };
+        for seq_id in [11, 12] {
+            adapter.reset_for_new_request(seq_id).unwrap();
+            adapter
+                .record_tokens_for(seq_id, &(0..12).collect::<Vec<_>>())
+                .unwrap();
+            adapter.prune_sliding_window_for(seq_id).unwrap();
+            adapter.activate_request(seq_id).unwrap();
+            adapter.finalize_turn_keep_live_no_prefix().unwrap();
+        }
+        adapter.release_request_for(11).unwrap();
+        assert!(adapter.block_table_for(11).is_none());
+        assert!(adapter.is_live_for_continue_for(12));
+        let prompt = (0..14).collect::<Vec<_>>();
+        adapter.activate_request(12).unwrap();
+        let (boundary, allocated) = adapter.continue_turn(&prompt, 14).unwrap();
+        assert_eq!(boundary, 12);
+        assert_eq!(allocated, 0, "sliding continuation allocates lazily");
+        adapter.record_tokens(&prompt[12..]).unwrap();
+        adapter.prune_sliding_window_for(12).unwrap();
+        assert_eq!(adapter.request_tokens(), prompt);
+        assert!(adapter.num_allocated_blocks() <= 3);
     }
 
     #[test]

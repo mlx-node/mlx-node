@@ -1101,7 +1101,7 @@ mod persist_cold_resolution_tests {
         // cold bracket dormant until its family is admitted, so an unproven
         // path (e.g. qwen3_5_moe before its parity gate passes) cannot be
         // exercised by a direct library caller that bypasses the agent.
-        for family in ["lfm2", "lfm2_moe", "harrier", "not-a-family"] {
+        for family in ["gemma4", "lfm2", "lfm2_moe", "harrier", "not-a-family"] {
             assert!(
                 !resolve_persist_cold(family, Some("1"), Some(true)),
                 "{family} is off the allowlist and must never persist a cold tier"
@@ -1109,7 +1109,6 @@ mod persist_cold_resolution_tests {
         }
         // A family on the list still honours the config/env precedence above.
         assert!(resolve_persist_cold("qwen3", Some("0"), Some(true)));
-        assert!(resolve_persist_cold("gemma4", Some("1"), None));
         assert!(resolve_persist_cold("qwen3_5", None, Some(true)));
         assert!(resolve_persist_cold("qwen3_5_moe", Some("1"), None));
     }

@@ -2,16 +2,19 @@
 
 A vLLM-style block-paged KV cache lives alongside the legacy flat `Vec<KVCache>` path. Multiple in-flight requests share refcounted KV blocks for any prompt prefix they have in common (system prompt, shared few-shot preamble, repeated tool-result frames, etc.).
 
-Routing is per-model via the `use_block_paged_cache: Option<bool>` config field. Only the full-attention layers of supported models go through the paged adapter — sliding-window, convolutional, and recurrent (GDN) layers stay on their dedicated cache types regardless of the flag.
+Routing is per-model via the `use_block_paged_cache: Option<bool>` config field.
+Dense models use one paged group. Hybrid models may retain dedicated recurrent
+state (LFM2 ShortConv and Qwen3.5 GDN), while Gemma4 maps both full and sliding
+attention to separate paged groups and aliases KV-shared layers to their anchor.
 
 ## Foundation types
 
-| Type                  | Location                                                    | Role                                                                                                                                                                                                  |
-| --------------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BlockAllocator`      | `crates/mlx-paged-attn/src/block_allocator.rs`              | Logical lifecycle — per-block refcounts, LRU eviction, prefix-hash table for cross-request reuse                                                                                                      |
-| `LayerKVPool`         | `crates/mlx-paged-attn/src/layer_kv_pool.rs`                | Physical storage — per-layer Metal K and V `Buffer` pairs sized to `paged_cache_memory_mb`                                                                                                            |
-| `PagedKVCacheAdapter` | `crates/mlx-core/src/transformer/paged_kv_cache_adapter.rs` | Session-friendly wrapper. Per-request lifecycle: `reset_for_new_request` → `find_cached_prefix` → `allocate_suffix_blocks` → `record_tokens` → `register_full_blocks_for_reuse` → `release_request`   |
-| `KVCacheCoordinator`  | `crates/mlx-core/src/transformer/kv_cache_spec.rs`          | Keeps declared cache groups, per-layer physical routes, and one runtime manager per group aligned. Gemma4 uses it as the owner of the paged full-attention manager and sliding-window group metadata. |
+| Type                  | Location                                                    | Role                                                                                                                                                                                                |
+| --------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BlockAllocator`      | `crates/mlx-paged-attn/src/block_allocator.rs`              | Logical lifecycle — per-block refcounts, LRU eviction, prefix-hash table for cross-request reuse                                                                                                    |
+| `LayerKVPool`         | `crates/mlx-paged-attn/src/layer_kv_pool.rs`                | Physical storage — per-layer Metal K and V `Buffer` pairs sized to `paged_cache_memory_mb`                                                                                                          |
+| `PagedKVCacheAdapter` | `crates/mlx-core/src/transformer/paged_kv_cache_adapter.rs` | Session-friendly wrapper. Per-request lifecycle: `reset_for_new_request` → `find_cached_prefix` → `allocate_suffix_blocks` → `record_tokens` → `register_full_blocks_for_reuse` → `release_request` |
+| `KVCacheCoordinator`  | `crates/mlx-core/src/transformer/kv_cache_spec.rs`          | Keeps declared cache groups, per-layer physical routes, and one runtime manager per group aligned. Gemma4 owns independent full/sliding paged managers through it.                                  |
 
 `BlockAllocator` and `LayerKVPool` are intentionally split so the legacy `CacheEngineManager` path (used by `use_paged_attention`, a different flag — see below) is unaffected. `paged_cache_memory_mb` defaults to 2048 when `None`.
 
@@ -32,13 +35,47 @@ rather than accepting an arbitrary client-selected namespace.
 
 ## Per-model support matrix
 
-| Model             | Default | Status                                                                                                                                                                                                                                        |
-| ----------------- | :-----: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Qwen3**         | **on**  | Greedy + prefix-reuse byte-equal vs. flat path on Qwen3-0.6B BF16. Opt out via `use_block_paged_cache: Some(false)`.                                                                                                                          |
-| **LFM2.5**        | **on**  | Same parity result on LFM2.5-1.2B. Hybrid arch — only `full_attention` layers go through the adapter; conv layers stay on `Lfm2LayerCache::Conv`.                                                                                             |
-| **Gemma4**        | **on**  | Same parity result on Gemma-4-E2B-IT. Sliding layers stay on `RotatingKVCache`; global layers go through the adapter; KV-shared layers consume the anchor via `SharedOnGlobal` / `SharedOnSliding`.                                           |
-| **Qwen3.5 Dense** | **off** | Single-turn greedy parity verified on Qwen3.5-0.8B BF16. Default-flip pending a perf decision against the eager Rust flat path. GDN linear-attention layers stay on flat `ArraysCache` (no cross-request reuse — vLLM `MambaManager` stance). |
-| **Qwen3.5 MoE**   | **off** | Forward dispatch wired and parity-test scaffold present, but no local MoE checkpoint to verify against yet.                                                                                                                                   |
+| Model             | Default | Status                                                                                                                                                                                                                                                                                                                                         |
+| ----------------- | :-----: | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Qwen3**         | **on**  | Greedy + prefix-reuse byte-equal vs. flat path on Qwen3-0.6B BF16. Opt out via `use_block_paged_cache: Some(false)`.                                                                                                                                                                                                                           |
+| **LFM2.5**        | **on**  | Same parity result on LFM2.5-1.2B. Hybrid arch — only `full_attention` layers go through the adapter; conv layers stay on `Lfm2LayerCache::Conv`.                                                                                                                                                                                              |
+| **Gemma4**        | **on**  | Serial/concurrent start and continuation parity on Gemma-4-E2B-IT with a real occupancy-2 wave. Full and sliding layers use distinct paged groups; expired sliding blocks are replaced by a null sentinel; KV-shared layers alias their global/sliding anchor. Same-owner continuation is live; cross-owner prefix hits currently fail closed. |
+| **Qwen3.5 Dense** | **off** | Single-turn greedy parity verified on Qwen3.5-0.8B BF16. Default-flip pending a perf decision against the eager Rust flat path. GDN linear-attention layers stay on flat `ArraysCache` (no cross-request reuse — vLLM `MambaManager` stance).                                                                                                  |
+| **Qwen3.5 MoE**   | **off** | Forward dispatch wired and parity-test scaffold present, but no local MoE checkpoint to verify against yet.                                                                                                                                                                                                                                    |
+
+### Gemma4 hybrid groups and draft coexistence
+
+Gemma4 follows vLLM's `HybridKVCacheCoordinator` shape rather than allocating
+one maximum-context cache per request:
+
+```text
+layer specs ──group──▶ full pool ───────▶ GlobalPaged
+                  └─▶ sliding pool ────▶ SlidingPaged(window)
+KV-shared layer ───────────────────────▶ alias(anchor group, physical slot)
+```
+
+Each live owner has one sequence id across every group. The scheduler only
+advances a row after every group accepts the same cursor, rolls all groups back
+on a partial failure, and preempts the newest victim by releasing all of its
+tables before recomputing. Sliding adapters retain absolute logical block-table
+width: once a block is wholly outside the attention window its physical block
+is freed and that logical entry becomes a shared null sentinel. This bounds
+sliding residency without renumbering RoPE positions.
+
+The Gemma4 KV budget is a shared pool budget, not
+`max_context × max_num_seqs`. The automatic minimum holds one maximum-context
+request in every group plus a null block and at least one starter block per live
+row. Short rows can therefore batch up to the scheduler width; as aggregate
+contexts grow, recompute preemption—not a static per-request partition—arbitrates
+the shared blocks. The server exposes this admission width through
+`maxConcurrentSequences()`.
+
+MTP/DSpark and assistant drafts remain flat-cache algorithms, but loading one
+does not turn the paged coordinator off. The model scheduler installs a
+request-local flat owner lane only while that speculative command executes;
+ordinary owners continue to use the resident grouped pools. A live owner may
+not switch cache layouts mid-history, and releasing the owner drops both lane
+registries plus metadata.
 
 For Qwen3.5 (dense + MoE) both the flat and paged decode paths are pure-Rust
 eager — the compiled C++ forward and its process-wide locks
@@ -63,17 +100,16 @@ and is drift-guarded by a test:
 | Guard | `packages/agent/__test__/cold-tier-families.test.ts`                        |
 
 Dense `qwen3` is sound because its pool covers **all** layers, so a restored block
-reconstructs the whole prefix. Every other supported family is **hybrid** — it sizes
-the pool to attention layers only and keeps the rest of its cross-token state
-outside:
+reconstructs the whole prefix. The remaining rows show which hybrid layouts have a
+complete sidecar contract and which must fail closed:
 
-| Family              | Out-of-pool state                        | Sidecar | Restore-eligible |
-| ------------------- | ---------------------------------------- | ------- | ---------------- |
-| `qwen3` (dense)     | none — pool covers every layer           | n/a     | **yes**          |
-| `gemma4`            | sliding-window `RotatingKVCache`         | yes     | **yes**          |
-| `qwen3_5` (dense)   | GDN (gated delta-net) recurrent state    | yes     | **yes**          |
-| `qwen3_5_moe`       | GDN recurrent state (same as dense)      | yes     | **yes**          |
-| `lfm2` / `lfm2_moe` | short-conv state (no serialization path) | no      | no               |
+| Family              | Out-of-pool state                        | Sidecar                   | Restore-eligible                       |
+| ------------------- | ---------------------------------------- | ------------------------- | -------------------------------------- |
+| `qwen3` (dense)     | none — pool covers every layer           | n/a                       | **yes**                                |
+| `gemma4`            | grouped full + sliding paged KV          | obsolete rotating sidecar | no — grouped restore is not atomic yet |
+| `qwen3_5` (dense)   | GDN (gated delta-net) recurrent state    | yes                       | **yes**                                |
+| `qwen3_5_moe`       | GDN recurrent state (same as dense)      | yes                       | **yes**                                |
+| `lfm2` / `lfm2_moe` | short-conv state (no serialization path) | no                        | no                                     |
 
 The allowlist is enforced **natively**, not only in the agent:
 `cold_tier::resolve_persist_cold` consults `cold_restore_supported(model_type)`
@@ -251,7 +287,15 @@ restore reconciles down to the deepest boundary a validated sidecar backs, so lo
 makes the turn's whole chain unusable. The families now use
 `enqueue_sidecar_before(…, now + budget.max_walk)`.
 
-### gemma4's sliding-window sidecar
+### Legacy gemma4 sliding-window sidecar (inactive)
+
+Gemma4 continuous batching now stores both full- and sliding-attention KV in
+separate paged groups. The rotating-cache sidecar described below is retained
+only as a history of the superseded single-full-pool design and is not attached
+by the loader. None of the capture/gate claims in this legacy subsection apply
+to the grouped runtime. Cold restore remains fail-closed until persistence can
+restore every physical group at one reconciled boundary; reusing only the full
+group would be incorrect.
 
 `crates/mlx-core/src/models/gemma4/sliding_sidecar.rs` persists one
 `RotatingKVCacheSnapshot` per **physical** sliding layer (`is_sliding_layer &&
@@ -694,10 +738,6 @@ MLX_COLD_CACHE_DIR=$(mktemp -d) \
   cargo test -p mlx-core --test qwen3_cold_tier_parity -- --ignored --test-threads=1 --nocapture
 
 MLX_COLD_CACHE_DIR=$(mktemp -d) \
-  MLX_TEST_MODEL_PATH=~/.mlx-node/models/Gemma-4-26B-A4B-IT-UD-Q3_K_XL-mlx \
-  cargo test -p mlx-core --test gemma4_cold_tier_parity -- --ignored --test-threads=1 --nocapture
-
-MLX_COLD_CACHE_DIR=$(mktemp -d) \
   MLX_TEST_MODEL_PATH=~/.mlx-node/models/qwen3.5-0.8b-mlx-bf16 \
   cargo test -p mlx-core --test qwen3_5_cold_tier_parity -- --ignored --test-threads=1 --nocapture
 
@@ -709,11 +749,9 @@ MLX_COLD_CACHE_DIR=$(mktemp -d) \
 The large-checkpoint gates are minutes, not hours. Measured on an M5 Max, `--release`,
 with the checkpoint already resident in the page cache:
 
-| gate                                         | wall  | fresh model loads |
-| -------------------------------------------- | ----- | ----------------- |
-| `qwen3_5_moe_cold_tier_restart_parity`       | 105 s | 5                 |
-| `gemma4_cold_tier_restart_parity`            | 175 s | 15                |
-| `gemma4_cold_tier_restart_parity_sub_window` | 84 s  | 9                 |
+| gate                                   | wall  | fresh model loads |
+| -------------------------------------- | ----- | ----------------- |
+| `qwen3_5_moe_cold_tier_restart_parity` | 105 s | 5                 |
 
 Earlier notes here said ~66 min and ~26 min. **Do not read the drop as something the
 cold-tier commits bought** — the arithmetic does not support it. The long gemma4 gate

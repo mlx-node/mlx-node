@@ -400,11 +400,10 @@ pub(crate) fn sidecar_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
 ///  * `qwen3` (dense) sizes its pool over all layers, so the pool holds the
 ///    complete KV for the prefix and needs no sidecar
 ///    (`ColdTierContext::sidecar_policy` is `None`).
-///  * `gemma4` sizes its pool over the full-attention layers only, but persists
-///    its out-of-pool sliding-window `RotatingKVCache` state as a
-///    `ColdGroup::SlidingWindow` sidecar
-///    (`crate::models::gemma4::sliding_sidecar`). Its `ColdSidecarPolicy` makes
-///    the restore walk refuse any boundary a validated sidecar does not back.
+///  * `gemma4` now owns both full- and sliding-attention state in separate
+///    paged groups. Its former rotating-cache sidecar cannot represent that
+///    grouped layout, so cold restore stays fail-closed until persistence can
+///    reconcile a common content-addressed boundary across every group.
 ///  * `qwen3_5` (dense) sizes its pool over the full-attention layers only, but
 ///    persists its out-of-pool GDN recurrent state (conv + recurrent) as a
 ///    `ColdGroup::GdnState` sidecar (`crate::models::qwen3_5::gdn_sidecar`). A
@@ -429,7 +428,7 @@ pub(crate) fn sidecar_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
 /// authorized by exactly one thing: the family's restart-parity gate
 /// (`crates/mlx-core/tests/cold_tier_parity_harness.rs`) passing on real
 /// weights with `hits > 0` and `corruptions == 0`.
-const COLD_RESTORE_FAMILIES: &[&str] = &["gemma4", "qwen3", "qwen3_5", "qwen3_5_moe"];
+const COLD_RESTORE_FAMILIES: &[&str] = &["qwen3", "qwen3_5", "qwen3_5_moe"];
 
 /// Whether the cold tier may restore persisted paged blocks for `model_type`
 /// (see [`COLD_RESTORE_FAMILIES`]). Fails closed: an unknown or misspelled
@@ -1190,11 +1189,9 @@ mod tests {
     fn cold_restore_allowlist_covers_gated_families_only() {
         // Dense: the pool holds the whole prefix.
         assert!(cold_restore_supported("qwen3"));
-        // Hybrid, admitted only because its out-of-pool sliding-window state is
-        // persisted as a `ColdGroup::SlidingWindow` sidecar AND its
-        // restart-parity gate passes on real weights
-        // (`crates/mlx-core/tests/gemma4_cold_tier_parity.rs`).
-        assert!(cold_restore_supported("gemma4"));
+        // Gemma4's grouped full/sliding paged layout has no atomic multi-group
+        // cold restore contract yet. The former rotating sidecar is obsolete.
+        assert!(!cold_restore_supported("gemma4"));
         // Hybrid, admitted only because its out-of-pool GDN recurrent state is
         // persisted as a `ColdGroup::GdnState` sidecar AND its restart-parity
         // gate passes on real weights
@@ -1234,7 +1231,6 @@ mod tests {
         assert_eq!(
             cold_restore_families(),
             vec![
-                "gemma4".to_string(),
                 "qwen3".to_string(),
                 "qwen3_5".to_string(),
                 "qwen3_5_moe".to_string()

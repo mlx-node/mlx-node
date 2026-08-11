@@ -193,6 +193,8 @@ export declare class Gemma4Model {
    * without a model-thread roundtrip.
    */
   hasBlockPagedCache(): boolean;
+  maxConcurrentSequences(): number;
+  schedulerStats(): Promise<SchedulerStats>;
   /**
    * Whether this loaded instance can execute image-bearing chat turns.
    * Config-only stubs and incomplete/non-paged physical paths return false.
@@ -3331,10 +3333,9 @@ export interface Gemma4LoadOptions {
    * alongside the target model for speculative decoding — either a
    * DSpark draft or a Google assistant draft; the kind is probed from
    * the draft config.json. When omitted, `<model_path>/draft/` is loaded
-   * automatically when present. Draft decoding runs only on the flat
-   * KV-cache path: setting this while the model config explicitly enables
-   * `use_block_paged_cache` is a hard load error, and an unset
-   * `use_block_paged_cache` is forced to `false`.
+   * automatically when present. Draft decoding uses a request-local flat
+   * target-cache lane. The resident target retains its grouped paged pools,
+   * so loading an optional proposer does not disable ordinary batching.
    */
   draftModelPath?: string;
 }
@@ -4851,6 +4852,7 @@ export interface SchedulerStats {
   globalSteps: number;
   maxBatchOccupancy: number;
   decodeBatchOccupancyHist: Array<DecodeBatchOccupancyBucket>;
+  fusedGreedyEpilogueSteps: number;
   admitted: number;
   completed: number;
   admissionDeferredBlocks: number;

@@ -218,6 +218,7 @@ impl Qwen35StepExecutor<'_> {
             effective_cached_prefix_len: start,
             suffix_len: row.num_tokens as usize,
             full_tokens,
+            cache_salt: turn.payload.prefix.cache_salt,
             gdn_prefix_already_primed: !first_chunk
                 || turn.payload.prefix.gdn_prefix_already_primed,
         };
@@ -429,7 +430,7 @@ impl Qwen35StepExecutor<'_> {
         &mut self,
         plan: &StepPlan,
         running: &mut [TurnState<ScheduledTurn>],
-    ) -> (Vec<(usize, RowStepResult)>, usize) {
+    ) -> (Vec<(usize, RowStepResult)>, usize, usize) {
         let (work, mut results, batch_rows) = Self::prepare_decode_rows(plan, running);
         let executed_decode_batch = batch_rows.len();
         crate::array::maybe_clear_cache_for_paged_step(plan.global_step as i32);
@@ -486,6 +487,11 @@ impl Qwen35StepExecutor<'_> {
             }
             _ => Ok(None),
         };
+        let executed_greedy_epilogue_batch = greedy_tokens
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map_or(0, Vec::len);
         for row in work {
             let planned = &plan.rows[row.plan_index];
             let turn = running
@@ -563,7 +569,11 @@ impl Qwen35StepExecutor<'_> {
                 },
             ));
         }
-        (results, executed_decode_batch)
+        (
+            results,
+            executed_decode_batch,
+            executed_greedy_epilogue_batch,
+        )
     }
 }
 
@@ -577,7 +587,8 @@ impl StepExecutor<ScheduledTurn> for Qwen35StepExecutor<'_> {
     ) -> std::result::Result<StepResult, Self::Error> {
         let mut rows = Vec::with_capacity(plan.rows.len());
         rows.resize_with(plan.rows.len(), || None);
-        let (decode_results, executed_decode_batch) = self.execute_decode_rows(plan, running);
+        let (decode_results, executed_decode_batch, executed_greedy_epilogue_batch) =
+            self.execute_decode_rows(plan, running);
         for (index, result) in decode_results {
             rows[index] = Some(result);
         }
@@ -600,6 +611,7 @@ impl StepExecutor<ScheduledTurn> for Qwen35StepExecutor<'_> {
                 .map(|row| row.expect("every planned row executed"))
                 .collect(),
             executed_decode_batch,
+            executed_greedy_epilogue_batch,
             rows_alloc_evicted: running
                 .iter()
                 .filter(|turn| turn.payload.allocation_failed)

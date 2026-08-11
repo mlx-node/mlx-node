@@ -4,7 +4,7 @@
 //! Loads ONE Gemma4 target model per test WITH the assistant draft attached
 //! (`Gemma4LoadOptions::draft_model_path`); the plain-AR oracle runs on the
 //! SAME instance with `enableMtp: false` (the draft never touches the target
-//! weights or the flat AR path, so this is the exact byte-parity reference —
+//! weights, so this is the exact byte-parity reference —
 //! and only one ~24 GB target is resident at a time).
 //!
 //! PRIMARY ORACLE: speculative decoding must be LOSSLESS at T=0 — the
@@ -96,8 +96,12 @@ async fn load_assistant_model(model: &str, draft: &str) -> Gemma4Model {
         "assistant draft loaded via Gemma4LoadOptions must flip hasMtpWeights()"
     );
     assert!(
-        !m.has_block_paged_cache(),
-        "an assistant-draft load must force the flat KV path (paged adapter off)"
+        m.has_block_paged_cache(),
+        "loading an assistant draft must retain grouped paged KV for ordinary AR owners"
+    );
+    assert!(
+        m.max_concurrent_sequences() >= 2,
+        "a resident assistant draft must not collapse ordinary Gemma4 scheduler capacity"
     );
     m
 }

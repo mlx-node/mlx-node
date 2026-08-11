@@ -374,6 +374,10 @@ pub(crate) struct StepResult {
     /// This is executor-reported rather than inferred from the plan so a
     /// silent N-times-scalar fallback cannot fake occupancy telemetry.
     pub executed_decode_batch: usize,
+    /// Rows whose next tokens were selected by one successful batched greedy
+    /// argmax. Zero means the executor used scalar sampling or the optional
+    /// epilogue fell back.
+    pub executed_greedy_epilogue_batch: usize,
     pub rows_alloc_evicted: u32,
 }
 
@@ -392,6 +396,7 @@ pub(crate) struct SchedulerStats {
     pub global_steps: u64,
     pub max_batch_occupancy: usize,
     pub decode_batch_occupancy_hist: BTreeMap<usize, u64>,
+    pub fused_greedy_epilogue_steps: u64,
     pub admitted: u64,
     pub completed: u64,
     pub admission_deferred_blocks: u64,
@@ -488,6 +493,7 @@ pub struct SchedulerStatsJs {
     pub global_steps: f64,
     pub max_batch_occupancy: u32,
     pub decode_batch_occupancy_hist: Vec<DecodeBatchOccupancyBucketJs>,
+    pub fused_greedy_epilogue_steps: f64,
     pub admitted: f64,
     pub completed: f64,
     pub admission_deferred_blocks: f64,
@@ -524,6 +530,7 @@ impl SchedulerStats {
                     steps: steps as f64,
                 })
                 .collect(),
+            fused_greedy_epilogue_steps: self.fused_greedy_epilogue_steps as f64,
             admitted: self.admitted as f64,
             completed: self.completed as f64,
             admission_deferred_blocks: self.admission_deferred_blocks as f64,
@@ -1073,6 +1080,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             .map_err(SchedulerError::Executor)?;
         let allocation_blocked = result.rows.iter().any(|row| row.allocation_blocked);
         let executed_decode_batch = result.executed_decode_batch;
+        let executed_greedy_epilogue_batch = result.executed_greedy_epilogue_batch;
         let rows_alloc_evicted = result.rows_alloc_evicted;
         let planned_decode_rows = plan
             .rows
@@ -1082,6 +1090,11 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         if executed_decode_batch > planned_decode_rows {
             return Err(SchedulerError::InvalidResult(format!(
                 "executor reported decode occupancy {executed_decode_batch} for {planned_decode_rows} planned decode rows"
+            )));
+        }
+        if executed_greedy_epilogue_batch > executed_decode_batch {
+            return Err(SchedulerError::InvalidResult(format!(
+                "executor reported greedy epilogue occupancy {executed_greedy_epilogue_batch} for {executed_decode_batch} executed decode rows"
             )));
         }
         self.apply_result(&plan, result)
@@ -1100,6 +1113,10 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                 .decode_batch_occupancy_hist
                 .entry(decode_occupancy)
                 .or_default() += 1;
+        }
+        if executed_greedy_epilogue_batch != 0 {
+            self.stats.fused_greedy_epilogue_steps =
+                self.stats.fused_greedy_epilogue_steps.saturating_add(1);
         }
 
         let mut preempted = None;
@@ -1253,6 +1270,7 @@ mod tests {
         finish: HashSet<SeqId>,
         allocation_blocked: HashSet<SeqId>,
         next_token: u32,
+        executed_greedy_epilogue_batch: usize,
     }
 
     impl StepExecutor<&'static str> for MockStep {
@@ -1298,6 +1316,7 @@ mod tests {
                     .iter()
                     .filter(|row| row.kind == StepKind::Decode)
                     .count(),
+                executed_greedy_epilogue_batch: self.executed_greedy_epilogue_batch,
                 rows_alloc_evicted: 0,
             })
         }
@@ -1567,6 +1586,45 @@ mod tests {
         assert_eq!(js.max_batch_occupancy, 2);
         assert_eq!(js.decode_batch_occupancy_hist[0].occupancy, 2);
         assert_eq!(js.decode_batch_occupancy_hist[0].steps, 4.0);
+    }
+
+    #[test]
+    fn fused_greedy_epilogue_stats_require_executor_reported_engagement() {
+        let mut scheduler = Scheduler::<_, (), ()>::new(2, 2).expect("scheduler");
+        for seq_id in [1, 2] {
+            let mut request = turn(seq_id, 4, &[4], None);
+            request.token_history.push(9);
+            request.num_tokens += 1;
+            scheduler.enqueue_turn(request).expect("enqueue");
+        }
+        let mut step = MockStep {
+            executed_greedy_epilogue_batch: 2,
+            ..MockStep::default()
+        };
+        assert!(matches!(
+            scheduler.drive_once(&mut step).expect("fused step"),
+            SchedulerAction::Stepped { .. }
+        ));
+        assert_eq!(scheduler.stats().fused_greedy_epilogue_steps, 1);
+        assert_eq!(scheduler.stats().to_js().fused_greedy_epilogue_steps, 1.0);
+    }
+
+    #[test]
+    fn greedy_epilogue_occupancy_cannot_exceed_executed_decode_occupancy() {
+        let mut scheduler = Scheduler::<_, (), ()>::new(1, 1).expect("scheduler");
+        let mut request = turn(1, 4, &[4], None);
+        request.token_history.push(9);
+        request.num_tokens += 1;
+        scheduler.enqueue_turn(request).expect("enqueue");
+        let mut step = MockStep {
+            executed_greedy_epilogue_batch: 2,
+            ..MockStep::default()
+        };
+        assert!(matches!(
+            scheduler.drive_once(&mut step),
+            Err(SchedulerError::InvalidResult(message))
+                if message.contains("greedy epilogue occupancy 2 for 1 executed decode rows")
+        ));
     }
 
     #[test]
