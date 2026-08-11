@@ -2429,11 +2429,9 @@ impl Gemma4Inner {
         // shard-identity bracket can open on the pre-mmap snapshot.
         // Precedence: explicit config > `MLX_PERSIST_PAGED_CACHE` > off.
         let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
-        // Gemma4 deliberately remains outside COLD_RESTORE_FAMILIES until its
-        // full + sliding paged groups can persist and restore one atomic
-        // boundary. `resolve_persist_cold` therefore returns false here even
-        // for an explicit config/env enablement: the attach/capture block below
-        // is format scaffolding only and is unreachable in production today.
+        // Gemma4's full-attention chain and grouped sliding sidecar restore one
+        // exact boundary atomically. The native allowlist remains the final
+        // fail-closed gate before this loader attaches persistence.
         let persist_cold =
             resolve_persist_cold("gemma4", persist_env.as_deref(), config.persist_paged_cache);
         let shard_snapshot_before_mmap = if persist_cold {

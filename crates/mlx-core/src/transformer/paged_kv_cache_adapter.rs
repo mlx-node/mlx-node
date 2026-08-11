@@ -3690,6 +3690,138 @@ impl PagedKVCacheAdapter {
         Ok(released_count)
     }
 
+    /// Restore one sliding-window cache group at an exact hybrid-prefix
+    /// boundary without materializing the retired logical prefix.
+    ///
+    /// `layer_kv` is layer-major and uses the read-side shape
+    /// `[1, kv_heads, live_tokens, head_size]`. The logical block table keeps
+    /// absolute positions: blocks wholly before the live window point at the
+    /// reserved null sentinel, while only blocks intersecting the live suffix
+    /// consume physical capacity. This is the local equivalent of vLLM's
+    /// hybrid KV-group restore: the caller must install every group at the same
+    /// boundary or discard all of them.
+    pub fn restore_sliding_prefix_for(
+        &mut self,
+        seq_id: SeqId,
+        prompt_tokens: &[u32],
+        boundary: u32,
+        layer_kv: &[(MxArray, MxArray)],
+    ) -> Result<(), String> {
+        if self.sliding_window == 0 {
+            return Err("restore_sliding_prefix_for requires a sliding adapter".to_string());
+        }
+        if boundary == 0 || boundary as usize > prompt_tokens.len() {
+            return Err(format!(
+                "restore_sliding_prefix_for boundary {boundary} is outside prompt length {}",
+                prompt_tokens.len()
+            ));
+        }
+        if layer_kv.len() != self.layer_kv_pool.num_layers() {
+            return Err(format!(
+                "restore_sliding_prefix_for received {} layers, expected {}",
+                layer_kv.len(),
+                self.layer_kv_pool.num_layers()
+            ));
+        }
+
+        let live_tokens = boundary.min(self.sliding_window);
+        let first_live_position = boundary - live_tokens;
+        let first_live_block = first_live_position / self.block_size;
+        let total_blocks = boundary.div_ceil(self.block_size);
+        let live_blocks = total_blocks.saturating_sub(first_live_block);
+        let null_block = self
+            .null_block
+            .as_ref()
+            .ok_or_else(|| "sliding adapter is missing its reserved null block".to_string())?
+            .clone();
+
+        self.release_request_for(seq_id)?;
+        self.begin_request(seq_id)?;
+        let allocated = {
+            let mut guard = self
+                .allocator
+                .lock()
+                .map_err(|error| format!("BlockAllocator mutex poisoned: {error}"))?;
+            let mut blocks = Vec::with_capacity(live_blocks as usize);
+            for allocated_count in 0..live_blocks {
+                let Some(block) = guard.allocate() else {
+                    for block in blocks.drain(..) {
+                        guard.free(block);
+                    }
+                    drop(guard);
+                    let _ = self.release_request_for(seq_id);
+                    return Err(format!(
+                        "restore_sliding_prefix_for could allocate only {allocated_count} of \
+                         {live_blocks} live blocks"
+                    ));
+                };
+                blocks.push(block);
+            }
+            blocks
+        };
+
+        let Some(table) = self.block_table.as_mut() else {
+            let mut guard = self
+                .allocator
+                .lock()
+                .map_err(|error| format!("BlockAllocator mutex poisoned: {error}"))?;
+            for block in allocated {
+                guard.free(block);
+            }
+            drop(guard);
+            let _ = self.release_request_for(seq_id);
+            return Err(
+                "restore_sliding_prefix_for: begin_request did not install a block table"
+                    .to_string(),
+            );
+        };
+        for _ in 0..first_live_block {
+            table.add_block(Arc::clone(&null_block));
+        }
+        for block in allocated {
+            table.add_block(block);
+        }
+        table.set_num_tokens(boundary);
+        self.request_tokens
+            .extend_from_slice(&prompt_tokens[..boundary as usize]);
+        self.cached_token_count = boundary;
+        self.prefix_lookup_done = true;
+        self.already_registered = false;
+        self.restored_sidecar = None;
+        self.aux_prefix_unbacked = false;
+
+        let num_kv_heads = self.layer_kv_pool.config().num_kv_heads as i64;
+        let head_size = self.layer_kv_pool.config().head_size as i64;
+        for (layer, (keys, values)) in layer_kv.iter().enumerate() {
+            // Match the normal attention write path exactly:
+            // [B, H, T, D] -> [B, T, H, D] -> [B*T, H, D]. The final
+            // reshape is load-bearing, not cosmetic. A bare transpose/squeeze
+            // leaves a strided view whose backing Metal buffer is still laid
+            // out as [H, T, D], while `reshape_and_cache` consumes a contiguous
+            // [T, H, D] buffer and has no stride metadata. That silently
+            // transposes tokens and heads for multi-head sliding groups.
+            let keys = keys
+                .transpose(Some(&[0, 2, 1, 3]))
+                .map_err(|error| format!("restore sliding keys transpose: {error}"))?
+                .reshape(&[live_tokens as i64, num_kv_heads, head_size])
+                .map_err(|error| format!("restore sliding keys reshape: {error}"))?;
+            let values = values
+                .transpose(Some(&[0, 2, 1, 3]))
+                .map_err(|error| format!("restore sliding values transpose: {error}"))?
+                .reshape(&[live_tokens as i64, num_kv_heads, head_size])
+                .map_err(|error| format!("restore sliding values reshape: {error}"))?;
+            if let Err(error) =
+                self.update_keys_values(layer as u32, &keys, &values, first_live_position)
+            {
+                let _ = self.release_request_for(seq_id);
+                return Err(format!(
+                    "restore_sliding_prefix_for failed to upload layer {layer}: {error}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Record tokens emitted/consumed in this request. Updates
     /// `request_tokens` and `block_table.num_tokens`. Caller passes
     /// EVERY token (prompt prefill + decoded output) in order.
@@ -14094,6 +14226,92 @@ mod tests {
             assert!(
                 elem.abs() < 0.01,
                 "K[{i}] = {elem}, expected 0.0 (initial K was zeros)"
+            );
+        }
+    }
+
+    /// A grouped sliding sidecar is decoded as `[B, H, T, D]`, while the
+    /// Metal cache writer consumes contiguous `[T, H, D]`. Exercise more than
+    /// one head with non-uniform BF16 bits so dropping the final materializing
+    /// reshape (and passing a strided transpose view to the raw writer) swaps
+    /// token/head rows and fails byte-for-byte.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restore_sliding_prefix_materializes_multi_head_layout() {
+        let block_size = 8;
+        let boundary = 16;
+        let num_kv_heads = 8;
+        let head_size = 64;
+        let num_layers = 2;
+        let num_blocks = 8;
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size,
+            num_kv_heads,
+            head_size,
+            num_layers,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new_for_test(
+            cfg,
+            num_blocks,
+            num_layers,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(error) if error.contains("No Metal device found") => {
+                eprintln!(
+                    "skipping restore_sliding_prefix_materializes_multi_head_layout: {error}"
+                );
+                return;
+            }
+            Err(error) => panic!("create multi-head test pool: {error}"),
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+        let mut adapter = PagedKVCacheAdapter::new_sliding(allocator, pool, block_size, 32, 64)
+            .expect("create sliding adapter");
+        let elements = num_kv_heads as usize * boundary as usize * head_size as usize;
+        let shape = [1, num_kv_heads as i64, boundary as i64, head_size as i64];
+        let mut expected = Vec::with_capacity(num_layers as usize);
+        for layer in 0..num_layers {
+            let keys = (0..elements)
+                .map(|index| 0x3f00u16 + ((index + layer as usize * 17) % 0x7f) as u16)
+                .collect::<Vec<_>>();
+            let values = (0..elements)
+                .map(|index| 0x4000u16 + ((index * 3 + layer as usize * 29) % 0x7f) as u16)
+                .collect::<Vec<_>>();
+            expected.push((keys, values));
+        }
+        let layer_kv = expected
+            .iter()
+            .map(|(keys, values)| {
+                Ok((
+                    MxArray::from_bfloat16(keys, &shape)?,
+                    MxArray::from_bfloat16(values, &shape)?,
+                ))
+            })
+            .collect::<napi::Result<Vec<_>>>()
+            .expect("build sliding sidecar arrays");
+        let prompt_tokens = (0..boundary).collect::<Vec<_>>();
+
+        adapter
+            .restore_sliding_prefix_for(7, &prompt_tokens, boundary, &layer_kv)
+            .expect("restore multi-head sliding prefix");
+        for (layer, (expected_k, expected_v)) in expected.iter().enumerate() {
+            let (actual_k, actual_v) = adapter
+                .read_kv_range(layer as u32, 0, boundary)
+                .expect("read restored sliding layer");
+            assert_eq!(
+                actual_k.to_uint16_native().expect("read K bits"),
+                *expected_k,
+                "restored K differs at layer {layer}"
+            );
+            assert_eq!(
+                actual_v.to_uint16_native().expect("read V bits"),
+                *expected_v,
+                "restored V differs at layer {layer}"
             );
         }
     }

@@ -40,8 +40,8 @@ rather than accepting an arbitrary client-selected namespace.
 | **Qwen3**         | **on**  | Greedy + prefix-reuse byte-equal vs. flat path on Qwen3-0.6B BF16. Opt out via `use_block_paged_cache: Some(false)`.                                                                                                                                                                                                                           |
 | **LFM2.5**        | **on**  | Same parity result on LFM2.5-1.2B. Hybrid arch — only `full_attention` layers go through the adapter; conv layers stay on `Lfm2LayerCache::Conv`.                                                                                                                                                                                              |
 | **Gemma4**        | **on**  | Serial/concurrent start and continuation parity on Gemma-4-E2B-IT with a real occupancy-2 wave. Full and sliding layers use distinct paged groups; expired sliding blocks are replaced by a null sentinel; KV-shared layers alias their global/sliding anchor. Same-owner continuation is live; cross-owner prefix hits currently fail closed. |
-| **Qwen3.5 Dense** | **off** | Single-turn greedy parity verified on Qwen3.5-0.8B BF16. Default-flip pending a perf decision against the eager Rust flat path. GDN linear-attention layers stay on flat `ArraysCache` (no cross-request reuse — vLLM `MambaManager` stance).                                                                                                  |
-| **Qwen3.5 MoE**   | **off** | Forward dispatch wired and parity-test scaffold present, but no local MoE checkpoint to verify against yet.                                                                                                                                                                                                                                    |
+| **Qwen3.5 Dense** | **on**  | Single-turn greedy parity and paged construction are verified on Qwen3.5-0.8B BF16. Full-attention K/V is paged; GDN recurrent state remains request-local and is checkpointed beside K/V for SSD restore. Explicit false and the environment override retain a rollback path.                                                                 |
+| **Qwen3.5 MoE**   | **on**  | Uses the same paged full-attention and exact-boundary GDN sidecar contract as dense, but remains whole-turn exclusive rather than continuously batched. A real 35B-A3B restart gate remains local-only because no small published checkpoint fits the standard CI runner; a synthetic Metal gate covers construction in CI.                    |
 
 ### Gemma4 hybrid groups and draft coexistence
 
@@ -93,23 +93,23 @@ blocks so a warm prefix survives a process restart. Whether a family may _restor
 from it is a correctness decision, gated by an allowlist that exists in two places
 and is drift-guarded by a test:
 
-| Side  | Symbol                                                                      |
-| ----- | --------------------------------------------------------------------------- |
-| Rust  | `COLD_RESTORE_FAMILIES` in `crates/mlx-core/src/cold_tier.rs`               |
-| TS    | `COLD_TIER_RESTORE_FAMILIES` in `packages/agent/src/provider/model-host.ts` |
-| Guard | `packages/agent/__test__/cold-tier-families.test.ts`                        |
+| Side  | Symbol                                                            |
+| ----- | ----------------------------------------------------------------- |
+| Rust  | `COLD_RESTORE_FAMILIES` in `crates/mlx-core/src/cold_tier.rs`     |
+| TS    | `COLD_TIER_RESTORE_FAMILIES` in `packages/agent/src/cold-tier.ts` |
+| Guard | `packages/agent/__test__/cold-tier-families.test.ts`              |
 
 Dense `qwen3` is sound because its pool covers **all** layers, so a restored block
-reconstructs the whole prefix. The remaining rows show which hybrid layouts have a
-complete sidecar contract and which must fail closed:
+reconstructs the whole prefix. Every supported hybrid family now pairs K/V with an
+exact-boundary sidecar or a second paged group:
 
-| Family              | Out-of-pool state                        | Sidecar                   | Restore-eligible                       |
-| ------------------- | ---------------------------------------- | ------------------------- | -------------------------------------- |
-| `qwen3` (dense)     | none — pool covers every layer           | n/a                       | **yes**                                |
-| `gemma4`            | grouped full + sliding paged KV          | obsolete rotating sidecar | no — grouped restore is not atomic yet |
-| `qwen3_5` (dense)   | GDN (gated delta-net) recurrent state    | yes                       | **yes**                                |
-| `qwen3_5_moe`       | GDN recurrent state (same as dense)      | yes                       | **yes**                                |
-| `lfm2` / `lfm2_moe` | short-conv state (no serialization path) | no                        | no                                     |
+| Family              | State outside the primary full-attention pool | Restore companion                                                   | Restore-eligible |
+| ------------------- | --------------------------------------------- | ------------------------------------------------------------------- | :--------------: |
+| `qwen3` (dense)     | none — pool covers every layer                | n/a                                                                 |     **yes**      |
+| `gemma4`            | sliding-attention paged groups                | grouped live-window K/V sidecar; all groups install at one boundary |     **yes**      |
+| `qwen3_5` (dense)   | GDN recurrent state                           | exact-boundary GDN sidecar                                          |     **yes**      |
+| `qwen3_5_moe`       | GDN recurrent state (same as dense)           | exact-boundary GDN sidecar                                          |     **yes**      |
+| `lfm2` / `lfm2_moe` | ShortConv recurrent state                     | exact-boundary `ConvState` sidecar                                  |     **yes**      |
 
 The allowlist is enforced **natively**, not only in the agent:
 `cold_tier::resolve_persist_cold` consults `cold_restore_supported(model_type)`
@@ -120,11 +120,14 @@ A loader may therefore carry a fully wired cold bracket ahead of proving it; the
 keeps that bracket dormant until the family is admitted.
 
 A K/V-only restore for a hybrid would resume from state the pool never held. Two
-mechanisms make that impossible rather than merely unlikely.
+mechanisms make that impossible rather than merely unlikely. Gemma4 applies the
+same rule to its physical groups: the full group proposes a boundary, a validated
+sliding sidecar reconstructs every sliding group there, and any decode/install
+failure resets all groups to zero.
 
 Hybrid sidecar capture uses the same `cache_salt` as the K/V chain. The salt is
 part of the first-block domain for both the hot prefix checkpoint and the
-persisted GDN/sliding sidecar key, so a salted request can use the cold tier
+persisted GDN/ShortConv/sliding sidecar key, so a salted request can use the cold tier
 without either crossing domains or failing at finalization.
 
 **Reconcile-down (`ColdSidecarPolicy`).** A family whose out-of-pool state _is_
@@ -287,15 +290,21 @@ restore reconciles down to the deepest boundary a validated sidecar backs, so lo
 makes the turn's whole chain unusable. The families now use
 `enqueue_sidecar_before(…, now + budget.max_walk)`.
 
-### Legacy gemma4 sliding-window sidecar (inactive)
+### Gemma4 sliding-window sidecars
 
-Gemma4 continuous batching now stores both full- and sliding-attention KV in
-separate paged groups. The rotating-cache sidecar described below is retained
-only as a history of the superseded single-full-pool design and is not attached
-by the loader. None of the capture/gate claims in this legacy subsection apply
-to the grouped runtime. Cold restore remains fail-closed until persistence can
-restore every physical group at one reconciled boundary; reusing only the full
-group would be incorrect.
+Gemma4 continuous batching stores full- and sliding-attention K/V in separate
+paged groups. The scheduled text route snapshots the live K/V suffix from every
+sliding group, persists it under `ColdGroup::SlidingWindow`, and reinstalls every
+group at the full group's reconciled boundary. Retired logical positions become
+null sentinels, so the restored block table preserves absolute positions without
+allocating the expired prefix. Missing, malformed, or partially installable state
+resets all groups to zero; reusing only the full group is forbidden.
+
+The older rotating-cache representation remains active for the flat/exclusive
+route used by media and MTP/DSpark commands. It shares the same sidecar layout
+rules below, while the grouped route encodes/decodes layer-major paged K/V arrays
+directly. It is therefore not an obsolete compatibility path: the two codecs cover
+the two cache layouts that intentionally coexist on one loaded Gemma4 model.
 
 `crates/mlx-core/src/models/gemma4/sliding_sidecar.rs` persists one
 `RotatingKVCacheSnapshot` per **physical** sliding layer (`is_sliding_layer &&
@@ -744,6 +753,16 @@ MLX_COLD_CACHE_DIR=$(mktemp -d) \
 MLX_COLD_CACHE_DIR=$(mktemp -d) \
   MLX_TEST_MODEL_PATH=~/.mlx-node/models/Qwen3.6-35b-a3b-UD-Q2_K_XL-mlx \
   cargo test -p mlx-core --test qwen3_5_moe_cold_tier_parity -- --ignored --test-threads=1 --nocapture
+
+MLX_COLD_CACHE_DIR=$(mktemp -d) \
+  MLX_TEST_MODEL_PATH=~/.mlx-node/models/lfm2.5-1.2b-thinking-mlx \
+  cargo test -p mlx-core --test lfm2_cold_tier_parity -- --ignored --exact \
+    --test-threads=1 --nocapture lfm2_cold_tier_restart_parity
+
+MLX_PAGED_PREFILL_CHUNK_SIZE=64 MLX_COLD_CACHE_DIR=$(mktemp -d) \
+  MLX_TEST_MODEL_PATH=~/.mlx-node/models/gemma-4-12b-it-qat-q4_0-mlx \
+  cargo test -p mlx-core --test gemma4_grouped_cold_tier_parity -- --ignored --exact \
+    --test-threads=1 --nocapture gemma4_grouped_cold_tier_restart_parity
 ```
 
 The large-checkpoint gates are minutes, not hours. Measured on an M5 Max, `--release`,
@@ -770,26 +789,25 @@ page cache, and expect minutes per load otherwise.** The 264 s/load figure is wh
 arithmetic implies, not a re-measured number — the cold case was not re-run. What is
 certain is the direction: the cold-tier commits moved seconds, not the headline.
 
-The two small-checkpoint gates run in CI, on the existing `model-test` matrix legs
+The small-checkpoint gates run in CI, on the existing `model-test` matrix legs
 that already download and convert the checkpoint they need (`.github/workflows/ci.yml`):
 `qwen3_cold_tier_parity` on the `qwen3` leg, `qwen3_5_cold_tier_parity` plus the
 Metal-gated unit tests `dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy`
 and `moe_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy` on the
-`qwen3_5-dense` leg. The MoE unit test rides that leg because it needs no checkpoint
-at all — it builds a tiny synthetic MoE and a real paged pool — and there is no MoE
-leg for it to ride instead.
+`qwen3_5-dense` leg, `lfm2_cold_tier_parity` on the LFM2.5 leg, and
+`gemma4_grouped_cold_tier_parity` on the Gemma4 QAT PR leg. The MoE unit test rides
+the dense Qwen leg because it needs no checkpoint at all — it builds a tiny synthetic
+MoE and a real paged pool — and there is no MoE model leg for it to ride instead.
 
 The two real-weights gates that stay local-only stay that way because of their
 CHECKPOINTS, not their runtime:
 
 - **MoE** — the smallest published `qwen3_5_moe` is 35B-A3B. Even the UD-Q2_K_XL quant
   peaks at 14.2 GB resident, past a standard macOS runner.
-- **gemma4** — the only CI-reachable gemma4 is the gated
-  `google/gemma-4-E2B-it-qat-mobile-transformers`, whose `sliding_window` is **512**.
-  `gemma4_cold_tier_parity.rs` pins `SLIDING_WINDOW_TOKENS = 1024` and uses it as both
-  the long gate's `min_restored_tokens` floor and the sub-window gate's ceiling
-  assertion, so on a 512-window checkpoint those two assertions stop meaning what
-  their messages say. Wiring it needs the window read from the loaded config first.
+- **gemma4 MoE** — the standard CI runner covers dense E2B grouped restore. The
+  local-only MoE gate uses a real 26B-A4B checkpoint; its grouped cache layout and
+  codec are shared with dense, but the separate real gate protects the loader and
+  KV-shared/MoE composition.
 
 The structural fact both gemma4 gates rest on: with a `ColdSidecarPolicy` installed, a
 non-zero `cached_tokens` in a _freshly loaded_ instance (empty hot cache) can only

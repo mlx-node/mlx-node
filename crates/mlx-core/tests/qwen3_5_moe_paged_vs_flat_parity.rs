@@ -57,13 +57,19 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
         }
     }
 
-    if use_block_paged {
+    {
         let cfg_path = dst.join("config.json");
         let raw = fs::read_to_string(&cfg_path)
             .map_err(|e| format!("read config.json: {e} (path={})", cfg_path.display()))?;
         let mut cfg: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| format!("parse config.json: {e} (path={})", cfg_path.display()))?;
-        cfg["use_block_paged_cache"] = serde_json::Value::Bool(true);
+        if use_block_paged {
+            cfg.as_object_mut()
+                .ok_or_else(|| "config.json must contain an object".to_string())?
+                .remove("use_block_paged_cache");
+        } else {
+            cfg["use_block_paged_cache"] = serde_json::Value::Bool(false);
+        }
         cfg["paged_cache_memory_mb"] = serde_json::Value::from(1024u32);
         cfg["paged_block_size"] = serde_json::Value::from(16u32);
         let pretty = serde_json::to_string_pretty(&cfg)
@@ -167,6 +173,10 @@ async fn qwen3_5_moe_paged_vs_flat_greedy_token_parity() {
     let paged_model = Qwen3_5MoeModel::load(paged_dir.to_string_lossy().to_string())
         .await
         .expect("failed to load paged-path Qwen3.5 MoE model");
+    assert!(
+        paged_model.has_block_paged_cache(),
+        "an unmodified use_block_paged_cache setting must default Qwen3.5 MoE to paged"
+    );
 
     let prompts = parity_prompts();
     for (idx, prompt) in prompts.iter().enumerate() {

@@ -1524,23 +1524,24 @@ async fn lfm2_paged_prefill_bridge_cache_hit_ab_probe() {
 
 // ---------------------------------------------------------------------------
 // Regression: a quantized LFM2 checkpoint loaded with NO config override must
-// default to the FLAT decode path.
+// default to the block-paged decode path.
 //
-// The default is resolved in `Lfm2Inner::load_from_dir` from the authoritative
-// `.scales` tensor signal (NOT config metadata), the same signal that gates
-// compiled registration. This proves the wiring end-to-end on real weights and
-// guards against a quantized checkpoint silently landing on the slow eager-PAGED
-// path (the bug this branch removes). Because detection keys on tensors, a
+// The default is resolved in `Lfm2Inner::load_from_dir` after authoritative
+// tensor-based storage classification (NOT config metadata), the same point
+// that can force structurally incompatible sym8 checkpoints flat. This proves
+// the compatible-quantized wiring end-to-end on real weights and
+// guards against the default drifting back to the former flat-only policy.
+// Because detection keys on tensors, a
 // checkpoint whose `quantization` block lacks top-level `bits`/`mode` (per-layer
 // only) is handled identically — the metadata shape is never consulted.
 //
 // Gated on its OWN env var so it only runs when the operator explicitly points
-// at a QUANTIZED checkpoint (a bf16 checkpoint would correctly stay paged and
-// fail this assertion).
+// at a QUANTIZED checkpoint; bf16 and quantized checkpoints now share the same
+// default.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs MLX_TEST_QUANTIZED_MODEL_PATH pointing to a real QUANTIZED LFM2 checkpoint"]
-async fn lfm2_quantized_default_load_takes_flat_path() {
+async fn lfm2_quantized_default_load_takes_paged_path() {
     let Ok(model_path) = std::env::var("MLX_TEST_QUANTIZED_MODEL_PATH") else {
         eprintln!(
             "skipping: MLX_TEST_QUANTIZED_MODEL_PATH unset (point it at a quantized LFM2 \
@@ -1554,15 +1555,15 @@ async fn lfm2_quantized_default_load_takes_flat_path() {
     }
 
     // DEFAULT load — no config override, no clone. The on-disk config.json has
-    // `use_block_paged_cache` unset; the loader must flip it to flat because the
-    // weights carry `.scales`.
+    // `use_block_paged_cache` unset; the loader must select paged even though
+    // the weights carry `.scales` (sym8 remains the one forced-flat format).
     let model = Lfm2Model::load_from_dir(&model_path)
         .await
         .expect("failed to load quantized LFM2 model");
 
     assert!(
-        !model.has_block_paged_cache(),
-        "a quantized LFM2 checkpoint with use_block_paged_cache unset must default to FLAT \
-         (has_block_paged_cache()==false); got paged — the .scales-keyed default did not fire"
+        model.has_block_paged_cache(),
+        "a compatible quantized LFM2 checkpoint with use_block_paged_cache unset must default \
+         to paged (has_block_paged_cache()==true)"
     );
 }

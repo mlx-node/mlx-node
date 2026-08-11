@@ -110,6 +110,9 @@ pub enum ColdGroup {
     /// lives outside the paged pool and is therefore not covered by any KV
     /// block.
     GdnState,
+    /// Short-convolution recurrent state at a block boundary (lfm2 /
+    /// lfm2_moe), which lives outside the paged full-attention pool.
+    ConvState,
     /// Sliding-window (`RotatingKVCache`) state at a block boundary (gemma4),
     /// likewise outside the paged pool.
     SlidingWindow,
@@ -118,7 +121,7 @@ pub enum ColdGroup {
 impl ColdGroup {
     /// Every non-KV group, in a stable order. Used by name parsing and by the
     /// dashboard-facing filename contract.
-    pub const SIDECAR_GROUPS: [Self; 2] = [Self::GdnState, Self::SlidingWindow];
+    pub const SIDECAR_GROUPS: [Self; 3] = [Self::GdnState, Self::ConvState, Self::SlidingWindow];
 
     /// Domain-separation tag hashed as the first component of every key.
     ///
@@ -131,6 +134,7 @@ impl ColdGroup {
             // Byte-identical to the pre-group constant: DO NOT EDIT.
             Self::Kv => b"mlx-node:cold-prefix-block:v1\0",
             Self::GdnState => b"mlx-node:cold-sidecar-gdn-state:v1\0",
+            Self::ConvState => b"mlx-node:cold-sidecar-conv-state:v1\0",
             Self::SlidingWindow => b"mlx-node:cold-sidecar-sliding-window:v1\0",
         }
     }
@@ -142,6 +146,7 @@ impl ColdGroup {
         match self {
             Self::Kv => "kv",
             Self::GdnState => "gdn_state",
+            Self::ConvState => "conv_state",
             Self::SlidingWindow => "sliding_window",
         }
     }
@@ -150,6 +155,7 @@ impl ColdGroup {
         match label {
             "kv" => Some(Self::Kv),
             "gdn_state" => Some(Self::GdnState),
+            "conv_state" => Some(Self::ConvState),
             "sliding_window" => Some(Self::SlidingWindow),
             _ => None,
         }
@@ -4357,7 +4363,12 @@ mod tests {
     #[test]
     fn groups_never_collide_for_identical_inputs() {
         let fp = fingerprint();
-        let groups = [ColdGroup::Kv, ColdGroup::GdnState, ColdGroup::SlidingWindow];
+        let groups = [
+            ColdGroup::Kv,
+            ColdGroup::GdnState,
+            ColdGroup::ConvState,
+            ColdGroup::SlidingWindow,
+        ];
         let parent = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &[1, 2, 3, 4], &[], 0, 0);
         for (parent, tokens, extra, salt, index) in [
             (None, vec![1u32, 2, 3, 4], vec![], 0u64, 0usize),

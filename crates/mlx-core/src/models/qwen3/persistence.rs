@@ -1099,9 +1099,9 @@ mod persist_cold_resolution_tests {
         // loudly persistence is requested — not via an explicit config `true`,
         // not via `MLX_PERSIST_PAGED_CACHE=1`. This is what keeps a loader's
         // cold bracket dormant until its family is admitted, so an unproven
-        // path (e.g. qwen3_5_moe before its parity gate passes) cannot be
+        // path cannot be
         // exercised by a direct library caller that bypasses the agent.
-        for family in ["gemma4", "lfm2", "lfm2_moe", "harrier", "not-a-family"] {
+        for family in ["harrier", "not-a-family"] {
             assert!(
                 !resolve_persist_cold(family, Some("1"), Some(true)),
                 "{family} is off the allowlist and must never persist a cold tier"
@@ -1111,6 +1111,9 @@ mod persist_cold_resolution_tests {
         assert!(resolve_persist_cold("qwen3", Some("0"), Some(true)));
         assert!(resolve_persist_cold("qwen3_5", None, Some(true)));
         assert!(resolve_persist_cold("qwen3_5_moe", Some("1"), None));
+        assert!(resolve_persist_cold("gemma4", Some("1"), None));
+        assert!(resolve_persist_cold("lfm2", Some("1"), None));
+        assert!(resolve_persist_cold("lfm2_moe", Some("1"), None));
     }
 
     #[test]

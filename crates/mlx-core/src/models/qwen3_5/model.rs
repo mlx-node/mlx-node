@@ -1417,7 +1417,7 @@ impl Qwen35Inner {
     /// been installed and materialized. The configured memory value is a
     /// requested maximum; live unified-memory/Metal probes may only reduce it.
     pub(crate) fn initialize_paged_adapter(&mut self) -> Result<()> {
-        if !self.config.use_block_paged_cache.unwrap_or(false)
+        if !self.config.use_block_paged_cache.unwrap_or(true)
             || !crate::engine::persistence::compiled_forward_backend_available()
         {
             return Ok(());
@@ -11007,11 +11007,9 @@ pub struct Qwen3_5Model {
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5Config,
     /// Snapshot of `Qwen35Inner::paged_adapter.is_some()` captured at
-    /// construction time. Text-only checkpoints default-OFF on Qwen3.5
-    /// (parity-pending — see CLAUDE.md and
-    /// `Qwen3_5Config::use_block_paged_cache`). VLM checkpoints default the
-    /// adapter ON: dense image turns ONLY run on the paged-vision core, and a
-    /// vision turn that reaches a None adapter errors at dispatch. Surfaced
+    /// construction time. Qwen3.5 checkpoints default the adapter ON; an
+    /// explicit false or a structurally unsupported sym8 checkpoint keeps the
+    /// flat path. Dense image turns only run on the paged-vision core. Surfaced
     /// through the `hasBlockPagedCache()` NAPI method.
     pub(crate) paged_active: bool,
     /// Snapshot of `Qwen35Inner::has_mtp_weights()` captured
@@ -11050,11 +11048,10 @@ impl Qwen3_5Model {
     ///
     /// `true` iff `Qwen35Inner::paged_adapter` was successfully
     /// constructed at load time (driven by
-    /// `Qwen3_5Config::use_block_paged_cache`, default-OFF for text-only
-    /// checkpoints because parity is pending real-weights validation, and
-    /// default-ON for VLM checkpoints). On VLM checkpoints dense image turns
-    /// ONLY run on the paged-vision core; a vision turn that reaches a None
-    /// adapter errors at dispatch. Surfaced through this NAPI method so
+    /// `Qwen3_5Config::use_block_paged_cache`, default-ON for every compatible
+    /// checkpoint). On VLM checkpoints dense image turns ONLY run on the
+    /// paged-vision core; a vision turn that reaches a None adapter errors at
+    /// dispatch. Surfaced through this NAPI method so
     /// server endpoints can branch on it without round-tripping through
     /// the model thread.
     #[napi]

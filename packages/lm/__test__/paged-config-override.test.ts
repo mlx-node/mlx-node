@@ -1,7 +1,7 @@
 /**
  * `PagedConfigOverrideManager` persist-paged-cache injection.
  *
- * The agent enables the qwen3 dense cold tier by asking the config overlay to
+ * The agent enables each allowlisted family's cold tier by asking the config overlay to
  * write `persist_paged_cache: true` into the cloned `config.json` the native
  * loader reads — never mutating the downloaded checkpoint. These tests pin that
  * injection (and its absence) without loading any weights.

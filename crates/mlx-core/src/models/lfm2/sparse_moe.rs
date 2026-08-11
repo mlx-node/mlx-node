@@ -217,6 +217,7 @@ mod tests {
             paged_cache_memory_mb: None,
             paged_block_size: None,
             use_block_paged_cache: None,
+            persist_paged_cache: None,
             intermediate_size: Some(4),
             moe_intermediate_size: Some(4),
             num_experts: Some(4),

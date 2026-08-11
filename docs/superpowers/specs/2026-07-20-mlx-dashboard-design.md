@@ -82,7 +82,7 @@ All three phases land in a single PR on this branch. Phases are internal milesto
 - Restore: on in-memory prefix miss, walk the `ColdCacheKey::chain` and `restore_block` before falling back to normal prefill. Any validation failure falls through silently.
 - NAPI additions: `coldCacheStats()` (`ColdCacheStats` counters + root path + quota) + cold-tier disk info. (Live paged-pool capacity counters — `num_free_blocks`/`num_allocated_blocks`/`total_blocks` — stay internal to Rust and are intentionally **not** exposed via NAPI: the dashboard never links the native addon and receives all runtime data through trace records (see Phase B), so a direct export would have no consumer. If ever needed on the cache page, they belong in the Phase B trace schema, not a direct NAPI.)
 - Trace hook: expose per-turn cold-cache counter deltas so Phase B can persist them.
-- **Resolved during planning research:** cold restore is only sound where paged blocks fully determine layer state. Per-family audit: only **qwen3 dense** is fully covered (all layers full-attention); lfm2 (conv), gemma4 (sliding `RotatingKVCache` + KV-shared aliases), and qwen3.5/3.6 (GDN recurrent/conv state + checkpoint store) all keep per-layer state outside the paged pool. **v1 gates cold restore to qwen3 dense**; capture/persist wiring is family-generic so hybrids can be added later by persisting their extra state. This mirrors vLLM, which defaults prefix caching off for hybrid models. Byte-parity tests follow the existing paged parity-gate pattern.
+- **Current family contract:** cold restore is sound only when paged blocks plus a validated exact-boundary companion reconstruct every layer's state. Dense qwen3 needs no sidecar; qwen3.5/3.6 persists GDN state; LFM2/2.5 persists ShortConv state; Gemma4 restores its full and sliding paged groups atomically. The native and TypeScript allowlists admit only those restart-parity-gated families. Byte-parity tests follow the existing paged parity-gate pattern.
 
 ### Phase B — metrics sink (agent)
 
@@ -123,22 +123,22 @@ packages/cli/src/commands/dashboard.ts   thin: flags, start server, open browser
 
 #### HTTP API
 
-| Route                       | Method       | Purpose                                                                     |
-| --------------------------- | ------------ | --------------------------------------------------------------------------- |
-| `/api/models`               | GET          | local models: name, path, family, quant summary, size on disk, ctx window   |
-| `/api/models/:name`         | DELETE       | delete model dir (path-checked, confirmed in UI)                            |
-| `/api/catalog`              | GET          | static recommended list + installed/installable state                       |
-| `/api/downloads`            | GET/POST     | list active jobs / start a catalog download                                 |
-| `/api/downloads/:id/events` | GET (SSE)    | per-file + byte progress, resume-aware                                      |
+| Route                       | Method       | Purpose                                                                                             |
+| --------------------------- | ------------ | --------------------------------------------------------------------------------------------------- |
+| `/api/models`               | GET          | local models: name, path, family, quant summary, size on disk, ctx window                           |
+| `/api/models/:name`         | DELETE       | delete model dir (path-checked, confirmed in UI)                                                    |
+| `/api/catalog`              | GET          | static recommended list + installed/installable state                                               |
+| `/api/downloads`            | GET/POST     | list active jobs / start a catalog download                                                         |
+| `/api/downloads/:id/events` | GET (SSE)    | per-file + byte progress, resume-aware                                                              |
 | `/api/downloads/:id`        | DELETE       | cancel an in-flight/failed job (aborts + cleans its staging; leaves the shared HF cache for resume) |
-| `/api/sessions`             | GET          | indexed session list; search + filters (cwd, model, date)                   |
-| `/api/sessions/:id`         | GET          | transcript (active branch) + per-turn usage                                 |
-| `/api/sessions/:id`         | PATCH/DELETE | rename (pi `session_info` entry) / delete file + rows                       |
-| `/api/sessions/:id/metrics` | GET          | joined trace metrics for the session                                        |
-| `/api/metrics/overview`     | GET          | aggregates: tokens/day, tok/s + TTFT trends, MTP acceptance, model share    |
-| `/api/cache`                | GET          | cold tier: entries, bytes, quota, age histogram; hit/miss trend from traces |
-| `/api/cache`                | DELETE       | clear all, or evict older-than-N-days                                       |
-| `/api/ingest`               | POST         | trigger incremental rescan                                                  |
+| `/api/sessions`             | GET          | indexed session list; search + filters (cwd, model, date)                                           |
+| `/api/sessions/:id`         | GET          | transcript (active branch) + per-turn usage                                                         |
+| `/api/sessions/:id`         | PATCH/DELETE | rename (pi `session_info` entry) / delete file + rows                                               |
+| `/api/sessions/:id/metrics` | GET          | joined trace metrics for the session                                                                |
+| `/api/metrics/overview`     | GET          | aggregates: tokens/day, tok/s + TTFT trends, MTP acceptance, model share                            |
+| `/api/cache`                | GET          | cold tier: entries, bytes, quota, age histogram; hit/miss trend from traces                         |
+| `/api/cache`                | DELETE       | clear all, or evict older-than-N-days                                                               |
+| `/api/ingest`               | POST         | trigger incremental rescan                                                                          |
 
 #### SQLite schema (Drizzle, `~/.mlx-node/dashboard.db`)
 
@@ -150,14 +150,14 @@ Ingest: full scan on start, then incremental by file mtime; manual refresh endpo
 
 #### UI pages
 
-| Page           | Content                                                                                                  | Actions                                                                  |
-| -------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| Overview       | stat tiles (models/disk, sessions, tokens 7d, cache size + hit rate), recent sessions, active downloads  | —                                                                        |
+| Page           | Content                                                                                                  | Actions                                                                                                |
+| -------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Overview       | stat tiles (models/disk, sessions, tokens 7d, cache size + hit rate), recent sessions, active downloads  | —                                                                                                      |
 | Models         | local table: name, family, quant, size, ctx window                                                       | delete; install from recommended list w/ live progress; cancel/dismiss an in-flight or failed download |
-| Sessions       | table w/ search + filters                                                                                | open, rename, delete, copy resume command (`mlx agent --session <file>`) |
-| Session detail | transcript (collapsible tool calls) + per-turn tokens/tok-s chips + charts                               | —                                                                        |
-| Metrics        | tokens/day (in/out/cached), tok/s + TTFT trends per model, MTP acceptance, model usage share; date range | —                                                                        |
-| Cache          | disk usage vs quota, entry count + age histogram, hit/miss trend                                         | clear all, evict older-than                                              |
+| Sessions       | table w/ search + filters                                                                                | open, rename, delete, copy resume command (`mlx agent --session <file>`)                               |
+| Session detail | transcript (collapsible tool calls) + per-turn tokens/tok-s chips + charts                               | —                                                                                                      |
+| Metrics        | tokens/day (in/out/cached), tok/s + TTFT trends per model, MTP acceptance, model usage share; date range | —                                                                                                      |
+| Cache          | disk usage vs quota, entry count + age histogram, hit/miss trend                                         | clear all, evict older-than                                                                            |
 
 ## Error handling & safety
 

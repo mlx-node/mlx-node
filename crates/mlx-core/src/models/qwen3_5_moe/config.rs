@@ -58,7 +58,8 @@ pub struct Qwen3_5MoeConfig {
     #[napi(ts_type = "number[] | undefined")]
     pub mlp_only_layers: Option<Vec<i32>>,
 
-    // Paged attention options (opt-in, mirror Qwen3/Gemma4/LFM2 knobs).
+    // Paged attention options (default on for compatible checkpoints; explicit
+    // false and MLX_QWEN35_PAGED_OVERRIDE retain the rollback path).
     /// GPU memory budget for paged KV cache in megabytes.
     /// Only used when `use_block_paged_cache` is true.
     /// Default: automatically sized for one full-context sequence.

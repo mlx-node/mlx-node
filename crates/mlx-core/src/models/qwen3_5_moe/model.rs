@@ -702,7 +702,7 @@ impl Qwen35MoeInner {
     /// MoE mirror of the dense post-materialization adaptive paged-pool
     /// initialization.
     pub(crate) fn initialize_paged_adapter(&mut self) -> Result<()> {
-        if !self.config.use_block_paged_cache.unwrap_or(false)
+        if !self.config.use_block_paged_cache.unwrap_or(true)
             || !crate::engine::persistence::compiled_forward_backend_available()
         {
             return Ok(());
@@ -8929,11 +8929,10 @@ pub struct Qwen3_5MoeModel {
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5MoeConfig,
     /// Snapshot of `Qwen35MoeInner::paged_adapter.is_some()` captured at
-    /// construction time. Currently default-OFF on Qwen3.5 MoE
-    /// (parity-pending — see CLAUDE.md and
-    /// `Qwen3_5MoeConfig::use_block_paged_cache`). VLM checkpoints can
-    /// load with the adapter on for text-only inference; image-bearing
-    /// chat turns are rejected at runtime by the chat-entry sites.
+    /// construction time. Compatible Qwen3.5 MoE checkpoints default the
+    /// adapter ON; explicit false and sym8 retain the flat path. VLM
+    /// checkpoints can load with the adapter on for text-only inference;
+    /// image-bearing chat turns are rejected at runtime by the chat-entry sites.
     /// Surfaced through the `hasBlockPagedCache()` NAPI method.
     pub(crate) paged_active: bool,
     /// Snapshot of `Qwen35MoeInner::has_mtp_weights()` captured at
@@ -8965,9 +8964,8 @@ impl Qwen3_5MoeModel {
     ///
     /// `true` iff `Qwen35MoeInner::paged_adapter` was successfully
     /// constructed at load time (driven by
-    /// `Qwen3_5MoeConfig::use_block_paged_cache`, currently default-OFF
-    /// because parity is pending real-weights validation). On VLM
-    /// checkpoints the adapter can still be active for text-only
+    /// `Qwen3_5MoeConfig::use_block_paged_cache`, default-ON for compatible
+    /// checkpoints). On VLM checkpoints the adapter can still be active for text-only
     /// inference; image-bearing chat turns are rejected at runtime by
     /// the chat-entry sites. Surfaced through this NAPI method so
     /// server endpoints can branch on it without round-tripping through

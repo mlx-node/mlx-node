@@ -1991,17 +1991,15 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
             .map(|v| v as u32),
         use_block_paged_cache: {
             let explicit = raw.get("use_block_paged_cache").and_then(|v| v.as_bool());
-            // Vision (VLM) checkpoints default to the block-paged KV backend:
-            // MoE image turns only run on the paged-vision core. When the config
-            // leaves `use_block_paged_cache` unset and a `vision_config` is
-            // present, force paged on. An explicit value is honored as-is; an
-            // explicit `false` leaves the model flat so its image turns are
-            // rejected at dispatch.
-            match explicit {
-                Some(_) => explicit,
-                None if raw.get("vision_config").is_some() => Some(true),
-                None => None,
-            }
+            let env_override = std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok();
+            let resolved = crate::models::qwen3_5::config::resolve_qwen35_paged_default(
+                explicit,
+                env_override.as_deref(),
+            );
+            // Match dense Qwen3.5: paged is the default for compatible text
+            // and vision checkpoints. Explicit false remains a diagnostic
+            // escape hatch; sym8 is forced flat after quant metadata is known.
+            resolved
         },
         // Persist the out-of-pool GDN recurrent state to the SSD cold tier. Off
         // unless explicitly present as a bool (the agent overlay / a config

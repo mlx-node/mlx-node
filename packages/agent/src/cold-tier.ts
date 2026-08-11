@@ -38,10 +38,9 @@ import type { ModelType } from '@mlx-node/lm';
  *
  *  - `qwen3` (dense) sizes its pool over all layers, so the pool holds the
  *    complete KV for the prefix and needs no sidecar.
- *  - `gemma4` now owns full and sliding attention in distinct paged groups.
- *    Its former rotating-cache sidecar cannot represent that grouped layout,
- *    so it remains off this allowlist until all groups can restore one common
- *    content-addressed boundary atomically.
+ *  - `gemma4` owns full and sliding attention in distinct paged groups. The
+ *    full-attention chain is authoritative and one grouped sliding sidecar
+ *    restores every sliding group at the same exact boundary, atomically.
  *  - `qwen3_5` (dense) sizes its pool over the full-attention layers only, but
  *    persists its out-of-pool GDN recurrent state (conv + recurrent) as a
  *    `ColdGroup::GdnState` sidecar, and its `ColdSidecarPolicy` reconciles the
@@ -53,10 +52,9 @@ import type { ModelType } from '@mlx-node/lm';
  *    since been run on `Qwen3.6-35b-a3b-UD-Q2_K_XL-mlx`: the restore reconciled
  *    onto ladder rung 304 of `[16, 64, 304, 1248]` with `hits=42` and
  *    `corruptions=0`, and the text matched a no-persist baseline.
- *  - `lfm2` / `lfm2_moe` keep short-conv state outside the pool with no
- *    serialization path for it at all, AND drive the uniform native adapter
- *    API whose restore branch is already wired to the tier — asking for
- *    persistence on their behalf would restore an incomplete prefix silently.
+ *  - `lfm2` / `lfm2_moe` keep ShortConv state outside the full-attention pool.
+ *    A `ColdGroup::ConvState` sidecar persists that state at the same exact
+ *    boundary; missing or malformed state reconciles down or restarts at zero.
  *
  * Widening this set is a correctness decision, never a perf one, and it is
  * authorized by exactly one thing: the family's native restart-parity gate
@@ -72,7 +70,14 @@ import type { ModelType } from '@mlx-node/lm';
  * {@link coldTierRestoreFamilyList} in `packages/cli/src/commands/agent/index.ts`
  * and asserted by `packages/cli/__test__/agent-cmd.test.ts`.
  */
-export const COLD_TIER_RESTORE_FAMILIES: ReadonlySet<string> = new Set<ModelType>(['qwen3', 'qwen3_5', 'qwen3_5_moe']);
+export const COLD_TIER_RESTORE_FAMILIES: ReadonlySet<string> = new Set<ModelType>([
+  'qwen3',
+  'qwen3_5',
+  'qwen3_5_moe',
+  'gemma4',
+  'lfm2',
+  'lfm2_moe',
+]);
 
 /** Allowlisted families in a stable, human-facing order (help text, API payload). */
 export function coldTierRestoreFamilyList(): string[] {

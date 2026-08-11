@@ -472,13 +472,23 @@ impl Gemma4StepExecutor<'_> {
             }
             None
         };
-        if !terminal
-            && let Some(coordinator) = self.inner.kv_cache_coordinator.as_mut()
-            && let Err(error) = coordinator
-                .eval_pending_pool_writes_all()
-                .and_then(|_| coordinator.prune_sliding_all(row.seq_id).map(|_| ()))
-        {
-            return Ok(Self::fail(turn, row, Error::from_reason(error)));
+        if !terminal {
+            if let Some(coordinator) = self.inner.kv_cache_coordinator.as_mut()
+                && let Err(error) = coordinator.eval_pending_pool_writes_all()
+            {
+                return Ok(Self::fail(turn, row, Error::from_reason(error)));
+            }
+            if let Err(error) = self
+                .inner
+                .remember_grouped_sliding_cold_checkpoint(row.seq_id)
+            {
+                return Ok(Self::fail(turn, row, error));
+            }
+            if let Some(coordinator) = self.inner.kv_cache_coordinator.as_mut()
+                && let Err(error) = coordinator.prune_sliding_all(row.seq_id)
+            {
+                return Ok(Self::fail(turn, row, Error::from_reason(error)));
+            }
         }
 
         turn.payload.profiler.step();
@@ -594,13 +604,22 @@ impl Gemma4StepExecutor<'_> {
             self.inner
                 .run_paged_decode_step_batched(&batch_rows)
                 .and_then(|logits| {
+                    self.inner
+                        .kv_cache_coordinator
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Error::from_reason("Gemma4 batched decode lost its KV coordinator")
+                        })?
+                        .eval_pending_pool_writes_all()
+                        .map_err(Error::from_reason)?;
+                    for &(seq_id, _) in &batch_rows {
+                        self.inner
+                            .remember_grouped_sliding_cold_checkpoint(seq_id)?;
+                    }
                     let coordinator =
                         self.inner.kv_cache_coordinator.as_mut().ok_or_else(|| {
                             Error::from_reason("Gemma4 batched decode lost its KV coordinator")
                         })?;
-                    coordinator
-                        .eval_pending_pool_writes_all()
-                        .map_err(Error::from_reason)?;
                     for &(seq_id, _) in &batch_rows {
                         coordinator
                             .prune_sliding_all(seq_id)
@@ -1314,21 +1333,21 @@ impl Gemma4SchedulerState {
         );
         self.inner
             .set_turn_cancel_flag(Some(Arc::clone(&cancelled)));
-        let cached_prefix = match self
-            .inner
-            .kv_cache_coordinator
-            .as_mut()
-            .expect("Gemma4 scheduled route requires coordinator")
-            .prepare_scheduled_request(seq_id, &admitted.tokens)
-        {
+        let cached_prefix = match self.inner.prepare_scheduled_text_request(
+            seq_id,
+            &admitted.tokens,
+            admitted.params.cache_salt,
+            true,
+        ) {
             Ok(prefix) if prefix < admitted.tokens.len() as u32 => prefix,
             Ok(_) => {
-                let coordinator = self
+                let reset = self
                     .inner
                     .kv_cache_coordinator
                     .as_mut()
-                    .expect("Gemma4 scheduled route requires coordinator");
-                match coordinator.reset_scheduled_request(seq_id) {
+                    .ok_or_else(|| "Gemma4 scheduled route lost its KV coordinator".to_string())
+                    .and_then(|coordinator| coordinator.reset_scheduled_request(seq_id));
+                match reset {
                     Ok(()) => 0,
                     Err(error) => {
                         if newly_assigned {
@@ -1345,7 +1364,7 @@ impl Gemma4SchedulerState {
                     self.owner_sequences.remove(&owner_id);
                 }
                 self.inner.set_turn_cancel_flag(None);
-                Self::reply_error(response, cancelled.as_ref(), Error::from_reason(error));
+                Self::reply_error(response, cancelled.as_ref(), error);
                 return;
             }
         };
@@ -1408,6 +1427,11 @@ impl Gemma4SchedulerState {
                 .min(prompt_tokens_len(&payload.prompt_tokens));
             pinned_prefill_breaks.push(boundary);
         }
+        pinned_prefill_breaks.extend(self.inner.scheduled_cold_anchor_rungs().into_iter().filter(
+            |&rung| rung > cached_prefix && rung < prompt_tokens_len(&payload.prompt_tokens),
+        ));
+        pinned_prefill_breaks.sort_unstable();
+        pinned_prefill_breaks.dedup();
         let turn = TurnState::new(
             seq_id,
             admitted.tokens,
@@ -1535,12 +1559,12 @@ impl Gemma4SchedulerState {
             self.finish_completed(turn);
             return;
         };
-        let result = self
-            .inner
-            .kv_cache_coordinator
-            .as_mut()
-            .expect("Gemma4 preemption requires coordinator")
-            .prepare_scheduled_request(turn.seq_id, &replay.tokens);
+        let result = self.inner.prepare_scheduled_text_request(
+            turn.seq_id,
+            &replay.tokens,
+            turn.payload.params.cache_salt,
+            true,
+        );
         match result {
             Ok(cached) => {
                 replay.cached_prefix = cached;
@@ -1554,13 +1578,21 @@ impl Gemma4SchedulerState {
                         .min(target);
                     turn.pinned_prefill_breaks.push(boundary);
                 }
+                turn.pinned_prefill_breaks.extend(
+                    self.inner
+                        .scheduled_cold_anchor_rungs()
+                        .into_iter()
+                        .filter(|&rung| rung > cached && rung < target),
+                );
+                turn.pinned_prefill_breaks.sort_unstable();
+                turn.pinned_prefill_breaks.dedup();
                 self.scheduler.ready_preempted(turn, false);
             }
-            Err(error) if is_paged_allocation_blocked(&error) => {
+            Err(error) if is_paged_allocation_blocked(&error.reason) => {
                 self.scheduler.prepend_preempted(turn);
             }
             Err(error) => {
-                turn.payload.failure = Some(Error::from_reason(error));
+                turn.payload.failure = Some(error);
                 self.finish_completed(turn);
             }
         }

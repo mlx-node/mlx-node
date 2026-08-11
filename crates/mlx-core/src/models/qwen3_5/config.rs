@@ -47,6 +47,22 @@ pub(crate) fn qwen35_resolve_paged_cache_memory_mb(
     }
 }
 
+/// Resolve the shared dense/MoE Qwen3.5 paged-cache policy.
+///
+/// The environment override is intentionally an input rather than read here:
+/// both loaders use this pure function, and unit tests can pin precedence
+/// without mutating process-global environment state.
+pub(crate) fn resolve_qwen35_paged_default(
+    explicit: Option<bool>,
+    env_override: Option<&str>,
+) -> Option<bool> {
+    match env_override {
+        Some("1") | Some("true") | Some("TRUE") => Some(true),
+        Some("0") | Some("false") | Some("FALSE") => Some(false),
+        _ => Some(explicit.unwrap_or(true)),
+    }
+}
+
 /// Qwen3.5 model configuration (dense variant).
 ///
 /// For MoE models, use `Qwen3_5MoeConfig` from `qwen3_5_moe`.
@@ -88,7 +104,7 @@ pub struct Qwen3_5Config {
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
 
-    // Paged attention options (opt-in, mirror Qwen3/Gemma4/LFM2 knobs).
+    // Paged attention options (default-on, mirror Qwen3/Gemma4/LFM2 knobs).
     /// GPU memory budget for paged KV cache in megabytes.
     /// Only used when `use_block_paged_cache` is true.
     /// Default: automatically sized for one full-context sequence.
@@ -106,7 +122,7 @@ pub struct Qwen3_5Config {
     /// Use the block-paged KV cache adapter (`PagedKVCacheAdapter`) for
     /// full-attention layers.
     ///
-    /// **OPT-IN — experimental.** When `Some(true)`, `Qwen35Inner`
+    /// When enabled (the default), `Qwen35Inner`
     /// allocates a `BlockAllocator` + `LayerKVPool` pair sized for the
     /// model's full-attention layer count and constructs a
     /// `PagedKVCacheAdapter`. The chat-session forward dispatch routes
@@ -117,12 +133,12 @@ pub struct Qwen3_5Config {
     /// prefix reuse for recurrent layers" stance.
     ///
     /// **Paged vs flat eager**: this flag selects the eager paged decode
-    /// over the eager flat decode. When `Some(true)`, full-attention
+    /// over the eager flat decode. When enabled, full-attention
     /// layers run through the paged adapter (cross-request prefix reuse);
-    /// when unset, they run the eager flat decode. Either way the forward
-    /// is pure-Rust eager.
+    /// an explicit false runs eager flat decode. Either way the forward is
+    /// pure-Rust eager.
     ///
-    /// **VLM under paged**: a VLM checkpoint defaults this flag ON at load, so
+    /// **VLM under paged**: VLM checkpoints also default this flag ON, so
     /// dense image turns ONLY run on the paged-vision core. A fresh single-turn
     /// image-bearing prompt prefills through the paged adapter (M-RoPE positions
     /// feed the rotary; the merged vision embeddings feed the forward) and
@@ -132,8 +148,9 @@ pub struct Qwen3_5Config {
     /// that reaches a None adapter (explicit `Some(false)`, non-Metal build, or
     /// a sym8 checkpoint) errors at dispatch.
     ///
-    /// Default: `None` for text-only checkpoints (eager flat decode);
-    /// `Some(true)` for VLM checkpoints (block-paged, set in `parse_config`).
+    /// Load default: `Some(true)` for compatible text and VLM checkpoints.
+    /// Explicit false remains available for flat-path diagnostics; sym8 is
+    /// forced flat by persistence after its storage mode is known.
     #[serde(default)]
     #[napi(ts_type = "boolean | undefined")]
     pub use_block_paged_cache: Option<bool>,
@@ -264,6 +281,7 @@ impl Qwen3_5Config {
 mod tests {
     use super::{
         Qwen3_5Config, qwen35_default_paged_cache_memory_mb, qwen35_resolve_paged_cache_memory_mb,
+        resolve_qwen35_paged_default,
     };
     use mlx_paged_attn::PagedAttentionConfig;
 
@@ -318,6 +336,24 @@ mod tests {
         };
         // Two linear layers. conv=[3, (1*4)*2 + (2*3)=14], recurrent=[2,3,4].
         assert_eq!(config.recurrent_state_bytes(), 2 * (3 * 14 + 2 * 3 * 4) * 2);
+    }
+
+    #[test]
+    fn paged_default_and_override_precedence_match_dense_and_moe() {
+        assert_eq!(resolve_qwen35_paged_default(None, None), Some(true));
+        assert_eq!(resolve_qwen35_paged_default(Some(false), None), Some(false));
+        assert_eq!(
+            resolve_qwen35_paged_default(Some(false), Some("1")),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_qwen35_paged_default(Some(true), Some("0")),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_qwen35_paged_default(None, Some("unexpected")),
+            Some(true)
+        );
     }
 
     #[test]

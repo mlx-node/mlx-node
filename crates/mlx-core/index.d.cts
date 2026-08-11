@@ -1205,11 +1205,10 @@ export declare class Qwen35Model {
    *
    * `true` iff `Qwen35Inner::paged_adapter` was successfully
    * constructed at load time (driven by
-   * `Qwen3_5Config::use_block_paged_cache`, default-OFF for text-only
-   * checkpoints because parity is pending real-weights validation, and
-   * default-ON for VLM checkpoints). On VLM checkpoints dense image turns
-   * ONLY run on the paged-vision core; a vision turn that reaches a None
-   * adapter errors at dispatch. Surfaced through this NAPI method so
+   * `Qwen3_5Config::use_block_paged_cache`, default-ON for every compatible
+   * checkpoint). On VLM checkpoints dense image turns ONLY run on the
+   * paged-vision core; a vision turn that reaches a None adapter errors at
+   * dispatch. Surfaced through this NAPI method so
    * server endpoints can branch on it without round-tripping through
    * the model thread.
    */
@@ -1373,9 +1372,8 @@ export declare class Qwen35MoeModel {
    *
    * `true` iff `Qwen35MoeInner::paged_adapter` was successfully
    * constructed at load time (driven by
-   * `Qwen3_5MoeConfig::use_block_paged_cache`, currently default-OFF
-   * because parity is pending real-weights validation). On VLM
-   * checkpoints the adapter can still be active for text-only
+   * `Qwen3_5MoeConfig::use_block_paged_cache`, default-ON for compatible
+   * checkpoints). On VLM checkpoints the adapter can still be active for text-only
    * inference; image-bearing chat turns are rejected at runtime by
    * the chat-entry sites. Surfaced through this NAPI method so
    * server endpoints can branch on it without round-tripping through
@@ -3911,6 +3909,12 @@ export interface Lfm2Config {
    */
   useBlockPagedCache?: boolean | undefined;
   /**
+   * Persist block-paged attention state and the co-keyed short-convolution
+   * sidecar to the SSD cold tier. Explicit config overrides the process-wide
+   * `MLX_PERSIST_PAGED_CACHE` default.
+   */
+  persistPagedCache?: boolean | undefined;
+  /**
    * MLP intermediate size for the DENSE-in-MoE layers (`layer_idx <
    * num_dense_layers`). Used DIRECTLY (no 2/3 `computed_ff_dim()` shrink).
    * Only present on MoE checkpoints.
@@ -4358,7 +4362,7 @@ export interface Qwen35Config {
    * Use the block-paged KV cache adapter (`PagedKVCacheAdapter`) for
    * full-attention layers.
    *
-   * **OPT-IN — experimental.** When `Some(true)`, `Qwen35Inner`
+   * When enabled (the default), `Qwen35Inner`
    * allocates a `BlockAllocator` + `LayerKVPool` pair sized for the
    * model's full-attention layer count and constructs a
    * `PagedKVCacheAdapter`. The chat-session forward dispatch routes
@@ -4369,12 +4373,12 @@ export interface Qwen35Config {
    * prefix reuse for recurrent layers" stance.
    *
    * **Paged vs flat eager**: this flag selects the eager paged decode
-   * over the eager flat decode. When `Some(true)`, full-attention
+   * over the eager flat decode. When enabled, full-attention
    * layers run through the paged adapter (cross-request prefix reuse);
-   * when unset, they run the eager flat decode. Either way the forward
-   * is pure-Rust eager.
+   * an explicit false runs eager flat decode. Either way the forward is
+   * pure-Rust eager.
    *
-   * **VLM under paged**: a VLM checkpoint defaults this flag ON at load, so
+   * **VLM under paged**: VLM checkpoints also default this flag ON, so
    * dense image turns ONLY run on the paged-vision core. A fresh single-turn
    * image-bearing prompt prefills through the paged adapter (M-RoPE positions
    * feed the rotary; the merged vision embeddings feed the forward) and
@@ -4384,8 +4388,9 @@ export interface Qwen35Config {
    * that reaches a None adapter (explicit `Some(false)`, non-Metal build, or
    * a sym8 checkpoint) errors at dispatch.
    *
-   * Default: `None` for text-only checkpoints (eager flat decode);
-   * `Some(true)` for VLM checkpoints (block-paged, set in `parse_config`).
+   * Load default: `Some(true)` for compatible text and VLM checkpoints.
+   * Explicit false remains available for flat-path diagnostics; sym8 is
+   * forced flat by persistence after its storage mode is known.
    */
   useBlockPagedCache?: boolean | undefined;
   /**

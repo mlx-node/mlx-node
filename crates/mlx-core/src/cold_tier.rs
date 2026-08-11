@@ -388,7 +388,7 @@ pub(crate) fn sidecar_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
 /// Model families whose paged prefix blocks can be restored from the SSD
 /// cold tier soundly. The single source of truth on the native side, and the
 /// exact mirror of `COLD_TIER_RESTORE_FAMILIES` in
-/// `packages/agent/src/provider/model-host.ts`; the two gate the same
+/// `packages/agent/src/cold-tier.ts`; the two gate the same
 /// decision from opposite ends, so a test asserts they never drift.
 ///
 /// A family belongs here only when EVERY piece of per-token state its forward
@@ -400,10 +400,10 @@ pub(crate) fn sidecar_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
 ///  * `qwen3` (dense) sizes its pool over all layers, so the pool holds the
 ///    complete KV for the prefix and needs no sidecar
 ///    (`ColdTierContext::sidecar_policy` is `None`).
-///  * `gemma4` now owns both full- and sliding-attention state in separate
-///    paged groups. Its former rotating-cache sidecar cannot represent that
-///    grouped layout, so cold restore stays fail-closed until persistence can
-///    reconcile a common content-addressed boundary across every group.
+///  * `gemma4` owns full- and sliding-attention state in separate paged groups.
+///    The full-attention chain is the authority; a `ColdGroup::SlidingWindow`
+///    sidecar stores every sliding group at the same exact block boundary. A
+///    restore installs every group atomically or discards the candidate.
 ///  * `qwen3_5` (dense) sizes its pool over the full-attention layers only, but
 ///    persists its out-of-pool GDN recurrent state (conv + recurrent) as a
 ///    `ColdGroup::GdnState` sidecar (`crate::models::qwen3_5::gdn_sidecar`). A
@@ -419,16 +419,23 @@ pub(crate) fn sidecar_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
 ///    the ladder `[16, 64, 304, 1248]` with `hits=42`, `corruptions=0`, and text
 ///    matching a no-persist baseline
 ///    (`crates/mlx-core/tests/qwen3_5_moe_cold_tier_parity.rs`).
-///  * `lfm2` / `lfm2_moe` keep short-conv state outside the pool with no
-///    serialization path for it at all, AND drive the uniform adapter API
-///    whose restore branch is already wired to the tier — attaching a context
-///    to them would restore an incomplete prefix silently.
+///  * `lfm2` / `lfm2_moe` keep ShortConv recurrent state outside the full-
+///    attention pool. `ColdGroup::ConvState` serializes that state at the same
+///    exact boundary as the K/V chain, so missing or malformed auxiliary state
+///    reconciles to a smaller backed boundary or zero.
 ///
 /// Widening this list is a correctness decision, never a perf one, and it is
 /// authorized by exactly one thing: the family's restart-parity gate
 /// (`crates/mlx-core/tests/cold_tier_parity_harness.rs`) passing on real
 /// weights with `hits > 0` and `corruptions == 0`.
-const COLD_RESTORE_FAMILIES: &[&str] = &["qwen3", "qwen3_5", "qwen3_5_moe"];
+const COLD_RESTORE_FAMILIES: &[&str] = &[
+    "qwen3",
+    "qwen3_5",
+    "qwen3_5_moe",
+    "gemma4",
+    "lfm2",
+    "lfm2_moe",
+];
 
 /// Whether the cold tier may restore persisted paged blocks for `model_type`
 /// (see [`COLD_RESTORE_FAMILIES`]). Fails closed: an unknown or misspelled
@@ -1189,10 +1196,9 @@ mod tests {
     fn cold_restore_allowlist_covers_gated_families_only() {
         // Dense: the pool holds the whole prefix.
         assert!(cold_restore_supported("qwen3"));
-        // Gemma4's grouped full/sliding paged layout has no atomic multi-group
-        // cold restore contract yet. The former rotating sidecar is obsolete.
-        assert!(!cold_restore_supported("gemma4"));
-        assert!(!resolve_persist_cold("gemma4", Some("1"), Some(true)));
+        // Gemma4 restores full and sliding groups at one exact boundary.
+        assert!(cold_restore_supported("gemma4"));
+        assert!(resolve_persist_cold("gemma4", Some("1"), Some(true)));
         // Hybrid, admitted only because its out-of-pool GDN recurrent state is
         // persisted as a `ColdGroup::GdnState` sidecar AND its restart-parity
         // gate passes on real weights
@@ -1204,14 +1210,11 @@ mod tests {
         // (`crates/mlx-core/tests/qwen3_5_moe_cold_tier_parity.rs`) — sharing a
         // codec with a passing family is not evidence, so the MoE ran its own.
         assert!(cold_restore_supported("qwen3_5_moe"));
-        // Every remaining family still keeps per-token state outside the paged
-        // pool with no cold-tier attach wired. lfm2 / lfm2_moe matter most:
-        // they drive the uniform adapter API whose restore branch is already
-        // wired to the tier, so admitting them would corrupt output rather
-        // than merely slow it down.
+        // LFM2 dense and MoE share the same exact-boundary ShortConv codec.
+        assert!(cold_restore_supported("lfm2"));
+        assert!(cold_restore_supported("lfm2_moe"));
+        // Unknown spellings still fail closed.
         for family in [
-            "lfm2",
-            "lfm2_moe",
             // Fails closed on anything unrecognized, including near-misses.
             "Qwen3",
             "qwen3 ",
@@ -1234,7 +1237,10 @@ mod tests {
             vec![
                 "qwen3".to_string(),
                 "qwen3_5".to_string(),
-                "qwen3_5_moe".to_string()
+                "qwen3_5_moe".to_string(),
+                "gemma4".to_string(),
+                "lfm2".to_string(),
+                "lfm2_moe".to_string()
             ]
         );
     }

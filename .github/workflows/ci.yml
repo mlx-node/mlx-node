@@ -337,8 +337,10 @@ jobs:
               --test lfm2_paged_vs_flat_parity
               --test lfm2_session
               --test lfm2_concurrent_batched_parity
+              --test lfm2_cold_tier_parity
           # gemma4 QAT (wNa8o8): convert the prequantized source and run the
-          # single-instance TS e2e coherence test (text + vision on examples/ocr.png).
+          # single-instance TS e2e coherence test (text + vision on examples/ocr.png)
+          # plus grouped full/sliding SSD restart parity.
           # PR-opt-in only — the run step skips it on the push/release gate.
           - name: gemma4
             model: google/gemma-4-E2B-it-qat-mobile-transformers
@@ -427,6 +429,10 @@ jobs:
             # checkpoint and run the single test file through Vitest.
             yarn build:ts
             GEMMA4_QAT_MODEL_PATH="$ckpt" yarn test ${{ matrix.tests }}
+            MLX_PAGED_PREFILL_CHUNK_SIZE=64 MLX_TEST_MODEL_PATH="$ckpt" \
+              cargo test -p mlx-core --test gemma4_grouped_cold_tier_parity \
+                -- --ignored --exact --test-threads=1 --nocapture \
+                gemma4_grouped_cold_tier_restart_parity
           else
             # cargo leg: point this family's gating env var(s) at the converted
             # checkpoint so the #[ignore]'d tests un-skip; `-- --ignored` runs only those.

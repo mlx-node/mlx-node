@@ -66,7 +66,6 @@
 use mlx_paged_attn::{ColdGroup, ColdSidecarLayout, ColdSidecarPolicy};
 use napi::bindgen_prelude::*;
 
-#[cfg(test)]
 use crate::array::DType;
 use crate::array::MxArray;
 use crate::transformer::rotating_kv_cache::RotatingKVCacheSnapshot;
@@ -249,6 +248,98 @@ fn layout_carrying(
 pub(crate) fn policy(config: &Gemma4Config) -> Option<ColdSidecarPolicy> {
     let geo = geometry(config)?;
     ColdSidecarPolicy::new_boundary_scaled(template_layout(&geo), 2).ok()
+}
+
+/// Encode the live K/V suffix read from a paged sliding-group adapter.
+/// Arrays are layer-major and shaped `[1, kv_heads, live_tokens, head_dim]`.
+pub(crate) fn encode_layer_kv(
+    geo: &SlidingSidecarGeometry,
+    layer_kv: &[(MxArray, MxArray)],
+    boundary_tokens: u32,
+) -> Result<Option<Vec<Vec<u8>>>> {
+    if layer_kv.len() != geo.physical_layers as usize || boundary_tokens == 0 {
+        return Ok(None);
+    }
+    let cached = payload_tokens(geo, boundary_tokens);
+    let Some(elements) = geo.elements_per_tensor(cached) else {
+        return Ok(None);
+    };
+    let expected_shape = [
+        1i64,
+        geo.kv_heads as i64,
+        cached as i64,
+        geo.head_dim as i64,
+    ];
+    let mut tensors = Vec::with_capacity(layer_kv.len() * TENSORS_PER_LAYER as usize);
+    for (keys, values) in layer_kv {
+        for array in [keys, values] {
+            if array.dtype()? != DType::BFloat16
+                || array.shape()?.as_ref() != expected_shape.as_slice()
+            {
+                return Ok(None);
+            }
+            let raw = array.to_uint16_native()?;
+            if raw.len() != elements {
+                return Ok(None);
+            }
+            tensors.push(
+                raw.into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    Ok(Some(tensors))
+}
+
+/// Decode a validated sidecar into the exact arrays consumed by
+/// `PagedKVCacheAdapter::restore_sliding_prefix_for`.
+pub(crate) fn decode_layer_kv(
+    geo: &SlidingSidecarGeometry,
+    tensors: &[Vec<u8>],
+    boundary_tokens: u32,
+) -> Result<Option<Vec<(MxArray, MxArray)>>> {
+    if boundary_tokens == 0
+        || tensors.len() != geo.physical_layers as usize * TENSORS_PER_LAYER as usize
+    {
+        return Ok(None);
+    }
+    let cached = payload_tokens(geo, boundary_tokens);
+    let Some(elements) = geo.elements_per_tensor(cached) else {
+        return Ok(None);
+    };
+    let shape = [
+        1i64,
+        geo.kv_heads as i64,
+        cached as i64,
+        geo.head_dim as i64,
+    ];
+    let mut layer_kv = Vec::with_capacity(geo.physical_layers as usize);
+    for pair in tensors.chunks_exact(TENSORS_PER_LAYER as usize) {
+        let mut arrays = Vec::with_capacity(TENSORS_PER_LAYER as usize);
+        for bytes in pair {
+            if bytes.len() != elements * std::mem::size_of::<u16>() {
+                return Ok(None);
+            }
+            let raw = bytes
+                .chunks_exact(2)
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .collect::<Vec<_>>();
+            arrays.push(MxArray::from_bfloat16(&raw, &shape)?);
+        }
+        let mut arrays = arrays.into_iter();
+        let Some(keys) = arrays.next() else {
+            return Ok(None);
+        };
+        let Some(values) = arrays.next() else {
+            return Ok(None);
+        };
+        if arrays.next().is_some() {
+            return Ok(None);
+        }
+        layer_kv.push((keys, values));
+    }
+    Ok(Some(layer_kv))
 }
 
 /// Whether `boundary_tokens` is representable by this policy: a positive
