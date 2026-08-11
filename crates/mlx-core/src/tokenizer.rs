@@ -57,10 +57,9 @@ const IM_END_TOKEN_ID: u32 = 151645;
 /// Valid roles for ChatML format (prevents role injection attacks)
 const VALID_CHATML_ROLES: &[&str] = &["system", "user", "assistant", "tool", "developer"];
 
-/// How much of a refused tool name [`Qwen3Tokenizer::validate_tool_name`] quotes
-/// back. The name is caller-supplied and unbounded; an error message is not the
-/// place to echo a megabyte of it.
-const TOOL_NAME_IN_ERROR_CHARS: usize = 80;
+/// How much of a caller-supplied string a refusal message quotes back — see
+/// [`Qwen3Tokenizer::bounded_for_error`]. These strings are unbounded.
+const CALLER_TEXT_IN_ERROR_CHARS: usize = 80;
 
 /// Muse-Glimmer control markers that must never survive inside caller-supplied
 /// content, fed to [`Qwen3Tokenizer::sanitize_marker_content`].
@@ -1430,28 +1429,45 @@ impl Qwen3Tokenizer {
                             calls
                                 .iter()
                                 .map(|call| {
-                                    Self::validate_tool_name(&call.name, control_markers)?;
+                                    Self::validate_identifier(
+                                        "tool name",
+                                        &call.name,
+                                        control_markers,
+                                    )?;
+                                    // An IDENTIFIER, so refused rather than
+                                    // rewritten: this id is matched against a tool
+                                    // result's `tool_call_id` to resolve a function
+                                    // name, and neutralising is not injective, so two
+                                    // distinct ids could collapse and misattribute a
+                                    // result. Refusing also means both sides of that
+                                    // match see identical bytes.
+                                    if let Some(id) = call.id.as_deref() {
+                                        Self::validate_identifier(
+                                            "tool call id",
+                                            id,
+                                            control_markers,
+                                        )?;
+                                    }
                                     Ok(ToolCall {
-                                        // Not a render site, but neutralised anyway
-                                        // — and it has to be the SAME transform
-                                        // [`serialize_messages_for_jinja`] applies
-                                        // to `tool_call_id`, or the id match that
-                                        // resolves a tool result's name would stop
-                                        // agreeing and the template would fall back
-                                        // to printing the raw id.
-                                        id: call.id.as_deref().map(neutralise),
-                                        // Validated above; never rewritten.
+                                        // Both validated above; neither is rewritten.
+                                        id: call.id.clone(),
                                         name: call.name.clone(),
                                         arguments: Self::sanitize_json_string_field(
                                             &call.arguments,
                                             control_markers,
-                                        ),
+                                        )?,
                                     })
                                 })
                                 .collect::<std::result::Result<Vec<ToolCall>, String>>()
                         })
                         .transpose()?,
-                    tool_call_id: msg.tool_call_id.as_deref().map(neutralise),
+                    // The other half of the id match — same rule, same reason.
+                    tool_call_id: {
+                        if let Some(id) = msg.tool_call_id.as_deref() {
+                            Self::validate_identifier("tool call id", id, control_markers)?;
+                        }
+                        msg.tool_call_id.clone()
+                    },
                     is_error: msg.is_error,
                     reasoning_content: msg.reasoning_content.as_deref().map(neutralise),
                     thinking_enabled: msg.thinking_enabled,
@@ -1516,7 +1532,11 @@ impl Qwen3Tokenizer {
                 tools
                     .iter()
                     .map(|tool| {
-                        Self::validate_tool_name(&tool.function.name, control_markers)?;
+                        Self::validate_identifier(
+                            "tool name",
+                            &tool.function.name,
+                            control_markers,
+                        )?;
                         Ok(ToolDefinition {
                             // Not a render site; see the field invariant on
                             // [`Self::sanitize_messages`].
@@ -1525,20 +1545,38 @@ impl Qwen3Tokenizer {
                                 // Validated above; never rewritten.
                                 name: tool.function.name.clone(),
                                 description: tool.function.description.as_deref().map(neutralise),
-                                parameters: tool.function.parameters.as_ref().map(|params| {
-                                    FunctionParameters {
-                                        r#type: neutralise(&params.r#type),
-                                        // A JSON document, so keys and values at
-                                        // every depth — `required` is a plain list
-                                        // of parameter names.
-                                        properties: params.properties.as_deref().map(|props| {
-                                            Self::sanitize_json_string_field(props, control_markers)
-                                        }),
-                                        required: params.required.as_ref().map(|names| {
-                                            names.iter().map(|n| neutralise(n)).collect()
-                                        }),
-                                    }
-                                }),
+                                parameters: tool
+                                    .function
+                                    .parameters
+                                    .as_ref()
+                                    .map(|params| -> std::result::Result<_, String> {
+                                        Ok(FunctionParameters {
+                                            r#type: neutralise(&params.r#type),
+                                            // A JSON document, so keys and values at
+                                            // every depth, and a key collision is
+                                            // refused rather than resolved.
+                                            properties: params
+                                                .properties
+                                                .as_deref()
+                                                .map(|props| {
+                                                    Self::sanitize_json_string_field(
+                                                        props,
+                                                        control_markers,
+                                                    )
+                                                })
+                                                .transpose()?,
+                                            // Parameter NAMES, neutralised with the
+                                            // identical transform the `properties`
+                                            // keys get, so the two keep agreeing.
+                                            // Non-injective, but this is a LIST: a
+                                            // collision duplicates an entry rather
+                                            // than dropping one, so nothing is lost.
+                                            required: params.required.as_ref().map(|names| {
+                                                names.iter().map(|n| neutralise(n)).collect()
+                                            }),
+                                        })
+                                    })
+                                    .transpose()?,
                             },
                         })
                     })
@@ -1547,46 +1585,66 @@ impl Qwen3Tokenizer {
             .transpose()
     }
 
-    /// Refuse a tool/function name that carries a control marker.
+    /// Refuse an IDENTIFIER field that carries a control marker. `kind` names the
+    /// field for the error message (`"tool name"`, `"tool call id"`).
     ///
-    /// A name is an IDENTIFIER, not prose, so the answer is not to escape it. The
-    /// Muse-Glimmer template renders a name at three sites with no `tojson` at all
-    /// — `'<|start|>assistant to=' + tc.function.name`, `'<atem:invoke name="' +
-    /// tc.function.name + '">'`, and the `# Valid recipients: "<ns>.*"` line — plus
-    /// two `tojson`'d ones in the schema block, which a marker survives anyway.
+    /// An identifier is not prose, so the answer is not to escape it — and for these
+    /// fields it cannot be, because [`Self::sanitize_marker_content`] substitutes one
+    /// space per marker and that is **not injective**. Two distinct values can
+    /// collapse into one, and for an identifier a collapse is a correctness bug, not
+    /// a cosmetic one:
     ///
-    /// Rewriting instead of refusing would break two things that are already load
-    /// bearing elsewhere in this family:
+    /// - **Tool names.** The Muse-Glimmer template renders a name at three sites with
+    ///   no `tojson` at all — `'<|start|>assistant to=' + tc.function.name`,
+    ///   `'<atem:invoke name="' + tc.function.name + '">'`, and the
+    ///   `# Valid recipients: "<ns>.*"` line — plus two `tojson`'d ones in the schema
+    ///   block, which a marker survives anyway. `output_parser.rs` then accepts an
+    ///   `<atem:invoke name=…>` only when the name equals the recipient it appeared
+    ///   under, so rewriting the name in the prompt while the model echoes what it
+    ///   was trained on desynchronises the two halves of that check. And
+    ///   `stream_guard.rs` sizes its header allowance from the longest **configured**
+    ///   recipient (a 107-character name yields a 129-character anchored header), so
+    ///   a rewrite that shortens a name moves a bound derived from the caller's own
+    ///   tool list.
+    /// - **Call ids.** `serialize_messages_for_jinja` resolves a tool result's
+    ///   function name by matching `tool_call_id` against a prior `tool_calls[].id`,
+    ///   and its map is last-writer-wins. Measured on the round-1 code:
+    ///   `call<|eot|>1` (answering `wx.forecast`) and `call 1` (answering `db.query`)
+    ///   both normalised to `call 1`, and a result answering the FIRST resolved to
+    ///   `db.query` — a tool result attributed to the wrong tool. Neither input was a
+    ///   duplicate; the sanitizer manufactured the collision.
     ///
-    /// - `output_parser.rs` accepts an `<atem:invoke name=…>` only when the name
-    ///   equals the recipient of the message it appeared under. Rewriting the name
-    ///   in the prompt while the model echoes what it was trained on desynchronises
-    ///   the two halves of that check.
-    /// - `stream_guard.rs` sizes its header allowance from the longest **configured**
-    ///   recipient (a 107-character name yields a 129-character anchored header).
-    ///   Substituting a space per marker shortens a name, so a rewrite would move a
-    ///   bound that is derived from the caller's own tool list.
-    ///
-    /// Refusal changes no length and no identity, and nothing legitimate puts
-    /// `<|start|>` inside a function name.
+    /// Refusal changes no length and no identity. It also dissolves a coupling rather
+    /// than adding one: because ids are never rewritten, both sides of that
+    /// resolution match see identical bytes, so "the two transforms must agree" is
+    /// trivially true instead of an invariant to maintain.
     ///
     /// `Ok(())` unconditionally when `markers` is empty, which is every family but
     /// this one — no other family's prompt can be refused here.
-    fn validate_tool_name(name: &str, markers: &[&str]) -> std::result::Result<(), String> {
+    fn validate_identifier(
+        kind: &str,
+        value: &str,
+        markers: &[&str],
+    ) -> std::result::Result<(), String> {
         for marker in markers {
-            if name.contains(marker) {
-                // The caller controls this string's length, so bound what the error
-                // quotes back.
-                let shown: String = name.chars().take(TOOL_NAME_IN_ERROR_CHARS).collect();
+            if value.contains(marker) {
                 return Err(format!(
-                    "invalid tool name {shown:?}: it contains the control marker {marker:?}, which \
-                     this checkpoint's vocabulary encodes to a real control token — rendered, it \
-                     would forge a turn boundary in the prompt. Tool names are identifiers, not \
-                     prose, so they are validated rather than escaped: fix the name."
+                    "invalid {kind} {:?}: it contains the control marker {marker:?}, which this \
+                     checkpoint's vocabulary encodes to a real control token — rendered, it would \
+                     forge a turn boundary in the prompt. This field is an identifier, not prose, \
+                     so it is validated rather than escaped: neutralising it would let two \
+                     distinct values collapse into one. Fix the value.",
+                    Self::bounded_for_error(value),
                 ));
             }
         }
         Ok(())
+    }
+
+    /// Caller strings are unbounded; an error message is not the place to echo a
+    /// megabyte of one.
+    fn bounded_for_error(value: &str) -> String {
+        value.chars().take(CALLER_TEXT_IN_ERROR_CHARS).collect()
     }
 
     /// Neutralise every marker in a JSON document's string KEYS and string VALUES,
@@ -1603,7 +1661,25 @@ impl Qwen3Tokenizer {
     /// Hence: recurse, and cover keys. Depth is bounded by serde_json's own
     /// 128-level recursion limit on `from_str` — a deeper document never parses, so
     /// it never reaches here.
-    fn sanitize_json_markers(value: &mut serde_json::Value, markers: &[&str]) -> bool {
+    ///
+    /// # Errs on a manufactured key collision
+    ///
+    /// A key is neutralised, not refused, because a parameter name has no routing
+    /// authority and because `required` names the same strings and must keep agreeing
+    /// with `properties` — both sides get the identical transform. But space
+    /// substitution is not injective, so two DISTINCT keys can normalise to one.
+    /// Measured on the round-1 code: `{"city<|eot|>": 1, "city ": 2}` parses to two
+    /// keys and came back as `{"city ":2}` — one parameter silently dropped and its
+    /// value replaced. A dropped argument is a wrong tool call, so refuse instead of
+    /// picking a winner, and do not invent a suffixing scheme.
+    ///
+    /// This can only fire on a collision the sanitizer *created*: `serde_json`
+    /// already collapses genuinely duplicate input keys at parse time, so by the time
+    /// a `Map` reaches here its keys are distinct.
+    fn sanitize_json_markers(
+        value: &mut serde_json::Value,
+        markers: &[&str],
+    ) -> std::result::Result<bool, String> {
         match value {
             serde_json::Value::String(text) => {
                 let clean = Self::sanitize_marker_content(text, markers);
@@ -1611,7 +1687,7 @@ impl Qwen3Tokenizer {
                 if changed {
                     *text = clean;
                 }
-                changed
+                Ok(changed)
             }
             serde_json::Value::Array(items) => {
                 // An explicit loop, and NOT `.any(…)` however loudly clippy asks for
@@ -1621,32 +1697,45 @@ impl Qwen3Tokenizer {
                 // two-element list in `arguments_with` exists to catch exactly that.
                 let mut changed = false;
                 for item in items {
-                    changed |= Self::sanitize_json_markers(item, markers);
+                    changed |= Self::sanitize_json_markers(item, markers)?;
                 }
-                changed
+                Ok(changed)
             }
             serde_json::Value::Object(map) => {
                 // Rebuilt rather than mutated: `Map` exposes no key rename. Order is
                 // preserved because `serde_json` is built with `preserve_order` and
                 // the rendered ATEM parameter order has to match the caller's.
-                //
-                // Two keys that differ only inside a marker collapse to one, which
-                // drops a parameter. That needs a caller who sent two keys differing
-                // only in a control marker, and losing a duplicate is what a
-                // duplicate JSON key does anyway.
                 let mut changed = false;
                 let mut rebuilt = serde_json::Map::new();
+                // Normalised key -> the original it came from, so a collision can
+                // name BOTH sides. Naming only the second is not enough: the marker
+                // may live in the first, as it does in the fixture above.
+                let mut origin: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
                 for (key, mut val) in std::mem::take(map) {
-                    changed |= Self::sanitize_json_markers(&mut val, markers);
+                    changed |= Self::sanitize_json_markers(&mut val, markers)?;
                     let clean = Self::sanitize_marker_content(&key, markers);
                     changed |= clean != key;
+                    if let Some(first) = origin.get(&clean) {
+                        return Err(format!(
+                            "invalid JSON field: the names {:?} and {:?} are distinct but both \
+                             normalise to {:?} once control markers are neutralised, so they \
+                             collide. Keeping both is impossible and dropping one would silently \
+                             change the payload — a dropped argument is a wrong tool call. Rename \
+                             whichever name carries the marker.",
+                            Self::bounded_for_error(first),
+                            Self::bounded_for_error(&key),
+                            Self::bounded_for_error(&clean),
+                        ));
+                    }
+                    origin.insert(clean.clone(), key);
                     rebuilt.insert(clean, val);
                 }
                 *map = rebuilt;
-                changed
+                Ok(changed)
             }
             // Numbers, booleans and null hold no text.
-            _ => false,
+            _ => Ok(false),
         }
     }
 
@@ -1670,22 +1759,25 @@ impl Qwen3Tokenizer {
     /// Unparseable input is neutralised as plain text. For Muse-Glimmer such a
     /// string cannot render at all (`render_atem` raises unless `arguments` parses
     /// to a mapping), but the fallback does not rely on that staying true.
-    fn sanitize_json_string_field(raw: &str, markers: &[&str]) -> String {
+    fn sanitize_json_string_field(
+        raw: &str,
+        markers: &[&str],
+    ) -> std::result::Result<String, String> {
         if markers.is_empty() {
-            return raw.to_string();
+            return Ok(raw.to_string());
         }
         match serde_json::from_str::<serde_json::Value>(raw) {
             Ok(mut value) => {
-                if Self::sanitize_json_markers(&mut value, markers) {
+                if Self::sanitize_json_markers(&mut value, markers)? {
                     // A `Value` that came from `from_str` always re-serializes;
                     // fall back rather than unwrap if it somehow does not.
-                    serde_json::to_string(&value)
-                        .unwrap_or_else(|_| Self::sanitize_marker_content(raw, markers))
+                    Ok(serde_json::to_string(&value)
+                        .unwrap_or_else(|_| Self::sanitize_marker_content(raw, markers)))
                 } else {
-                    raw.to_string()
+                    Ok(raw.to_string())
                 }
             }
-            Err(_) => Self::sanitize_marker_content(raw, markers),
+            Err(_) => Ok(Self::sanitize_marker_content(raw, markers)),
         }
     }
 
@@ -5580,9 +5672,15 @@ mod tests {
         );
     }
 
+    /// `tool_call_id` against the real checkpoint. This test previously asserted the
+    /// neutralisation property; a marker-bearing id is now an invalid IDENTIFIER and
+    /// the render is REFUSED, so the control-id property here is vacuous by
+    /// construction — nothing is rendered at all. What is left to pin is that the
+    /// refusal names the field, and that a clean id in the same position still
+    /// reaches the template's unresolved-name fallback.
     #[test]
     #[ignore = "requires the local Muse-Glimmer checkpoint; set MLX_TEST_MUSE_GLIMMER_MODEL_PATH and run with --ignored"]
-    fn a_hostile_tool_call_id_adds_no_control_ids_to_the_encoded_prompt() {
+    fn a_hostile_tool_call_id_is_refused_by_the_real_checkpoint() {
         let tokenizer = real_muse_tokenizer();
         assert_field_is_hostile(tokenizer, HOSTILE_FIELD);
 
@@ -5599,58 +5697,376 @@ mod tests {
                 .expect("the checkpoint's own chat template must render")
         };
 
-        let hostile = render(HOSTILE_FIELD);
-        assert_eq!(
-            encoded_control_ids(tokenizer, &hostile),
-            encoded_control_ids(tokenizer, &render(BENIGN_FIELD)),
-            "tool_call_id promoted extra control ids: {hostile}",
-        );
-        assert_eq!(
-            hostile,
-            render(HOSTILE_FIELD_NEUTRALISED),
-            "each marker must become one space, not vanish: {hostile}",
-        );
-        assert_eq!(
-            hostile.matches(HOSTILE_FIELD_NEUTRALISED).count(),
-            2,
-            "the fallback renders the id twice, and both must be sanitized: {hostile}",
-        );
-    }
-
-    /// A tool call whose id DOES resolve must keep resolving after sanitisation:
-    /// the id is rewritten on both sides of the match, so a well-formed round trip
-    /// still reaches the direct path rather than the fallback.
-    #[test]
-    #[ignore = "requires the local Muse-Glimmer checkpoint; set MLX_TEST_MUSE_GLIMMER_MODEL_PATH and run with --ignored"]
-    fn a_marker_bearing_call_id_still_resolves_its_tool_name() {
-        let tokenizer = real_muse_tokenizer();
-        let hostile_id = "call<|eot|>1";
-        let rendered = tokenizer
+        let error = tokenizer
             .render_chat_template_sync(
                 &[
                     user_msg("weather?", 0),
-                    assistant_with_tool_call(
-                        "wx.forecast",
-                        Some(hostile_id),
-                        r#"{"city": "Paris"}"#,
-                    ),
-                    tool_result_answering(hostile_id),
+                    tool_result_answering(HOSTILE_FIELD),
                 ],
                 Some(true),
                 None,
                 None,
             )
-            .expect("the checkpoint's own chat template must render");
+            .expect_err("a marker inside tool_call_id must fail the render")
+            .to_string();
         assert!(
-            rendered.contains(
-                r#"<|start|>tool wx.forecast<|message|><tool_output name="wx.forecast">"#
+            error.contains("tool call id") && error.contains("<|eot|>"),
+            "the error must name the field and the marker: {error}",
+        );
+        let clean = render(BENIGN_FIELD);
+        assert_eq!(
+            encoded_control_ids(tokenizer, &clean),
+            encoded_control_ids(tokenizer, &render("another benign id")),
+            "a clean id must render, and its text must not perturb the structure: {clean}",
+        );
+        assert!(
+            clean.contains(&format!(r#"<tool_output name="{BENIGN_FIELD}">"#)),
+            "the unresolved-name fallback must still render a clean id: {clean}",
+        );
+    }
+
+    // ── Identity fields must stay DISTINCT (the round-2 defect) ────────────────
+    //
+    // Round 1 neutralised `ToolCall::id` and `tool_call_id` the way it neutralised
+    // prose: one space per marker. Space substitution is NOT injective, so two
+    // different ids can become one — and measured against this code, they did:
+    //
+    //   `call<|eot|>1` (answering wx.forecast) + `call 1` (answering db.query)
+    //     -> both `call 1`
+    //   a tool result answering the FIRST resolved to `db.query`
+    //
+    // `serialize_messages_for_jinja`'s `name_by_call_id` is last-writer-wins, so
+    // the result was attributed to the WRONG tool. The same shape hit JSON keys:
+    // `{"city<|eot|>": 1, "city ": 2}` parses to TWO keys and came back as
+    // `{"city ":2}` — one parameter dropped and its value replaced.
+    //
+    // Neither input had a duplicate. The sanitizer manufactured the collision, and
+    // silently corrupting a tool result's attribution is worse than refusing the
+    // input. So an id is now REFUSED exactly like a tool name, and a key collision
+    // fails the render. Refusing ids also DISSOLVES the sync constraint round 1
+    // documented: ids are never rewritten, so both sides of the resolution match
+    // see identical bytes and "the transform must match" is trivially true.
+
+    /// A Muse-marker fixture over [`HOSTILE_FIELD_TEMPLATE`], so these gates run in
+    /// CI without the 59.5 GB checkpoint.
+    fn muse_field_fixture(label: &str) -> (TestModelDir, Qwen3Tokenizer) {
+        let dir = TestModelDir::new(label);
+        let tokenizer =
+            dir.load_with_template(super::MUSE_GLIMMER_CONTROL_MARKERS, HOSTILE_FIELD_TEMPLATE);
+        (dir, tokenizer)
+    }
+
+    /// codex's exact fixture: two DIFFERENT ids that normalise to the same value.
+    /// The refusal fires on the marker, before a collision can even arise — which is
+    /// the point: the collision is now unreachable rather than handled.
+    #[test]
+    fn two_call_ids_that_normalise_to_the_same_value_are_refused() {
+        let (_dir, tokenizer) = muse_field_fixture("muse-id-collision");
+        // Non-vacuity: the two ids really are distinct, and really do collapse.
+        let (first, second) = ("call<|eot|>1", "call 1");
+        assert_ne!(first, second, "the fixture must supply two DIFFERENT ids");
+        assert_eq!(
+            Qwen3Tokenizer::sanitize_marker_content(first, super::MUSE_GLIMMER_CONTROL_MARKERS),
+            second,
+            "the fixture must be one that the round-1 transform collapsed",
+        );
+
+        let error = tokenizer
+            .render_chat_template_sync(
+                &[
+                    assistant_with_tool_call("wx.forecast", Some(first), r#"{"a": 1}"#),
+                    assistant_with_tool_call("db.query", Some(second), r#"{"b": 2}"#),
+                    tool_result_answering(first),
+                ],
+                Some(false),
+                None,
+                None,
+            )
+            .expect_err("colliding ids must fail the render, not be silently merged")
+            .to_string();
+        assert!(
+            error.contains("tool call id") && error.contains("<|eot|>"),
+            "the error must name the field and the marker: {error}",
+        );
+        // The corruption this replaces, spelled out so a regression is unmistakable:
+        // the tool result answered wx.forecast and used to resolve to db.query.
+        assert!(
+            !error.contains("db.query"),
+            "the refusal must not be reporting the misattribution: {error}",
+        );
+    }
+
+    /// The control the coordinator asked for. Two ids that were ALREADY identical in
+    /// the input are pre-existing caller behaviour, not this change's business: the
+    /// render still succeeds and the later call still wins the resolution, which is
+    /// what the templates' own rescue loops do (they overwrite on every match rather
+    /// than stopping at the first).
+    #[test]
+    fn two_identical_call_ids_resolve_the_way_they_always_did() {
+        let (_dir, tokenizer) = muse_field_fixture("muse-id-duplicate");
+        let rendered = tokenizer
+            .render_chat_template_sync(
+                &[
+                    assistant_with_tool_call("wx.forecast", Some("call_1"), r#"{"a": 1}"#),
+                    assistant_with_tool_call("db.query", Some("call_1"), r#"{"b": 2}"#),
+                    tool_result_answering("call_1"),
+                ],
+                Some(false),
+                None,
+                None,
+            )
+            .expect("a duplicate id carries no marker, so nothing may refuse it");
+        // `serialize_messages_for_jinja` records each call AFTER pushing its own
+        // message, so the tool result sees both and the later one wins.
+        assert!(
+            rendered.contains("[tool=18C, clear][tcid=call_1]"),
+            "the clean id must reach the prompt untouched: {rendered}",
+        );
+        assert!(
+            rendered.contains("[to=wx.forecast]") && rendered.contains("[to=db.query]"),
+            "both calls must still render: {rendered}",
+        );
+    }
+
+    /// A single marker-bearing id, with no second id to collide with, is refused too.
+    /// The rule is "identifiers are validated, not rewritten" — not "collisions are
+    /// detected" — because a rewritten id also silently changes what the
+    /// unresolved-name fallback prints.
+    #[test]
+    fn a_lone_marker_bearing_call_id_is_refused() {
+        let (_dir, tokenizer) = muse_field_fixture("muse-id-lone");
+        for (label, messages) in [
+            (
+                "ToolCall::id",
+                vec![assistant_with_tool_call(
+                    "wx.forecast",
+                    Some("call<|start|>9"),
+                    r#"{"a": 1}"#,
+                )],
             ),
-            "sanitizing the id on only one side of the match would drop the tool name: {rendered}",
+            (
+                "ChatMessage::tool_call_id",
+                vec![tool_result_answering("call<|start|>9")],
+            ),
+        ] {
+            let error = tokenizer
+                .render_chat_template_sync(&messages, Some(false), None, None)
+                .expect_err(label)
+                .to_string();
+            assert!(
+                error.contains("tool call id") && error.contains("<|start|>"),
+                "{label}: the error must name the field and the marker: {error}",
+            );
+        }
+        // And the same shapes with a clean id must still render, so the rule is
+        // "reject a marker", not "reject an id".
+        for messages in [
+            vec![assistant_with_tool_call(
+                "wx.forecast",
+                Some("call_9"),
+                r#"{"a": 1}"#,
+            )],
+            vec![tool_result_answering("call_9")],
+        ] {
+            tokenizer
+                .render_chat_template_sync(&messages, Some(false), None, None)
+                .expect("a clean id must render");
+        }
+    }
+
+    /// codex's exact fixture for keys: two DIFFERENT keys that normalise to the same
+    /// value. One is already spelled with the space the sanitizer would produce, so
+    /// the collision is manufactured purely by neutralising the other.
+    #[test]
+    fn two_json_keys_that_normalise_to_the_same_value_are_refused() {
+        let (_dir, tokenizer) = muse_field_fixture("muse-key-collision");
+        let arguments = r#"{"city<|eot|>": 1, "city ": 2}"#;
+        // Non-vacuity: the document really has TWO keys before anything touches it.
+        // `serde_json` already collapses genuinely duplicate input keys at parse
+        // time, so any collision reaching the sanitizer is one the sanitizer made.
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(arguments)
+                .expect("fixture is valid JSON")
+                .as_object()
+                .map(serde_json::Map::len),
+            Some(2),
+            "the fixture must parse to two distinct keys",
+        );
+
+        let error = tokenizer
+            .render_chat_template_sync(
+                &[assistant_with_tool_call(
+                    "wx.forecast",
+                    Some("call_1"),
+                    arguments,
+                )],
+                Some(false),
+                None,
+                None,
+            )
+            .expect_err("a manufactured key collision must fail the render")
+            .to_string();
+        assert!(
+            error.contains("city") && error.contains("<|eot|>"),
+            "the error must name the colliding key and the marker: {error}",
         );
         assert!(
-            !rendered.contains("call  1") && !rendered.contains("call 1"),
-            "the id must not reach the prompt at all once the name resolves: {rendered}",
+            error.contains("collide") || error.contains("collision"),
+            "the error must say what went wrong: {error}",
         );
+    }
+
+    /// The recursion has to propagate the refusal, not swallow it: a collision two
+    /// levels down is the same dropped parameter.
+    #[test]
+    fn a_key_collision_nested_inside_arguments_is_refused() {
+        let (_dir, tokenizer) = muse_field_fixture("muse-key-collision-nested");
+        let error = tokenizer
+            .render_chat_template_sync(
+                &[assistant_with_tool_call(
+                    "wx.forecast",
+                    Some("call_1"),
+                    r#"{"outer": {"deep": {"k<|eom|>": 1, "k ": 2}}}"#,
+                )],
+                Some(false),
+                None,
+                None,
+            )
+            .expect_err("a nested key collision must fail the render")
+            .to_string();
+        assert!(
+            error.contains("collide") && error.contains("<|eom|>"),
+            "the nested collision must surface: {error}",
+        );
+    }
+
+    /// The same collision through the OTHER JSON field — a tool schema's
+    /// `properties`, which takes the identical code path.
+    #[test]
+    fn a_key_collision_in_a_tool_schema_is_refused() {
+        let (_dir, tokenizer) = muse_field_fixture("muse-schema-key-collision");
+        let mut tool = tool_with(BENIGN_FIELD, BENIGN_KEY);
+        if let Some(params) = tool.function.parameters.as_mut() {
+            params.properties =
+                Some(r#"{"city<|eot|>": {"type": "string"}, "city ": {"type": "string"}}"#.into());
+        }
+        let error = tokenizer
+            .render_chat_template_sync(&[user_msg("hi", 0)], Some(false), Some(&[tool]), None)
+            .expect_err("a schema key collision must fail the render")
+            .to_string();
+        assert!(
+            error.contains("collide") && error.contains("city"),
+            "the schema collision must surface: {error}",
+        );
+    }
+
+    /// The other half of fail-closed: do NOT over-reject. A marker-bearing key with
+    /// nothing to collide with still neutralises to a space, exactly as in round 1.
+    #[test]
+    fn a_marker_bearing_key_without_a_collision_still_neutralises() {
+        let (_dir, tokenizer) = muse_field_fixture("muse-key-no-collision");
+        let rendered = tokenizer
+            .render_chat_template_sync(
+                &[assistant_with_tool_call(
+                    "wx.forecast",
+                    Some("call_1"),
+                    r#"{"city<|eot|>": 1, "days": 2}"#,
+                )],
+                Some(false),
+                None,
+                None,
+            )
+            .expect("a key with no collision must still render");
+        assert!(
+            rendered.contains("[city =1][days=2]"),
+            "the lone marker-bearing key must become one space: {rendered}",
+        );
+        assert_eq!(
+            encoded_control_ids(&tokenizer, &rendered),
+            std::collections::BTreeMap::new(),
+            "and it must still promote nothing: {rendered}",
+        );
+    }
+
+    /// The third place the non-injective transform runs — `required`, a `Vec<String>`
+    /// of parameter names. It is NOT refused, and this pins why that is right rather
+    /// than an oversight: a list keeps both entries, so a collision duplicates rather
+    /// than drops, and nothing is lost. It also has to keep using the identical
+    /// transform the `properties` keys get, or a `required` entry would stop naming
+    /// the property it refers to.
+    #[test]
+    fn colliding_required_entries_duplicate_rather_than_drop() {
+        let markers = super::MUSE_GLIMMER_CONTROL_MARKERS;
+        let mut tool = tool_with(BENIGN_FIELD, BENIGN_KEY);
+        if let Some(params) = tool.function.parameters.as_mut() {
+            // Two DISTINCT names that normalise to the same value — the exact shape
+            // that costs a key its slot in an object.
+            params.required = Some(vec!["city<|eot|>".to_string(), "city ".to_string()]);
+            // One property, whose key carries the same marker, so the agreement
+            // between the two is observable.
+            params.properties = Some(r#"{"city<|eot|>": {"type": "string"}}"#.to_string());
+        }
+        let sanitized = Qwen3Tokenizer::sanitize_tools(Some(&[tool]), markers)
+            .expect("required is a list, so a collision there is not a refusal")
+            .expect("Some in, Some out");
+        let params = sanitized[0]
+            .function
+            .parameters
+            .as_ref()
+            .expect("parameters survive");
+        assert_eq!(
+            params.required.as_deref(),
+            Some(&["city ".to_string(), "city ".to_string()][..]),
+            "both entries must survive; a list has room for both",
+        );
+        // And the surviving property key is the same string, so `required` still
+        // names a property that exists.
+        assert_eq!(
+            params.properties.as_deref(),
+            Some(r#"{"city ":{"type":"string"}}"#),
+            "the property key must get the identical transform, or required dangles",
+        );
+    }
+
+    /// Both refusals are family-gated like everything else. Another family keeps its
+    /// colliding ids and colliding keys verbatim, and must NOT be refused — refusing
+    /// another family's prompt would itself be the regression.
+    #[test]
+    fn a_non_muse_family_keeps_colliding_ids_and_keys_verbatim() {
+        let dir = TestModelDir::new("non-muse-collisions");
+        let tokenizer =
+            dir.load_with_template(&["<|start|>", "<|message|>"], HOSTILE_FIELD_TEMPLATE);
+        assert!(
+            tokenizer.control_markers.is_empty(),
+            "fixture must be non-Muse, or this proves nothing",
+        );
+        let rendered = tokenizer
+            .render_chat_template_sync(
+                &[
+                    assistant_with_tool_call(
+                        "wx.forecast",
+                        Some("call<|eot|>1"),
+                        r#"{"city<|eot|>": 1, "city ": 2}"#,
+                    ),
+                    assistant_with_tool_call("db.query", Some("call 1"), r#"{"b": 2}"#),
+                    tool_result_answering("call<|eot|>1"),
+                ],
+                Some(false),
+                None,
+                None,
+            )
+            .expect("a non-Muse family must not be refused for a marker in an id or a key");
+        for expected in [
+            "[tcid=call<|eot|>1]",
+            "[city<|eot|>=1]",
+            "[city =2]",
+            "[to=wx.forecast]",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "expected {expected:?} verbatim in {rendered}",
+            );
+        }
     }
 
     #[test]
@@ -5800,7 +6216,17 @@ mod tests {
 
     /// Every field the Muse-Glimmer template renders, all carrying `field`, with
     /// `key` as both a tool-call parameter name and a schema property name.
-    fn every_hostile_field(field: &str, key: &str) -> (Vec<ChatMessage>, Vec<ToolDefinition>) {
+    ///
+    /// The two id fields carry `id_field`, which the neutralisation gates pass CLEAN
+    /// and the non-Muse gate passes hostile. Ids are IDENTIFIERS: on a Muse
+    /// vocabulary a marker in one is refused outright, not neutralised, so a hostile
+    /// id here would abort the render before any other field could be measured —
+    /// see `a_lone_marker_bearing_call_id_is_refused`.
+    fn every_hostile_field(
+        field: &str,
+        key: &str,
+        id_field: &str,
+    ) -> (Vec<ChatMessage>, Vec<ToolDefinition>) {
         let mut assistant =
             assistant_with_tool_call("wx.forecast", Some("call_1"), &arguments_with(field, key));
         assistant.reasoning_content = Some(field.to_string());
@@ -5810,7 +6236,7 @@ mod tests {
                 assistant,
                 // Answers nothing, so the template's unresolved-name fallback puts
                 // the id itself in the prompt.
-                tool_result_answering(field),
+                tool_result_answering(id_field),
             ],
             vec![tool_with(field, key)],
         )
@@ -5832,7 +6258,9 @@ mod tests {
                 "fixture for {marker} encodes to no control id — the assertion below would be \
                  vacuous",
             );
-            let (messages, tools) = every_hostile_field(&field, &field);
+            // Clean ids: on this vocabulary a marker in an id is REFUSED, so a
+            // hostile one would abort before the other ten sites could be measured.
+            let (messages, tools) = every_hostile_field(&field, &field, "call_1");
             let rendered = tokenizer
                 .render_chat_template_sync(&messages, Some(false), Some(&tools), None)
                 .expect("the field template must render");
@@ -5845,13 +6273,14 @@ mod tests {
             // site: tool `description`, the `properties` key, the nested property
             // `description`, the `required` entry, `content`, `reasoning_content`,
             // the scalar argument value, BOTH list elements, the doubly-nested
-            // value, the argument KEY, and `tool_call_id`. Counting them pins
-            // deletion out — a sanitizer that dropped markers would leave
-            // `beforeafter` — and pins the list's second element, which a
-            // short-circuiting recursion would skip.
+            // value, and the argument KEY. Eleven, not twelve: the two id fields
+            // are IDENTIFIERS and carry a clean value here, because a marker in one
+            // is refused rather than neutralised. Counting pins deletion out — a
+            // sanitizer that dropped markers would leave `beforeafter` — and pins
+            // the list's second element, which a short-circuiting recursion skips.
             assert_eq!(
                 rendered.matches("before after").count(),
-                12,
+                11,
                 "marker {marker}: every site must neutralise to one space and keep its prose: \
                  {rendered}",
             );
@@ -5922,9 +6351,10 @@ mod tests {
             "fixture must be non-Muse, or this proves nothing",
         );
 
-        let (messages, tools) = every_hostile_field(HOSTILE_FIELD, HOSTILE_KEY);
-        // A marker inside a tool name must NOT fail the render here: fail-closed is
-        // family-gated too, and refusing another family's prompt is a regression.
+        // Hostile ids too: fail-closed is family-gated, so a non-Muse family keeps
+        // them verbatim rather than being refused.
+        let (messages, tools) = every_hostile_field(HOSTILE_FIELD, HOSTILE_KEY, HOSTILE_FIELD);
+        // A marker inside a tool name must NOT fail the render here either.
         let mut named = messages;
         if let Some(calls) = named[1].tool_calls.as_mut() {
             calls[0].name = format!("wx{HOSTILE_KEY}.forecast");
@@ -6040,7 +6470,7 @@ mod tests {
     /// second-pass change behind an idempotent template.
     #[test]
     fn sanitising_every_field_twice_changes_nothing() {
-        let (messages, tools) = every_hostile_field(HOSTILE_FIELD, HOSTILE_KEY);
+        let (messages, tools) = every_hostile_field(HOSTILE_FIELD, HOSTILE_KEY, "call_1");
         let markers = super::MUSE_GLIMMER_CONTROL_MARKERS;
 
         let once = Qwen3Tokenizer::sanitize_messages(&messages, markers)
