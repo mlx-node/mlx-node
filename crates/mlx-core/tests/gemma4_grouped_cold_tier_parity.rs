@@ -39,7 +39,11 @@ async fn gemma4_grouped_cold_tier_restart_parity() {
     require_deterministic_prefill_shape();
     harness::run_restart_parity(
         harness::ColdTierParitySpec::new("gemma4-grouped")
-            .with_pool_memory_mb(5120)
+            // E2B needs about 914 MiB for one full-context full-attention
+            // lane plus its sliding window. 1 GiB keeps that real geometry
+            // while avoiding a 5 GiB test-only pool that can make Metal
+            // readback fail on the standard shared runner before SSD capture.
+            .with_pool_memory_mb(1024)
             .with_prompt(GEMMA4_COLD_PROMPT)
             .with_max_new_tokens(16)
             .expecting_sidecar_install(),
