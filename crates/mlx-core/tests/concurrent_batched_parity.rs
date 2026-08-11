@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use futures::future::join_all;
 use mlx_core::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
+use mlx_core::models::qwen3::Qwen3Model;
 use mlx_core::models::qwen3::persistence::load_with_thread;
 use mlx_core::tokenizer::ChatMessage;
 
@@ -139,6 +140,62 @@ async fn drain_stream_outcome(
     Err("stream closed without a terminal chunk".to_string())
 }
 
+/// Queue one complete wave behind an ordered reset barrier.
+///
+/// Concurrent async calls do not promise that the model thread observes every
+/// send before a short first row reaches decode. The holder keeps the reset
+/// barrier ordered behind live work; polling reset once proves the barrier was
+/// sent, and the synchronous stream helpers then enqueue all target rows behind
+/// it before cancellation lets the scheduler advance. No timing sleep is part
+/// of the admission premise.
+async fn barriered_stream_wave(
+    model: &Qwen3Model,
+    prompts: &[&str],
+    label: &str,
+) -> Vec<ChatStreamChunk> {
+    let holder_prompt = format!(
+        "Keep this request active while a scheduler barrier is queued: {}",
+        "holder context ".repeat(1_024)
+    );
+    let mut holder_config = config(&format!("{label}-holder"), 0);
+    holder_config.max_new_tokens = Some(4_096);
+    let (holder_handle, holder_receiver) = model
+        .chat_stream_session_start_for_test(vec![user_message(&holder_prompt)], Some(holder_config))
+        .expect("dispatch admission holder");
+
+    let reset = model.reset_caches();
+    tokio::pin!(reset);
+    assert!(
+        matches!(futures::poll!(reset.as_mut()), std::task::Poll::Pending),
+        "the reset barrier must wait behind the admission holder"
+    );
+
+    let mut receivers = Vec::with_capacity(prompts.len());
+    for (index, prompt) in prompts.iter().enumerate() {
+        let (_handle, receiver) = model
+            .chat_stream_session_start_for_test(
+                vec![user_message(prompt)],
+                Some(config(&format!("{label}-{index}"), index)),
+            )
+            .expect("enqueue stream behind reset barrier");
+        receivers.push(receiver);
+    }
+
+    holder_handle.cancel();
+    let (reset_result, holder_outcome) =
+        tokio::join!(reset.as_mut(), drain_stream_outcome(holder_receiver),);
+    reset_result.expect("ordered reset barrier");
+    assert!(
+        holder_outcome.is_err()
+            || holder_outcome
+                .as_ref()
+                .is_ok_and(|chunk| chunk.finish_reason.as_deref() == Some("cancelled")),
+        "admission holder must terminate as cancelled: {holder_outcome:?}"
+    );
+
+    join_all(receivers.into_iter().map(drain_stream)).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs QWEN3_STAGE1_MODEL_PATH pointing to a real Qwen3 checkpoint"]
 async fn serial_uniform_batch_and_interleaved_streams_are_token_identical() {
@@ -190,6 +247,19 @@ async fn serial_uniform_batch_and_interleaved_streams_are_token_identical() {
     let batched_elapsed = batched_started.elapsed();
     for ((expected, actual), prompt) in serial.iter().zip(batched).zip(prompts) {
         assert_same(expected, &actual.expect("batched turn"), prompt);
+    }
+    let uniform_terminals = barriered_stream_wave(&model, &prompts, "uniform-wave").await;
+    for ((expected, terminal), prompt) in serial.iter().zip(uniform_terminals).zip(prompts) {
+        assert_eq!(
+            terminal.raw_text.as_deref(),
+            Some(expected.raw_text.as_str()),
+            "uniform stream raw_text mismatch for {prompt:?}"
+        );
+        assert_eq!(
+            terminal.finish_reason.as_deref(),
+            Some(expected.finish_reason.as_str())
+        );
+        assert_eq!(terminal.num_tokens, Some(expected.num_tokens));
     }
     let stats = model.scheduler_stats().await.expect("scheduler stats");
     assert!(
@@ -270,34 +340,6 @@ async fn serial_uniform_batch_and_interleaved_streams_are_token_identical() {
         "the penalty-free N=2 wave must execute the batched greedy epilogue"
     );
 
-    model
-        .reset_caches()
-        .await
-        .expect("reset before uniform streams");
-    let mut uniform_receivers = Vec::new();
-    for (index, prompt) in prompts[..2].iter().enumerate() {
-        let (_handle, receiver) = model
-            .chat_stream_session_start_for_test(
-                vec![user_message(prompt)],
-                Some(config(&format!("uniform-stream-{index}"), index)),
-            )
-            .expect("dispatch uniform stream");
-        uniform_receivers.push(receiver);
-    }
-    let uniform_terminals = join_all(uniform_receivers.into_iter().map(drain_stream)).await;
-    for ((expected, terminal), prompt) in serial.iter().zip(uniform_terminals).zip(prompts) {
-        assert_eq!(
-            terminal.raw_text.as_deref(),
-            Some(expected.raw_text.as_str()),
-            "uniform stream raw_text mismatch for {prompt:?}"
-        );
-        assert_eq!(
-            terminal.finish_reason.as_deref(),
-            Some(expected.finish_reason.as_str())
-        );
-        assert_eq!(terminal.num_tokens, Some(expected.num_tokens));
-    }
-
     // Cancellation is request-local in a real scheduled wave. Keep one row in
     // a long prefill, cancel it after both commands have been dispatched, and
     // require the healthy twin to remain byte-identical to its serial oracle.
@@ -362,6 +404,19 @@ async fn serial_uniform_batch_and_interleaved_streams_are_token_identical() {
     for ((expected, actual), prompt) in serial.iter().zip(ragged).zip(prompts) {
         assert_same(expected, &actual.expect("ragged turn"), prompt);
     }
+    let ragged_terminals = barriered_stream_wave(&ragged_model, &prompts, "ragged-wave").await;
+    for ((expected, terminal), prompt) in serial.iter().zip(ragged_terminals).zip(prompts) {
+        assert_eq!(
+            terminal.raw_text.as_deref(),
+            Some(expected.raw_text.as_str()),
+            "ragged stream raw_text mismatch for {prompt:?}"
+        );
+        assert_eq!(
+            terminal.finish_reason.as_deref(),
+            Some(expected.finish_reason.as_str())
+        );
+        assert_eq!(terminal.num_tokens, Some(expected.num_tokens));
+    }
     let ragged_stats = ragged_model
         .scheduler_stats()
         .await
@@ -382,33 +437,6 @@ async fn serial_uniform_batch_and_interleaved_streams_are_token_identical() {
         batched_elapsed.as_secs_f64() / ragged_elapsed.as_secs_f64()
     );
 
-    ragged_model
-        .reset_caches()
-        .await
-        .expect("reset before streams");
-    let mut receivers = Vec::new();
-    for (index, prompt) in prompts[..2].iter().enumerate() {
-        let (_handle, receiver) = ragged_model
-            .chat_stream_session_start_for_test(
-                vec![user_message(prompt)],
-                Some(config(&format!("stream-{index}"), index)),
-            )
-            .expect("dispatch stream");
-        receivers.push(receiver);
-    }
-    let terminals = join_all(receivers.into_iter().map(drain_stream)).await;
-    for ((expected, terminal), prompt) in serial.iter().zip(terminals).zip(prompts) {
-        assert_eq!(
-            terminal.raw_text.as_deref(),
-            Some(expected.raw_text.as_str()),
-            "stream raw_text mismatch for {prompt:?}"
-        );
-        assert_eq!(
-            terminal.finish_reason.as_deref(),
-            Some(expected.finish_reason.as_str())
-        );
-        assert_eq!(terminal.num_tokens, Some(expected.num_tokens));
-    }
     drop(ragged_model);
     drop(ragged_guard);
 }
