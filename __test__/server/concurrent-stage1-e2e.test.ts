@@ -19,6 +19,9 @@ const MODEL_ENV_NAME = 'QWEN3_STAGE1_MODEL_PATH';
 const MODEL_ENV_PRESENT = Object.prototype.hasOwnProperty.call(process.env, MODEL_ENV_NAME);
 const MODEL_PATH = process.env[MODEL_ENV_NAME];
 const MODEL_NAME = 'stage1-qwen3';
+const REQUEST_TIMEOUT_MS = 120_000;
+const ACCOUNTING_TIMEOUT_MS = 20_000;
+const TEST_TIMEOUT_MS = REQUEST_TIMEOUT_MS + ACCOUNTING_TIMEOUT_MS + 10_000;
 
 type SchedulerStatsModel = SessionCapableModel & {
   schedulerStats(): Promise<{ maxBatchOccupancy: number }>;
@@ -33,6 +36,19 @@ async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 5_
     await delay(10);
   }
   throw new Error(`${label} (>${timeoutMs}ms)`);
+}
+
+async function withRequestTimeout<T>(label: string, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new Error(`${label} exceeded ${REQUEST_TIMEOUT_MS}ms`)),
+    REQUEST_TIMEOUT_MS,
+  );
+  try {
+    return await run(controller.signal);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function isStage1Model(model: LoadableModel): model is LoadableModel & SchedulerStatsModel {
@@ -89,9 +105,7 @@ function instrumentStreams(target: SchedulerStatsModel): {
 }
 
 async function postStream(baseUrl: string, input: string): Promise<string> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error('Stage-1 SSE request exceeded 30s')), 30_000);
-  try {
+  return withRequestTimeout('Stage-1 SSE request', async (signal) => {
     const response = await fetch(`${baseUrl}/v1/responses`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -102,46 +116,50 @@ async function postStream(baseUrl: string, input: string): Promise<string> {
         temperature: 0,
         max_output_tokens: 64,
       }),
-      signal: controller.signal,
+      signal,
     });
     expect(response.status).toBe(200);
     return await response.text();
-  } finally {
-    clearTimeout(timer);
-  }
+  });
 }
 
 async function postMessage(
   baseUrl: string,
   input: string,
 ): Promise<{ content?: Array<{ type?: string; text?: string }> }> {
-  const response = await fetch(`${baseUrl}/v1/messages`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      model: MODEL_NAME,
-      messages: [{ role: 'user', content: input }],
-      max_tokens: 16,
-      temperature: 0,
-    }),
+  return withRequestTimeout('Stage-1 Messages request', async (signal) => {
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: MODEL_NAME,
+        messages: [{ role: 'user', content: input }],
+        max_tokens: 16,
+        temperature: 0,
+      }),
+      signal,
+    });
+    expect(response.status).toBe(200);
+    return (await response.json()) as { content?: Array<{ type?: string; text?: string }> };
   });
-  expect(response.status).toBe(200);
-  return (await response.json()) as { content?: Array<{ type?: string; text?: string }> };
 }
 
 async function postResponse(baseUrl: string, input: string): Promise<{ id?: string; output_text?: string }> {
-  const response = await fetch(`${baseUrl}/v1/responses`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      model: MODEL_NAME,
-      input,
-      temperature: 0,
-      max_output_tokens: 16,
-    }),
+  return withRequestTimeout('Stage-1 Responses request', async (signal) => {
+    const response = await fetch(`${baseUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: MODEL_NAME,
+        input,
+        temperature: 0,
+        max_output_tokens: 16,
+      }),
+      signal,
+    });
+    expect(response.status).toBe(200);
+    return (await response.json()) as { id?: string; output_text?: string };
   });
-  expect(response.status).toBe(200);
-  return (await response.json()) as { id?: string; output_text?: string };
 }
 
 const stage1Describe = MODEL_ENV_PRESENT ? describe.sequential : describe.skip;
@@ -152,6 +170,17 @@ stage1Describe('Stage-1 real-model server admission', () => {
   let peakActive: () => number;
   let releasedOwners: () => readonly string[];
   let baseUrl: string;
+
+  async function waitForAccountingDrain(label: string): Promise<void> {
+    await waitUntil(
+      () =>
+        instance.registry.getSessionRegistry(MODEL_NAME)?.queueDepth === 0 &&
+        instance.registry.getSessionRegistry(MODEL_NAME)?.preDispatchAdmitCount === 0 &&
+        instance.health().work.inFlight === 0,
+      label,
+      ACCOUNTING_TIMEOUT_MS,
+    );
+  }
 
   beforeAll(async () => {
     if (!MODEL_ENV_PRESENT) return;
@@ -196,70 +225,103 @@ stage1Describe('Stage-1 real-model server admission', () => {
     if (instance !== undefined) await instance.close({ timeoutMs: 10_000 });
   }, 20_000);
 
-  it('admits two SSE turns together and executes a real N=2 decode batch', async () => {
-    expect(nativeModel.hasBlockPagedCache?.()).toBe(true);
-    const capacity = nativeModel.maxConcurrentSequences?.() ?? 0;
-    expect(capacity).toBeGreaterThanOrEqual(2);
-    expect(instance.registry.getSessionRegistry(MODEL_NAME)?.concurrentAdmissionLimit).toBe(capacity);
+  it(
+    'admits two SSE turns together and executes a real N=2 decode batch',
+    async () => {
+      expect(nativeModel.hasBlockPagedCache?.()).toBe(true);
+      const capacity = nativeModel.maxConcurrentSequences?.() ?? 0;
+      expect(capacity).toBeGreaterThanOrEqual(2);
+      expect(instance.registry.getSessionRegistry(MODEL_NAME)?.concurrentAdmissionLimit).toBe(capacity);
 
-    const prompt = 'Continue this sequence with concise comma-separated integers: ' + '1, 2, 3, '.repeat(256);
-    const [first, second] = await Promise.all([
-      postStream(baseUrl, `${prompt}\nFirst stream.`),
-      postStream(baseUrl, `${prompt}\nSecond stream.`),
-    ]);
+      const prompt = 'Continue this sequence with concise comma-separated integers: ' + '1, 2, 3, '.repeat(256);
+      const [firstResult, secondResult] = await Promise.allSettled([
+        postStream(baseUrl, `${prompt}\nFirst stream.`),
+        postStream(baseUrl, `${prompt}\nSecond stream.`),
+      ]);
+      await waitForAccountingDrain('batched SSE request accounting did not settle');
+      if (firstResult.status === 'rejected') throw firstResult.reason;
+      if (secondResult.status === 'rejected') throw secondResult.reason;
+      const first = firstResult.value;
+      const second = secondResult.value;
 
-    expect(first).toContain('response.created');
-    expect(second).toContain('response.created');
-    expect(first).toMatch(/response\.(completed|incomplete)/u);
-    expect(second).toMatch(/response\.(completed|incomplete)/u);
-    const stats = await nativeModel.schedulerStats();
-    expect(peakActive(), `native stream peak; scheduler occupancy=${stats.maxBatchOccupancy}`).toBe(2);
-    expect(stats.maxBatchOccupancy).toBeGreaterThanOrEqual(2);
-    expect(instance.registry.getSessionRegistry(MODEL_NAME)?.queueDepth).toBe(0);
-  }, 45_000);
+      expect(first).toContain('response.created');
+      expect(second).toContain('response.created');
+      expect(first).toMatch(/response\.(completed|incomplete)/u);
+      expect(second).toMatch(/response\.(completed|incomplete)/u);
+      const stats = await nativeModel.schedulerStats();
+      expect(peakActive(), `native stream peak; scheduler occupancy=${stats.maxBatchOccupancy}`).toBe(2);
+      expect(stats.maxBatchOccupancy).toBeGreaterThanOrEqual(2);
+    },
+    TEST_TIMEOUT_MS,
+  );
 
-  it('releases each stateless Messages cache owner after its response', async () => {
-    const before = releasedOwners().length;
-    const [first, second] = await Promise.all([
-      postMessage(baseUrl, 'Reply with one short word for red.'),
-      postMessage(baseUrl, 'Reply with one short word for blue.'),
-    ]);
+  it(
+    'releases each stateless Messages cache owner after its response',
+    async () => {
+      const before = releasedOwners().length;
+      const [firstResult, secondResult] = await Promise.allSettled([
+        postMessage(baseUrl, 'Reply with one short word for red.'),
+        postMessage(baseUrl, 'Reply with one short word for blue.'),
+      ]);
+      if (firstResult.status === 'rejected') {
+        await waitForAccountingDrain('failed Messages request accounting did not settle');
+        throw firstResult.reason;
+      }
+      if (secondResult.status === 'rejected') {
+        await waitForAccountingDrain('failed Messages request accounting did not settle');
+        throw secondResult.reason;
+      }
+      const first = firstResult.value;
+      const second = secondResult.value;
 
-    expect(first.content).toBeInstanceOf(Array);
-    expect(second.content).toBeInstanceOf(Array);
-    await waitUntil(
-      () =>
-        releasedOwners().length === before + 2 &&
-        instance.registry.getSessionRegistry(MODEL_NAME)?.queueDepth === 0 &&
-        instance.registry.getSessionRegistry(MODEL_NAME)?.preDispatchAdmitCount === 0 &&
-        instance.health().work.inFlight === 0,
-      'stateless owner release and request accounting did not settle',
-    );
-    const released = releasedOwners().slice(before);
-    expect(released).toHaveLength(2);
-    expect(released.every((owner) => owner.length > 0)).toBe(true);
-    expect(new Set(released).size).toBe(2);
-    expect(instance.registry.getSessionRegistry(MODEL_NAME)?.queueDepth).toBe(0);
-    expect(instance.registry.getSessionRegistry(MODEL_NAME)?.preDispatchAdmitCount).toBe(0);
-    expect(instance.health().work.inFlight).toBe(0);
-  }, 45_000);
+      expect(first.content).toBeInstanceOf(Array);
+      expect(second.content).toBeInstanceOf(Array);
+      await waitUntil(
+        () =>
+          releasedOwners().length === before + 2 &&
+          instance.registry.getSessionRegistry(MODEL_NAME)?.queueDepth === 0 &&
+          instance.registry.getSessionRegistry(MODEL_NAME)?.preDispatchAdmitCount === 0 &&
+          instance.health().work.inFlight === 0,
+        'stateless owner release and request accounting did not settle',
+        ACCOUNTING_TIMEOUT_MS,
+      );
+      const released = releasedOwners().slice(before);
+      expect(released).toHaveLength(2);
+      expect(released.every((owner) => owner.length > 0)).toBe(true);
+      expect(new Set(released).size).toBe(2);
+      expect(instance.registry.getSessionRegistry(MODEL_NAME)?.queueDepth).toBe(0);
+      expect(instance.registry.getSessionRegistry(MODEL_NAME)?.preDispatchAdmitCount).toBe(0);
+      expect(instance.health().work.inFlight).toBe(0);
+    },
+    TEST_TIMEOUT_MS,
+  );
 
-  it('releases the prior Responses owner when a stateless chain replaces the warm slot', async () => {
-    const first = await postResponse(baseUrl, 'Reply with one short word for circle.');
-    const afterFirst = releasedOwners().length;
-    const second = await postResponse(baseUrl, 'Reply with one short word for square.');
+  it(
+    'releases the prior Responses owner when a stateless chain replaces the warm slot',
+    async () => {
+      try {
+        const first = await postResponse(baseUrl, 'Reply with one short word for circle.');
+        const afterFirst = releasedOwners().length;
+        const second = await postResponse(baseUrl, 'Reply with one short word for square.');
 
-    expect(first.id).toMatch(/^resp_/u);
-    expect(second.id).toMatch(/^resp_/u);
-    expect(second.id).not.toBe(first.id);
-    await waitUntil(
-      () =>
-        releasedOwners().length === afterFirst + 1 &&
-        instance.registry.getSessionRegistry(MODEL_NAME)?.queueDepth === 0 &&
-        instance.registry.getSessionRegistry(MODEL_NAME)?.preDispatchAdmitCount === 0 &&
-        instance.health().work.inFlight === 0,
-      'Responses owner replacement and request accounting did not settle',
-    );
-    expect(releasedOwners().slice(afterFirst)).toHaveLength(1);
-  }, 45_000);
+        expect(first.id).toMatch(/^resp_/u);
+        expect(second.id).toMatch(/^resp_/u);
+        expect(second.id).not.toBe(first.id);
+        await waitUntil(
+          () =>
+            releasedOwners().length === afterFirst + 1 &&
+            instance.registry.getSessionRegistry(MODEL_NAME)?.queueDepth === 0 &&
+            instance.registry.getSessionRegistry(MODEL_NAME)?.preDispatchAdmitCount === 0 &&
+            instance.health().work.inFlight === 0,
+          'Responses owner replacement and request accounting did not settle',
+          ACCOUNTING_TIMEOUT_MS,
+        );
+        expect(releasedOwners().slice(afterFirst)).toHaveLength(1);
+      } catch (error) {
+        await waitForAccountingDrain('failed Responses request accounting did not settle');
+        throw error;
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
 });
