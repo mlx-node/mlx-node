@@ -132,15 +132,22 @@
 //! Because the guard sees ids, it knows which `<|…|>` characters were a real
 //! control token and which the model merely typed. It accumulates the turn's raw
 //! text and the byte spans of the control tokens it decoded, and
-//! [`StreamGuard::raw_turn`] hands both to
-//! [`super::output_parser::GeneratedTurn::from_token_spans`]. That distinction is
-//! the whole point: `<|eot|>` from token 200008 and `<|eot|>` typed as seven
-//! characters are the same bytes, and a quoted terminator was authorising real
-//! tool calls.
+//! [`super::output_parser::GeneratedTurn::from_guard`] — reached through
+//! [`StreamGuard::generated_turn`] — is how the parser receives both. That
+//! distinction is the whole point: `<|eot|>` from token 200008 and `<|eot|>` typed
+//! as seven characters are the same bytes, and a quoted terminator was authorising
+//! real tool calls.
 //!
 //! Spans are recorded only for ids that [`StreamGuard::new`] resolved to a control
 //! literal through the tokenizer, so a span is never guessed. Omitting one costs
 //! only recognition; inventing one re-opens the bypass.
+//!
+//! **This guard is the only producer.** The parser's raw-span constructor is
+//! module-private to `output_parser`, so `from_guard` is the sole non-test way to
+//! build a `GeneratedTurn` and it demands a real guard. `pub(super)` was not enough:
+//! it reached every sibling in `models::muse_glimmer`, M1's `model.rs` included, and
+//! a non-test sibling with no guard and no tokenizer really did parse typed text
+//! into `rm { path: "/" }`.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -3907,10 +3914,10 @@ mod tests {
             }
         }
         streamed.push_str(&g.flush());
-        // `generated_turn`, not `from_token_spans`: this is the production path, and
-        // after fix round 5 it is the ONLY one — the constructor is `pub(super)`, so
-        // a caller cannot hand the parser spans it made up. Going through it here is
-        // also what keeps these tests honest about what a real caller can do.
+        // `generated_turn`, i.e. `GeneratedTurn::from_guard`: this is the production
+        // path, and it is the ONLY one — the parser's raw-span constructor is
+        // module-private, so no caller can hand it spans it made up. Going through it
+        // here is what keeps these tests honest about what a real caller can do.
         let parsed = response_template().parse(g.generated_turn());
         Seam {
             streamed,
