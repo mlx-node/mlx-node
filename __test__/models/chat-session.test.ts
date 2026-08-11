@@ -256,6 +256,40 @@ describe('ChatSession', () => {
       expect(session.turns).toBe(2);
     });
 
+    it('keeps complete-history preflight cache owners provisional until dispatch', async () => {
+      const { model, chatSessionStart, releaseCacheOwner } = makeMockModel();
+      const session = new ChatSession(model);
+      const messages: ChatMessage[] = [{ role: 'user', content: 'preflight only' }];
+
+      const preflight = await session.preflightContextCapacity(messages, { cacheOwnerId: 'preflight-owner' });
+      await session.send('first real turn', { config: { cacheOwnerId: 'turn-owner' } });
+      await session.dispose();
+
+      expect(preflight.cacheOwnerId).toBe('preflight-owner');
+      expect(chatSessionStart.mock.calls[0][1]?.cacheOwnerId).toBe('turn-owner');
+      expect(releaseCacheOwner.mock.calls.map(([ownerId]) => ownerId)).toEqual(['turn-owner']);
+    });
+
+    it('keeps pending-history preflight cache owners provisional until dispatch', async () => {
+      const { model, chatSessionStart, releaseCacheOwner } = makeMockModel();
+      const session = new ChatSession(model);
+      session.primeHistory([
+        { role: 'user', content: 'seed' },
+        { role: 'assistant', content: 'seeded' },
+      ]);
+
+      const preflight = await session.preflightPendingContextCapacity(
+        { role: 'user', content: 'first real turn' },
+        { cacheOwnerId: 'preflight-owner' },
+      );
+      await session.send('first real turn', { config: { cacheOwnerId: 'turn-owner' } });
+      await session.dispose();
+
+      expect(preflight.cacheOwnerId).toBe('preflight-owner');
+      expect(chatSessionStart.mock.calls[0][1]?.cacheOwnerId).toBe('turn-owner');
+      expect(releaseCacheOwner.mock.calls.map(([ownerId]) => ownerId)).toEqual(['turn-owner']);
+    });
+
     it('dispose releases the exact native owners once and permanently closes the session', async () => {
       const { model, chatSessionStart, releaseCacheOwner } = makeMockModel();
       const session = new ChatSession(model);

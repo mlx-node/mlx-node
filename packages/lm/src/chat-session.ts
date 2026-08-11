@@ -834,7 +834,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     if (this.inFlight) {
       throw new Error('ChatSession: cannot preflight context capacity while a send() is in flight');
     }
-    return await this.constrainToContextCapacity(messages.slice(), this.mergeConfig(config));
+    return await this.constrainToContextCapacity(messages.slice(), this.mergeConfig(config, false));
   }
 
   /**
@@ -856,7 +856,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     } else {
       throw new Error('ChatSession: pending context capacity preflight requires a user or tool message');
     }
-    return await this.constrainToContextCapacity(this.historyWithPending(pending), this.mergeConfig(config));
+    return await this.constrainToContextCapacity(this.historyWithPending(pending), this.mergeConfig(config, false));
   }
 
   /**
@@ -1829,8 +1829,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * cache the delta depends on.
    *
    * Tool resolution here is side-effect free because public capacity
-   * preflights use this same merge path. Successful turn commit sites call
-   * {@link commitActiveTools} after native inference finishes.
+   * preflights use this same merge path with owner establishment disabled.
+   * Successful turn commit sites call {@link commitActiveTools} after native
+   * inference finishes.
    *
    * MTP auto-default: if neither `defaultConfig` nor `overlay`
    * sets `enableMtp` AND the underlying model exposes
@@ -1842,7 +1843,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * assistant (`hasMtpWeights()` reports the external draft there,
    * not in-checkpoint MTP heads).
    */
-  private mergeConfig(overlay: ChatConfig | undefined): ChatConfig {
+  private mergeConfig(overlay: ChatConfig | undefined, establishCacheOwner = true): ChatConfig {
     if (this.disposed) {
       throw new Error('ChatSession: session has been disposed');
     }
@@ -1853,14 +1854,19 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     };
     const requestedOwnerId = merged.cacheOwnerId;
     if (this.cacheOwnerId === null) {
-      this.cacheOwnerId = requestedOwnerId === undefined || requestedOwnerId === '' ? randomUUID() : requestedOwnerId;
+      if (establishCacheOwner) {
+        this.cacheOwnerId = requestedOwnerId === undefined || requestedOwnerId === '' ? randomUUID() : requestedOwnerId;
+        merged.cacheOwnerId = this.cacheOwnerId;
+        this.nativeCacheOwnerIds.add(this.cacheOwnerId);
+      }
     } else if (requestedOwnerId !== undefined && requestedOwnerId !== '' && requestedOwnerId !== this.cacheOwnerId) {
       throw new Error(
         `ChatSession: cacheOwnerId cannot change after the session owner is established; create a new ChatSession for owner ${requestedOwnerId}`,
       );
+    } else {
+      merged.cacheOwnerId = this.cacheOwnerId;
+      if (establishCacheOwner) this.nativeCacheOwnerIds.add(this.cacheOwnerId);
     }
-    merged.cacheOwnerId = this.cacheOwnerId;
-    this.nativeCacheOwnerIds.add(this.cacheOwnerId);
     // Tools are part of the committed conversation state. Constructor
     // defaults seed that state, but must not overwrite a tool set committed by
     // a later successful turn. A current-call overlay is the only higher
