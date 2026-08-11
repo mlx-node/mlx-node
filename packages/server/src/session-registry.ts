@@ -692,16 +692,12 @@ export class SessionRegistry {
   }
 
   /**
-   * Endpoint-side early admission against this registry's cap, taken
-   * BEFORE the request enters any pre-dispatch parking spot the FIFO
-   * cannot see. In host mode (`createInferenceHost`) every request
-   * passes the `ModelWorkCoordinator` writer bracket ahead of
-   * the resident admission lane; while a turn holds the coordinator's reader, each
-   * arrival parks there as a writer waiter with `queuedCount` still 0 —
-   * so without this gate the resident-lane cap could never fire and
-   * the parked backlog grew without bound (H3). The same applies to a
-   * continuation blocked in `await store.getChain(...)` on a slow
-   * store: pre-lock async work of any kind parks OUTSIDE `queuedCount`.
+   * Endpoint-side early admission against this registry's cap, taken BEFORE
+   * the request enters any pre-dispatch parking spot the resident lane cannot
+   * see. Resident host traffic deliberately bypasses the model-load writer so
+   * continuous batching remains reachable, but a continuation can still block
+   * in `await store.getChain(...)` (or other pre-lock work) with `queuedCount`
+   * unchanged. This permit keeps all such work inside the same bounded budget.
    *
    * Accounting: pre-dispatch permits, active dispatches, and queued callers
    * draw from ONE budget: `maxQueueDepth` waiter slots plus the selected

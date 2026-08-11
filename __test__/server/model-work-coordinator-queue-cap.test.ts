@@ -412,10 +412,9 @@ describe('ModelWorkCoordinator + SessionRegistry queue cap', () => {
 
 /**
  * Gated model for host-mode admission tests: the FIRST `chatSessionStart`
- * parks on `hold` and signals `onEnter`, so the test can pin one
- * inference open — holding the coordinator READER inside `withExclusive`
- * — while concurrent arrivals park in the `resolveModel` writer queue.
- * Later calls return immediately so the backlog drains. Exposes the
+ * parks on `hold` and signals `onEnter`, so the test can pin one inference
+ * open while concurrent resident arrivals move into the SessionRegistry
+ * lane. Later calls return immediately so the backlog drains. Exposes the
  * `chatSessionStart` mock so a test can gate one more turn via
  * `mockImplementationOnce`.
  */
@@ -445,14 +444,12 @@ function createGatedModel(
 }
 
 /**
- * H3 host-mode regression: with `resolveModel` wired (as
- * `createInferenceHost` wires it), every request enters the
- * `ModelWorkCoordinator` writer bracket BEFORE `withExclusive`. While a
- * turn holds the coordinator's reader, arrivals park as writer waiters
- * where `SessionRegistry.queueDepth` stays 0 — so without a pre-dispatch
- * gate the per-model cap could never fire and the parked backlog grew
- * without bound. These tests pin the gate: over-cap arrivals get the
- * same 429 envelope, BEFORE the active turn completes.
+ * H3 host-mode regression with `resolveModel` wired exactly as
+ * `createInferenceHost` wires it. A resident request must bypass the
+ * model-load writer: otherwise an active inference reader serializes every
+ * arrival before it reaches the continuous-batching admission lane. These
+ * tests prove arrivals reach the SessionRegistry queue, stay bounded by its
+ * pre-dispatch gate, and return the same 429 envelope before the holder ends.
  */
 describe('pre-dispatch admission gate (resolveModel + coordinator wiring)', () => {
   it('POST /v1/messages rejects over-cap arrivals with 429 while the active turn still holds the reader', async () => {
@@ -462,8 +459,8 @@ describe('pre-dispatch admission gate (resolveModel + coordinator wiring)', () =
     const releaseHolder = deferred();
     const { model } = createGatedModel(() => holderEntered.resolve(undefined), releaseHolder.promise);
     registry.register('gated-model', model);
-    // Resident fast path: the host's resolveModel is a no-op once the
-    // model is registered, but it still runs inside the writer bracket.
+    // Resident fast path: endpoints must recognize the existing registry and
+    // avoid invoking even this no-op resolver inside the writer bracket.
     const resolveModel = vi.fn(async () => {});
 
     const sendOne = () => {
@@ -487,9 +484,8 @@ describe('pre-dispatch admission gate (resolveModel + coordinator wiring)', () =
     const holder = sendOne();
     await holderEntered.promise;
 
-    // 18 concurrent arrivals against cap 16: the first 16 are admitted
-    // (they park behind the coordinator writer gate), #17 and #18 are
-    // rejected by the pre-dispatch gate.
+    // 18 concurrent arrivals against cap 16: the first 16 reach the resident
+    // queue, while #17 and #18 are rejected by the pre-dispatch gate.
     const arrivals = Array.from({ length: 18 }, () => sendOne());
     await tick();
 
@@ -507,10 +503,11 @@ describe('pre-dispatch admission gate (resolveModel + coordinator wiring)', () =
       expect(parsed.error.type).toBe('rate_limit_error');
       expect(parsed.error.message).toContain('Model queue full');
     }
-    // The finding's mechanism, pinned: the admitted arrivals are parked
-    // at the COORDINATOR, not in the SessionRegistry FIFO — queueDepth
-    // never needs to exceed (or even reach) the cap for the gate to fire.
-    expect(registry.getSessionRegistry('gated-model')!.queueDepth).toBe(0);
+    // The admitted arrivals reached the resident lane instead of parking as
+    // coordinator writers. The fixed waiter bound is fully occupied.
+    expect(resolveModel).not.toHaveBeenCalled();
+    expect(coordinator.waitingWriters).toBe(0);
+    expect(registry.getSessionRegistry('gated-model')!.queueDepth).toBe(16);
 
     releaseHolder.resolve(undefined);
     await holder.done;
@@ -565,7 +562,9 @@ describe('pre-dispatch admission gate (resolveModel + coordinator wiring)', () =
       expect(parsed.error.code).toBe('queue_full');
       expect(parsed.error.message).toContain('Model queue full');
     }
-    expect(registry.getSessionRegistry('gated-model')!.queueDepth).toBe(0);
+    expect(resolveModel).not.toHaveBeenCalled();
+    expect(coordinator.waitingWriters).toBe(0);
+    expect(registry.getSessionRegistry('gated-model')!.queueDepth).toBe(16);
 
     releaseHolder.resolve(undefined);
     await holder.done;
@@ -843,42 +842,35 @@ describe('pre-dispatch permit lifetime (pre-lock async work)', () => {
     expect(b.mock.getStatus()).toBe(200);
   }, 15000);
 
-  it('an idle-chain permitless cold-load alias cannot double-spend the reserved runner entitlement', async () => {
-    // The variant above starts with an ACTIVE holder. This one starts
-    // with the exec chain IDLE: the gate has legitimately lent the
-    // whole runner-plus-waiter capacity (cap 1 + runner entitlement =
-    // 2 permits) to two resident requests parked in pre-lock work
-    // (resolveModel), with `withExclusive` untouched. A cold-alias
-    // request skips the gate, dispatches permitless into the SAME
-    // still-idle registry, and — because `asWaiter === false` — would
-    // seat itself on the runner entitlement one of those permits
-    // already owns unless the runner path checks the combined
-    // footprint too.
+  it('an idle-chain cold-load alias cannot double-spend permits parked in store preflight', async () => {
+    // The variant above starts with an ACTIVE holder. This one starts with the
+    // exec chain IDLE: the gate has legitimately lent the whole
+    // runner-plus-waiter capacity (cap 1 + runner entitlement = 2 permits) to
+    // two resident continuations parked in store.getChain(), with
+    // withExclusive untouched. A cold-alias request reaches the SAME still-idle
+    // registry and must not spend a runner seat one of those permits owns.
     const registry = new ModelRegistry({ maxQueueDepth: 1 });
     const model = createModel();
     registry.register('m', model);
     const sessReg = registry.getSessionRegistry('m')!;
 
-    const resolveGate = deferred();
     const resolveModel = vi.fn(async (name: string) => {
-      if (name === 'm') {
-        // Both resident requests park HERE — pre-lock, permits
-        // retained, exec chain still idle.
-        await resolveGate.promise;
-        return;
-      }
       if (name === 'm-alias') {
         // Same model object -> same SessionRegistry (alias binding).
         registry.register('m-alias', model);
       }
     });
 
+    let rejectGetChain!: (error: Error) => void;
+    const getChainGate = new Promise<StoredResponseRecord[]>((_, reject) => {
+      rejectGetChain = reject;
+    });
     const store = {
-      getChain: vi.fn(async () => []),
+      getChain: vi.fn(() => getChainGate),
       store: vi.fn(async () => {}),
     } as unknown as ResponseStore;
 
-    const sendOne = (body: { model: string; input: string }) => {
+    const sendOne = (body: { model: string; input: string; previous_response_id?: string }) => {
       const mock = createMockRes();
       const done = handleCreateResponse(
         mock.res,
@@ -894,10 +886,10 @@ describe('pre-dispatch permit lifetime (pre-lock async work)', () => {
       return { mock, done };
     };
 
-    // A1 + A2: resident requests; each takes a permit at the gate (an
-    // idle chain admits cap + 1 = 2) and parks in resolveModel.
-    const a1 = sendOne({ model: 'm', input: 'a1' });
-    const a2 = sendOne({ model: 'm', input: 'a2' });
+    // A1 + A2: resident requests; each takes a permit at the gate (an idle
+    // chain admits cap + 1 = 2) and parks in store preflight.
+    const a1 = sendOne({ model: 'm', input: 'a1', previous_response_id: 'resp_1' });
+    const a2 = sendOne({ model: 'm', input: 'a2', previous_response_id: 'resp_2' });
     await tick();
     expect(sessReg.queueDepth).toBe(0);
     expect(sessReg.preDispatchAdmitCount).toBe(2);
@@ -919,22 +911,14 @@ describe('pre-dispatch permit lifetime (pre-lock async work)', () => {
     expect(sessReg.queueDepth).toBe(0);
     expect(sessReg.preDispatchAdmitCount).toBe(2);
 
-    // Unblock the parked requests: their permits hand off at
-    // placement (one runner + the one legal waiter). Sample the
-    // invariant on every tick of the drain — the queue depth must
-    // never exceed the waiter capacity.
-    resolveGate.resolve(undefined);
-    const drained = Promise.all([a1.done, a2.done]).then(() => 'done' as const);
-    let settled: 'done' | 'pending' = 'pending';
-    while (settled === 'pending') {
-      settled = await Promise.race([drained, tick().then(() => 'pending' as const)]);
-      expect(sessReg.queueDepth).toBeLessThanOrEqual(1);
-      expect(sessReg.queueDepth + sessReg.preDispatchAdmitCount).toBeLessThanOrEqual(2);
-    }
+    // Unblock both parked requests with the native miss shape. Neither ever
+    // reaches placement, and both permits return to the idle registry.
+    rejectGetChain(new Error('Response not found'));
+    await Promise.all([a1.done, a2.done]);
     await a1.mock.waitForEnd();
     await a2.mock.waitForEnd();
-    expect(a1.mock.getStatus()).toBe(200);
-    expect(a2.mock.getStatus()).toBe(200);
+    expect(a1.mock.getStatus()).toBe(404);
+    expect(a2.mock.getStatus()).toBe(404);
     expect(sessReg.queueDepth).toBe(0);
     expect(sessReg.preDispatchAdmitCount).toBe(0);
   }, 15000);

@@ -1825,21 +1825,18 @@ export async function handleCreateResponse(
   }
   const effectiveRetentionSec = requestedRetentionSec ?? responseRetentionSec;
 
-  // Pre-dispatch admission gate (H3, host mode). In host mode every
-  // request enters the `ModelWorkCoordinator` writer bracket just below
-  // and, while a turn holds the coordinator's reader, parks there as a
-  // writer waiter that `SessionRegistry.queueDepth` cannot see — so the
-  // `withExclusive` cap alone never fires and the parked backlog grows
-  // without bound. When the model is ALREADY resident, admit-or-429 up
-  // front against the same per-model budget (same envelope as the
-  // `withExclusive` reject below). A non-resident model has no
-  // `SessionRegistry` yet, so it takes the coordinator's bounded
-  // pre-resolution permit below instead of entering its writer queue
-  // uncounted.
+  // Pre-dispatch admission gate (H3, host mode). Resident requests bypass
+  // the model-load writer below and proceed toward the continuous-batching
+  // lane, but can still park in pre-lock store work before reaching it. Admit
+  // or 429 up front against the same per-model budget so that work stays
+  // bounded too. A non-resident model has no `SessionRegistry` yet, so it
+  // takes the coordinator's bounded pre-resolution permit below instead of
+  // entering its writer queue uncounted.
   //
-  // The permit is RETAINED through every pre-lock await — the writer
-  // bracket below AND the `store.getChain` continuation lookups — and
-  // handed to `withExclusive` at placement, which consumes it
+  // The applicable permit is RETAINED through every pre-lock await — the
+  // writer bracket for a cold model, or the `store.getChain` continuation
+  // lookups for a resident model — and handed to the selected resident lane
+  // at placement, which consumes it
   // atomically as this request's admission (one budget, one token,
   // never double-counted). It is released only on the bail-out exits:
   // explicitly on the early returns before the outer `try`, and by the
@@ -1873,8 +1870,9 @@ export async function handleCreateResponse(
     }
   }
 
-  // Lazy load, exactly as the Anthropic endpoints do. Nothing is resident at
-  // boot — `createInferenceHost` only discovers — so without this the very
+  // Lazy load, exactly as the Anthropic endpoints do, only when the requested
+  // name has no resident registry. Nothing is resident at boot —
+  // `createInferenceHost` only discovers — so without this the very
   // first `/v1/responses` 404s against a `/v1/models` list that advertises the
   // model, and a client id that exists only as an alias 404s forever.
   //
@@ -1882,7 +1880,7 @@ export async function handleCreateResponse(
   // 400 cannot burn a 30 s load or evict the resident model. BEFORE
   // `registry.get` below, and therefore before the dispatch lease, which needs
   // a registered name.
-  if (resolveModel) {
+  if (resolveModel && !preDispatchRegistry) {
     // Errors serialize through the OpenAI envelope here. Letting them reach
     // the outer `createHandler` catch would be right for this endpoint by
     // accident and wrong for the Anthropic one — `messages.ts` has the mirror

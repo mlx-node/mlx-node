@@ -104,8 +104,8 @@ describe('deriveHealthStatus', () => {
   });
 
   it("does NOT report 'error' for a successful load with nothing resident", () => {
-    // `withModelLoad` brackets every resolve attempt, including no-op fast
-    // paths, so `ok: true` with an empty registry is possible and benign.
+    // A successfully loaded binding can be removed later, leaving a successful
+    // historical record and an empty registry. That state is benign.
     expect(deriveHealthStatus(inputs({ residentModelCount: 0, lastLoad: loadRecord({ ok: true }) }))).toBe('ok');
   });
 

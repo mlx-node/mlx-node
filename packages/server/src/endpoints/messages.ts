@@ -1107,13 +1107,12 @@ export async function handleCreateMessage(
 
   // Pre-dispatch admission gate (H3, host mode). Mirror of the
   // `/v1/responses` gate — see the long-form rationale there. In host
-  // mode arrivals park in the `ModelWorkCoordinator` writer bracket
-  // below, invisible to `SessionRegistry.queueDepth`, so the
-  // `withExclusive` cap alone cannot bound the backlog. Resident model:
-  // admit-or-429 (Anthropic envelope) against the same per-model
-  // budget. Non-resident (cold-load) requests use the coordinator's
-  // bounded pre-resolution permit below because no `SessionRegistry`
-  // exists yet. The permit is RETAINED through every pre-lock
+  // mode resident arrivals bypass the `ModelWorkCoordinator` writer bracket
+  // below and proceed toward the continuous-batching lane, but can still park
+  // in pre-lock work. Admit-or-429 (Anthropic envelope) against the same
+  // per-model budget so that work stays bounded too. Non-resident (cold-load)
+  // requests use the coordinator's bounded pre-resolution permit below
+  // because no `SessionRegistry` exists yet. The permit is RETAINED through every pre-lock
   // await and handed to `withExclusive` at placement, which consumes it
   // atomically as this request's admission (one budget, one token,
   // never double-counted); it is released only on bail-out exits —
@@ -1148,9 +1147,9 @@ export async function handleCreateMessage(
     }
   }
 
-  // Lazy-load hook: give the host a chance to register the requested
-  // model before we look it up. Errors bubble up to the handler's
-  // top-level catch which returns 500.
+  // Lazy-load hook for a requested name with no resident registry: give the
+  // host a chance to register it before we look it up. Resident requests skip
+  // this writer bracket so they can reach the continuous-batching lane.
   //
   // The load is bracketed by `idleSweeper.withSuspendedDrains` so the
   // post-request drain timer armed by the PREVIOUS request's
@@ -1164,7 +1163,7 @@ export async function handleCreateMessage(
   // The wrapper handles try/finally itself and is a pass-through on
   // the disabled sweeper, so the bracket is unconditional whenever
   // a sweeper is supplied.
-  if (resolveModel) {
+  if (resolveModel && !preDispatchRegistry) {
     // A throw here (bad model path, corrupt weights, native loader failure)
     // would otherwise bubble up to the outer `createHandler` catch which
     // emits the OpenAI-shape `{ error: ... }` envelope via `sendInternalError`.
@@ -1191,7 +1190,8 @@ export async function handleCreateMessage(
         // observability fields:
         //  - owner driving a cold load → waitMs ≈ 0, ownMs ≈ load duration
         //  - follower parked behind peer → waitMs ≈ peer load, ownMs ≈ 0
-        //  - already-loaded fast path  → waitMs ≈ 0, ownMs ≈ 0
+        // Resident requests bypass this block entirely and therefore omit all
+        // three load-timing fields.
         // This matches the documented contract in `timing.ts` where
         // `server_model_resolve_ms` excludes peer-wait time.
         const outcome = await modelWorkCoordinator.withModelLoadInstrumented(runResolve);
