@@ -2334,13 +2334,10 @@ impl PagedKVCacheAdapter {
             )
         })?;
         if block_table.seq_id != seq_id {
+            let table_seq_id = block_table.seq_id;
             self.block_table = Some(block_table);
             return Err(format!(
-                "active paged request id {seq_id} does not match block table id {}",
-                self.block_table
-                    .as_ref()
-                    .expect("table restored above")
-                    .seq_id
+                "active paged request id {seq_id} does not match block table id {table_seq_id}"
             ));
         }
         Ok(PagedRequestState {
