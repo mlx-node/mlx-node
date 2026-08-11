@@ -11,15 +11,13 @@
  * `SessionRegistry` hit or a block-paged model whose allocator validates
  * reusable prefixes by content hash and isolates live cache owners.
  *
- * Why this helper exists at all: `ChatSession.reset()` is the safe
- * public wipe — it always calls `model.resetCaches()` because the
- * underlying `SessionCapableModel` is shared across every session
- * lifetime via the native `ModelRegistry`. A partial wipe that leaves
- * shared native KV state intact without an ownership or content-
- * verification gate would leak an unrelated request's prefix into the
- * next `chat_session_start_sync` call. Warm leases provide the ownership
- * gate; block-paged adapters provide the content-verification gate. A
- * JS-state-only reset is valid in either case.
+ * Why this helper exists at all: public `ChatSession.reset()` invalidates the
+ * current session's native state — owner-scoped on block-paged models and
+ * model-wide on exclusive/flat models. A warm registry HIT instead needs to
+ * preserve the already-authorized native prefix while clearing only the JS
+ * conversation wrapper. Warm leases provide the ownership gate; block-paged
+ * adapters provide the content-verification gate. A JS-state-only reset is
+ * valid in either case.
  *
  * Fields accessed: `inFlight`, `history`, `lastImagesKey`, `lastAudioKey`, `turnCount`,
  * `unresolvedOkToolCallCount`, `needsFullReplay`, `defaultConfig`, `activeTools`.

@@ -365,18 +365,17 @@ describe('MlxModelHost', () => {
       expect(resolveModelPathFn.mock.calls[0]).toEqual([QWEN3, { persistPagedCache: false }]);
     });
 
-    it('requests cold-tier persistence by default for a hybrid family too', async () => {
+    it('hands no cold-tier policy to Gemma4 until grouped restore is atomic', async () => {
       const resolveModelPathFn = trackingResolver();
       const host = new MlxModelHost(HOST_MODELS, { loadModelFn: makeLoader(), resolveModelPathFn });
 
       await getSession(host, 'gemma-mid');
 
-      // gemma4 keeps sliding-window state outside the paged pool, but persists
-      // it as a cold-tier sidecar and passed its restart-parity gate, so it is
-      // on the allowlist and gets the same default-on policy as dense qwen3.
-      // Asserted literally rather than through `expectedResolveArgs`, so this
-      // still fails if the allowlist and the default ever drift apart.
-      expect(resolveModelPathFn.mock.calls[0]).toEqual([HOST_MODELS[1], { persistPagedCache: true }]);
+      // Gemma4 now owns full and sliding attention in separate paged groups.
+      // Its obsolete rotating-cache sidecar cannot restore those groups at one
+      // atomic boundary, so the host must not request persistence until a
+      // grouped restart-parity gate exists.
+      expect(resolveModelPathFn.mock.calls[0]).toEqual([HOST_MODELS[1]]);
     });
 
     it('hands no policy at all to a family off the allowlist', async () => {

@@ -731,8 +731,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * requests. Give every ChatSession its own identity while still allowing an
    * explicit provider identity to override it.
    */
-  private readonly cacheOwnerId = randomUUID();
-  /** Every native owner used by this session, normally the UUID above. */
+  private cacheOwnerId: string | null = null;
+  /** The native owner used by this session, retained as a set for retryable release. */
   private readonly nativeCacheOwnerIds = new Set<string>();
   private disposed = false;
   /** Tool definitions are conversation state for deterministic template replay. */
@@ -1230,9 +1230,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * when the native session is cold (turnCount===0 — e.g. after an
    * interrupted media-held replay rolled the cache back) and by the
    * media-held rejection catch. `mediaChanged=true` forces a
-   * resetCaches so the prefill always starts from a guaranteed-clean
-   * cache; `isFirstTurn=false` because a tool result always follows a
-   * prior tool-call turn.
+   * native cache invalidation so the prefill starts from a guaranteed-clean
+   * owner; `isFirstTurn=false` because a tool result always follows a prior
+   * tool-call turn.
    */
   private async replayToolResultThroughStartPath(
     toolMsg: ChatMessage,
@@ -1397,37 +1397,24 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   /**
    * Reset the session state.
    *
-   * Clears the underlying model's KV caches and wipes local history,
-   * image key, and turn counter so the next `send()` goes through
-   * `chatSessionStart` again.
+   * Invalidates this session's native KV state and wipes local history,
+   * media keys, and turn counter so the next `send()` goes through
+   * `chatSessionStart` again. Block-paged models release only this stable
+   * session owner; clearing the model-wide scheduler would invalidate every
+   * other live `ChatSession`. Exclusive/flat models retain the model-wide
+   * `resetCaches()` barrier because they have no independently releasable
+   * owner state.
    *
-   * This is a full wipe — safe default for public callers. It always
-   * calls `model.resetCaches()`, which is the ONLY behavior exposed
-   * on the public API because the underlying `SessionCapableModel`
-   * is shared across every `ChatSession` lifetime via the native
-   * `ModelRegistry`: a partial wipe that leaves the shared native
-   * KV cache intact would leak a previous (unrelated) request's
-   * cached prefix into the next `chat_session_start_sync` call. The
-   * server-side warm-lease replay path (where preserving the native
-   * cache is correct) uses its own server-private helper gated by
-   * the `SessionRegistry` HIT signal — the only authoritative proof
-   * that the native cache genuinely belongs to this chain. That
-   * helper lives inside `@mlx-node/server`, never touches the
-   * `@mlx-node/lm` export map, and is not reachable from downstream
-   * consumers. Public consumers of `@mlx-node/lm` have no such HIT
-   * signal, so the public API intentionally offers only the full-wipe
-   * option.
-   *
-   * The native `resetCaches()` is async (H1a): the wipe is awaited so
-   * the reset command has fully drained through the model thread
-   * before this promise resolves — callers that `await reset()` and
+   * Native invalidation is async: the release/reset command is awaited so it
+   * has fully drained through the model thread before this promise resolves —
+   * callers that `await reset()` and
    * then start a turn keep strict command-queue ordering. Because the
    * await genuinely suspends, `reset()` RESERVES the same in-flight
    * guard as the send entry points for its whole duration: any
    * concurrent `send*()`, `reset()`, `primeHistory()`, or
    * `startFromHistory*()` on this session rejects until the reset
    * settles, so a racing turn can never commit against the pre-wipe
-   * history (or have its state erased mid-commit). If the native reset
+   * history (or have its state erased mid-commit). If native invalidation
    * rejects, no JS state is wiped and the guard is released.
    */
   async reset(): Promise<void> {
@@ -1439,7 +1426,15 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     }
     this.inFlight = true;
     try {
-      await this.model.resetCaches();
+      if (this.model.hasBlockPagedCache?.() === true && this.model.releaseCacheOwner) {
+        for (const ownerId of Array.from(this.nativeCacheOwnerIds)) {
+          await this.model.releaseCacheOwner(ownerId);
+          this.nativeCacheOwnerIds.delete(ownerId);
+        }
+      } else {
+        await this.model.resetCaches();
+        this.nativeCacheOwnerIds.clear();
+      }
       this.history = [];
       this.lastImagesKey = null;
       this.lastAudioKey = null;
@@ -1453,12 +1448,12 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   }
 
   /**
-   * Permanently dispose this JS session and release every native scheduler
-   * owner it used. The operation is awaited and idempotent; it rejects while
+   * Permanently dispose this JS session and release its native scheduler
+   * owner. The operation is awaited and idempotent; it rejects while
    * a turn is in flight so native state cannot be torn down mid-decode.
    *
-   * A caller-supplied `cacheOwnerId` becomes owned by this session just like
-   * the generated default owner. Do not share an explicit owner id between
+   * A caller-supplied first `cacheOwnerId` becomes this session's stable owner
+   * just like the generated default. Do not share an explicit owner id between
    * independently disposed sessions: disposing either session releases that
    * owner's native scheduler state for both.
    */
@@ -1856,10 +1851,16 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       ...overlay,
       reuseCache: true,
     };
-    if (merged.cacheOwnerId === undefined || merged.cacheOwnerId === '') {
-      merged.cacheOwnerId = this.cacheOwnerId;
+    const requestedOwnerId = merged.cacheOwnerId;
+    if (this.cacheOwnerId === null) {
+      this.cacheOwnerId = requestedOwnerId === undefined || requestedOwnerId === '' ? randomUUID() : requestedOwnerId;
+    } else if (requestedOwnerId !== undefined && requestedOwnerId !== '' && requestedOwnerId !== this.cacheOwnerId) {
+      throw new Error(
+        `ChatSession: cacheOwnerId cannot change after the session owner is established; create a new ChatSession for owner ${requestedOwnerId}`,
+      );
     }
-    this.nativeCacheOwnerIds.add(merged.cacheOwnerId);
+    merged.cacheOwnerId = this.cacheOwnerId;
+    this.nativeCacheOwnerIds.add(this.cacheOwnerId);
     // Tools are part of the committed conversation state. Constructor
     // defaults seed that state, but must not overwrite a tool set committed by
     // a later successful turn. A current-call overlay is the only higher

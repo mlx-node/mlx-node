@@ -245,12 +245,15 @@ The real-checkpoint correctness gates run independently of the benchmark:
   request-local cache owner; without that identity native correctly falls back
   to the legacy exclusive sequence-zero lane.
 
-`ChatSession.dispose()` releases every native cache owner used by that session.
-This includes an explicit `cacheOwnerId` supplied through `ChatConfig`, not only
-the session-generated default. Do not share one explicit owner id between
-independently disposed sessions: disposing either wrapper releases the shared
-native scheduler state. Server warm-slot eviction and stateless request cleanup
-await this lifecycle transition before dispatching replacement work.
+`ChatSession` pins its first effective `cacheOwnerId` for the wrapper's entire
+lifetime; a later per-call attempt to switch identities rejects before native
+dispatch. `reset()` releases only that owner on block-paged models, preserving
+unrelated live sessions, while exclusive/flat models retain their model-wide
+reset barrier. `dispose()` releases the same stable owner. Do not share one
+explicit owner id between independent sessions: resetting or disposing either
+wrapper releases the shared native scheduler state. Server warm-slot eviction
+and stateless request cleanup await this lifecycle transition before dispatching
+replacement work.
 
 Performance evidence is deliberately reported separately. On 2026-08-10, an
 Apple M5 Max with 128 GiB ran one uncooled fresh-process A/B sample against
