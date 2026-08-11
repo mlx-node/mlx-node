@@ -63,6 +63,23 @@
 //! partial marker first: the tail is by definition the ambiguous part, and a
 //! turn that stops mid-marker must not publish the fragment.
 //!
+//! # The lifecycle: `push_id`* then `flush`, and the turn is closed
+//!
+//! `flush` is **terminal**. Both ends of a turn are sticky, and for the same
+//! reason: an [`GuardOutcome::EndTurn`] repeats forever so a caller that misses
+//! the first one cannot restart a self-played turn, and a flushed guard rejects
+//! every later id so a late token cannot rewrite a finalised one. Draining the
+//! buffers without sealing was not a bookkeeping slip — the detokenizer bytes of
+//! an "already dropped" scalar stayed live, and the next id revived it and
+//! rewrote [`StreamGuard::raw_turn`], which is the text the parser reads to decide
+//! whether a tool call was authorised.
+//!
+//! So the caller's contract is: push ids until an outcome is `EndTurn` or the
+//! stream stops, call `flush` **once** for the trailing content, then read
+//! `raw_turn` for the parser. `raw_turn` stays valid for the guard's whole life;
+//! the next turn gets a **new guard**, which is also how `max_messages` and
+//! `max_tokens` stay per-turn.
+//!
 //! # The guard consumes token **ids**, and decodes them itself
 //!
 //! [`StreamGuard::push_id`] takes one sampled token id and charges exactly one
@@ -411,9 +428,11 @@ impl StreamGuard {
         if self.ended {
             return GuardOutcome::EndTurn;
         }
-        // Cap first, before anything is decoded or retained.
+        // Cap first, before anything is decoded or retained. `seal` rather than
+        // `stop`: the tail already in `pending` came from ids *within* the cap and
+        // is still the caller's, so only the turn and the parked bytes end here.
         if self.tokens >= self.max_tokens {
-            self.ended = true;
+            self.seal();
             return GuardOutcome::EndTurn;
         }
         // An id this vocabulary does not contain is not something to guess about.
@@ -558,6 +577,10 @@ impl StreamGuard {
     /// A span appears only where a decoded id was resolved to a control literal in
     /// [`Self::new`]. Characters the model merely *typed* get none, which is the
     /// distinction the parser gates its terminators on.
+    ///
+    /// **Frozen once [`Self::flush`] has run.** Nothing a caller does afterwards can
+    /// change it, which is the property the parser depends on: it authorises tool
+    /// calls from this text, so it must not be reading a turn that is still moving.
     pub fn raw_turn(&self) -> (&str, &[Range<usize>]) {
         (&self.raw, &self.control_spans)
     }
@@ -576,6 +599,21 @@ impl StreamGuard {
     /// would be fabricating output, and retaining the bytes in the parser's input
     /// would put invalid text there. At most one incomplete scalar is lost, and only
     /// when generation was cut off inside it.
+    ///
+    /// **`flush` is TERMINAL.** It seals the guard, so every later push returns
+    /// [`GuardOutcome::EndTurn`] and cannot change what [`Self::raw_turn`] reports.
+    /// Draining the buffers without sealing left the parked detokenizer bytes live,
+    /// and the dropped scalar was not dropped at all — measured against the
+    /// checkpoint, `flush` after the first id of `😀` returned `"done "`, and then
+    /// its second id RESURRECTED the scalar: a second `flush` returned `"😀"` and
+    /// `raw_turn` became `" to=user<|message|>done 😀"`. `raw_turn` is what the
+    /// parser reads to decide whether a tool call was authorised, so a late token
+    /// rewriting a finalised turn can change what runs. Stickiness at the end of a
+    /// turn is the same property `push_ids(&[])` already had at the start of one.
+    ///
+    /// Calling it twice is safe and returns `""` the second time; [`Self::raw_turn`]
+    /// stays readable for as long as the guard lives, which is what the caller
+    /// needs after the turn ends.
     pub fn flush(&mut self) -> String {
         let mut out = std::mem::take(&mut self.ready);
         let tail = std::mem::take(&mut self.pending);
@@ -588,6 +626,7 @@ impl StreamGuard {
         ) {
             out.push_str(strip_partial_marker(&tail));
         }
+        self.seal();
         out
     }
 
@@ -728,8 +767,24 @@ impl StreamGuard {
     /// [`strip_partial_marker`] left it alone. Content resolved **before** the
     /// stop is already in `ready` and is still handed back.
     fn stop(&mut self) {
-        self.ended = true;
+        self.seal();
         self.pending.clear();
+    }
+
+    /// Ends the turn for good, and throws away the parked detokenizer bytes with
+    /// it. **Every** terminal path goes through here — a scan that stops the turn,
+    /// the token cap, and [`Self::flush`] — so there is one place where "this turn
+    /// is over" is defined and one place that can forget to clear something.
+    ///
+    /// Clearing the three detokenizer fields is what makes the dropped scalar
+    /// actually dropped. While they survived a `flush`, a later id completed the
+    /// parked bytes and rewrote `raw` after the turn had been finalised; `ended`
+    /// alone did not prevent it because `flush` never set `ended`.
+    fn seal(&mut self) {
+        self.ended = true;
+        self.decode_ids.clear();
+        self.decode_prefix.clear();
+        self.decode_prefix_index = 0;
     }
 
     /// Moves `pending[..upto]` out, into `ready` when it is content.
@@ -924,13 +979,54 @@ mod tests {
         format!("{BARE_HEADER_PREFIX}{}{MSG}", "q".repeat(200))
     }
 
-    /// The tokenizer the default-gate tests run against: a `WordLevel` model with no
-    /// decoder, so `decode(&[id], false)` returns that id's piece exactly, plus the
-    /// five control markers as real **special** tokens.
+    /// One byte of a UTF-8 scalar, spelled the way a `ByteFallback` vocabulary
+    /// spells it. `byte_token(0xC3)` is `"<0xC3>"`.
+    fn byte_token(b: u8) -> String {
+        format!("<0x{b:02X}>")
+    }
+
+    /// `text`'s UTF-8 bytes as **one id per byte**, so a scalar spans as many ids as
+    /// it has bytes: `é` is `[<0xC3>, <0xA9>]` and `😀` is
+    /// `[<0xF0>, <0x9F>, <0x98>, <0x80>]`.
     ///
-    /// Synthetic because the guard now needs a tokenizer and CI has no checkpoint —
+    /// This is the model-free stand-in for the checkpoint's byte-level BPE, and it
+    /// is what moves the round-5 correctness property into the **default** gate. The
+    /// bytes chosen are the reviewer's: `<0xC3>` `<0xA9>`.
+    fn byte_ids(text: &str) -> Vec<u32> {
+        text.bytes().map(|b| id_of(&byte_token(b))).collect()
+    }
+
+    /// Every byte value that `byte_ids` can need, plus the lone continuation bytes
+    /// the never-completing-scalar fixture repeats.
+    fn byte_vocab() -> Vec<String> {
+        (0u8..=255).map(byte_token).collect()
+    }
+
+    /// The tokenizer the default-gate tests run against: a `WordLevel` model whose
+    /// decoder is `ByteFallback`, plus the five control markers as real **special**
+    /// tokens.
+    ///
+    /// Synthetic because the guard needs a tokenizer and CI has no checkpoint —
     /// 59.5 GB never reaches it. The `#[ignore]`d checkpoint tests run the same
-    /// properties against the real vocabulary.
+    /// properties against the real vocabulary, as fidelity pins on this fixture.
+    ///
+    /// # Why `ByteFallback`, and why not a second tokenizer
+    ///
+    /// Round 5 fixed stateful detokenization but left its regressions in the
+    /// `#[ignore]`d gates, on my claim that only the real checkpoint could express a
+    /// UTF-8 scalar split across ids. That claim was wrong, and codex round 6 said
+    /// so: `ByteFallback` turns `<0xC3>` into one raw byte and yields `U+FFFD` while
+    /// the bytes do not yet form a scalar, which is exactly the condition
+    /// `tokenizers::step_decode_stream` buffers on. No model, no weights, no
+    /// checkpoint — so the property belongs in CI, and an avoidable gap in a
+    /// correctness property on ordinary user text is not a residual to park.
+    ///
+    /// It replaces `Fuse` rather than living in a second fixture, and that is
+    /// deliberate: `ByteFallback`'s chain output is joined with `""` exactly as
+    /// `Fuse` concatenates, so every existing fixture keeps its meaning, while a
+    /// separate byte tokenizer would leave the other 50-odd state-machine tests
+    /// running on a decoder that cannot buffer — and the interaction between
+    /// buffering and the scanner is precisely what round 6 is about.
     fn test_tokenizer() -> Arc<Tokenizer> {
         static TOKENIZER: std::sync::OnceLock<Arc<Tokenizer>> = std::sync::OnceLock::new();
         TOKENIZER
@@ -959,6 +1055,12 @@ mod tests {
                 ] {
                     add(piece, &mut vocab, &mut next);
                 }
+                // One token per byte value, so `byte_ids` can split any scalar. They
+                // sort ahead of nothing in `ids_for` — no fixture's text contains a
+                // literal `<0x..>` — so ordinary encodings are unaffected.
+                for piece in byte_vocab() {
+                    add(piece, &mut vocab, &mut next);
+                }
                 // The control markers, both in the model vocabulary (so the ids are
                 // ours to choose) and in `added_tokens` with `special: true`.
                 let mut added = Vec::new();
@@ -983,17 +1085,15 @@ mod tests {
                     "normalizer": null,
                     "pre_tokenizer": null,
                     "post_processor": null,
-                    // `Fuse` concatenates the tokens, so decoding a window of ids
-                    // gives their pieces run together. With `null` the default is
-                    // `tokens.join(" ")`, which was harmless while each id was
-                    // decoded alone and inserts spaces now that decoding is
-                    // stateful over a window.
-                    //
-                    // This tokenizer still cannot model a scalar spanning ids —
-                    // there is no byte-level stage for its bytes to split in — which
-                    // is exactly why the multi-id-scalar regressions are
-                    // real-checkpoint gates.
-                    "decoder": { "type": "Fuse" },
+                    // `ByteFallback` maps a `<0xNN>` token to that raw byte and
+                    // yields one `U+FFFD` per byte while they do not form a scalar,
+                    // which is the condition `step_decode_stream` buffers on — so
+                    // this fixture DOES model a scalar spanning ids. Its chain output
+                    // is joined with `""`, so ordinary multi-character pieces
+                    // concatenate exactly as `Fuse` made them (`null` would be
+                    // `tokens.join(" ")`, which inserts spaces across a decode
+                    // window).
+                    "decoder": { "type": "ByteFallback" },
                     "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "<unk>" },
                 });
                 let tok: Tokenizer = spec
@@ -2721,6 +2821,58 @@ mod tests {
         assert_eq!(g.tokens, ids.len(), "the partial id was not charged");
     }
 
+    /// Codex round-6 finding 1, against the real ids it was reported with. Measured
+    /// before the fix: the first `flush` returned `"done "`, then id `222`
+    /// resurrected the scalar — the second `flush` returned `"😀"` and `raw_turn`
+    /// became `" to=user<|message|>done 😀"`, with `push_id` answering `Hold` after
+    /// finalisation. The turn a parser had already been handed changed underneath
+    /// it, and the parser is what authorises tool calls.
+    #[test]
+    #[ignore = "requires the local Muse-Glimmer checkpoint; set MLX_TEST_MUSE_GLIMMER_MODEL_PATH and run with --ignored"]
+    fn checkpoint_flush_is_terminal_and_a_late_id_cannot_resurrect_a_scalar() {
+        let dir = std::env::var("MLX_TEST_MUSE_GLIMMER_MODEL_PATH")
+            .expect("set MLX_TEST_MUSE_GLIMMER_MODEL_PATH to the checkpoint directory");
+        let tok = Arc::new(
+            Tokenizer::from_file(std::path::Path::new(&dir).join("tokenizer.json"))
+                .expect("checkpoint has a loadable tokenizer.json"),
+        );
+        let mut ids = tok
+            .encode(" to=user", false)
+            .expect("encodes")
+            .get_ids()
+            .to_vec();
+        ids.push(tok.token_to_id(MSG).expect("checkpoint has <|message|>"));
+        ids.extend(tok.encode("done ", false).expect("encodes").get_ids());
+        let emoji = tok.encode("😀", false).expect("encodes").get_ids().to_vec();
+        assert_eq!(emoji.len(), 2, "😀 no longer spans exactly two ids");
+
+        let mut g = StreamGuard::new(tok, 8, 1024, 16);
+        for id in &ids {
+            g.push_id(*id);
+        }
+        g.push_id(emoji[0]);
+
+        let first = g.flush();
+        let frozen = g.raw_turn().0.to_string();
+        let frozen_spans = g.raw_turn().1.to_vec();
+        let late = g.push_id(emoji[1]);
+        let second = g.flush();
+        let (raw, spans) = g.raw_turn();
+        println!(
+            "CHECKPOINT terminal flush: first={first:?} late={late:?} second={second:?} raw={raw:?}"
+        );
+
+        assert_eq!(first, "done ");
+        assert!(
+            matches!(late, GuardOutcome::EndTurn),
+            "the id that completes a dropped scalar was accepted: {late:?}"
+        );
+        assert_eq!(second, "", "a second flush released the resurrected scalar");
+        assert_eq!(raw, frozen, "a late id rewrote the finalised turn: {raw:?}");
+        assert_eq!(spans, frozen_spans.as_slice());
+        assert!(!raw.contains('😀'), "the dropped scalar came back: {raw:?}");
+    }
+
     /// Codex round-4 finding 2, against the **real** id it was reported with:
     /// 9,280 of id 169871 is 1,048,640 characters, which the deleted per-call bound
     /// rejected in a batch and streamed in full one at a time.
@@ -3207,5 +3359,269 @@ mod tests {
         emitted.push_str(&g.flush());
         assert!(!emitted.contains("<|message|>"), "marker leaked: {emitted}");
         assert_eq!(emitted, "first half  second half of the answer");
+    }
+
+    // ---- Stateful detokenization, in the DEFAULT gate ------------------------
+    //
+    // Round 5 fixed per-id decoding corrupting scalars whose bytes span ids, but
+    // left every regression in the `#[ignore]`d gates, because the `Fuse`
+    // `WordLevel` fixture could not express the failure. Codex round 6 showed that
+    // a `ByteFallback` decoder can, with no checkpoint at all — so these four run
+    // in CI, and the checkpoint versions of them stay on as fidelity pins.
+    //
+    // The measured agreement is exact: this fixture's fragment case produces
+    // `" to=user<|message|>hi\u{fffd}<|eot|>"` with spans `[8..19, 24..31]`, byte
+    // for byte what the real checkpoint produced in round 5.
+
+    /// A UTF-8 scalar whose bytes span ids survives whole — in the delta, in
+    /// `raw_turn`, and in the control-span offsets on **both sides** of it.
+    ///
+    /// The `assert_ne!` is the premise, not decoration: it proves the fixture can
+    /// express the bug. Without a decoder that buffers, per-id decoding equals
+    /// whole-sequence decoding and the test is vacuous whatever the guard does.
+    #[test]
+    fn a_scalar_spanning_ids_is_not_corrupted() {
+        let tok = test_tokenizer();
+        // `é` is the reviewer's case, `[<0xC3>, <0xA9>]`; `😀` spans four ids.
+        for answer in ["é", "😀", "a😀b", "hi 😀 there é ok"] {
+            let answer_ids = byte_ids(answer);
+            let per_id: String = answer_ids
+                .iter()
+                .map(|i| tok.decode(&[*i], false).expect("a byte token decodes"))
+                .collect();
+            assert_ne!(
+                per_id, answer,
+                "{answer:?} does not span ids in this fixture, so it cannot \
+                 exercise stateful decoding"
+            );
+
+            let mut ids = ids_for(" to=user");
+            ids.push(id_of(MSG));
+            ids.extend(answer_ids);
+            ids.push(id_of(EOT));
+            let whole = tok.decode(&ids, false).expect("the turn decodes");
+
+            let mut g = guard(8, 4096, TEST_RECIPIENT_CHARS);
+            let mut emitted = String::new();
+            for id in &ids {
+                if let GuardOutcome::Emit(s) = g.push_id(*id) {
+                    emitted.push_str(&s);
+                }
+            }
+            emitted.push_str(&g.flush());
+            let (raw, spans) = g.raw_turn();
+
+            assert_eq!(
+                emitted, answer,
+                "{answer:?} was corrupted on its way to a content delta"
+            );
+            assert_eq!(
+                raw, whole,
+                "{answer:?}: raw_turn does not equal whole-sequence decoding"
+            );
+            assert!(
+                !raw.contains('\u{fffd}'),
+                "{answer:?}: a replacement character reached the parser's input"
+            );
+            assert_eq!(
+                spans.iter().map(|s| &raw[s.clone()]).collect::<Vec<_>>(),
+                vec![MSG, EOT],
+                "{answer:?}: control spans shifted around a multi-id scalar"
+            );
+            let msg_at = whole.find(MSG).expect("the turn has <|message|>");
+            let eot_at = whole.rfind(EOT).expect("the turn has <|eot|>");
+            assert_eq!(
+                spans[0],
+                msg_at..msg_at + MSG.len(),
+                "{answer:?}: the marker BEFORE the scalar moved"
+            );
+            assert_eq!(
+                spans[1],
+                eot_at..eot_at + EOT.len(),
+                "{answer:?}: the marker AFTER the scalar moved"
+            );
+        }
+    }
+
+    /// The adversarial offset case: a terminator arriving while a scalar is still
+    /// **incomplete**, so the detokenizer hands back the fragment and the marker in
+    /// one delta and a span taken from the start of that delta would name both.
+    ///
+    /// The prose is ordinary tokens and only the fragment is a byte token, which is
+    /// what the checkpoint does — its `hi` is one BPE token — and it makes the two
+    /// fixtures agree byte for byte.
+    #[test]
+    fn a_marker_after_an_incomplete_scalar_keeps_its_own_span() {
+        let tok = test_tokenizer();
+        let mut ids = ids_for(" to=user");
+        ids.push(id_of(MSG));
+        ids.extend(ids_for("hi"));
+        // The first byte of `😀` and nothing else: three of its four bytes never
+        // arrive, so the scalar cannot complete.
+        ids.push(id_of(&byte_token(0xF0)));
+        ids.push(id_of(EOT));
+        let whole = tok.decode(&ids, false).expect("the turn decodes");
+
+        let mut g = guard(8, 4096, TEST_RECIPIENT_CHARS);
+        for id in &ids {
+            g.push_id(*id);
+        }
+        g.flush();
+        let (raw, spans) = g.raw_turn();
+
+        assert_eq!(
+            raw, whole,
+            "raw_turn does not equal whole-sequence decoding: {raw:?}"
+        );
+        assert_eq!(
+            spans.len(),
+            2,
+            "expected spans for <|message|> and <|eot|>: {spans:?}"
+        );
+        assert_eq!(
+            &raw[spans[1].clone()],
+            EOT,
+            "a span named more than its marker: {:?}",
+            &raw[spans[1].clone()]
+        );
+        assert!(
+            !raw[spans[1].clone()].contains('\u{fffd}'),
+            "the terminator's span swallowed the incomplete scalar's bytes"
+        );
+        let eot_at = raw.rfind(EOT).expect("the turn has <|eot|>");
+        assert_eq!(spans[1], eot_at..eot_at + EOT.len());
+
+        // The fidelity claim, pinned rather than described: these are the values
+        // `checkpoint_a_marker_after_an_incomplete_scalar_keeps_its_own_span`
+        // measured against the real 30B vocabulary, digit for digit. If the stand-in
+        // ever stops standing in, this fails and someone re-measures instead of
+        // trusting a note in a report.
+        assert_eq!(
+            raw, " to=user<|message|>hi\u{fffd}<|eot|>",
+            "the fixture no longer reproduces the checkpoint's measured turn"
+        );
+        assert_eq!(
+            spans,
+            [8..19, 24..31].as_slice(),
+            "the fixture no longer reproduces the checkpoint's measured spans"
+        );
+    }
+
+    /// [`StreamGuard::flush`] is terminal, which codex round 6 found it was not:
+    /// against the checkpoint, `flush` after the first id of `😀` returned `"done "`
+    /// and then its second id RESURRECTED the scalar — a second `flush` returned
+    /// `"😀"` and `raw_turn` became `" to=user<|message|>done 😀"`. `raw_turn` is
+    /// what the parser reads to decide whether a tool call was authorised, so a
+    /// late token rewriting a finalised turn can change what runs.
+    ///
+    /// Both halves are here: an id that would complete the parked scalar, and
+    /// ordinary content text. Neither may emit anything or move `raw_turn`.
+    #[test]
+    fn flush_is_terminal_and_a_late_id_cannot_resurrect_a_scalar() {
+        let mut g = guard(8, 4096, TEST_RECIPIENT_CHARS);
+        push_text(&mut g, " to=user");
+        g.push_id(id_of(MSG));
+        drain_char_by_char(&mut g, "done ");
+        let emoji = byte_ids("😀");
+        // Two of the four bytes: the scalar is parked, not dropped, unless `flush`
+        // clears the detokenizer state.
+        assert!(matches!(g.push_id(emoji[0]), GuardOutcome::Hold));
+        assert!(matches!(g.push_id(emoji[1]), GuardOutcome::Hold));
+
+        let first = g.flush();
+        assert_eq!(first, "done ", "the incomplete scalar was published");
+        let frozen = g.raw_turn().0.to_string();
+        let frozen_spans = g.raw_turn().1.to_vec();
+        assert_eq!(frozen, " to=user<|message|>done ");
+
+        // The rest of the scalar, then unrelated content, then a whole second turn.
+        for id in emoji[2..]
+            .iter()
+            .copied()
+            .chain(ids_for("LATE"))
+            .chain(std::iter::once(id_of(MSG)))
+        {
+            assert!(
+                matches!(g.push_id(id), GuardOutcome::EndTurn),
+                "a push after flush was not terminal"
+            );
+        }
+        assert!(
+            matches!(g.push_ids(&byte_ids("😀")), GuardOutcome::EndTurn),
+            "a batch after flush was not terminal"
+        );
+
+        assert_eq!(g.flush(), "", "a second flush released text");
+        assert_eq!(
+            g.raw_turn().0,
+            frozen,
+            "a late id rewrote the finalised turn: {:?}",
+            g.raw_turn().0
+        );
+        assert_eq!(
+            g.raw_turn().1,
+            frozen_spans,
+            "a late id changed the control spans of a finalised turn"
+        );
+        assert!(
+            !g.raw_turn().0.contains('😀'),
+            "the dropped scalar came back: {:?}",
+            g.raw_turn().0
+        );
+
+        // White-box, and LAST on purpose. The behavioural assertions above are what
+        // the finding was about, and they must be the ones that fail when `flush`
+        // stops sealing — an assertion order that trips on the fields first would
+        // hide which property broke. This one is here because `ended` alone makes
+        // the resurrection unreachable, so nothing observable distinguishes "sealed"
+        // from "sealed and cleared": without it, a `seal` that forgot to clear the
+        // three fields would pass. If a later change ever makes a push after `flush`
+        // reachable again, the parked bytes are already gone.
+        assert!(
+            g.decode_ids.is_empty() && g.decode_prefix.is_empty() && g.decode_prefix_index == 0,
+            "flush left detokenizer state live: {} ids, prefix {:?}, index {}",
+            g.decode_ids.len(),
+            g.decode_prefix,
+            g.decode_prefix_index
+        );
+    }
+
+    /// A stream that never completes a scalar cannot buffer without limit.
+    /// `MAX_TURN_CHARS` cannot see these bytes — their text has not materialised —
+    /// so [`MAX_PENDING_DECODE_IDS`] is what bounds them, and it fails closed.
+    #[test]
+    fn a_stream_that_never_completes_a_scalar_is_bounded() {
+        let mut g = guard(8, 4096, TEST_RECIPIENT_CHARS);
+        push_text(&mut g, " to=user");
+        g.push_id(id_of(MSG));
+        // `0xF0` starts a four-byte scalar; a run of them is never valid UTF-8, so
+        // the decoder buffers for ever if nothing stops it.
+        let lead = id_of(&byte_token(0xF0));
+        let mut accepted = 0usize;
+        let mut last = GuardOutcome::Hold;
+        for _ in 0..(MAX_PENDING_DECODE_IDS + 8) {
+            last = g.push_id(lead);
+            if matches!(last, GuardOutcome::EndTurn) {
+                break;
+            }
+            accepted += 1;
+        }
+        assert!(
+            matches!(last, GuardOutcome::EndTurn),
+            "an endless incomplete scalar never ended the turn"
+        );
+        assert!(
+            accepted <= MAX_PENDING_DECODE_IDS,
+            "buffered {accepted} ids, over the bound of {MAX_PENDING_DECODE_IDS}"
+        );
+        let (raw, _) = g.raw_turn();
+        assert!(
+            !raw.contains('\u{fffd}'),
+            "replacement characters were retained: {raw:?}"
+        );
+        assert_eq!(
+            raw, " to=user<|message|>",
+            "buffered bytes reached the parser's input"
+        );
     }
 }
