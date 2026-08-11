@@ -1604,6 +1604,7 @@ pub struct PagedRequestState {
     request_tokens: Vec<u32>,
     already_registered: bool,
     prefix_lookup_done: bool,
+    cache_salt: Option<u64>,
     restored_sidecar: Option<mlx_paged_attn::ColdSidecar>,
     aux_prefix_unbacked: bool,
     cold_capture: ColdCaptureOutcome,
@@ -1631,6 +1632,7 @@ impl PagedRequestState {
             request_tokens: Vec::new(),
             already_registered: false,
             prefix_lookup_done: false,
+            cache_salt: None,
             restored_sidecar: None,
             aux_prefix_unbacked: false,
             cold_capture: ColdCaptureOutcome::default(),
@@ -1694,6 +1696,11 @@ pub struct PagedKVCacheAdapter {
     /// the shared allocator). Both violate the documented at-most-once
     /// lifecycle.
     prefix_lookup_done: bool,
+
+    /// Prefix-cache security domain bound to the active logical request.
+    /// A live continuation is valid only in the same domain; changing the salt
+    /// forces the normal release + fresh lookup path even when tokens match.
+    request_cache_salt: Option<u64>,
 
     /// Optional SSD cold tier for persisting full blocks across process
     /// restarts. `None` (the default) keeps persistence fully off. Lives
@@ -2029,6 +2036,7 @@ impl PagedKVCacheAdapter {
             request_tokens: Vec::new(),
             already_registered: false,
             prefix_lookup_done: false,
+            request_cache_salt: None,
             cold_tier: None,
             suppress_cold_restore_once: false,
             restored_sidecar: None,
@@ -2231,6 +2239,19 @@ impl PagedKVCacheAdapter {
         ))
     }
 
+    fn bind_request_cache_salt(&mut self, cache_salt: u64, op: &str) -> Result<(), String> {
+        match self.request_cache_salt {
+            Some(bound) if bound != cache_salt => Err(format!(
+                "{op}: cache_salt changed within one live request (bound={bound}, requested={cache_salt}); release the request and start a fresh cache-domain lookup"
+            )),
+            Some(_) => Ok(()),
+            None => {
+                self.request_cache_salt = Some(cache_salt);
+                Ok(())
+            }
+        }
+    }
+
     /// Shared per-layer K/V pool. Exposed so callers can fold the pool's
     /// cache layout (block size, layers, heads, head size, dtype) into the
     /// cold-tier fingerprint.
@@ -2263,6 +2284,7 @@ impl PagedKVCacheAdapter {
             request_tokens: std::mem::take(&mut self.request_tokens),
             already_registered: std::mem::take(&mut self.already_registered),
             prefix_lookup_done: std::mem::take(&mut self.prefix_lookup_done),
+            cache_salt: self.request_cache_salt.take(),
             restored_sidecar: self.restored_sidecar.take(),
             aux_prefix_unbacked: std::mem::take(&mut self.aux_prefix_unbacked),
             cold_capture: std::mem::take(&mut self.cold_capture),
@@ -2290,6 +2312,7 @@ impl PagedKVCacheAdapter {
         self.request_tokens = state.request_tokens;
         self.already_registered = state.already_registered;
         self.prefix_lookup_done = state.prefix_lookup_done;
+        self.request_cache_salt = state.cache_salt;
         self.restored_sidecar = state.restored_sidecar;
         self.aux_prefix_unbacked = state.aux_prefix_unbacked;
         self.cold_capture = state.cold_capture;
@@ -2491,6 +2514,7 @@ impl PagedKVCacheAdapter {
         let max_live_continue_tokens = usize::try_from(max_cache_hit_tokens).unwrap_or(usize::MAX);
         let can_continue = reuse_cache
             && self.is_live_for_continue()
+            && self.request_cache_salt == Some(cache_salt)
             && prompt_tokens.starts_with(self.request_tokens())
             && self.request_tokens().len() <= max_live_continue_tokens;
         if can_continue {
@@ -2824,6 +2848,7 @@ impl PagedKVCacheAdapter {
             .unwrap_or(usize::MAX);
         let can_continue = reuse_cache
             && self.is_live_for_continue()
+            && self.request_cache_salt == Some(cache_salt)
             && prompt_tokens.starts_with(self.request_tokens())
             && self.request_tokens().len() <= max_live_continue_tokens;
 
@@ -3058,6 +3083,7 @@ impl PagedKVCacheAdapter {
                  Call reset_for_new_request() to start a new request."
                 .to_string());
         }
+        self.bind_request_cache_salt(cache_salt, "find_cached_prefix")?;
         // Consume the command-reset one-shot on every processed lookup
         // (including the forced-miss `skip_lookup` path below), so exactly the
         // immediately-following request is suppressed.
@@ -3267,6 +3293,7 @@ impl PagedKVCacheAdapter {
                     .to_string(),
             );
         }
+        self.bind_request_cache_salt(cache_salt, "find_cached_prefix_per_block")?;
         // Consume the command-reset one-shot on every processed lookup
         // (including the forced-miss `skip_lookup` path below), exactly as the
         // uniform entry point does. Leaving it armed here would let a
@@ -6373,6 +6400,7 @@ impl PagedKVCacheAdapter {
         cache_salt: u64,
         capture_cold: bool,
     ) -> Result<u32, String> {
+        self.bind_request_cache_salt(cache_salt, "register_full_blocks_for_reuse")?;
         // Never publish blocks computed on top of a prefix whose out-of-pool
         // half nobody established — that would hand the same unsound resume
         // point to every later request.
@@ -6531,30 +6559,8 @@ impl PagedKVCacheAdapter {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Result<u32, String> {
+        self.bind_request_cache_salt(cache_salt, "register_full_blocks_for_reuse_per_block")?;
         self.ensure_aux_prefix_primed("register_full_blocks_for_reuse_per_block")?;
-        // A family that captures an auxiliary sidecar derives that sidecar's
-        // chain with a salt of ZERO (see `capture_dense_gdn_cold_sidecar` /
-        // `capture_gemma4_sliding_cold_sidecar`), while the restore walk chains
-        // under whatever salt the LOOKUP carried. Both are zero today, so they
-        // agree. Should a salt ever be introduced (tenant isolation is the
-        // obvious reason) the K/V chain would move and the sidecar chain would
-        // not, so `deepest_backed_boundary` would find nothing — every hybrid
-        // restore silently and permanently pinned at zero, indistinguishable
-        // from a cold cache. Fail loudly at the seam instead: the fix is to
-        // thread the salt into sidecar capture, not to quietly lose the tier.
-        if cache_salt != 0
-            && self
-                .cold_tier
-                .as_ref()
-                .is_some_and(|cold| cold.sidecar_policy.is_some())
-        {
-            return Err(format!(
-                "register_full_blocks_for_reuse_per_block: cache_salt={cache_salt} with an \
-                 auxiliary sidecar policy installed, but sidecar capture derives its chain \
-                 with salt 0 — the two chains would disagree and every restore would miss. \
-                 Thread the salt through sidecar capture before using a non-zero salt."
-            ));
-        }
         if self.already_registered {
             return Ok(0);
         }
@@ -9721,15 +9727,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Sidecar capture hardcodes salt 0 while the restore walk chains under the
-    /// lookup's salt. They agree only because every caller passes 0, so a
-    /// non-zero salt would move the K/V chain, leave the sidecar chain behind,
-    /// and pin every hybrid restore at zero for good. That must be an error at
-    /// the seam, not a silently dead tier — while a family with no sidecar
-    /// policy keeps salting freely, since it has no second chain to desync.
+    /// Salt remains legal with a sidecar policy: hybrid families derive their
+    /// auxiliary key from the same turn salt as the K/V capture. The adapter
+    /// must not reject the K/V half after a successful model turn.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_nonzero_salt_is_refused_while_a_sidecar_policy_is_installed() {
+    fn a_nonzero_salt_is_accepted_while_a_sidecar_policy_is_installed() {
         let tokens: Vec<u32> = (0..32u32).map(|i| 7_100 + i).collect();
         let root = std::env::temp_dir().join(format!(
             "mlx-adapter-salt-guard-{}-{}",
@@ -9777,19 +9780,11 @@ mod tests {
         adapter.reset_for_new_request(1).unwrap();
         adapter.allocate_suffix_blocks(32).unwrap();
         adapter.record_tokens(&tokens).unwrap();
-        let err = adapter
-            .register_full_blocks_for_reuse_per_block(&per_block, 42)
-            .expect_err("a non-zero salt desyncs the sidecar chain and must be refused");
-        assert!(
-            err.contains("cache_salt"),
-            "the error must name the offending knob, got: {err}"
-        );
-        // Salt 0 is the contract capture actually honours, so it still works.
         assert!(
             adapter
-                .register_full_blocks_for_reuse_per_block(&per_block, 0)
+                .register_full_blocks_for_reuse_per_block(&per_block, 42)
                 .is_ok(),
-            "the supported salt must remain usable after the refusal"
+            "hybrid K/V publication must accept the salt its sidecar capture also uses"
         );
         adapter.release_request().unwrap();
         drop(adapter);
@@ -14086,6 +14081,37 @@ mod tests {
         assert!(!plan.continued_live_prefix);
         assert_eq!(plan.cached_prefix_len, 0);
         assert_eq!(plan.suffix_len, diverged.len() as u32);
+
+        adapter.release_request().unwrap();
+    }
+
+    #[test]
+    fn test_prepare_turn_never_continues_live_state_across_cache_salts() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping test_prepare_turn_never_continues_live_state_across_cache_salts: Metal unavailable"
+            );
+            return;
+        };
+
+        let tokens_t1: [u32; 5] = [10, 20, 30, 40, 50];
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.find_cached_prefix(&[], &[], 11, false).unwrap();
+        adapter
+            .allocate_suffix_blocks(tokens_t1.len() as u32)
+            .unwrap();
+        adapter.record_tokens(&tokens_t1).unwrap();
+        adapter.finalize_turn_keep_live(&[], 11).unwrap();
+
+        let tokens_t2: [u32; 6] = [10, 20, 30, 40, 50, 60];
+        let plan = adapter
+            .prepare_turn(0, &tokens_t2, tokens_t2.len() as u32, true, &[], 22, false)
+            .unwrap();
+        assert_eq!(plan.reason, PagedTurnPlanReason::FreshReset);
+        assert!(!plan.continued_live_prefix);
+        assert_eq!(plan.cached_prefix_len, 0);
+        assert_eq!(plan.suffix_len, tokens_t2.len() as u32);
 
         adapter.release_request().unwrap();
     }

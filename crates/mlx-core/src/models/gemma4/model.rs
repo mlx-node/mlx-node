@@ -569,6 +569,10 @@ pub(crate) struct Gemma4Inner {
     /// `0` outside a paged text turn, which fails the capture closed (no
     /// reachable boundary, so no sidecar) rather than open.
     paged_turn_prompt_len: u32,
+    /// Cache security domain of the paged turn currently in flight. Generic
+    /// history publication runs after the backend setup object is gone, so the
+    /// model retains the exact salt beside `paged_turn_prompt_len`.
+    paged_turn_cache_salt: u64,
     sliding_last_history_checkpoint: Option<Gemma4SlidingHistoryCheckpoint>,
     /// Media kinds causally represented by the current session's live/persisted
     /// prefix. This survives every successful warm text continuation because
@@ -1173,6 +1177,7 @@ impl Gemma4SlidingPrefixCheckpointDraft {
 struct Gemma4SlidingHistoryCheckpoint {
     tokens: Vec<u32>,
     image_token_positions: Vec<(u32, u64)>,
+    cache_salt: u64,
     snapshots: Vec<Option<RotatingKVCacheSnapshot>>,
 }
 
@@ -1955,6 +1960,7 @@ impl Gemma4Inner {
             sliding_prompt_boundary_checkpoint: None,
             sliding_cold_restore_tail_checkpoint: None,
             paged_turn_prompt_len: 0,
+            paged_turn_cache_salt: 0,
             sliding_last_history_checkpoint: None,
             media_session_context: MediaCapabilities::NONE,
             paged_text_turn_context: MediaCapabilities::NONE,
@@ -2073,6 +2079,7 @@ impl Gemma4Inner {
         self.sliding_prompt_boundary_checkpoint = None;
         self.sliding_cold_restore_tail_checkpoint = None;
         self.paged_turn_prompt_len = 0;
+        self.paged_turn_cache_salt = 0;
         self.sliding_last_history_checkpoint = None;
         // Covers both reset paths (init_caches_sync + reset_caches_sync): a
         // session that just dropped its media KV can no longer warm-continue.
@@ -2100,6 +2107,7 @@ impl Gemma4Inner {
         tokens: &[u32],
         prefix_len: u32,
         image_token_positions: &[(u32, u64)],
+        cache_salt: u64,
     ) -> Result<Option<Vec<Gemma4LayerCache>>> {
         let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
             return Ok(None);
@@ -2109,6 +2117,7 @@ impl Gemma4Inner {
         };
         if checkpoint.tokens.as_slice() != prefix_tokens
             || checkpoint.image_token_positions.as_slice() != image_token_positions
+            || checkpoint.cache_salt != cache_salt
         {
             return Ok(None);
         }
@@ -2118,6 +2127,7 @@ impl Gemma4Inner {
     fn remember_gemma4_sliding_history_checkpoint(
         &mut self,
         history_tokens: &[u32],
+        cache_salt: u64,
     ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
         let trace_enabled = inference_trace_enabled();
         let total_start = trace_enabled.then(std::time::Instant::now);
@@ -2164,6 +2174,7 @@ impl Gemma4Inner {
         self.sliding_last_history_checkpoint = Some(Gemma4SlidingHistoryCheckpoint {
             tokens,
             image_token_positions: self.cached_paged_image_token_positions.clone(),
+            cache_salt,
             snapshots,
         });
         trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
@@ -2680,6 +2691,7 @@ impl Gemma4Inner {
         &mut self,
         trace_label: &str,
         trace_enabled: bool,
+        cache_salt: u64,
     ) -> Result<()> {
         let Some(adapter) = self.kv_cache_coordinator.as_ref() else {
             return Ok(());
@@ -2698,7 +2710,7 @@ impl Gemma4Inner {
             &request_tokens,
             boundary.prefix_len,
             boundary.block_size,
-            0,
+            cache_salt,
         )?;
         if trace_enabled {
             write_inference_trace(format_args!(
@@ -2724,6 +2736,7 @@ impl Gemma4Inner {
         tokens: &[u32],
         boundary_len: u32,
         trace_enabled: bool,
+        cache_salt: u64,
     ) -> Result<()> {
         let Some(adapter) = self.kv_cache_coordinator.as_ref() else {
             return Ok(());
@@ -2737,7 +2750,7 @@ impl Gemma4Inner {
             tokens,
             boundary_len,
             block_size,
-            0,
+            cache_salt,
         )?;
         if trace_enabled {
             write_inference_trace(format_args!(
@@ -2763,6 +2776,7 @@ impl Gemma4Inner {
         extra_keys_per_block: &[Vec<u64>],
         image_token_positions: &[(u32, u64)],
         require_exact_checkpoint: bool,
+        cache_salt: u64,
     ) -> Result<Gemma4SlidingPrefixPreparation> {
         let trace_enabled = inference_trace_enabled();
         let prepare_start = trace_enabled.then(std::time::Instant::now);
@@ -2832,6 +2846,7 @@ impl Gemma4Inner {
             tokens,
             cached_prefix_len,
             image_token_positions,
+            cache_salt,
         )? {
             self.caches = Some(caches);
             if trace_enabled {
@@ -2859,7 +2874,7 @@ impl Gemma4Inner {
             cached_prefix_len,
             block_size,
             extra_keys_per_block,
-            0,
+            cache_salt,
         )? {
             let hit_prefix_len = hit.prefix_len;
             if require_exact_checkpoint && hit_prefix_len != cached_prefix_len {
@@ -3039,7 +3054,11 @@ impl Gemma4Inner {
     /// image run), deliberately: the first durable media implementation shares
     /// one fail-closed rule with unified bidirectional vision and never resumes
     /// from a half-image boundary.
-    fn capture_gemma4_sliding_cold_sidecar(&self, context: Gemma4SlidingColdCaptureContext<'_>) {
+    fn capture_gemma4_sliding_cold_sidecar(
+        &self,
+        context: Gemma4SlidingColdCaptureContext<'_>,
+        cache_salt: u64,
+    ) {
         crate::cold_tier::cold_sidecar_counters().record_capture_reached();
         let media = match context.media {
             Gemma4SlidingColdCaptureMedia::Text => "text",
@@ -3231,6 +3250,7 @@ impl Gemma4Inner {
                 &extra_keys_per_block,
                 block_size,
                 *boundary,
+                cache_salt,
             ) else {
                 return Gemma4ColdCaptureProbe::Underivable;
             };
@@ -4111,6 +4131,7 @@ impl Gemma4Inner {
                             prompt_len,
                             image_token_positions,
                         ),
+                        cache_salt,
                     );
                 }
 
@@ -4120,16 +4141,17 @@ impl Gemma4Inner {
                 self.publish_media_session_context(new_image_key, new_audio_key);
                 self.cached_paged_image_token_positions = image_token_positions.to_vec();
                 let history_for_ckpt = self.cached_token_history.clone();
-                let stored =
-                    match self.remember_gemma4_sliding_history_checkpoint(&history_for_ckpt) {
-                        Ok(trace) => trace.stored,
-                        Err(error) => {
-                            self.invalidate_gemma4_hybrid_session(
-                                "VLM sliding-history checkpoint failure",
-                            );
-                            return Err(error);
-                        }
-                    };
+                let stored = match self
+                    .remember_gemma4_sliding_history_checkpoint(&history_for_ckpt, cache_salt)
+                {
+                    Ok(trace) => trace.stored,
+                    Err(error) => {
+                        self.invalidate_gemma4_hybrid_session(
+                            "VLM sliding-history checkpoint failure",
+                        );
+                        return Err(error);
+                    }
+                };
                 // Warm continuation is only faithful when the sliding state is
                 // restorable from a stored checkpoint (or the in-place live
                 // caches it implies). A text position's true embedding IS
@@ -4255,6 +4277,7 @@ impl Gemma4Inner {
                     &turn.extra_keys_per_block,
                     &image_token_positions,
                     turn.publish_prefix_checkpoints,
+                    cache_salt,
                 )?
             };
 
@@ -4490,6 +4513,7 @@ impl Gemma4Inner {
                     &turn.extra_keys_per_block,
                     &image_token_positions,
                     turn.publish_prefix_checkpoints,
+                    cache_salt,
                 )?
             };
 
@@ -4845,6 +4869,7 @@ impl Gemma4Inner {
                 extra_keys_per_block,
                 image_token_positions,
                 prefix_policy.require_exact_checkpoint,
+                cache_salt,
             )
         } else {
             self.caches = Some(init_caches_for_config(&self.config));
@@ -4887,7 +4912,7 @@ impl Gemma4Inner {
                     candidate_plan.cached_prefix_len,
                     block_size,
                     extra_keys_per_block,
-                    0,
+                    cache_salt,
                 )?;
                 Ok(())
             })();
@@ -5056,6 +5081,7 @@ impl Gemma4Inner {
             &extra_keys_per_block,
             &image_token_positions,
             carries_image_lineage,
+            cache_salt,
         )?;
         if carries_image_lineage && sliding_preparation.primed_prefix_len < cached_prefix_len {
             if let Some(adapter) = self.kv_cache_coordinator.as_mut() {
@@ -5086,6 +5112,7 @@ impl Gemma4Inner {
                     &extra_keys_per_block,
                     &image_token_positions,
                     false,
+                    cache_salt,
                 )?;
                 if trace_enabled {
                     write_inference_trace(format_args!(
@@ -5166,6 +5193,7 @@ impl Gemma4Inner {
         suffix_tokens: &[u32],
         cached_prefix_len: u32,
         sliding_primed_prefix_len: u32,
+        cache_salt: u64,
     ) -> Result<MxArray> {
         if suffix_tokens.is_empty() {
             return Err(Error::from_reason(
@@ -5211,7 +5239,7 @@ impl Gemma4Inner {
                 full_tokens,
                 cached_prefix_len,
                 block_size,
-                0,
+                cache_salt,
             )?;
             if trace_enabled {
                 write_inference_trace(format_args!(
@@ -5529,7 +5557,7 @@ impl Gemma4Inner {
                         full_tokens,
                         boundary,
                         block_size,
-                        0,
+                        cache_salt,
                         snapshots,
                         sink,
                     )?;
@@ -5561,6 +5589,7 @@ impl Gemma4Inner {
                         full_tokens,
                         prompt_checkpoint_boundary_len,
                         trace_enabled,
+                        cache_salt,
                     )?;
                 }
                 if trace_enabled {
@@ -5636,6 +5665,7 @@ impl Gemma4Inner {
             full_tokens,
             pass2_first_position + pass2_tokens.len() as u32,
             trace_enabled,
+            cache_salt,
         )?;
 
         // Final norm + lm_head + softcap (only for the final token).
@@ -6192,6 +6222,7 @@ impl Gemma4Inner {
         extra_keys_per_block: &[Vec<u64>],
         image_token_positions: &[(u32, u64)],
         publish_prefix_checkpoints: bool,
+        cache_salt: u64,
     ) -> Result<MxArray> {
         if expanded_tokens.is_empty() {
             return Err(Error::from_reason(
@@ -6365,7 +6396,7 @@ impl Gemma4Inner {
                         chunk_end,
                         block_size,
                         extra_keys_per_block,
-                        0,
+                        cache_salt,
                         true,
                     )?;
                 } else if publish_prefix_checkpoints
@@ -6376,7 +6407,7 @@ impl Gemma4Inner {
                         chunk_end,
                         block_size,
                         extra_keys_per_block,
-                        0,
+                        cache_salt,
                     )?;
                 }
                 crate::array::clear_cache();
@@ -7148,6 +7179,7 @@ pub(crate) struct Gemma4PagedDecode<'a> {
     /// forward. The engine loop has no step index in the `DecodeStep`
     /// seam, so the stepper carries its own.
     step: i32,
+    cache_salt: u64,
     inner: &'a mut Gemma4Inner,
 }
 
@@ -7178,7 +7210,11 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
         // this forward, so it would read a stale cursor) — see the engine
         // loop ordering. Fallible: a checkpoint/eval error aborts the turn.
         self.inner
-            .maybe_remember_gemma4_sliding_decode_boundary_checkpoint("paged", trace_enabled)?;
+            .maybe_remember_gemma4_sliding_decode_boundary_checkpoint(
+                "paged",
+                trace_enabled,
+                self.cache_salt,
+            )?;
         // `run_paged_decode_step` returns `[1, 1, vocab]`; `true` requests
         // the engine's squeeze of axis 1 (the eager convention).
         Ok((logits, true))
@@ -7226,6 +7262,7 @@ pub(crate) struct Gemma4PrefixState {
     effective_cached_prefix_len: usize,
     suffix_len: usize,
     sliding_primed_prefix_len: u32,
+    cache_salt: u64,
     full_tokens: Vec<u32>,
 }
 
@@ -7262,6 +7299,7 @@ impl PagedBackend for Gemma4Inner {
         // to survive the decode. `engine::paged_turn::run_paged_turn` calls this
         // exactly once per turn and always before that finalize.
         self.paged_turn_prompt_len = total_budget;
+        self.paged_turn_cache_salt = cache_salt;
         // Per-turn seq_id: the adapter is single-request and the prepare's
         // warm-continue / cold-reset arms make the previous seq_id
         // irrelevant.
@@ -7285,6 +7323,7 @@ impl PagedBackend for Gemma4Inner {
             effective_cached_prefix_len: prep.cached_prefix_len as usize,
             suffix_len: prep.suffix_len as usize,
             sliding_primed_prefix_len: prep.sliding_primed_prefix_len,
+            cache_salt,
             // Sliding-layer re-prefill needs the FULL prompt, not just the
             // suffix the engine passes to `paged_prefill`.
             full_tokens: plan.to_vec(),
@@ -7306,12 +7345,14 @@ impl PagedBackend for Gemma4Inner {
             suffix_tokens,
             prefix.effective_cached_prefix_len as u32,
             prefix.sliding_primed_prefix_len,
+            prefix.cache_salt,
         )
     }
 
-    fn begin_paged_decode(&mut self, _setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
+    fn begin_paged_decode(&mut self, setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
         Ok(Gemma4PagedDecode {
             step: 0,
+            cache_salt: setup.params.cache_salt,
             inner: self,
         })
     }
@@ -7355,10 +7396,13 @@ impl PagedBackend for Gemma4Inner {
         // finalize failed: the K/V chain the sidecar would anchor on was not
         // published, so nothing could ever select it.
         if finalize_error.is_none() {
-            self.capture_gemma4_sliding_cold_sidecar(Gemma4SlidingColdCaptureContext::text(
-                self.paged_turn_prompt_len,
-                &self.cached_paged_image_token_positions,
-            ));
+            self.capture_gemma4_sliding_cold_sidecar(
+                Gemma4SlidingColdCaptureContext::text(
+                    self.paged_turn_prompt_len,
+                    &self.cached_paged_image_token_positions,
+                ),
+                cache_salt,
+            );
         }
         if release_pending && let Some(adapter) = self.kv_cache_coordinator.as_mut() {
             finalize_error = finalize_error.or(adapter.release_request().err());
@@ -7444,8 +7488,10 @@ impl PagedBackend for Gemma4Inner {
             // reusable state is never published without a materialized
             // checkpoint.
             let history_for_checkpoint = self.cached_token_history.clone();
-            let _store_trace =
-                self.remember_gemma4_sliding_history_checkpoint(&history_for_checkpoint)?;
+            let _store_trace = self.remember_gemma4_sliding_history_checkpoint(
+                &history_for_checkpoint,
+                self.paged_turn_cache_salt,
+            )?;
         } else {
             self.cached_token_history.clear();
             self.sliding_last_history_checkpoint = None;
@@ -9528,6 +9574,7 @@ fn gemma4_sliding_cold_sidecar_chain_key(
     extra_keys_per_block: &[Vec<u64>],
     block_size: u32,
     boundary: u32,
+    cache_salt: u64,
 ) -> Option<mlx_paged_attn::ColdCacheKey> {
     if block_size == 0 {
         return None;
@@ -9544,7 +9591,7 @@ fn gemma4_sliding_cold_sidecar_chain_key(
             parent,
             tokens,
             extra_keys,
-            0,
+            cache_salt,
             index,
         ));
     }
@@ -10492,6 +10539,23 @@ mod tests {
     use super::*;
     use crate::engine::plan::{TurnPath, TurnPlan, TurnRequest};
     use crate::models::gemma4::output_parser::{StreamSegment, parse_gemma4_output};
+
+    #[test]
+    fn sliding_sidecar_chain_isolated_by_cache_salt() {
+        let fingerprint = mlx_paged_attn::ColdCacheFingerprint::from_components([
+            b"gemma4-sidecar-salt-test".as_slice(),
+        ]);
+        let tokens: Vec<u32> = (1..=8).collect();
+        let extra_keys = vec![Vec::new(), Vec::new()];
+        let key = |salt| {
+            gemma4_sliding_cold_sidecar_chain_key(fingerprint, &tokens, &extra_keys, 4, 8, salt)
+                .expect("two-block sidecar chain")
+        };
+
+        assert_ne!(key(0), key(11));
+        assert_ne!(key(11), key(22));
+        assert_eq!(key(11), key(11));
+    }
 
     #[test]
     fn test_gemma4_session_media_payload_identity() {
@@ -14078,7 +14142,7 @@ mod tests {
             }
         }
 
-        let last_logits = match inner.run_paged_prefill_chunk(&prompt, &prompt, 0, 0) {
+        let last_logits = match inner.run_paged_prefill_chunk(&prompt, &prompt, 0, 0, 0) {
             Ok(l) => l,
             Err(e) => {
                 let msg = e.reason.to_string();
@@ -14134,7 +14198,7 @@ mod tests {
         adapter
             .allocate_suffix_blocks(16)
             .map_err(Error::from_reason)?;
-        inner.run_paged_prefill_chunk(prompt, prompt, 0, 0)?;
+        inner.run_paged_prefill_chunk(prompt, prompt, 0, 0, 0)?;
         Ok(())
     }
 

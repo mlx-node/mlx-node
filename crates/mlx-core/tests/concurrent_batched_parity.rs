@@ -94,6 +94,13 @@ fn config(owner: &str, index: usize) -> ChatConfig {
     }
 }
 
+fn greedy_config(owner: &str) -> ChatConfig {
+    ChatConfig {
+        max_new_tokens: Some(12),
+        ..config(owner, 1)
+    }
+}
+
 fn assert_same(expected: &ChatResult, actual: &ChatResult, prompt: &str) {
     assert_eq!(actual.text, expected.text, "text mismatch for {prompt:?}");
     assert_eq!(
@@ -202,6 +209,43 @@ async fn serial_uniform_batch_and_interleaved_streams_are_token_identical() {
             .map(|bucket| (bucket.occupancy, bucket.steps))
             .collect::<Vec<_>>()
     );
+
+    // The mixed-penalty wave above deliberately proves scalar fallback and
+    // row-local penalty state. This separate penalty-free N=2 wave engages the
+    // production `[batch, 1, vocab]` greedy epilogue instead of merely proving
+    // the batched forward beneath it.
+    model
+        .reset_caches()
+        .await
+        .expect("reset before greedy serial oracles");
+    let greedy_prompts = &prompts[..2];
+    let mut greedy_serial = Vec::new();
+    for (index, prompt) in greedy_prompts.iter().enumerate() {
+        greedy_serial.push(
+            model
+                .chat_session_start(
+                    vec![user_message(prompt)],
+                    Some(greedy_config(&format!("greedy-serial-{index}"))),
+                )
+                .await
+                .expect("greedy serial oracle"),
+        );
+        model
+            .reset_caches()
+            .await
+            .expect("reset greedy serial oracle");
+    }
+    let greedy_batched = join_all(greedy_prompts.iter().enumerate().map(|(index, prompt)| {
+        model.chat_session_start(
+            vec![user_message(prompt)],
+            Some(greedy_config(&format!("greedy-batch-{index}"))),
+        )
+    }))
+    .await;
+    for ((expected, actual), prompt) in greedy_serial.iter().zip(greedy_batched).zip(greedy_prompts)
+    {
+        assert_same(expected, &actual.expect("greedy batched turn"), prompt);
+    }
 
     model
         .reset_caches()

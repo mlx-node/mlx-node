@@ -1467,15 +1467,24 @@ impl Qwen35Inner {
             )));
         }
         let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
-        let (num_blocks, sizing_source) = match mlx_paged_attn::profile::load_time_pool_sizing(
-            requested_blocks,
-            attn_layer_count,
-            num_kv_heads,
-            head_size,
-            block_size,
-            cache_dtype,
-        ) {
-            Ok(sizing) => (
+        let (num_blocks, sizing_source) = if self.config.paged_cache_memory_mb.is_some() {
+            (requested_blocks, "explicit".to_string())
+        } else {
+            let sizing = mlx_paged_attn::profile::load_time_pool_sizing(
+                requested_blocks,
+                attn_layer_count,
+                num_kv_heads,
+                head_size,
+                block_size,
+                cache_dtype,
+            )
+            .map_err(|e| {
+                Error::from_reason(format!(
+                    "Qwen3.5 adaptive paged cache sizing failed safely; refusing an uncapped \
+                     pool request: {e}"
+                ))
+            })?;
+            (
                 sizing.selected_blocks,
                 format!(
                     "adaptive(requested_blocks={}, active_mib={}, working_set_mib={})",
@@ -1486,13 +1495,7 @@ impl Qwen35Inner {
                         .map(|v| (v / (1024 * 1024)).to_string())
                         .unwrap_or_else(|| "n/a".to_string())
                 ),
-            ),
-            Err(e) => {
-                return Err(Error::from_reason(format!(
-                    "Qwen3.5 adaptive paged cache sizing failed safely; refusing an uncapped \
-                     pool request: {e}"
-                )));
-            }
+            )
         };
 
         let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
@@ -2058,7 +2061,7 @@ impl Qwen35Inner {
             });
         match finalize_result {
             Ok(_) => {
-                self.capture_dense_gdn_cold_sidecar(image_token_positions);
+                self.capture_dense_gdn_cold_sidecar(image_token_positions, cache_salt);
                 Ok(())
             }
             Err(error) => {
@@ -2588,7 +2591,11 @@ impl Qwen35Inner {
     /// `cached_paged_image_token_positions` before their prefill and reassign it
     /// only after finalization returns, so a `self`-read guard would see an
     /// empty vec on exactly the media turns it exists to refuse.
-    fn capture_dense_gdn_cold_sidecar(&self, image_token_positions: &[(u32, u64)]) {
+    fn capture_dense_gdn_cold_sidecar(
+        &self,
+        image_token_positions: &[(u32, u64)],
+        cache_salt: u64,
+    ) {
         crate::cold_tier::cold_sidecar_counters().record_capture_reached();
         let Some(adapter) = self.paged_adapter.as_ref() else {
             return;
@@ -2650,11 +2657,9 @@ impl Qwen35Inner {
             engine::build_paged_extra_keys(request_tokens.len(), block_size, image_token_positions);
 
         // Deepest same-owner in-memory GDN checkpoint whose block-hash chain
-        // matches this request and whose prefix the KV chain reaches. `cache_salt`
-        // is 0 here to match the KV-chain finalize
-        // (`finalize_turn_keep_live_per_block`) and the in-memory publish,
-        // so the restore walk — which chains the sidecar under the SAME salt as
-        // the KV blocks — can select it.
+        // matches this request and whose prefix the K/V chain reaches. The
+        // sidecar uses the turn's exact cache security domain so capture and
+        // restore derive the same parent-linked chain.
         let (idx, boundary) = match select_gdn_sidecar_boundary(
             &self.gdn_prefix_checkpoints,
             &self.active_cache_owner_id,
@@ -2662,7 +2667,7 @@ impl Qwen35Inner {
             ceiling_tokens,
             block_size,
             &extra_keys_per_block,
-            0,
+            cache_salt,
             |checkpoint| dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)),
         ) {
             GdnSidecarBoundary::Selected { index, boundary } => (index, boundary),
@@ -2718,7 +2723,7 @@ impl Qwen35Inner {
                 parent,
                 tokens,
                 extra_keys,
-                0,
+                cache_salt,
                 index,
             ));
         }
@@ -9465,7 +9470,10 @@ impl PagedBackend for Qwen35Inner {
         // K/V chain the sidecar would anchor on was not published, so nothing
         // could ever select it.
         if finalize_error.is_none() {
-            self.capture_dense_gdn_cold_sidecar(&self.cached_paged_image_token_positions);
+            self.capture_dense_gdn_cold_sidecar(
+                &self.cached_paged_image_token_positions,
+                cache_salt,
+            );
         }
         // Always attempt the release for the non-reuse path, even when
         // registration failed (mirrors the prior `register_error.or(release)`).

@@ -44,10 +44,6 @@ impl<T> StreamTx<T> {
             }
         }
     }
-
-    pub fn is_closed(&self) -> bool {
-        self.inner.is_closed()
-    }
 }
 
 /// Create one bounded request-output mailbox.
@@ -319,6 +315,37 @@ mod tests {
                 .expect("second item failed"),
             2
         );
+        producer.join().expect("producer panicked");
+    }
+
+    #[test]
+    fn dropping_a_full_mailbox_receiver_wakes_the_blocked_producer() {
+        let (tx, rx) = stream_channel::<u32>(1);
+        tx.send(Ok(1)).expect("fill mailbox");
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            entered_tx.send(()).expect("announce blocked send");
+            result_tx
+                .send(tx.send(Ok(2)))
+                .expect("report blocked-send result");
+        });
+
+        entered_rx.recv().expect("producer did not start");
+        assert!(
+            matches!(
+                result_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "the producer advanced past a full mailbox"
+        );
+        drop(rx);
+        let error = result_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("receiver drop did not wake the blocked producer")
+            .expect_err("closed mailbox send unexpectedly succeeded");
+        assert_eq!(error.0.expect("unsent item changed"), 2);
         producer.join().expect("producer panicked");
     }
 

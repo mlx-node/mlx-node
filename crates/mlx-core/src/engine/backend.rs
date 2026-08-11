@@ -4,19 +4,14 @@
 //! [`crate::engine::decode::run_decode_loop`], the generic decode loop.
 //! `ChatBackend` is the per-family seam the session cores drive.
 //!
-//! `ChunkSink` unifies the two streaming-callback shapes the decode
-//! loops use: the per-family `StreamSender(StreamTx)` mpsc wrapper
-//! (e.g. `models/lfm2/model.rs`, `models/qwen3/model.rs`) and the raw
-//! NAPI `ThreadsafeFunction` used by the pump-to-callback helpers — both
-//! expose `.call(napi::Result<ChatStreamChunk>, ThreadsafeFunctionCallMode)`,
-//! and the trait collapses that to a single `send`.
+//! `ChunkSink` exposes the per-request bounded `StreamTx` mailbox to the
+//! model-neutral decode loops.
 
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 
 use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
@@ -193,23 +188,9 @@ pub(crate) trait DecodeStep {
 
 /// Streaming-chunk sink driven by the generic decode loop.
 ///
-/// Unifies the two `.call(result, mode)` shapes in use today:
-///   * the per-family `StreamSender(StreamTx<ChatStreamChunk>)` mpsc
-///     wrappers (`models/lfm2/model.rs`, `models/qwen3/model.rs`,
-///     `models/qwen3_5/model.rs`, `models/qwen3_5_moe/model.rs`) whose
-///     `call` forwards to the request's bounded mailbox and ignores the mode;
-///   * the raw `ThreadsafeFunction<ChatStreamChunk, ()>` used by the
-///     `pump_stream_to_callback` helpers, always invoked `NonBlocking`.
+/// The only production sink is the per-request bounded model-thread mailbox.
 pub(crate) trait ChunkSink {
     fn send(&self, chunk: Result<ChatStreamChunk>);
-}
-
-impl ChunkSink for ThreadsafeFunction<ChatStreamChunk, ()> {
-    fn send(&self, chunk: Result<ChatStreamChunk>) {
-        // Mirrors `pump_stream_to_callback`: always NonBlocking, status
-        // ignored (a torn-down JS callback just drops the chunk).
-        self.call(chunk, ThreadsafeFunctionCallMode::NonBlocking);
-    }
 }
 
 impl ChunkSink for crate::model_thread::StreamTx<ChatStreamChunk> {

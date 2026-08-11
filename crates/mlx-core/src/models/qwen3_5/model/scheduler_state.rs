@@ -465,21 +465,24 @@ impl Qwen35StepExecutor<'_> {
         }
         let greedy_tokens: std::result::Result<Option<Vec<u32>>, String> = match &logits {
             Ok(Some(logits))
-                if work
-                    .iter()
-                    .filter(|row| row.batch_index.is_some())
-                    .all(|row| {
-                        let turn = running
-                            .iter()
-                            .find(|turn| turn.seq_id == row.seq_id)
-                            .expect("prepared row remains running");
-                        engine::batch_sampling::can_batch_greedy(&turn.payload.params)
-                            && !turn.payload.reasoning_tracker.force_think_end_pending()
-                    }) =>
+                if engine::batch_sampling::can_batch_greedy_wave(work.iter().filter_map(
+                    |row| {
+                        row.batch_index.map(|_| {
+                            let turn = running
+                                .iter()
+                                .find(|turn| turn.seq_id == row.seq_id)
+                                .expect("prepared row remains running");
+                            (
+                                &turn.payload.params,
+                                turn.payload.reasoning_tracker.force_think_end_pending(),
+                            )
+                        })
+                    },
+                )) =>
             {
-                engine::batch_sampling::batch_greedy_tokens(logits)
-                    .map(Some)
-                    .map_err(|error| error.reason)
+                Ok(engine::batch_sampling::batch_greedy_tokens_or_fallback(
+                    logits,
+                ))
             }
             _ => Ok(None),
         };

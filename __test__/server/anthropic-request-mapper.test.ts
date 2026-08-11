@@ -1087,6 +1087,17 @@ describe('mapAnthropicRequest', () => {
     ).toThrow('cache_salt must not be empty');
   });
 
+  it('rejects a cache_salt larger than 256 UTF-8 bytes', () => {
+    expect(() =>
+      mapAnthropicRequest({
+        model: 'test',
+        max_tokens: 8,
+        messages: [{ role: 'user', content: 'hello' }],
+        cache_salt: 'é'.repeat(129),
+      }),
+    ).toThrow('cache_salt must be at most 256 UTF-8 bytes');
+  });
+
   it('maps temperature to config', () => {
     const { config } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',

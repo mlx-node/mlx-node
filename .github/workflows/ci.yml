@@ -336,6 +336,7 @@ jobs:
             tests: >-
               --test lfm2_paged_vs_flat_parity
               --test lfm2_session
+              --test lfm2_concurrent_batched_parity
           # gemma4 QAT (wNa8o8): convert the prequantized source and run the
           # single-instance TS e2e coherence test (text + vision on examples/ocr.png).
           # PR-opt-in only — the run step skips it on the push/release gate.

@@ -120,7 +120,8 @@ export interface ResponsesAPIRequest {
   /**
    * Security domain for native content-addressed prefix-cache reuse.
    * Identical prompts only share physical KV blocks when this non-empty value
-   * is also identical. Multi-tenant callers should derive a high-entropy stable value
+   * is also identical. Values are limited to 256 UTF-8 bytes. Multi-tenant
+   * callers should derive a high-entropy stable value
    * from the authenticated tenant identity. This is independent from
    * `prompt_cache_key`, which controls warm conversation affinity.
    */

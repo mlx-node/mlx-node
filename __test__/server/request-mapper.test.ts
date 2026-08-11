@@ -150,6 +150,16 @@ describe('mapRequest', () => {
     ).toThrow('cache_salt must not be empty');
   });
 
+  it('rejects a cache_salt larger than 256 UTF-8 bytes', () => {
+    expect(() =>
+      mapRequest({
+        model: 'test',
+        input: 'hello',
+        cache_salt: 'é'.repeat(129),
+      }),
+    ).toThrow('cache_salt must be at most 256 UTF-8 bytes');
+  });
+
   it('maps temperature to config', () => {
     const { config } = mapRequest({
       model: 'test-model',

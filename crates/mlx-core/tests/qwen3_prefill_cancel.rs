@@ -66,7 +66,7 @@ static HEAVY_GATE: Mutex<()> = Mutex::const_new(());
 /// prefill (the pre-start cancel guard would otherwise swallow the turn
 /// before any chunk ran — asserted below), and short enough to land well
 /// before the multi-second full prefill completes.
-const DEFAULT_CANCEL_DELAY_MS: u64 = 100;
+const DEFAULT_CANCEL_DELAY_MS: u64 = 250;
 // Debug Rust real-weight prefills are intentionally unoptimized and the
 // fail-closed proof must complete the full, uncached 11k-token follow-up.
 // Five minutes still turns a deadlock into a bounded failure instead of the
@@ -187,20 +187,31 @@ fn clone_flat_model_dir(src: &Path) -> Result<TemporaryModelDir, String> {
     Ok(TemporaryModelDir(dst))
 }
 
-/// A prompt long enough for many 512-token prefill chunks (~11k tokens
-/// on the qwen3 tokenizer — 20+ chunk boundaries). The wide window keeps
-/// the timer away from the final chunk even on faster Metal generations.
-fn long_prompt() -> String {
+fn repeated_prompt(paragraphs: usize) -> String {
     let paragraph = "The quick brown fox jumps over the lazy dog while the \
                      patient owl watches from a very tall oak tree near the \
                      river bend, counting every leaf that falls into the \
                      slow-moving water below. ";
-    let mut prompt = String::with_capacity(paragraph.len() * 300 + 64);
+    let mut prompt = String::with_capacity(paragraph.len() * paragraphs + 64);
     prompt.push_str("Summarize the following text in one sentence:\n");
-    for _ in 0..300 {
+    for _ in 0..paragraphs {
         prompt.push_str(paragraph);
     }
     prompt
+}
+
+/// A prompt long enough for many 512-token prefill chunks (~11k tokens
+/// on the Qwen3 tokenizer). The wide window keeps the cancellation timer
+/// away from the final chunk even on faster Metal generations.
+fn cancellation_prompt() -> String {
+    repeated_prompt(300)
+}
+
+/// The follow-up only proves that cancellation state was cleared and that a
+/// fresh multi-chunk prefill can finish. Replaying the full 11k-token premise
+/// makes this gate quadratically expensive without strengthening that claim.
+fn follow_up_prompt() -> String {
+    repeated_prompt(64)
 }
 
 fn chat_config(max_new_tokens: i32) -> ChatConfig {
@@ -312,14 +323,13 @@ async fn qwen3_paged_mid_prefill_cancel_fails_closed() {
          must load with use_block_paged_cache enabled (qwen3's default)",
     );
 
-    // `ChatMessage` is not `Clone` (napi payload buffers) — rebuild the
-    // identical message list per turn instead.
-    let messages = || vec![user_message(long_prompt())];
-
     // ---- Turn 1: cancel mid-prefill via a timer thread. ----
     let started1 = Instant::now();
     let (handle1, rx1) = model
-        .chat_stream_session_start_for_test(messages(), Some(chat_config(64)))
+        .chat_stream_session_start_for_test(
+            vec![user_message(cancellation_prompt())],
+            Some(chat_config(64)),
+        )
         .expect("turn 1 dispatch failed");
     let delay_ms: u64 = std::env::var("MLX_TEST_PAGED_CANCEL_DELAY_MS")
         .ok()
@@ -349,10 +359,13 @@ async fn qwen3_paged_mid_prefill_cancel_fails_closed() {
         turn1.done.as_ref().and_then(|c| c.finish_reason.clone()),
     );
 
-    // ---- Turn 2: identical prompt, no cancel — must run to done. ----
+    // ---- Turn 2: fresh multi-chunk prompt, no cancel — must run to done. ----
     let started2 = Instant::now();
     let (_handle2, rx2) = model
-        .chat_stream_session_start_for_test(messages(), Some(chat_config(8)))
+        .chat_stream_session_start_for_test(
+            vec![user_message(follow_up_prompt())],
+            Some(chat_config(8)),
+        )
         .expect("turn 2 dispatch failed");
     let turn2 = drain_turn(rx2, started2).await;
     assert!(
@@ -443,7 +456,7 @@ async fn qwen3_flat_mid_prefill_cancel_fails_closed() {
         "flat clone must load WITHOUT the paged adapter",
     );
 
-    let messages = || vec![user_message(long_prompt())];
+    let messages = || vec![user_message(cancellation_prompt())];
 
     // Turn 1: cancel mid-prefill via a timer thread. The long prompt leaves
     // several full chunks after the default timer, so cancellation is caught

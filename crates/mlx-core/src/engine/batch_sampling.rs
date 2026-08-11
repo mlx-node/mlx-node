@@ -1,6 +1,6 @@
 //! Batch-level decode epilogues shared by continuously scheduled families.
 //!
-//! The model forward already returns one `[batch, vocab]` logits array. For
+//! The model forward returns one `[batch, 1, vocab]` decode-logits array. For
 //! the common deterministic server configuration, slicing that array and
 //! constructing/evaluating one scalar sampler graph per request defeats part
 //! of the fused batch. This module keeps the logits batched through argmax and
@@ -24,13 +24,31 @@ pub(crate) fn can_batch_greedy(params: &ChatParams) -> bool {
             .is_some_and(|config| is_greedy_temperature(config.temperature.unwrap_or(1.0)))
 }
 
-/// Select one greedy token per row from `[batch, vocab]` logits with one MLX
-/// graph evaluation. The returned vector preserves row order.
+/// Whether every row in one scheduled wave can share the greedy epilogue.
+///
+/// `force_think_end_pending` is kept beside the row parameters because it is
+/// mutable turn state rather than a sampling parameter. Requiring a non-empty
+/// iterator prevents an empty `.all()` from accidentally engaging the gate.
+pub(crate) fn can_batch_greedy_wave<'a>(
+    rows: impl IntoIterator<Item = (&'a ChatParams, bool)>,
+) -> bool {
+    let mut rows = rows.into_iter().peekable();
+    rows.peek().is_some()
+        && rows.all(|(params, force_think_end_pending)| {
+            can_batch_greedy(params) && !force_think_end_pending
+        })
+}
+
+/// Select one greedy token per row from production-shaped
+/// `[batch, 1, vocab]` logits with one MLX graph evaluation. The returned
+/// vector preserves row order.
 pub(crate) fn batch_greedy_tokens(logits: &MxArray) -> Result<Vec<u32>> {
-    if logits.ndim()? != 2 {
+    let ndim = logits.ndim()?;
+    if ndim != 3 || logits.shape_at(1)? != 1 {
         return Err(Error::from_reason(format!(
-            "batch_greedy_tokens expects [batch, vocab] logits, got {} dimensions",
-            logits.ndim()?
+            "batch_greedy_tokens expects [batch, 1, vocab] logits, got {} dimensions with axis 1 = {}",
+            ndim,
+            if ndim > 1 { logits.shape_at(1)? } else { -1 }
         )));
     }
     let batch = logits.shape_at(0)?;
@@ -39,11 +57,30 @@ pub(crate) fn batch_greedy_tokens(logits: &MxArray) -> Result<Vec<u32>> {
             "batch_greedy_tokens received a negative batch dimension",
         ));
     }
-    let tokens = logits.argmax(1, None)?;
+    let tokens = logits.argmax(2, None)?;
     tokens.eval();
     (0..batch as usize)
         .map(|row| tokens.item_at_int32(row).map(|token| token as u32))
         .collect()
+}
+
+/// Availability-preserving wrapper for the optional fused epilogue.
+///
+/// A shared optimization must never turn a successfully-computed model
+/// forward into a wave-wide request failure. Shape/kernel regressions are
+/// reported and the callers fall back to the established per-row sampler.
+pub(crate) fn batch_greedy_tokens_or_fallback(logits: &MxArray) -> Option<Vec<u32>> {
+    match batch_greedy_tokens(logits) {
+        Ok(tokens) => Some(tokens),
+        Err(error) => {
+            tracing::warn!(
+                target: "mlx_core::scheduler",
+                "batched greedy epilogue failed; falling back to scalar sampling: {}",
+                error.reason
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -91,7 +128,7 @@ mod tests {
                 5.0, 4.0, 7.0, 6.0, // row 1 -> 2
                 -1.0, -2.0, -3.0, 0.0, // row 2 -> 3
             ],
-            &[3, 4],
+            &[3, 1, 4],
         )
         .expect("logits");
         assert_eq!(
@@ -111,5 +148,23 @@ mod tests {
         let mut penalized = params(0.0);
         penalized.presence_penalty = 0.5;
         assert!(!can_batch_greedy(&penalized));
+
+        assert!(can_batch_greedy_wave([(&greedy, false), (&greedy, false)]));
+        assert!(!can_batch_greedy_wave([
+            (&greedy, false),
+            (&penalized, false),
+        ]));
+        assert!(!can_batch_greedy_wave([
+            (&penalized, false),
+            (&greedy, false),
+        ]));
+        assert!(!can_batch_greedy_wave([(&greedy, true)]));
+        assert!(!can_batch_greedy_wave(std::iter::empty()));
+    }
+
+    #[test]
+    fn malformed_batch_shape_falls_back_instead_of_failing_the_wave() {
+        let logits = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]).expect("logits");
+        assert!(batch_greedy_tokens_or_fallback(&logits).is_none());
     }
 }

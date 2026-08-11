@@ -101,7 +101,8 @@ export interface AnthropicMessagesRequest {
   /**
    * MLX-Node extension matching vLLM's Anthropic surface. Separates native
    * content-addressed prefix-cache reuse between security domains. The value
-   * must be non-empty, stable for the tenant, secret, and unpredictable.
+   * must be non-empty, at most 256 UTF-8 bytes, stable for the tenant, secret,
+   * and unpredictable.
    */
   cache_salt?: string;
   output_config?: {

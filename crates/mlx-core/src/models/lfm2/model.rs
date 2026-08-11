@@ -475,6 +475,12 @@ impl Lfm2Inner {
         if self.paged_adapter.is_none() {
             return Ok(());
         }
+        // Preserve an explicit operator/test cap. Adaptive sizing is only for
+        // uncapped configurations; replacing a successfully co-resident fixed
+        // pool here can fail spuriously as prior model instances tear down.
+        if self.config.paged_cache_memory_mb.is_some() {
+            return Ok(());
+        }
         self.paged_adapter = None;
 
         let attn_layer_count = self.config.full_attn_idxs().len() as u32;
@@ -1845,22 +1851,24 @@ impl Lfm2StepExecutor<'_> {
             .is_err_and(|error| is_paged_allocation_blocked(&error.reason));
         let greedy_tokens: std::result::Result<Option<Vec<u32>>, String> = match &batched_logits {
             Ok(Some(logits))
-                if !work.is_empty()
-                    && work
-                        .iter()
-                        .filter(|row| row.batch_index.is_some())
-                        .all(|row| {
+                if engine::batch_sampling::can_batch_greedy_wave(work.iter().filter_map(
+                    |row| {
+                        row.batch_index.map(|_| {
                             let turn = running
                                 .iter()
                                 .find(|turn| turn.seq_id == row.seq_id)
                                 .expect("prepared decode row remains running");
-                            engine::batch_sampling::can_batch_greedy(&turn.payload.params)
-                                && !turn.payload.reasoning_tracker.force_think_end_pending()
-                        }) =>
+                            (
+                                &turn.payload.params,
+                                turn.payload.reasoning_tracker.force_think_end_pending(),
+                            )
+                        })
+                    },
+                )) =>
             {
-                engine::batch_sampling::batch_greedy_tokens(logits)
-                    .map(Some)
-                    .map_err(|error| error.reason)
+                Ok(engine::batch_sampling::batch_greedy_tokens_or_fallback(
+                    logits,
+                ))
             }
             _ => Ok(None),
         };
@@ -2034,17 +2042,26 @@ impl StepExecutor<Lfm2ScheduledTurn> for Lfm2StepExecutor<'_> {
             .unwrap_or_else(|error| Self::fail(turn, row, error));
             results[index] = Some(result);
         }
+        let rows = results
+            .into_iter()
+            .map(|result| result.expect("every planned row executed"))
+            .collect::<Vec<_>>();
+        let scalar_decode_occupancy = plan
+            .rows
+            .iter()
+            .zip(&rows)
+            .filter(|(planned, result)| {
+                planned.kind == StepKind::Decode && !result.allocation_blocked
+            })
+            .count();
         Ok(StepResult {
-            rows: results
-                .into_iter()
-                .map(|result| result.expect("every planned row executed"))
-                .collect(),
+            rows,
             executed_decode_batch: if batched_decode_blocked {
                 0
             } else if used_batched_decode {
                 executed_batch_rows
             } else {
-                usize::from(decode_count != 0)
+                scalar_decode_occupancy
             },
             rows_alloc_evicted: running
                 .iter()

@@ -1012,21 +1012,24 @@ impl QwenStepExecutor<'_> {
                     .iter()
                     .any(|row| row.batch_index.is_some() && !row.at_length);
                 if has_sampling_rows
-                    && work
-                        .iter()
-                        .filter(|row| row.batch_index.is_some() && !row.at_length)
-                        .all(|row| {
-                            let turn = running
-                                .iter()
-                                .find(|turn| turn.seq_id == row.seq_id)
-                                .expect("prepared decode row remains running");
-                            engine::batch_sampling::can_batch_greedy(&turn.payload.params)
-                                && !turn.payload.reasoning_tracker.force_think_end_pending()
-                        })
+                    && engine::batch_sampling::can_batch_greedy_wave(
+                        work.iter()
+                            .filter(|row| row.batch_index.is_some() && !row.at_length)
+                            .map(|row| {
+                                let turn = running
+                                    .iter()
+                                    .find(|turn| turn.seq_id == row.seq_id)
+                                    .expect("prepared decode row remains running");
+                                (
+                                    &turn.payload.params,
+                                    turn.payload.reasoning_tracker.force_think_end_pending(),
+                                )
+                            }),
+                    )
                 {
-                    engine::batch_sampling::batch_greedy_tokens(logits)
-                        .map(Some)
-                        .map_err(|error| error.reason)
+                    Ok(engine::batch_sampling::batch_greedy_tokens_or_fallback(
+                        logits,
+                    ))
                 } else {
                     Ok(None)
                 }
@@ -1571,17 +1574,26 @@ impl StepExecutor<QwenScheduledTurn> for QwenStepExecutor<'_> {
             .unwrap_or_else(|error| Self::fail(turn, row, error));
             results[index] = Some(result);
         }
+        let rows = results
+            .into_iter()
+            .map(|result| result.expect("every planned row executed"))
+            .collect::<Vec<_>>();
+        let scalar_decode_occupancy = plan
+            .rows
+            .iter()
+            .zip(&rows)
+            .filter(|(planned, result)| {
+                planned.kind == StepKind::Decode && !result.allocation_blocked
+            })
+            .count();
         Ok(StepResult {
-            rows: results
-                .into_iter()
-                .map(|result| result.expect("every planned row executed"))
-                .collect(),
+            rows,
             executed_decode_batch: if batched_decode_blocked {
                 0
             } else if used_batched_decode {
                 executed_batch_rows
             } else {
-                usize::from(decode_count != 0)
+                scalar_decode_occupancy
             },
             rows_alloc_evicted: running
                 .iter()
@@ -2925,6 +2937,13 @@ impl Qwen3Inner {
     /// capped against the real working set instead of double-budgeting them.
     pub(crate) fn size_paged_pool_after_weight_load(&mut self) -> Result<()> {
         if self.paged_adapter.is_none() {
+            return Ok(());
+        }
+        // An explicit pool size is an operator cap, not a sizing hint. The
+        // constructor already built and successfully co-resident-loaded that
+        // exact pool with the weights, so adaptive replacement is reserved for
+        // genuinely uncapped configurations.
+        if self.config.paged_cache_memory_mb.is_some() {
             return Ok(());
         }
         // Drop the provisional pool before sizing/allocating its replacement.
