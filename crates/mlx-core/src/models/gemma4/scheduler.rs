@@ -1096,19 +1096,26 @@ impl Gemma4SchedulerState {
     }
 
     fn release_cache_owner_now(&mut self, owner_id: &str) -> Result<()> {
-        let paged_release = self
-            .owner_sequences
-            .remove(owner_id)
-            .and_then(|seq_id| {
-                self.inner
-                    .kv_cache_coordinator
-                    .as_mut()
-                    .map(|coordinator| coordinator.release_request_all(seq_id))
-            })
-            .transpose();
+        self.release_cache_owner_with(owner_id, |inner, seq_id| {
+            if let Some(coordinator) = inner.kv_cache_coordinator.as_mut() {
+                coordinator.release_request_all(seq_id)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn release_cache_owner_with(
+        &mut self,
+        owner_id: &str,
+        release_paged: impl FnOnce(&mut Gemma4Inner, u32) -> std::result::Result<(), String>,
+    ) -> Result<()> {
+        if let Some(&seq_id) = self.owner_sequences.get(owner_id) {
+            release_paged(&mut self.inner, seq_id).map_err(Error::from_reason)?;
+        }
+        self.owner_sequences.remove(owner_id);
         self.flat_owner_caches.remove(owner_id);
         self.owner_metadata.remove(owner_id);
-        paged_release.map(|_| ()).map_err(Error::from_reason)
+        Ok(())
     }
 
     fn reply_error(response: ScheduledReply, cancelled: &AtomicBool, error: Error) {
@@ -1823,6 +1830,51 @@ mod tests {
         state
             .release_cache_owner_now("session-a")
             .expect("release owner");
+        assert!(!state.owner_sequences.contains_key("session-a"));
+        assert!(!state.flat_owner_caches.contains_key("session-a"));
+        assert!(!state.owner_metadata.contains_key("session-a"));
+    }
+
+    #[test]
+    fn failed_owner_release_retains_every_registry_for_retry() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let mut state = Gemma4SchedulerState::new(tiny_paged_inner());
+        state.owner_sequences.insert("session-a".to_string(), 7);
+        state.inner.init_caches_sync().expect("flat caches");
+        state.flat_owner_caches.insert(
+            "session-a".to_string(),
+            state
+                .inner
+                .take_flat_owner_caches()
+                .expect("flat caches live"),
+        );
+        state.owner_metadata.insert(
+            "session-a".to_string(),
+            Gemma4OwnerMetadata {
+                cached_token_history: vec![1, 2, 3],
+                ..Gemma4OwnerMetadata::default()
+            },
+        );
+
+        let error = state
+            .release_cache_owner_with("session-a", |_, seq_id| {
+                assert_eq!(seq_id, 7);
+                Err("injected paged release failure".to_string())
+            })
+            .expect_err("failed paged release must be retryable");
+        assert!(error.reason.contains("injected paged release failure"));
+        assert_eq!(state.owner_sequences.get("session-a"), Some(&7));
+        assert!(state.flat_owner_caches.contains_key("session-a"));
+        assert!(state.owner_metadata.contains_key("session-a"));
+
+        state
+            .release_cache_owner_with("session-a", |_, seq_id| {
+                assert_eq!(seq_id, 7);
+                Ok(())
+            })
+            .expect("retry owner release");
         assert!(!state.owner_sequences.contains_key("session-a"));
         assert!(!state.flat_owner_caches.contains_key("session-a"));
         assert!(!state.owner_metadata.contains_key("session-a"));
