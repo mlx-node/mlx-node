@@ -21,8 +21,10 @@
  *   - An image hash (`lastImagesKey`) tracks the images bound to the
  *     current cache. A `send()` call whose image set has changed
  *     (different bytes or different ordering) triggers a full
- *     restart: `resetCaches()` → push the new user message (with
- *     images) to history → `chatSessionStart(history)`.
+ *     restart: release this session's native cache owner → push the new user
+ *     message (with images) to history → `chatSessionStart(history)`. Native
+ *     models without owner-scoped release retain the exclusive-model
+ *     `resetCaches()` fallback.
  *
  *   - Text-only `send()` on turn >= 1 still gets incremental prefill
  *     on a token-prefix hit. Prompt structure is never reconstructed
@@ -1973,20 +1975,21 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     signal?: AbortSignal,
   ): Promise<ChatResult> {
     // Capture pre-state so the restart can be rolled back if the
-    // native call fails. The media-change branch resets caches BEFORE
-    // we know whether the new prefill will succeed, so on failure we
-    // also have to drop turnCount + lastImagesKey/lastAudioKey to force
-    // the next call to re-route through the start path (rather than a
-    // delta continue against wiped caches).
+    // native call fails. The media-change branch releases this owner's caches
+    // BEFORE we know whether the new prefill will succeed, so on failure we
+    // also have to drop turnCount + lastImagesKey/lastAudioKey to force the
+    // next call to re-route through the start path (rather than a delta
+    // continue against released caches).
     const wasMediaChangeRestart = mediaChanged && !isFirstTurn;
     const historyLenBefore = this.history.length;
 
     // Capacity validation must happen before `prepareStartPath()` because a
-    // media-change restart clears native caches. A rejected oversized prompt
-    // is a request error and must leave both JS history and native state intact.
+    // media-change restart releases native owner state. A rejected oversized
+    // prompt is a request error and must leave both JS history and native state
+    // intact.
     const constrainedConfig = await this.constrainToContextCapacity(this.historyWithPending(pendingMessage), config);
 
-    await this.prepareStartPath(mediaChanged, isFirstTurn);
+    await this.prepareStartPath(mediaChanged, isFirstTurn, constrainedConfig.cacheOwnerId);
     this.history.push(pendingMessage);
     try {
       // Pass a shallow snapshot so later pushes to `this.history`
@@ -2028,7 +2031,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // consistent with turnCount.
       this.history.length = historyLenBefore;
       if (wasMediaChangeRestart) {
-        // Caches were wiped by prepareStartPath() but the new prefill
+        // This owner's caches were released by prepareStartPath() but the new prefill
         // failed. Force the next call to re-route through the start
         // path with the (preserved) prior history.
         this.turnCount = 0;
@@ -2071,11 +2074,11 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     const wasMediaChangeRestart = mediaChanged && !isFirstTurn;
     const historyLenBefore = this.history.length;
 
-    // See the sync start path: reject before a media restart can clear native
-    // state, and make the output budget explicit before allocating KV blocks.
+    // See the sync start path: reject before a media restart can release native
+    // owner state, and make the output budget explicit before allocating KV blocks.
     const constrainedConfig = await this.constrainToContextCapacity(this.historyWithPending(pendingMessage), config);
 
-    await this.prepareStartPath(mediaChanged, isFirstTurn);
+    await this.prepareStartPath(mediaChanged, isFirstTurn, constrainedConfig.cacheOwnerId);
     // Stage the pending message on the pending history BEFORE the
     // stream starts — the native call reads it synchronously via
     // `model.chatStreamSessionStart(history, config)`.
@@ -2156,7 +2159,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // consistent with turnCount.
         this.history.length = historyLenBefore;
         if (wasMediaChangeRestart) {
-          // Caches were wiped by prepareStartPath() but the new
+          // This owner's caches were released by prepareStartPath() but the new
           // prefill never reached a successful done:true. Force the
           // next call to re-route through the start path with the
           // preserved prior history.
@@ -2171,8 +2174,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   /**
    * Shared pre-start bookkeeping for both `send()` and `sendStream()`:
    *
-   *   - On an image-change restart (turn >= 1), reset the native KV
-   *     caches so the new image set gets a fresh prefill. History is
+   *   - On an image-change restart (turn >= 1), release this session's native
+   *     cache owner so the new image set gets a fresh prefill without wiping
+   *     concurrently live owners. History is
    *     intentionally preserved — `chatSessionStart` receives the full
    *     accumulated conversation plus the new user turn so the jinja
    *     render walks every prior turn and every prior image again
@@ -2183,13 +2187,22 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    *     turn.
    *   - On a fresh / reset history, re-inject the system prompt.
    */
-  private async prepareStartPath(mediaChanged: boolean, isFirstTurn: boolean): Promise<void> {
+  private async prepareStartPath(
+    mediaChanged: boolean,
+    isFirstTurn: boolean,
+    cacheOwnerId: string | undefined,
+  ): Promise<void> {
     if (mediaChanged && !isFirstTurn) {
-      // Await the async native reset (H1a) so the wipe has drained
-      // through the model thread before the start call is enqueued —
-      // without the await, two async NAPI calls carry no relative
-      // ordering guarantee.
-      await this.model.resetCaches();
+      // Await owner release so it has drained through the model thread before
+      // the replacement start is enqueued. This is deliberately owner-scoped
+      // on continuously batched models: a model-wide reset would invalidate
+      // unrelated live ChatSessions. Third-party/exclusive models predating
+      // the owner lifecycle retain the full-reset fallback.
+      if (this.model.hasBlockPagedCache?.() === true && this.model.releaseCacheOwner && cacheOwnerId) {
+        await this.model.releaseCacheOwner(cacheOwnerId);
+      } else {
+        await this.model.resetCaches();
+      }
     }
     if (this.history.length === 0 && this.system != null) {
       this.history.push({ role: 'system', content: this.system });

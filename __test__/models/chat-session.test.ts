@@ -135,6 +135,7 @@ function makeMockModel() {
     chatStreamSessionContinueTool,
     resetCaches,
     releaseCacheOwner,
+    hasBlockPagedCache: () => true,
   };
 
   return {
@@ -455,8 +456,8 @@ describe('ChatSession', () => {
       expect(session.hasImages).toBe(true);
     });
 
-    it('different image bytes trigger a full restart', async () => {
-      const { model, chatSessionStart, chatSessionContinueTool, resetCaches } = makeMockModel();
+    it('different image bytes trigger an owner-scoped full restart', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool, resetCaches, releaseCacheOwner } = makeMockModel();
       const session = new ChatSession(model, { system: 'You are helpful.' });
 
       // Seed the first turn so it emits a single ok tool call — the
@@ -475,13 +476,15 @@ describe('ChatSession', () => {
 
       expect(chatSessionStart).toHaveBeenCalledTimes(2);
       expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
-      // Restart path: resetCaches invoked exactly once at the image
-      // boundary. History is PRESERVED across the restart — the plan's
+      // Restart path: only this session's native owner is released at the
+      // image boundary. History is PRESERVED across the restart — the plan's
       // Turn 3 example requires "full jinja on 3-turn history + image
       // B", i.e. chatSessionStart receives the system prompt plus
       // every prior user / assistant / tool turn plus the new user
       // turn with the new image attached.
-      expect(resetCaches).toHaveBeenCalledTimes(1);
+      expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
+      expect(releaseCacheOwner).toHaveBeenCalledWith(chatSessionStart.mock.calls[0][1]?.cacheOwnerId);
+      expect(resetCaches).not.toHaveBeenCalled();
 
       const restartMessages = chatSessionStart.mock.calls[1][0];
       expect(restartMessages).toEqual([
@@ -504,6 +507,63 @@ describe('ChatSession', () => {
       ]);
       // Three successful turns: initial send, tool result, restart send.
       expect(session.turns).toBe(3);
+    });
+
+    it('a media restart does not invalidate a concurrently live cache owner', async () => {
+      const liveOwners = new Set<string>();
+      const ownerFrom = (config?: ChatConfig | null): string => {
+        const owner = config?.cacheOwnerId;
+        if (!owner) throw new Error('test model requires a cache owner');
+        return owner;
+      };
+      const chatSessionStart = vi.fn(async (_messages: ChatMessage[], config?: ChatConfig | null) => {
+        liveOwners.add(ownerFrom(config));
+        return makeChatResult('start-reply');
+      });
+      const chatSessionContinue = vi.fn(async (_messages: ChatMessage[], config?: ChatConfig | null) => {
+        const owner = ownerFrom(config);
+        if (!liveOwners.has(owner)) throw new Error('requires an initialized session');
+        return makeChatResult('continue-reply');
+      });
+      const resetCaches = vi.fn(async () => {
+        liveOwners.clear();
+      });
+      const releaseCacheOwner = vi.fn(async (ownerId: string) => {
+        liveOwners.delete(ownerId);
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart,
+        chatSessionContinue,
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('tool-reply')),
+        chatStreamSessionStart: vi.fn(async function* () {
+          yield finalChunk('start-reply');
+        }),
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('continue-reply');
+        }),
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('tool-reply');
+        }),
+        resetCaches,
+        releaseCacheOwner,
+        hasBlockPagedCache: () => true,
+      };
+      const first = new ChatSession(model);
+      const second = new ChatSession(model);
+
+      await first.send('first image', { images: [imgA] });
+      await second.send('second image', { images: [imgA] });
+      const firstOwner = ownerFrom(chatSessionStart.mock.calls[0][1]);
+      const secondOwner = ownerFrom(chatSessionStart.mock.calls[1][1]);
+
+      await first.send('changed image', { images: [imgB] });
+      expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
+      expect(releaseCacheOwner).toHaveBeenCalledWith(firstOwner);
+      expect(resetCaches).not.toHaveBeenCalled();
+      expect(liveOwners.has(secondOwner)).toBe(true);
+
+      await expect(second.send('still live')).resolves.toMatchObject({ text: 'continue-reply' });
+      expect(chatSessionContinue).toHaveBeenCalledTimes(1);
     });
 
     it('identical image bytes do NOT trigger a restart', async () => {
@@ -612,7 +672,7 @@ describe('ChatSession', () => {
     });
 
     it('failed image-change restart rolls back state and re-routes through start on next call', async () => {
-      const { model, chatSessionStart, resetCaches } = makeMockModel();
+      const { model, chatSessionStart, resetCaches, releaseCacheOwner } = makeMockModel();
       const session = new ChatSession(model, { system: 'You are helpful.' });
 
       // Turn 1: image start succeeds.
@@ -625,12 +685,14 @@ describe('ChatSession', () => {
       // Turn 3: image change triggers restart, but the native call
       // rejects. State must roll back: prior history is preserved,
       // but turnCount + lastImagesKey drop so the next call re-routes
-      // through the start path (caches were already wiped).
+      // through the start path (this owner's caches were already released).
       chatSessionStart.mockRejectedValueOnce(new Error('restart-fail'));
       await expect(session.send('describe B', { images: [imgB] })).rejects.toThrow('restart-fail');
 
-      // resetCaches was called once (the failed restart).
-      expect(resetCaches).toHaveBeenCalledTimes(1);
+      // Only the failed restart's owner was released.
+      expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
+      expect(releaseCacheOwner).toHaveBeenCalledWith(chatSessionStart.mock.calls[0][1]?.cacheOwnerId);
+      expect(resetCaches).not.toHaveBeenCalled();
       expect(session.turns).toBe(0);
       expect(session.hasImages).toBe(false);
 
@@ -1127,7 +1189,7 @@ describe('ChatSession', () => {
     });
 
     it('clears inFlight on exception and replays the retry from preserved history', async () => {
-      const { model, chatSessionStart, chatSessionContinueTool, resetCaches } = makeMockModel();
+      const { model, chatSessionStart, chatSessionContinueTool, resetCaches, releaseCacheOwner } = makeMockModel();
       // Seed an outstanding single-call turn. The failed native delta may
       // already have mutated its cached history, so the retry must preserve
       // the outstanding-call flag but use a clean full replay.
@@ -1143,10 +1205,13 @@ describe('ChatSession', () => {
       await session.sendToolResult('c1', 'out2');
 
       // Retrying does not issue another delta against the possibly-desynced
-      // native cache. It wipes that cache and replays the preserved history
-      // plus the replacement tool result through chatSessionStart.
+      // native cache. It releases only this session's owner and replays the
+      // preserved history plus the replacement tool result through
+      // chatSessionStart.
       expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
-      expect(resetCaches).toHaveBeenCalledTimes(1);
+      expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
+      expect(releaseCacheOwner).toHaveBeenCalledWith(chatSessionStart.mock.calls[0][1]?.cacheOwnerId);
+      expect(resetCaches).not.toHaveBeenCalled();
       expect(chatSessionStart).toHaveBeenCalledTimes(2);
       expect(chatSessionStart.mock.calls[1][0]).toEqual([
         { role: 'user', content: 'fire' },
@@ -2190,7 +2255,7 @@ describe('ChatSession', () => {
     });
 
     it('sendToolResult(): a non-prefix rejection propagates, then forces a full replay on retry', async () => {
-      const { model, chatSessionStart, chatSessionContinueTool, resetCaches } = makeMockModel();
+      const { model, chatSessionStart, chatSessionContinueTool, resetCaches, releaseCacheOwner } = makeMockModel();
       const session = new ChatSession(model);
 
       chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
@@ -2212,7 +2277,9 @@ describe('ChatSession', () => {
       // failed call may already have advanced.
       await session.sendToolResult('c1', 'retry');
       expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
-      expect(resetCaches).toHaveBeenCalledTimes(1);
+      expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
+      expect(releaseCacheOwner).toHaveBeenCalledWith(chatSessionStart.mock.calls[0][1]?.cacheOwnerId);
+      expect(resetCaches).not.toHaveBeenCalled();
       expect(chatSessionStart).toHaveBeenCalledTimes(2);
       expect(chatSessionStart.mock.calls[1][0]).toEqual([
         { role: 'user', content: 'describe', images: [imgA] },
