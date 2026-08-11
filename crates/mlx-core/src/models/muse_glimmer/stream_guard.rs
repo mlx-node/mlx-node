@@ -3624,4 +3624,269 @@ mod tests {
             "buffered bytes reached the parser's input"
         );
     }
+
+    // ── The seam: guard -> parser ──────────────────────────────────────
+    //
+    // Nothing used to cross it. This file never called `parse`; `output_parser`
+    // never built a `StreamGuard`; and the 40-odd `raw_turn()` assertions above
+    // only ever compared against whole-sequence tokenizer decoding. That absence
+    // is why two green suites asserted OPPOSITE results for byte-identical input:
+    //
+    //   * the parser demanded a control-token span for the whole 18-byte
+    //     `<|start|>assistant`, which no guard can emit — a span is one token's own
+    //     bytes and `<|start|>` is nine of them — so `next_anchor` returned `None`
+    //     for every guarded turn and only a turn's FIRST message was ever visible;
+    //   * the `xml` latch ended the turn on ATEM markup in ANY channel, so a
+    //     `to=user` answer that merely quoted the syntax was truncated or killed,
+    //     while the parser publishes those bytes as the answer's own text.
+    //
+    // Every test below therefore runs one stream through the whole path —
+    // `push_id`* then `flush` then `parse` — and asserts the two sides agree about
+    // it. None of them needs the checkpoint.
+
+    use crate::models::muse_glimmer::output_parser::{
+        GeneratedTurn, ParsedTurn, ResponseTemplate, SPEC_JSON,
+    };
+
+    /// What one turn looked like on both sides of the seam.
+    struct Seam {
+        /// Everything a caller would have shown the user: every delta, then
+        /// `flush`.
+        streamed: String,
+        /// What the parser makes of the turn the guard recorded.
+        parsed: ParsedTurn,
+        /// The outcome of the last id the guard accepted.
+        last: GuardOutcome,
+    }
+
+    /// The checkpoint's compiled `response_template`, from the same transcription
+    /// `output_parser`'s own tests compile — one spec, so the two sides cannot
+    /// drift.
+    fn response_template() -> ResponseTemplate {
+        ResponseTemplate::from_tokenizer_config_str(SPEC_JSON)
+            .expect("the transcribed response_template compiles")
+    }
+
+    /// Runs `ids` through a guard the way a decode loop does — stopping at
+    /// `EndTurn`, as the caller's contract requires — then parses what it
+    /// recorded.
+    ///
+    /// Honouring `EndTurn` is what makes this the real path: a harness that kept
+    /// pushing would measure a turn no caller can produce.
+    fn seam_of_ids(ids: &[u32], batched: bool) -> Seam {
+        let mut g = guard(8, 100_000, TEST_RECIPIENT_CHARS);
+        let mut streamed = String::new();
+        let mut last = GuardOutcome::Hold;
+        if batched {
+            last = g.push_ids(ids);
+            if let GuardOutcome::Emit(s) = &last {
+                streamed.push_str(s);
+            }
+        } else {
+            for id in ids {
+                last = g.push_id(*id);
+                match &last {
+                    GuardOutcome::Emit(s) => streamed.push_str(s),
+                    GuardOutcome::Hold => {}
+                    GuardOutcome::EndTurn => break,
+                }
+            }
+        }
+        streamed.push_str(&g.flush());
+        let (raw, spans) = g.raw_turn();
+        let parsed = response_template().parse(GeneratedTurn::from_token_spans(raw, spans));
+        Seam {
+            streamed,
+            parsed,
+            last,
+        }
+    }
+
+    /// [`seam_of_ids`] for text, in both feed orders, asserting they agree — the
+    /// same batch/scalar discipline every other test in this module uses.
+    fn seam(text: &str) -> Seam {
+        let ids = ids_for(text);
+        let scalar = seam_of_ids(&ids, false);
+        let batched = seam_of_ids(&ids, true);
+        assert_eq!(
+            scalar.streamed, batched.streamed,
+            "batch and scalar streamed different content"
+        );
+        assert_eq!(
+            scalar.parsed, batched.parsed,
+            "batch and scalar parsed to different turns"
+        );
+        scalar
+    }
+
+    /// The parsed call names, in order.
+    fn call_names(parsed: &ParsedTurn) -> Vec<&str> {
+        parsed
+            .tool_calls
+            .iter()
+            .map(|tc| tc.name.as_str())
+            .collect()
+    }
+
+    /// Every channel a caller could render or forward, as one haystack — so a
+    /// protected payload can be shown to have reached NO output at all.
+    fn every_channel(parsed: &ParsedTurn) -> String {
+        let mut s = parsed.reasoning.clone().unwrap_or_default();
+        s.push('\u{1}');
+        s.push_str(parsed.content.as_deref().unwrap_or(""));
+        for tc in &parsed.tool_calls {
+            s.push('\u{1}');
+            s.push_str(&tc.name);
+            s.push('\u{1}');
+            s.push_str(&tc.arguments.to_string());
+        }
+        s
+    }
+
+    /// Reasoning then an answer: the shape every real turn has.
+    ///
+    /// Measured before the fix: the guard streamed `"the answer"` and the parser
+    /// reported `content=None`, on the same bytes, because the anchor's provenance
+    /// gate wanted a span no tokenizer can produce.
+    #[test]
+    fn an_answer_after_reasoning_survives_the_seam() {
+        let s = seam(
+            " to=self<|message|>thinking<|eom|>\
+             <|start|>assistant to=user<|message|>the answer<|eot|>",
+        );
+        assert_eq!(s.parsed.reasoning.as_deref(), Some("thinking"));
+        assert_eq!(
+            s.parsed.content.as_deref(),
+            Some("the answer"),
+            "the answer never reached the parser: {:?}",
+            s.parsed
+        );
+        assert_eq!(
+            s.streamed,
+            s.parsed.content.clone().unwrap_or_default(),
+            "the stream and the parse disagree about the answer"
+        );
+        assert!(s.parsed.tool_calls.is_empty(), "got {:?}", s.parsed);
+        assert!(
+            !s.streamed.contains("thinking"),
+            "reasoning streamed: {:?}",
+            s.streamed
+        );
+        assert!(matches!(s.last, GuardOutcome::EndTurn), "got {:?}", s.last);
+    }
+
+    /// Reasoning then a tool call — the worse half of the same defect, because a
+    /// dropped call is silent: before the fix the parse reported no calls at all
+    /// while the model had made one.
+    #[test]
+    fn a_tool_call_after_reasoning_survives_the_seam() {
+        let s = seam(
+            " to=self<|message|>thinking<|eom|>\
+             <|start|>assistant to=wx<|message|><atem:invoke name=\"wx\">\
+             <atem:parameter name=\"q\">SF</atem:parameter></atem:invoke><|eot|>",
+        );
+        assert_eq!(
+            s.streamed, "",
+            "a tool body is not the answer: {:?}",
+            s.streamed
+        );
+        assert_eq!(s.parsed.reasoning.as_deref(), Some("thinking"));
+        assert_eq!(
+            call_names(&s.parsed),
+            vec!["wx"],
+            "the call was silently dropped: {:?}",
+            s.parsed
+        );
+        assert_eq!(
+            s.parsed.tool_calls[0].arguments["q"],
+            serde_json::json!("SF")
+        );
+        assert_eq!(s.parsed.content, None, "got {:?}", s.parsed);
+    }
+
+    /// Repeated tool calls, both shapes `repeats` covers.
+    ///
+    /// Inside ONE message two invokes both survive the seam whole. Across two
+    /// MESSAGES the guard is fail-closed and stays that way: `<|eom|>` inside a
+    /// latched tool body ends the turn, because nothing short of an XML tracker
+    /// can tell a payload that terminated from one whose remainder would be handed
+    /// to the next header. So the second message is never generated — and the
+    /// parse of what WAS generated reports exactly the first call, with its own
+    /// arguments and nothing from the message that followed.
+    #[test]
+    fn repeated_tool_calls_survive_the_seam() {
+        let s = seam(
+            " to=a<|message|>\
+             <atem:invoke name=\"a\"><atem:parameter name=\"x\">1</atem:parameter></atem:invoke>\
+             <atem:invoke name=\"a\"><atem:parameter name=\"x\">2</atem:parameter></atem:invoke>\
+             <|eot|>",
+        );
+        assert_eq!(s.streamed, "");
+        assert_eq!(call_names(&s.parsed), vec!["a", "a"], "got {:?}", s.parsed);
+        assert_eq!(s.parsed.tool_calls[0].arguments["x"], serde_json::json!(1));
+        assert_eq!(s.parsed.tool_calls[1].arguments["x"], serde_json::json!(2));
+
+        let two_messages = seam(
+            " to=a<|message|><atem:invoke name=\"a\">\
+             <atem:parameter name=\"x\">1</atem:parameter></atem:invoke><|eom|>\
+             <|start|>assistant to=b<|message|><atem:invoke name=\"b\">\
+             <atem:parameter name=\"SECOND\">2</atem:parameter></atem:invoke><|eot|>",
+        );
+        assert_eq!(two_messages.streamed, "");
+        assert!(
+            matches!(two_messages.last, GuardOutcome::EndTurn),
+            "a tool body's terminator must be fail-closed: {:?}",
+            two_messages.last
+        );
+        assert_eq!(
+            call_names(&two_messages.parsed),
+            vec!["a"],
+            "got {:?}",
+            two_messages.parsed
+        );
+        assert_eq!(
+            two_messages.parsed.tool_calls[0].arguments["x"],
+            serde_json::json!(1)
+        );
+        assert!(
+            !every_channel(&two_messages.parsed).contains("SECOND"),
+            "text after the fail-closed stop reached a channel: {:?}",
+            two_messages.parsed
+        );
+    }
+
+    /// The escalation the reviewer alleged, REFUTED and now pinned: an
+    /// unterminated invoke followed by a later message must not reach that
+    /// message's `</atem:invoke>` and post its text as an argument.
+    ///
+    /// Pinned here because the `xml` latch is what makes it impossible on the
+    /// streaming side, and gating that latch is exactly the change that could have
+    /// made the allegation true. The parser's own extent check is the second,
+    /// independent refusal — both are asserted, so neither can be the only one
+    /// left standing without this failing.
+    #[test]
+    fn an_unterminated_invoke_cannot_consume_a_later_messages_close_tag() {
+        let s = seam(
+            " to=t<|message|><atem:invoke name=\"t\"><atem:parameter name=\"q\">x\
+             <|start|>assistant to=user<|message|>SENT_TO_TOOL</atem:parameter>\
+             </atem:invoke><|eot|>",
+        );
+        assert!(
+            s.parsed.tool_calls.is_empty(),
+            "an invoke whose close arrives in a later message must not run: {:?}",
+            s.parsed
+        );
+        assert!(
+            !every_channel(&s.parsed).contains("SENT_TO_TOOL"),
+            "the later message's text reached a channel: {:?}",
+            s.parsed
+        );
+        assert_eq!(
+            s.streamed, "",
+            "the guard ends the turn inside an unclosed tool body, so nothing \
+             streams: {:?}",
+            s.streamed
+        );
+        assert!(matches!(s.last, GuardOutcome::EndTurn), "got {:?}", s.last);
+    }
 }
