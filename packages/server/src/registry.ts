@@ -412,7 +412,17 @@ export class ModelRegistry {
    * persists that crossed the safety breaker.
    */
   private finalizeBindingTeardown(model: ServableModel): void {
-    this.sessionRegistriesByModel.get(model)?.registry.clear();
+    const binding = this.sessionRegistriesByModel.get(model);
+    if (!binding) return;
+    binding.registry.clear();
+    // The binding maps are removed synchronously below, so no later request can
+    // discover this registry and call flushPendingDisposals() for it. Start the
+    // flush while the registry is still in hand: the promise retains it until
+    // every pending disposal has settled and every transient failure observed
+    // during this flush has received its one bounded retry.
+    void binding.registry.flushPendingDisposals().catch((error: unknown) => {
+      console.error('[server] failed to flush final chat-session owner disposals:', error);
+    });
     this.sessionRegistriesByModel.delete(model);
     this.instanceIds.delete(model);
   }

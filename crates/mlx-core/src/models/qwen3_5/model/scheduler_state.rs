@@ -589,6 +589,9 @@ impl StepExecutor<ScheduledTurn> for Qwen35StepExecutor<'_> {
         rows.resize_with(plan.rows.len(), || None);
         let (decode_results, executed_decode_batch, executed_greedy_epilogue_batch) =
             self.execute_decode_rows(plan, running);
+        let batched_decode_blocked = decode_results
+            .iter()
+            .any(|(_, result)| result.allocation_blocked);
         for (index, result) in decode_results {
             rows[index] = Some(result);
         }
@@ -610,8 +613,16 @@ impl StepExecutor<ScheduledTurn> for Qwen35StepExecutor<'_> {
                 .into_iter()
                 .map(|row| row.expect("every planned row executed"))
                 .collect(),
-            executed_decode_batch,
-            executed_greedy_epilogue_batch,
+            executed_decode_batch: if batched_decode_blocked {
+                0
+            } else {
+                executed_decode_batch
+            },
+            executed_greedy_epilogue_batch: if batched_decode_blocked {
+                0
+            } else {
+                executed_greedy_epilogue_batch
+            },
             rows_alloc_evicted: running
                 .iter()
                 .filter(|turn| turn.payload.allocation_failed)

@@ -88,9 +88,13 @@ describe('ModelRegistry', () => {
     expect(registry.get('model-a')).toBeUndefined();
   });
 
-  it('disposes the warm session when the final model binding is torn down', async () => {
+  it('retries a transient warm-owner release during final binding teardown', async () => {
     const registry = new ModelRegistry();
-    const releaseCacheOwner = vi.fn((_ownerId: string) => Promise.resolve(undefined));
+    let releaseAttempts = 0;
+    const releaseCacheOwner = vi.fn(async (_ownerId: string) => {
+      releaseAttempts += 1;
+      if (releaseAttempts === 1) throw new Error('transient release failure');
+    });
     const model = Object.assign(createMockSessionModel(), { releaseCacheOwner });
     registry.register('model-a', model);
     const sessionRegistry = registry.getSessionRegistry('model-a')!;
@@ -99,11 +103,17 @@ describe('ModelRegistry', () => {
     const ownerId = (model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0][1].cacheOwnerId;
     sessionRegistry.adopt('warm-response', session, null);
 
-    expect(registry.unregister('model-a')).toBe(true);
-    await sessionRegistry.flushPendingDisposals();
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      expect(registry.unregister('model-a')).toBe(true);
+      // No direct flush through the captured SessionRegistry: final teardown
+      // must retain and retry its own otherwise-unreachable cleanup.
+      await vi.waitFor(() => expect(releaseCacheOwner).toHaveBeenCalledTimes(2), { timeout: 1000 });
+    } finally {
+      consoleError.mockRestore();
+    }
 
-    expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
-    expect(releaseCacheOwner).toHaveBeenCalledWith(ownerId);
+    expect(releaseCacheOwner.mock.calls.map(([releasedOwner]) => releasedOwner)).toEqual([ownerId, ownerId]);
   });
 
   it('returns false when unregistering a non-existent model', () => {
