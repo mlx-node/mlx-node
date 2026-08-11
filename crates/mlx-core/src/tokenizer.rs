@@ -5796,28 +5796,49 @@ mod tests {
         );
     }
 
-    /// The control the coordinator asked for. Two ids that were ALREADY identical in
-    /// the input are pre-existing caller behaviour, not this change's business: the
-    /// render still succeeds and the later call still wins the resolution, which is
-    /// what the templates' own rescue loops do (they overwrite on every match rather
-    /// than stopping at the first).
+    /// The control: two ids that were ALREADY identical in the input are pre-existing
+    /// caller behaviour, not this change's business. The render still succeeds and the
+    /// later call still wins the resolution, which is what the templates' own rescue
+    /// loops do — they overwrite on every match rather than stopping at the first.
+    ///
+    /// Asserted through `serialize_messages_for_jinja`, because that is where the
+    /// resolution happens and `HOSTILE_FIELD_TEMPLATE` never renders `m.name`: an
+    /// earlier revision of this test checked only the rendered string and so proved
+    /// nothing about the resolution it claims to pin.
     #[test]
     fn two_identical_call_ids_resolve_the_way_they_always_did() {
+        let messages = [
+            assistant_with_tool_call("wx.forecast", Some("call_1"), r#"{"a": 1}"#),
+            assistant_with_tool_call("db.query", Some("call_1"), r#"{"b": 2}"#),
+            tool_result_answering("call_1"),
+        ];
+        let sanitized =
+            Qwen3Tokenizer::sanitize_messages(&messages, super::MUSE_GLIMMER_CONTROL_MARKERS)
+                .expect("a duplicate id carries no marker, so nothing may refuse it");
+        assert_eq!(
+            sanitized[2].tool_call_id.as_deref(),
+            Some("call_1"),
+            "a clean id must pass through untouched",
+        );
+
+        let serialized =
+            serialize_messages_for_jinja(&sanitized, MultimodalContentOrder::TextThenMedia, None);
+        // LAST writer wins, exactly as before this change: the map records each call
+        // after pushing its own message, so the tool result sees both.
+        assert_eq!(
+            serialized[2]
+                .get("name")
+                .and_then(serde_json::Value::as_str),
+            Some("db.query"),
+            "duplicate-id resolution must still be last-writer-wins: {:?}",
+            serialized[2],
+        );
+
+        // And it still renders, with both calls intact.
         let (_dir, tokenizer) = muse_field_fixture("muse-id-duplicate");
         let rendered = tokenizer
-            .render_chat_template_sync(
-                &[
-                    assistant_with_tool_call("wx.forecast", Some("call_1"), r#"{"a": 1}"#),
-                    assistant_with_tool_call("db.query", Some("call_1"), r#"{"b": 2}"#),
-                    tool_result_answering("call_1"),
-                ],
-                Some(false),
-                None,
-                None,
-            )
+            .render_chat_template_sync(&messages, Some(false), None, None)
             .expect("a duplicate id carries no marker, so nothing may refuse it");
-        // `serialize_messages_for_jinja` records each call AFTER pushing its own
-        // message, so the tool result sees both and the later one wins.
         assert!(
             rendered.contains("[tool=18C, clear][tcid=call_1]"),
             "the clean id must reach the prompt untouched: {rendered}",
@@ -5913,6 +5934,29 @@ mod tests {
         assert!(
             error.contains("collide") || error.contains("collision"),
             "the error must say what went wrong: {error}",
+        );
+
+        // BOTH orders, because the diagnostic reads the two sides from different
+        // places: with the marker first it can only be named via the remembered
+        // original, and with the marker second only via the current key. Either way
+        // the message has to carry it, or whoever hits this cannot tell what to fix.
+        let reversed = r#"{"city ": 1, "city<|eot|>": 2}"#;
+        let error = tokenizer
+            .render_chat_template_sync(
+                &[assistant_with_tool_call(
+                    "wx.forecast",
+                    Some("call_1"),
+                    reversed,
+                )],
+                Some(false),
+                None,
+                None,
+            )
+            .expect_err("the collision must be refused whichever key carries the marker")
+            .to_string();
+        assert!(
+            error.contains("collide") && error.contains("<|eot|>"),
+            "the reversed order must name the marker too: {error}",
         );
     }
 
