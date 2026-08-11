@@ -3122,9 +3122,18 @@ mod tests {
         );
     }
 
-    /// Prose then a tool call inside one `to=user` message — the
-    /// `output_parser::content_then_tool_call_in_the_same_message` shape. The
-    /// prose streams; everything from the tag on is the call, not the answer.
+    /// Prose then ATEM markup inside one `to=user` message: the prose streams;
+    /// everything from the tag on is suppressed.
+    ///
+    /// This used to cite `output_parser::content_then_tool_call_in_the_same_message`
+    /// as its justification. `git log --all -S` says that test name has NEVER
+    /// existed in `output_parser.rs` — it appears only in this file's own first
+    /// commit. The citation was written against a policy the parser had already
+    /// abandoned: fix round 3 REVERSED it, and the parser's rule for these exact
+    /// bytes is now `an_atem_block_in_an_answer_stays_in_the_answer`, which asserts
+    /// the block is part of the answer's text and not a call. So the assertion
+    /// below contradicts the parser rather than agreeing with it, and the next
+    /// commit is what settles that.
     #[test]
     fn content_before_a_tool_call_streams_but_the_xml_does_not() {
         let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
