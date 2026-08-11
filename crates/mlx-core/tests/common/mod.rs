@@ -56,8 +56,9 @@ use mlx_core::tokenizer::ChatMessage;
 /// `fa_idx = interval - 1 = 0`) full-attention, so no GDN state is involved;
 /// `decoder_sparse_step: 1` makes layer 0 MoE-flavored, which is the flavor
 /// the MTP loader gate expects for this config. `use_block_paged_cache` is
-/// left unset so the reloaded model has no paged adapter and the eager MTP
-/// arm is reachable.
+/// explicitly disabled because this MTP-only fixture deliberately uses a
+/// tiny 16-wide attention head, which is not valid PagedAttention geometry,
+/// and the eager MTP arm must remain reachable.
 ///
 /// `vocab_size` MUST cover every id the real Qwen tokenizer can emit
 /// (chat-template special tokens reach id ~248076 on the Qwen3.5 tokenizer):
@@ -99,7 +100,7 @@ fn tiny_mtp_config() -> Qwen3_5MoeConfig {
         mlp_only_layers: None,
         paged_cache_memory_mb: None,
         paged_block_size: None,
-        use_block_paged_cache: None,
+        use_block_paged_cache: Some(false),
         persist_paged_cache: None,
         n_mtp_layers: 1,
     }
