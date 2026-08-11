@@ -2,7 +2,7 @@
 //!
 //! Three hazards, all structural rather than incidental:
 //!   * `<atem:*>` XML is ordinary BPE text and splits across token boundaries,
-//!     so a naive emitter leaks `<atem` fragments as content.
+//!     so a naive emitter leaks `<atem` fragments out of a tool call.
 //!   * the model's first characters are ` to=<recipient><|message|>`, which is
 //!     routing metadata, not content.
 //!   * `<|eom|>` (200007) is deliberately not a stop, so the model can emit
@@ -17,6 +17,18 @@
 //! header selected — and only [`Channel::Content`] text ever reaches an
 //! [`GuardOutcome::Emit`]. Reasoning and tool-call bodies are consumed and
 //! dropped, never buffered for later release.
+//!
+//! The recipient decides the `<atem:*>` surface too, and for the same reason.
+//! `chat_template.jinja` renders an ATEM block only on a
+//! `<|start|>assistant to=<tool>` message, so a block inside a `to=user` answer or
+//! a `to=self` thought is not a call the model was trained to make — it is prose,
+//! most likely written because a human asked how the tools work. The
+//! [`State::InMessage`] `xml` latch therefore arms on the TOOL channel only. One
+//! needle set for every channel truncated an answer at its own markup, and — since
+//! a latched body is fail-closed at `<|eom|>` and `<|start|>` — ENDED THE TURN over
+//! a thought that quoted the syntax, so the real answer was never generated.
+//! [`super::output_parser`] has ruled this way since its own round 3; the guard
+//! disagreed with it on byte-identical input until the seam was tested.
 //!
 //! A header is valid only if it matches one of two literal prefixes **byte for
 //! byte** — [`BARE_HEADER_PREFIX`] for the turn's first message,
@@ -139,6 +151,12 @@ use tokenizers::Tokenizer;
 /// Held-back tail, in characters. Must be at least the longest entry of
 /// [`MARKER_LITERALS`] (currently `</atem:function_calls>` and
 /// `<atem:parameter name="`, both 22); the spec asks for `>= 24`.
+///
+/// Since fix round 5 the bound is conservative on the content channel rather than
+/// exact: the ATEM literals are prose there, so what actually has to fit is the
+/// longest CONTROL literal, `<|end_of_text|>` at 15. It stays at 24 because the
+/// tool channel still detects the ATEM literals whole, and because a hold-back
+/// derived from the full inventory cannot be wrong by being too long.
 pub const HOLD_BACK_CHARS: usize = 24;
 
 /// Every literal that must never be split across an emit boundary, and the set
@@ -268,9 +286,18 @@ enum State {
     /// Before `<|message|>`: routing metadata. Never emitted, never dropped —
     /// the role and the `to=` value both live here and are needed whole.
     AwaitingHeader,
-    /// Inside a message body. `xml` latches once `<atem:` or `</atem:` appears
-    /// and suppresses the rest of the message: a tool call may follow prose in
-    /// a `to=user` message, and everything from the tag on belongs to the call.
+    /// Inside a message body.
+    ///
+    /// `xml` latches once `<atem:` or `</atem:` appears **in a
+    /// [`Channel::ToolCall`] message**, and then suppresses the rest of it: that is
+    /// a real tool payload, and the guard cannot tell a terminated one from one
+    /// whose remainder would be handed to the next header, so it fails closed.
+    ///
+    /// It does NOT latch on a text channel. The same characters in a `to=user`
+    /// answer or a `to=self` thought are prose the recipient makes prose, and
+    /// suppressing them truncated answers and killed turns. `Content`/`Reasoning`
+    /// with `xml: true` is therefore unreachable, and [`StreamGuard::scan`] fails
+    /// closed if it ever occurs.
     InMessage { channel: Channel, xml: bool },
 }
 
@@ -588,10 +615,17 @@ impl StreamGuard {
     /// Drains everything releasable at end of turn: resolved content, plus the
     /// held tail when the stream stopped inside a content message.
     ///
-    /// A trailing partial marker is stripped, so a turn cut off mid-`<atem:`
+    /// A trailing partial CONTROL marker is stripped, so a turn cut off mid-`<|eo`
     /// publishes nothing of it. That also drops a trailing `<` from an answer
     /// truncated at exactly that character — the fragment could be the start of
-    /// any literal, and there is no further token to say it is not.
+    /// `<|start|>`, and there is no further token to say it is not.
+    ///
+    /// Only the control half of [`MARKER_LITERALS`], because only that half is
+    /// ambiguous here. On the content channel an `<atem:` fragment is prose whether
+    /// it completes or not — the recipient decides, and this recipient is `user` —
+    /// so stripping it swallowed up to 22 characters of an answer that
+    /// `output_parser` reports in full. Same policy as the scan: ATEM markup is a
+    /// marker on the tool channel and text everywhere else.
     ///
     /// **A turn that ends mid-scalar drops the incomplete bytes.** They are in
     /// `decode_ids` and were never added to `raw` or `pending`, so there is nothing
@@ -624,7 +658,7 @@ impl StreamGuard {
                 xml: false
             }
         ) {
-            out.push_str(strip_partial_marker(&tail));
+            out.push_str(strip_partial_marker(&tail, CONTROL_MARKERS));
         }
         self.seal();
         out
@@ -645,9 +679,11 @@ impl StreamGuard {
                     // trailing partial marker for the early check only; once the
                     // marker has landed the region is exact and nothing is
                     // stripped, so the strict shape check still sees the truth.
+                    // The WHOLE inventory here, unlike `flush`: a header is not a
+                    // channel, so no marker shape in it is ever prose.
                     let region = match end {
                         Some((i, _)) => &self.pending[..i],
-                        None => strip_partial_marker(&self.pending),
+                        None => strip_partial_marker(&self.pending, MARKER_LITERALS),
                     };
                     // Measured on the region, before classification and before
                     // any drain, so the limit means the same thing however the
@@ -693,7 +729,7 @@ impl StreamGuard {
                         xml: false,
                     };
                 }
-                // A latched tool body is fail-closed at every marker that could
+                // A latched TOOL body is fail-closed at every marker that could
                 // end it. `<|eot|>`/`<|end_of_text|>` end the turn anyway; both
                 // `<|eom|>` and `<|start|>` would otherwise hand the remainder of
                 // an unterminated payload to a fresh header, and an unanchored
@@ -702,11 +738,29 @@ impl StreamGuard {
                 // a tool body it could not delimit makes the rest of the input
                 // unstructured, and resuming inside it is how a payload becomes
                 // the answer.
-                State::InMessage { xml: true, .. } => {
+                //
+                // The channel is MATCHED here, not discarded with `..`. Ignoring it
+                // is what made this arm kill a turn over an answer's own prose: the
+                // recipient is what decides whether an ATEM block is an action, and
+                // this arm's whole justification is about a real tool payload.
+                State::InMessage {
+                    channel: Channel::ToolCall,
+                    xml: true,
+                } => {
                     if let Some((i, _)) = earliest(&self.pending, &[EOM, EOT, EOS, START]) {
                         self.resolve(i, false);
                         self.stop();
                     }
+                    return;
+                }
+                // `xml` latches on the tool channel and nowhere else, so a latched
+                // text channel is unreachable. Fail closed rather than run the arm
+                // above on an answer, which is the bug this gating fixed — and if a
+                // future edit puts the ATEM needles back on a text channel, the turn
+                // stops here and the seam tests say so, rather than silently
+                // suppressing prose again.
+                State::InMessage { xml: true, .. } => {
+                    self.stop();
                     return;
                 }
                 State::InMessage {
@@ -714,7 +768,25 @@ impl StreamGuard {
                     xml: false,
                 } => {
                     let emit = channel == Channel::Content;
-                    let needles = &[EOM, EOT, EOS, START, MSG, ATEM_OPEN, ATEM_CLOSE];
+                    // `<atem:` opens a CALL only where `chat_template.jinja` renders
+                    // one: a message addressed to a TOOL. In a `to=user` answer or a
+                    // `to=self` thought the same characters are prose — most often
+                    // because a human asked how the tools work — so they are not a
+                    // marker here at all, and the text keeps flowing on whatever
+                    // channel it was written in.
+                    //
+                    // `output_parser` has ruled exactly this since fix round 3
+                    // (`an_atem_block_is_an_action_only_in_a_tool_channel_message`,
+                    // `an_atem_block_in_an_answer_stays_in_the_answer`). One needle
+                    // set for every channel was the disagreement: it truncated an
+                    // answer at the tag, and — because a latched body is fail-closed
+                    // at `<|eom|>` and `<|start|>` — it ENDED THE TURN over a thought
+                    // that quoted the syntax, so the real answer was never generated.
+                    let needles: &[&str] = if channel == Channel::ToolCall {
+                        &[EOM, EOT, EOS, START, MSG, ATEM_OPEN, ATEM_CLOSE]
+                    } else {
+                        &[EOM, EOT, EOS, START, MSG]
+                    };
                     let Some((i, marker)) = earliest(&self.pending, needles) else {
                         return; // need more input
                     };
@@ -739,7 +811,11 @@ impl StreamGuard {
                         MSG => {
                             self.pending.drain(..MSG.len());
                         }
-                        ATEM_OPEN | ATEM_CLOSE => {
+                        // Only in the needle set on the tool channel, so the guard
+                        // is redundant — and deliberately so: it is the one line
+                        // that makes "an action needs a tool recipient" impossible
+                        // to lose by editing the needle list alone.
+                        ATEM_OPEN | ATEM_CLOSE if channel == Channel::ToolCall => {
                             self.pending.drain(..marker.len());
                             self.state = State::InMessage { channel, xml: true };
                         }
@@ -905,18 +981,25 @@ fn channel_for(recipient: &str) -> Channel {
     }
 }
 
-/// `s` without a trailing run of characters that could be the start of a
-/// marker. Longest candidate suffix wins, so `a<|eo` yields `a`.
-fn strip_partial_marker(s: &str) -> &str {
+/// `s` without a trailing run of characters that could be the start of one of
+/// `literals`. Longest candidate suffix wins, so `a<|eo` yields `a`.
+///
+/// The set is a parameter because the two callers are asking different questions.
+/// The header region is checked against the whole of [`MARKER_LITERALS`] — inside a
+/// header any marker shape at all is reason to wait rather than read a recipient
+/// with a `<` in it. [`StreamGuard::flush`] passes [`CONTROL_MARKERS`], because on
+/// the content channel an ATEM fragment is prose and stripping it swallowed part of
+/// an answer.
+fn strip_partial_marker<'a>(s: &'a str, literals: &[&str]) -> &'a str {
     let n = s.chars().count();
-    let longest = MARKER_LITERALS
+    let longest = literals
         .iter()
         .map(|m| m.chars().count())
         .max()
         .unwrap_or(0);
     for k in (1..=n.min(longest)).rev() {
         let cut = s.char_indices().nth(n - k).map_or(0, |(i, _)| i);
-        if MARKER_LITERALS.iter().any(|m| m.starts_with(&s[cut..])) {
+        if literals.iter().any(|m| m.starts_with(&s[cut..])) {
             return &s[..cut];
         }
     }
@@ -1384,57 +1467,135 @@ mod tests {
         }
     }
 
-    /// Both halves bite: the guard must not leak the tag, and must not swallow
-    /// the prose in front of it either — a fixed 24-character tail with no
-    /// marker detection releases only `ok th` here.
+    /// [`CONTROL_MARKERS`] is exactly the `<|…|>` half of [`MARKER_LITERALS`].
     ///
-    /// It is NOT a test of the hold-back's *length*: detection fires on the
-    /// six-character [`ATEM_OPEN`] prefix, so this input still passes with
-    /// `HOLD_BACK_CHARS` at 5 and only leaks at 4 (both measured by mutation).
-    /// The length bound is pinned by
+    /// It was only the provenance lookup until fix round 5; `flush` now strips
+    /// partial markers against it, so the two lists have to mean the same thing. A
+    /// literal in the inventory that is not in here would be publishable as prose
+    /// on the content channel — which is right for `<atem:*>` and wrong for
+    /// anything the checkpoint renders from one id.
+    #[test]
+    fn the_control_markers_are_exactly_the_token_rendered_literals() {
+        let control: BTreeSet<&str> = CONTROL_MARKERS.iter().copied().collect();
+        let from_inventory: BTreeSet<&str> = MARKER_LITERALS
+            .iter()
+            .copied()
+            .filter(|m| m.starts_with("<|"))
+            .collect();
+        assert_eq!(
+            control, from_inventory,
+            "the control set and the inventory's control half disagree"
+        );
+        for marker in CONTROL_MARKERS {
+            assert!(
+                test_tokenizer().token_to_id(marker).is_some(),
+                "{marker:?} has no id, so it renders from no token"
+            );
+        }
+    }
+
+    /// An ATEM opener split one character at a time, on both kinds of channel.
+    ///
+    /// REWRITTEN in fix round 5, when the `xml` latch was gated on the tool
+    /// channel. Both halves still bite, but they are on different channels now,
+    /// because the recipient is what decides whether the tag is a call:
+    ///
+    ///   * `to=<tool>` — nothing escapes, tag or prose. This is the leak the test
+    ///     was built for, and it is where the tag really is part of a call.
+    ///   * `to=user` — the tag IS the answer's own text, so the whole body comes
+    ///     back, byte for byte. It used to assert `!contains("<atem")` here, which
+    ///     is what made the guard truncate an answer that
+    ///     `output_parser::an_atem_block_in_an_answer_stays_in_the_answer` reports
+    ///     whole.
+    ///
+    /// Neither half tests the hold-back's *length*; that is pinned by
     /// `no_marker_literal_leaks_when_split_one_character_at_a_time`, where
     /// `<|message|>` and `<|end_of_text|>` need 11 and 15.
     #[test]
     fn split_atem_opener_never_leaks() {
-        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
-        let emitted =
-            drain_char_by_char(&mut g, " to=user<|message|>ok then <atem:function_calls>");
-        assert!(!emitted.contains("<atem"), "leaked XML: {emitted}");
-        assert!(
-            emitted.contains("ok then"),
-            "held back real content: {emitted}"
+        let body = "ok then <atem:function_calls>";
+
+        let mut tool = guard(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut from_tool = drain_char_by_char(&mut tool, &format!(" to=t<|message|>{body}"));
+        from_tool.push_str(&tool.flush());
+        assert_eq!(
+            from_tool, "",
+            "a tool message's tag or its prose escaped: {from_tool:?}"
+        );
+
+        let mut answer = guard(8, 1024, TEST_RECIPIENT_CHARS);
+        let mut from_answer =
+            drain_char_by_char(&mut answer, &format!(" to=user<|message|>{body}"));
+        from_answer.push_str(&answer.flush());
+        assert_eq!(
+            from_answer, body,
+            "an answer's own markup was swallowed: {from_answer:?}"
         );
     }
 
     /// Every literal in the inventory, split one character at a time, with
     /// enough content in front that the guard is already releasing when the
     /// literal starts to arrive — otherwise the hold-back hides a leak by
-    /// accident. Nothing containing `<` may reach content, and the content in
-    /// front of the literal must survive.
+    /// accident. The content in front of the literal must always survive.
     ///
     /// Two phases, and the second is the one that bites. With the literal at the
     /// end of the stream, `flush`'s partial-marker strip covers for a scanner
     /// that never detected the literal at all — dropping `</atem:` from the
     /// needle list left every assertion green. Text after the literal pushes it
     /// out of the held tail, so only real detection keeps it out of content.
+    ///
+    /// The literal's own fate is decided per class, which is fix round 5's gating:
+    ///
+    ///   * a CONTROL literal is structural on every channel and must never reach a
+    ///     content delta — `<|message|>` is dropped, the rest end or switch the
+    ///     message. Nothing containing `<` may come back;
+    ///   * an ATEM literal in a `to=user` answer is prose, so the body must come
+    ///     back exactly — `filler + lit + tail`, nothing swallowed and nothing
+    ///     duplicated. The `tail == ""` case is the one that pins `flush` releasing
+    ///     it rather than stripping it as a partial marker;
+    ///   * the same ATEM literal in a `to=<tool>` message must not escape at all.
     #[test]
     fn no_marker_literal_leaks_when_split_one_character_at_a_time() {
         let filler = "f".repeat(40);
         let trailer = "t".repeat(40);
         for lit in MARKER_LITERALS {
+            let control = lit.starts_with("<|");
             for tail in ["", trailer.as_str()] {
+                let body = format!("{filler}{lit}{tail}");
                 let mut g = guard(8, 4096, TEST_RECIPIENT_CHARS);
-                let mut emitted =
-                    drain_char_by_char(&mut g, &format!(" to=user<|message|>{filler}{lit}{tail}"));
+                let mut emitted = drain_char_by_char(&mut g, &format!(" to=user<|message|>{body}"));
                 emitted.push_str(&g.flush());
-                assert!(
-                    !emitted.contains('<'),
-                    "leaked {lit:?} into content (trailing {} chars): {emitted:?}",
-                    tail.len()
-                );
                 assert!(
                     emitted.starts_with(&filler),
                     "content in front of {lit:?} was lost: {emitted:?}"
+                );
+                if control {
+                    assert!(
+                        !emitted.contains('<'),
+                        "leaked {lit:?} into content (trailing {} chars): {emitted:?}",
+                        tail.len()
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    emitted,
+                    body,
+                    "an answer's own ATEM markup did not survive whole (trailing {} \
+                     chars): {emitted:?}",
+                    tail.len()
+                );
+
+                // …and the identical literal on a tool channel still escapes
+                // nothing, which is where it really is part of a call.
+                let mut tool = guard(8, 4096, TEST_RECIPIENT_CHARS);
+                let mut from_tool =
+                    drain_char_by_char(&mut tool, &format!(" to=t<|message|>{body}"));
+                from_tool.push_str(&tool.flush());
+                assert_eq!(
+                    from_tool,
+                    "",
+                    "{lit:?} escaped a tool message (trailing {} chars): {from_tool:?}",
+                    tail.len()
                 );
             }
         }
@@ -3122,30 +3283,34 @@ mod tests {
         );
     }
 
-    /// Prose then ATEM markup inside one `to=user` message: the prose streams;
-    /// everything from the tag on is suppressed.
+    /// Prose then ATEM markup inside one `to=user` message: all of it is the
+    /// answer, because the recipient is `user`.
     ///
-    /// This used to cite `output_parser::content_then_tool_call_in_the_same_message`
-    /// as its justification. `git log --all -S` says that test name has NEVER
-    /// existed in `output_parser.rs` — it appears only in this file's own first
-    /// commit. The citation was written against a policy the parser had already
-    /// abandoned: fix round 3 REVERSED it, and the parser's rule for these exact
-    /// bytes is now `an_atem_block_in_an_answer_stays_in_the_answer`, which asserts
-    /// the block is part of the answer's text and not a call. So the assertion
-    /// below contradicts the parser rather than agreeing with it, and the next
-    /// commit is what settles that.
+    /// REVERSED in fix round 5, and this test is the whole defect in one place. It
+    /// asserted `emitted == "on it"` and cited
+    /// `output_parser::content_then_tool_call_in_the_same_message` for it — a test
+    /// name `git log --all -S` shows has NEVER existed in that file; it appears only
+    /// in this one's first commit. The guard was written against the parser's
+    /// pre-round-3 policy, the citation was never real, and round 3 had already
+    /// reversed the rule with the comment "That made an answer's own prose
+    /// executable".
+    ///
+    /// The parser's ruling for these exact bytes is
+    /// `output_parser::an_atem_block_in_an_answer_stays_in_the_answer`, which
+    /// asserts the block is part of the answer's text and not a call. The seam test
+    /// `atem_shaped_prose_in_an_answer_streams_exactly_what_the_parser_reports` now
+    /// runs the same bytes through both modules and requires them equal, so this
+    /// cannot drift back on its own.
     #[test]
-    fn content_before_a_tool_call_streams_but_the_xml_does_not() {
+    fn atem_markup_in_an_answer_streams_with_the_prose() {
+        let body = "on it<atem:invoke name=\"t\">\
+                    <atem:parameter name=\"x\">1</atem:parameter></atem:invoke>";
         let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
-        let mut emitted = drain_char_by_char(
-            &mut g,
-            " to=user<|message|>on it<atem:invoke name=\"t\">\
-             <atem:parameter name=\"x\">1</atem:parameter></atem:invoke>",
-        );
+        let mut emitted = drain_char_by_char(&mut g, &format!(" to=user<|message|>{body}"));
         emitted.push_str(&g.flush());
         assert_eq!(
-            emitted, "on it",
-            "tool XML leaked into content: {emitted:?}"
+            emitted, body,
+            "the answer was truncated at its own markup: {emitted:?}"
         );
     }
 
@@ -3263,12 +3428,28 @@ mod tests {
         assert!(flushed.contains("tail text"), "held tail lost: {flushed}");
     }
 
+    /// A partial CONTROL marker is withheld; a partial ATEM tag is not.
+    ///
+    /// SPLIT in fix round 5. `<|eo` is ambiguous — the next token decides whether
+    /// the message ended — so it cannot be published. `<ate` is not: on the `to=user`
+    /// channel that fragment is prose whether it completes or not, and `output_parser`
+    /// reports it in the answer, so stripping it dropped up to 22 characters the
+    /// parser keeps. A leading `<` is still withheld, because it could begin
+    /// `<|start|>`.
     #[test]
-    fn flush_does_not_release_a_partial_marker() {
-        let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
-        push_text(&mut g, " to=user<|message|>answer<ate");
-        let flushed = g.flush();
-        assert_eq!(flushed, "answer", "partial marker escaped through flush");
+    fn flush_withholds_a_partial_control_marker_and_releases_atem_prose() {
+        for (tail, want) in [
+            ("<|eo", "answer"),
+            ("<|", "answer"),
+            ("<", "answer"),
+            ("<ate", "answer<ate"),
+            ("<atem:inv", "answer<atem:inv"),
+        ] {
+            let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
+            push_text(&mut g, &format!(" to=user<|message|>answer{tail}"));
+            let flushed = g.flush();
+            assert_eq!(flushed, want, "flush mishandled the tail {tail:?}");
+        }
     }
 
     #[test]
@@ -3321,19 +3502,18 @@ mod tests {
         );
     }
 
+    /// Multi-byte prose either side of ATEM markup in an answer. The property is
+    /// that nothing is corrupted at the boundary; fix round 5 changed only what
+    /// the answer consists of — the markup is part of it now, so the expectation is
+    /// the whole body rather than the prose alone.
     #[test]
-    fn a_multi_byte_answer_around_a_tool_call_survives() {
+    fn a_multi_byte_answer_around_atem_markup_survives() {
         let mut g = guard(8, 1024, TEST_RECIPIENT_CHARS);
         let prose = "天気を調べます。🌤️ ".repeat(4);
-        let mut emitted = drain_char_by_char(
-            &mut g,
-            &format!(" to=user<|message|>{prose}<atem:invoke name=\"t\"></atem:invoke>"),
-        );
+        let body = format!("{prose}<atem:invoke name=\"t\"></atem:invoke>{prose}");
+        let mut emitted = drain_char_by_char(&mut g, &format!(" to=user<|message|>{body}"));
         emitted.push_str(&g.flush());
-        assert_eq!(
-            emitted, prose,
-            "multi-byte content around XML was corrupted"
-        );
+        assert_eq!(emitted, body, "multi-byte content around XML was corrupted");
     }
 
     /// Two recipients is not a header. Suffix routing read this as `to=self` and
@@ -3862,6 +4042,112 @@ mod tests {
             "text after the fail-closed stop reached a channel: {:?}",
             two_messages.parsed
         );
+    }
+
+    /// One ATEM block, as prose, in each of the three channels — the input the two
+    /// modules flatly disagreed about.
+    ///
+    /// `chat_template.jinja` renders an ATEM block only on a
+    /// `<|start|>assistant to=<tool>` message, so the RECIPIENT decides whether one
+    /// is an action. The parser has ruled that way since fix round 3
+    /// (`an_atem_block_is_an_action_only_in_a_tool_channel_message`); the guard's
+    /// `xml` latch ignored the channel and did the opposite.
+    ///
+    /// Measured before the fix, on these bytes: `streamed="on it"` against
+    /// `parsed.content=Some("on it<atem:invoke …></atem:invoke>")`. Asking a model
+    /// how its tools work is all it takes to produce them.
+    #[test]
+    fn atem_shaped_prose_in_an_answer_streams_exactly_what_the_parser_reports() {
+        let block = "<atem:invoke name=\"t\">\
+                     <atem:parameter name=\"x\">1</atem:parameter></atem:invoke>";
+        let s = seam(&format!(" to=user<|message|>on it{block}<|eot|>"));
+        // Byte-for-byte equality, not containment: a guard that truncates the answer
+        // at the tag and a guard that swallows the tag both fail here.
+        assert_eq!(
+            s.parsed.content.as_deref(),
+            Some(&*format!("on it{block}")),
+            "got {:?}",
+            s.parsed
+        );
+        assert_eq!(
+            s.streamed,
+            s.parsed.content.clone().unwrap_or_default(),
+            "the stream and the parse disagree about the answer"
+        );
+        assert!(
+            s.parsed.tool_calls.is_empty(),
+            "an ATEM block in an ANSWER is not a call: {:?}",
+            s.parsed
+        );
+    }
+
+    /// The same block in a chain of thought. `output_parser` blesses it explicitly,
+    /// and the guard used to ABORT THE TURN over it: the latch fired, `<|eom|>`
+    /// reached a latched body, and `stop()` killed the turn — so the answer the
+    /// model went on to write was never generated. Measured before the fix:
+    /// `streamed=""` for this input, against a control with the identical shape
+    /// minus the tag that streamed the answer normally.
+    ///
+    /// Reasoning still never streams. What must survive is the ANSWER after it.
+    #[test]
+    fn atem_shaped_prose_in_a_chain_of_thought_does_not_abort_the_turn() {
+        let block = "<atem:invoke name=\"rm\">\
+                     <atem:parameter name=\"path\">/</atem:parameter></atem:invoke>";
+        let s = seam(&format!(
+            " to=self<|message|>maybe {block}<|eom|>\
+             <|start|>assistant to=user<|message|>here is the answer<|eot|>"
+        ));
+        assert_eq!(
+            s.streamed, "here is the answer",
+            "the answer after an ATEM-quoting thought was lost"
+        );
+        assert_eq!(s.parsed.content.as_deref(), Some("here is the answer"));
+        assert_eq!(
+            s.parsed.reasoning.as_deref(),
+            Some(&*format!("maybe {block}")),
+            "got {:?}",
+            s.parsed
+        );
+        assert!(
+            s.parsed.tool_calls.is_empty(),
+            "an ATEM block in a CHAIN OF THOUGHT is not a call: {:?}",
+            s.parsed
+        );
+        // The control, with the identical shape minus the tag: this is what proves
+        // the tag was the cause rather than something else about the fixture.
+        let control = seam(
+            " to=self<|message|>maybe not<|eom|>\
+             <|start|>assistant to=user<|message|>here is the answer<|eot|>",
+        );
+        assert_eq!(control.streamed, s.streamed);
+    }
+
+    /// The `to=user` variant of the same abort: an answer that quotes ATEM, ends
+    /// properly with `<|eom|>`, and is followed by the real answer. The latch turned
+    /// the `<|eom|>` into `EndTurn`, so the later message was never generated.
+    #[test]
+    fn an_answer_quoting_atem_can_still_be_followed_by_another_message() {
+        let block = "<atem:invoke name=\"t\"></atem:invoke>";
+        let s = seam(&format!(
+            " to=user<|message|>you write {block}<|eom|>\
+             <|start|>assistant to=user<|message|>anything else?<|eot|>"
+        ));
+        assert_eq!(
+            s.streamed,
+            format!("you write {block}anything else?"),
+            "the message after an ATEM-quoting answer was lost"
+        );
+        // `content` is single-valued by spec, so the parser keeps the FIRST segment
+        // and the stream carries both. That difference is the `set_once` contract,
+        // not a channel disagreement: every byte streamed here is text the parser
+        // also attributes to a `to=user` message.
+        assert_eq!(
+            s.parsed.content.as_deref(),
+            Some(&*format!("you write {block}")),
+            "got {:?}",
+            s.parsed
+        );
+        assert!(s.parsed.tool_calls.is_empty(), "got {:?}", s.parsed);
     }
 
     /// The escalation the reviewer alleged, REFUTED and now pinned: an
