@@ -167,6 +167,15 @@ const ABSOLUTE_MAX_HEADER_CHARS: usize = 4096;
 /// accepted token. 4 MiB is roughly 37,000 of this checkpoint's longest tokens.
 const MAX_TURN_CHARS: usize = 1 << 22;
 
+/// Bound on the ids held back while a UTF-8 scalar is still incomplete.
+///
+/// Stateful detokenization keeps a small window — measured at **2 ids** for every
+/// multi-id scalar in this checkpoint, including `😀` and `🌤️`. 64 is far above
+/// that; it exists so a stream that never completes a scalar cannot buffer ids
+/// forever, since those ids are guard state that [`MAX_TURN_CHARS`] does not see
+/// (their text has not materialised yet).
+const MAX_PENDING_DECODE_IDS: usize = 64;
+
 /// The control markers whose *provenance* the parser needs: the ones the
 /// tokenizer renders from a single special-token id, so "the model emitted the
 /// marker" and "the model typed those characters" are distinguishable.
@@ -276,6 +285,13 @@ pub struct StreamGuard {
     /// Byte ranges in `raw` covering the control markers, in push order — which is
     /// ascending and non-overlapping because `raw` only ever grows at the end.
     control_spans: Vec<Range<usize>>,
+    /// Detokenizer state, owned rather than borrowed. These are exactly the three
+    /// values `tokenizers::DecodeStream` keeps, passed to the free function
+    /// `tokenizers::step_decode_stream` instead — see [`Self::push_id`] for why
+    /// that matters.
+    decode_ids: Vec<u32>,
+    decode_prefix: String,
+    decode_prefix_index: usize,
     max_messages: usize,
     max_tokens: usize,
     /// `ANCHORED_HEADER_PREFIX` plus the longest recipient the caller declared,
@@ -352,6 +368,9 @@ impl StreamGuard {
             ready: String::new(),
             raw: String::new(),
             control_spans: Vec::new(),
+            decode_ids: Vec::new(),
+            decode_prefix: String::new(),
+            decode_prefix_index: 0,
             max_messages,
             max_tokens,
             header_allowance,
@@ -376,6 +395,16 @@ impl StreamGuard {
     /// `max_tokens` reaches neither a delta nor [`Self::flush`], and is not
     /// retained for the parser either.
     ///
+    /// **Detokenization is stateful.** This checkpoint is byte-level, so a single
+    /// UTF-8 scalar's bytes can span ids — `😀` is `[80883, 222]` and `🌤️` is
+    /// `[93293, 148676]` — and decoding each id on its own is *not* equivalent to
+    /// decoding the stream: measured, per-id decoding of `a😀b` returns `"a��b"`
+    /// against a whole-sequence `"a😀b"`. That is silent corruption of ordinary
+    /// answer text, so the guard carries the detokenizer's state across calls and
+    /// only takes text once it forms complete scalars. An id whose bytes do not
+    /// complete one yet still charges a token and returns [`GuardOutcome::Hold`];
+    /// its bytes stay in `decode_ids`, bounded by [`MAX_PENDING_DECODE_IDS`].
+    ///
     /// `EndTurn` is sticky: once returned, every later push returns it too, so
     /// a caller that misses the first one cannot restart a self-played turn.
     pub fn push_id(&mut self, id: u32) -> GuardOutcome {
@@ -396,28 +425,64 @@ impl StreamGuard {
             self.stop();
             return GuardOutcome::EndTurn;
         }
-        // `skip_special_tokens = false`: a control marker's characters are text the
-        // guard has to see.
-        let Ok(piece) = self.tokenizer.decode(&[id], false) else {
-            self.stop();
-            return GuardOutcome::EndTurn;
-        };
-        // Cumulative, never per call, so no legal token sequence can end a turn
-        // because of how the caller grouped it.
-        if self.raw.len().saturating_add(piece.len()) > MAX_TURN_CHARS {
-            self.stop();
-            return GuardOutcome::EndTurn;
-        }
 
         self.tokens += 1;
-        let at = self.raw.len();
-        self.raw.push_str(&piece);
-        if self.control_ids.contains_key(&id) {
-            // `raw` only grows at the end, so pushing in arrival order keeps the
-            // spans sorted and non-overlapping, which is what the parser asserts.
-            self.control_spans.push(at..self.raw.len());
+
+        // `tokenizers::step_decode_stream` is the same algorithm as
+        // `tokenizers::DecodeStream`, but as a free function taking its state by
+        // `&mut`. That is what keeps the state ownable: `DecodeStream<'tok, …>`
+        // holds `&'tok Tokenizer`, which would make this struct self-referential
+        // next to its `Arc<Tokenizer>` — and would have forced a lifetime onto the
+        // public type. `skip_special_tokens = false`: a control marker's characters
+        // are text the guard has to see.
+        let piece = match tokenizers::step_decode_stream(
+            &self.tokenizer,
+            vec![id],
+            false,
+            &mut self.decode_ids,
+            &mut self.decode_prefix,
+            &mut self.decode_prefix_index,
+        ) {
+            Ok(Some(text)) => text,
+            // Bytes buffered, no complete scalar yet.
+            Ok(None) => {
+                if self.decode_ids.len() > MAX_PENDING_DECODE_IDS {
+                    self.stop();
+                    return GuardOutcome::EndTurn;
+                }
+                String::new()
+            }
+            Err(_) => {
+                self.stop();
+                return GuardOutcome::EndTurn;
+            }
+        };
+
+        if !piece.is_empty() {
+            // Cumulative, never per call, so no legal token sequence can end a turn
+            // because of how the caller grouped it.
+            if self.raw.len().saturating_add(piece.len()) > MAX_TURN_CHARS {
+                self.stop();
+                return GuardOutcome::EndTurn;
+            }
+            let at = self.raw.len();
+            self.raw.push_str(&piece);
+            if let Some(marker) = self.control_ids.get(&id).copied() {
+                // Pin the span to the marker's own bytes at the end of what this
+                // step appended, not to the whole step. They are normally the same,
+                // but a scalar left incomplete by the previous id is completed by
+                // this one, so the delta can carry a leading fragment. If the marker
+                // is not there, record nothing: omitting a span costs recognition,
+                // inventing one costs safety.
+                let start = self.raw.len().saturating_sub(marker.len());
+                if start >= at && self.raw[start..] == *marker {
+                    // `raw` only grows at the end, so pushing in arrival order keeps
+                    // the spans sorted and non-overlapping, as the parser asserts.
+                    self.control_spans.push(start..self.raw.len());
+                }
+            }
+            self.pending.push_str(&piece);
         }
-        self.pending.push_str(&piece);
 
         self.scan();
         if self.ended {
@@ -504,6 +569,13 @@ impl StreamGuard {
     /// publishes nothing of it. That also drops a trailing `<` from an answer
     /// truncated at exactly that character — the fragment could be the start of
     /// any literal, and there is no further token to say it is not.
+    ///
+    /// **A turn that ends mid-scalar drops the incomplete bytes.** They are in
+    /// `decode_ids` and were never added to `raw` or `pending`, so there is nothing
+    /// here to release: there is no correct text for half a scalar, emitting `U+FFFD`
+    /// would be fabricating output, and retaining the bytes in the parser's input
+    /// would put invalid text there. At most one incomplete scalar is lost, and only
+    /// when generation was cut off inside it.
     pub fn flush(&mut self) -> String {
         let mut out = std::mem::take(&mut self.ready);
         let tail = std::mem::take(&mut self.pending);
@@ -911,8 +983,17 @@ mod tests {
                     "normalizer": null,
                     "pre_tokenizer": null,
                     "post_processor": null,
-                    // No decoder, so a single id decodes to its piece verbatim.
-                    "decoder": null,
+                    // `Fuse` concatenates the tokens, so decoding a window of ids
+                    // gives their pieces run together. With `null` the default is
+                    // `tokens.join(" ")`, which was harmless while each id was
+                    // decoded alone and inserts spaces now that decoding is
+                    // stateful over a window.
+                    //
+                    // This tokenizer still cannot model a scalar spanning ids —
+                    // there is no byte-level stage for its bytes to split in — which
+                    // is exactly why the multi-id-scalar regressions are
+                    // real-checkpoint gates.
+                    "decoder": { "type": "Fuse" },
                     "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "<unk>" },
                 });
                 let tok: Tokenizer = spec
@@ -2355,6 +2436,289 @@ mod tests {
             "lexemes no longer overstate the decoded count; the reason this test \
              decodes instead of measuring keys may have gone away"
         );
+    }
+
+    /// Codex round-5 finding, against the real checkpoint, which is the only place
+    /// it can be tested: the synthetic tokenizer has no byte-level stage, so a
+    /// scalar's bytes have nowhere to split and the fixture cannot express the bug.
+    ///
+    /// Measured before the fix, with per-id decoding:
+    ///
+    /// ```text
+    /// "😀"    ids=[80883, 222]        whole="😀"       per_id="��"
+    /// "🌤️"   ids=[93293, 148676]     whole="🌤️"      per_id="��\u{fe0f}"
+    /// "a😀b"  ids=[77, 80883, 222, 78] whole="a😀b"    per_id="a��b"
+    /// ```
+    ///
+    /// Emitted text **and** `raw_turn()` must equal whole-sequence decoding, and the
+    /// control spans around the scalar must not shift — a marker before it and a
+    /// marker after it are both checked, because an offset error shows up on one
+    /// side only.
+    #[test]
+    #[ignore = "requires the local Muse-Glimmer checkpoint; set MLX_TEST_MUSE_GLIMMER_MODEL_PATH and run with --ignored"]
+    fn checkpoint_a_scalar_spanning_two_ids_is_not_corrupted() {
+        let dir = std::env::var("MLX_TEST_MUSE_GLIMMER_MODEL_PATH")
+            .expect("set MLX_TEST_MUSE_GLIMMER_MODEL_PATH to the checkpoint directory");
+        let tok = Arc::new(
+            Tokenizer::from_file(std::path::Path::new(&dir).join("tokenizer.json"))
+                .expect("checkpoint has a loadable tokenizer.json"),
+        );
+        let encode = |text: &str| -> Vec<u32> {
+            tok.encode(text, false)
+                .expect("fixture encodes")
+                .get_ids()
+                .to_vec()
+        };
+        let msg = tok.token_to_id(MSG).expect("checkpoint has <|message|>");
+        let eot = tok.token_to_id(EOT).expect("checkpoint has <|eot|>");
+
+        for answer in ["😀", "🌤️", "a😀b", "hi 😀 there 🌤️ ok"] {
+            // The premise: this answer really does need more than one id per scalar,
+            // and per-id decoding really does corrupt it. Without this the test
+            // could pass against a checkpoint where the bug cannot occur.
+            let answer_ids = encode(answer);
+            let per_id: String = answer_ids
+                .iter()
+                .map(|i| tok.decode(&[*i], false).expect("decodes"))
+                .collect();
+            assert_ne!(
+                per_id, answer,
+                "{answer:?} does not span ids in this checkpoint, so it cannot \
+                 exercise stateful decoding"
+            );
+
+            // A control marker on each side of the scalar.
+            let mut ids = encode(" to=user");
+            ids.push(msg);
+            ids.extend(answer_ids);
+            ids.push(eot);
+            let whole = tok.decode(&ids, false).expect("the turn decodes");
+
+            let mut g = StreamGuard::new(tok.clone(), 8, 1024, 16);
+            let mut emitted = String::new();
+            for id in &ids {
+                if let GuardOutcome::Emit(s) = g.push_id(*id) {
+                    emitted.push_str(&s);
+                }
+            }
+            emitted.push_str(&g.flush());
+            let (raw, spans) = g.raw_turn();
+
+            println!("CHECKPOINT {answer:?} emitted={emitted:?} spans={spans:?}");
+            assert_eq!(
+                emitted, answer,
+                "{answer:?} was corrupted on its way to a content delta"
+            );
+            assert_eq!(
+                raw, whole,
+                "{answer:?}: raw_turn does not equal whole-sequence decoding"
+            );
+            assert!(
+                !raw.contains('\u{fffd}'),
+                "{answer:?}: a replacement character reached the parser's input"
+            );
+            // The offsets: the marker before the scalar and the marker after it.
+            assert_eq!(
+                spans.iter().map(|s| &raw[s.clone()]).collect::<Vec<_>>(),
+                vec![MSG, EOT],
+                "{answer:?}: control spans shifted around a multi-id scalar"
+            );
+            assert_eq!(
+                spans[0],
+                whole.find(MSG).expect("the turn has <|message|>")
+                    ..whole.find(MSG).unwrap() + MSG.len(),
+                "{answer:?}: the marker BEFORE the scalar moved"
+            );
+            assert_eq!(
+                spans[1],
+                whole.rfind(EOT).expect("the turn has <|eot|>")
+                    ..whole.rfind(EOT).unwrap() + EOT.len(),
+                "{answer:?}: the marker AFTER the scalar moved"
+            );
+        }
+    }
+
+    /// The adversarial offset case: a control marker arriving while a scalar is
+    /// still **incomplete**. The detokenizer then hands back the fragment and the
+    /// marker in one delta, so a span taken from the start of the delta would name
+    /// the fragment too.
+    ///
+    /// Measured: ids `… hi` + the first id of `😀` + `<|eot|>` decode to
+    /// `" to=user<|message|>hi\u{fffd}<|eot|>"`, and the marker's span must be
+    /// `24..31`, covering `<|eot|>` alone.
+    ///
+    /// The `U+FFFD` is not fabricated — it is exactly what whole-sequence decoding
+    /// of those ids produces, and `raw_turn` is asserted equal to it. The model
+    /// emitted bytes that are not a character; the guard neither invents text for
+    /// them nor hides that the tokenizer could not read them.
+    #[test]
+    #[ignore = "requires the local Muse-Glimmer checkpoint; set MLX_TEST_MUSE_GLIMMER_MODEL_PATH and run with --ignored"]
+    fn checkpoint_a_marker_after_an_incomplete_scalar_keeps_its_own_span() {
+        let dir = std::env::var("MLX_TEST_MUSE_GLIMMER_MODEL_PATH")
+            .expect("set MLX_TEST_MUSE_GLIMMER_MODEL_PATH to the checkpoint directory");
+        let tok = Arc::new(
+            Tokenizer::from_file(std::path::Path::new(&dir).join("tokenizer.json"))
+                .expect("checkpoint has a loadable tokenizer.json"),
+        );
+        let encode = |text: &str| -> Vec<u32> {
+            tok.encode(text, false)
+                .expect("fixture encodes")
+                .get_ids()
+                .to_vec()
+        };
+        let emoji = encode("😀");
+        assert_eq!(emoji.len(), 2, "😀 no longer spans exactly two ids");
+
+        let mut ids = encode(" to=user");
+        ids.push(tok.token_to_id(MSG).expect("checkpoint has <|message|>"));
+        ids.extend(encode("hi"));
+        ids.push(emoji[0]); // half a scalar …
+        ids.push(tok.token_to_id(EOT).expect("checkpoint has <|eot|>")); // … then a marker
+        let whole = tok.decode(&ids, false).expect("the turn decodes");
+
+        let mut g = StreamGuard::new(tok, 8, 1024, 16);
+        let mut emitted = String::new();
+        for id in &ids {
+            if let GuardOutcome::Emit(s) = g.push_id(*id) {
+                emitted.push_str(&s);
+            }
+        }
+        emitted.push_str(&g.flush());
+        let (raw, spans) = g.raw_turn();
+        println!("CHECKPOINT marker-after-fragment: raw={raw:?} spans={spans:?}");
+
+        assert_eq!(
+            raw, whole,
+            "raw_turn diverged from whole-sequence decoding of the same ids"
+        );
+        assert_eq!(
+            spans.iter().map(|s| &raw[s.clone()]).collect::<Vec<_>>(),
+            vec![MSG, EOT],
+            "a span named more than its marker"
+        );
+        // The assertion that bites: the terminator's span must start at the
+        // terminator, not at the fragment the same delta carried in front of it.
+        assert_eq!(
+            spans[1],
+            raw.rfind(EOT).expect("the turn has <|eot|>")..raw.rfind(EOT).unwrap() + EOT.len(),
+            "the marker's span was taken from the start of the delta"
+        );
+        assert!(
+            !raw[spans[1].clone()].contains('\u{fffd}'),
+            "the span swallowed the incomplete scalar's replacement character"
+        );
+    }
+
+    /// A stream that never completes a scalar cannot buffer ids forever. Pushing the
+    /// **first** id of `😀` over and over is a legal thing for a model to sample and
+    /// never forms a character, so the detokenizer holds every one of them — that
+    /// buffer is guard state whose text has not materialised, so `MAX_TURN_CHARS`
+    /// cannot see it and [`MAX_PENDING_DECODE_IDS`] has to.
+    #[test]
+    #[ignore = "requires the local Muse-Glimmer checkpoint; set MLX_TEST_MUSE_GLIMMER_MODEL_PATH and run with --ignored"]
+    fn checkpoint_a_stream_that_never_completes_a_scalar_is_bounded() {
+        let dir = std::env::var("MLX_TEST_MUSE_GLIMMER_MODEL_PATH")
+            .expect("set MLX_TEST_MUSE_GLIMMER_MODEL_PATH to the checkpoint directory");
+        let tok = Arc::new(
+            Tokenizer::from_file(std::path::Path::new(&dir).join("tokenizer.json"))
+                .expect("checkpoint has a loadable tokenizer.json"),
+        );
+        let emoji = tok.encode("😀", false).expect("encodes").get_ids().to_vec();
+        assert_eq!(emoji.len(), 2, "😀 no longer spans exactly two ids");
+        let partial = emoji[0];
+
+        let mut ids = tok
+            .encode(" to=user", false)
+            .expect("encodes")
+            .get_ids()
+            .to_vec();
+        ids.push(tok.token_to_id(MSG).expect("checkpoint has <|message|>"));
+
+        // A cap well above the pending bound, so the token cap is not what trips.
+        let mut g = StreamGuard::new(tok, 8, 10_000, 16);
+        g.push_ids(&ids);
+        let mut last = GuardOutcome::Hold;
+        let mut accepted = 0usize;
+        for _ in 0..(MAX_PENDING_DECODE_IDS + 8) {
+            last = g.push_id(partial);
+            if matches!(last, GuardOutcome::EndTurn) {
+                break;
+            }
+            accepted += 1;
+        }
+        println!("CHECKPOINT never-completing scalar: accepted={accepted} last={last:?}");
+        assert!(
+            matches!(last, GuardOutcome::EndTurn),
+            "an endless run of partial bytes was not bounded, got {last:?}"
+        );
+        assert!(
+            accepted <= MAX_PENDING_DECODE_IDS,
+            "buffered {accepted} ids, over the bound of {MAX_PENDING_DECODE_IDS}"
+        );
+        // Nothing invalid was published or retained.
+        assert_eq!(g.flush(), "", "partial bytes were published");
+        let (raw, _) = g.raw_turn();
+        assert!(
+            !raw.contains('\u{fffd}'),
+            "partial bytes reached the parser's input: {raw:?}"
+        );
+    }
+
+    /// A turn cut off **inside** a multi-id scalar drops the incomplete bytes: no
+    /// replacement character in the delta, none in `raw_turn`, and nothing retained.
+    #[test]
+    #[ignore = "requires the local Muse-Glimmer checkpoint; set MLX_TEST_MUSE_GLIMMER_MODEL_PATH and run with --ignored"]
+    fn checkpoint_a_turn_ending_mid_scalar_drops_the_partial_bytes() {
+        let dir = std::env::var("MLX_TEST_MUSE_GLIMMER_MODEL_PATH")
+            .expect("set MLX_TEST_MUSE_GLIMMER_MODEL_PATH to the checkpoint directory");
+        let tok = Arc::new(
+            Tokenizer::from_file(std::path::Path::new(&dir).join("tokenizer.json"))
+                .expect("checkpoint has a loadable tokenizer.json"),
+        );
+        let mut ids = tok
+            .encode(" to=user", false)
+            .expect("encodes")
+            .get_ids()
+            .to_vec();
+        ids.push(tok.token_to_id(MSG).expect("checkpoint has <|message|>"));
+        ids.extend(
+            tok.encode("done ", false)
+                .expect("encodes")
+                .get_ids()
+                .to_vec(),
+        );
+        // The FIRST id of `😀` only. `[80883, 222]` is the pair; stopping after
+        // 80883 leaves two of the four bytes buffered.
+        let emoji = tok.encode("😀", false).expect("encodes").get_ids().to_vec();
+        assert_eq!(emoji.len(), 2, "😀 no longer spans exactly two ids");
+        ids.push(emoji[0]);
+
+        let mut g = StreamGuard::new(tok, 8, 1024, 16);
+        let mut emitted = String::new();
+        for id in &ids {
+            if let GuardOutcome::Emit(s) = g.push_id(*id) {
+                emitted.push_str(&s);
+            }
+        }
+        emitted.push_str(&g.flush());
+        let (raw, _) = g.raw_turn();
+        println!("CHECKPOINT mid-scalar cut: emitted={emitted:?} raw={raw:?}");
+
+        assert_eq!(emitted, "done ", "the incomplete scalar was published");
+        assert!(
+            !emitted.contains('\u{fffd}'),
+            "a replacement character was fabricated: {emitted:?}"
+        );
+        assert!(
+            !raw.contains('\u{fffd}'),
+            "a replacement character reached the parser's input: {raw:?}"
+        );
+        assert!(
+            raw.ends_with("done "),
+            "the incomplete scalar was retained: {raw:?}"
+        );
+        // The token was still charged: accounting is per id, not per scalar.
+        assert_eq!(g.tokens, ids.len(), "the partial id was not charged");
     }
 
     /// Codex round-4 finding 2, against the **real** id it was reported with:
