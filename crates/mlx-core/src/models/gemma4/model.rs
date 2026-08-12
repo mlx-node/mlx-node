@@ -191,6 +191,14 @@ impl Gemma4KVCacheCoordinator {
         self.max_concurrent_sequences
     }
 
+    pub(crate) fn pool_allocated_bytes(&self) -> std::result::Result<u64, String> {
+        (0..self.inner.groups().len()).try_fold(0u64, |total, group_id| {
+            self.adapter(group_id)
+                .and_then(PagedKVCacheAdapter::pool_allocated_bytes)
+                .map(|bytes| total.saturating_add(bytes))
+        })
+    }
+
     fn prepare_scheduled_request(
         &mut self,
         seq_id: u32,
@@ -1128,6 +1136,10 @@ pub struct Gemma4Model {
     /// coordinator on drop. `None` for instances constructed via the
     /// synchronous `new(config)` path that never loaded weights.
     pub(crate) _cache_limit_guard: Option<crate::cache_limit::CacheLimitGuard>,
+    /// RAII registration for the grouped paged-KV pools, whose private Metal
+    /// buffers are outside MLX allocator accounting but consume the same
+    /// unified-memory budget. `None` for flat or uninitialized models.
+    pub(crate) _pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
     /// Snapshot of `Gemma4Inner::draft.is_some()` captured at load time
     /// (same mirroring pattern as `paged_active`): whether a draft model —
     /// either [`Gemma4Draft`] variant — was loaded via
@@ -7207,6 +7219,7 @@ impl Gemma4Model {
             paged_active: false,
             max_concurrent_sequences: 1,
             _cache_limit_guard: None,
+            _pool_cache_limit_guard: None,
             draft_active: false,
         }
     }
@@ -11934,6 +11947,33 @@ mod tests {
             },
         );
         assert_eq!(ar_plan.path(), TurnPath::Paged);
+    }
+
+    #[test]
+    fn gemma4_grouped_pool_accounting_covers_every_private_adapter() {
+        let inner = Gemma4Inner::new(paged_tiny_config(Some(true)))
+            .expect("construct tiny paged Gemma4 target");
+        let coordinator = inner
+            .kv_cache_coordinator
+            .as_ref()
+            .expect("paged target must own a grouped coordinator");
+        let expected = (0..coordinator.inner.groups().len())
+            .map(|group_id| {
+                coordinator
+                    .adapter(group_id)
+                    .and_then(PagedKVCacheAdapter::pool_allocated_bytes)
+            })
+            .try_fold(0u64, |total, bytes| {
+                bytes.map(|bytes| total.saturating_add(bytes))
+            })
+            .expect("read every grouped pool footprint");
+        assert!(expected > 0, "paged Gemma4 must allocate private KV pools");
+        assert_eq!(
+            coordinator
+                .pool_allocated_bytes()
+                .expect("report grouped pool footprint"),
+            expected
+        );
     }
 
     /// A finished conversation's anchors must not squat. `Ladder` defers

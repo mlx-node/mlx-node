@@ -75,9 +75,10 @@ gemmaDescribe('Gemma4 grouped hybrid KV continuous batching', () => {
   }
 
   const config = {
-    // Two tokens are enough to force one genuine decode step after prefill;
-    // keeping this small makes the real 9.6 GiB CI checkpoint practical.
-    maxNewTokens: 2,
+    // Keep enough decode runway for both async ChatSession preflights to reach
+    // native before either row can finish. A two-token budget made the N=2
+    // telemetry premise timing-dependent on a warm, fast local checkpoint.
+    maxNewTokens: 8,
     temperature: 0,
     repetitionPenalty: 1,
     repetitionContextSize: 0,
@@ -124,4 +125,59 @@ gemmaDescribe('Gemma4 grouped hybrid KV continuous batching', () => {
     expect(stats.decodeBatchOccupancyHist.some(({ occupancy, steps }) => occupancy >= 2 && steps > 0)).toBe(true);
     expect(stats.fusedGreedyEpilogueSteps).toBeGreaterThan(0);
   }, 300_000);
+
+  it('rejects a duplicate explicit owner before replacing its live grouped cache', async () => {
+    const owner = 'gemma-duplicate-live-owner';
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    const ownerConfig = {
+      ...config,
+      maxNewTokens: 128,
+      cacheOwnerId: owner,
+      cacheRootOwnerId: owner,
+    };
+    const first = model.chatSessionStart(
+      [
+        {
+          role: 'user',
+          content: 'Write a detailed numbered explanation of how rainbows form.',
+        },
+      ],
+      ownerConfig,
+      firstController.signal,
+    );
+    const second = model.chatSessionStart(
+      [
+        {
+          role: 'user',
+          content: 'This duplicate owner must never replace the active request.',
+        },
+      ],
+      ownerConfig,
+      secondController.signal,
+    );
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      const outcome = await Promise.race([
+        second.then(
+          () => ({ status: 'fulfilled' as const }),
+          (reason: unknown) => ({ status: 'rejected' as const, reason }),
+        ),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error('duplicate-owner rejection timed out')), 30_000);
+        }),
+      ]);
+      if (outcome.status !== 'rejected') {
+        throw new Error('duplicate explicit owner was admitted while its first turn was live');
+      }
+      expect(outcome.reason).toBeInstanceOf(Error);
+      expect((outcome.reason as Error).message).toBe('chat session already has an in-flight scheduled turn');
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+      firstController.abort();
+      secondController.abort();
+      await Promise.allSettled([first, second]);
+    }
+  }, 60_000);
 });

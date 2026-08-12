@@ -2871,7 +2871,16 @@ impl Gemma4Model {
                 // module docs.
                 let (inner, weight_bytes) =
                     Gemma4Inner::load_from_dir(&model_path, draft_model_path.as_deref())?;
+                let pool_bytes = inner
+                    .kv_cache_coordinator
+                    .as_ref()
+                    .map(super::model::Gemma4KVCacheCoordinator::pool_allocated_bytes)
+                    .transpose()
+                    .map_err(Error::from_reason)?
+                    .unwrap_or(0);
                 let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
+                let pool_cache_limit_guard = (pool_bytes != 0)
+                    .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
                 let model_id = inner.model_id;
                 let has_vision = inner.image_path_loaded();
                 let has_audio = inner.embed_audio.is_some();
@@ -2893,6 +2902,7 @@ impl Gemma4Model {
                         has_vision,
                         has_audio,
                         cache_limit_guard,
+                        pool_cache_limit_guard,
                         paged_active,
                         max_concurrent_sequences,
                         draft_active,
@@ -2907,6 +2917,7 @@ impl Gemma4Model {
             has_vision,
             has_audio,
             cache_limit_guard,
+            pool_cache_limit_guard,
             paged_active,
             max_concurrent_sequences,
             draft_active,
@@ -2923,6 +2934,7 @@ impl Gemma4Model {
             paged_active,
             max_concurrent_sequences,
             _cache_limit_guard: Some(cache_limit_guard),
+            _pool_cache_limit_guard: pool_cache_limit_guard,
             draft_active,
         })
     }

@@ -66,6 +66,19 @@ methods on each model backend. This follows vLLM's separation between its
 scheduler/KV-cache manager and per-layer cache specifications/model runner
 without importing its CUDA or multiprocessing topology.
 
+The cache-manager boundary follows the same unitary-versus-hybrid distinction
+as vLLM's `UnitaryKVCacheCoordinator` and `HybridKVCacheCoordinator`. A family
+with one homogeneous attention group exposes its `PagedKVCacheAdapter`
+directly; wrapping that adapter in a one-element coordinator would add another
+owner without changing allocation, prefix matching, or restore semantics.
+Gemma4 uses `KVCacheCoordinator` because its full- and sliding-attention groups
+really do need independent managers and reconcile-down routing. New families
+should select between those two representations from their declared layer
+specs, rather than forcing every cache through the grouped representation.
+Whichever representation is selected, every active private adapter contributes
+its allocated pool bytes to the process cache-limit coordinator for the model's
+entire lifetime; grouped models sum all managers before registering the guard.
+
 Cold auxiliary restore has the same coordinator/runner boundary. The cold-tier
 coordinator consumes a candidate and validates its cache group, exact token
 boundary, and loaded-checkpoint geometry once. Through
@@ -89,6 +102,15 @@ paged target state. This matters for a text delta over image-derived KV: an
 empty current input is not a text-only context. An unsupported combination
 keeps the exact target-model path and disables speculation for that turn; it
 never discards media or the request.
+
+Native MTP and external-draft speculation are intentionally unified at
+`SpeculativeKind`/turn planning, not at their tensor-state stepper. Native MTP
+commits hidden-state and GDN snapshots from the target checkpoint; an external
+draft owns proposal distributions, target taps, and an autoregressive fallback.
+A shared lowest-common-denominator stepper would hide those different commit
+and rollback invariants. Introduce a deeper common trait only when another
+implementation demonstrates a reusable state transaction, not merely because
+both routes propose and verify tokens.
 
 ## Current routing contracts
 
@@ -144,6 +166,14 @@ otherwise expose the optimization behind the relevant narrow backend.
 One-shot OCR pipelines and embedding-only models are intentionally not forced
 through `ChatBackend`. They use the same registry for loading but retain APIs
 that match their lifecycle.
+
+The TypeScript model registry is the load-time source of truth. Native N-API
+classes remain statically typed exports, so a runtime native descriptor cannot
+construct or register them dynamically. The cold-restore family set is also
+mirrored deliberately in a native-free agent leaf used by CLI/catalog code;
+its parity test makes that duplication fail closed without loading the native
+addon. These boundaries should only be replaced by code generation that keeps
+the native-free import contract, not by a second runtime registry.
 
 ## Cache and speculative safety
 

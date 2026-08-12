@@ -274,7 +274,11 @@ reset barrier. `dispose()` releases the same stable owner. Do not share one
 explicit owner id between independent sessions: resetting or disposing either
 wrapper releases the shared native scheduler state. Server warm-slot eviction
 and stateless request cleanup await this lifecycle transition before dispatching
-replacement work.
+replacement work. Native also rejects a second in-flight turn for the same
+owner before any family-specific start reset can replace its cache. If paged
+admission is waiting on memory held by completed owners, idle-owner release
+commands may bypass ordinary pending work. Global resets and ordinary inference
+turns remain FIFO and cannot use this cleanup lane to overtake earlier work.
 
 Performance evidence is deliberately reported separately. On 2026-08-10, an
 Apple M5 Max with 128 GiB ran one uncooled fresh-process A/B sample against

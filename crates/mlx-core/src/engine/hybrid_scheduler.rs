@@ -5,7 +5,7 @@
 //! multimodal turns, raw generation, calibration, persistence, and training
 //! remain ordered barriers and execute through the existing command handler.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -448,6 +448,12 @@ struct PreparedDecodeRow {
     cancelled: bool,
     repetition: Option<&'static str>,
     batch_index: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeferredCleanupProgress {
+    None,
+    OwnerReleaseProcessed,
 }
 
 pub(crate) struct HybridStepExecutor<'a, B: HybridSchedulerBackend> {
@@ -1208,6 +1214,59 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         self.release_cache_owner_with(owner_id, B::release_owner_resources)
     }
 
+    /// Run only owner cleanup that can make a memory-blocked prepared
+    /// turn admissible. Ordinary requests remain FIFO in `pending`; an idle
+    /// owner's release is independent of them. Global resets stay in FIFO:
+    /// overtaking the prepared request would change which turns the reset
+    /// orders after.
+    fn process_deferred_cleanup(&mut self, blocked_owner_id: &str) -> DeferredCleanupProgress {
+        let mut release_index = None;
+        let mut owners_with_earlier_turns = HashSet::new();
+        for (index, command) in self.pending.iter().enumerate() {
+            match command.as_chat() {
+                Some(ChatCmd::ReleaseCacheOwner { owner_id, .. })
+                    if owner_id != blocked_owner_id
+                        && !owners_with_earlier_turns.contains(owner_id)
+                        && !self.cache_owner_release_blocked(owner_id) =>
+                {
+                    release_index = Some(index);
+                    break;
+                }
+                // A reset or family-specific barrier orders every later
+                // command after itself, so cleanup must not cross it.
+                Some(ChatCmd::ResetCaches { .. }) | None => break,
+                Some(chat) => {
+                    if let Some(owner_id) = Self::chat_config(chat)
+                        .and_then(|config| config.cache_owner_id.as_deref())
+                        .filter(|owner_id| !owner_id.is_empty())
+                    {
+                        owners_with_earlier_turns.insert(owner_id.to_owned());
+                    }
+                }
+            }
+        }
+        let Some(index) = release_index else {
+            return DeferredCleanupProgress::None;
+        };
+        let Some(command) = self.pending.remove(index) else {
+            return DeferredCleanupProgress::None;
+        };
+        match command.into_chat() {
+            Ok(ChatCmd::ReleaseCacheOwner { owner_id, reply }) => {
+                let _ = reply.send(self.release_cache_owner_now(&owner_id));
+                DeferredCleanupProgress::OwnerReleaseProcessed
+            }
+            Ok(chat) => {
+                self.pending.insert(index, B::Command::from_chat(chat));
+                DeferredCleanupProgress::None
+            }
+            Err(command) => {
+                self.pending.insert(index, command);
+                DeferredCleanupProgress::None
+            }
+        }
+    }
+
     fn prepare_chat(&mut self, command: ChatCmd) -> Option<Box<PreparedTurn>> {
         let (messages, config, response, cancelled, kind, guard) = match command {
             ChatCmd::SessionStart {
@@ -1300,12 +1359,18 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return None;
         }
         let owner_id = config.cache_owner_id.clone().unwrap_or_default();
-        if kind == engine::session::TurnKind::Start
-            && self.inner.reset_owner_on_session_start()
-            && let Err(error) = self.release_cache_owner_now(&owner_id)
-        {
-            response.send_error(error, cancelled.as_ref());
-            return None;
+        if kind == engine::session::TurnKind::Start && self.inner.reset_owner_on_session_start() {
+            if self.cache_owner_release_blocked(&owner_id) {
+                response.send_error(
+                    Error::from_reason("chat session already has an in-flight scheduled turn"),
+                    cancelled.as_ref(),
+                );
+                return None;
+            }
+            if let Err(error) = self.release_cache_owner_now(&owner_id) {
+                response.send_error(error, cancelled.as_ref());
+                return None;
+            }
         }
         if kind == engine::session::TurnKind::Continue && !self.owner_states.contains_key(&owner_id)
         {
@@ -2210,6 +2275,14 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 }
             }
         }
+        if deferred
+            && let Some(blocked_owner_id) = self
+                .prepared_waiting
+                .as_ref()
+                .map(|prepared| prepared.owner_id.clone())
+        {
+            self.process_deferred_cleanup(&blocked_owner_id);
+        }
         while !deferred
             && !self.scheduler.has_pending_control()
             && let Some(command) = self.pending.front()
@@ -2356,7 +2429,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
 mod tests {
     use super::*;
     use crate::models::qwen3_5::config::Qwen3_5Config;
-    use crate::models::qwen3_5::model::Qwen35Inner;
+    use crate::models::qwen3_5::model::{Qwen35Cmd, Qwen35Inner};
     use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
     use crate::models::qwen3_5_moe::model::Qwen35MoeInner;
 
@@ -2539,15 +2612,139 @@ mod tests {
     }
 
     #[test]
-    fn cache_owner_release_bypasses_unrelated_legacy_owner_drain() {
-        let (reply, _result) = tokio::sync::oneshot::channel();
-        let command = ChatCmd::ReleaseCacheOwner {
-            owner_id: "completed-owner".into(),
-            reply,
-        };
-        assert!(
-            !HybridSchedulerState::<Qwen35Inner>::chat_requires_legacy_owner_drain(&command),
-            "per-owner release must reach cache_owner_release_blocked instead of waiting for every unrelated sequence"
+    fn deferred_admission_processes_idle_owner_release_behind_ordinary_work() {
+        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        state.owner_sequences.insert("completed-owner".into(), 9);
+        state
+            .owner_states
+            .insert("completed-owner".into(), vec![7, 8]);
+        state
+            .inner
+            .activate_scheduled_recurrent(9)
+            .expect("activate completed owner recurrent state");
+
+        let (ordinary_reply, _ordinary_result) = tokio::sync::oneshot::channel();
+        state
+            .pending
+            .push_back(Qwen35Cmd::from_chat(ChatCmd::SessionStart {
+                messages: Vec::new(),
+                config: ChatConfig::default(),
+                reply: ordinary_reply,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }));
+        let (release_reply, mut release_result) = tokio::sync::oneshot::channel();
+        state
+            .pending
+            .push_back(Qwen35Cmd::from_chat(ChatCmd::ReleaseCacheOwner {
+                owner_id: "completed-owner".into(),
+                reply: release_reply,
+            }));
+
+        assert_eq!(
+            state.process_deferred_cleanup("blocked-owner"),
+            DeferredCleanupProgress::OwnerReleaseProcessed
+        );
+        assert_eq!(
+            state.pending.len(),
+            1,
+            "ordinary work stays queued in place"
+        );
+        assert!(state.pending.front().is_some_and(|command| {
+            command
+                .as_chat()
+                .is_some_and(|chat| matches!(chat, ChatCmd::SessionStart { .. }))
+        }));
+        assert!(matches!(release_result.try_recv(), Ok(Ok(()))));
+        assert!(!state.owner_sequences.contains_key("completed-owner"));
+        assert!(!state.owner_states.contains_key("completed-owner"));
+        assert!(!state.inner.has_scheduled_recurrent(9));
+    }
+
+    #[test]
+    fn deferred_cleanup_does_not_cross_an_earlier_global_reset() {
+        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        state.owner_sequences.insert("completed-owner".into(), 9);
+        state
+            .owner_states
+            .insert("completed-owner".into(), vec![7, 8]);
+        let (ordinary_reply, _ordinary_result) = tokio::sync::oneshot::channel();
+        state
+            .pending
+            .push_back(Qwen35Cmd::from_chat(ChatCmd::SessionStart {
+                messages: Vec::new(),
+                config: ChatConfig::default(),
+                reply: ordinary_reply,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }));
+        let (reset_reply, _reset_result) = tokio::sync::oneshot::channel();
+        state
+            .pending
+            .push_back(Qwen35Cmd::from_chat(ChatCmd::ResetCaches {
+                reply: reset_reply,
+            }));
+        let (release_reply, mut release_result) = tokio::sync::oneshot::channel();
+        state
+            .pending
+            .push_back(Qwen35Cmd::from_chat(ChatCmd::ReleaseCacheOwner {
+                owner_id: "completed-owner".into(),
+                reply: release_reply,
+            }));
+
+        assert_eq!(
+            state.process_deferred_cleanup("blocked-owner"),
+            DeferredCleanupProgress::None
+        );
+        assert_eq!(state.pending.len(), 3);
+        assert!(matches!(
+            release_result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(state.owner_sequences.get("completed-owner"), Some(&9));
+    }
+
+    #[test]
+    fn deferred_cleanup_does_not_overtake_an_earlier_turn_for_the_same_owner() {
+        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        state.owner_sequences.insert("continued-owner".into(), 9);
+        state
+            .owner_states
+            .insert("continued-owner".into(), vec![7, 8]);
+        let (turn_reply, _turn_result) = tokio::sync::oneshot::channel();
+        state
+            .pending
+            .push_back(Qwen35Cmd::from_chat(ChatCmd::SessionContinue {
+                messages: Vec::new(),
+                config: ChatConfig {
+                    cache_owner_id: Some("continued-owner".into()),
+                    ..ChatConfig::default()
+                },
+                reply: turn_reply,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }));
+        let (release_reply, mut release_result) = tokio::sync::oneshot::channel();
+        state
+            .pending
+            .push_back(Qwen35Cmd::from_chat(ChatCmd::ReleaseCacheOwner {
+                owner_id: "continued-owner".into(),
+                reply: release_reply,
+            }));
+
+        assert_eq!(
+            state.process_deferred_cleanup("blocked-owner"),
+            DeferredCleanupProgress::None
+        );
+        assert_eq!(state.pending.len(), 2);
+        assert!(matches!(
+            release_result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(state.owner_sequences.get("continued-owner"), Some(&9));
+        assert_eq!(
+            state.owner_states.get("continued-owner").map(Vec::as_slice),
+            Some(&[7, 8][..])
         );
     }
 }
