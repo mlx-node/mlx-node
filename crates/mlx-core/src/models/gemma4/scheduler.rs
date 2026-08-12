@@ -413,7 +413,7 @@ impl Gemma4StepExecutor<'_> {
         let at_length = turn.payload.generated_tokens.len()
             >= turn.payload.params.max_new_tokens.max(0) as usize;
 
-        let forward_logits = if !terminal {
+        let forward_logits = if !terminal && !at_length {
             let _stream_context = StreamContext::new(turn.payload.generation_stream);
             turn.payload.profiler.begin("forward");
             let logits = match self
@@ -472,7 +472,7 @@ impl Gemma4StepExecutor<'_> {
             }
             None
         };
-        if !terminal {
+        if !terminal && !at_length {
             if let Some(coordinator) = self.inner.kv_cache_coordinator.as_mut()
                 && let Err(error) = coordinator.eval_pending_pool_writes_all()
             {
@@ -562,11 +562,9 @@ impl Gemma4StepExecutor<'_> {
             let terminal = stops_at_eos || row.cancel_snapshot || repetition.is_some();
             let at_length = turn.payload.generated_tokens.len()
                 >= turn.payload.params.max_new_tokens.max(0) as usize;
-            // Gemma's paged finalize saves the generated history only after
-            // the last sampled token is materialized in K/V. Therefore an
-            // at-length non-terminal row still participates in this forward,
-            // but its logits are not sampled.
-            let batch_index = (!terminal).then(|| {
+            // The final length token is returned without another forward;
+            // reusable native history is one token shorter than public output.
+            let batch_index = (!terminal && !at_length).then(|| {
                 let index = batch_rows.len();
                 batch_rows.push((row.seq_id, token_id));
                 index
@@ -1485,6 +1483,7 @@ impl Gemma4SchedulerState {
                 suffix_len: turn.payload.prefix.suffix_len,
                 generated_tokens: &turn.payload.generated_tokens,
                 finish_reason: std::mem::take(&mut turn.payload.finish_reason),
+                retain_final_length_token: false,
                 generation_start: turn.payload.generation_start,
                 first_token_instant: turn.payload.first_token_instant,
                 reasoning_tokens: turn.payload.reasoning_tracker.reasoning_token_count(),

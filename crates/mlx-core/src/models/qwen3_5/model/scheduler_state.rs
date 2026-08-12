@@ -937,7 +937,8 @@ impl Qwen35SchedulerState {
             }
         };
         admitted.params.max_new_tokens = max_new_tokens as i32;
-        let requested_tokens = prompt_tokens.saturating_add(max_new_tokens);
+        let requested_tokens =
+            engine::scheduler::scheduled_materialized_tokens(prompt_tokens, max_new_tokens);
         let block_size = self
             .inner
             .paged_adapter
@@ -1485,6 +1486,7 @@ impl Qwen35SchedulerState {
                 suffix_len: turn.payload.prefix.suffix_len,
                 generated_tokens: &turn.payload.generated_tokens,
                 finish_reason: std::mem::take(&mut turn.payload.finish_reason),
+                retain_final_length_token: false,
                 generation_start: turn.payload.generation_start,
                 first_token_instant: turn.payload.first_token_instant,
                 reasoning_tokens: turn.payload.reasoning_tracker.reasoning_token_count(),

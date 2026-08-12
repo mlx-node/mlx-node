@@ -13,22 +13,27 @@ use crate::transformer::paged_kv_cache_adapter::SeqId;
 use napi_derive::napi;
 
 /// Clamp a scheduled turn's requested output to the fixed per-sequence
-/// context window. The scheduled path must reserve every generated token,
-/// unlike the whole-turn helper whose final sampled token is never forwarded
-/// again, so a prompt that already fills the window has no generation room.
+/// context window. The final sampled token is returned without another model
+/// forward, so `N` outputs consume only `N - 1` additional cache positions.
 pub(crate) fn clamp_scheduled_output_tokens(
     prompt_tokens: u32,
     requested_max_new_tokens: u32,
     per_seq_context: u32,
 ) -> Result<u32, String> {
-    if prompt_tokens > per_seq_context
-        || (prompt_tokens == per_seq_context && requested_max_new_tokens != 0)
-    {
+    if prompt_tokens > per_seq_context {
         return Err(format!(
-            "context_length_exceeded: prompt ({prompt_tokens}) leaves no requested generation room in scheduler per-sequence context {per_seq_context}"
+            "context_length_exceeded: prompt ({prompt_tokens}) exceeds scheduler per-sequence context {per_seq_context}"
         ));
     }
-    Ok(requested_max_new_tokens.min(per_seq_context - prompt_tokens))
+    let max_output = per_seq_context
+        .saturating_sub(prompt_tokens)
+        .saturating_add(1);
+    Ok(requested_max_new_tokens.min(max_output))
+}
+
+/// Physical cache positions consumed by a scheduled turn at its output cap.
+pub(crate) fn scheduled_materialized_tokens(prompt_tokens: u32, max_new_tokens: u32) -> u32 {
+    prompt_tokens.saturating_add(max_new_tokens.saturating_sub(1))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1251,15 +1256,15 @@ mod tests {
 
     #[test]
     fn scheduled_output_hint_clamps_to_remaining_context() {
-        assert_eq!(clamp_scheduled_output_tokens(48, 100, 64), Ok(16));
+        assert_eq!(clamp_scheduled_output_tokens(48, 100, 64), Ok(17));
         assert_eq!(clamp_scheduled_output_tokens(48, 10, 64), Ok(10));
+        assert_eq!(clamp_scheduled_output_tokens(64, 1, 64), Ok(1));
+        assert_eq!(scheduled_materialized_tokens(48, 17), 64);
+        assert_eq!(scheduled_materialized_tokens(64, 1), 64);
     }
 
     #[test]
-    fn scheduled_output_hint_rejects_a_prompt_without_generation_room() {
-        let full = clamp_scheduled_output_tokens(64, 1, 64).unwrap_err();
-        assert!(full.starts_with("context_length_exceeded: prompt (64)"));
-
+    fn scheduled_output_hint_rejects_an_oversized_prompt() {
         let oversized = clamp_scheduled_output_tokens(65, 1, 64).unwrap_err();
         assert!(oversized.starts_with("context_length_exceeded: prompt (65)"));
     }

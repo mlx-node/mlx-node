@@ -37,6 +37,9 @@ pub(crate) struct FinishPagedTurnArgs<'a> {
     pub suffix_len: usize,
     pub generated_tokens: &'a [u32],
     pub finish_reason: String,
+    /// Whether a length-exit final token was forwarded into native cache.
+    /// Scheduled turns use vLLM-style one-short caching and set this false.
+    pub retain_final_length_token: bool,
     pub generation_start: Option<Instant>,
     pub first_token_instant: Option<Instant>,
     pub reasoning_tokens: u32,
@@ -52,7 +55,7 @@ pub(crate) fn finish_paged_turn<B: PagedBackend>(
     backend: &mut B,
     mut args: FinishPagedTurnArgs<'_>,
 ) -> Result<TurnOutput> {
-    let keep_all = args.finish_reason == "length";
+    let keep_all = args.finish_reason == "length" && args.retain_final_length_token;
     let reconcile_ok = if args.reuse_cache {
         backend.reconcile_paged_request_tokens(
             args.prompt_tokens.len(),
@@ -406,6 +409,7 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
             suffix_len,
             generated_tokens: &generated_tokens,
             finish_reason,
+            retain_final_length_token: true,
             generation_start,
             first_token_instant,
             reasoning_tokens: reasoning_tracker.reasoning_token_count(),
@@ -438,12 +442,13 @@ mod tests {
 
     use napi::bindgen_prelude::*;
 
-    use super::run_paged_turn;
+    use super::{FinishPagedTurnArgs, finish_paged_turn, run_paged_turn};
     use crate::array::MxArray;
     use crate::decode_profiler::DecodeProfiler;
     use crate::engine::backend::{
         ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix,
-        PagedTurnSetup, ResetScope, SaveStateArgs, ThinkingSetup, TurnSetup, WholeTurnArgs,
+        PagedTurnSetup, ResetScope, SaveStateArgs, ThinkingSetup, TurnOutput, TurnSetup,
+        WholeTurnArgs,
     };
     use crate::engine::plan::{DecoderPlan, MediaCapabilities, MediaInputs, TurnPlan};
     use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
@@ -1631,6 +1636,87 @@ mod tests {
              mlx-lm / mlx-vlm), so the warm-continue \
              reuses it exactly with no re-prefilled tail"
         );
+    }
+
+    #[test]
+    fn scheduled_length_exit_drops_the_unmaterialized_final_token() {
+        let prompt = [0u32, 1, 2];
+        let generated = [1u32, 2];
+        let adapter_cursor = Arc::new(AtomicUsize::new(prompt.len() + generated.len() - 1));
+        let saved = Arc::new(std::sync::Mutex::new(None));
+        let tokenizer = tiny_qwen3_tokenizer();
+        let mut backend = MockBackend {
+            ledger: Arc::new(Ledger::default()),
+            forward_count: Arc::new(AtomicUsize::new(0)),
+            tokenizer: tokenizer.clone(),
+            vocab: 4,
+            target: 1,
+            decode_target: 2,
+            fail_prime: false,
+            fail_prefill: false,
+            fail_forward_on: None,
+            fail_save: false,
+            adapter_cursor: adapter_cursor.clone(),
+            prime_cache_salt: Arc::new(AtomicU64::new(0)),
+            finalize_cache_salt: Arc::new(AtomicU64::new(0)),
+            saved: saved.clone(),
+            cancel: None,
+            flip_on_forward: None,
+        };
+        let config = ChatConfig {
+            temperature: Some(0.0),
+            max_new_tokens: Some(generated.len() as i32),
+            reuse_cache: Some(true),
+            ..Default::default()
+        };
+        let params = crate::engine::params::extract_chat_params(&config);
+        let profiler = crate::decode_profiler::DecodeProfiler::new("scheduled-test", "mock");
+
+        let output = finish_paged_turn(
+            &mut backend,
+            FinishPagedTurnArgs {
+                tokenizer: &tokenizer,
+                params: &params,
+                config: &config,
+                thinking: ThinkingSetup {
+                    enabled: false,
+                    budget: None,
+                },
+                is_delta: false,
+                reuse_cache: true,
+                prompt_tokens: &prompt,
+                effective_cached_prefix_len: 0,
+                suffix_len: prompt.len(),
+                generated_tokens: &generated,
+                finish_reason: "length".to_string(),
+                retain_final_length_token: false,
+                generation_start: None,
+                first_token_instant: None,
+                reasoning_tokens: 0,
+                profiler: &profiler,
+                stream_skip_special: false,
+                streamed_text_len: 0,
+                last_is_reasoning: false,
+                sink: None,
+                emitter: None,
+            },
+        )
+        .expect("scheduled finish");
+        match output {
+            TurnOutput::Complete(result) => {
+                assert_eq!(result.finish_reason, "length");
+                assert_eq!(result.num_tokens, generated.len() as u32);
+            }
+            TurnOutput::Streamed => panic!("sync finish must be complete"),
+        }
+        let saved = saved
+            .lock()
+            .expect("saved poisoned")
+            .clone()
+            .expect("history saved");
+        assert!(!saved.keep_all);
+        assert_eq!(saved.persisted_history, vec![0, 1, 2, 1]);
+        assert_eq!(adapter_cursor.load(Ordering::Relaxed), 4);
     }
 
     /// FLAT-parity counterpart: a turn that exits by an EARLY STOP (the

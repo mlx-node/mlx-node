@@ -704,7 +704,7 @@ impl QwenStepExecutor<'_> {
         let at_length = turn.payload.generated_tokens.len()
             >= turn.payload.params.max_new_tokens.max(0) as usize;
 
-        let forward_logits = if !terminal {
+        let forward_logits = if !terminal && !at_length {
             let _stream_context = StreamContext::new(turn.payload.generation_stream);
             turn.payload.profiler.begin("forward");
             let logits = match self.inner.run_paged_decode_step(
@@ -943,7 +943,7 @@ impl QwenStepExecutor<'_> {
             let terminal = stops_at_eos || row.cancel_snapshot || repetition.is_some();
             let at_length = turn.payload.generated_tokens.len()
                 >= turn.payload.params.max_new_tokens.max(0) as usize;
-            let batch_index = (!terminal).then(|| {
+            let batch_index = (!terminal && !at_length).then(|| {
                 let index = batch_rows.len();
                 batch_rows.push((row.seq_id, token_id));
                 index
@@ -1309,7 +1309,7 @@ impl QwenStepExecutor<'_> {
                         repetition,
                         batch_index: None,
                     };
-                    if terminal {
+                    if terminal || at_length {
                         terminal_decodes.push(prepared);
                     } else {
                         turn.payload.profiler.begin("forward");
@@ -1891,7 +1891,8 @@ impl QwenSchedulerState {
             }
         };
         admitted.params.max_new_tokens = max_new_tokens as i32;
-        let requested_tokens = prompt_tokens.saturating_add(max_new_tokens);
+        let requested_tokens =
+            engine::scheduler::scheduled_materialized_tokens(prompt_tokens, max_new_tokens);
         let block_size = self
             .inner
             .paged_adapter
@@ -2574,6 +2575,7 @@ impl QwenSchedulerState {
                 suffix_len: turn.payload.prefix.suffix_len,
                 generated_tokens: &turn.payload.generated_tokens,
                 finish_reason: std::mem::take(&mut turn.payload.finish_reason),
+                retain_final_length_token: false,
                 generation_start: turn.payload.generation_start,
                 first_token_instant: turn.payload.first_token_instant,
                 reasoning_tokens: turn.payload.reasoning_tracker.reasoning_token_count(),
