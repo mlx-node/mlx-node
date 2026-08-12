@@ -323,6 +323,7 @@ jobs:
             lib_tests: >-
               models::qwen3_5::model::paged_construction_tests::dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy
               models::qwen3_5_moe::model::paged_construction_tests::moe_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy
+              models::qwen3_5_moe::model::paged_construction_tests::moe_hybrid_n2_batched_decode_matches_scalar_replay
           - name: lfm2
             model: LiquidAI/LFM2.5-1.2B-Thinking
             slug: lfm2.5-1.2b-thinking

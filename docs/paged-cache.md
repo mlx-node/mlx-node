@@ -35,13 +35,13 @@ rather than accepting an arbitrary client-selected namespace.
 
 ## Per-model support matrix
 
-| Model             | Default | Status                                                                                                                                                                                                                                                                                                                                         |
-| ----------------- | :-----: | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Qwen3**         | **on**  | Greedy + prefix-reuse byte-equal vs. flat path on Qwen3-0.6B BF16. Opt out via `use_block_paged_cache: Some(false)`.                                                                                                                                                                                                                           |
-| **LFM2.5**        | **on**  | Same parity result on LFM2.5-1.2B. Hybrid arch — only `full_attention` layers go through the adapter; conv layers stay on `Lfm2LayerCache::Conv`.                                                                                                                                                                                              |
-| **Gemma4**        | **on**  | Serial/concurrent start and continuation parity on Gemma-4-E2B-IT with a real occupancy-2 wave. Full and sliding layers use distinct paged groups; expired sliding blocks are replaced by a null sentinel; KV-shared layers alias their global/sliding anchor. Same-owner continuation is live; cross-owner prefix hits currently fail closed. |
-| **Qwen3.5 Dense** | **on**  | Single-turn greedy parity and paged construction are verified on Qwen3.5-0.8B BF16. Full-attention K/V is paged; GDN recurrent state remains request-local and is checkpointed beside K/V for SSD restore. Explicit false and the environment override retain a rollback path.                                                                 |
-| **Qwen3.5 MoE**   | **on**  | Uses the same paged full-attention and exact-boundary GDN sidecar contract as dense, but remains whole-turn exclusive rather than continuously batched. A real 35B-A3B restart gate remains local-only because no small published checkpoint fits the standard CI runner; a synthetic Metal gate covers construction in CI.                    |
+| Model             | Default | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ----------------- | :-----: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Qwen3**         | **on**  | Greedy + prefix-reuse byte-equal vs. flat path on Qwen3-0.6B BF16. Opt out via `use_block_paged_cache: Some(false)`.                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| **LFM2.5**        | **on**  | Same parity result on LFM2.5-1.2B. Hybrid arch — only `full_attention` layers go through the adapter; conv layers stay on `Lfm2LayerCache::Conv`.                                                                                                                                                                                                                                                                                                                                                                                                 |
+| **Gemma4**        | **on**  | Serial/concurrent start and continuation parity on Gemma-4-E2B-IT with a real occupancy-2 wave. Full and sliding layers use distinct paged groups; expired sliding blocks are replaced by a null sentinel; KV-shared layers alias their global/sliding anchor. Same-owner continuation is live; cross-owner prefix hits currently fail closed.                                                                                                                                                                                                    |
+| **Qwen3.5 Dense** | **on**  | Single-turn greedy parity and paged construction are verified on Qwen3.5-0.8B BF16. Full-attention K/V is paged; GDN recurrent state remains request-local and is checkpointed beside K/V for SSD restore. Explicit false and the environment override retain a rollback path.                                                                                                                                                                                                                                                                    |
+| **Qwen3.5 MoE**   | **on**  | Uses the same paged full-attention, exact-boundary GDN sidecar, and two-row text scheduler contract as dense. Sparse expert routing stays batched over `[N,1,H]`; checkpoint-specific projections preserve exact greedy parity while K/V gather/attention remains batched. MTP/media turns remain exclusive. Real `Qwen3.6-35B-A3B-mxfp4-mlx` decode and SSD-restart parity gates remain local-only because no small published checkpoint fits the standard CI runner; synthetic Metal gates cover paged construction and N=2 token parity in CI. |
 
 ### Gemma4 hybrid groups and draft coexistence
 
@@ -751,7 +751,7 @@ MLX_COLD_CACHE_DIR=$(mktemp -d) \
   cargo test -p mlx-core --test qwen3_5_cold_tier_parity -- --ignored --test-threads=1 --nocapture
 
 MLX_COLD_CACHE_DIR=$(mktemp -d) \
-  MLX_TEST_MODEL_PATH=~/.mlx-node/models/Qwen3.6-35b-a3b-UD-Q2_K_XL-mlx \
+  MLX_TEST_MODEL_PATH=~/.mlx-node/models/Qwen3.6-35B-A3B-mxfp4-mlx \
   cargo test -p mlx-core --test qwen3_5_moe_cold_tier_parity -- --ignored --test-threads=1 --nocapture
 
 MLX_COLD_CACHE_DIR=$(mktemp -d) \
@@ -765,29 +765,17 @@ MLX_PAGED_PREFILL_CHUNK_SIZE=64 MLX_COLD_CACHE_DIR=$(mktemp -d) \
     --test-threads=1 --nocapture gemma4_grouped_cold_tier_restart_parity
 ```
 
-The large-checkpoint gates are minutes, not hours. Measured on an M5 Max, `--release`,
-with the checkpoint already resident in the page cache:
+The large-checkpoint gates are minutes, not hours. The latest local MoE run on
+an M5 Max used the debug test profile with the checkpoint already resident in
+the page cache:
 
 | gate                                   | wall  | fresh model loads |
 | -------------------------------------- | ----- | ----------------- |
-| `qwen3_5_moe_cold_tier_restart_parity` | 105 s | 5                 |
+| `qwen3_5_moe_cold_tier_restart_parity` | 721 s | 5                 |
 
-Earlier notes here said ~66 min and ~26 min. **Do not read the drop as something the
-cold-tier commits bought** — the arithmetic does not support it. The long gemma4 gate
-restores 739 blocks; at the batched command buffer's own measured saving that is
-`739 x (5.271 - 1.158) ms` = **3.0 s**, and the capture side is smaller again. A few
-seconds, against a 62-minute difference.
-
-What the two numbers really differ in is model-load I/O. Neither checkpoint carries a
-`.mlx-download-complete.json` marker, so every persist-enabled load full-shard-hashes
-~14 GB of weights, and the long gate makes 15 such loads. 175 s over 15 loads is
-11.7 s per load, with the weights already in the page cache. 66 min over the same 15
-loads is 264 s per load — about what ~14 GB reads like when it has to come off the
-disk each time. Both runs keep their checkpoints on the same volume, so page-cache
-state is the variable, not the storage. So: **budget the table above only for a warm
-page cache, and expect minutes per load otherwise.** The 264 s/load figure is what the
-arithmetic implies, not a re-measured number — the cold case was not re-run. What is
-certain is the direction: the cold-tier commits moved seconds, not the headline.
+This is a correctness gate, not a performance benchmark. Its wall time is dominated
+by five loads of the 24.13 GiB MXFP4 weights and is sensitive to page-cache state and
+build profile; do not use it to attribute a speedup to the cold-tier implementation.
 
 The small-checkpoint gates run in CI, on the existing `model-test` matrix legs
 that already download and convert the checkpoint they need (`.github/workflows/ci.yml`):
@@ -802,8 +790,8 @@ MoE and a real paged pool — and there is no MoE model leg for it to ride inste
 The two real-weights gates that stay local-only stay that way because of their
 CHECKPOINTS, not their runtime:
 
-- **MoE** — the smallest published `qwen3_5_moe` is 35B-A3B. Even the UD-Q2_K_XL quant
-  peaks at 14.2 GB resident, past a standard macOS runner.
+- **MoE** — the smallest published `qwen3_5_moe` is 35B-A3B. The locally gated
+  MXFP4 checkpoint contains 24.13 GiB of weight shards, past a standard macOS runner.
 - **gemma4 MoE** — the standard CI runner covers dense E2B grouped restore. The
   local-only MoE gate uses a real 26B-A4B checkpoint; its grouped cache layout and
   codec are shared with dense, but the separate real gate protects the loader and

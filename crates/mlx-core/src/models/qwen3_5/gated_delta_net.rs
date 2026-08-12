@@ -69,7 +69,7 @@ impl GdnLayerTape {
         let new_recurrent = self
             .kernel
             .replay_recurrent_state(&start_state, accepted_steps)?;
-        cache.set(1, new_recurrent);
+        cache.set(1, new_recurrent)?;
 
         // --- Conv state --------------------------------------------------
         let keep = (self.conv_kernel_dim - 1) as i64;
@@ -91,7 +91,7 @@ impl GdnLayerTape {
             let total_len = conv_input.shape_at(1)?;
             if total_len >= keep {
                 let new_conv_state = conv_input.slice_axis(1, total_len - keep, total_len)?;
-                cache.set(0, new_conv_state);
+                cache.set(0, new_conv_state)?;
             }
         }
         Ok(())
@@ -330,7 +330,7 @@ impl GatedDeltaNet {
             let keep = (self.conv_kernel_dim - 1) as i64;
             if total_len >= keep {
                 let new_conv_state = conv_input.slice_axis(1, total_len - keep, total_len)?;
-                cache.set(0, new_conv_state);
+                cache.set(0, new_conv_state)?;
             }
         }
 
@@ -430,7 +430,7 @@ impl GatedDeltaNet {
 
         // Update recurrent state in cache
         if let Some(cache) = cache {
-            cache.set(1, new_state);
+            cache.set(1, new_state)?;
         }
 
         // Reshape z to per-head format: [B, T, value_dim] → [B, T, Hv, Dv]

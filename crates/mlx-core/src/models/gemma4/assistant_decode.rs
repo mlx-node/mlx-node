@@ -466,9 +466,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::engine::backend::{
-        ChatBackend, DsparkBackend, DsparkTurnSetup, TurnOutput, WholeTurnArgs,
-    };
+    use crate::engine::backend::{ChatBackend, DsparkBackend, TurnOutput, WholeTurnArgs};
     use crate::engine::plan::{
         DecoderPlan, MediaCapabilities, MediaInputs, SpeculativeKind, TurnPlan,
     };
@@ -476,7 +474,7 @@ mod tests {
     use crate::models::gemma4::assistant::AssistantDraftModel;
     use crate::models::gemma4::dspark::DsparkContextCache;
     use crate::models::gemma4::dspark_decode::tests::{
-        CancelAfterSink, chat_config, run_tiny_draft_turn, tiny_assistant_config,
+        CancelAfterSink, run_tiny_draft_turn, tiny_assistant_config,
         tiny_inner_with_assistant_draft, tiny_inner_with_draft, tiny_qwen_tokenizer,
         tiny_target_config, tiny_target_config_with_window, tiny_turn_config,
     };
@@ -507,7 +505,6 @@ mod tests {
     /// dispatch).
     fn prefilled_assistant_stepper<'a>(
         inner: &'a mut Gemma4Inner,
-        p: &ChatParams,
         block_size: usize,
     ) -> Gemma4DraftStepper<'a> {
         let tokens: Vec<u32> = vec![0, 1, 2, 3];
@@ -517,12 +514,8 @@ mod tests {
             .expect("tiny assistant prefill must succeed");
         assert_eq!(state.next_pos, 4, "prefill must report the prompt length");
         inner.draft_turn_state = Some(Gemma4DraftTurnState::Assistant(state));
-        let setup = DsparkTurnSetup {
-            params: p,
-            block_size,
-        };
         inner
-            .begin_dspark_decode(&setup)
+            .begin_dspark_decode(block_size)
             .expect("begin with an assistant stash must succeed")
     }
 
@@ -535,15 +528,10 @@ mod tests {
     #[test]
     fn begin_dspark_decode_dispatches_assistant() {
         let mut inner = tiny_inner_with_assistant_draft();
-        let p = ChatBackend::resolve_params(&inner, &chat_config(None));
-        let setup = DsparkTurnSetup {
-            params: &p,
-            block_size: 3,
-        };
 
         // No stash → hard error naming the missing prefill.
         let err = inner
-            .begin_dspark_decode(&setup)
+            .begin_dspark_decode(3)
             .err()
             .expect("begin without a stash must fail");
         assert!(
@@ -559,7 +547,7 @@ mod tests {
         }));
         {
             let stepper = match inner
-                .begin_dspark_decode(&setup)
+                .begin_dspark_decode(3)
                 .expect("begin with an assistant stash must succeed")
             {
                 Gemma4DraftStepper::Assistant(stepper) => stepper,
@@ -594,7 +582,7 @@ mod tests {
             next_pos: 3,
         }));
         let err = inner
-            .begin_dspark_decode(&setup)
+            .begin_dspark_decode(3)
             .err()
             .expect("a DSpark stash on an assistant draft must fail");
         assert!(
@@ -611,7 +599,7 @@ mod tests {
             next_pos: 7,
         }));
         let err = dspark_inner
-            .begin_dspark_decode(&setup)
+            .begin_dspark_decode(3)
             .err()
             .expect("an assistant stash on a DSpark draft must fail");
         assert!(
@@ -638,7 +626,7 @@ mod tests {
         let offsets_before: Vec<i32>;
         let (prop1_ids, prop2_ids);
         {
-            let mut stepper = match prefilled_assistant_stepper(&mut inner, &p, 3) {
+            let mut stepper = match prefilled_assistant_stepper(&mut inner, 3) {
                 Gemma4DraftStepper::Assistant(stepper) => stepper,
                 Gemma4DraftStepper::Dspark(_) => panic!("expected the assistant stepper"),
             };
@@ -700,9 +688,8 @@ mod tests {
     fn commit_updates_h_prev_and_cursor() {
         unsafe { mlx_sys::mlx_seed(0xA551_0002) };
         let mut inner = tiny_inner_with_assistant_draft();
-        let p = ChatBackend::resolve_params(&inner, &greedy_config(Some(2)));
         {
-            let mut stepper = match prefilled_assistant_stepper(&mut inner, &p, 2) {
+            let mut stepper = match prefilled_assistant_stepper(&mut inner, 2) {
                 Gemma4DraftStepper::Assistant(stepper) => stepper,
                 Gemma4DraftStepper::Dspark(_) => panic!("expected the assistant stepper"),
             };

@@ -4,6 +4,8 @@
 //! sidecar validates at the same boundary. The shared harness requires a
 //! genuine sidecar install, non-zero SSD hits, zero corruption, and exact
 //! deterministic output parity with a persistence-disabled fresh prefill.
+//! `MLX_TEST_GEMMA4_POOL_MEMORY_MB` may override the E2B-sized default when a
+//! larger local checkpoint is used.
 
 mod cold_tier_parity_harness;
 
@@ -33,6 +35,16 @@ fn require_deterministic_prefill_shape() {
     );
 }
 
+fn pool_memory_mb(default: u32) -> u32 {
+    match std::env::var("MLX_TEST_GEMMA4_POOL_MEMORY_MB") {
+        Ok(raw) => raw.parse::<u32>().unwrap_or_else(|error| {
+            panic!("MLX_TEST_GEMMA4_POOL_MEMORY_MB must be an unsigned integer: {error}")
+        }),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => panic!("failed to read MLX_TEST_GEMMA4_POOL_MEMORY_MB: {error}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Gemma4 checkpoint"]
 async fn gemma4_grouped_cold_tier_restart_parity() {
@@ -43,7 +55,7 @@ async fn gemma4_grouped_cold_tier_restart_parity() {
             // lane plus its sliding window. 1 GiB keeps that real geometry
             // while avoiding a 5 GiB test-only pool that can make Metal
             // readback fail on the standard shared runner before SSD capture.
-            .with_pool_memory_mb(1024)
+            .with_pool_memory_mb(pool_memory_mb(1024))
             .with_prompt(GEMMA4_COLD_PROMPT)
             .with_max_new_tokens(16)
             .expecting_sidecar_install(),
@@ -60,7 +72,7 @@ async fn gemma4_grouped_cold_tier_restart_parity() {
 async fn gemma4_moe_grouped_cold_tier_restart_parity() {
     require_deterministic_prefill_shape();
     let mut spec = harness::ColdTierParitySpec::new("gemma4-moe-grouped")
-        .with_pool_memory_mb(6144)
+        .with_pool_memory_mb(pool_memory_mb(6144))
         .with_prompt(GEMMA4_COLD_PROMPT)
         .with_max_new_tokens(16)
         .expecting_sidecar_install();

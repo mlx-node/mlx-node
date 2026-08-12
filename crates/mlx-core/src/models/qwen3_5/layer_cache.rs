@@ -117,18 +117,18 @@ impl Qwen3_5LayerCache {
         p0: *mut sys::mlx_array,
         p1: *mut sys::mlx_array,
         new_offset: i32,
-    ) {
+    ) -> Result<()> {
         match self {
             Self::Linear(c) => {
                 if !p0.is_null()
                     && let Ok(arr) = MxArray::from_handle(p0, "fused_conv_state")
                 {
-                    c.set(0, arr);
+                    c.set(0, arr)?;
                 }
                 if !p1.is_null()
                     && let Ok(arr) = MxArray::from_handle(p1, "fused_recurrent_state")
                 {
-                    c.set(1, arr);
+                    c.set(1, arr)?;
                 }
             }
             Self::FullAttention(c) => {
@@ -145,6 +145,7 @@ impl Qwen3_5LayerCache {
                 c.set_offset(new_offset);
             }
         }
+        Ok(())
     }
 
     /// Capture a restore point for speculative decoding.
@@ -197,7 +198,6 @@ impl Qwen3_5LayerCache {
     /// dev builds when a FullAttention slot is snapshotted with empty
     /// underlying buffers (the most reliable in-process signal that the
     /// paged path is active).
-    #[allow(dead_code)] // Wired in by W6 speculative-decode loop.
     pub(crate) fn snapshot(&self) -> Result<Qwen3_5LayerSnapshot> {
         match self {
             Self::FullAttention(c) => {
@@ -244,7 +244,7 @@ impl Qwen3_5LayerCache {
     /// `new_len >= offset`, which would otherwise hide bugs such as
     /// restoring a stale snapshot from a longer-running cache onto a
     /// shorter one.
-    #[allow(dead_code)] // Wired in by W6 speculative-decode loop.
+    #[cfg(test)]
     pub(crate) fn restore(&mut self, snap: &Qwen3_5LayerSnapshot) -> Result<()> {
         match (self, snap) {
             (Self::FullAttention(c), Qwen3_5LayerSnapshot::FullAttention { offset }) => {
@@ -269,10 +269,10 @@ impl Qwen3_5LayerCache {
             ) => {
                 c.reset();
                 if let Some(arr) = conv_state {
-                    c.set(0, arr.clone());
+                    c.set(0, arr.clone())?;
                 }
                 if let Some(arr) = recurrent_state {
-                    c.set(1, arr.clone());
+                    c.set(1, arr.clone())?;
                 }
                 Ok(())
             }
@@ -292,9 +292,8 @@ impl Qwen3_5LayerCache {
 
 /// Per-layer restore point captured by [`Qwen3_5LayerCache::snapshot`].
 ///
-/// Designed for the W6 speculative-decode loop: snapshot before drafting,
+/// Used by speculative decode: snapshot before drafting,
 /// restore (`rollback_after_verify` equivalent) if the verifier rejects.
-#[allow(dead_code)] // Wired in by W6 speculative-decode loop.
 pub(crate) enum Qwen3_5LayerSnapshot {
     /// Logical token offset of the full-attention KV cache. The underlying
     /// pre-allocated buffer is shared with the live cache and is rewound by
@@ -308,7 +307,6 @@ pub(crate) enum Qwen3_5LayerSnapshot {
 }
 
 /// Snapshot every layer's cache in one shot.
-#[allow(dead_code)] // Wired in by W6 speculative-decode loop.
 pub(crate) fn snapshot_all(caches: &[Qwen3_5LayerCache]) -> Result<Vec<Qwen3_5LayerSnapshot>> {
     caches.iter().map(|c| c.snapshot()).collect()
 }
@@ -356,7 +354,7 @@ pub(crate) fn snapshot_all_mtp(
 /// including) the failing index will have been rolled back. The variant
 /// pre-validation removes the most common source of partial-rollback
 /// inconsistency observed during speculative decoding.
-#[allow(dead_code)] // Wired in by W6 speculative-decode loop.
+#[cfg(test)]
 pub(crate) fn restore_all(
     caches: &mut [Qwen3_5LayerCache],
     snaps: &[Qwen3_5LayerSnapshot],
@@ -495,8 +493,8 @@ mod tests {
         if !try_eval_or_skip(&conv0, "snapshot_linear_byte_equality::seed") {
             return;
         }
-        arrays.set(0, conv0);
-        arrays.set(1, rec0);
+        arrays.set(0, conv0).unwrap();
+        arrays.set(1, rec0).unwrap();
 
         let snap = cache.snapshot().expect("snapshot");
         match &snap {
@@ -526,14 +524,18 @@ mod tests {
 
         // Mutate both arrays by replacing the cache slots with junk.
         let arrays = cache.as_arrays_cache_mut().unwrap();
-        arrays.set(
-            0,
-            MxArray::from_float32(&[-1.0, -2.0, -3.0, -4.0], &[1, 4]).unwrap(),
-        );
-        arrays.set(
-            1,
-            MxArray::from_float32(&[-5.0, -6.0, -7.0, -8.0, -9.0], &[1, 5]).unwrap(),
-        );
+        arrays
+            .set(
+                0,
+                MxArray::from_float32(&[-1.0, -2.0, -3.0, -4.0], &[1, 4]).unwrap(),
+            )
+            .unwrap();
+        arrays
+            .set(
+                1,
+                MxArray::from_float32(&[-5.0, -6.0, -7.0, -8.0, -9.0], &[1, 5]).unwrap(),
+            )
+            .unwrap();
 
         // Restore and confirm byte-for-byte equality with the original seeds.
         cache.restore(&snap).expect("restore");
@@ -569,8 +571,8 @@ mod tests {
         // should clear.
         let arrays = cache.as_arrays_cache_mut().unwrap();
         let filler = MxArray::from_float32(&[1.0], &[1, 1]).unwrap();
-        arrays.set(0, filler.clone());
-        arrays.set(1, filler);
+        arrays.set(0, filler.clone()).unwrap();
+        arrays.set(1, filler).unwrap();
 
         cache.restore(&snap).expect("restore");
         let arrays = cache.as_arrays_cache_mut().unwrap();
@@ -627,7 +629,7 @@ mod tests {
         // Prime the linear cache.
         if let Some(arrays) = caches[1].as_arrays_cache_mut() {
             let c0 = MxArray::from_float32(&[7.0, 8.0], &[1, 2]).unwrap();
-            arrays.set(0, c0);
+            arrays.set(0, c0).unwrap();
         }
 
         let snaps = snapshot_all(&caches).expect("snapshot_all");
@@ -641,7 +643,9 @@ mod tests {
             assert_eq!(kv.get_offset(), 3);
         }
         if let Some(arrays) = caches[1].as_arrays_cache_mut() {
-            arrays.set(0, MxArray::from_float32(&[-1.0, -2.0], &[1, 2]).unwrap());
+            arrays
+                .set(0, MxArray::from_float32(&[-1.0, -2.0], &[1, 2]).unwrap())
+                .unwrap();
         }
 
         restore_all(&mut caches, &snaps).expect("restore_all");
@@ -670,7 +674,9 @@ mod tests {
             Qwen3_5LayerCache::new_linear(),
         ];
         if let Some(arrays) = caches[1].as_arrays_cache_mut() {
-            arrays.set(0, MxArray::from_float32(&[7.0, 8.0], &[1, 2]).unwrap());
+            arrays
+                .set(0, MxArray::from_float32(&[7.0, 8.0], &[1, 2]).unwrap())
+                .unwrap();
         }
 
         // The paged-aware snapshot must NOT call `snapshot()` on the empty
@@ -719,7 +725,7 @@ mod tests {
         }
         if let Some(arrays) = caches[1].as_arrays_cache_mut() {
             let c0 = MxArray::from_float32(&[42.0, 43.0], &[1, 2]).unwrap();
-            arrays.set(0, c0);
+            arrays.set(0, c0).unwrap();
         }
 
         // Build a snaps vec whose index 0 is deliberately Linear (mismatches

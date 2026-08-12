@@ -1,9 +1,9 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Instant;
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
@@ -14,28 +14,24 @@ use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
 use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, MtpBackend, MtpStepper, MtpTurnSetup, PagedBackend,
-    PagedPrefix, PagedTurnSetup, ResetScope, SaveStateArgs, StreamEmitter, ThinkingSetup,
-    TrainBackend, TurnOutput, TurnSetup, WholeTurnArgs,
+    PagedPrefix, ResetScope, SaveStateArgs, ThinkingSetup, TrainBackend, TurnOutput, TurnSetup,
+    WholeTurnArgs,
 };
 use crate::engine::cmd::{
     ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
 };
+use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, HybridSchedulerCommand};
 use crate::engine::plan::{
     DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
     SpeculativePlan,
 };
 use crate::engine::recurrent_state::{HYBRID_LIVE_STATE_UNITS, RecurrentStateTable};
-use crate::engine::scheduler::{
-    PreemptionMode, PreemptionReplay, RowStepResult, Scheduler, SchedulerAction, StepExecutor,
-    StepKind, StepPlan, StepResult, TurnState, install_preemption_replay,
-    is_paged_allocation_blocked,
-};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
-use crate::model_thread::{LoopControl, ResponseTx, StreamTx, send_and_await};
+use crate::model_thread::{ResponseTx, send_and_await};
 use crate::nn::{Embedding, Linear, RMSNorm};
-use crate::sampling::{SamplingConfig, check_repetition_cutoff, sample};
+use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
@@ -66,8 +62,8 @@ use crate::engine::{
 };
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 
-mod scheduler_state;
-pub(crate) use scheduler_state::Qwen35SchedulerState;
+pub(crate) type Qwen35SchedulerState =
+    crate::engine::hybrid_scheduler::HybridSchedulerState<Qwen35Inner>;
 
 /// Hard cap on inactive per-image feature entries retained by the vision LRU.
 /// The active request is protected from eviction even when it is larger than
@@ -85,76 +81,6 @@ const VISION_SAFETY_RESERVE_MAX_BYTES: u64 = 16 * VISION_GIB;
 const VISION_CACHE_MAX_BYTES: u64 = VISION_GIB;
 const VISION_MISS_BATCH_MIN_PATCHES: u64 = 1;
 const VISION_MISS_BATCH_MAX_PATCHES: u64 = 32 * 1024;
-
-fn scheduler_max_num_seqs() -> usize {
-    static VALUE: OnceLock<usize> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        std::env::var("MLX_SCHED_MAX_NUM_SEQS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(8)
-            .min(32)
-            // Hybrid state has a deliberate vLLM Mamba-style two-unit cap.
-            .min(crate::engine::recurrent_state::HYBRID_LIVE_STATE_UNITS)
-    })
-}
-
-fn scheduler_max_batched_tokens() -> u32 {
-    static VALUE: OnceLock<u32> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        std::env::var("MLX_SCHED_MAX_BATCHED_TOKENS")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(2048)
-    })
-}
-
-fn scheduler_long_prefill_tokens() -> u32 {
-    static VALUE: OnceLock<u32> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        std::env::var("MLX_SCHED_LONG_PREFILL_TOKENS")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(2048)
-    })
-}
-
-fn scheduler_per_seq_context() -> u32 {
-    static VALUE: OnceLock<u32> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        std::env::var("MLX_PAGED_PER_SEQ_CTX")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(32_768)
-    })
-}
-
-fn scheduler_watermark_fraction() -> f64 {
-    static VALUE: OnceLock<f64> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        std::env::var("MLX_SCHED_WATERMARK_FRACTION")
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
-            .unwrap_or(0.05)
-    })
-}
-
-fn scheduler_reserve_full_isl() -> bool {
-    static VALUE: OnceLock<bool> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        std::env::var("MLX_SCHED_RESERVE_FULL_ISL").map_or(true, |value| {
-            !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-    })
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisionMemoryCapSource {
@@ -1106,6 +1032,31 @@ impl FromTrainCmd for Qwen35Cmd {
     }
 }
 
+impl HybridSchedulerCommand for Qwen35Cmd {
+    fn as_chat(&self) -> Option<&ChatCmd> {
+        match self {
+            Self::Chat(chat) => Some(chat),
+            _ => None,
+        }
+    }
+
+    fn into_chat(self) -> std::result::Result<ChatCmd, Self> {
+        match self {
+            Self::Chat(chat) => Ok(chat),
+            other => Err(other),
+        }
+    }
+
+    fn into_scheduler_stats(
+        self,
+    ) -> std::result::Result<ResponseTx<engine::SchedulerStatsJs>, Self> {
+        match self {
+            Self::SchedulerStats { reply } => Ok(reply),
+            other => Err(other),
+        }
+    }
+}
+
 /// Training backend the model-neutral [`handle_train_cmd`] drives. Each
 /// method forwards to the inherent `*_sync_impl` body on [`Qwen35Inner`].
 impl TrainBackend for Qwen35Inner {
@@ -1217,6 +1168,105 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         Qwen35Cmd::SchedulerStats { reply } => {
             let _ = reply.send(Ok(engine::scheduler::SchedulerStats::default().to_js()));
         }
+    }
+}
+
+impl HybridSchedulerBackend for Qwen35Inner {
+    type Command = Qwen35Cmd;
+    type RestoreTicket = crate::engine::hybrid_scheduler::NoRestoreTicket;
+    type OwnerState = Vec<u32>;
+    type StepExecutor<'a> = crate::engine::hybrid_scheduler::HybridStepExecutor<'a, Self>;
+
+    const SCHEDULER_NAME: &'static str = "Qwen3.5 dense";
+    const ENABLED_BY_DEFAULT: bool = false;
+
+    fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter> {
+        self.paged_adapter.as_ref()
+    }
+
+    fn paged_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter> {
+        self.paged_adapter.as_mut()
+    }
+
+    fn max_position_embeddings(&self) -> i32 {
+        self.config.max_position_embeddings
+    }
+
+    fn recurrent_state_bytes(&self) -> u64 {
+        self.config.recurrent_state_bytes()
+    }
+
+    fn scheduled_recurrent_bytes(&self) -> u64 {
+        self.scheduled_recurrent_bytes()
+    }
+
+    fn has_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
+        self.has_scheduled_recurrent(seq_id)
+    }
+
+    fn can_activate_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
+        self.can_activate_scheduled_recurrent(seq_id)
+    }
+
+    fn activate_scheduled_recurrent(&mut self, seq_id: SeqId) -> Result<()> {
+        self.activate_scheduled_recurrent(seq_id)
+    }
+
+    fn activate_paged_seq(&mut self, seq_id: SeqId) -> Result<()> {
+        self.activate_paged_seq(seq_id)
+    }
+
+    fn park_active_scheduled_recurrent(&mut self) -> Result<()> {
+        self.park_active_scheduled_recurrent()
+    }
+
+    fn release_scheduled_recurrent_for(&mut self, seq_id: SeqId) {
+        self.release_scheduled_recurrent_for(seq_id);
+    }
+
+    fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+        self.run_paged_decode_step_batched(rows)
+    }
+
+    fn replace_cached_token_history(&mut self, history: Vec<u32>) {
+        self.cached_token_history = history;
+    }
+
+    fn owner_tokens(state: &Self::OwnerState) -> &[u32] {
+        state
+    }
+
+    fn capture_owner_state(&mut self, _seq_id: SeqId) -> Self::OwnerState {
+        self.cached_token_history.clone()
+    }
+
+    fn build_scheduled_prefix(
+        &self,
+        base: &Self::PrefixState,
+        effective_cached_prefix_len: usize,
+        suffix_len: usize,
+        full_tokens: Vec<u32>,
+        first_chunk: bool,
+    ) -> Self::PrefixState {
+        Qwen35PrefixState {
+            effective_cached_prefix_len,
+            suffix_len,
+            full_tokens,
+            cache_salt: base.cache_salt,
+            gdn_prefix_already_primed: !first_chunk || base.gdn_prefix_already_primed,
+        }
+    }
+
+    fn step_executor(&mut self) -> Self::StepExecutor<'_> {
+        crate::engine::hybrid_scheduler::HybridStepExecutor::new(self)
+    }
+
+    fn execute_barrier(
+        &mut self,
+        command: Self::Command,
+        _owners: crate::engine::hybrid_scheduler::SchedulerOwnerContext<'_, Self::OwnerState>,
+    ) {
+        handle_qwen35_cmd(self, command);
     }
 }
 
@@ -1703,7 +1753,7 @@ impl Qwen35Inner {
             .unwrap_or_else(|| fresh_dense_layer_caches(&self.config));
         self.scheduled_recurrent
             .insert_live(seq_id, bytes, state)
-            .expect("recurrent-state insertion was prevalidated");
+            .map_err(Error::from_reason)?;
         Ok(())
     }
 
@@ -1879,10 +1929,11 @@ impl Qwen35Inner {
         let recurrent_snapshots = rows
             .iter()
             .map(|&(seq_id, _)| {
-                let state = self
-                    .scheduled_recurrent
-                    .live(seq_id)
-                    .expect("residency validated above");
+                let state = self.scheduled_recurrent.live(seq_id).ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "Qwen3.5 sequence {seq_id} disappeared before recurrent snapshot"
+                    ))
+                })?;
                 crate::models::qwen3_5::paged_forward::snapshot_materialized_linear_layer_caches(
                     state,
                 )
@@ -1897,17 +1948,20 @@ impl Qwen35Inner {
 
         let mut recorded = Vec::with_capacity(rows.len());
         for &(seq_id, token_id) in rows {
-            if let Err(error) = self
+            let record_result = self
                 .paged_adapter
                 .as_mut()
-                .expect("adapter validated above")
-                .record_token_for(seq_id, token_id)
-            {
+                .ok_or_else(|| {
+                    Error::from_reason("Qwen3.5 paged adapter disappeared before token recording")
+                })?
+                .record_token_for(seq_id, token_id);
+            if let Err(error) = record_result {
                 for &recorded_seq in recorded.iter().rev() {
-                    let adapter = self
-                        .paged_adapter
-                        .as_mut()
-                        .expect("adapter validated above");
+                    let Some(adapter) = self.paged_adapter.as_mut() else {
+                        return Err(Error::from_reason(format!(
+                            "Qwen3.5 paged adapter disappeared while rolling back a failed token record for sequence {seq_id}: {error}"
+                        )));
+                    };
                     adapter
                         .activate_request(recorded_seq)
                         .map_err(Error::from_reason)?;
@@ -1963,10 +2017,11 @@ impl Qwen35Inner {
         })();
         if result.is_err() {
             for &recorded_seq in recorded.iter().rev() {
-                let adapter = self
-                    .paged_adapter
-                    .as_mut()
-                    .expect("adapter validated above");
+                let Some(adapter) = self.paged_adapter.as_mut() else {
+                    return Err(Error::from_reason(
+                        "Qwen3.5 paged adapter disappeared while rolling back a failed batched decode",
+                    ));
+                };
                 if adapter.activate_request(recorded_seq).is_ok() {
                     let _ = adapter.rollback_last_tokens(1);
                 }
@@ -1974,7 +2029,11 @@ impl Qwen35Inner {
             for (seq_id, snapshot) in recurrent_snapshots {
                 self.scheduled_recurrent
                     .insert_live(seq_id, self.config.recurrent_state_bytes(), snapshot)
-                    .expect("rollback replaces an existing recurrent row");
+                    .map_err(|error| {
+                        Error::from_reason(format!(
+                            "Qwen3.5 failed to restore recurrent state for sequence {seq_id} after a batched decode error: {error}"
+                        ))
+                    })?;
             }
         }
         result
@@ -4797,9 +4856,9 @@ impl Qwen35Inner {
             // NOT a `self.caches` KV trim.
             MxArray::async_eval_arrays(&[&y]);
 
-            let mut profiler = mtp_profiler
-                .take()
-                .expect("paged MTP profiler must be created before prefill");
+            let mut profiler = mtp_profiler.take().ok_or_else(|| {
+                Error::from_reason("Qwen3.5 paged MTP profiler was not initialized before decode")
+            })?;
 
             let eos_id = eos_token_id;
             let generation_stream = crate::stream::Stream::new(crate::stream::DeviceType::Gpu);
@@ -6408,9 +6467,11 @@ impl Qwen35Inner {
             // `run_mtp_turn` streaming path emits decoded text per token via `cb`.
             MxArray::async_eval_arrays(&[&y]);
 
-            let mut profiler = mtp_profiler
-                .take()
-                .expect("paged MTP profiler must be created before prefill");
+            let mut profiler = mtp_profiler.take().ok_or_else(|| {
+                Error::from_reason(
+                    "Qwen3.5 streaming paged MTP profiler was not initialized before decode",
+                )
+            })?;
 
             let eos_id = eos_token_id;
             let generation_stream = crate::stream::Stream::new(crate::stream::DeviceType::Gpu);
@@ -8279,7 +8340,9 @@ impl Qwen35Inner {
             // Skipped steps must still advance the authoritative step counter
             // (H1) and drop the cached generation so the next cycle starts
             // clean.
-            let ts = self.training_state.as_mut().unwrap();
+            let ts = self.training_state.as_mut().ok_or_else(|| {
+                Error::from_reason("Training state disappeared during GRPO loss handling")
+            })?;
             ts.clear_generation_cache();
             ts.step += 1;
             let new_step = ts.step;
@@ -8316,7 +8379,9 @@ impl Qwen35Inner {
                     warn!("Gradient '{}' contains NaN/Inf - SKIPPING STEP", name);
                 }
 
-                let ts = self.training_state.as_mut().unwrap();
+                let ts = self.training_state.as_mut().ok_or_else(|| {
+                    Error::from_reason("Training state disappeared during GRPO gradient validation")
+                })?;
                 ts.nan_gradient_count += 1;
                 ts.consecutive_nan_count += 1;
 
@@ -8376,7 +8441,9 @@ impl Qwen35Inner {
         };
 
         // Accumulate gradients
-        let ts = self.training_state.as_mut().unwrap();
+        let ts = self.training_state.as_mut().ok_or_else(|| {
+            Error::from_reason("Training state disappeared before GRPO gradient accumulation")
+        })?;
         // Reset consecutive NaN count on successful gradient computation
         ts.consecutive_nan_count = 0;
 
@@ -8447,7 +8514,14 @@ impl Qwen35Inner {
 
                 tracing::debug!(
                     "Applied AdamW update (step={})",
-                    self.training_state.as_ref().unwrap().step
+                    self.training_state
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::from_reason(
+                                "Training state disappeared after the GRPO optimizer update",
+                            )
+                        })?
+                        .step
                 );
             } else {
                 // SGD path
@@ -8458,7 +8532,9 @@ impl Qwen35Inner {
                 tracing::debug!("Applied SGD gradients with lr: {}", lr);
             }
 
-            let ts = self.training_state.as_mut().unwrap();
+            let ts = self.training_state.as_mut().ok_or_else(|| {
+                Error::from_reason("Training state disappeared while finalizing the GRPO update")
+            })?;
             ts.accumulated_gradients = None;
             ts.micro_step = 0;
             ts.step += 1;
@@ -8489,7 +8565,9 @@ impl Qwen35Inner {
 
         // Count tokens BEFORE clearing the cache — otherwise total_tokens is
         // always zero on the success path.
-        let ts = self.training_state.as_ref().unwrap();
+        let ts = self.training_state.as_ref().ok_or_else(|| {
+            Error::from_reason("Training state disappeared before GRPO token accounting")
+        })?;
         let total_tokens: i32 = if let Some(ref ct) = ts.cached_completion_tokens {
             ct.iter()
                 .filter_map(|t| t.shape_at(0).ok())
@@ -8507,7 +8585,9 @@ impl Qwen35Inner {
         // CRITICAL: heavy_cleanup after autograd to clear compiled graph cache
         heavy_cleanup();
 
-        let ts = self.training_state.as_ref().unwrap();
+        let ts = self.training_state.as_ref().ok_or_else(|| {
+            Error::from_reason("Training state disappeared before GRPO metrics were returned")
+        })?;
         Ok(crate::training_model::TrainStepPlainMetrics {
             loss: loss_value,
             gradients_applied,
@@ -8580,7 +8660,9 @@ impl Qwen35Inner {
         if loss_value.is_nan() || loss_value.is_infinite() {
             warn!("SFT: Skipping step due to invalid loss: {}", loss_value);
             synchronize_and_clear_cache();
-            let ts = self.training_state.as_mut().unwrap();
+            let ts = self.training_state.as_mut().ok_or_else(|| {
+                Error::from_reason("Training state disappeared during SFT loss handling")
+            })?;
             ts.nan_gradient_count += 1;
             ts.consecutive_nan_count += 1;
 
@@ -8630,7 +8712,9 @@ impl Qwen35Inner {
                     warn!("SFT: Gradient '{}' contains NaN/Inf - SKIPPING STEP", name);
                 }
 
-                let ts = self.training_state.as_mut().unwrap();
+                let ts = self.training_state.as_mut().ok_or_else(|| {
+                    Error::from_reason("Training state disappeared during SFT gradient validation")
+                })?;
                 ts.nan_gradient_count += 1;
                 ts.consecutive_nan_count += 1;
 
@@ -8688,7 +8772,9 @@ impl Qwen35Inner {
         };
 
         // Accumulate gradients
-        let ts = self.training_state.as_mut().unwrap();
+        let ts = self.training_state.as_mut().ok_or_else(|| {
+            Error::from_reason("Training state disappeared before SFT gradient accumulation")
+        })?;
         ts.consecutive_nan_count = 0;
 
         Self::accumulate_gradients_inner(ts, final_gradients)?;
@@ -8757,7 +8843,14 @@ impl Qwen35Inner {
 
                 tracing::debug!(
                     "SFT: Applied AdamW update (step={})",
-                    self.training_state.as_ref().unwrap().step
+                    self.training_state
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::from_reason(
+                                "Training state disappeared after the SFT optimizer update",
+                            )
+                        })?
+                        .step
                 );
             } else {
                 let lr = learning_rate / grad_acc_steps as f64;
@@ -8790,7 +8883,9 @@ impl Qwen35Inner {
                 tracing::debug!("SFT: Applied SGD gradients with lr: {}", lr);
             }
 
-            let ts = self.training_state.as_mut().unwrap();
+            let ts = self.training_state.as_mut().ok_or_else(|| {
+                Error::from_reason("Training state disappeared while finalizing the SFT update")
+            })?;
             ts.accumulated_gradients = None;
             ts.micro_step = 0;
             ts.step += 1;
@@ -8812,7 +8907,9 @@ impl Qwen35Inner {
         // CRITICAL: heavy_cleanup after autograd to clear compiled graph cache
         heavy_cleanup();
 
-        let ts = self.training_state.as_ref().unwrap();
+        let ts = self.training_state.as_ref().ok_or_else(|| {
+            Error::from_reason("Training state disappeared before SFT metrics were returned")
+        })?;
         Ok(crate::training_model::TrainStepPlainMetrics {
             loss: loss_value,
             gradients_applied,
@@ -9424,7 +9521,7 @@ impl PagedBackend for Qwen35Inner {
         Ok(logits)
     }
 
-    fn begin_paged_decode(&mut self, _setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
+    fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
         // Pure-Rust eager paged decode: the stepper drives
         // `run_paged_decode_step` against the live post-prefill adapter pools +
         // GDN caches. No compiled-graph seeding / lifecycle locks needed.
@@ -11069,7 +11166,7 @@ impl Qwen3_5Model {
             && Qwen35SchedulerState::continuous_batching_enabled()
             && !Qwen35SchedulerState::force_serial()
         {
-            scheduler_max_num_seqs() as u32
+            crate::engine::hybrid_scheduler::scheduler_max_num_seqs() as u32
         } else {
             1
         }
@@ -11264,24 +11361,22 @@ impl Qwen3_5Model {
     /// the desync flag on flat MTP. Serialized behind the model thread, so it
     /// observes the fully-finalized preceding turn.
     #[doc(hidden)]
-    pub async fn mtp_flat_state_for_test(&self) -> (usize, bool, u64, usize) {
+    pub async fn mtp_flat_state_for_test(&self) -> Result<(usize, bool, u64, usize)> {
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::MtpFlatStateForTest {
             reply,
         })
         .await
-        .expect("mtp_flat_state_for_test: model thread reply failed")
     }
 
     /// Test-only: arm the flat-MTP desync heal so the NEXT delta turn takes the
     /// discard+re-prefill path. Lets a test exercise the heal deterministically
     /// (the mid-cycle cancel that naturally arms it is host-timing-dependent).
     #[doc(hidden)]
-    pub async fn force_flat_mtp_desync_for_test(&self) {
+    pub async fn force_flat_mtp_desync_for_test(&self) -> Result<()> {
         crate::model_thread::send_and_await(&self.thread, |reply| {
             Qwen35Cmd::ForceFlatMtpDesyncForTest { reply }
         })
         .await
-        .expect("force_flat_mtp_desync_for_test: model thread reply failed")
     }
 
     /// Get the number of parameters in the model.
@@ -12044,7 +12139,9 @@ pub(crate) fn inject_image_placeholders(
                         new_tokens.extend(std::iter::repeat_n(IMAGE_TOKEN_ID as u32, count));
                     }
                     None => {
-                        unreachable!("placeholder count was validated before expansion");
+                        return Err(Error::from_reason(
+                            "image placeholder expansion exhausted its validated image counts",
+                        ));
                     }
                 }
             } else {
@@ -12102,14 +12199,12 @@ pub(crate) fn get_rope_index(
     let seq_len = shape[1];
 
     // If no images, use simple sequential positions
-    if image_grid_thw.is_none() {
+    let Some(grid_thw) = image_grid_thw else {
         let pos = MxArray::arange(0.0, seq_len as f64, Some(1.0), None)?;
         let pos = pos.reshape(&[1, 1, seq_len])?;
         let position_ids = MxArray::tile(&pos, &[3, batch_size as i32, 1])?;
         return Ok((position_ids, 0));
-    }
-
-    let grid_thw = image_grid_thw.unwrap();
+    };
     let input_ids_data = input_ids.to_int32()?;
     grid_thw.eval();
     let grid_data = grid_thw.to_int32()?;
@@ -12260,8 +12355,11 @@ pub(crate) fn get_rope_index(
         // End of the last image token in the token stream — everything
         // beyond is trailing text. For case (a) this is the last run's
         // end; for case (b) it's the shared run's end. In both cases
-        // it equals `image_runs.last().unwrap().1`.
-        let last_image_end = image_runs.last().expect("at least one run").1;
+        // it equals the end of the validated non-empty `image_runs` list.
+        let last_image_end = image_runs
+            .last()
+            .ok_or_else(|| Error::from_reason("image run validation lost its non-empty run"))?
+            .1;
 
         // Emit positions by walking the sequence: text gap, image,
         // text gap, image, … final text gap. `current_pos` carries the
@@ -13810,75 +13908,6 @@ mod rope_index_tests {
         // image 1 base=3, max_axis = max(0,3,3) = 3 → current_pos = 7
         // Trailing TEXT_B at 7.
         assert_eq!(*t.last().unwrap(), 7);
-    }
-}
-
-#[cfg(test)]
-mod prefix_cache_reuse_integration_tests {
-    //! End-to-end tests for the prefix KV cache reuse refactor on
-    //! Qwen3.5 Dense. These verify that `chat_session_start_sync` no
-    //! longer unconditionally wipes the cache — stateless agent clients
-    //! (Aider, Codex CLI, pi-mono, etc.) that resend the full transcript
-    //! on every turn should hit the `verify_cache_prefix_direct`
-    //! exact-append path and pay only the delta prefill cost.
-    //!
-    //! These tests are `#[ignore]`-marked because they require loading a
-    //! real Qwen3.5 model file and a tokenizer. Run them with:
-    //!
-    //!     cargo test -p mlx-core --test '*' -- --ignored prefix_cache_reuse_integration
-    //!
-    //! with `MLX_NODE_QWEN35_MODEL_DIR` set to a local Qwen3.5 dir
-    //! (e.g. `~/models/Qwen3.5-0.8B`).
-    //!
-    //! The test bodies are intentionally skeletal — they document what
-    //! needs to hold rather than wiring up the full model-loading
-    //! boilerplate. Flesh them out alongside the end-to-end harness in
-    //! `serve.ts`.
-
-    /// Append hit: two back-to-back session-start calls where the second's
-    /// token sequence is `first_tokens + extra_tokens`. The result of the
-    /// second call must report `cached_tokens > 0` and a prefill that
-    /// counts only the delta tokens.
-    #[ignore = "requires a real Qwen3.5 Dense model directory; run with --ignored"]
-    #[test]
-    fn append_hit_reuses_cached_prefix() {
-        // Pseudocode for the real test body:
-        //
-        //   let mut model = Qwen35Model::load(env!("MLX_NODE_QWEN35_MODEL_DIR"))?;
-        //   let turn1 = vec![ChatMessage::user("What is 2+2?")];
-        //   let r1 = model.chat_session_start_sync(turn1, cfg())?;
-        //   assert_eq!(r1.cached_tokens, 0);
-        //
-        //   let turn2 = vec![
-        //       ChatMessage::user("What is 2+2?"),
-        //       ChatMessage::assistant(&r1.text),
-        //       ChatMessage::user("And 3+3?"),
-        //   ];
-        //   let r2 = model.chat_session_start_sync(turn2, cfg())?;
-        //   assert!(r2.cached_tokens > 0);
-        //   assert!(r2.performance.as_ref().unwrap().prefill_tokens
-        //             < turn2_token_count);  // only the delta was prefilled
-    }
-
-    /// Divergence miss: two calls with totally different histories. The
-    /// result of the second call must report `cached_tokens == 0` and a
-    /// full-history prefill.
-    #[ignore = "requires a real Qwen3.5 Dense model directory; run with --ignored"]
-    #[test]
-    fn divergence_miss_resets_and_full_prefills() {
-        // Pseudocode:
-        //
-        //   let r1 = model.chat_session_start_sync(
-        //       vec![ChatMessage::user("Hello")],
-        //       cfg(),
-        //   )?;
-        //   let r2 = model.chat_session_start_sync(
-        //       vec![ChatMessage::user("Goodbye")],
-        //       cfg(),
-        //   )?;
-        //   assert_eq!(r2.cached_tokens, 0);
-        //   // And the second call must have done a full prefill, not
-        //   // attempted to decode from stale caches.
     }
 }
 

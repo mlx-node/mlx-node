@@ -492,8 +492,8 @@ pub(crate) fn decode_caches(
         let Some(Qwen3_5LayerCache::Linear(arrays)) = caches.get_mut(layer_idx) else {
             return Ok(None);
         };
-        arrays.set(0, conv);
-        arrays.set(1, rec);
+        arrays.set(0, conv)?;
+        arrays.set(1, rec)?;
     }
     Ok(Some(caches))
 }
@@ -612,8 +612,12 @@ mod tests {
                 }
             };
             if let Some(Qwen3_5LayerCache::Linear(arrays)) = caches.get_mut(layer) {
-                arrays.set(0, make(conv_elems, ordinal as u16 * 2, &conv_shape));
-                arrays.set(1, make(rec_elems, ordinal as u16 * 2 + 1, &rec_shape));
+                arrays
+                    .set(0, make(conv_elems, ordinal as u16 * 2, &conv_shape))
+                    .expect("test cache slot 0");
+                arrays
+                    .set(1, make(rec_elems, ordinal as u16 * 2 + 1, &rec_shape))
+                    .expect("test cache slot 1");
             }
         }
         caches

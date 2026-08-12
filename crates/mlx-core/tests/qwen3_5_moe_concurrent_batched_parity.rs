@@ -1,20 +1,24 @@
-//! Scheduler-driven Qwen3.5 hybrid-state lifecycle gate.
+//! Real-checkpoint Qwen3.5 MoE continuous-batching parity gate.
 //!
-//! Run with a dense Qwen3.5 checkpoint. Installed vision/MTP weights are
-//! allowed because every request explicitly uses text-only plain AR:
-//! `QWEN35_STAGE2_MODEL_PATH=/abs/qwen3.5-text cargo test -p mlx-core --test qwen3_5_concurrent_batched_parity -- --ignored --nocapture`
+//! Every request is text-only plain autoregressive decode. MTP-capable and
+//! vision-capable checkpoints are therefore valid fixtures, but the test
+//! explicitly disables MTP so those ordered-barrier paths cannot mask the
+//! scheduled lane.
+//!
+//! `QWEN35_MOE_STAGE2_MODEL_PATH=/abs/qwen3.5-moe cargo test -p mlx-core \
+//!   --test qwen3_5_moe_concurrent_batched_parity -- --ignored --nocapture`
 
 use std::path::PathBuf;
 
 use futures::future::join_all;
 use mlx_core::engine::types::{ChatConfig, ChatResult};
-use mlx_core::models::qwen3_5::persistence::load_with_thread;
+use mlx_core::models::qwen3_5_moe::persistence::load_with_thread;
 use mlx_core::tokenizer::ChatMessage;
 
 fn model_path() -> Option<PathBuf> {
-    let path = std::env::var_os("QWEN35_STAGE2_MODEL_PATH")?;
+    let path = std::env::var_os("QWEN35_MOE_STAGE2_MODEL_PATH")?;
     let path = PathBuf::from(path);
-    assert!(path.exists(), "QWEN35_STAGE2_MODEL_PATH does not exist");
+    assert!(path.exists(), "QWEN35_MOE_STAGE2_MODEL_PATH does not exist");
     Some(path)
 }
 
@@ -64,20 +68,24 @@ fn assert_same(expected: &ChatResult, actual: &ChatResult, label: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs QWEN35_STAGE2_MODEL_PATH pointing to a dense Qwen3.5 checkpoint"]
+#[ignore = "needs QWEN35_MOE_STAGE2_MODEL_PATH pointing to a Qwen3.5 MoE checkpoint"]
 async fn asymmetric_finish_and_cross_owner_warm_wave_match_serial() {
     let Some(path) = model_path() else {
-        eprintln!("skipping: QWEN35_STAGE2_MODEL_PATH unset");
+        eprintln!("skipping: QWEN35_MOE_STAGE2_MODEL_PATH unset");
         return;
     };
-    // Process-local ignored gate: set before the model thread and OnceLock are
-    // created. No sibling test runs in this binary.
+
+    // This ignored gate is the only test in its binary, so setting these
+    // process-local controls before model-thread creation is deterministic.
     unsafe { std::env::set_var("MLX_CONTINUOUS_BATCHING", "1") };
     unsafe { std::env::set_var("MLX_SERVE_FORCE_SERIAL", "1") };
     let model = load_with_thread(&path.to_string_lossy())
         .await
-        .expect("load qwen3.5");
-    assert!(model.has_block_paged_cache(), "gate requires paged Qwen3.5");
+        .expect("load Qwen3.5 MoE");
+    assert!(
+        model.has_block_paged_cache(),
+        "gate requires block-paged Qwen3.5 MoE"
+    );
 
     let cases = [
         ("Explain briefly why the sky appears blue.", 7),
@@ -103,6 +111,35 @@ async fn asymmetric_finish_and_cross_owner_warm_wave_match_serial() {
         model.max_concurrent_sequences() >= 2,
         "opted-in checkpoint must advertise the scheduled lane"
     );
+    let scheduled_solo = model
+        .chat_session_start(
+            vec![user_message(cases[0].0)],
+            Some(config("scheduled-solo", cases[0].1)),
+        )
+        .await
+        .expect("scheduled one-row oracle");
+    assert_same(&serial[0], &scheduled_solo, "scheduled one-row oracle");
+    model
+        .reset_caches()
+        .await
+        .expect("reset scheduled one-row oracle");
+    let scheduled_solo_second = model
+        .chat_session_start(
+            vec![user_message(cases[1].0)],
+            Some(config("scheduled-solo-second", cases[1].1)),
+        )
+        .await
+        .expect("scheduled second one-row oracle");
+    assert_same(
+        &serial[1],
+        &scheduled_solo_second,
+        "scheduled second one-row oracle",
+    );
+    model
+        .reset_caches()
+        .await
+        .expect("reset scheduled second one-row oracle");
+
     let batched = join_all(
         cases[..2]
             .iter()
@@ -115,13 +152,17 @@ async fn asymmetric_finish_and_cross_owner_warm_wave_match_serial() {
             }),
     )
     .await;
-    for ((expected, actual), (prompt, _)) in serial.iter().zip(batched).zip(&cases[..2]) {
-        assert_same(expected, &actual.expect("asymmetric batched turn"), prompt);
+    let batched = batched
+        .into_iter()
+        .map(|result| result.expect("asymmetric batched turn"))
+        .collect::<Vec<_>>();
+    for ((expected, actual), (prompt, _)) in serial.iter().zip(&batched).zip(&cases[..2]) {
+        assert_same(expected, actual, prompt);
     }
 
-    // Both completed rows are now legal warm residents. A third owner creates
-    // a sequential one-row wave while one old warm row remains in the table.
-    // The decode must select its own row instead of demanding table_len == 1.
+    // Both completed rows are legal warm residents. A third owner forces a
+    // one-row wave while another warm row still exists, catching accidental
+    // table-wide recurrent-state selection.
     let third = model
         .chat_session_start(
             vec![user_message(cases[2].0)],
@@ -134,7 +175,7 @@ async fn asymmetric_finish_and_cross_owner_warm_wave_match_serial() {
     let stats = model.scheduler_stats().await.expect("scheduler stats");
     assert!(
         stats.max_batch_occupancy >= 2,
-        "expected a genuine N=2 hybrid decode, got {}",
+        "expected a genuine N=2 sparse-MoE decode, got {}",
         stats.max_batch_occupancy
     );
 }

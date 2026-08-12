@@ -33,7 +33,7 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttentionType, MLPType};
-use super::model::{Qwen3_5MoeModel, Qwen35MoeInner, handle_qwen35_moe_cmd};
+use super::model::{Qwen3_5MoeModel, Qwen35MoeInner, Qwen35MoeSchedulerState};
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
     MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, QuantizedSwitchLinear,
@@ -1456,7 +1456,7 @@ fn pin_sym8_to_flat_kv_cache(
 pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
     let model_path = model_path.to_string();
 
-    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
         move || {
             let path = Path::new(&model_path);
 
@@ -1687,6 +1687,12 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
 
                     // Create inner model
                     let mut inner = Qwen35MoeInner::new(config.clone())?;
+                    inner.row_exact_decode_projections =
+                        has_kquant_mode(top_level_mode, &per_layer_quant)
+                            || top_level_mode == Some(PerLayerMode::Affine)
+                            || per_layer_quant
+                                .values()
+                                .any(|quant| quant.mode == PerLayerMode::Affine);
                     inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(
                         path,
                     ));
@@ -1832,7 +1838,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
             );
 
             Ok((
-                inner,
+                Qwen35MoeSchedulerState::new(inner)?,
                 (
                     config_out,
                     model_id,
@@ -1848,7 +1854,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                 ),
             ))
         },
-        handle_qwen35_moe_cmd,
+        |state, receiver| state.drive(receiver),
     );
 
     let (

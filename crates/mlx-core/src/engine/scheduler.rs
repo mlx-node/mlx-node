@@ -138,26 +138,36 @@ pub(crate) fn install_preemption_replay<P>(
 }
 
 impl<P> TurnState<P> {
-    pub fn new(
+    pub fn try_new_recover_payload(
         seq_id: SeqId,
         token_history: Vec<u32>,
         num_computed_tokens: u32,
         pinned_prefill_breaks: Vec<u32>,
         cancelled: Option<Arc<AtomicBool>>,
         payload: P,
-    ) -> Result<Self, String> {
-        let prompt_tokens = u32::try_from(token_history.len())
-            .map_err(|_| "token history length exceeds u32::MAX".to_string())?;
+    ) -> Result<Self, (String, P)> {
+        let prompt_tokens = match u32::try_from(token_history.len()) {
+            Ok(prompt_tokens) => prompt_tokens,
+            Err(_) => {
+                return Err(("token history length exceeds u32::MAX".to_string(), payload));
+            }
+        };
         if num_computed_tokens > prompt_tokens {
-            return Err(format!(
-                "request {seq_id}: computed tokens {num_computed_tokens} exceed prompt tokens {prompt_tokens}"
+            return Err((
+                format!(
+                    "request {seq_id}: computed tokens {num_computed_tokens} exceed prompt tokens {prompt_tokens}"
+                ),
+                payload,
             ));
         }
         let mut prior = 0;
         for &boundary in &pinned_prefill_breaks {
             if boundary <= prior || boundary > prompt_tokens {
-                return Err(format!(
-                    "request {seq_id}: invalid pinned prefill boundary {boundary} after {prior} for prompt length {prompt_tokens}"
+                return Err((
+                    format!(
+                        "request {seq_id}: invalid pinned prefill boundary {boundary} after {prior} for prompt length {prompt_tokens}"
+                    ),
+                    payload,
                 ));
             }
             prior = boundary;
@@ -182,6 +192,26 @@ impl<P> TurnState<P> {
             payload,
             arrival_order: 0,
         })
+    }
+
+    #[cfg(test)]
+    pub fn new(
+        seq_id: SeqId,
+        token_history: Vec<u32>,
+        num_computed_tokens: u32,
+        pinned_prefill_breaks: Vec<u32>,
+        cancelled: Option<Arc<AtomicBool>>,
+        payload: P,
+    ) -> Result<Self, String> {
+        Self::try_new_recover_payload(
+            seq_id,
+            token_history,
+            num_computed_tokens,
+            pinned_prefill_breaks,
+            cancelled,
+            payload,
+        )
+        .map_err(|(error, _)| error)
     }
 
     fn snapshot_cancel(&mut self) {
@@ -246,6 +276,7 @@ pub(crate) struct BlockTelemetry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct BlockAdmission {
     pub admitted: bool,
     pub watermark_blocks: u32,
@@ -309,6 +340,7 @@ pub(crate) fn memory_admission_decision(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn block_admission_decision(
     telemetry: BlockTelemetry,
     existing_unallocated: u32,
@@ -564,7 +596,6 @@ impl SchedulerStats {
 #[derive(Debug)]
 pub(crate) enum SchedulerError<E> {
     Executor(E),
-    #[allow(dead_code)] // retained in the Debug payload surfaced by model-driver panics
     InvalidResult(String),
 }
 
@@ -573,7 +604,7 @@ pub(crate) enum SchedulerAction<P, Exclusive, Barrier> {
     Exclusive(Exclusive),
     Barrier(Barrier),
     Stepped {
-        #[cfg_attr(not(test), allow(dead_code))]
+        #[cfg(test)]
         plan: StepPlan,
         completed: Vec<TurnState<P>>,
         preempted: Option<TurnState<P>>,
@@ -626,14 +657,26 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         order
     }
 
-    pub fn enqueue_turn(&mut self, mut turn: TurnState<P>) -> Result<(), String> {
+    #[cfg(test)]
+    pub fn enqueue_turn(&mut self, turn: TurnState<P>) -> Result<(), String> {
+        self.try_enqueue_turn(turn)
+            .map_err(|error_and_turn| error_and_turn.0)
+    }
+
+    pub fn try_enqueue_turn(
+        &mut self,
+        mut turn: TurnState<P>,
+    ) -> Result<(), Box<(String, TurnState<P>)>> {
         if self
             .waiting
             .iter()
             .chain(self.running.iter())
             .any(|existing| existing.seq_id == turn.seq_id)
         {
-            return Err(format!("duplicate scheduler sequence {}", turn.seq_id));
+            return Err(Box::new((
+                format!("duplicate scheduler sequence {}", turn.seq_id),
+                turn,
+            )));
         }
         turn.status = TurnStatus::Waiting;
         turn.arrival_order = self.take_order();
@@ -707,27 +750,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             })
     }
 
-    pub fn observe_blocks(
-        &mut self,
-        telemetry: BlockTelemetry,
-        watermark_fraction: f64,
-    ) -> BlockAdmission {
-        let decision = block_admission_decision(
-            telemetry,
-            self.unallocated_reserved_blocks(),
-            0,
-            self.has_live_turns(),
-            watermark_fraction,
-        );
-        self.stats.block_capacity = telemetry.total_blocks;
-        self.stats.free_blocks = telemetry.free_blocks;
-        self.stats.reclaimable_blocks = telemetry.reclaimable_blocks;
-        self.stats.allocated_blocks = telemetry.allocated_blocks;
-        self.stats.watermark_blocks = decision.watermark_blocks;
-        self.stats.reserved_blocks = decision.reserved_blocks;
-        decision
-    }
-
+    #[cfg(test)]
     pub fn try_reserve_blocks(
         &mut self,
         telemetry: BlockTelemetry,
@@ -779,10 +802,69 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         self.stats.memory_watermark_bytes = decision.watermark_bytes;
         self.stats.reserved_block_bytes = decision.reserved_block_bytes;
         self.stats.reserved_state_bytes = decision.reserved_state_bytes;
+        if bytes_per_block > 0 {
+            let blocks =
+                |bytes: u64| bytes.div_euclid(bytes_per_block).min(u64::from(u32::MAX)) as u32;
+            self.stats.block_capacity = blocks(telemetry.capacity_bytes);
+            self.stats.free_blocks = blocks(telemetry.free_bytes);
+            self.stats.reclaimable_blocks = blocks(telemetry.reclaimable_bytes);
+            self.stats.allocated_blocks = self
+                .stats
+                .block_capacity
+                .saturating_sub(self.stats.free_blocks);
+            self.stats.watermark_blocks = decision
+                .watermark_bytes
+                .div_ceil(bytes_per_block)
+                .min(u64::from(u32::MAX)) as u32;
+            self.stats.reserved_blocks = blocks(decision.reserved_block_bytes);
+        }
         if !decision.admitted {
             self.stats.admission_deferred_state =
                 self.stats.admission_deferred_state.saturating_add(1);
         }
+        decision
+    }
+
+    pub fn observe_hybrid_memory(
+        &mut self,
+        blocks: BlockTelemetry,
+        bytes_per_block: u64,
+        resident_state_bytes: u64,
+        watermark_fraction: f64,
+    ) -> MemoryAdmission {
+        let telemetry = MemoryTelemetry {
+            capacity_bytes: u64::from(blocks.total_blocks).saturating_mul(bytes_per_block),
+            free_bytes: u64::from(blocks.free_blocks).saturating_mul(bytes_per_block),
+            reclaimable_bytes: u64::from(blocks.reclaimable_blocks).saturating_mul(bytes_per_block),
+        };
+        let decision = memory_admission_decision(
+            telemetry,
+            self.unallocated_reserved_blocks(),
+            0,
+            bytes_per_block,
+            self.reserved_recurrent_state_bytes()
+                .max(resident_state_bytes),
+            0,
+            self.has_live_turns(),
+            watermark_fraction,
+        );
+        self.stats.block_capacity = blocks.total_blocks;
+        self.stats.free_blocks = blocks.free_blocks;
+        self.stats.reclaimable_blocks = blocks.reclaimable_blocks;
+        self.stats.allocated_blocks = blocks.allocated_blocks;
+        self.stats.watermark_blocks = if bytes_per_block == 0 {
+            0
+        } else {
+            decision
+                .watermark_bytes
+                .div_ceil(bytes_per_block)
+                .min(u64::from(u32::MAX)) as u32
+        };
+        self.stats.reserved_blocks = self.unallocated_reserved_blocks();
+        self.stats.memory_capacity_bytes = telemetry.capacity_bytes;
+        self.stats.memory_watermark_bytes = decision.watermark_bytes;
+        self.stats.reserved_block_bytes = decision.reserved_block_bytes;
+        self.stats.reserved_state_bytes = decision.reserved_state_bytes;
         decision
     }
 
@@ -927,7 +1009,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         Some(turn)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn running(&self) -> &[TurnState<P>] {
         &self.running
     }
@@ -936,7 +1018,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         &self.stats
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn maintenance_due(&self, cadence: u64) -> bool {
         cadence != 0 && self.global_step != 0 && self.global_step.is_multiple_of(cadence)
     }
@@ -976,7 +1058,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             .map(|item| SchedulerAction::Barrier(item.value))
     }
 
-    fn admit_waiting(&mut self) {
+    fn admit_waiting(&mut self) -> Result<(), String> {
         let control_order = self.earliest_control_order();
         // A preempted row keeps its original FCFS position while the model
         // rebuilds or restores its cache. Later arrivals may not leapfrog it:
@@ -997,14 +1079,17 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             let Some(candidate) = candidate else {
                 break;
             };
-            let mut turn = self
-                .waiting
-                .remove(candidate)
-                .expect("candidate checked above");
+            let mut turn = self.waiting.remove(candidate).ok_or_else(|| {
+                format!(
+                    "scheduler admission selected missing waiting index {candidate} (len={})",
+                    self.waiting.len()
+                )
+            })?;
             turn.status = TurnStatus::Running;
             self.running.push(turn);
             self.stats.admitted = self.stats.admitted.saturating_add(1);
         }
+        Ok(())
     }
 
     fn build_plan(&mut self) -> StepPlan {
@@ -1072,7 +1157,8 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         if let Some(action) = self.pop_control_if_due() {
             return Ok(action);
         }
-        self.admit_waiting();
+        self.admit_waiting()
+            .map_err(SchedulerError::InvalidResult)?;
         if self.running.is_empty() {
             return Ok(SchedulerAction::Idle);
         }
@@ -1152,6 +1238,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         }
         self.running = retained;
         Ok(SchedulerAction::Stepped {
+            #[cfg(test)]
             plan,
             completed,
             preempted,
@@ -1944,6 +2031,58 @@ mod tests {
         assert!(decision.admitted);
         assert_eq!(decision.reserved_state_bytes, 670 * MIB);
         assert_eq!(scheduler.stats().reserved_state_bytes, 670 * MIB);
+    }
+
+    #[test]
+    fn unified_memory_admission_preserves_block_telemetry() {
+        let telemetry = MemoryTelemetry {
+            capacity_bytes: 100 * 4096,
+            free_bytes: 70 * 4096,
+            reclaimable_bytes: 5 * 4096,
+        };
+        let mut scheduler = Scheduler::<(), (), ()>::new(2, 2).expect("scheduler");
+        let decision = scheduler.try_reserve_memory(telemetry, 3, 4096, 0, 0, 0.05);
+
+        assert!(decision.admitted);
+        assert_eq!(scheduler.stats().block_capacity, 100);
+        assert_eq!(scheduler.stats().free_blocks, 70);
+        assert_eq!(scheduler.stats().reclaimable_blocks, 5);
+        assert_eq!(scheduler.stats().allocated_blocks, 30);
+        assert_eq!(scheduler.stats().watermark_blocks, 0);
+        assert_eq!(scheduler.stats().reserved_blocks, 3);
+    }
+
+    #[test]
+    fn hybrid_observation_replaces_stale_candidate_reservation() {
+        let blocks = BlockTelemetry {
+            total_blocks: 100,
+            free_blocks: 70,
+            reclaimable_blocks: 5,
+            allocated_blocks: 30,
+        };
+        let mut scheduler = Scheduler::<(), (), ()>::new(2, 2).expect("scheduler");
+        assert!(
+            scheduler
+                .try_reserve_memory(
+                    MemoryTelemetry {
+                        capacity_bytes: 100 * 4096,
+                        free_bytes: 70 * 4096,
+                        reclaimable_bytes: 5 * 4096,
+                    },
+                    3,
+                    4096,
+                    0,
+                    0,
+                    0.05,
+                )
+                .admitted
+        );
+        assert_eq!(scheduler.stats().reserved_blocks, 3);
+
+        let observed = scheduler.observe_hybrid_memory(blocks, 4096, 0, 0.05);
+        assert!(observed.admitted);
+        assert_eq!(scheduler.stats().reserved_blocks, 0);
+        assert_eq!(scheduler.stats().allocated_blocks, 30);
     }
 
     #[test]

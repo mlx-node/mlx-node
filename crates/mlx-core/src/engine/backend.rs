@@ -472,32 +472,6 @@ pub(crate) struct TurnSetup<'a> {
     pub total_seq_len: usize,
 }
 
-/// Turn-constant inputs for [`PagedBackend::begin_paged_decode`].
-///
-/// The paged analog of [`TurnSetup`]. The paged decode stepper reaches
-/// its per-token logical-position cursor source through `&mut self`; the
-/// effective cached-prefix / suffix lengths come from
-/// [`PagedBackend::PrefixState`], NOT from here.
-///
-/// `#[allow(dead_code)]`: the paged `PagedBackend` impls are pure-eager
-/// and ignore every field — their decode cursor comes from the adapter.
-/// The fields are kept so the trait surface can carry turn-constant
-/// inputs without an ABI change if a future paged family needs them.
-#[allow(dead_code)]
-pub(crate) struct PagedTurnSetup<'a> {
-    /// The turn's resolved [`ChatParams`] — `params.max_new_tokens` is
-    /// the decode budget (the paged path grows blocks lazily via
-    /// per-token `record_tokens`, so this is informational).
-    pub params: &'a ChatParams,
-    /// Session-delta continuation flag (ignored by the eager paged
-    /// families; their cursor comes from the adapter).
-    pub is_delta: bool,
-    /// Effective cached-prefix length the prefix prime resolved (block-
-    /// granular). The eager paged families ignore it — their decode
-    /// cursor comes from `adapter.current_token_count()`.
-    pub cached_prefix_len: usize,
-}
-
 /// Effective prefix/suffix split a [`PagedBackend::prime_prefix_state`]
 /// resolved for one turn.
 ///
@@ -1231,12 +1205,11 @@ pub(crate) trait PagedBackend: ChatBackend {
     ) -> Result<MxArray>;
 
     /// Build the per-step paged decode stepper (the analog of
-    /// [`ChatBackend::begin_decode`]). Captures the turn constants into
-    /// the returned stepper (qwen3: `num_layers` + its dummy positions
-    /// array; gemma4 adds a diagnostic step counter; the rest just wrap
-    /// `self`), which then drives
+    /// [`ChatBackend::begin_decode`]). The returned stepper derives its
+    /// logical cursor from the live adapter (qwen3 also creates a dummy
+    /// positions array; gemma4 adds a diagnostic step counter), then drives
     /// [`crate::engine::decode::run_decode_loop`].
-    fn begin_paged_decode(&mut self, setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>>;
+    fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>>;
 
     /// Post-turn adapter lifecycle, run by the engine AFTER the decode
     /// scope drops the stepper and BEFORE [`Self::save_paged_history`].
@@ -1398,31 +1371,12 @@ pub(crate) trait PagedBackend: ChatBackend {
 
 /// Per-turn setup the engine hands to [`MtpBackend::begin_mtp_decode`].
 ///
-/// Paged analog of [`PagedTurnSetup`] — carries the turn constants the
-/// MTP propose/verify loop needs to construct its per-turn stepper. The
+/// MTP propose/verify turn constants used to construct its per-turn stepper. The
 /// per-cycle scratch (snapshot / GDN tape / stashed replay error) does
 /// NOT live here: it becomes STRUCT FIELDS of the concrete
 /// [`MtpStepper`], so the GDN tape never crosses the trait boundary.
 ///
-/// `depth` is the outer policy's requested draft depth (`params.mtp_depth`
-/// clamped to `[1, 5]`); the stepper still applies its own intra-cycle
-/// adaptive/EV gates on top, exactly as the per-cycle `run_mtp_cycle` does.
-///
-/// `#[allow(dead_code)]`: SCAFFOLD — the engine-owned `run_mtp_turn`
-/// constructs this and `MtpBackend::begin_mtp_decode` consumes it in a
-/// later step; nothing references it yet.
-#[allow(dead_code)]
 pub(crate) struct MtpTurnSetup<'a> {
-    /// The turn's resolved [`ChatParams`] — `params.sampling_config`
-    /// drives the per-cycle accept policy and `params.max_new_tokens` is
-    /// the decode budget.
-    pub params: &'a ChatParams,
-    /// Session-delta continuation flag (the MTP loop primes the same way
-    /// the AR path does; threaded for parity with [`PagedTurnSetup`]).
-    pub is_delta: bool,
-    /// Requested draft depth for this turn (`1..=5`), before the
-    /// stepper's intra-cycle depth gates.
-    pub depth: usize,
     /// Post-final-norm hidden state for every prefilled prompt token,
     /// `[1, prefill_len, hidden]`. `Some` only when the MTP prefill ran the
     /// hidden-emitting forward; consumed ONCE by
@@ -1464,10 +1418,6 @@ pub(crate) struct MtpTurnSetup<'a> {
 /// [`PagedBackend::PagedDecode`] / [`ChatBackend::Decode`]) and holds the
 /// per-cycle snapshot/tape/replay-error as its own fields.
 ///
-/// `#[allow(dead_code)]`: SCAFFOLD — the families implement this and the
-/// engine-owned `run_mtp_turn` drives it in a later step; no impl or
-/// caller exists yet.
-#[allow(dead_code)]
 pub(crate) trait MtpBackend: ChatBackend {
     /// Per-turn MTP propose/verify stepper. Borrows `&mut self` for the
     /// whole decode loop. The per-cycle GDN tape / linear-cache snapshot /
@@ -1519,11 +1469,6 @@ pub(crate) trait MtpBackend: ChatBackend {
 ///   * GDN tape — [`Self::verify_step`] RECORDS, [`Self::rollback`]
 ///     REPLAYS via the snapshot; the tape never leaves the stepper.
 ///
-/// `#[allow(dead_code)]`: SCAFFOLD — exercised by the
-/// `engine::mtp_turn` mock tests; the production family steppers + the
-/// engine-owned `run_mtp_turn` loop that calls these methods land in a
-/// later step.
-#[allow(dead_code)]
 pub(crate) trait MtpStepper {
     /// The model's embedding table (already resolved to the LM head when
     /// `tie_word_embeddings=false`). == the `embedding_weight` arg the
@@ -1691,28 +1636,6 @@ pub(crate) trait MtpStepper {
     fn into_desynced(self) -> bool;
 }
 
-/// Per-turn setup the engine hands to [`DsparkBackend::begin_dspark_decode`].
-///
-/// DSpark analog of [`MtpTurnSetup`] — carries the turn constants the
-/// engine-owned draft/verify loop
-/// ([`crate::engine::dspark_turn::run_dspark_turn`]) needs to construct its
-/// per-turn stepper. Per-cycle scratch (the tapped target hidden states, the
-/// draft-model KV window) lives as STRUCT FIELDS of the concrete
-/// [`DsparkStepper`], never here. Prefill-derived state (the gemma4 draft
-/// context / assistant seed hidden) travels through the family's own stash
-/// (`Gemma4Inner::draft_turn_state`), consumed by `begin_dspark_decode`.
-#[allow(dead_code)]
-pub(crate) struct DsparkTurnSetup<'a> {
-    /// The turn's resolved [`ChatParams`] — `params.sampling_config` drives
-    /// the per-cycle accept policy and `params.max_new_tokens` is the decode
-    /// budget.
-    pub params: &'a ChatParams,
-    /// Draft block size: the hard upper bound on tokens drafted per
-    /// propose/verify cycle. The engine additionally caps each cycle by
-    /// `params.mtp_depth` and by the remaining token budget minus one.
-    pub block_size: usize,
-}
-
 /// Sub-trait of [`ChatBackend`] for families whose DSpark (draft-model)
 /// speculative-decode whole-turn flows through the engine-owned
 /// propose/verify loop [`crate::engine::dspark_turn::run_dspark_turn`].
@@ -1734,10 +1657,7 @@ pub(crate) trait DsparkBackend: ChatBackend {
     /// [`MtpBackend::begin_mtp_decode`]). Captures the turn constants (draft
     /// model handle, target tap, block size) into the returned stepper,
     /// which then drives the engine-owned `run_dspark_turn` loop.
-    fn begin_dspark_decode(
-        &mut self,
-        setup: &DsparkTurnSetup<'_>,
-    ) -> Result<Self::DsparkDecode<'_>>;
+    fn begin_dspark_decode(&mut self, block_size: usize) -> Result<Self::DsparkDecode<'_>>;
 }
 
 /// One cycle's drafted block from [`DsparkStepper::propose`].

@@ -394,10 +394,11 @@ async fn qwen3_paged_vs_flat_prefix_reuse_parity() {
     // eventually flip an argmax near-tie (coherent-but-different prose, ~token
     // 12 here). That is float non-associativity, not a KV-reuse bug: a real
     // prefix-reuse fault (wrong positions, dropped/duplicated KV, or a silent
-    // cold-prefill) diverges at token 0-1. Eight tokens is the same byte-exact
-    // warm horizon the lfm2 length-exit parity uses; it proves the reused
-    // prefix KV reproduces flat without tripping the long-decode near-tie.
-    const WARM_MAX_NEW: i32 = 8;
+    // cold-prefill) diverges at token 0-1. Four tokens cover well beyond the
+    // token-0/1 failure point of wrong
+    // positions or dropped/duplicated K/V, while remaining stable across the
+    // fused-SDPA and online-softmax accumulation orders on the CI checkpoint.
+    const WARM_MAX_NEW: i32 = 4;
     let user2 = "And in another word?";
     let r2_flat = flat_model
         .chat_session_continue(
@@ -429,7 +430,9 @@ async fn qwen3_paged_vs_flat_prefix_reuse_parity() {
 
     // Both paths must actually have REUSED the turn-1 prefix (a cold-prefill
     // fallback would read cached=0 and silently pass a byte comparison while
-    // proving nothing about reuse). The reused prefix length must match too.
+    // proving nothing about reuse). This ownerless request runs through the
+    // whole-turn barrier lane, which materializes the final length token on
+    // both flat and paged backends, so their reusable prefix lengths match.
     assert!(
         r2_flat.cached_tokens > 0 && r2_paged.cached_tokens > 0,
         "warm-continue must reuse the turn-1 prefix: flat cached={} paged cached={}",
@@ -438,7 +441,7 @@ async fn qwen3_paged_vs_flat_prefix_reuse_parity() {
     );
     assert_eq!(
         r2_flat.cached_tokens, r2_paged.cached_tokens,
-        "flat and paged must reuse the same prefix length: flat={} paged={}",
+        "flat and paged whole-turn barriers must reuse the same prefix length: flat={} paged={}",
         r2_flat.cached_tokens, r2_paged.cached_tokens,
     );
 

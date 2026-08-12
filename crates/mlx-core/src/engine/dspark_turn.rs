@@ -19,7 +19,7 @@ use napi::bindgen_prelude::*;
 
 use crate::array::{DType, MxArray};
 use crate::decode_profiler::DecodeProfiler;
-use crate::engine::backend::{DsparkBackend, DsparkProposal, DsparkStepper, DsparkTurnSetup};
+use crate::engine::backend::{DsparkBackend, DsparkProposal, DsparkStepper};
 use crate::engine::decode::StreamingCtx;
 use crate::engine::params::ChatParams;
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
@@ -289,11 +289,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
     // single ungated read covers both paths byte-identically.
     let turn_cancelled = || cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed));
 
-    let setup = DsparkTurnSetup {
-        params: p,
-        block_size,
-    };
-    let mut step = backend.begin_dspark_decode(&setup)?;
+    let mut step = backend.begin_dspark_decode(block_size)?;
 
     // Materialize the prefill-sampled seed once; it is the first anchor.
     y.eval();
@@ -901,7 +897,7 @@ mod tests {
     use crate::decode_profiler::DecodeProfiler;
     use crate::engine::backend::{
         ChatBackend, ChunkSink, DefaultStreamEmitter, DsparkBackend, DsparkProposal, DsparkStepper,
-        DsparkTurnSetup, DsparkVerifyOutput, FinalizeArgs, ResetScope, SaveStateArgs, TurnSetup,
+        DsparkVerifyOutput, FinalizeArgs, ResetScope, SaveStateArgs, TurnSetup,
     };
     use crate::engine::decode::StreamingCtx;
     use crate::engine::params::ChatParams;
@@ -1323,12 +1319,9 @@ mod tests {
         where
             Self: 'a;
 
-        fn begin_dspark_decode(
-            &mut self,
-            setup: &DsparkTurnSetup<'_>,
-        ) -> Result<Self::DsparkDecode<'_>> {
+        fn begin_dspark_decode(&mut self, block_size: usize) -> Result<Self::DsparkDecode<'_>> {
             self.begin_calls.set(self.begin_calls.get() + 1);
-            self.seen_block_size.set(setup.block_size);
+            self.seen_block_size.set(block_size);
             Ok(MockDsparkStepper {
                 vocab: self.vocab,
                 cycles: self.cycles.clone(),

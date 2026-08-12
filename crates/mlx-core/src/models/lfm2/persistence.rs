@@ -1636,7 +1636,7 @@ impl Lfm2Model {
                 let config = inner.config.clone();
                 let paged_active = inner.paged_adapter.is_some();
                 Ok((
-                    super::model::Lfm2SchedulerState::new(inner),
+                    super::model::Lfm2SchedulerState::new(inner)?,
                     (
                         config,
                         cache_limit_guard,

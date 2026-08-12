@@ -10,6 +10,22 @@
 /// Oneshot sender for request–response commands.
 pub type ResponseTx<T> = tokio::sync::oneshot::Sender<napi::Result<T>>;
 
+/// Deliver the one-shot model-thread initialization result from whichever
+/// side wins the spawn lifecycle: the new thread after `Builder::spawn`
+/// succeeds, or the caller when OS thread creation itself fails.
+fn send_init_result<T>(
+    slot: &std::sync::Mutex<Option<tokio::sync::oneshot::Sender<napi::Result<T>>>>,
+    result: napi::Result<T>,
+) {
+    let mut sender = match slot.lock() {
+        Ok(sender) => sender,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(sender) = sender.take() {
+        let _ = sender.send(result);
+    }
+}
+
 /// Producer side of one request's bounded streaming mailbox.
 ///
 /// Model execution runs on a dedicated OS thread, so once the mailbox is full
@@ -66,7 +82,6 @@ pub struct ModelThread<Cmd: Send + 'static> {
 }
 
 /// Result of one scheduler-owned model-thread loop iteration.
-#[allow(dead_code)] // B4 scheduler seam; B5 wires the Qwen3 model loop.
 pub(crate) enum LoopControl {
     Continue,
     Break,
@@ -80,7 +95,6 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
     /// `blocking_recv` while idle and `try_recv` between active scheduler
     /// steps, which is the required shape for continuous batching without a
     /// polling thread or a busy wait.
-    #[allow(dead_code)] // B4 scheduler seam; B5 wires the Qwen3 model loop.
     pub(crate) fn spawn_with_scheduler<State, Init, InitResult, LoopBody>(
         init_fn: Init,
         mut loop_body: LoopBody,
@@ -97,27 +111,39 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
     {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
         let (init_tx, init_rx) = tokio::sync::oneshot::channel();
-        let handle = std::thread::Builder::new()
+        let init_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(init_tx)));
+        let thread_init_tx = std::sync::Arc::clone(&init_tx);
+        let handle = match std::thread::Builder::new()
             .name("mlx-model".into())
             .spawn(move || {
                 let mut state = match init_fn() {
                     Ok((state, init_result)) => {
-                        let _ = init_tx.send(Ok(init_result));
+                        send_init_result(&thread_init_tx, Ok(init_result));
                         state
                     }
                     Err(error) => {
-                        let _ = init_tx.send(Err(error));
+                        send_init_result(&thread_init_tx, Err(error));
                         return;
                     }
                 };
                 while matches!(loop_body(&mut state, &mut cmd_rx), LoopControl::Continue) {}
-            })
-            .expect("failed to spawn mlx-model thread");
+            }) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                send_init_result(
+                    &init_tx,
+                    Err(napi::Error::from_reason(format!(
+                        "failed to spawn mlx-model thread: {error}"
+                    ))),
+                );
+                None
+            }
+        };
 
         (
             Self {
                 cmd_tx: Some(cmd_tx),
-                _handle: Some(handle),
+                _handle: handle,
             },
             init_rx,
         )
@@ -145,17 +171,19 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
     {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
         let (init_tx, init_rx) = tokio::sync::oneshot::channel();
+        let init_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(init_tx)));
+        let thread_init_tx = std::sync::Arc::clone(&init_tx);
 
-        let handle = std::thread::Builder::new()
+        let handle = match std::thread::Builder::new()
             .name("mlx-model".into())
             .spawn(move || {
                 let mut state = match init_fn() {
                     Ok((state, init_result)) => {
-                        let _ = init_tx.send(Ok(init_result));
+                        send_init_result(&thread_init_tx, Ok(init_result));
                         state
                     }
                     Err(e) => {
-                        let _ = init_tx.send(Err(e));
+                        send_init_result(&thread_init_tx, Err(e));
                         return;
                     }
                 };
@@ -163,12 +191,22 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
                 while let Some(cmd) = cmd_rx.blocking_recv() {
                     handler(&mut state, cmd);
                 }
-            })
-            .expect("failed to spawn mlx-model thread");
+            }) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                send_init_result(
+                    &init_tx,
+                    Err(napi::Error::from_reason(format!(
+                        "failed to spawn mlx-model thread: {error}"
+                    ))),
+                );
+                None
+            }
+        };
 
         let thread = Self {
             cmd_tx: Some(cmd_tx),
-            _handle: Some(handle),
+            _handle: handle,
         };
         (thread, init_rx)
     }

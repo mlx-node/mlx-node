@@ -361,7 +361,8 @@ impl DecoderLayer {
                     }
                 };
                 let normed = self.input_layernorm.forward(x)?;
-                let attn_out = attn.forward_paged_batched(&normed, adapter, paged_idx, rows)?;
+                let attn_out =
+                    attn.forward_paged_batched(&normed, adapter, paged_idx, rows, false)?;
                 let h = x.add(&attn_out)?;
                 let normed = self.post_attention_layernorm.forward(&h)?;
                 let mlp_out = self.mlp.forward(&normed)?;

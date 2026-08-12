@@ -2877,10 +2877,17 @@ impl Gemma4Model {
                 let has_audio = inner.embed_audio.is_some();
                 let paged_active = inner.kv_cache_coordinator.is_some();
                 let max_concurrent_sequences =
-                    super::model::Gemma4SchedulerState::configured_capacity(&inner);
+                    crate::engine::hybrid_scheduler::scheduler_max_num_seqs_for(
+                        inner
+                            .kv_cache_coordinator
+                            .as_ref()
+                            .map_or(1, |coordinator| {
+                                coordinator.max_concurrent_sequences() as usize
+                            }),
+                    ) as u32;
                 let draft_active = inner.draft.is_some();
                 Ok((
-                    super::model::Gemma4SchedulerState::new(inner),
+                    super::model::Gemma4SchedulerState::new(inner)?,
                     (
                         model_id,
                         has_vision,

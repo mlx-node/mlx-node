@@ -476,28 +476,6 @@ macro_rules! chat_napi_continuation_media_guard {
     };
 }
 
-// Compile-adjacent H1a pin: changing any emitted/manual `reset_caches`
-// surface back to a synchronous return makes this helper fail to type-check.
-// The runtime event-loop oracle remains the env-gated Stage-0 e2e test.
-#[cfg(test)]
-#[allow(dead_code)]
-fn reset_cache_surfaces_return_futures(
-    qwen3: &crate::models::qwen3::Qwen3Model,
-    qwen35: &crate::models::qwen3_5::Qwen3_5Model,
-    qwen35_moe: &crate::models::qwen3_5_moe::Qwen3_5MoeModel,
-    gemma4: &crate::models::gemma4::Gemma4Model,
-    lfm2: &crate::models::lfm2::model::Lfm2Model,
-    qianfan: &crate::models::qianfan_ocr::QianfanOCRModel,
-) {
-    fn assert_future<F: std::future::Future<Output = napi::Result<()>>>(_: F) {}
-    assert_future(qwen3.reset_caches());
-    assert_future(qwen35.reset_caches());
-    assert_future(qwen35_moe.reset_caches());
-    assert_future(gemma4.reset_caches());
-    assert_future(lfm2.reset_caches());
-    assert_future(qianfan.reset_caches());
-}
-
 pub(crate) use chat_napi_continuation_media_guard;
 pub(crate) use chat_napi_image_guard;
 pub(crate) use chat_napi_surface;

@@ -69,7 +69,7 @@ impl ShortConv {
             Some(cache) => {
                 let state = cache.get(0).cloned();
                 let (output, next_state) = self.forward_with_state(x, state.as_ref())?;
-                cache.set(0, next_state);
+                cache.set(0, next_state)?;
                 Ok(output)
             }
             None => self.forward_with_state(x, None).map(|(output, _)| output),

@@ -280,7 +280,7 @@ pub(crate) fn decode_caches(
         else {
             return Ok(None);
         };
-        cache.set(0, state);
+        cache.set(0, state)?;
     }
     Ok(Some(caches))
 }
@@ -354,7 +354,8 @@ mod tests {
             caches[layer]
                 .as_conv_cache_mut()
                 .unwrap()
-                .set(0, MxArray::from_bfloat16(&raw, &[1, 2, 4]).unwrap());
+                .set(0, MxArray::from_bfloat16(&raw, &[1, 2, 4]).unwrap())
+                .unwrap();
         }
         let tensors = encode_tensors(&config, &geometry, &caches)
             .unwrap()
@@ -391,7 +392,8 @@ mod tests {
         caches[0]
             .as_conv_cache_mut()
             .unwrap()
-            .set(0, MxArray::from_float16(&[0; 8], &[1, 2, 4]).unwrap());
+            .set(0, MxArray::from_float16(&[0; 8], &[1, 2, 4]).unwrap())
+            .unwrap();
         assert!(
             encode_tensors(&config, &geometry, &caches)
                 .unwrap()

@@ -1260,7 +1260,10 @@ async fn cancel_midcycle_then_continue_mtp_keeps_session_usable() {
     );
 
     let (committed_after_turn1, desynced_after_turn1, reprefills_before, rollback_unemitted) =
-        model.mtp_flat_state_for_test().await;
+        model
+            .mtp_flat_state_for_test()
+            .await
+            .expect("read flat MTP state after turn 1");
     assert!(
         committed_after_turn1 > 0,
         "cancelled turn did not preserve any committed history"
@@ -1308,8 +1311,10 @@ async fn cancel_midcycle_then_continue_mtp_keeps_session_usable() {
         final2.finish_reason
     );
 
-    let (_, desynced_after_turn2, reprefills_after, turn2_rollback_unemitted) =
-        model.mtp_flat_state_for_test().await;
+    let (_, desynced_after_turn2, reprefills_after, turn2_rollback_unemitted) = model
+        .mtp_flat_state_for_test()
+        .await
+        .expect("read flat MTP state after turn 2");
     println!(
         "cancel: emitted={n_mtp} committed_hist={committed_after_turn1} \
          rollback_unemitted={rollback_unemitted} desynced={desynced_after_turn1} \
@@ -1402,14 +1407,23 @@ async fn desync_heal_reprefills_to_uncancelled() {
             }
         }
         let turn1_terminal = turn1_terminal.expect("turn 1 missing terminal stream chunk");
-        let (committed, desynced0, reprefills_before, _) = model.mtp_flat_state_for_test().await;
+        let (committed, desynced0, reprefills_before, _) = model
+            .mtp_flat_state_for_test()
+            .await
+            .expect("read clean flat MTP state");
         assert!(
             !desynced0,
             "a clean length-stopped turn 1 must not be desynced"
         );
         if arm_desync {
-            model.force_flat_mtp_desync_for_test().await;
-            let (_, armed, _, _) = model.mtp_flat_state_for_test().await;
+            model
+                .force_flat_mtp_desync_for_test()
+                .await
+                .expect("arm flat MTP desync");
+            let (_, armed, _, _) = model
+                .mtp_flat_state_for_test()
+                .await
+                .expect("read armed flat MTP state");
             assert!(armed, "force_flat_mtp_desync_for_test did not arm the flag");
         }
 
@@ -1437,7 +1451,10 @@ async fn desync_heal_reprefills_to_uncancelled() {
         let (chunks2, _ttft, done2) = drain_stream_turn(rx2).await;
         assert!(done2, "turn 2 didn't reach done");
         let text: String = chunks2.iter().map(|c| c.text.as_str()).collect();
-        let (_, desynced_after, reprefills_after, _) = model.mtp_flat_state_for_test().await;
+        let (_, desynced_after, reprefills_after, _) = model
+            .mtp_flat_state_for_test()
+            .await
+            .expect("read flat MTP state after heal");
         // Heal ran iff turn 2 took the discard+re-prefill path (the counter
         // incremented). The streaming chunk's `prompt_tokens`/`cached_tokens`
         // report identically for heal and warm, so the counter is the only

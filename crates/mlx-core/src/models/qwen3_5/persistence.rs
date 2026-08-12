@@ -2181,7 +2181,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 super::model::Qwen3_5ContextLimits::from_tuple(inner.paged_context_limits());
 
             Ok((
-                Qwen35SchedulerState::new(inner),
+                Qwen35SchedulerState::new(inner)?,
                 (
                     config_out,
                     model_id,

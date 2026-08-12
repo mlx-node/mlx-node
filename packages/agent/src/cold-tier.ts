@@ -49,7 +49,7 @@ import type { ModelType } from '@mlx-node/lm';
  *  - `qwen3_5_moe` keeps the SAME GDN recurrent state outside the pool — same
  *    shapes, same dtype, same layer mapping — so it shares the dense family's
  *    sidecar codec and `ColdSidecarPolicy` verbatim. Its restart-parity gate has
- *    since been run on `Qwen3.6-35b-a3b-UD-Q2_K_XL-mlx`: the restore reconciled
+ *    since been run on `Qwen3.6-35B-A3B-mxfp4-mlx`: the restore reconciled
  *    onto ladder rung 304 of `[16, 64, 304, 1248]` with `hits=42` and
  *    `corruptions=0`, and the text matched a no-persist baseline.
  *  - `lfm2` / `lfm2_moe` keep ShortConv state outside the full-attention pool.

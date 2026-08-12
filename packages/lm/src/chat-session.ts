@@ -450,10 +450,10 @@ export interface SessionCapableModel {
    *
    * `true` iff the adapter was successfully constructed at load time
    * (driven by the per-model `use_block_paged_cache` config flag, which
-   * defaults to ON for Qwen3 + LFM2 after parity verification and OFF
-   * for Gemma4 + Qwen3.5 + Qwen3.5 MoE pending parity validation; also
-   * always `false` on Qwen3.5 VLM checkpoints where
-   * `set_vision_encoder` rejects when the adapter is populated).
+   * defaults to ON for Qwen3, LFM2, Gemma4, and Qwen3.5 dense/MoE after
+   * parity validation). Qwen3.5 VLM instances expose the loaded paged
+   * text lane while media/MTP requests retain their model-specific ordered
+   * execution path.
    *
    * When `true`, the native cache reuses SYS blocks across requests via
    * content-addressing in the `BlockAllocator`'s prefix-hash table —

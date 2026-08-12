@@ -2,15 +2,6 @@
 //! path — the MTP analog of [`crate::engine::paged_turn`]. Families opt in
 //! via [`crate::engine::backend::MtpBackend`]; their
 //! `ChatBackend::run_speculative_turn` delegates to `run_mtp_turn`.
-//!
-//! SCAFFOLD STEP: the relocated `decode_loop_mtp!` outer body
-//! (`run_mtp_turn`) and the relocated `run_mtp_cycle_inner` (`run_mtp_cycle`)
-//! land in later steps. Today this module carries ONLY the
-//! [`MtpStepper`](crate::engine::backend::MtpStepper) contract's test
-//! harness — a scripted [`MockMtpStepper`] double + call-ledger unit tests
-//! that PROVE the trait + GAT lifetimes + the strictly-sequential
-//! `&mut self` borrow model compile and are usable. Nothing in production
-//! calls this module yet, so the families' MTP behavior is byte-identical.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -45,12 +36,6 @@ use crate::engine::decode::{StreamingCtx, mtp_trace_logits, trace_top2};
 /// return slice, adaptive/EV-depth orchestration) is byte-for-byte identical
 /// in logic and ORDER.
 ///
-/// DEAD CODE in this step: nothing in production drives it yet (the family
-/// steppers + the engine-owned `run_mtp_turn` loop that calls it land in a
-/// later step), so the relocated `run_mtp_cycle_inner` remains the sole
-/// production cycle and the families stay byte-identical. Exercised only by
-/// the module's mock tests.
-///
 /// Translated `ops.*` → `step.*` swap sites (the ONLY substantive change
 /// vs the original body):
 ///   * `(ops.draft_step)(a, b)` → `step.draft_step(a, b)`
@@ -65,7 +50,6 @@ use crate::engine::decode::{StreamingCtx, mtp_trace_logits, trace_top2};
 ///   * `(ops.rollback)(k, d)` → `step.rollback(k, d)`
 ///   * `(ops.restore_and_replay_main)(ids, emb)` →
 ///     `step.restore_and_replay_main(ids, emb)`
-#[allow(dead_code)]
 pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     step: &mut S,
     prev_hidden_in: MxArray,
@@ -1052,10 +1036,6 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
 /// `embedding_weight` + the per-cycle scratch live on the
 /// [`MtpStepper`] (captured at `begin_mtp_decode`), so they are NOT here.
 ///
-/// `#[allow(dead_code)]`: SCAFFOLD — nothing in production calls
-/// [`run_mtp_turn`] yet (the family steppers + the rewire land in a later
-/// step), so the relocated loop is byte-identical dead code.
-#[allow(dead_code)]
 pub(crate) struct MtpTurnArgs<'a> {
     /// First generated token (sampled from the prefill logits BEFORE the
     /// turn). The loop takes ownership; its final reassignment is not
@@ -1101,9 +1081,6 @@ pub(crate) struct MtpTurnArgs<'a> {
 /// desync-latch, and rollback-observation side channels the family code reads
 /// after the speculative loop.
 ///
-/// `#[allow(dead_code)]`: SCAFFOLD — produced only by the dead
-/// [`run_mtp_turn`] / the module's mock tests until the family rewire.
-#[allow(dead_code)]
 pub(crate) struct MtpTurnOutcome {
     /// Whether the LAST emitted token's K/V is already in the physical
     /// cache. The save uses `drop_last_always = !last_in_cache` (the
@@ -1239,7 +1216,6 @@ impl DecodeProgressTrace {
 /// reasoning-suppression gate `run_decode_loop` uses. `None` ⇒ the SYNC
 /// (non-streaming) path; both share ONE loop with a sink switch, so the
 /// sync path is byte-identical with or without the arm wired.
-#[allow(dead_code)]
 pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     backend: &mut B,
     rng: &mut R,
@@ -1289,9 +1265,6 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // macro threaded `embedding_weight` as `$emb`; the stepper now owns it and
     // exposes it via `embedding_weight()`. Read once at turn entry.
     let setup = MtpTurnSetup {
-        params: p,
-        is_delta: false,
-        depth,
         prompt_hidden: prompt_hidden.as_ref(),
         prompt_hidden_ids: prompt_hidden_ids.as_deref(),
         prompt_hidden_position_base,

@@ -25,8 +25,8 @@ use napi::bindgen_prelude::*;
 use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
-    ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkTurnSetup, DsparkVerifyOutput,
-    FinalizeArgs, ResetScope, StreamEmitter, TurnOutput, WholeTurnArgs,
+    ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput, FinalizeArgs,
+    ResetScope, StreamEmitter, TurnOutput, WholeTurnArgs,
 };
 use crate::engine::decode::StreamingCtx;
 use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
@@ -48,8 +48,7 @@ use super::model::{
 /// [`DsparkBackend::begin_dspark_decode`], one variant per
 /// [`super::model::Gemma4Draft`] variant.
 ///
-/// The engine's [`DsparkTurnSetup`] carries only turn constants, so the
-/// prefill-derived state travels through `Gemma4Inner::draft_turn_state`:
+/// The prefill-derived state travels through `Gemma4Inner::draft_turn_state`:
 /// the whole-turn core stashes it right before calling `run_dspark_turn`,
 /// and `begin_dspark_decode` TAKES it into the stepper (so it can never
 /// leak across turns — fresh state is built every turn).
@@ -527,10 +526,7 @@ impl DsparkBackend for Gemma4Inner {
     where
         Self: 'a;
 
-    fn begin_dspark_decode(
-        &mut self,
-        _setup: &DsparkTurnSetup<'_>,
-    ) -> Result<Self::DsparkDecode<'_>> {
+    fn begin_dspark_decode(&mut self, _block_size: usize) -> Result<Self::DsparkDecode<'_>> {
         let state = self.draft_turn_state.take().ok_or_else(|| {
             Error::from_reason(
                 "gemma4 draft decode: begin_dspark_decode requires a prepared draft context \
@@ -1463,15 +1459,9 @@ pub(crate) mod tests {
             .map(|d| d.num_layers())
             .expect("draft loaded");
 
-        let p = ChatBackend::resolve_params(&inner, &chat_config(None));
-        let setup = DsparkTurnSetup {
-            params: &p,
-            block_size: 3,
-        };
-
         // No stash → hard error naming the missing prefill.
         let err = inner
-            .begin_dspark_decode(&setup)
+            .begin_dspark_decode(3)
             .err()
             .expect("begin without a stash must fail");
         assert!(
@@ -1488,7 +1478,7 @@ pub(crate) mod tests {
         }));
         {
             let stepper = match inner
-                .begin_dspark_decode(&setup)
+                .begin_dspark_decode(3)
                 .expect("begin with a stash must succeed")
             {
                 Gemma4DraftStepper::Dspark(stepper) => stepper,
@@ -1525,14 +1515,9 @@ pub(crate) mod tests {
             ctx: DsparkContextCache::new(num_draft_layers),
             next_pos: 0,
         }));
-        let p = ChatBackend::resolve_params(&inner, &chat_config(None));
-        let setup = DsparkTurnSetup {
-            params: &p,
-            block_size: 3,
-        };
 
         let mut stepper = match inner
-            .begin_dspark_decode(&setup)
+            .begin_dspark_decode(3)
             .expect("prepared DSpark stepper")
         {
             Gemma4DraftStepper::Dspark(stepper) => stepper,
@@ -1638,13 +1623,8 @@ pub(crate) mod tests {
             ctx: DsparkContextCache::new(num_draft_layers),
             next_pos: 0,
         }));
-        let p = ChatBackend::resolve_params(&inner, &chat_config(None));
-        let setup = DsparkTurnSetup {
-            params: &p,
-            block_size: 3,
-        };
         let mut stepper = match inner
-            .begin_dspark_decode(&setup)
+            .begin_dspark_decode(3)
             .expect("prepared DSpark stepper")
         {
             Gemma4DraftStepper::Dspark(stepper) => stepper,

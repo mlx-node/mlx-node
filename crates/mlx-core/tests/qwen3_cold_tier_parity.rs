@@ -49,11 +49,19 @@ async fn qwen3_cold_tier_restart_parity() {
     let collected = Arc::clone(&scheduler_stats);
     harness::run_restart_parity(
         harness::ColdTierParitySpec::new("qwen3"),
-        move |model_dir, messages, config| {
+        move |model_dir, messages, mut config| {
             let collected = Arc::clone(&collected);
             async move {
                 // Loaded fresh per instance and dropped when this future
                 // completes, so instance 2 really starts from an empty hot cache.
+                // The shared scheduler admits only explicitly owned turns;
+                // anonymous native calls intentionally use the legacy
+                // exclusive lane and therefore cannot prove async SSD wait
+                // telemetry. Public ChatSession/server calls provide this
+                // stable identity automatically.
+                let owner = String::from("qwen3-cold-tier-parity");
+                config.cache_owner_id = Some(owner.clone());
+                config.cache_root_owner_id = Some(owner);
                 let model = qwen3_load_with_thread(&model_dir.to_string_lossy()).await?;
                 let result = model.chat_session_start(messages, Some(config)).await?;
                 let stats = model.scheduler_stats().await?;

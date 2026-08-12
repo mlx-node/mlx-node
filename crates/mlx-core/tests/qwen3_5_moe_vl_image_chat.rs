@@ -13,7 +13,7 @@
 //! and a determinism replay.
 //!
 //! Gated on a real Qwen3.5-VL MoE checkpoint + a test image. Run:
-//!   MLX_TEST_QWEN35MOE_VL_MODEL_PATH=.cache/models/Qwen3.6-35b-a3b-UD-Q2_K_XL-mlx \
+//!   MLX_TEST_QWEN35MOE_VL_MODEL_PATH=.cache/models/Qwen3.6-35B-A3B-mxfp4-mlx \
 //!   MLX_TEST_VLM_IMAGE_PATH=examples/ocr.png \
 //!     cargo test -p mlx-core --test qwen3_5_moe_vl_image_chat -- --ignored --nocapture
 

@@ -8,8 +8,8 @@ use std::time::Instant;
 use napi::bindgen_prelude::*;
 
 use crate::engine::backend::{
-    ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, PagedTurnSetup, StreamEmitter,
-    ThinkingSetup, TurnOutput, WholeTurnArgs,
+    ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, StreamEmitter, ThinkingSetup,
+    TurnOutput, WholeTurnArgs,
 };
 use crate::engine::decode::{DecodeLoopArgs, StreamingCtx, run_decode_loop};
 use crate::engine::finalize::compute_performance_metrics;
@@ -312,12 +312,7 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     // (this hook only needs `&self`).
     let decode_generation_stream = backend.paged_decode_stream(generation_stream);
     let decode_result: Result<()> = (|| {
-        let setup = PagedTurnSetup {
-            params: p,
-            is_delta,
-            cached_prefix_len: effective_cached_prefix_len,
-        };
-        let mut step = backend.begin_paged_decode(&setup)?;
+        let mut step = backend.begin_paged_decode()?;
         if let Some(label) = step.profiler_relabel() {
             profiler.set_label(label);
         }
@@ -446,9 +441,8 @@ mod tests {
     use crate::array::MxArray;
     use crate::decode_profiler::DecodeProfiler;
     use crate::engine::backend::{
-        ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix,
-        PagedTurnSetup, ResetScope, SaveStateArgs, ThinkingSetup, TurnOutput, TurnSetup,
-        WholeTurnArgs,
+        ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, ResetScope,
+        SaveStateArgs, ThinkingSetup, TurnOutput, TurnSetup, WholeTurnArgs,
     };
     use crate::engine::plan::{DecoderPlan, MediaCapabilities, MediaInputs, TurnPlan};
     use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
@@ -777,10 +771,7 @@ mod tests {
             MxArray::from_float32(&v, &[self.vocab])
         }
 
-        fn begin_paged_decode(
-            &mut self,
-            _setup: &PagedTurnSetup<'_>,
-        ) -> Result<Self::PagedDecode<'_>> {
+        fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
             self.ledger.push("begin_paged_decode");
             Ok(MockPagedDecode {
                 ledger: self.ledger.clone(),

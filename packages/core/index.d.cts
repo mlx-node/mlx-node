@@ -1381,6 +1381,14 @@ export declare class Qwen35MoeModel {
    */
   hasBlockPagedCache(): boolean;
   /**
+   * Native admission width for plain text autoregressive turns. MTP and
+   * multimodal turns remain ordered barriers and do not enter the batched
+   * decode lane.
+   */
+  maxConcurrentSequences(): number;
+  /** Snapshot scheduler occupancy plus unified block/recurrent admission. */
+  schedulerStats(): Promise<SchedulerStats>;
+  /**
    * Whether this checkpoint shipped an MTP head (module loaded by
    * `persistence::apply_weights_moe_inner`). Snapshotted at load time from
    * `Qwen35MoeInner::has_mtp_weights()` so the TS `ChatSession` can
@@ -4489,8 +4497,8 @@ export interface Qwen35MoeConfig {
   /**
    * Use the block-paged KV cache adapter for full-attention layers.
    *
-   * **OPT-IN — experimental.** Same semantics as the dense
-   * `Qwen3_5Config::use_block_paged_cache` field. Selects the eager
+   * Same semantics as the dense `Qwen3_5Config::use_block_paged_cache`
+   * field. Selects the eager
    * paged decode over the eager flat decode: routes full-attention
    * layers through `PagedKVCacheAdapter` (cross-request prefix reuse);
    * GDN linear-attention layers stay on `Qwen3_5LayerCache::Linear`
@@ -4504,7 +4512,8 @@ export interface Qwen35MoeConfig {
    * runtime; warm image-bearing session continues / cache-hit reuse are
    * cold-started (no warm GDN two-pass prefix).
    *
-   * Default: `None` / `false`.
+   * Default: enabled for compatible Metal checkpoints. Explicit `false`
+   * and `MLX_QWEN35_PAGED_OVERRIDE=0` retain the flat rollback path.
    */
   useBlockPagedCache?: boolean | undefined;
   /**

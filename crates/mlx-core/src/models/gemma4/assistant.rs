@@ -120,10 +120,6 @@ impl AssistantTextConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AssistantConfig {
     pub(crate) model_type: String,
-    /// Checkpoint schema surface (deserialized for completeness; the
-    /// loader gate keys on `model_type`).
-    #[allow(dead_code)]
-    pub(crate) architectures: Vec<String>,
     /// Backbone width B — the TARGET model's hidden size. The draft consumes
     /// `[token_embed, h_prev]` pairs in this width and projects back to it.
     pub(crate) backbone_hidden_size: i64,
@@ -131,11 +127,6 @@ pub(crate) struct AssistantConfig {
     /// lm_head with an ordered/centroid masked-embedding head — unsupported.
     #[serde(default)]
     pub(crate) use_ordered_embeddings: bool,
-    /// Checkpoint schema surface (the draft head is tied by construction:
-    /// `embed_tokens` IS the lm_head and is never used for input lookup).
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub(crate) tie_word_embeddings: bool,
     pub(crate) text_config: AssistantTextConfig,
 }
 

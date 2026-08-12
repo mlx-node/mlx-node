@@ -753,7 +753,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
             let tokenizer_out = Some(Arc::new(tokenizer));
 
             Ok((
-                QwenSchedulerState::new(inner),
+                QwenSchedulerState::new(inner)?,
                 (
                     config_out,
                     tokenizer_out,

@@ -83,10 +83,6 @@ pub(crate) struct DsparkRopeParameters {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct DsparkConfig {
     pub(crate) architectures: Vec<String>,
-    /// Checkpoint schema surface (deserialized for completeness; the
-    /// architecture gate keys on `architectures`).
-    #[allow(dead_code)]
-    pub(crate) model_type: String,
     pub(crate) block_size: usize,
     pub(crate) mask_token_id: i32,
     pub(crate) hidden_size: i64,
@@ -588,21 +584,18 @@ impl DsparkContextCache {
         }
     }
 
-    /// Number of cached context positions. Production appends only KEPT
-    /// rows (the stepper never needs len/reset/trim — a fresh cache is
-    /// built every turn); these accessors serve the inline tests and any
-    /// future retention policy.
-    #[allow(dead_code)]
+    /// Number of cached context positions for structural tests.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> i32 {
         self.caches.first().map_or(0, |c| c.get_offset())
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn reset(&mut self) {
         for cache in &mut self.caches {
             cache.reset();
@@ -611,7 +604,7 @@ impl DsparkContextCache {
 
     /// Keep only the first `new_len` context positions (passthrough to each
     /// layer's `KVCache::trim`).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn trim(&mut self, new_len: i32) {
         for cache in &mut self.caches {
             cache.trim(new_len);
