@@ -38,14 +38,13 @@
  *     `ChatSession`'s single-flight "concurrent send() not allowed"
  *     guard.
  *
- *   - **Instructions / prefix-state change also misses.** Each entry
- *     records the `instructions` string used to adopt it.
- *     `getOrCreate` compares the caller's `requestedInstructions`
- *     against the cached value; mismatch forces cold replay so the
- *     new prefix state is re-primed instead of silently reusing a
- *     stale warmed prompt. The OpenAI `instructions` field and the
- *     Anthropic `system` field both flow through the same parameter
- *     — the registry does not care which is which.
+ *   - **Prefix compatibility changes miss.** Each entry records its
+ *     `instructions` plus an opaque fingerprint of the cache salt used to
+ *     adopt it. `getOrCreate` compares both against the new request;
+ *     mismatch forces owner release and cold replay instead of reusing a
+ *     stale prompt or changing the security domain of one live native
+ *     request. OpenAI `instructions` and Anthropic `system` share the same
+ *     parameter; both endpoints also thread their mapped `cache_salt`.
  *
  *   - **Cache miss fallback.** On a miss (eviction, interleaved turn
  *     on a different chain, restart, lease-on-hit) the endpoint
@@ -152,12 +151,17 @@ function getNonce(): Buffer {
   return cachedNonce;
 }
 
+/** Opaque equality token for a cache salt; the caller's raw value is never retained. */
+function fingerprintCacheSalt(cacheSalt: string | null | undefined): string | null {
+  if (cacheSalt == null) return null;
+  return createHmac('sha256', getNonce()).update(cacheSalt).digest('hex').slice(0, 32);
+}
+
 /**
- * Test-only hook used by the scoping unit tests to simulate a
- * server restart: resets the module-scoped HMAC nonce (so every
- * previously stored tier-2 key misses) and clears the silent-miss
- * dedupe cache so tests can re-exercise the once-per-key diagnostic
- * path.
+ * Test-only hook used by the scoping unit tests to simulate a server
+ * restart: resets the module-scoped HMAC nonce (so every previously stored
+ * tier-2 key and cache-salt fingerprint misses) and clears the silent-miss
+ * dedupe cache so tests can re-exercise the once-per-key diagnostic path.
  *
  * **Not exported from the package's public `index.ts` surface** —
  * exporting it there would let downstream consumers nuke tier-2
@@ -406,6 +410,13 @@ interface SessionEntry {
    * otherwise let a hit silently reuse a stale warmed prompt.
    */
   instructions: string | null;
+  /**
+   * Prefix-cache security domain used when this warm session was adopted.
+   * Omission is represented as `null` (native salt 0) and must remain
+   * distinct from every explicit salt because a live native request cannot
+   * change domains.
+   */
+  cacheSaltFingerprint: string | null;
   /**
    * Stable caller-supplied key identifying the logical conversation
    * chain for warm-session reuse across stateless turns that do NOT
@@ -784,11 +795,11 @@ export class SessionRegistry {
    *
    *   1. **Tier 1 — `previousResponseId`.** The existing hot path:
    *      exact id match on a live, non-expired entry whose stored
-   *      `instructions` are byte-equal to `requestedInstructions`. On
+   *      `instructions` and cache-salt fingerprint match the request. On
    *      a match the entry is leased out (single-use: removed from the
    *      map so a concurrent second request cannot share the live
-   *      `ChatSession`). On a miss — unknown id, expired, or
-   *      instructions drift — the method falls through to a FRESH
+   *      `ChatSession`). On a miss — unknown id, expired, instructions
+   *      drift, or cache-salt drift — the method falls through to a FRESH
    *      session regardless of whether tier 2 would have hit.
    *
    *      `previousResponseId` wins unconditionally when supplied. The
@@ -808,9 +819,9 @@ export class SessionRegistry {
    *      is to key on the client-supplied `prompt_cache_key`. Scans
    *      for any live, non-expired entry whose stored
    *      `promptCacheKey` is non-null AND byte-equal to the caller's
-   *      `promptCacheKey` AND whose stored `instructions` are byte-
-   *      equal. Empty string is treated as a distinct key from
-   *      `null` — an opt-out sentinel from a client that forgot to
+   *      `promptCacheKey`, whose stored `instructions` are byte-equal,
+   *      AND whose cache-salt fingerprint matches. Empty string is treated
+   *      as a distinct key from `null` — an opt-out sentinel from a client that forgot to
    *      thread the key must NOT collide with another client that
    *      did set it to empty. On a match the entry is leased out
    *      (same single-use semantics as tier 1). On a miss, fall
@@ -830,7 +841,9 @@ export class SessionRegistry {
     previousResponseId: string | null,
     requestedInstructions: string | null,
     promptCacheKey: string | null = null,
+    requestedCacheSalt: string | null = null,
   ): SessionLookupResult {
+    const requestedCacheSaltFingerprint = fingerprintCacheSalt(requestedCacheSalt);
     // Tier 1: previousResponseId exact match.
     //
     // Every call is about to overwrite native KV state, so drop any
@@ -848,10 +861,14 @@ export class SessionRegistry {
         this.evictEntriesExcept();
         return { session: this.newSession(), hit: false };
       }
-      // Prefix-state mismatch forces cold replay so the new
-      // instructions are re-primed; without this guard, output would
-      // silently depend on cache state instead of request contents.
+      // Prefix-state mismatch forces cold replay so new instructions are
+      // re-primed; cache-salt mismatch below likewise prevents a live native
+      // request from crossing prefix-cache security domains.
       if (entry.instructions !== requestedInstructions) {
+        this.evictEntriesExcept();
+        return { session: this.newSession(), hit: false };
+      }
+      if (entry.cacheSaltFingerprint !== requestedCacheSaltFingerprint) {
         this.evictEntriesExcept();
         return { session: this.newSession(), hit: false };
       }
@@ -871,7 +888,7 @@ export class SessionRegistry {
     // invariant, so the "scan" is actually a single lookup — walk the
     // map, check the one entry if present, hit or miss. A non-null
     // scoped key on both the request and the entry plus byte-equal
-    // instructions is the match condition.
+    // instructions and cache-salt fingerprints is the match condition.
     //
     // SECURITY: raw caller-supplied keys never touch the map. They
     // are run through {@link scopePromptCacheKey}, which (a) returns
@@ -888,6 +905,7 @@ export class SessionRegistry {
         if (entry.promptCacheKey === null) continue;
         if (entry.promptCacheKey !== scopedKey) continue;
         if (entry.instructions !== requestedInstructions) continue;
+        if (entry.cacheSaltFingerprint !== requestedCacheSaltFingerprint) continue;
         // Tier-2 hit: clear and lease (same single-warm / single-use
         // semantics as tier 1).
         this.evictEntriesExcept(entry.session);
@@ -969,17 +987,18 @@ export class SessionRegistry {
    * registry's own warm slot.
    *
    * Behaviour: walk the registry's at-most-one warm entry. If it is
-   * non-expired AND its stored `instructions` are byte-equal to
-   * `requestedInstructions`, lease it out (single-use — `entries.clear()`
-   * before return, mirroring the tier-1 / tier-2 lease-on-hit
-   * semantics). Otherwise clear the map and return a fresh session.
+   * non-expired, its stored `instructions` are byte-equal to
+   * `requestedInstructions`, AND its stored cache salt equals
+   * `requestedCacheSalt`, lease it out (single-use — `entries.clear()`
+   * before return, mirroring the tier-1 / tier-2 lease-on-hit semantics).
+   * Otherwise clear the map and return a fresh session.
    *
    * Crucially, this lookup IGNORES `entry.promptCacheKey` and ignores
    * the entry's prior `previousResponseId` keying — any warm slot is
-   * fair game for `/v1/messages` reuse. The byte-equal `instructions`
-   * compare is the SOLE correctness gate: a system prompt change
-   * forces cold replay so the new prefix state is re-primed instead
-   * of silently reusing a stale warmed prompt.
+   * fair game for `/v1/messages` reuse. Byte-equal instructions and cache
+   * salt are the correctness gates: a system prompt or prefix-cache
+   * security-domain change forces cold replay instead of reusing stale state
+   * or asking the native adapter to mutate a live request's salt.
    *
    * **Adoption sentinel.** `/v1/messages` adopts back under the literal
    * sentinel id `'__msg_warm__'`. That sentinel will never appear as a
@@ -1015,19 +1034,24 @@ export class SessionRegistry {
    * `responses.ts` (around the `runSessionNonStreaming` /
    * `runSessionStreaming` branches) describes.
    */
-  getOrCreateWarmAny(requestedInstructions: string | null): SessionLookupResult {
+  getOrCreateWarmAny(
+    requestedInstructions: string | null,
+    requestedCacheSalt: string | null = null,
+  ): SessionLookupResult {
+    const requestedCacheSaltFingerprint = fingerprintCacheSalt(requestedCacheSalt);
     // Single-warm invariant: at most one entry. Walk it once, lease
-    // on a fresh + instructions-matched hit, otherwise clear and
+    // on a fresh + instructions-and-salt-matched hit, otherwise clear and
     // cold-start. The ignored fields (promptCacheKey,
     // previousResponseId-keying) are deliberate — see the docstring.
     for (const entry of this.entries.values()) {
       if (entry.expiresAt < nowSec()) continue;
       if (entry.instructions !== requestedInstructions) continue;
+      if (entry.cacheSaltFingerprint !== requestedCacheSaltFingerprint) continue;
       // Hit: clear and lease (single-use semantics, same as tiers 1/2).
       this.evictEntriesExcept(entry.session);
       return { session: entry.session, hit: true };
     }
-    // Miss (no entry, expired, or instructions drift). Clear the map
+    // Miss (no entry, expired, instructions drift, or salt drift). Clear the map
     // so a stale wrapper cannot leak into a later lookup, and return
     // a fresh session.
     this.evictEntriesExcept();
@@ -1042,6 +1066,8 @@ export class SessionRegistry {
    * `instructions` is the prefix/system state used for this turn;
    * stored on the entry and compared on the next `getOrCreate` to
    * detect prefix changes that must force a cold replay.
+   * `cacheSalt` is HMAC-fingerprinted before storage and compared alongside
+   * the prefix so the raw security-domain key is not retained.
    *
    * `promptCacheKey` is the client-supplied conversation-chain key
    * that enables the registry's tier-2 lookup for stateless agent
@@ -1057,6 +1083,7 @@ export class SessionRegistry {
     session: ChatSession<SessionCapableModel>,
     instructions: string | null,
     promptCacheKey: string | null | undefined = null,
+    cacheSalt: string | null | undefined = null,
   ): void {
     // Scope the caller-supplied key BEFORE storing so a later
     // `getOrCreate` can only resolve entries via the same opt-in +
@@ -1068,6 +1095,7 @@ export class SessionRegistry {
     this.entries.set(responseId, {
       session,
       instructions,
+      cacheSaltFingerprint: fingerprintCacheSalt(cacheSalt),
       promptCacheKey: scopePromptCacheKey(promptCacheKey ?? null),
       expiresAt: nowSec() + this.ttlSec,
     });

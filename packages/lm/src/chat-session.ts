@@ -458,7 +458,7 @@ export interface SessionCapableModel {
    * When `true`, the native cache reuses SYS blocks across requests via
    * content-addressing in the `BlockAllocator`'s prefix-hash table —
    * the JS-side warm slot in
-   * `SessionRegistry.getOrCreateWarmAny(requestedSystem)` becomes
+   * `SessionRegistry.getOrCreateWarmAny(requestedSystem, cacheSalt)` becomes
    * redundant for stateless `/v1/messages` traffic. The server
    * endpoint reads this getter to decide whether to allocate a fresh
    * `ChatSession` per request (paged-active) or to lease the warm slot

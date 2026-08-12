@@ -204,6 +204,52 @@ describe('SessionRegistry', () => {
     expect(reg.size).toBe(0);
   });
 
+  it.each([
+    ['a changed salt', 'tenant-b/high-entropy-secret'],
+    ['an omitted salt', null],
+  ])('treats %s as a tier-1 warm-session mismatch', async (_label, requestedCacheSalt) => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model });
+    const warm = new ChatSession(model);
+    await warm.send('seed owner');
+
+    reg.adopt('resp_1', warm, null, null, 'tenant-a/high-entropy-secret');
+    const got = reg.getOrCreate('resp_1', null, null, requestedCacheSalt);
+
+    expect(got.session).not.toBe(warm);
+    expect(got.hit).toBe(false);
+    expect(reg.size).toBe(0);
+    await reg.flushPendingDisposals();
+    expect(releaseOwnerSpy(model)).toHaveBeenCalledTimes(1);
+  });
+
+  it('leases a tier-1 warm session when cache salts are equal', () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model });
+    const warm = new ChatSession(model);
+
+    reg.adopt('resp_1', warm, null, null, 'tenant-a/high-entropy-secret');
+    const got = reg.getOrCreate('resp_1', null, null, 'tenant-a/high-entropy-secret');
+
+    expect(got.session).toBe(warm);
+    expect(got.hit).toBe(true);
+  });
+
+  it('treats cache salt as part of non-paged Messages warm-any compatibility', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model });
+    const warm = new ChatSession(model);
+    await warm.send('seed owner');
+
+    reg.adopt('__msg_warm__', warm, 'system', null, 'tenant-a/high-entropy-secret');
+    const got = reg.getOrCreateWarmAny('system', 'tenant-b/high-entropy-secret');
+
+    expect(got.session).not.toBe(warm);
+    expect(got.hit).toBe(false);
+    await reg.flushPendingDisposals();
+    expect(releaseOwnerSpy(model)).toHaveBeenCalledTimes(1);
+  });
+
   it('evicts entries whose TTL has expired on lookup', () => {
     const model = makeMockModel();
     const reg = new SessionRegistry({ model, ttlSec: 60 });

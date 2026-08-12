@@ -31,7 +31,7 @@
  *   * **Non-paged path** (Qwen3.5 dense + MoE — default-off pending a
  *     perf decision; the Qianfan-OCR VLM — no adapter wired). Each
  *     request looks up the warm slot via
- *     `SessionRegistry.getOrCreateWarmAny(requestedSystem)`. On a
+ *     `SessionRegistry.getOrCreateWarmAny(requestedSystem, cacheSalt)`. On a
  *     HIT we keep the underlying native KV cache alive
  *     (`resetPreservingNativeCacheForWarmReuse` wipes only JS-side
  *     session state) so the native `verify_cache_prefix_direct` can
@@ -1486,7 +1486,9 @@ export async function handleCreateMessage(
           }
 
           const pagedActive = leaseModel.hasBlockPagedCache?.() === true;
-          const lookup = pagedActive ? sessionReg.createFreshSession() : sessionReg.getOrCreateWarmAny(requestedSystem);
+          const lookup = pagedActive
+            ? sessionReg.createFreshSession()
+            : sessionReg.getOrCreateWarmAny(requestedSystem, config.cacheSalt ?? null);
           const session = lookup.session;
           await sessionReg.flushPendingDisposals();
           let sessionRetained = false;
@@ -1599,7 +1601,7 @@ export async function handleCreateMessage(
               // the session is reachable from a subsequent request.
               if (!pagedActive) {
                 if (streamResult.ok && outcome.wasCommitted() && !streamResult.suppressedToolCalls) {
-                  sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null);
+                  sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null, config.cacheSalt ?? null);
                   sessionRetained = true;
                 } else {
                   sessionReg.drop(MESSAGES_WARM_SLOT_ID);
@@ -1673,7 +1675,7 @@ export async function handleCreateMessage(
               // that paged is supposed to eliminate.
               if (!pagedActive) {
                 if (outcome.committed && !hasSuppressedToolCalls(result, body)) {
-                  sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null);
+                  sessionReg.adopt(MESSAGES_WARM_SLOT_ID, session, requestedSystem, null, config.cacheSalt ?? null);
                   sessionRetained = true;
                 } else {
                   sessionReg.drop(MESSAGES_WARM_SLOT_ID);

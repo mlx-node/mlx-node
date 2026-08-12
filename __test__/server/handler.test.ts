@@ -8042,6 +8042,90 @@ describe('createHandler', () => {
       expect(systemMsg?.content).toBe('B');
     });
 
+    it('cold-replays a warm continuation when cache_salt changes', async () => {
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'salt-a' }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'salt-b' }));
+      const chatSessionContinue = vi.fn().mockResolvedValueOnce(makeChatResult({ text: 'salt-a-warm' }));
+      const releaseCacheOwner = vi.fn().mockResolvedValue(undefined);
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue,
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
+        releaseCacheOwner,
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const record = storedRecords.get(cursor);
+            if (!record) break;
+            out.unshift(record);
+            cursor = record.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const first = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'first turn',
+        cache_salt: 'tenant-a/high-entropy-secret',
+      });
+      const firstResponse = createMockRes();
+      await handler(first, firstResponse.res);
+      await firstResponse.waitForEnd();
+      const firstBody = JSON.parse(firstResponse.getBody());
+      expect(firstBody.status).toBe('completed');
+
+      const second = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'second turn',
+        previous_response_id: firstBody.id,
+        cache_salt: 'tenant-a/high-entropy-secret',
+      });
+      const secondResponse = createMockRes();
+      await handler(second, secondResponse.res);
+      await secondResponse.waitForEnd();
+      const secondBody = JSON.parse(secondResponse.getBody());
+      expect(secondBody.status).toBe('completed');
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(chatSessionContinue).toHaveBeenCalledTimes(1);
+
+      const third = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'third turn',
+        previous_response_id: secondBody.id,
+        cache_salt: 'tenant-b/high-entropy-secret',
+      });
+      const thirdResponse = createMockRes();
+      await handler(third, thirdResponse.res);
+      await thirdResponse.waitForEnd();
+
+      expect(JSON.parse(thirdResponse.getBody()).status).toBe('completed');
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(chatSessionContinue).toHaveBeenCalledTimes(1);
+      expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
+      const secondConfig = chatSessionStart.mock.calls[1]?.[1] as { cacheSalt?: string };
+      expect(secondConfig.cacheSalt).toBe('tenant-b/high-entropy-secret');
+    });
+
     it('inherits stored instructions on cold replay when the continuation omits them (Finding 4)', async () => {
       // Invariant: the cold-replay path reads the trailing
       // stored record's `instructions` field and inherits it

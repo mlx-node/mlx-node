@@ -5150,6 +5150,7 @@ describe('handleCreateMessage', () => {
             model: 'test-model',
             messages: [{ role: 'user', content: 'A' }],
             max_tokens: 100,
+            cache_salt: 'tenant-a/high-entropy-secret',
           },
           registry,
         );
@@ -5173,6 +5174,7 @@ describe('handleCreateMessage', () => {
               { role: 'user', content: 'B' },
             ],
             max_tokens: 100,
+            cache_salt: 'tenant-a/high-entropy-secret',
           },
           registry,
         );
@@ -5199,6 +5201,7 @@ describe('handleCreateMessage', () => {
               { role: 'user', content: 'C' },
             ],
             max_tokens: 100,
+            cache_salt: 'tenant-a/high-entropy-secret',
           },
           registry,
         );
@@ -5258,6 +5261,65 @@ describe('handleCreateMessage', () => {
       } finally {
         primeHistorySpy.mockRestore();
       }
+    });
+
+    it('cold-replays the non-paged warm slot when cache_salt changes', async () => {
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'A1', cachedTokens: 0 }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'A2', cachedTokens: 0 }));
+      const resetCaches = vi.fn().mockResolvedValue(undefined);
+      const releaseCacheOwner = vi.fn().mockResolvedValue(undefined);
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionStart: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        chatStreamSessionContinue: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        chatStreamSessionContinueTool: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        resetCaches,
+        releaseCacheOwner,
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('test-model', mockModel);
+
+      const first = createMockRes();
+      await handleCreateMessage(
+        first.res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'A' }],
+          max_tokens: 100,
+          cache_salt: 'tenant-a/high-entropy-secret',
+        },
+        registry,
+      );
+      expect(first.getStatus()).toBe(200);
+      const resetsAfterFirst = resetCaches.mock.calls.length;
+      expect(resetsAfterFirst).toBeGreaterThanOrEqual(1);
+
+      const second = createMockRes();
+      await handleCreateMessage(
+        second.res,
+        {
+          model: 'test-model',
+          messages: [
+            { role: 'user', content: 'A' },
+            { role: 'assistant', content: 'A1' },
+            { role: 'user', content: 'B' },
+          ],
+          max_tokens: 100,
+          cache_salt: 'tenant-b/high-entropy-secret',
+        },
+        registry,
+      );
+
+      expect(second.getStatus()).toBe(200);
+      expect(second.getHeaders()['x-session-cache']).toBe('fresh');
+      expect(resetCaches.mock.calls.length).toBeGreaterThan(resetsAfterFirst);
+      expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
+      const secondConfig = chatSessionStart.mock.calls[1]?.[1] as { cacheSalt?: string };
+      expect(secondConfig.cacheSalt).toBe('tenant-b/high-entropy-secret');
     });
 
     it('rotating x-anthropic-billing-header does not bust the warm slot', async () => {

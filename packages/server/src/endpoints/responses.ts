@@ -2949,6 +2949,7 @@ export async function handleCreateResponse(
             previousResponseId ?? null,
             requestedInstructions,
             effectivePromptCacheKey,
+            config.cacheSalt ?? null,
           );
           const session = lookup.session;
           await sessionReg.flushPendingDisposals();
@@ -3599,7 +3600,13 @@ export async function handleCreateResponse(
               // tier-2 hit and lease rA's chain session — a cross-chain
               // corruption the precedence rule was explicitly designed
               // to prevent. Keep adopt's key aligned with lookup's key.
-              sessionReg.adopt(responseId, session, requestedInstructions, effectivePromptCacheKey);
+              sessionReg.adopt(
+                responseId,
+                session,
+                requestedInstructions,
+                effectivePromptCacheKey,
+                config.cacheSalt ?? null,
+              );
               sessionRetained = true;
             }
 
