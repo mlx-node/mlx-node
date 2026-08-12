@@ -1820,7 +1820,7 @@ impl Qwen35MoeInner {
     /// turn's paged K/V prefix. MoE mirror of
     /// `Qwen35Inner::install_dense_gdn_cold_sidecar` — same source (an on-disk
     /// [`mlx_paged_attn::ColdSidecar`]), same destination (`self.caches`), same
-    /// fail-closed re-checks (group, layout equality against this config's
+    /// fail-closed preparation (group, layout equality against this config's
     /// geometry, boundary == the reported prefix). Consulted ONLY after every
     /// in-memory source missed.
     ///
@@ -1840,30 +1840,14 @@ impl Qwen35MoeInner {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Result<bool> {
-        let sidecar = {
+        let (restored, cache_dtype) = {
             let Some(adapter) = self.paged_adapter.as_mut() else {
                 return Ok(false);
             };
-            match adapter.take_restored_sidecar() {
-                Some(sidecar) => sidecar,
-                None => return Ok(false),
-            }
-        };
-        if sidecar.layout.group != mlx_paged_attn::ColdGroup::GdnState {
-            return Ok(false);
-        }
-        let boundary = sidecar.layout.boundary_tokens;
-        // The walk reconciles the prefix and the state together, so a sidecar
-        // that does not describe EXACTLY the reported prefix is a broken
-        // contract, not a deeper opportunity: refuse it.
-        if boundary == 0 || boundary != cached_prefix_len {
-            return Ok(false);
-        }
-        let cache_dtype = {
-            let Some(adapter) = self.paged_adapter.as_ref() else {
-                return Ok(false);
-            };
-            format!("{:?}", adapter.layer_kv_pool().cache_dtype())
+            (
+                adapter.take_restored_sidecar(),
+                format!("{:?}", adapter.layer_kv_pool().cache_dtype()),
+            )
         };
         let dense_config = self.config.to_dense_config();
         let Some(geometry) =
@@ -1871,26 +1855,31 @@ impl Qwen35MoeInner {
         else {
             return Ok(false);
         };
-        // `load_sidecar` already compared the layout to the policy's template;
-        // comparing again against the geometry derived from the LOADED config
-        // makes the install independent of that earlier check.
-        if crate::models::qwen3_5::gdn_sidecar::layout_at(&geometry, boundary) != sidecar.layout {
-            return Ok(false);
-        }
-        let Some(caches) = crate::models::qwen3_5::gdn_sidecar::decode_caches(
-            &dense_config,
-            &geometry,
-            &sidecar.tensors,
-            boundary,
-        )?
-        else {
+        let expected_layout =
+            crate::models::qwen3_5::gdn_sidecar::layout_at(&geometry, cached_prefix_len);
+        let installed_boundary = crate::cold_tier::try_install_cold_sidecar(
+            restored,
+            &expected_layout,
+            |tensors, boundary| {
+                let Some(caches) = crate::models::qwen3_5::gdn_sidecar::decode_caches(
+                    &dense_config,
+                    &geometry,
+                    tensors,
+                    boundary,
+                )?
+                else {
+                    return Ok(None);
+                };
+                self.caches = Some(caches);
+                Ok(Some(boundary))
+            },
+        )?;
+        let Some(boundary) = installed_boundary else {
             return Ok(false);
         };
-        self.caches = Some(caches);
         // The one observable that separates "the tier restored the recurrent
         // half" from "the tier read it and every arm above declined". See the
         // dense twin.
-        crate::cold_tier::cold_sidecar_counters().record_install();
         // Feed the in-memory store so later turns in this process hit RAM
         // instead of decoding the sidecar again. Best-effort: a failure to
         // clone/store never invalidates the freshly installed live caches.

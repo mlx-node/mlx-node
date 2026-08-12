@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use mlx_paged_attn::{ColdCacheFingerprint, ColdCacheManager, ColdCacheStats};
+use mlx_paged_attn::{
+    ColdCacheFingerprint, ColdCacheManager, ColdCacheStats, ColdSidecar, ColdSidecarLayout,
+};
 use napi_derive::napi;
 use sha2::{Digest, Sha256};
 
@@ -240,10 +242,10 @@ pub struct ColdSidecarTelemetry {
     ///
     /// The only counter on the read side, and it exists because every other
     /// signal a restore emits is satisfiable with the sidecar thrown away.
-    /// `install_*_gdn_cold_sidecar` has eight `Ok(false)` arms and each one falls
-    /// through to a full O(prefix) recurrent replay that produces CORRECT state
-    /// — so `cached_tokens`, `hits`, `corruptions`, and text/`num_tokens` parity
-    /// all stay exactly as they were. Without this counter a regression from
+    /// A family can reject an otherwise readable sidecar and fall through to a
+    /// full O(prefix) recurrent replay that produces CORRECT state — so
+    /// `cached_tokens`, `hits`, `corruptions`, and text/`num_tokens` parity all
+    /// stay exactly as they were. Without this counter a regression from
     /// "restored and used" to "restored and re-derived from scratch" is
     /// invisible, and that regression is the whole feature.
     pub installed: u64,
@@ -370,6 +372,36 @@ pub fn cold_sidecar_counters() -> &'static ColdSidecarCounters {
 /// without forcing the tier open.
 pub fn cold_sidecar_telemetry() -> ColdSidecarTelemetry {
     SIDECAR_COUNTERS.snapshot()
+}
+
+/// Consume, validate, and transactionally install one restored auxiliary payload.
+///
+/// A rejected payload stays consumed so it cannot be reconsidered later in the
+/// turn. Any mismatch degrades to a cache miss; no caller may install state at a
+/// different boundary or under a geometry derived from another checkpoint.
+///
+/// This is the MLX equivalent of vLLM's cache coordinator handing the model
+/// runner one already-matched cache group. The family callback still decodes
+/// and seats its architecture-specific GDN, ShortConv, or sliding tensors, but
+/// the shared transaction owns the validation and success commit. Returning
+/// `Ok(None)` declines the payload without advancing install telemetry;
+/// returning `Err` fails the turn without claiming the state became live.
+pub(crate) fn try_install_cold_sidecar<T>(
+    restored: Option<ColdSidecar>,
+    expected_layout: &ColdSidecarLayout,
+    install: impl FnOnce(&[Vec<u8>], u32) -> napi::Result<Option<T>>,
+) -> napi::Result<Option<T>> {
+    let Some(sidecar) = restored else {
+        return Ok(None);
+    };
+    if expected_layout.boundary_tokens == 0 || &sidecar.layout != expected_layout {
+        return Ok(None);
+    }
+    let installed = install(&sidecar.tensors, sidecar.layout.boundary_tokens)?;
+    if installed.is_some() {
+        cold_sidecar_counters().record_install();
+    }
+    Ok(installed)
 }
 
 /// Serializes tests that assert on a DELTA of the process-wide counters.
@@ -1119,6 +1151,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use mlx_paged_attn::ColdGroup;
+
     use super::*;
 
     fn unique_tmp(tag: &str) -> PathBuf {
@@ -1163,6 +1197,123 @@ mod tests {
     /// shard bytes, not the pass size.
     fn materialized() -> WeightsResident {
         WeightsResident::for_test(1, 4096)
+    }
+
+    fn restored_sidecar(layout: ColdSidecarLayout) -> ColdSidecar {
+        let fingerprint = ColdCacheFingerprint::from_components([b"aux-install".as_slice()]);
+        let key = mlx_paged_attn::ColdCacheKey::chain(
+            layout.group,
+            fingerprint,
+            None,
+            &[1, 2, 3, 4],
+            &[],
+            0,
+            0,
+        );
+        let tensor_count = layout.tensor_count().unwrap_or(0);
+        let bytes_per_tensor = layout.bytes_per_tensor;
+        ColdSidecar {
+            key,
+            fingerprint,
+            layout,
+            tensors: vec![vec![0xA5; bytes_per_tensor]; tensor_count],
+        }
+    }
+
+    #[test]
+    fn cold_sidecar_transaction_validates_once_and_commits_only_after_seating() {
+        let _guard = sidecar_counter_test_lock();
+        let layout = ColdSidecarLayout {
+            group: ColdGroup::GdnState,
+            boundary_tokens: 32,
+            num_layers: 2,
+            tensors_per_layer: 2,
+            dtype: "BFloat16".to_string(),
+            dims: vec![2, 4],
+            bytes_per_tensor: 16,
+        };
+        let before = cold_sidecar_telemetry();
+        let mut seated = false;
+        let installed = try_install_cold_sidecar(
+            Some(restored_sidecar(layout.clone())),
+            &layout,
+            |tensors, boundary| {
+                assert_eq!(boundary, 32);
+                assert_eq!(tensors.len(), 4);
+                assert_eq!(
+                    cold_sidecar_telemetry().installed,
+                    before.installed,
+                    "the transaction must not commit before the family seats state"
+                );
+                seated = true;
+                Ok::<_, napi::Error>(Some(boundary))
+            },
+        )
+        .expect("matching restored sidecar");
+        assert!(seated);
+        assert_eq!(installed, Some(32));
+        assert_eq!(cold_sidecar_telemetry().installed, before.installed + 1);
+
+        let mut wrong_layout = layout.clone();
+        wrong_layout.dims = vec![4, 2];
+        let mut rejected_callback_ran = false;
+        assert!(
+            try_install_cold_sidecar(
+                Some(restored_sidecar(layout.clone())),
+                &wrong_layout,
+                |_tensors, _boundary| {
+                    rejected_callback_ran = true;
+                    Ok::<_, napi::Error>(Some(()))
+                },
+            )
+            .expect("layout mismatch is a cache miss")
+            .is_none(),
+            "loaded-model geometry mismatch must fail closed"
+        );
+        assert!(!rejected_callback_ran);
+        let mut wrong_group = layout.clone();
+        wrong_group.group = ColdGroup::ConvState;
+        assert!(
+            try_install_cold_sidecar(
+                Some(restored_sidecar(layout.clone())),
+                &wrong_group,
+                |_tensors, _boundary| Ok::<_, napi::Error>(Some(())),
+            )
+            .expect("group mismatch is a cache miss")
+            .is_none(),
+            "a payload from another auxiliary group must fail closed"
+        );
+        let mut wrong_boundary = layout.clone();
+        wrong_boundary.boundary_tokens = 16;
+        assert!(
+            try_install_cold_sidecar(
+                Some(restored_sidecar(layout.clone())),
+                &wrong_boundary,
+                |_tensors, _boundary| Ok::<_, napi::Error>(Some(())),
+            )
+            .expect("boundary mismatch is a cache miss")
+            .is_none(),
+            "a payload at another token boundary must fail closed"
+        );
+        let decode_error = try_install_cold_sidecar(
+            Some(restored_sidecar(layout.clone())),
+            &layout,
+            |_tensors, _boundary| Err::<Option<()>, _>(napi::Error::from_reason("decode failed")),
+        )
+        .expect_err("family decode error must escape the transaction");
+        assert_eq!(decode_error.reason, "decode failed");
+        let declined = try_install_cold_sidecar(
+            Some(restored_sidecar(layout.clone())),
+            &layout,
+            |_tensors, _boundary| Ok::<_, napi::Error>(None::<()>),
+        )
+        .expect("family decline is a cache miss");
+        assert!(declined.is_none());
+        assert_eq!(
+            cold_sidecar_telemetry().installed,
+            before.installed + 1,
+            "rejected, failed, and declined payloads must not advance telemetry"
+        );
     }
 
     fn build(dir: &Path) -> Option<ColdCacheFingerprint> {

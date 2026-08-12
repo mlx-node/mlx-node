@@ -66,6 +66,17 @@ methods on each model backend. This follows vLLM's separation between its
 scheduler/KV-cache manager and per-layer cache specifications/model runner
 without importing its CUDA or multiprocessing topology.
 
+Cold auxiliary restore has the same coordinator/runner boundary. The cold-tier
+coordinator consumes a candidate and validates its cache group, exact token
+boundary, and loaded-checkpoint geometry once. Through
+`try_install_cold_sidecar`, only the family callback can decode and seat its
+GDN, ShortConv, or sliding-attention tensors; the shared transaction records
+success only after that callback returns the installed state. A mismatch is
+consumed as a cache miss, while a decode/seat error fails the turn without
+claiming a successful install. This keeps the reusable restore transaction
+outside model files without flattening different hybrid states into a
+misleading uniform cache type.
+
 `MediaPlan` distinguishes media that this loaded instance can execute from
 `backend_validated` input. The latter is admitted only so an existing family
 handler can produce a precise compatibility error; it is never reported as a

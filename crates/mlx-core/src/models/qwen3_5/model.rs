@@ -2244,11 +2244,10 @@ impl Qwen35Inner {
     /// those are already materialized and cost no decode.
     ///
     /// `ColdTierWalk::restore_extend` guarantees the sidecar backs EXACTLY the
-    /// prefix the adapter reported, so no boundary re-derivation is needed — but
-    /// every structural precondition is re-checked here (group, layout equality
-    /// against this config's geometry, boundary == the reported prefix). A
-    /// contract slip degrades to a MISS (`Ok(false)`) that falls through to the
-    /// caller's replay, never state installed at the wrong offset.
+    /// prefix the adapter reported. The shared cold-tier preparation re-checks
+    /// group, boundary, and loaded-config geometry before this family decodes
+    /// it. A contract slip degrades to a MISS (`Ok(false)`) that falls through
+    /// to the caller's replay, never state installed at the wrong offset.
     ///
     /// Taking the sidecar is unconditional so a rejected one cannot be
     /// reconsidered later in the same turn. On success the decoded state is also
@@ -2261,51 +2260,39 @@ impl Qwen35Inner {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Result<bool> {
-        let sidecar = {
+        let (restored, cache_dtype) = {
             let Some(adapter) = self.paged_adapter.as_mut() else {
                 return Ok(false);
             };
-            match adapter.take_restored_sidecar() {
-                Some(sidecar) => sidecar,
-                None => return Ok(false),
-            }
-        };
-        if sidecar.layout.group != mlx_paged_attn::ColdGroup::GdnState {
-            return Ok(false);
-        }
-        let boundary = sidecar.layout.boundary_tokens;
-        // The walk reconciles the prefix and the state together, so a sidecar
-        // that does not describe EXACTLY the reported prefix is a broken
-        // contract, not a deeper opportunity: refuse it.
-        if boundary == 0 || boundary != cached_prefix_len {
-            return Ok(false);
-        }
-        let cache_dtype = {
-            let Some(adapter) = self.paged_adapter.as_ref() else {
-                return Ok(false);
-            };
-            format!("{:?}", adapter.layer_kv_pool().cache_dtype())
+            (
+                adapter.take_restored_sidecar(),
+                format!("{:?}", adapter.layer_kv_pool().cache_dtype()),
+            )
         };
         let Some(geometry) = super::gdn_sidecar::geometry(&self.config, &cache_dtype) else {
             return Ok(false);
         };
-        // `load_sidecar` already compared the layout to the policy's template;
-        // comparing again against the geometry derived from the LOADED config
-        // makes the install independent of that earlier check.
-        if super::gdn_sidecar::layout_at(&geometry, boundary) != sidecar.layout {
-            return Ok(false);
-        }
-        let Some(caches) =
-            super::gdn_sidecar::decode_caches(&self.config, &geometry, &sidecar.tensors, boundary)?
-        else {
+        let expected_layout = super::gdn_sidecar::layout_at(&geometry, cached_prefix_len);
+        let installed_boundary = crate::cold_tier::try_install_cold_sidecar(
+            restored,
+            &expected_layout,
+            |tensors, boundary| {
+                let Some(caches) =
+                    super::gdn_sidecar::decode_caches(&self.config, &geometry, tensors, boundary)?
+                else {
+                    return Ok(None);
+                };
+                self.caches = Some(caches);
+                Ok(Some(boundary))
+            },
+        )?;
+        let Some(boundary) = installed_boundary else {
             return Ok(false);
         };
-        self.caches = Some(caches);
         // The one observable that separates "the tier restored the recurrent
         // half" from "the tier read it and every arm above declined". Both
         // produce identical text, identical `num_tokens` and identical
         // `cached_tokens`; only the second re-forwards the whole prefix.
-        crate::cold_tier::cold_sidecar_counters().record_install();
         // Feed the in-memory store so later turns in this process hit RAM
         // instead of decoding the sidecar again. Best-effort: a failure to
         // clone/store never invalidates the freshly installed live caches.

@@ -52,7 +52,8 @@ gemmaDescribe('Gemma4 grouped hybrid KV continuous batching', () => {
       text_config?: { model_type?: unknown };
     };
     const modelType = raw.text_config?.model_type ?? raw.model_type;
-    if (modelType !== 'gemma4_text' && modelType !== 'gemma4') {
+    const supportedModelTypes = new Set(['gemma4_text', 'gemma4', 'gemma4_unified_text', 'gemma4_unified']);
+    if (typeof modelType !== 'string' || !supportedModelTypes.has(modelType)) {
       throw new Error(`${MODEL_ENV_NAME} must identify Gemma4 text; model_type=${String(modelType)}`);
     }
 

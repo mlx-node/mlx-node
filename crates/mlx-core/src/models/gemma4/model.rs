@@ -1672,10 +1672,6 @@ impl<'a> Gemma4SlidingColdCaptureContext<'a> {
     }
 }
 
-const fn gemma4_sliding_cold_sidecar_matches_prefix(boundary: u32, cached_prefix_len: u32) -> bool {
-    boundary > 0 && boundary == cached_prefix_len
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Gemma4VlmPrefixPolicy {
     unified_boundary_safe: bool,
@@ -2568,31 +2564,31 @@ impl Gemma4Inner {
         }
 
         let restored = coordinator.full_adapter_mut().take_restored_sidecar();
-        let layer_kv = restored
-            .as_ref()
-            .filter(|sidecar| {
-                sidecar.layout.group == mlx_paged_attn::ColdGroup::SlidingWindow
-                    && sidecar.layout.boundary_tokens == plan.cached_prefix_len
-            })
-            .and_then(|sidecar| {
-                let geometry = geometry.as_ref()?;
-                (sliding_sidecar::layout_at(geometry, plan.cached_prefix_len) == sidecar.layout)
-                    .then_some((geometry, sidecar))
-            })
-            .map(|(geometry, sidecar)| {
-                sliding_sidecar::decode_layer_kv(geometry, &sidecar.tensors, plan.cached_prefix_len)
-            })
-            .transpose()?
-            .flatten();
-
-        let installed = layer_kv.is_some_and(|layer_kv| {
-            coordinator
-                .restore_sliding_groups(seq_id, tokens, plan.cached_prefix_len, &layer_kv)
-                .is_ok()
-        });
-        if installed {
-            crate::cold_tier::cold_sidecar_counters().record_install();
-            return Ok(plan.cached_prefix_len);
+        let installed_boundary = if let Some(geometry) = geometry.as_ref() {
+            let expected_layout = sliding_sidecar::layout_at(geometry, plan.cached_prefix_len);
+            crate::cold_tier::try_install_cold_sidecar(
+                restored,
+                &expected_layout,
+                |tensors, boundary| {
+                    let Some(layer_kv) =
+                        sliding_sidecar::decode_layer_kv(geometry, tensors, boundary)?
+                    else {
+                        return Ok(None);
+                    };
+                    if coordinator
+                        .restore_sliding_groups(seq_id, tokens, boundary, &layer_kv)
+                        .is_err()
+                    {
+                        return Ok(None);
+                    }
+                    Ok(Some(boundary))
+                },
+            )?
+        } else {
+            None
+        };
+        if let Some(boundary) = installed_boundary {
+            return Ok(boundary);
         }
 
         // A hot-only full-group hit is deliberately not enough: the sliding
@@ -3249,12 +3245,11 @@ impl Gemma4Inner {
     /// decode.
     ///
     /// `ColdTierWalk::restore_extend` guarantees the sidecar backs EXACTLY the
-    /// prefix the adapter reported, so no boundary re-derivation is needed —
-    /// but every structural precondition is re-checked here anyway (group,
-    /// layout equality against this config's geometry, boundary equal to the
-    /// reported prefix). A contract slip must degrade to a MISS, i.e. a return
-    /// of `None` that falls through to the caller's full replay, never to
-    /// state installed at the wrong offset.
+    /// prefix the adapter reported. The shared cold-tier preparation re-checks
+    /// group, boundary, and loaded-config geometry before this family decodes
+    /// it. A contract slip must degrade to a MISS, i.e. a return of `None` that
+    /// falls through to the caller's full replay, never to state installed at
+    /// the wrong offset.
     ///
     /// Returns `None` when there is no sidecar, or when anything about it
     /// fails to line up. Taking the sidecar is unconditional so a rejected one
@@ -3263,52 +3258,35 @@ impl Gemma4Inner {
         &mut self,
         cached_prefix_len: u32,
     ) -> Result<Option<Gemma4SlidingPrefixPreparation>> {
-        let Some(adapter) = self.kv_cache_coordinator.as_mut() else {
-            return Ok(None);
-        };
-        let Some(sidecar) = adapter.take_restored_sidecar() else {
-            return Ok(None);
-        };
-        if sidecar.layout.group != mlx_paged_attn::ColdGroup::SlidingWindow {
-            return Ok(None);
-        }
-        let boundary = sidecar.layout.boundary_tokens;
-        // The walk reconciles the prefix and the state together, so the two
-        // boundaries must be identical. Accepting a shallower sidecar would
-        // create a global/sliding split-brain state; on an image turn it would
-        // also invite replay across real vision embeddings. Refuse every
-        // mismatch and let the caller restart cold.
-        if !gemma4_sliding_cold_sidecar_matches_prefix(boundary, cached_prefix_len) {
-            return Ok(None);
-        }
+        let restored = self
+            .kv_cache_coordinator
+            .as_mut()
+            .and_then(|coordinator| coordinator.take_restored_sidecar());
         let Some(geometry) = sliding_sidecar::geometry(&self.config) else {
             return Ok(None);
         };
-        // `load_sidecar` already compared the layout to the policy's template;
-        // comparing again against the geometry derived from the LOADED config
-        // makes the install independent of that earlier check.
-        if sliding_sidecar::layout_at(&geometry, boundary) != sidecar.layout {
-            return Ok(None);
-        }
-        let Some(snapshots) =
-            sliding_sidecar::decode_snapshots(&self.config, &geometry, &sidecar.tensors, boundary)?
-        else {
-            return Ok(None);
-        };
-        let Some(caches) = restore_gemma4_sliding_caches(&self.config, &snapshots, boundary)?
-        else {
-            return Ok(None);
-        };
-        self.caches = Some(caches);
-        // The one observable that separates "the tier restored the sliding half"
-        // from "the tier read it and every arm above declined". Both produce
-        // identical text, identical `num_tokens` and identical `cached_tokens`;
-        // only the second re-forwards the whole prefix.
-        crate::cold_tier::cold_sidecar_counters().record_install();
-        Ok(Some(Gemma4SlidingPrefixPreparation {
-            state: "cold_sidecar",
-            primed_prefix_len: boundary,
-        }))
+        let expected_layout = sliding_sidecar::layout_at(&geometry, cached_prefix_len);
+        crate::cold_tier::try_install_cold_sidecar(
+            restored,
+            &expected_layout,
+            |tensors, boundary| {
+                let Some(snapshots) =
+                    sliding_sidecar::decode_snapshots(&self.config, &geometry, tensors, boundary)?
+                else {
+                    return Ok(None);
+                };
+                let Some(caches) =
+                    restore_gemma4_sliding_caches(&self.config, &snapshots, boundary)?
+                else {
+                    return Ok(None);
+                };
+                self.caches = Some(caches);
+                Ok(Some(Gemma4SlidingPrefixPreparation {
+                    state: "cold_sidecar",
+                    primed_prefix_len: boundary,
+                }))
+            },
+        )
     }
 
     /// Build the process-global SSD cold-tier context (manager + COMPLETE
@@ -9958,14 +9936,6 @@ mod tests {
             None,
             "an unrepresentable exclusive image endpoint must fail closed"
         );
-    }
-
-    #[test]
-    fn gemma4_restored_sliding_sidecar_must_match_the_effective_prefix_exactly() {
-        assert!(!gemma4_sliding_cold_sidecar_matches_prefix(0, 0));
-        assert!(!gemma4_sliding_cold_sidecar_matches_prefix(16, 32));
-        assert!(gemma4_sliding_cold_sidecar_matches_prefix(32, 32));
-        assert!(!gemma4_sliding_cold_sidecar_matches_prefix(48, 32));
     }
 
     #[test]

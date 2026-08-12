@@ -648,39 +648,34 @@ impl Lfm2Inner {
         seq_id: SeqId,
         cached_prefix_len: u32,
     ) -> Result<bool> {
-        let (sidecar, cache_dtype) = {
+        let (restored, cache_dtype) = {
             let Some(adapter) = self.paged_adapter.as_mut() else {
                 return Ok(false);
             };
             let cache_dtype = format!("{:?}", adapter.layer_kv_pool().cache_dtype());
-            let Some(sidecar) = adapter.take_restored_sidecar() else {
-                return Ok(false);
-            };
-            (sidecar, cache_dtype)
+            (adapter.take_restored_sidecar(), cache_dtype)
         };
-        if sidecar.layout.group != mlx_paged_attn::ColdGroup::ConvState
-            || sidecar.layout.boundary_tokens == 0
-            || sidecar.layout.boundary_tokens != cached_prefix_len
-        {
-            return Ok(false);
-        }
         let Some(geometry) = conv_sidecar::geometry(&self.config, &cache_dtype) else {
             return Ok(false);
         };
-        if conv_sidecar::layout_at(&geometry, cached_prefix_len) != sidecar.layout {
-            return Ok(false);
-        }
-        let Some(caches) = conv_sidecar::decode_caches(&self.config, &geometry, &sidecar.tensors)?
-        else {
-            return Ok(false);
-        };
-        if seq_id == 0 || self.active_scheduled_seq == Some(seq_id) {
-            self.caches = caches;
-        } else {
-            self.scheduled_caches.insert(seq_id, caches);
-        }
-        crate::cold_tier::cold_sidecar_counters().record_install();
-        Ok(true)
+        let expected_layout = conv_sidecar::layout_at(&geometry, cached_prefix_len);
+        crate::cold_tier::try_install_cold_sidecar(
+            restored,
+            &expected_layout,
+            |tensors, _boundary| {
+                let Some(caches) = conv_sidecar::decode_caches(&self.config, &geometry, tensors)?
+                else {
+                    return Ok(None);
+                };
+                if seq_id == 0 || self.active_scheduled_seq == Some(seq_id) {
+                    self.caches = caches;
+                } else {
+                    self.scheduled_caches.insert(seq_id, caches);
+                }
+                Ok(Some(()))
+            },
+        )
+        .map(|installed| installed.is_some())
     }
 
     fn capture_lfm2_conv_cold_sidecar(&self, cache_salt: u64) {
