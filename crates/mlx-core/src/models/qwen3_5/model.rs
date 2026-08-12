@@ -1879,6 +1879,9 @@ impl Qwen35Inner {
     /// stack the two request-local arrays, execute once over `[N,1,H]`, then
     /// scatter the replacement arrays back to their sequence entries.
     fn validate_scheduled_decode_residency(&self, rows: &[(SeqId, u32)]) -> Result<()> {
+        if self.config.recurrent_state_bytes() == 0 {
+            return Ok(());
+        }
         for &(seq_id, _) in rows {
             if self.scheduled_recurrent.live(seq_id).is_none() {
                 return Err(Error::from_reason(format!(
@@ -1887,6 +1890,33 @@ impl Qwen35Inner {
             }
         }
         Ok(())
+    }
+
+    fn scheduled_decode_recurrent_snapshots(
+        &self,
+        rows: &[(SeqId, u32)],
+    ) -> Result<Vec<(SeqId, Vec<Qwen3_5LayerCache>)>> {
+        if self.config.recurrent_state_bytes() == 0 {
+            return Ok(Vec::new());
+        }
+        rows.iter()
+            .map(|&(seq_id, _)| {
+                let state = self.scheduled_recurrent.live(seq_id).ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "Qwen3.5 sequence {seq_id} disappeared before recurrent snapshot"
+                    ))
+                })?;
+                crate::models::qwen3_5::paged_forward::snapshot_materialized_linear_layer_caches(
+                    state,
+                )
+                .map(|snapshot| (seq_id, snapshot))
+                .ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "Qwen3.5 sequence {seq_id} has an unmaterialized recurrent state"
+                    ))
+                })
+            })
+            .collect()
     }
 
     fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
@@ -1926,25 +1956,7 @@ impl Qwen35Inner {
         // contain warm completed rows or a newly admitted prefill row. Only
         // the rows selected for this decode must be present and materialized;
         // stack_rows below reads exactly this filtered set.
-        let recurrent_snapshots = rows
-            .iter()
-            .map(|&(seq_id, _)| {
-                let state = self.scheduled_recurrent.live(seq_id).ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "Qwen3.5 sequence {seq_id} disappeared before recurrent snapshot"
-                    ))
-                })?;
-                crate::models::qwen3_5::paged_forward::snapshot_materialized_linear_layer_caches(
-                    state,
-                )
-                .map(|snapshot| (seq_id, snapshot))
-                .ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "Qwen3.5 sequence {seq_id} has an unmaterialized recurrent state"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let recurrent_snapshots = self.scheduled_decode_recurrent_snapshots(rows)?;
 
         let mut recorded = Vec::with_capacity(rows.len());
         for &(seq_id, token_id) in rows {
@@ -14017,6 +14029,15 @@ mod paged_construction_tests {
         assert_eq!(inner.scheduled_recurrent_bytes(), 0);
         assert!(!inner.has_scheduled_recurrent(7));
         assert!(inner.can_activate_scheduled_recurrent(8));
+        inner
+            .validate_scheduled_decode_residency(&[(7, 11), (8, 13)])
+            .expect("attention-only decode must not require recurrent rows");
+        assert!(
+            inner
+                .scheduled_decode_recurrent_snapshots(&[(7, 11), (8, 13)])
+                .expect("attention-only decode must not snapshot recurrent rows")
+                .is_empty()
+        );
     }
 
     #[test]
