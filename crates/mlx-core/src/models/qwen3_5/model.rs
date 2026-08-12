@@ -1737,9 +1737,9 @@ impl Qwen35Inner {
         };
         let bytes = self.config.recurrent_state_bytes();
         if bytes == 0 {
-            return Err(Error::from_reason(
-                "Qwen3.5 scheduled recurrent state has zero byte size",
-            ));
+            self.active_scheduled_seq = None;
+            self.caches = None;
+            return Ok(());
         }
         if !self.scheduled_recurrent.can_insert_live(seq_id) {
             return Err(Error::from_reason(format!(
@@ -13991,6 +13991,32 @@ mod paged_construction_tests {
             .expect("an idle row release opens exactly one slot");
         assert_eq!(inner.scheduled_recurrent_units(), 2);
         assert_eq!(inner.scheduled_recurrent_bytes(), bytes * 2);
+    }
+
+    #[test]
+    fn all_full_attention_recurrent_lifecycle_is_a_noop() {
+        let mut config = tiny_cfg(false);
+        config.full_attention_interval = 1;
+        let mut inner = Qwen35Inner::new(config).expect("construct all-full dense model");
+        assert_eq!(inner.config.recurrent_state_bytes(), 0);
+
+        inner
+            .activate_scheduled_recurrent(7)
+            .expect("activate empty recurrent shell");
+        assert_eq!(inner.active_scheduled_seq, Some(7));
+        inner
+            .park_active_scheduled_recurrent()
+            .expect("zero-byte recurrent state must park as a no-op");
+
+        assert_eq!(inner.active_scheduled_seq, None);
+        assert!(
+            inner.caches.is_none(),
+            "the empty recurrent shell is dropped"
+        );
+        assert_eq!(inner.scheduled_recurrent_units(), 0);
+        assert_eq!(inner.scheduled_recurrent_bytes(), 0);
+        assert!(!inner.has_scheduled_recurrent(7));
+        assert!(inner.can_activate_scheduled_recurrent(8));
     }
 
     #[test]
