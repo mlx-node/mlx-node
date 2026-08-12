@@ -206,6 +206,11 @@ export class ModelRegistry {
     this.maxQueueDepth = opts?.maxQueueDepth;
   }
 
+  /** Configured per-model waiter cap, or `undefined` when unbounded. */
+  get queueDepthLimit(): number | undefined {
+    return this.maxQueueDepth;
+  }
+
   /**
    * Connect cold-load admission to name registration. The coordinator is
    * attached by the HTTP handler before dispatch; existing names are

@@ -13445,4 +13445,92 @@ describe('createHandler', () => {
       expect(results).toHaveLength(10);
     });
   });
+
+  describe('implicit cold-load queue cap', () => {
+    it.each([
+      {
+        endpoint: '/v1/responses',
+        body: (input: string) => ({ model: 'cold-model', input }),
+        assertEnvelope: (body: string) => {
+          const parsed = JSON.parse(body);
+          expect(parsed.error.type).toBe('rate_limit_error');
+          expect(parsed.error.code).toBe('queue_full');
+        },
+      },
+      {
+        endpoint: '/v1/messages',
+        body: (input: string) => ({
+          model: 'cold-model',
+          messages: [{ role: 'user', content: input }],
+          max_tokens: 16,
+        }),
+        assertEnvelope: (body: string) => {
+          const parsed = JSON.parse(body);
+          expect(parsed.type).toBe('error');
+          expect(parsed.error.type).toBe('rate_limit_error');
+        },
+      },
+    ])('bounds unresolved $endpoint requests with the registry limit', async ({ endpoint, body, assertEnvelope }) => {
+      let releaseLoad!: () => void;
+      const loadHold = new Promise<void>((resolve) => {
+        releaseLoad = resolve;
+      });
+      let markLoadStarted!: () => void;
+      const loadStarted = new Promise<void>((resolve) => {
+        markLoadStarted = resolve;
+      });
+      const model = {
+        chatSessionStart: vi.fn(async () => makeChatResult({ text: 'ok' })),
+        chatSessionContinue: vi.fn(async () => makeChatResult({ text: 'ok' })),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult({ text: 'ok' })),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry({ maxQueueDepth: 1 });
+      let firstLoad = true;
+      const resolveModel = vi.fn(async (name: string) => {
+        if (firstLoad) {
+          firstLoad = false;
+          markLoadStarted();
+          await loadHold;
+        }
+        registry.register(name, model);
+      });
+      const handler = createHandler(registry, { resolveModel });
+
+      const requestA = createMockRes();
+      const pendingA = handler(createMockReq('POST', endpoint, body('A')), requestA.res);
+      await loadStarted;
+
+      const requestB = createMockRes();
+      const pendingB = handler(createMockReq('POST', endpoint, body('B')), requestB.res);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const requestC = createMockRes();
+      const pendingC = handler(createMockReq('POST', endpoint, body('C')), requestC.res);
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const outcome = await Promise.race([
+          pendingC.then(() => 'done' as const),
+          new Promise<'timeout'>((resolve) => {
+            timeoutId = setTimeout(() => resolve('timeout'), 200);
+          }),
+        ]);
+        expect(outcome).toBe('done');
+        await requestC.waitForEnd();
+        expect(requestC.getStatus()).toBe(429);
+        expect(requestC.getHeaders()['retry-after']).toBe('1');
+        assertEnvelope(requestC.getBody());
+      } finally {
+        if (timeoutId !== undefined) clearTimeout(timeoutId);
+        releaseLoad();
+        await Promise.allSettled([pendingA, pendingB, pendingC]);
+      }
+      await Promise.all([requestA.waitForEnd(), requestB.waitForEnd()]);
+      expect(requestA.getStatus()).toBe(200);
+      expect(requestB.getStatus()).toBe(200);
+    });
+  });
 });

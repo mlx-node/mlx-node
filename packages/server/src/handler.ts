@@ -119,7 +119,8 @@ export function createHandler(
   const responseRetentionSec = options?.responseRetentionSec;
   const idleSweeper = options?.idleSweeper ?? null;
   const resolveModel = options?.resolveModel;
-  const modelWorkCoordinator = options?.modelWorkCoordinator ?? (resolveModel ? new ModelWorkCoordinator() : undefined);
+  const modelWorkCoordinator =
+    options?.modelWorkCoordinator ?? (resolveModel ? new ModelWorkCoordinator(registry.queueDepthLimit) : undefined);
   const listModels = options?.listModels;
   const health =
     options?.health ?? createHealthReporter({ registry, idleSweeper, modelWorkCoordinator: modelWorkCoordinator });
