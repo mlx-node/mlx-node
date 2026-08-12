@@ -8955,6 +8955,9 @@ pub struct Qwen3_5MoeModel {
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop.
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
+    /// RAII debit for the native paged KV pool, whose Metal buffers are not
+    /// visible to MLX allocator accounting.
+    pub(crate) _pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
 }
 
 #[napi]

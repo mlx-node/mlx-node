@@ -29,6 +29,7 @@ use crate::models::qwen3_5::persistence::{
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
 use crate::tokenizer::Qwen3Tokenizer;
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttentionType, MLPType};
@@ -1472,12 +1473,11 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
             // the sum of `params.values().nbytes()` is race-free and
             // deterministic. Caveat: post-load lazy growth (the warmup
             // forward pass and any lazy scratch) lands after this
-            // measurement — the coordinator's
-            // 1.75x multiplier adds ~75% slack to cover that post-load
-            // growth without needing runtime measurements. See
-            // `cache_limit.rs` module docs.
-            let load_result: Result<(Qwen35MoeInner, u64)> =
-                (|| -> Result<(Qwen35MoeInner, u64)> {
+            // measurement. The private paged pool is measured separately
+            // after construction because its Metal buffers are invisible to
+            // MLX allocator counters. See `cache_limit.rs` module docs.
+            let load_result: Result<(Qwen35MoeInner, u64, u64)> =
+                (|| -> Result<(Qwen35MoeInner, u64, u64)> {
                     // Load config
                     let config_path = path.join("config.json");
                     let config_data = fs::read_to_string(&config_path)
@@ -1801,10 +1801,19 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     // retained BF16 correctness reconstructions are extra.
                     weight_bytes = weight_bytes.saturating_add(plain_fp8_residency.nbytes());
 
-                    Ok((inner, weight_bytes))
+                    let pool_bytes = inner
+                        .paged_adapter
+                        .as_ref()
+                        .map(PagedKVCacheAdapter::pool_allocated_bytes)
+                        .transpose()
+                        .map_err(Error::from_reason)?
+                        .unwrap_or(0);
+                    Ok((inner, weight_bytes, pool_bytes))
                 })();
-            let (inner, weight_bytes) = load_result?;
+            let (inner, weight_bytes, pool_bytes) = load_result?;
             let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
+            let pool_cache_limit_guard = (pool_bytes != 0)
+                .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
 
             let model_id = inner.model_id;
             let config_out = inner.config.clone();
@@ -1831,6 +1840,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     spatial_merge_size,
                     tokenizer_out,
                     cache_limit_guard,
+                    pool_cache_limit_guard,
                     paged_active,
                     mtp_active,
                     vision_active,
@@ -1848,6 +1858,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         spatial_merge_size,
         _tokenizer,
         cache_limit_guard,
+        pool_cache_limit_guard,
         paged_active,
         mtp_active,
         vision_active,
@@ -1866,6 +1877,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         spatial_merge_size,
         context_limits,
         _cache_limit_guard: cache_limit_guard,
+        _pool_cache_limit_guard: pool_cache_limit_guard,
     })
 }
 
@@ -3122,6 +3134,16 @@ mod tests {
             assert!(
                 inner.paged_adapter.is_some(),
                 "affine paged config must build the paged adapter"
+            );
+            let pool_bytes = inner
+                .paged_adapter
+                .as_ref()
+                .expect("paged adapter")
+                .pool_allocated_bytes()
+                .expect("paged pool byte accounting");
+            assert!(
+                pool_bytes > 0,
+                "paged pool must report its private Metal bytes"
             );
         }
     }
