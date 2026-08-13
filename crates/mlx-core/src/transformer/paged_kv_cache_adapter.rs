@@ -716,6 +716,50 @@ pub struct PagedPrefillMemorySnapshot {
     pub paged_pool_allocated_bytes: Option<u64>,
 }
 
+/// The sliding window a **dense** (gathered-K/V) attention route must apply,
+/// handed out only by the adapter that owns the K/V.
+///
+/// This is the crate's default-deny gate for the defect class where a route
+/// that has no kernel-side window silently attends the whole context. The
+/// dense readers ([`PagedKVCacheAdapter::gather_kv_for_dense_cache_hit_prefill`]
+/// and [`PagedKVCacheAdapter::read_kv_range_for_dense_attention`]) return one
+/// of these **alongside** the K/V, so a caller cannot obtain
+/// placeholder-laden dense K/V for a windowed group without also holding the
+/// window it has to mask with. The window-blind spellings
+/// ([`PagedKVCacheAdapter::gather_kv_for_prefill_sdpa`],
+/// [`PagedKVCacheAdapter::read_kv_range`]) refuse a windowed group instead of
+/// serving it, which is vLLM's `AttentionBackend::supports_sliding_window()`
+/// defaulting to `False` expressed in Rust: a route that cannot express a
+/// window is not selectable, model-independently
+/// (`vllm/v1/attention/backend.py:260-262`, refusal assembled at `:385-386`).
+///
+/// There is deliberately no public constructor, no `Default` and no public
+/// field, so a literal `0` cannot be substituted for a live adapter read at
+/// any dense call site -- `dense_attention(.., 0, ..)` does not type-check.
+/// The `#[cfg(test)]` constructor exists for table-driven policy tests and is
+/// unavailable to production code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DenseAttentionWindow(u32);
+
+impl DenseAttentionWindow {
+    /// Window in tokens. `0` means the group is global (full causal).
+    pub fn tokens(self) -> u32 {
+        self.0
+    }
+
+    /// Whether this group has a window at all.
+    pub fn is_windowed(self) -> bool {
+        self.0 != 0
+    }
+
+    /// Policy-test constructor. Not available to production code, so the only
+    /// production source of a window remains the adapter that owns the K/V.
+    #[cfg(test)]
+    pub(crate) fn for_test(tokens: u32) -> Self {
+        Self(tokens)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PagedBlockTelemetry {
     pub total_blocks: u32,
@@ -5875,8 +5919,58 @@ impl PagedKVCacheAdapter {
     /// The native pool arrays are used directly, retaining any lazy
     /// `paged_kv_write` dependency. This path intentionally rejects FP8: a
     /// plain `take` cannot apply the per-layer dequantization scales.
+    ///
+    /// **Refuses a windowed group.** A dense gather materializes the retired
+    /// null placeholders `prune_sliding_window_for` installed, and this
+    /// signature has nowhere to return the window a caller would have to mask
+    /// them out with. Windowed callers use
+    /// [`Self::gather_kv_for_dense_cache_hit_prefill`], which hands back the
+    /// window with the K/V. Refusing here is the model-independent half of the
+    /// fix: `transformer/block.rs`, `qwen3_5` and `lfm2` all consume this
+    /// gather window-blind, so a future sliding group in any of them fails
+    /// closed instead of silently over-attending.
     #[cfg(target_os = "macos")]
     pub fn gather_kv_for_prefill_sdpa(
+        &mut self,
+        layer_idx: u32,
+        total_context: u32,
+    ) -> Result<(MxArray, MxArray), String> {
+        if self.sliding_window != 0 {
+            return Err(format!(
+                "gather_kv_for_prefill_sdpa: refusing a sliding group (sliding_window = {}). \
+                 A dense gather materializes the positions prune_sliding_window_for retired \
+                 onto the never-written null block, and this signature cannot return the \
+                 window needed to mask them. Call \
+                 gather_kv_for_dense_cache_hit_prefill, which returns \
+                 (keys, values, DenseAttentionWindow), and apply the window as an explicit \
+                 keep-mask.",
+                self.sliding_window
+            ));
+        }
+        self.gather_kv_dense_unchecked(layer_idx, total_context)
+    }
+
+    /// Dense K/V gather for a cache-hit prefill chunk, **with** the window the
+    /// caller must apply.
+    ///
+    /// The only way to obtain dense K/V for a windowed group. The returned
+    /// [`DenseAttentionWindow`] is derived from this adapter's own group, so
+    /// the window travels with the data rather than through a per-route
+    /// argument list -- which is exactly where vLLM's design note says a
+    /// window gets lost.
+    #[cfg(target_os = "macos")]
+    pub fn gather_kv_for_dense_cache_hit_prefill(
+        &mut self,
+        layer_idx: u32,
+        total_context: u32,
+    ) -> Result<(MxArray, MxArray, DenseAttentionWindow), String> {
+        let window = DenseAttentionWindow(self.sliding_window);
+        let (keys, values) = self.gather_kv_dense_unchecked(layer_idx, total_context)?;
+        Ok((keys, values, window))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn gather_kv_dense_unchecked(
         &mut self,
         layer_idx: u32,
         total_context: u32,
@@ -5995,6 +6089,18 @@ impl PagedKVCacheAdapter {
         _total_context: u32,
     ) -> Result<(MxArray, MxArray), String> {
         Err("gather_kv_for_prefill_sdpa is only supported on macOS (Metal backend)".to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn gather_kv_for_dense_cache_hit_prefill(
+        &mut self,
+        _layer_idx: u32,
+        _total_context: u32,
+    ) -> Result<(MxArray, MxArray, DenseAttentionWindow), String> {
+        Err(
+            "gather_kv_for_dense_cache_hit_prefill is only supported on macOS (Metal backend)"
+                .to_string(),
+        )
     }
 
     /// Run MLX-graph paged attention for a multi-token prefill suffix chunk.
@@ -6351,8 +6457,58 @@ impl PagedKVCacheAdapter {
     /// (system-prompt prefix cache reuse) the cost is amortized across the
     /// reused tokens, so the host-side cost is bounded by the prefix
     /// length × `num_kv_heads * head_size` (typically a few MB per layer).
+    /// ## Windowed groups
+    ///
+    /// A read wider than this adapter's sliding window is **refused**. For a
+    /// windowed group the positions below `end - sliding_window` are either
+    /// stale (out of window) or, once `prune_sliding_window_for` has fired,
+    /// physically on the reserved null block and never written -- and this
+    /// signature has nowhere to return the window a caller would have to mask
+    /// them out with. Callers that legitimately need the whole context for a
+    /// dense attention route use [`Self::read_kv_range_for_dense_attention`],
+    /// which returns the window with the K/V. Cold-tier sliding capture is
+    /// unaffected: it reads `min(boundary, sliding_window)` tokens by
+    /// construction.
     #[cfg(target_os = "macos")]
     pub fn read_kv_range(
+        &mut self,
+        layer_idx: u32,
+        start_pos: u32,
+        num_tokens: u32,
+    ) -> Result<(MxArray, MxArray), String> {
+        if self.sliding_window != 0 && num_tokens > self.sliding_window {
+            return Err(format!(
+                "read_kv_range: refusing to read {num_tokens} tokens from a sliding group \
+                 (sliding_window = {}). Positions older than the window are out of window, \
+                 and once prune_sliding_window_for has run they sit on the never-written \
+                 null block. Call read_kv_range_for_dense_attention, which returns \
+                 (keys, values, DenseAttentionWindow), and apply the window as an explicit \
+                 keep-mask.",
+                self.sliding_window
+            ));
+        }
+        self.read_kv_range_unchecked(layer_idx, start_pos, num_tokens)
+    }
+
+    /// Host-read the full `[0, total_context)` K/V for a **dense** attention
+    /// route, with the window the caller must apply.
+    ///
+    /// The only way to host-read past a windowed group's live window. Same
+    /// contract as [`Self::gather_kv_for_dense_cache_hit_prefill`]: the window
+    /// travels with the data.
+    #[cfg(target_os = "macos")]
+    pub fn read_kv_range_for_dense_attention(
+        &mut self,
+        layer_idx: u32,
+        total_context: u32,
+    ) -> Result<(MxArray, MxArray, DenseAttentionWindow), String> {
+        let window = DenseAttentionWindow(self.sliding_window);
+        let (keys, values) = self.read_kv_range_unchecked(layer_idx, 0, total_context)?;
+        Ok((keys, values, window))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_kv_range_unchecked(
         &mut self,
         layer_idx: u32,
         start_pos: u32,
@@ -6610,6 +6766,19 @@ impl PagedKVCacheAdapter {
         _num_tokens: u32,
     ) -> Result<(MxArray, MxArray), String> {
         Err("read_kv_range is only supported on macOS (Metal backend)".to_string())
+    }
+
+    /// Non-macOS stub.
+    #[cfg(not(target_os = "macos"))]
+    pub fn read_kv_range_for_dense_attention(
+        &mut self,
+        _layer_idx: u32,
+        _total_context: u32,
+    ) -> Result<(MxArray, MxArray, DenseAttentionWindow), String> {
+        Err(
+            "read_kv_range_for_dense_attention is only supported on macOS (Metal backend)"
+                .to_string(),
+        )
     }
 
     /// Register the request's FULL blocks in the prefix cache so future
@@ -7418,6 +7587,15 @@ impl PagedKVCacheAdapter {
         self.sliding_window
     }
 
+    /// This group's window as the type a dense attention route must carry.
+    ///
+    /// Use this rather than [`Self::sliding_window`] anywhere the value ends up
+    /// in an attention dispatch: [`DenseAttentionWindow`] has no public
+    /// constructor, so a literal cannot be written where one is expected.
+    pub fn dense_attention_window(&self) -> DenseAttentionWindow {
+        DenseAttentionWindow(self.sliding_window)
+    }
+
     /// Number of physical blocks shared by the allocator and layer pool.
     pub fn block_capacity(&self) -> u32 {
         self.layer_kv_pool.num_blocks()
@@ -7728,16 +7906,18 @@ impl PagedKVCacheAdapter {
     /// routes have no mask argument, so the window can only be applied
     /// kernel-side.
     ///
-    /// It is deliberately **not** a correctness barrier on prefill. A dense
-    /// gather of a sliding group does materialize the retired null
-    /// placeholders -- `gather_kv_for_prefill_sdpa` will hand them back --
-    /// so prefill correctness comes from the caller masking them out, not
-    /// from this `None`. Gemma4's cache-hit prefill does exactly that: it
-    /// carries `sliding_window` in `CacheHitPrefillPlan` and builds a
-    /// windowed `create_causal_mask` for both dense routes. On prefill this
-    /// value only scales a byte estimate. Do not re-document this as an
-    /// invariant that keeps sliding groups off the dense gather; nothing
-    /// enforces that, and after the masking fix nothing needs to.
+    /// On **prefill** it is only a byte estimate, and it never was the barrier
+    /// its first doc claimed. What keeps a sliding group off a window-blind
+    /// dense prefill route is now a refusal in the gather itself:
+    /// `gather_kv_for_prefill_sdpa` and `read_kv_range` **Err** for a windowed
+    /// group, and the only dense readers that serve one --
+    /// `gather_kv_for_dense_cache_hit_prefill` / `read_kv_range_for_dense_attention`
+    /// -- hand back a [`DenseAttentionWindow`] with the K/V so the caller
+    /// cannot hold the placeholders without holding the window. Do not
+    /// re-document *this accessor* as that barrier: routing on a byte estimate
+    /// is not a correctness gate, and reading it as one is how the dropped
+    /// mask survived. Gemma4's cache-hit prefill takes the windowed readers and
+    /// builds a windowed `create_causal_mask` for both dense routes.
     pub(crate) fn prefill_sdpa_cache_dtype(&self) -> Option<DType> {
         if self.sliding_window != 0 {
             return None;
@@ -13801,13 +13981,12 @@ mod tests {
         // Direct read of what the retired positions actually hold. The pool is
         // `StorageModePrivate` and explicitly not zeroed (layer_kv_pool.rs),
         // so this is driver behaviour and formally undefined -- reported to
-        // characterise the symptom, never asserted on. The gather succeeding
-        // at all is itself the finding: the dense SDPA route materializes the
-        // null placeholders that `prefill_sdpa_cache_dtype`'s comment claims
-        // it keeps a sliding group away from.
+        // characterise the symptom, never asserted on. The gather handing them
+        // back at all is the finding, which is why the windowed reader is the
+        // only spelling that serves a sliding group.
         let (null_k_max, null_v_max) = {
-            let (keys, values) = adapter
-                .gather_kv_for_prefill_sdpa(0, TOTAL)
+            let (keys, values, _window) = adapter
+                .gather_kv_for_dense_cache_hit_prefill(0, TOTAL)
                 .expect("dense gather of a sliding group's full context");
             let k_vals = keys.to_float32().expect("K to_float32");
             let v_vals = values.to_float32().expect("V to_float32");
@@ -14080,9 +14259,14 @@ mod tests {
 
         // The dense gather hands back the retired placeholders -- that is
         // precisely why the mask is mandatory on this route.
-        let (keys, values) = adapter
-            .gather_kv_for_prefill_sdpa(0, FIX_TOTAL)
+        let (keys, values, window) = adapter
+            .gather_kv_for_dense_cache_hit_prefill(0, FIX_TOTAL)
             .expect("dense gather of a sliding group's context");
+        assert_eq!(
+            window.tokens(),
+            WINDOW,
+            "the windowed dense reader must report the group's own window"
+        );
 
         let q = MxArray::zeros(
             &[1, FIX_NUM_Q_HEADS, FIX_CHUNK_LEN as i64, FIX_HEAD_SIZE],
@@ -14093,11 +14277,12 @@ mod tests {
 
         let reference = windowed_reference(WINDOW);
 
-        // Exactly the mask the fixed dense arms build.
+        // Exactly the mask the fixed dense arms build, from the window the
+        // gather handed back rather than from the local constant.
         let mask = crate::array::mask::create_causal_mask(
             FIX_CHUNK_LEN as i32,
             Some(FIX_PREFIX_LEN as i32),
-            Some(WINDOW as i32),
+            Some(window.tokens() as i32),
         )
         .expect("windowed keep-mask");
         let masked = crate::array::attention::scaled_dot_product_attention(
@@ -14155,6 +14340,104 @@ mod tests {
                 reference[i]
             );
         }
+    }
+
+    /// DEFAULT-DENY: the window-blind dense readers refuse a sliding group.
+    ///
+    /// This is the model-independent half of the fix, and the reason it is
+    /// here rather than in gemma4: `transformer/block.rs:423`,
+    /// `qwen3_5/attention.rs:1129`/`:1323` and `lfm2/attention.rs:391` all
+    /// consume these two readers window-blind. None is reachable today because
+    /// `new_sliding` has exactly one production caller, so nothing but this
+    /// refusal stops the next family that wires a sliding adapter from
+    /// re-deriving the same defect in a shared file. It mirrors vLLM's
+    /// `AttentionBackend.supports_sliding_window()` defaulting to `False`
+    /// (`vllm/v1/attention/backend.py:260-262`): a route that cannot express a
+    /// window is not selectable.
+    ///
+    /// Mutations caught: deleting either `sliding_window != 0` refusal (the
+    /// windowed group would be served window-blind again); returning
+    /// `DenseAttentionWindow(0)` from either windowed reader (the reported
+    /// window would stop tracking the group).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn window_blind_dense_readers_refuse_a_sliding_group() {
+        const WINDOW: u32 = 16;
+        let Some(fixture) = build_sliding_prefill_fixture(WINDOW).expect("sliding fixture") else {
+            eprintln!("skipping dense-reader refusal test: Metal GPU not available");
+            return;
+        };
+        let mut adapter = fixture.adapter;
+
+        let refused = match adapter.gather_kv_for_prefill_sdpa(0, FIX_TOTAL) {
+            Ok(_) => panic!("the window-blind dense gather must refuse a sliding group"),
+            Err(e) => e,
+        };
+        assert!(
+            refused.contains("gather_kv_for_dense_cache_hit_prefill"),
+            "the refusal must name the windowed reader, got: {refused}"
+        );
+
+        // Wider than the window: the host read would hand back out-of-window
+        // and null-block positions with no way to report the window.
+        let refused = match adapter.read_kv_range(0, 0, FIX_TOTAL) {
+            Ok(_) => panic!("a sliding read wider than the window must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            refused.contains("read_kv_range_for_dense_attention"),
+            "the refusal must name the windowed reader, got: {refused}"
+        );
+
+        // Within the window it is still legal -- this is the shape cold-tier
+        // sliding capture uses (`min(boundary, sliding_window)` tokens), and
+        // refusing it would break a working path.
+        adapter
+            .read_kv_range(0, FIX_TOTAL - WINDOW, WINDOW)
+            .expect("a sliding read inside the live window stays legal");
+
+        // Both windowed readers serve the group AND report its window.
+        let (_k, _v, window) = adapter
+            .gather_kv_for_dense_cache_hit_prefill(0, FIX_TOTAL)
+            .expect("the windowed dense gather serves a sliding group");
+        assert_eq!(window.tokens(), WINDOW);
+        assert!(window.is_windowed());
+        let (_k, _v, window) = adapter
+            .read_kv_range_for_dense_attention(0, FIX_TOTAL)
+            .expect("the windowed host read serves a sliding group");
+        assert_eq!(window.tokens(), WINDOW);
+    }
+
+    /// CONTROL: a full-attention group is served by every reader, window 0.
+    ///
+    /// The refusal above must not become over-strictness. A global group has
+    /// no window to lose, and both window-blind readers are its historical
+    /// path -- refusing it would break every non-sliding paged model.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dense_readers_serve_a_full_attention_group_and_report_window_zero() {
+        let Some(fixture) = build_sliding_prefill_fixture(0).expect("full fixture") else {
+            eprintln!("skipping full-attention dense-reader test: Metal GPU not available");
+            return;
+        };
+        let mut adapter = fixture.adapter;
+
+        adapter
+            .gather_kv_for_prefill_sdpa(0, FIX_TOTAL)
+            .expect("a full group keeps the window-blind dense gather");
+        adapter
+            .read_kv_range(0, 0, FIX_TOTAL)
+            .expect("a full group keeps the window-blind host read");
+
+        let (_k, _v, window) = adapter
+            .gather_kv_for_dense_cache_hit_prefill(0, FIX_TOTAL)
+            .expect("windowed gather on a full group");
+        assert_eq!(window.tokens(), 0, "a full group has no window");
+        assert!(!window.is_windowed());
+        let (_k, _v, window) = adapter
+            .read_kv_range_for_dense_attention(0, FIX_TOTAL)
+            .expect("windowed host read on a full group");
+        assert_eq!(window.tokens(), 0);
     }
 
     /// After pruning, no route may read a position backed by the null block.
