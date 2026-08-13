@@ -291,6 +291,43 @@ impl MuseGlimmerConfig {
             ));
         }
 
+        // `sliding_window` leaves this module as the `AttentionKind::SlidingWindow`
+        // payload of 39 of the 52 layers, so a bad value here mis-describes three
+        // quarters of the decoder. Two traps, both of which fail OPEN without a
+        // check here:
+        //
+        //   * 0 is not "no window" in the direction a reader expects. vLLM's
+        //     disable sentinel is `sliding_window = None`
+        //     (`vllm/config/model.py`, `disable_sliding_window`) and its
+        //     truthiness checks read a literal 0 as "not a sliding layer", so a 0
+        //     would silently promote every sliding layer to full attention —
+        //     fluent output, wrong receptive field, no error anywhere. Note this
+        //     0 is a DIFFERENT namespace from `layer_rope_theta`'s 0, which means
+        //     NoPE; the same digit means unrelated things in the two tables and
+        //     they must never be conflated.
+        //   * a value past `u32::MAX` truncates on the way into the KV-cache
+        //     seam, which carries the window as a `u32`. 5_000_000_000 would
+        //     arrive as 705_032_704: a plausible-looking window nobody asked for.
+        //
+        // Validating here rather than at spec derivation is deliberate. The seam
+        // does refuse a 0 (`KVCacheSpecError::InvalidSlidingWindow`), but only
+        // once grouping runs and without naming the config field that carried it.
+        if text.sliding_window == 0 {
+            return Err(Error::from_reason(format!(
+                "muse_glimmer: sliding_window must be non-zero, got {}; 39 of this \
+                 decoder's layers are sliding_attention, and a 0 window would widen \
+                 all of them to full attention instead of failing",
+                text.sliding_window
+            )));
+        }
+        if u32::try_from(text.sliding_window).is_err() {
+            return Err(Error::from_reason(format!(
+                "muse_glimmer: sliding_window {} does not fit in a u32; the KV cache \
+                 seam carries the window as a u32 and a cast would truncate it",
+                text.sliding_window
+            )));
+        }
+
         Ok(Self {
             image_token_id: raw.image_token_id,
             video_token_id: raw.video_token_id,
@@ -654,6 +691,42 @@ mod tests {
         assert!(
             err.contains("layer_rope_theta") && err.contains("entries but num_hidden_layers"),
             "expected a layer_rope_theta arity error, got: {err}"
+        );
+    }
+
+    /// `sliding_window` is the window of 39 of this decoder's 52 layers, and it
+    /// leaves this module as the `AttentionKind::SlidingWindow` payload of every
+    /// one of them. A 0 must not survive parsing: vLLM's disable sentinel is
+    /// `sliding_window = None` (`vllm/config/model.py`, `disable_sliding_window`),
+    /// and its truthiness checks read a literal 0 as "not a sliding layer", so a
+    /// 0 reaching a spec would silently widen three quarters of the decoder to
+    /// full attention. The seam does refuse it
+    /// (`KVCacheSpecError::InvalidSlidingWindow`), but only at grouping time and
+    /// without naming the config field, which is too late to be actionable.
+    #[test]
+    fn rejects_a_zero_sliding_window() {
+        let bad = text_config_json(52).replace("\"sliding_window\": 2048", "\"sliding_window\": 0");
+        let err = parse(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("sliding_window must be non-zero, got 0"),
+            "a zero sliding_window must fail closed at config load and name the field \
+             and the value, got: {err}"
+        );
+    }
+
+    /// The window crosses into the KV-cache seam as a `u32`. A `usize` value
+    /// past `u32::MAX` must be an error, never a silent truncation: `as u32`
+    /// turns 5_000_000_000 into 705_032_704, a plausible-looking window that is
+    /// not the one the checkpoint asked for.
+    #[test]
+    fn rejects_a_sliding_window_that_does_not_fit_a_u32() {
+        let bad = text_config_json(52)
+            .replace("\"sliding_window\": 2048", "\"sliding_window\": 5000000000");
+        let err = parse(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("sliding_window") && err.contains("5000000000"),
+            "an out-of-u32 sliding_window must fail closed and print the observed \
+             value, got: {err}"
         );
     }
 
