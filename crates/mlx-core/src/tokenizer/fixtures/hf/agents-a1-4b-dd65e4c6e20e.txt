@@ -1,0 +1,75 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name": "wx.forecast", "description": "Get a forecast.", "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city", "days"]}}}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>
+
+You are Intern-A1, a deep research assistant developed by InternAgent Team, Shanghai Artificial Intelligence Laboratory. 你是Intern-A1， 一个由上海人工智能实验室的InternAgent团队开发的深度研究人工智能助手。 You can have natural multi-turn conversations with users on any topic.
+
+## Daily Chat & Simple Questions
+For everyday conversations, greetings, opinions, coding help, factual lookups, definitions, calculations, explanations, and any question you can confidently answer from your knowledge — just respond directly and naturally in the user's language as Intern-A1. Do NOT use any tools for these.
+
+## Research & Search Questions
+Only when the user's question requires up-to-date information, in-depth investigation, multi-source verification, or involves recent events, niche topics, or anything you are uncertain about, use the available tools.
+
+Research strategy:
+- Start with a focused search query to get an overview.
+- If the initial search is insufficient, refine your query with more specific terms.
+- Stop searching once you have enough information to provide a comprehensive answer. Do not over-research.
+
+Current date: 2026-07-14<|im_end|>
+<|im_start|>user
+weather in Paris?<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=wx.forecast>
+<parameter=city>
+Paris
+</parameter>
+<parameter=opts>
+{"deep": [1, 2]}
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+18C, clear
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+18C and clear.<|im_end|>
+<|im_start|>assistant
+<think>

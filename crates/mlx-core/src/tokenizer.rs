@@ -4529,6 +4529,229 @@ mod tests {
         );
     }
 
+    /// HuggingFace's OWN rendering of each installed `tojson` template, keyed by
+    /// the sha256 prefix of the template that produced it.
+    ///
+    /// Keyed by content hash, not by directory name, for the reason the ternary
+    /// gate classifies by content: the cache holds several quant variants per
+    /// family and they get renamed and re-quantized. The family label in the
+    /// filename is cosmetic.
+    ///
+    /// Regenerate with `fixtures/hf/render_fixture.py` — its module docstring is
+    /// the record of exactly what context and message shapes were fed in, and
+    /// `--check` re-renders and reports drift.
+    const HF_GROUND_TRUTH: &[(&str, &str, &str)] = &[
+        (
+            "114f55ebdc18",
+            "muse-glimmer",
+            include_str!("tokenizer/fixtures/hf/muse-glimmer-114f55ebdc18.txt"),
+        ),
+        (
+            "182e77dd83bd",
+            "ornith-1.0-35b",
+            include_str!("tokenizer/fixtures/hf/ornith-1.0-35b-182e77dd83bd.txt"),
+        ),
+        (
+            "24f80538d671",
+            "agentworld",
+            include_str!("tokenizer/fixtures/hf/agentworld-24f80538d671.txt"),
+        ),
+        (
+            "46cd92afe7fe",
+            "lfm2.5-8b-a1b",
+            include_str!("tokenizer/fixtures/hf/lfm2.5-8b-a1b-46cd92afe7fe.txt"),
+        ),
+        (
+            "58933db77d30",
+            "nemotron-3.5-lightning",
+            include_str!("tokenizer/fixtures/hf/nemotron-3.5-lightning-58933db77d30.txt"),
+        ),
+        (
+            "8b4d21a1e70c",
+            "ornith-1.0-9b",
+            include_str!("tokenizer/fixtures/hf/ornith-1.0-9b-8b4d21a1e70c.txt"),
+        ),
+        (
+            "a4aee8afcf2e",
+            "qwen3.5",
+            include_str!("tokenizer/fixtures/hf/qwen3.5-a4aee8afcf2e.txt"),
+        ),
+        (
+            "dd65e4c6e20e",
+            "agents-a1-4b",
+            include_str!("tokenizer/fixtures/hf/agents-a1-4b-dd65e4c6e20e.txt"),
+        ),
+        (
+            "e84f32a23fdd",
+            "qwen3.6",
+            include_str!("tokenizer/fixtures/hf/qwen3.6-e84f32a23fdd.txt"),
+        ),
+        (
+            "ea663864491d",
+            "lfm2.5-2.6b",
+            include_str!("tokenizer/fixtures/hf/lfm2.5-2.6b-ea663864491d.txt"),
+        ),
+        (
+            "f05bf4b967dc",
+            "lfm2.5-1.2b-thinking",
+            include_str!("tokenizer/fixtures/hf/lfm2.5-1.2b-thinking-f05bf4b967dc.txt"),
+        ),
+        (
+            "f428623fc81c",
+            "step-3.7-flash",
+            include_str!("tokenizer/fixtures/hf/step-3.7-flash-f428623fc81c.txt"),
+        ),
+    ];
+
+    /// THE HF GROUND-TRUTH GATE. Our renderer's bytes against HuggingFace
+    /// transformers' bytes, family by family, on the same tool-calling turn.
+    ///
+    /// This is the pin the separator change deserved and did not have. The
+    /// cross-family gate above proves the separators are *spaced*; this one proves
+    /// they are spaced the way HF spaces them, and catches every other kind of
+    /// renderer drift in the same breath.
+    ///
+    /// Byte-identity is asserted per family where it holds, and where it does not
+    /// the residual is NAMED in `HF_RESIDUAL_GAPS` and only the JSON regions are
+    /// asserted. A named gap is worth more than a skipped family: the skip looks
+    /// like coverage and is not.
+    ///
+    /// ## Measured
+    ///
+    /// 12 distinct `tojson` templates in the cache. **Nine render BYTE-IDENTICAL
+    /// to HuggingFace** — ornith-1.0-9b, ornith-1.0-35b, qwen3.5, qwen3.6,
+    /// agentworld, agents-a1-4b, lfm2.5-1.2b-thinking, lfm2.5-2.6b, muse-glimmer.
+    /// One diverges by whitespace only (`HF_RESIDUAL_GAPS`). Two do not render at
+    /// all (`KNOWN_UNRENDERABLE_CAUSES`).
+    ///
+    /// ## Non-vacuity, verified by mutation
+    ///
+    /// | mutation | fails on |
+    /// |---|---|
+    /// | `install_template_helpers`' filter back to `serde_json::to_string` | byte-identity, naming the family and the differing offset |
+    /// | one byte edited in `qwen3.5-a4aee8afcf2e.txt` | the same, at that offset |
+    /// | a `HF_GROUND_TRUTH` hash no cache template has | the `matched.len()` floor, which is what stops a stale fixture set from silently covering nothing |
+    ///
+    /// That last floor matters more than it looks: the fixtures are keyed by
+    /// template hash, so an upstream template edit does not make this test wrong,
+    /// it makes it STOP RUNNING for that family. The floor turns that into a
+    /// failure that says "regenerate with `render_fixture.py`".
+    #[test]
+    #[ignore = "requires a local model cache; set MLX_TEST_MODEL_CACHE_DIR and run with --ignored"]
+    fn our_render_matches_hf_transformers_byte_for_byte() {
+        let Ok(root) = std::env::var("MLX_TEST_MODEL_CACHE_DIR") else {
+            panic!("set MLX_TEST_MODEL_CACHE_DIR to the directory holding checkpoint directories");
+        };
+        let entries = std::fs::read_dir(&root).unwrap_or_else(|e| panic!("read_dir {root}: {e}"));
+
+        let mut matched: Vec<&str> = Vec::new();
+        let mut report: Vec<String> = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(template) = std::fs::read_to_string(entry.path().join("chat_template.jinja"))
+            else {
+                continue;
+            };
+            let digest = sha256_prefix(&template);
+            let Some((_, family, hf)) = HF_GROUND_TRUTH.iter().find(|(d, _, _)| *d == digest)
+            else {
+                continue;
+            };
+            if matched.contains(family) {
+                continue; // another quant variant of a template already compared
+            }
+            matched.push(family);
+            let ours = match render_separator_probe(&template) {
+                Ok(ours) => ours,
+                Err(e) => {
+                    assert!(
+                        KNOWN_UNRENDERABLE_CAUSES
+                            .iter()
+                            .any(|cause| e.contains(cause)),
+                        "{family} does not render, and not for a recorded reason: {e}",
+                    );
+                    report.push(format!("{family}: DOES NOT RENDER ({e})"));
+                    continue;
+                }
+            };
+            report.push(format!("{family}: ours {}B, HF {}B", ours.len(), hf.len()));
+            if ours == *hf {
+                continue;
+            }
+            let offset = first_difference(&ours, hf);
+            assert!(
+                HF_RESIDUAL_GAPS.iter().any(|(f, _)| f == family),
+                "{family} diverges from HuggingFace at byte {offset} and is not a recorded \
+                 residual gap.\n  ours: {:?}\n  HF:   {:?}",
+                &ours[offset.saturating_sub(40)..(offset + 40).min(ours.len())],
+                &hf[offset.saturating_sub(40)..(offset + 40).min(hf.len())],
+            );
+            // A recorded gap still has to be spaced-JSON-correct: the gap is about
+            // whitespace and context keys OUTSIDE the JSON, never inside it.
+            for (detector, expected) in SEPARATOR_PROBES {
+                if ours.contains(detector) {
+                    assert!(
+                        ours.contains(expected),
+                        "{family} is a recorded residual gap, but its JSON regions must still \
+                         match HF exactly. Expected:\n  {expected}\nin:\n{ours}",
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            matched.len(),
+            HF_GROUND_TRUTH.len(),
+            "only {} of {} ground-truth fixtures found a template in {root} — either the cache \
+             shrank or a template changed and its fixture needs regenerating with \
+             fixtures/hf/render_fixture.py. Matched: {matched:?}",
+            matched.len(),
+            HF_GROUND_TRUTH.len(),
+        );
+        eprintln!("{}", report.join("\n"));
+    }
+
+    /// Families whose whole prompt does NOT match HF byte-for-byte, and why.
+    /// Populated from a real run; the gate refuses any divergence not listed, and
+    /// a recorded family still has to match HF inside its JSON regions.
+    ///
+    /// One entry, and it is NOT a separator defect — it is Jinja whitespace
+    /// control. HF builds its environment with `trim_blocks=True,
+    /// lstrip_blocks=True` (`chat_template_utils.py:487`) and miniJinja defaults
+    /// both to false. Nine of the ten renderable families are byte-identical
+    /// anyway, because their templates spell every trim explicitly as `{%- … -%}`;
+    /// Nemotron's does not, so we emit 1614 bytes where HF emits 1601 — 13 extra
+    /// newlines after block tags, all inside the tool-schema block.
+    ///
+    /// MEASURED CANDIDATE FIX, deliberately not taken here: adding
+    /// `env.set_trim_blocks(true); env.set_lstrip_blocks(true);` to
+    /// `render_chat_template_jinja2_with_content_order` makes ALL TEN renderable
+    /// families byte-identical to HF and regresses none of the nine that already
+    /// matched. It is still the wrong commit for it: those settings apply to every
+    /// template, and the 22 installed templates that do not use `tojson` — gemma4
+    /// among them — have no HF fixture here, so nothing in this file would notice
+    /// if it moved a gemma4 prompt. Ship it behind fixtures for the whole cache,
+    /// not behind these ten.
+    const HF_RESIDUAL_GAPS: &[(&str, &str)] = &[(
+        "nemotron-3.5-lightning",
+        "miniJinja defaults trim_blocks/lstrip_blocks to false; HF sets both true",
+    )];
+
+    /// First byte at which two strings differ; `min(len)` when one is a prefix.
+    fn first_difference(a: &str, b: &str) -> usize {
+        a.bytes()
+            .zip(b.bytes())
+            .position(|(x, y)| x != y)
+            .unwrap_or(a.len().min(b.len()))
+    }
+
+    /// 12 hex chars of the template's sha256 — the key `HF_GROUND_TRUTH` and
+    /// `render_fixture.py` agree on.
+    fn sha256_prefix(text: &str) -> String {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(text.as_bytes());
+        digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
+    }
+
     /// Finding B end-to-end: a template that emits literal `{% generation %}`
     /// text via a `{{ ... }}` expression and a `{% raw %}` block must RENDER
     /// with that literal text intact (byte-identical), while a real top-level

@@ -1,0 +1,46 @@
+<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.
+Knowledge cutoff: 2026-01-04.
+Current date: 2026-08-10.
+
+Reasoning strength: high.
+
+In this environment you have access to a set of tools you can use to answer the user's question.
+
+You can invoke a function by writing a "<atem:function_calls>" block like the following:
+<atem:function_calls>
+<atem:invoke name="$FUNCTION_NAME">
+<atem:parameter name="$PARAMETER_NAME">$PARAMETER_VALUE</atem:parameter>
+...
+</atem:invoke>
+</atem:function_calls>
+
+String and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.
+Here are the functions available in JSONSchema format:
+// Tool metadata
+{"name": "wx", "description": ""}
+// Function schemas
+{"name": "wx.forecast", "description": "Get a forecast.", "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city", "days"]}}
+
+Here's an example of how to call a function in the tool set:
+(If the tool namespace is not specified, invoke the function directly as `example_function_name` rather than `example_tool_name.example_function_name`)
+
+to=example_tool_name.example_function_name
+
+<atem:function_calls>
+<atem:invoke name="example_tool_name.example_function_name">
+<atem:parameter name="example_parameter_1">value_1</atem:parameter>
+<atem:parameter name="example_parameter_2">This is the value for the second parameter
+that can span
+"multiple" lines
+</atem:parameter>
+</atem:invoke>
+</atem:function_calls>
+
+# Valid recipients: "self", "wx.*", "user".<|eot|><|start|>user<|message|>weather in Paris?<|eot|><|start|>assistant to=wx.forecast<|message|><atem:function_calls>
+<atem:invoke name="wx.forecast">
+<atem:parameter name="city">Paris</atem:parameter>
+<atem:parameter name="opts">{"deep": [1, 2]}</atem:parameter>
+</atem:invoke>
+</atem:function_calls><|eot|><|start|>tool wx.forecast<|message|><tool_output name="wx.forecast">
+18C, clear
+</tool_output><|eot|><|start|>assistant to=user<|message|>18C and clear.<|eot|><|start|>assistant
