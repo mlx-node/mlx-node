@@ -73,17 +73,14 @@ See [docs/models.md](docs/models.md) for loading options and model-specific beha
 
 ## Models
 
-Current model support includes:
+| Type      | Models                                                                 | Notes                                                   |
+| --------- | ---------------------------------------------------------------------- | ------------------------------------------------------- |
+| General   | Qwen3, Qwen3.5/3.6 Dense and MoE, Gemma4, LFM2, LFM2.5                 | Qwen models support GRPO and SFT; others inference-only |
+| Vision    | Qwen3.5/3.6 VLM, Gemma4 VLM, PaddleOCR-VL, Qianfan OCR, PP-StructureV3 | General vision, OCR, and document processing            |
+| Audio     | Qwen3-ASR                                                              | Offline, streaming, and meeting transcription           |
+| Embedding | Harrier                                                                | Embedding inference                                     |
 
-- Qwen3 and Qwen3.5/3.6 Dense and MoE
-- Gemma4
-- LFM2 and LFM2.5
-- Qwen3.5/3.6 VLM and Gemma4 VLM
-- PaddleOCR-VL, Qianfan OCR, and the PP-StructureV3 document pipeline
-- Qwen3-ASR
-- Harrier embeddings
-
-Qwen3 and Qwen3.5/3.6 Dense and MoE support GRPO and SFT training. Other model families are inference-only. The detailed support matrix is in [docs/models.md](docs/models.md).
+The detailed support matrix is in [docs/models.md](docs/models.md).
 
 ## Server
 
